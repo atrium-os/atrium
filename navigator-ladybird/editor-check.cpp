@@ -1,5 +1,6 @@
 #include "CheckConfinement.h"
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include "EditorPage.h"
 #include "PinnedFonts.h"
 #include <LibCore/EventLoop.h>
@@ -22,6 +23,10 @@ static constexpr char fixture[] = {
 };
 
 extern "C" bool navigator_fixture_channel(int);
+#ifdef ATRIUM_MAIL_PAGE
+extern "C" NavigatorScene* navigator_mail_scene_open(u8 const**, size_t*, u8 const**, size_t*);
+extern "C" void navigator_mail_scene_wait(NavigatorScene*);
+#endif
 
 // The I0 loader completes its one bounded broker request synchronously.
 static ByteBuffer document_body;
@@ -51,12 +56,20 @@ int main(int argc, char** argv)
     socklen_t length = sizeof(type);
     if (argc == 1 && getsockopt(STDIN_FILENO, SOL_SOCKET, SO_TYPE, &type, &length) == 0)
         embedded = true;
-    if (argc != 1 && !embedded)
+    bool mail_probe = false;
+#ifdef ATRIUM_I0_SIGN_IN
+    struct stat input {};
+    mail_probe = (argc == 2 && strcmp(argv[1], "--mail-first-screen-check") == 0)
+        || (argc == 1 && !embedded && fstat(STDIN_FILENO, &input) == 0 && (S_ISREG(input.st_mode) || S_ISFIFO(input.st_mode)));
+#endif
+    if (argc != 1 && !embedded && !mail_probe)
         return 1;
     if (embedded) {
+#ifndef ATRIUM_MAIL_PAGE
         int channel = dup(STDOUT_FILENO);
         if (channel < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0 || !navigator_fixture_channel(channel))
             return 1;
+#endif
     }
     if (!Navigator::enter_fixture_capability_mode())
         return 1;
@@ -71,6 +84,36 @@ int main(int argc, char** argv)
     auto palette = Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value()));
     auto client = Navigator::EditorPage::create(move(palette));
 #ifdef ATRIUM_I0_SIGN_IN
+#ifdef ATRIUM_MAIL_PAGE
+    if (!embedded) return 1;
+    u8 const* url = nullptr;
+    u8 const* body = nullptr;
+    size_t url_len = 0, body_len = 0;
+    auto* scene = navigator_mail_scene_open(&url, &url_len, &body, &body_len);
+    if (!scene) return 4;
+    ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+    auto painted = Navigator::paint_mail_document(*client, scene, { url, url_len }, { body, body_len }, false);
+    if (painted.is_error()) return 4;
+    navigator_mail_scene_wait(scene);
+    return 0;
+#endif
+    if (mail_probe) {
+        // The development gate pipes the HTML that came back through the
+        // cookie courier. The jailed process has no path or network grant.
+        char html[65537];
+        auto size = fread(html, 1, sizeof(html), stdin);
+        if (!size || size == sizeof(html) || ferror(stdin))
+            return 4;
+        auto* scene = navigator_scene_create(false);
+        if (!scene) return 4;
+        ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+        auto probe = Navigator::paint_mail_document(*client, scene, "https://login.microsoftonline.com/first"sv, { html, size }, true);
+        if (probe.is_error()) {
+            warnln("Mail development document: {}", probe.error());
+            return 4;
+        }
+        return 0;
+    }
     auto result = Navigator::run_sign_in(client->palette(), [](Web::Page& page, URL::URL const& url) -> ErrorOr<StringView> {
         if (!fetch_fixture(page, url))
             return Error::from_string_literal("broker did not return the common fixture");

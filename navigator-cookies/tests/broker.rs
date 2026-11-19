@@ -135,6 +135,15 @@ impl Arca for InProcArca {
         self.issued.push((ask.clone(), id));
         Ok(id)
     }
+    fn script_cookies(&mut self, host: &str, port: u16, partition: &str, path: &str) -> Result<String, String> {
+        let mut w = Writer::new();
+        arcad::proto::write_endpoint(&mut w, host, port);
+        w.str(partition);
+        w.str(path);
+        let r = self.s.borrow_mut().handle(&broker_label(), arcad::proto::broker_op::W_SCRIPT_COOKIES, &w.buf);
+        if r.status != status::OK { return Err(format!("status {}", r.status)); }
+        String::from_utf8(r.body.bytes().to_vec()).map_err(|e| e.to_string())
+    }
     fn forget(&mut self, partition: &str, prefix: bool) -> Result<u32, String> {
         let mut w = Writer::new();
         w.str(partition); w.u8(prefix as u8);
@@ -515,4 +524,57 @@ fn a_sign_in_windows_forms_go_through_couriers_and_the_token_to_crypta() {
     let r = b.fetch(V, &Fetch::navigation(&format!("{gw}/echo"), None, true)).unwrap();
     assert_eq!(String::from_utf8_lossy(&r.body), "webvpnlogin=1");
     assert!(gw_log.lock().unwrap().iter().all(|(_, c)| !c.contains("TOKEN123")), "the token never went back out");
+}
+
+#[test]
+fn microsoft_sheet_claims_mail_session_and_fetches_with_its_own_cookies() {
+    const HOST: &str = "login.microsoftonline.com";
+    const FIRST_SCREEN: &str = "<!doctype html><label id=prompt for=account></label><input id=account><script>document.getElementById('prompt').textContent='Enter your account'</script>";
+    let p = pki(&[HOST]);
+    let (addr, log) = serve(&p, HOST, Arc::new(|target, cookie| {
+        if target.starts_with("/common/oauth2/v2.0/authorize?") {
+            http("302 Found", &["Location: /first".into(), "Set-Cookie: flow=dev; Path=/; Secure; HttpOnly".into()], "")
+        } else if target == "/first" && cookie.contains("flow=dev") {
+            http("200 OK", &["Content-Type: text/html; charset=utf-8".into()], FIRST_SCREEN)
+        } else { http("403 Forbidden", &[], "") }
+    }));
+    let mut world = world();
+    let net = Box::leak(Box::new(Net(HashMap::from([(HOST.into(), addr)]))));
+    world.b.couriers.net = net;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(p.ca_der.into()).unwrap();
+    world.b.couriers.tls = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth());
+    let mail = Label::App { user: "alice".into(), app_id: "org.atrium.mail".into(), publisher: [9; 32] };
+    let mut arca = world.s.borrow_mut();
+    assert_eq!(arca.handle(&mail, op::MAIL_SIGN_IN, &[]).status, status::UNSUPPORTED);
+    arca.mail_sign_ins.registration = Some("11111111-1111-4111-8111-111111111111".into());
+    arca.mail_sign_ins.mail_publisher = Some([9; 32]);
+    let reply = arca.handle(&mail, op::MAIL_SIGN_IN, &[]);
+    assert_eq!(reply.status, status::OK);
+    let handle: [u8; 16] = reply.body.bytes().try_into().unwrap();
+    let claim = arcad::proto::broker_op::W_MAIL_SIGN_IN;
+    assert_ne!(arca.handle(&mail, claim, &handle).status, status::OK);
+    let url = arca.handle(&broker_label(), claim, &handle);
+    assert_eq!(url.status, status::OK);
+    assert_eq!(arca.handle(&broker_label(), claim, &handle).status, status::DENIED);
+    drop(arca);
+    let url = std::str::from_utf8(url.body.bytes()).unwrap();
+    assert!(url.contains("code_challenge_method=S256"));
+    let page = world.b.mail_first_screen(1, &handle, url).unwrap();
+    assert_eq!(page.status, 200);
+    assert_eq!(page.body, FIRST_SCREEN.as_bytes());
+    assert_eq!(log.lock().unwrap().len(), 2);
+    assert_eq!(world.b.script_cookies(1, &page.url).unwrap().as_deref(), Some(""));
+    if let Some(path) = std::env::var_os("I0_DEVELOPMENT_DOCUMENT") {
+        // Only the public fixture DOM crosses into the engine test, never the authorization URL.
+        std::fs::File::create_new(path).unwrap().write_all(&page.body).unwrap();
+    }
+    let tickets = world.b.tickets;
+    for target in ["https://other.example/x", arcad::oauth::MICROSOFT.redirect] {
+        assert!(world.b.fetch(1, &Fetch::navigation(target, Some(HOST), false)).is_err());
+    }
+    assert_eq!(world.b.tickets, tickets);
+    world.b.close_mail_sheet(1);
+    assert_eq!(world.b.partition(1), None);
 }

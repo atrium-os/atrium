@@ -37,6 +37,7 @@ pub struct State {
     audit: Option<File>,
     handles: crate::handles::Handles,
     tickets: crate::tickets::Tickets,
+    pub mail_sign_ins: crate::oauth::Sessions,
     /// The machine store (arca.md §6.4): open from boot, for services.
     machine: Option<Store>,
     /// Unrecorded trails' cookie jars: in memory only (`crate::jar`).
@@ -151,7 +152,27 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
+        Ok(State { mail_sign_ins: Default::default(), dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
+    }
+
+    fn mail_begin(&mut self, user: &str, publisher: &[u8; 32], app: &str, body: &[u8]) -> Reply {
+        if !body.is_empty() { return malformed(); }
+        if app != "org.atrium.mail" { return reply(status::DENIED); }
+        if self.mail_sign_ins.registration.is_none() { return reply(status::UNSUPPORTED); }
+        if self.mail_sign_ins.mail_publisher.as_ref() != Some(publisher) { return reply(status::DENIED); }
+        if !self.stores.get(user).is_some_and(|s| s.state() == LockState::Unlocked) { return reply(status::LOCKED); }
+        match self.mail_sign_ins.begin(user) {
+            Ok(handle) => ok(handle.to_vec()),
+            Err(code) => reply(code),
+        }
+    }
+
+    fn mail_claim(&mut self, user: &str, body: &[u8]) -> Reply {
+        let Ok(handle) = body.try_into() else { return malformed(); };
+        match self.mail_sign_ins.claim(user, handle) {
+            Some(url) => ok(url.as_bytes().to_vec()),
+            None => reply(status::DENIED),
+        }
     }
 
     /// Run a request that answered `NEEDS_VERIFICATION` again, after
@@ -227,6 +248,8 @@ impl State {
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
+            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN => self.mail_begin(user, publisher, app_id, body),
+            Label::WebBroker { user, .. } if op == broker_op::W_MAIL_SIGN_IN => self.mail_claim(user, body),
             Label::App { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
@@ -1367,6 +1390,7 @@ impl State {
                         let _ = ring.drop_key(&id);
                     }
                 }
+                self.mail_sign_ins.lock(&user);
                 self.handles.lock_user(&user);
                 self.jars.lock(&user);
                 ok(Vec::new())

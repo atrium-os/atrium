@@ -242,6 +242,12 @@ Microsoft needs only an app registration (and tenant admin consent where an orga
 requires it). Until Google verification exists, Gmail works with an app password (needs
 2-Step Verification on the account), which Arca stores like any password.
 
+Development decision (2026-11-20): defer project registration. Test the
+first screen against the local TLS provider; a future operator can supply
+a public native-client ID for a live test. Mail asks Arca for an opaque
+session ticket and sends it to Navigator's sheet. See the
+[development gate](navigator-islands.md#development-registration-and-mails-first-screen).
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and

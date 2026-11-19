@@ -68,6 +68,10 @@ fn main() -> ExitCode {
     }
     let state = match arcad::server::State::new(dir.clone().into()) {
         Ok(mut s) => {
+            s.mail_sign_ins.registration = std::env::var("ARCA_MICROSOFT_CLIENT_ID").ok().filter(|id| arcad::oauth::client_id_ok(id));
+            s.mail_sign_ins.mail_publisher = std::env::var("ARCA_MAIL_PUBLISHER").ok()
+                .and_then(|hex| arcad::label::parse_web_broker(&format!("org.atrium.mail {hex}")))
+                .map(|(publisher, _)| publisher);
             // The machine store (§6.4) serves system services at the login
             // screen; a failure here leaves users' stores working.
             if let Err(e) = s.open_machine() {

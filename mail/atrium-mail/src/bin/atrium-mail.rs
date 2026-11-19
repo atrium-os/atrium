@@ -297,6 +297,7 @@ struct SettingsWin {
     size: pergola::Mutable<(f32, f32)>,
     /// Arca's field, while an account is being added.
     cred: Option<limen::proto::EmbedId>,
+    microsoft: Option<limen::proto::EmbedId>,
     next_ask: Instant,
 }
 
@@ -309,7 +310,7 @@ fn settings_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pe
     let s = atrium_mail::settings::Settings::new(engine.clone(), dirty.clone(), atrium_mail::accounts::arca_socket());
     let view = atrium_mail::settings::SettingsView::new(s.clone(), (win.width, win.height));
     let size = view.size.clone();
-    Ok(SettingsWin { win, app: App::new_with_flag(view, dirty), s, size, cred: None, next_ask: Instant::now() })
+    Ok(SettingsWin { win, app: App::new_with_flag(view, dirty), s, size, cred: None, microsoft: None, next_ask: Instant::now() })
 }
 
 /// The drafts whose windows were open, so a crash or a restart opens them
@@ -675,6 +676,27 @@ fn main() {
                 mail.refresh();
             }
             close_settings |= sw.s.closed();
+            if let Some(ticket) = sw.s.take_microsoft_ticket() {
+                if let (false, None, Some(e), Some(token)) = (close_settings, sw.microsoft, &embeds, sw.win.embed_token()) {
+                    let mut e = e.borrow_mut();
+                    match e.request("mail-sign-in", token, 0x4d534947) {
+                        Ok(id) if e.send(id, ticket.to_vec()).is_ok() => {
+                            sw.microsoft = Some(id);
+                            sw.s.microsoft_sheet_open.set(true);
+                            sw.s.sign_in_note("Continue in the Microsoft sign-in sheet.");
+                        }
+                        Ok(id) => { let _ = e.detach_embed(id); sw.s.sign_in_note("Navigator could not open the sign-in session."); }
+                        Err(_) => sw.s.sign_in_note("Navigator's sign-in sheet is unavailable."),
+                    }
+                } else if sw.microsoft.is_none() {
+                    sw.s.sign_in_note("The sign-in sheet is unavailable.");
+                }
+            }
+            if close_settings {
+                if let (Some(e), Some(id)) = (&embeds, sw.microsoft.take()) {
+                    let _ = e.borrow_mut().detach_embed(id);
+                }
+            }
             // Arca's password field, while an account is being added.
             if let Some(e) = &embeds {
                 match (sw.s.wants_field() && !close_settings, sw.cred) {
@@ -1183,6 +1205,22 @@ fn main() {
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if looked.as_ref().is_some_and(|l| l.2 == embed) => {
                         looked = None;
                         mail.look_failed("The viewer went away");
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed } | limen::proto::ParentEvent::Detached { embed }))
+                        if settings.as_ref().is_some_and(|s| s.microsoft == Some(embed)) => {
+                        if let Some(sw) = settings.as_mut() {
+                            sw.microsoft = None;
+                            sw.s.microsoft_sheet_open.set(false);
+                            sw.s.sign_in_note("The Microsoft sign-in sheet closed.");
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if bytes == b"failed" && settings.as_ref().is_some_and(|s| s.microsoft == Some(embed)) => {
+                        if let Some(sw) = settings.as_mut() {
+                            sw.microsoft = None;
+                            sw.s.microsoft_sheet_open.set(false);
+                            sw.s.sign_in_note("Navigator could not display the Microsoft sign-in page.");
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                        }
                     }
                     // Arca's field in the settings window: filled, or its handle.
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if settings.as_ref().is_some_and(|s| s.cred == Some(embed)) => {

@@ -765,10 +765,11 @@ pub mod host {
         faces: PinnedFaces,
         previous: NodeTree,
         pointer: Option<(f32, f32)>,
+        mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(limen::client::Child, u64, FrescoSurface)>,
     }
 
-    fn attach() -> Result<(limen::client::Child, u64, FrescoSurface), String> {
+    fn attach(expected_role: &str) -> Result<(limen::client::Child, u64, FrescoSurface), String> {
         use limen::proto::ChildEvent;
         use std::time::{Duration, Instant};
         let (mut child, stream) = limen::client::Child::embedded().map_err(|e| format!("{e:?}"))?;
@@ -776,8 +777,8 @@ pub mod host {
             .poll(Duration::from_secs(10))
             .map_err(|e| format!("{e:?}"))?
         {
-            Some(ChildEvent::Attach { embed, role, .. }) if role == "web-island" => embed,
-            _ => return Err("expected web-island attach".into()),
+            Some(ChildEvent::Attach { embed, role, .. }) if role == expected_role => embed,
+            _ => return Err("unexpected Limen role".into()),
         };
         let mut conn = fresco_client::Connection::wrap(stream).map_err(|e| e.to_string())?;
         conn.set_read_timeout(Some(Duration::from_secs(10)))
@@ -813,7 +814,7 @@ pub mod host {
     pub extern "C" fn navigator_scene_create(embedded: bool) -> *mut SceneState {
         let mut state = SceneState::default();
         if embedded {
-            match attach() {
+            match attach("web-island") {
                 Ok(embed) => state.embed = Some(embed),
                 Err(reason) => {
                     eprintln!("editor attach: {reason}");
@@ -825,6 +826,47 @@ pub mod host {
     }
 
     /// # Safety
+    /// The trusted Navigator sheet supplies the final document URL and the
+    /// sealed response body. Only this embed can send the document.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_mail_scene_open(out_url: *mut *const u8, url_len: *mut usize,
+        html: *mut *const u8, html_len: *mut usize) -> *mut SceneState {
+        use std::io::Read;
+        let Ok((mut child, embed, surface)) = attach("mail-sign-in-page") else { return std::ptr::null_mut() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let url = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return std::ptr::null_mut(); }
+            match child.poll(remaining) {
+                Ok(Some(limen::proto::ChildEvent::MessageFd { embed: id, bytes })) if id == embed => break bytes,
+                Ok(Some(limen::proto::ChildEvent::Resumed { .. })) => continue,
+                _ => return std::ptr::null_mut(),
+            }
+        };
+        let Ok(location) = String::from_utf8(url) else { return std::ptr::null_mut() };
+        let Some(fd) = child.take_fd() else { return std::ptr::null_mut() };
+        let file = std::fs::File::from(fd);
+        let mut bytes = Vec::new();
+        if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
+            || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 { return std::ptr::null_mut(); }
+        let state = Box::new(SceneState { embed: Some((child, embed, surface)), mail_document: Some((location, bytes)), ..Default::default() });
+        let (location, bytes) = state.mail_document.as_ref().unwrap();
+        unsafe { *out_url = location.as_ptr(); *url_len = location.len(); *html = bytes.as_ptr(); *html_len = bytes.len(); }
+        Box::into_raw(state)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_mail_scene_wait(state: &mut SceneState) {
+        let Some((child, _, _)) = &mut state.embed else { return };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while std::time::Instant::now() < until {
+            match child.poll(until.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Some(limen::proto::ChildEvent::Resumed { .. } | limen::proto::ChildEvent::Suspended { .. })) => {}
+                _ => break,
+            }
+        }
+    }
+
     /// The owner releases a state from navigator_scene_create exactly once.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn navigator_scene_destroy(state: *mut SceneState) {
@@ -928,6 +970,7 @@ pub mod host {
                     if child.emit(*embed, b"frame".to_vec()).is_err() {
                         return false;
                     }
+                    if state.mail_document.is_some() { state.previous = next; return true; }
                     let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
                     loop {
                         if std::time::Instant::now() >= until {

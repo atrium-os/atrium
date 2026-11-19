@@ -2516,9 +2516,11 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "atrium-open",
+ "fresco-client",
  "fresco-protocol",
  "fresco-split",
  "libc",
+ "limen",
  "monstrator",
  "navigator-backend",
  "navigator-control",

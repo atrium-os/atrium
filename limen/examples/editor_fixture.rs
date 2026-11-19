@@ -4,7 +4,7 @@ use limen::daemon::{Launcher, Shared};
 use limen::proto::{EmbedId, ParentEvent};
 use std::error::Error;
 use std::io::Write;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -83,15 +83,20 @@ struct Fixture {
 
 impl Launcher for Fixture {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        if app != limen::catalogue::NAVIGATOR_ENGINE {
+        let mail = std::env::var_os("I0_MAIL_DOCUMENT").is_some();
+        let expected = if mail { "org.atrium.navigator.mail-page" } else { limen::catalogue::NAVIGATOR_ENGINE };
+        if app != expected {
             return Err("unexpected worker".into());
         }
-        let (fetcher, engine) = UnixStream::pair().map_err(|e| e.to_string())?;
-        std::thread::spawn(move || {
-            if let Err(e) = serve_fixture(fetcher) {
-                eprintln!("fixture broker: {e}");
-            }
-        });
+        let stdout = if mail {
+            Stdio::inherit()
+        } else {
+            let (fetcher, engine) = UnixStream::pair().map_err(|e| e.to_string())?;
+            std::thread::spawn(move || {
+                if let Err(e) = serve_fixture(fetcher) { eprintln!("fixture broker: {e}"); }
+            });
+            Stdio::from(OwnedFd::from(engine))
+        };
         let mut worker = Command::new("/usr/local/bin/portcullis")
             .args([
                 "exec",
@@ -103,7 +108,7 @@ impl Launcher for Fixture {
             ])
             .arg(&self.bundle)
             .stdin(Stdio::from(OwnedFd::from(channel)))
-            .stdout(Stdio::from(OwnedFd::from(engine)))
+            .stdout(stdout)
             .spawn()
             .map_err(|e| e.to_string())?;
         let exit = self.exit.clone();
@@ -162,9 +167,10 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             }
         }
     };
+    let document = std::env::var_os("I0_MAIL_DOCUMENT");
     let start = Instant::now();
     let embed = parent
-        .request("web-island", token)
+        .request(if document.is_some() { "mail-sign-in-page" } else { "web-island" }, token)
         .map_err(|e| format!("{e:?}"))?;
     parent
         .place(embed, Some([0., 0., 640., 360.]))
@@ -172,7 +178,14 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
     let raster_log = dir.join("frescod.log");
     let mut cursor = std::fs::metadata(&raster_log)?.len() as usize;
     let mut attached = false;
-    let stages: &[&str] = if std::env::var_os("I0_SIGN_IN").is_some() {
+    if let Some(path) = &document {
+        let data = std::fs::read(path)?;
+        let fd = limen::fdpass::sealed_file("development-first-screen", &data)?;
+        parent.send_fd(embed, b"https://login.microsoftonline.com/first".to_vec(), fd.as_fd()).map_err(|e| format!("{e:?}"))?;
+    }
+    let stages: &[&str] = if document.is_some() {
+        &["baseline"]
+    } else if std::env::var_os("I0_SIGN_IN").is_some() {
         &["baseline", "refused", "callback"]
     } else {
         &["baseline", "blink", "restore", "key", "scroll"]
@@ -273,6 +286,10 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             } else {
                 inject.write_all(b"MOVE 40 40\nSCROLL 24\n")?;
             }
+        }
+        if document.is_some() {
+            parent.detach(embed).map_err(|e| format!("{e:?}"))?;
+            break;
         }
         parent
             .send(embed, b"advance".to_vec())

@@ -210,7 +210,7 @@ pub trait Couriers {
 }
 
 #[derive(Debug, Clone)]
-struct View { partition: String, cookied: Option<Why>, sign_in: Option<String> }
+struct View { partition: String, cookied: Option<Why>, sign_in: Option<String>, microsoft: bool }
 
 /// ★ THE BROKER'S COOKIE STATE: which views are cookied, and the only
 /// path by which a request of theirs carries a cookie.
@@ -271,7 +271,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         let p = partition_in(jar, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
         match self.views.get_mut(&view) {
             Some(v) if v.partition == p => {}
-            _ => { self.views.insert(view, View { partition: p, cookied: None, sign_in: None }); }
+            _ => { self.views.insert(view, View { partition: p, cookied: None, sign_in: None, microsoft: false }); }
         }
         Ok(())
     }
@@ -288,8 +288,28 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             return Ok(());
         }
         let p = vpn_partition(profile, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
-        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: Some(profile.into()) });
+        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: Some(profile.into()), microsoft: false });
         Ok(())
+    }
+
+    /// Begin the first-screen GET in a session-specific Arca cookie partition.
+    /// The trusted sheet gets the URL from arcad by claiming Mail's handle.
+    pub fn mail_first_screen(&mut self, view: ViewId, handle: &[u8; 16], url: &str) -> Result<Fetched, Refused> {
+        if url.split_once('?').map(|(base, _)| base) != Some(arcad::oauth::MICROSOFT.authorize) {
+            return Err(Refused::Malformed("unexpected Microsoft authorization endpoint".into()));
+        }
+        let partition = partition_in(Some(u64::from_le_bytes(handle[..8].try_into().unwrap())), url)
+            .ok_or_else(|| Refused::Malformed("invalid authorization URL".into()))?;
+        self.views.insert(view, View { partition,
+            cookied: Some(Why::Reader), sign_in: None, microsoft: true });
+        self.fetch(view, &Fetch::navigation(url, None, true))
+    }
+
+    pub fn close_mail_sheet(&mut self, view: ViewId) {
+        if let Some(v) = self.views.get(&view).filter(|v| v.microsoft) {
+            let _ = self.arca.forget(&v.partition, false);
+            self.close(view);
+        }
     }
 
     /// The reader's action, or the site's need, turns a view cookied: from
@@ -335,7 +355,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// [`Refused::NotCookied`] before anything is asked of Arca: the caller
     /// sends it the plain way, and it carries no cookie.
     pub fn fetch(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
-        let Some(View { partition, cookied: Some(_), sign_in }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
+        let Some(View { partition, cookied: Some(_), sign_in, microsoft }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
         // A form only from a sign-in window, and only as a form.
         let form = sign_in.is_some() && f.method == Method::Post && f.reason == Reason::Form;
         if !matches!(f.method, Method::Get | Method::Head) && !form { return Err(Refused::Method) }
@@ -355,6 +375,15 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         loop {
             let host = url.host_str().ok_or_else(|| Refused::Malformed("no host".into()))?.to_ascii_lowercase();
             let port = url.port_or_known_default().unwrap_or(443);
+            if microsoft {
+                let login = host == "login.microsoftonline.com";
+                let asset = matches!(host.as_str(), "aadcdn.msauth.net" | "aadcdn.msftauth.net");
+                if url.scheme() != "https" || port != 443 || !url.username().is_empty() || url.password().is_some()
+                    || !(login || asset && reason == Reason::Subresource)
+                    || login && url.path().eq_ignore_ascii_case("/common/oauth2/nativeclient") {
+                    return Err(Refused::Redirect("outside the Microsoft first-screen grant".into()));
+                }
+            }
             let path = if url.path().is_empty() { "/".to_string() } else { url.path().to_string() };
             let query = url.query().unwrap_or("").to_string();
             let site = arcad::cookie::site(&host);
@@ -540,6 +569,11 @@ impl Arca for ArcadSocket {
 }
 
 impl ArcadSocket {
+    pub fn claim_mail_sign_in(&self, handle: &[u8; 16]) -> Result<String, String> {
+        let bytes = self.ask(arcad::proto::broker_op::W_MAIL_SIGN_IN, handle, "open the Mail sign-in sheet")?;
+        String::from_utf8(bytes).map_err(|_| "Arca returned an invalid authorization URL".into())
+    }
+
     /// One request to arcad, its OK body.
     fn ask(&self, op: u16, body: &[u8], what: &str) -> Result<Vec<u8>, String> {
         let mut s = UnixStream::connect(&self.path).map_err(|e| format!("arcad: {e}"))?;

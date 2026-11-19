@@ -51,6 +51,7 @@ fn main() -> std::io::Result<()> {
         let reg = portcullis_peer::AppRegistry::load(&reg_path).ok()?;
         reg.persona(uid).flatten().map(String::from)
     });
+    let sheet_registry = registry.clone();
     let resolve = Box::new(move |uid: u32| {
         let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
         reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string()))
@@ -69,6 +70,14 @@ fn main() -> std::io::Result<()> {
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
     // The picker is told its parent's persona (personas.md §4.1).
+    if let Ok(config) = std::env::var("ARCA_WEB_BROKER") {
+        shared.set_mail_sheet_provider(Box::new(move |uid| {
+            let Ok(reg) = portcullis_peer::AppRegistry::load(&sheet_registry) else { return false; };
+            let Some(Some(key)) = reg.publisher(uid) else { return false; };
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            key != [0; 32] && config == format!("org.atrium.navigator {hex}")
+        }));
+    }
     shared.set_persona_lookup(persona_of);
     // The share sheet is a system service (`_share`), not a registry app;
     // it may choose only installed share targets for the parent's person.

@@ -1,0 +1,12 @@
+[app]
+id = "org.atrium.navigator.mail-page"
+name = "Navigator sign-in page"
+version = "0.1.0"
+entry = "bin/mail-page"
+
+[capabilities]
+network = "none"
+
+[resources]
+memory = "256M"
+cpu = 100

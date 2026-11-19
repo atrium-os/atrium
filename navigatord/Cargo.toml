@@ -11,6 +11,8 @@ name = "navigatord"
 path = "src/main.rs"
 
 [dependencies]
+limen = { path = "../limen" }
+fresco-client = { path = "../fresco-client" }
 navigator-control = { path = "../navigator-control" }
 navigator-cookies = { path = "../navigator-cookies" }
 navigator-backend = { path = "../navigator-backend" }

@@ -108,6 +108,9 @@ impl World {
         let ended = Arc::new(Mutex::new(Vec::new()));
         let resolve = Box::new(|uid: u32| match uid {
             APP => Some(("ana".into(), "org.example.mail".into())),
+            4101 | 4102 => Some(("ana".into(), "org.atrium.navigator".into())),
+            4111 | 4112 => Some(("ana".into(), "org.atrium.mail".into())),
+            4113 => Some(("ben".into(), "org.atrium.mail".into())),
             OTHER => Some(("ana".into(), "org.example.other".into())),
             ARCA_UID => Some(("ana".into(), catalogue::ARCA.into())),
             SCRINIUM_UID => Some(("ana".into(), catalogue::SCRINIUM.into())),
@@ -798,4 +801,17 @@ fn the_print_sheet_takes_a_sealed_pdf_hands_back_save_as_pdf_and_opens_once_per_
     app.detach(e3).unwrap();
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(refused(app.request("print", W_APP)), refusal::RATE, "the fourth in a minute, at once");
+}
+
+#[test]
+fn mail_sheet_requires_its_publisher_owner_and_persona() {
+    let w = World::new();
+    w.shared.set_persona_lookup(Box::new(|uid| matches!(uid, 4102 | 4112).then(|| "school".into())));
+    assert_eq!(refused(provider(w.connect(4101), "mail-sign-in").map(|_| ())), refusal::NOT_PROVIDER);
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    let _sheet = provider(w.connect(4101), "mail-sign-in").unwrap();
+    assert_eq!(refused(provider(w.connect(4102), "mail-sign-in").map(|_| ())), refusal::NOT_PROVIDER);
+    assert!(w.parent(4111).request("mail-sign-in", W_APP).is_ok());
+    assert_eq!(refused(w.parent(4112).request("mail-sign-in", W_APP)), refusal::NO_PROVIDER);
+    assert_eq!(refused(w.parent(4113).request("mail-sign-in", W_APP)), refusal::NO_PROVIDER);
 }

@@ -153,6 +153,7 @@ struct State {
     embeds: HashMap<EmbedId, Embed>,
     /// role → the system provider's connection.
     providers: HashMap<&'static str, (ConnId, u32)>,
+    mail_sheets: HashMap<(String, Option<String>), (ConnId, u32)>,
     /// parent → the app the person chose for its next `share-target`, and
     /// when (share-sheet.md §3).
     choices: HashMap<ConnId, (String, Option<String>, Instant)>,
@@ -195,6 +196,7 @@ pub struct Shared {
     system_uids: Mutex<HashMap<&'static str, u32>>,
     /// A uid's persona, from the launch registry (`None`: Personal).
     persona: Mutex<Option<PersonaOf>>,
+    mail_sheet_provider: Mutex<Option<Box<dyn Fn(u32) -> bool + Send + Sync>>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
     /// Without one (tests), any app may embed any role.
     embed_check: Mutex<Option<EmbedCheck>>,
@@ -216,6 +218,7 @@ impl Shared {
             defaults,
             system_uids: Mutex::new(HashMap::new()),
             persona: Mutex::new(None),
+            mail_sheet_provider: Mutex::new(None),
             attribution: Mutex::new(None),
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
@@ -232,6 +235,11 @@ impl Shared {
     /// Without one every parent counts as Personal.
     pub fn set_persona_lookup(&self, f: PersonaOf) {
         *self.persona.lock().unwrap() = Some(f);
+    }
+
+    /// Only the Navigator signed by the configured web broker publisher can frame Mail sign-in.
+    pub fn set_mail_sheet_provider(&self, check: Box<dyn Fn(u32) -> bool + Send + Sync>) {
+        *self.mail_sheet_provider.lock().unwrap() = Some(check);
     }
 
     /// Where attribution tickets come from (choragusd). Without one, an
@@ -412,6 +420,14 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     st.next_embed = st.next_embed.wrapping_add(1);
     let embed = st.next_embed;
     let (child, child_uid, spawned) = match role.provider {
+        Provider::System(_) if role.name == "mail-sign-in" => {
+            if app != "org.atrium.mail" { return refuse(refusal::NOT_AN_APP); }
+            let persona = shared.persona.lock().unwrap().as_ref().and_then(|f| f(uid));
+            match st.mail_sheets.get(&(user.clone(), persona)) {
+                Some(&(c, u)) => (c, u, false),
+                None => return refuse(refusal::NO_PROVIDER),
+            }
+        }
         Provider::System(_) => match st.providers.get(role.name) {
             Some(&(c, u)) => (c, u, false),
             None => return refuse(refusal::NO_PROVIDER),
@@ -763,7 +779,16 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
     if !ok {
         return Err(Reply::Refused { reason: refusal::NOT_PROVIDER });
     }
-    shared.state.lock().unwrap().providers.insert(role.name, (conn, uid));
+    if role.name == "mail-sign-in" {
+        let Some((owner, _)) = (shared.resolve)(uid) else { return Err(Reply::Refused { reason: refusal::NOT_PROVIDER }); };
+        if !shared.mail_sheet_provider.lock().unwrap().as_ref().is_some_and(|f| f(uid)) {
+            return Err(Reply::Refused { reason: refusal::NOT_PROVIDER });
+        }
+        let persona = shared.persona.lock().unwrap().as_ref().and_then(|f| f(uid));
+        shared.state.lock().unwrap().mail_sheets.insert((owner, persona), (conn, uid));
+    } else {
+        shared.state.lock().unwrap().providers.insert(role.name, (conn, uid));
+    }
     Ok(Reply::Ok)
 }
 
@@ -799,6 +824,7 @@ fn gone(shared: &Arc<Shared>, conn: ConnId) {
     let mut st = shared.state.lock().unwrap();
     st.conns.remove(&conn);
     st.providers.retain(|_, (c, _)| *c != conn);
+    st.mail_sheets.retain(|_, (c, _)| *c != conn);
     st.choices.remove(&conn);
     let mine: Vec<EmbedId> = st.embeds.iter().filter(|(_, e)| e.parent == conn || e.child == conn).map(|(k, _)| *k).collect();
     for id in mine {

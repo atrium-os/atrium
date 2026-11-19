@@ -25,6 +25,12 @@ Related specs:
 - [artifex.md](artifex.md) §7: the `editor-extension` role.
 - [tabula.md](tabula.md): drag and drop and the clipboard across the boundary.
 
+Mail's `mail-sign-in` system sheet is served by the signed Navigator for
+the parent's owning user and persona. Mail sends only a one-use Arca
+session ticket. The nested `mail-sign-in-page` worker receives a sealed
+document and an embed-only Fresco connection. See
+[Navigator I0](navigator-islands.md#development-registration-and-mails-first-screen).
+
 ## 0. Position
 
 ### 0.1 What Limen is

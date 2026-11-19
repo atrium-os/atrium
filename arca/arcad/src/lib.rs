@@ -18,6 +18,7 @@ pub mod courier;
 pub mod handles;
 pub mod jar;
 pub mod label;
+pub mod oauth;
 pub mod passkey;
 pub mod proto;
 pub mod recovery;

@@ -205,6 +205,8 @@ pub struct Settings {
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
     kept: Rc<RefCell<Option<mpsc::Receiver<Result<(AccountConfig, Option<(mail_store::Server, [u8; 16])>), String>>>>>,
+    microsoft: Rc<RefCell<Option<mpsc::Receiver<Result<[u8; 16], String>>>>>,
+    pub microsoft_sheet_open: Rc<std::cell::Cell<bool>>,
     added: Rc<std::cell::Cell<bool>>,
     /// Arca's answer to removing a removed account's items.
     forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
@@ -254,6 +256,8 @@ impl Settings {
             ui,
             found: Rc::default(),
             kept: Rc::default(),
+            microsoft: Rc::default(),
+            microsoft_sheet_open: Rc::default(),
             added: Rc::default(),
             forgot: Rc::default(),
             arca: Rc::new(arca),
@@ -387,6 +391,7 @@ impl Settings {
 
     pub fn cancel_adding(&self) {
         *self.found.borrow_mut() = None;
+        *self.microsoft.borrow_mut() = None;
         self.cred_state.set(CredentialState::default());
         self.update(|u| u.adding = Adding::Closed);
     }
@@ -413,8 +418,8 @@ impl Settings {
         let address = self.address.get_cloned().text().trim().to_string();
         let name = self.name.get_cloned().text().trim().to_string();
         let cfg = crate::accounts::config_for(f, &address, &name);
-        let note = if cfg.oauth.is_some() {
-            Some("This account signs in with its provider's own page, in Arca's sign-in sheet, which isn't built yet.".to_string())
+        let note = if cfg.oauth.as_deref() == Some("microsoft") {
+            Some("Sign in to Microsoft in Navigator. Arca keeps the account credentials.".to_string())
         } else {
             f.note.map(str::to_string)
         };
@@ -432,7 +437,7 @@ impl Settings {
     /// Whether Add can be pressed.
     pub fn can_add(&self) -> bool {
         match &self.ui.get_cloned().adding {
-            Adding::Found(s) => s.cfg.oauth.is_none() && (s.handled_by.is_none() || s.use_anyway) && self.cred_state.get_cloned().handle.is_some(),
+            Adding::Found(s) => (s.handled_by.is_none() || s.use_anyway) && match s.cfg.oauth.as_deref() { Some("microsoft") => self.microsoft.borrow().is_none() && !self.microsoft_sheet_open.get(), Some(_) => false, None => self.cred_state.get_cloned().handle.is_some() },
             _ => false,
         }
     }
@@ -441,6 +446,15 @@ impl Settings {
     /// keep the account.
     pub fn add(&self) {
         let Adding::Found(s) = self.ui.get_cloned().adding else { return };
+        if s.cfg.oauth.as_deref() == Some("microsoft") {
+            if !self.can_add() { return; }
+            let path = (*self.arca).clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || { let _ = tx.send(crate::accounts::microsoft_sign_in(&path)); });
+            *self.microsoft.borrow_mut() = Some(rx);
+            self.update(|u| u.note = Some("Requesting Microsoft sign-in…".into()));
+            return;
+        }
         let Some(handle) = self.cred_state.get_cloned().handle else {
             self.update(|u| u.note = Some("Type the password first".into()));
             return;
@@ -458,6 +472,19 @@ impl Settings {
             u.adding = Adding::Keeping(s);
             u.note = None;
         });
+    }
+
+    pub fn take_microsoft_ticket(&self) -> Option<[u8; 16]> {
+        let result = self.microsoft.borrow().as_ref()?.try_recv().ok()?;
+        self.microsoft.borrow_mut().take();
+        match result {
+            Ok(ticket) => Some(ticket),
+            Err(message) => { self.sign_in_note(&message); None }
+        }
+    }
+
+    pub fn sign_in_note(&self, message: &str) {
+        self.update(|u| u.note = Some(message.into()));
     }
 
     fn added(&self, cfg: AccountConfig, sieve: Option<(mail_store::Server, [u8; 16])>) {
@@ -1179,7 +1206,7 @@ impl SettingsView {
                     y += em(22.0);
                 }
                 let s = self.s.clone();
-                let r = button(ctx, x + lw, y + em(16.0), if keeping { "Adding…" } else { "Add account" }, true, !keeping && self.s.can_add(), move || s.add());
+                let r = button(ctx, x + lw, y + em(16.0), if keeping { "Adding…" } else if sh.cfg.oauth.as_deref() == Some("microsoft") { "Sign in with Microsoft" } else { "Add account" }, true, !keeping && self.s.can_add(), move || s.add());
                 let s = self.s.clone();
                 button(ctx, r.x() + r.w() + em(8.0), y + em(16.0), "Cancel", false, !keeping, move || s.cancel_adding());
                 y += em(44.0);

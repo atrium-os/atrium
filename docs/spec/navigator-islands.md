@@ -541,6 +541,67 @@ record the last successful fetch and first failing stage. Full account setup
 also needs Arca to intercept the registered redirect, verify state, exchange
 the code and store the initial grant as described in mail.md §5.3.
 
+### Development registration and Mail's first screen
+
+**Decision, 2026-11-20.** Defer a project Microsoft registration. An operator
+with an Entra test tenant can later supply its public application ID with the
+native-client redirect in mail.md §5.3. Development uses a loopback TLS
+provider, a test-only application ID and no personal credentials. No other
+mail client's ID is shipped. A live provider render and mailbox authorization
+remain separate gates.
+
+Mail's Microsoft button calls arcad with an empty `MAIL_SIGN_IN` request.
+The configured Mail publisher and an unlocked user store are required. Arca
+owns the S256 verifier and state and gives Mail a 16-byte random ticket.
+The signed Navigator broker can claim the URL once for the same user. Lock
+invalidates outstanding tickets. The ten-minute session is memory-only.
+The deployment settings are `ARCA_MICROSOFT_CLIENT_ID` and
+`ARCA_MAIL_PUBLISHER` on arcad and the existing signed `ARCA_WEB_BROKER`
+identity on arcad, courierd and limend. An unconfigured development install
+reports the missing registration on a press.
+
+Mail requests the `mail-sign-in` Limen sheet. Limen matches the configured
+Navigator publisher, owner and persona. Navigator claims the ticket and
+routes the authorization GET and redirects through the Arca cookie courier
+in a fresh Unrecorded partition. The first-screen grant admits HTTPS on
+port 443 and excludes the native-client callback from fetching. The sheet
+hands the returned HTML in a sealed descriptor to its nested
+`org.atrium.navigator.mail-page` worker. The engine receives the document
+URL and bytes; the session ticket and cookie jar stay outside the engine.
+Cross-build the worker with `I0_MAIL_PAGE=ON`, link it with the interpreter
+and native painter, and sign the mail-page manifest. Deployment needs a
+Limen worker rule and Navigator's manifest grant for `mail-sign-in-page`.
+
+The development provider requires a Secure HttpOnly session cookie on its
+redirect before serving a page whose inline script labels an account field.
+The TLS test checks the cookie at the provider, its absence from script
+access, one-use ticket claiming and refusal before a ticket is issued for
+an unrelated origin or callback. The guest gate
+`scripts/navigator-mail-sign-in-gate.sh BROKER_TEST SIGNED_ENGINE_BUNDLE`
+uses the cross-built navigator-cookies broker test and the `I0_SIGN_IN=ON`
+engine. It transfers only the response body from that test into the jail.
+
+On 2026-11-20 the development gate passed on kernel `9f2eed03a36c`
+with a fresh read-write Tessera root. The broker used the TLS fixture and
+in-process Arca and courier handlers. Portcullis verified the engine bundle.
+In the jail, uid 1011 entered capability mode and an ambient open returned
+ECAPMODE. The response created the expected account input and script label.
+A separate Limen routing test checked publisher, owner and persona. Three
+render trials passed the 153-byte response as a sealed descriptor to the
+JIT-off worker. Every initial frame measured 3 changed nodes, 4,198,501
+wire bytes including initial resources, and 920 tiles at 640 × 360. The
+worker SHA-256 was `dc89eef333707065c036aa3ba49487a8e6712b34537377d973ff0abb08362873`.
+For the visible test, stage the `I0_MAIL_PAGE=ON` binary as the signed
+gate worker and run the editor gate with `I0_MAIL_DOCUMENT` pointing to
+the public response saved by the first gate.
+
+Mail and navigatord cross-checked for arm64. The real Mail button, deployed
+signed services and session-backed sheet still need one continuous UI trial.
+This milestone covers the first HTML response and inline script. External
+script and stylesheet loading from LibWeb, interactive continuation, redirect
+redemption and first-grant storage still need separate verification. The
+development gate does not establish Microsoft's behavior in an embedded engine.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

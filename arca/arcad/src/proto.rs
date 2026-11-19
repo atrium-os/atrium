@@ -92,6 +92,8 @@ pub mod op {
     pub const PRINT_LOGIN_GRANT: u16 = 0x12;
     /// Print worker: `handle[16] | key[32] | uuid` → bytes `account:password`.
     pub const TAKE_PRINT_LOGIN: u16 = 0x13;
+    /// Signed Mail: empty → opaque handle[16] for the person's Navigator sheet.
+    pub const MAIL_SIGN_IN: u16 = 0x14;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -212,6 +214,8 @@ pub mod broker_op {
     /// and partition redeems (`FILL`), once. Typed values only, not
     /// stored items.
     pub const W_HANDLE_FOR: u16 = 0x76;
+    /// Signed web broker: handle[16] → the PKCE authorization URL once.
+    pub const W_MAIL_SIGN_IN: u16 = 0x77;
     pub const ACCOUNT_PASSKEY: u8 = 1;
     pub const ACCOUNT_PASSWORD: u8 = 2;
     pub const ACCOUNTS_MAX: usize = 16;

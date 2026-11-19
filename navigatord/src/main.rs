@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 mod files;
 mod portal;
 mod vpn;
+mod mail_sheet;
 mod press;
 mod settings;
 mod worker;
@@ -1856,6 +1857,15 @@ fn main() {
         }
         Arc::new(Mutex::new(b))
     });
+    if cfg.vpn.is_none() {
+        if let (Some(socket), Some(_)) = (&cfg.limen, &cookies) {
+            if let Some((arca, launcher)) = &cfg.arca {
+                // Dedicated view IDs and cookie state for the sheet provider.
+                let broker = Broker::new(ArcadSocket { path: arca.clone() }, Launcher::new(launcher.clone()));
+                mail_sheet::start(socket.clone(), Arc::new(Mutex::new(broker)));
+            }
+        }
+    }
     // In a directory of its own: the page child's jail mounts that
     // directory (the `navigator-page` capability) and nothing else of ours.
     // Shared with every other navigatord (each person's, each persona's):

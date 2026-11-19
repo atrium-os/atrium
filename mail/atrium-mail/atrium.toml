@@ -27,7 +27,7 @@ notify = true
 # a doc-viewer for HTML bodies, reply quotes and image thumbnails, a pdf-viewer
 # and a media-player for quick look, the credential sheet (sign-in), and
 # the print sheet.
-embeds = ["picker", "doc-viewer", "pdf-viewer", "pdf-sanitizer", "media-player", "credential", "print"]
+embeds = ["picker", "doc-viewer", "pdf-viewer", "pdf-sanitizer", "media-player", "credential", "mail-sign-in", "print"]
 
 # The parser (§4): every message is parsed here, in a jail of its own as
 # a uid of its own, with no capability (app-composition.md §4).

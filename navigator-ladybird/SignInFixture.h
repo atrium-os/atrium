@@ -23,6 +23,35 @@ extern "C" bool navigator_scene_sample(NavigatorScene*, Web::Layout::RustFFI::Do
 
 namespace Navigator {
 
+// The development provider sets this field from an inline script after a
+// cookie-authenticated redirect. Exercise DOM, script, layout and scene building.
+inline ErrorOr<void> paint_mail_document(EditorPage& client, NavigatorScene* scene, StringView location, StringView html, bool check_fixture)
+{
+    auto nav = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(client.page(), nullptr);
+    client.page().set_top_level_traversable(nav);
+    nav->set_viewport_size({ 640, 360 });
+    auto doc = nav->active_document();
+    auto parsed = URL::Parser::basic_parse(location);
+    if (!parsed.has_value() || parsed->scheme() != "https"sv) return Error::from_string_literal("invalid document origin");
+    auto& url = *parsed;
+    doc->set_url(url);
+    doc->set_origin(url.origin());
+    doc->remove_all_children();
+    Web::HTML::HTMLParser::create_from_byte_string(*doc, html, Web::HTML::ParserScriptingMode::Normal, "utf-8"sv)->run();
+    auto field = doc->get_element_by_id(u"account"sv);
+    auto label = doc->get_element_by_id(u"prompt"sv);
+    if (check_fixture && (!field || !is<Web::HTML::HTMLInputElement>(*field) || !label || label->text_content() != u"Enter your account"_utf16))
+        return Error::from_string_literal("missing account input or script-generated prompt");
+
+    Web::Layout::ForcedReadScope read { *doc };
+    doc->update_layout(Web::DOM::UpdateLayoutReason::DumpDisplayList);
+    if (!doc->record_display_list(read, Web::HTML::PaintConfig {}, Web::Painting::PaintCommandCacheMode::ReadWrite)
+        || !navigator_scene_sample(scene, doc->layout_node_arena().host(), true, false))
+        return Error::from_string_literal("development form could not paint");
+    if (check_fixture) puts("development_account_input=1 inline_script=1 native_scene=1");
+    return {};
+}
+
 inline ErrorOr<void> run_sign_in(Gfx::Palette palette, Function<ErrorOr<StringView>(Web::Page&, URL::URL const&)> fetch)
 {
     // The fixture launcher owns navigation. Each accepted replacement gets a fresh

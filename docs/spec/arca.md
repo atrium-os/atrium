@@ -18,6 +18,11 @@ client among many. It replaces two things that were heading towards separate des
 [Loculus](loculus.md) stays separate. It holds data the user *shares with* an app (addresses,
 profiles). Arca holds data that is *kept from* the app. Loculus's master key is an Arca item.
 
+Mail's Microsoft first-screen gate uses `MAIL_SIGN_IN` and
+`W_MAIL_SIGN_IN` to pass a same-user, one-use authorization URL to the
+signed Navigator broker while Arca retains the PKCE verifier.
+[Development configuration and gate](navigator-islands.md#development-registration-and-mails-first-screen).
+
 ## 1. The three promises
 
 1. **Use without read.** Wherever the protocol allows, a secret is *used* for the app
