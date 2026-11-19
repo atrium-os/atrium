@@ -10,6 +10,7 @@
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
+//! | 25 | PICTURE | one embedded raster picture: sheet, anchor and encoded bytes |
 //! | 10 | CHARTS | charts: kind, grouping, legend, titles, anchor, series ranges |
 //! | 11 | MACROS | macros kept inert: family, VBA code names (the parts follow) |
 //! | 12 | MACRO_PART | one macro part: path, media type, bytes, never parsed |
@@ -58,6 +59,7 @@ pub const HIDDEN_WIDTHS: u16 = 21;
 pub const FREEZE_FROM: u16 = 22;
 pub const TRACKED_CELLS: u16 = 23;
 pub const AXIS_IDENTITIES: u16 = 24;
+pub const PICTURE: u16 = 25;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -286,6 +288,11 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             ch.encode(&mut w);
         }
         c.add(CHARTS, &w.into_bytes())?;
+    }
+    for picture in wb.pictures() {
+        let mut w = Writer::new();
+        picture.encode(&mut w);
+        c.add(PICTURE, &w.into_bytes())?;
     }
     if let Some(m) = &wb.macros {
         let mut w = Writer::new();
@@ -569,6 +576,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             wb.add_chart(ch).map_err(LoadError::Bad)?;
         }
         done(&r)?;
+    }
+
+    let mut picture_room = crate::charts::MAX_PICTURE_TOTAL.min(usize::try_from(budget).unwrap_or(usize::MAX));
+    for (index, i) in of(PICTURE).enumerate() {
+        if index >= crate::charts::MAX_PICTURES {
+            return Err(LoadError::Bad("too many pictures"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        let picture = crate::charts::Picture::decode(&mut r, picture_room)?;
+        picture_room -= picture.bytes.len();
+        done(&r)?;
+        wb.add_picture(picture).map_err(LoadError::Bad)?;
     }
 
     // Conditional formats.

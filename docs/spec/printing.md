@@ -786,8 +786,11 @@ jailed child lays it out on the paper and writes the PDF, handed back to the win
 sealed memory file, and it answers Relayout the same way.
 
 Sheets honors a saved XLSX print area consisting of one absolute cell or rectangle.
-Without a saved area it prints the used range. Frozen titles repeat within the printed bounds.
-Charts and pictures remain open for Sheets. Mail prints message text;
+Without a saved area it prints the used range, including anchored charts and embedded
+PNG and JPEG pictures imported from XLSX. Charts use the on-screen layout with paper
+colors and PDF text and vectors. Pictures and charts are clipped at the print area and
+page boundaries. Frozen titles repeat within the printed bounds, while drawings appear
+only at their original sheet positions. Mail prints message text;
 colour, two-sided and tray options wait for R5's attributes; Scrinium's
 quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
 Pergola (`officina_pdf::plain` is the text half).

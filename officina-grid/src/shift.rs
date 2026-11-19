@@ -381,6 +381,13 @@ pub(crate) fn shift_with_ids(
         ops.push(GridOp::Tables(tables));
     }
 
+    let pin = |p: (u32, u32, f32, f32)| {
+        let (r, cc) = match axis {
+            Axis::Rows => (s.map_span(p.0, p.0).map_or(at.min(p.0), |x| x.0), p.1),
+            Axis::Cols => (p.0, s.map_span(p.1, p.1).map_or(at.min(p.1), |x| x.0)),
+        };
+        (r, cc, p.2, p.3)
+    };
     // Charts: their data and where they sit.
     let charts: Vec<_> = wb.charts().iter().filter_map(|c| {
         let mut c = c.clone();
@@ -404,13 +411,6 @@ pub(crate) fn shift_with_ids(
         }
         c.series = series;
         if c.anchor.sheet == sheet {
-            let pin = |p: (u32, u32, f32, f32)| {
-                let (r, cc) = match axis {
-                    Axis::Rows => (s.map_span(p.0, p.0).map_or(at.min(p.0), |x| x.0), p.1),
-                    Axis::Cols => (p.0, s.map_span(p.1, p.1).map_or(at.min(p.1), |x| x.0)),
-                };
-                (r, cc, p.2, p.3)
-            };
             c.anchor.from = pin(c.anchor.from);
             c.anchor.to = pin(c.anchor.to);
         }
@@ -418,6 +418,17 @@ pub(crate) fn shift_with_ids(
     }).collect();
     if charts != wb.charts() {
         ops.push(GridOp::Charts(charts));
+    }
+
+    let pictures: Vec<_> = wb.pictures().iter().cloned().map(|mut picture| {
+        if picture.anchor.sheet == sheet {
+            picture.anchor.from = pin(picture.anchor.from);
+            picture.anchor.to = pin(picture.anchor.to);
+        }
+        picture
+    }).collect();
+    if pictures != wb.pictures() {
+        ops.push(GridOp::Pictures(pictures));
     }
 
     // Pivot tables: their sources and outputs.

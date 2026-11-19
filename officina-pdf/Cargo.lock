@@ -696,6 +696,20 @@ name = "officina-core"
 version = "0.1.0"
 
 [[package]]
+name = "officina-draw"
+version = "0.1.0"
+dependencies = [
+ "officina-grid",
+]
+
+[[package]]
+name = "officina-grid"
+version = "0.1.0"
+dependencies = [
+ "officina-core",
+]
+
+[[package]]
 name = "officina-pdf"
 version = "0.1.0"
 dependencies = [
@@ -706,6 +720,7 @@ dependencies = [
  "folium-render",
  "folium-syntax",
  "navigator-image",
+ "officina-draw",
  "officina-slides",
  "officina-text",
  "png 0.17.16",

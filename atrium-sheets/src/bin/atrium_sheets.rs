@@ -456,6 +456,7 @@ fn main() {
         None
     };
     let dedicated = workbook.is_some();
+    officina_convert::pictures::install();
     let root = state_root();
     // The custom lists fills follow, kept beside the autosaves.
     if let Some(dir) = root.parent() {

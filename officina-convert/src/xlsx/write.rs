@@ -490,7 +490,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         o.extend_from_slice(b"</hyperlinks>");
     }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
-    if wb.charts().iter().any(|c| c.anchor.sheet == s) {
+    if wb.charts().iter().any(|c| c.anchor.sheet == s) || wb.pictures().iter().any(|p| p.anchor.sheet == s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
     }
     if !wb.comments(s).is_empty() {
@@ -596,6 +596,9 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     }
     let main = if macros.is_some() { super::macros::MAIN_MACRO } else { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" };
     let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="{MAIN}"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#).replace("{MAIN}", main);
+    if !wb.pictures().is_empty() {
+        ct.push_str(r#"<Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/>"#);
+    }
     if let Some(m) = macros {
         ct.push_str(&super::macros::content_type_xml(m));
     }
@@ -603,7 +606,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         ct.push_str(&format!(r#"<Override PartName="/xl/worksheets/sheet{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#, s + 1));
     }
     for s in 0..n {
-        if wb.charts().iter().any(|c| c.anchor.sheet as usize == s) {
+        if wb.charts().iter().any(|c| c.anchor.sheet as usize == s) || wb.pictures().iter().any(|p| p.anchor.sheet as usize == s) {
             ct.push_str(&format!(r#"<Override PartName="/xl/drawings/drawing{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#, s + 1));
         }
     }
@@ -726,21 +729,31 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         // Its tables, in the order its tableParts name them.
         let mine: Vec<usize> = (0..wb.tables().len()).filter(|&i| wb.tables()[i].rect.sheet as usize == s).collect();
         let charts: Vec<usize> = (1..=wb.charts().len()).filter(|&i| wb.charts()[i - 1].anchor.sheet as usize == s).collect();
+        let pictures: Vec<usize> = wb.pictures().iter().enumerate()
+            .filter(|(_, p)| p.anchor.sheet as usize == s).map(|(i, _)| i).collect();
         let pivots: Vec<usize> = (0..wb.pivots().len()).filter(|&i| wb.pivots()[i].dest.sheet as usize == s).collect();
         let noted = !wb.comments(s as u16).is_empty();
         let external: Vec<&str> = wb.links(s as u16).values().filter(|l| l.is_external()).map(|l| &*l.target).collect();
-        if !mine.is_empty() || !charts.is_empty() || !pivots.is_empty() || noted || !external.is_empty() {
+        if !mine.is_empty() || !charts.is_empty() || !pictures.is_empty() || !pivots.is_empty() || noted || !external.is_empty() {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
             }
-            if !charts.is_empty() {
+            if !charts.is_empty() || !pictures.is_empty() {
                 // One drawing per sheet with charts, numbered by its sheet.
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing{}.xml"/>"#, mine.len() + 1, s + 1));
-                z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts).as_bytes())?;
+                z.add(&format!("xl/drawings/drawing{}.xml", s + 1), super::chart::drawing_xml(wb, &charts, &pictures).as_bytes())?;
                 let mut dr = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
                 for (j, i) in charts.iter().enumerate() {
                     dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{i}.xml"/>"#, j + 1));
+                }
+                for (j, &i) in pictures.iter().enumerate() {
+                    let bytes = &wb.pictures()[i].bytes;
+                    let ext = officina_grid::charts::Picture::extension(bytes)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unsupported picture"))?;
+                    let name = format!("sheet-picture-{i}.{ext}");
+                    z.add_stored(&format!("xl/media/{name}"), bytes)?;
+                    dr.push_str(&format!(r#"<Relationship Id="rIdPic{j}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{name}"/>"#));
                 }
                 dr.push_str("</Relationships>");
                 z.add(&format!("xl/drawings/_rels/drawing{}.xml.rels", s + 1), dr.as_bytes())?;

@@ -3,8 +3,8 @@
 //!
 //! Read: column, bar, line, area, scatter, pie and doughnut groups (3-D ones drawn
 //! flat), combos of them, series names, categories and values by reference, titles,
-//! axis titles and the legend's place. Other chart kinds, pictures and shapes are
-//! reported.
+//! axis titles, the legend's place and embedded raster pictures. Other drawing
+//! objects are reported.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Legen
 use officina_grid::Workbook;
 
 #[cfg(feature = "read")]
-use super::read::{attr, decode_escapes, parse_ref, rels, xml, XlsxError};
+use super::read::{attr, decode_escapes, internal_rels, parse_ref, xml, XlsxError};
 use crate::report::{Kind, Report};
 use crate::zip::Archive;
 
@@ -41,41 +41,65 @@ fn range(wb: &Workbook, f: &str) -> Option<Rect> {
 #[cfg(feature = "read")]
 /// Reads the charts of sheet `sheet` (its part is `part`).
 pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str, rep: &mut Report) -> Result<(), XlsxError> {
-    let drawings: Vec<String> = rels(z, part)?.into_values().filter(|(t, _)| t.ends_with("/drawing")).map(|(_, p)| p).collect();
+    let mut drawings: Vec<String> = internal_rels(z, part)?.into_values().filter(|(t, _)| t.ends_with("/drawing")).map(|(_, p)| p).collect();
+    drawings.sort();
     for d in drawings {
         let Some(data) = z.read_name(&d)? else { continue };
-        let drels = rels(z, &d)?;
+        let drels = internal_rels(z, &d)?;
         let mut r = xml(&data);
         let mut buf = Vec::new();
         // The anchor being read: from/to (col, colOff, row, rowOff), which corner.
         let mut corner = 0usize;
         let mut field: Option<&'static str> = None;
         let mut pos = [[0i64; 4]; 2];
-        let mut in_anchor = false;
+        let mut anchor_kind: &[u8] = b"";
+        let mut picture = None;
+        let mut in_picture = false;
         let mut chart: Option<String> = None;
         let mut other = false;
         loop {
             match r.read_event_into(&mut buf)? {
                 Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
-                    b"twoCellAnchor" => {
-                        in_anchor = true;
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
+                        anchor_kind = match e.local_name().as_ref() {
+                            b"twoCellAnchor" => b"twoCellAnchor",
+                            b"oneCellAnchor" => b"oneCellAnchor",
+                            _ => b"absoluteAnchor",
+                        };
+                        picture = None;
+                        in_picture = false;
+                        corner = 0;
+                        field = None;
                         chart = None;
                         other = false;
                         pos = [[0; 4]; 2];
                     }
-                    b"oneCellAnchor" | b"absoluteAnchor" => rep.note(Kind::Dropped, "charts, pictures and shapes not anchored to two cells"),
+                    b"pos" if anchor_kind == b"absoluteAnchor" => {
+                        pos[0][1] = attr(&e, b"x")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+                        pos[0][3] = attr(&e, b"y")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+                    }
+                    b"ext" if !in_picture && matches!(anchor_kind, b"oneCellAnchor" | b"absoluteAnchor") => {
+                        pos[1][1] = attr(&e, b"cx")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+                        pos[1][3] = attr(&e, b"cy")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+                    }
                     b"from" => corner = 0,
                     b"to" => corner = 1,
                     b"col" => field = Some("col"),
                     b"colOff" => field = Some("colOff"),
                     b"row" => field = Some("row"),
                     b"rowOff" => field = Some("rowOff"),
-                    b"chart" if in_anchor => {
+                    b"chart" if !anchor_kind.is_empty() => {
                         if let Some(id) = attr(&e, b"id")? {
                             chart = drels.get(&id).map(|(_, p)| p.clone());
                         }
                     }
-                    b"pic" | b"sp" | b"cxnSp" | b"grpSp" if in_anchor => other = true,
+                    b"pic" if !anchor_kind.is_empty() => in_picture = true,
+                    b"blip" if in_picture => {
+                        if let Some(id) = attr(&e, b"embed")? {
+                            picture = drels.get(&id).filter(|(ty, _)| ty.ends_with("/image")).map(|(_, p)| p.clone());
+                        }
+                    }
+                    b"sp" | b"cxnSp" | b"grpSp" if !anchor_kind.is_empty() => other = true,
                     _ => {}
                 },
                 Event::Text(t) => {
@@ -92,19 +116,39 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                 }
                 Event::End(e) => match e.local_name().as_ref() {
                     b"col" | b"colOff" | b"row" | b"rowOff" => field = None,
-                    b"twoCellAnchor" => {
-                        in_anchor = false;
+                    b"pic" => {
+                        in_picture = false;
+                        if picture.is_none() {
+                            rep.note(Kind::Dropped, "pictures without embedded media");
+                        }
+                    }
+                    b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
+                        if anchor_kind != b"twoCellAnchor" {
+                            pos[1][0] = pos[0][0];
+                            pos[1][2] = pos[0][2];
+                            pos[1][1] = pos[0][1].saturating_add(pos[1][1]);
+                            pos[1][3] = pos[0][3].saturating_add(pos[1][3]);
+                        }
+                        anchor_kind = b"";
                         if other {
-                            rep.note(Kind::Dropped, "pictures and shapes");
+                            rep.note(Kind::Dropped, "drawing shapes");
+                        }
+                        let cl = |v: i64, max: u32| v.clamp(0, max as i64 - 1) as u32;
+                        let off = |v: i64| (v as f64 / EMU_PT).clamp(0.0, 1e6) as f32;
+                        let corner = |p: [i64; 4]| (cl(p[2], officina_grid::addr::MAX_ROWS), cl(p[0], officina_grid::addr::MAX_COLS), off(p[1]), off(p[3]));
+                        let anchor = Anchor { sheet, from: corner(pos[0]), to: corner(pos[1]) };
+                        if let Some(p) = picture.take().filter(|_| !other) {
+                            let bytes = match z.find(&p) {
+                                Some(entry) if usize::try_from(entry.size).ok().is_some_and(|size| wb.can_add_picture(size)) => Some(z.read(entry)?),
+                                _ => None,
+                            };
+                            if bytes.is_none_or(|bytes| wb.add_picture(officina_grid::charts::Picture {
+                                anchor, bytes: Arc::from(bytes),
+                            }).is_err()) {
+                                rep.note(Kind::Dropped, "missing, oversized or unsupported pictures (embedded PNG and JPEG supported)");
+                            }
                         }
                         if let Some(p) = chart.take() {
-                            let cl = |v: i64, max: u32| v.clamp(0, max as i64 - 1) as u32;
-                            let off = |v: i64| (v as f64 / EMU_PT).clamp(0.0, 1e6) as f32;
-                            let anchor = Anchor {
-                                sheet,
-                                from: (cl(pos[0][2], officina_grid::addr::MAX_ROWS), cl(pos[0][0], officina_grid::addr::MAX_COLS), off(pos[0][1]), off(pos[0][3])),
-                                to: (cl(pos[1][2], officina_grid::addr::MAX_ROWS), cl(pos[1][0], officina_grid::addr::MAX_COLS), off(pos[1][1]), off(pos[1][3])),
-                            };
                             if let Some(data) = z.read_name(&p)? {
                                 match chart_part(wb, &data, anchor, rep)? {
                                     Some(c) => {
@@ -501,16 +545,19 @@ pub(crate) fn chart_xml(wb: &Workbook, c: &Chart) -> String {
 
 /// `xl/drawings/drawingN.xml` for the charts `ids` (their numbers in the package,
 /// from 1) of one sheet; the drawing's relationship `rId{j+1}` is chart `j`.
-pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize]) -> String {
+pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> String {
     let mut o = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#);
-    for (j, &i) in ids.iter().enumerate() {
-        let a = wb.charts()[i - 1].anchor;
-        let emu = |v: f32| (v as f64 * EMU_PT).round() as i64;
+    let anchor = |o: &mut String, a: Anchor| {
+        let emu = |pt: f32| (f64::from(pt) * EMU_PT).round() as i64;
+
         let _ = write!(
             o,
             r#"<xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from><xdr:to><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>"#,
             a.from.1, emu(a.from.2), a.from.0, emu(a.from.3), a.to.1, emu(a.to.2), a.to.0, emu(a.to.3)
         );
+    };
+    for (j, &i) in ids.iter().enumerate() {
+        anchor(&mut o, wb.charts()[i - 1].anchor);
         let _ = write!(
             o,
             r#"<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{}" name="Chart {}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId{}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#,
@@ -518,6 +565,11 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize]) -> String {
             j + 1,
             j + 1
         );
+    }
+    for (j, &i) in pictures.iter().enumerate() {
+        anchor(&mut o, wb.pictures()[i].anchor);
+        let id = ids.len() + j + 2;
+        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdPic{j}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
     }
     o.push_str("</xdr:wsDr>");
     o

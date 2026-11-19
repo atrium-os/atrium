@@ -75,6 +75,10 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if charts.len() != wb.charts().len() {
         ops.push(GridOp::Charts(charts));
     }
+    let pictures: Vec<_> = wb.pictures().iter().filter(|p| p.anchor.sheet != s).cloned().collect();
+    if pictures.len() != wb.pictures().len() {
+        ops.push(GridOp::Pictures(pictures));
+    }
     let pivots = wb.pivot_state();
     let kept_p: Vec<_> = pivots.iter().filter(|(p, _)| p.source.sheet != s && p.dest.sheet != s).cloned().collect();
     if kept_p.len() != pivots.len() {

@@ -139,6 +139,19 @@ fn bands_after(sizes: &[f64], room: f64, from: usize, title: f64) -> Vec<(usize,
     out
 }
 
+/// An object in sheet pixel coordinates, relative to the print area's origin.
+pub struct Drawing {
+    pub bounds: [f64; 4],
+    pub content: DrawingContent,
+}
+
+pub enum DrawingContent {
+    Chart(Vec<officina_draw::chart::Prim>),
+    Picture(std::sync::Arc<[u8]>),
+}
+
+mod drawing;
+
 /// Cells' text shaped in the screen's face at one size.
 struct Shaper<'f> {
     doc: RefCell<TextDoc>,
@@ -226,6 +239,10 @@ fn fit(s: &Shaper, c: &Cell, room: i64) -> Option<(Para, ParaLayout, i64)> {
 /// Writes `sheet` as PDF on `setup`'s paper to `out`, calling
 /// `progress(done, total)` after each page.
 pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
+    export_drawings(sheet, &[], setup, fonts, files, title, out, progress)
+}
+
+fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
     let (pw, ph) = (setup.w, setup.h);
     let m = setup.margin.clamp(0.0, pw.min(ph) / 3.0);
     let (room_w, room_h) = (pw - 2.0 * m, ph - 2.0 * m);
@@ -375,6 +392,14 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
             }
         }
     };
+    let offsets = |sizes: &[f64]| {
+        let mut at = 0.0;
+        std::iter::once(0.0).chain(sizes.iter().map(move |size| {
+            at += size;
+            at
+        })).collect::<Vec<_>>()
+    };
+    let (xs, ys) = (offsets(&cols), offsets(&rows));
     // Down, then across; the print titles (frozen rows and columns) on
     // every page that doesn't already start with them.
     for &(c0, c1) in &across {
@@ -405,6 +430,12 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
                 page.c.extend([Op::Stroke, Op::Restore]);
             }
             pdf.items(&mut page, items, ph, files, &none)?;
+            drawing::paint(&mut pdf, &mut page, drawings, drawing::Tile {
+                origin: [m + dx - xs[c0], m + dy - ys[r0]],
+                clip: [m + dx, m + dy, (xs[c1] - xs[c0]).min(room_w - dx), (ys[r1] - ys[r0]).min(room_h - dy)],
+                scale: k,
+                height: ph,
+            }, fonts, files)?;
             pdf.end_page(page, pw, ph)?;
             done += 1;
             progress(done, total);
@@ -421,8 +452,13 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
 /// [`export`] into memory in the system's fonts: what Sheets hands the
 /// print sheet.
 pub fn print(sheet: &Sheet, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
+    print_drawings(sheet, &[], setup, title)
+}
+
+/// Print with the sheet's anchored charts and pictures over the cells.
+pub fn print_drawings(sheet: &Sheet, drawings: &[Drawing], setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
     let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
-    export(sheet, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
+    export_drawings(sheet, drawings, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
 }
 
 #[cfg(test)]

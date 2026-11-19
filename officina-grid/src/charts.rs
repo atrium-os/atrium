@@ -82,6 +82,90 @@ pub struct Anchor {
     pub to: (u32, u32, f32, f32),
 }
 
+/// An embedded raster drawing, anchored like a chart. The bytes stay encoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picture {
+    pub anchor: Anchor,
+    pub bytes: Arc<[u8]>,
+}
+
+pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PICTURES: usize = 256;
+// Leave room for anchors and lengths in a journal record.
+pub(crate) const MAX_PICTURE_TOTAL: usize = (64 << 20) - (MAX_PICTURES * 64);
+
+impl Picture {
+    /// The extension used when saving the embedded bytes to XLSX.
+    pub fn extension(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("png")
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            Some("jpg")
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn encode(&self, w: &mut Writer) {
+        w.u16(self.anchor.sheet);
+        for (row, col, x, y) in [self.anchor.from, self.anchor.to] {
+            w.u32(row);
+            w.u32(col);
+            w.f64(f64::from(x));
+            w.f64(f64::from(y));
+        }
+        w.bytes(&self.bytes);
+    }
+
+    pub(crate) fn decode(r: &mut Reader, limit: usize) -> Result<Self, WireError> {
+        let sheet = r.u16()?;
+        let mut corner = || -> Result<_, WireError> {
+            Ok((r.u32()?, r.u32()?, r.f64()? as f32, r.f64()? as f32))
+        };
+        let anchor = Anchor { sheet, from: corner()?, to: corner()? };
+        let bytes = Arc::from(r.bytes("picture", limit.min(MAX_PICTURE_BYTES) as u64)?);
+        Ok(Self { anchor, bytes })
+    }
+}
+
+impl Workbook {
+    pub fn pictures(&self) -> &[Picture] {
+        &self.pictures
+    }
+
+    /// Whether there is room for another embedded picture of this size.
+    pub fn can_add_picture(&self, size: usize) -> bool {
+        self.pictures.len() < MAX_PICTURES
+            && (1..=MAX_PICTURE_BYTES).contains(&size)
+            && self.pictures.iter().map(|p| p.bytes.len()).sum::<usize>() <= MAX_PICTURE_TOTAL - size
+    }
+
+    pub fn add_picture(&mut self, picture: Picture) -> Result<(), &'static str> {
+        let a = picture.anchor;
+        if !self.can_add_picture(picture.bytes.len()) || Picture::extension(&picture.bytes).is_none()
+            || a.sheet as usize >= self.sheet_count()
+            || [a.from, a.to].iter().any(|&(r, c, x, y)| {
+                r >= MAX_ROWS || c >= MAX_COLS || !(0.0..=1e6).contains(&x) || !(0.0..=1e6).contains(&y)
+            })
+        {
+            return Err("invalid picture or workbook picture limits exceeded");
+        }
+        self.pictures.push(picture);
+        Ok(())
+    }
+
+    pub(crate) fn replace_pictures(&mut self, pictures: Vec<Picture>) -> Vec<Picture> {
+        let old = std::mem::take(&mut self.pictures);
+        for picture in pictures {
+            if self.add_picture(picture).is_err() {
+                self.pictures.clone_from(&old);
+                return old;
+            }
+        }
+        old
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chart {
     pub kind: ChartKind,

@@ -11,6 +11,7 @@ default = ["local-decode"]
 local-decode = ["dep:navigator-image"]
 
 [dependencies]
+officina-draw = { path = "../officina-draw" }
 officina-text = { path = "../officina-text" }
 # Decks drawn as display lists (printing from Slides).
 officina-slides = { path = "../officina-slides" }

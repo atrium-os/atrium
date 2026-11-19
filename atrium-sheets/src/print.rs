@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use officina_pdf::sheet::{Align, Cell, Setup, Sheet, MAX_CELLS};
+use officina_pdf::sheet::{Align, Cell, Drawing, DrawingContent, Setup, Sheet, MAX_CELLS};
 use pergola::widgets::{CellAlign, CellView, GridSource};
 use pergola::Color;
 
@@ -17,6 +17,7 @@ use crate::source::SheetSource;
 /// another.
 pub struct Snapshot {
     pub name: String,
+    pub drawings: Vec<Drawing>,
     pub cols: Vec<f64>,
     pub rows: Vec<f64>,
     /// Row by row.
@@ -83,7 +84,7 @@ fn print_area(d: &Doc) -> Result<Option<[u32; 4]>, String> {
 
 /// The current sheet's print area or its used range, captured at print time.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
-    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges) = {
+    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges, drawings, object_rows, object_cols) = {
         let d = doc.borrow();
         let area = print_area(&d)?;
         let (r, c) = d.wb.extent(d.sheet);
@@ -95,13 +96,63 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
                 right = right.max(m.c1 + 1);
             }
         }
-        let [top, left, bottom, right] = area.unwrap_or([0, 0, bottom, right]);
+        let sh = d.wb.sheet(d.sheet);
+        let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
+        let cs = &sh.col_sizes;
+        let [top, left, _, _] = area.unwrap_or([0; 4]);
+        let (ox, oy) = (cs.offset(left), rs.offset(top));
+        let bounds = |a: officina_grid::charts::Anchor| {
+            let point = |(r, c, x, y): (u32, u32, f32, f32)| {
+                (cs.offset(c) + f64::from(x) / officina_pdf::sheet::PT_PER_PX,
+                 rs.offset(r) + f64::from(y) / officina_pdf::sheet::PT_PER_PX)
+            };
+            let (x0, y0) = point(a.from);
+            let (x1, y1) = point(a.to);
+            [x0 - ox, y0 - oy, x1 - x0, y1 - y0]
+        };
+        let mut drawings = Vec::new();
+        let (mut object_rows, mut object_cols) = (0, 0);
+        let past = |sizes: &officina_grid::column::Sizes, end: f64, max: u32| {
+            let i = sizes.index_at(end).min(max);
+            (i + u32::from(sizes.offset(i) < end)).min(max)
+        };
+        let mut include = |[x, y, w, h]: [f64; 4]| {
+            if w < 4.0 || h < 4.0 || x + w <= 0.0 || y + h <= 0.0 {
+                return false;
+            }
+            if let Some([_, _, r, c]) = area {
+                return x < cs.offset(c) - ox && y < rs.offset(r) - oy;
+            }
+            object_rows = object_rows.max(past(&rs, y + h, officina_grid::addr::MAX_ROWS));
+            object_cols = object_cols.max(past(cs, x + w, officina_grid::addr::MAX_COLS));
+            true
+        };
+        for picture in d.wb.pictures().iter().filter(|p| p.anchor.sheet == d.sheet) {
+            let bounds = bounds(picture.anchor);
+            if include(bounds) {
+                drawings.push(Drawing { bounds, content: DrawingContent::Picture(picture.bytes.clone()) });
+            }
+        }
+        for chart in d.wb.charts().iter().filter(|c| c.anchor.sheet == d.sheet) {
+            let [x, y, w, h] = bounds(chart.anchor);
+            let (w, h) = (w.min(8000.0), h.min(8000.0));
+            let bounds = [x, y, w, h];
+            if include(bounds) {
+                let data = chart.data(&d.wb, 1_000_000);
+                let title = chart.title.as_ref().map(|t| officina_grid::charts::Chart::text(&d.wb, t));
+                let measure = |text: &str, size| {
+                    let style = pergola::TextStyle { family: pergola::theme::font::SANS.into(), size, weight: pergola::theme::Weight::Regular, color: Color::TRANSPARENT };
+                    pergola::text::measure_chars(text, &style)
+                };
+                let prims = officina_draw::chart::layout(chart, &data, title.as_deref(), w as f32, h as f32, &Default::default(), &measure);
+                drawings.push(Drawing { bounds, content: DrawingContent::Chart(prims) });
+            }
+        }
+        let [top, left, bottom, right] = area.unwrap_or([0, 0, bottom.max(object_rows), right.max(object_cols)]);
         let (rows, cols) = (bottom - top, right - left);
         if u64::from(rows) * u64::from(cols) > MAX_CELLS {
             return Err(format!("the print area has more than {MAX_CELLS} cells"));
         }
-        let sh = d.wb.sheet(d.sheet);
-        let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
         let col_px = (left..right).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect::<Vec<_>>();
         let row_px = (top..bottom).map(|i| rs.offset(i + 1) - rs.offset(i)).collect::<Vec<_>>();
         let merges = all_merges.iter()
@@ -110,11 +161,11 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             .collect::<Vec<_>>();
         let from = (sh.freeze_from.0.saturating_sub(top), sh.freeze_from.1.saturating_sub(left));
         let to = (sh.freeze.0.saturating_sub(top), sh.freeze.1.saturating_sub(left));
-        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges)
+        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges, drawings, object_rows, object_cols)
     };
     let src = SheetSource::new(doc.clone());
     let mut cells = Vec::with_capacity((rows * cols) as usize);
-    let (mut last_r, mut last_c) = (0, 0);
+    let (mut last_r, mut last_c) = (object_rows, object_cols);
     let mut across = Vec::new();
     for r in 0..rows {
         for c in 0..cols {
@@ -160,7 +211,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
+    Ok(Snapshot { name, drawings, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
 }
 
 /// The snapshot as PDF on paper `w` × `h` points.
@@ -168,7 +219,7 @@ pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String>
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
     let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone(), title_rows: s.title_rows, title_cols: s.title_cols };
-    officina_pdf::sheet::print(&sheet, &Setup::paper(w, h), title).map_err(|e| e.to_string())
+    officina_pdf::sheet::print_drawings(&sheet, &s.drawings, &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -206,6 +257,43 @@ mod tests {
         assert_eq!((s.rows.len(), s.cols.len()), (3, 2));
         assert_eq!(s.cells[0].as_ref().unwrap().text, "Inside");
         assert_eq!(s.cells.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn pictures_survive_conversion_and_extend_the_used_range() {
+        use officina_grid::{charts::{Anchor, Picture}, native};
+        use std::sync::Arc;
+
+        let doc = Rc::new(RefCell::new(Doc::new("Proof")));
+        let anchor = Anchor { sheet: 0, from: (8, 4, 0.0, 0.0), to: (8, 4, 48.0, 30.0) };
+        let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
+        {
+            let mut d = doc.borrow_mut();
+            d.wb.add_picture(Picture { anchor, bytes: bytes.clone() }).unwrap();
+            let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
+            let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
+            d.wb = native::load(&native::save_to_vec(&imported)).unwrap();
+            assert_eq!(d.wb.pictures()[0].anchor, anchor);
+            assert_eq!(d.wb.pictures()[0].bytes, bytes);
+        }
+        let page = snapshot(&doc).unwrap();
+        assert!(page.cells.iter().all(Option::is_none));
+        assert_eq!(page.cols.len(), 5);
+        assert_eq!(page.drawings[0].bounds[2..], [64.0, 40.0]);
+
+        doc.borrow_mut().wb.define_name("_xlnm.Print_Area", Some(0), "=$A$1:$B$3").unwrap();
+        assert!(snapshot(&doc).unwrap().drawings.is_empty());
+
+        use officina_core::history::Op;
+        use officina_grid::ops::GridOp;
+        let mut d = doc.borrow_mut();
+        d.wb.add_sheet("Other").unwrap();
+        let remove = officina_grid::sheetops::delete_sheet_op(&d.wb, 0).unwrap();
+        let inverse = GridOp::decode(&remove.encode()).unwrap().apply(&mut d.wb);
+        assert!(d.wb.pictures().is_empty());
+        GridOp::decode(&inverse.encode()).unwrap().apply(&mut d.wb);
+        assert_eq!(d.wb.pictures()[0].anchor, anchor);
+        assert_eq!(d.wb.pictures()[0].bytes, bytes);
     }
 
     #[test]

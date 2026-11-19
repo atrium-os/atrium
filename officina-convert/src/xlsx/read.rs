@@ -115,6 +115,14 @@ fn resolve(base: &str, target: &str) -> String {
 
 /// A part's relationships: id → (type, resolved target).
 pub(crate) fn rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, String)>, XlsxError> {
+    read_rels(z, part, true)
+}
+
+pub(crate) fn internal_rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, String)>, XlsxError> {
+    read_rels(z, part, false)
+}
+
+fn read_rels(z: &Archive, part: &str, allow_external: bool) -> Result<HashMap<String, (String, String)>, XlsxError> {
     let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
     let path = if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") };
     let mut out = HashMap::new();
@@ -127,6 +135,7 @@ pub(crate) fn rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, S
                 let (Some(id), Some(target)) = (attr(&e, b"Id")?, attr(&e, b"Target")?) else { continue };
                 let ty = attr(&e, b"Type")?.unwrap_or_default();
                 let external = attr(&e, b"TargetMode")?.is_some_and(|m| m == "External");
+                if external && !allow_external { continue; }
                 let t = if external { target } else { resolve(part, &target) };
                 out.insert(id, (ty, t));
             }

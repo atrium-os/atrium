@@ -159,6 +159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-message"
 version = "0.1.0"
 dependencies = [
@@ -1093,6 +1100,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",
@@ -1289,6 +1297,7 @@ dependencies = [
  "libc",
  "md-5",
  "miniz_oxide 0.8.9",
+ "navigator-dom",
  "navigator-image",
  "officina-core",
  "officina-grid",
@@ -1297,6 +1306,7 @@ dependencies = [
  "officina-text",
  "pbkdf2",
  "quick-xml",
+ "serde_json",
  "sha1",
  "sha2",
 ]
@@ -1304,6 +1314,13 @@ dependencies = [
 [[package]]
 name = "officina-core"
 version = "0.1.0"
+
+[[package]]
+name = "officina-draw"
+version = "0.1.0"
+dependencies = [
+ "officina-grid",
+]
 
 [[package]]
 name = "officina-grid"
@@ -1320,6 +1337,7 @@ dependencies = [
  "folium-content",
  "folium-font",
  "folium-syntax",
+ "officina-draw",
  "officina-slides",
  "officina-text",
 ]

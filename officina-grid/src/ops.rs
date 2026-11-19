@@ -53,6 +53,8 @@ pub enum GridOp {
     Tables(Vec<crate::tables::Table>),
     /// The workbook's charts, swapped in whole.
     Charts(Vec<crate::charts::Chart>),
+    /// The workbook's embedded pictures, swapped in whole.
+    Pictures(Vec<crate::charts::Picture>),
     /// The workbook's pivot tables with where their output is, swapped in whole
     /// (their cells change by the `Replace`s beside it).
     Pivots(Vec<(crate::pivot::Pivot, Option<Rect>)>),
@@ -216,6 +218,14 @@ impl GridOp {
                 w.var(cs.len() as u64);
                 for c in cs {
                     c.encode(&mut w);
+                }
+                return w.into_bytes();
+            }
+            GridOp::Pictures(pictures) => {
+                w.u8(23);
+                w.var(pictures.len() as u64);
+                for picture in pictures {
+                    picture.encode(&mut w);
                 }
                 return w.into_bytes();
             }
@@ -403,6 +413,21 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 23 {
+            use crate::charts::{Picture, MAX_PICTURES, MAX_PICTURE_TOTAL};
+            let count = r.count("pictures", MAX_PICTURES as u64, 51)?;
+            let mut pictures = Vec::with_capacity(count);
+            let mut room = MAX_PICTURE_TOTAL;
+            for _ in 0..count {
+                let picture = Picture::decode(&mut r, room)?;
+                room -= picture.bytes.len();
+                pictures.push(picture);
+            }
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Pictures(pictures));
         }
         if kind == 7 {
             let n = r.count("pivot tables", crate::pivot::MAX_PIVOTS as u64, 8)?;
@@ -611,6 +636,7 @@ impl Op<Workbook> for GridOp {
             GridOp::Filter(f) => GridOp::Filter(wb.replace_filter(f)),
             GridOp::Tables(ts) => GridOp::Tables(wb.replace_tables(ts)),
             GridOp::Charts(cs) => GridOp::Charts(wb.replace_charts(cs)),
+            GridOp::Pictures(pictures) => GridOp::Pictures(wb.replace_pictures(pictures)),
             GridOp::Pivots(ps) => GridOp::Pivots(wb.replace_pivots(ps)),
             GridOp::Validations(b) => {
                 let old = wb.encode_validations(wb.validations());

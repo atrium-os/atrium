@@ -157,6 +157,7 @@ pub struct Workbook {
     pub(crate) names: Names,
     /// Structured tables; change them with [`Workbook::add_table`] so formulas re-bind.
     pub(crate) tables: Vec<crate::tables::Table>,
+    pub(crate) pictures: Vec<crate::charts::Picture>,
     pub(crate) charts: Vec<crate::charts::Chart>,
     /// The file's macros, kept inert ([`crate::macros`]).
     pub(crate) macros: Option<crate::macros::Macros>,
@@ -206,6 +207,7 @@ impl Workbook {
             names: Names::default(),
             tables: Vec::new(),
             charts: Vec::new(),
+            pictures: Vec::new(),
             macros: None,
             groups: Vec::new(),
             free_groups: Vec::new(),
@@ -256,6 +258,7 @@ impl Workbook {
             n += sh.links.values().map(|k| 48 + k.target.len() as u64).sum::<u64>();
         }
         n += self.strings.bytes();
+        n += self.pictures.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
         for (_, g) in self.groups() {
             n += 256 + (g.r1 - g.r0) as u64 * 8;
         }
@@ -298,7 +301,7 @@ impl Workbook {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
         let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.freeze == (0, 0);
-        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
+        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
         }
@@ -970,6 +973,9 @@ impl Workbook {
             c
         }).collect();
         self.replace_charts(cs);
+        for picture in &mut self.pictures {
+            picture.anchor.sheet = m(picture.anchor.sheet);
+        }
         let ps: Vec<_> = self.pivot_state().into_iter().map(|(mut pv, area)| {
             pv.source = rect(pv.source);
             pv.dest = addr(pv.dest);
