@@ -138,6 +138,18 @@ fn settings_window() {
     drawn(&mut app, &["boss@example.org"]);
     s.remove_vip("boss@example.org");
     assert!(engine.prefs().vips.is_empty());
+    // Mail rules (§11.6): shown in words; one that doesn't read says why.
+    drawn(&mut app, &["RULES"]);
+    s.mail_rule.set(TextEdit::new("from:@GitHub.com move GitHub"));
+    s.add_mail_rule();
+    assert_eq!(engine.rules().len(), 1);
+    drawn(&mut app, &["Mail from anyone at github.com goes to GitHub"]);
+    s.mail_rule.set(TextEdit::new("subject:invoice delete"));
+    s.add_mail_rule();
+    assert!(s.ui.get_cloned().note.unwrap().starts_with("That rule doesn't read: say what to do"));
+    assert_eq!(engine.rules().len(), 1);
+    s.remove_mail_rule(0);
+    assert!(engine.rules().is_empty());
     // Lane rules: one that reads is kept first; one that doesn't says why.
     drawn(&mut app, &["LANES"]);
     s.rule.set(TextEdit::new("from:@GitHub.com Updates"));

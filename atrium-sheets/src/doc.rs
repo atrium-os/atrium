@@ -947,7 +947,8 @@ mod tests {
         d.take_clip(r(4, 0, 4, 1), true, text.clone());
         assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
         d.paste(9, 2, &text);
-        assert_eq!(d.wb.formula_text(CellAddr::new(0, 9, 3)).as_deref(), Some("=A5*2"));
+        // It read A5, which moved with it.
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 9, 3)).as_deref(), Some("=C10*2"));
         assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)), None);
         assert!(d.clip.is_none());
         assert!(d.undo());

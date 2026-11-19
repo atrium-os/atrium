@@ -62,6 +62,8 @@ pub struct SettingsUi {
     pub prefs: Prefs,
     /// The person's lane rules, as written (E10).
     pub rules: Vec<String>,
+    /// The person's mail rules (§11.6): as written, and in words.
+    pub mail_rules: Vec<(String, String)>,
     /// Private addresses (§13.3): the account shown, its domain, its addresses.
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
@@ -158,6 +160,7 @@ pub struct Settings {
     pub review_at: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
+    pub mail_rule: Mutable<TextEdit>,
     pub domain: Mutable<TextEdit>,
     pub made_for: Mutable<TextEdit>,
     /// Find someone in the address book.
@@ -193,6 +196,7 @@ impl Settings {
             review_at: ui.sibling(TextEdit::new(&format_hm(prefs.review))),
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
+            mail_rule: ui.sibling(TextEdit::new("")),
             domain: ui.sibling(TextEdit::new("")),
             made_for: ui.sibling(TextEdit::new("")),
             person: ui.sibling(TextEdit::new("")),
@@ -228,6 +232,7 @@ impl Settings {
             .collect();
         let prefs = e.prefs();
         let rules: Vec<String> = e.lane_rules().iter().map(|r| r.text()).collect();
+        let mail_rules: Vec<(String, String)> = e.rules().iter().map(|r| (r.text(), r.words())).collect();
         let u = self.ui.get_cloned();
         let rows: Vec<Row> = rows;
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
@@ -246,11 +251,12 @@ impl Settings {
                 u.people_query = q;
             });
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
                 u.rules = rules;
+                u.mail_rules = mail_rules;
                 u.priv_account = pa;
                 u.priv_domain = pd;
                 u.privates = privates;
@@ -476,6 +482,38 @@ impl Settings {
         }
         self.vip.set(TextEdit::new(""));
         self.set_prefs(|p| p.vips.push(a));
+    }
+
+    /// A mail rule as typed (`from:@github.com move GitHub`, §11.6), first
+    /// in the list; said when no account has the folder it moves to.
+    pub fn add_mail_rule(&self) {
+        let text = self.mail_rule.get_cloned().text().to_string();
+        match mail_engine::rules::parse_rule(&text) {
+            Ok(r) => {
+                let accounts: Vec<_> = self.engine.configured().into_iter().map(|(id, _)| id).collect();
+                let missing = (!accounts.is_empty()).then(|| accounts.iter().map(|a| self.engine.missing_folder(*a, &r)).collect::<Vec<_>>()).filter(|m| m.iter().all(Option::is_some)).and_then(|m| m.into_iter().next().flatten());
+                match self.engine.add_rule(r) {
+                    Ok(()) => {
+                        self.mail_rule.set(TextEdit::new(""));
+                        self.update(|u| u.note = missing.map(|f| format!("No account has a folder named {f} yet; the rule moves nothing until one does")));
+                    }
+                    Err(e) => self.update(|u| u.note = Some(format!("Couldn't keep the rule: {e:?}"))),
+                }
+            }
+            Err(why) => self.update(|u| u.note = Some(format!("That rule doesn't read: {why}. For example: from:@github.com move GitHub"))),
+        }
+        self.reload();
+    }
+
+    pub fn remove_mail_rule(&self, i: usize) {
+        let mut rules = self.engine.rules();
+        if i < rules.len() {
+            rules.remove(i);
+            if let Err(e) = self.engine.set_rules(&rules) {
+                self.update(|u| u.note = Some(format!("Couldn't change the rules: {e:?}")));
+            }
+        }
+        self.reload();
     }
 
     /// A lane rule as typed (`from:@github.com updates`), first in the list.
@@ -1047,6 +1085,24 @@ impl SettingsView {
         switch(ctx, x, y + em(14.0), "Keep company link scanning", ui.prefs.keeps_scanning(named), move || s.toggle_link_scanning());
         y += em(32.0);
         y += para(ctx, x, y, inner, "A link through Safe Links, URL Defense or Mimecast opens through it, so your company's scanner still checks it. Mail shows where it goes either way.", type_size::XS, t.text_tertiary()) + em(8.0);
+
+        // Rules (§11.6): what happens to new inbox mail, in words.
+        y += em(8.0);
+        section(ctx, x, &mut y, "RULES");
+        y += para(ctx, x, y, inner, "For new mail in your inboxes, the first rule that fits: from:, to:, list: or subject:, then move <folder>, flag, read or quiet.", type_size::XS, t.text_tertiary()) + em(8.0);
+        for (i, (_, words)) in ui.mail_rules.iter().enumerate() {
+            text(ctx, x, y + em(14.0), words, type_size::SM, Weight::Regular, t.text_primary());
+            let s = self.s.clone();
+            let rw = measure("Remove", type_size::SM, Weight::Medium) + em(24.0);
+            button(ctx, right - rw, y + em(14.0), "Remove", false, true, move || s.remove_mail_rule(i));
+            y += em(30.0);
+        }
+        let fw = (inner - em(80.0)).max(em(160.0));
+        let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+        ctx.place(TextField::new(self.s.mail_rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com move GitHub"));
+        let s = self.s.clone();
+        button(ctx, x + fw + em(8.0), y + em(18.0), "Add", false, true, move || s.add_mail_rule());
+        y += em(40.0);
 
         // Lanes (E10): the person's rules, then what Mail does by itself.
         y += em(8.0);
