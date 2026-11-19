@@ -890,6 +890,11 @@ another origin. An active portal-profile session stays in engine memory.
   IPv4 echo on ESP after reconnect and on TLS after rebind, with the same
   HIP approval rules.
   The arm64 rebind fallback variant passed 42/42 in one run.
+  With `--hip esp-loss`, the peer answers the first ESP echo and then
+  drops ESP packets. The gate checks automatic TLS recovery on the same
+  login, unchanged HIP submission and refresh without prompting, and
+  fresh approval before sending changed IPv6 forwarding posture. IPv4
+  echo continues on the recovered TLS tunnel. The arm64 run passed 14/14.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

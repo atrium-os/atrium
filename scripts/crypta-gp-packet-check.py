@@ -71,7 +71,7 @@ def frames(stream, reader, calls):
 
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
-REFRESH_HIP = ("refresh", "posture", *TESSERA_HIP)
+REFRESH_HIP = ("refresh", "posture", "esp-loss", *TESSERA_HIP)
 
 
 def require_reconnect_approval(receipts, config_index):
@@ -88,10 +88,11 @@ CYCLE_REBINDS = frozenset((3, 5, 7))
 
 
 class EspPeer:
-    def __init__(self, socket, drop, reconnect_approval=None, drop_config_indices=()):
+    def __init__(self, socket, drop, reconnect_approval=None, drop_config_indices=(), lose_active=False):
         self.socket = socket
         self.drop = drop
         self.drop_config_indices = drop_config_indices
+        self.lose_active = lose_active
         self.dropped_probe_spis = set()
         self.reconnect_approval = reconnect_approval
         self.configs = []
@@ -158,6 +159,10 @@ class EspPeer:
                     self.probes += 1
                 if self.configs.index(pair) in self.drop_config_indices:
                     assert probe, "ESP carried data on an association that should fall back"
+                    self.dropped_probe_spis.add(spi_in)
+                    continue
+                if self.lose_active and self.echo:
+                    assert probe, "ESP data arrived during the active outage"
                     self.dropped_probe_spis.add(spi_in)
                     continue
                 if self.drop:
@@ -456,11 +461,12 @@ def main():
         reconnect_approval = receipts.with_suffix(".approved") if args.hip in RECONNECT_HIP else None
         with ExitStack() as stack:
             esp = None
-            if args.esp or args.drop_esp or drop_config_indices:
+            if args.esp or args.drop_esp or drop_config_indices or args.hip == "esp-loss":
                 udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 udp.bind(("127.0.0.1", 4501))
                 udp.settimeout(300)
-                esp = EspPeer(udp, args.drop_esp, reconnect_approval, drop_config_indices)
+                esp = EspPeer(udp, args.drop_esp, reconnect_approval, drop_config_indices,
+                              lose_active=args.hip == "esp-loss")
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
@@ -639,6 +645,27 @@ def main():
                 else:
                     assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
                 print("Declining the rebound review sent no changed HIP count and opened no rebound data tunnel")
+                return
+            if args.hip == "esp-loss":
+                assert not esp.errors, esp.errors
+                assert len(esp.configs) == 2 and calls.count("getconfig.esp") == 2, calls
+                original_spi = esp.configs[0][0][0]
+                assert esp.echo == [original_spi] and esp.dropped_probe_spis == {original_spi}, esp.echo
+                assert esp.received_spis == {original_spi}, esp.received_spis
+                assert calls.count("login.esp") == 1 and calls[-1] == "logout.esp", calls
+                recovery = len(calls) - 1 - calls[::-1].index("getconfig.esp")
+                assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
+                assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
+                reports = receipts.read_text().splitlines()
+                report_index = calls[:recovery].count("hipreport.esp")
+                original, changed = reports[0], reports[-1]
+                assert original.split()[0] != changed.split()[0], reports
+                assert reports[report_index:report_index + 2] == [original, original], reports
+                assert all(report == original for report in reports[:report_index]), reports
+                assert reports[report_index:] == sorted(reports[report_index:],
+                                                         key=lambda report: report != original), reports
+                assert set(reports) == {original, changed}, reports
+                print("Active ESP loss recovered on TLS, with silent unchanged HIP and approval for the changed report")
                 return
             if args.hip in ("refresh", "posture", "tessera", "tessera-domain", "tessera-rebind"):
                 connections = 2 if args.hip == "tessera-rebind" else 1

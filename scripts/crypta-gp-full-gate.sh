@@ -598,7 +598,34 @@ if [ -n "$tessera_fact" ]; then
     echo "$pass checks passed"
     exit 0
 fi
-if [ "$hip" = refresh ]; then
+if [ "$hip" = esp-loss ]; then
+    initial_report=$(head -n 1 "$receipts")
+    reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
+    probe "IPv4 echo on active ESP before outage"
+    for _ in $(seq 1 50); do
+        [ "$(field signin)" != prompt ] || fail "ESP loss prompted for unchanged HIP"
+        if "$V" "grep -q 'GlobalProtect data transport: TLS$' $G/cryptad.log"; then break; fi
+        sleep 1
+    done
+    "$V" "grep -q 'not connected (GlobalProtect ESP lost; reconnecting over TLS)' $G/cryptad.log &&
+          grep -q 'GlobalProtect data transport: TLS$' $G/cryptad.log" ||
+        fail "the active ESP tunnel did not recover over TLS"
+    wait_field handshake 1
+    [ "$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")" = "$reviews" ] ||
+        fail "ESP recovery issued another review"
+    [ "$(tail -n 1 "$receipts")" = "$initial_report" ] || fail "ESP recovery reported different HIP facts"
+    ok "active ESP loss recovered over TLS with unchanged HIP and no prompt"
+    before_refresh=$(awk 'END { print NR }' "$receipts")
+    for _ in $(seq 1 20); do
+        [ "$(field signin)" = in ] || fail "TLS recovery refresh prompted or disconnected"
+        [ "$(awk 'END { print NR }' "$receipts")" -le "$before_refresh" ] || break
+        sleep 1
+    done
+    [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$initial_report" ] ||
+        fail "the recovered TLS tunnel did not refresh unchanged HIP"
+    ok "unchanged HIP report refreshed on recovered TLS without prompting"
+fi
+if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
     original=$("$V" 'sysctl -n net.inet6.ip6.forwarding')
     case "$original" in
         0) changed=1; changed_word=yes ;;
@@ -635,7 +662,7 @@ if [ "$hip" = refresh ]; then
     probe "IPv4 echo after approved HIP refresh"
     [ "$(field starts)" = 1 ] || fail "HIP refresh restarted the engine"
     "$V" "$CTL down name=gp-gate" >/dev/null
-    ok "HIP refreshed on the original tunnel"
+    ok "HIP refreshed on the active tunnel"
     echo "$pass checks passed"
     exit 0
 fi
