@@ -1692,8 +1692,9 @@ Stalwart in the cloud VM, and later a real account):
    answered is told when it does. The spec's wording was "coloured"; a line naming them
    is used because a text field can't colour single addresses in what is typed. Tests:
    engine 1 (inside, subdomain, look-alike, duplicates), compose window 1 (Personal
-   silent, Work's line, all inside). **Not yet**: a VM run in a Work instance (company
-   domains: see below).
+   silent, Work's line, all inside). A signed Mail fixture launched through
+   Portcullis as Work on FreeBSD arm64 verified the live To and Cc warning
+   and the company subdomain exemption.
 
    **Company link scanning kept in Work (2026-11-19, §7.6).** Settings has a LINKS
    section with a "Keep company link scanning" switch (stored as a setting; absent means
@@ -1705,8 +1706,10 @@ Stalwart in the cloud VM, and later a real account):
    still comes first). Turned off, or in Personal, such links are peeled as before.
    Mail learns its persona from portcullisd as in §9.1. Tests: links 1 (scanner named,
    original kept), prefs 1 (default by persona), window 1 (Work keeps the Safe Links
-   link and names it, turning it off peels it). **Not yet**: a VM run in a Work
-   instance (a company's own scanner: see below, typed in Settings).
+   link and names it, turning it off peels it). In the same live Work fixture,
+   clicking a plain-text Safe Links URL showed the destination and scanner.
+   Open sent the original wrapped URL and a press token to a local Monstrator
+   test double. Plain-text links have hit targets sized to their displayed text.
 
    **Export as mbox (2026-11-19, §6.5).** The command palette has "Export Inbox as mbox"
    (the folder shown), "Export these results as mbox" (a search, view or saved search)

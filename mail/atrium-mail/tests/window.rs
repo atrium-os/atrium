@@ -332,8 +332,11 @@ fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
     {
         let mut sink = engine.sink(account);
         sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
-        let bytes = message(1, "Bank <alerts@bank.example>", "Verify now", &body, true, NOW - 60);
-        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW - 60), server_id: None, bytes, full: true }]).unwrap();
+        let fetched = |uid, body: &str, html, date| {
+            let bytes = message(uid, "Bank <alerts@bank.example>", if html { "Verify now" } else { "Plain text link" }, body, html, date);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(date), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![fetched(1, &body, true, NOW - 60), fetched(2, wrapped, false, NOW - 120)]).unwrap();
     }
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
@@ -406,6 +409,18 @@ fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
     assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://login.evil.example/x");
     mail.link(other);
     assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://dash.acme.example/q4");
+    mail.close_link();
+    mail.open(1);
+    app.tick();
+    let at = app.tree().iter().find_map(|(_, node)| match node {
+        Node::Text { rect, content, .. } if rect.origin.x > 624.0 && content.starts_with("https://eur01.safelinks") => {
+            Some(Point::new(rect.origin.x + 4.0, rect.origin.y + rect.size.h / 2.0))
+        }
+        _ => None,
+    }).expect("plain-text link");
+    app.handle_event(Event::PointerDown { at });
+    app.handle_event(Event::PointerUp { at });
+    assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://login.evil.example/x");
 }
 
 #[test]

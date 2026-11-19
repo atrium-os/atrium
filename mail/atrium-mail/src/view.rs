@@ -4602,11 +4602,17 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             let color = if *depth > 0 { t.text_secondary() } else { t.text_primary() };
             for (s, link) in spans {
                 let id = text(ctx, tx, cy, s, type_size::MD, Weight::Regular, if link.is_some() { t.accent_fg() } else { color });
+                let span_width = width(s, type_size::MD, Weight::Regular);
                 if let Some(url) = link {
+                    // Text normally uses intrinsic width for painting. A
+                    // pointer target needs an explicit width for hit testing.
+                    if let Some(Node::Text { rect, .. }) = ctx.tree.get_mut(id) {
+                        rect.size.w = span_width;
+                    }
                     let (url, mm) = (url.clone(), mail.clone());
                     ctx.on_click(id, move || mm.link(&url));
                 }
-                tx += width(s, type_size::MD, Weight::Regular);
+                tx += span_width;
             }
         }
         Item::Fold { msg, quoted, shown } => {
