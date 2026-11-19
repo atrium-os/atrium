@@ -36172,11 +36172,43 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, mounts,
     "Per-mount metadata-reserve admission inputs and pinscan state");
 
 /*
+ * An unverified on-disk group ID is insufficient. Check the domain MAC
+ * with an active, authenticated group key, under the same locks used when
+ * assigning a domain to a group. A locked domain remains encrypted, but
+ * cannot be independently verified by this query while its key is away.
+ */
+static unsigned int
+tessera_fs_verified_domain_count(struct tessera_mount *t)
+{
+	unsigned int count = 0;
+
+	if (!t->groups_sx_init)
+		return (0);
+	if (t->flush_mtx_init)
+		tessera_fs_flush_gate_enter(t);
+	sx_xlock(&t->groups_sx);
+	tessera_fs_groups_refresh(t);
+	for (uint32_t i = 0; i < t->quota_ndomains; i++) {
+		const tessera_quota_domain_t *d = &t->quota_domains[i];
+		if (d->key_group == 0)
+			continue;
+		struct tessera_fs_group *g = tessera_fs_group_find(t, d->key_group);
+		if (g != NULL && !g->bad && !g->closing && g->keys != NULL &&
+		    tessera_domain_verify_group(g->keys, d) == TESSERA_OK)
+			count++;
+	}
+	sx_xunlock(&t->groups_sx);
+	if (t->flush_mtx_init)
+		tessera_fs_flush_gate_exit(t);
+	return (count);
+}
+
+/*
  * A mount has a seal only after the kernel has authenticated the volume.
  * Count live mounts without exporting mount paths, volume IDs or keys.
  */
 static int
-tessera_sysctl_sealed_mounts(SYSCTL_HANDLER_ARGS)
+tessera_sysctl_encryption_count(SYSCTL_HANDLER_ARGS)
 {
 	struct mount *mp, *next;
 	unsigned int count = 0;
@@ -36198,8 +36230,12 @@ tessera_sysctl_sealed_mounts(SYSCTL_HANDLER_ARGS)
 		if (error != 0)
 			break;
 		struct tessera_mount *t = VFSTOTESSERA(mp);
-		if (t != NULL && t->seal != NULL)
-			count++;
+		if (t != NULL) {
+			if (arg2 != 0)
+				count += tessera_fs_verified_domain_count(t);
+			else if (t->seal != NULL)
+				count++;
+		}
 		mtx_lock(&mountlist_mtx);
 		next = TAILQ_NEXT(mp, mnt_list);
 		vfs_unbusy(mp);
@@ -36211,7 +36247,12 @@ tessera_sysctl_sealed_mounts(SYSCTL_HANDLER_ARGS)
 }
 SYSCTL_PROC(_kern_tessera, OID_AUTO, sealed_mounts,
     CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
-    tessera_sysctl_sealed_mounts, "IU", "Number of mounted sealed Tessera volumes");
+    tessera_sysctl_encryption_count, "IU", "Number of mounted sealed Tessera volumes");
+
+SYSCTL_PROC(_kern_tessera, OID_AUTO, verified_encrypted_domains,
+    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 1,
+    tessera_sysctl_encryption_count, "IU",
+    "Number of Tessera domains authenticated with an active encryption key");
 
 /* ── E4.4: dropping a group's key (encryption §10, page cache) ───── */
 

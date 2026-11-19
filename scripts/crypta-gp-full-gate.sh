@@ -36,7 +36,12 @@ if [ "$hip" = posture ]; then
     (cd "$ROOT/portcullis" && cargo build -q --release --target "$T" -p opifex --bin opifexd)
     EXTRA="$EXTRA $ROOT/portcullis/target/$T/release/opifexd"
 fi
-if [ "$hip" = tessera ]; then
+case "$hip" in
+    tessera) tessera_fact='Mounted sealed Tessera volumes' ;;
+    tessera-domain) tessera_fact='Tessera encrypted domains verified with active keys' ;;
+    *) tessera_fact= ;;
+esac
+if [ -n "$tessera_fact" ]; then
     module=${CRYPTA_GATE_TESSERA_KMOD:?path to a host-built tessera_fs.ko}
     [ -f "$module" ] && [ "${module##*/}" = tessera_fs.ko ] ||
         fail "expected a host-built tessera_fs.ko"
@@ -44,7 +49,7 @@ if [ "$hip" = tessera ]; then
 fi
 setup
 
-if [ "$hip" = tessera ]; then
+if [ -n "$tessera_fact" ]; then
     tessera_cleanup() {
         "$V" 'G=/tmp/crypta-gate
             umount "$G/tessera" 2>/dev/null || true
@@ -61,7 +66,7 @@ if [ "$hip" = tessera ]; then
         kill "$LANPID" 2>/dev/null || true
     }
     trap tessera_cleanup EXIT
-    "$V" 'sh -s' <<'GUEST'
+    "$V" "sh -s -- $hip" <<'GUEST'
 set -eu
 G=/tmp/crypta-gate
 tools=/root/sealed
@@ -78,6 +83,20 @@ test "$(sysctl -n kern.tessera.sealed_mounts)" = 0
 mkdir "$G/tessera"
 umask 077
 head -c 32 /dev/random > "$G/tessera-key"
+if [ "$1" = tessera-domain ]; then
+    test -x "$tools/tessera-quota-set"
+    uuid=a1b2c3d4e5f60718293a4b5c6d7e8f90
+    "$tools/tessera-mkfs-sealed" --plain --create -s 64 -j 64 --uuid "$uuid" "$G/tessera.img" >/dev/null
+    mdconfig -a -t vnode -f "$G/tessera.img" > "$G/tessera-md"
+    mount -t tessera "/dev/$(cat "$G/tessera-md")" "$G/tessera"
+    mkdir "$G/tessera/persona"
+    "$tools/tessera-quota-set" "$G/tessera/persona" 1000000000 >/dev/null
+    "$tools/tessera-keyload" load-group "$G/tessera-key" "$kid" "$uuid" 9 >/dev/null
+    "$tools/tessera-keyload" group-create "$G/tessera" "$kid" 9 >/dev/null
+    rm -f "$G/tessera-key"
+    test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0
+    exit 0
+fi
 printf '%s\n' 'sealed HIP fixture' > "$G/tessera-content"
 "$tools/tessera-mkfs-sealed" --key-file "$G/tessera-key" --key-id "$kid" --create -s 64 -j 64 \
     --seed-file probe --seed-content "$G/tessera-content" "$G/tessera.img" > "$G/tessera-format"
@@ -235,11 +254,11 @@ if [ -n "$hip" ]; then
         done
         ok "review shows live GELI, Opifex and active-session lock facts"
     fi
-    if [ "$hip" = tessera ]; then
-        case "$preview" in *"$(hex 'Mounted sealed Tessera volumes  0')"*) ;;
+    if [ -n "$tessera_fact" ]; then
+        case "$preview" in *"$(hex "$tessera_fact  0")"*) ;;
             *) fail "initial HIP review omitted the verified zero Tessera count" ;;
         esac
-        ok "review shows zero mounted sealed Tessera volumes"
+        ok "review shows zero for $tessera_fact"
     fi
     ok "Settings prompt exposes the HIP facts before the data tunnel is up"
     if [ "$hip" = decline ]; then
@@ -295,27 +314,42 @@ if [ "$hip" = posture ]; then
     echo "$pass checks passed"
     exit 0
 fi
-if [ "$hip" = tessera ]; then
-    probe "IPv4 echo before the sealed Tessera mount"
+if [ -n "$tessera_fact" ]; then
+    probe "IPv4 echo before the Tessera encryption change"
     grep -q '^0 ' "$receipts" || fail "initial Tessera report did not reach peer"
-    "$V" 'G=/tmp/crypta-gate; set -e
-        mount -t tessera -r "/dev/$(cat "$G/tessera-md")" "$G/tessera"
-        cmp "$G/tessera/probe" "$G/tessera-content"
-        test "$(sysctl -n kern.tessera.sealed_mounts)" = 1'
+    if [ "$hip" = tessera-domain ]; then
+        "$V" 'G=/tmp/crypta-gate; set -e
+            /root/sealed/tessera-keyload quota-group "$G/tessera/persona" 9
+            /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
+            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 1
+            test "$(sysctl -n kern.tessera.sealed_mounts)" = 0'
+    else
+        "$V" 'G=/tmp/crypta-gate; set -e
+            mount -t tessera -r "/dev/$(cat "$G/tessera-md")" "$G/tessera"
+            cmp "$G/tessera/probe" "$G/tessera-content"
+            test "$(sysctl -n kern.tessera.sealed_mounts)" = 1'
+    fi
     wait_prompt gp_hip_approval
     printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-        grep -q "$(hex 'Mounted sealed Tessera volumes  1')" ||
-        fail "HIP review omitted the verified sealed mount"
-    if grep -q '^1 ' "$receipts"; then fail "sealed mount was uploaded without approval"; fi
+        grep -q "$(hex "$tessera_fact  1")" ||
+        fail "HIP review omitted the updated Tessera count"
+    if grep -q '^1 ' "$receipts"; then fail "Tessera count was uploaded without approval"; fi
     "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
     for _ in $(seq 1 20); do
         grep -q '^1 ' "$receipts" && break
         sleep 1
     done
     grep -q '^1 ' "$receipts" || fail "approved Tessera report did not reach peer"
-    ok "sealed Tessera mount required fresh approval before upload"
+    ok "Tessera encryption change required fresh approval before upload"
     probe "IPv4 echo after approved Tessera posture refresh"
     "$V" "$CTL down name=gp-gate" >/dev/null
+    if [ "$hip" = tessera-domain ]; then
+        "$V" 'set -e
+            /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
+            /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
+            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
+        ok "Tessera excludes a still-encrypted domain when its key is locked"
+    fi
     echo "$pass checks passed"
     exit 0
 fi

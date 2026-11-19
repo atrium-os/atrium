@@ -546,7 +546,7 @@ encryption, patch management, data loss prevention) and repeats every HIP interv
 | OS and version | Opifex / build info | `Linux` class (decision 14), version string Atrium's |
 | Host ID, hostname, MACs | cryptad | §9.5 |
 | Firewall | atrium-net (pf enabled, default deny for apps) | enabled, product "Atrium pf" |
-| Disk encryption | FreeBSD GEOM, kernel mount table and Tessera kernel state | Counts of mounted active GELI providers and authenticated sealed Tessera volumes, when available |
+| Disk encryption | FreeBSD GEOM, kernel mount table and Tessera kernel state | Counts of mounted active GELI providers, authenticated sealed Tessera volumes, and Tessera domains verified with active keys, when available |
 | Patch management | Opifex catalog | Last check time and catalog update count, or last check failure |
 | Screen lock | Ostiarius active seat and lock marker | Whether the active seat is locked, when known |
 | Antivirus / anti-malware | none on Atrium | none listed |
@@ -770,9 +770,10 @@ another origin. An active portal-profile session stays in engine memory.
   kernel and the pf running flag from atrium-net. For disk encryption,
   cryptad counts mounted providers that FreeBSD GEOM reports as active GELI
   and reads the kernel count of mounted authenticated Tessera sealed volumes
-  from `kern.tessera.sealed_mounts`. These counts cover the mounts in each
-  category. Tessera encrypted domains have separate keys and are outside
-  the sealed-volume count. For patch status, cryptad reads the
+  from `kern.tessera.sealed_mounts`. The separate domain count comes from
+  `kern.tessera.verified_encrypted_domains` and includes only records the
+  kernel authenticates with active group keys. Locked domains remain
+  encrypted while outside that count. For patch status, cryptad reads the
   last check and catalog update count from root-owned Opifex over its local
   socket. A failed check reports the failure and omits the count. This covers
   the Opifex catalog. For screen lock, cryptad reads Ostiarius's active seat
@@ -806,6 +807,13 @@ another origin. An active portal-profile session stays in engine memory.
   tunnel and checks that the gateway receives the new count only after
   fresh approval. IPv4 echo passes on the original data connection. The
   arm64 Tessera gate passed 10/10 on TLS and 10/10 with `--esp`.
+  The `--hip tessera-domain` case uses the same module and the guest's
+  Tessera quota tool. It assigns an empty quota domain to an authenticated
+  key group while the tunnel is up, checks that the updated count waits
+  for approval, and verifies echo on the original connection. After the
+  tunnel closes, the gate confirms locking the key excludes the domain
+  from the verified count. The arm64 domain gate passed 11/11 on TLS and
+  11/11 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

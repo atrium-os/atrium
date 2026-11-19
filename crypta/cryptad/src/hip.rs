@@ -131,13 +131,13 @@ pub fn mounted_geli() -> Option<u32> {
 }
 
 #[cfg(target_os = "freebsd")]
-pub fn mounted_tessera_sealed() -> Option<u32> {
+fn tessera_count(name: &std::ffi::CStr) -> Option<u32> {
     let mut count = 0u32;
     let mut size = std::mem::size_of_val(&count);
     // SAFETY: count and size are writable and the new-value pointer is null.
     let rc = unsafe {
         libc::sysctlbyname(
-            c"kern.tessera.sealed_mounts".as_ptr(),
+            name.as_ptr(),
             (&mut count as *mut u32).cast(),
             &mut size,
             std::ptr::null(),
@@ -148,8 +148,16 @@ pub fn mounted_tessera_sealed() -> Option<u32> {
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn mounted_tessera_sealed() -> Option<u32> {
+fn tessera_count(_name: &std::ffi::CStr) -> Option<u32> {
     None
+}
+
+pub fn mounted_tessera_sealed() -> Option<u32> {
+    tessera_count(c"kern.tessera.sealed_mounts")
+}
+
+pub fn tessera_verified_domains() -> Option<u32> {
+    tessera_count(c"kern.tessera.verified_encrypted_domains")
 }
 
 #[cfg(test)]

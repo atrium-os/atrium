@@ -65,6 +65,11 @@ The read-only `kern.tessera.sealed_mounts` sysctl gives the host administrator
 the count of mounts with an authenticated volume seal. Crypta uses it for
 reviewed GlobalProtect HIP posture. The count includes sealed filesystems
 only and exports no volume paths, identifiers or keys.
+The read-only `kern.tessera.verified_encrypted_domains` sysctl gives the host
+administrator a separate count of domain records on live mounts whose MAC
+verifies against a loaded, authenticated group key. Locked domains remain
+encrypted and are outside this count while the key is unavailable. Neither
+query exports domain or group identifiers.
 
 ## 2. Words
 

@@ -679,15 +679,29 @@ impl HipReport {
             ));
             let _ = writeln!(review, "Mounted GELI encrypted providers  {count}");
         }
+        let mut tessera =
+            Element::new("entry").with_child(Element::new("product").with_text("Atrium Tessera"));
         if let Some(count) = facts.mounted_tessera_sealed {
-            disk = disk.with_child(encryption_entry(
-                "Atrium Tessera",
-                "mounted-sealed-volumes",
-                count,
-            ));
+            tessera = tessera
+                .with_child(Element::new("mounted-sealed-volumes").with_text(&count.to_string()));
             let _ = writeln!(review, "Mounted sealed Tessera volumes  {count}");
         }
-        if facts.mounted_geli.is_some() || facts.mounted_tessera_sealed.is_some() {
+        if let Some(count) = facts.tessera_verified_domains {
+            tessera = tessera.with_child(
+                Element::new("verified-encrypted-domains").with_text(&count.to_string()),
+            );
+            let _ = writeln!(
+                review,
+                "Tessera encrypted domains verified with active keys  {count}"
+            );
+        }
+        if facts.mounted_tessera_sealed.is_some() || facts.tessera_verified_domains.is_some() {
+            disk = disk.with_child(tessera);
+        }
+        if facts.mounted_geli.is_some()
+            || facts.mounted_tessera_sealed.is_some()
+            || facts.tessera_verified_domains.is_some()
+        {
             categories = categories.with_child(disk);
         }
         if let Some(status) = facts.patch_status {
@@ -842,6 +856,7 @@ mod tests {
         let facts = HipFacts {
             mounted_geli: Some(1),
             mounted_tessera_sealed: Some(0),
+            tessera_verified_domains: Some(0),
             patch_status: Some(HipPatchStatus {
                 last_check: 100,
                 pending: Some(2),
@@ -860,6 +875,10 @@ mod tests {
             },
             HipFacts {
                 mounted_tessera_sealed: Some(1),
+                ..facts
+            },
+            HipFacts {
+                tessera_verified_domains: Some(1),
                 ..facts
             },
             HipFacts {
