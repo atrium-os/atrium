@@ -437,6 +437,27 @@ if [ -n "$tessera_fact" ]; then
             /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 1'
     }
+    rebind_unlocked_tessera() {
+        unlocked_report=$(tail -n 1 "$receipts")
+        [ "${unlocked_report%% *}" = 1 ] || fail "missing approved unlocked-key report"
+        before_rebind=$(wc -l < "$receipts" | tr -d ' ')
+        reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
+        "$V" "$CTL rebind name=gp-gate" >/dev/null
+        # The old connection can still show handshake=1 until rebind is processed.
+        for _ in $(seq 1 30); do
+            [ "$(field signin)" != prompt ] || fail "unchanged unlocked report prompted on rebind"
+            connected=$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")
+            [ "$connected" != "$1" ] || break
+            sleep 1
+        done
+        [ "$connected" = "$1" ] || fail "post-unlock rebound tunnel did not connect"
+        wait_field handshake 1
+        [ "$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")" = "$reviews" ] ||
+            fail "post-unlock rebind issued another review"
+        [ "$(sed -n "$((before_rebind + 1))p" "$receipts")" = "$unlocked_report" ] ||
+            fail "the post-unlock rebind reported different facts"
+        ok "post-unlock rebind sent the unchanged HIP report without prompting"
+    }
     lock_tessera_key() {
         "$V" 'set -e
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
@@ -483,24 +504,7 @@ if [ -n "$tessera_fact" ]; then
         approve_tessera_change 1 "Tessera domain key unlock"
         probe "IPv4 echo after approved Tessera domain key unlock"
         if [ "$hip" = tessera-reconnect ]; then
-            unlocked_report=$(tail -n 1 "$receipts")
-            [ "${unlocked_report%% *}" = 1 ] || fail "missing approved unlocked-key report"
-            reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
-            "$V" "$CTL rebind name=gp-gate" >/dev/null
-            # The old connection can still show handshake=1 until rebind is processed.
-            for _ in $(seq 1 30); do
-                [ "$(field signin)" != prompt ] || fail "unchanged unlocked report prompted on rebind"
-                connected=$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")
-                [ "$connected" != 3 ] || break
-                sleep 1
-            done
-            [ "$connected" = 3 ] || fail "post-unlock rebound tunnel did not connect"
-            wait_field handshake 1
-            [ "$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")" = "$reviews" ] ||
-                fail "post-unlock rebind issued another review"
-            [ "$(tail -n 1 "$receipts")" = "$unlocked_report" ] ||
-                fail "the post-unlock rebind reported different facts"
-            ok "post-unlock rebind sent the unchanged HIP report without prompting"
+            rebind_unlocked_tessera 3
             probe "IPv4 echo on the post-unlock rebound tunnel"
 
             receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
@@ -543,6 +547,8 @@ if [ -n "$tessera_fact" ]; then
                 "$V" "rm -f '$G/tessera-key'"
                 approve_tessera_change 1 "Tessera domain key unlock after second-decline reconnect"
                 probe "IPv4 echo after approved unlock on the second reconnect"
+                rebind_unlocked_tessera 5
+                probe "IPv4 echo after the second reconnect rebind"
             else
                 probe "IPv4 echo on the rebound tunnel after approved key lock"
             fi
