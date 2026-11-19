@@ -2860,9 +2860,11 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
-        // The terminal lists them only, for its switcher (homes.md §5.3).
+        // The terminal lists them for its switcher, and Settings for
+        // workspace access. Neither permission authorizes workspace changes.
         Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_workspaces(app)
-            || (matches!(req, Request::Workspaces) && (launch::app_shows_consoles(app) || launch::app_execs_in_workspaces(app))),
+            || (matches!(req, Request::Workspaces) && (launch::app_shows_consoles(app) || launch::app_execs_in_workspaces(app)
+                || launch::app_manages_grants(app))),
         // Not an app: a person, with a home, asking about their own.
         None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
     };

@@ -14,7 +14,9 @@ mkdir -p /etc/atrium/services.d
 install -m 0644 "$ROOT/arca/arca-ssh-agent/etc/services.d/44-atrium-ssh-agent.toml" /etc/atrium/services.d/
 J=/var/lib/atrium/jails/ssh-agent
 for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/ssh-agent atrium/sockets/arca var/run/atrium etc; do mkdir -p "$J/$d"; done
-: > "$J/var/run/atrium/app-registry"; : > "$J/etc/pwd.db"
+for f in var/run/atrium/app-registry etc/pwd.db; do
+    [ -f "$J/$f" ] || touch "$J/$f"
+done
 A=/etc/atrium/services.d/42-atrium-arcad.toml
 if [ -f "$A" ] && ! grep -q 'ssh-agent=65047' "$A"; then
     sed -i '' -e 's/{ key = "ARCA_SERVICES", value = "\([^"]*\)" }/{ key = "ARCA_SERVICES", value = "\1,ssh-agent=65047" }/' "$A"

@@ -431,3 +431,16 @@ to eleven minutes for that answer. Model `AppsPage::directions`, `set_crossing`;
   `vinculum-ctl power off`, a restart and `status` show off kept. The drawn page is checked by the host render test; no VM run, as
   the cloud VM has no Bluetooth controller.
 
+
+## Workspace access (Dev tools M9)
+
+Workspace access reads the signed-in person's workspace names and personas
+through portcullisd. A caller with the installed Settings manifest's
+`app-grants` capability may list its owner's workspaces. That capability
+does not authorize workspace administration. Curia shows the results on
+entry, with loading, empty and service-error states.
+
+To finish the page, broker SSH key and HTTPS token metadata through
+portcullisd for that owner and workspace persona. Bind changes to a confirmed
+press, and resolve the workspace again on the server before applying them.
+See [arca.md](arca.md) §9.1.

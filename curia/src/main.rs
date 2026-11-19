@@ -386,10 +386,23 @@ fn follow_bt(tx: Sender<BtMsg>, send: BtSend) {
     });
 }
 
+fn ask_portcullis(req: &portcullis_ipc::Request, wait: Duration) -> Result<portcullis_ipc::Response, String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    s.set_read_timeout(Some(wait)).and_then(|_| s.set_write_timeout(Some(wait))).map_err(|e| e.to_string())?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+        Ok(other) => return Err(format!("portcullisd: {other:?}")),
+        Err(e) => return Err(format!("portcullisd is not answering ({e})")),
+    }
+    round_trip(&mut s, req).map_err(|e| format!("portcullisd is not answering ({e})"))
+}
+
 /// One Apps page ask of portcullisd (curia.md §13), on a thread of its own.
 fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc<AtomicBool>) {
     use curia::apps::{Got, Want};
-    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    use portcullis_ipc::{Request, Response};
     use std::sync::atomic::Ordering;
     if w == Want::Refresh && refreshing.swap(true, Ordering::SeqCst) {
         return;
@@ -397,17 +410,7 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
     // Turning a crossing on waits for the person on Sigillum's sheet.
     let wait = Duration::from_secs(if matches!(w, Want::SetCrossing { on: true, .. } | Want::RemovePersona { .. }) { 11 * 60 } else { 10 });
     std::thread::spawn(move || {
-        let ask = |req: &Request| -> Result<Response, String> {
-            let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
-            let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
-            s.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
-            match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
-                Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
-                Ok(other) => return Err(format!("portcullisd: {other:?}")),
-                Err(e) => return Err(format!("portcullisd is not answering ({e})")),
-            }
-            round_trip(&mut s, req).map_err(|e| format!("portcullisd is not answering ({e})"))
-        };
+        let ask = |req: &Request| ask_portcullis(req, wait);
         let done = |r: Result<Response, String>| match r {
             Ok(Response::Ok) => Ok(()),
             Ok(Response::Error { message }) => Err(message),
@@ -563,7 +566,11 @@ fn main() {
     // The system picker, while a WireGuard file is chosen (vpn.md §7.3).
     let mut vpn_pick: Option<limen::proto::EmbedId> = None;
     let mut vpn_pick_ask = false;
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn: vpn.clone(), vpn_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), vpn_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn_cred: vcred.clone() };
+    let workspaces = Mutable::with_dirty(None, dirty.clone());
+    let (workspaces_tx, workspaces_rx) = channel();
+    let mut workspace_page_open = false;
+    let mut workspace_visit = 0u64;
+    let view = CuriaView { workspaces: workspaces.clone(), workspace_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn: vpn.clone(), vpn_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), vpn_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn_cred: vcred.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -760,6 +767,29 @@ fn main() {
             }
             for w in wants {
                 curia::printers::work(w, names.clone(), prtx.clone());
+            }
+        }
+        let workspace_page_now = which.get() == curia::view::Which::WorkspaceCredentials;
+        if workspace_page_now && !workspace_page_open {
+            workspace_visit += 1;
+            let visit = workspace_visit;
+            workspaces.set(None);
+            let tx = workspaces_tx.clone();
+            std::thread::spawn(move || {
+                use portcullis_ipc::{Request, Response};
+                let result = ask_portcullis(&Request::Workspaces, Duration::from_secs(5))
+                    .and_then(|reply| match reply {
+                        Response::WorkspaceList { workspaces, .. } => Ok(workspaces),
+                        Response::Error { message } => Err(message),
+                        _ => Err("Unexpected workspace response".into()),
+                    });
+                let _ = tx.send((visit, result));
+            });
+        }
+        workspace_page_open = workspace_page_now;
+        while let Ok((visit, result)) = workspaces_rx.try_recv() {
+            if visit == workspace_visit {
+                workspaces.set(Some(result));
             }
         }
         // The VPN page: asked again every 3 s while it shows (a handshake,
