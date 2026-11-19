@@ -753,8 +753,10 @@ Next: R4, the `print` role, `prelum-sheet` and the apps.
 - **Apps**: Write (Print… and Ctrl+P: officina-pdf in memory, the document's own paper as
   the hint). Mail (Print and ⌃P in the reader: the message's subject, sender, recipients,
   date and text through `officina_pdf::plain`, laid out again when the sheet's paper
-  changes; the HTML stays in the doc-viewer's jail, so pictures and formatting don't
-  print yet. Ctrl+P in a PDF attachment's quick look prints the attachment). Atrium
+  changes. The PDF lists attachment filenames after the body. Mail asks the
+  reader to reopen a message if its full body is unavailable. HTML bodies
+  print as text. Ctrl+P in a PDF attachment's quick look prints that attachment
+  separately). Atrium
   PDF (the `pdf-viewer` child sends `PrintAsked` on Ctrl+P and the parent prints the
   file it handed over; standalone, Ctrl+P prints the file). `prelum-print-demo` is the
   test app.

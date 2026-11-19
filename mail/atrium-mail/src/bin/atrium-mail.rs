@@ -244,7 +244,12 @@ fn message_pdf(ask: &atrium_mail::view::PrintAsk, paper: pergola::print::Paper) 
     let ask = ask.clone();
     std::thread::spawn(move || {
         use officina_pdf::Plain;
-        let r = officina_pdf::plain(&ask.subject, &[Plain::Heading(&ask.subject), Plain::Text(&ask.head), Plain::Text(""), Plain::Text(&ask.text)], paper.w_pt, paper.h_pt);
+        let mut blocks = vec![Plain::Heading(&ask.subject), Plain::Text(&ask.head), Plain::Text(""), Plain::Text(&ask.text)];
+        let attachments = ask.attachments.join("\n");
+        if !attachments.is_empty() {
+            blocks.extend([Plain::Text(""), Plain::Heading("Attachments (names only)"), Plain::Text(&attachments)]);
+        }
+        let r = officina_pdf::plain(&ask.subject, &blocks, paper.w_pt, paper.h_pt);
         let _ = tx.send(r.map_err(|e| e.to_string()));
     });
     rx
@@ -1164,7 +1169,7 @@ fn main() {
                             match r {
                                 Ok(p) => {
                                     printing = Some(p);
-                                    print_ask = Some(atrium_mail::view::PrintAsk { msg, subject: f.name.clone(), head: String::new(), text: String::new() });
+                                    print_ask = Some(atrium_mail::view::PrintAsk { msg, subject: f.name.clone(), head: String::new(), text: String::new(), attachments: Vec::new() });
                                     mail.set_saving(true);
                                 }
                                 Err(why) => mail.file_note(format!("Couldn't print {}: {why}", f.name)),

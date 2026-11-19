@@ -267,6 +267,7 @@ pub struct PrintAsk {
     pub subject: String,
     pub head: String,
     pub text: String,
+    pub attachments: Vec<String>,
 }
 
 /// An export (§6.5): what goes in the mbox file, and the name the
@@ -1414,7 +1415,10 @@ impl Mail {
         let text = match &m.body {
             Some(Body { plain: Some(p), .. }) => p.lines.iter().map(|l| format!("{}{}", "> ".repeat(l.depth as usize), l.text)).collect::<Vec<_>>().join("\n"),
             Some(Body { document: Some(d), .. }) => mail_compose::quote::text_of(&d.0.html),
-            _ => m.preview.clone(),
+            _ => {
+                self.file_note("The full message is not available. Open it again before printing.".into());
+                return true;
+            }
         };
         let from = if m.from.is_empty() || m.sender.name == m.from { m.sender.name.clone() } else { format!("{} <{}>", m.sender.name, m.from) };
         let mut head = format!("From: {from}");
@@ -1424,7 +1428,10 @@ impl Mail {
         if !m.date.is_empty() {
             head.push_str(&format!("\nDate: {}", m.date));
         }
-        *self.print.borrow_mut() = Some(PrintAsk { msg: m.msg, subject: r.subject.clone(), head, text });
+        *self.print.borrow_mut() = Some(PrintAsk {
+            msg: m.msg, subject: r.subject.clone(), head, text,
+            attachments: m.files.iter().map(|name| name.split_whitespace().collect::<Vec<_>>().join(" ")).collect(),
+        });
         true
     }
 

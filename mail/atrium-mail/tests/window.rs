@@ -140,6 +140,8 @@ fn list_and_read() {
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "Headers only so far");
     assert!(note(&r).contains("headers"));
+    assert!(mail.key(&ctrl_p, None));
+    assert!(mail.take_print().is_none(), "an incomplete message must not print a preview");
     assert!(mail.key(&key("k"), None), "at the top k stays");
     assert_eq!(mail.ui.get_cloned().cursor, Some(0));
     assert!(!mail.key(&key("x"), None), "other keys are not Mail's");
