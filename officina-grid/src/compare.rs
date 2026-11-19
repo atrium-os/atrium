@@ -45,13 +45,14 @@ pub enum Change {
     SheetAdded { name: String },
     /// A sheet only ours has.
     SheetRemoved { sheet: u16 },
+    StructuralConflict { sheet: u16, axis: crate::shift::Axis, at: u32, reason: &'static str },
 }
 
 impl Change {
     /// Our sheet it is on, if any.
     pub fn sheet(&self) -> Option<u16> {
         match *self {
-            Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } => Some(sheet),
+            Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::StructuralConflict { sheet, .. } => Some(sheet),
             Change::SheetAdded { .. } => None,
         }
     }
@@ -63,6 +64,10 @@ impl Change {
             Change::RowsAdded { sheet, at, .. } => Some((sheet, at, 0)),
             Change::RowsRemoved { sheet, row, .. } => Some((sheet, row, 0)),
             Change::SheetRemoved { sheet } => Some((sheet, 0, 0)),
+            Change::StructuralConflict { sheet, axis, at, .. } => Some(match axis {
+                crate::shift::Axis::Rows => (sheet, at, 0),
+                crate::shift::Axis::Cols => (sheet, 0, at),
+            }),
             Change::SheetAdded { .. } => None,
         }
     }
@@ -95,6 +100,10 @@ impl Change {
                 format!("{} added before row {}{}", rows(*n), at + 1, first.map(|t| format!(" ({t})")).unwrap_or_default())
             }
             Change::RowsRemoved { row, n, .. } => format!("{} removed from row {}", rows(*n), row + 1),
+            Change::StructuralConflict { axis, at, reason, .. } => match axis {
+                crate::shift::Axis::Rows => format!("Row {}: {reason}", at + 1),
+                crate::shift::Axis::Cols => format!("Column {}: {reason}", crate::addr::col_name(*at)),
+            },
             Change::SheetAdded { name } => format!("Sheet “{name}” added"),
             Change::SheetRemoved { sheet } => format!("Sheet “{}” removed", ours.sheet_name(*sheet)),
         }
@@ -150,6 +159,7 @@ pub struct MergePlan {
 pub enum MergeError {
     SheetLayout,
     TooManyChanges,
+    StructuralAlignment,
 }
 
 impl CellSnapshot {
@@ -179,7 +189,7 @@ impl CellSnapshot {
         Ok(changes)
     }
 
-    fn plan_with(&self, wb: &Workbook, current: &Self, theirs: &Self) -> Result<MergePlan, MergeError> {
+    pub(crate) fn plan_with(&self, wb: &Workbook, current: &Self, theirs: &Self) -> Result<MergePlan, MergeError> {
         if self.sheets.keys().ne(current.sheets.keys()) || self.sheets.keys().ne(theirs.sheets.keys()) {
             return Err(MergeError::SheetLayout);
         }
@@ -516,7 +526,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             (!ops.is_empty()).then_some(ops)
         }
         Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
-        Change::SheetAdded { .. } | Change::SheetRemoved { .. } => None,
+        Change::SheetAdded { .. } | Change::SheetRemoved { .. } | Change::StructuralConflict { .. } => None,
     }
 }
 

@@ -40,6 +40,7 @@ pub mod ops;
 pub mod pivot;
 pub mod recalc;
 pub mod shift;
+pub mod structural_merge;
 pub mod sheetops;
 pub mod sort;
 pub mod spill;

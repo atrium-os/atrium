@@ -37,6 +37,7 @@ pub enum ReviewMode {
 pub fn merge_error(error: MergeError) -> &'static str {
     match error {
         MergeError::SheetLayout => "The workbooks must contain the same named sheets.",
+        MergeError::StructuralAlignment => "The row or column changes could not be aligned safely.",
         MergeError::TooManyChanges => "The review exceeds 100,000 cell changes.",
     }
 }
