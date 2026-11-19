@@ -133,6 +133,8 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         cpu_pct,
         extra_env: vec![],
         worker: None,
+        // The CLI's own lane: the host's table.
+        fib: None,
         // ★★ Never from the environment. This path needs root, and `$USER`
         // is whatever the caller's shell left behind — `su -m` keeps root's,
         // so it silently named root (and a sudo'd shell could name anyone).
