@@ -67,7 +67,14 @@ fn serve(p: &Pki, name: &str, handler: Handler) -> (SocketAddr, Arc<Mutex<Vec<(S
                     match t.read(&mut one) { Ok(1) => b.push(one[0]), _ => return }
                 }
                 let head = String::from_utf8_lossy(&b).to_string();
-                let target = head.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+                let mut target = head.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+                // A form's body, if any, after a `#` (the sign-in checks).
+                let len: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                if len > 0 {
+                    let mut body = vec![0u8; len];
+                    if t.read_exact(&mut body).is_err() { return }
+                    target = format!("{target}#{}", String::from_utf8_lossy(&body));
+                }
                 let cookie = head.lines().find_map(|l| l.strip_prefix("Cookie: ").or_else(|| l.strip_prefix("cookie: "))).unwrap_or("").to_string();
                 log.lock().unwrap().push((target.clone(), cookie.clone()));
                 if t.write_all(&h(&target, &cookie)).and_then(|_| t.flush()).is_err() { return }
@@ -392,4 +399,82 @@ fn moving_a_view_to_another_site_makes_it_anonymous_again() {
     w.b.show(NEWS_VIEW, &format!("{}/", w.cdn)).unwrap();
     assert_eq!(w.b.cookied(NEWS_VIEW), None, "another site: consent is not carried");
     assert_eq!(w.b.partition(NEWS_VIEW), Some("other.example"));
+}
+
+/// A VPN gateway's SAML sign-in, as the sign-in window makes it: the
+/// gateway's login sends the window to the identity provider; its login
+/// form is posted with its session cookie; its answer is posted to the
+/// gateway, whose sign-on token Arca keeps for Crypta, never the jar.
+#[test]
+fn a_sign_in_windows_forms_go_through_couriers_and_the_token_to_crypta() {
+    let p = pki(&["gw.corp.example", "sso.idp.example"]);
+    let (ia, idp_log) = serve(&p, "sso.idp.example", Arc::new(|target, cookie| {
+        let (path, body) = target.split_once('#').unwrap_or((target, ""));
+        let path = path.split('?').next().unwrap_or("");
+        match path {
+            "/auth" => http("200 OK", &["Set-Cookie: KC_SESSION=s1; Secure; SameSite=None".into()], "<form method=post action=/login>"),
+            "/login" if cookie.contains("KC_SESSION=s1") && body == "username=alice&password=pw" => http("200 OK", &[], "<form method=post action=gw/acs>"),
+            _ => http("403 Forbidden", &[], "no session"),
+        }
+    }));
+    let idp_port = ia.port();
+    let (ga, gw_log) = serve(&p, "gw.corp.example", Arc::new(move |target, cookie| {
+        let (path, body) = target.split_once('#').unwrap_or((target, ""));
+        let path = path.split('?').next().unwrap_or("");
+        match path {
+            "/login" => http("302 Found", &[format!("Location: https://sso.idp.example:{idp_port}/auth?SAMLRequest=r")], ""),
+            "/acs" if body == "SAMLResponse=signed&RelayState=x" =>
+                http("303 See Other", &["Set-Cookie: acSamlv2Token=TOKEN123; Secure; HttpOnly".into(), "Set-Cookie: webvpnlogin=1; Secure".into(), "Location: /final".into()], ""),
+            "/final" => http("200 OK", &[], "signed on"),
+            "/echo" => http("200 OK", &[], cookie),
+            _ => http("404 Not Found", &[], "no"),
+        }
+    }));
+    let net: &'static Net = Box::leak(Box::new(Net(HashMap::from([("gw.corp.example".into(), ga), ("sso.idp.example".into(), ia)]))));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls_pki_types::CertificateDer::from(p.ca_der.clone())).unwrap();
+    let tls = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth());
+    let d = tempfile::tempdir().unwrap();
+    let mut st = State::new(d.path().into()).unwrap();
+    st.open_machine().unwrap();
+    let mut w = Writer::new();
+    w.str("alice"); w.raw(&[1; 32]);
+    assert_eq!(st.handle(&Label::Vestibulum, op::V_CREATE, &w.buf).status, status::OK);
+    let s: Shared = Rc::new(RefCell::new(st));
+    let mut b = Broker::new(InProcArca { s: s.clone(), issued: vec![] }, InProcCouriers { s: s.clone(), net, tls, open: HashMap::new() });
+    let gw = format!("https://gw.corp.example:{}", ga.port());
+    let idp = format!("https://sso.idp.example:{}", ia.port());
+    let _ = idp_log;
+    const V: ViewId = 7;
+
+    // An ordinary cookied view sends no form.
+    b.show(1, &format!("{gw}/")).unwrap();
+    b.set_cookied(1, Why::Reader).unwrap();
+    assert_eq!(b.fetch(1, &Fetch::form(&format!("{gw}/acs"), "gw.corp.example", b"x=1".to_vec())), Err(Refused::Method));
+
+    b.show_sign_in(V, &format!("{gw}/login"), "corp").unwrap();
+    assert_eq!(b.partition(V), Some("vpn-corp.corp.example"));
+    assert!(b.sign_in(V) && b.cookied(V).is_some(), "cookied from the start");
+    // The gateway sends the window to the identity provider; its pages
+    // stay in the same jar (one jar for the whole sign-in).
+    let r = b.fetch(V, &Fetch::navigation(&format!("{gw}/login"), None, true)).unwrap();
+    assert_eq!((r.status, r.redirects), (200, 1));
+    assert!(r.url.starts_with(&idp));
+    b.show_sign_in(V, &r.url, "corp").unwrap();
+    assert_eq!(b.partition(V), Some("vpn-corp.corp.example"));
+    let r = b.fetch(V, &Fetch::form(&format!("{idp}/login"), "sso.idp.example", b"username=alice&password=pw".to_vec())).unwrap();
+    assert_eq!(r.status, 200, "the idp's own session cookie went with its form");
+    let r = b.fetch(V, &Fetch::form(&format!("{gw}/acs"), "sso.idp.example", b"SAMLResponse=signed&RelayState=x".to_vec())).unwrap();
+    assert_eq!((r.status, r.body.as_slice()), (200, &b"signed on"[..]), "after the form, the answer's page by GET");
+    assert!(r.url.ends_with("/final"));
+    // The token is Crypta's, bound to the gateway's host.
+    let lr = s.borrow_mut().handle(&Label::Service(op::CRYPTA_SERVICE.into()), op::LIST, &[]);
+    let listed = String::from_utf8_lossy(lr.body.bytes()).into_owned();
+    assert!(listed.contains("corp/sso@gw.corp.example"), "{listed:?}");
+    // And never the page's: the jar has the gateway's other cookie only.
+    b.show_sign_in(V, &format!("{gw}/"), "corp").unwrap();
+    let r = b.fetch(V, &Fetch::navigation(&format!("{gw}/echo"), None, true)).unwrap();
+    assert_eq!(String::from_utf8_lossy(&r.body), "webvpnlogin=1");
+    assert!(gw_log.lock().unwrap().iter().all(|(_, c)| !c.contains("TOKEN123")), "the token never went back out");
 }

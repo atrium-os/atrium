@@ -314,7 +314,15 @@ impl Engine {
         // The secret fields answered last round: asked again with words of
         // failure means the answer was wrong.
         let mut answered: Vec<String> = Vec::new();
+        // A sign-on token just sent: a form back instead of a session means
+        // the gateway did not take it.
+        let mut after_sso = false;
         for _ in 0..MAX_ROUNDS {
+            if let (true, Answer::Form { form, .. }) = (after_sso, &a) {
+                let words = if form.error.is_empty() { "the gateway did not accept the single sign-on".to_string() } else { form.error.clone() };
+                a = Answer::Refused(words);
+            }
+            after_sso = matches!(a, Answer::Sso { .. });
             if let Answer::Form { form, .. } = &a {
                 let again = form.fields.iter().any(|f| matches!(f.kind, Kind::Secret | Kind::Otp) && answered.contains(&f.name));
                 if again && (form.message.to_ascii_lowercase().contains("fail") || !form.error.is_empty()) {

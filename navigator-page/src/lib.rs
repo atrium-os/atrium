@@ -164,7 +164,7 @@ pub fn prepare_with(kind: DocKind, bytes: &[u8], provided: &BTreeMap<String, (u3
 /// button. A `<select>` is sent as its chosen option, as a page would send it
 /// untouched.
 pub fn forms(doc: &str) -> Vec<limen::doc_viewer::Form> {
-    use limen::doc_viewer::{cut, Field, FieldKind, Form, FIELDS_MAX, FIELD_LABEL_MAX, FIELD_NAME_MAX, FIELD_VALUE_MAX, FORMS_MAX, URL_MAX};
+    use limen::doc_viewer::{cut, Field, FieldKind, Form, FIELDS_MAX, FIELD_LABEL_MAX, FIELD_NAME_MAX, FIELD_VALUE_MAX, FIXED_VALUE_MAX, FORMS_MAX, URL_MAX};
     if !doc.get(..doc.len().min(8 << 20)).unwrap_or(doc).to_ascii_lowercase().contains("<form") {
         return Vec::new();
     }
@@ -222,7 +222,8 @@ pub fn forms(doc: &str) -> Vec<limen::doc_viewer::Form> {
             let name = dom.attr(h, "name").unwrap_or("").to_string();
             let value = |d: &str| dom.attr(h, "value").unwrap_or(d).to_string();
             let field = |kind, label: String, value: String, checked| Field {
-                kind, name: cut(&name, FIELD_NAME_MAX), label: cut(&label, FIELD_LABEL_MAX), value: cut(&value, FIELD_VALUE_MAX), checked,
+                kind, name: cut(&name, FIELD_NAME_MAX), label: cut(&label, FIELD_LABEL_MAX),
+                value: cut(&value, if kind == FieldKind::Fixed { FIXED_VALUE_MAX } else { FIELD_VALUE_MAX }), checked,
             };
             let got = match tag.as_str() {
                 "input" => match dom.attr(h, "type").map(|t| t.trim().to_ascii_lowercase()).as_deref().unwrap_or("text") {
@@ -243,6 +244,27 @@ pub fn forms(doc: &str) -> Vec<limen::doc_viewer::Form> {
                     _ => None,
                 },
                 "textarea" => Some(field(FieldKind::Text, label_of(h), fold(&dom.text_content(h)), false)),
+                // We parse with scripting on, so a `<noscript>` is text; a
+                // browser without scripts shows it, and a sign-in's
+                // self-posting form (a SAML answer) puts its button there.
+                "noscript" => {
+                    let inner = navigator_dom::parse(&dom.text_content(h));
+                    for b in inner.by_tag_anywhere("input").into_iter().chain(inner.by_tag_anywhere("button")) {
+                        let is_input = inner.tag(b).is_some_and(|t| t.eq_ignore_ascii_case("input"));
+                        let ty = inner.attr(b, "type").map(|t| t.trim().to_ascii_lowercase()).unwrap_or_else(|| if is_input { "text".into() } else { "submit".into() });
+                        if ty != "submit" || fields.len() == FIELDS_MAX {
+                            continue;
+                        }
+                        let text = if is_input { inner.attr(b, "value").map(fold).unwrap_or_default() } else { fold(&inner.visible_text(b)) };
+                        let n = inner.attr(b, "name").unwrap_or("");
+                        fields.push(Field {
+                            kind: FieldKind::Submit, name: cut(n, FIELD_NAME_MAX),
+                            label: cut(if text.is_empty() { "Continue" } else { &text }, FIELD_LABEL_MAX),
+                            value: cut(inner.attr(b, "value").unwrap_or(""), FIELD_VALUE_MAX), checked: false,
+                        });
+                    }
+                    None
+                }
                 "select" => {
                     let opts = dom.by_tag_anywhere("option").into_iter().filter(|&o| dom.contains(h, o)).collect::<Vec<_>>();
                     let chosen = opts.iter().copied().find(|&o| dom.attr(o, "selected").is_some()).or(opts.first().copied());
@@ -613,6 +635,24 @@ mod print_tests {
         let letter = print::pdf(p.html.clone(), p.subs.clone(), &p.title, print::Paper::new(612, 792), &|_| None).unwrap();
         assert!(letter.pages <= out.pages + 1);
         assert!(print::pdf(p.html, p.subs, "", print::Paper::new(100, 100), &|_| None).is_err(), "too small");
+    }
+
+    #[test]
+    fn a_keycloak_sign_in_is_read_without_scripts() {
+        use limen::doc_viewer::FieldKind::*;
+        let f = forms(include_str!("../tests/keycloak-login.html"));
+        assert_eq!(f.len(), 1);
+        let k: Vec<_> = f[0].fields.iter().map(|x| (x.kind, x.name.as_str())).collect();
+        assert_eq!(k, vec![(Text, "username"), (Password, "password"), (Fixed, "credentialId"), (Submit, "login")]);
+        assert!(f[0].post && f[0].action.contains("/login-actions/authenticate?session_code="));
+        // The signed answer posts itself with a script; without one, its
+        // `<noscript>` button sends it, whole.
+        let f = forms(include_str!("../tests/keycloak-saml-post.html"));
+        assert_eq!(f.len(), 1);
+        let k: Vec<_> = f[0].fields.iter().map(|x| (x.kind, x.name.as_str(), x.label.as_str())).collect();
+        assert_eq!(k, vec![(Fixed, "SAMLResponse", ""), (Fixed, "RelayState", ""), (Submit, "", "Continue")]);
+        assert!(f[0].fields[0].value.len() > 4000, "the assertion is not cut");
+        assert_eq!(f[0].action, "https://sso.crypta.test:447/+CSCOE+/saml/sp/acs");
     }
 
     #[test]

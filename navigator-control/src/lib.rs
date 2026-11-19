@@ -204,11 +204,14 @@ pub struct FormField {
 /// The most fields a form sent has, and the longest name or value.
 pub const FORM_FIELDS_MAX: usize = 32;
 pub const FORM_TEXT_MAX: usize = 1024;
+/// The longest value a form sends as its page gave it (a sign-in's hidden
+/// assertion; limen's `FIXED_VALUE_MAX`).
+pub const FORM_FIXED_MAX: usize = 32 * 1024;
 
 /// A `SubmitForm` in shape.
 pub fn form_ok(action: &str, fields: &[FormField]) -> bool {
     clean(action, URL_MAX) && fields.len() <= FORM_FIELDS_MAX
-        && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, FORM_TEXT_MAX))
+        && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, if f.typed { FORM_TEXT_MAX } else { FORM_FIXED_MAX }))
 }
 
 /// frescod's activation token for a press (zero: none).

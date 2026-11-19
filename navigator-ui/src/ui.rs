@@ -1131,12 +1131,17 @@ fn form_bar(ctx: &mut Ctx, r: Rect, network: &str, f: Option<&shell::FormPanel>,
     rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
     let x = r.x() + em(16.0);
     let cy = r.y() + em(shell::FORM_HEAD) / 2.0;
-    icon(ctx, x, cy - em(8.0), ph::WIFI_HIGH, 16.0, t.accent_fg());
+    let vpn = shell::window_vpn();
+    icon(ctx, x, cy - em(8.0), if vpn { ph::SHIELD_CHECK } else { ph::WIFI_HIGH }, 16.0, t.accent_fg());
     let head = format!("Sign in to {network}");
     let hs = sans(type_size::SM, Weight::Semibold, t.text_primary());
     let hw = width(&head, &hs).min(r.w() / 2.0);
     text(ctx, x + em(24.0), cy, &fit(&head, &hs, r.w() / 2.0), type_size::SM, Weight::Semibold, t.text_primary());
-    let note = "This network's own page, not a website. Nothing here is kept.";
+    let note = if vpn {
+        "Your organisation's sign-in. What it keeps stays in this VPN's own jar."
+    } else {
+        "This network's own page, not a website. Nothing here is kept."
+    };
     let ns = sans(type_size::XS, Weight::Regular, t.text_secondary());
     text(ctx, x + em(36.0) + hw, cy, &fit(note, &ns, r.w() - hw - em(64.0)), type_size::XS, Weight::Regular, t.text_secondary());
     let Some(p) = f else { return };

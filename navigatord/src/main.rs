@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 mod files;
 mod portal;
+mod vpn;
 mod press;
 mod settings;
 mod worker;
@@ -134,12 +135,17 @@ struct Config {
     /// when portcullisd started us in the reserved `portal` persona. Every
     /// page then comes through its fetcher, and its forms may be sent.
     portal: Option<Arc<portal::Portal>>,
+    /// A corporate VPN's sign-in window (vpn.md §9.3): set when
+    /// portcullisd started us in the reserved `vpn` persona. Every page
+    /// then comes through Arca's couriers in the profile's own jar, and its
+    /// forms may be sent.
+    vpn: Option<Arc<vpn::SignIn>>,
 }
 
 impl Config {
     fn from_env(unconfined: bool) -> Result<Self, String> {
         let var = settings::get;
-        let c = Config {
+        let mut c = Config {
             converter: var("NAVIGATORD_CONVERTER").and_then(|v| worker::Spec::parse(&v)),
             prerender: var("NAVIGATORD_PRERENDER").unwrap_or_else(|| "prerender".into()),
             fetchd: var("NAVIGATORD_FETCHD").and_then(|v| worker::Spec::parse(&v)),
@@ -157,6 +163,7 @@ impl Config {
             activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
             opifex: var("NAVIGATORD_OPIFEX").map(PathBuf::from).unwrap_or_else(|| OPIFEX_SOCKET.into()),
             portal: None,
+            vpn: None,
             schemes: {
                 let mut a = SchemeAllowlist::default();
                 for sch in std::iter::once("atrium-app".to_string()).chain(var("NAVIGATORD_SCHEMES").unwrap_or_default().split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from)) {
@@ -165,6 +172,13 @@ impl Config {
                 a
             },
         };
+        // A test run's sign-in window, without portcullisd to ask.
+        if let Some(v) = var("NAVIGATORD_VPN_SIGN_IN") {
+            if !unconfined {
+                return Err("NAVIGATORD_VPN_SIGN_IN is for tests (--unconfined-for-testing)".into());
+            }
+            c.vpn = Some(Arc::new(vpn::SignIn::parse(&v).ok_or("NAVIGATORD_VPN_SIGN_IN: <profile> <https start> <https final>")?));
+        }
         if !unconfined {
             if c.activation.is_none() {
                 return Err("no NAVIGATORD_ACTIVATION: refusing to save or hand on without frescod's word on the press".into());
@@ -460,7 +474,9 @@ enum Upstream {
     Fixtures(PathBuf),
     /// A page whose site knows you: its https requests through Arca's
     /// couriers with the broker's tickets; the rest the plain way.
-    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, plain: Box<Upstream> },
+    /// In a sign-in window, the first ask may be a form's POST of these
+    /// bytes, from a page on this host.
+    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, form: Option<(Vec<u8>, String)>, plain: Box<Upstream> },
     /// The sign-in window's fetcher; the first navigation is a form's POST
     /// of these bytes when there are any.
     Portal(Arc<portal::Portal>, Option<Vec<u8>>),
@@ -468,11 +484,15 @@ enum Upstream {
 
 impl Upstream {
     fn reply(&mut self, ask: Ask) -> Reply {
-        if let Upstream::Cookied { cookies, view, host, navigated, plain } = self {
+        if let Upstream::Cookied { cookies, view, host, navigated, form, plain } = self {
             let url = ask.url().to_string();
-            // The first ask is the page itself (the reader's navigation);
-            // the converter's are its subresources.
-            let f = if *navigated { Fetch::subresource(&url, host) } else { Fetch::navigation(&url, None, true) };
+            // The first ask is the page itself (the reader's navigation, or
+            // the form they sent); the converter's are its subresources.
+            let f = match form.take() {
+                Some((body, from)) if !*navigated => Fetch::form(&url, &from, body),
+                _ if *navigated => Fetch::subresource(&url, host),
+                _ => Fetch::navigation(&url, None, true),
+            };
             *navigated = true;
             let got = cookies.lock().unwrap().fetch(*view, &f);
             return match got {
@@ -627,17 +647,22 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
 }
 
 /// [`convert`]; with `form`, the page is the answer to a form's POST of
-/// those bytes to `url` (the sign-in window only).
-fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<Vec<u8>>) -> Result<Got, String> {
+/// those bytes to `url`, from a page on that host (the sign-in windows
+/// only: the portal's through its fetcher, a VPN's through Arca's couriers).
+fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<(Vec<u8>, String)>) -> Result<Got, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
-    if let (Upstream::Portal(_, f), Some(b)) = (&mut up, form) {
-        *f = Some(b);
+    let mut form = form;
+    if let Upstream::Portal(_, f) = &mut up {
+        *f = form.take().map(|(b, _)| b);
     }
     let jar = cookies.as_ref().map(|(c, v)| (c.clone(), *v));
     if let Some((cookies, view)) = cookies {
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
-        up = Upstream::Cookied { cookies, view, host, navigated: false, plain: Box::new(up) };
+        up = Upstream::Cookied { cookies, view, host, navigated: false, form: form.take(), plain: Box::new(up) };
+    }
+    if form.is_some() {
+        return Err("a form is sent only from a sign-in window".into());
     }
     let mut budget = FetchBudget::new(FetchBudget::DEFAULT);
     let mut hops = vec![];
@@ -1212,7 +1237,18 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     // The site knowing you needs Arca; without it the page
                     // opens anonymously, and the UI is told why.
                     let mut note = None;
-                    let cookied = match (knows, &cookies) {
+                    let cookied = match (knows || cfg.vpn.is_some(), &cookies) {
+                        // A VPN sign-in window's every page is in its jar.
+                        (_, Some(c)) if cfg.vpn.is_some() => {
+                            let v = cfg.vpn.as_ref().expect("vpn");
+                            match c.lock().unwrap().show_sign_in(vpn::VIEW, &v.start_url, &v.profile) {
+                                Ok(()) => Some((c.clone(), vpn::VIEW)),
+                                Err(e) => {
+                                    send(&w, &Event::Failed { id, url: url.clone(), why: format!("the sign-in's jar: {e:?}") });
+                                    return;
+                                }
+                            }
+                        }
                         (false, _) => None,
                         (true, None) => {
                             note = Some("this site can't remember you: Arca isn't running here".to_string());
@@ -1310,7 +1346,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                             }
                         }
                     };
-                    if let (Some(v), Some(c)) = (view, &cookies) {
+                    if let (Some(v), Some(c)) = (view.filter(|&v| v != vpn::VIEW), &cookies) {
                         c.lock().unwrap().close(v);
                     }
                     let ms = t.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -1326,6 +1362,15 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                 }
                             }
                             send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
+                            // The gateway's final page: the sign-in is over
+                            // (its token, if it set one, is Arca's now).
+                            if cfg.vpn.as_ref().is_some_and(|v| v.ends_at(&p.url)) {
+                                eprintln!("navigatord: the VPN sign-in reached its final page; the window closes");
+                                std::thread::spawn(|| {
+                                    std::thread::sleep(vpn::LINGER);
+                                    std::process::exit(0);
+                                });
+                            }
                         }
                         Err(why) => {
                             eprintln!("navigatord: {url}: {why}");
@@ -1361,10 +1406,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     eprintln!("navigatord: a form not sent: {why}");
                     send(&w, &Event::Link { id, action: LinkAction::Blocked { why } });
                 };
-                let Some(portal) = cfg.portal.clone() else {
-                    refuse("only the sign-in window sends a page's form".into());
+                if cfg.portal.is_none() && cfg.vpn.is_none() {
+                    refuse("only a sign-in window sends a page's form".into());
                     continue;
-                };
+                }
                 if !ctl::form_ok(&action, &fields) {
                     refuse("the form is out of shape".into());
                     continue;
@@ -1398,13 +1443,25 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
                 // A POST: its answer converted as a page in the trail's jar,
                 // then opened from the cache as the link it leads to.
-                let (cfg, state, w) = (cfg.clone(), state.clone(), w.clone());
-                let _ = portal;
+                let (cfg, state, w, cookies) = (cfg.clone(), state.clone(), w.clone(), cookies.clone());
+                let from = url::Url::parse(&p.url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
                 std::thread::spawn(move || {
                     let body = portal::encode(&pairs).into_bytes();
-                    let ctx = Ctx { jar, knows: false };
+                    // A VPN sign-in's form goes through Arca's couriers, in
+                    // the profile's jar; the portal's through its fetcher.
+                    let jarred = match (&cfg.vpn, &cookies) {
+                        (Some(v), Some(c)) => match c.lock().unwrap().show_sign_in(vpn::VIEW, &v.start_url, &v.profile) {
+                            Ok(()) => Some((c.clone(), vpn::VIEW)),
+                            Err(e) => {
+                                send(&w, &Event::Link { id, action: LinkAction::Blocked { why: format!("the sign-in's jar: {e:?}") } });
+                                return;
+                            }
+                        },
+                        _ => None,
+                    };
+                    let ctx = Ctx { jar, knows: jarred.is_some() };
                     eprintln!("navigatord: a form sent as a POST to {} ({} bytes)", origin(&target).unwrap_or_default(), body.len());
-                    let action = match convert_with(&cfg, &target, ctx, None, Some(body)) {
+                    let action = match convert_with(&cfg, &target, ctx, jarred, Some((body, from))) {
                         Ok(Got::Page(p)) => {
                             let mut st = state.lock().unwrap();
                             let p = Arc::new(st.stored(Page { ctx, ..p }));
@@ -1726,6 +1783,19 @@ fn main() {
         if name == portcullis_ipc::PORTAL_PERSONA {
             start_portal(&mut cfg);
         }
+        if name == portcullis_ipc::VPN_PERSONA {
+            start_vpn(&mut cfg);
+        }
+    }
+    if cfg.vpn.is_some() {
+        // Nothing of the window is kept but the sign-in jar (vpn.rs).
+        cfg.trails = None;
+        cfg.store = None;
+        cfg.downloads = None;
+        if cfg.arca.is_none() {
+            eprintln!("navigatord: no VPN sign-in window: it needs Arca (NAVIGATORD_ARCA, NAVIGATORD_COURIERD)");
+            std::process::exit(1);
+        }
     }
     let cfg = Arc::new(cfg);
     if unconfined {
@@ -1787,6 +1857,13 @@ fn main() {
     if cfg.portal.is_some() {
         std::thread::spawn(watch_portal);
     }
+    if cfg.vpn.is_some() {
+        std::thread::spawn(|| {
+            std::thread::sleep(vpn::LIFETIME);
+            eprintln!("navigatord: the VPN sign-in window closes after {} minutes", vpn::LIFETIME.as_secs() / 60);
+            std::process::exit(0);
+        });
+    }
     document_channel();
     // The UI as our worker: its control channel is one end of a pair, and
     // the Navigator ends when it does.
@@ -1804,6 +1881,12 @@ fn main() {
             pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS" && k != "NAVIGATOR_UI_OPEN");
             pairs.push(("NAVIGATOR_UI_PORTAL".into(), p.network.clone()));
             pairs.push(("NAVIGATOR_UI_OPEN".into(), p.start_url.clone()));
+        } else if let Some(v) = &cfg.vpn {
+            // A VPN's sign-in window: as the portal's, with its own words.
+            pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS" && k != "NAVIGATOR_UI_OPEN");
+            pairs.push(("NAVIGATOR_UI_PORTAL".into(), v.title()));
+            pairs.push(("NAVIGATOR_UI_VPN".into(), "1".into()));
+            pairs.push(("NAVIGATOR_UI_OPEN".into(), v.start_url.clone()));
         } else if let Some(persona) = persona {
             pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS");
             match persona {
@@ -1847,6 +1930,21 @@ fn main() {
     for s in ui.incoming().flatten() {
         let (cfg, state, cookies) = (cfg.clone(), state.clone(), cookies.clone());
         std::thread::spawn(move || serve_ui(cfg, state, cookies, s));
+    }
+}
+
+/// Become a VPN's sign-in window: the profile and its addresses from
+/// portcullisd. Without them there is nothing to show.
+fn start_vpn(cfg: &mut Config) {
+    match vpn::status() {
+        Ok(v) => {
+            eprintln!("navigatord: the sign-in window for VPN {} at {}", v.profile, origin(&v.start_url).unwrap_or_default());
+            cfg.vpn = Some(Arc::new(v));
+        }
+        Err(why) => {
+            eprintln!("navigatord: no VPN sign-in window: {why}");
+            std::process::exit(1);
+        }
     }
 }
 

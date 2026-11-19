@@ -34,7 +34,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use arca_courier::schema::{Header, Method, Request, Response};
+use arca_courier::schema::{Header, Method, Request, Response, Segment};
 use arca_store::codec::Writer;
 
 /// As navigator-fetch's.
@@ -50,6 +50,8 @@ pub enum Reason {
     Navigation = 1,
     /// Anything the document needs: script, style, image, a page's fetch.
     Subresource = 2,
+    /// A form the reader sent (only in a sign-in window's jar).
+    Form = 3,
 }
 
 /// Why a view turned cookied (legacy-web §5.4.1e).
@@ -74,14 +76,21 @@ pub struct Fetch {
     pub initiator: Option<String>,
     /// A reader's gesture started it (a click, a key).
     pub gesture: bool,
+    /// A form's fields, `application/x-www-form-urlencoded` (a POST).
+    pub body: Vec<u8>,
 }
 
 impl Fetch {
     pub fn navigation(url: &str, initiator: Option<&str>, gesture: bool) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![] }
     }
     pub fn subresource(url: &str, page_host: &str) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![] }
+    }
+    /// A form the reader pressed to send, as a POST of `body` from a page
+    /// on `page_host`. Only a sign-in window's view sends one.
+    pub fn form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
+        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body }
     }
 }
 
@@ -192,7 +201,7 @@ pub trait Couriers {
 }
 
 #[derive(Debug, Clone)]
-struct View { partition: String, cookied: Option<Why> }
+struct View { partition: String, cookied: Option<Why>, sign_in: Option<String> }
 
 /// ★ THE BROKER'S COOKIE STATE: which views are cookied, and the only
 /// path by which a request of theirs carries a cookie.
@@ -212,6 +221,13 @@ pub fn partition_of(top_url: &str) -> Option<String> {
 }
 
 pub use arcad::proto::broker_op::{ACCOUNT_PASSKEY, ACCOUNT_PASSWORD};
+
+/// The partition for `top_url` in VPN profile `profile`'s sign-in jar:
+/// `vpn-<profile>.` then the site, as Arca reads it (arcad's
+/// `jar::vpn_profile`).
+pub fn vpn_partition(profile: &str, top_url: &str) -> Option<String> {
+    Some(format!("{}{profile}.{}", arcad::jar::VPN_JAR, partition_of(top_url)?))
+}
 
 /// An Unrecorded trail's jar prefix (navigator-ui.md §2.4): every partition
 /// of that trail begins with it, so closing the trail forgets them all.
@@ -246,8 +262,24 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         let p = partition_in(jar, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
         match self.views.get_mut(&view) {
             Some(v) if v.partition == p => {}
-            _ => { self.views.insert(view, View { partition: p, cookied: None }); }
+            _ => { self.views.insert(view, View { partition: p, cookied: None, sign_in: None }); }
         }
+        Ok(())
+    }
+
+    /// ★ A VPN sign-in window's view (vpn.md §9.3): every partition in the
+    /// profile's own jar ([`vpn_partition`]), cookied from the start (the
+    /// identity provider's session is kept for the next sign-in, apart from
+    /// the person's browsing), and its forms are sent, on a press. Arca
+    /// keeps the gateway's sign-on token out of the jar.
+    pub fn show_sign_in(&mut self, view: ViewId, top_url: &str, profile: &str) -> Result<(), Refused> {
+        // One jar for the whole sign-in: the gateway's site names it, and
+        // the identity provider's pages it passes through stay in it.
+        if self.views.get(&view).is_some_and(|v| v.sign_in.as_deref() == Some(profile)) {
+            return Ok(());
+        }
+        let p = vpn_partition(profile, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
+        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: Some(profile.into()) });
         Ok(())
     }
 
@@ -265,6 +297,9 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         if let Some(v) = self.views.get_mut(&view) { v.cookied = None }
     }
 
+    /// Whether a view is a sign-in window's (it may send forms).
+    pub fn sign_in(&self, view: ViewId) -> bool { self.views.get(&view).is_some_and(|v| v.sign_in.is_some()) }
+
     /// The view closed.
     pub fn close(&mut self, view: ViewId) { self.views.remove(&view); }
 
@@ -278,7 +313,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// `url`: its non-`HttpOnly` cookies from the view's partition. A view
     /// that is not cookied has none, and Arca is not asked.
     pub fn script_cookies(&mut self, view: ViewId, url: &str) -> Result<Option<String>, Refused> {
-        let Some(View { partition, cookied: Some(_) }) = self.views.get(&view).cloned() else { return Ok(None) };
+        let Some(View { partition, cookied: Some(_), .. }) = self.views.get(&view).cloned() else { return Ok(None) };
         let url = url::Url::parse(url).map_err(|e| Refused::Malformed(e.to_string()))?;
         if url.scheme() != "https" { return Ok(None) }
         let host = url.host_str().ok_or_else(|| Refused::Malformed("no host".into()))?.to_ascii_lowercase();
@@ -291,8 +326,13 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// [`Refused::NotCookied`] before anything is asked of Arca: the caller
     /// sends it the plain way, and it carries no cookie.
     pub fn fetch(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
-        let Some(View { partition, cookied: Some(_) }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
-        if !matches!(f.method, Method::Get | Method::Head) { return Err(Refused::Method) }
+        let Some(View { partition, cookied: Some(_), sign_in }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
+        // A form only from a sign-in window, and only as a form.
+        let form = sign_in.is_some() && f.method == Method::Post && f.reason == Reason::Form;
+        if !matches!(f.method, Method::Get | Method::Head) && !form { return Err(Refused::Method) }
+        if f.reason == Reason::Form && !form { return Err(Refused::Method) }
+        if f.body.len() > arca_courier::schema::BODY_MAX { return Err(Refused::Malformed("the form is too big".into())) }
+        let (mut method, mut reason, mut form_body) = (f.method, f.reason, f.body.clone());
         let mut url = url::Url::parse(&f.url).map_err(|e| Refused::Malformed(e.to_string()))?;
         if url.scheme() != "https" { return Err(Refused::NotHttps) }
         let origin = f.initiator.clone().unwrap_or_default().to_ascii_lowercase();
@@ -312,10 +352,15 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             // first host on the way that is not.
             let initiator = std::iter::once(&origin).filter(|o| !o.is_empty()).chain(chain.iter())
                 .find(|h| arcad::cookie::site(h) != site).cloned().unwrap_or_else(|| origin.clone());
-            let ask = TicketAsk { host: host.clone(), port, partition: partition.clone(), method: f.method, path: path.clone(),
-                                  query: query.clone(), reason: f.reason, initiator, gesture: f.gesture };
-            let req = |ticket| Request { method: f.method, path: path.clone().into_bytes(), query: query.clone().into_bytes(),
-                                headers: vec![(Header::Accept, b"*/*".to_vec())], slots: vec![], body: vec![], ticket: Some(ticket) };
+            let ask = TicketAsk { host: host.clone(), port, partition: partition.clone(), method, path: path.clone(),
+                                  query: query.clone(), reason, initiator, gesture: f.gesture };
+            let mut headers = vec![(Header::Accept, b"*/*".to_vec())];
+            if method == Method::Post {
+                headers.push((Header::ContentType, b"application/x-www-form-urlencoded".to_vec()));
+            }
+            let segs = if form_body.is_empty() { vec![] } else { vec![Segment::Literal(form_body.clone())] };
+            let req = |ticket| Request { method, path: path.clone().into_bytes(), query: query.clone().into_bytes(),
+                                headers: headers.clone(), slots: vec![], body: segs.clone(), ticket: Some(ticket) };
             // A ticket is spent once: a courier that failed mid-exchange
             // may have spent it, so the one retry asks for a new one.
             let mut sent = Err(String::new());
@@ -341,6 +386,12 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
                     if next.scheme() != "https" { return Err(Refused::Redirect(format!("down to {}", next.scheme()))) }
                     chain.push(host);
                     url = next;
+                    // After a form, the answer's page is fetched (a 307 or
+                    // 308 would send the form on, to wherever it says: no).
+                    if method == Method::Post {
+                        if matches!(status, 307 | 308) { return Err(Refused::Redirect("a form sent on by 307 or 308".into())) }
+                        (method, reason, form_body) = (Method::Get, Reason::Navigation, vec![]);
+                    }
                 }
                 _ => return Ok(Fetched { status, headers, body, url: url.to_string(), redirects }),
             }

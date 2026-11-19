@@ -52,7 +52,8 @@ VM listens) and the answers come back from 198.51.100.51.
 AnyConnect gateways at 198.51.100.52:443-446 (vpn.md §11): the guest's TCP
 to them ends here, in a small TCP of this script's own, and each connection
 is carried on to 127.0.0.1:8443-8446 (crypta-ocserv-vm.sh's forwards to
-ocserv in the Ubuntu VM).
+ocserv in the Ubuntu VM). Ports 447 and 448 go to 127.0.0.1:8447-8448: the
+SAML stand-in gateway and Keycloak (crypta-sso-stand.sh).
 """
 import json, random, socket, struct, sys
 
@@ -77,7 +78,7 @@ WG_GW = bytes([198, 51, 100, 51])  # a WireGuard gateway, also beyond it
 WG_PORT = 51820
 WG_RELAY = ("127.0.0.1", 51820)
 AC_GW = bytes([198, 51, 100, 52])  # AnyConnect gateways, beyond the router
-AC_PORTS = {443: 8443, 444: 8444, 445: 8445, 446: 8446}
+AC_PORTS = {443: 8443, 444: 8444, 445: 8445, 446: 8446, 447: 8447, 448: 8448}
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
 seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120

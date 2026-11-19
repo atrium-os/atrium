@@ -811,6 +811,16 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &handle_portal_status(uid))?;
             continue;
         }
+        /* ★ A corporate VPN's sign-in window (vpn.md §9.3, SAML). */
+        if let Request::VpnSignInWindow { profile, start_url, final_url, activation } = req {
+            let resp = handle_vpn_sign_in_window(uid, &owner, VpnSignIn { profile, start_url, final_url }, activation, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if matches!(req, Request::VpnSignInStatus) {
+            write_response(&mut writer, &handle_vpn_sign_in_status(uid))?;
+            continue;
+        }
         if let Request::NewWindowIn { persona, activation } = req {
             let resp = handle_new_window_in(uid, &persona, activation, &shared);
             write_response(&mut writer, &resp)?;
@@ -2036,6 +2046,105 @@ fn handle_portal_window(uid: u32, owner: &str, activation: Option<[u8; 16]>, sha
     Response::Ok
 }
 
+/// A VPN sign-in the person asked for: the profile and its addresses, for
+/// the window to ask (`VpnSignInStatus`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VpnSignIn {
+    profile: String,
+    start_url: String,
+    final_url: String,
+}
+
+/// Each person's latest VPN sign-in, by owner.
+static VPN_SIGN_INS: Mutex<Vec<(String, VpnSignIn)>> = Mutex::new(Vec::new());
+
+/// Whether `uid` is an instance in the reserved VPN sign-in persona.
+fn is_vpn_instance(uid: u32) -> bool {
+    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+        .persona(uid).flatten() == Some(portcullis_peer::VPN_PERSONA)
+}
+
+impl VpnSignIn {
+    /// A profile name as Crypta's, and two https addresses.
+    fn check(&self) -> Result<(), String> {
+        let p = &self.profile;
+        if p.is_empty() || p.len() > 32 || p.starts_with('-') || !p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err("not a VPN profile's name".into());
+        }
+        for u in [&self.start_url, &self.final_url] {
+            if u.len() > 8192 || !u.starts_with("https://") || u.chars().any(|c| c.is_control() || c == ' ') {
+                return Err("a sign-in address must be https".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// VpnSignInWindow (vpn.md §9.3): the person `owner`'s Navigator in the
+/// reserved `vpn` persona, at the gateway's sign-on address. Started if it
+/// isn't running; brought forward on a press if it is (it signs in to the
+/// latest profile asked for when it starts).
+fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: Option<[u8; 16]>, shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::opens;
+    let refuse = |why: String| {
+        eprintln!("portcullisd: VPN sign-in window REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    if is_vpn_instance(uid) || is_portal_instance(uid) {
+        return refuse("that is a sign-in window".into());
+    }
+    if let Err(why) = ask.check() {
+        return refuse(why);
+    }
+    if shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(owner).is_err() {
+        return refuse(format!("{owner} is not a person with a policy"));
+    }
+    let Some(app) = launch::portal_app() else {
+        return refuse("no installed app holds network-portal (the Navigator)".into());
+    };
+    let profile = ask.profile.clone();
+    {
+        let mut v = VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner());
+        v.retain(|(o, _)| o != owner);
+        v.push((owner.to_string(), ask));
+    }
+    let p = Some(portcullis_peer::VPN_PERSONA);
+    if launch::running_jid_instance(&app, p).is_some() {
+        let Some(press) = activation else {
+            eprintln!("portcullisd: VPN sign-in window for {owner}: already open");
+            return Response::Ok;
+        };
+        if let Err(why) = opens::spend_press_for(&opens::activation_socket(), press, uid, fresco_protocol::activation::purpose::LINK) {
+            return refuse(why);
+        }
+        match launch::instance_uid(owner, &app, p).map(|u| opens::raise(&opens::activation_socket(), u)) {
+            Some(Ok(w)) => eprintln!("portcullisd: VPN sign-in window for {owner}: window {w} brought forward"),
+            Some(Err(why)) => eprintln!("portcullisd: VPN sign-in window for {owner}: not brought forward: {why}"),
+            None => eprintln!("portcullisd: VPN sign-in window for {owner}: no uid for it"),
+        }
+    } else {
+        eprintln!("portcullisd: VPN sign-in window for {owner} ({profile}): starting {app} (asked by uid {uid})");
+        start_for_instance(&app, p, owner, "a VPN sign-in window");
+    }
+    Response::Ok
+}
+
+/// VpnSignInStatus: the profile and addresses, for that window only.
+fn handle_vpn_sign_in_status(uid: u32) -> Response {
+    if !is_vpn_instance(uid) {
+        eprintln!("portcullisd: VPN sign-in status REFUSED to uid {uid}: not a VPN sign-in window");
+        return Response::Error { message: "only a VPN sign-in window's instance".into() };
+    }
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let Some(owner) = reg.resolve(uid).map(|(u, _)| u.to_string()) else {
+        return Response::Error { message: "not a launched app".into() };
+    };
+    match VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(o, _)| *o == owner) {
+        Some((_, s)) => Response::VpnSignInStatus { profile: s.profile.clone(), start_url: s.start_url.clone(), final_url: s.final_url.clone() },
+        None => Response::Error { message: "no VPN sign-in was asked for".into() },
+    }
+}
+
 /// PortalStatus: the sign-in window's network, for that window only.
 fn handle_portal_status(uid: u32) -> Response {
     if !is_portal_instance(uid) {
@@ -2073,7 +2182,7 @@ fn handle_new_window_in(uid: u32, persona: &str, activation: [u8; 16], shared: &
     if launch::not_instanced(&app).is_some() {
         return refuse(format!("{app} runs once for every persona"));
     }
-    if here.as_deref() == Some(portcullis_peer::PORTAL_PERSONA) {
+    if matches!(here.as_deref(), Some(portcullis_peer::PORTAL_PERSONA | portcullis_peer::VPN_PERSONA)) {
         return refuse("the sign-in window opens no other windows".into());
     }
     let target = (persona != portcullis_policy::PERSONAL).then(|| persona.to_string());
@@ -3566,7 +3675,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::WorkerCall { .. } => Response::Error {
             message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),
         },
-        Request::PortalWindow { .. } | Request::PortalStatus => Response::Error {
+        Request::PortalWindow { .. } | Request::PortalStatus | Request::VpnSignInWindow { .. } | Request::VpnSignInStatus => Response::Error {
             message: "internal: the sign-in window's verbs go through the peer-uid path".into(),
         },
         Request::OpenPortalFetcher => Response::Error {
@@ -3629,6 +3738,7 @@ mod tests {
     #[test]
     fn the_sign_in_persona_is_named_alike_on_both_sides() {
         assert_eq!(portcullis_ipc::PORTAL_PERSONA, portcullis_peer::PORTAL_PERSONA);
+        assert_eq!(portcullis_ipc::VPN_PERSONA, portcullis_peer::VPN_PERSONA);
     }
     use portcullis_ipc::{round_trip, write_request};
     use std::io::Read;

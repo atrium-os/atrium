@@ -133,10 +133,15 @@ struct Entry {
 /// only by portcullisd's `PortalWindow`.
 pub const PORTAL_PERSONA: &str = "portal";
 
+/// The reserved persona of a corporate VPN's sign-in window (vpn.md
+/// §9.3): like [`PORTAL_PERSONA`], an instance of its own, started only by
+/// portcullisd's `VpnSignInWindow`.
+pub const VPN_PERSONA: &str = "vpn";
+
 /// A name a person may give one of their personas: [`valid_persona`], and
-/// not the reserved [`PORTAL_PERSONA`].
+/// not a reserved one ([`PORTAL_PERSONA`], [`VPN_PERSONA`]).
 pub fn valid_person_persona(name: &str) -> bool {
-    valid_persona(name) && name != PORTAL_PERSONA
+    valid_persona(name) && name != PORTAL_PERSONA && name != VPN_PERSONA
 }
 
 pub fn valid_persona(name: &str) -> bool {
@@ -619,6 +624,7 @@ mod tests {
         assert_eq!(r.persona(50006), Some(Some("work")));
         assert_eq!(r.resolve(50007), None);
         assert!(valid_persona(PORTAL_PERSONA) && !valid_person_persona(PORTAL_PERSONA) && valid_person_persona("work"));
+        assert!(valid_persona(VPN_PERSONA) && !valid_person_persona(VPN_PERSONA));
         assert!(valid_persona("work") && valid_persona("acme-2") && !valid_persona("2acme")
             && !valid_persona("a.b") && !valid_persona(&"a".repeat(33)));
     }

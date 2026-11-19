@@ -27,6 +27,8 @@
 //! arca-probe SOCK vk-forget USER PERSONA KEYID             # as a volume service
 //! arca-probe SOCK vk-sweep USER PERSONA KEYID UUIDHEX      # every op: the longest reply
 //! arca-probe SOCK vk-find USER KEYID UUIDHEX               # as a volume service: whose stick
+//! arca-probe SOCK web-ticket HOST[:PORT] PARTITION METHOD PATH REASON INITIATOR  # as the web broker
+//! arca-probe SOCK web-set-cookie TICKET METHOD PATH NAME VALUE ATTRS  # as a web courier: redeem, then Set-Cookie
 //! ```
 //!
 //! Prints `status=N` and any body; exits 0 whatever the status, so a
@@ -116,6 +118,40 @@ fn main() -> ExitCode {
         }
         "release" => call(sock, op::RELEASE, &unhex(arg(3))),
         "list" => call(sock, op::LIST, &[]),
+        // The Navigator's broker asking for a request's ticket (arca.md §8.2).
+        "web-ticket" => {
+            let (h, port) = host_port(arg(3));
+            arcad::proto::write_endpoint(&mut w, h, port);
+            w.str(arg(4));
+            w.u8(arg(5).parse().unwrap_or(0));
+            w.str(arg(6));
+            w.u8(arg(7).parse().unwrap_or(0));
+            w.str(arg(8));
+            w.u8(1);
+            w.str("");
+            call(sock, proto::broker_op::W_TICKET, &w.buf)
+        }
+        // A web courier, as arcad sees one: the request's cookies (which
+        // redeems the ticket), then a Set-Cookie of its response.
+        "web-set-cookie" => {
+            let t = unhex(arg(3));
+            w.str(arg(5));
+            w.raw(&t);
+            w.u8(arg(4).parse().unwrap_or(0));
+            w.str("");
+            let (st, _) = call(sock, proto::courier_op::COOKIES, &w.buf);
+            if st != 0 {
+                println!("status={st} (cookies)");
+                return ExitCode::SUCCESS;
+            }
+            let mut w = Writer::new();
+            w.str(arg(6));
+            w.bytes(arg(7).as_bytes());
+            w.bytes(arg(8).as_bytes());
+            w.str(arg(5));
+            w.raw(&t);
+            call(sock, proto::courier_op::SET_COOKIE, &w.buf)
+        }
         "mint" => {
             w.u16(0x100);
             w.u8(2);

@@ -54,6 +54,8 @@ pub enum Want {
     Prompt(String),
     Answer(Answer),
     SsoDone(SsoDone),
+    /// The sign-in window for a tunnel's single sign-on, with the press.
+    SsoWindow { name: String, login: String, final_url: String, activation: Option<[u8; 16]> },
     CertRequest(String),
     Certificate(Certificate),
 }
@@ -418,6 +420,16 @@ impl VpnPage {
         }
     }
 
+    /// Open (or bring forward) the single sign-on's window: the Navigator,
+    /// in the tunnel's own jar. The tunnel signs in once its gateway has
+    /// handed the window's sign-in to Arca.
+    pub fn sso_window(&mut self, activation: Option<[u8; 16]>) {
+        if let Some(SignIn { name, ask: Ask::Sso { login, final_url }, .. }) = &self.signin {
+            let w = Want::SsoWindow { name: name.clone(), login: login.clone(), final_url: final_url.clone(), activation };
+            self.change(w);
+        }
+    }
+
     /// Arca's field said something: a handle, or none (emptied).
     pub fn field(&mut self, handle: Option<[u8; 16]>, now: std::time::Instant) {
         self.handle = handle;
@@ -601,6 +613,26 @@ fn set_persona_vpn(persona: &str, vpn: Option<&str>, activation: [u8; 16]) -> Re
     }
 }
 
+/// portcullisd's `VpnSignInWindow` (vpn.md §9.3): the person's Navigator
+/// in its reserved `vpn` persona, at the gateway's sign-on address.
+fn sso_window(name: &str, login: &str, final_url: &str, activation: Option<[u8; 16]>) -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+        _ => return Err("portcullisd is not answering".into()),
+    }
+    let r = Request::VpnSignInWindow { profile: name.into(), start_url: login.into(), final_url: final_url.into(), activation };
+    match round_trip(&mut s, &r) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected reply: {other:?}")),
+        Err(e) => Err(format!("portcullisd is not answering ({e})")),
+    }
+}
+
 /// One ask, on a thread of its own.
 pub fn work(w: Want, tx: Sender<Got>) {
     std::thread::spawn(move || {
@@ -687,6 +719,9 @@ pub fn work(w: Want, tx: Sender<Got>) {
                 let n = s.name.clone();
                 say(connect().and_then(|mut c| c.sso_done(&s).map_err(fail(n.clone()))).map(|_| format!("{n}: single sign-on ended")))
             }
+            Want::SsoWindow { name, login, final_url, activation } => {
+                say(sso_window(&name, &login, &final_url, activation).map(|_| format!("{name}: the sign-in window is open")))
+            }
             Want::CertRequest(n) => {
                 let r = connect().and_then(|mut c| c.cert_request(&CertRequest { name: n.clone(), cn: None }).map_err(|e| e.1));
                 match &r {
@@ -718,7 +753,12 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
             let host = login.split('/').nth(2).unwrap_or(login);
             text(ctx, em(16.0), y + em(44.0), &format!("at {host}, in a sign-in window of its own"), type_size::SM, Weight::Regular, t.text_secondary());
             let pg = page.clone();
-            button(ctx, em(16.0), y + em(56.0), "Cancel", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.cancel_signin()));
+            let w = button(ctx, em(16.0), y + em(56.0), "Sign in\u{2026}", Look::Primary, !p.busy, move || {
+                let token = pergola::clipboard::current_activation();
+                with_vpn(&pg, |a| a.sso_window(token))
+            });
+            let pg = page.clone();
+            button(ctx, em(24.0) + w, y + em(56.0), "Cancel", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.cancel_signin()));
             return y + h + em(8.0);
         }
         Ask::Form(f) => f,
@@ -1128,6 +1168,23 @@ mod tests {
                 f("Password:", FieldKind::Password, vec![]),
             ],
         })
+    }
+
+    #[test]
+    fn a_single_sign_on_opens_its_window_with_the_press() {
+        let mut p = VpnPage::default();
+        p.apply(Got::Tunnels(Ok(vec![corp(State::SignIn)])));
+        assert_eq!(p.take_wants(), vec![Want::Prompt("corp".into())]);
+        let sso = Ask::Sso { login: "https://gw.example/+CSCOE+/saml/sp/login".into(), final_url: "https://gw.example/+CSCOE+/saml_ac_login.html".into() };
+        p.apply(Got::Prompt("corp".into(), Ok(Some(sso))));
+        assert!(!p.wants_field(), "no field: the window asks");
+        p.sso_window(Some([3; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SsoWindow { name: "corp".into(), login: "https://gw.example/+CSCOE+/saml/sp/login".into(),
+            final_url: "https://gw.example/+CSCOE+/saml_ac_login.html".into(), activation: Some([3; 16]) }]);
+        p.apply(Got::Done(Ok(String::new())));
+        p.take_wants();
+        p.cancel_signin();
+        assert_eq!(p.take_wants(), vec![Want::SsoDone(SsoDone { name: "corp".into(), ok: false })]);
     }
 
     #[test]

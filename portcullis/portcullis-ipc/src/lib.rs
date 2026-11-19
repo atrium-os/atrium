@@ -76,6 +76,11 @@ pub const NUNTIUS_APP: &str = "org.atrium.nuntius";
 /// Navigator to know itself by.
 pub const PORTAL_PERSONA: &str = "portal";
 
+/// The reserved persona of a corporate VPN's sign-in window (vpn.md §9.3,
+/// SAML): portcullis-peer's `VPN_PERSONA`, for the Navigator to know
+/// itself by.
+pub const VPN_PERSONA: &str = "vpn";
+
 /// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
 pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 
@@ -236,6 +241,25 @@ pub enum Request {
     /// atrium-net through portcullisd. Only from the portal instance.
     /// Answer: `PortalStatus`.
     PortalStatus,
+
+    /// ★ Open the sign-in window for VPN profile `profile` (vpn.md §9.3,
+    /// SAML): the person's Navigator in its reserved `vpn` persona, at
+    /// `start_url` (the gateway's single sign-on address), in that
+    /// profile's own jar; it closes when it reaches `final_url`. Started,
+    /// or brought forward when `activation` (a press, purpose LINK) is
+    /// given. From Settings, for the person the caller runs for.
+    /// Answer: `Ok`.
+    VpnSignInWindow {
+        profile: String,
+        start_url: String,
+        final_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<[u8; 16]>,
+    },
+
+    /// ★ The VPN sign-in window's profile and addresses. Only from that
+    /// window's instance. Answer: `VpnSignInStatus`.
+    VpnSignInStatus,
 
     /// ★ A content decryption module of the caller's own (docs/spec/hospes.md
     /// §3, §8.4): `hospes-cdm` (`HOSPES_CDM_APP`) in a one-shot jail of its
@@ -934,6 +958,9 @@ pub enum Response {
     /// interface's), where its sign-in starts (`None`: atrium-net knows no
     /// router), and whether it is online now (the window closes then).
     PortalStatus { network: String, start_url: Option<String>, online: bool },
+    /// VpnSignInStatus → the profile the window signs in to, where its
+    /// sign-in starts, and the address that ends it.
+    VpnSignInStatus { profile: String, start_url: String, final_url: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.

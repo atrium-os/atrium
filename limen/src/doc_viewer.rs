@@ -206,6 +206,9 @@ pub const FIELDS_MAX: usize = 32;
 pub const FIELD_NAME_MAX: usize = 256;
 pub const FIELD_LABEL_MAX: usize = 128;
 pub const FIELD_VALUE_MAX: usize = 1024;
+/// A `Fixed` field's value: a sign-in's hidden fields carry a signed
+/// assertion (a SAML response is several kilobytes).
+pub const FIXED_VALUE_MAX: usize = 32 * 1024;
 
 impl Form {
     /// In shape: bounded, clean, and with a button to send it.
@@ -213,7 +216,7 @@ impl Form {
         clean_text(&self.action, URL_MAX) && self.fields.len() <= FIELDS_MAX
             && self.fields.iter().any(|f| f.kind == FieldKind::Submit)
             && self.fields.iter().all(|f| clean_text(&f.name, FIELD_NAME_MAX) && clean_text(&f.label, FIELD_LABEL_MAX)
-                && clean_text(&f.value, FIELD_VALUE_MAX))
+                && clean_text(&f.value, if f.kind == FieldKind::Fixed { FIXED_VALUE_MAX } else { FIELD_VALUE_MAX }))
     }
 }
 

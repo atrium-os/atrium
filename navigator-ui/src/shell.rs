@@ -346,6 +346,12 @@ pub fn window_portal() -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
+/// Whether this sign-in window is a corporate VPN's (`NAVIGATOR_UI_VPN`,
+/// vpn.md §9.3) rather than a network's captive portal.
+pub fn window_vpn() -> bool {
+    std::env::var("NAVIGATOR_UI_VPN").is_ok_and(|v| v == "1")
+}
+
 /// The window's named persona from the settings, capitalised for the rail
 /// ("work" shows as "Work"), if it is a fit name.
 pub fn window_persona() -> Option<String> {

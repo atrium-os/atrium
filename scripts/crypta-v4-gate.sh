@@ -22,6 +22,10 @@ P=$D/pki
 EXTRA_BUILD=1
 CRYPTA_GATE_LIB=1 . "$ROOT/scripts/crypta-v1-gate.sh"
 GW=198.51.100.52
+NAVPUB=$(printf 'c%.0s' $(seq 64))
+# A web courier's uid: arcad's courier range (64000-64999), clear of the
+# launcher's (it counts up from 64000).
+COURIER_UID=64990
 PUBK=$(printf 'a%.0s' $(seq 64))
 asks() { "$V" "grep -c 'the gateway asks' $G/cryptad.log" || true; }
 hexof() { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
@@ -73,6 +77,55 @@ prompt_text() { # $1 profile, $2 k: the text, decoded
 # A split tunnel: what the guest sent the LAN for the tunnel's networks.
 acleaks() { lanctl seen | python3 -c "import json,sys; d=json.load(sys.stdin); print(' '.join(f'{k}={v}' for k,v in sorted(d.items()) if k.split(' ')[1].startswith(('10.98.', '203.0.113.'))))"; }
 
+# The sign-in window's part as Arca sees it: the broker's ticket for the
+# gateway's answer to the SAML form, then the courier's Set-Cookie of the
+# token the gateway set (what navigator-cookies' Broker and arca-courier do
+# for the window; their path is navigator-cookies' tests/broker.rs).
+courier_token() { # $1 the token
+    t=$("$V" "su -m cg-nav -c '$G/arca-probe $G/arcad.sock web-ticket sso.crypta.test:447 vpn-sso.crypta.test 3 /+CSCOE+/saml/sp/acs 3 idp.crypta.test'" | sed -n 's/^status=0 body=//p')
+    [ ${#t} = 32 ] || fail "no ticket for the window's form: $t"
+    "$V" "su -m cg-cour -c '$G/arca-probe $G/arcad.sock web-set-cookie $t 3 /+CSCOE+/saml/sp/acs acSamlv2Token $1 \"Secure;HttpOnly\"'"
+}
+
+sso_checks() {
+    "$V" "$CTL create-ac name=sso host=sso.crypta.test:447 ca=$CA scoped=0" >/dev/null || fail "create sso"
+    a5=$(asks)
+    "$V" "$CTL up name=sso" >/dev/null
+    wait_for sso signin sso "no single sign-on asked"
+    pr=$("$V" "$CTL prompt name=sso")
+    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    case "$login" in https://sso.crypta.test:447/+CSCOE+/saml/sp/login*) ok "the gateway asks for single sign-on at $login" ;; *) fail "sso prompt: $pr" ;; esac
+    [ "$(asks)" = "$a5" ] && ok "no form asked: the sign-in window's" || fail "a form was asked"
+    # The window's sign-in, from the host: the gateway's sign-on address,
+    # Keycloak's login form, its signed SAML answer back to the gateway.
+    tok=$(sh "$ROOT/scripts/crypta-sso-stand.sh" token alice alice-sso-pw) || fail "the sign-in at Keycloak: $tok"
+    ok "signed in at Keycloak; the gateway set its token (${#tok} characters)"
+    # A token set anywhere but the profile's own sign-in jar is not Crypta's:
+    # a Personal jar's cookie of the same name stays a cookie.
+    n0=$(curl -sk https://127.0.0.1:8447/stats | sed -n 's/.*"token_ok": \([0-9]*\).*/\1/p')
+    r=$(courier_token "$tok")
+    case "$r" in status=0*) ok "the courier hands the token to Arca" ;; *) fail "courier: $r" ;; esac
+    wait_for sso handshake 1 "not signed on with the token"
+    ok "signed on: the engine took the token from Arca (tunnel $(tl sso addr))"
+    r=$("$V" 'fetch -T 10 -qo - http://10.98.0.1/' 2>&1) && [ "$r" = crypta-ac-ok ] && ok "single sign-on: through the tunnel" || fail "sso HTTP: $r"
+    "$V" "grep -rq $tok $G/state $G/cryptad.log" && fail "the token is in cryptad's state or log" || ok "the token is not in cryptad's state or log"
+    left=$("$V" "su -m _crypta-key -c '$G/arca-probe $G/arcad.sock list'" | sed -n 's/^status=0 body=//p')
+    case "$(python3 -c 'import sys; print(bytes.fromhex(sys.argv[1]).decode("latin-1"))' "$left")" in *sso/sso@*) fail "the token is still in Arca" ;; *) ok "used once: Arca no longer has it" ;; esac
+    st=$(curl -sk https://127.0.0.1:8447/stats)
+    n1=$(echo "$st" | sed -n 's/.*"token_ok": \([0-9]*\).*/\1/p')
+    [ "$n1" = $((n0 + 1)) ] && ok "the gateway took it once ($st)" || fail "stand-in: $st"
+    # A replayed token: refused by the gateway, and nothing signed in.
+    "$V" "$CTL down name=sso" >/dev/null
+    "$V" "$CTL up name=sso" >/dev/null
+    wait_for sso signin sso "no sign-on asked again"
+    r0=$(curl -sk https://127.0.0.1:8447/stats | sed -n 's/.*"token_refused": \([0-9]*\).*/\1/p')
+    r=$(courier_token "$tok")
+    i=0; until [ "$(curl -sk https://127.0.0.1:8447/stats | sed -n 's/.*"token_refused": \([0-9]*\).*/\1/p')" = $((r0 + 1)) ]; do i=$((i + 1)); [ $i -lt 30 ] || fail "the replayed token never reached the gateway: $r"; sleep 1; done
+    wait_for sso signin sso "not asked to sign on again after the refusal"
+    [ "$(tl sso handshake)" != 1 ] && ok "a used token again: refused by the gateway, and single sign-on asked again" || fail "replayed token got in"
+    "$V" "$CTL down name=sso" >/dev/null
+}
+
 case "${1:-}" in
 run)
     for p in 8443 8444 8445 8446; do
@@ -87,14 +140,21 @@ run)
     echo "== the AnyConnect engine, Arca's field and a person's store"
     "$V" "set -e
         install -m 755 $G/atrium-crypta-ac /usr/local/bin/atrium-crypta-ac
-        for u in cg-vest cg-ui; do id \$u >/dev/null 2>&1 || pw useradd \$u -d /nonexistent -s /usr/sbin/nologin -c 'crypta gate'; done
+        for u in cg-vest cg-ui cg-nav; do id \$u >/dev/null 2>&1 || pw useradd \$u -d /nonexistent -s /usr/sbin/nologin -c 'crypta gate'; done
+        id cg-cour >/dev/null 2>&1 || pw useradd cg-cour -u $COURIER_UID -d /nonexistent -s /usr/sbin/nologin -c 'crypta gate courier'
         pkill -f atrium-cryptad; pkill -f atrium-arcad-gate; sleep 1
+        # The Navigator's broker and one web courier, as arcad knows them
+        # (the launch and courier registries): a VPN sign-in window's jar.
+        echo \"\$(id -u cg-nav) alice org.atrium.navigator $NAVPUB persona=vpn\" > $G/apps.registry
+        echo '$COURIER_UID alice web https sso.crypta.test 447 vpn-sso.crypta.test' > $G/courier-registry
         env ARCA_DIR=$G/arca ARCA_SOCKET=$G/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry ARCA_SERVICES=cryptad=65052 ARCA_SIGILLUM_SOCKET=none \
+            ARCA_WEB_BROKER='org.atrium.navigator $NAVPUB' ARCA_COURIER_REGISTRY=$G/courier-registry \
             ARCA_VESTIBULUM_UID=\$(id -u cg-vest) ARCA_UI_UID=\$(id -u cg-ui) daemon -f -o $G/arcad.log /usr/local/bin/atrium-arcad-gate
         sleep 1
         su -m cg-vest -c '$G/arca-probe $G/arcad.sock unlock alice correct-horse' >/dev/null
         daemon -f -o $G/cryptad.log /usr/local/bin/atrium-cryptad -v --sock $G/crypta.sock --state $G/state --net-sock $G/net.sock --arca $G/arcad.sock
         grep -q gw.crypta.test /etc/hosts || echo '$GW gw.crypta.test' >> /etc/hosts
+        grep -q sso.crypta.test /etc/hosts || echo '$GW sso.crypta.test' >> /etc/hosts
         sleep 1"
     h=$(hold probe); [ ${#h} = 32 ] && ok "Arca holds a typed value for Crypta (a handle)" || fail "hold: $h"
     CA=$(openssl x509 -in "$P/ca.pem" -outform DER | base64 -w0)
@@ -227,8 +287,15 @@ run)
     [ -z "$rt" ] && ok "none of its routes applied" || fail "hostile routes: $rt"
     "$V" 'local-unbound-control list_forwards' | grep -q 'localhost' && fail "localhost forwarded" || ok "no forward for localhost"
 
+    echo "== single sign-on: Keycloak (SAML) through the stand-in gateway"
+    if nc -z 127.0.0.1 8447 2>/dev/null && nc -z 127.0.0.1 8448 2>/dev/null; then
+        sso_checks
+    else
+        echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"
+    fi
+
     echo "== delete: everything Arca kept for the profiles"
-    for n in corp ann otp cert pin badpin hostile; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
+    for n in corp ann otp cert pin badpin hostile sso; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
     left=$(arca_items)
     [ "$left" = 0 ] && ok "Arca keeps nothing for them (passwords, sessions, the client key)" || fail "Arca still holds items: $left"
     echo "crypta V4 gate: $pass checks passed"
