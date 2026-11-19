@@ -365,7 +365,7 @@ pub fn look(p: &Path, name: &str) -> io::Result<(crate::browser::LookBody, Optio
             let more = buf.len() > LOOK_TEXT;
             buf.truncate(LOOK_TEXT);
             let (text, cut) = look_text(&buf, more);
-            Ok((LookBody::Text { text, words, cut }, None))
+            Ok((LookBody::Text { text, words, cut }, Some(f)))
         }
         // Read-only here; limend checks that and narrows it to read, seek
         // and fstat as it passes it on (limen fdpass), so the viewer can't
@@ -379,6 +379,23 @@ pub fn look(p: &Path, name: &str) -> io::Result<(crate::browser::LookBody, Optio
     }
 }
 
+/// All text in the preview's retained file, within the PDF writer's limit.
+pub fn read_print_text(mut file: std::fs::File) -> io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let limit = officina_pdf::PLAIN_MAX;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "This text file exceeds the 4 MiB print limit"));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Lossy decoding may expand invalid bytes, but never increases the
+    // number of characters beyond the original byte count.
+    Ok(text.into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +405,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn print_text_reads_past_the_preview_line_limit() {
+        let dir = tmp("look-text-print");
+        let path = dir.join("proof.txt");
+        let original = format!("{}FINAL PRINT LINE", "test line\n".repeat(crate::browser::LOOK_LINES + 1));
+        std::fs::write(&path, &original).unwrap();
+        let (body, file) = look(&path, "proof.txt").unwrap();
+        assert!(matches!(body, crate::browser::LookBody::Text { cut: true, .. }));
+        assert_eq!(read_print_text(file.unwrap()).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

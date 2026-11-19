@@ -809,8 +809,9 @@ session and its relayouts. The relationship target remains inert. Mail prints me
 colour, two-sided and tray options wait for R5's attributes. Scrinium Quick Look
 can print PDFs from its Print button or a `PrintAsked` from the active PDF viewer.
 It passes the read-only descriptor for that preview to the print sheet as a
-fixed-layout document. `print_image` and `print_text` helpers in
-Pergola (`officina_pdf::plain` is the text half).
+fixed-layout document. Quick Look can also print files shown as plain text.
+It formats the complete file up to the 4 MiB print limit with
+`officina_pdf::plain` on A4 and passes the PDF to the print sheet.
 
 Next: R5.
 

@@ -272,6 +272,10 @@ impl Look {
     pub fn is_pdf(&self) -> bool {
         matches!(&self.body, Some(LookBody::Embed { role, .. }) if *role == "pdf-viewer")
     }
+
+    pub fn can_print(&self) -> bool {
+        self.is_pdf() || matches!(self.body, Some(LookBody::Text { .. }))
+    }
 }
 
 /// What the pane shows.

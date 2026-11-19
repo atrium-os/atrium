@@ -217,7 +217,9 @@ viewer's jail, not Scrinium. Types with no viewer show their icon, size
 and type. A PDF preview can print from **Print…** or Ctrl+P inside its
 viewer. Scrinium keeps the read-only descriptor used for that preview and
 passes it to the system print sheet. The sheet handles paper selection and
-submission without reopening the file by pathname.
+submission without reopening the file by pathname. For a plain-text preview,
+**Print…** formats the complete file from the retained descriptor, up to 4 MiB.
+Files over that limit show an error and queue no job.
 
 ## 8. What never runs
 

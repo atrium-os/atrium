@@ -21,6 +21,7 @@ name = "scrinium-pick-demo"
 path = "src/bin/pick_demo.rs"
 
 [dependencies]
+officina-pdf = { path = "../officina-pdf", default-features = false }
 pergola = { path = "../pergola" }
 fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }

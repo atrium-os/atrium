@@ -533,6 +533,7 @@ enum Job {
     Installed(scrinium::browser::OpenReq, Result<scrinium::install::Outcome, String>),
     /// Quick look's read: what to show, and the file for a viewer.
     Looked(std::path::PathBuf, std::io::Result<(scrinium::browser::LookBody, Option<std::fs::File>)>),
+    LookPrint(std::path::PathBuf, String, std::io::Result<Vec<u8>>),
     /// A share's "connect at login", as dispensatord answered.
     /// `true`: the user asked to change it (a failure is shown).
     AtLogin(String, Result<bool, String>, bool),
@@ -589,6 +590,8 @@ struct Network {
     /// Quick look's viewer (opening-files.md §7), for this file.
     look_embed: Option<LookViewer>,
     printing: Option<pergola::print::Printing>,
+    text_pdf_pending: bool,
+    look_text_file: Option<(std::path::PathBuf, std::fs::File)>,
     /// The file read for the viewer, until it is handed over.
     look_file: Option<(std::path::PathBuf, std::fs::File)>,
     tx: Sender<Job>,
@@ -620,7 +623,7 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, printing: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, printing: None, text_pdf_pending: false, look_text_file: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
     }
@@ -629,8 +632,26 @@ impl Network {
         use std::os::fd::AsFd;
         use pergola::print::Printing;
 
-        let Some(look) = b.look.as_ref().filter(|look| look.path == path && look.is_pdf()) else { return };
-        if self.printing.is_some() {
+        let Some(look) = b.look.as_ref().filter(|look| look.path == path && look.can_print()) else { return };
+        if self.printing.is_some() || self.text_pdf_pending {
+            return;
+        }
+        if !look.is_pdf() {
+            let file = self.look_text_file.as_ref().filter(|(current, _)| current == path).map(|(_, file)| file.try_clone());
+            let Some(Ok(file)) = file else {
+                b.notice = Some(scrinium::browser::Notice { text: "The text preview isn't ready to print.".into(), error: true });
+                return;
+            };
+            let (path, name, tx) = (path.to_path_buf(), look.name.clone(), self.tx.clone());
+            self.text_pdf_pending = true;
+            b.notice = Some(scrinium::browser::Notice { text: "Preparing the text to print…".into(), error: false });
+            std::thread::spawn(move || {
+                let paper = pergola::print::Paper::A4;
+                let pdf = scrinium::fs::read_print_text(file).and_then(|text| {
+                    officina_pdf::plain(&name, &[officina_pdf::Plain::Text(&text)], paper.w_pt, paper.h_pt)
+                });
+                let _ = tx.send(Job::LookPrint(path, name, pdf));
+            });
             return;
         }
         let pdf = self.look_embed.as_ref().filter(|viewer| viewer.path == path).and_then(|viewer| viewer.pdf.as_ref());
@@ -967,9 +988,13 @@ impl Network {
             });
         }
         // Quick look: read off this thread; a viewer gets the file.
+        if self.look_text_file.as_ref().is_some_and(|(path, _)| b.look.as_ref().is_none_or(|look| look.path != *path)) {
+            self.look_text_file = None;
+        }
         if let Some(path) = b.want_look.take() {
             changed = true;
             self.look_file = None;
+            self.look_text_file = None;
             let name = b.look.as_ref().map(|l| l.name.clone()).unwrap_or_default();
             let tx = self.tx.clone();
             std::thread::spawn(move || {
@@ -1024,13 +1049,36 @@ impl Network {
                 Job::Installed(req, r) => b.installed(&req, r),
                 Job::Looked(path, r) => match r {
                     Ok((body, file)) => {
+                        let text = matches!(body, scrinium::browser::LookBody::Text { .. });
                         b.looked(&path, Ok(body));
                         if let (Some(f), true) = (file, b.look.as_ref().is_some_and(|l| l.path == path)) {
-                            self.look_file = Some((path, f));
+                            if text {
+                                self.look_text_file = Some((path, f));
+                            } else {
+                                self.look_file = Some((path, f));
+                            }
                         }
                     }
                     Err(e) => b.looked(&path, Err(e)),
                 },
+                Job::LookPrint(path, name, pdf) => {
+                    self.text_pdf_pending = false;
+                    if b.look.as_ref().is_some_and(|look| look.path == path && look.can_print()) {
+                        let result = pdf.map_err(|err| err.to_string()).and_then(|pdf| {
+                            let (Some(embeds), Some(token)) = (&self.embeds, pane.win.embed_token()) else {
+                                return Err("The print sheet isn't available.".into());
+                            };
+                            pergola::print::Printing::start_bytes(embeds, token, scrinium::view::PRINT_SLOT, &pdf, &name, false, Some(pergola::print::Paper::A4))
+                                .map_err(|err| format!("Couldn't open the print sheet: {err:?}"))
+                        });
+                        match result {
+                            Ok(printing) => { self.printing = Some(printing); b.notice = None; }
+                            Err(error) => b.notice = Some(scrinium::browser::Notice { text: error, error: true }),
+                        }
+                    } else if b.notice.as_ref().is_some_and(|n| n.text == "Preparing the text to print…") {
+                        b.notice = None;
+                    }
+                }
                 Job::Media(r) => {
                     // A code that didn't open it: type it again.
                     if r.is_err() {

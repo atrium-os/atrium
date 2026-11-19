@@ -1157,9 +1157,9 @@ impl ScriniumView {
         rect(ctx, x0, y0, w, y1 - y0, t.bg_surface(), 0.0);
         rect(ctx, x0, y0, 1.0, y1 - y0, t.border_default(), 0.0);
         let inner = (w - 2.0 * pad).max(0.0);
-        let title_width = if l.is_pdf() { (inner - button_w("Print…") - pad).max(0.0) } else { inner };
+        let title_width = if l.can_print() { (inner - button_w("Print…") - pad).max(0.0) } else { inner };
         text(ctx, x0 + pad, y0 + em(22.0), &fit(&l.name, type_size::MD, Weight::Medium, title_width), type_size::MD, Weight::Medium, t.text_primary());
-        if l.is_pdf() {
+        if l.can_print() {
             let state = self.state.clone();
             let path = l.path.clone();
             button(ctx, x1 - pad - button_w("Print…"), y0 + em(8.0), "Print…", Look::Ghost, true, move || {
