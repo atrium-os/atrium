@@ -3331,6 +3331,70 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_resolves_sheet_settings_across_row_replacement() {
+        use crate::review::ReviewCmd;
+        use officina_grid::{filter::{AutoFilter, Cond}, native, Rect as Cells};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Data").unwrap();
+            wb.add_sheet("Other").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        let sh = incoming.wb.sheet_mut(1);
+        sh.tab_color = Some(0x123456);
+        sh.freeze = (3, 4);
+        sh.freeze_from = (1, 2);
+        sh.hidden = vec![(2, 3), (10, 10)];
+        let rect = Cells { sheet: 1, r0: 0, c0: 0, r1: 4, c1: 2 };
+        sh.filter = Some(AutoFilter { rect, conds: vec![(0, Cond::Values(vec!["open".into()]))] });
+        incoming.wb.sheet_mut(0).tab_color = Some(0xabcdef);
+        let incoming = native::load(&native::save_to_vec(&incoming.wb)).unwrap();
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let mut incoming = incoming;
+        incoming.set_input(officina_grid::CellAddr::new(1, 0, 0), "added").unwrap();
+        sheets.compare_with("settings.osheet", incoming);
+        let labels = || {
+            let pane = sheets.review.get_cloned();
+            let d = sheets.doc.borrow();
+            pane.changes.iter().map(|c| c.describe(&d.wb, &d.wb)).collect::<Vec<_>>()
+        };
+        let choose = |label, cmd| {
+            let index = labels().iter().position(|s| s == label).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(index));
+            sheets.review_cmd(cmd);
+        };
+        assert_eq!(labels().len(), 5);
+        assert!(labels().contains(&"Data · Auto-filter on, 3 hidden rows".into()));
+        choose("Data · Tab color → #123456", ReviewCmd::Keep);
+        choose("Data · Frozen panes from C2 · 2 rows, 2 columns", ReviewCmd::Take);
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let d = sheets.doc.borrow();
+            let reopened = native::load(&native::save_to_vec(&d.wb)).unwrap();
+            let sh = reopened.sheet(0);
+            assert_eq!(sh.tab_color, None);
+            assert_eq!(reopened.sheet(1).tab_color, Some(0xabcdef));
+            assert_eq!((sh.freeze, sh.freeze_from), ((3, 4), (1, 2)));
+            assert_eq!(sh.hidden, vec![(2, 3), (10, 10)]);
+            assert_eq!(sh.filter, Some(AutoFilter { rect: Cells { sheet: 0, ..rect },
+                conds: vec![(0, Cond::Values(vec!["open".into()]))] }));
+            assert_eq!(reopened.value(0, 0, 0).display(), "added");
+        }
+        let mut d = sheets.doc.borrow_mut();
+        assert!(d.undo());
+        assert!(d.wb.sheet(0).filter.is_none() && d.wb.sheet(0).hidden.is_empty());
+        assert_eq!(d.wb.sheet(1).tab_color, None);
+        assert!(d.wb.value(0, 0, 0).is_empty());
+        assert_eq!(d.wb.sheet(0).freeze_from, (1, 2));
+        assert!(d.undo());
+        assert_eq!(d.wb.sheet(0).freeze, (0, 0));
+    }
+
+    #[test]
     fn workbook_review_flags_takes_and_keeps_merges_and_sizes() {
         use crate::review::ReviewCmd;
         use officina_grid::{Rect as Cells, compare::Change, native};

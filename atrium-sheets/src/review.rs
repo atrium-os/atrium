@@ -125,7 +125,8 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
     for ch in changes {
         if ch.is_object() { continue; }
         let Some(s) = ch.sheet() else { continue };
-        if whole.contains(&s) {
+        // Sheet settings are independent of the row replacement below.
+        if whole.contains(&s) && !matches!(ch, Change::Setting(_)) {
             if let std::collections::btree_map::Entry::Vacant(entry) = done.entry(s) {
                 let op = compare::take_sheet(&d.wb, theirs, s);
                 entry.insert(op.is_some());

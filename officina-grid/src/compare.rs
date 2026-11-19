@@ -25,6 +25,8 @@ mod annotations;
 mod layout;
 mod parts;
 mod rules;
+mod settings;
+pub use settings::SettingChange;
 mod tables;
 pub use annotations::AnnotationChange;
 pub use layout::{MergeChange, SizeChange};
@@ -54,6 +56,7 @@ pub enum Change {
     Chart(ChartChange),
     Picture(PictureChange),
     Merge(MergeChange),
+    Setting(SettingChange),
     RowHeight(SizeChange),
     ColumnWidth(SizeChange),
     Name(NameChange),
@@ -94,6 +97,7 @@ impl Change {
             Change::Link(ref link) => Some(link.at.sheet),
             Change::Chart(ref chart) => chart.sheet,
             Change::Picture(ref picture) => picture.sheet,
+            Change::Setting(ref setting) => Some(setting.sheet),
             Change::Merge(ref merge) => Some(merge.at.sheet),
             Change::RowHeight(ref size) | Change::ColumnWidth(ref size) => Some(size.at.sheet),
             Change::Name(ref name) => name.sheet,
@@ -121,6 +125,7 @@ impl Change {
             Change::Link(ref link) => Some((link.at.sheet, link.at.row, link.at.col)),
             Change::Chart(ref chart) => chart.anchor(),
             Change::Picture(ref picture) => picture.anchor(),
+            Change::Setting(ref setting) => Some((setting.sheet, 0, 0)),
             Change::Merge(ref merge) => Some((merge.at.sheet, merge.at.row, merge.at.col)),
             Change::RowHeight(ref size) | Change::ColumnWidth(ref size) => Some((size.at.sheet, size.at.row, size.at.col)),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
@@ -169,6 +174,7 @@ impl Change {
             Change::Link(link) => link.describe("Hyperlink"),
             Change::Chart(chart) => chart.describe(),
             Change::Picture(picture) => picture.describe(),
+            Change::Setting(setting) => setting.describe(),
             Change::Merge(merge) => merge.describe(),
             Change::RowHeight(size) => size.describe(true),
             Change::ColumnWidth(size) => size.describe(false),
@@ -468,6 +474,7 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
         i = mi + 1;
         j = mj + 1;
     }
+    if settings::compare(ours, s, theirs, t, out) { return true; }
     if !paired_metadata { return false; }
     parts::pair(&mut row_pairs, ra.n, rb.n, MAX_ROWS - ra.n.max(rb.n));
     (compare_styles && parts::styles(ours, s, theirs, t, &row_pairs, out))
@@ -639,6 +646,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             let set = change.take(ours.link(sheet, row, col), ours.links(sheet).len(), crate::links::MAX_LINKS)?;
             Some(vec![GridOp::Links { sheet, set: vec![set] }])
         }
+        Change::Setting(setting) => setting.take(ours),
         Change::Merge(_) | Change::RowHeight(_) | Change::ColumnWidth(_) => {
             let (ops, taken) = take_layout(ours, &[ch]);
             (taken != 0).then_some(ops)
@@ -751,6 +759,27 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn sheet_settings_review_clears_hidden_rows_and_refuses_stale_changes() {
+        let mut ours = book(&[&["header"]]);
+        let theirs = book(&[&["header"]]);
+        ours.sheet_mut(0).hidden = vec![(5, 9)];
+        ours.sheet_mut(0).freeze = (2, 1);
+        ours.sheet_mut(0).tab_color = Some(0x112233);
+        let (changes, more) = compare(&ours, &theirs);
+        assert!(!more);
+        assert_eq!(changes.len(), 3);
+        for change in &changes {
+            let ops = take(&ours, &theirs, change).unwrap();
+            for op in ops { op.apply(&mut ours); }
+            assert!(take(&ours, &theirs, change).is_none());
+        }
+        assert!(compare(&ours, &theirs).0.is_empty());
+        assert!(ours.sheet(0).hidden.is_empty());
+        assert_eq!(ours.sheet(0).freeze, (0, 0));
+        assert_eq!(ours.sheet(0).tab_color, None);
+    }
 
     #[test]
     fn review_defaults_round_trip_and_keep_explicit_sizes() {
