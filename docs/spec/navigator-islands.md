@@ -1,6 +1,6 @@
 # Navigator live code: the island engine (tier 4)
 
-Status: **proposed 2026-11-19**, for Shankar's decisions in §9. Shankar asked for site
+Status: **accepted 2026-11-19** (Shankar: all §9 decisions as recommended; D1 and D3 as amended). Shankar asked for site
 scripts to run live in the jailed environment (2026-11-19) and chose to plan first, then
 build. Sign-in is the second case that needs it (Shankar, same day): single sign-on pages
 (Okta, Entra ID) and WebAuthn with fingerprints and security keys run scripts, so the VPN's
@@ -226,8 +226,8 @@ alongside I0.
 | | question | options | recommendation |
 |---|---|---|---|
 | **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Decided (Shankar, 2026-11-19): measure Servo and Ladybird side by side in I0, and choose on the measurements.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
-| **D2** | MPL-2.0, if I0 picks Servo (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft: we publish the source of any MPL file we change, and nothing of ours changes licence. toolkit-backends.md already accepted it for Servo. Nothing else links it |
+| **D2** ✓ | MPL-2.0, if I0 picks Servo (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft: we publish the source of any MPL file we change, and nothing of ours changes licence. toolkit-backends.md already accepted it for Servo. Nothing else links it |
 | **D3** ✓ | Where I0 builds | cross-build on the Mac · natively in the Mac VM · a larger cloud build environment | **Decided (Shankar, 2026-11-19): cross-build on the Mac** with a FreeBSD sysroot, from a Mac session. An engine whose C++ side won't cross-build builds natively in the shared Mac VM, booked through the coordinator. The VM runs I0's measurements either way |
-| **D4** | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
-| **D5** | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
-| **D6** | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
+| **D4** ✓ | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
+| **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
+| **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
