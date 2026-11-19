@@ -851,8 +851,13 @@ The arm64 desktop gate used registered Personal and Work app instances,
 jailed workers, and three IPPS simulators. It verified private and shared
 printing from both personas, default denial in both directions, a fixture
 Work-to-Personal switch and its revocation, and no document upload when the
-Work VPN route was unavailable. The guest had one FIB. A live VPN print
-requires a guest with an additional routing table.
+Work VPN route was unavailable. A separate arm64 FreeBSD clone with nine
+FIBs verified live VPN printing. Atrium-net allocated Work's FIB, and the
+fixture installed a WireGuard route in that table to a peer in its own VNET.
+The Work desktop job reached Done through a jailed IPP worker. A capture on
+`wg0` showed the worker's TCP traffic to the IPPS endpoint, and the simulator
+received one PDF. FIB 0 could not connect. With the tunnel down, a second
+Work job went offline without sending another PDF.
 
 The picker applies the persona policy in §9 to saved printers and discovery IDs.
 Prelumd checks access again at submission and the start of each attempt,
