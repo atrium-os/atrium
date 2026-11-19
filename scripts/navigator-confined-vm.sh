@@ -63,12 +63,19 @@ ok() { echo "  ok: $*"; }
 bad() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 die() { echo "ABORT: $*"; exit 1; }
 PORTAL_LAN="${PORTAL_LAN:-0}"
+MAIL_APP=/var/lib/atrium/apps/org.atrium.mail
+MAIL_ASIDE=/var/lib/atrium/navigator-confined-mail-$$
 cleanup() {
     [ -n "${SRVPID:-}" ] && kill "$SRVPID" 2>/dev/null
     [ -n "${LANPID:-}" ] && kill "$LANPID" 2>/dev/null
-    true
+    if [ "${MAIL_ISOLATED:-0}" = 1 ]; then
+        g "if [ -e $MAIL_ASIDE ]; then test ! -e $MAIL_APP && mv $MAIL_ASIDE $MAIL_APP; fi" \
+            || die "could not restore the installed Mail bundle from $MAIL_ASIDE"
+    fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$OUT"
 echo "=== fixture network"
@@ -276,6 +283,11 @@ fi
 echo "  staged in $D"
 
 echo "=== bundles"
+# This chooser exercises exactly the two fixture mailto handlers.
+g "test ! -e $MAIL_ASIDE" || die "Mail fixture staging path is busy: $MAIL_ASIDE"
+MAIL_ISOLATED=1
+g "if [ -e $MAIL_APP ]; then mv $MAIL_APP $MAIL_ASIDE; fi" \
+    || die "could not set aside the installed Mail bundle"
 g "set -e
     grep -q 'atlas.example' /etc/hosts || printf '$PUB $SITES\n' >> /etc/hosts
     test -f /root/e2e-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/e2e-key.pem
