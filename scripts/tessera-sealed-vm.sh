@@ -509,6 +509,11 @@ tessera-mkfs-sealed --plain --create -s 64 -j 64 --uuid $U5 $IMG >/dev/null ||
 head -c 32 /dev/random > $T/gkey
 DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
 mount -t tessera $DEV $M || fail "plain mount for group gc"
+# Every commit keeps a snapshot that still holds what was deleted; keep one
+# and commit twice after each rm so the deletes are collectable.
+RET=$(sysctl -n kern.tessera.snapshot_retention)
+sysctl kern.tessera.snapshot_retention=1 >/dev/null || fail "retention"
+ticks() { for i in 1 2; do sync; echo $i > $M/other/tick; sync; sleep 1; done; sync; }
 mkdir $M/persona $M/other || fail "gc dirs"
 tessera-quota-set $M/persona 1000000000 >/dev/null || fail "quota persona"
 tessera-quota-set $M/other 1000000000 >/dev/null || fail "quota other"
@@ -524,11 +529,11 @@ free() { sync; sleep 2; sync; df -k $M | awk 'NR==2 {print $4}'; }
 gc() { tessera-gc $M >/dev/null || fail "tessera-gc"; }
 f0=$(free)
 rm $M/persona/a.txt || fail "rm a"
-gc; f1=$(free)
+ticks; gc; f1=$(free)
 echo "group gc, key loaded: $f0 -> $f1 KiB free"
 [ $((f1 - f0)) -gt 1500 ] || fail "GC freed nothing of the group with its key loaded"
 rm $M/persona/b.txt $M/other/plain.txt || fail "rm b, plain"
-sync
+ticks
 tessera-keyload drop $GKID >/dev/null || fail "drop group 9"
 dmesg -c >/dev/null
 gc; f2=$(free)
@@ -561,6 +566,7 @@ rmdir $M/persona || fail "rmdir the erased group's root"
 jot -w 'shared plain line %06d' 1000 > $M/other/after.txt || fail "write after erase"
 umount $M; mdconfig -d -u ${DEV#/dev/md}
 rm -f $IMG $T/gkey
+sysctl kern.tessera.snapshot_retention=$RET >/dev/null
 echo "group gc and erase: ok"
 
 tessera-keyload drop $KID >/dev/null

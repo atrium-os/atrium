@@ -590,6 +590,7 @@ static unsigned long tessera_stat_gc_aborts      = 0;
 static unsigned long tessera_stat_gc_group_packs  = 0;
 static unsigned long tessera_stat_gc_group_erased = 0;
 static unsigned long tessera_stat_gc_group_skips  = 0;
+static unsigned long tessera_stat_gc_group_erased_walks = 0;
 /* ★ #99: duty-cycle bound for the data-zone GC. A pass costing T that
  * reclaims nothing earns T*(100/pct - 1) of quiet, so GC's share of the
  * machine stays near pct whatever the volume size. 0 = the old
@@ -1079,6 +1080,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_packs, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_erased, CTLFLAG_RD,
     &tessera_stat_gc_group_erased, 0,
     "Packs of erased key groups GC found dead (E4.5)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_erased_walks, CTLFLAG_RD,
+    &tessera_stat_gc_group_erased_walks, 0,
+    "Retained inodes of erased domains whose manifests GC skipped (E4.5)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_skips, CTLFLAG_RD,
     &tessera_stat_gc_group_skips, 0,
     "Key groups a GC pass couldn't walk, all their packs kept (E4.5)");
@@ -22112,6 +22116,19 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				_sp = 0;                                  \
 				continue;                                 \
 			}                                                 \
+			/* A retained snapshot's inode of an erased    \
+			 * group: its domain is gone and its packs     \
+			 * don't open (no group record). They are dead \
+			 * by their preludes; don't veto the pass. */  \
+			if (_frc != 0 && (_frc == EACCES ||               \
+			    _frc == EINTEGRITY) &&                        \
+			    (_ino).quota_domain != 0 &&                   \
+			    tessera_quota_find(tmp_,                      \
+			    (_ino).quota_domain) == NULL) {               \
+				tessera_stat_gc_group_erased_walks++;     \
+				_sp = 0;                                  \
+				continue;                                 \
+			}                                                 \
 			if (_frc != 0) {                                  \
 				if (gc_abort_fetchfail++ == 0)            \
 					memcpy(gc_abort_hash, _h,         \
@@ -34249,9 +34266,9 @@ static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 /*
  * Crypto-erase a key group (tessera-encryption §9, E4.5): what atrium-volumes
  * does when a persona is removed, after arcad deleted its key and the
- * kernel dropped it. Needs no key. The group must be locked, no vnode of it
- * in use, and no snapshot retained (a snapshot's inodes would name packs
- * this frees). Every inode of the group's domains goes; each domain's root
+ * kernel dropped it. Needs no key. The group must be locked and no vnode
+ * of it in use. Retained snapshots may still name its inodes: GC skips
+ * those (their domains are gone) and frees the packs anyway. Every inode of the group's domains goes; each domain's root
  * stays, as an empty directory in no domain, for the caller to remove by
  * name; the domain and group records go; then a GC pass frees every pack
  * whose prelude names the group, without opening it.
@@ -34289,19 +34306,6 @@ tessera_fs_group_erase(struct vnode *ivp, uint64_t gid)
 	sx_xunlock(&tmp_->groups_sx);
 	if (err != 0)
 		return (err);
-	if (tmp_->snapshots_tree != NULL) {
-		tessera_btree_cursor_t *c =
-		    tessera_btree_seek_first(tmp_->snapshots_tree);
-		if (c != NULL) {
-			uint8_t sk[8];
-			uint8_t sv[TESSERA_SNAPSHOT_RECORD_SIZE];
-			if (tessera_btree_cursor_get(c, sk, sv) == TESSERA_OK)
-				err = EBUSY;
-			tessera_btree_cursor_free(c);
-		}
-		if (err != 0)
-			return (err);
-	}
 
 	/* No vnode of the group may be in use; the others are thrown away
 	 * so none outlives its inode (inode numbers are reused). */

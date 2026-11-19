@@ -875,14 +875,17 @@ kept. So a locked group loses nothing, and GC still frees everything else.
 A group with no inodes left is not in the skip set, but its packs only go
 once its key is loaded. Crypto-erase is `TESSERA_IOC_GROUP_ERASE` (group id;
 `tessera-keyload group-erase DIR GROUP`), for atrium-volumes after arcad
-deleted the key: the group must be locked (EBUSY otherwise), none of its
-vnodes in use, and no snapshot retained (EBUSY: a snapshot's inodes would
-name packs it frees; to be lifted when snapshots learn groups). It deletes
+deleted the key: the group must be locked (EBUSY otherwise) and none of its
+vnodes in use. It deletes
 every inode of the group's domains, turns each domain's root into an empty
 directory in no domain (the caller removes it by name), retires the domain
 records and the group record, then runs a GC pass, which frees every pack
 whose prelude names a group with no record without opening it (no grace
-period). A group id should not be reused before that pass has run: a later
+period). Retained snapshots (one per commit, `snapshot_retention`) still
+name the erased inodes; pass 1 skips an inode whose domain is gone when its
+manifest doesn't open, rather than abort. Deleted data in a group, as
+anywhere, is only collectable once the snapshots that hold it age out. A
+group id should not be reused before that pass has run: a later
 group with the same id would keep the old packs. VM gate:
 `tessera-sealed-vm.sh` check 14.
 
