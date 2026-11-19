@@ -13,6 +13,7 @@
 //! ```
 
 pub mod addr;
+pub mod autofill;
 pub mod book;
 pub mod charts;
 pub mod column;

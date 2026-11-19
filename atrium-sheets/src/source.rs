@@ -575,6 +575,9 @@ impl SheetSource {
 }
 
 impl GridSource for SheetSource {
+    fn fills(&self) -> bool {
+        true
+    }
     fn frozen(&self) -> (u32, u32) {
         let d = self.doc.borrow();
         d.wb.sheet(d.sheet).freeze

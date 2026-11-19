@@ -621,6 +621,30 @@ impl Doc {
         self.run("Clear", vec![GridOp::clear(Rect { sheet: self.sheet, r0, c0, r1, c1 })]);
     }
 
+    /// Fills `to` from `from` on this sheet: series (the fill handle) or a
+    /// copy (Ctrl+D, Ctrl+R). One undo step; the reason goes to `status` if
+    /// it can't.
+    pub fn fill(&mut self, from: Rect, to: Rect, copy: bool) -> bool {
+        use officina_grid::autofill::{fill, Mode};
+        let from = Rect { sheet: self.sheet, ..from };
+        let to = Rect { sheet: self.sheet, ..to };
+        match fill(&self.wb, from, to, if copy { Mode::Copy } else { Mode::Series }) {
+            Ok(GridOp::Batch(ops)) => {
+                self.status.clear();
+                self.run(if copy { "Fill" } else { "Fill Series" }, ops);
+                true
+            }
+            Ok(op) => {
+                self.run("Fill", vec![op]);
+                true
+            }
+            Err(e) => {
+                self.status = e;
+                false
+            }
+        }
+    }
+
     /// Pastes tab-separated text (a range from any spreadsheet) at (`row`, `col`).
     pub fn paste_tsv(&mut self, row: u32, col: u32, text: &str) -> bool {
         let text = text.strip_suffix('\n').unwrap_or(text);
@@ -839,6 +863,29 @@ mod tests {
 
     fn v(doc: &Doc, r: u32, c: u32) -> Value {
         doc.wb.get(CellAddr::new(0, r, c))
+    }
+
+    #[test]
+    fn the_fill_handle_continues_a_series_and_ctrl_d_copies() {
+        let mut d = Doc::new("fill");
+        for (r, t) in [(0, "Week 1"), (1, "Week 2")] {
+            d.type_into(r, 0, t);
+        }
+        d.type_into(0, 1, "=ROW()*10");
+        let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
+        assert!(d.fill(r(0, 0, 1, 1), r(0, 0, 3, 1), false));
+        let shown = |d: &Doc, row, col| d.wb.formatted(CellAddr::new(0, row, col)).text;
+        assert_eq!((shown(&d, 3, 0), shown(&d, 2, 1)), ("Week 4".to_string(), "30".to_string()));
+        // B2 was empty: B3 is a copy of B1's formula, B4 of the empty B2.
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 2, 1)).as_deref(), Some("=ROW()*10"));
+        assert_eq!(shown(&d, 3, 1), "");
+        assert!(d.undo());
+        assert_eq!(shown(&d, 3, 0), "");
+        // Copy down: the first row into the rest.
+        assert!(d.fill(r(0, 0, 0, 0), r(0, 0, 2, 0), true));
+        assert_eq!(shown(&d, 1, 0), "Week 1");
+        assert!(!d.fill(r(0, 0, 0, 0), r(0, 1, 2, 1), true));
+        assert!(!d.status.is_empty());
     }
 
     #[test]

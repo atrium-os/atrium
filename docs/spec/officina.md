@@ -3735,8 +3735,25 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Command.** Data ▸ Center Across Selection (needs two or more columns) gives the selection Excel's "centre across" alignment without merging. It is one undo step. With the selection's first cell already centred across, the item is checked, and choosing it again puts the cells back to General.
 - **Grid.** A cell centred across is drawn centred over itself and the cells after it in its row, while those cells are empty, also centred across, and not merged (up to 32 columns). Text wider than the run is cut. pergola: `CellAlign::Across`.
 - **Files.** .xlsx keeps it as `centerContinuous` (and .xls reads it). .ods has no such alignment, so it is written as `center`, which is what LibreOffice shows for it.
-- **Printing** draws it centred in its own cell for now.
+- **Printing** centres it across the same run (d39d04a8).
 - **Gates:** atrium-sheets `center_across_selection_turns_on_and_off_without_merging`; pergola `text_centred_across_the_selection_spans_its_cells`.
+
+### 16.87 The fill handle, Fill Down and Fill Right (2026-11-19)
+
+- **Engine** (`officina-grid::autofill::fill(wb, from, to, mode)`): one undoable batch that fills the cells of `to` outside `from`, down, up, right or left. Each column (filling down or up) or row (across) of the selection is read in the fill's direction:
+  - Two or more numbers carry on along their best-fit line (1, 3 → 5, 7; 0.1, 0.2 → 0.3 without drift: values are rounded to 15 digits). One number is copied, as Excel's handle does.
+  - Dates (by their format): one date steps a day; dates on the same day of the month a whole number of months apart step by months, keeping the day where the month has it (31 Jan → 28 Feb).
+  - Text whose last digits count ("Item 1", "Q3", "Room 008", keeping leading zeros) steps by one, or by the step two or more show.
+  - Day and month names, short or long, in the same case.
+  - Anything else, and any line holding a formula or mixed kinds, repeats in turn. Formulas move as a copy moves them (relative references shift, `$` ones stay), and a column of them is one formula fill.
+  - Styles repeat with the cells.
+  - Filling up or left, one cell counts down ("Item 5" → "Item 4", "Item 3").
+  - `Mode::Copy` repeats without series.
+  - Refused: areas meeting merged cells, and more than 4 M new cells.
+- **Grid** (pergola): a source that says `fills()` gets a small square at the selection's bottom-right corner. Dragging it rings the area it reaches, down, up, right or left, whichever way the pointer is farther out. Letting go sends `GridAction::Fill { from, to, copy: false }` and selects the filled area. Ctrl+D and Ctrl+R send `copy: true`: the selection's first row (or column) into the rest, or with one row chosen, the row above.
+- **Sheets:** `Doc::fill`, undone as one step ("Fill Series" or "Fill").
+- **Not yet:** Excel's Ctrl-drag to flip between series and copy, the Auto Fill Options button after a drag, custom lists, Flash Fill, and double-clicking the handle to fill down to the data's end.
+- **Gates:** officina-grid `autofill::tests` (4); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

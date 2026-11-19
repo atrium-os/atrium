@@ -328,6 +328,11 @@ pub trait GridSource {
     fn last_used(&self) -> (u32, u32) {
         (self.rows().saturating_sub(1), self.cols().saturating_sub(1))
     }
+    /// The selection shows a fill handle at its corner, and Ctrl+D and
+    /// Ctrl+R fill down and right ([`GridAction::Fill`]).
+    fn fills(&self) -> bool {
+        false
+    }
 }
 
 /// Something drawn over the cells, such as a chart.
@@ -401,6 +406,8 @@ enum Drag {
     /// A picked float pressed: moved (or sized from its corner) by the
     /// distance from where the press began, content px.
     Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
+    /// The fill handle dragged: the area it reaches so far.
+    Fill { to: CellRange },
 }
 
 /// The grid's own state, kept by the app in a `Mutable`.
@@ -455,6 +462,9 @@ pub enum GridAction {
     PressFloat(u64),
     /// Alt+Down on cell (`row`, `col`): offer what it can hold (a list).
     Choose { row: u32, col: u32 },
+    /// Fill `to` from `from` (inside it, `to` reaching past it one way):
+    /// the fill handle (`copy` false: series), Ctrl+D and Ctrl+R (`copy`).
+    Fill { from: CellRange, to: CellRange, copy: bool },
 }
 
 impl GridState {
@@ -465,6 +475,38 @@ impl GridState {
             _ => None,
         }
     }
+
+    /// The area the fill handle reaches, while it is dragged.
+    pub fn fill_drag(&self) -> Option<CellRange> {
+        match self.drag {
+            Drag::Fill { to } => Some(to),
+            _ => None,
+        }
+    }
+}
+
+/// How near the selection's corner a press takes the fill handle, px.
+const FILL_GRIP: f64 = 5.0;
+
+/// The fill handle dragged to `cell` from selection `sel`: `sel` grown down,
+/// up, right or left, whichever way `cell` is farther outside it.
+fn fill_reach(sel: CellRange, cell: (u32, u32)) -> CellRange {
+    let (r, c) = cell;
+    let down = r.saturating_sub(sel.r1) as i64 - sel.r0.saturating_sub(r) as i64;
+    let right = c.saturating_sub(sel.c1) as i64 - sel.c0.saturating_sub(c) as i64;
+    if down == 0 && right == 0 {
+        return sel;
+    }
+    if down.abs() >= right.abs() {
+        if down > 0 { CellRange { r1: r, ..sel } } else { CellRange { r0: r, ..sel } }
+    } else if right > 0 {
+        CellRange { c1: c, ..sel }
+    } else {
+        CellRange { c0: c, ..sel }
+    }
+}
+
+impl GridState {
 }
 
 /// How near a float's bottom-right corner a press sizes it, px.
@@ -672,6 +714,36 @@ impl GridView {
                     }
                     gst.set(g);
                     return;
+                }
+                if let (Drag::Fill { .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
+                    let sel = grow_to_merges(&*src, g.selection());
+                    let to = fill_reach(sel, cell);
+                    if phase == DragPhase::End {
+                        g.drag = Drag::None;
+                        if to != sel {
+                            g.anchor = (to.r0, to.c0);
+                            g.cursor = (to.r1, to.c1);
+                            gst.set(g);
+                            if let Some(f) = &act {
+                                f(GridAction::Fill { from: sel, to, copy: false });
+                            }
+                            return;
+                        }
+                    } else {
+                        g.drag = Drag::Fill { to };
+                    }
+                    gst.set(g);
+                    return;
+                }
+                if phase == DragPhase::Start && src.fills() && g.edit.is_none() {
+                    let sel = grow_to_merges(&*src, g.selection());
+                    let (hx, hy) = (src.col_left(sel.c1 + 1), src.row_top(sel.r1 + 1));
+                    if (cx - hx).abs() <= FILL_GRIP && (cy - hy).abs() <= FILL_GRIP {
+                        g.picked = None;
+                        g.drag = Drag::Fill { to: sel };
+                        gst.set(g);
+                        return;
+                    }
                 }
                 if phase == DragPhase::Start {
                     let pressed = buttons.borrow().iter().rev().find(|(_, a)| cx >= a[0] && cx < a[0] + a[2] && cy >= a[1] && cy < a[1] + a[3]).map(|b| b.0);
@@ -1122,6 +1194,25 @@ fn emit_floats(ctx: &mut Ctx, floats: Vec<GridFloat>, t: &crate::theme::Semantic
     }
 }
 
+/// The fill handle at the selection's corner, and while it is dragged the
+/// area it reaches, ringed.
+fn emit_fill_handle(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, sel: CellRange, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32)) {
+    if let Some(to) = gs.fill_drag().filter(|to| *to != sel) {
+        let cut = CellRange { r0: to.r0.max(vis.r0), c0: to.c0.max(vis.c0), r1: to.r1.min(vis.r1), c1: to.c1.min(vis.c1) };
+        if cut.r0 <= cut.r1 && cut.c0 <= cut.c1 {
+            let (sx, sy) = at(src.col_left(cut.c0), src.row_top(cut.r0));
+            let (ex, ey) = at(src.col_left(cut.c1 + 1), src.row_top(cut.r1 + 1));
+            let mut c = t.accent_fg();
+            c.a = 0.6;
+            ring(ctx, Rect::new(sx, sy, ex - sx, ey - sy), c);
+        }
+    }
+    if vis.contains(sel.r1, sel.c1) {
+        let (x, y) = at(src.col_left(sel.c1 + 1), src.row_top(sel.r1 + 1));
+        ctx.add(Node::Rect { rect: Rect::new(x - 4.0, y - 4.0, 7.0, 7.0), fill: t.accent_fg(), radius: 1.0 });
+    }
+}
+
 fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32)) {
     // A selection meeting part of a merged area shows all of it.
     let sel = grow_to_merges(src, gs.selection());
@@ -1133,6 +1224,9 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
         let mut fill = t.accent_fill();
         fill.a = 0.12;
         ctx.add(Node::Rect { rect: Rect::new(sx, sy, ex - sx, ey - sy), fill, radius: 0.0 });
+    }
+    if src.fills() && gs.edit.is_none() {
+        emit_fill_handle(ctx, src, t, gs, sel, vis, at);
     }
     let (ar, ac) = gs.cursor;
     if !vis.contains(ar, ac) {
@@ -1638,6 +1732,20 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 "z" => send(GridAction::Undo),
                 "y" => send(GridAction::Redo),
                 "c" => send(GridAction::Copy(g.selection())),
+                // Fill down or right: from the selection's first row or
+                // column, or the cell above or left of a one-row selection.
+                "d" | "r" if src.fills() => {
+                    let sel = g.selection();
+                    let down = chars.eq_ignore_ascii_case("d");
+                    let (from, to) = match down {
+                        true if sel.r1 > sel.r0 => (CellRange { r1: sel.r0, ..sel }, sel),
+                        true if sel.r0 > 0 => (CellRange { r0: sel.r0 - 1, r1: sel.r0 - 1, ..sel }, CellRange { r0: sel.r0 - 1, ..sel }),
+                        false if sel.c1 > sel.c0 => (CellRange { c1: sel.c0, ..sel }, sel),
+                        false if sel.c0 > 0 => (CellRange { c0: sel.c0 - 1, c1: sel.c0 - 1, ..sel }, CellRange { c0: sel.c0 - 1, ..sel }),
+                        _ => return true,
+                    };
+                    send(GridAction::Fill { from, to, copy: true });
+                }
                 "x" => send(GridAction::Cut(g.selection())),
                 "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0 }),
                 "a" => {
@@ -1725,11 +1833,12 @@ mod tests {
         frozen: std::cell::Cell<(u32, u32)>,
         /// Pressable floats: key and where.
         buttons: RefCell<Vec<(u64, [f64; 4])>>,
+        fills: std::cell::Cell<bool>,
     }
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), buttons: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), buttons: Default::default(), fills: Default::default() }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -1782,6 +1891,9 @@ mod tests {
         }
         fn frozen(&self) -> (u32, u32) {
             self.frozen.get()
+        }
+        fn fills(&self) -> bool {
+            self.fills.get()
         }
         fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
             self.buttons.borrow().iter().map(|&(key, at)| GridFloat { key, at, nodes: Rc::new(vec![Node::Rect { rect: Rect::new(0.0, 0.0, at[2] as f32, at[3] as f32), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 }]), movable: false, pressable: true }).collect()
@@ -1895,6 +2007,47 @@ mod tests {
         key(&mut app, Key::Down, "", Modifiers { alt: true, ..Modifiers::default() });
         assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Choose { row: 2, col: 1 })));
         assert_eq!(state.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn the_fill_handle_and_ctrl_d_ask_to_fill() {
+        let (mut app, grid, _, state, log) = host(100, 10);
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let at = |c: f64, r: f64| Point::new(hw + (c * 64.0) as f32, HEADER_H + (r * 20.0) as f32);
+        let mut g = state.get_cloned();
+        g.anchor = (1, 1);
+        g.cursor = (2, 1);
+        state.set(g);
+        app.tick();
+        // Without the source's say, no handle.
+        app.handle_event(Event::PointerDown { at: at(2.0, 3.0) });
+        app.handle_event(Event::PointerUp { at: at(2.0, 3.0) });
+        app.tick();
+        assert!(log.borrow().is_empty());
+        grid.fills.set(true);
+        let mut g = state.get_cloned();
+        g.anchor = (1, 1);
+        g.cursor = (2, 1);
+        state.set(g);
+        app.tick();
+        // The handle at B3's bottom-right corner, dragged down to row 6.
+        app.handle_event(Event::PointerDown { at: at(2.0, 3.0) });
+        app.handle_event(Event::PointerMove { at: at(1.5, 5.5) });
+        app.tick();
+        assert_eq!(state.get_cloned().fill_drag(), Some(CellRange { r0: 1, c0: 1, r1: 5, c1: 1 }));
+        app.handle_event(Event::PointerMove { at: at(1.5, 6.5) });
+        app.handle_event(Event::PointerUp { at: at(1.5, 6.5) });
+        app.tick();
+        let from = CellRange { r0: 1, c0: 1, r1: 2, c1: 1 };
+        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from, to: CellRange { r1: 6, ..from }, copy: false }));
+        assert_eq!(state.get_cloned().selection(), CellRange { r1: 6, ..from });
+        // Ctrl+D with one row chosen copies the row above into it.
+        let mut g = state.get_cloned();
+        g.select(4, 3);
+        state.set(g);
+        key(&mut app, Key::Char, "d", Modifiers { ctrl: true, ..Modifiers::default() });
+        let one = CellRange { r0: 3, c0: 3, r1: 3, c1: 3 };
+        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from: one, to: CellRange { r1: 4, ..one }, copy: true }));
     }
 
     #[test]

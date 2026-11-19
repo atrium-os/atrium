@@ -1205,6 +1205,11 @@ impl Sheets {
                 d.type_into(row, col, &text);
             }
             GridAction::Clear(r) => d.clear(r.r0, r.c0, r.r1, r.c1),
+            GridAction::Fill { from, to, copy } => {
+                let rect = |r: CellRange| officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
+                let (from, to) = (rect(from), rect(to));
+                d.fill(from, to, copy);
+            }
             GridAction::ResizeCol { col, width } => d.set_col_width(col, width),
             GridAction::Undo => {
                 d.undo();
