@@ -79,6 +79,9 @@ enum Record {
     Saved,
     /// The file's macros (kept inert) are dropped; the next save writes none.
     RemoveMacros,
+    /// More of the last action (a row grown to fit what was just typed):
+    /// undone with it.
+    Extend { ops: Vec<GridOp> },
 }
 
 impl Record {
@@ -103,6 +106,13 @@ impl Record {
             }
             Record::Saved => w.u8(5),
             Record::RemoveMacros => w.u8(6),
+            Record::Extend { ops } => {
+                w.u8(7);
+                w.var(ops.len() as u64);
+                for op in ops {
+                    w.bytes(&op.encode());
+                }
+            }
         }
         w.into_bytes()
     }
@@ -132,6 +142,14 @@ impl Record {
             }
             5 => Record::Saved,
             6 => Record::RemoveMacros,
+            7 => {
+                let n = r.count("ops", 1 << 20, 1)?;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    ops.push(GridOp::decode(r.bytes("op", 64 << 20)?)?);
+                }
+                Record::Extend { ops }
+            }
             _ => return Err(WireError::Invalid("record")),
         };
         if !r.is_empty() {
@@ -493,6 +511,7 @@ impl Doc {
     fn replay(&mut self, r: Record) {
         match r {
             Record::Run { label, ops } => self.history.run(&mut self.wb, &label, ops),
+            Record::Extend { ops } => self.history.extend_last(&mut self.wb, "Row Height", ops),
             Record::Undo => {
                 self.history.undo(&mut self.wb);
             }
@@ -579,6 +598,31 @@ impl Doc {
 
     /// The user typed `text` into a cell. A formula that doesn't parse is refused
     /// (the cell keeps what it had) and the reason goes to `status`.
+    /// `ops` as part of the last action, undone with it.
+    pub fn extend(&mut self, ops: Vec<GridOp>) {
+        if ops.is_empty() {
+            return;
+        }
+        let r = Record::Extend { ops };
+        self.journal(&r);
+        self.replay(r);
+        self.keep_sheet();
+    }
+
+    /// Row `row` grown to `px` as part of the last action, when nobody has
+    /// sized it (no height of its own) and it needs more than it has.
+    pub fn grow_row(&mut self, row: u32, px: f64) {
+        let s = self.sheet;
+        let sizes = &self.wb.sheet(s).row_sizes;
+        if sizes.overrides().iter().any(|o| o.0 == row) || px <= sizes.size(row) || !px.is_finite() {
+            return;
+        }
+        let mut over = sizes.overrides().to_vec();
+        over.push((row, px.min(crate::app::MAX_ROW_PX)));
+        over.sort_by_key(|o| o.0);
+        self.extend(vec![GridOp::Sizes { sheet: s, rows: true, over }]);
+    }
+
     pub fn type_into(&mut self, row: u32, col: u32, text: &str) -> bool {
         let input = Input::typed(text);
         if let Input::Formula(f) = &input {
@@ -1055,6 +1099,7 @@ mod tests {
             Record::ColWidth { sheet: 0, col: 3, width: 120.5 },
             Record::Saved,
             Record::RemoveMacros,
+            Record::Extend { ops: vec![GridOp::Sizes { sheet: 0, rows: true, over: vec![(4, 51.0)] }] },
         ] {
             assert_eq!(Record::decode(&r.encode()).unwrap(), r);
         }

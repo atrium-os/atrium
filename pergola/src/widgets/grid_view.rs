@@ -68,6 +68,16 @@ pub const MIN_ROW_H: f64 = 6.0;
 const PAD: f32 = 4.0;
 const TEXT_SIZE: f32 = type_size::SM;
 
+/// Where a cell's lines sit up and down in a taller cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellVAlign {
+    Top,
+    #[default]
+    Center,
+    /// A spreadsheet's default.
+    Bottom,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellAlign {
     Left,
@@ -105,6 +115,7 @@ pub struct CellView {
     /// runs over its neighbours. Text with line breaks shows its lines
     /// either way.
     pub wrap: bool,
+    pub valign: CellVAlign,
 }
 
 /// One step of a cell's indent, px.
@@ -263,7 +274,7 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -556,19 +567,53 @@ fn editor_rect(src: &dyn GridSource, g: &GridState) -> Option<[f64; 4]> {
     let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
     let (x, y) = (src.col_left(one.c0), src.row_top(one.r0));
     let (w, h) = (src.col_left(one.c1 + 1) - x, src.row_top(one.r1 + 1) - y);
-    let tw = crate::text::measure(ed.text(), &editor_style()).w as f64;
-    Some([x, y, w.max(tw + 2.0 * PAD as f64 + 2.0), h])
+    let (tw, th) = editor_size(ed.text(), &editor_style());
+    Some([x, y, w.max(tw as f64 + 2.0 * PAD as f64 + 2.0), h.max(th as f64)])
+}
+
+/// The editor's lines: byte ranges of `text` between line breaks.
+fn editor_lines(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            out.push(start..i);
+            start = i + 1;
+        }
+    }
+    out.push(start..text.len());
+    out
+}
+
+/// The widest line and the height the editor's lines need, px.
+fn editor_size(text: &str, style: &TextStyle) -> (f32, f32) {
+    let lines = editor_lines(text);
+    let w = lines.iter().map(|r| crate::text::measure(&text[r.clone()], style).w).fold(0.0, f32::max);
+    let h = if lines.len() > 1 { lines.len() as f32 * TEXT_SIZE * 1.3 + 2.0 * LINE_PAD } else { 0.0 };
+    (w, h)
+}
+
+/// Where the editor's first line starts down from its top, px: one line
+/// centred in the cell, several from the top.
+fn editor_top(lines: usize, h: f32) -> f32 {
+    if lines > 1 { LINE_PAD } else { ((h - TEXT_SIZE * 1.3) / 2.0).max(0.0) }
 }
 
 fn in_editor(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> bool {
     editor_rect(src, g).is_some_and(|r| cx >= r[0] && cx < r[0] + r[2] && cy >= r[1] && cy < r[1] + r[3])
 }
 
-/// The editor's text index nearest content x `cx` (a character boundary).
-fn editor_index(src: &dyn GridSource, g: &GridState, cx: f64) -> Option<usize> {
+/// The editor's text index nearest content point (`cx`, `cy`) (a
+/// character boundary): on the line at `cy`, nearest `cx`.
+fn editor_index(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> Option<usize> {
     let r = editor_rect(src, g)?;
     let text = g.edit.as_ref()?.text();
-    Some(index_at(text, (cx - r[0]) as f32 - PAD, &editor_style()))
+    let lines = editor_lines(text);
+    let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
+    let h = (src.row_top(one.r1 + 1) - src.row_top(one.r0)) as f32;
+    let k = (((cy - r[1]) as f32 - editor_top(lines.len(), h)) / (TEXT_SIZE * 1.3)).floor().clamp(0.0, (lines.len() - 1) as f32) as usize;
+    let line = lines[k].clone();
+    Some(line.start + index_at(&text[line.clone()], (cx - r[0]) as f32 - PAD, &editor_style()))
 }
 
 /// The character boundary of `text` nearest `x` px from its start.
@@ -883,7 +928,7 @@ impl GridView {
                 // In the editor: the press places the caret, a drag selects,
                 // a double-click takes the word.
                 if let (Drag::Caret, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
-                    if let Some(i) = editor_index(&*src, &g, cx) {
+                    if let Some(i) = editor_index(&*src, &g, cx, cy) {
                         if let Some(ed) = g.edit.as_mut() {
                             ed.set_caret(i, true);
                         }
@@ -895,7 +940,7 @@ impl GridView {
                     return;
                 }
                 if phase == DragPhase::Start && g.edit.is_some() && in_editor(&*src, &g, cx, cy) {
-                    let i = editor_index(&*src, &g, cx).unwrap_or(0);
+                    let i = editor_index(&*src, &g, cx, cy).unwrap_or(0);
                     let now = std::time::Instant::now();
                     let double = g.text_press.is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK);
                     g.text_press = Some(now);
@@ -1496,23 +1541,32 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
         ring(ctx, Rect::new(sx, sy, w, h), t.accent_fg());
         return;
     };
-    // The editor: as wide as its text needs, from the cell.
+    // The editor: as wide and tall as its lines need, from the cell.
     let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: t.text_primary() };
-    let tw = crate::text::measure(ed.text(), &style).w;
-    let ew = w.max(tw + 2.0 * PAD + 2.0);
-    ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, h), fill: t.bg_canvas(), radius: 0.0 });
+    let text = ed.text();
+    let (tw, th) = editor_size(text, &style);
+    let (ew, eh) = (w.max(tw + 2.0 * PAD + 2.0), h.max(th));
+    ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, eh), fill: t.bg_canvas(), radius: 0.0 });
     let lh = TEXT_SIZE * 1.3;
-    let ty = sy + ((h - lh) / 2.0).max(0.0);
-    if ed.has_selection() {
-        let s = ed.selection();
-        let a = crate::text::measure(&ed.text()[..s.start], &style).w;
-        let b = crate::text::measure(&ed.text()[..s.end], &style).w;
-        ctx.add(Node::Rect { rect: Rect::new(sx + PAD + a, ty, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
+    let lines = editor_lines(text);
+    let top = sy + editor_top(lines.len(), h);
+    let sel = ed.has_selection().then(|| ed.selection());
+    for (k, line) in lines.iter().enumerate() {
+        let ty = top + k as f32 * lh;
+        let x_of = |i: usize| crate::text::measure(&text[line.start..i.clamp(line.start, line.end)], &style).w;
+        if let Some(s) = sel.as_ref().filter(|s| s.start <= line.end && s.end >= line.start) {
+            let (a, b) = (x_of(s.start), x_of(s.end));
+            // A selection running on past the line's end shows a little of the break.
+            let b = if s.end > line.end { b + 4.0 } else { b };
+            ctx.add(Node::Rect { rect: Rect::new(sx + PAD + a, ty, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
+        }
+        let lw = x_of(line.end);
+        ctx.add(Node::Text { rect: Rect::new(sx + PAD, ty, lw, lh), content: text[line.clone()].to_string(), style: style.clone() });
+        if (line.start..=line.end).contains(&ed.caret()) && (k + 1 == lines.len() || ed.caret() < lines[k + 1].start) {
+            ctx.add(Node::Rect { rect: Rect::new(sx + PAD + x_of(ed.caret()), ty, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+        }
     }
-    let cx = crate::text::measure(&ed.text()[..ed.caret()], &style).w;
-    ctx.add(Node::Text { rect: Rect::new(sx + PAD, ty, tw, lh), content: ed.text().to_string(), style });
-    ctx.add(Node::Rect { rect: Rect::new(sx + PAD + cx, ty, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
-    ring(ctx, Rect::new(sx, sy, ew, h), t.accent_fg());
+    ring(ctx, Rect::new(sx, sy, ew, eh), t.accent_fg());
 }
 
 /// Cells `rr` × `cr` (inclusive): grid lines, contents and the merged areas
@@ -1760,7 +1814,7 @@ fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, 
                 CellAlign::Across => q((((x0 + x1) / 2.0 - w / 2.0).max(x0 + PAD)) as f64),
             };
             let lh = TEXT_SIZE * 1.3;
-            ctx.add(Node::Text { rect: Rect::new(tx0, y0 + q(((y1 - y0 - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
+            ctx.add(Node::Text { rect: Rect::new(tx0, y0 + line_top(cv.valign, y1 - y0, lh), w, lh), content: shown, style });
         }
     }
     if layer.is_some() {
@@ -1813,7 +1867,7 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         let lines = text_lines(cv, avail, &style);
         let room = (((ch - 2.0 * LINE_PAD) / lh).floor() as usize).max(1);
         let n = lines.len().min(room);
-        let top = if lines.len() <= room { cy + q(((ch - n as f32 * lh) / 2.0).max(0.0) as f64) } else { cy + LINE_PAD };
+        let top = if lines.len() <= room { cy + line_top(cv.valign, ch, n as f32 * lh) } else { cy + LINE_PAD };
         for (i, line) in lines.iter().take(n).enumerate() {
             let (shown, w) = fit_text(&CellView { text: line.clone(), ..cv.clone() }, avail, &style);
             let tx0 = match cv.align {
@@ -1831,7 +1885,17 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
-    ctx.add(Node::Text { rect: Rect::new(tx0, cy + q(((ch - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
+    ctx.add(Node::Text { rect: Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), content: shown, style });
+}
+
+/// How far down a cell `ch` px tall lines `th` px tall start, by `v`.
+fn line_top(v: CellVAlign, ch: f32, th: f32) -> f32 {
+    let y = match v {
+        CellVAlign::Top => LINE_PAD,
+        CellVAlign::Center => (ch - th) / 2.0,
+        CellVAlign::Bottom => ch - th - LINE_PAD,
+    };
+    q(y.clamp(0.0, (ch - th).max(0.0)) as f64)
 }
 
 fn q(v: f64) -> f32 {
@@ -2749,6 +2813,11 @@ mod tests {
         let lines = text_lines(&CellView { wrap: true, ..CellView::text(long) }, 60.0, &style);
         assert!(lines.len() > 2 && lines.iter().all(|l| crate::text::measure(l.trim_end(), &style).w <= 60.0), "{lines:?}");
         assert_eq!(lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" "), long);
+        // Lines sit at the top, middle or bottom of a taller cell.
+        assert_eq!(line_top(CellVAlign::Top, 60.0, 17.0), LINE_PAD);
+        assert_eq!(line_top(CellVAlign::Center, 60.0, 17.0), 21.5);
+        assert_eq!(line_top(CellVAlign::Bottom, 60.0, 17.0), 60.0 - 17.0 - LINE_PAD);
+        assert_eq!(line_top(CellVAlign::Bottom, 10.0, 17.0), 0.0);
         // A word too long breaks between letters.
         let lines = text_lines(&CellView { wrap: true, ..CellView::text("abcdefghijklmnopqrstuvwxyz") }, 30.0, &style);
         assert!(lines.len() > 1 && lines.concat().replace('-', "") == "abcdefghijklmnopqrstuvwxyz", "{lines:?}");
@@ -2817,7 +2886,7 @@ mod tests {
 
     #[test]
     fn a_press_in_the_editor_places_the_caret_and_a_drag_selects() {
-        let (mut app, _, _, state, log) = host(100, 20);
+        let (mut app, grid, _, state, log) = host(100, 20);
         app.tick();
         let hw = GridView::header_width(TILE_ROWS * 2);
         let b2 = Point::new(hw + 64.0 + 10.0, HEADER_H + 25.0);
@@ -2869,6 +2938,16 @@ mod tests {
         key(&mut app, Key::Enter, "", Modifiers { alt: true, ..Default::default() });
         key(&mut app, Key::Char, "x", Modifiers::default());
         assert_eq!(state.get_cloned().edit.unwrap().text(), "hello world\nx");
+        // The editor grows a line; a press on the second line lands there.
+        let g = state.get_cloned();
+        let r = editor_rect(&*grid, &g).unwrap();
+        assert!(r[3] > 20.0, "{r:?}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let second = Point::new(x_of("") + 1.0, HEADER_H + 20.0 + LINE_PAD + TEXT_SIZE * 1.3 + 3.0);
+        app.handle_event(Event::PointerDown { at: second });
+        app.handle_event(Event::PointerUp { at: second });
+        app.tick();
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.caret()), Some("hello world\n".len()));
         // A press on another cell still commits and moves there.
         let c5 = Point::new(hw + 128.0 + 10.0, HEADER_H + 85.0);
         app.handle_event(Event::PointerDown { at: c5 });

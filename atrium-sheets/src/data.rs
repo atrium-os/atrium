@@ -13,7 +13,12 @@ use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Legen
 use officina_grid::filter::{AutoFilter, Cond};
 use officina_grid::ops::GridOp;
 use officina_grid::sort::{sort_op, SortKey};
-use officina_grid::style::HAlign;
+use officina_grid::style::{HAlign, VAlign};
+
+/// The vertical alignment of the selection's first cell.
+fn v_at(wb: &Workbook, s: u16, sel: CellRange) -> VAlign {
+    wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).v_align
+}
 use officina_grid::tables::Table;
 use officina_grid::{Value, Workbook};
 use pergola::widgets::{CellRange, MenuItem};
@@ -101,6 +106,10 @@ pub enum DataCmd {
     /// Text in the selection broken onto lines to its column's width, or
     /// not.
     WrapText,
+    /// The selection's text at the top, middle or bottom of its cells.
+    AlignTop,
+    AlignMiddle,
+    AlignBottom,
     /// The merged areas the selection meets, back to separate cells.
     Unmerge,
     /// Write or change the cursor's cell comment; the window runs it (a bar
@@ -322,6 +331,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         },
         (MenuItem::new("Center Across Selection").checked(across_at(wb, s, sel)).enabled(nc > 1 || across_at(wb, s, sel)), Some(DataCmd::CenterAcross)),
         (MenuItem::new("Wrap Text").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).wrap), Some(DataCmd::WrapText)),
+        (MenuItem::new("Align Top").checked(v_at(wb, s, sel) == VAlign::Top), Some(DataCmd::AlignTop)),
+        (MenuItem::new("Align Middle").checked(v_at(wb, s, sel) == VAlign::Center), Some(DataCmd::AlignMiddle)),
+        (MenuItem::new("Align Bottom").checked(v_at(wb, s, sel) == VAlign::Bottom), Some(DataCmd::AlignBottom)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
@@ -626,6 +638,16 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let to = if off { HAlign::General } else { HAlign::CenterAcross };
             d.run("Center Across Selection", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { h_align: to, ..st.clone() })]);
             Ok(if off { "Text no longer centred across the selection.".into() } else { "Text centred across the selection.".into() })
+        }
+        DataCmd::AlignTop | DataCmd::AlignMiddle | DataCmd::AlignBottom => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let (to, word) = match cmd {
+                DataCmd::AlignTop => (VAlign::Top, "top"),
+                DataCmd::AlignMiddle => (VAlign::Center, "middle"),
+                _ => (VAlign::Bottom, "bottom"),
+            };
+            d.run("Vertical Alignment", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { v_align: to, ..st.clone() })]);
+            Ok(format!("Text at the {word} of its cells."))
         }
         DataCmd::WrapText => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -1113,6 +1135,10 @@ mod tests {
         assert!(menu(&d, sel, (0, 0)).iter().any(|(m, _)| m.label == "Wrap Text" && m.mark == pergola::widgets::Mark::Check(true)));
         run(&mut d, sel, (0, 0), DataCmd::WrapText);
         assert!(!d.wb.style(CellAddr { sheet: 0, row: 0, col: 0 }).wrap);
+        // Vertical alignment: bottom by default, as Excel; top when asked.
+        assert!(menu(&d, sel, (0, 0)).iter().any(|(m, _)| m.label == "Align Bottom" && m.mark == pergola::widgets::Mark::Check(true)));
+        run(&mut d, sel, (0, 0), DataCmd::AlignTop);
+        assert_eq!(d.wb.style(CellAddr { sheet: 0, row: 1, col: 1 }).v_align, VAlign::Top);
         // Hidden rows 3-4: a double-click on their line (row 3) shows both.
         run(&mut d, CellRange { r0: 2, c0: 0, r1: 3, c1: 0 }, (2, 0), DataCmd::HideRows);
         assert!(!unhide_rows_at(&mut d, 1));
