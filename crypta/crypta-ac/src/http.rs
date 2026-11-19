@@ -98,6 +98,9 @@ pub fn head(buf: &[u8]) -> Result<Option<(Head, usize)>, Error> {
     Ok(Some((Head { status: code, headers }, end + 4)))
 }
 
+/// The longest chunk-size line taken (size and extensions).
+const MAX_CHUNK_LINE: usize = 256;
+
 /// The body after `h`, if `buf` (what followed the head) holds all of it:
 /// the body and the bytes it took. A response with neither length nor
 /// chunking has none (we never read to close).
@@ -106,9 +109,14 @@ pub fn body(h: &Head, buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>, Error> {
         let mut out = Vec::new();
         let mut i = 0;
         loop {
+            // The size line, extensions included, at most MAX_CHUNK_LINE
+            // bytes: refused the same however the stream splits it.
             let Some(e) = buf[i..].windows(2).position(|w| w == b"\r\n") else {
-                return if buf.len() - i > 32 { Err(Error::Syntax("bad chunk size")) } else { Ok(None) };
+                return if buf.len() - i >= MAX_CHUNK_LINE + 2 { Err(Error::Syntax("bad chunk size")) } else { Ok(None) };
             };
+            if e > MAX_CHUNK_LINE {
+                return Err(Error::Syntax("bad chunk size"));
+            }
             let line = std::str::from_utf8(&buf[i..i + e]).map_err(|_| Error::Syntax("bad chunk size"))?;
             let hex = line.split(';').next().unwrap_or("").trim();
             if hex.is_empty() || hex.len() > 8 {
@@ -181,5 +189,20 @@ mod tests {
         let h = Head { status: 200, headers: vec![("transfer-encoding".into(), "chunked".into())] };
         assert!(body(&h, b"zz\r\n").is_err());
         assert!(body(&h, b"ffffffff\r\n").is_err());
+    }
+
+    #[test]
+    fn a_long_chunk_line_is_refused_however_it_arrives() {
+        // Found by the http fuzz target: a long extension was taken whole
+        // but refused when the stream split it.
+        let h = Head { status: 200, headers: vec![("transfer-encoding".into(), "chunked".into())] };
+        let line = format!("5;{}\r\nhello\r\n0\r\n\r\n", "x".repeat(MAX_CHUNK_LINE));
+        assert!(body(&h, line.as_bytes()).is_err());
+        assert!(body(&h, &line.as_bytes()[..MAX_CHUNK_LINE + 2]).is_err());
+        let ok = format!("5;{}\r\nhello\r\n0\r\n\r\n", "x".repeat(MAX_CHUNK_LINE - 2));
+        assert_eq!(body(&h, ok.as_bytes()).unwrap().unwrap().0, b"hello");
+        for k in 0..ok.len() {
+            assert!(matches!(body(&h, &ok.as_bytes()[..k]), Ok(None)), "{k}");
+        }
     }
 }
