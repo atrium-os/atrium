@@ -1541,7 +1541,7 @@ impl Sheets {
             use pergola::inline::Emphasis;
             let fw = (w - 444.0).clamp(88.0, 640.0);
             let cmds = self.cmds.clone();
-            TextField::new(self.comment_text.clone()).autofocus(true).at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
+            TextField::new(self.comment_text.clone()).key(0x5348_4e43).autofocus(true).at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
             let edit = self.comment_text.get_cloned();
             let mut x = 154.0 + fw;
             for (label, tip, mark) in [
@@ -4263,6 +4263,75 @@ mod tests {
         assert_eq!(source.doc.borrow().wb.value(0, 0, 0), Value::Empty);
         assert_eq!(source.doc.borrow().wb.formula_text(cell(4, 0)).as_deref(), Some("=5/4"));
         assert!(source.doc.borrow().clip.is_none());
+
+        // Include a comment-only cell past the data extent in a copied range.
+        use crate::tabs::TabCmd;
+        use officina_grid::comments::{Comment, CommentRun, CommentStyle};
+        let rich = Comment::with_runs("Amina", "écho\nmarked\ttext", [
+            CommentRun { start: 0, end: 5, style: CommentStyle::from_mask(3) },
+            CommentRun { start: 6, end: 12, style: CommentStyle::from_mask(12) },
+        ]);
+        let old = Comment::with_runs("Bo", "previous", [
+            CommentRun { start: 0, end: 8, style: CommentStyle::from_mask(1) },
+        ]);
+        source.doc.borrow_mut().wb.set_comments(0, vec![(6, 4, Some(rich.clone()))]);
+        target.doc.borrow_mut().wb.set_comments(0, vec![(8, 2, Some(old.clone()))]);
+        target.doc.borrow_mut().wb.set_value(cell(8, 2), Value::num(8.0));
+        let mut grid = source.grid.get_cloned();
+        grid.anchor = (5, 3);
+        grid.cursor = (6, 4);
+        source.grid.set(grid);
+        chord(&mut first, "c", Some([11; 16]));
+        let mut grid = target.grid.get_cloned();
+        grid.select(7, 1);
+        target.grid.set(grid);
+        chord(&mut second, "v", Some([12; 16]));
+        let note = || target.doc.borrow().wb.comment(0, 8, 2).cloned();
+        assert_eq!(note(), Some(rich.clone()));
+        assert_eq!(target.doc.borrow().wb.value(0, 8, 2), Value::Empty);
+        assert!(target.doc.borrow_mut().undo());
+        assert_eq!(note(), Some(old.clone()));
+        assert_eq!(target.doc.borrow().wb.value(0, 8, 2), Value::num(8.0));
+        assert!(target.doc.borrow_mut().redo());
+        assert_eq!(note(), Some(rich.clone()));
+        assert!(target.doc.borrow_mut().undo());
+
+        // Copy a text selection between the comment editors in two windows.
+        let mut grid = source.grid.get_cloned();
+        grid.select(6, 4);
+        source.grid.set(grid);
+        source.tab_cmd(TabCmd::Commenting);
+        first.tick();
+        chord(&mut first, "a", None);
+        assert_eq!(source.comment_text.get_cloned().selected_text(), rich.text.as_ref());
+        chord(&mut first, "c", Some([13; 16]));
+        let inline = offers.borrow().clone();
+        assert_eq!(inline.len(), 2);
+        assert_eq!(inline[0], ("text/plain".into(), rich.text.as_bytes().to_vec()));
+        let mut grid = target.grid.get_cloned();
+        grid.select(8, 2);
+        target.grid.set(grid);
+        target.tab_cmd(TabCmd::Commenting);
+        second.tick();
+        chord(&mut second, "a", None);
+        let mut invalid = inline.clone();
+        *invalid[1].1.last_mut().unwrap() = 0xff;
+        *offers.borrow_mut() = invalid;
+        chord(&mut second, "v", Some([14; 16]));
+        assert_eq!(target.comment_text.get_cloned().text(), old.text.as_ref());
+        *offers.borrow_mut() = inline;
+        chord(&mut second, "v", Some([15; 16]));
+        assert_eq!(crate::comment::save(&rich.author, &target.comment_text.get_cloned()), Some(rich.clone()));
+        chord(&mut second, "z", None);
+        assert_eq!(crate::comment::save(&old.author, &target.comment_text.get_cloned()), Some(old.clone()));
+        chord(&mut second, "y", None);
+        target.tab_cmd(TabCmd::CommentDone);
+        let saved = note().unwrap();
+        assert_eq!(saved.author, old.author);
+        assert_eq!(saved.text, rich.text);
+        assert_eq!(saved.runs(), rich.runs());
+        assert!(target.doc.borrow_mut().undo());
+        assert_eq!(note(), Some(old));
     }
 
     #[test]

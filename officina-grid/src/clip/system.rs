@@ -1,6 +1,5 @@
-//! The Sheets system clipboard payload contains only values and static cell
-//! styles. Formulas, links, comments and move semantics stay in the source
-//! document's local copy.
+//! The Sheets system clipboard payload contains values, static cell styles
+//! and comments. Formulas, links and move semantics stay in the local copy.
 
 use officina_core::wire::{Reader, WireError, Writer};
 
@@ -12,7 +11,8 @@ use crate::value::Value;
 
 /// The largest selection Sheets exports as one clipboard item.
 pub const MAX_SYSTEM_COPY_CELLS: u64 = 2_000_000;
-const VERSION: u8 = 1;
+const VALUES_AND_STYLES: u8 = 1;
+const WITH_COMMENTS: u8 = 2;
 
 impl Clip {
     /// A rectangular clipboard range from an external table. Missing cells
@@ -40,14 +40,14 @@ impl Clip {
         Some(Clip { from, cut: false, cells, styles, notes: Vec::new(), links: Vec::new() })
     }
 
-    /// Encode a copy as values and styles, with a per-copy ID that can match
+    /// Encode a copy as values, styles and comments, with a per-copy ID that can match
     /// the source document's local copy. Return none above the byte limit.
     pub fn encode_system(&self, id: &[u8; 16], max_bytes: usize) -> Option<Vec<u8>> {
         if self.from.cells() > MAX_SYSTEM_COPY_CELLS {
             return None;
         }
         let mut w = Writer::new();
-        w.u8(VERSION);
+        w.u8(if self.notes.is_empty() { VALUES_AND_STYLES } else { WITH_COMMENTS });
         w.bytes(id);
         w.var(self.rows() as u64);
         w.var(self.cols() as u64);
@@ -69,6 +69,15 @@ impl Clip {
             style.encode(&mut w);
             if w.buf.len() > max_bytes { return None; }
         }
+        if !self.notes.is_empty() {
+            w.var(self.notes.len() as u64);
+            for (row, col, comment) in &self.notes {
+                if comment.estimated_bytes() > max_bytes.saturating_sub(w.buf.len()) as u64 {
+                    return None;
+                }
+                crate::comments::encode_entry(&mut w, *row, *col, Some(comment));
+            }
+        }
         (w.buf.len() <= max_bytes).then(|| w.into_bytes())
     }
 
@@ -78,7 +87,8 @@ impl Clip {
             return Err(WireError::Invalid("clipboard size"));
         }
         let mut r = Reader::new(bytes);
-        if r.u8()? != VERSION || r.bytes("clipboard copy ID", 16)?.len() != 16 {
+        let version = r.u8()?;
+        if !matches!(version, VALUES_AND_STYLES | WITH_COMMENTS) || r.bytes("clipboard copy ID", 16)?.len() != 16 {
             return Err(WireError::Invalid("clipboard header"));
         }
         let rows = r.len("clipboard rows", MAX_ROWS as u64)? as u32;
@@ -109,11 +119,41 @@ impl Clip {
             }
             styles.push((col, first, last, Style::decode(&mut r)?));
         }
+        let mut notes = Vec::new();
+        if version == WITH_COMMENTS {
+            for (row, col, comment) in crate::comments::decode_in(&mut r, rows, cols, area.min(crate::comments::MAX_COMMENTS as u64))? {
+                let comment = comment.ok_or(WireError::Invalid("missing clipboard comment"))?;
+                if notes.last().is_some_and(|&(r, c, _)| (r, c) >= (row, col)) {
+                    return Err(WireError::Invalid("duplicate or unordered clipboard comments"));
+                }
+                notes.push((row, col, comment));
+            }
+        }
         if !r.is_empty() {
             return Err(WireError::Invalid("clipboard trailing data"));
         }
-        // The values and formats are position-independent and never cut.
+        // Clipboard contents are position-independent and never cut.
         let from = Rect { sheet: 0, r0: 0, c0: 0, r1: rows - 1, c1: cols - 1 };
-        Ok(Clip { from, cut: false, cells, styles, notes: Vec::new(), links: Vec::new() })
+        Ok(Clip { from, cut: false, cells, styles, notes, links: Vec::new() })
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comments::Comment;
+
+    #[test]
+    fn clipboard_rejects_comments_outside_the_range_or_repeated_at_one_cell() {
+        for notes in [
+            vec![(1, 0, Comment::new("A", "out of range"))],
+            vec![(0, 0, Comment::new("B", "one")), (0, 0, Comment::new("C", "two"))],
+        ] {
+            let mut clip = Clip::from_table(vec![vec![(Value::Empty, Style::default()); 2]]).unwrap();
+            clip.notes = notes;
+            let bytes = clip.encode_system(&[0; 16], 4096).unwrap();
+            assert!(Clip::decode_system(&bytes, 4096).is_err());
+        }
     }
 }

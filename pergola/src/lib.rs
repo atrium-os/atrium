@@ -34,6 +34,7 @@ pub mod geom;
 pub mod icon;
 pub mod input;
 pub mod inline;
+mod inline_clipboard;
 pub mod interaction;
 pub mod layout;
 pub mod node;

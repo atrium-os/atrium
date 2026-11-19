@@ -73,3 +73,49 @@ fn a_drop_is_taken_with_frescods_drop_token() {
     // Once.
     assert!(target.drop_get(drop, &["text/plain"]).is_err());
 }
+
+#[test]
+fn rich_text_field_round_trips_emphasis_through_tabula() {
+    use pergola::clipboard::set_backend;
+    use pergola::event::{Event, Key, KeyEventKind, Modifiers};
+    use pergola::text_edit::TextEdit;
+    use pergola::widgets::TextField;
+    use pergola::{App, Mutable};
+
+    let (_dir, path, fake) = server();
+    let me = unsafe { libc::getuid() };
+    let mut edit = TextEdit::rich("é\ntext", [(0..2, 3), (3..7, 12)]);
+    edit.select_all();
+    let expected: Vec<_> = edit.inline_runs().collect();
+    let source_text = Mutable::new(edit);
+    let mut source = App::new(TextField::new(source_text.clone()).autofocus(true));
+    let mut before = TextEdit::rich("original", [(0..8, 1)]);
+    before.select_all();
+    let target = Mutable::new(before);
+    let mut destination = App::new(TextField::new(target.clone()).autofocus(true));
+    let chord = |key: &str| Event::Key {
+        kind: KeyEventKind::Down, key: Key::Char, chars: key.into(),
+        modifiers: Modifiers { ctrl: true, ..Default::default() },
+    };
+    source.tick();
+    set_backend(Box::new(Tabula::at(&path).unwrap()));
+    source.handle_event_activated(chord("c"), Some(fake.mint(me, kind::KEY)));
+    destination.tick();
+    set_backend(Box::new(Tabula::at(&path).unwrap()));
+    destination.handle_event_activated(chord("v"), Some(fake.mint(me, kind::KEY)));
+    assert_eq!(target.get_cloned().text(), "é\ntext");
+    assert_eq!(target.get_cloned().inline_runs().collect::<Vec<_>>(), expected);
+    destination.handle_event(chord("z"));
+    assert_eq!(target.get_cloned().text(), "original");
+    assert_eq!(target.get_cloned().inline_runs().collect::<Vec<_>>(), vec![(0..8, 1)]);
+
+    let mut unstyled = TextEdit::rich("plain", []);
+    unstyled.select_all();
+    source_text.set(unstyled);
+    set_backend(Box::new(Tabula::at(&path).unwrap()));
+    source.handle_event_activated(chord("c"), Some(fake.mint(me, kind::KEY)));
+    set_backend(Box::new(Tabula::at(&path).unwrap()));
+    destination.handle_event_activated(chord("v"), Some(fake.mint(me, kind::KEY)));
+    assert_eq!(target.get_cloned().text(), "plain");
+    assert_eq!(target.get_cloned().inline_runs().collect::<Vec<_>>(), vec![(0..5, 0)]);
+}

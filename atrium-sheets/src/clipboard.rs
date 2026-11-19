@@ -1,5 +1,5 @@
 //! Sheets sends Tabula a native range with HTML and plain text alternatives.
-//! The native range contains typed values and styles. The source document can
+//! The native range contains typed values, styles and comments. The source document can
 //! match its own offer to use the original formulas and one-shot cut state.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};

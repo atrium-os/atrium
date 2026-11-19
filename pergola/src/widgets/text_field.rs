@@ -302,20 +302,21 @@ impl View for TextField {
             {
                 return;
             }
+            let inline = ((modifiers.ctrl || modifiers.meta) && *key == crate::event::Key::Char
+                && (chars.eq_ignore_ascii_case("c") || chars.eq_ignore_ascii_case("x")))
+                .then(|| crate::inline_clipboard::offer(&e)).flatten();
             match e.key(*key, *modifiers, chars) {
                 KeyOutcome::Changed => state.set(e),
                 KeyOutcome::Copy(t) => {
                     // Copy goes first: a cut that can't reach the clipboard
                     // keeps its text.
-                    if crate::clipboard::copy_text(&t, false).is_ok() {
+                    if crate::inline_clipboard::copy(&t, inline.as_deref()).is_ok() {
                         state.set(e);
                     }
                 }
                 KeyOutcome::Paste => {
-                    if let Ok(Some(t)) = crate::clipboard::paste_text() {
-                        if e.insert(&t) {
-                            state.set(e);
-                        }
+                    if crate::inline_clipboard::paste(&mut e, modifiers.shift) {
+                        state.set(e);
                     }
                 }
                 KeyOutcome::Submit => {

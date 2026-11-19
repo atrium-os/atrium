@@ -282,6 +282,43 @@ impl TextEdit {
         true
     }
 
+    pub(crate) fn selected_masks(&self) -> Option<&[u8]> {
+        self.marks.as_ref().filter(|_| self.is_rich()).map(|marks| &marks[self.selection()])
+    }
+
+    /// Replace the selection with portable inline emphasis in one undo step.
+    pub(crate) fn paste_inline(&mut self, text: &str, masks: &[u8]) -> bool {
+        if !self.is_rich() || text.is_empty() || masks.len() != text.len()
+            || text.char_indices().any(|(i, c)| {
+                let mask = masks[i];
+                mask > 15 || masks[i..i + c.len_utf8()].iter().any(|&m| m != mask)
+            })
+        {
+            return false;
+        }
+        let clean = self.clean(text);
+        if clean.is_empty() { return false; }
+        let mut kept_masks = Vec::new();
+        let masks = if clean == text {
+            masks
+        } else {
+            for (i, c) in text.char_indices() {
+                if self.accepts_char(c) {
+                    kept_masks.extend_from_slice(&masks[i..i + c.len_utf8()]);
+                }
+            }
+            &kept_masks
+        };
+        let range = self.selection();
+        self.checkpoint(Kind::Other);
+        self.replace(range.clone(), &clean, 0);
+        self.caret = range.start + clean.len();
+        self.anchor = self.caret;
+        self.marks.as_mut().unwrap()[range.start..self.caret].copy_from_slice(masks);
+        self.typing_marks = None;
+        true
+    }
+
     /// Insert a tracked token and an untracked suffix as one undo step.
     pub fn insert_tracked(&mut self, id: usize, token: &str, suffix: &str) -> bool {
         if self.secret { return false; }
@@ -487,8 +524,12 @@ impl TextEdit {
         }
     }
 
+    fn accepts_char(&self, c: char) -> bool {
+        !c.is_control() || (self.multiline && c == '\n') || (self.shows_line_markers() && matches!(c, '\n' | '\t'))
+    }
+
     fn clean(&self, s: &str) -> String {
-        s.chars().filter(|&c| !c.is_control() || (self.multiline && c == '\n') || (self.shows_line_markers() && matches!(c, '\n' | '\t'))).collect()
+        s.chars().filter(|&c| self.accepts_char(c)).collect()
     }
 
     fn cut_selection(&mut self) {

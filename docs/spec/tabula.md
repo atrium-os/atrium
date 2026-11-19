@@ -511,8 +511,12 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
 dispatched (`App::handle_event_activated` scopes it; outside a dispatch there is none and nothing
 is sent), over a `Backend` that is Tabula's socket in production (`TABULA_SOCKET`, else
 `/atrium/sockets/clipboard.sock`). `TextField`: Ctrl/Cmd chords are commands and are never typed
-(they used to append the letter); Ctrl-C/X copy or cut the whole field (no selection yet); Ctrl-V
-appends `text/plain` with control characters dropped; a `secret` field never copies or cuts.
+(they used to append the letter). Ctrl-C/X copy or cut the selection. Ctrl-V replaces the
+selection or inserts at the caret. A `secret` field never copies or cuts.
+Rich fields additionally offer `application/vnd.atrium.pergola.inline-text` alongside `text/plain`,
+up to 32 KiB of source text. Version 1 is a version byte, UTF-8 text, and one emphasis byte per
+UTF-8 byte. The decoder checks that emphasis is consistent over each character. Ctrl-Shift-V
+requests plain text. A rich paste writes text and emphasis in one editor undo step.
 `copy_formats` publishes alternative MIME representations in one SET. `paste_format` submits an
 ordered list of accepted types in one GET and Tabula returns the first available type. Fresco
 supplies and checks the gesture token. Tabula negotiates the MIME type and serves its bytes.
@@ -520,7 +524,7 @@ Tested in `text_field.rs` and against the real server code in `pergola/tests/cli
 `Window` passes the `activation` of fresco-client's key and button presses (04c295d) and of
 `Event::Drop`. Drops: fresco-client's `Drop` becomes `pergola::Event::Drop { at }`; the App
 hit-tests it to the nearest `Ctx::on_drop` node, whose handler calls `clipboard::drop_text`
-(`DROP_GET` with the drop token). `TextField` takes drops like pastes. Not built: starting a drag
+(`DROP_GET` with the drop token). `TextField` inserts drops as plain text. Not built: starting a drag
 from Pergola (`DRAG_BEGIN` + `Connection::drag_begin`), and a drop highlight on
 `DragEnter`/`DragLeave`.
 

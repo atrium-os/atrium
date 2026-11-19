@@ -210,39 +210,47 @@ pub type Comments = BTreeMap<(u32, u32), Comment>;
 pub fn encode(w: &mut Writer, set: &[(u32, u32, Option<Comment>)]) {
     w.var(set.len() as u64);
     for (r, c, k) in set {
-        w.var(*r as u64);
-        w.var(*c as u64);
-        match k {
-            Some(k) if !k.thread.is_empty() => {
-                let mentions = k.thread().iter().any(|m| !m.mentions.is_empty());
-                w.u8(if mentions { 4 } else { 3 });
-                encode_thread(w, k.thread(), mentions);
-            }
-            Some(k) => {
-                w.u8(if k.runs.is_empty() { 1 } else { 2 });
-                w.str(&k.author);
-                w.str(&k.text);
-                if !k.runs.is_empty() {
-                    w.var(k.runs.len() as u64);
-                    for run in k.runs() {
-                        w.var(run.start as u64);
-                        w.var(run.end as u64);
-                        w.u8(run.style.mask());
-                    }
+        encode_entry(w, *r, *c, k.as_ref());
+    }
+}
+
+pub(crate) fn encode_entry(w: &mut Writer, row: u32, col: u32, comment: Option<&Comment>) {
+    w.var(row as u64);
+    w.var(col as u64);
+    match comment {
+        Some(k) if !k.thread.is_empty() => {
+            let mentions = k.thread().iter().any(|m| !m.mentions.is_empty());
+            w.u8(if mentions { 4 } else { 3 });
+            encode_thread(w, k.thread(), mentions);
+        }
+        Some(k) => {
+            w.u8(if k.runs.is_empty() { 1 } else { 2 });
+            w.str(&k.author);
+            w.str(&k.text);
+            if !k.runs.is_empty() {
+                w.var(k.runs.len() as u64);
+                for run in k.runs() {
+                    w.var(run.start as u64);
+                    w.var(run.end as u64);
+                    w.u8(run.style.mask());
                 }
             }
-            None => w.u8(0),
         }
+        None => w.u8(0),
     }
 }
 
 /// Reads what [`encode`] wrote.
 pub fn decode(r: &mut Reader) -> Result<Vec<(u32, u32, Option<Comment>)>, WireError> {
-    let n = r.count("comments", MAX_COMMENTS as u64 * 2, 3)?;
+    decode_in(r, MAX_ROWS, MAX_COLS, MAX_COMMENTS as u64 * 2)
+}
+
+pub(crate) fn decode_in(r: &mut Reader, rows: u32, cols: u32, max: u64) -> Result<Vec<(u32, u32, Option<Comment>)>, WireError> {
+    let n = r.count("comments", max, 3)?;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         let (row, col) = (r.var()?, r.var()?);
-        if row >= MAX_ROWS as u64 || col >= MAX_COLS as u64 {
+        if row >= rows as u64 || col >= cols as u64 {
             return Err(WireError::Invalid("comment cell"));
         }
         let k = match r.u8()? {

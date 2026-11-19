@@ -101,6 +101,15 @@ impl Clip {
             used.c1 = used.c1.max(*col);
             used.r1 = used.r1.max(*last);
         }
+        let notes = wb.comments(rect.sheet).range((rect.r0, 0)..=(rect.r1, u32::MAX))
+            .filter(|&(&(r, c), _)| {
+                if c < rect.c0 || c > rect.c1 { return false; }
+                used.r1 = used.r1.max(r);
+                used.c1 = used.c1.max(c);
+                true
+            })
+            .map(|(&(r, c), k)| (r - rect.r0, c - rect.c0, k.clone()))
+            .collect();
         let snap = wb.snapshot(&used);
         let mut cells = Vec::new();
         for (r, c, v) in snap.values {
@@ -118,7 +127,6 @@ impl Clip {
         }
         let styles = formats.spans.into_iter().map(|(c, a, b, st)| (c - rect.c0, a - rect.r0, b - rect.r0, st)).collect();
         let inside = |&(r, c): &(u32, u32)| used.contains(CellAddr::new(rect.sheet, r, c));
-        let notes = wb.comments(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), k)| (r - rect.r0, c - rect.c0, k.clone())).collect();
         let links = wb.links(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), l)| (r - rect.r0, c - rect.c0, l.clone())).collect();
         Clip { from: used, cut, cells, styles, notes, links }
     }
