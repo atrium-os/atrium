@@ -22,6 +22,12 @@ use std::process::Command;
 pub const SLOTS: u32 = 16384;
 
 /// Host-end and app-end addresses of `slot`.
+/// The /30's network address.
+pub fn slot_net(slot: u32) -> String {
+    let base = slot * 4;
+    format!("100.64.{}.{}", base / 256, base % 256)
+}
+
 pub fn slot_addrs(slot: u32) -> (String, String) {
     let base = slot * 4;
     let (o3, o4) = (base / 256, base % 256);
@@ -74,15 +80,62 @@ pub fn isolation_loaded() -> Result<(), String> {
 }
 
 /// Create the epair and configure the host end. Returns (a, b).
-pub fn create_host_end(slot: u32) -> io::Result<(String, String)> {
+///
+/// With `fib`, the host end is in that routing table: ★ set BEFORE the
+/// address, so the /30's routes are made there (measured on 16-CURRENT:
+/// moving an addressed interface to another FIB left a dead route to the
+/// /30 in FIB 0 after the epair was destroyed, and the address could not be
+/// added again). Then a route to the /30 in FIB 0 as well, through the
+/// epair, so replies to the app (un-NATed on the egress or the tunnel, both
+/// in FIB 0) find their way back. Both go with the epair.
+pub fn create_host_end(slot: u32, fib: Option<u32>) -> io::Result<(String, String)> {
     let a = sh("ifconfig", &["epair", "create"])?.trim().to_string();
     let b = format!("{}b", a.strip_suffix('a').unwrap_or(&a));
     let (host, _) = slot_addrs(slot);
-    if let Err(e) = sh("ifconfig", &[&a, "inet", &format!("{host}/30"), "up", "group", "atrium"]) {
+    let made = (|| {
+        if let Some(f) = fib {
+            sh("ifconfig", &[&a, "fib", &f.to_string()])?;
+        }
+        sh("ifconfig", &[&a, "inet", &format!("{host}/30"), "up", "group", "atrium"])?;
+        if fib.is_some() {
+            let net = slot_net(slot);
+            sh("route", &["-q", "-n", "add", "-net", &format!("{net}/30"), "-iface", &a])?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = made {
         let _ = destroy(&a);
         return Err(e);
     }
     Ok((a, b))
+}
+
+/// The pf table of route domain `fib`'s app addresses: atrium-net's
+/// `atrium/vpn` redirects their DNS to the domain's tunnel (vpn.md §5.5).
+pub fn domain_table(fib: u32) -> String {
+    format!("atrium_fib_{fib}")
+}
+
+/// Put slot `slot`'s app address in its route domain's table. Returns the
+/// table, which [`release_grants`] empties of it again.
+pub fn join_domain(slot: u32, fib: u32) -> io::Result<String> {
+    let (_, app) = slot_addrs(slot);
+    let t = domain_table(fib);
+    sh("pfctl", &["-t", &t, "-T", "add", &app])?;
+    Ok(t)
+}
+
+/// Whether `fib` names a routing table a jail may be put in: 1..=MAX_FIB,
+/// and one the kernel has.
+pub fn valid_fib(fib: u32) -> Result<(), String> {
+    if fib == 0 || fib > crate::protocol::MAX_FIB {
+        return Err(format!("fib {fib} is not 1..={}", crate::protocol::MAX_FIB));
+    }
+    let have: u32 = sh("sysctl", &["-n", "net.fibs"]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1);
+    if fib >= have {
+        return Err(format!("fib {fib}: the kernel has {have} (atrium-net raises net.fibs)"));
+    }
+    Ok(())
 }
 
 /// Move `b` into the jail's vnet and configure the app end: the derived MAC,

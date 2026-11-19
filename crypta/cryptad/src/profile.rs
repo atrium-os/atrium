@@ -30,6 +30,10 @@ pub struct Profile {
     /// Block when not connected (§5.4). Default: on for a full tunnel.
     pub block: bool,
     pub insecure: bool,
+    /// Persona scope (vpn.md §5.3, §9.7): only the instances of personas
+    /// whose `vpn` names this profile use it, through its route domain;
+    /// the rest of the machine never sees it. Off: machine scope.
+    pub scoped: bool,
 }
 
 /// A profile name: what the user calls the tunnel, as a file name and an
@@ -104,6 +108,7 @@ impl Profile {
             mtu: c.mtu,
             block: full,
             insecure: false,
+            scoped: false,
         })
     }
 
@@ -125,6 +130,7 @@ impl Profile {
             gateway: *self.endpoint.ip(),
             port: self.endpoint.port(),
             block: self.block && full,
+            scoped: self.scoped,
         }
     }
 
@@ -137,6 +143,7 @@ impl Profile {
             .with("endpoint", self.endpoint)
             .with("block", self.block as u8)
             .with("insecure", self.insecure as u8)
+            .with("scoped", self.scoped as u8)
             .with("addr", join(&self.addrs.iter().map(|p| format!("{}/{}", p.addr, p.len)).collect::<Vec<_>>()));
         if let Some(i) = self.psk {
             p = p.with_hex("psk", &i);
@@ -205,6 +212,7 @@ impl Profile {
             mtu: l.num("mtu"),
             block: flag("block"),
             insecure: flag("insecure"),
+            scoped: flag("scoped"),
         })
     }
 

@@ -21,6 +21,7 @@ const SIOCGIFFLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 17, IFREQ);
 const SIOCDIFADDR: u64 = ioc(IOC_IN, b'i', 25, IFREQ);
 const SIOCAIFADDR: u64 = ioc(IOC_IN, b'i', 43, 68);
 const SIOCSIFMTU: u64 = ioc(IOC_IN, b'i', 52, IFREQ);
+const SIOCSIFFIB: u64 = ioc(IOC_IN, b'i', 93, IFREQ);
 const SIOCGIFMTU: u64 = ioc(IOC_IN | IOC_OUT, b'i', 51, IFREQ);
 const IFGROUPREQ: usize = 40;
 const SIOCAIFGROUP: u64 = ioc(IOC_IN, b'i', 135, IFGROUPREQ);
@@ -288,6 +289,18 @@ impl Ifc {
         Ok(i32::from_ne_bytes(r[16..20].try_into().unwrap()) as u32)
     }
 
+    /// Put interface `name` in routing table `fib`: its addresses' routes go
+    /// there, and what arrives on it is routed there (a persona's tunnel,
+    /// vpn.md §5.3). Before its addresses, or their routes stay in the old one.
+    pub fn set_fib(&self, name: &str, fib: u32) -> io::Result<()> {
+        let mut r = ifreq(name);
+        r[16..20].copy_from_slice(&fib.to_ne_bytes());
+        if unsafe { ioctl(self.s.as_raw_fd(), SIOCSIFFIB, r.as_mut_ptr()) } != 0 {
+            return err("SIOCSIFFIB");
+        }
+        Ok(())
+    }
+
     pub fn set_mtu(&self, name: &str, mtu: u16) -> io::Result<()> {
         let mut r = ifreq(name);
         r[16..20].copy_from_slice(&(mtu as i32).to_ne_bytes());
@@ -391,6 +404,21 @@ impl Rtsock {
         Ok(Rtsock { s: unsafe { OwnedFd::from_raw_fd(fd) }, seq: 0 })
     }
 
+    /// A routing socket whose changes go to routing table `fib`. Write-only
+    /// for us: what it would read (every table's messages) is the main
+    /// socket's business, so it never takes part in the poll.
+    pub fn new_in(fib: u32) -> io::Result<Rtsock> {
+        let r = Rtsock::new()?;
+        let f = fib as libc::c_int;
+        // SAFETY: an int option of the right size on our own socket.
+        if unsafe { libc::setsockopt(r.s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SETFIB, (&f as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t) } != 0 {
+            return err("SO_SETFIB");
+        }
+        // Never read: shut its receive side so its queue cannot fill.
+        unsafe { libc::shutdown(r.s.as_raw_fd(), libc::SHUT_RD) };
+        Ok(r)
+    }
+
     /// Add, change or delete an IPv4 route. `gw` unspecified means on-link
     /// through `ifaddr`.
     pub fn route(&mut self, op: u8, dst: Ipv4Addr, prefix: u8, gw: Ipv4Addr, ifaddr: Ipv4Addr) -> io::Result<()> {
@@ -409,6 +437,34 @@ impl Rtsock {
         m[2] = RTM_VERSION;
         m[3] = op;
         m[8..12].copy_from_slice(&flags.to_ne_bytes());
+        m[12..16].copy_from_slice(&(RTA_DST | RTA_GATEWAY | RTA_NETMASK).to_ne_bytes());
+        m[20..24].copy_from_slice(&self.seq.to_ne_bytes());
+        let n = unsafe { libc::write(self.s.as_raw_fd(), m.as_ptr().cast(), m.len()) };
+        if n != m.len() as isize {
+            return err(match op { RTM_ADD => "RTM_ADD", RTM_DELETE => "RTM_DELETE", _ => "RTM_CHANGE" });
+        }
+        Ok(())
+    }
+
+    /// A route to `dst/prefix` straight out interface `index` (an AF_LINK
+    /// gateway, as `route add -iface`): unlike an interface address, it
+    /// works in a routing table the interface is not in (vpn.md §5.3).
+    pub fn route_link(&mut self, op: u8, dst: Ipv4Addr, prefix: u8, index: u16) -> io::Result<()> {
+        self.seq += 1;
+        let mut m = vec![0u8; RT_MSGHDR];
+        m.extend_from_slice(&sin(dst));
+        // sockaddr_dl: len, AF_LINK (18), index; no name or address. 8-byte aligned.
+        let mut sdl = [0u8; 56];
+        sdl[0] = 54;
+        sdl[1] = 18;
+        sdl[2..4].copy_from_slice(&index.to_ne_bytes());
+        m.extend_from_slice(&sdl);
+        m.extend_from_slice(&sin(Ipv4Addr::from(net_proto::mask(prefix))));
+        let len = m.len() as u16;
+        m[0..2].copy_from_slice(&len.to_ne_bytes());
+        m[2] = RTM_VERSION;
+        m[3] = op;
+        m[8..12].copy_from_slice(&(RTF_UP | RTF_STATIC).to_ne_bytes());
         m[12..16].copy_from_slice(&(RTA_DST | RTA_GATEWAY | RTA_NETMASK).to_ne_bytes());
         m[20..24].copy_from_slice(&self.seq.to_ne_bytes());
         let n = unsafe { libc::write(self.s.as_raw_fd(), m.as_ptr().cast(), m.len()) };
@@ -743,6 +799,26 @@ pub fn sysctl_int(name: &str, v: i32) -> io::Result<()> {
     let r = unsafe { libc::sysctlbyname(n.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), (&v as *const i32).cast(), 4) };
     if r != 0 {
         return err(name);
+    }
+    Ok(())
+}
+
+/// Make sure the kernel has at least `n` routing tables (`net.fibs` can
+/// grow at run time on 16-CURRENT; vpn.md §5.3).
+pub fn raise_fibs(n: u32) -> io::Result<()> {
+    let name = std::ffi::CString::new("net.fibs").unwrap();
+    let mut have: u32 = 0;
+    let mut len = std::mem::size_of::<u32>();
+    // SAFETY: a u32 out-parameter of the right size.
+    if unsafe { libc::sysctlbyname(name.as_ptr(), (&mut have as *mut u32).cast(), &mut len, std::ptr::null(), 0) } != 0 {
+        return err("net.fibs");
+    }
+    if have >= n {
+        return Ok(());
+    }
+    // SAFETY: a u32 in-parameter of the right size.
+    if unsafe { libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), (&n as *const u32).cast(), std::mem::size_of::<u32>()) } != 0 {
+        return err("net.fibs (set)");
     }
     Ok(())
 }

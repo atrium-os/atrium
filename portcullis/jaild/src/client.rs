@@ -262,8 +262,17 @@ pub fn allocate_net(socket: &Path, jail_name: &str, mac: &str,
                     grants: Option<crate::protocol::NetGrants>)
     -> Result<(String, String, String), String>
 {
+    allocate_net_in(socket, jail_name, mac, grants, None)
+}
+
+/// [`allocate_net`] with the host end in routing table `fib` (a persona's
+/// route domain, vpn.md §5.3).
+pub fn allocate_net_in(socket: &Path, jail_name: &str, mac: &str,
+                       grants: Option<crate::protocol::NetGrants>, fib: Option<u32>)
+    -> Result<(String, String, String), String>
+{
     let mut c = Client::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    match c.send(&Request::AllocateNet { jail_name: jail_name.into(), mac: mac.into(), grants }) {
+    match c.send(&Request::AllocateNet { jail_name: jail_name.into(), mac: mac.into(), grants, fib }) {
         Ok((Response::NetAllocated { epair_b, app_addr, host_addr }, _)) => Ok((epair_b, app_addr, host_addr)),
         Ok((Response::PolicyDenied { rule, detail }, _)) => Err(format!("jaild refused ({rule}): {detail}")),
         Ok((other, _)) => Err(format!("jaild: unexpected reply {other:?}")),

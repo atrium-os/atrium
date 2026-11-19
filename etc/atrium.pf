@@ -22,6 +22,10 @@ set skip on lo0
 # up tunnel's nat (apps' traffic it carries leaves as the tunnel's address),
 # so it comes before the egress nat. Its filter rules ride on "atrium/*".
 nat-anchor "atrium/vpn"
+# A persona's tunnel (vpn.md §5.5): its apps' DNS, wherever they send it,
+# goes to the tunnel's servers (rdr pass, so the host block below never
+# sees it). The apps are in table <atrium_fib_N>, kept by jaild.
+rdr-anchor "atrium/vpn"
 nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)
 
 # An app never reaches the host itself — any of the host's addresses. First,
@@ -33,5 +37,9 @@ block in quick on atrium inet from any to (self)
 anchor "atrium/*"
 # Everything else from an app: denied — including other apps.
 block in quick on atrium
+# An app's own address never leaves by the egress: replies for a jail that
+# is gone (a VPN engine's, after down) would otherwise follow the default
+# route out un-NATed (vpn.md §5.4, seen in the V2 gate).
+block out quick on atrium_egress inet from any to 100.64.0.0/16
 
 pass all

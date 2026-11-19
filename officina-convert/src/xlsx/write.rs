@@ -243,6 +243,9 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             if px.is_some() {
                 o.extend_from_slice(br#" customWidth="1""#);
             }
+            if px.is_some_and(|w| w <= 0.0) {
+                o.extend_from_slice(br#" hidden="1""#);
+            }
             if id != 0 {
                 let _ = write!(o, r#" style="{id}""#);
             }

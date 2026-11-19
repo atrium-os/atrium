@@ -30,9 +30,8 @@
 //! rows and columns and their labels; presses there map to the unscrolled
 //! cells ([`Geom::content`]), and moving the cursor keeps it clear of them.
 //!
-//! Not yet: row resizing, auto-scroll while dragging a
-//! selection past the edge, Ctrl+arrow data edges beyond what the source
-//! says, and placing the caret by pointer in the editor.
+//! Not yet: Ctrl+arrow data edges beyond what the source says, and placing
+//! the caret by pointer in the editor.
 
 use std::rc::Rc;
 
@@ -64,6 +63,8 @@ pub const HEADER_H: f32 = 24.0;
 pub const RESIZE_GRIP: f32 = 4.0;
 /// The narrowest a column can be dragged.
 pub const MIN_COL_W: f64 = 12.0;
+/// The lowest a dragged row goes, px.
+pub const MIN_ROW_H: f64 = 6.0;
 /// Text inset from a cell's edges.
 const PAD: f32 = 4.0;
 const TEXT_SIZE: f32 = type_size::SM;
@@ -403,6 +404,8 @@ enum Drag {
     Cols,
     Rows,
     Resize { col: u32, x0: f32, w0: f64 },
+    /// A row's bottom edge dragged (in the row labels).
+    ResizeRow { row: u32, y0: f32, h0: f64 },
     /// A picked float pressed: moved (or sized from its corner) by the
     /// distance from where the press began, content px.
     Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
@@ -423,6 +426,12 @@ pub struct GridState {
     /// When the fill handle was last pressed: a second press soon after is
     /// a double-click.
     fill_press: Option<std::time::Instant>,
+    /// The column edge last pressed, and when: a second press soon after is
+    /// a double-click (fit the column).
+    edge_press: Option<(u32, std::time::Instant)>,
+    /// While a selection or the fill handle is dragged past the body's
+    /// edge: where the pointer is (window px). Each frame scrolls toward it.
+    edge: Option<crate::geom::Point>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -448,6 +457,13 @@ pub enum GridAction {
     Clear(CellRange),
     /// Column `col` dragged to `width` px.
     ResizeCol { col: u32, width: f64 },
+    /// Row `row` dragged to `height` px.
+    ResizeRow { row: u32, height: f64 },
+    /// A column or row resize let go: the sizes it left are final.
+    ResizeEnd,
+    /// A double-click on column `col`'s right edge: fit it to what it
+    /// holds (the app measures, with [`needed_width`]).
+    FitCol(u32),
     Undo,
     Redo,
     Copy(CellRange),
@@ -491,11 +507,47 @@ impl GridState {
     }
 }
 
+/// `at`, or past the hidden (zero-sized) rows or columns it is in, the way
+/// the cursor was going (`dr`, `dc`), to the next shown one; `from` (where
+/// it was) if there is none.
+fn past_hidden(src: &dyn GridSource, from: (u32, u32), at: (u32, u32), dr: i32, dc: i32) -> (u32, u32) {
+    let (r, c) = at;
+    if dr != 0 && src.row_top(r + 1) - src.row_top(r) <= 0.0 {
+        let y = src.row_top(r);
+        let to = if dr > 0 { src.row_at(y) } else if y > 0.0 { src.row_at(y - 0.5) } else { r };
+        let shown = src.row_top(to + 1) - src.row_top(to) > 0.0;
+        return if shown { (to, c) } else { from };
+    }
+    if dc != 0 && src.col_left(c + 1) - src.col_left(c) <= 0.0 {
+        let x = src.col_left(c);
+        let to = if dc > 0 { src.col_at(x) } else if x > 0.0 { src.col_at(x - 0.5) } else { c };
+        let shown = src.col_left(to + 1) - src.col_left(to) > 0.0;
+        return if shown { (r, to) } else { from };
+    }
+    at
+}
+
 /// How near the selection's corner a press takes the fill handle, px.
 const FILL_GRIP: f64 = 5.0;
 
 /// Two presses closer than this are a double-click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// How far `p` is past the body's edges, px: (right +, left -), (below +,
+/// above -); 0 inside.
+fn past_edge(geom: &Geom, p: crate::geom::Point) -> (f32, f32) {
+    let b = geom.body;
+    let o = |v: f32, lo: f32, hi: f32| if v < lo { v - lo } else if v > hi { v - hi } else { 0.0 };
+    (o(p.x, b.x(), b.x() + b.w()), o(p.y, b.y(), b.y() + b.h()))
+}
+
+/// The cell under `p`, or past the body's edge, the cell at that edge.
+fn cell_at_edge(src: &dyn GridSource, geom: &Geom, st: &ScrollState, p: crate::geom::Point) -> (u32, u32) {
+    let b = geom.body;
+    let q = crate::geom::Point::new(p.x.clamp(b.x(), (b.x() + b.w() - 1.0).max(b.x())), p.y.clamp(b.y(), (b.y() + b.h() - 1.0).max(b.y())));
+    let (cx, cy) = geom.content(st, q);
+    (src.row_at(cy.max(0.0)), src.col_at(cx.max(0.0)))
+}
 
 /// The fill handle dragged to `cell` from selection `sel`: `sel` grown down,
 /// up, right or left, whichever way `cell` is farther outside it.
@@ -686,9 +738,31 @@ impl GridView {
             s.set(st);
         });
         let s = self.scroll.clone();
+        let (fsrc, fgst) = (src.clone(), self.state.clone());
         ctx.on_frame(body_id, move |t, node| {
             let mut st = s.get();
-            let more = st.frame(t, node);
+            let mut more = st.frame(t, node);
+            // A drag held past the edge: scroll toward the pointer, and the
+            // selection (or fill) follows to the cell now at the edge.
+            let mut g = fgst.get_cloned();
+            if let Some(p) = g.edge.filter(|_| matches!(g.drag, Drag::Cells | Drag::Fill { .. })) {
+                let (ox, oy) = past_edge(&geom, p);
+                let speed = |o: f32| if o == 0.0 { 0.0 } else { o.signum() as f64 * (o.abs() as f64 * 0.5).clamp(4.0, 60.0) };
+                st.physics.set_max(geom.ext[1] - geom.body.h() as f64);
+                st.physics_x.set_max(geom.ext[0] - geom.body.w() as f64);
+                let (y0, x0) = (st.physics.y, st.physics_x.y);
+                st.physics.stop();
+                st.physics_x.stop();
+                st.physics.set_position((y0 + speed(oy)).clamp(0.0, (geom.ext[1] - geom.body.h() as f64).max(0.0)));
+                st.physics_x.set_position((x0 + speed(ox)).clamp(0.0, (geom.ext[0] - geom.body.w() as f64).max(0.0)));
+                let cell = cell_at_edge(&*fsrc, &geom, &st, p);
+                match g.drag {
+                    Drag::Fill { from, .. } => g.drag = Drag::Fill { to: fill_reach(grow_to_merges(&*fsrc, g.selection()), cell), from },
+                    _ => g.cursor = cell,
+                }
+                fgst.set(g);
+                more = true;
+            }
             if st != s.get() {
                 s.set(st);
             }
@@ -704,8 +778,10 @@ impl GridView {
                 if geom.rows == 0 || geom.cols == 0 {
                     return;
                 }
-                let cell = (src.row_at(cy.max(0.0)), src.col_at(cx.max(0.0)));
+                // Past the body's edge, the cell at the edge (the view scrolls on to it).
+                let cell = cell_at_edge(&*src, &geom, &st, p);
                 let mut g = gst.get_cloned();
+                g.edge = (phase == DragPhase::Move && matches!(g.drag, Drag::Cells | Drag::Fill { .. }) && past_edge(&geom, p) != (0.0, 0.0)).then_some(p);
                 // A movable float under the press (the topmost) is picked and dragged.
                 if let (Drag::Float { key, size, from, .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
                     let (dx, dy) = (cx - from.0, cy - from.1);
@@ -983,6 +1059,17 @@ impl GridView {
                         } else {
                             None
                         };
+                        let now = std::time::Instant::now();
+                        if let Some(k) = grip.filter(|k| g.edge_press.is_some_and(|(c, t)| c == *k && now.duration_since(t) < DOUBLE_CLICK)) {
+                            g.edge_press = None;
+                            g.drag = Drag::None;
+                            gst.set(g);
+                            if let Some(a) = &act {
+                                a(GridAction::FitCol(k));
+                            }
+                            return;
+                        }
+                        g.edge_press = grip.map(|k| (k, now));
                         match grip {
                             Some(k) => g.drag = Drag::Resize { col: k, x0: p.x, w0: src.col_left(k + 1) - src.col_left(k) },
                             None => {
@@ -999,6 +1086,14 @@ impl GridView {
                         return;
                     }
                     (DragPhase::Move, Drag::Cols) => g.cursor = (geom.rows - 1, c),
+                    (DragPhase::End, Drag::Resize { .. }) => {
+                        g.drag = Drag::None;
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeEnd);
+                        }
+                        return;
+                    }
                     (DragPhase::End, _) => g.drag = Drag::None,
                     _ => return,
                 }
@@ -1063,15 +1158,42 @@ impl GridView {
                 let (_, cy) = geom.content(&st, crate::geom::Point::new(geom.body.x() + geom.fz[0] as f32, p.y));
                 let row = src.row_at(cy.max(0.0));
                 let mut g = gst.get_cloned();
-                match phase {
-                    DragPhase::Start => {
+                match (phase, g.drag) {
+                    (DragPhase::Start, _) => {
                         commit(&mut g, &act);
-                        g.anchor = (row, 0);
-                        g.cursor = (row, geom.cols - 1);
-                        g.drag = Drag::Rows;
+                        // Near a row's bottom edge: resize that row.
+                        let grip = if (src.row_top(row + 1) - cy).abs() <= RESIZE_GRIP as f64 {
+                            Some(row)
+                        } else if row > 0 && (cy - src.row_top(row)).abs() <= RESIZE_GRIP as f64 {
+                            Some(src.row_at((src.row_top(row) - 0.5).max(0.0)))
+                        } else {
+                            None
+                        };
+                        match grip {
+                            Some(k) => g.drag = Drag::ResizeRow { row: k, y0: p.y, h0: src.row_top(k + 1) - src.row_top(k) },
+                            None => {
+                                g.anchor = (row, 0);
+                                g.cursor = (row, geom.cols - 1);
+                                g.drag = Drag::Rows;
+                            }
+                        }
                     }
-                    DragPhase::Move if g.drag == Drag::Rows => g.cursor = (row, geom.cols - 1),
-                    DragPhase::End => g.drag = Drag::None,
+                    (DragPhase::Move, Drag::ResizeRow { row, y0, h0 }) => {
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeRow { row, height: (h0 + (p.y - y0) as f64).max(MIN_ROW_H) });
+                        }
+                        return;
+                    }
+                    (DragPhase::Move, Drag::Rows) => g.cursor = (row, geom.cols - 1),
+                    (DragPhase::End, Drag::ResizeRow { .. }) => {
+                        g.drag = Drag::None;
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeEnd);
+                        }
+                        return;
+                    }
+                    (DragPhase::End, _) => g.drag = Drag::None,
                     _ => return,
                 }
                 gst.set(g);
@@ -1353,6 +1475,18 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
 
 /// Columns text may run over beside its cell, at most.
 pub const SPILL_COLS: u32 = 32;
+
+/// The width cell view `cv` needs to show whole, px: its widest line, its
+/// indent, an icon, and the cell's padding. For fitting a column.
+pub fn needed_width(cv: &CellView) -> f64 {
+    if cv.text.is_empty() {
+        return 0.0;
+    }
+    let st = cell_style(cv, &crate::theme::Semantic::LIGHT);
+    let w = cv.text.lines().map(|l| crate::text::measure(l, &st).w).fold(0.0f32, f32::max);
+    let icon = if cv.icon.is_some() { TEXT_SIZE + 4.0 } else { 0.0 };
+    (w + 2.0 * PAD + cv.indent as f32 * INDENT_STEP + icon + 2.0).ceil() as f64
+}
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
     TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) }
@@ -1722,7 +1856,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 Key::Left => (0, -1),
                 _ => (0, 1),
             };
-            Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { step(g.cursor, dr as i64, dc as i64) })
+            Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
         Key::PageUp => Some(step(g.cursor, -page(st), 0)),
         Key::PageDown => Some(step(g.cursor, page(st), 0)),
@@ -2027,6 +2161,35 @@ mod tests {
         key(&mut app, Key::Down, "", Modifiers { alt: true, ..Modifiers::default() });
         assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Choose { row: 2, col: 1 })));
         assert_eq!(state.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn arrows_step_over_hidden_columns() {
+        let (mut app, grid, _, state, _) = host(100, 10);
+        // C and D hidden (no width).
+        grid.widths.borrow_mut().insert(2, 0.0);
+        grid.widths.borrow_mut().insert(3, 0.0);
+        app.tick();
+        // A click on B1 gives the grid the keys.
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        app.handle_event(Event::PointerDown { at: Point::new(hw + 74.0, HEADER_H + 5.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(hw + 74.0, HEADER_H + 5.0) });
+        app.tick();
+        assert_eq!(state.get_cloned().cursor, (0, 1));
+        let none = Modifiers::default();
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 4));
+        key(&mut app, Key::Left, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 1));
+        // Hidden up to the last column: the cursor stays.
+        for c in 5..10 {
+            grid.widths.borrow_mut().insert(c, 0.0);
+        }
+        let mut g = state.get_cloned();
+        g.select(0, 4);
+        state.set(g);
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 4));
     }
 
     #[test]
@@ -2361,6 +2524,92 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(hw + 158.0 + 30.0, HEADER_H / 2.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 2, r1: 99, c1: 2 });
+    }
+
+    #[test]
+    fn a_row_label_s_edge_resizes_the_row() {
+        let (mut app, _, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        // Row 2's bottom edge (40 px into the rows), dragged 15 px down.
+        let edge = Point::new(hw / 2.0, HEADER_H + 40.0 - 1.0);
+        app.handle_event(Event::PointerDown { at: edge });
+        app.handle_event(Event::PointerMove { at: Point::new(edge.x, edge.y + 15.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, edge.y + 15.0) });
+        app.tick();
+        let got: Vec<_> = log.borrow().iter().filter(|a| matches!(a, GridAction::ResizeRow { .. } | GridAction::ResizeEnd)).cloned().collect();
+        assert_eq!(got, [GridAction::ResizeRow { row: 1, height: 35.0 }, GridAction::ResizeEnd]);
+        // Just below the edge, the next row's top: still row 2. Mid-label: selects.
+        log.borrow_mut().clear();
+        app.handle_event(Event::PointerDown { at: Point::new(edge.x, HEADER_H + 41.0) });
+        app.handle_event(Event::PointerMove { at: Point::new(edge.x, HEADER_H + 31.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 31.0) });
+        assert_eq!(log.borrow().first(), Some(&GridAction::ResizeRow { row: 1, height: MIN_ROW_H.max(10.0) }));
+        app.handle_event(Event::PointerDown { at: Point::new(edge.x, HEADER_H + 70.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 70.0) });
+        app.tick();
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 3, c0: 0, r1: 3, c1: 19 });
+    }
+
+    #[test]
+    fn a_double_click_on_a_column_edge_asks_to_fit_it() {
+        let (mut app, _, _, _, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let edge = Point::new(hw + 128.0 - 1.0, HEADER_H / 2.0);
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at: edge });
+            app.handle_event(Event::PointerUp { at: edge });
+            app.tick();
+        }
+        assert_eq!(log.borrow().last(), Some(&GridAction::FitCol(1)));
+        // Longer text needs more; an indent adds a step.
+        let a = needed_width(&CellView::text("abc"));
+        let b = needed_width(&CellView::text("abcdefghij"));
+        assert!(b > a && a > 2.0 * PAD as f64, "{a} {b}");
+        assert_eq!(needed_width(&CellView { indent: 1, ..CellView::text("abc") }), a + INDENT_STEP as f64);
+    }
+
+    #[test]
+    fn a_selection_held_past_the_edge_scrolls_on() {
+        let (mut app, _, scroll, state, _) = host(1000, 50);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let start = Point::new(hw + 10.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: start });
+        // Below the grid (it is 600 px high), held there.
+        let below = Point::new(hw + 10.0, 640.0);
+        app.handle_event(Event::PointerMove { at: below });
+        app.tick();
+        let first = state.get_cloned().cursor.0;
+        assert!(app.wants_frame());
+        for i in 0..20 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        let y = scroll.get().physics.y;
+        let row = state.get_cloned().cursor.0;
+        assert!(y > 300.0, "{y}");
+        assert!(row > first + 10, "{first} -> {row}");
+        // Above the grid: back up. Let go: it stops.
+        app.handle_event(Event::PointerMove { at: Point::new(hw + 10.0, 2.0) });
+        for i in 20..25 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        assert!(scroll.get().physics.y < y);
+        app.handle_event(Event::PointerUp { at: Point::new(hw + 10.0, 2.0) });
+        app.tick();
+        let y2 = scroll.get().physics.y;
+        for i in 25..30 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        assert_eq!(scroll.get().physics.y, y2);
+        assert_eq!(state.get_cloned().selection().c0, 0);
     }
 
     #[test]

@@ -66,7 +66,7 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>) -> R
         children_max: 0,
         mounts,
         devfs_ruleset: DEVFS_RULESET,
-        network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants) },
+        network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
         exec: Some(ExecSpec {
             path: EXEC_PATH.into(),
             argv: vec![EXEC_PATH.into()],

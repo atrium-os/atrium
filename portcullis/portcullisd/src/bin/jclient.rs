@@ -12,6 +12,13 @@
 //!     atrium-portcullisd-jclient <socket> create <name> <path> [<children_max>]
 //!     atrium-portcullisd-jclient <socket> remove <jid>
 //!     atrium-portcullisd-jclient <socket> exec <name> <path> <bin> [<arg>...]
+//!     atrium-portcullisd-jclient <socket> persona-net <jail> <mac> <person> <persona>
+//!     atrium-portcullisd-jclient <socket> release-net <jail>
+//!
+//! `persona-net` is the jail(8) lane's network as portcullisd launches it
+//! for a persona (vpn.md §5.3): the persona's route domain from the
+//! person's policy and atrium-net, then jaild's epair in that table.
+//! Prints `fib=N epair_b app_addr host_addr` (fib=0: the host's table).
 
 use std::process::ExitCode;
 
@@ -30,6 +37,8 @@ usage:
   atrium-portcullisd-jclient <socket> exec <name> <path> <bin> [<arg>...]
   atrium-portcullisd-jclient <socket> attach <jail> <source> <dest> <kind>
   atrium-portcullisd-jclient <socket> detach <jail> <dest> [force]
+  atrium-portcullisd-jclient <socket> persona-net <jail> <mac> <person> <persona>
+  atrium-portcullisd-jclient <socket> release-net <jail>
 
 kind = ro_nullfs | rw_nullfs | tmpfs
 ");
@@ -42,6 +51,23 @@ fn main() -> ExitCode {
     let socket_path = &args[0];
     let cmd         = &args[1];
     let rest        = &args[2..];
+
+    if cmd == "persona-net" {
+        if rest.len() < 4 { return usage(); }
+        let fib = match portcullisd::route_domain::for_persona(&rest[2], Some(rest[3].as_str())) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("route domain: {e}"); return ExitCode::FAILURE; }
+        };
+        return match jaild::client::allocate_net_in(std::path::Path::new(socket_path), &rest[0], &rest[1], None, fib) {
+            Ok((b, app, host)) => { println!("fib={} {b} {app} {host}", fib.unwrap_or(0)); ExitCode::SUCCESS }
+            Err(e) => { eprintln!("{e}"); ExitCode::FAILURE }
+        };
+    }
+    if cmd == "release-net" {
+        if rest.is_empty() { return usage(); }
+        jaild::client::release_net(std::path::Path::new(socket_path), &rest[0]);
+        return ExitCode::SUCCESS;
+    }
 
     let mut client = match Client::connect(socket_path) {
         Ok(c) => c,

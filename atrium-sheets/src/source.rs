@@ -574,6 +574,34 @@ impl SheetSource {
     }
 }
 
+impl SheetSource {
+    /// The width column `col` needs to show its widest entry whole, px
+    /// (shown rows; cells merged across columns left out; at most
+    /// [`FIT_CELLS`] cells read). `None`: nothing in it.
+    pub fn fit_width(&self, col: u32) -> Option<f64> {
+        let rows: Vec<u32> = {
+            let d = self.doc.borrow();
+            let (er, _) = d.wb.extent(d.sheet);
+            let mut rows = Vec::new();
+            if er > 0 {
+                d.wb.each(&officina_grid::Rect { sheet: d.sheet, r0: 0, c0: col, r1: er - 1, c1: col }, &mut |r, _, v| {
+                    if rows.len() < FIT_CELLS && !v.is_empty() {
+                        rows.push(r);
+                    }
+                });
+            }
+            let sh = d.wb.sheet(d.sheet);
+            rows.retain(|&r| !sh.row_hidden(r) && d.wb.merge_at(CellAddr::new(d.sheet, r, col)).is_none_or(|m| m.c0 == m.c1));
+            rows
+        };
+        let w = rows.into_iter().filter_map(|r| self.cell(r, col)).map(|cv| pergola::widgets::grid_view::needed_width(&cv)).fold(0.0, f64::max);
+        (w > 0.0).then_some(w.max(pergola::widgets::grid_view::MIN_COL_W))
+    }
+}
+
+/// The most cells one column fit reads.
+pub const FIT_CELLS: usize = 200_000;
+
 impl GridSource for SheetSource {
     fn fills(&self) -> bool {
         true
@@ -807,6 +835,17 @@ mod tests {
         assert!(styled_view(&t, d, &Value::Empty).is_none());
         assert_eq!(styled_view(&t, d, &Value::Num(46340.0)).unwrap().text, "2026-11-14");
         assert_eq!(styled_view(&t, d, &Value::Num(-1.0)).unwrap().text, "########");
+    }
+
+    #[test]
+    fn a_column_fits_its_widest_shown_entry() {
+        let s = src(&[(0, 0, "short"), (1, 0, "a much longer entry than that"), (2, 0, "x")]);
+        let wide = s.fit_width(0).unwrap();
+        assert!(wide > 64.0, "{wide}");
+        assert_eq!(s.fit_width(3), None);
+        // Hidden, the long one no longer counts.
+        s.doc.borrow_mut().wb.sheet_mut(0).hidden = vec![(1, 1)];
+        assert!(s.fit_width(0).unwrap() < wide);
     }
 
     fn src(cells: &[(u32, u32, &str)]) -> SheetSource {

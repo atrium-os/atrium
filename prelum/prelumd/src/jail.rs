@@ -156,7 +156,7 @@ impl Launcher for Jailed {
         };
         let mac = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(e.to_string()))?.mac;
         let err = io::stderr();
-        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants) }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None);
+        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants), fib: None }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None);
         drop(theirs);
         match r {
             Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),

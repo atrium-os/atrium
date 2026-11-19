@@ -296,7 +296,7 @@ pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
         return false;
     };
     let network_ok = match &req.network {
-        NetworkConfig::Routed { grants: Some(g), .. } => {
+        NetworkConfig::Routed { grants: Some(g), fib: None, .. } => {
             !g.outbound_any && g.no_resolver && g.peers.is_empty() && g.inbound.is_empty() && !g.outbound.is_empty()
                 && g.outbound.len() <= 8
                 && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && d.udp)
@@ -386,7 +386,21 @@ fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<
          * unicast — so a caller cannot hand a jail the real NIC's address
          * (portcullis.md §9.1c). pf being loaded is checked at create time,
          * not here: it is machine state, not request shape. */
-        NetworkConfig::Routed { mac, grants } => {
+        NetworkConfig::Routed { mac, grants, fib } => {
+            if fib.is_some_and(|f| f == 0 || f > crate::protocol::MAX_FIB) {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "network.routed.fib",
+                    detail: format!("fib {fib:?} is not 1..={}", crate::protocol::MAX_FIB),
+                });
+            }
+            // A tunnel engine's own packets must leave by the host's table:
+            // in a route domain they would be routed into its own tunnel.
+            if fib.is_some() && grants.as_ref().is_some_and(|g| g.tag.is_some()) {
+                return Err(JaildError::PolicyViolation {
+                    rule:   "network.routed.fib",
+                    detail: "a tagged (tunnel engine) jail stays in the host's routing table".into(),
+                });
+            }
             if !crate::routed::valid_mac(mac) {
                 return Err(JaildError::PolicyViolation {
                     rule:   "network.routed.mac",
@@ -1249,7 +1263,7 @@ mod tests {
             r.network = net;
             r
         };
-        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g) };
+        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g), fib: None };
         let render = worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62001, NetworkConfig::Disable);
         assert!(is_print_worker(&render, &p));
         validate_create(&render, &p).expect("a render worker");
@@ -1267,7 +1281,7 @@ mod tests {
         mlock.allow_mlock = true;
         for (r, why) in [
             (worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62001, routed(grants(printer()))), "render with a network"),
-            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None }), "ipp reaching anywhere"),
+            (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None, fib: None }), "ipp reaching anywhere"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(any)), "ipp with outbound_any"),
             (worker("system-prelum-62003", "/usr/local/bin/atrium-prelum-browse", 62003, routed(grants(printer()))), "browse with a network"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(dns)), "ipp with a resolver"),
@@ -1297,7 +1311,7 @@ mod tests {
             tag: tag.map(str::to_string),
         };
         let gw = || vec![NetDest { cidr: "198.51.100.51/32".into(), port: Some(51820), udp: true }];
-        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g) };
+        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g), fib: None };
         let engine = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
             let mut r = instance_req(name, &format!("/var/lib/atrium/jails/{name}"), exe, true);
             let e = r.exec.as_mut().unwrap();
@@ -1318,10 +1332,11 @@ mod tests {
             (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.51/32".into(), port: Some(443), udp: false }], Some("CRYPTA_OUTER")))), "tcp"),
             (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.0/24".into(), port: Some(51820), udp: true }], Some("CRYPTA_OUTER")))), "a subnet"),
             (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.51/32".into(), port: None, udp: true }], Some("CRYPTA_OUTER")))), "any port"),
-            (engine("system-crypta-61001", wg, 61001, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None }), "anywhere"),
+            (engine("system-crypta-61001", wg, 61001, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None, fib: None }), "anywhere"),
             (engine("system-crypta-61001", wg, 61002, routed(grants(gw(), Some("CRYPTA_OUTER")))), "uid not the name's"),
             (engine("system-crypta-60999", wg, 60999, routed(grants(gw(), Some("CRYPTA_OUTER")))), "below the range"),
             (engine("system-crypta-61001", "/usr/local/bin/atrium-svc", 61001, routed(grants(gw(), Some("CRYPTA_OUTER")))), "another binary"),
+            (engine("system-crypta-61001", wg, 61001, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(grants(gw(), Some("CRYPTA_OUTER"))), fib: Some(1) }), "in a route domain"),
             (mlock, "locked memory"),
         ] {
             assert!(!is_crypta_engine(&r, &p), "{why}");
@@ -1335,6 +1350,13 @@ mod tests {
             g.tag = None;
         }
         validate_create(&ipp, &p).expect("the same worker untagged");
+        // A route domain: 1..=MAX_FIB only.
+        for (f, ok) in [(Some(1), true), (Some(8), true), (Some(0), false), (Some(9), false), (None, true)] {
+            if let NetworkConfig::Routed { fib, .. } = &mut ipp.network {
+                *fib = f;
+            }
+            assert_eq!(validate_create(&ipp, &p).is_ok(), ok, "fib {f:?}");
+        }
     }
 
     /// Network share servers: exactly the policy's name, root, binary, uid

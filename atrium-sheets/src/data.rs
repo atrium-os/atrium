@@ -22,6 +22,13 @@ use crate::doc::Doc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataCmd {
+    /// The selection's rows hidden, or the hidden ones in it shown.
+    HideRows,
+    UnhideRows,
+    /// The selection's columns hidden (no width), or the hidden ones in it
+    /// shown at the default width.
+    HideCols,
+    UnhideCols,
     /// Paste Special: the cells last copied here, only their values (formula
     /// results), only formulas and values, or only formats.
     PasteValues,
@@ -235,6 +242,9 @@ fn links_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u32,
 /// fine; a whole sheet is not).
 const MAX_MERGE_CELLS: u64 = 1 << 24;
 
+/// The most columns one Hide Columns hides (Excel's sheet width).
+const MAX_HIDE_COLS: u32 = 16_384;
+
 /// The Data menu as it reads now, with the command of each item.
 /// The selection's top-left cell is centred across: the command then takes
 /// it off.
@@ -268,6 +278,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
+        (MenuItem::new(format!("Hide {}", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::HideRows)),
+        (MenuItem::new("Unhide Rows").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
+        (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
+        (MenuItem::new("Unhide Columns").enabled(wb.sheet(s).col_sizes.overrides().iter().any(|&(c, w)| w <= 0.0 && (sel.c0..=sel.c1).contains(&c))), Some(DataCmd::UnhideCols)),
         (MenuItem::new(if wb.comment(s, row, col).is_some() { "Edit Comment…" } else { "New Comment…" }).separated(), Some(DataCmd::Comment)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
@@ -448,6 +462,54 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
     match cmd {
+        DataCmd::HideRows | DataCmd::UnhideRows => {
+            let mut st = d.wb.filter_state(s);
+            let had: u64 = st.hidden.iter().map(|(a, b)| (b - a + 1) as u64).sum();
+            if cmd == DataCmd::HideRows {
+                st.hidden.push((sel.r0, sel.r1));
+            } else {
+                st.hidden = st.hidden.iter().flat_map(|&(a, b)| {
+                    let mut keep = Vec::new();
+                    if a < sel.r0 {
+                        keep.push((a, b.min(sel.r0 - 1)));
+                    }
+                    if b > sel.r1 {
+                        keep.push((a.max(sel.r1 + 1), b));
+                    }
+                    if b < sel.r0 || a > sel.r1 {
+                        keep = vec![(a, b)];
+                    }
+                    keep
+                }).collect();
+            }
+            st.hidden = officina_grid::filter::merge(st.hidden);
+            let now: u64 = st.hidden.iter().map(|(a, b)| (b - a + 1) as u64).sum();
+            if now == had {
+                return Err(if cmd == DataCmd::HideRows { "Those rows are hidden already.".into() } else { "No hidden rows there. Select the rows around them.".into() });
+            }
+            d.run(if cmd == DataCmd::HideRows { "Hide Rows" } else { "Unhide Rows" }, vec![GridOp::Filter(st)]);
+            let n = now.abs_diff(had);
+            Ok(if cmd == DataCmd::HideRows { format!("{n} rows hidden.") } else { format!("{n} rows shown.") })
+        }
+        DataCmd::HideCols | DataCmd::UnhideCols => {
+            if cmd == DataCmd::HideCols && sel.c1 - sel.c0 + 1 > MAX_HIDE_COLS {
+                return Err(format!("Hide at most {MAX_HIDE_COLS} columns at once."));
+            }
+            let old = d.wb.sheet(s).col_sizes.overrides().to_vec();
+            let inside = |c: u32| (sel.c0..=sel.c1).contains(&c);
+            let mut over: Vec<(u32, f64)> = old.iter().copied().filter(|&(c, w)| !inside(c) || (cmd == DataCmd::UnhideCols && w > 0.0)).collect();
+            if cmd == DataCmd::HideCols {
+                over.extend((sel.c0..=sel.c1).map(|c| (c, 0.0)));
+                over.sort_by_key(|o| o.0);
+            }
+            if over == old {
+                return Err(if cmd == DataCmd::HideCols { "Those columns are hidden already.".into() } else { "No hidden columns there. Select the columns around them.".into() });
+            }
+            let hidden = |v: &[(u32, f64)]| v.iter().filter(|o| o.1 <= 0.0).count();
+            let n = hidden(&over).abs_diff(hidden(&old));
+            d.run(if cmd == DataCmd::HideCols { "Hide Columns" } else { "Unhide Columns" }, vec![GridOp::Sizes { sheet: s, rows: false, over }]);
+            Ok(if cmd == DataCmd::HideCols { format!("{n} columns hidden.") } else { format!("{n} columns shown.") })
+        }
         DataCmd::PasteValues | DataCmd::PasteFormulas | DataCmd::PasteFormats | DataCmd::PasteTransposed => {
             use officina_grid::clip::What;
             let (what, turn, label) = match cmd {
@@ -884,6 +946,30 @@ mod tests {
         // After a cut: not offered.
         d.take_clip(r, true, String::new());
         assert!(!item(&d));
+    }
+
+    #[test]
+    fn rows_and_columns_are_hidden_and_shown_again() {
+        let mut d = doc();
+        run(&mut d, CellRange { r0: 2, c0: 0, r1: 3, c1: 0 }, (2, 0), DataCmd::HideRows);
+        assert_eq!(d.status, "2 rows hidden.");
+        assert!(d.wb.sheet(0).row_hidden(2) && d.wb.sheet(0).row_hidden(3) && !d.wb.sheet(0).row_hidden(4));
+        // Unhide over the rows around them.
+        let around = CellRange { r0: 1, c0: 0, r1: 4, c1: 0 };
+        assert!(menu(&d, around, (1, 0)).iter().any(|(m, _)| m.label == "Unhide Rows" && m.enabled));
+        run(&mut d, around, (1, 0), DataCmd::UnhideRows);
+        assert_eq!(d.status, "2 rows shown.");
+        assert!(d.wb.sheet(0).hidden.is_empty());
+        run(&mut d, CellRange { r0: 0, c0: 1, r1: 0, c1: 2 }, (0, 1), DataCmd::HideCols);
+        assert_eq!(d.status, "2 columns hidden.");
+        assert_eq!(d.wb.sheet(0).col_sizes.size(1), 0.0);
+        run(&mut d, CellRange { r0: 0, c0: 0, r1: 0, c1: 3 }, (0, 0), DataCmd::UnhideCols);
+        assert_eq!(d.status, "2 columns shown.");
+        assert!(d.wb.sheet(0).col_sizes.size(2) > 0.0);
+        assert!(d.undo());
+        assert_eq!(d.wb.sheet(0).col_sizes.size(2), 0.0);
+        run(&mut d, one(0, 5), (0, 5), DataCmd::UnhideCols);
+        assert!(d.status.starts_with("No hidden columns"), "{}", d.status);
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub use portcullis_trust as manifest_trust;
 /// Rate and concurrency limits for the one-shot jail path — the first daemon
 /// verb a program calls in a loop rather than a person clicking something.
 pub mod ratelimit;
+/// A persona's route domain (vpn.md §5.4).
+pub mod route_domain;
 pub mod supervisor;
 pub mod system_services;
 pub mod volumes_client;

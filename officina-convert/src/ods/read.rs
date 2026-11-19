@@ -907,13 +907,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:table-column" => {
                         let a = attrs(e);
                         let n = a.get("table:number-columns-repeated").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).clamp(1, MAX_COLS as u64);
-                        if let Some(w) = a.get("table:style-name").and_then(|s| styles.col_width.get(s)) {
+                        let shown = a.get("table:visibility").is_none_or(|v| v == "visible");
+                        if let Some(w) = a.get("table:style-name").and_then(|s| styles.col_width.get(s)).filter(|_| shown) {
                             for c in col_x..(col_x + n).min(MAX_COLS as u64).min(col_x + 4096) {
                                 widths.push((c as u32, w.round().max(2.0)));
                             }
                         }
-                        if a.get("table:visibility").is_some_and(|v| v != "visible") {
-                            rep.note(Kind::Approximate, "hidden columns shown");
+                        // Hidden columns: no width, as Sheets hides them.
+                        if !shown {
+                            for c in col_x..(col_x + n).min(MAX_COLS as u64).min(col_x + 4096) {
+                                widths.push((c as u32, 0.0));
+                            }
                         }
                         col_defaults.push((col_x, col_x + n - 1, a.get("table:default-cell-style-name").cloned()));
                         col_x += n;

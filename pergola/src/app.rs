@@ -575,6 +575,10 @@ impl<V: View> App<V> {
                     if let Some(cb) = self.interactions.get(d).and_then(|h| h.on_drag.as_ref()) {
                         cb(crate::interaction::DragPhase::Move, self.drag_point(d, *at));
                     }
+                    // A drag may need frames (a grid scrolling while a
+                    // selection is held past its edge); handlers that
+                    // don't say so, and frames stop.
+                    self.animating = true;
                 }
                 // Hover target = nearest interactive ancestor (clickable
                 // or focusable) under the pointer.

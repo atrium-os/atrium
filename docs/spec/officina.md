@@ -3769,6 +3769,31 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** names, conditional formats, charts and validation rules following moved cells; formulas that read the cells a move overwrites becoming `#REF!` (Excel's do); pasting a clip into a larger selection as tiles, transposing formulas' references, Paste Special's arithmetic (add, multiply) and skip-blanks, and rich formats on the system clipboard for other apps.
 - **Gates:** officina-grid `clip::tests` (5); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`, `paste_special_is_offered_after_a_copy_and_pastes_values`.
 
+### 16.89 Hiding rows and columns by hand (2026-11-19)
+
+- **Sheets** (Data menu): Hide Rows and Hide Columns hide the selection's; Unhide Rows and Unhide Columns show the hidden ones inside the selection (select the rows or columns around them, as in Excel). Each is one undo step, and the status line counts what changed.
+  - Rows join the sheet's hidden ranges (`Sheet.hidden`, which the filter shares: rows hidden by hand outside a filter's range stay hidden when it filters again; inside it, filtering decides).
+  - Columns get no width; shown again, they take the default width. At most 16,384 at once.
+- **Grid** (pergola `past_hidden`): arrow keys step over hidden rows and columns (filtered ones too) to the next shown one, or stay put if none.
+- **Files:** .xlsx columns with no width are written `hidden="1"` and read back hidden (they used to show 2 px wide, with a note); .ods columns get `table:visibility="collapse"` and are read back hidden. Hidden rows were kept already. LibreOffice keeps both ways (`officina-convert/tests/hidden.rs`).
+- **Not yet:** remembering a hidden column's width for when it is shown, the double line Excel draws where rows or columns are hidden, and Home/Page keys skipping hidden ones.
+- **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
+
+### 16.90 Row heights by dragging, and sizes undone in one step (2026-11-19)
+
+- **Grid** (pergola): a press within 4 px of a row label's bottom edge drags that row's height (at least 6 px), as a column label's right edge drags its width; elsewhere on the label it still selects the row. It sends `GridAction::ResizeRow` while dragging and `GridAction::ResizeEnd` when let go (for columns too).
+- **Sheets:** the drag shows live (`Doc::size_preview`, not journaled), and letting go makes it one undoable `GridOp::Sizes` ("Row Height" or "Column Width", `Doc::size_done`). Column widths used to change without undo.
+- **Fit a column** (2026-11-19): a double-click on a column label's right edge sends `GridAction::FitCol`; Sheets sets the column to its widest shown entry (`SheetSource::fit_width`: shown rows, cells not merged across columns, at most 200,000 cells read; pergola `needed_width` measures a cell view's widest line with its indent, icon and padding), as one undo step. An empty column is left alone.
+- **Several at once** (2026-11-19): with whole columns (or rows) selected, dragging or double-clicking the edge of one of them sizes all of them (each fitted to its own entries on a double-click), as one undo step; up to 16,384 at once (`app::sized_span`).
+- **Not yet:** fitting rows to wrapped text, and a Row Height… / Column Width… box for exact numbers.
+- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`, `an_edge_of_selected_whole_columns_sizes_them_all`.
+
+### 16.91 The grid scrolls on while a selection is dragged past its edge (2026-11-19)
+
+- **Grid** (pergola): a selection or the fill handle dragged past the cells' edge takes the cell at that edge, and while the pointer stays out there each frame scrolls toward it (faster the farther out, 4 to 60 px a frame), the selection following. Before, a drag above the view jumped to row 1. `GridState.edge`, `past_edge`, `cell_at_edge`.
+- **pergola App:** a drag's move now asks for frames, so `on_frame` handlers can animate while a press is held still; handlers that don't need them stop the frames as before.
+- **Gate:** pergola `a_selection_held_past_the_edge_scrolls_on`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
