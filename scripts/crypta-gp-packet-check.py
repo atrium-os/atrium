@@ -83,9 +83,11 @@ def require_reconnect_approval(receipts, config_index):
 
 
 class EspPeer:
-    def __init__(self, socket, drop, reconnect_approval=None):
+    def __init__(self, socket, drop, reconnect_approval=None, drop_after_initial=False):
         self.socket = socket
         self.drop = drop
+        self.drop_after_initial = drop_after_initial
+        self.dropped_probe_spis = set()
         self.reconnect_approval = reconnect_approval
         self.configs = []
         self.errors = []
@@ -149,6 +151,10 @@ class EspPeer:
                 probe = packet[offset + 8:].startswith(b"monitor\0\0pan ha ")
                 if probe:
                     self.probes += 1
+                if self.drop_after_initial and pair != self.configs[0]:
+                    assert probe, "ESP carried data on an association that should fall back"
+                    self.dropped_probe_spis.add(spi_in)
+                    continue
                 if self.drop:
                     continue
                 reply = echo_reply(packet)
@@ -402,8 +408,12 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
+    parser.add_argument("--drop-esp-after-initial", action="store_true",
+                        help="use ESP initially and force TLS fallback on later Tessera connections")
     parser.add_argument("--hip", choices=("approve", "decline", *REFRESH_HIP), help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
+    if args.drop_esp_after_initial and (args.hip != "tessera-cycle" or args.drop_esp):
+        parser.error("--drop-esp-after-initial requires --hip tessera-cycle")
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
@@ -429,11 +439,11 @@ def main():
         reconnect_approval = receipts.with_suffix(".approved") if args.hip in RECONNECT_HIP else None
         with ExitStack() as stack:
             esp = None
-            if args.esp or args.drop_esp:
+            if args.esp or args.drop_esp or args.drop_esp_after_initial:
                 udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 udp.bind(("127.0.0.1", 4501))
                 udp.settimeout(300)
-                esp = EspPeer(udp, args.drop_esp, reconnect_approval)
+                esp = EspPeer(udp, args.drop_esp, reconnect_approval, args.drop_esp_after_initial)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
@@ -553,16 +563,23 @@ def main():
                     assert runs[2][0] == runs[4][0], reports
                 rebound_echoes = 1 if declined_relock or second_reconnect else 2
                 second_rebind_echoes = 1 if declined_final_lock else 2
+                fallback = args.drop_esp_after_initial
                 if esp:
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == config_count, calls
                     original, _, reconnected, rebound, *rest = (config[0][0] for config in esp.configs)
                     echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest[:1] * 3 + rest[1:2] * second_rebind_echoes + rest[2:3] * 3 + rest[3:]
-                    assert esp.received_spis == set(echo_spis) and esp.echo == echo_spis, esp.echo
-                    assert "ssl-tunnel-connect.sslvpn" not in calls, calls
-                else:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - 1, calls
-                    assert calls.count("echo") == 5 + rebound_echoes + (3 + second_rebind_echoes if second_reconnect else 0) + (4 if final_reconnect else 0), calls
+                    assert esp.received_spis == set(echo_spis), esp.received_spis
+                    if fallback:
+                        assert esp.echo == [original, original], esp.echo
+                        assert esp.dropped_probe_spis == set(echo_spis) - {original}, esp.dropped_probe_spis
+                    else:
+                        assert esp.echo == echo_spis, esp.echo
+                        assert "ssl-tunnel-connect.sslvpn" not in calls, calls
+                if not esp or fallback:
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - (2 if fallback else 1), calls
+                    echoes = 5 + rebound_echoes + (3 + second_rebind_echoes if second_reconnect else 0) + (4 if final_reconnect else 0)
+                    assert calls.count("echo") == echoes - (2 if fallback else 0), calls
                     if final_reconnect:
                         for phase, echoes in ((third_calls, 3), (last_rebind_calls, 1)):
                             assert phase[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
@@ -575,6 +592,8 @@ def main():
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                     assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == rebound_echoes, calls
                 if final_reconnect:
+                    if fallback:
+                        print("ESP carried the initial traffic, then dropped probes forced TLS on every reconnect and rebind")
                     print("Final reconnect verified decline, silent refresh, fresh unlock approval, and rebind")
                 elif declined_final_lock:
                     print("Declining the final lock closed the second rebound tunnel without sending the changed count")

@@ -875,6 +875,11 @@ another origin. An active portal-profile session stays in engine memory.
   requires a HIP submission for the newly offered ESP association before
   accepting its first packet.
   The batched arm64 gate passed 42/42 on TLS and 42/42 with `--esp`.
+  With `--hip tessera-cycle --drop-esp-after-initial`, the fixture carries
+  initial IPv4 echo over ESP and drops authenticated probes on each later
+  connection. It checks that each reconnect and rebind falls back to TLS
+  while unchanged reports refresh without prompting and changed reports
+  wait for fresh approval. The mixed arm64 gate passed 42/42 in one run.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
