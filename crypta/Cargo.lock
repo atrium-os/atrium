@@ -351,6 +351,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypta-gp"
+version = "0.1.0"
+
+[[package]]
 name = "crypta-proto"
 version = "0.1.0"
 dependencies = [
