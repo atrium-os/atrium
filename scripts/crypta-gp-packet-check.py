@@ -485,20 +485,26 @@ def main():
                 assert calls[configs[1]:configs[2]] == exchange, calls
                 final_calls = calls[configs[2]:]
                 assert final_calls[:3] == [*exchange, "hipreport.esp"] and final_calls[-1] == "logout.esp", calls
-                counts = [line.split()[0] for line in receipts.read_text().splitlines()]
-                transitions = [count for i, count in enumerate(counts) if i == 0 or count != counts[i - 1]]
-                assert transitions == ["0", "1", "0"], counts
+                reports = [line.split() for line in receipts.read_text().splitlines()]
+                runs = []
+                for report in reports:
+                    if not runs or runs[-1][0] != report:
+                        runs.append([])
+                    runs[-1].append(report)
+                assert [run[0][0] for run in runs] == ["0", "1", "0", "1"], reports
+                assert len(runs[2]) >= 2 and runs[1][0] == runs[3][0], reports
                 if esp:
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == 3, calls
                     original, _, reconnected = (config[0][0] for config in esp.configs)
                     assert esp.received_spis == {original, reconnected}, esp.received_spis
-                    assert esp.echo == [original, original, reconnected], esp.echo
+                    assert esp.echo == [original, original] + [reconnected] * 3, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == 2 and calls.count("echo") == 3, calls
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == 2 and calls.count("echo") == 5, calls
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                print("Fresh approval preceded the changed HIP report and traffic on the explicit reconnect")
+                    assert final_calls.count("echo") == 3, calls
+                print("Unchanged HIP refreshed and unlock required approval on the reconnected tunnel")
                 return
             if args.hip == "tessera-rebind-decline":
                 assert calls.count("login.esp") == 1 and calls.count("getconfig.esp") == 2, calls

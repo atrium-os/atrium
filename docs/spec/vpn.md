@@ -830,10 +830,13 @@ another origin. An active portal-profile session stays in engine memory.
   packet on the newly offered association. The arm64 decline gate passed
   13/13 on TLS and 13/13 with `--esp`.
   The `--hip tessera-reconnect` variant starts the profile again after
-  declining the rebound review. It rejects the declined approval choice,
-  verifies the route and changed report wait for the new approval, and
-  checks IPv4 echo on the newly opened TLS connection or ESP association.
-  The arm64 reconnect gate passed 16/16 on TLS and 16/16 with `--esp`.
+  declining the rebound review. It rejects the declined approval choice
+  and verifies the route and changed report wait for the new approval.
+  After reconnect, the timer must submit an identical locked-key report
+  without prompting. Reloading the domain key then requires fresh approval
+  before the unlocked count goes to the gateway. IPv4 echo uses the same
+  reconnected TLS connection or ESP association through both refreshes.
+  The arm64 reconnect gate passed 20/20 on TLS and 20/20 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

@@ -436,9 +436,21 @@ if [ -n "$tessera_fact" ]; then
         if [ "$hip" = tessera-reconnect ]; then
             "$V" "route -n get 10.77.0.1 | grep -Eq 'interface: $reconnect_iface$'" ||
                 fail "approved reconnect did not install its tunnel route"
-            "$V" "$CTL down name=gp-gate" >/dev/null
-            echo "$pass checks passed"
-            exit 0
+            first_locked=$(awk -v offset="$receipt_offset" 'NR > offset && $1 == 0 { print NR; exit }' "$receipts")
+            [ -n "$first_locked" ] || fail "expected an approved locked-key report"
+            second_locked=$((first_locked + 1))
+            for _ in $(seq 1 20); do
+                [ "$(field signin)" = in ] || fail "unchanged reconnect HIP report prompted or disconnected"
+                [ "$(wc -l < "$receipts" | tr -d ' ')" -lt "$second_locked" ] || break
+                sleep 1
+            done
+            [ "$(wc -l < "$receipts" | tr -d ' ')" -ge "$second_locked" ] ||
+                fail "unchanged reconnect HIP report did not reach the fixture"
+            locked_report=$(sed -n "${first_locked}p" "$receipts")
+            [ "$(sed -n "${second_locked}p" "$receipts")" = "$locked_report" ] ||
+                fail "the unchanged reconnect reports differed"
+            ok "unchanged HIP report refreshed after reconnect without prompting"
+            probe "IPv4 echo after unchanged reconnect refresh"
         fi
 
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
