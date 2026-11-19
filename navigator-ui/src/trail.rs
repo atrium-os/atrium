@@ -163,8 +163,8 @@ pub enum Prompt {
     /// A link for another program (`mailto:`, an allowlisted scheme;
     /// threat model §2.10).
     Handoff { url: String, scheme: String },
-    /// An `atrium-app:` link (navigator.md §2.2): try it in a jail that
-    /// keeps nothing, or open it. `about`: what the package catalog says
+    /// An `atrium-app:` link (opening-links.md §4.3).
+    /// `about`: what the package catalog says
     /// of it (who publishes it, what it asks for), when it knows the id.
     OpenApp { url: String, name: String, about: Option<navigator_control::AppAbout> },
     /// Opened from history (§5.5): this is the version stored when it was
@@ -199,7 +199,7 @@ impl Prompt {
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
-            Prompt::OpenApp { .. } => &["Not now", "Open", "Try it"],
+            Prompt::OpenApp { .. } => &["Not now", "Open"],
             Prompt::Stored { .. } => &["Not now", "Fetch the current version"],
         }
     }

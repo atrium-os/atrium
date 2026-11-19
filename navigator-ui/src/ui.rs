@@ -1392,7 +1392,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
                 v.push(("by".into(), body(t.text_secondary(), Weight::Regular)));
                 v.push((by.chars().take(60).collect(), body(t.text_primary(), Weight::Semibold)));
             }
-            v.push((format!("· {asks} · Try it keeps nothing"), body(t.text_secondary(), Weight::Regular)));
+            v.push((format!("· {asks}"), body(t.text_secondary(), Weight::Regular)));
             (ph::ARROW_RIGHT, v)
         }
         Prompt::NotPrivate { origin } => (ph::WARNING, vec![

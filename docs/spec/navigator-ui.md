@@ -747,7 +747,7 @@ Questions that need the person, drawn by the UI in the prompt row between toolba
 
 | prompt | when | answers |
 |---|---|---|
-| open an app | an `atrium-app://` link (navigator.md §2.2) | *Try it* (ephemeral jail, insula trial-launch) · *Open* · *Not now*. Shows the publisher and the capabilities it will ask for, and whether it is installed (Open on one that isn't goes to Opifex's install sheet). *Built 2026-11-18:* navigatord asks opifexd's read-only `Describe` (the `navigator-broker` capability mounts `/atrium/sockets/opifex/`, one-second limit) and sends it with the hand-off as `AppAbout`; an id the catalog doesn't know (a side-loaded app) is named by its id alone. navigatord asks as the Navigator's own uid, so a catalog a person added for themselves isn't seen here; the install sheet shows those |
+| open an app | an `atrium-app://` link (navigator.md §2.2) | *Not now* · *Open*. Trial launch in an ephemeral jail is pending Insula. Shows the publisher and the capabilities it will ask for, and whether it is installed (Open on one that isn't goes to Opifex's install sheet). *Built 2026-11-18:* navigatord asks opifexd's read-only `Describe` (the `navigator-broker` capability mounts `/atrium/sockets/opifex/`, one-second limit) and sends it with the hand-off as `AppAbout`; an id the catalog doesn't know (a side-loaded app) is named by its id alone. navigatord asks as the Navigator's own uid, so a catalog a person added for themselves isn't seen here; the install sheet shows those |
 | hand off a link | an allowlisted scheme (`mailto:`), threat model §2.10 | *Open* · *Not now*; names no app, since Monstrator chooses it (opening-links.md §7) |
 | save a download | a link to a file | *Save* · *Open in viewer* (a jailed viewer, threat model §2.10) · *Cancel*; the row shows the file's origin |
 | not private | a form on an `http:` page | *Go back* · *Continue* |
@@ -1386,8 +1386,8 @@ Each step runs in the VM on headless frescod before the next.
      **Other programs' windows over the row** (built 2026-11-15): the UI tells frescod the
      row's rect (`OP_WINDOW_GUARD`, passed on by the renderer in split mode as
      `Msg::Guard`), and frescod watches it like a credential slot: whole on screen, inside
-     the window, at least 120 x 24, nothing composed above it overlapping it, still. Save,
-     Try it and Open go to navigatord with the press's activation token, and navigatord
+     the window, at least 120 x 24, nothing composed above it overlapping it, still. Save
+     and Open go to navigatord with the press's activation token, and navigatord
      (a consumer on frescod's activation socket, `NAVIGATORD_ACTIVATION`, required unless
      testing) spends it with the new purpose `PROMPT`, which frescod grants only if the
      row was so for 500 ms up to the press. A refused press does nothing (the file and
@@ -1439,14 +1439,11 @@ Each step runs in the VM on headless frescod before the next.
        so the person's own app is the viewer.
    - **Hand-offs** (threat model §2.10). `NAVIGATORD_SCHEMES` lists the schemes the person
      allowed (e.g. `mailto`), and `atrium-app` is always allowed. A link to one of them is
-     `Handoff` and asks first: *Not now* · *Open in Mail* for `mailto:`, *Not now* · *Open*
-     · *Try it* for an app, named by its host part. The answer goes back as `Hand { url, how }`,
-     and navigatord hands on only a link it decided as a hand-off on that same connection,
-     once. *(As built since 2026-11-15, opening-links.md §7: to Monstrator with the press, which
-     portcullisd spends as `LINK`; the prompt names no app, and *Try it* waits for the app
-     catalog. Before that:)* to `NAVIGATORD_OPENER` (`<opener…> open|try <url>`, no shell). Without an opener
-     it says nothing here takes hand-offs. The app's publisher and the capabilities it will
-     ask for are not shown yet: that needs Nomenclator and Opifex.
+     `Handoff` and asks first with *Not now* and *Open*. The app prompt uses the available package
+     catalog details (§6.4). Open goes back as `Hand { url, how }`, and navigatord hands
+     on only a link it decided as a hand-off on that same connection, once. It sends
+     the link and the press to Monstrator (opening-links.md §7), and portcullisd spends
+     the press as `LINK`. Nomenclator resolution is pending.
    - **Islands** (§6.3). frescod has a third slot kind, `slot::kind::ISLAND` (2), and Limen
      has the role `web-island` (provider `org.atrium.navigator.engine`, slot `Island`). An
      island is a sibling slot of the page in the UI's window, stacked above it by `z`, since a

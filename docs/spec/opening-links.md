@@ -201,8 +201,7 @@ new trail.
    removed; links into the Navigator open trails; `navigator-confined-vm.sh`. *Built
    2026-11-15 (before L3, which only adds the sheet):* navigatord sends a hand-off with its
    press to Monstrator (`NAVIGATORD_MONSTRATOR`, default its socket) instead of spending
-   `PROMPT`; the prompt names no app (*Not now* · *Open*); *Try it* answers that trying waits
-   for the app catalog. jaild's policy allows `monstrator/` and `portcullis/` socket
+   `PROMPT`. The prompt offers *Not now* and *Open*. Insula trial launch is pending. jaild's policy allows `monstrator/` and `portcullis/` socket
    directories for services. `navigator-confined-vm.sh` 55/55: monstratord from the
    bootstrap in its jail as 65038, a `mailto:` link pressed in the jailed Navigator reaches
    `org.test.mail` (open-probe) on its document channel, started for navtest by portcullisd.

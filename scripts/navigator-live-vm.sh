@@ -240,8 +240,7 @@ ui https://atlas.example/wiki/Atrium ui8
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "prompts: first page: $(last)"
 P=$(last | sed -n 's/.* page=\([0-9.]*\),\([0-9.]*\).*/\1 \2/p'); PX=${P% *}; PY=${P#* }; PX=${PX%.*}; PY=${PY%.*}
 W=$(last | sed -n 's/.* w=\([0-9]*\).*/\1/p')
-# The prompt row's primary answer is its rightmost button (Save, Open in
-# Mail, Try it), in the row under the toolbar.
+# The prompt row's primary answer (Save or Open) is its rightmost button.
 answer() { press $((W - 40)) $((TOP + 41 + 22)); }
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 4 * 40))    # The survey (PDF)
 until_trace 'prompt=download .*url=https://atlas.example/wiki/Atrium ' && ok "a link to a PDF asked in the prompt row, and the trail stayed on its page" || bad "download: $(last); $(g "tail -3 $S/navigatord2.log")"
@@ -265,11 +264,11 @@ sleep 3
 g "grep -q '\"OpenLink\":{\"url\":\"mailto:curator@atlas.example\",\"activation\":\[' $S/mon.log" && ok "…Open handed it to the link opener, with the press" || bad "monstrator: $(g "cat $S/mon.log; grep -v trace $S/ui8.log | tail -3")"
 until_trace 'prompt=- ' || bad "the row stayed: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 6 * 40))    # atrium-app:
-until_trace 'prompt=app' && ok "an atrium-app: link asked to try or open the app" || bad "app: $(last)"
+until_trace 'prompt=app' && ok "an atrium-app: link asked before opening the app" || bad "app: $(last)"
 answer
-sleep 3
-g "grep -q 'trying an app comes with the app catalog' $S/ui8.log" && ok "…Try it waits for the app catalog" || bad "try: $(g "grep -v trace $S/ui8.log | tail -3")"
-g "grep -c OpenLink $S/mon.log" | grep -qx 1 && ok "nothing else was handed on" || bad "monstrator log: $(g "cat $S/mon.log")"
+until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
+i=0; while [ $i -lt 15 ] && ! g "grep -q 'OpenLink.*atrium-app:' $S/mon.log"; do sleep 1; i=$((i+1)); done
+g "grep -q 'OpenLink.*atrium-app:.*activation' $S/mon.log" && ok "…Open handed the app link to the link opener with the press" || bad "monstrator log: $(g "cat $S/mon.log")"
 echo "--- park and restore times (TCG)"
 g "grep -hE 'showed live page|parked .* in [0-9]+ ms|page .* in [0-9]+ ms' $S/ui5.log $S/ui6.log"
 g "pkill -x navigator-ui; sleep 2; true"

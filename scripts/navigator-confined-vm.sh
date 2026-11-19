@@ -636,7 +636,7 @@ g "ls $NH/Downloads/ | grep -c survey" | grep -qx 1 && ok "Open wrote nothing" |
 until_trace 'prompt=- ' || bad "the row stayed after Open: $(last)"
 # An atrium-app: link (navigator-ui.md §6.4): the prompt names the app,
 # its publisher and what it asks for, from opifexd's Describe through the
-# Navigator jail's opifex socket. Try it, the primary answer, clears it.
+# Navigator jail's opifex socket. Dismiss it here; L5 checks installation below.
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 6 * 40))    # atrium-app:
 until_trace 'prompt=app' && ok "an atrium-app: link asked before going anywhere" || bad "app link: $(last)"
 g "grep -q 'asking: This link opens the app L5 hello by Atrium; it asks for nothing; not installed, Open asks to install it' $UL" \
@@ -645,10 +645,10 @@ sleep 3
 shot confined-3-app
 sleep 15
 shot confined-3-app-later   # the same row, a while on (a label drawn late?)
-inj "MOVE 1173 125"; sleep 3   # over the Open button: its tiles drawn again
+inj "MOVE $((W - 40)) $((TOP + 41 + 22))"; sleep 3   # over Open
 shot confined-3-app-hover
 inj "MOVE 700 400"
-press $((W - 40)) $((TOP + 41 + 22))                   # Try it
+press $((W - 106)) $((TOP + 41 + 22))                  # Not now
 until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "back on Atrium: $(last)"

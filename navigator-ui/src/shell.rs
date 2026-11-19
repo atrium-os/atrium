@@ -797,7 +797,6 @@ impl Shell {
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
-            (Prompt::OpenApp { url, .. }, "Try it") if live => self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Try, press }),
             (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
@@ -2342,8 +2341,10 @@ mod tests {
         s.handoff("atrium-app://example.com/photos?path=/x", "atrium-app", None, 0.0);
         let a = s.store.trail().page().unwrap().asked.clone().unwrap();
         assert_eq!(a.prompt, Prompt::OpenApp { url: "atrium-app://example.com/photos?path=/x".into(), name: "example.com".into(), about: None });
-        assert!(s.answer(2, 600.0), "Try it");
-        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try, press: [0; 16] }));
+        assert_eq!(a.prompt.answers(), &["Not now", "Open"]);
+        assert!(!s.answer(2, 600.0));
+        assert!(s.answer_pressed(1, 600.0, Some([1; 16])), "Open");
+        assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Open, press: [1; 16] }));
         s.handoff("mailto:a@atlas.example", "mailto", None, 2000.0);
         assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open"]);
         assert!(s.answer(1, 2600.0));
