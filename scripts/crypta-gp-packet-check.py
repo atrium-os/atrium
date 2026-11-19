@@ -524,10 +524,11 @@ def main():
                 if not declined_relock:
                     expected_counts.append("0")
                 if second_reconnect:
-                    expected_counts.append("1")
+                    expected_counts.extend(("1", "0"))
                 assert [run[0][0] for run in runs] == expected_counts, reports
                 if second_reconnect:
                     assert len(runs[4]) >= 2 and len(runs[5]) >= 2 and runs[3][0] == runs[5][0], reports
+                    assert runs[4][0] == runs[6][0], reports
                 assert len(runs[2]) >= 2 and len(runs[3]) >= 2 and runs[1][0] == runs[3][0], reports
                 if not declined_relock:
                     assert runs[2][0] == runs[4][0], reports
@@ -536,21 +537,21 @@ def main():
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == config_count, calls
                     original, _, reconnected, rebound, *rest = (config[0][0] for config in esp.configs)
-                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest[:1] * 3 + rest[1:]
+                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest[:1] * 3 + rest[1:] * 2
                     assert esp.received_spis == set(echo_spis) and esp.echo == echo_spis, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
                     assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - 1, calls
-                    assert calls.count("echo") == 5 + rebound_echoes + (4 if second_reconnect else 0), calls
+                    assert calls.count("echo") == 5 + rebound_echoes + (5 if second_reconnect else 0), calls
                     if second_reconnect:
                         assert second_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                         assert second_calls.count("echo") == 3, calls
                         assert second_rebind_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                        assert second_rebind_calls.count("echo") == 1, calls
+                        assert second_rebind_calls.count("echo") == 2, calls
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                     assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == rebound_echoes, calls
                 if second_reconnect:
-                    print("The second reconnect rebind sent the unchanged unlock report before traffic resumed")
+                    print("The second rebound tunnel carried traffic after fresh approval of the locked report")
                 elif declined_relock:
                     print("Declining the second key lock sent no changed count and closed the rebound tunnel")
                 else:

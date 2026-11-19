@@ -856,7 +856,10 @@ another origin. An active portal-profile session stays in engine memory.
   After approving the unlock, the gate rebinds the second reconnect and
   verifies that the peer receives the identical report without prompting
   before IPv4 echo on the new TLS connection or ESP association.
-  The extended arm64 case passed 32/32 on TLS and 32/32 with `--esp`.
+  The gate then locks the key on that rebound tunnel. It checks that the
+  repeated locked count waits for fresh approval and IPv4 echo resumes on
+  the same TLS connection or ESP association.
+  The extended arm64 case passed 34/34 on TLS and 34/34 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

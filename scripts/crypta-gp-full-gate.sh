@@ -549,6 +549,11 @@ if [ -n "$tessera_fact" ]; then
                 probe "IPv4 echo after approved unlock on the second reconnect"
                 rebind_unlocked_tessera 5
                 probe "IPv4 echo after the second reconnect rebind"
+
+                receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                lock_tessera_key
+                approve_tessera_change 0 "Tessera domain key lock after the second reconnect rebind"
+                probe "IPv4 echo on the second rebound tunnel after approved key lock"
             else
                 probe "IPv4 echo on the rebound tunnel after approved key lock"
             fi
