@@ -824,6 +824,28 @@ impl Daemon {
         self.enqueue(uid, persona, req, pdf, None)
     }
 
+    pub fn pin_binding(&self, uid: u32, persona: &str, printer: u32) -> Result<print::PinBinding, Fail> {
+        let s = self.saved(uid, printer)?;
+        if !visible_to(&s, persona) {
+            return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
+        }
+        let Some(key) = s.key.as_deref().and_then(store::unhex).filter(|_| s.tls) else {
+            return fail(status::NOT_ALLOWED, "This printer needs pinned IPPS for PIN jobs");
+        };
+        let Some(uuid) = s.uuid else {
+            return fail(status::NOT_ALLOWED, "This printer has no pinned UUID");
+        };
+        if s.info.job_password_max.is_none()
+            || !s.info.supports(prelum_ipp_codec::ops::op::CREATE_JOB)
+            || !s.info.supports(prelum_ipp_codec::ops::op::SEND_DOCUMENT)
+        {
+            return fail(status::NOT_ALLOWED, "This printer does not support PIN jobs");
+        }
+        let user = portcullis_peer::username(uid).ok_or((status::NOT_ALLOWED, "unknown account for PIN printing".into()))?;
+        let persona = if persona.is_empty() { "personal" } else { persona };
+        Ok(print::PinBinding { user, persona: persona.into(), key, uuid })
+    }
+
     pub fn submit_pin(self: &Arc<Self>, uid: u32, persona: &str, req: print::Print, pdf: OwnedFd, handle: [u8; 16]) -> Result<u64, Fail> {
         let user = portcullis_peer::username(uid).ok_or((status::NOT_ALLOWED, "unknown account for PIN printing".into()))?;
         let persona_name = if persona.is_empty() { "personal" } else { persona };

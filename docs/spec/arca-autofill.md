@@ -300,3 +300,12 @@ recognises by uid, arcad knows as its trusted UI (`ARCA_UI_UID`) and frescod lis
    yes.* Some sites will need one link the first time.
 5. **Third-party password managers** plug in later as Arca providers on the same slot,
    never as apps that fill other apps' fields. *Recommend: later, not now.*
+
+### Printer PIN field
+
+The system print sheet opens a credential slot in its own sheet window. Arca checks
+the parent's fixed system UID and accepts a printer binding only from that sheet.
+The PIN stays in Arca's locked field buffer, shows as bullets, and is staged only
+after the sheet counts a Print press. Arca clears the field and hands over just the
+one-use handle. An accepted handover survives closing the sheet so the queued
+worker can redeem it. See [printing.md](printing.md) §11.6.

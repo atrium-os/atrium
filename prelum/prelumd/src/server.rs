@@ -60,7 +60,7 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
             continue;
         }
         // A sheet represents the app's persona and only needs picker operations.
-        if sheet && acting && !matches!(m.op, op::FOR | op::PRINTERS | op::ADD | op::NEARBY | op::PREVIEW | op::SAVE_PDF | op::PRINT | op::PRINT_PIN) {
+        if sheet && acting && !matches!(m.op, op::FOR | op::PRINTERS | op::ADD | op::NEARBY | op::PREVIEW | op::SAVE_PDF | op::PRINT | op::PRINT_PIN | op::PIN_BINDING) {
             let _ = conn.take_fds(1);
             let out = reply::<String>(Err((status::NOT_ALLOWED, "not for the print sheet".into())));
             conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?;
@@ -115,6 +115,7 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
                     (_, None) => Err((status::MALFORMED, "no document".into())),
                 })
             }
+            op::PIN_BINDING if sheet => reply(arg::<u32>(p).and_then(|printer| d.pin_binding(uid, &persona, printer))),
             op::PRINT_PIN => {
                 let fd = conn.take_fds(1).and_then(|mut v| v.pop());
                 reply(match (arg::<(print::Print, [u8; 16])>(p), fd) {

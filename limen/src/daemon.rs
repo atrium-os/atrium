@@ -371,12 +371,19 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
 
 fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) -> Result<Reply, Reply> {
     let refuse = |reason| Err(Reply::Refused { reason });
-    let Some((user, app)) = (shared.resolve)(uid) else { return refuse(refusal::NOT_AN_APP) };
+    let print_pin = req.role == "credential"
+        && shared.system_uids.lock().unwrap().get(catalogue::PRELUM) == Some(&uid);
+    let (user, app) = if print_pin {
+        (String::new(), catalogue::PRELUM.into())
+    } else {
+        let Some(identity) = (shared.resolve)(uid) else { return refuse(refusal::NOT_AN_APP) };
+        identity
+    };
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
     // A chosen role needs no `embeds` of its own: the choice can only come
     // from a share sheet the parent opened, which did need it.
     if let (Provider::System(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
-        if !check(&app, role.name) {
+        if !print_pin && !check(&app, role.name) {
             eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
             return refuse(refusal::NOT_EMBEDDABLE);
         }

@@ -844,6 +844,12 @@ Curia still lists every printer for the person and asks for confirmation before
 sharing one with every persona. The print sheet cannot change sharing or other
 printer administration settings.
 
+For a saved IPPS printer, **Use PIN** opens Arca's credential field inside the
+print sheet. Prelumd supplies the authenticated person, persona, TLS key and
+UUID through `PIN_BINDING`. The PIN field accepts digits and shows bullets.
+After the sheet counts the Print press, Arca stages the PIN and returns the
+one-use handle. An empty or unavailable field leaves the job unsubmitted.
+
 A PIN job enters via `CLASS_PRINT/PRINT_PIN` with the PDF and an opaque handle
 from Arca. prelumd derives the person and persona from the connection and passes
 the handle to the IPP worker. The PIN worker has a read-only mount of the Arca
@@ -859,9 +865,15 @@ requests, serves real arcad handlers over a Unix socket, and checks the printer'
 TLS and IPP traffic. It covers changed TLS key and UUID, acceptance before
 document upload, replay refusal, and cancellation without upload if the printer
 reports it ignored or substituted attributes. It supplies the Arca peer roles in the
-harness. The desktop credential prompt, the FreeBSD jail runtime gate, stored
-printer passwords and PINs, Sigillum verification for sharing, and per-persona
-routing and crossing policy remain open.
+harness. The desktop gate drove Fresco input on the arm64 FreeBSD guest. A print-demo
+window opened the sheet, an empty PIN queued no job, and a typed synthetic PIN
+was staged in Arca and redeemed by the jailed worker. The IPPS simulator checked
+the PIN in Create-Job before it accepted the PDF in Send-Document. The app
+reported queued and Prelum reported Done. The fixture worker used an alternate
+socket filename in the usual Arca mount so the resident Arca service stayed up.
+
+Stored printer passwords and PINs, Sigillum verification for sharing, and
+per-persona routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

@@ -137,15 +137,27 @@ impl Arcad {
     pub fn hold(&self, p: &Parent, value: &[u8], hold: u8) -> Result<[u8; 16], Error> {
         let mut w = Writer::new();
         p.write(&mut w);
-        let head = w.buf;
+        self.hold_value(op::U_HOLD, &w.buf, value, hold)
+    }
+
+    pub fn hold_print_pin(&self, user: &str, persona: &str, key: &[u8; 32], uuid: &str, value: &[u8]) -> Result<[u8; 16], Error> {
+        let mut w = Writer::new();
+        w.str(user);
+        w.str(persona);
+        w.raw(key);
+        w.str(uuid);
+        self.hold_value(op::U_HOLD_PRINT_PIN, &w.buf, value, 0)
+    }
+
+    fn hold_value(&self, opcode: u16, head: &[u8], value: &[u8], hold: u8) -> Result<[u8; 16], Error> {
         let n = 2 + head.len() + 4 + value.len() + (hold != 0) as usize;
         let mut frame = LockedBuf::zeroed(4 + n)?;
         {
             let f = frame.as_mut();
             f[..4].copy_from_slice(&(n as u32).to_le_bytes());
-            f[4..6].copy_from_slice(&op::U_HOLD.to_le_bytes());
+            f[4..6].copy_from_slice(&opcode.to_le_bytes());
             let mut at = 6;
-            f[at..at + head.len()].copy_from_slice(&head);
+            f[at..at + head.len()].copy_from_slice(head);
             at += head.len();
             f[at..at + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
             at += 4;

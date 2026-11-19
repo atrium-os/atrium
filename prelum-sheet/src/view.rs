@@ -25,10 +25,15 @@ const LABEL_W: f32 = 104.0;
 const ROW: f32 = 28.0;
 const MAX_ROWS: usize = 5;
 const OPT: f32 = 36.0;
+const PIN_Y: f32 = 422.0;
 
 /// Where Print is: the guard frescod watches (printing.md §5.2).
 pub fn print_button() -> Rect {
     Rect::new(W - PAD - 120.0, H - PAD - 32.0, 120.0, 32.0)
+}
+
+pub fn pin_slot() -> Rect {
+    Rect::new(RIGHT_X + 126.0, PIN_Y, 194.0, 36.0)
 }
 
 fn cancel_button() -> Rect {
@@ -41,6 +46,7 @@ pub struct Asked {
     /// A press on Print, with frescod's token for it (none: synthetic).
     pub print: Option<Option<fresco_protocol::activation::Token>>,
     pub cancel: bool,
+    pub toggle_pin: bool,
 }
 
 #[derive(Clone)]
@@ -231,6 +237,21 @@ impl View for SheetView {
         }
         if let Some(w) = s.working {
             self.text(ctx, RIGHT_X, H - PAD - 24.0, 140.0, w, style(type_size::SM, Weight::Regular, t.text_secondary()));
+        }
+        if matches!(s.dest(), Dest::Saved(p) if p.tls && p.uuid.is_some()) {
+            let asked = self.asked.clone();
+            let busy = s.working.is_some();
+            Button::secondary(if s.pin_requested() { "Remove PIN" } else { "Use PIN" })
+                .at(RIGHT_X, PIN_Y + 2.0)
+                .width(98.0)
+                .on_click(move || {
+                    if !busy {
+                        let mut a = asked.get_cloned();
+                        a.toggle_pin = true;
+                        asked.set(a);
+                    }
+                })
+                .render(ctx);
         }
         let c = cancel_button();
         let asked = self.asked.clone();

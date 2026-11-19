@@ -160,6 +160,12 @@ impl Field {
         }
     }
 
+    pub fn clear_print_pin(&mut self) {
+        self.typed.as_mut()[..self.len].fill(0);
+        self.len = 0;
+        self.content = Content::Empty;
+    }
+
     pub fn configure(&mut self, purpose: Purpose, username_field: bool) -> Vec<Do> {
         self.purpose = purpose;
         self.username_field = username_field;
@@ -183,7 +189,7 @@ impl Field {
         match self.purpose {
             Purpose::CurrentPassword => (0..self.accounts.len()).map(Offer::Account).collect(),
             Purpose::NewPassword => vec![Offer::Generate],
-            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode | Purpose::VpnSecret => Vec::new(),
+            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode | Purpose::VpnSecret | Purpose::PrintPin => Vec::new(),
         }
     }
 
@@ -215,7 +221,7 @@ impl Field {
 
     /// Typed and not yet held: hold it, so the parent has a handle.
     fn commit(&mut self) -> Option<Do> {
-        (self.content == Content::Typed && self.handle.is_none() && self.len > 0).then_some(Do::Hold)
+        (self.purpose != Purpose::PrintPin && self.content == Content::Typed && self.handle.is_none() && self.len > 0).then_some(Do::Hold)
     }
 
     /// The value changed: whatever handle there was is void.
@@ -246,7 +252,8 @@ impl Field {
                 if matches!(self.content, Content::Filled(_)) {
                     self.clear(&mut out);
                 }
-                if self.len < TYPED_MAX {
+                let allowed = if self.purpose == Purpose::PrintPin { self.len < 255 && c.is_ascii_digit() } else { self.len < TYPED_MAX };
+                if allowed {
                     self.void(&mut out);
                     self.typed.as_mut()[self.len] = c;
                     self.len += 1;

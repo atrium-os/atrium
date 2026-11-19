@@ -1210,7 +1210,7 @@ impl Compositor {
     /// window, one without the keys, or one with no child shown.
     pub fn focus_embed(&mut self, parent: WindowId, by: ClientId) -> bool {
         let Some(w) = self.windows.get(&parent) else { return false };
-        if w.owner != by || w.slot.is_some() || self.base_keyboard_window() != parent || self.key_popup().is_some() || self.lock.is_some() {
+        if w.owner != by || (w.slot.is_some() && !self.is_sheet(parent)) || self.base_keyboard_window() != parent || self.key_popup().is_some() || self.lock.is_some() {
             return false;
         }
         let child = self
@@ -1610,7 +1610,7 @@ impl Compositor {
 
     /// Whether `e` is shown in a slot of `parent`.
     fn embed_in(&self, e: WindowId, parent: WindowId) -> bool {
-        self.windows.get(&e).is_some_and(|w| !w.hidden && w.slot.is_some_and(|s| s.parent == parent))
+        self.z_order.contains(&e) && self.windows.get(&e).is_some_and(|w| !w.hidden && w.slot.is_some_and(|s| s.parent == parent))
     }
 
     /// Make `child` a credential slot at `rect` in `parent` (`None`:
@@ -1649,11 +1649,12 @@ impl Compositor {
         }
         let c = &self.windows[&child];
         let ok = child != parent
-            && self.windows[&parent].slot.is_none()
+            && self.windows[&parent].slot.is_none_or(|s| s.kind == k::SHEET && kind == k::CREDENTIAL)
             && c.role != WmRole::Notification
             && c.slot.is_none_or(|s| s.parent == parent)
             && c.kept_by.is_none_or(|p| p == parent)
-            && !self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
+            && (!self.windows.values().any(|w| w.slot.is_some_and(|s| s.parent == child))
+                || (kind == k::SHEET && c.slot.is_some_and(|s| s.kind == k::SHEET && s.parent == parent)))
             && matches!(kind, k::PLAIN | k::CREDENTIAL | k::ISLAND | k::SHEET)
             // One sheet per parent.
             && (kind != k::SHEET || !self.windows.iter().any(|(&id, w)| id != child && w.slot.is_some_and(|s| s.parent == parent && s.kind == k::SHEET)))
@@ -1687,6 +1688,7 @@ impl Compositor {
                 let w = self.windows.get_mut(&child).unwrap();
                 w.slot = None;
                 w.kept_by = None;
+                self.release_slots_in(child);
                 self.hide(child);
             }
         }
@@ -1702,6 +1704,7 @@ impl Compositor {
             let w = self.windows.get_mut(&id).unwrap();
             w.slot = None;
             w.kept_by = None;
+            self.release_slots_in(id);
             self.hide(id);
         }
     }
@@ -2409,6 +2412,29 @@ mod notification_tests {
         assert_eq!(c.bind_slot(s, p, kind::SHEET, None, 0), Ok(()));
         assert_eq!(c.sheet_of(p), None);
         assert_eq!(c.key_target(p), p);
+        assert_eq!(c.keyboard_window(), p as u32);
+    }
+
+    #[test]
+    fn a_sheet_can_host_one_level_of_credential_input() {
+        use fresco_protocol::slot::{kind, refusal};
+        let mut c = Compositor::new();
+        let p = c.create(1, (900, 640));
+        let sheet = c.create(2, (760, 540));
+        let credential = c.create(3, (200, 36));
+        let other = c.create(4, (200, 36));
+        let rect = Some([20.0, 400.0, 200.0, 36.0]);
+        c.bind_slot(sheet, p, kind::SHEET, Some([0.0, 0.0, 760.0, 540.0]), 0).unwrap();
+        assert_eq!(c.bind_slot(other, sheet, kind::PLAIN, rect, 0), Err(refusal::INVALID));
+        c.bind_slot(credential, sheet, kind::CREDENTIAL, rect, 0).unwrap();
+        assert_eq!(c.bind_slot(other, credential, kind::CREDENTIAL, rect, 0), Err(refusal::INVALID));
+        let pos = c.windows[&sheet].pos;
+        assert_eq!(c.pointer_target(pos.0 + 25.0, pos.1 + 405.0).0, credential);
+        c.set_focus_no_raise(Some(p));
+        c.press_focus(credential);
+        assert_eq!(c.keyboard_window(), credential as u32);
+        c.bind_slot(sheet, p, kind::SHEET, None, 0).unwrap();
+        assert!(!c.z_order.contains(&credential));
         assert_eq!(c.keyboard_window(), p as u32);
     }
 

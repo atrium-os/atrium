@@ -23,6 +23,8 @@ pub enum Purpose {
     /// offered, held so that only the crypta service redeems it, for the
     /// tunnel's engine.
     VpnSecret,
+    /// A printer-specific, digit-only field owned by Arca.
+    PrintPin,
 }
 
 /// One submit's worth of reference to the value, meaningful only on this
@@ -37,6 +39,10 @@ pub enum ToChild {
     /// `username_field`: the parent has its own username field that Arca
     /// may fill on the same press.
     Configure { purpose: Purpose, username_field: bool },
+    /// Accepted only from the system print sheet. The binding came from prelumd.
+    ConfigurePrintPin { user: String, persona: String, key: [u8; 32], uuid: String },
+    /// Transfer a one-use handle after the print sheet has counted the Print press.
+    SubmitPrintPin,
 }
 
 impl ToChild {

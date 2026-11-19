@@ -504,8 +504,13 @@ renderer's, not frescod's, so windows are named by an **embed token** instead of
 
 Tested by unit tests in fresco-scene-server and by `atrium-activation-probe` in the VM, in
 direct and split mode: an `embed_pending` window takes no click; once bound it takes the clicks
-in its slot; a made-up token and a slot as a parent are refused; after a release, or after its
+in its slot; a made-up token is refused; after a release, or after its
 parent is destroyed, the click goes past it again; and a gone window's token is dead.
+
+A sheet may contain a credential slot, clipped and stacked above the sheet.
+Other slots still require a top-level parent. Limen lets the fixed-UID system
+print sheet request the Arca credential role for its own surface. Frescod checks
+the window owner on bind as it does for other requests.
 
 ### 5.2 Placing, moving, hiding
 

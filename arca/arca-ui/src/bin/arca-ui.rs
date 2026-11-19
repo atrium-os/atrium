@@ -24,7 +24,7 @@ use arca_ui::{keymap, view};
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 use limen::client::Child;
-use limen::credential::ToChild;
+use limen::credential::{Purpose, ToChild, ToParent};
 use limen::proto::{ChildEvent, EmbedId};
 
 /// Until frescod's FocusChanged says pointer or keyboard, a focus this soon
@@ -37,11 +37,20 @@ fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 
+struct PrintPin {
+    user: String,
+    persona: String,
+    key: [u8; 32],
+    uuid: String,
+}
+
 struct Embed {
     win: Connection,
     window_id: u32,
     font: view::Font,
     parent: Option<Parent>,
+    print_sheet: bool,
+    print_pin: Option<PrintPin>,
     field: Field,
     /// The slot's size in points.
     size: (f32, f32),
@@ -108,6 +117,30 @@ impl Ctx {
         }
     }
 
+    fn submit_print_pin(&mut self, id: EmbedId, e: &mut Embed) {
+        let Some(binding) = &e.print_pin else { return };
+        let result = if e.field.typed().is_empty() {
+            Err(Notice::Failed)
+        } else {
+            self.arcad.hold_print_pin(&binding.user, &binding.persona, &binding.key, &binding.uuid, e.field.typed())
+                .map_err(|err| if err.locked() { Notice::Locked } else { Notice::Failed })
+        };
+        match result {
+            Ok(handle) => {
+                e.field.clear_print_pin();
+                // The print sheet now owns the grant. Detach must allow the queued worker to redeem it.
+                if self.child.emit(id, ToParent::Handle { handle }.encode()).is_err() {
+                    let _ = self.arcad.drop_handle(&handle);
+                }
+            }
+            Err(notice) => {
+                e.field.notice = Some(notice);
+                let _ = self.child.emit(id, ToParent::Cleared.encode());
+            }
+        }
+        e.dirty = true;
+    }
+
     /// The press first, then the handle: arcad is asked for nothing until
     /// frescod has vouched the user pressed this field while it was seen.
     fn fill(&mut self, e: &mut Embed, offer: Offer, token: [u8; 16]) -> Vec<Do> {
@@ -166,6 +199,7 @@ fn main() -> ExitCode {
     let fresco = std::env::var("FRESCO_SOCKET")
         .unwrap_or_else(|_| fresco_client::default_socket_path().to_string_lossy().into_owned());
     let registry = env("ARCA_APP_REGISTRY", "/var/run/atrium/app-registry");
+    let prelum_uid = std::env::var("ARCA_PRELUM_UID").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(65046);
     let allow_unsigned = std::env::var_os("ARCA_ALLOW_UNSIGNED").is_some();
     let child = match Child::provider(env("LIMEN_SOCKET", limen::client::DEFAULT_SOCKET), "credential") {
         Ok(c) => c,
@@ -212,10 +246,11 @@ fn main() -> ExitCode {
                             continue;
                         }
                     };
-                    if parent.is_none() {
+                    let print_sheet = parent_uid == prelum_uid && parent_app == limen::catalogue::PRELUM;
+                    if parent.is_none() && !print_sheet {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, field, size: (240.0, 36.0), scale, look: view::Look::default(), shown_chip: None, pressed_at: None, dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, print_sheet, print_pin: None, field, size: (240.0, 36.0), scale, look: view::Look::default(), shown_chip: None, pressed_at: None, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -226,10 +261,19 @@ fn main() -> ExitCode {
                 }
                 ChildEvent::Message { embed, bytes } => {
                     let Some(e) = embeds.get_mut(&embed) else { continue };
-                    if let Ok(ToChild::Configure { purpose, username_field }) = postcard::from_bytes(&bytes) {
-                        let dos = e.field.configure(purpose, username_field);
-                        cx.run(embed, e, dos);
-                        cx.refresh_accounts(e);
+                    match postcard::from_bytes(&bytes) {
+                        Ok(ToChild::Configure { purpose, username_field }) if !e.print_sheet && purpose != Purpose::PrintPin => {
+                            let dos = e.field.configure(purpose, username_field);
+                            cx.run(embed, e, dos);
+                            cx.refresh_accounts(e);
+                        }
+                        Ok(ToChild::ConfigurePrintPin { user, persona, key, uuid }) if e.print_sheet && e.print_pin.is_none() => {
+                            e.print_pin = Some(PrintPin { user, persona, key, uuid });
+                            let dos = e.field.configure(Purpose::PrintPin, false);
+                            cx.run(embed, e, dos);
+                        }
+                        Ok(ToChild::SubmitPrintPin) if e.print_sheet => cx.submit_print_pin(embed, e),
+                        _ => {}
                     }
                 }
                 ChildEvent::Suspended { embed } => {

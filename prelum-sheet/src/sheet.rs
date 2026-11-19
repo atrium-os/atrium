@@ -75,6 +75,7 @@ pub struct Sheet {
     pub notice: Option<(String, Tone)>,
     /// Something is under way ("Printing…"): the buttons wait.
     pub working: Option<&'static str>,
+    pub pin_printer: Option<u32>,
 }
 
 impl Sheet {
@@ -110,6 +111,7 @@ impl Sheet {
             preview_note: None,
             notice: None,
             working: None,
+            pin_printer: None,
         }
     }
 
@@ -313,6 +315,10 @@ impl Sheet {
             Dest::SavePdf => "Save…",
             _ => "Print",
         }
+    }
+
+    pub fn pin_requested(&self) -> bool {
+        matches!(self.dest(), Dest::Saved(p) if self.pin_printer == Some(p.id))
     }
 
     /// What a counted press does, or why it can't.

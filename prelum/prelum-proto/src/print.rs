@@ -21,6 +21,7 @@
 //! | `WATCH` 0x16 | postcard `u64`: the last generation seen (0 at first) | postcard [`Watched`]: the jobs once they differ from that generation, or after 25 s unchanged |
 //! | `SAVE_PDF` 0x15 | postcard [`Layout`], the PDF as the one descriptor | postcard `u64` (its size), the rewritten PDF as the reply's one descriptor (§5.2's Save as PDF) |
 //! | `PRINT_PIN` 0x17 | postcard `(Print, [u8; 16])`, the Arca handle and a PDF descriptor | postcard `u64`: queued job id |
+//! | `PIN_BINDING` 0x18 | postcard `u32`: saved printer ID | postcard [`PinBinding`], only for the acting print sheet |
 //! | `FOR` 0x20 | postcard `u32`: the app's uid, as limend named the sheet's parent | postcard `String`: the app's persona ("" for Personal). Only from prelum-sheet's uid, once per connection: from then on the connection acts for that app's person (§5.2) |
 //!
 //! On anything but `OK` the payload after the status is a postcard
@@ -61,6 +62,7 @@ pub mod op {
     pub const SAVE_PDF: u16 = 0x15;
     pub const WATCH: u16 = 0x16;
     pub const PRINT_PIN: u16 = 0x17;
+    pub const PIN_BINDING: u16 = 0x18;
     pub const FOR: u16 = 0x20;
 }
 
@@ -96,6 +98,15 @@ pub struct Share {
 pub struct Rename {
     pub printer: u32,
     pub name: String,
+}
+
+/// The authenticated person and pinned destination of a desktop PIN job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinBinding {
+    pub user: String,
+    pub persona: String,
+    pub key: [u8; 32],
+    pub uuid: String,
 }
 
 /// A saved printer as clients see it.
@@ -459,6 +470,9 @@ pub mod client {
         }
         pub fn print(&mut self, p: &Print, pdf: &dyn AsRawFd) -> Res<u64> {
             self.call(op::PRINT, &Self::enc(p), Some(pdf))
+        }
+        pub fn pin_binding(&mut self, printer: u32) -> Res<PinBinding> {
+            self.call(op::PIN_BINDING, &Self::enc(&printer), None)
         }
         /// Submit a PDF with the opaque, one-use handle from Arca's credential UI.
         pub fn print_pin(&mut self, p: &Print, handle: [u8; 16], pdf: &dyn AsRawFd) -> Res<u64> {
