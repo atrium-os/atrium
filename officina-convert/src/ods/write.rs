@@ -1004,6 +1004,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     // Columns: (width, default style) grouped.
     let ncols = cols.max(tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1)).max(sh.col_sizes.overrides().last().map_or(0, |o| o.0 + 1)).min(ODS_COLS);
     let width = |c: u32| sh.col_sizes.overrides().binary_search_by_key(&c, |o| o.0).map(|i| sh.col_sizes.overrides()[i].1).unwrap_or(sh.col_sizes.default);
+    // A hidden column's style keeps the width it will show again at.
+    let kept = |c: u32| sh.hidden_widths.binary_search_by_key(&c, |h| h.0).map_or(sh.col_sizes.default, |i| sh.hidden_widths[i].1);
     let mut style_of_width = |px: f64| {
         let key = (px * 64.0).round() as u64;
         let n = col_style.len();
@@ -1012,11 +1014,12 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     let mut c = 0;
     while c < ncols.max(1) {
         let (w, t) = (width(c), tail(c));
+        let k = if w <= 0.0 { kept(c) } else { w };
         let mut n = 1;
-        while c + n < ncols && width(c + n) == w && tail(c + n) == t {
+        while c + n < ncols && width(c + n) == w && tail(c + n) == t && (w > 0.0 || kept(c + n) == k) {
             n += 1;
         }
-        let _ = write!(out, r#"<table:table-column table:style-name="co{}""#, style_of_width(w));
+        let _ = write!(out, r#"<table:table-column table:style-name="co{}""#, style_of_width(k));
         if n > 1 {
             let _ = write!(out, r#" table:number-columns-repeated="{n}""#);
         }

@@ -21,6 +21,7 @@
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
 //! | 20 | VALIDATIONS | data validation rules: ranges, kind, operator, formulas as text, flags, messages |
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
+//! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -50,6 +51,7 @@ pub const COMMENTS: u16 = 17;
 pub const LINKS: u16 = 18;
 pub const FREEZE: u16 = 19;
 pub const VALIDATIONS: u16 = 20;
+pub const HIDDEN_WIDTHS: u16 = 21;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -304,6 +306,18 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u32(c);
         }
         c.add(FREEZE, &w.into_bytes())?;
+    }
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        if !sh.hidden_widths.is_empty() {
+            let mut w = Writer::new();
+            w.u16(si as u16);
+            w.var(sh.hidden_widths.len() as u64);
+            for (i, v) in &sh.hidden_widths {
+                w.var(*i as u64);
+                w.f64(*v);
+            }
+            c.add(HIDDEN_WIDTHS, &w.into_bytes())?;
+        }
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if !sh.merges.is_empty() {
@@ -793,6 +807,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             }
             sh.freeze = (rows, cols);
         }
+        done(&r)?;
+    }
+
+    for i in of(HIDDEN_WIDTHS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let s = r.u16()? as usize;
+        let list = crate::ops::decode_widths(&mut r)?;
+        let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("hidden widths for a sheet that does not exist")) };
+        if !sh.hidden_widths.is_empty() {
+            return Err(LoadError::Bad("a sheet's hidden widths twice"));
+        }
+        sh.hidden_widths = list;
         done(&r)?;
     }
 

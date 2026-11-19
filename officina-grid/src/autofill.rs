@@ -30,6 +30,9 @@ pub enum Mode {
     /// The handle let go with Ctrl held, as Excel flips it: one number
     /// counts up (or down) by one; anything else is copied.
     Flip,
+    /// Fill Series chosen after a fill: a series as `Series` makes, and
+    /// one number counts by one too.
+    Count,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +131,10 @@ pub fn fill(wb: &Workbook, src: Rect, to: Rect, mode: Mode) -> Result<GridOp, St
         let series = match mode {
             Mode::Series => series_of(&read, back),
             Mode::Copy => Series::Repeat,
+            Mode::Count => match &read[..] {
+                [(Src::Value(Value::Num(n)), _)] => Series::Days { first: *n, step: if back { -1.0 } else { 1.0 } },
+                _ => series_of(&read, back),
+            },
             Mode::Flip => match &read[..] {
                 [(Src::Value(Value::Num(n)), _)] => Series::Days { first: *n, step: if back { -1.0 } else { 1.0 } },
                 _ => Series::Repeat,
@@ -515,6 +522,11 @@ mod tests {
         assert_eq!((shown(&wb, 1, 0), shown(&wb, 2, 0)), ("6".into(), "7".into()));
         fill(&wb, rect(0, 1, 1, 1), rect(0, 1, 3, 1), Mode::Flip).unwrap().apply(&mut wb);
         assert_eq!((shown(&wb, 2, 1), shown(&wb, 3, 1)), ("1".into(), "3".into()));
+        // Count: one number counts; a series stays one.
+        fill(&wb, rect(0, 0, 0, 0), rect(0, 0, 4, 0), Mode::Count).unwrap().apply(&mut wb);
+        assert_eq!(shown(&wb, 4, 0), "9");
+        fill(&wb, rect(0, 1, 1, 1), rect(0, 1, 3, 1), Mode::Count).unwrap().apply(&mut wb);
+        assert_eq!(shown(&wb, 3, 1), "7");
     }
 
     #[test]

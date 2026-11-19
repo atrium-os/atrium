@@ -464,6 +464,15 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::Merges { sheet, list: merges });
     }
 
+    // Hidden columns' remembered widths go with their columns.
+    if axis == Axis::Cols {
+        let hw = &wb.sheet(sheet).hidden_widths;
+        let moved: Vec<(u32, f64)> = hw.iter().filter_map(|&(c, w)| s.map(c).map(|c| (c, w))).collect();
+        if moved != *hw {
+            ops.push(GridOp::HiddenWidths { sheet, list: moved });
+        }
+    }
+
     // The filter and hidden rows.
     let st = wb.filter_state(sheet);
     let mut st2 = st.clone();

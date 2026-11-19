@@ -15,6 +15,8 @@ fn book() -> Workbook {
     // Rows 3-4 and 7, columns B and D-E hidden; C wider.
     wb.sheet_mut(0).hidden = vec![(2, 3), (6, 6)];
     wb.sheet_mut(0).col_sizes = Sizes::from_overrides(64.0, vec![(1, 0.0), (2, 100.0), (3, 0.0), (4, 0.0)]);
+    // B was 150 px wide before it was hidden; D and E had the default.
+    wb.sheet_mut(0).hidden_widths = vec![(1, 150.0)];
     wb
 }
 
@@ -26,16 +28,27 @@ fn all(wb: &Workbook) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
     (sh.hidden.clone(), cols, shown)
 }
 
+/// The width hidden column B will show again at, as wide (to within 2 px)
+/// against shown column C as it was (files keep widths in characters or
+/// inches, and LibreOffice measures characters a little wider).
+fn b_kept(wb: &Workbook) -> bool {
+    let sh = wb.sheet(0);
+    let scale = sh.col_sizes.size(2) / 100.0;
+    sh.hidden_widths.iter().any(|&(c, w)| c == 1 && (w - 150.0 * scale).abs() <= 2.0)
+}
+
 #[test]
 fn hidden_rows_and_columns_round_trip() {
     let wb = book();
     let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
     let (back, rep) = officina_convert::xlsx::read(&x).unwrap();
     assert_eq!(all(&back), all(&wb));
+    assert!(b_kept(&back), "{:?}", back.sheet(0).hidden_widths);
     assert!(!format!("{rep:?}").contains("hidden"), "{rep:?}");
     let o = officina_convert::ods::write(&wb, Vec::new()).unwrap();
     let (back, rep) = officina_convert::ods::read(&o).unwrap();
     assert_eq!(all(&back), all(&wb));
+    assert!(b_kept(&back), "{:?}", back.sheet(0).hidden_widths);
     assert!(!format!("{rep:?}").contains("hidden"), "{rep:?}");
 }
 
@@ -63,6 +76,7 @@ fn libreoffice_keeps_our_hidden_rows_and_columns() {
         let data = std::fs::read(out.join(format!("h.{to}"))).unwrap();
         let back = if to == "ods" { officina_convert::ods::read(&data).unwrap().0 } else { officina_convert::xlsx::read(&data).unwrap().0 };
         assert_eq!(all(&back), all(&wb), "{ext} -> LibreOffice -> {to}");
+        assert!(b_kept(&back), "{ext} -> LibreOffice -> {to}: {:?}", back.sheet(0).hidden_widths);
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
