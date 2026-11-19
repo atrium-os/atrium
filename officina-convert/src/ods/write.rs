@@ -686,7 +686,9 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     }
     let align = match st.h_align {
         HAlign::Left => Some("start"),
-        HAlign::Center => Some("center"),
+        // .ods has no centring across cells; LibreOffice centres each in
+        // its own cell, as it does for .xlsx's centerContinuous.
+        HAlign::Center | HAlign::CenterAcross => Some("center"),
         HAlign::Right => Some("end"),
         HAlign::Justify => Some("justify"),
         _ => None,

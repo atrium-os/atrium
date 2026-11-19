@@ -40,7 +40,7 @@ pub fn cell_of(v: CellView) -> Cell {
         text: v.text,
         align: match v.align {
             CellAlign::Left => Align::Left,
-            CellAlign::Center => Align::Center,
+            CellAlign::Center | CellAlign::Across => Align::Center,
             CellAlign::Right => Align::Right,
         },
         bold: v.bold,

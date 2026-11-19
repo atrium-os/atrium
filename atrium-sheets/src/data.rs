@@ -13,6 +13,7 @@ use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Legen
 use officina_grid::filter::{AutoFilter, Cond};
 use officina_grid::ops::GridOp;
 use officina_grid::sort::{sort_op, SortKey};
+use officina_grid::style::HAlign;
 use officina_grid::tables::Table;
 use officina_grid::{Value, Workbook};
 use pergola::widgets::{CellRange, MenuItem};
@@ -68,6 +69,9 @@ pub enum DataCmd {
     DeleteCols,
     /// The selection as one merged cell, its top-left's value centred across it.
     Merge,
+    /// The selection's text centred across its columns without merging
+    /// them (again: back to General).
+    CenterAcross,
     /// The merged areas the selection meets, back to separate cells.
     Unmerge,
     /// Write or change the cursor's cell comment; the window runs it (a bar
@@ -225,6 +229,12 @@ fn links_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u32,
 const MAX_MERGE_CELLS: u64 = 1 << 24;
 
 /// The Data menu as it reads now, with the command of each item.
+/// The selection's top-left cell is centred across: the command then takes
+/// it off.
+fn across_at(wb: &Workbook, s: u16, sel: CellRange) -> bool {
+    wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).h_align == HAlign::CenterAcross
+}
+
 pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Option<DataCmd>)> {
     let wb = &d.wb;
     let s = d.sheet;
@@ -262,6 +272,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         } else {
             (MenuItem::new("Merge Cells").enabled(nr > 1 || nc > 1).separated(), Some(DataCmd::Merge))
         },
+        (MenuItem::new("Center Across Selection").checked(across_at(wb, s, sel)).enabled(nc > 1 || across_at(wb, s, sel)), Some(DataCmd::CenterAcross)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
@@ -425,6 +436,16 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
     match cmd {
+        DataCmd::CenterAcross => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let off = across_at(&d.wb, s, sel);
+            if !off && r.c1 == r.c0 {
+                return Err("Select the columns to centre across first.".into());
+            }
+            let to = if off { HAlign::General } else { HAlign::CenterAcross };
+            d.run("Center Across Selection", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { h_align: to, ..st.clone() })]);
+            Ok(if off { "Text no longer centred across the selection.".into() } else { "Text centred across the selection.".into() })
+        }
         DataCmd::Merge => {
             let r = d.wb.grow_to_merges(Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
             if r.cells() < 2 {
@@ -815,6 +836,28 @@ mod tests {
         assert_eq!((1..=4).map(|r| cell(&d, r, 0)).collect::<Vec<_>>(), ["apple", "apple", "fig", "pear"]);
         assert_eq!(cell(&d, 4, 1), "3");
         assert_eq!(d.wb.merges(0), &list[..]);
+    }
+
+    #[test]
+    fn center_across_selection_turns_on_and_off_without_merging() {
+        let mut d = doc();
+        let sel = CellRange { r0: 0, c0: 0, r1: 0, c1: 2 };
+        let item = |d: &Doc, sel| menu(d, sel, (0, 0)).into_iter().find(|(m, _)| m.label == "Center Across Selection").unwrap().0;
+        assert!(item(&d, sel).enabled && item(&d, sel).mark == pergola::widgets::Mark::Check(false));
+        assert!(!item(&d, one(0, 0)).enabled);
+        let before = cell(&d, 0, 1);
+        run(&mut d, sel, (0, 0), DataCmd::CenterAcross);
+        assert_eq!(d.status, "Text centred across the selection.");
+        let at = |d: &Doc, c| d.wb.style(CellAddr { sheet: 0, row: 0, col: c }).h_align;
+        assert!((0..=2).all(|c| at(&d, c) == HAlign::CenterAcross));
+        assert!(d.wb.merges(0).is_empty());
+        assert_eq!(cell(&d, 0, 1), before);
+        assert!(item(&d, sel).mark == pergola::widgets::Mark::Check(true));
+        // Again: back to General; undo brings it back.
+        run(&mut d, sel, (0, 0), DataCmd::CenterAcross);
+        assert!((0..=2).all(|c| at(&d, c) == HAlign::General));
+        assert!(d.undo());
+        assert!((0..=2).all(|c| at(&d, c) == HAlign::CenterAcross));
     }
 
     #[test]

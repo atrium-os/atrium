@@ -73,6 +73,9 @@ pub enum CellAlign {
     Left,
     Center,
     Right,
+    /// Centred across this cell and the empty cells after it that are
+    /// `Across` too (a spreadsheet's Center Across Selection).
+    Across,
 }
 
 /// What one cell shows.
@@ -1251,7 +1254,21 @@ fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
 /// alignment points (both, centred), up to [`SPILL_COLS`]. None when it fits,
 /// is a number, or has no empty neighbour.
 fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u32)> {
-    if cv.numeric || cv.text.is_empty() || cv.text.contains('\n') {
+    if cv.text.is_empty() || cv.text.contains('\n') {
+        return None;
+    }
+    let last = src.cols().saturating_sub(1);
+    if cv.align == CellAlign::Across {
+        // The run: following cells that show nothing and centre across too.
+        let mut b = c;
+        while b < last && b - c < SPILL_COLS && src.merge_at(r, b + 1).is_none() && src.cell(r, b + 1).is_some_and(|v| v.text.is_empty() && v.align == CellAlign::Across) {
+            b += 1;
+        }
+        if b > c {
+            return Some((c, b));
+        }
+    }
+    if cv.numeric {
         return None;
     }
     let cw = (src.col_left(c + 1) - src.col_left(c)) as f32;
@@ -1266,12 +1283,11 @@ fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u3
         return None;
     }
     let need = (w - room) as f64;
-    let last = src.cols().saturating_sub(1);
     let (mut a, mut b) = (c, c);
     let (want_l, want_r) = match cv.align {
         CellAlign::Left => (0.0, need),
         CellAlign::Right => (need, 0.0),
-        CellAlign::Center => (need / 2.0, need / 2.0),
+        CellAlign::Center | CellAlign::Across => (need / 2.0, need / 2.0),
     };
     let mut got = 0.0;
     while got < want_r && b < last && b - c < SPILL_COLS && blank(src, r, b + 1) {
@@ -1352,6 +1368,8 @@ fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, 
                 CellAlign::Right => ox1 - PAD - w,
                 // Centred on its own cell, kept inside the run.
                 CellAlign::Center => q((((ox + ox1) / 2.0 - w / 2.0).max(x0 + PAD).min(x1 - PAD - w)) as f64),
+                // Centred across the whole run.
+                CellAlign::Across => q((((x0 + x1) / 2.0 - w / 2.0).max(x0 + PAD)) as f64),
             };
             let lh = TEXT_SIZE * 1.3;
             ctx.add(Node::Text { rect: Rect::new(tx0, y0 + q(((y1 - y0 - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
@@ -1402,7 +1420,7 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
     let (shown, w) = fit_text(cv, cw - 2.0 * PAD - lead, &style);
     let tx0 = match cv.align {
         CellAlign::Left => cx + PAD + lead,
-        CellAlign::Center => cx + q(((cw - w) / 2.0) as f64),
+        CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
     let lh = TEXT_SIZE * 1.3;
@@ -1427,7 +1445,7 @@ fn ring(ctx: &mut Ctx, r: Rect, c: Color) {
 /// text is cut with an ellipsis.
 fn fit_text(cv: &CellView, avail: f32, style: &TextStyle) -> (String, f32) {
     let est = cv.text.chars().count() as f32 * style.size * 0.6;
-    let w = if est < avail * 0.7 && !matches!(cv.align, CellAlign::Right | CellAlign::Center) {
+    let w = if est < avail * 0.7 && !matches!(cv.align, CellAlign::Right | CellAlign::Center | CellAlign::Across) {
         // Clearly fits and left-aligned: no need to measure.
         return (cv.text.clone(), est);
     } else {
@@ -1745,6 +1763,10 @@ mod tests {
         }
         fn cell(&self, r: u32, c: u32) -> Option<CellView> {
             if let Some(s) = self.cells.borrow().get(&(r, c)) {
+                // "»…": centred across the cells after it.
+                if let Some(t) = s.strip_prefix('»') {
+                    return Some(CellView { align: CellAlign::Across, ..CellView::text(t.to_string()) });
+                }
                 return Some(CellView::text(s.clone()));
             }
             (r % 3 == 0).then(|| CellView::number(format!("{}", r as u64 * 1000 + c as u64)))
@@ -1913,6 +1935,24 @@ mod tests {
         assert!(shown.iter().any(|(t, w)| t == long && *w > 64.0), "{shown:?}");
         assert!(shown.iter().any(|(t, w)| t.ends_with('…') && t.starts_with("A ") && *w <= 64.0), "{shown:?}");
         assert_eq!(shown.iter().filter(|(t, _)| t == long).count(), 1, "{shown:?}");
+    }
+
+    #[test]
+    fn text_centred_across_the_selection_spans_its_cells() {
+        let (mut app, grid, _, _, _) = host(100, 10);
+        // Row 2: "Total" across A:C. Row 3: across A:B only (C not across).
+        for (r, c, t) in [(1, 0, "»Total"), (1, 1, "»"), (1, 2, "»"), (2, 0, "»Total"), (2, 1, "»")] {
+            grid.cells.borrow_mut().insert((r, c), t.into());
+        }
+        app.tick();
+        let at: Vec<f32> = app.tree().iter().filter_map(|(_, n)| if let Node::Text { content, rect, .. } = n { (content == "Total").then(|| rect.x() + rect.w() / 2.0) } else { None }).collect();
+        assert_eq!(at.len(), 2, "{at:?}");
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        // Centres at the middle of three columns, then of two.
+        let mut at = at;
+        at.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert!((at[0] - (hw + 96.0)).abs() <= 2.0, "{at:?}");
+        assert!((at[1] - (hw + 64.0)).abs() <= 2.0, "{at:?}");
     }
 
     #[test]
