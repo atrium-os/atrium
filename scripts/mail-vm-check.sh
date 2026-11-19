@@ -23,14 +23,14 @@ die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 say "cross-build (mail-parse-jail, mail-sync-worker, the dovecot tests)"
 set -- env; . "$ROOT/scripts/cloud-vm.sh"; set --
 S="$VMDIR/sysroot"
-export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
+export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd="${AR_aarch64_unknown_freebsd:-$(command -v llvm-ar || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$S"
 export CARGO_INCREMENTAL=0
 xb() { (cd "$ROOT/mail/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --target "$TARGET" --bin "$2") || die "build of $2"; }
 xb mail-parse mail-parse-jail
 xb mail-sync mail-sync-worker
-(cd "$ROOT/mail/mail-engine" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo test -q --no-run --target "$TARGET" --test dovecot) || die "build of the dovecot tests"
-T=$(ls -t "$ROOT/mail/mail-engine/target/$TARGET/debug/deps/"dovecot-* | grep -v '\.d$' | head -1)
+# cargo names the binary (a build.build-dir puts it outside target/)
+T=$(cd "$ROOT/mail/mail-engine" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo test -q --no-run --target "$TARGET" --test dovecot --message-format=json | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1) || die "build of the dovecot tests"
 [ -x "$T" ] || die "no test binary"
 
 say "guest: Dovecot and Pigeonhole"
