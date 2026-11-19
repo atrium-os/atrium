@@ -17,10 +17,10 @@ transport=${5:-}
 hip=${6:-}
 receipts=${7:-}
 decline_relock=0
-if [ "$hip" = tessera-relock-decline ]; then
-    hip=tessera-reconnect
-    decline_relock=1
-fi
+case "$hip" in
+    tessera-relock-decline) hip=tessera-reconnect; decline_relock=1 ;;
+    tessera-relock-reconnect) hip=tessera-reconnect; decline_relock=2 ;;
+esac
 if [ -n "$transport" ]; then
     export CRYPTA_GP_TEST_ESP=4501
 fi
@@ -331,6 +331,28 @@ fi
 if [ -n "$tessera_fact" ]; then
     probe "IPv4 echo before the Tessera encryption change"
     grep -q '^0 ' "$receipts" || fail "initial Tessera report did not reach peer"
+    reconnect_tessera() {
+        "$V" "$CTL up name=gp-gate" >/dev/null
+        wait_tessera_review
+        [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined HIP choice"
+        if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
+            fail "reconnect accepted the declined HIP choice"
+        fi
+        [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected rejection: $stale_reply"
+        sleep 1
+        [ "$(field handshake)" = 0 ] || fail "reconnect opened before HIP approval"
+        reconnect_iface=$(field iface)
+        [ -n "$reconnect_iface" ] || fail "reconnect has no tunnel interface"
+        "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $reconnect_iface$'; then exit 1; fi" ||
+            fail "reconnect installed its tunnel route before approval"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed before reconnect approval"
+        [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = "$1" ] ||
+            fail "reconnect came up before fresh approval"
+        if new_tessera_receipt; then fail "$change was uploaded before reconnect approval"; fi
+        ok "explicit reconnect waited for a new HIP approval"
+        touch "$receipts.$2"
+    }
     approve_tessera_change() {
         expected_count=$1
         change=$2
@@ -372,26 +394,7 @@ if [ -n "$tessera_fact" ]; then
                 echo "$pass checks passed"
                 exit 0
             fi
-            "$V" "$CTL up name=gp-gate" >/dev/null
-            wait_tessera_review
-            [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined HIP choice"
-            if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
-                fail "reconnect accepted the declined HIP choice"
-            fi
-            [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected rejection: $stale_reply"
-            sleep 1
-            [ "$(field handshake)" = 0 ] || fail "reconnect opened before HIP approval"
-            reconnect_iface=$(field iface)
-            [ -n "$reconnect_iface" ] || fail "reconnect has no tunnel interface"
-            "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $reconnect_iface$'; then exit 1; fi" ||
-                fail "reconnect installed its tunnel route before approval"
-            "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
-                fail "IPv4 echo passed before reconnect approval"
-            [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = 1 ] ||
-                fail "reconnect came up before fresh approval"
-            if new_tessera_receipt; then fail "$change was uploaded before reconnect approval"; fi
-            ok "explicit reconnect waited for a new HIP approval"
-            touch "$receipts.approved"
+            reconnect_tessera 1 approved
         fi
         approve_hip
         for _ in $(seq 1 20); do
@@ -493,10 +496,11 @@ if [ -n "$tessera_fact" ]; then
 
             receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
             lock_tessera_key
-            if [ "$decline_relock" = 1 ]; then
+            if [ "$decline_relock" != 0 ]; then
                 expected_count=0
                 change="Tessera domain key lock after rebind"
                 wait_tessera_review
+                declined_choice=$(hip_choice)
                 [ "$(field handshake)" = 1 ] || fail "the rebound tunnel was down before decline"
                 "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
                 wait_field up 0
@@ -514,11 +518,19 @@ if [ -n "$tessera_fact" ]; then
                     fail "IPv4 echo passed after declining the second key lock"
                 if new_tessera_receipt; then fail "the declined locked-key count reached the gateway"; fi
                 ok "declining the second key lock shut down the rebound tunnel without uploading the changed count"
-                echo "$pass checks passed"
-                exit 0
+                if [ "$decline_relock" = 1 ]; then
+                    echo "$pass checks passed"
+                    exit 0
+                fi
+                reconnect_tessera 3 relock-approved
             fi
             approve_tessera_change 0 "Tessera domain key lock after rebind"
-            probe "IPv4 echo on the rebound tunnel after approved key lock"
+            if [ "$decline_relock" = 2 ]; then
+                wait_field handshake 1
+                probe "IPv4 echo after approved second-decline reconnect"
+            else
+                probe "IPv4 echo on the rebound tunnel after approved key lock"
+            fi
         fi
     fi
     "$V" "$CTL down name=gp-gate" >/dev/null

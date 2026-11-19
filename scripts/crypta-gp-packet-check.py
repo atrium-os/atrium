@@ -69,7 +69,7 @@ def frames(stream, reader, calls):
         calls.append("echo")
 
 
-RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline")
+RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 REFRESH_HIP = ("refresh", "posture", *TESSERA_HIP)
 
@@ -130,8 +130,10 @@ class EspPeer:
                 if self.reconnect_approval and pair in self.configs[1:]:
                     assert pair != self.configs[1], "ESP used the declined association"
                     assert self.reconnect_approval.exists(), "ESP opened before reconnect approval"
-                    if pair in self.configs[3:]:
+                    if pair in self.configs[3:4]:
                         assert self.rebound_hip_received, "rebound ESP opened before HIP submission"
+                    if pair in self.configs[4:]:
+                        assert self.reconnect_approval.with_suffix(".relock-approved").exists(), "ESP opened before second reconnect approval"
                 plain = self.cipher(ekey, wire[8:24], wire[24:-12], decrypt=True)
                 assert plain[-1] == 4
                 padding = plain[-2]
@@ -225,6 +227,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert fields["authcookie"] == [COOKIE]
                         if hip in RECONNECT_HIP and calls.count("getconfig.esp") > 1:
                             assert calls.count("getconfig.esp") >= 3 and receipts.with_suffix(".approved").exists(), calls
+                            if calls.count("getconfig.esp") == 5:
+                                assert receipts.with_suffix(".relock-approved").exists(), calls
                         report, = fields["report"]
                         doc = ET.fromstring(report)
                         assert doc.tag == "hip-report" and doc.attrib == {"name": "hip-report"}
@@ -287,6 +291,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "ssl-tunnel-connect.sslvpn":
                         if hip in RECONNECT_HIP and calls.count("getconfig.esp") > 1:
                             assert calls.count("getconfig.esp") >= 3 and receipts.with_suffix(".approved").exists(), calls
+                            if calls.count("getconfig.esp") == 5:
+                                assert receipts.with_suffix(".relock-approved").exists(), calls
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
                         return
@@ -487,16 +493,23 @@ def main():
                 return
             if args.hip in RECONNECT_HIP:
                 declined_relock = args.hip == "tessera-relock-decline"
+                second_reconnect = args.hip == "tessera-relock-reconnect"
+                config_count = 5 if second_reconnect else 4
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(configs) == 4 and calls.count("login.esp") == 1, calls
+                assert len(configs) == config_count and calls.count("login.esp") == 1, calls
                 assert calls[configs[1]:configs[2]] == exchange, calls
                 reconnect_calls = calls[configs[2]:configs[3]]
-                final_calls = calls[configs[3]:]
+                rebound_end = configs[4] if second_reconnect else len(calls)
+                final_calls = calls[configs[3]:rebound_end]
+                if second_reconnect:
+                    second_calls = calls[rebound_end:]
+                    assert second_calls[:3] == [*exchange, "hipreport.esp"] and second_calls[-1] == "logout.esp", calls
+                    assert final_calls[-1] == "hipreportcheck.esp", calls
                 assert reconnect_calls[:3] == [*exchange, "hipreport.esp"], calls
                 assert final_calls[:3] == [*exchange, "hipreport.esp"], calls
                 if declined_relock:
                     assert final_calls[-1] == "hipreportcheck.esp", calls
-                else:
+                elif not second_reconnect:
                     assert final_calls[-1] == "logout.esp", calls
                 reports = [line.split() for line in receipts.read_text().splitlines()]
                 runs = []
@@ -511,19 +524,24 @@ def main():
                 assert len(runs[2]) >= 2 and len(runs[3]) >= 2 and runs[1][0] == runs[3][0], reports
                 if not declined_relock:
                     assert runs[2][0] == runs[4][0], reports
-                rebound_echoes = 1 if declined_relock else 2
+                rebound_echoes = 1 if declined_relock or second_reconnect else 2
                 if esp:
                     assert not esp.errors, esp.errors
-                    assert len(esp.configs) == 4, calls
-                    original, _, reconnected, rebound = (config[0][0] for config in esp.configs)
-                    assert esp.received_spis == {original, reconnected, rebound}, esp.received_spis
-                    assert esp.echo == [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes, esp.echo
+                    assert len(esp.configs) == config_count, calls
+                    original, _, reconnected, rebound, *rest = (config[0][0] for config in esp.configs)
+                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest
+                    assert esp.received_spis == set(echo_spis) and esp.echo == echo_spis, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == 3 and calls.count("echo") == 5 + rebound_echoes, calls
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - 1, calls
+                    assert calls.count("echo") == 5 + rebound_echoes + second_reconnect, calls
+                    if second_reconnect:
+                        assert second_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                     assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == rebound_echoes, calls
-                if declined_relock:
+                if second_reconnect:
+                    print("Fresh approval preceded the locked report and traffic after the second decline")
+                elif declined_relock:
                     print("Declining the second key lock sent no changed count and closed the rebound tunnel")
                 else:
                     print("The rebound tunnel carried traffic after the unchanged report and the approved key lock")

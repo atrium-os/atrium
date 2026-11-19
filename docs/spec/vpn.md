@@ -846,6 +846,11 @@ another origin. An active portal-profile session stays in engine memory.
   review while the rebound tunnel is active. It verifies that the changed
   count remains unsent, the engine stops, the route is removed, and IPv4
   echo fails after decline. It passed 23/23 on TLS and 23/23 with `--esp`.
+  The `--hip tessera-relock-reconnect` variant then explicitly reconnects
+  with the key still locked. It rejects the declined choice and verifies
+  that the locked report, tunnel route and IPv4 echo wait for fresh approval.
+  The peer distinguishes the new TLS connection or ESP association.
+  It passed 26/26 on arm64 TLS and 26/26 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
