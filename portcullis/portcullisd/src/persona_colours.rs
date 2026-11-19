@@ -16,13 +16,31 @@ fn plain(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
+/// The persona routes file (vpn.md §7.4, personas.md §7): one
+/// `<person> <persona> <profile>` line per named persona whose policy names
+/// a VPN, next to the colours; frescod puts the route in the chip from it
+/// and cryptad's `vpn-state`. `PORTCULLISD_PERSONA_VPN` overrides the path.
+pub fn routes_path() -> PathBuf {
+    std::env::var_os("PORTCULLISD_PERSONA_VPN").map(PathBuf::from).unwrap_or_else(|| "/var/run/atrium/persona-vpn".into())
+}
+
 /// Replace `person`'s lines with `personas` (name, colour); other people's
 /// lines stay.
 pub fn publish(person: &str, personas: &[(String, String)]) -> std::io::Result<()> {
+    publish_to(&path(), person, personas)
+}
+
+/// Replace `person`'s lines in the routes file with `routes` (persona, VPN
+/// profile).
+pub fn publish_routes(person: &str, routes: &[(String, String)]) -> std::io::Result<()> {
+    publish_to(&routes_path(), person, routes)
+}
+
+fn publish_to(p: &std::path::Path, person: &str, personas: &[(String, String)]) -> std::io::Result<()> {
     if !plain(person) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a user name"));
     }
-    let p = path();
+    let p = p.to_path_buf();
     let old = std::fs::read_to_string(&p).unwrap_or_default();
     let mut lines: Vec<String> = old.lines().filter(|l| l.split(' ').next() != Some(person) && l.split(' ').count() == 3).map(String::from).collect();
     lines.extend(personas.iter().filter(|(n, c)| plain(n) && plain(c)).map(|(n, c)| format!("{person} {n} {c}")));
@@ -71,6 +89,9 @@ mod tests {
         assert!(read("carol").is_empty());
         publish("alice", &[]).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("c")).unwrap(), "bob school green\n");
+        std::env::set_var("PORTCULLISD_PERSONA_VPN", d.join("v"));
+        publish_routes("alice", &[("work".into(), "acme".into())]).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("v")).unwrap(), "alice work acme\n");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

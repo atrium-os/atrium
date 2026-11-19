@@ -68,6 +68,45 @@ fn lock(dir: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// The most cells one Ctrl+Enter fills.
+pub const MAX_TYPE_ALL: u64 = officina_grid::clip::MAX_TILES;
+
+/// A date or time typed in ISO form (`2026-11-19`, `14:30`, `14:30:05`,
+/// `2026-11-19 14:30`): its serial and the format to show it in.
+pub fn typed_date(s: &str) -> Option<(f64, &'static str)> {
+    let s = s.trim();
+    let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().ok().filter(|n| (lo..=hi).contains(n) && !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit()));
+    let date = |t: &str| -> Option<f64> {
+        let mut p = t.split('-');
+        let (y, m, d) = (p.next()?, p.next()?, p.next()?);
+        if p.next().is_some() || y.len() != 4 {
+            return None;
+        }
+        let (y, m, d) = (num(y, 1900, 9999)?, num(m, 1, 12)?, num(d, 1, 31)?);
+        let serial = officina_grid::eval::dates::date_serial(y as f64, m as f64, d as f64)?;
+        // 2026-02-31 is not a day.
+        (officina_grid::eval::dates::ymd(serial) == Some((y as i64, m as i64, d as i64))).then_some(serial)
+    };
+    let time = |t: &str| -> Option<(f64, bool)> {
+        let p: Vec<&str> = t.split(':').collect();
+        if !(2..=3).contains(&p.len()) || p[1].len() != 2 {
+            return None;
+        }
+        let (h, m) = (num(p[0], 0, 23)?, num(p[1], 0, 59)?);
+        let sec = if p.len() == 3 { num(p[2], 0, 59).filter(|_| p[2].len() == 2)? } else { 0 };
+        Some(((h * 3600 + m * 60 + sec) as f64 / 86400.0, p.len() == 3))
+    };
+    if let Some((d, t)) = s.split_once(' ') {
+        let (t, secs) = time(t.trim())?;
+        return Some((date(d)? + t, if secs { "yyyy-mm-dd hh:mm:ss" } else { "yyyy-mm-dd hh:mm" }));
+    }
+    if let Some(d) = date(s) {
+        return Some((d, "yyyy-mm-dd"));
+    }
+    let (t, secs) = time(s)?;
+    Some((t, if secs { "hh:mm:ss" } else { "hh:mm" }))
+}
+
 /// One record of the journal: one user action.
 #[derive(Debug, Clone, PartialEq)]
 enum Record {
@@ -397,6 +436,9 @@ pub struct Doc {
     /// Widths of columns hidden here, by (sheet, column), for showing them
     /// again as they were (for this session; files keep only "hidden").
     pub hidden_widths: std::collections::HashMap<(u16, u32), f64>,
+    /// Rows grown to fit typed lines, by (sheet, row): they shrink back when
+    /// their text needs less (for this session; a row sized by hand leaves).
+    pub grown_rows: std::collections::HashSet<(u16, u32)>,
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
@@ -454,7 +496,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, hidden_widths: Default::default() }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, hidden_widths: Default::default(), grown_rows: Default::default() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -609,22 +651,67 @@ impl Doc {
         self.keep_sheet();
     }
 
-    /// Row `row` grown to `px` as part of the last action, when nobody has
-    /// sized it (no height of its own) and it needs more than it has.
+    /// Row `row` fitted to `px` (what its cells now need) as part of the
+    /// last action: grown when nobody has sized it and it needs more, or,
+    /// grown here before, back down as far as the default height.
     pub fn grow_row(&mut self, row: u32, px: f64) {
         let s = self.sheet;
         let sizes = &self.wb.sheet(s).row_sizes;
-        if sizes.overrides().iter().any(|o| o.0 == row) || px <= sizes.size(row) || !px.is_finite() {
+        let grown = self.grown_rows.contains(&(s, row));
+        let sized = sizes.overrides().iter().any(|o| o.0 == row);
+        if (sized && !grown) || !px.is_finite() || sizes.size(row) <= 0.0 {
             return;
         }
-        let mut over = sizes.overrides().to_vec();
-        over.push((row, px.min(crate::app::MAX_ROW_PX)));
+        let to = px.max(sizes.default).min(crate::app::MAX_ROW_PX);
+        if to == sizes.size(row) || (!grown && to <= sizes.size(row)) {
+            return;
+        }
+        let mut over: Vec<(u32, f64)> = sizes.overrides().iter().copied().filter(|o| o.0 != row).collect();
+        if to != sizes.default {
+            over.push((row, to));
+        }
         over.sort_by_key(|o| o.0);
         self.extend(vec![GridOp::Sizes { sheet: s, rows: true, over }]);
+        if to == self.wb.sheet(s).row_sizes.default {
+            self.grown_rows.remove(&(s, row));
+        } else {
+            self.grown_rows.insert((s, row));
+        }
+    }
+
+    /// Ctrl+Enter: `text` typed into every cell of `area`, as one step;
+    /// formulas move as a copy moves them. At most [`MAX_TYPE_ALL`] cells.
+    pub fn type_all(&mut self, area: officina_grid::Rect, text: &str) -> bool {
+        if area.cells() > MAX_TYPE_ALL {
+            self.status = format!("Ctrl+Enter fills at most {MAX_TYPE_ALL} cells.");
+            return false;
+        }
+        if !self.type_into(area.r0, area.c0, text) {
+            return false;
+        }
+        if area.cells() == 1 {
+            return true;
+        }
+        let one = officina_grid::Rect { r1: area.r0, c1: area.c0, ..area };
+        let clip = officina_grid::clip::Clip::take(&self.wb, one, false);
+        match clip.paste_into_as(&self.wb, area, officina_grid::clip::What::Formulas) {
+            Ok((ops, _)) => {
+                self.extend(ops);
+                self.recalc();
+                true
+            }
+            Err(e) => {
+                self.status = e;
+                false
+            }
+        }
     }
 
     pub fn type_into(&mut self, row: u32, col: u32, text: &str) -> bool {
-        let input = Input::typed(text);
+        let (input, date_fmt) = match typed_date(text) {
+            Some((serial, fmt)) => (Input::Value(officina_grid::Value::Num(serial)), Some(fmt)),
+            None => (Input::typed(text), None),
+        };
         if let Input::Formula(f) = &input {
             if let Err(e) = self.wb.parse(f, self.sheet, row, col) {
                 self.status = format!("That formula has a problem at character {}: {}", e.at + 1, e.msg);
@@ -637,7 +724,13 @@ impl Doc {
         self.status.clear();
         self.warned = None;
         let a = CellAddr::new(self.sheet, row, col);
-        self.run("Typing", vec![GridOp::set(a, input)]);
+        let mut ops = vec![GridOp::set(a, input)];
+        // A date or time typed: shown as one, unless the cell has a format.
+        if let Some(fmt) = date_fmt.filter(|_| &*self.wb.style(a).num_fmt == "General") {
+            let r = officina_grid::Rect { sheet: a.sheet, r0: row, c0: col, r1: row, c1: col };
+            ops.push(GridOp::restyle(&self.wb, r, |st| officina_grid::style::Style { num_fmt: fmt.into(), ..st.clone() }));
+        }
+        self.run("Typing", ops);
         // A validation rule over the cell: refuse, warn, or tell (§16.83).
         if let Err(r) = self.wb.check_cell(a) {
             let msg = refusal_text(&r);
@@ -842,7 +935,11 @@ impl Doc {
             self.size_done();
             self.sizing = Some((s, rows, sizes(self, s, rows).overrides().to_vec()));
         }
-        let px = px.clamp(1.0, 8192.0);
+        // 0 hides (the size bar); a drag never goes below its minimum.
+        let px = px.clamp(0.0, 8192.0);
+        if rows {
+            self.grown_rows.retain(|&(t, r)| t != s || r < lo || r > hi);
+        }
         let mut over: Vec<(u32, f64)> = sizes(self, s, rows).overrides().iter().copied().filter(|o| o.0 < lo || o.0 > hi).collect();
         over.extend((lo..=hi).map(|i| (i, px)));
         over.sort_by_key(|o| o.0);
@@ -1088,6 +1185,27 @@ mod tests {
         // Ctrl on the handle: one number counts.
         assert!(d.fill_as(r(0, 0, 0, 0), r(0, 0, 0, 2), officina_grid::autofill::Mode::Flip));
         assert_eq!(d.wb.formatted(CellAddr::new(0, 0, 2)).text, "9");
+    }
+
+    #[test]
+    fn typed_dates_and_times_become_them() {
+        assert_eq!(typed_date("2026-11-19"), Some((46345.0, "yyyy-mm-dd")));
+        assert_eq!(typed_date("14:30"), Some((14.5 / 24.0, "hh:mm")));
+        assert_eq!(typed_date("2026-11-19 06:00"), Some((46345.25, "yyyy-mm-dd hh:mm")));
+        for no in ["2026-02-31", "26-11-19", "24:00", "1:5", "12", "2026-11", "x"] {
+            assert_eq!(typed_date(no), None, "{no}");
+        }
+        let mut d = Doc::new("t");
+        d.type_into(0, 0, "2026-11-19");
+        assert_eq!(d.wb.value(0, 0, 0), officina_grid::Value::Num(46345.0));
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 0, 0)).text, "2026-11-19");
+        // Ctrl+Enter: every cell, formulas moving; one undo step.
+        let area = officina_grid::Rect { sheet: 0, r0: 2, c0: 1, r1: 4, c1: 2 };
+        assert!(d.type_all(area, "=A1+1"));
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 2)).as_deref(), Some("=B3+1"));
+        assert!(d.undo());
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 2, 1)), None);
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 2)), None);
     }
 
     #[test]
