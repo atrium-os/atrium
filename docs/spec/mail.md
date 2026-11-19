@@ -515,20 +515,38 @@ doesn't run a spam classifier of its own in v1.
 
 ### 8.2 Opening and saving
 
-- **Open in…** the type's default app: portcullisd's open path takes a sealed, read-only
-  descriptor of the attachment from Mail with a press (new verb, `OpenAttachment`,
-  §16 step M5) and hands it to the app as opening-files §6.2 does for a file from Scrinium.
-  The app can't learn where it came from beyond its name.
-- **No temporary files** (Shankar 2026-11-18): other mail clients write an opened
-  attachment to a temp folder and leave it there. Mail never writes one: opening and quick
-  look hand over a sealed memfd, which is gone when the app closes it. An app that edits it
-  saves a copy through the picker; the memfd can't be written.
+- **Open and Open with…** Mail's capability-free parser worker handles incoming MIME.
+  Mail checks the attachment name and leading bytes with atrium-types. Only a
+  recognized type whose family permits app handlers is eligible. Open uses a default
+  handler. Open with… asks portcullisd for eligible installed handlers and marks the
+  default. Showing or cancelling the menu transfers no attachment bytes.
+- **Broker checks.** On selection, portcullisd identifies Mail by its peer UID and
+  checks its installed manifest for `open-attachments`. It accepts a basename and one
+  memory descriptor, verifies the seals against writes and size changes, and reads the
+  header itself. It rejects a type mismatch or an ineligible handler, checks launch
+  policy, and spends a Fresco press token bound to the caller before delivery.
+- **Read-only delivery.** The selected app receives the descriptor in its own jail,
+  with Capsicum rights limited to read, seek and stat. Mail creates no temporary
+  pathname. The memory file lasts until its last descriptor closes. An editor saves a
+  separate copy through the picker. The recipient's own capabilities govern what it
+  can do with the bytes after reading them.
+- **Content safety.** Type detection identifies a handler. A correctly identified PDF
+  can still contain hostile content. The current open path performs no malware scan
+  or content sanitization. The UI must not describe a recognized file as scanned or safe.
+- **Persona routing (required, pending).** Ordinary Open and Open with… must resolve
+  the receiving instance in Mail's persona, including when the handler must be started.
+  If that instance cannot receive the file, refuse delivery. Any explicit transfer to
+  another persona must follow the directional file-crossing policy in personas.md §6.
+  Today the attachment broker routes by owner and app ID. The FreeBSD VM check must
+  open a synthetic attachment from Work with a Personal instance of the same handler
+  already running, verify that the Work handler reads the expected bytes, and verify
+  that Personal receives no descriptor. Repeat with the Work handler already running.
 - **Save** goes through Scrinium's picker (Save target, persona places only), with the
   origin written to `atrium.origin` ("mail: from priya@example.com, 2026-11-15") like a
   Navigator download.
 - **Nothing runs**: executables, scripts, shortcuts, disk images and installers are shown
-  and savable but no "Open" is offered (opening-files §1). An Atrium app bundle opens the
-  installer, which checks its signature.
+  and savable but no "Open" is offered (opening-files §1). Mail also excludes Atrium app bundles from
+  Open and Open with…. Installation of a saved bundle follows the installer’s signature checks.
 - **Encrypted ZIPs and PDFs** ask for their password in Arca's field (Officina O7a's path).
 
 ### 8.3 Sending big files
