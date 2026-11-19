@@ -44,6 +44,7 @@ pub enum Cmd {
     /// Closing with unsaved changes: keep the window open.
     CloseCancel,
     Open,
+    NewWorkbook(Option<fresco_protocol::activation::Token>),
     Save,
     SaveAs,
     /// Print the sheet through the print sheet (Ctrl+P too).
@@ -248,6 +249,7 @@ pub struct Ui {
 /// Cheap to clone: every field is shared.
 #[derive(Clone)]
 pub struct Sheets {
+    pub launcher: bool,
     pub doc: Rc<RefCell<Doc>>,
     pub source: Rc<SheetSource>,
     pub scroll: Mutable<ScrollState>,
@@ -330,7 +332,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { launcher: false, doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -1846,12 +1848,27 @@ impl View for Sheets {
         let st = |size, weight, color| TextStyle { family: font::SANS.into(), size, weight, color };
         ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
 
-        // Toolbar.
+        let new_button = |ctx: &mut Ctx, x| {
+            let cmds = self.cmds.clone();
+            Button::secondary("New").at(x, 8.0).width(64.0).on_click(move || {
+                cmds.lock().unwrap().push(Cmd::NewWorkbook(pergola::clipboard::current_activation()));
+            }).render(ctx);
+        };
         let mut x = 12.0;
-        for (label, cmd, wd) in [("Open…", Cmd::Open, 76.0), ("Save", Cmd::Save, 64.0), ("Save As…", Cmd::SaveAs, 92.0), ("Print…", Cmd::Print, 64.0), ("Undo", Cmd::Undo, 64.0), ("Redo", Cmd::Redo, 64.0)] {
+        let buttons = [("Open…", Cmd::Open, 76.0), ("Save", Cmd::Save, 64.0), ("Save As…", Cmd::SaveAs, 92.0), ("Print…", Cmd::Print, 64.0), ("Undo", Cmd::Undo, 64.0), ("Redo", Cmd::Redo, 64.0)];
+        for &(label, cmd, wd) in &buttons[..if self.launcher { 1 } else { buttons.len() }] {
             let cmds = self.cmds.clone();
             Button::secondary(label).at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(cmd)).render(ctx);
             x += wd + 8.0;
+        }
+        new_button(ctx, x);
+        x += 72.0;
+        if self.launcher {
+            ctx.add(Node::Text { rect: Rect::new(12.0, 54.0, w - 24.0, 22.0),
+                content: self.doc.borrow().status.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            self.picker_slot(ctx, w, h);
+            ctx.pop();
+            return;
         }
         // The Data menu, read from the document and the selection as they are now.
         {
@@ -2599,16 +2616,19 @@ impl View for Sheets {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
-        if self.ui.get_cloned().asking {
-            // The system places the picker's sheet over the window.
-            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
-            ctx.slot(id, PICKER_SLOT);
-        }
+        self.picker_slot(ctx, w, h);
         ctx.pop();
     }
 }
 
 impl Sheets {
+    fn picker_slot(&self, ctx: &mut Ctx, w: f32, h: f32) {
+        if self.ui.get_cloned().asking {
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, PICKER_SLOT);
+        }
+    }
+
     /// The toolbar's file commands since the last call; undo and redo are run here.
     pub fn take_cmds(&self) -> Vec<Cmd> {
         self.poll_link();

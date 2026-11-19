@@ -192,6 +192,10 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
   the app-wide channel. Eight concurrent workbook launches are allowed. Each
   slot has a separate UID and fresh temporary upper filesystem. Download and
   attachment opens use the same launch path and keep their read-only access.
+- In Sheets' embedded Open picker, Scrinium sends `OpenFile` with the
+  picker's press and the parent UID supplied by Limen. Portcullis verifies
+  the parent is Sheets for the same owner and starts the new jail in its
+  persona. The picker sends the old window a completion message.
 - The app never learns the path, the folder, or the place. Save As goes
   through the picker (officina.md §4.2).
 

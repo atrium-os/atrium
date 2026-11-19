@@ -170,6 +170,8 @@ pub struct Notice {
 pub enum Outcome {
     /// Files to hand over open: (name, full path in Scrinium's jail).
     Files(Vec<(String, PathBuf)>),
+    /// A workbook for a new Sheets jail, with the picker's own press.
+    Workbook { name: String, path: PathBuf, write: bool, activation: [u8; 16] },
     /// A folder of a stick to put into the app's jail: the stick's
     /// partition and the folder's path on it (`/` for all of it).
     Folder { part: String, path: String, name: String },
@@ -501,7 +503,7 @@ impl Browser {
             Ok(mut v) => {
                 if let Some(f) = self.picker() {
                     let f = f.clone();
-                    v.retain(|e| e.dir && !e.link || (matches!(f.kind, Kind::File | Kind::Save) && !e.link && f.shows(&e.name)));
+                    v.retain(|e| e.dir && !e.link || (matches!(f.kind, Kind::File | Kind::Save | Kind::Workbook) && !e.link && f.shows(&e.name)));
                 }
                 self.entries = v;
                 self.unreadable = None;
@@ -1251,12 +1253,19 @@ impl Browser {
         let dir = self.dir().ok_or("No folder is open")?;
         let sel: Vec<&Entry> = self.selected.iter().filter_map(|&i| self.entries.get(i)).collect();
         match f.kind {
-            Kind::File => {
+            Kind::File | Kind::Workbook => {
                 if sel.is_empty() || sel.iter().any(|e| e.dir || e.link) {
                     return Err(if f.multiple { "Select files" } else { "Select a file" }.into());
                 }
                 if sel.len() > if f.multiple { limen::picker::MAX_FILES } else { 1 } {
                     return Err("Too many files".into());
+                }
+                if f.kind == Kind::Workbook {
+                    let entry = sel[0];
+                    return Ok(Outcome::Workbook {
+                        name: entry.name.clone(), path: dir.join(&entry.name),
+                        write: f.write && !place.read_only, activation: [0; 16],
+                    });
                 }
                 if f.write && place.read_only {
                     return Err("This stick is read-only, and the app wants to change the file".into());
@@ -1298,7 +1307,12 @@ impl Browser {
 
     pub fn choose(&mut self) {
         match self.pick() {
-            Ok(o) => self.outcome = Some(o),
+            Ok(mut o) => {
+                if let Outcome::Workbook { activation, .. } = &mut o {
+                    *activation = pergola::clipboard::current_activation().unwrap_or_default();
+                }
+                self.outcome = Some(o);
+            }
             Err(e) => self.say(e, true),
         }
     }
@@ -1612,6 +1626,24 @@ mod tests {
         b.press(1, Mods::default(), 3100.0);
         assert_eq!(b.outcome, Some(Outcome::Files(vec![("note.txt".into(), d.join("Docs/note.txt"))])), "a double press picks");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn workbook_picker_routes_one_selection_without_returning_a_file_outcome() {
+        let (dir, mut place) = stick("pick-workbook");
+        place.read_only = true;
+        let mut browser = picker(Filter { kind: Kind::Workbook, write: true, ..Filter::file() });
+        browser.set_places(vec![place]);
+        browser.enter("Docs");
+        let index = browser.entries.iter().position(|entry| entry.name == "note.txt").unwrap();
+        browser.activate(index);
+        assert_eq!(browser.outcome, Some(Outcome::Workbook {
+            name: "note.txt".into(),
+            path: dir.join("Docs/note.txt"),
+            write: false,
+            activation: [0; 16],
+        }));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

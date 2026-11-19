@@ -119,6 +119,7 @@ pub static TYPES: &[Type] = &[
     t!("application/vnd.oasis.opendocument.presentation", "OpenDocument presentation", Presentation, ["odp"], [Bytes(&[(0, b"PK\x03\x04"), (30, b"mimetypeapplication/vnd.oasis.opendocument.presentation")])], [Bytes(ZIP)]),
     t!("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "Word document", Document, ["docx"], [], [Bytes(ZIP)]),
     t!("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Excel spreadsheet", Spreadsheet, ["xlsx"], [], [Bytes(ZIP)]),
+    t!("application/vnd.ms-excel.sheet.macroenabled.12", "Excel macro-enabled spreadsheet", Spreadsheet, ["xlsm"], [], [Bytes(ZIP)]),
     t!("application/vnd.openxmlformats-officedocument.presentationml.presentation", "PowerPoint presentation", Presentation, ["pptx"], [], [Bytes(ZIP)]),
     t!("application/msword", "Word 97 document", Document, ["doc"], [], [Bytes(&[(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")])]),
     t!("application/vnd.ms-excel", "Excel 97 spreadsheet", Spreadsheet, ["xls"], [], [Bytes(&[(0, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")])]),

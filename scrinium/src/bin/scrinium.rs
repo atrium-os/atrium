@@ -106,7 +106,19 @@ impl Pane {
         // selection under it.
         let (id, state, field) = (self.win.id(), &self.state, &self.field);
         let first = |ev: &fresco_client::Event| match ev {
-            fresco_client::Event::Key { window_id, .. } if *window_id == id => translate(ev).is_some_and(|k| take_key(state, field, &k)),
+            fresco_client::Event::Key { window_id, hid_usage, pressed, activation, .. } if *window_id == id => {
+                let handled = translate(ev).is_some_and(|k| take_key(state, field, &k));
+                // take_key can choose a file even when it lets Enter continue
+                // through the window's normal dispatch.
+                if *pressed && matches!(*hid_usage, 0x28 | 0x58) {
+                    with(state, |browser| {
+                        if let Some(Outcome::Workbook { activation: token, .. }) = browser.outcome.as_mut() {
+                            *token = *activation;
+                        }
+                    });
+                }
+                handled
+            }
             _ => false,
         };
         match self.win.step_with(&mut self.app, Some(wait), first) {
@@ -322,6 +334,7 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
 struct Embed {
     to_pane: Sender<ToPane>,
     parent_uid: u32,
+    sheets: bool,
     write: bool,
 }
 
@@ -357,6 +370,32 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
                 eprintln!("scrinium: picker {embed}: handed over {name}{}", if e.write { " (read-write)" } else { "" });
             }
             let _ = child.emit(embed, ToParent::Done { files: open.len() as u32 }.encode());
+            Ok(())
+        }
+        Outcome::Workbook { name, path, write, activation } => {
+            use std::os::unix::fs::FileExt;
+            if !e.sheets {
+                return Err("Only Sheets can open a workbook this way".into());
+            }
+            let open = |write| std::fs::OpenOptions::new().read(true).write(write)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
+            let (file, write) = if write {
+                open(true).map(|f| (f, true)).or_else(|_| open(false).map(|f| (f, false)))
+            } else {
+                open(false).map(|f| (f, false))
+            }.map_err(|err| format!("Couldn't open “{name}”: {}", scrinium::browser::err_text(&err)))?;
+            if !file.metadata().map_err(|err| err.to_string())?.is_file() {
+                return Err(format!("“{name}” is not a file"));
+            }
+            let mut head = [0; atrium_types::HEAD];
+            let n = file.read_at(&mut head, 0).map_err(|err| err.to_string())?;
+            let bytes = &head[..n];
+            let detected = atrium_types::detect(&name, bytes);
+            let ty = detected.known().ok_or_else(|| detected.question().unwrap_or_else(|| "Unknown workbook format".into()))?;
+            let mime = if ty.mime == "text/plain" { "text/csv" } else { ty.mime };
+            let write = write && mime != "application/vnd.ms-excel";
+            scrinium::open::open_workbook(e.parent_uid, mime, &name, write, activation, &file)?;
+            child.emit(embed, ToParent::Done { files: 0 }.encode()).map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
         Outcome::Save { dir, name, origin } => {
@@ -413,7 +452,7 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                 Some(ChildEvent::Attach { embed, role, parent_app, parent_uid }) if role == "picker" => {
                     eprintln!("scrinium: picker {embed} for {parent_app} (uid {parent_uid})");
                     let (ptx, prx) = mpsc::channel();
-                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, write: false });
+                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", write: false });
                     let (f, pl, t) = (fresco.clone(), places.clone(), tx.clone());
                     std::thread::spawn(move || picker_pane(embed, parent_app, f, pl, prx, t));
                 }
@@ -425,6 +464,10 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
                     if let (Some(e), Some(ToChild::Open(f))) = (embeds.get_mut(&embed), ToChild::decode(&bytes)) {
+                        if f.kind == limen::picker::Kind::Workbook && !e.sheets {
+                            let _ = child.emit(embed, ToParent::Failed { why: "Only Sheets can open a workbook this way".into() }.encode());
+                            continue;
+                        }
                         e.write = f.write;
                         let _ = e.to_pane.send(ToPane::Open(f));
                     }

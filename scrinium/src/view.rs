@@ -1109,7 +1109,7 @@ impl ScriniumView {
         let entries = b.entries.clone();
         let selected = b.selected.clone();
         let handlers: Vec<_> = (0..entries.len()).map(|i| std::rc::Rc::new(self.press_handler(i))).collect();
-        let picking_files = b.picker().map(|f| f.kind == Kind::File);
+        let picking_files = b.picker().map(|f| matches!(f.kind, Kind::File | Kind::Workbook));
         VirtualList::new(self.scroll.clone(), Rect::new(x0, top, lw, lh), entries.len(), row_h(), move |i, ctx| {
             let t = ctx.theme;
             let e = &entries[i];
@@ -1389,8 +1389,8 @@ impl ScriniumView {
         } else {
             match (filter.kind, filter.multiple) {
                 (Kind::Folder, _) => "Choose a folder".into(),
-                (Kind::File, true) => "Choose files".into(),
-                (Kind::File, false) => "Choose a file".into(),
+                (Kind::File | Kind::Workbook, true) => "Choose files".into(),
+                (Kind::File | Kind::Workbook, false) => "Choose a file".into(),
                 (Kind::Save, _) => format!("Save “{}”", filter.name),
             }
         };
@@ -1422,7 +1422,7 @@ impl ScriniumView {
         rect(ctx, 0.0, foot, w, 1.0, t.border_default(), 0.0);
         let pick = b.pick();
         let go = match filter.kind {
-            Kind::File => "Open",
+            Kind::File | Kind::Workbook => "Open",
             Kind::Folder => "Choose folder",
             Kind::Save => "Save",
         };
@@ -1437,6 +1437,7 @@ impl ScriniumView {
             (_, _, Some(Outcome::Cancelled)) => ("Cancelled".to_string(), t.text_secondary()),
             (_, _, Some(_)) => ("Handing it over…".to_string(), t.text_secondary()),
             (Some(n), _, _) if n.error => (n.text.clone(), t.danger_fg()),
+            (_, Ok(Outcome::Workbook { name, .. }), _) => (format!("“{name}”"), t.text_primary()),
             (_, Ok(Outcome::Files(f)), _) if f.len() == 1 => (format!("“{}”", f[0].0), t.text_primary()),
             (_, Ok(Outcome::Files(f)), _) => (format!("{} files", f.len()), t.text_primary()),
             (_, Ok(Outcome::Folder { name, .. }), _) => (format!("The folder “{name}”"), t.text_primary()),

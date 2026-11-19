@@ -31,6 +31,7 @@ types = [
     "application/vnd.atrium.osheet",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.ms-excel.sheet.macroenabled.12",
     "text/csv",
 ]
 mode = "edit"

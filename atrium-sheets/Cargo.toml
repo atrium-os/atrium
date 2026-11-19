@@ -20,6 +20,7 @@ path = "examples/scroll_cost.rs"
 
 [dependencies]
 atrium-open = { path = "../atrium-open" }
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
 # Writers, protection and the launcher: the readers run in the convert worker.

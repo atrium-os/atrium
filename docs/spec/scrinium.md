@@ -112,7 +112,7 @@ embeds.send(e, ToChild::Open(Filter::file(&["txt", "md"])).encode())?;
 //   ParentEvent::Message { bytes }                       -> Folder { at, name, read_only } | Done { files } | Cancelled | Failed { why }
 ```
 
-`Filter { kind: File | Folder, extensions, multiple, write, title }`. Limits:
+`Filter { kind: File | Folder | Save | Workbook, extensions, multiple, write, title }`. Limits:
 16 extensions of 16 bytes, a title of 80, 64 files, names of 255; anything
 over is refused by the decoder. The app never names a path or a stick.
 
@@ -132,6 +132,13 @@ or read-write as the filter asked, and sends `ToParent::File` with
 
 Then `Done { files }`, and the app detaches. Nothing is mounted in the app's
 jail for a file.
+
+When Sheets asks for `Workbook`, Limen identifies the parent. Scrinium
+spends the picker's confirmation press through Portcullis and sends the file
+directly to a new Sheets jail in the parent's persona. The parent receives
+`Done { files: 0 }` after the broker accepts the launch. Sheets review inputs
+use ordinary `File` mode. `Save` creates a unique named file in the chosen
+folder and sends its writable descriptor to the parent.
 
 Known limit: the descriptor is on Scrinium's grant mount, so it stops working
 if Scrinium's jail goes, or the session locks, the stick is ejected or

@@ -106,7 +106,7 @@ one Officina document are never cross-process embeds (§17 D3).
 ## 3. Processes and trust
 
 ```
- Scrinium picker ──fd──► limend ──fd──► atrium-sheets (doc jail, one per document)
+ Scrinium picker ──fd──► portcullisd ──fd──► atrium-sheets (one jail per workbook)
                                            │   holds: this document's fd, its autosave dir,
                                            │          Pergola window, no network
                                            │
@@ -129,15 +129,14 @@ cost is the engine's memory plus Pergola's, to be measured in O1 (target under 4
 empty document, §15). A light "launcher" window (new, recent files, templates) is a
 separate instance with no document.
 
-**Sheets brokered opens.** Files, downloads and attachments enter separate
-Sheets jails through Portcullis, with one startup descriptor per process. Each
-live slot has its own jail root, UID and temporary writable layer. The layer
-keeps autosave data private while the jail runs and is discarded at teardown.
-Save still writes through the granted descriptor, and Files can reopen native
-`.osheet` files. A workbook opened this way directs further opens to Files.
-An ordinary Sheets launch still supports picker Open, and embedded review
-pickers still supply comparison inputs to the current workbook. Launcher and
-picker routing for new document jails remain to be wired up.
+**Sheets document launches.** The launcher window offers Open and New. New
+uses a Sheets press that Portcullis checks before starting a blank workbook.
+The embedded Open picker gives the selected file directly from Scrinium to
+Portcullis with the picker's own press and the parent persona from Limen.
+Files, downloads and attachments use the same document launcher. Each live
+workbook slot has its own jail root, UID and temporary writable layer. The
+layer keeps autosaves private while the jail runs and is discarded at
+teardown. Review pickers give comparison inputs to the current workbook.
 
 **The converter jail.** Built the way the Navigator's converter is (threat model §2,
 portcullis §6.5.2e′): a fresh jail per conversion, rctl `memoryuse` and `pcpu` limits plus
@@ -161,40 +160,23 @@ every length bounded.
 
 ### 4.1 Open
 
-The app asks Scrinium's picker (`limen::picker`, `Filter::file` with the format's
-extensions, `write: true` when editing) and gets an open, Capsicum-narrowed descriptor
-(scrinium.md §4.2). Opening from Scrinium's manager ("open with", scrinium.md §8, not built)
-goes the same way: the manager hands the descriptor to a new instance.
+Sheets asks for one workbook using the picker’s `Workbook` mode. The file
+descriptor goes to the new jail. The window that requested Open receives
+completion and keeps its own workbook. Opening from the Files window uses
+the same Portcullis launcher.
 
 ### 4.2 Save and Save As
 
-Writing through a read-write descriptor in place is not crash-safe: a power cut in the
-middle leaves a torn file. And Save As needs a file that doesn't exist yet, which the
-picker couldn't hand out. Picker additions, owned and to be built by Scrinium after its
-network-shares S1 work (agreed with the Scrinium thread, 2026-11-14; nothing in O1 needs
-them):
+Sheets Save writes through its existing read-write descriptor. Save As uses
+Scrinium’s `Save` picker to create a new `.osheet` file in the chosen folder.
+Scrinium chooses a unique name when the suggested name already exists.
+The current workbook jail receives a writable descriptor and keeps it for
+subsequent Save operations. The workbook process never receives a folder
+path or mount.
 
-| message | where | meaning |
-|---|---|---|
-| `Open { filter: { kind: Save, suggested_name, extensions } }` | picker sheet | the sheet (limen slot kind `sheet`) shows a name field and folders; the user names the file. If the name exists, the sheet asks to replace before going on |
-| `ToParent::SaveTarget { name, handle }` + `EMIT_FD` | picker sheet | a **write-only** descriptor to a new temporary file in the chosen folder, plus a **save handle**. The sheet then closes |
-| `Commit { fsync: true }` → `Saved` | save role | Scrinium fsyncs the temporary file, `renameat`s it over the target, fsyncs the folder |
-| `Abandon` | save role | Scrinium unlinks the temporary file |
-| plain Save of an already-picked file | save role | the same exchange with the save handle, no sheet |
-
-- **Commit and Abandon don't ride the sheet**, since it closes as soon as the user picks and
-  writing a big document takes a while. They go to a windowless Scrinium role that limend
-  starts on demand, keyed by the save handle. limend binds the handle to the parent's uid,
-  app id and document process, and drops it when that process exits; Scrinium then unlinks
-  any temporary file not committed.
-- **limend's `EMIT_FD`** gains `O_WRONLY` regular files for `SaveTarget` only (today it passes
-  only `O_RDONLY` and `O_RDWR`). Scrinium makes that change.
-- **The temporary file** is created by Scrinium with `O_EXCL | O_NOFOLLOW`, mode 0600, named
-  `.<name>.save-XXXXXX` in the target folder. Scrinium sweeps stale ones in folders it opens.
-- **Fallback.** Where an atomic replace isn't possible (a read-only stick, a folder that can't
-  take a temporary file, a network share whose server lacks atomic rename, such as SFTP
-  without `posix-rename@openssh.com`, which Scrinium's SFTP server checks at connect), Save
-  writes in place after a full backup to the autosave folder, and says so.
+Saving through a descriptor updates the file in place. A crash during the
+write can leave a partial file. An atomic replacement protocol with a
+Scrinium commit handle remains future work.
 
 ### 4.3 Recent files and reopening
 

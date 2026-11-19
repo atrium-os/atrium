@@ -30,6 +30,8 @@ pub enum Kind {
     Folder,
     /// A new file in a folder the user picks (mail.md §8.2's Save).
     Save,
+    /// Open a single workbook directly in a fresh Sheets jail.
+    Workbook,
 }
 
 /// What the app asks for. A hint about what to show, never a scope: the
@@ -85,7 +87,7 @@ impl Filter {
             && self.extensions.iter().all(|e| !e.is_empty() && e.len() <= MAX_EXTENSION && e.chars().all(|c| c.is_ascii_alphanumeric()))
             && self.title.len() <= MAX_TITLE
             && !self.title.chars().any(char::is_control)
-            && !(self.kind == Kind::Folder && self.multiple)
+            && !(matches!(self.kind, Kind::Folder | Kind::Workbook) && self.multiple)
             && match self.kind {
                 Kind::Save => {
                     !self.multiple
@@ -191,6 +193,7 @@ mod tests {
             Filter { extensions: vec!["x".into(); MAX_EXTENSIONS + 1], ..Filter::file() },
             Filter { title: "a\u{1b}[2J".into(), ..Filter::file() },
             Filter { multiple: true, ..Filter::folder() },
+            Filter { kind: Kind::Workbook, multiple: true, ..Filter::file() },
             Filter::save("../x", ""),
             Filter::save("", ""),
             Filter::save("a\nb", ""),

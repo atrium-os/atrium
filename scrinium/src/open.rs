@@ -38,8 +38,16 @@ pub fn apps(mime: &str) -> Result<Vec<Choice>, String> {
 
 /// Hand `file` to `app`; the app's name on success.
 pub fn open(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File) -> Result<String, String> {
+    open_file(app, mime, name, write, always, token, file, None)
+}
+
+pub fn open_workbook(parent: u32, mime: &str, name: &str, write: bool, token: [u8; 16], file: &std::fs::File) -> Result<String, String> {
+    open_file("org.atrium.sheets", mime, name, write, false, token, file, Some(parent))
+}
+
+fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>) -> Result<String, String> {
     let mut s = connect()?;
-    let req = Request::OpenFile { app: app.into(), mime: mime.into(), name: name.into(), write, activation: token, always };
+    let req = Request::OpenFile { app: app.into(), mime: mime.into(), name: name.into(), write, activation: token, always, workbook_picker };
     match round_trip(&mut s, &req).map_err(|e| e.to_string())? {
         Response::ReadyForFds => {}
         Response::Error { message } => return Err(message),

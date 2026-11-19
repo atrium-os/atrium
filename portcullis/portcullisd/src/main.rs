@@ -302,8 +302,8 @@ fn launch_owner(peer_user: &str, registry_owner: Option<&str>) -> String {
     registry_owner.unwrap_or(peer_user).to_string()
 }
 
-/// One connection. `workers_only`: the worker-call socket, where nothing
-/// but Hello and WorkerCall is answered.
+/// One connection. The worker-call socket takes WorkerCall and the
+/// gesture-gated NewWorkbook request from Sheets.
 fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) -> std::io::Result<()> {
     /* Identify the peer before reading any protocol bytes. If we
      * can't, refuse the connection — we have no way to know whose
@@ -365,9 +365,25 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        if let Request::NewWorkbook { activation } = req {
+            let result = (|| {
+                if !registry.resolve(uid).is_some_and(|(_, app)| app == portcullis_policy::opens::SHEETS) {
+                    return Err("Only Sheets can request a new workbook".into());
+                }
+                may_run_unasked(portcullis_policy::opens::SHEETS, &owner, &shared)?;
+                portcullisd::opens::spend_press(&portcullisd::opens::activation_socket(), activation, uid)?;
+                launch::new_workbook(&owner, registry.persona(uid).flatten()).map_err(|e| e.to_string())
+            })();
+            let response = match result {
+                Ok(()) => Response::Opened { app: "Sheets".into(), name: "Untitled".into() },
+                Err(message) => Response::Error { message },
+            };
+            write_response(&mut writer, &response)?;
+            continue;
+        }
         if workers_only && !matches!(req, Request::WorkerCall { .. }) {
             write_response(&mut writer, &Response::Error {
-                message: "this socket takes only WorkerCall".into() })?;
+                message: "request is unavailable on the worker-call socket".into() })?;
             return Ok(());
         }
         if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into } = req {
@@ -1511,7 +1527,14 @@ fn handle_open(
             list.sort_by_key(|c| !c.default);
             write_response(writer, &Response::OpenApps { apps: list })
         }
-        Request::OpenFile { app, mime, name, write, activation, always } => {
+        Request::OpenFile { app, mime, name, write, activation, always, workbook_picker } => {
+            let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let persona = match workbook_picker {
+                Some(parent) if app == portcullis_policy::opens::SHEETS && !always
+                    && registry.resolve(parent) == Some((owner, app.as_str())) => registry.persona(parent).flatten(),
+                Some(_) => return refuse(writer, "invalid workbook picker parent".into()),
+                None => None,
+            };
             let Some(t) = declarable(&mime) else {
                 return refuse(writer, format!("{mime}: not a type Atrium opens in apps"));
             };
@@ -1556,7 +1579,7 @@ fn handle_open(
                     eprintln!("portcullisd: {owner}'s default for {mime} is now {app}");
                 }
             }
-            if let Err(e) = deliver_open(owner, &app, None, &name, &mime, write, fd) {
+            if let Err(e) = deliver_open(owner, &app, persona, &name, &mime, write, fd) {
                 return refuse(writer, e.to_string());
             }
             eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
@@ -3777,7 +3800,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

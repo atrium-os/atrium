@@ -204,6 +204,7 @@ dependencies = [
  "officina-grid",
  "officina-pdf",
  "pergola",
+ "portcullis-ipc",
  "uuid",
 ]
 

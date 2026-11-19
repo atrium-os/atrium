@@ -1,6 +1,6 @@
 //! atrium-sheets: the spreadsheet app (docs/spec/officina.md §8, O2).
 //!
-//!   atrium-sheets                 a new sheet (or the one a crash left, restored)
+//!   atrium-sheets                 the launcher when started by Portcullis
 //!   atrium-sheets FILE            open FILE by path (development; apps get files
 //!                                 from the picker)
 //!   atrium-sheets --bench PATTERN ROWS SECS [HZ]
@@ -9,13 +9,9 @@
 //!                                 jump, or all) on the wall clock; logs one report line
 //!                                 per pattern and exits
 //!
-//! Files come from the system picker (scrinium.md §4.1): Open asks for one file,
-//! read-write; Save writes back to it. Save As asks for a folder with write access and
-//! writes `NAME.osheet` there (temp file, then rename), until the picker's own Save As
-//! sheet exists (§4.2). Every change is journaled to a private autosave folder
-//! (`$XDG_STATE_HOME` or `~/.local/state`, `atrium-sheets/autosave/`); a document that
-//! did not close cleanly is restored at the next start.
-//!
+//! Open asks Scrinium to launch the picked workbook in its own jail. Save
+//! writes through the granted descriptor. Save As asks Scrinium for a new
+//! native workbook descriptor, which becomes the target for subsequent saves.
 //! FRESCO_SOCKET and LIMEN_SOCKET as usual; without limend the app runs, and Open and
 //! Save As say the picker is not available.
 
@@ -49,7 +45,7 @@ const SYNC_EVERY: Duration = Duration::from_secs(2);
 enum Target {
     /// A picked file, open read-write.
     Picked { file: File, format: Format },
-    /// A path (development, or written by Save As).
+    /// A path supplied for development.
     Path { path: PathBuf, format: Format },
 }
 
@@ -125,36 +121,33 @@ fn write_over(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Writes `bytes` to `dir/name` through a temp file and a rename; never replaces a
-/// file already there (`name 2.osheet` and so on instead). Returns the path.
-fn write_new(dir: &Path, stem: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    let stem: String = stem.chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
+fn save_name(name: &str) -> String {
+    let stem: String = stem_of(name).chars().map(|c| if c == '/' || c.is_control() { '_' } else { c }).collect();
     let stem = stem.trim_start_matches('.');
     let stem = if stem.is_empty() { "Sheet" } else { stem };
-    let tmp = dir.join(format!(".{stem}.{}.tmp", std::process::id()));
-    {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+    let mut end = stem.len().min(200);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
     }
-    for n in 1..1000 {
-        let name = if n == 1 { format!("{stem}.osheet") } else { format!("{stem} {n}.osheet") };
-        let path = dir.join(&name);
-        // A hard link fails when the name is taken, so nothing is replaced.
-        match fs::hard_link(&tmp, &path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&tmp);
-                return Ok(path);
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
+    format!("{}.osheet", &stem[..end])
+}
+
+fn new_workbook(activation: Option<fresco_protocol::activation::Token>) -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION, WORKERS_SOCKET_PATH};
+    use std::os::unix::net::UnixStream;
+    let activation = activation.ok_or("Choose New in the Sheets window")?;
+    let mut socket = UnixStream::connect(WORKERS_SOCKET_PATH).map_err(|e| e.to_string())?;
+    let timeout = Some(Duration::from_secs(2));
+    socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
+    match round_trip(&mut socket, &Request::Hello { version: PROTO_VERSION }).map_err(|e| e.to_string())? {
+        Response::Hello { .. } => {}
+        response => return Err(format!("The workbook broker answered {response:?}")),
     }
-    let _ = fs::remove_file(&tmp);
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, "every name is taken"))
+    match round_trip(&mut socket, &Request::NewWorkbook { activation }).map_err(|e| e.to_string())? {
+        Response::Opened { .. } => Ok(()),
+        Response::Error { message } => Err(message),
+        response => Err(format!("The workbook broker answered {response:?}")),
+    }
 }
 
 
@@ -265,26 +258,25 @@ impl Run {
         true
     }
 
-    fn save_into(&mut self, dir: &Path) {
-        { let mut d = self.sheets.doc.borrow_mut(); if d.wb.recalc_pending() { d.wb.recalc(); } }
-        let (stem, bytes) = {
-            let d = self.sheets.doc.borrow();
-            (stem_of(&d.name).to_string(), encode(&d, Format::Native))
+    fn save_as(&mut self, name: String, mut file: File) {
+        let result = {
+            let mut doc = self.sheets.doc.borrow_mut();
+            if doc.wb.recalc_pending() { doc.wb.recalc(); }
+            encode(&doc, Format::Native).and_then(|bytes| write_over(&mut file, &bytes))
         };
-        let r = bytes.and_then(|b| write_new(dir, &stem, &b));
-        match r {
-            Ok(path) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                {
-                    let mut d = self.sheets.doc.borrow_mut();
-                    d.name = name.clone();
-                    let _ = d.saved();
-                    d.status = format!("Saved as “{name}”.");
-                }
-                self.target = Some(Target::Path { path, format: Format::Native });
+        match result {
+            Ok(()) => {
+                self.target = Some(Target::Picked { file, format: Format::Native });
+                let mut doc = self.sheets.doc.borrow_mut();
+                doc.name = name.clone();
+                doc.status = match doc.saved() {
+                    Ok(()) => format!("Saved as “{name}”."),
+                    Err(e) => format!("Saved as “{name}”, but couldn't clear the autosave: {e}."),
+                };
+                drop(doc);
                 self.sheets.changed();
             }
-            Err(e) => self.set_status(format!("Couldn't save there: {e}.")),
+            Err(e) => self.set_status(format!("Couldn't save “{name}”: {e}.")),
         }
     }
 
@@ -455,7 +447,7 @@ fn main() {
     } else {
         None
     };
-    let dedicated = workbook.is_some();
+    let dedicated = workbook.is_some() || args.get(1).is_some_and(|arg| arg == "--blank-document");
     officina_convert::pictures::install();
     let root = state_root();
     // The custom lists fills follow, kept beside the autosaves.
@@ -468,7 +460,7 @@ fn main() {
     let mut locked: Option<(PathBuf, String)> = None;
     let mut restore: Option<(PathBuf, String)> = None;
     let mut start_file: Option<(String, Vec<u8>, Target)> = None;
-    if let Some((dir, name)) = doc::pending(&root).pop() {
+    if let Some((dir, name)) = (!dedicated).then(|| doc::pending(&root).pop()).flatten() {
         if doc::recovery_locked(&dir) {
             locked = Some((dir, name));
         } else {
@@ -485,6 +477,8 @@ fn main() {
             }
         }
     }
+    let launcher = args.len() == 1 && restore.is_none() && locked.is_none()
+        && Path::new(portcullis_ipc::WORKERS_SOCKET_PATH).exists();
     let (doc, target) = (Doc::new("Untitled"), None);
 
     let mut win = match Window::open(&WindowDesc::new("Sheets", SizeSpec::Fixed(1100, 720))) {
@@ -505,7 +499,7 @@ fn main() {
         win.set_slot_binder(Embeds::binder(e));
     }
     let dirty = Arc::new(AtomicBool::new(true));
-    let sheets = Sheets::new(
+    let mut sheets = Sheets::new(
         Doc::new(""),
         Mutable::with_dirty(ScrollState::default(), dirty.clone()),
         Mutable::with_dirty(GridState::default(), dirty.clone()),
@@ -513,8 +507,11 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
+    sheets.launcher = launcher;
     let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
-    run.show(doc, target);
+    if !launcher {
+        run.show(doc, target);
+    }
     if let Some(file) = workbook {
         eprintln!("atrium-sheets: “{}” opened in its document jail{}", file.name,
                   if file.write { " (write)" } else { "" });
@@ -590,7 +587,11 @@ fn main() {
         }
         for c in run.sheets.take_cmds() {
             match c {
-                Cmd::Open if dedicated => run.set_status("Open another workbook from Files."),
+                Cmd::NewWorkbook(activation) => {
+                    if let Err(why) = new_workbook(activation) {
+                        run.set_status(format!("Couldn't start a workbook: {why}"));
+                    }
+                }
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
                 Cmd::Data(atrium_sheets::data::DataCmd::MergeCopies) => {
@@ -676,7 +677,7 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
-                        Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into(), name: String::new(), origin: String::new() },
+                        Asking::Open => Filter { kind: Kind::Workbook, extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into(), name: String::new(), origin: String::new() },
                         Asking::Compare | Asking::MergeBase | Asking::MergeIncoming => Filter {
                             kind: Kind::File,
                             extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(),
@@ -688,7 +689,7 @@ fn main() {
                             },
                             name: String::new(), origin: String::new(),
                         },
-                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::SaveAs => Filter::save(&save_name(&name), ""),
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
@@ -740,7 +741,7 @@ fn main() {
                 Ok(Some(ParentEvent::MessageFd { bytes, .. })) => {
                     let fd = e.borrow_mut().take_fd();
                     match (ToParent::decode(&bytes), fd) {
-                        (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
+                        (Some(ToParent::File { name, write: true, .. }), Some(fd)) if asking == Some(Asking::SaveAs) => run.save_as(name, fd.into()),
                         (Some(ToParent::File { name, .. }), Some(fd))
                             if matches!(asking, Some(Asking::Compare | Asking::MergeBase | Asking::MergeIncoming)) =>
                             run.read_review(name, fd, asking.unwrap()),
@@ -748,13 +749,6 @@ fn main() {
                     }
                 }
                 Ok(Some(ParentEvent::Message { bytes, .. })) => match ToParent::decode(&bytes) {
-                    Some(ToParent::Folder { at, read_only, name }) if asking == Some(Asking::SaveAs) => {
-                        if read_only {
-                            run.set_status(format!("“{name}” is read-only; choose another folder."));
-                        } else {
-                            run.save_into(Path::new(&at));
-                        }
-                    }
                     Some(ToParent::Cancelled) => {
                         if asking == Some(Asking::MergeIncoming) { run.merge_base = None; }
                         finish = true;

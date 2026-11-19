@@ -213,7 +213,7 @@ pub fn move_to(src: &Path, name: &str, dst: &Path) -> io::Result<String> {
 /// `1.2 MB`, `640 KB`, `12 bytes`.
 /// A new file named `name` in `dir`, for a save target (limen picker
 /// `Kind::Save`): never over another (`q4 (2).csv`, …), never through a
-/// link, never executable. The file, open for writing, and its name.
+/// link, never executable. The file is opened read-write so Limen can return it.
 pub fn create_new(dir: &Path, name: &str) -> io::Result<(std::fs::File, String)> {
     use std::os::unix::fs::OpenOptionsExt;
     if !valid_name(name) || hidden(name) {
@@ -228,7 +228,7 @@ pub fn create_new(dir: &Path, name: &str) -> io::Result<(std::fs::File, String)>
         if !valid_name(&try_name) {
             break;
         }
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(dir.join(&try_name)) {
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(dir.join(&try_name)) {
             Ok(f) => return Ok((f, try_name)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -470,11 +470,15 @@ mod tests {
     }
 
     #[test]
-    fn a_save_target_is_new_and_never_over_another() {
-        use std::io::Write;
+    fn a_save_target_is_read_write_and_never_over_another() {
+        use std::io::{Read, Seek, SeekFrom, Write};
         let d = tmp("save");
         let (mut f, n) = create_new(&d, "q4.csv").unwrap();
         f.write_all(b"region,total\n").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut saved = String::new();
+        f.read_to_string(&mut saved).unwrap();
+        assert_eq!(saved, "region,total\n");
         assert_eq!(n, "q4.csv");
         let (_, n2) = create_new(&d, "q4.csv").unwrap();
         assert_eq!(n2, "q4 (2).csv");

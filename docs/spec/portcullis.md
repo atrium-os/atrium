@@ -1205,6 +1205,12 @@ the default, not a mitigation"), talking over a pipe, living exactly as long as 
 is open. Sixteen open pages are sixteen concurrent jails **of the same app**. Three things
 in the current design stand in the way.
 
+Sheets uses a bounded document launcher for file opens and blank workbooks.
+On the worker-call socket, `NewWorkbook` is authorized only for a registered
+Sheets process with a valid press in its window and a current launch grant.
+Portcullis starts a separate workbook jail in the caller's persona. A blank
+launch carries no file descriptor.
+
 ### 6.5.1 Names must carry an instance — and the failure was silent
 
 `jail_name_from_app_id` derives the name from the app id alone. Two concurrent workers get

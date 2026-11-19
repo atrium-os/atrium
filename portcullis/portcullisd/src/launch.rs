@@ -206,12 +206,27 @@ fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_
     }))
 }
 
-/// Reserve a document slot until its launch thread has torn down the jail.
+struct WorkbookLaunch {
+    slot: u8,
+    blank: bool,
+}
+
+pub fn new_workbook(user: &str, persona: Option<&str>) -> std::io::Result<()> {
+    launch_workbook(user, persona, None)
+}
 pub fn open_workbook(
     user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd,
 ) -> std::io::Result<()> {
-    use std::os::fd::{AsFd, AsRawFd};
-    use std::os::unix::net::UnixStream;
+    use std::os::fd::AsRawFd;
+    let (sender, receiver) = std::os::unix::net::UnixStream::pair()?;
+    atrium_open::send(&sender, name, mime, write, fd.as_raw_fd())?;
+    drop(sender);
+    launch_workbook(user, persona, Some(receiver.into()))
+}
+
+/// Reserve a document slot until its launch thread has torn down the jail.
+fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>) -> std::io::Result<()> {
+    use std::os::fd::AsFd;
 
     const DOCUMENT_LIMIT: usize = 8;
     static ACTIVE: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
@@ -223,14 +238,14 @@ pub fn open_workbook(
         }
     }
 
-    let (sender, receiver) = UnixStream::pair()?;
-    atrium_open::send(&sender, name, mime, write, fd.as_raw_fd())?;
-    drop(sender);
-    let stdio = Some([
-        receiver.into(),
-        std::io::stdout().as_fd().try_clone_to_owned()?,
-        std::io::stderr().as_fd().try_clone_to_owned()?,
-    ]);
+    let blank = startup.is_none();
+    let stdio = startup.map(|receiver| -> std::io::Result<_> {
+        Ok([
+            receiver,
+            std::io::stdout().as_fd().try_clone_to_owned()?,
+            std::io::stderr().as_fd().try_clone_to_owned()?,
+        ])
+    }).transpose()?;
     let slot = {
         let mut active = ACTIVE.lock().unwrap();
         let slot = active.iter().position(|used| !used)
@@ -242,7 +257,7 @@ pub fn open_workbook(
     std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
         let index = slot.0;
         let result = launch_inner(portcullis_policy::opens::SHEETS, persona.as_deref(),
-                                  &user, stdio, None, None, Some(index as u8));
+                                  &user, stdio, None, None, Some(WorkbookLaunch { slot: index as u8, blank }));
         if let Err(e) = result {
             eprintln!("portcullisd: Sheets workbook launch: {e:?}");
         }
@@ -258,7 +273,7 @@ fn launch_inner(
     stdio:   Option<[OwnedFd; 3]>,
     debug:   Option<OwnedFd>,
     files_bundle: Option<&mut Option<BundleIdentity>>,
-    document: Option<u8>,
+    document: Option<WorkbookLaunch>,
 ) -> Result<LaunchOutcome, LaunchError> {
     let mut stdio = stdio;
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
@@ -313,8 +328,8 @@ fn launch_inner(
     }
 
     let key = instance_key(app_id, persona);
-    let (app_uid, run_as_user) = resolve_launch_uid(user, app_id, publisher.as_ref(), persona, document)?;
-    let instance = document.map(|_| format!("document-{app_uid}"));
+    let (app_uid, run_as_user) = resolve_launch_uid(user, app_id, publisher.as_ref(), persona, document.as_ref().map(|doc| doc.slot))?;
+    let instance = document.as_ref().map(|_| format!("document-{app_uid}"));
     let jail_path = PathBuf::from(JAILS_DIR).join(instance.as_ref().unwrap_or(&key));
 
     /* PRIVILEGE INVARIANT (portcullis.md §9.0): the app runs under a dedicated,
@@ -564,8 +579,9 @@ fn launch_inner(
     /* A named persona's instance has a channel of its own, keyed
      * `<id>@<persona>`: what reaches it comes from its own persona
      * (personas.md §3; crossing is P3, off by default). */
-    if document.is_some() {
-        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} --document", manifest.entry())));
+    if let Some(doc) = document {
+        let option = if doc.blank { "--blank-document" } else { "--document" };
+        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option}", manifest.entry())));
     } else if (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
         || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))

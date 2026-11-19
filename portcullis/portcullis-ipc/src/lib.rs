@@ -387,7 +387,14 @@ pub enum Request {
         activation: [u8; 16],
         #[serde(default)]
         always:     bool,
+        /// For a workbook selected in a Sheets embed. Limen supplied this UID
+        /// to the file manager, and its persona determines the new jail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workbook_picker: Option<u32>,
     },
+
+    /// Start an empty workbook in a fresh Sheets jail on a Sheets press.
+    NewWorkbook { activation: [u8; 16] },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with
