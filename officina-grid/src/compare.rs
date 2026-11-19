@@ -7,19 +7,22 @@
 //! keeps matching), with a longest-common-subsequence over row hashes between
 //! the common start and end; rows left over between two matches are paired in
 //! order and compared cell by cell, and what is left after that are rows
-//! added or removed. Styles are not compared.
+//! added or removed. Static styles follow matched rows in two-way review.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::addr::{CellAddr, Rect};
+use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use crate::book::{Input, Workbook};
 use crate::deps::GroupId;
 use crate::formula;
 use crate::ops::{Fill, GridOp, Region};
 use crate::value::Value;
+
+mod parts;
+pub use parts::{ChartChange, NameChange};
 
 /// The row formulas are printed for when compared, so that relative
 /// references read the same wherever the row is.
@@ -36,6 +39,10 @@ pub enum Change {
     /// A cell that differs: what ours holds and what theirs does (a
     /// formula written for our cell).
     Cell { sheet: u16, row: u32, col: u32, ours: Input, theirs: Input },
+    /// A static style change over a contiguous run in one column.
+    Style { rect: Rect, ours: Box<crate::style::Style>, theirs: Box<crate::style::Style> },
+    Chart(ChartChange),
+    Name(NameChange),
     /// `n` rows of theirs, from their row `theirs_row`, that ours doesn't
     /// have; they would go before our row `at`.
     RowsAdded { sheet: u16, at: u32, n: u32, theirs_row: u32 },
@@ -49,10 +56,23 @@ pub enum Change {
 }
 
 impl Change {
+    /// Matches the same review entry after taking other changes, including
+    /// charts whose collection indices shifted.
+    pub fn same_review_item(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Chart(a), Self::Chart(b)) => a.same_review_item(b),
+            _ => self == other,
+        }
+    }
+
+
     /// Our sheet it is on, if any.
     pub fn sheet(&self) -> Option<u16> {
         match *self {
             Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::StructuralConflict { sheet, .. } => Some(sheet),
+            Change::Style { rect, .. } => Some(rect.sheet),
+            Change::Chart(ref chart) => chart.sheet,
+            Change::Name(ref name) => name.sheet,
             Change::SheetAdded { .. } => None,
         }
     }
@@ -68,6 +88,9 @@ impl Change {
                 crate::shift::Axis::Rows => (sheet, at, 0),
                 crate::shift::Axis::Cols => (sheet, 0, at),
             }),
+            Change::Style { rect, .. } => Some((rect.sheet, rect.r0, rect.c0)),
+            Change::Chart(ref chart) => chart.anchor(),
+            Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
             Change::SheetAdded { .. } => None,
         }
     }
@@ -95,6 +118,13 @@ impl Change {
                     (a, b) => format!("{at}: {} → {}", shown(a), shown(b)),
                 }
             }
+            Change::Style { rect, .. } => {
+                let first = crate::addr::a1(rect.r0, rect.c0);
+                if rect.r0 == rect.r1 { format!("Style {first} changed") }
+                else { format!("Style {first}:{} changed", crate::addr::a1(rect.r1, rect.c1)) }
+            }
+            Change::Chart(chart) => chart.describe(),
+            Change::Name(name) => name.describe(),
             Change::RowsAdded { at, n, theirs_row, .. } => {
                 let first = theirs_row_text(theirs, ours, self, *theirs_row);
                 format!("{} added before row {}{}", rows(*n), at + 1, first.map(|t| format!(" ({t})")).unwrap_or_default())
@@ -137,8 +167,13 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
     for t in 0..theirs.sheet_count() as u16 {
         let name = theirs.sheet_name(t);
         if ours.sheet_id(&name).is_none() {
+            if out.len() == MAX_CHANGES { return (out, true); }
             out.push(Change::SheetAdded { name });
         }
+    }
+    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)) {
+        if out.len() == MAX_CHANGES { return (out, true); }
+        out.push(change);
     }
     (out, more)
 }
@@ -339,13 +374,18 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
     let hb: Vec<u64> = (0..rb.n).map(|r| rb.hash(r)).collect();
     let mut pairs = match_rows(&ha, &hb);
     pairs.push((ra.n, rb.n));
+    let compare_styles = !ours.sheet(s).styles.is_empty() || !theirs.sheet(t).styles.is_empty();
+    let mut style_pairs = Vec::new();
     let (mut i, mut j) = (0u32, 0u32);
     for (mi, mj) in pairs {
         // The gap before this match: rows paired by likeness, the rest added
         // or removed.
         for step in align_gap(&ra, i..mi, &rb, j..mj) {
             match step {
-                Step::Pair(x, y) => cells(ours, &ra, s, x, theirs, &rb, y, out),
+                Step::Pair(x, y) => {
+                    cells(ours, &ra, s, x, theirs, &rb, y, out);
+                    if compare_styles { parts::pair(&mut style_pairs, x, y, 1); }
+                }
                 Step::Add(at, y, n) => out.push(Change::RowsAdded { sheet: s, at, n, theirs_row: y }),
                 Step::Remove(x, n) => out.push(Change::RowsRemoved { sheet: s, row: x, n }),
             }
@@ -353,10 +393,15 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
                 return true;
             }
         }
+        if compare_styles && mi < ra.n && mj < rb.n {
+            parts::pair(&mut style_pairs, mi, mj, 1);
+        }
         i = mi + 1;
         j = mj + 1;
     }
-    false
+    if !compare_styles { return false; }
+    parts::pair(&mut style_pairs, ra.n, rb.n, MAX_ROWS - ra.n.max(rb.n));
+    parts::styles(ours, s, theirs, t, &style_pairs, out)
 }
 
 /// How a gap between matched rows lines up.
@@ -504,9 +549,18 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             }
             Some(vec![GridOp::set(CellAddr::new(*sheet, *row, *col), input.clone())])
         }
+        Change::Style { rect, ours: before, theirs: after } => {
+            if rect.sheet as usize >= ours.sheet_count() { return None; }
+            if ours.style_snapshot(rect).spans != parts::style_spans(*rect, before) { return None; }
+            Some(vec![GridOp::style(*rect, (**after).clone())])
+        }
+        Change::Chart(_) | Change::Name(_) => {
+            let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
+            (n != 0).then_some(ops)
+        }
         Change::RowsAdded { sheet, at, n, theirs_row } => {
             let t = theirs.sheet_id(&ours.sheet_name(*sheet))?;
-            let mut ops: Vec<GridOp> = shift_op(ours, *sheet, Axis::Rows, *at, *n as i64).into_iter().collect();
+            let mut ops = vec![shift_op(ours, *sheet, Axis::Rows, *at, *n as i64)?];
             let cols = theirs.extent(t).1;
             let spills: Vec<Rect> = theirs.spills().filter(|(a, _)| a.sheet == t).filter_map(|(a, _)| theirs.spill_area(*a)).collect();
             let rows: Vec<Vec<Input>> = (0..*n)
@@ -527,11 +581,19 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             if rows.iter().flatten().any(|i| *i != Input::Empty) {
                 ops.push(GridOp::block(*sheet, *at, 0, rows));
             }
-            (!ops.is_empty()).then_some(ops)
+            let source = Rect { sheet: t, r0: *theirs_row, r1: *theirs_row + *n - 1, c0: 0, c1: 0 };
+            let target = Rect { sheet: *sheet, r0: *at, r1: *at + *n - 1, ..source };
+            if let Some(op) = parts::row_styles(theirs, source, target) { ops.push(op); }
+            Some(ops)
         }
         Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
         Change::SheetAdded { .. } | Change::SheetRemoved { .. } | Change::StructuralConflict { .. } => None,
     }
+}
+
+/// Builds a combined update for chart and name changes in a review selection.
+pub fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (Vec<GridOp>, usize) {
+    parts::take_objects(ours, theirs, changes)
 }
 
 /// Our sheet `s` made the same as theirs of its name: cells, formulas and
@@ -567,7 +629,7 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
         }
         values.push((r, c, v));
     });
-    let mut styles = theirs.style_snapshot(&theirs_rect);
+    let mut styles = theirs.style_snapshot(&Rect { r1: MAX_ROWS - 1, c1: MAX_COLS - 1, ..theirs_rect });
     styles.rect.sheet = s;
     Some(GridOp::Batch(vec![GridOp::Replace(Region { rect, values, fills }), GridOp::Restyle(styles)]))
 }
@@ -576,6 +638,30 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn styles_follow_matched_rows_and_take_new_row_styles() {
+        use crate::style::Style;
+
+        let mut ours = book(&[&["Name"], &["one"], &["two"]]);
+        let mut theirs = book(&[&["Name"], &["one"], &["added"], &["two"]]);
+        let style = Style { fill: Some(0x112233), ..Style::default() };
+        let inserted = Style { fill: Some(0xaabbcc), ..Style::default() };
+        theirs.set_style(&Rect::cell(CellAddr::new(0, 3, 1)), style.clone());
+        theirs.set_style(&Rect::cell(CellAddr::new(0, 2, 5)), inserted.clone());
+        let (changes, more) = compare(&ours, &theirs);
+        assert!(!more);
+        assert_eq!(changes.len(), 2);
+        let aligned = changes.iter().find(|c| matches!(c, Change::Style { .. })).unwrap();
+        assert_eq!(aligned.at(), Some((0, 2, 1)));
+        take(&ours, &theirs, aligned).unwrap().into_iter().for_each(|op| { op.apply(&mut ours); });
+        let (changes, _) = compare(&ours, &theirs);
+        assert!(matches!(changes.as_slice(), [Change::RowsAdded { .. }]));
+        take(&ours, &theirs, &changes[0]).unwrap().into_iter().for_each(|op| { op.apply(&mut ours); });
+        assert_eq!(ours.style(CellAddr::new(0, 3, 1)), &style);
+        assert_eq!(ours.style(CellAddr::new(0, 2, 5)), &inserted);
+        assert!(compare(&ours, &theirs).0.is_empty());
+    }
 
     fn book(rows: &[&[&str]]) -> Workbook {
         let mut wb = Workbook::new();

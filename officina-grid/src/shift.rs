@@ -293,28 +293,38 @@ pub(crate) fn shift_with_ids(
         let mut fills = Vec::new();
         fills_of(wb, cells, &mut fills);
         ops.push(GridOp::Replace(Region { rect, values, fills }));
-        // Styles move with their cells; inserted ones start plain.
-        let snap = wb.style_snapshot(&old);
+    }
+
+    // Styled blank cells can lie beyond the data extent. Move their sparse
+    // runs independently, leaving inserted rows and columns unstyled.
+    if !wb.sheet(sheet).styles.is_empty() {
+        let rect = Rect { sheet, r0: 0, c0: 0, r1: MAX_ROWS - 1, c1: MAX_COLS - 1 };
+        let snap = wb.style_snapshot(&rect);
         let mut spans = Vec::new();
-        for (c, r0, r1, st) in snap.spans {
+        for (c, r0, r1, st) in &snap.spans {
+            let (c, r0, r1) = (*c, *r0, *r1);
             match axis {
                 Axis::Cols => {
                     if let Some(c2) = s.map(c) {
-                        spans.push((c2, r0, r1, st));
+                        spans.push((c2, r0, r1, st.clone()));
                     }
                 }
                 Axis::Rows if n > 0 && r0 < at && r1 >= at => {
                     spans.push((c, r0, at - 1, st.clone()));
-                    spans.push((c, at + grow, r1 + grow, st));
+                    if let Some((a, b)) = s.map_span(at, r1) {
+                        spans.push((c, a, b, st.clone()));
+                    }
                 }
                 Axis::Rows => {
                     if let Some((a, b)) = s.map_span(r0, r1) {
-                        spans.push((c, a, b, st));
+                        spans.push((c, a, b, st.clone()));
                     }
                 }
             }
         }
-        ops.push(GridOp::Restyle(StyleRegion { rect, spans }));
+        if spans != snap.spans {
+            ops.push(GridOp::Restyle(StyleRegion { rect, spans }));
+        }
     }
 
     // Formulas on other sheets that refer to this one.

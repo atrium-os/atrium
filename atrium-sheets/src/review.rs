@@ -65,7 +65,13 @@ impl ReviewPane {
     /// The changes from `ours` to `theirs` now, less those kept.
     pub fn refresh(&mut self, ours: &Workbook, theirs: &Workbook) {
         let (all, more) = compare::compare(ours, theirs);
-        self.changes = all.into_iter().filter(|c| !self.kept.contains(c)).collect();
+        let mut matched = vec![false; self.kept.len()];
+        self.changes = all.into_iter().filter(|c| {
+            if let Some(i) = self.kept.iter().enumerate().position(|(i, k)| !matched[i] && c.same_review_item(k)) {
+                matched[i] = true;
+                false
+            } else { true }
+        }).collect();
         self.more = more;
         self.picked = self.picked.filter(|_| !self.changes.is_empty()).map(|i| i.min(self.changes.len() - 1));
     }
@@ -101,26 +107,34 @@ pub fn take(d: &mut Doc, theirs: &Workbook, ch: &Change) -> bool {
 
 /// Takes every change that can be taken as one undo step: a sheet with rows
 /// added or removed whole, other sheets cell by cell. The number taken.
-pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change]) -> usize {
-    let whole: Vec<u16> = changes.iter().filter(|c| c.is_rows()).filter_map(Change::sheet).collect();
+pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Change]) -> usize {
+    let protected: std::collections::BTreeSet<_> = kept.iter().filter(|change| {
+        matches!(change, Change::Cell { .. } | Change::Style { .. }) || change.is_rows()
+    }).filter_map(Change::sheet).collect();
+    let whole: std::collections::BTreeSet<_> = changes.iter().filter(|c| c.is_rows()).filter_map(Change::sheet)
+        .filter(|s| !protected.contains(s)).collect();
+    let (objects, mut n) = compare::take_objects(&d.wb, theirs, changes);
     let mut ops = Vec::new();
-    let mut n = 0;
-    let mut done: Vec<u16> = Vec::new();
+    let mut done = std::collections::BTreeSet::new();
     for ch in changes {
+        if matches!(ch, Change::Chart(_) | Change::Name(_)) { continue; }
         let Some(s) = ch.sheet() else { continue };
         if whole.contains(&s) {
             if !done.contains(&s) {
                 if let Some(op) = compare::take_sheet(&d.wb, theirs, s) {
                     ops.push(op);
-                    done.push(s);
+                    done.insert(s);
                 }
             }
-            n += 1;
-        } else if let Some(more) = compare::take(&d.wb, theirs, ch) {
-            ops.extend(more);
-            n += 1;
+            n += usize::from(done.contains(&s));
+        } else if !ch.is_rows() {
+            if let Some(more) = compare::take(&d.wb, theirs, ch) {
+                ops.extend(more);
+                n += 1;
+            }
         }
     }
+    ops.extend(objects);
     d.run("Take All Changes", ops);
     n
 }

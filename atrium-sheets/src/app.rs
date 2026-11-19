@@ -627,8 +627,12 @@ impl Sheets {
                     if c == ReviewCmd::Keep {
                         p.kept.push(ch);
                     } else if !rv::take(&mut self.doc.borrow_mut(), other, &ch) {
-                        self.doc.borrow_mut().status = "Sheets added or removed can't be taken here; add or delete the sheet itself.".into();
-                        p.kept.push(ch);
+                        if matches!(ch, officina_grid::compare::Change::SheetAdded { .. } | officina_grid::compare::Change::SheetRemoved { .. }) {
+                            self.doc.borrow_mut().status = "Sheets added or removed can't be taken here; add or delete the sheet itself.".into();
+                            p.kept.push(ch);
+                        } else {
+                            self.doc.borrow_mut().status = "This change could not be applied to the current workbook.".into();
+                        }
                     }
                     p.refresh(&self.doc.borrow().wb, other);
                     if let Some(ch) = p.picked.map(|i| p.changes[i].clone()) {
@@ -637,7 +641,7 @@ impl Sheets {
                 }
             }
             ReviewCmd::TakeAll => {
-                let n = rv::take_all(&mut self.doc.borrow_mut(), other, &p.changes);
+                let n = rv::take_all(&mut self.doc.borrow_mut(), other, &p.changes, &p.kept);
                 p.refresh(&self.doc.borrow().wb, other);
                 self.doc.borrow_mut().status = format!("Took {n} change{} from “{}”.", if n == 1 { "" } else { "s" }, p.name);
             }
@@ -3223,6 +3227,87 @@ mod tests {
         sheets.review_cmd(ReviewCmd::Take);
         assert_eq!(input(0, 1), number(44.0));
         assert_eq!(sheets.review.get_cloned().changes.len(), 1);
+    }
+
+    #[test]
+    fn workbook_review_flags_and_takes_or_keeps_styles_charts_and_names() {
+        use crate::review::ReviewCmd;
+        use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Series};
+        use officina_grid::{compare::Change, style::Style, CellAddr, Rect as Cells};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Summary").unwrap();
+            wb.add_sheet("Data").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        incoming.wb.rename_sheet(0, "data").unwrap();
+        let style = |color| Style { fill: Some(color), ..Style::default() };
+        let kept_style = style(0x112233);
+        let taken_style = style(0x556677);
+        let region = |sheet, c, r0, r1| Cells { sheet, r0, r1, c0: c, c1: c };
+        local.wb.set_style(&region(0, 1, 10, 12), kept_style.clone());
+        incoming.wb.set_style(&region(1, 1, 10, 12), style(0x222222));
+        incoming.wb.set_style(&region(1, 2, 50, 60), taken_style.clone());
+        local.wb.set_style(&region(0, 3, 51, 51), style(0x999999));
+        let chart = |sheet, data, row, title: &str| Chart {
+            kind: ChartKind::Line, grouping: Grouping::Standard, title: Some(ChartText::Lit(title.into())),
+            legend: None, x_title: None, y_title: None,
+            series: vec![Series { name: Some(ChartText::Cell(CellAddr::new(data, 0, 0))),
+                cats: Some(region(data, 0, 0, 3)), vals: region(data, 1, 0, 3), kind: None }],
+            anchor: Anchor { sheet, from: (row, 0, 0.0, 0.0), to: (row + 4, 3, 0.0, 0.0) },
+        };
+        let kept_chart = chart(0, 1, 8, "Keep chart");
+        local.wb.add_chart(chart(0, 1, 2, "Removed")).unwrap();
+        local.wb.add_chart(kept_chart.clone()).unwrap();
+        local.wb.add_chart(chart(0, 1, 14, "Before")).unwrap();
+        incoming.wb.add_chart(chart(1, 0, 8, "Other chart")).unwrap();
+        incoming.wb.add_chart(chart(1, 0, 14, "After")).unwrap();
+        incoming.wb.add_chart(chart(1, 0, 20, "Added")).unwrap();
+        local.wb.define_name("Rate", None, "=1").unwrap();
+        local.wb.define_name("Rate", Some(0), "=2").unwrap();
+        local.wb.define_name("Obsolete", None, "=3").unwrap();
+        incoming.wb.define_name("Rate", None, "=4").unwrap();
+        incoming.wb.define_name("Rate", Some(1), "=Data!$B$2").unwrap();
+        incoming.wb.define_name("NewTotal", None, "=Data!$A$1").unwrap();
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming.wb);
+        let choose = |pred: &dyn Fn(&Change) -> bool, action| {
+            let pane = sheets.review.get_cloned();
+            let row = pane.changes.iter().position(pred).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(row));
+            sheets.review_cmd(action);
+        };
+        assert_eq!(sheets.review.get_cloned().changes.len(), 11);
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == "Style B11:B13 changed")));
+        choose(&|c| matches!(c, Change::Style { rect, .. } if rect.c0 == 1), ReviewCmd::Keep);
+        choose(&|c| matches!(c, Change::Chart(_)) && c.at() == Some((0, 8, 0)), ReviewCmd::Keep);
+        choose(&|c| matches!(c, Change::Name(_)) && c.sheet().is_none()
+            && c.describe(&sheets.doc.borrow().wb, &sheets.doc.borrow().wb).starts_with("Name Rate"), ReviewCmd::Keep);
+        choose(&|c| matches!(c, Change::Name(_)) && c.sheet() == Some(0), ReviewCmd::Take);
+        assert_eq!(sheets.doc.borrow().wb.name_text(sheets.doc.borrow().wb.names().get(0, "Rate").unwrap()), "=Data!$B$2");
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let doc = sheets.doc.borrow();
+            assert_eq!(doc.wb.style(CellAddr::new(0, 11, 1)), &kept_style);
+            assert_eq!(doc.wb.style(CellAddr::new(0, 55, 2)), &taken_style);
+            assert_eq!(doc.wb.style(CellAddr::new(0, 51, 3)), &Style::default());
+            assert_eq!(doc.wb.charts(), &[kept_chart, chart(0, 1, 14, "After"), chart(0, 1, 20, "Added")]);
+            assert_eq!(doc.wb.name_text(doc.wb.names().get(1, "Rate").unwrap()), "=1");
+            assert!(doc.wb.names().get(0, "Obsolete").is_none());
+            assert_eq!(doc.wb.name_text(doc.wb.names().get(0, "NewTotal").unwrap()), "=Data!$A$1");
+        }
+        assert!(sheets.doc.borrow_mut().undo());
+        let doc = sheets.doc.borrow();
+        assert_eq!(doc.wb.charts().len(), 3);
+        assert_eq!(doc.wb.charts()[0], chart(0, 1, 2, "Removed"));
+        assert!(doc.wb.names().get(0, "Obsolete").is_some());
+        assert_eq!(doc.wb.style(CellAddr::new(0, 55, 2)), &Style::default());
     }
 
     #[test]
