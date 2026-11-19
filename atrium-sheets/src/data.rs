@@ -41,6 +41,8 @@ pub enum DataCmd {
     PasteFormats,
     /// The cells last copied here with rows turned into columns.
     PasteTransposed,
+    /// The copied cells' comments only.
+    PasteComments,
     /// The copied numbers added to, taken from, multiplied with or
     /// dividing the numbers where they land.
     PasteAdd,
@@ -308,6 +310,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
         (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
+        (MenuItem::new("Paste Comments").enabled(special), Some(DataCmd::PasteComments)),
         (MenuItem::new("Paste Skipping Blanks").enabled(special), Some(DataCmd::PasteSkipBlanks)),
         (MenuItem::new("Paste and Add").enabled(special), Some(DataCmd::PasteAdd)),
         (MenuItem::new("Paste and Subtract").enabled(special), Some(DataCmd::PasteSubtract)),
@@ -614,6 +617,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         | DataCmd::PasteFormats
         | DataCmd::PasteTransposed
         | DataCmd::PasteSkipBlanks
+        | DataCmd::PasteComments
         | DataCmd::PasteAdd
         | DataCmd::PasteSubtract
         | DataCmd::PasteMultiply
@@ -625,6 +629,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 DataCmd::PasteValues => (of(What::Values), "Paste Values"),
                 DataCmd::PasteFormulas => (of(What::Formulas), "Paste Formulas"),
                 DataCmd::PasteFormats => (of(What::Formats), "Paste Formats"),
+                DataCmd::PasteComments => (of(What::Comments), "Paste Comments"),
                 DataCmd::PasteSkipBlanks => (Special { skip_blanks: true, ..of(What::All) }, "Paste Skipping Blanks"),
                 DataCmd::PasteAdd => (math(Arith::Add), "Paste and Add"),
                 DataCmd::PasteSubtract => (math(Arith::Sub), "Paste and Subtract"),

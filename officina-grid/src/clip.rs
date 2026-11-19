@@ -42,6 +42,8 @@ pub enum What {
     Formulas,
     /// Styles only.
     Formats,
+    /// Comments only.
+    Comments,
 }
 
 /// Paste Special's arithmetic: each pasted number combined with the
@@ -80,6 +82,9 @@ pub struct Clip {
     pub cut: bool,
     cells: Vec<(u32, u32, Content)>,
     styles: Vec<(u32, u32, u32, Style)>,
+    /// Comments and links on the cells, by place in the area.
+    notes: Vec<(u32, u32, crate::comments::Comment)>,
+    links: Vec<(u32, u32, crate::links::Link)>,
 }
 
 impl Clip {
@@ -104,7 +109,10 @@ impl Clip {
             }
         }
         let styles = wb.style_snapshot(&used).spans.into_iter().map(|(c, a, b, st)| (c - rect.c0, a - rect.r0, b - rect.r0, st)).collect();
-        Clip { from: used, cut, cells, styles }
+        let inside = |&(r, c): &(u32, u32)| used.contains(CellAddr::new(rect.sheet, r, c));
+        let notes = wb.comments(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), k)| (r - rect.r0, c - rect.c0, k.clone())).collect();
+        let links = wb.links(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), l)| (r - rect.r0, c - rect.c0, l.clone())).collect();
+        Clip { from: used, cut, cells, styles, notes, links }
     }
 
     pub fn rows(&self) -> u32 {
@@ -159,7 +167,7 @@ impl Clip {
     /// As [`paste_as`](Self::paste_as), with arithmetic and skipping blanks.
     pub fn paste_special(&self, wb: &Workbook, sheet: u16, row: u32, col: u32, sp: Special) -> Result<(Vec<GridOp>, Rect), String> {
         let Special { what, transpose, arith, skip_blanks } = sp;
-        if arith.is_some() && what == What::Formats {
+        if arith.is_some() && matches!(what, What::Formats | What::Comments) {
             return Err("Formats can't be added or multiplied.".into());
         }
         if self.cut && (what != What::All || transpose || arith.is_some() || skip_blanks) {
@@ -256,7 +264,7 @@ impl Clip {
                 }
             }
         }
-        if let (Some(op), true) = (arith, what != What::Formats) {
+        if let (Some(op), true) = (arith, !matches!(what, What::Formats | What::Comments)) {
             // Each copied number with the cell it lands on.
             let mut cells = Vec::new();
             for (dr, dc, content) in &self.cells {
@@ -292,23 +300,129 @@ impl Clip {
                 cells.push((r, c, Some(v), None));
             }
             ops.extend(by_runs(sheet, cells));
-        } else if what != What::Formats && skip_blanks {
+        } else if !matches!(what, What::Formats | What::Comments) && skip_blanks {
             let mut cells: Vec<_> = values.into_iter().map(|(r, c, v)| (r, c, Some(v), None)).collect();
             for f in fills {
                 cells.push((f.r0, f.col, None, Some(f)));
             }
             ops.extend(by_runs(sheet, cells));
-        } else if what != What::Formats {
+        } else if !matches!(what, What::Formats | What::Comments) {
             ops.push(GridOp::Replace(Region { rect: to, values, fills }));
         }
         if matches!(what, What::All | What::Formats) {
             ops.push(GridOp::Restyle(StyleRegion { rect: to, spans }));
+        }
+        // Comments and links come with the cells (a cut takes them away
+        // from where they were first).
+        if matches!(what, What::All | What::Comments) {
+            let fsh = self.from.sheet;
+            let place = |dr: u32, dc: u32| at(dr, dc);
+            if !self.notes.is_empty() {
+                let mut set: Vec<(u32, u32, Option<crate::comments::Comment>)> = Vec::new();
+                if self.cut {
+                    let gone: Vec<_> = self.notes.iter().map(|(dr, dc, _)| (self.from.r0 + dr, self.from.c0 + dc, None)).collect();
+                    ops.push(GridOp::Comments { sheet: fsh, set: gone });
+                }
+                for (dr, dc, k) in &self.notes {
+                    let (r, c) = place(*dr, *dc);
+                    set.push((r, c, Some(k.clone())));
+                }
+                ops.push(GridOp::Comments { sheet, set });
+            }
+            if !self.links.is_empty() && what == What::All {
+                if self.cut {
+                    let gone: Vec<_> = self.links.iter().map(|(dr, dc, _)| (self.from.r0 + dr, self.from.c0 + dc, None)).collect();
+                    ops.push(GridOp::Links { sheet: fsh, set: gone });
+                }
+                let set = self.links.iter().map(|(dr, dc, l)| { let (r, c) = place(*dr, *dc); (r, c, Some(l.clone())) }).collect();
+                ops.push(GridOp::Links { sheet, set });
+            }
+        }
+        if self.cut {
+            ops.extend(self.follow(wb, sheet, row, col));
         }
         Ok((ops, to))
     }
 }
 
 impl Clip {
+    /// What else points at cells a cut moves, moved with them: defined
+    /// names, conditional formats and validation rules (their areas wholly
+    /// inside, and their formulas), and charts' data.
+    fn follow(&self, wb: &Workbook, sheet: u16, row: u32, col: u32) -> Vec<GridOp> {
+        let m = self.mover(sheet, row, col);
+        let mut ops = Vec::new();
+        // An area wholly inside the cut, where it goes.
+        let area = |r: Rect| -> Option<Rect> {
+            (r.sheet == self.from.sheet && self.from.contains(CellAddr::new(r.sheet, r.r0, r.c0)) && self.from.contains(CellAddr::new(r.sheet, r.r1, r.c1))).then(|| {
+                let (dr, dc) = (row as i64 - self.from.r0 as i64, col as i64 - self.from.c0 as i64);
+                Rect { sheet, r0: (r.r0 as i64 + dr) as u32, c0: (r.c0 as i64 + dc) as u32, r1: (r.r1 as i64 + dr) as u32, c1: (r.c1 as i64 + dc) as u32 }
+            })
+        };
+        // A list of areas: each wholly inside moves; onto another sheet,
+        // only when all of them do.
+        let areas = |own: u16, rs: &[Rect]| -> (u16, Vec<Rect>) {
+            let all = rs.iter().all(|r| area(Rect { sheet: own, ..*r }).is_some());
+            if own != sheet && !all {
+                return (own, rs.to_vec());
+            }
+            let to = if all { sheet } else { own };
+            (to, rs.iter().map(|r| area(Rect { sheet: own, ..*r }).map_or(*r, |a| Rect { sheet: to, ..a })).collect())
+        };
+        let defs: Vec<_> = wb.names().iter().cloned().collect();
+        let moved: Vec<_> = defs.iter().map(|d| {
+            let own = d.scope.unwrap_or(0);
+            crate::names::NameDef { expr: Arc::new(m.expr(&d.expr, 0, 0, own, 0, 0, own)), ..d.clone() }
+        }).collect();
+        if moved.iter().zip(&defs).any(|(a, b)| a.expr != b.expr) {
+            ops.push(GridOp::names(wb, &moved));
+        }
+        let cfs: Vec<_> = wb.cond_formats().iter().map(|f| {
+            let mut f = f.clone();
+            let ((or, oc), own) = (f.origin(), f.sheet);
+            let (to, ranges) = areas(f.sheet, &f.ranges);
+            f.sheet = to;
+            f.ranges = ranges;
+            let (nr, nc) = f.origin();
+            for r in &mut f.rules {
+                r.kind = r.kind.map_exprs(&|e| m.expr(e, or, oc, own, nr, nc, to));
+            }
+            f
+        }).collect();
+        if cfs != wb.cond_formats() {
+            ops.push(GridOp::cond_formats(wb, &cfs));
+        }
+        let vs: Vec<_> = wb.validations().iter().map(|v| {
+            let mut v = v.clone();
+            let ((or, oc), own) = (v.origin(), v.sheet);
+            let (to, ranges) = areas(v.sheet, &v.ranges);
+            v.sheet = to;
+            v.ranges = ranges;
+            let (nr, nc) = v.origin();
+            v.map_exprs(&|e| m.expr(e, or, oc, own, nr, nc, to))
+        }).collect();
+        if vs != wb.validations() {
+            ops.push(GridOp::validations(wb, &vs));
+        }
+        let charts: Vec<_> = wb.charts().iter().map(|c| {
+            let mut c = c.clone();
+            for x in &mut c.series {
+                x.vals = area(x.vals).unwrap_or(x.vals);
+                x.cats = x.cats.map(|r| area(r).unwrap_or(r));
+                if let Some(crate::charts::ChartText::Cell(a)) = x.name.clone() {
+                    if let Some(t) = area(Rect { sheet: a.sheet, r0: a.row, c0: a.col, r1: a.row, c1: a.col }) {
+                        x.name = Some(crate::charts::ChartText::Cell(CellAddr::new(t.sheet, t.r0, t.c0)));
+                    }
+                }
+            }
+            c
+        }).collect();
+        if charts != wb.charts() {
+            ops.push(GridOp::Charts(charts));
+        }
+        ops
+    }
+
     fn mover(&self, sheet: u16, row: u32, col: u32) -> Mover {
         let (dr, dc) = (row as i64 - self.from.r0 as i64, col as i64 - self.from.c0 as i64);
         let dead = self.cut.then(|| Rect { sheet, r0: row, c0: col, r1: row + self.rows() - 1, c1: col + self.cols() - 1 });
@@ -657,6 +771,57 @@ mod tests {
         // A cut does neither.
         let cut = Clip::take(&wb, rect(0, 0, 0, 0), true);
         assert!(cut.paste_special(&wb, 0, 9, 9, sp(Some(Arith::Add))).is_err());
+    }
+
+    #[test]
+    fn a_move_brings_comments_links_names_and_rules() {
+        use crate::condfmt::CmpOp;
+        use crate::validation::{Allow, Validation};
+        let mut wb = wb();
+        set(&mut wb, 0, 0, "1");
+        set(&mut wb, 1, 0, "2");
+        wb.set_comments(0, vec![(0, 0, Some(crate::comments::Comment::new("me", "look")))]);
+        wb.set_links(0, vec![(1, 0, crate::links::Link::new("https://example.org"))]);
+        wb.define_name("Two", None, "=Sheet1!$A$1:$A$2").unwrap();
+        let f = wb.validation_formula("A1>0", 0, (0, 0)).unwrap();
+        wb.add_validation(Validation::new(0, vec![rect(0, 0, 1, 0)], Allow::Custom, CmpOp::Between, Some(f), None)).unwrap();
+        let ch = crate::charts::Chart {
+            kind: crate::charts::ChartKind::Column,
+            grouping: crate::charts::Grouping::Standard,
+            title: None,
+            series: vec![crate::charts::Series { name: None, cats: None, vals: rect(0, 0, 1, 0), kind: None }],
+            legend: None,
+            x_title: None,
+            y_title: None,
+            anchor: crate::charts::Anchor { sheet: 0, from: (5, 5, 0.0, 0.0), to: (15, 9, 0.0, 0.0) },
+        };
+        GridOp::Charts(vec![ch]).apply(&mut wb);
+        // A copy brings the comment and link, and leaves the rest.
+        let copy = Clip::take(&wb, rect(0, 0, 1, 0), false);
+        let (ops, _) = copy.paste(&wb, 0, 0, 3).unwrap();
+        run(&mut wb, ops);
+        assert_eq!(wb.comment(0, 0, 3).map(|k| k.text.to_string()).as_deref(), Some("look"));
+        assert!(wb.link(0, 1, 3).is_some() && wb.comment(0, 0, 0).is_some());
+        // Paste Comments: only them.
+        let (ops, _) = copy.paste_as(&wb, 0, 0, 7, What::Comments, false).unwrap();
+        run(&mut wb, ops);
+        assert!(wb.comment(0, 0, 7).is_some() && wb.link(0, 1, 7).is_none() && shown(&wb, 0, 0, 7).is_empty());
+        // A cut moves all of them to C6.
+        let cut = Clip::take(&wb, rect(0, 0, 1, 0), true);
+        let (ops, _) = cut.paste(&wb, 0, 5, 2).unwrap();
+        let undo = run(&mut wb, ops);
+        assert!(wb.comment(0, 0, 0).is_none() && wb.link(0, 1, 0).is_none());
+        assert!(wb.comment(0, 5, 2).is_some() && wb.link(0, 6, 2).is_some());
+        let name = wb.names().iter().find(|d| &*d.name == "Two").cloned().unwrap();
+        assert_eq!(wb.name_text(&name), "=Sheet1!$C$6:$C$7");
+        assert_eq!(wb.validations()[0].ranges, vec![rect(5, 2, 6, 2)]);
+        assert_eq!(wb.charts()[0].series[0].vals, rect(5, 2, 6, 2));
+        let moved = wb.validations()[0].clone();
+        let back = crate::formula::to_a1(moved.f1.as_ref().unwrap(), 5, 2, &|id| wb.sheet_name(id));
+        assert_eq!(back, "=C6>0");
+        undo.apply(&mut wb);
+        assert!(wb.comment(0, 0, 0).is_some() && wb.comment(0, 5, 2).is_none());
+        assert_eq!(wb.validations()[0].ranges, vec![rect(0, 0, 1, 0)]);
     }
 
     #[test]
