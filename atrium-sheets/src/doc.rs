@@ -369,6 +369,10 @@ pub struct Doc {
     /// ([`Workbook::memory_bytes`]): a change that would take it past is undone
     /// and the user told. [`MAKE_LIMIT`], so a workbook made here opens anywhere.
     pub memory_budget: u64,
+    /// The cells last copied or cut here, with the text that went on the
+    /// clipboard: while the clipboard still holds that text, a paste brings
+    /// formulas and styles too (a cut moves them).
+    pub clip: Option<(officina_grid::clip::Clip, String)>,
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
@@ -426,7 +430,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -641,6 +645,41 @@ impl Doc {
             Err(e) => {
                 self.status = e;
                 false
+            }
+        }
+    }
+
+    /// Keeps `rect` of this sheet as the clip, with `text` (what went on
+    /// the clipboard).
+    pub fn take_clip(&mut self, rect: Rect, cut: bool, text: String) {
+        self.clip = Some((officina_grid::clip::Clip::take(&self.wb, Rect { sheet: self.sheet, ..rect }, cut), text));
+        self.status = if cut { "Cut: paste to move it.".into() } else { String::new() };
+    }
+
+    /// Pastes clipboard text `text` at (`row`, `col`): the clip if the text
+    /// is still its own, else as tab-separated values. The area pasted, if
+    /// any.
+    pub fn paste(&mut self, row: u32, col: u32, text: &str) -> Option<Rect> {
+        let norm = |t: &str| t.replace("\r\n", "\n").trim_end_matches('\n').to_string();
+        let ours = self.clip.as_ref().is_some_and(|(_, t)| norm(t) == norm(text));
+        if !ours {
+            return self.paste_tsv(row, col, text).then_some(Rect { sheet: self.sheet, r0: row, c0: col, r1: row, c1: col });
+        }
+        let (clip, _) = self.clip.as_ref()?;
+        match clip.paste(&self.wb, self.sheet, row, col) {
+            Ok((ops, to)) => {
+                let cut = clip.cut;
+                self.status.clear();
+                self.run(if cut { "Move" } else { "Paste" }, ops);
+                if cut {
+                    // A cut pastes once, as Excel's does.
+                    self.clip = None;
+                }
+                Some(to)
+            }
+            Err(e) => {
+                self.status = e;
+                None
             }
         }
     }
@@ -886,6 +925,33 @@ mod tests {
         assert_eq!(shown(&d, 1, 0), "Week 1");
         assert!(!d.fill(r(0, 0, 0, 0), r(0, 1, 2, 1), true));
         assert!(!d.status.is_empty());
+    }
+
+    #[test]
+    fn copy_and_paste_here_bring_formulas_and_a_cut_moves() {
+        let mut d = Doc::new("clip");
+        d.type_into(0, 0, "3");
+        d.type_into(0, 1, "=A1*2");
+        let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
+        let text = d.copy_tsv(0, 0, 0, 1);
+        d.take_clip(r(0, 0, 0, 1), false, text.clone());
+        // The clipboard may come back with Windows line ends.
+        assert_eq!(d.paste(4, 0, &text.replace('\n', "\r\n")), Some(r(4, 0, 4, 1)));
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 4, 1)).text, "6");
+        // Other text on the clipboard pastes as text.
+        d.paste(6, 0, "a\tb\n");
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 6, 1)).text, "b");
+        // A cut moves on paste, once.
+        let text = d.copy_tsv(4, 0, 4, 1);
+        d.take_clip(r(4, 0, 4, 1), true, text.clone());
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
+        d.paste(9, 2, &text);
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 9, 3)).as_deref(), Some("=A5*2"));
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)), None);
+        assert!(d.clip.is_none());
+        assert!(d.undo());
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
     }
 
     #[test]

@@ -3756,6 +3756,17 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** Excel's Ctrl-drag to flip between series and copy, the Auto Fill Options button after a drag, custom lists, and Flash Fill.
 - **Gates:** officina-grid `autofill::tests` (5); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
+### 16.88 Copy, cut and paste within Sheets (2026-11-19)
+
+- **Before:** copying put only the shown values on the clipboard, so a formula pasted as its result, and a cut emptied the cells at once.
+- **Engine** (`officina-grid::clip::Clip`): `take(wb, rect, cut)` keeps the used part of the area (a whole column costs what it holds): values, formulas and styles. `paste(wb, sheet, row, col)` gives the edit and the area pasted.
+  - A copy keeps formulas as expressions, so relative references move with them (`=A1*2` copied four rows down reads `=A5*2`; `$` ones stay). A column of them pastes as one formula fill.
+  - A cut keeps the formula text as it is and empties its source in the same step, so pasting moves the cells, as Excel does. Overlapping moves keep what lands.
+  - Refused: an area that would run off the sheet, and pasting over merged cells.
+- **Sheets:** Copy and Cut still put tab-separated values on the clipboard for other apps, and `Doc.clip` keeps the cells with that text. A paste whose clipboard text is still that text (Windows line ends allowed) pastes the clip; anything else pastes as text, as before. A cut now waits for the paste ("Cut: paste to move it.") and pastes once. One undo step ("Paste" or "Move").
+- **Not yet:** formulas elsewhere that read moved cells following them (Excel's cut does), pasting a clip into a larger selection as tiles, Paste Special (values only, formats only, transpose), and rich formats on the system clipboard for other apps.
+- **Gates:** officina-grid `clip::tests` (3); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

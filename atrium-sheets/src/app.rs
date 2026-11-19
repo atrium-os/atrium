@@ -1220,17 +1220,16 @@ impl Sheets {
             GridAction::Copy(r) | GridAction::Cut(r) if cells(r) > MAX_COPY_CELLS => {
                 d.status = format!("That is {} cells; copying takes at most {MAX_COPY_CELLS}.", cells(r));
             }
-            GridAction::Copy(r) => {
-                copy(&mut d, r);
-            }
-            GridAction::Cut(r) => {
-                if copy(&mut d, r) {
-                    d.clear(r.r0, r.c0, r.r1, r.c1);
+            GridAction::Copy(r) | GridAction::Cut(r) => {
+                let cut = matches!(a, GridAction::Cut(_));
+                if let Some(text) = copy(&mut d, r) {
+                    let rect = officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
+                    d.take_clip(rect, cut, text);
                 }
             }
             GridAction::Paste { row, col } => match clipboard::paste_text() {
                 Ok(Some(t)) => {
-                    d.paste_tsv(row, col, &t);
+                    d.paste(row, col, &t);
                 }
                 Ok(None) => d.status = "The clipboard holds no text.".into(),
                 Err(e) => d.status = format!("Couldn't paste: {e:?}"),
@@ -1248,13 +1247,13 @@ fn cells(r: CellRange) -> u64 {
     (r.r1 - r.r0) as u64 * (r.c1 - r.c0 + 1) as u64 + (r.c1 - r.c0 + 1) as u64
 }
 
-fn copy(d: &mut Doc, r: CellRange) -> bool {
+fn copy(d: &mut Doc, r: CellRange) -> Option<String> {
     let text = d.copy_tsv(r.r0, r.c0, r.r1, r.c1);
     match clipboard::copy_text(&text, false) {
-        Ok(()) => true,
+        Ok(()) => Some(text),
         Err(e) => {
             d.status = format!("Couldn't copy: {e:?}");
-            false
+            None
         }
     }
 }
