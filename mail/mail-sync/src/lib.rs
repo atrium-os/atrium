@@ -28,6 +28,7 @@
 pub mod jmap;
 pub mod remote;
 pub mod setup;
+pub mod sieve;
 pub mod submit;
 
 use std::io::{Read, Write};

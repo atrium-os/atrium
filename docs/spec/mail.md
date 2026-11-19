@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -713,7 +713,8 @@ person turns that on. §17 D1 lists it as later.
 
 Local rules (from/to/subject/list → folder/flag/label/notify) in the engine, and
 **ManageSieve** (RFC 5804) for servers that have it, so rules run when the machine is off.
-Vacation replies through Sieve or JMAP `VacationResponse`.
+Vacation replies through Sieve or JMAP `VacationResponse`. (Built: §16, "Filters on IMAP
+servers through ManageSieve".)
 
 ### 11.7 Views: conversations or messages, filters, grouping (Shankar 2026-11-16)
 
@@ -1775,6 +1776,42 @@ Stalwart in the cloud VM, and later a real account):
    isn't asked), settings 1 (no text, a bad day, saved, the line). **Not yet**: ManageSieve
    (RFC 5804) through a courier for IMAP accounts, which also carries the rules to the
    server, a start date, and a multi-line reply.
+
+   **Filters on IMAP servers through ManageSieve (2026-11-19, §11.6).** An IMAP account's
+   automatic reply and the person's rules now go to its server as one Sieve script
+   (RFC 5228) named `atrium-mail`, put there through ManageSieve (RFC 5804), so both run
+   with the machine off. Arca learned a `sieve` scheme (port 4190): its mail courier
+   starts TLS (a server that doesn't offer it is refused), signs in with SASL PLAIN or
+   XOAUTH2 and hands Mail the post-login capabilities and its own `OK`; its relay passes
+   only the script commands (list, put, check, activate, rename, delete, space, log out),
+   refuses a sign-in or a synchronising literal, and holds a script to 1 MiB. Adding an IMAP
+   account has Arca keep the password for a third endpoint, the IMAP host's port 4190,
+   except where the provider is known to have no ManageSieve (Gmail, Outlook, Yahoo,
+   iCloud, AOL, GMX) or signs in by OAuth; the item is kept in a new store table (`sieve`)
+   beside the account's settings and deleted from Arca with the account. `mail-proto`'s
+   `sieve` reads responses (strings, literals, response codes) and writes the commands;
+   `mail-sync`'s `sieve` writes the script for the server's extensions and puts it, in the
+   sync worker (worker call `Sieve`, like a submission). The reply is `vacation :days 1`
+   with the subject and the account's addresses, inside `currentdate` checks in the
+   person's zone when the server has `date` and `relational`; otherwise Mail writes it in
+   or leaves it out by the day. Each rule is an `if` that ends in `stop`, newest first as
+   here: `fileinto` the folder's server name, `addflag \Flagged` or `\Seen`; `quiet`, a
+   folder the account lacks, or an action the server can't do only stops (Mail still does
+   those itself, as before). In each pass, after mail, Mail sends the script only when it
+   would differ from what the server last got; a script someone else made active (in
+   webmail, say) is never replaced, and the account's line says so; a refusal is kept with
+   its reason and tried again after an hour or when the reply or rules change; a server
+   whose Sieve has no `vacation` says it can't send automatic replies, and the rules still
+   go. Accounts added before this have no sign-in for the filters and say to add the
+   account again. Tests: Arca courier 2 (signed in after STARTTLS and scripts pass; a wrong
+   password, and a server without STARTTLS refused) and relay filter 1, `mail-proto` 2
+   (responses a byte at a time, commands, refusals), `mail-sync` 2 (the reply by date or by
+   day, rules) and worker 1, engine 1 (nothing asked with nothing to say, the script made
+   active, unchanged not sent, someone else's script left alone, a refusal retried, no
+   `vacation`, removal), app 1 (the third endpoint kept, known providers and OAuth
+   without, all three deleted). **Not yet**: a run against Dovecot with Pigeonhole (none
+   on this host; the VM), JMAP Sieve (RFC 9661) for rules on JMAP accounts, and reading
+   back a script changed on the server.
 
 ## 17. Decisions, with recommendations
 

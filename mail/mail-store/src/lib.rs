@@ -38,6 +38,7 @@ pub mod later;
 pub mod people;
 pub mod imports;
 pub mod away;
+pub mod sieve;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
@@ -296,6 +297,7 @@ impl Store {
             tx.open_table(people::PEOPLE_COUNTED)?;
             tx.open_table(imports::IMPORTS)?;
             tx.open_table(away::AWAY)?;
+            tx.open_table(sieve::SIEVE)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();

@@ -17,7 +17,7 @@
 //! The app gets one end of a socketpair; the courier has the other as its
 //! stdin and stdout. Nothing else of the courier's is the app's to touch.
 //!
-//! Wire: the app sends `u32 LE len | u8 scheme (1 https, 3–6 mail) | str host | u16
+//! Wire: the app sends `u32 LE len | u8 scheme (1 https, 3–7 mail) | str host | u16
 //! port [| str partition]` (arcad's endpoint encoding) and reads one status
 //! byte; on [`reply::OK`] the courier's socket rides on that byte
 //! (SCM_RIGHTS). Only the web broker (arca.md §8.2) may name a partition:

@@ -639,8 +639,8 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     assert!(matches!(engine.store.account_config(account).unwrap().unwrap().reached, Reached::Ok { .. }));
     let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
     assert_eq!(engine.store.count(inbox).unwrap(), 300);
-    // No automatic reply over IMAP yet (§11.6): said, and not asked for.
-    assert!(engine.away_line(account, now()).contains("ManageSieve"));
+    // No sign-in for its filters (§11.6): said, and not asked for.
+    assert!(engine.away_line(account, now()).contains("add it again"));
     engine.set_away(&mail_store::away::Away { on: true, ..Default::default() }).unwrap();
     assert!(engine.away(account).wanted.is_none());
 

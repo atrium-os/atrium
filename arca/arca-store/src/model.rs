@@ -161,6 +161,9 @@ pub enum Scheme {
     Imap = 5,
     /// SMTP submission on port 587, upgraded with STARTTLS likewise.
     Submission = 6,
+    /// ManageSieve (RFC 5804, port 4190): the server's filters and
+    /// automatic reply, always upgraded with STARTTLS (mail.md §11.6).
+    Sieve = 7,
 }
 
 impl Scheme {
@@ -172,6 +175,7 @@ impl Scheme {
             4 => Scheme::Submissions,
             5 => Scheme::Imap,
             6 => Scheme::Submission,
+            7 => Scheme::Sieve,
             _ => return None,
         })
     }
@@ -185,11 +189,12 @@ impl Scheme {
             Scheme::Submissions => "submissions",
             Scheme::Imap => "imap",
             Scheme::Submission => "submission",
+            Scheme::Sieve => "sieve",
         }
     }
 
     pub fn from_name(n: &str) -> Option<Scheme> {
-        [Scheme::Https, Scheme::Http, Scheme::Imaps, Scheme::Submissions, Scheme::Imap, Scheme::Submission]
+        [Scheme::Https, Scheme::Http, Scheme::Imaps, Scheme::Submissions, Scheme::Imap, Scheme::Submission, Scheme::Sieve]
             .into_iter()
             .find(|s| s.name() == n)
     }
@@ -197,7 +202,12 @@ impl Scheme {
     /// A mail protocol, logged in by a mail courier rather than carrying
     /// HTTP requests.
     pub fn is_mail(self) -> bool {
-        matches!(self, Scheme::Imaps | Scheme::Submissions | Scheme::Imap | Scheme::Submission)
+        matches!(self, Scheme::Imaps | Scheme::Submissions | Scheme::Imap | Scheme::Submission | Scheme::Sieve)
+    }
+
+    /// ManageSieve.
+    pub fn is_sieve(self) -> bool {
+        self == Scheme::Sieve
     }
 
     /// IMAP (as opposed to SMTP submission).
@@ -207,7 +217,7 @@ impl Scheme {
 
     /// TLS from the first byte (as opposed to STARTTLS).
     pub fn implicit_tls(self) -> bool {
-        !matches!(self, Scheme::Imap | Scheme::Submission | Scheme::Http)
+        !matches!(self, Scheme::Imap | Scheme::Submission | Scheme::Http | Scheme::Sieve)
     }
 }
 

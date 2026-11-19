@@ -70,6 +70,9 @@ pub enum Call {
     JmapImport { folder: String, message: Vec<u8> },
     /// The vacation reply, set first if given; answers [`Reply::Vacation`].
     JmapVacation(Option<crate::jmap::Vacation>),
+    /// Put Mail's filters on a ManageSieve session (instead of `Start`;
+    /// the worker ends after it). Answers [`Reply::Sieved`].
+    Sieve(crate::sieve::Plan),
 }
 
 /// What [`Error`] was, across the wire.
@@ -96,6 +99,7 @@ pub enum Reply {
     JmapSent(std::result::Result<String, String>),
     Vacation(std::result::Result<Option<crate::jmap::Vacation>, String>),
     Watched(std::result::Result<crate::jmap::Pushed, String>),
+    Sieved(std::result::Result<crate::sieve::Sieved, String>),
     /// How many messages a server search found.
     Found(u32),
     Failed(Kind, String),
@@ -503,7 +507,8 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
             (Call::Submit { from, rcpts, bytes, hold_for }, None) => {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
-            (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
+            (Call::Sieve(plan), None) => Reply::Sieved(crate::sieve::apply(Tunnel(chan.clone()), &plan)),
+            (Call::Start, Some(_)) | (Call::Submit { .. } | Call::Sieve(_), Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
             (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapVacation(_), _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
@@ -518,7 +523,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::LoggedOut
             }
         };
-        let done = matches!(reply, Reply::LoggedOut | Reply::Submitted(_));
+        let done = matches!(reply, Reply::LoggedOut | Reply::Submitted(_) | Reply::Sieved(_));
         let b = enc(&reply)?;
         write_frame(&mut chan.borrow_mut().w, REPLY, &b)?;
         if done {
@@ -629,6 +634,18 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
             Ok(Reply::Failed(_, t)) => Err(SendError::Failed { why: t, transient: true }),
             Ok(other) => Err(SendError::Failed { why: format!("the worker answered {other:?}"), transient: true }),
             Err(e) => Err(SendError::Failed { why: format!("the sync worker: {e}"), transient: true }),
+        }
+    }
+
+    /// Put Mail's filters on a ManageSieve `courier` in the worker (then
+    /// the worker ends).
+    pub fn sieve(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O, plan: &crate::sieve::Plan) -> std::result::Result<crate::sieve::Sieved, String> {
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
+        match r.call(&Call::Sieve(plan.clone()), None, QUIET) {
+            Ok(Reply::Sieved(x)) => x,
+            Ok(Reply::Failed(_, t)) => Err(t),
+            Ok(other) => Err(format!("the worker answered {other:?}")),
+            Err(e) => Err(format!("the sync worker: {e}")),
         }
     }
 
