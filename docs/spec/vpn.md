@@ -591,9 +591,14 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
   for the control plane (`scripts/crypta-gp-control-check.py`, Python with Flask).
   The fixture is run from its own checkout or release archive. Configure it for TLS
   with ESP disabled. Its TLS tunnel opening deliberately returns HTTP 502.
-  Run the Atrium loopback TLS peer (`scripts/crypta-gp-packet-check.py`) for IPv4
-  packet transfer, rebind and logout. The FreeBSD gate and OpenConnect packet
-  interoperability check still need a packet-capable peer.
+  Run the Atrium TLS peer (`python3 scripts/crypta-gp-packet-check.py`) for IPv4
+  packet transfer, rebind and logout. With `--vm arm64` it builds and stages the
+  engine and harness on an already booted FreeBSD VM with QEMU user networking.
+  The harness runs the engine in a temporary jail, checks its jail ID and
+  capability mode, and pings through a real tun before and after rebind. Its
+  control and Arca descriptors are harness fixtures. With
+  `--openconnect /path/to/openconnect` the same peer answers an ICMP echo sent
+  through OpenConnect's script-tun socket. Both modes validate wire traffic.
 - **No real company gateway** (Shankar 2026-11-15): every gate runs on local servers.
   Free public services only add value for WireGuard (for example Proton VPN's free
   plan, which hands out WireGuard configs), as an optional real-internet check.
@@ -735,7 +740,7 @@ challenge forms are future work.
   tries to log out on disconnect. Required HIP, local-network lockdown and split
   exclusions are refused until Atrium can enforce those policies.
 - ESP, truthful HIP reporting with review in Curia, portal and challenge support, and
-  the FreeBSD/OpenConnect packet interop gate remain part of V5. Scripted SSO and passkeys
+  the full jaild/cryptad/atrium-net integration gate remain part of V5. Scripted SSO and passkeys
   remain parked pending Navigator I3.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
