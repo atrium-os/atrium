@@ -16,6 +16,11 @@ portal_port=${4:-}
 transport=${5:-}
 hip=${6:-}
 receipts=${7:-}
+decline_relock=0
+if [ "$hip" = tessera-relock-decline ]; then
+    hip=tessera-reconnect
+    decline_relock=1
+fi
 if [ -n "$transport" ]; then
     export CRYPTA_GP_TEST_ESP=4501
 fi
@@ -488,6 +493,30 @@ if [ -n "$tessera_fact" ]; then
 
             receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
             lock_tessera_key
+            if [ "$decline_relock" = 1 ]; then
+                expected_count=0
+                change="Tessera domain key lock after rebind"
+                wait_tessera_review
+                [ "$(field handshake)" = 1 ] || fail "the rebound tunnel was down before decline"
+                "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+                wait_field up 0
+                [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+                    fail "declining the second key lock did not stop the profile"
+                # Allow another refresh interval to catch retries or delayed uploads.
+                sleep 6
+                [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+                    fail "the profile restarted after declining the second key lock"
+                [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = 3 ] ||
+                    fail "another tunnel connected after declining the second key lock"
+                "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $reconnect_iface$'; then exit 1; fi" ||
+                    fail "the declined rebound tunnel retained its route"
+                "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+                    fail "IPv4 echo passed after declining the second key lock"
+                if new_tessera_receipt; then fail "the declined locked-key count reached the gateway"; fi
+                ok "declining the second key lock shut down the rebound tunnel without uploading the changed count"
+                echo "$pass checks passed"
+                exit 0
+            fi
             approve_tessera_change 0 "Tessera domain key lock after rebind"
             probe "IPv4 echo on the rebound tunnel after approved key lock"
         fi

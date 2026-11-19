@@ -842,6 +842,10 @@ another origin. An active portal-profile session stays in engine memory.
   again requires fresh approval before the gateway receives the locked
   count. Echo then resumes on that same rebound transport.
   The extended arm64 gate passed 24/24 on TLS and 24/24 with `--esp`.
+  The `--hip tessera-relock-decline` variant declines the second lock
+  review while the rebound tunnel is active. It verifies that the changed
+  count remains unsent, the engine stops, the route is removed, and IPv4
+  echo fails after decline. It passed 23/23 on TLS and 23/23 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
