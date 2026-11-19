@@ -22043,7 +22043,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		int _sp = 0;                                              \
 		int _gw = 1;                                              \
 		uint64_t _wg = tessera_fs_gc_record_group(tmp_, &(_ino),  \
-		    &gc_groups, &_gw);                                    \
+		    gc_groups, &_gw);                                     \
 		if (!_gw) break;                                          \
 		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
 			if (tessera_gc_walk_trust_leaf &&                 \
@@ -22108,7 +22108,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			 * all its packs. */                           \
 			if (_frc != 0 && _wg != 0 && (_frc == EACCES ||   \
 			    _frc == EINTEGRITY)) {                        \
-				tessera_gc_groups_skip(&gc_groups, _wg);  \
+				tessera_gc_groups_skip(gc_groups, _wg);   \
 				_sp = 0;                                  \
 				continue;                                 \
 			}                                                 \
@@ -22218,8 +22218,9 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 */
 	int gc_walk_abort = 0;
 	/* E4.5: groups pass 1 couldn't walk; pass 2 keeps their packs. */
-	struct tessera_gc_groups gc_groups;
-	memset(&gc_groups, 0, sizeof(gc_groups));
+	/* On the heap: 264 bytes on the GC frame (check-frames). */
+	struct tessera_gc_groups *gc_groups = malloc(sizeof(*gc_groups),
+	    M_TESSERA, M_WAITOK | M_ZERO);
 	/* Teardown aborts the walk exactly like a corrupt-read does — same
 	 * "reclaim nothing this pass" outcome, which is always correct. */
 #define _GC_TEARDOWN()	(tmp_->gc_abort != 0)
@@ -22685,6 +22686,7 @@ snap_next:
 		free(seen, M_TESSERA);
 		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
+		free(gc_groups, M_TESSERA);
 		return (0);
 	}
 	/* In-flight state (task #37): inode records still in the dirty
@@ -22779,6 +22781,7 @@ snap_next:
 		free(seen, M_TESSERA);
 		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
+		free(gc_groups, M_TESSERA);
 		return (0);
 	}
 	/*
@@ -22819,6 +22822,7 @@ snap_next:
 		free(seen, M_TESSERA);
 		free(gc_walk_stack, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
+		free(gc_groups, M_TESSERA);
 		return (0);
 	}
 
@@ -22873,10 +22877,10 @@ snap_next:
 		uint64_t              *pels;
 		uint32_t               npels;
 	};
-	for (uint32_t gi = 0; gi < gc_groups.n; gi++)
+	for (uint32_t gi = 0; gi < gc_groups->n; gi++)
 		printf("tessera_fs: gc: key group %ju locked, not walked; "
-		    "its packs are kept\n", (uintmax_t)gc_groups.skip[gi]);
-	tessera_stat_gc_group_skips += gc_groups.n;
+		    "its packs are kept\n", (uintmax_t)gc_groups->skip[gi]);
+	tessera_stat_gc_group_skips += gc_groups->n;
 	uint32_t dead_cap = 16, dead_count = 0;
 	struct dead *deads = malloc(dead_cap * sizeof(*deads), M_TESSERA,
 	    M_WAITOK);
@@ -22952,7 +22956,7 @@ snap_next:
 				free(exts, M_TESSERA);
 				if (tessera_fs_pack_prelude_group(tmp_, &re,
 				    &pg) != 0 ||
-				    tessera_gc_groups_skipped(&gc_groups, pg))
+				    tessera_gc_groups_skipped(gc_groups, pg))
 					goto next_p;
 				if (!tessera_fs_group_known(tmp_, pg)) {
 					memset(bh, 0, sizeof(bh));
@@ -23593,6 +23597,7 @@ next_p:
 		tessera_fs_flush_gate_exit(tmp_);
 	tessera_stat_gc_reclaimed += gone_n;
 	printf("tessera_fs: gc done\n");
+	free(gc_groups, M_TESSERA);
 	return ((int)gone_n);
 #undef _GC_CLOSE_SCAN_TREES
 }
@@ -34251,7 +34256,7 @@ static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
  * name; the domain and group records go; then a GC pass frees every pack
  * whose prelude names the group, without opening it.
  */
-static int
+static __noinline int
 tessera_fs_group_erase(struct vnode *ivp, uint64_t gid)
 {
 	struct mount *mp = ivp->v_mount;
@@ -34259,8 +34264,10 @@ tessera_fs_group_erase(struct vnode *ivp, uint64_t gid)
 	struct tessera_fs_group *g;
 	struct tessera_fs_wctx wv;
 	struct vnode *vp, *mvp;
-	uint64_t doms[TESSERA_FS_MAX_GROUPS * 4];
-	uint32_t roots[TESSERA_FS_MAX_GROUPS * 4];
+	/* On the heap: 1.5 KiB of arrays on the ioctl path (check-frames). */
+	const uint32_t maxdoms = TESSERA_FS_MAX_GROUPS * 4;
+	uint64_t *doms = NULL;
+	uint32_t *roots;
 	uint32_t ndoms = 0, nvict = 0, vcap = 64, *vict = NULL;
 	uint8_t *mft = NULL;
 	size_t mlen = 0;
@@ -34342,11 +34349,14 @@ tessera_fs_group_erase(struct vnode *ivp, uint64_t gid)
 	}
 	tessera_manifest_free(mb);
 
+	doms = malloc(maxdoms * (sizeof(*doms) + sizeof(*roots)), M_TESSERA,
+	    M_WAITOK);
+	roots = (uint32_t *)(doms + maxdoms);
 	if (tmp_->flush_mtx_init) {
 		tessera_fs_flush_gate_enter(tmp_);
 		gated = 1;
 	}
-	for (uint32_t i = 0; i < tmp_->quota_ndomains && ndoms < nitems(doms);
+	for (uint32_t i = 0; i < tmp_->quota_ndomains && ndoms < maxdoms;
 	    i++) {
 		if (tmp_->quota_domains[i].key_group != gid)
 			continue;
@@ -34473,6 +34483,7 @@ out:
 	if (gated)
 		tessera_fs_flush_gate_exit(tmp_);
 	free(vict, M_TESSERA);
+	free(doms, M_TESSERA);
 	free(mft, M_TESSERA);
 	return (err);
 }
