@@ -116,19 +116,35 @@ fn keys_learned_signatures_checked_and_mail_encrypted() {
     sink.messages("Sent", vec![fetched(1, signed(&ada, "ada@example.org", Some(&ada_pub), "Sent."))]).unwrap();
     assert_eq!(engine.my_pgp_key(account).unwrap().emails, vec!["ada@example.org".to_string()]);
 
-    engine.send_protected(account, &draft, Default::default(), Protect { sign: None, encrypt: true }).unwrap();
+    let hidden = key("Hidden <hidden@example.net>");
+    let hidden_pub = hidden.to_public_key().to_bytes().unwrap();
+    engine.give_pgp_key(&hidden_pub, 100).unwrap();
+    let mut group = draft.clone();
+    group.cc = vec![Mailbox::new("", "bob@example.net"), Mailbox::new("", "PRIYA@example.com")];
+    group.bcc = vec![Mailbox::new("", "hidden@example.net")];
+    engine.send_protected(account, &group, Default::default(), Protect { sign: None, encrypt: true }).unwrap();
     let (_, o) = engine.store.sends_due(i64::MAX).unwrap().into_iter().next().unwrap();
     let sent = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
     assert!(sent.contains("Subject: Plan\r\n") && sent.contains("Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\""), "{sent}");
     assert!(!sent.contains("The plan."));
+    assert!(!sent.contains("Autocrypt-Gossip:") && !sent.contains("hidden@example.net"));
     let a = sent.find("-----BEGIN PGP MESSAGE-----").unwrap();
     let b = sent.find("-----END PGP MESSAGE-----").unwrap() + "-----END PGP MESSAGE-----".len();
-    for sk in [&priya, &ada] {
+    for sk in [&priya, &bob, &hidden, &ada] {
         let (m, _) = Message::from_armor(Cursor::new(sent[a..b].as_bytes())).unwrap();
         let mut d = m.decrypt(&Password::empty(), sk).unwrap();
         if d.is_compressed() { d = d.decompress().unwrap(); }
         let inner = String::from_utf8(d.as_data_vec().unwrap()).unwrap();
-        assert!(inner.starts_with("Content-Type: text/plain") && inner.contains("The plan."), "{inner}");
+        let (headers, entity) = inner.split_once("Content-Type: text/plain").unwrap();
+        assert!(entity.contains("The plan."));
+        let gossip: Vec<_> = headers.trim_end().split("Autocrypt-Gossip: ").skip(1)
+            .map(|value| mail_pgp::autocrypt(value).expect("valid gossip"))
+            .collect();
+        assert_eq!(gossip, [
+            ("priya@example.com".into(), priya_pub.clone()),
+            ("bob@example.net".into(), bob.to_public_key().to_bytes().unwrap()),
+        ]);
+        assert!(!headers.contains("hidden@example.net") && !headers.contains("ada@example.org"));
     }
     // And the parser sees it as PGP/MIME encrypted.
     let o = engine.parser.open(sent.as_bytes(), vec![], &[], None, vec![]).unwrap().unwrap();

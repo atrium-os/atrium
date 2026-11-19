@@ -267,7 +267,7 @@ impl Engine {
     }
 
     /// The written message `w`, signed and/or encrypted.
-    pub(crate) fn protect(&self, w: &mail_compose::Written, p: Protect, t: i64, random: &[u8; 16]) -> Result<Vec<u8>, Error> {
+    pub(crate) fn protect(&self, w: &mail_compose::Written, draft: &mail_compose::Draft, p: Protect, t: i64, random: &[u8; 16]) -> Result<Vec<u8>, Error> {
         use mail_compose::smime as shape;
         if p.sign.is_none() && !p.encrypt {
             return Ok(w.bytes.clone());
@@ -289,8 +289,11 @@ impl Engine {
             // Not everyone has a certificate: OpenPGP, when everyone has a
             // key and nothing was signed with S/MIME (§10.2).
             if !missing.is_empty() && !signed && w.rcpts.iter().all(|a| !self.pgp_keys_for(a).is_empty()) {
-                let entity = shape::entity_of(&bytes).ok_or(Error::Compose("the message can't be cut for OpenPGP".into()))?.to_vec();
-                let armored = self.pgp_encrypt(&entity, &w.from, &w.rcpts)?;
+                let entity = shape::entity_of(&bytes).ok_or(Error::Compose("the message can't be cut for OpenPGP".into()))?;
+                let visible: Vec<String> = draft.to.iter().chain(&draft.cc)
+                    .map(|m| mail_compose::write::address(&m.addr))
+                    .collect::<Result<_, _>>().map_err(|e| Error::Compose(e.to_string()))?;
+                let armored = self.pgp_encrypt(entity, &w.from, &w.rcpts, &visible)?;
                 let outer = shape::split(&bytes).map(|(o, _)| o.to_vec()).unwrap_or_default();
                 let boundary = format!("=_atrium_pgp_{}", random[8..].iter().map(|b| format!("{b:02x}")).collect::<String>());
                 bytes = shape::pgp_encrypted(&outer, &armored, &boundary);

@@ -90,7 +90,7 @@ impl Engine {
         let later = when.later.filter(|l| *l > t + undo);
         let random = random16();
         let mut w = mail_compose::write(draft, &Stamp { date: later.unwrap_or(t), random }).map_err(|e| Error::Compose(e.to_string()))?;
-        w.bytes = self.protect(&w, protect, t, &random)?;
+        w.bytes = self.protect(&w, draft, protect, t, &random)?;
         let message = self.store.put_blob(&w.bytes)?;
         let draft_blob = self.store.put_blob(&postcard::to_stdvec(draft).map_err(|e| Error::Compose(e.to_string()))?)?;
         let o = Outgoing {

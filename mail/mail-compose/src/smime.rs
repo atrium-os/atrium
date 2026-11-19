@@ -57,6 +57,35 @@ pub fn enveloped(outer: &[u8], env: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Add visible recipients' Autocrypt gossip to the entity that will be
+/// encrypted. Fold the key data so even large certificates fit on the wire.
+pub fn autocrypt_gossip<'a>(entity: &[u8], keys: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
+    const HEADER_BUDGET: usize = 256 << 10;
+    let mut out = Vec::new();
+    for (addr, key) in keys {
+        let Ok(addr) = crate::write::address(addr) else { continue };
+        if addr.len() > 254 || key.is_empty() {
+            continue;
+        }
+        let data = base64(key);
+        let header = format!("Autocrypt-Gossip: addr={addr};\r\n keydata=");
+        let folded_len = header.len() + data.len() + 3 * data.len().div_ceil(68);
+        if out.len() + folded_len > HEADER_BUDGET {
+            break;
+        }
+        out.extend_from_slice(header.as_bytes());
+        for (i, chunk) in data.as_bytes().chunks(68).enumerate() {
+            if i != 0 {
+                out.extend_from_slice(b"\r\n ");
+            }
+            out.extend_from_slice(chunk);
+        }
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(entity);
+    out
+}
+
 /// `outer` with a PGP/MIME encrypted body (RFC 3156 §4): `armored`, the
 /// OpenPGP message, ASCII-armored.
 pub fn pgp_encrypted(outer: &[u8], armored: &[u8], boundary: &str) -> Vec<u8> {

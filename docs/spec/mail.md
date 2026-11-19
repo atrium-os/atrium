@@ -607,7 +607,10 @@ the person's contacts quietly; going over shows a notice.
 
 With `rpgp` (MIT/Apache; Sequoia is LGPL and out per LICENSING-POLICY.md), keys in Arca
 (key class, use-not-read), Autocrypt headers and WKD lookups (through Nuntius) for finding
-keys, and an "encrypt when every recipient has a key" switch. §17 D7.
+keys, and an "encrypt when every recipient has a key" switch. Outbound PGP/MIME
+includes Autocrypt-Gossip keys for visible To/Cc recipients inside the encrypted
+entity. It excludes the sender and Bcc-only recipients, and caps added headers at
+256 KiB. §17 D7.
 
 ### 10.3 What the person sees
 
@@ -1344,7 +1347,7 @@ Stalwart in the cloud VM, and later a real account):
    (learned from their sent mail, or pasted in Settings). Tests: jail 2, engine 2,
    mail-pgp 1, schema 1, window and settings. **Not yet**: reading PGP/MIME encrypted
    mail and signing with OpenPGP (the private key belongs in Arca, which has no OpenPGP
-   ops; the reader says so), inline PGP, Autocrypt's prefer-encrypt and gossip, key
+   ops; the reader says so), inline PGP, Autocrypt's prefer-encrypt and receiving gossip, key
    expiry and revocation and a keys page (built 2026-11-19, below); cards need DKIM lookups to show;
    lane counts (built 2026-11-19, below) and notifications per lane. *Big-file links* need a share-link service
    (Loculus or Crypta) and *local assistance* a local model service, neither of which

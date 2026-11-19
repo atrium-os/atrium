@@ -162,20 +162,26 @@ impl Engine {
 
     /// `entity` (a MIME entity: its headers and body) as an armored
     /// OpenPGP message for `rcpts` and `from` (a copy they can read again).
-    pub(crate) fn pgp_encrypt(&self, entity: &[u8], from: &str, rcpts: &[String]) -> Result<Vec<u8>, Error> {
+    pub(crate) fn pgp_encrypt(&self, entity: &[u8], from: &str, rcpts: &[String], visible: &[String]) -> Result<Vec<u8>, Error> {
         let now = crate::now();
         // Expired and revoked keys are never encrypted to (§10.2).
-        let missing: Vec<&str> = rcpts.iter().filter(|a| self.usable_pgp_key(a, now).is_none()).map(|a| a.as_str()).collect();
+        let recipients: Vec<_> = rcpts.iter().map(|a| (a.as_str(), self.usable_pgp_key(a, now))).collect();
+        let missing: Vec<&str> = recipients.iter().filter_map(|(addr, key)| key.is_none().then_some(*addr)).collect();
         if !missing.is_empty() {
             let stale = missing.iter().any(|a| !self.pgp_keys_for(a).is_empty());
             let why = if stale { " (their key has expired or was revoked)" } else { "" };
             return Err(Error::Compose(format!("No certificate or OpenPGP key to encrypt to {}{why}", missing.join(", "))));
         }
         let own = self.usable_pgp_key(from, now).ok_or(Error::Compose("Mail has no OpenPGP key of yours to keep a copy you can read (or yours has expired); add yours in Settings".into()))?;
-        let mut keys: Vec<Vec<u8>> = rcpts.iter().filter_map(|a| self.usable_pgp_key(a, now)).collect();
+        let gossip = recipients.iter().filter_map(|(addr, key)| {
+            let shared = !addr.eq_ignore_ascii_case(from) && visible.iter().any(|a| a.eq_ignore_ascii_case(addr));
+            key.as_deref().filter(|_| shared).map(|key| (*addr, key))
+        });
+        let entity = mail_compose::smime::autocrypt_gossip(entity, gossip);
+        let mut keys: Vec<Vec<u8>> = recipients.into_iter().filter_map(|(_, key)| key).collect();
         keys.push(own);
         keys.sort();
         keys.dedup();
-        mail_pgp::encrypt(entity, &keys).map_err(|e| Error::Compose(format!("OpenPGP: {e}")))
+        mail_pgp::encrypt(&entity, &keys).map_err(|e| Error::Compose(format!("OpenPGP: {e}")))
     }
 }
