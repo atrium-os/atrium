@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const URL: &str = "https://inbox.example/inbox";
+use navigator_control::INBOX_FIXTURE_URL as URL;
 type Transport = Broker<ArcadSocket, Launcher>;
 
 fn document(broker: &mut Transport, url: &str) -> Result<std::os::fd::OwnedFd, String> {
@@ -121,17 +121,19 @@ fn run(socket: PathBuf, mut broker: Transport) -> Result<(), String> {
                     .send_fd(page, bytes, fd.as_fd())
                     .map_err(|e| format!("resource: {e:?}"))?;
             }
-            Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. }) => break,
+            Some(ParentEvent::ChildLost { .. }) => return Err("The live page worker stopped".into()),
+            Some(ParentEvent::Detached { .. }) => break,
             _ => {}
         }
     }
     Ok(())
 }
 
-pub fn start(socket: PathBuf, broker: Transport) {
+pub fn start(socket: PathBuf, broker: Transport, failed: impl FnOnce(String) + Send + 'static) {
     std::thread::spawn(move || {
         if let Err(e) = run(socket, broker) {
             eprintln!("navigatord: inbox fixture: {e}");
+            failed(e);
         }
     });
 }

@@ -190,7 +190,11 @@ pub enum Request {
     /// or as the page gave it, which navigatord checks the page carries.
     /// Answered by `Link` with the same `id`: `Navigate` to the answer.
     SubmitForm { id: u32, page: String, jar: Jar, action: String, post: bool, fields: Vec<FormField>, press: Press },
+    RunLive { url: String, jar: Jar, press: Press },
 }
+
+/// The single whole-page fixture granted during I0.
+pub const INBOX_FIXTURE_URL: &str = "https://inbox.example/inbox";
 
 /// One field of a form sent: its name and value, and whether the person
 /// typed the value (else it is the page's, and navigatord checks it is).
@@ -337,6 +341,7 @@ pub enum Event {
     /// `OpenFile` done: the app it opened in, or why not (the file is
     /// dropped either way).
     FileOpened { id: u32, app: Option<String>, why: Option<String> },
+    LivePageFailed { why: String },
 }
 
 /// The most accounts an `Accounts` names, and the longest name.

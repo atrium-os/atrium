@@ -145,6 +145,12 @@ struct Config {
 }
 
 impl Config {
+    fn inbox_enabled(&self) -> bool {
+        self.ui.is_some() && self.portal.is_none() && self.vpn.is_none() && self.activation.is_some()
+            && self.limen.is_some() && self.arca.is_some()
+            && settings::get("NAVIGATORD_INBOX_FIXTURE").as_deref() == Some(ctl::INBOX_FIXTURE_URL)
+    }
+
     fn from_env(unconfined: bool) -> Result<Self, String> {
         let var = settings::get;
         let mut c = Config {
@@ -1505,6 +1511,21 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     send(&w, &Event::Link { id, action });
                 });
             }
+            Request::RunLive { url, jar, press } => {
+                if !cfg.inbox_enabled() || url != ctl::INBOX_FIXTURE_URL || jar != ctl::Jar::Personal {
+                    send(&w, &Event::LivePageFailed { why: "Live mode is unavailable for this page or jar".into() });
+                    continue;
+                }
+                if let Err(why) = spend(press) {
+                    send(&w, &Event::PressRefused { why });
+                    continue;
+                }
+                if let (Some(socket), Some((arca, launcher))) = (&cfg.limen, &cfg.arca) {
+                    let broker = Broker::new(ArcadSocket { path: arca.clone() }, Launcher::new(launcher.clone()));
+                    let w = w.clone();
+                    inbox_fixture::start(socket.clone(), broker, move |why| send(&w, &Event::LivePageFailed { why }));
+                }
+            }
             Request::Save { id, press } => {
                 if !waiting.lock().unwrap().holds(id) {
                     send(&w, &Event::NotSaved { id, why: "that file is no longer held".into() });
@@ -1858,12 +1879,6 @@ fn main() {
         }
         Arc::new(Mutex::new(b))
     });
-    if settings::get("NAVIGATORD_INBOX_FIXTURE").as_deref() == Some(inbox_fixture::URL) {
-        if let (Some(socket), Some((arca, launcher))) = (&cfg.limen, &cfg.arca) {
-            let broker = Broker::new(ArcadSocket { path: arca.clone() }, Launcher::new(launcher.clone()));
-            inbox_fixture::start(socket.clone(), broker);
-        }
-    }
     if cfg.vpn.is_none() {
         if let (Some(socket), Some(_)) = (&cfg.limen, &cookies) {
             if let Some((arca, launcher)) = &cfg.arca {
@@ -1919,6 +1934,10 @@ fn main() {
             std::process::exit(1)
         });
         let mut pairs = settings::ui_pairs();
+        pairs.retain(|(k, _)| k != "NAVIGATOR_UI_INBOX_FIXTURE");
+        if cfg.inbox_enabled() {
+            pairs.push(("NAVIGATOR_UI_INBOX_FIXTURE".into(), ctl::INBOX_FIXTURE_URL.into()));
+        }
         // The window's persona (personas.md §3), for the rail; frescod
         // draws the strip chip itself, from our uid.
         if let Some(p) = &cfg.portal {

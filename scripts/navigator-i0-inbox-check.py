@@ -3,6 +3,7 @@
 import argparse
 import csv
 import io
+import hashlib
 from pathlib import Path
 import subprocess
 import time
@@ -13,6 +14,8 @@ def main():
     parser.add_argument("ssh", help="guest command wrapper, such as scripts/vssh")
     parser.add_argument("requests", type=Path, help="fixture provider's request log")
     parser.add_argument("output", type=Path, help="directory for before and after PNGs")
+    parser.add_argument("--where", type=Path, metavar="HOST_WORKER",
+                        help="start from the blank 960 × 540 Navigator window and verify the installed worker")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -37,6 +40,54 @@ def main():
             if time.monotonic() >= end:
                 raise SystemExit(f"{expected!r} missing from {name}: {text!r}")
             time.sleep(.25)
+
+    if args.where:
+        worker = "/var/lib/atrium/apps/org.atrium.navigator.inbox-page/bin/inbox-page"
+        with args.where.open("rb") as host:
+            digest = hashlib.file_digest(host, "sha256").hexdigest()
+        if remote("sha256 -q " + worker).decode().strip() != digest:
+            raise SystemExit("Installed engine differs from host worker")
+        initial = args.requests.read_text()
+        if "refused" not in initial.splitlines():
+            raise SystemExit("Run the cookie-free API check first")
+
+        def inject(lines):
+            remote("nc -N -U /tmp/inbox/inject.sock", ("\n".join(lines) + "\n").encode())
+
+        def await_trace(part):
+            end = time.monotonic() + 15
+            while time.monotonic() < end:
+                last = remote("grep 'navigator-ui: trace' /tmp/inbox/nav.log | tail -1").decode()
+                if part in last:
+                    return
+                time.sleep(.1)
+            raise SystemExit(f"Missing Navigator UI state {part!r}")
+
+        def assert_idle():
+            if args.requests.read_text() != initial or remote("pgrep -x inbox-page || true").strip():
+                raise SystemExit("The fixture ran before the guarded press")
+
+        await_trace('where=""')
+        assert_idle()
+        keys = []
+        for c in "https://inbox.example/inbox\n":
+            hid, mod = (ord(c) - ord("a") + 4, 0) if c.isalpha() else {
+                ":": (51, 2), "/": (56, 0), ".": (55, 0), "\n": (40, 0)
+            }[c]
+            keys.extend([f"KEY {hid} 1 {mod}", f"KEY {hid} 0 {mod}"])
+        inject(keys)
+        await_trace("prompt=run-live")
+        time.sleep(.75)  # Fresco requires the guard to be still for 500 ms.
+        snapshot("offer")
+        assert_idle()
+        inject(["MOVE 822 63", "BTN 1 1", "BTN 1 0"])
+        await_trace("prompt=- rail=248 url=https://inbox.example/inbox")
+        assert_idle()
+        inject(["KEY 21 1 1", "KEY 21 0 1"])  # Ctrl-R
+        await_trace("prompt=run-live")
+        time.sleep(.75)
+        assert_idle()
+        inject(["MOVE 908 63", "BTN 1 1", "BTN 1 0"])
 
     before, _, text = await_screen("before", "School field trip")
     if "New draft" in text:

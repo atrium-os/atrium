@@ -743,6 +743,12 @@ last line, so "Static" is never read as "safe to give your password to".
 
 ### 6.4 What the system is asking: the prompt row (the UI)
 
+In a Navigator configured for the I0 inbox fixture, entering its exact URL in
+Where presents **Not now** and **Run live**. The question names the site and
+says the window will use its cookies. Reload offers the choice again.
+Navigator validates the press with Fresco before opening the live window.
+See the [whole-page gate](navigator-islands.md#direct-navigator-inbox-fixture).
+
 Questions that need the person, drawn by the UI in the prompt row between toolbar and page:
 
 | prompt | when | answers |

@@ -641,8 +641,8 @@ On 2026-11-20 the installed Navigator app opened a 640 × 360 whole-page
 fixture in its own window, from the opt-in setting
 `NAVIGATORD_INBOX_FIXTURE=https://inbox.example/inbox`. Two cold Navigator
 launches passed on a fresh arm64 HVF overlay with `/dev/vtbd1p1` mounted as
-Tessera root. General address-bar navigation and live Gmail compatibility
-remain open.
+Tessera root. That first gate used a startup launch. The Where-field gate below
+now opens the same worker on a press.
 
 Build the worker with `I0_INBOX_PAGE=ON`, the interpreter patch and generated
 `LIBWEB_RUST_BINDINGS`. The host installs Ladybird's inline fetch executor
@@ -658,9 +658,32 @@ Use the Mail gate's restricted forwarding setup with `inbox.example`. Start
 `courier-test-server inbox.example CA_FILE PORT_FILE MARKER_LOG 127.0.0.1:0 inbox`.
 First require a cookie-free GET of `/api/inbox` to return 403. Install the
 inbox worker with its shipped manifest and allow only Limen to start it.
-After Navigator launches, run `python3 scripts/navigator-i0-inbox-check.py
-SSH_WRAPPER MARKER_LOG OUTPUT_DIRECTORY` on the Mac. It reads the headless
-display and input socket under `/tmp/inbox` in the guest.
+For the Where-field gate, install the Navigator UI worker, configure
+`NAVIGATORD_UI=jail:org.atrium.navigator.ui`, the chrome and activation sockets,
+and set the inbox fixture URL in the broker config. Start at the empty Where
+field with `NAVIGATOR_UI_TRACE=1` and `NAVIGATOR_UI_SIZE=960x540` on a
+960 × 540 headless display. Run this on the Mac:
+
+```sh
+python3 scripts/navigator-i0-inbox-check.py --where HOST_WORKER SSH_WRAPPER MARKER_LOG OUTPUT_DIRECTORY
+```
+
+The gate checks the installed worker SHA-256 against the host executable.
+It enters the URL, waits for the prompt, presses Not now, reloads and presses
+Run live. Before acceptance it requires zero new provider requests and no
+worker. Navigator spends the compositor's guarded prompt token before
+creating the separate window and requesting any document. The offer applies
+to the exact fixture URL in a recorded, non-anonymous trail. Unrecorded
+trails and the portal and VPN sign-in brokers do not offer it.
+
+On a fresh arm64 Tessera snapshot the Where-field gate passed. FreeBSD
+reported Capsicum flag `C` for the worker (uid 50006), with both IP families
+disabled. Before/after frames, the prompt, and the guest proof are in
+`~/atrium-vm/evidence/navigator-where-20261120/`. An earlier attempt exited
+after the HTML request. The installed worker differed from both its staged
+copy and the Mac binary. Restaging restored matching hashes and the full
+flow passed. The cause of the initial installed-file mismatch is unverified.
+This result covers the fixture. Live Gmail remains untested.
 
 Both visits requested the document, CSS, JS and authenticated JSON. Each
 before-frame showed “School field trip” and 22,631 heading pixels in the

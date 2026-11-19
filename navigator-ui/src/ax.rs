@@ -116,6 +116,7 @@ pub fn prompt_text(p: &Prompt) -> String {
     match p {
         Prompt::Download { file, size, origin, kind, .. } => format!("{file}, {size} {kind} from {origin}"),
         Prompt::NotPrivate { origin } => format!("This form is on {origin} over http: anyone on the network can read it"),
+        Prompt::RunLive => "Open inbox.example in a live window using its cookies?".into(),
         Prompt::FetchAgain => "This page could not be restored and will be fetched again".into(),
         Prompt::Play { origin } => format!("{origin} wants to play sound"),
         Prompt::Handoff { url, scheme } => format!("This link is for another program ({scheme}): {url}"),
@@ -263,7 +264,7 @@ pub fn tree(s: &Shell) -> Node {
         Some(p) => {
             // The worker's own tree is grafted here; hidden while the
             // history view is drawn in its place or it is not shown yet.
-            let shown = s.history.is_none() && !matches!(s.live, Some(LivePage::Loading(_)) | Some(LivePage::Failed { .. }) | Some(LivePage::File { .. }));
+            let shown = s.history.is_none() && !matches!(s.live, Some(LivePage::LiveOffer) | Some(LivePage::Loading(_)) | Some(LivePage::Failed { .. }) | Some(LivePage::File { .. }));
             let mut n = Node::new(id::PAGE, "embedded-content", p.title.clone()).value(p.url.clone());
             if !shown {
                 n.state |= state::HIDDEN;

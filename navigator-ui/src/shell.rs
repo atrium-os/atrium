@@ -238,6 +238,7 @@ pub enum Region {
 pub enum LivePage {
     /// Asked for, not yet converted.
     Loading(String),
+    LiveOffer,
     /// Opened and handed to the page child.
     Shown(String),
     /// navigatord could not open it.
@@ -262,6 +263,7 @@ pub enum Out {
     Discard { id: u32 },
     /// Open that file in the person's app for it (§6.4), with the press.
     OpenFile { id: u32, press: navigator_control::Press },
+    RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
@@ -797,10 +799,15 @@ impl Shell {
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
+            (Prompt::RunLive, "Run live") if live => {
+                if let Some(url) = self.shown_url() {
+                    self.outbox.push(Out::RunLive { url, jar: self.store.trail().jar(), press });
+                }
+            }
             (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
-        if matches!(self.outbox.last(), Some(Out::Save { .. } | Out::OpenFile { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
+        if matches!(self.outbox.last(), Some(Out::RunLive { .. } | Out::Save { .. } | Out::OpenFile { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
             self.answered = key.map(|k| (k, prompt));
         }
         true
@@ -1193,7 +1200,7 @@ impl Shell {
 
     /// A page the person can give the keys to is on screen.
     fn live_page_shown(&self) -> bool {
-        self.store.trail().page().is_some() && !matches!(self.live, Some(LivePage::Failed { .. }) | Some(LivePage::File { .. }))
+        self.store.trail().page().is_some() && !matches!(self.live, Some(LivePage::LiveOffer) | Some(LivePage::Failed { .. }) | Some(LivePage::File { .. }))
     }
 
     /// A key while the rail has the keys: Up and Down go through the
@@ -2268,6 +2275,24 @@ mod tests {
         s.apply(Action::NextRegion, 0.0);
         assert!(s.rail_focus && !s.focus_page, "the page is skipped while history is up");
         assert!(s.escape() && !s.rail_focus);
+    }
+
+    #[test]
+    fn accepting_the_live_offer_passes_the_current_address_jar_and_press() {
+        let mut s = shell();
+        let url = navigator_control::INBOX_FIXTURE_URL;
+        s.enter(url);
+        s.live = Some(LivePage::LiveOffer);
+        assert!(s.ask(Prompt::RunLive, 0.0));
+        assert!(!s.answer_pressed(1, 100.0, Some([3; 16])));
+        assert!(s.outbox.is_empty());
+        assert!(s.answer_pressed(1, 700.0, Some([3; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::RunLive {
+            url: url.into(), jar: s.store.trail().jar(), press: [3; 16],
+        }));
+        s.press_refused("covered", 1000.0);
+        assert!(s.answer_pressed(0, 1700.0, Some([4; 16])));
+        assert!(s.outbox.is_empty());
     }
 
     #[test]

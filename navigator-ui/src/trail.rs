@@ -159,6 +159,7 @@ pub enum Prompt {
     Download { id: u32, file: String, size: String, origin: String, kind: String },
     NotPrivate { origin: String },
     FetchAgain,
+    RunLive,
     Play { origin: String },
     /// A link for another program (`mailto:`, an allowlisted scheme;
     /// threat model §2.10).
@@ -196,6 +197,7 @@ impl Prompt {
             // Open: in the person's app for it, through portcullisd.
             Prompt::Download { .. } => &["Cancel", "Open", "Save"],
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
+            Prompt::RunLive => &["Not now", "Run live"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
@@ -210,6 +212,7 @@ impl Prompt {
         match self {
             Prompt::Download { file, origin, .. } => format!("download {origin} {file}"),
             Prompt::NotPrivate { origin } => format!("not-private {origin}"),
+            Prompt::RunLive => "run-live".into(),
             Prompt::FetchAgain => "fetch-again".into(),
             Prompt::Play { origin } => format!("play {origin}"),
             Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. } => format!("hand {url}"),

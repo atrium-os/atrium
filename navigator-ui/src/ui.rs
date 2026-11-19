@@ -107,6 +107,7 @@ pub fn trace(s: &mut Shell) {
             t.page().and_then(|p| p.asked.as_ref()).map_or("-", |a| match a.prompt {
                 Prompt::Download { .. } => "download",
                 Prompt::NotPrivate { .. } => "not-private",
+                Prompt::RunLive => "run-live",
                 Prompt::FetchAgain => "fetch-again",
                 Prompt::Play { .. } => "play",
                 Prompt::Handoff { .. } => "handoff",
@@ -117,6 +118,7 @@ pub fn trace(s: &mut Shell) {
             t.page().map_or("-", |p| p.url.as_str()),
             match &s.live {
                 None => "-".to_string(),
+                Some(crate::shell::LivePage::LiveOffer) => "live-offer".into(),
                 Some(crate::shell::LivePage::Loading(_)) => "loading".into(),
                 Some(crate::shell::LivePage::Shown(_)) => "shown".into(),
                 Some(crate::shell::LivePage::Failed { why, .. }) => format!("failed:{}", why.replace(' ', "_")),
@@ -1400,6 +1402,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
+        Prompt::RunLive => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
         Prompt::FetchAgain => (ph::ARROW_CLOCKWISE, vec![("This page could not be restored and will be fetched again".into(), body(t.text_secondary(), Weight::Regular))]),
         Prompt::Stored { at_s } => (ph::CLOCK, vec![
             ("The version you saw".into(), body(t.text_secondary(), Weight::Regular)),
@@ -1464,6 +1467,9 @@ fn page_slot(ctx: &mut Ctx, g: &Geo, p: &trail::Page, st: &Mutable<Shell>) -> Op
         let y = r.y() + em(48.0);
         let ns = sans(type_size::SM, Weight::Regular, t.text_secondary());
         match live {
+            crate::shell::LivePage::LiveOffer => {
+                text(ctx, x, y, "Inbox", type_size::LG, Weight::Semibold, t.text_primary());
+            }
             crate::shell::LivePage::Loading(u) => {
                 text(ctx, x, y, &fit(&format!("Opening {}…", crate::trail::host(u)), &ns, col), type_size::SM, Weight::Regular, t.text_secondary());
             }

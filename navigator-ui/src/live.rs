@@ -413,6 +413,16 @@ impl Live {
         let (Some(e), Some(w)) = (self.embeds.clone(), self.window) else { return };
         let Some((url, saved, scroll)) = s.store.page_by_key_mut(key.0, key.1).map(|p| (p.url.clone(), p.saved.clone(), p.scroll)) else { return };
         let (jar, knows) = s.store.presence_of(key.0, &url).unwrap_or((Jar::Personal, false));
+        if jar == Jar::Personal && !s.store.trail().anonymous && url == ctl::INBOX_FIXTURE_URL
+            && std::env::var("NAVIGATOR_UI_INBOX_FIXTURE").ok().as_deref() == Some(ctl::INBOX_FIXTURE_URL)
+        {
+            let _ = e.borrow_mut().hide(PAGE_SLOT);
+            self.fresh.remove(&key);
+            send(&mut self.w, &Request::Blank);
+            s.live = Some(LivePage::LiveOffer);
+            s.ask_at(key, crate::trail::Prompt::RunLive, crate::ui::now_ms());
+            return;
+        }
         let embed = {
             let mut e = e.borrow_mut();
             if let Err(err) = e.hide(PAGE_SLOT) {
@@ -630,6 +640,7 @@ impl Live {
                         }
                     }
                 }
+                Event::LivePageFailed { why } => s.last_note = Some(why),
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
                     eprintln!("navigator-ui: signed out of {site} here: {}", match (cookies, &why) {
@@ -870,6 +881,7 @@ impl Live {
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
                     let id = self.id();
