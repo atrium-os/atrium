@@ -67,6 +67,8 @@ pub struct SettingsUi {
     /// The automatic reply (§11.6): on in the form, and each account's line.
     pub away_on: bool,
     pub away_lines: Vec<(String, String)>,
+    /// Accounts whose rules aren't (all) on their server, and why (§11.6).
+    pub rules_lines: Vec<(String, String)>,
     /// Private addresses (§13.3): the account shown, its domain, its addresses.
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
@@ -258,6 +260,7 @@ impl Settings {
         let mail_rules: Vec<(String, String)> = e.rules().iter().map(|r| (r.text(), r.words())).collect();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let away_lines: Vec<(String, String)> = e.configured().into_iter().map(|(id, c)| (c.address, e.away_line(id, now))).collect();
+        let rules_lines: Vec<(String, String)> = if mail_rules.is_empty() { Vec::new() } else { e.configured().into_iter().filter_map(|(id, c)| Some((c.address, e.rules_line(id)?))).collect() };
         let u = self.ui.get_cloned();
         let rows: Vec<Row> = rows;
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
@@ -276,13 +279,14 @@ impl Settings {
                 u.people_query = q;
             });
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.rules_lines != rules_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
                 u.rules = rules;
                 u.mail_rules = mail_rules;
                 u.away_lines = away_lines;
+                u.rules_lines = rules_lines;
                 u.priv_account = pa;
                 u.priv_domain = pd;
                 u.privates = privates;
@@ -1238,6 +1242,10 @@ impl SettingsView {
             let uw = measure("Run on the inbox", type_size::SM, Weight::Medium) + em(24.0);
             button(ctx, right - rw - em(6.0) - uw, y + em(14.0), "Run on the inbox", false, true, move || s.run_mail_rule(i));
             y += em(30.0);
+        }
+        // Where they stand on each server (ManageSieve or JMAP Sieve).
+        for (addr, line) in &ui.rules_lines {
+            y += para(ctx, x, y, inner, &format!("{addr}: {line}"), type_size::XS, t.text_tertiary()) + em(4.0);
         }
         let fw = (inner - em(80.0)).max(em(160.0));
         let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;

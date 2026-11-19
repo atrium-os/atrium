@@ -174,6 +174,112 @@ pub trait Sink {
 /// A server search (§11.2) brings at most this many messages.
 pub const SERVER_HITS: usize = 50;
 
+/// What a server search asks for (§11.2): every word and condition must
+/// hold. Words go as typed; the server decides how it matches them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerQuery {
+    /// Anywhere in the message.
+    pub text: Vec<String>,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    pub subject: Vec<String>,
+    /// Received at or after / before (seconds since 1970; the start of
+    /// the person's local day).
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+    /// `Some(true)`: unread only; `Some(false)`: read only.
+    pub unread: Option<bool>,
+    pub flagged: bool,
+    pub larger: Option<u64>,
+    pub smaller: Option<u64>,
+}
+
+impl ServerQuery {
+    /// Nothing a server could narrow by: not asked.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty() && self.from.is_empty() && self.to.is_empty() && self.subject.is_empty() && self.after.is_none() && self.before.is_none() && self.unread.is_none() && !self.flagged && self.larger.is_none() && self.smaller.is_none()
+    }
+
+    /// As IMAP `SEARCH` keys (RFC 9051 §6.4.4). Its days are whole days, so
+    /// a local midnight is taken as the day it begins (its UTC instant
+    /// moved half a day on, right for every zone within ±12 h).
+    pub fn imap(&self) -> Search {
+        let day = |t: i64| imap_day(t + 43_200);
+        let mut v: Vec<Search> = Vec::new();
+        v.extend(self.text.iter().map(|w| Search::Text(w.clone())));
+        v.extend(self.from.iter().map(|w| Search::From(w.clone())));
+        v.extend(self.to.iter().map(|w| Search::To(w.clone())));
+        v.extend(self.subject.iter().map(|w| Search::Subject(w.clone())));
+        if let Some(t) = self.after {
+            v.push(Search::Since(day(t)));
+        }
+        if let Some(t) = self.before {
+            v.push(Search::Before(day(t)));
+        }
+        match self.unread {
+            Some(true) => v.push(Search::Unseen),
+            Some(false) => v.push(Search::Seen),
+            None => {}
+        }
+        if self.flagged {
+            v.push(Search::Flagged);
+        }
+        if let Some(n) = self.larger {
+            v.push(Search::Larger(n));
+        }
+        if let Some(n) = self.smaller {
+            v.push(Search::Smaller(n));
+        }
+        if v.is_empty() {
+            Search::All
+        } else {
+            Search::And(v)
+        }
+    }
+
+    /// As a JMAP `Email/query` filter (RFC 8621 §4.4.1).
+    pub fn jmap(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mut v = Vec::new();
+        v.extend(self.text.iter().map(|w| json!({ "text": w })));
+        v.extend(self.from.iter().map(|w| json!({ "from": w })));
+        v.extend(self.to.iter().map(|w| json!({ "to": w })));
+        v.extend(self.subject.iter().map(|w| json!({ "subject": w })));
+        if let Some(t) = self.after {
+            v.push(json!({ "after": mail_proto::jmap::utc_string(t) }));
+        }
+        if let Some(t) = self.before {
+            v.push(json!({ "before": mail_proto::jmap::utc_string(t) }));
+        }
+        match self.unread {
+            Some(true) => v.push(json!({ "notKeyword": "$seen" })),
+            Some(false) => v.push(json!({ "hasKeyword": "$seen" })),
+            None => {}
+        }
+        if self.flagged {
+            v.push(json!({ "hasKeyword": "$flagged" }));
+        }
+        if let Some(n) = self.larger {
+            v.push(json!({ "minSize": n + 1 }));
+        }
+        if let Some(n) = self.smaller {
+            v.push(json!({ "maxSize": n }));
+        }
+        match v.len() {
+            1 => v.pop().unwrap_or_default(),
+            _ => json!({ "operator": "AND", "conditions": v }),
+        }
+    }
+}
+
+/// An IMAP date, `d-Mon-yyyy`, of the UTC day holding `t`.
+fn imap_day(t: i64) -> String {
+    let s = mail_proto::jmap::utc_string(t);
+    let (y, m, d) = (&s[0..4], s[5..7].parse::<usize>().unwrap_or(1), s[8..10].parse::<u32>().unwrap_or(1));
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    format!("{d}-{}-{y}", MONTHS[m.clamp(1, 12) - 1])
+}
+
 /// A change the person made, to make on the server (mail.md §6.3).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Change {
@@ -412,18 +518,18 @@ impl<S: Read + Write> Session<S> {
         Ok(report)
     }
 
-    /// Search the server for messages with every one of `words` (IMAP
-    /// `UID SEARCH TEXT`, §11.2), newest first in each folder the pass
+    /// Search the server for messages that fit `query` (IMAP `UID
+    /// SEARCH`, §11.2), newest first in each folder the pass
     /// walks, at most `limit`; those not here with their text are fetched
     /// into `sink`: their headers, then the whole message when it is at
     /// most [`TEXT_MAX`]. How many the server found (up to `limit`).
-    pub fn search_server(&mut self, words: &[String], sink: &mut dyn Sink, limit: usize) -> Result<usize> {
-        if words.is_empty() || limit == 0 {
+    pub fn search_server(&mut self, query: &ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        if query.is_empty() || limit == 0 {
             return Ok(0);
         }
         let all = self.folders()?;
         sink.folders(&all).map_err(Error::Sink)?;
-        let q = Search::And(words.iter().map(|w| Search::Text(w.clone())).collect());
+        let q = query.imap();
         let mut found = 0;
         for f in self.walk(&all) {
             if found >= limit {
@@ -791,5 +897,22 @@ mod tests {
         assert_eq!(internal_date(" 1-Jan-2026 00:00:00 +0000"), Some(1_767_225_600));
         assert_eq!(expand("1:3,7,10:9"), vec![1, 2, 3, 7, 9, 10]);
         assert_eq!(expand("1:4000000000").len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod server_query_tests {
+    use super::*;
+
+    #[test]
+    fn a_server_query_as_imap_keys() {
+        let q = ServerQuery { text: vec!["deal".into()], from: vec!["arun@acme.example".into()], subject: vec!["q4".into()], after: Some(1_793_471_400), before: Some(1_794_681_000), unread: Some(false), flagged: true, smaller: Some(5000), ..Default::default() };
+        let mut e = mail_proto::imap::Encoder::default();
+        let cmd = e.uid_search(&q.imap());
+        let line = String::from_utf8_lossy(&cmd.chunks.iter().flat_map(|c| match c { mail_proto::imap::Chunk::Send(b) => b.clone(), _ => Vec::new() }).collect::<Vec<u8>>()).to_string();
+        // 2026-11-01 00:00 and 2026-11-15 00:00 in Kolkata (18:30 UTC the day before).
+        assert!(line.contains("UID SEARCH CHARSET UTF-8 (TEXT \"deal\" FROM \"arun@acme.example\" SUBJECT \"q4\" SINCE 1-Nov-2026 BEFORE 15-Nov-2026 SEEN FLAGGED SMALLER 5000)"), "{line}");
+        assert!(ServerQuery::default().is_empty() && !q.is_empty());
+        assert_eq!(ServerQuery { unread: Some(true), ..Default::default() }.jmap(), serde_json::json!({ "notKeyword": "$seen" }));
     }
 }

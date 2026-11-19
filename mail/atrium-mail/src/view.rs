@@ -596,7 +596,7 @@ pub struct Mail {
     unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
     /// A server search asked for (§11.2): its words, for the app's sync
     /// thread.
-    server_ask: Rc<RefCell<Option<Vec<String>>>>,
+    server_ask: Rc<RefCell<Option<mail_sync::ServerQuery>>>,
     /// Unwraps an encrypted message's content key with the person's
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
@@ -1993,7 +1993,7 @@ impl Mail {
         if s.view.is_some() || s.server.is_some() {
             return;
         }
-        let words = mail_engine::search::parse(&s.query, false).server_words();
+        let words = mail_engine::search::parse(&s.query, false).server_query();
         if words.is_empty() {
             return;
         }
@@ -2003,7 +2003,7 @@ impl Mail {
         self.ui.set(ui);
     }
 
-    pub fn take_server_search(&self) -> Option<Vec<String>> {
+    pub fn take_server_search(&self) -> Option<mail_sync::ServerQuery> {
         self.server_ask.borrow_mut().take()
     }
 

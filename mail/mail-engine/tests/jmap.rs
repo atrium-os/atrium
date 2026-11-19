@@ -49,6 +49,10 @@ struct Server {
     downloads: usize,
     hold: u64,
     vacation: Option<Value>,
+    /// JMAP Sieve (RFC 9661) when `Some`: id, name, active, text.
+    sieve: Option<Vec<(String, String, bool, String)>>,
+    /// Refuse SieveScript/set with this.
+    sieve_refuse: Option<&'static str>,
 }
 
 impl Server {
@@ -108,11 +112,15 @@ impl Server {
                 }
                 "Email/query" => {
                     // In a mailbox, or with text (the server's search).
-                    let words: Vec<String> = args["filter"]["text"].as_str().map(|t| t.split_whitespace().map(str::to_lowercase).collect()).unwrap_or_default();
+                    // The conditions under AND, or the one; a field's word
+                    // is matched anywhere (enough for these tests).
+                    let conds: Vec<Value> = args["filter"]["conditions"].as_array().cloned().unwrap_or_else(|| vec![args["filter"].clone()]);
+                    let words: Vec<String> = conds.iter().flat_map(|c| ["text", "subject", "from", "to"].map(|k| c[k].as_str().map(str::to_lowercase))).flatten().flat_map(|t| t.split_whitespace().map(str::to_string).collect::<Vec<_>>()).collect();
+                    let after = conds.iter().find_map(|c| c["after"].as_str().and_then(mail_proto::jmap::utc_date));
                     let mb = args["filter"]["inMailbox"].as_str();
                     let mut ids: Vec<(&i64, &String)> = self.mails.iter().filter(|(_, m)| match mb {
                         Some(mb) => m.boxes.contains(mb),
-                        None => { let t = String::from_utf8_lossy(&m.bytes).to_lowercase(); words.iter().all(|w| t.contains(w.as_str())) }
+                        None => { let t = String::from_utf8_lossy(&m.bytes).to_lowercase(); words.iter().all(|w| t.contains(w.as_str())) && after.is_none_or(|a| m.received >= a) }
                     }).map(|(id, m)| (&m.received, id)).collect();
                     ids.sort_by(|a, b| b.cmp(a));
                     let (pos, limit) = (args["position"].as_u64().unwrap() as usize, args["limit"].as_u64().unwrap() as usize);
@@ -180,6 +188,34 @@ impl Server {
                     self.vacation = Some(Value::Object(cur));
                     json!({ "newState": "v2", "updated": { "singleton": null } })
                 }
+                "SieveScript/get" => {
+                    let list: Vec<Value> = self.sieve.as_ref().unwrap().iter().map(|(id, n, a, _)| json!({ "id": id, "name": n, "isActive": a })).collect();
+                    json!({ "state": "z", "list": list, "notFound": [] })
+                }
+                "SieveScript/set" => {
+                    if let Some(why) = self.sieve_refuse {
+                        let k = if args.get("create").is_some() { "notCreated" } else { "notUpdated" };
+                        json!({ "newState": "z", k: { "s": { "type": "invalidSieve", "description": why } } })
+                    } else {
+                        let scripts = self.sieve.as_mut().unwrap();
+                        let text = |b: &Value| String::from_utf8(self.uploads[b.as_str().unwrap()].clone()).unwrap();
+                        let id = if let Some(c) = args["create"]["s"].as_object() {
+                            let id = format!("S{}", scripts.len() + 1);
+                            scripts.push((id.clone(), c["name"].as_str().unwrap().into(), false, text(&c["blobId"])));
+                            id
+                        } else {
+                            let (id, patch) = args["update"].as_object().unwrap().iter().next().unwrap();
+                            let t = text(&patch["blobId"]);
+                            scripts.iter_mut().find(|s| s.0 == *id).unwrap().3 = t;
+                            id.clone()
+                        };
+                        assert!(args["onSuccessActivateScript"] == json!(id) || args["onSuccessActivateScript"] == json!("#s"));
+                        for s in scripts.iter_mut() {
+                            s.2 = s.0 == id;
+                        }
+                        json!({ "newState": "z", "created": { "s": { "id": id } } })
+                    }
+                }
                 "Identity/get" => json!({ "state": "i", "list": [{ "id": "id1", "email": "ada@example.org", "name": "Ada" }] }),
                 "Email/import" => {
                     let e = &args["emails"]["m"];
@@ -210,9 +246,13 @@ impl Http for Fake {
     fn get(&mut self, url: &str, max: usize) -> Result<Vec<u8>, String> {
         let mut s = self.0.borrow_mut();
         let body = if url == SESSION {
+            let mut caps = json!({ "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold }, "urn:ietf:params:jmap:vacationresponse": {} });
+            if s.sieve.is_some() {
+                caps["urn:ietf:params:jmap:sieve"] = json!({ "sieveExtensions": ["fileinto", "imap4flags"], "maxSizeScript": 65536 });
+            }
             serde_json::to_vec(&json!({
                 "capabilities": { "urn:ietf:params:jmap:core": { "maxSizeUpload": 50_000_000 }, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} },
-                "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": { "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold }, "urn:ietf:params:jmap:vacationresponse": {} } } },
+                "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": caps } },
                 "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT },
                 "apiUrl": "https://jmap.test/api/",
                 "downloadUrl": "https://jmap.test/download/{accountId}/{blobId}/{name}?type={type}",
@@ -241,7 +281,7 @@ impl Http for Fake {
                 Ok(serde_json::to_vec(&s.api(&req)).unwrap())
             }
             "https://jmap.test/upload/u1/" => {
-                assert_eq!(content_type, "message/rfc822");
+                assert!(content_type == "message/rfc822" || content_type == "application/sieve", "{content_type}");
                 let id = format!("U{}", s.uploads.len() + 1);
                 s.uploads.insert(id.clone(), body.to_vec());
                 Ok(serde_json::to_vec(&json!({ "accountId": ACCOUNT, "blobId": id, "type": content_type, "size": body.len() })).unwrap())
@@ -402,7 +442,12 @@ fn jmap_sync_changes_and_send() {
     server.borrow_mut().add(message(5, "Old deal", "The zanzibar contract."), &["arch"], &[], t0 - 400 * 86_400);
     let q = mail_engine::search::parse("zanzibar", false);
     assert!(engine.search(&q).unwrap().is_empty());
-    assert_eq!(engine.search_jmap(account, client.as_mut(), &q.server_words()).unwrap(), 1);
+    assert_eq!(engine.search_jmap(account, client.as_mut(), &q.server_query()).unwrap(), 1);
+    // With operators: an AND of conditions; a date after it, nothing.
+    let with = |s: &str| mail_engine::search::parse(s, false).server_query();
+    assert_eq!(with("subject:deal zanzibar").jmap(), serde_json::json!({ "operator": "AND", "conditions": [{ "text": "zanzibar" }, { "subject": "deal" }] }));
+    assert_eq!(engine.search_jmap(account, client.as_mut(), &with("subject:deal zanzibar")).unwrap(), 1);
+    assert_eq!(engine.search_jmap(account, client.as_mut(), &with("zanzibar after:2026-11-01")).unwrap(), 0);
     let hits = engine.search(&q).unwrap();
     assert_eq!(hits.iter().map(|h| h.subject.as_str()).collect::<Vec<_>>(), ["Old deal"]);
     assert_eq!(engine.store.list(archive, 0, 10).unwrap().iter().filter(|r| r.subject == "Old deal").count(), 1);
@@ -563,4 +608,78 @@ fn jmap_push_reports_state_changes_only() {
     let h = Pushing { es: Some("https://jmap.test/events/"), events: vec![state("e1")], asked: vec![] };
     let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     assert_eq!(client.watch(&mut |_| true), Ok(Pushed::Ended));
+}
+
+#[test]
+fn jmap_rules_through_sieve() {
+    use mail_engine::rules::parse_rule;
+    let server = Rc::new(RefCell::new(Server { sieve: Some(Vec::new()), ..Server::default() }));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let t0 = 1_795_000_000;
+
+    // No rules: nothing asked.
+    engine.sync_jmap_sieve(account, client.as_mut(), t0).unwrap();
+    assert!(server.borrow().sieve.as_ref().unwrap().is_empty());
+    // A rule: Mail's script, made active, the folder by its server path.
+    engine.add_rule(parse_rule("from:@github.com move projects/q4").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0).unwrap();
+    {
+        let s = server.borrow();
+        let scripts = s.sieve.as_ref().unwrap();
+        assert_eq!(scripts.len(), 1);
+        let (_, name, active, text) = &scripts[0];
+        assert_eq!((name.as_str(), *active), ("atrium-mail", true));
+        assert!(text.contains("fileinto \"Projects/Q4\";") && !text.contains("vacation"), "{text}");
+    }
+    assert_eq!(engine.rules_line(account), None);
+    // Unchanged: not put again; changed: the same script updated.
+    let uploads = server.borrow().uploads.len();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 60).unwrap();
+    assert_eq!(server.borrow().uploads.len(), uploads);
+    engine.add_rule(parse_rule("subject:receipt read").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 120).unwrap();
+    {
+        let s = server.borrow();
+        let scripts = s.sieve.as_ref().unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].3.contains("receipt"), "{}", scripts[0].3);
+    }
+    // A refusal is said and tried again in an hour.
+    server.borrow_mut().sieve_refuse = Some("line 3: unknown command");
+    engine.add_rule(parse_rule("from:alerts@bank.example flag").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 200).unwrap();
+    assert!(engine.rules_line(account).unwrap().contains("line 3: unknown command"), "{:?}", engine.rules_line(account));
+    server.borrow_mut().sieve_refuse = None;
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 300).unwrap();
+    assert!(engine.rules_line(account).is_some(), "resting");
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 200 + 3600).unwrap();
+    assert_eq!(engine.rules_line(account), None);
+    // Someone else's active script: left alone, and said.
+    {
+        let mut s = server.borrow_mut();
+        let scripts = s.sieve.as_mut().unwrap();
+        scripts[0].2 = false;
+        scripts.push(("S9".into(), "webmail".into(), true, "keep;".into()));
+    }
+    engine.add_rule(parse_rule("to:team@example.org move archive").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 5000).unwrap();
+    assert!(engine.rules_line(account).unwrap().contains("“webmail”"), "{:?}", engine.rules_line(account));
+    assert!(server.borrow().sieve.as_ref().unwrap()[1].2, "still theirs");
+}
+
+#[test]
+fn jmap_without_sieve_keeps_rules_here() {
+    use mail_engine::rules::parse_rule;
+    let server = Rc::new(RefCell::new(Server::default()));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    engine.add_rule(parse_rule("subject:receipt read").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), 1_795_000_000).unwrap();
+    assert_eq!(engine.rules_line(account).as_deref(), Some(mail_engine::sieve::NO_SIEVE));
 }

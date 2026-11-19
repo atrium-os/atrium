@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1503,7 +1503,7 @@ Stalwart in the cloud VM, and later a real account):
    here), the JMAP suite (a message not yet synced found and placed once), the worker's
    JMAP parity test, the window (the button, the hand-off, the note). **Not yet**:
    results from the server shown before they are fetched (the "on server" mark of §6.4),
-   and operators other than words sent to the server.
+   and operators other than words sent to the server (built 2026-11-19, below).
 
    **Later's remaining rules built on the host (2026-11-18, §11.4).** The daily review
    names every item a week or more overdue and every item pushed back three times or
@@ -1810,7 +1810,7 @@ Stalwart in the cloud VM, and later a real account):
    active, unchanged not sent, someone else's script left alone, a refusal retried, no
    `vacation`, removal), app 1 (the third endpoint kept, known providers and OAuth
    without, all three deleted). **Not yet**: a run against Dovecot with Pigeonhole (none
-   on this host; the VM), JMAP Sieve (RFC 9661) for rules on JMAP accounts, and reading
+   on this host; the VM), JMAP Sieve (RFC 9661) for rules on JMAP accounts (built below), and reading
    back a script changed on the server.
 
    **The automatic reply's first day and its own lines (2026-11-19, §11.6).** AWAY in
@@ -1894,6 +1894,32 @@ Stalwart in the cloud VM, and later a real account):
    window 2 (rail icons; the report sent and undone; the conversation's files, Files from,
    the Files view), settings (the field, asked in Work). **Not yet**: a grid of
    thumbnails for the Files view (rows for now), and the Files view's counts.
+
+   **Search operators on the server, and rules on JMAP servers (2026-11-19, §11.2,
+   §11.6).** *Search server* now sends the search's operators too, not only its words:
+   `from:`, `to:` and `subject:` words in their fields, `before:`/`after:`, `is:unread` or
+   `is:read`, `is:flagged`, `larger:`/`smaller:` (a `ServerQuery` the worker carries).
+   IMAP gets them as `UID SEARCH` keys (FROM, TO, SUBJECT, SINCE/BEFORE on the local day,
+   UNSEEN/SEEN, FLAGGED, LARGER/SMALLER), JMAP as an `Email/query` filter (an AND of
+   conditions, `after`/`before`, `hasKeyword`/`notKeyword`, `minSize`/`maxSize`).
+   `in:`, `has:attachment` and the quick filters stay local: the results are run again
+   here once the server's finds are fetched. A JMAP account whose server keeps Sieve
+   scripts (RFC 9661, `urn:ietf:params:jmap:sieve`) gets Mail's rules there as the script
+   "atrium-mail" (written by the same `mail_sync::sieve` code as ManageSieve, for the
+   server's own extensions), uploaded and made active in the pass when they change; the
+   automatic reply stays the server's `VacationResponse`, so the script carries rules
+   only. Another active script is left alone and said; a refusal (with the server's
+   reason) is tried again in an hour or when a rule changes. Settings says under RULES,
+   per account, when the rules aren't all on its server (another script, a refusal, rules
+   the server's Sieve can't do, or a JMAP server without scripts, where they run only while
+   Mail is open). Also fixed: the worker relay no longer fails a ManageSieve or send call
+   when the server's last bytes arrive after the worker has answered (a flaky test).
+   Tests: sync 1 (the query as IMAP keys and a JMAP filter), Dovecot (subject, read or
+   unread, size and date sent to a real server), JMAP (an AND filter, a date; rules
+   through Sieve: put, unchanged not put, updated, refused and retried, another script
+   left alone; a server without Sieve), the window's server search. **Not yet**: reading
+   back a script changed on the server, and the vacation reply through JMAP Sieve on a
+   server with Sieve but no `VacationResponse`.
 
 ## 17. Decisions, with recommendations
 

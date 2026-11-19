@@ -45,13 +45,19 @@ pub trait Jmap {
     fn can_hold(&self, secs: i64) -> bool;
     /// See [`Client::watch`].
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed>;
-    /// Search the server for `text` (§11.2); see [`Client::search_server`].
-    fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
+    /// Search the server (§11.2); see [`Client::search_server`].
+    fn search(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
     /// Store `message` in `folder`, seen (an import, §6.5); its id.
     fn import(&mut self, folder: &str, message: &[u8]) -> Result<String>;
     /// The account's vacation reply, after setting it to `set` if given;
     /// `None` when the server has none (§11.6).
     fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>>;
+    /// Put Mail's filters on the server through JMAP Sieve (RFC 9661);
+    /// `None` when the account has none. See [`Client::sieve`].
+    fn sieve(&mut self, plan: &crate::sieve::Plan) -> Result<Option<crate::sieve::Sieved>> {
+        let _ = plan;
+        Ok(None)
+    }
 }
 
 /// An automatic reply (mail.md §11.6), as the worker carries it.
@@ -92,8 +98,11 @@ impl<H: Http> Jmap for Client<H> {
     fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>> {
         Client::vacation(self, set)
     }
-    fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
-        Client::search_server(self, text, sink, limit)
+    fn sieve(&mut self, plan: &crate::sieve::Plan) -> Result<Option<crate::sieve::Sieved>> {
+        Client::sieve(self, plan)
+    }
+    fn search(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        Client::search_server(self, query, sink, limit)
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed> {
         Client::watch(self, on)
@@ -305,18 +314,18 @@ impl<H: Http> Client<H> {
         Ok(report)
     }
 
-    /// Search the server for `text` (JMAP `Email/query`, §11.2), newest
+    /// Search the server for `query` (JMAP `Email/query`, §11.2), newest
     /// first, at most `limit`: messages not listed here are placed whole
     /// (or by their headers when large); listed ones without their text
     /// get it. How many the server found.
-    pub fn search_server(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
-        if text.trim().is_empty() || limit == 0 {
+    pub fn search_server(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        if query.is_empty() || limit == 0 {
             return Ok(0);
         }
         if self.mailboxes.is_empty() {
             self.folders(sink)?;
         }
-        let a = self.call(jmap::query_text(&self.session.account, text, limit as u64))?;
+        let a = self.call(jmap::query(&self.session.account, query.jmap(), limit as u64))?;
         let (emails, _, _) = jmap::mailbox_page(&a)?;
         let mut report = Report::default();
         for e in emails.iter().take(limit) {
@@ -514,6 +523,29 @@ impl<H: Http> Client<H> {
         }
         let a = self.call(jmap::get_vacation(&self.session.account))?;
         Ok(Some(jmap::vacation(&a)?.into()))
+    }
+
+    /// Put `plan` on the server as Mail's Sieve script (RFC 9661) and make
+    /// it the active one, unless another script is active (left alone,
+    /// and said). `None` when the account keeps no scripts.
+    pub fn sieve(&mut self, plan: &crate::sieve::Plan) -> Result<Option<crate::sieve::Sieved>> {
+        let Some(exts) = self.session.sieve.clone() else { return Ok(None) };
+        let a = self.call(jmap::get_sieve_scripts(&self.session.account))?;
+        let list = jmap::sieve_scripts(&a)?;
+        let mut done = crate::sieve::Sieved::default();
+        if let Some((_, other, _)) = list.iter().find(|(_, n, active)| *active && n != crate::sieve::SCRIPT) {
+            done.others = Some(other.clone());
+            return Ok(Some(done));
+        }
+        let caps = mail_proto::sieve::Caps { implementation: String::new(), sieve: exts };
+        let (text, no_vacation, skipped) = crate::sieve::script(plan, &caps);
+        (done.no_vacation, done.skipped) = (no_vacation, skipped);
+        let r = self.h.post(&self.session.upload(), "application/sieve", text.as_bytes(), 64 << 10).map_err(Error)?;
+        let blob = jmap::uploaded(&r)?;
+        let ours = list.iter().find(|(_, n, _)| n == crate::sieve::SCRIPT).map(|(id, ..)| id.as_str());
+        let a = self.call(jmap::put_sieve_script(&self.session.account, ours, crate::sieve::SCRIPT, &blob))?;
+        jmap::sieve_put(&a)?;
+        Ok(Some(done))
     }
 
     /// Store `message` in `folder` (a path as [`Client::folders`] names it),

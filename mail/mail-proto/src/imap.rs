@@ -657,8 +657,12 @@ pub enum Search {
     Since(String),
     Before(String),
     From(String),
+    To(String),
     Subject(String),
     Text(String),
+    Seen,
+    Larger(u64),
+    Smaller(u64),
     ModSeq(u64),
     Not(Box<Search>),
     And(Vec<Search>),
@@ -902,6 +906,9 @@ impl Encoder {
             Search::All => word("ALL", line),
             Search::Unseen => word("UNSEEN", line),
             Search::Flagged => word("FLAGGED", line),
+            Search::Seen => word("SEEN", line),
+            Search::Larger(n) => word(&format!("LARGER {n}"), line),
+            Search::Smaller(n) => word(&format!("SMALLER {n}"), line),
             Search::Uid(s) => {
                 let mut t = String::from("UID ");
                 s.write(&mut t);
@@ -912,10 +919,11 @@ impl Encoder {
                 // dates are d-Mon-yyyy; anything else is quoted safely
                 self.astring(chunks, line, d.as_bytes());
             }
-            Search::From(t) | Search::Subject(t) | Search::Text(t) => {
+            Search::From(t) | Search::To(t) | Search::Subject(t) | Search::Text(t) => {
                 word(
                     match q {
                         Search::From(_) => "FROM ",
+                        Search::To(_) => "TO ",
                         Search::Subject(_) => "SUBJECT ",
                         _ => "TEXT ",
                     },

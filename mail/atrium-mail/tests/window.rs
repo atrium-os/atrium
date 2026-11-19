@@ -684,7 +684,7 @@ fn search_as_you_type_and_a_saved_search() {
     assert!(texts(&app).iter().any(|x| x == "Search server"), "{:?}", texts(&app));
     assert_eq!(mail.ui.get_cloned().count, 0);
     mail.search_server();
-    assert_eq!(mail.take_server_search(), Some(vec!["zanzibar".to_string(), "contract".to_string()]));
+    assert_eq!(mail.take_server_search(), Some(mail_sync::ServerQuery { text: vec!["zanzibar".into(), "contract".into()], ..Default::default() }));
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "Searching server…"));
     {

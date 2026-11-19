@@ -453,8 +453,8 @@ pub enum Wake {
     Now,
     /// The server said this account's inbox changed.
     Changed(AccountId),
-    /// Search every account's server for these words (§11.2).
-    Search(Vec<String>),
+    /// Search every account's server for this (§11.2).
+    Search(mail_sync::ServerQuery),
     Stop,
 }
 
@@ -606,7 +606,7 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Conn
             only = None;
             // A server search runs alone, no pass with it (account 0 is
             // none: no account has id 0).
-            let search = |words: &[String]| {
+            let search = |words: &mail_sync::ServerQuery| {
                 let mut total = 0;
                 let mut failed = None;
                 for (id, _) in engine.configured() {

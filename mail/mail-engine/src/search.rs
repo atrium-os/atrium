@@ -41,13 +41,30 @@ pub struct Query {
 }
 
 impl Query {
-    /// The words a server search looks for (§11.2): every plain or field
-    /// word, as typed.
-    pub fn server_words(&self) -> Vec<String> {
-        self.conds.iter().filter_map(|c| match c {
-            Cond::Word { word, .. } => Some(word.clone()),
-            _ => None,
-        }).collect()
+    /// What a server search asks for (§11.2): the words in their fields
+    /// (a file name's anywhere), the dates, read or unread, flagged and the
+    /// sizes. `in:`, `has:attachment` and the quick filters stay here: the
+    /// results are run again locally once the server's are fetched.
+    pub fn server_query(&self) -> mail_sync::ServerQuery {
+        let mut q = mail_sync::ServerQuery::default();
+        for c in &self.conds {
+            match c {
+                Cond::Word { word, fields, .. } => match *fields {
+                    field::FROM => q.from.push(word.clone()),
+                    field::TO => q.to.push(word.clone()),
+                    field::SUBJECT => q.subject.push(word.clone()),
+                    _ => q.text.push(word.clone()),
+                },
+                Cond::Unread(u) => q.unread = Some(*u),
+                Cond::Flagged => q.flagged = true,
+                Cond::Before(t) => q.before = Some(q.before.map_or(*t, |b| b.min(*t))),
+                Cond::After(t) => q.after = Some(q.after.map_or(*t, |a| a.max(*t))),
+                Cond::Larger(n) => q.larger = Some(q.larger.map_or(*n, |l| l.max(*n))),
+                Cond::Smaller(n) => q.smaller = Some(q.smaller.map_or(*n, |s| s.min(*n))),
+                Cond::HasAttachment | Cond::In(_) | Cond::Quick(_) => {}
+            }
+        }
+        q
     }
 }
 

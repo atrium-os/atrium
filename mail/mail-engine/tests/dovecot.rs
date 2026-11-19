@@ -846,10 +846,16 @@ fn a_pass_with_sync_in_its_worker() {
     // its text is fetched, and then it is found here.
     let q = mail_engine::search::parse("body 250", false);
     assert!(engine.search(&q).unwrap().is_empty());
-    assert_eq!(engine.search_server(account, &q.server_words(), &Couriers(&dc)).unwrap(), 1);
+    assert_eq!(engine.search_server(account, &q.server_query(), &Couriers(&dc)).unwrap(), 1);
     let hits = engine.search(&q).unwrap();
     assert_eq!(hits.iter().map(|h| h.subject.as_str()).collect::<Vec<_>>(), ["Message 250"]);
     // Again: found on the server, nothing fetched (its text is here now).
-    assert_eq!(engine.search_server(account, &q.server_words(), &Couriers(&dc)).unwrap(), 1);
+    assert_eq!(engine.search_server(account, &q.server_query(), &Couriers(&dc)).unwrap(), 1);
     assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    // Operators go too: the subject, read or not, size.
+    let found = |q: &str| engine.search_server(account, &mail_engine::search::parse(q, false).server_query(), &Couriers(&dc)).unwrap();
+    assert_eq!(found("subject:250 is:unread"), 1);
+    assert_eq!(found("subject:250 is:read"), 0);
+    assert_eq!(found("subject:250 larger:1MB"), 0);
+    assert_eq!(found("subject:249 is:read before:2000-01-01"), 0);
 }

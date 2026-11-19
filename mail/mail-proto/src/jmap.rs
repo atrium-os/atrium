@@ -14,6 +14,8 @@ pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
 /// RFC 8621 §8: the account's automatic reply.
 pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+/// Sieve scripts on the server (RFC 9661).
+pub const SIEVE: &str = "urn:ietf:params:jmap:sieve";
 
 /// Largest answer read (the caller's HTTP stops at this many bytes).
 pub const MAX_RESPONSE: usize = 16 << 20;
@@ -103,6 +105,9 @@ pub struct Session {
     pub max_delayed_send: u64,
     /// The account has a vacation reply (urn:ietf:params:jmap:vacationresponse).
     pub can_vacation: bool,
+    /// The account keeps Sieve scripts (RFC 9661): the extensions its
+    /// Sieve has, `None` without the capability.
+    pub sieve: Option<Vec<String>>,
     pub state: String,
 }
 
@@ -133,6 +138,7 @@ pub fn session(body: &[u8]) -> Result<Session> {
         max_size_upload,
         max_delayed_send,
         can_vacation: acct.is_some_and(|c| c.contains_key(VACATION)),
+        sieve: acct.and_then(|c| c.get(SIEVE)).map(|s| s.get("sieveExtensions").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|e| e.len() <= 64).take(100).map(str::to_string).collect()).unwrap_or_default()),
         state: get_str(o, "state").filter(|s| state_ok(s)).unwrap_or("0").to_string(),
     })
 }
@@ -192,9 +198,15 @@ pub fn query_mailbox(account: &str, mailbox: &str, position: u64, limit: u64) ->
 /// search, §11.2), with what sync needs of each; read with
 /// [`mailbox_page`].
 pub fn query_text(account: &str, text: &str, limit: u64) -> Vec<u8> {
+    query(account, json!({ "text": text }), limit)
+}
+
+/// [`query_text`] with any filter (RFC 8621 §4.4.1): a condition, or an
+/// operator over conditions.
+pub fn query(account: &str, filter: serde_json::Value, limit: u64) -> Vec<u8> {
     request(
         vec![
-            json!(["Email/query", { "accountId": account, "filter": { "text": text }, "sort": [{ "property": "receivedAt", "isAscending": false }], "position": 0, "limit": limit, "calculateTotal": true }, "q"]),
+            json!(["Email/query", { "accountId": account, "filter": filter, "sort": [{ "property": "receivedAt", "isAscending": false }], "position": 0, "limit": limit, "calculateTotal": true }, "q"]),
             json!(["Email/get", { "accountId": account, "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" }, "properties": EMAIL_PROPS }, "g"]),
         ],
         false,
@@ -320,6 +332,49 @@ pub const VACATION_TEXT_MAX: usize = 64 << 10;
 
 pub fn get_vacation(account: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({ "using": [CORE, MAIL, VACATION], "methodCalls": [["VacationResponse/get", { "accountId": account, "ids": ["singleton"] }, "v"]] })).unwrap_or_default()
+}
+
+/// The account's Sieve scripts (RFC 9661 §2.1), without their content.
+pub fn get_sieve_scripts(account: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "using": [CORE, SIEVE], "methodCalls": [["SieveScript/get", { "accountId": account, "ids": Value::Null, "properties": ["id", "name", "isActive"] }, "g"]] })).unwrap_or_default()
+}
+
+/// The answer to [`get_sieve_scripts`]: id, name, active.
+pub fn sieve_scripts(a: &Answers) -> Result<Vec<(String, String, bool)>> {
+    let o = a.of("g", "SieveScript/get")?;
+    let list = o.get("list").and_then(Value::as_array).ok_or(Error("no list".into()))?;
+    Ok(list
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|s| Some((need_id(s, "id").ok()?, get_str(s, "name").unwrap_or("").chars().filter(|c| !c.is_control()).take(100).collect(), s.get("isActive").and_then(Value::as_bool).unwrap_or(false))))
+        .collect())
+}
+
+/// Put uploaded script `blob` as script `name` (a new one, or the one
+/// with id `existing`) and make it the active one (RFC 9661 §2.2).
+pub fn put_sieve_script(account: &str, existing: Option<&str>, name: &str, blob: &str) -> Vec<u8> {
+    let set = match existing {
+        Some(id) => json!({ "accountId": account, "update": { id: { "blobId": blob } }, "onSuccessActivateScript": id }),
+        None => json!({ "accountId": account, "create": { "s": { "name": name, "blobId": blob } }, "onSuccessActivateScript": "#s" }),
+    };
+    serde_json::to_vec(&json!({ "using": [CORE, SIEVE], "methodCalls": [["SieveScript/set", set, "s"]] })).unwrap_or_default()
+}
+
+/// The answer to [`put_sieve_script`]: done, or why not (an invalid
+/// script says where).
+pub fn sieve_put(a: &Answers) -> Result<()> {
+    let o = a.of("s", "SieveScript/set")?;
+    for k in ["notCreated", "notUpdated"] {
+        if let Some(e) = o.get(k).and_then(Value::as_object).and_then(|m| m.values().next()) {
+            let t = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").chars().filter(|c| !c.is_control()).take(160).collect::<String>();
+            let (ty, d) = (t("type"), t("description"));
+            return err(if d.is_empty() { format!("not stored: {ty}") } else { format!("not stored: {ty}: {d}") });
+        }
+    }
+    if let Some(e) = o.get("notActivated").and_then(|v| v.get("type")).and_then(Value::as_str) {
+        return err(format!("not turned on: {}", e.chars().take(64).collect::<String>()));
+    }
+    Ok(())
 }
 
 pub fn set_vacation(account: &str, v: &Vacation) -> Vec<u8> {

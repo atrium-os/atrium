@@ -11,4 +11,6 @@ mail-proto = { path = "../mail-proto" }
 # The `sync` worker's wire (remote.rs).
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
+# A JMAP search filter (ServerQuery::jmap).
+serde_json = "1"
 libc = "0.2"

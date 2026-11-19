@@ -22,6 +22,14 @@ pub const PORT: u16 = 4190;
 /// would put there changes.
 pub const RETRY_SECS: i64 = 60 * 60;
 
+/// A JMAP account's script as last put (the plan's words), why it isn't
+/// there, and when that was found (store keys, per account).
+const JMAP_PUT: &str = "jmap_sieve_put";
+const JMAP_WHY: &str = "jmap_sieve_why";
+const JMAP_TRIED: &str = "jmap_sieve_tried";
+/// Said of a JMAP server that keeps no scripts.
+pub const NO_SIEVE: &str = "the server doesn't keep filters, so they run here only, while Mail is open";
+
 /// The zone as Sieve's `:zone` writes it (`+0530`).
 fn zone(t: i64) -> String {
     let off = clock::local_offset(t);
@@ -140,6 +148,52 @@ impl Engine {
         Ok(())
     }
 
+    /// The pass's part for a JMAP account: its rules as a Sieve script on
+    /// the server (RFC 9661), when they changed. The automatic reply stays
+    /// the server's own (`VacationResponse`), so the script carries the
+    /// rules only. Nothing is asked of a server without the capability,
+    /// beyond noting that.
+    pub fn sync_jmap_sieve(&self, account: AccountId, client: &mut dyn mail_sync::jmap::Jmap, now: i64) -> Result<(), Error> {
+        let plan = Plan { rules: self.sieve_plan(account, None, now).rules, ..Plan::default() };
+        let words = format!("{plan:?}");
+        let s = &self.store;
+        let put = s.sync_state(account, JMAP_PUT)?;
+        let why = s.sync_state(account, JMAP_WHY)?;
+        let tried = s.setting(account, JMAP_TRIED)?.unwrap_or(0) as i64;
+        let changed = put.as_deref() != Some(words.as_str());
+        let nothing = put.is_none() && plan.rules.is_empty();
+        let resting = why.is_some() && now - tried < RETRY_SECS;
+        if !changed || nothing || resting {
+            return Ok(());
+        }
+        let (put, why) = match client.sieve(&plan) {
+            // No scripts on this server: the rules run here only.
+            Ok(None) => (Some(words), Some(NO_SIEVE.to_string())),
+            Ok(Some(done)) => match done.others {
+                Some(other) => (Some(words), Some(format!("the server already has its own filters (“{other}”), which Mail leaves alone"))),
+                None if done.skipped > 0 => (Some(words), Some(format!("{} rule{} only here: the server's Sieve can't do {}", done.skipped, if done.skipped == 1 { "" } else { "s" }, if done.skipped == 1 { "it" } else { "them" }))),
+                None => (Some(words), None),
+            },
+            Err(e) => (put, Some(e.0.chars().filter(|c| !c.is_control()).take(200).collect())),
+        };
+        let failed = why.as_deref().is_some_and(|w| w != NO_SIEVE && !w.starts_with("the server already") && !w.contains(" only here"));
+        self.store.write(|w| {
+            w.set_sync_state(account, JMAP_PUT, put.as_deref())?;
+            w.set_sync_state(account, JMAP_WHY, why.as_deref())?;
+            w.set_setting(account, JMAP_TRIED, failed.then_some(now as u64))
+        })?;
+        Ok(())
+    }
+
+    /// Where `account`'s rules stand on its server (§11.6), for Settings:
+    /// `None` when they are there (or there are none to put).
+    pub fn rules_line(&self, account: AccountId) -> Option<String> {
+        if let Some(sv) = self.store.sieve(account).ok().flatten() {
+            return sv.why.or(sv.others.map(|o| format!("the server already has its own filters (“{o}”), which Mail leaves alone")));
+        }
+        self.store.sync_state(account, JMAP_WHY).ok().flatten()
+    }
+
     /// Something the filters say changed (the reply, a rule): accounts
     /// whose last attempt failed try again at the next pass.
     pub(crate) fn sieve_soon(&self) -> Result<(), Error> {
@@ -147,6 +201,9 @@ impl Engine {
             if let Some(mut sv) = self.store.sieve(id)?.filter(|s| s.why.is_some()) {
                 sv.tried = 0;
                 self.store.write(|w| w.set_sieve(id, Some(&sv)))?;
+            }
+            if self.store.setting(id, JMAP_TRIED)?.is_some() {
+                self.store.write(|w| w.set_setting(id, JMAP_TRIED, None))?;
             }
         }
         Ok(())

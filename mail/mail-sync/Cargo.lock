@@ -103,6 +103,7 @@ dependencies = [
  "mail-proto",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
