@@ -82,11 +82,15 @@ def require_reconnect_approval(receipts, config_index):
     assert receipts.with_suffix(suffix).exists(), f"configuration {config_index + 1} used before HIP approval"
 
 
+# The cycle declines offer 1. The later reconnects use offers 2, 4, and 6.
+CYCLE_RECONNECTS = frozenset((2, 4, 6))
+
+
 class EspPeer:
-    def __init__(self, socket, drop, reconnect_approval=None, drop_after_initial=False):
+    def __init__(self, socket, drop, reconnect_approval=None, drop_config_indices=()):
         self.socket = socket
         self.drop = drop
-        self.drop_after_initial = drop_after_initial
+        self.drop_config_indices = drop_config_indices
         self.dropped_probe_spis = set()
         self.reconnect_approval = reconnect_approval
         self.configs = []
@@ -151,7 +155,7 @@ class EspPeer:
                 probe = packet[offset + 8:].startswith(b"monitor\0\0pan ha ")
                 if probe:
                     self.probes += 1
-                if self.drop_after_initial and pair != self.configs[0]:
+                if self.configs.index(pair) in self.drop_config_indices:
                     assert probe, "ESP carried data on an association that should fall back"
                     self.dropped_probe_spis.add(spi_in)
                     continue
@@ -410,10 +414,17 @@ def main():
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
     parser.add_argument("--drop-esp-after-initial", action="store_true",
                         help="use ESP initially and force TLS fallback on later Tessera connections")
+    parser.add_argument("--recover-esp-on-rebind", action="store_true",
+                        help="force TLS on Tessera reconnects and restore ESP on rebinds")
     parser.add_argument("--hip", choices=("approve", "decline", *REFRESH_HIP), help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
-    if args.drop_esp_after_initial and (args.hip != "tessera-cycle" or args.drop_esp):
-        parser.error("--drop-esp-after-initial requires --hip tessera-cycle")
+    if args.drop_esp_after_initial and args.recover_esp_on_rebind:
+        parser.error("choose one staged ESP outage")
+    drop_config_indices = frozenset()
+    if args.drop_esp_after_initial or args.recover_esp_on_rebind:
+        if args.hip != "tessera-cycle" or args.drop_esp:
+            parser.error("staged ESP outages require --hip tessera-cycle")
+        drop_config_indices = CYCLE_RECONNECTS if args.recover_esp_on_rebind else frozenset(range(1, 8))
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
@@ -439,11 +450,11 @@ def main():
         reconnect_approval = receipts.with_suffix(".approved") if args.hip in RECONNECT_HIP else None
         with ExitStack() as stack:
             esp = None
-            if args.esp or args.drop_esp or args.drop_esp_after_initial:
+            if args.esp or args.drop_esp or drop_config_indices:
                 udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 udp.bind(("127.0.0.1", 4501))
                 udp.settimeout(300)
-                esp = EspPeer(udp, args.drop_esp, reconnect_approval, args.drop_esp_after_initial)
+                esp = EspPeer(udp, args.drop_esp, reconnect_approval, drop_config_indices)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
@@ -563,36 +574,33 @@ def main():
                     assert runs[2][0] == runs[4][0], reports
                 rebound_echoes = 1 if declined_relock or second_reconnect else 2
                 second_rebind_echoes = 1 if declined_final_lock else 2
-                fallback = args.drop_esp_after_initial
+                phase_echoes = [2, 0, 3, rebound_echoes]
+                if second_reconnect:
+                    phase_echoes.extend((3, second_rebind_echoes))
+                if final_reconnect:
+                    phase_echoes.extend((3, 1))
+                active_indices = {i for i, echoes in enumerate(phase_echoes) if echoes}
+                tls_indices = active_indices & drop_config_indices if esp else active_indices
                 if esp:
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == config_count, calls
-                    original, _, reconnected, rebound, *rest = (config[0][0] for config in esp.configs)
-                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest[:1] * 3 + rest[1:2] * second_rebind_echoes + rest[2:3] * 3 + rest[3:]
-                    assert esp.received_spis == set(echo_spis), esp.received_spis
-                    if fallback:
-                        assert esp.echo == [original, original], esp.echo
-                        assert esp.dropped_probe_spis == set(echo_spis) - {original}, esp.dropped_probe_spis
-                    else:
-                        assert esp.echo == echo_spis, esp.echo
-                        assert "ssl-tunnel-connect.sslvpn" not in calls, calls
-                if not esp or fallback:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - (2 if fallback else 1), calls
-                    echoes = 5 + rebound_echoes + (3 + second_rebind_echoes if second_reconnect else 0) + (4 if final_reconnect else 0)
-                    assert calls.count("echo") == echoes - (2 if fallback else 0), calls
-                    if final_reconnect:
-                        for phase, echoes in ((third_calls, 3), (last_rebind_calls, 1)):
-                            assert phase[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                            assert phase.count("echo") == echoes, calls
-                    if second_reconnect:
-                        assert second_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                        assert second_calls.count("echo") == 3, calls
-                        assert second_rebind_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                        assert second_rebind_calls.count("echo") == second_rebind_echoes, calls
-                    assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                    assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == rebound_echoes, calls
+                    spis = [config[0][0] for config in esp.configs]
+                    assert esp.received_spis == {spis[i] for i in active_indices}, esp.received_spis
+                    assert esp.dropped_probe_spis == {spis[i] for i in tls_indices}, esp.dropped_probe_spis
+                    assert esp.echo == [spis[i] for i, echoes in enumerate(phase_echoes)
+                                        if i not in tls_indices for _ in range(echoes)], esp.echo
+                for i, (start, end) in enumerate(zip(configs, [*configs[1:], len(calls)])):
+                    data_calls = [call for call in calls[start:end]
+                                  if call in ("ssl-tunnel-connect.sslvpn", "echo")]
+                    expected_data = ["ssl-tunnel-connect.sslvpn"] + ["echo"] * phase_echoes[i] if i in tls_indices else []
+                    assert data_calls == expected_data, (i, data_calls, expected_data)
+                    if i in tls_indices:
+                        phase = calls[start:end]
+                        assert phase.index("hipreport.esp") < phase.index("ssl-tunnel-connect.sslvpn"), phase
                 if final_reconnect:
-                    if fallback:
+                    if args.recover_esp_on_rebind:
+                        print("Dropped probes forced TLS on reconnects and ESP carried echo again on rebinds")
+                    elif args.drop_esp_after_initial:
                         print("ESP carried the initial traffic, then dropped probes forced TLS on every reconnect and rebind")
                     print("Final reconnect verified decline, silent refresh, fresh unlock approval, and rebind")
                 elif declined_final_lock:
