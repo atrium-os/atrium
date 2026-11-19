@@ -160,6 +160,33 @@ fn a_deck_prints_a_page_per_slide_as_the_screen_draws_it() {
 }
 
 #[test]
+fn print_layouts_paginate_notes_and_pack_visible_slides() {
+    use officina_slides::model::TextBody;
+    use slides::PrintLayout;
+
+    let fonts = PinnedFonts::new().unwrap();
+    let mut deck = deck();
+    let title = deck.layout_of_kind("title").unwrap().id;
+    let mut slide = new_slide(&mut deck, title);
+    let notes = (0..100).map(|i| format!("Speaker note {i}")).collect::<Vec<_>>().join("\n");
+    slide.notes = Some(TextBody::plain(&notes));
+    deck.push_slide(slide);
+    let fourth = new_slide(&mut deck, title);
+    deck.push_slide(fourth);
+
+    for (layout, expected_pages) in [(PrintLayout::HandoutThree, 2), (PrintLayout::HandoutSix, 1)] {
+        let (pdf, printed) = slides::export_layout(&mut deck, Some((595.0, 842.0)), layout, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+        assert_eq!(printed.hidden, 1);
+        assert_eq!(printed.stats.pages, expected_pages);
+        assert_eq!(draw(&pdf).len(), expected_pages);
+    }
+    let (pdf, printed) = slides::export_layout(&mut deck, Some((595.0, 842.0)), PrintLayout::SpeakerNotes, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+    assert_eq!(printed.hidden, 1);
+    assert!(printed.stats.pages > 4, "long notes must continue on subsequent pages");
+    assert_eq!(draw(&pdf).len(), printed.stats.pages);
+}
+
+#[test]
 fn on_paper_slides_are_fitted_and_centred() {
     let fonts = PinnedFonts::new().unwrap();
     let mut d = deck();

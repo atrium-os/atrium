@@ -35,6 +35,7 @@ use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
 use pergola::window::StepResult;
+use officina_pdf::slides::PrintLayout;
 use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
 
 /// The largest file Open reads.
@@ -491,10 +492,10 @@ fn main() {
     let mut discard = false;
     // Printing: a copy of the deck as it was asked for, the PDF being made
     // (true once the print sheet is up: the answer to its Relayout), the sheet.
-    let mut print_deck: Option<(officina_slides::model::Deck, String)> = None;
+    let mut print_deck: Option<(officina_slides::model::Deck, String, PrintLayout)> = None;
     let mut print_pdf: Option<(std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, bool)> = None;
     let mut printing: Option<Printing> = None;
-    let mut want_print = false;
+    let mut want_print = None;
     // Files the user opens in Slides from Scrinium (opening-files.md §6.2).
     let mut channel = match atrium_open::Channel::connect() {
         Ok(c) => c,
@@ -509,7 +510,7 @@ fn main() {
         // Ctrl+P prints, as the toolbar's Print… does.
         let stepped = win.step_with(&mut app, Some(Duration::from_millis(if asking.is_some() || busy { 20 } else { 250 })), |ev| match ev {
             fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
-                want_print = true;
+                want_print = Some(PrintLayout::Slides);
                 true
             }
             _ => false,
@@ -540,7 +541,7 @@ fn main() {
                 Cmd::PasswordDone => run.password_done(),
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
-                Cmd::Print => want_print = true,
+                Cmd::Print(layout) => want_print = Some(layout),
                 Cmd::Picture => want_picker = Some(Asking::Picture),
                 Cmd::Present(cur) => present = Some(cur),
                 Cmd::Rehearse => run.rehearse(),
@@ -587,7 +588,7 @@ fn main() {
                 Err(e) => run.set_status(format!("The slide show didn't start: {e}")),
             }
         }
-        if std::mem::take(&mut want_print) {
+        if let Some(layout) = want_print.take() {
             if asking.is_some() || printing.is_some() || print_pdf.is_some() {
                 run.set_status("Finish what's open first, then print.");
             } else if embeds.is_none() || win.embed_token().is_none() {
@@ -598,8 +599,9 @@ fn main() {
                     (d.deck.clone(), stem_of(&d.name).to_string())
                 };
                 run.set_status("Getting the slides ready to print…");
-                print_pdf = Some((deck_pdf(deck.clone(), Paper::A4, Orientation::Landscape), false));
-                print_deck = Some((deck, title));
+                let orientation = if layout == PrintLayout::Slides { Orientation::Landscape } else { Orientation::Portrait };
+                print_pdf = Some((deck_pdf(deck.clone(), Paper::A4, orientation, layout), false));
+                print_deck = Some((deck, title, layout));
             }
         }
         if let Some((rx, again)) = &print_pdf {
@@ -610,9 +612,14 @@ fn main() {
                     print_pdf = None;
                     let r = r.map_err(|_| "the layout stopped".to_string()).and_then(|r| r);
                     let title = print_deck.as_ref().map(|d| d.1.clone()).unwrap_or_default();
+                    let paper = if print_deck.as_ref().is_some_and(|d| d.2 == PrintLayout::Slides) {
+                        Paper { w_pt: Paper::A4.h_pt, h_pt: Paper::A4.w_pt }
+                    } else {
+                        Paper::A4
+                    };
                     let r = match (r, &embeds, win.embed_token(), again) {
                         (Ok(pdf), Some(e), _, true) => printing.as_mut().map(|p| p.document_bytes(e, &pdf).map_err(|e| format!("{e:?}"))).unwrap_or(Ok(())),
-                        (Ok(pdf), Some(e), Some(token), false) => Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, true, Some(Paper { w_pt: Paper::A4.h_pt, h_pt: Paper::A4.w_pt }))
+                        (Ok(pdf), Some(e), Some(token), false) => Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, true, Some(paper))
                             .map(|p| {
                                 printing = Some(p);
                                 run.set_status("");
@@ -666,8 +673,8 @@ fn main() {
             let ours = step.is_some();
             match step {
                 Some(Step::Relayout { paper, orientation, .. }) => {
-                    if let Some((deck, _)) = &print_deck {
-                        print_pdf = Some((deck_pdf(deck.clone(), paper, orientation), true));
+                    if let Some((deck, _, layout)) = &print_deck {
+                        print_pdf = Some((deck_pdf(deck.clone(), paper, orientation, *layout), true));
                     }
                 }
                 Some(Step::Done(o)) => {
@@ -777,15 +784,15 @@ fn main() {
 
 /// The deck as PDF, a slide a page fitted on `paper` turned as asked,
 /// made on another thread (printing.md §5.1).
-fn deck_pdf(mut deck: officina_slides::model::Deck, paper: Paper, orientation: Orientation) -> std::sync::mpsc::Receiver<Result<Vec<u8>, String>> {
+fn deck_pdf(mut deck: officina_slides::model::Deck, paper: Paper, orientation: Orientation, layout: PrintLayout) -> std::sync::mpsc::Receiver<Result<Vec<u8>, String>> {
     let (w, h) = match orientation {
-        Orientation::Portrait => (paper.w_pt, paper.h_pt),
+        Orientation::Portrait => (paper.w_pt.min(paper.h_pt), paper.h_pt.max(paper.w_pt)),
         Orientation::Landscape => (paper.h_pt.max(paper.w_pt), paper.w_pt.min(paper.h_pt)),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let t = tx.clone();
     let spawned = std::thread::Builder::new().name("pdf-print".into()).spawn(move || {
-        let r = officina_pdf::slides::print(&mut deck, Some((w as f64, h as f64)), "").map(|(b, _)| b).map_err(|e| e.to_string());
+        let r = officina_pdf::slides::print_layout(&mut deck, Some((w as f64, h as f64)), "", layout).map(|(b, _)| b).map_err(|e| e.to_string());
         let _ = t.send(r);
     });
     if let Err(e) = spawned {

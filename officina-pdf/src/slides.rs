@@ -176,59 +176,151 @@ pub struct Printed {
     pub hidden: usize,
 }
 
-/// Writes `deck` as PDF to `out`: each slide on its own page, the slide's
-/// size, or on `paper` (points) fitted and centred when given. Calls
-/// `progress(done, total)` after each slide.
-#[allow(clippy::too_many_arguments)]
+/// What to put on each printed page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintLayout {
+    Slides,
+    SpeakerNotes,
+    HandoutThree,
+    HandoutSix,
+}
+
+/// Writes the visible slides, one per page.
 pub fn export<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Printed)> {
-    let (sw, sh) = (deck.size.0.max(1) as f64 / EMU_PER_PT as f64, deck.size.1.max(1) as f64 / EMU_PER_PT as f64);
-    let (pw, ph) = paper.map_or((sw, sh), |(w, h)| (w.clamp(72.0, 14400.0), h.clamp(72.0, 14400.0)));
-    let s = (pw / sw).min(ph / sh);
-    let (ox, oy) = ((pw - sw * s) / 2.0, (ph - sh * s) / 2.0);
-    let e = s / U;
-    // Slide EMU (y down) onto the page (points, y up).
-    let base: Xform = [e, 0.0, 0.0, -e, ox, ph - oy];
-    let total = deck.slide_count();
+    export_layout(deck, paper, PrintLayout::Slides, fonts, files, title, out, progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layout: PrintLayout, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Printed)> {
+    let slide_size = [deck.size.0.max(1) as f64 / U, deck.size.1.max(1) as f64 / U];
+    let (pw, ph) = paper.map_or((slide_size[0], slide_size[1]), |(w, h)| (w.clamp(72.0, 14400.0), h.clamp(72.0, 14400.0)));
+    let margin = 36.0f64.min(pw.min(ph) / 8.0);
+    let (body_w, body_h) = (pw - 2.0 * margin, ph - 2.0 * margin);
+    let slots = if layout == PrintLayout::HandoutSix { 6 } else { 3 };
+    let slot_h = body_h / 3.0;
+    let slot_w = (body_w - 12.0) / 2.0;
     let mut pdf = Pdf::new(out)?;
     let mut printed = Printed::default();
-    let mut notes = Notes::default();
-    let none = |_: u32| None;
+    let mut draw_notes = Notes::default();
+    let mut page = Page::default();
+    let mut slot = 0;
+    let total = deck.slide_count();
     for i in 0..total {
-        let items = draw::draw_slide(deck, i, fonts, &mut notes);
-        if deck.slide_if_loaded(i).is_some_and(|sl| sl.hidden) {
+        let items = draw::draw_slide(deck, i, fonts, &mut draw_notes);
+        let slide = deck.slide_if_loaded(i);
+        if slide.is_some_and(|sl| sl.hidden) {
             printed.hidden += 1;
-            progress(i + 1, total);
-            continue;
-        }
-        let mut page = Page::default();
-        match items {
-            Ok(items) => {
-                for it in &items {
-                    item(&mut pdf, &mut page, deck, it, &base, files, &none)?;
+        } else {
+            let items = items.unwrap_or_else(|_| {
+                printed.damaged += 1;
+                Vec::new()
+            });
+            match layout {
+                PrintLayout::Slides => {
+                    draw_thumbnail(&mut pdf, &mut page, deck, &items, slide_size, [0.0, 0.0, pw, ph], ph, paper.is_some(), false, files)?;
+                    pdf.end_page(std::mem::take(&mut page), pw, ph)?;
+                }
+                PrintLayout::SpeakerNotes => {
+                    let note_top = margin + body_h * 0.42;
+                    let thumbnail = [margin, margin, body_w, note_top - margin - 16.0];
+                    let note = slide.and_then(|slide| slide.notes.as_ref()).map(|body| &body.doc);
+                    write_notes(&mut pdf, deck, &items, slide_size, thumbnail, [pw, ph, margin, note_top], note, fonts, files)?;
+                }
+                PrintLayout::HandoutThree | PrintLayout::HandoutSix => {
+                    let (col, row) = if slots == 6 { (slot % 2, slot / 2) } else { (0, slot) };
+                    let x = margin + col as f64 * (slot_w + 12.0);
+                    let y = margin + row as f64 * slot_h;
+                    let frame = [x, y, slot_w, slot_h - 12.0];
+                    draw_thumbnail(&mut pdf, &mut page, deck, &items, slide_size, frame, ph, true, true, files)?;
+                    if slots == 3 {
+                        let left = margin + slot_w + 12.0;
+                        page.c.extend([Op::Save, Op::StrokeRgb([0.75, 0.76, 0.78]), Op::LineWidth(0.5)]);
+                        for line in 1..=5 {
+                            let line_y = ph - y - frame[3] * f64::from(line) / 6.0;
+                            page.c.extend([Op::MoveTo(left, line_y), Op::LineTo(pw - margin, line_y)]);
+                        }
+                        page.c.extend([Op::Stroke, Op::Restore]);
+                    }
+                    slot += 1;
+                    if slot == slots {
+                        pdf.end_page(std::mem::take(&mut page), pw, ph)?;
+                        slot = 0;
+                    }
                 }
             }
-            Err(_) => printed.damaged += 1,
         }
-        // The slide's edge when it doesn't fill the paper.
-        if paper.is_some() {
-            page.c.extend([Op::Save, Op::StrokeRgb([0.75, 0.76, 0.78]), Op::LineWidth(0.5), Op::Rect(ox, oy, sw * s, sh * s), Op::Stroke, Op::Restore]);
-        }
-        pdf.end_page(page, pw, ph)?;
         progress(i + 1, total);
     }
-    if pdf.stats.pages == 0 {
-        pdf.end_page(Page::default(), pw, ph)?;
+    if slot != 0 || pdf.stats.pages == 0 {
+        pdf.end_page(page, pw, ph)?;
     }
     let (w, stats) = pdf.finish(files, title, "Atrium Slides")?;
     printed.stats = stats;
     Ok((w, printed))
 }
 
-/// [`export`] into memory in the system's fonts: what Slides hands the
-/// print sheet.
+#[allow(clippy::too_many_arguments)]
+fn draw_thumbnail<W: Write>(pdf: &mut Pdf<W>, page: &mut Page, deck: &Deck, items: &[DrawItem], [sw, sh]: [f64; 2], [x, y, w, h]: [f64; 4], ph: f64, border: bool, clip: bool, files: &dyn FontFiles) -> io::Result<()> {
+    let s = (w / sw).min(h / sh);
+    let (slide_w, slide_h) = (sw * s, sh * s);
+    let (x, top) = (x + (w - slide_w) / 2.0, ph - y - (h - slide_h) / 2.0);
+    let (w, h) = (slide_w, slide_h);
+    let e = s / U;
+    let base = [e, 0.0, 0.0, -e, x, top];
+    if clip { page.c.extend([Op::Save, Op::Rect(x, top - h, w, h), Op::Clip, Op::EndPath]); }
+    for it in items {
+        item(pdf, page, deck, it, &base, files, &|_| None)?;
+    }
+    if clip { page.c.push(Op::Restore); }
+    if border {
+        page.c.extend([Op::Save, Op::StrokeRgb([0.75, 0.76, 0.78]), Op::LineWidth(0.5), Op::Rect(x, top - h, w, h), Op::Stroke, Op::Restore]);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_notes<W: Write>(pdf: &mut Pdf<W>, deck: &Deck, items: &[DrawItem], size: [f64; 2], thumbnail: [f64; 4], [pw, ph, margin, top]: [f64; 4], note: Option<&officina_text::model::TextDoc>, fonts: &dyn Fonts, files: &dyn FontFiles) -> io::Result<()> {
+    use officina_text::{layout::LayoutCache, lists::Numbering, model::PageSetup, paginate::Paginator, paint::paint_page};
+
+    let mut page = Page::default();
+    draw_thumbnail(pdf, &mut page, deck, items, size, thumbnail, ph, true, true, files)?;
+    let Some(note) = note else { return pdf.end_page(page, pw, ph) };
+    let mut note = note.clone();
+    let twips = |pt: f64| (pt * 20.0).round() as i32;
+    note.page = PageSetup {
+        width: twips(pw), height: twips(ph),
+        margin_top: twips(top), margin_bottom: twips(margin),
+        margin_start: twips(margin), margin_end: twips(margin),
+    };
+    let mut cache = LayoutCache::default();
+    let mut pager = Paginator::new(&note);
+    while !pager.run(&note, &mut cache, fonts, crate::CACHE_PAGES) {
+        cache = LayoutCache::default();
+    }
+    let pages = pager.pages();
+    let numbering = Numbering::build(&note);
+    let count = pages.len().to_string();
+    for i in 0..pages.len() {
+        if i % crate::CACHE_PAGES == 0 { cache = LayoutCache::default(); }
+        if i != 0 {
+            draw_thumbnail(pdf, &mut page, deck, items, size, thumbnail, ph, true, true, files)?;
+        }
+        let text = paint_page(&note, pages, i, pager.width(), &mut cache, fonts, &numbering, &count);
+        pdf.items(&mut page, text, ph, files, &|_| None)?;
+        pdf.end_page(std::mem::take(&mut page), pw, ph)?;
+    }
+    if pages.is_empty() { pdf.end_page(page, pw, ph)?; }
+    Ok(())
+}
+
+/// Print into memory using the system's fonts.
 pub fn print(deck: &mut Deck, paper: Option<(f64, f64)>, title: &str) -> io::Result<(Vec<u8>, Printed)> {
+    print_layout(deck, paper, title, PrintLayout::Slides)
+}
+
+pub fn print_layout(deck: &mut Deck, paper: Option<(f64, f64)>, title: &str, layout: PrintLayout) -> io::Result<(Vec<u8>, Printed)> {
     let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
-    export(deck, paper, &fonts, &fonts, title, Vec::new(), &mut |_, _| {})
+    export_layout(deck, paper, layout, &fonts, &fonts, title, Vec::new(), &mut |_, _| {})
 }
 
 /// EMU to a point.
