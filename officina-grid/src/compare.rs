@@ -10,7 +10,7 @@
 //! added or removed. Styles are not compared.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -132,6 +132,77 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
         }
     }
     (out, more)
+}
+
+/// Sparse, positional cell inputs for tracking edits and merging copies
+/// of the same sheet layout. Formula results and spill followers are excluded.
+pub struct CellSnapshot {
+    sheets: BTreeMap<String, BTreeMap<(u32, u32), Input>>,
+}
+
+pub struct MergePlan {
+    pub incoming: Vec<Change>,
+    pub conflicts: Vec<Change>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeError {
+    SheetLayout,
+    TooManyChanges,
+}
+
+impl CellSnapshot {
+    pub fn capture(wb: &Workbook) -> Self {
+        let sheets = (0..wb.sheet_count() as u16).map(|sheet| {
+            let inputs = Rows::of(wb, sheet).rows.into_iter().flat_map(|(row, cells)| {
+                cells.into_iter().map(move |(col, _)| ((row, col), wb.input(CellAddr::new(sheet, row, col))))
+            }).collect();
+            (wb.sheet_name(sheet), inputs)
+        }).collect();
+        Self { sheets }
+    }
+
+    /// Compare by address, with the base deciding which side changed.
+    /// Refuse a truncated plan before callers apply any of it.
+    pub fn plan(&self, ours: &Workbook, theirs: &Self) -> Result<MergePlan, MergeError> {
+        let current = Self::capture(ours);
+        self.plan_with(ours, &current, theirs)
+    }
+
+    pub fn changes_since(&self, wb: &Workbook) -> Result<Vec<Change>, MergeError> {
+        let current = Self::capture(wb);
+        let mut changes = current.plan_with(wb, &current, self)?.incoming;
+        for change in &mut changes {
+            if let Change::Cell { ours, theirs, .. } = change { std::mem::swap(ours, theirs); }
+        }
+        Ok(changes)
+    }
+
+    fn plan_with(&self, wb: &Workbook, current: &Self, theirs: &Self) -> Result<MergePlan, MergeError> {
+        if self.sheets.keys().ne(current.sheets.keys()) || self.sheets.keys().ne(theirs.sheets.keys()) {
+            return Err(MergeError::SheetLayout);
+        }
+        let mut plan = MergePlan { incoming: Vec::new(), conflicts: Vec::new() };
+        for (name, base) in &self.sheets {
+            let sheet = wb.sheet_id(name).expect("matching sheet");
+            let local = &current.sheets[name];
+            let other = &theirs.sheets[name];
+            // Only incoming edits can require either an apply or a decision.
+            for (&(row, col), value) in other.iter().chain(base.iter().filter(|(key, _)| !other.contains_key(key))) {
+                let key = (row, col);
+                let before = base.get(&key).unwrap_or(&Input::Empty);
+                let ours = local.get(&key).unwrap_or(&Input::Empty);
+                let theirs = if other.contains_key(&key) { value } else { &Input::Empty };
+                if theirs == before || ours == theirs { continue; }
+                if plan.incoming.len() + plan.conflicts.len() == MAX_CHANGES {
+                    return Err(MergeError::TooManyChanges);
+                }
+                let change = Change::Cell { sheet, row, col, ours: ours.clone(), theirs: theirs.clone() };
+                if ours == before { plan.incoming.push(change); } else { plan.conflicts.push(change); }
+            }
+        }
+        Ok(plan)
+    }
 }
 
 /// A cell as compared: its text (value, or formula in relative form) and

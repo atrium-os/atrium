@@ -164,6 +164,9 @@ pub enum DataCmd {
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
+    TrackChanges,
+    ReviewTracked,
+    MergeCopies,
     /// A new sheet at the end; the window runs it, as it shows the sheet.
     AddSheet,
     /// Rename the sheet on screen; the window runs it (a bar under the grid).
@@ -415,6 +418,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
     v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
+    v.push((MenuItem::new("Start Tracking Cell Changes"), Some(DataCmd::TrackChanges)));
+    v.push((MenuItem::new("Review Tracked Changes"), Some(DataCmd::ReviewTracked)));
+    v.push((MenuItem::new("Merge Copies…"), Some(DataCmd::MergeCopies)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
     v.push((MenuItem::new("Tab Colour…"), Some(DataCmd::TabColor)));
@@ -940,7 +946,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

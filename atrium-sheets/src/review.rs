@@ -2,7 +2,7 @@
 //! copy, listed in a pane beside the grid (officina.md §16.68). A change is
 //! looked at in place, taken from the other copy, or kept as it is here.
 
-use officina_grid::compare::{self, Change};
+use officina_grid::compare::{self, Change, MergeError};
 use officina_grid::Workbook;
 
 use crate::doc::Doc;
@@ -26,10 +26,31 @@ pub enum ReviewCmd {
     Close,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ReviewMode {
+    #[default]
+    Compare,
+    Tracked { author: String },
+    Merge { sheets: Vec<String> },
+}
+
+pub fn merge_error(error: MergeError) -> &'static str {
+    match error {
+        MergeError::SheetLayout => "The workbooks must contain the same named sheets.",
+        MergeError::TooManyChanges => "The review exceeds 100,000 cell changes.",
+    }
+}
+
+pub fn writable(wb: &Workbook, addr: officina_grid::CellAddr) -> bool {
+    !wb.merge_at(addr).is_some_and(|r| (r.r0, r.c0) != (addr.row, addr.col))
+        && wb.spilled_from(addr).is_none()
+}
+
 /// The pane: the other copy's name, its changes and the one picked.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReviewPane {
     pub open: bool,
+    pub mode: ReviewMode,
     pub name: String,
     pub changes: Vec<Change>,
     /// More changes than are listed.
@@ -51,6 +72,11 @@ impl ReviewPane {
     /// What the list's head line says.
     pub fn summary(&self) -> String {
         let n = self.changes.len();
+        match &self.mode {
+            ReviewMode::Tracked { author } => return format!("{n} tracked cell edits · {author}"),
+            ReviewMode::Merge { .. } => return format!("{n} conflicts with “{}”", self.name),
+            ReviewMode::Compare => {}
+        }
         let things = match n {
             0 => "No differences".to_string(),
             1 => "1 difference".to_string(),

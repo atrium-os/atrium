@@ -60,6 +60,8 @@ enum Asking {
     SaveAs,
     /// The copy to compare with.
     Compare,
+    MergeBase,
+    MergeIncoming,
 }
 
 fn state_root() -> PathBuf {
@@ -171,12 +173,13 @@ struct Run {
     /// A file being read (converted, loaded and recalculated) on its own
     /// thread, so the window keeps answering however big the file is.
     opening: Option<Opening>,
+    merge_base: Option<officina_grid::compare::CellSnapshot>,
 }
 
 struct Opening {
     name: String,
-    /// Read to compare with (Compare with…), not to open.
-    compare: bool,
+    /// A comparison or merge input instead of a workbook to open.
+    review: Option<Asking>,
     target: Option<Target>,
     read_only: bool,
     loading: atrium_sheets::files::Loading,
@@ -198,6 +201,7 @@ impl Run {
                 d.status = format!("{} Autosave is off: {e}.", d.status);
             }
         }
+        self.merge_base = None;
         let old = self.sheets.replace(d);
         self.target = target;
         if old.dirty {
@@ -292,16 +296,17 @@ impl Run {
 
     /// Compares the window's workbook with the picked copy, read on its own
     /// thread as an open is.
-    fn compare(&mut self, name: String, fd: std::os::fd::OwnedFd) {
+    fn read_review(&mut self, name: String, fd: std::os::fd::OwnedFd, purpose: Asking) {
         let mut f = File::from(fd);
         match read_all(&mut f) {
             Ok(data) => {
+                self.opening = None;
                 self.open_bytes(name, data, None, true, None);
                 if let Some(o) = &mut self.opening {
-                    o.compare = true;
+                    o.review = Some(purpose);
                 }
             }
-            Err(e) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
+            Err(e) => self.set_status(format!("Couldn't read review copy “{name}”: {e}")),
         }
     }
 
@@ -317,20 +322,38 @@ impl Run {
         };
         // A file still opening is dropped for this one (its thread finishes unheard).
         self.set_status(format!("Reading “{name}”…"));
-        self.opening = Some(Opening { name, compare: false, target, read_only, loading });
+        self.opening = Some(Opening { name, review: None, target, read_only, loading });
     }
 
     /// The file being opened, if its thread is done: on screen, or the
     /// password asked for, or why not. True while one is still opening.
-    fn poll_open(&mut self) -> bool {
+    fn poll_open(&mut self, want_picker: &mut Option<Asking>) -> bool {
         let Some(o) = &self.opening else { return false };
         let Some((r, data)) = o.loading.poll() else { return true };
-        let Opening { name, compare, target, read_only, .. } = self.opening.take().unwrap();
-        if compare {
-            match r {
-                Ok(d) => self.sheets.compare_with(&name, d.wb),
-                Err(ConvertError::NeedsPassword | ConvertError::WrongPassword) => self.set_status(format!("Couldn't compare with “{name}”: it is protected; open it and save an unprotected copy to compare with.")),
-                Err(ConvertError::Failed(e)) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
+        let Opening { name, review, target, read_only, .. } = self.opening.take().unwrap();
+        if let Some(purpose) = review {
+            match (purpose, r) {
+                (Asking::Compare, Ok(d)) => self.sheets.compare_with(&name, d.wb),
+                (Asking::MergeBase, Ok(d)) => {
+                    self.merge_base = Some(officina_grid::compare::CellSnapshot::capture(&d.wb));
+                    *want_picker = Some(Asking::MergeIncoming);
+                }
+                (Asking::MergeIncoming, Ok(d)) => {
+                    if let Some(base) = self.merge_base.take() {
+                        self.sheets.merge_copies(&name, &base, &d.wb);
+                    } else {
+                        self.set_status("The common base is no longer available. Run Merge Copies again.");
+                    }
+                }
+                (_, Err(ConvertError::NeedsPassword | ConvertError::WrongPassword)) => {
+                    self.merge_base = None;
+                    self.set_status(format!("“{name}” is protected. Use an unprotected review copy."));
+                }
+                (_, Err(ConvertError::Failed(e))) => {
+                    self.merge_base = None;
+                    self.set_status(format!("Couldn't read review copy “{name}”: {e}"));
+                }
+                _ => unreachable!("only review purposes reach this branch"),
             }
             return false;
         }
@@ -464,7 +487,7 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
-    let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None };
+    let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
     run.show(doc, target);
     if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
@@ -472,7 +495,7 @@ fn main() {
         match atrium_sheets::files::Loading::restore(dir, &name) {
             Ok(loading) => {
                 run.set_status(format!("Restoring “{name}”…"));
-                run.opening = Some(Opening { name, compare: false, target: None, read_only: false, loading });
+                run.opening = Some(Opening { name, review: None, target: None, read_only: false, loading });
             }
             Err(e) => eprintln!("atrium-sheets: couldn't restore {name}: {e}"),
         }
@@ -508,7 +531,7 @@ fn main() {
     'main: loop {
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
-        let opening = run.poll_open();
+        let opening = run.poll_open(&mut want_picker);
         let wait = if recalculating { 1 } else if asking.is_some() || opening { 20 } else { 250 };
         let wait = if printing.is_some() || print_pdf.is_some() { wait.min(20) } else { wait };
         // Ctrl+P prints, as the toolbar's Print… does.
@@ -547,6 +570,10 @@ fn main() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
+                Cmd::Data(atrium_sheets::data::DataCmd::MergeCopies) => {
+                    run.merge_base = None;
+                    want_picker = Some(Asking::MergeBase);
+                }
                 Cmd::PasswordDone => run.password_done(),
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
@@ -621,13 +648,23 @@ fn main() {
                 }
             }
         }
-        if let (Some(what), None, None) = (want_picker.take(), asking, &printing) {
+        if let Some(what) = want_picker.take_if(|_| asking.is_none() && printing.is_none()) {
             match (&embeds, win.embed_token()) {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into(), name: String::new(), origin: String::new() },
-                        Asking::Compare => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with…", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::Compare | Asking::MergeBase | Asking::MergeIncoming => Filter {
+                            kind: Kind::File,
+                            extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(),
+                            multiple: false, write: false,
+                            title: match what {
+                                Asking::MergeBase => "Choose the common base workbook".into(),
+                                Asking::MergeIncoming => "Choose the incoming workbook".into(),
+                                _ => format!("Compare “{}” with…", stem_of(&name)),
+                            },
+                            name: String::new(), origin: String::new(),
+                        },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
@@ -681,7 +718,9 @@ fn main() {
                     let fd = e.borrow_mut().take_fd();
                     match (ToParent::decode(&bytes), fd) {
                         (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
-                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Compare) => run.compare(name, fd),
+                        (Some(ToParent::File { name, .. }), Some(fd))
+                            if matches!(asking, Some(Asking::Compare | Asking::MergeBase | Asking::MergeIncoming)) =>
+                            run.read_review(name, fd, asking.unwrap()),
                         _ => eprintln!("atrium-sheets: an odd message with a descriptor from the picker"),
                     }
                 }
@@ -693,7 +732,11 @@ fn main() {
                             run.save_into(Path::new(&at));
                         }
                     }
-                    Some(ToParent::Done { .. }) | Some(ToParent::Cancelled) => finish = true,
+                    Some(ToParent::Cancelled) => {
+                        if asking == Some(Asking::MergeIncoming) { run.merge_base = None; }
+                        finish = true;
+                    }
+                    Some(ToParent::Done { .. }) => finish = true,
                     Some(ToParent::Failed { why }) => {
                         run.set_status(format!("The picker couldn't hand that over: {why}"));
                         finish = true;
