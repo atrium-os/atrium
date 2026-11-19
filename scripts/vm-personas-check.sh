@@ -11,7 +11,7 @@
 #
 #   - alice has a persona `work` in her policy file; bob has none;
 #   - alice's Personal and Work instances: two uids, two overlays
-#     (apps/<id>, apps/<id>@work, each its uid's, 0700), two counters,
+#     (apps/<id>, persona-apps/work/<id>, each its uid's, 0700), two counters,
 #     two host identities; the registry line for Work says persona=work;
 #   - a second Work launch reuses Work's uid and counter;
 #   - refused: a persona alice doesn't have, an invalid name, bob's
@@ -73,7 +73,7 @@ id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/s
 id bob >/dev/null 2>&1 || pw useradd bob -m -d /home/bob -s /bin/sh
 for id in $PROBE $FM; do
   opifex uninstall \$id >/dev/null 2>&1 || true
-  rm -rf /var/lib/atrium/overlays/\$id /home/alice/.atrium/apps/\$id /home/alice/.atrium/apps/\$id@* /home/bob/.atrium/apps/\$id
+  rm -rf /var/lib/atrium/overlays/\$id /home/alice/.atrium/apps/\$id /home/alice/.atrium/apps/\$id@* /home/alice/.atrium/persona-apps/*/\$id /home/alice/.atrium/persona-apps/*/\$id.img /home/bob/.atrium/apps/\$id
   O=$B/\$id; mkdir -p \$O/bin; cp $B/home_probe \$O/bin/
   printf '[app]\nid = "%s"\nname = "Probe"\nversion = "1"\nentry = "bin/home_probe"\n' \$id > \$O/atrium.toml
   [ \$id = $FM ] && printf '\n[capabilities]\nhome-files = true\n' >> \$O/atrium.toml
@@ -115,7 +115,7 @@ check "Work has its own counter" "runs=1" "$(field "$L" runs)"
 WU=$(field "$L" uid); WH=$(field "$L" hostuuid)
 [ -n "$PU" ] && [ -n "$WU" ] && [ "$PU" != "$WU" ] && ok "another uid ($PU, $WU)" || bad "same or no uid: $PU $WU"
 [ -n "$PH" ] && [ "$PH" != "hostuuid=?" ] && [ "$PH" != "$WH" ] && ok "another host identity" || bad "host identity: $PH $WH"
-check "Work's overlay is its uid's, 0700" "${WU#uid=} 700" "$(V "stat -f '%u %Lp' /home/alice/.atrium/apps/$PROBE@work")"
+check "Work's overlay is its uid's, 0700" "${WU#uid=} 700" "$(V "stat -f '%u %Lp' /home/alice/.atrium/persona-apps/work/$PROBE")"
 check "Personal's counter untouched by Work" "1" "$(V "cat /home/alice/.atrium/apps/$PROBE/var/probe-runs")"
 check "the registry names the persona" "${WU#uid=} alice $PROBE persona=work" "$(V "grep '^${WU#uid=} ' /var/run/atrium/app-registry | sed 's/ [0-9a-f]\{64\}//' | tail -1")"
 
@@ -130,7 +130,7 @@ check "a persona alice doesn't have" "yes" "$(run alice $PROBE home | grep -q 'p
 check "an invalid name" "yes" "$(run alice $PROBE Work | grep -q 'no persona' && echo yes)"
 check "bob has no work persona" "yes" "$(run bob $PROBE work | grep -q 'no persona' && echo yes)"
 check "the file manager spans personas" "yes" "$(run alice $FM work | grep -q 'runs once for every persona' && echo yes)"
-check "and none of them left an overlay" "" "$(V "ls -d /home/alice/.atrium/apps/$PROBE@home /home/alice/.atrium/apps/$FM@work /home/bob/.atrium/apps/$PROBE@work 2>/dev/null")"
+check "and none of them left an overlay" "" "$(V "ls -d /home/alice/.atrium/persona-apps/home/$PROBE /home/alice/.atrium/persona-apps/work/$FM /home/bob/.atrium/persona-apps/work/$PROBE 2>/dev/null")"
 
 echo "=== storage per persona (P2)"
 # The file manager (home-files) spans the personas: portcullisd makes
@@ -152,7 +152,7 @@ for s in navigator navigator-page fresco-chrome fresco-activation limen arca arc
 rm -f /home/alice/Downloads/report*.pdf /home/alice/.atrium/personas/work/Downloads/report*.pdf
 for id in $NAVP $DLP; do
   opifex uninstall \$id >/dev/null 2>&1 || true
-  rm -rf /home/alice/.atrium/apps/\$id /home/alice/.atrium/apps/\$id@*
+  rm -rf /home/alice/.atrium/apps/\$id /home/alice/.atrium/apps/\$id@* /home/alice/.atrium/persona-apps/*/\$id /home/alice/.atrium/persona-apps/*/\$id.img
   O=$B/\$id; rm -rf \$O; mkdir -p \$O/bin; cp $B/download_probe \$O/bin/
   printf '[app]\nid = "%s"\nname = "Download probe"\nversion = "1"\nentry = "bin/download_probe"\n' \$id > \$O/atrium.toml
   [ \$id = $NAVP ] && printf '\n[capabilities]\nnavigator-broker = true\n' >> \$O/atrium.toml
@@ -211,7 +211,7 @@ check "alice is asked, Work preselected" "yes" "$(V "grep -q 'persona question f
 V "cp $B/screen.png $B/q1.png 2>/dev/null || cp $B/screen $B/q1.png 2>/dev/null"; scp -q $K -P 2222 root@localhost:$B/q1.png "$OUT/question.png" 2>/dev/null && echo "  screenshot $OUT/question.png"
 inj "KEY 0x28 1" "KEY 0x28 0"; ended q1.log
 check "Enter: opened in Work" "yes" "$(V "grep -q 'in persona work' $B/q1.log && grep -q 'exited (code Some(0))' $B/q1.log" && echo yes)"
-check "Work's third run" "3" "$(V "cat /home/alice/.atrium/apps/$PROBE@work/var/probe-runs")"
+check "Work's third run" "3" "$(V "cat /home/alice/.atrium/persona-apps/work/$PROBE/var/probe-runs")"
 asked alice q2.log
 inj "KEY 0x1e 1" "KEY 0x1e 0"; ended q2.log
 check "1: opened in Personal" "yes" "$(V "grep -q 'in persona personal' $B/q2.log && grep -q 'exited (code Some(0))' $B/q2.log" && echo yes)"
@@ -220,7 +220,7 @@ check "and Personal is now the last used" "* personal -" "$(V "su -m alice -c 'p
 asked alice q3.log
 inj "KEY 0x29 1" "KEY 0x29 0"; ended q3.log
 check "Escape: nothing opened" "yes" "$(V "grep -q 'not opened' $B/q3.log && ! grep -q exited $B/q3.log" && echo yes)"
-check "no run counted" "3 3" "$(V "cat /home/alice/.atrium/apps/$PROBE/var/probe-runs") $(V "cat /home/alice/.atrium/apps/$PROBE@work/var/probe-runs")"
+check "no run counted" "3 3" "$(V "cat /home/alice/.atrium/apps/$PROBE/var/probe-runs") $(V "cat /home/alice/.atrium/persona-apps/work/$PROBE/var/probe-runs")"
 V "rm -f $B/q4.log; daemon -f -o $B/q4.log su -m bob -c 'env FRESCO_SOCKET=$FS $B/forum-dock launch $PROBE --ask'"; ended q4.log
 check "bob: never asked, opened" "yes" "$(V "! grep -q 'persona question' $B/q4.log && grep -q 'exited (code Some(0))' $B/q4.log" && echo yes)"
 

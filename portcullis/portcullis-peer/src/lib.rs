@@ -125,7 +125,7 @@ struct Entry {
 
 /// A named persona's name (personas.md §2): 1-32 of `[a-z0-9-]`, starting
 /// with a letter, never `personal` (Personal is the absence of a name).
-/// The name becomes part of paths (`apps/<id>@<persona>`) and jail names,
+/// The name becomes part of paths (`persona-apps/<persona>/<id>`) and jail names,
 /// so nothing else is allowed.
 /// The reserved persona of the Navigator's sign-in window for a captive
 /// portal (atrium-net.md §8.1): an instance of its own (uid, jail, overlay)
@@ -276,6 +276,13 @@ impl AppRegistry {
             .filter(|(_, e)| !e.session && e.user == user && e.persona.as_deref() == Some(persona))
             .map(|(uid, e)| (*uid, e.app_id.as_str()))
             .collect()
+    }
+
+    /// Every app uid of `user`, in every persona (not session components).
+    pub fn user_uids(&self, user: &str) -> Vec<u32> {
+        let mut v: Vec<u32> = self.map.iter().filter(|(_, e)| !e.session && e.user == user).map(|(uid, _)| *uid).collect();
+        v.sort_unstable();
+        v
     }
 
     /// Whether `uid` is a declared session component portcullisd launched

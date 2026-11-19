@@ -56,6 +56,12 @@ pub trait Launcher {
     fn launch(&mut self, spec: &LaunchSpec) -> Result<i32, String>;
     /// Tear a previously-launched app down (best-effort).
     fn teardown(&mut self, app_id: &str) -> Result<(), String>;
+    /// `user` is logging out: their apps and workspaces stop and their app
+    /// overlays are unmounted before their Arca locks (tessera-encryption.md
+    /// E6). The default (demo launchers) has nothing to stop.
+    fn session_ended(&mut self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Verify a credential, returning the canonical username. The default is the
     /// dev stub (any non-empty credential); the production [`JaildLauncher`]
     /// forwards it to the portcullisd broker, which runs PAM as root — the jailed
@@ -285,6 +291,11 @@ impl<L: Launcher> Ostiarius<L> {
                 for id in ids {
                     let _ = self.launcher.teardown(&id);
                 }
+            }
+            // Their apps' overlays too: the images are in their key groups
+            // (E6). What stays in use is flushed as the keys go.
+            if let Err(e) = self.launcher.session_ended(&active) {
+                eprintln!("ostiarius: logout of {active}: {e}");
             }
             self.lock_secrets(&active);
         }
@@ -590,6 +601,14 @@ impl Launcher for JaildLauncher {
         }
     }
 
+    fn session_ended(&mut self, user: &str) -> Result<(), String> {
+        match self.broker(Request::SessionEnded { user: user.to_string() })? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(format!("broker session end: {message}")),
+            other => Err(format!("broker session end: {other:?}")),
+        }
+    }
+
     fn verify_credential(&self, user: &str, password: &str) -> Result<String, String> {
         // Forward to the broker: portcullisd (root) runs PAM and reads shadow;
         // this jailed ostiarius never can. Empty-check first to avoid a round-trip.
@@ -649,6 +668,9 @@ mod tests {
     struct MockLauncher {
         launched: Vec<LaunchSpec>,
         torn_down: Vec<String>,
+        /// Users whose session end was told, and how many teardowns came
+        /// before it.
+        ended: Vec<(String, usize)>,
     }
     impl Launcher for MockLauncher {
         fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
@@ -657,6 +679,10 @@ mod tests {
         }
         fn teardown(&mut self, app: &str) -> Result<(), String> {
             self.torn_down.push(app.to_string());
+            Ok(())
+        }
+        fn session_ended(&mut self, user: &str) -> Result<(), String> {
+            self.ended.push((user.to_string(), self.torn_down.len()));
             Ok(())
         }
     }
@@ -727,6 +753,8 @@ mod tests {
         o.logout().unwrap();
         assert!(o.active_human().is_none(), "seat unbound → back to login");
         assert!(o.launcher.torn_down.contains(&"org.atrium.forum-wm".to_string()), "Forum torn down");
+        let n = o.launcher.torn_down.len();
+        assert_eq!(o.launcher.ended, vec![("alice".to_string(), n)], "then her apps stop, before Arca locks");
     }
 
     #[test]

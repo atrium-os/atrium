@@ -65,7 +65,7 @@ pub fn launch_with_stdio(
 /// Launch `(user, app_id)`'s instance in `persona` (personas.md §3; `None`:
 /// Personal). A named persona's instance is its own jail
 /// (`<id>@<persona>` root, `<name>__p_<persona>` jail), its own uid (registry
-/// line `persona=<name>`), its own overlay (`apps/<id>@<persona>`) and its own
+/// line `persona=<name>`), its own overlay (`persona-apps/<persona>/<id>`) and its own
 /// synthetic host identity, so the two instances share nothing an app could
 /// use to link them. The caller has checked the persona is the person's.
 pub fn launch_instance(
@@ -250,12 +250,18 @@ fn launch_inner(
      * reason the overlay is a volume rather than a directory: quota-scoped
      * statfs is per-mount and cannot be per-path.
      *
-     * Stays mounted across launches — it holds the app's persistent state, and
-     * only `portcullis remove` takes it down. */
+     * Stays mounted across launches — it holds the app's persistent state —
+     * until `portcullis remove`, or the person's logout (E6: its image is in
+     * their key group, which locks then). */
     let overlay_quota = manifest.resources.as_ref()
         .and_then(|r| r.storage.as_deref())
         .and_then(portcullis_overlay::parse_size)
         .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
+    // The person's app data in their key group (E6), before it mounts.
+    if portcullis_overlay::home_of(user).is_some() {
+        portcullisd::home::ensure_app_data(user, persona)
+            .map_err(|m| LaunchError::Failed("app data", m))?;
+    }
     // The person's own overlay, in their home (homes.md §3).
     let place = match persona {
         None => portcullis_overlay::place(Some(user), app_id),
@@ -1306,6 +1312,34 @@ pub fn running_in_persona(user: &str, persona: &str) -> Vec<String> {
     v.sort();
     v.dedup();
     v
+}
+
+/// Every app uid of `user` (each persona's instances and workers; not
+/// session components, which ostiarius tears down itself).
+pub fn user_uids(user: &str) -> Vec<u32> {
+    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().user_uids(user)
+}
+
+/// End the processes of `uids`: TERM, up to 3 s for them to go, then KILL.
+/// Each app's launch then tears its jail down as usual.
+pub fn end_processes(uids: &[u32]) {
+    let alive = |u: u32| Command::new("pgrep").args(["-U", &u.to_string()]).output().map(|o| o.status.success()).unwrap_or(false);
+    let live: Vec<u32> = uids.iter().copied().filter(|u| alive(*u)).collect();
+    if live.is_empty() {
+        return;
+    }
+    for u in &live {
+        let _ = Command::new("pkill").args(["-TERM", "-U", &u.to_string()]).status();
+    }
+    for _ in 0..30 {
+        if !live.iter().any(|u| alive(*u)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for u in &live {
+        let _ = Command::new("pkill").args(["-KILL", "-U", &u.to_string()]).status();
+    }
 }
 
 /// The uid of `user`'s instance of `app_id` in `persona`, if one was ever

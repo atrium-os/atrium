@@ -311,6 +311,15 @@ pub enum Request {
         jail_name: String,
     },
 
+    /// `_ostiarius` says `user` is logging out, before it locks their Arca
+    /// (tessera-encryption.md E6): portcullisd stops their apps and
+    /// workspaces and unmounts their app overlays, whose images are in the
+    /// key groups that lock with Arca. Same `session_launch` gate. `Ok`, or
+    /// an error naming what stayed in use (the logout goes on regardless).
+    SessionEnded {
+        user: String,
+    },
+
     /// A jailed, non-root broker client (e.g. `_stoad`) asks portcullisd to
     /// exec a shell INSIDE an existing jaild-created jail on a pty — Stoa's
     /// jail-target sessions / `jexec` reimagined (stoa.md §4.5). portcullisd
@@ -637,7 +646,7 @@ pub enum Request {
     /// ★ Remove persona `name` (personas.md §4.1): refused while any of its
     /// apps runs; then, after a press (APPROVE) and the person's
     /// verification on Sigillum's sheet (`VERIFY_USER`), its apps' data
-    /// (`~/.atrium/apps/<id>@<name>`) is deleted, its crossing switches go
+    /// (`~/.atrium/persona-apps/<name>/<id>`) is deleted, its crossing switches go
     /// and it leaves the policy file. `app-grants` only. Answer: `Ok`.
     RemovePersona { name: String, activation: [u8; 16] },
 }

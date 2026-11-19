@@ -42,6 +42,9 @@ pub trait Kernel {
     fn group_create(&self, dir: &Path, key_id: &[u8; 16], group: u64) -> io::Result<()>;
     fn join_group(&self, dir: &Path, group: u64) -> io::Result<()>;
     fn erase(&self, dir: &Path, group: u64) -> io::Result<()>;
+    /// Something is mounted in, or from, `dir` (an app's overlay, a jail's
+    /// view of it): a plain folder that is can't be moved in now.
+    fn busy(&self, dir: &Path) -> bool;
 }
 
 pub struct Tessera;
@@ -54,6 +57,7 @@ impl Kernel for Tessera {
     }
     fn join_group(&self, dir: &Path, group: u64) -> io::Result<()> { ffi::tessera_quota_group(dir, group) }
     fn erase(&self, dir: &Path, group: u64) -> io::Result<()> { ffi::tessera_group_erase(dir, group) }
+    fn busy(&self, dir: &Path) -> bool { ffi::mounts_under(dir) }
 }
 
 /// Where a plain folder waits while it moves in.
@@ -204,7 +208,7 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
             Ok(i) => i,
             Err(err) if entry.is_none() && is_enotty(&err) => {
                 info!("persona folders: {}'s {} stay plain: {} is not on Tessera", req.person, req.persona, probe.display());
-                return Response::FoldersReady { encrypted: false, moved: Vec::new() };
+                return Response::FoldersReady { encrypted: false, moved: Vec::new(), waiting: Vec::new() };
             }
             Err(err) if entry.is_some() && is_enotty(&err) => {
                 return refused(&probe, "its folders were encrypted and it is no longer on Tessera");
@@ -225,7 +229,7 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
                     Ok(k) => k,
                     Err(KeyError::Unavailable(why)) => {
                         warn!("persona folders: {}'s {} stay plain for now: {why}", req.person, req.persona);
-                        return Response::FoldersReady { encrypted: false, moved: Vec::new() };
+                        return Response::FoldersReady { encrypted: false, moved: Vec::new(), waiting: Vec::new() };
                     }
                     Err(err) => return error(format!("{}'s {} folder key: {err}", req.person, req.persona)),
                 };
@@ -251,6 +255,7 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
             return refused(&probe, "its folders' group is on another volume");
         }
         let mut moved = Vec::new();
+        let mut waiting = Vec::new();
         for f in &folders {
             let fs_ = f.display().to_string();
             let expected = e.folders.contains(&fs_);
@@ -277,6 +282,14 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
                     if let Err(r) = self.make(f, e.group_id, req) {
                         return r;
                     }
+                }
+                State::Plain if self.kernel.busy(f) => {
+                    // In use (E6: an overlay still mounted, a jail's view
+                    // of it): it stays plain, and isn't expected, until a
+                    // later ask finds it free.
+                    warn!("persona folders: {} is in use; it moves in later", f.display());
+                    waiting.push(fs_);
+                    continue;
                 }
                 State::Plain => {
                     let p = parked(f);
@@ -327,7 +340,7 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
         if !moved.is_empty() {
             self.scrub.kick();
         }
-        Response::FoldersReady { encrypted: true, moved }
+        Response::FoldersReady { encrypted: true, moved, waiting }
     }
 
     /// A removed persona (personas.md §4.1): its key goes, then its group.
@@ -419,6 +432,14 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
 /// from) and links. Anything else (a socket, a fifo) is left out. Files
 /// already in `to` are overwritten: this is how an interrupted move resumes.
 pub fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    let dev = fs::symlink_metadata(from)?.dev();
+    copy_tree_on(from, to, dev)
+}
+
+/// [`copy_tree`] within one file system: a folder on another (an app's
+/// overlay volume still mounted) stops the move, so nothing is deleted
+/// that wasn't copied (E6: `~/.atrium/apps` holds overlay mount points).
+fn copy_tree_on(from: &Path, to: &Path, dev: u64) -> io::Result<()> {
     for ent in fs::read_dir(from)? {
         let ent = ent?;
         let src = ent.path();
@@ -433,6 +454,10 @@ pub fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
             std::os::unix::fs::symlink(&target, &dst)?;
             std::os::unix::fs::lchown(&dst, Some(m.uid()), Some(m.gid()))?;
         } else if ft.is_dir() {
+            if m.dev() != dev {
+                return Err(io::Error::new(io::ErrorKind::ResourceBusy,
+                    format!("{} is a mount point (in use)", src.display())));
+            }
             match fs::symlink_metadata(&dst) {
                 Ok(d) if d.is_dir() => {}
                 Ok(_) => {
@@ -441,7 +466,7 @@ pub fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
                 }
                 Err(_) => fs::create_dir(&dst)?,
             }
-            copy_tree(&src, &dst)?;
+            copy_tree_on(&src, &dst, dev)?;
             std::os::unix::fs::lchown(&dst, Some(m.uid()), Some(m.gid()))?;
             fs::set_permissions(&dst, fs::Permissions::from_mode(m.mode() & 0o7777))?;
             set_times(&dst, &m)?;
@@ -472,7 +497,7 @@ fn copy_file(src: &Path, dst: &Path, m: &fs::Metadata) -> io::Result<()> {
     let mut from = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(src)?;
     let mut to = fs::OpenOptions::new().write(true).create(true).truncate(true)
         .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(dst)?;
-    io::copy(&mut from, &mut to)?;
+    copy_sparse(&mut from, &mut to)?;
     to.sync_all()?;
     std::os::unix::fs::fchown(&to, Some(m.uid()), Some(m.gid()))?;
     to.set_permissions(fs::Permissions::from_mode(m.mode() & 0o7777))?;
@@ -480,6 +505,44 @@ fn copy_file(src: &Path, dst: &Path, m: &fs::Metadata) -> io::Result<()> {
         warn!("persona folders: {}: origin not copied ({e})", dst.display());
     }
     to.set_times(fs::FileTimes::new().set_accessed(m.accessed()?).set_modified(m.modified()?))
+}
+
+/// Copy contents, leaving runs of zeros as holes (E6): an app's overlay
+/// image is gigabytes long and nearly all holes, and Tessera reports the
+/// whole file as data (FIOSEEKDATA phase 1), so holes are found by reading.
+/// A gap is made by extending the length, which Tessera keeps sparse.
+fn copy_sparse(from: &mut fs::File, to: &mut fs::File) -> io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const BLOCK: usize = 64 * 1024;
+    let mut buf = vec![0u8; BLOCK];
+    let (mut pos, mut written) = (0u64, 0u64);
+    loop {
+        let mut n = 0;
+        while n < BLOCK {
+            match from.read(&mut buf[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            if written < pos {
+                to.set_len(pos)?;
+            }
+            to.seek(SeekFrom::Start(pos))?;
+            to.write_all(&buf[..n])?;
+            written = pos + n as u64;
+        }
+        pos += n as u64;
+    }
+    if written < pos {
+        to.set_len(pos)?;
+    }
+    Ok(pos)
 }
 
 fn set_times(dir: &Path, m: &fs::Metadata) -> io::Result<()> {
@@ -514,6 +577,8 @@ mod tests {
         scrubs:  Vec<(PathBuf, bool)>,
         kicks:   u32,
         destroyed: Vec<String>,
+        /// Folders with something mounted in or from them.
+        busy:    HashSet<PathBuf>,
     }
 
     #[derive(Clone)]
@@ -584,6 +649,9 @@ mod tests {
             }
             w.groups.remove(&group);
             Ok(())
+        }
+        fn busy(&self, dir: &Path) -> bool {
+            self.0.borrow().busy.contains(dir)
         }
     }
 
@@ -687,7 +755,7 @@ mod tests {
 
     fn ready(r: &Response) -> (bool, Vec<String>) {
         match r {
-            Response::FoldersReady { encrypted, moved } => (*encrypted, moved.clone()),
+            Response::FoldersReady { encrypted, moved, .. } => (*encrypted, moved.clone()),
             other => panic!("not ready: {other:?}"),
         }
     }
@@ -890,5 +958,57 @@ mod tests {
         assert!(matches!(run(&mut t, &r), Response::Error { .. }));
         r.folders = vec![format!("{}/../bob/Documents", t.home.display())];
         assert!(matches!(run(&mut t, &r), Response::Error { .. }));
+    }
+
+    #[test]
+    fn a_long_mostly_hole_image_copies_whole_and_stays_sparse() {
+        use std::io::{Seek, SeekFrom, Write};
+        let d = tempfile::tempdir().unwrap();
+        let (src, dst) = (d.path().join("app.img"), d.path().join("copy.img"));
+        let mut f = fs::File::create(&src).unwrap();
+        f.set_len(64 << 20).unwrap();
+        f.write_all(b"superblock").unwrap();
+        f.seek(SeekFrom::Start(40 << 20)).unwrap();
+        f.write_all(&[7u8; 100_000]).unwrap();
+        drop(f);
+        let mut tail = fs::File::create(d.path().join("tail")).unwrap();
+        tail.write_all(&[0u8; 1000]).unwrap();
+        let m = fs::metadata(&src).unwrap();
+        copy_file(&src, &dst, &m).unwrap();
+        assert_eq!(fs::read(&src).unwrap(), fs::read(&dst).unwrap());
+        assert!(fs::metadata(&dst).unwrap().blocks() * 512 < 4 << 20, "holes stay holes");
+        // Only zeros, and short: the length is kept.
+        let t = d.path().join("tail");
+        copy_file(&t, &d.path().join("tail2"), &fs::metadata(&t).unwrap()).unwrap();
+        assert_eq!(fs::read(d.path().join("tail2")).unwrap(), vec![0u8; 1000]);
+    }
+
+    #[test]
+    fn app_data_in_use_waits_plain_and_moves_in_once_free() {
+        // E6: `~/.atrium/apps`, root's 0755, with an overlay image in it,
+        // and an app's overlay still mounted there the first time.
+        let mut t = setup();
+        let apps = t.home.join(".atrium/apps");
+        fs::create_dir_all(apps.join("org.x.mail")).unwrap();
+        fs::write(apps.join("org.x.mail.img"), b"overlay").unwrap();
+        t.fake.0.borrow_mut().busy.insert(apps.clone());
+        let mut r = req(&t, "personal");
+        r.folders = vec![apps.display().to_string()];
+        r.mode = 0o755;
+        match run(&mut t, &r) {
+            Response::FoldersReady { encrypted: true, moved, waiting } => {
+                assert!(moved.is_empty());
+                assert_eq!(waiting, vec![apps.display().to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(t.fake.0.borrow().domains.get(&apps).copied().unwrap_or(0), 0, "left plain");
+        assert!(t.groups.find("alice", "personal").unwrap().folders.is_empty(), "and not expected");
+        // Unmounted (at logout): the next ask moves it in.
+        t.fake.0.borrow_mut().busy.clear();
+        assert_eq!(ready(&run(&mut t, &r)), (true, vec![apps.display().to_string()]));
+        assert_ne!(t.fake.0.borrow().domains.get(&apps).copied().unwrap_or(0), 0);
+        assert_eq!(fs::read(apps.join("org.x.mail.img")).unwrap(), b"overlay");
+        assert_eq!(fs::metadata(&apps).unwrap().mode() & 0o777, 0o755);
     }
 }

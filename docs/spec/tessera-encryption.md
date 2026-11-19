@@ -801,7 +801,7 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | E3 | Trusted sticks: format from Scrinium, probe, kernel mount, Locked state, recovery code, high-water, eject recording | vm-automount-check: a sealed stick opens for its persona only; a stick from another machine is Locked; a recovery code adopts it; an older image is refused and opens read-only after verification; forgetting the key leaves it Locked |
 | E4 | Encrypted domains on the internal volume: key-group and domain records with MACs, group-tagged packs, keyed ids, names and CDC per group, the parent-domain rule, lock at logout with page invalidation, atrium-volumes `encrypt = "persona"` with expected groups | VM: two people; root cannot read B's files or names while B is logged out; an offline edit that strips a domain's group or moves a file out of it is refused at login; dedup within a group, none across groups; GC leaves a locked group's packs alone |
 | E5 | Personas: persona domains and sticks keyed in the persona's Arca, crypto-erase on persona removal (personas.md P2 and P4) | removing Work leaves none of its packs, items or keys, and its sticks show Locked. **Done** 2026-11-19 (993cd71d; `tessera-personas-vm.sh` 57/0: the Work stick key leaves the kernel and isn't found, the removal's scrub zeroes the deleted app data; arca 207/0 full and 124/0 VK only, sticks 74/0, sticks-ui 15/0) |
-| E6 | Move existing home folders and app data into the person's Personal group (copy into the new encrypted domain, then GC the old) | an upgraded VM keeps every file, now sealed |
+| E6 | Move existing home folders and app data into the person's Personal group (copy into the new encrypted domain, then GC the old); in steps in §13.2 | an upgraded VM keeps every file, now sealed |
 
 ### 13.1 E4 in steps
 
@@ -994,6 +994,46 @@ App data (overlays, caches) is not encrypted yet; it is deleted in the
 clear and the scrub makes it unreadable on the device (decision of
 2026-11-19, "delete, then scrub (now)"). Encrypting it live, in the
 persona's group, comes with E6.
+
+### 13.2 E6 in steps
+
+The home folders already move in at login (E4.6, scrubbed after by E4.7).
+What is left is the app data under `~/.atrium`, and a named persona's app
+overlays, which sat in among Personal's (`apps/<id>@<persona>`):
+
+| step | what | done when |
+|---|---|---|
+| E6.1 | atrium-volumes: a move-in copies a file's runs of zeros as holes (an overlay image is gigabytes, nearly all holes), refuses to cross a mount point, and leaves a plain folder that something is mounted in or from (an overlay, a jail's view) as it is, answering it in `waiting`, until a later ask finds it free | host tests |
+| E6.2 | Overlays: a persona's instances at `~/.atrium/persona-apps/<persona>/<id>`, one folder per persona so it can be a domain of that persona's group; old ones moved there (a rename, before anything is encrypted) | host check |
+| E6.3 | portcullisd: before a launch, a session component's state, a workspace or a dev core sweep, Personal's `apps` and `state` (root's, 0755) and `workspaces` and `cache` (root's, files group, 0750) are asked for in the Personal group, and a persona's `persona-apps/<persona>` (root's, 0700) in its own; ostiarius tells portcullisd at logout, before Arca locks, and portcullisd ends the person's app processes and workspaces and unmounts their overlays | VM: `tessera-personas-vm.sh` 6 |
+| E6.4 | VM gate: a person's state, workspace and overlay image from before E6 move in, the image stays sparse and mounts from the group, nothing is left in the clear, and none of it reads while they are out; the personas and apps gates pass with the new overlay places | `tessera-personas-vm.sh` 6, `vm-personas-check.sh` |
+
+**E6 as built (2026-11-19).** An app's overlay is its own Tessera volume in
+an image file (portcullis.md §4.1), so encrypting app data means the image
+file is in the person's group: the overlay's blocks are sealed on the
+internal volume, and the overlay itself stays a plain volume inside. The
+image mounts only while the group is open, so the overlays now come down at
+logout: ostiarius sends `SessionEnded` after tearing the session down and
+before locking Arca; portcullisd sends TERM, then KILL, to every app uid
+of the person (all personas), stops their workspaces and unmounts each
+overlay. Something left in use is flushed by the kernel as the key goes
+(E4.4) and its reads fail; it is logged. This is decision 7 (groups lock
+at logout) reaching apps: nothing of a person runs while they are logged
+out, workspaces included. Fast user switching keeps both sessions, and
+their keys, as before.
+
+A part of `~/.atrium` is asked for each time something is about to use
+it, which also loads the key after a login. A part with an overlay still
+mounted (a system upgraded without a reboot) waits, plain, and moves in at
+the first ask after it is unmounted, at the latest after the next logout.
+Any other trouble (no atrium-volumes, an Arca that is locked before the
+group was ever made) leaves the data plain and the launch goes on, as
+before E6; a part that should be encrypted and isn't is refused and the
+launch fails. A removed persona's `persona-apps/<persona>` goes with its
+group (E5).
+
+Not covered: the machine-wide overlays of apps launched with no person
+(`/var/lib/atrium/overlays`) are not personal data and stay plain.
 
 ## 14. Decisions
 

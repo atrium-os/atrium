@@ -256,6 +256,7 @@ pub fn take_cores(owner: &str, ws: &str) -> Result<Vec<String>, String> {
         }
     }
     let mut out = Vec::new();
+    portcullisd::home::ensure_app_data(owner, None)?;
     for id in bundles_of(owner, ws) {
         let place = portcullis_overlay::place(Some(owner), &id);
         if !place.dir.exists() && !place.img.exists() {

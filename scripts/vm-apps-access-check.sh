@@ -247,15 +247,15 @@ press ${AX2:-484} ${AY2:-325}                    # Add
 i=0; while [ $i -lt 20 ] && [ "$(count "persona school is now")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "persona school is now Some(\"blue\")")" = 1 ] && ok "School added, in the first free colour" || bad "add: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
 shot persona-4
-V "mkdir -p /home/alice/.atrium/apps/org.test.new@work/var && touch /home/alice/.atrium/apps/org.test.new@work/var/data /home/alice/.atrium/apps/org.test.new@school"
+V "mkdir -p /home/alice/.atrium/persona-apps/work/org.test.new/var /home/alice/.atrium/persona-apps/school && touch /home/alice/.atrium/persona-apps/work/org.test.new/var/data /home/alice/.atrium/persona-apps/school/org.test.new.img"
 press ${CX:-880} ${RY:-288}                      # Work's Remove…
 shot persona-5
 press ${DX:-330} ${DY:-379}                      # Remove Work
 i=0; while [ $i -lt 30 ] && [ "$(count "removed persona work")" = 0 ]; do sleep 2; i=$((i+2)); done
 V "grep -q 'verify alice for RemovePersona { name: \"work\" }: confirmed' $B/sigillum.log" && ok "Sigillum asked to confirm it's alice" || bad "no verify: $(V "tail -3 $B/sigillum.log")"
 [ "$(count "removed persona work (from $CURIA, verified): ")" = 1 ] && ok "Work removed, its app folder deleted" || bad "remove: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
-V "test -e /home/alice/.atrium/apps/org.test.new@work" && bad "Work's folder is still there" || ok "Work's folder is gone"
-V "test -e /home/alice/.atrium/apps/org.test.new@school" && ok "School's is kept" || bad "School's folder went too"
+V "test -e /home/alice/.atrium/persona-apps/work/org.test.new" && bad "Work's folder is still there" || ok "Work's folder is gone"
+V "test -e /home/alice/.atrium/persona-apps/school/org.test.new.img" && ok "School's is kept" || bad "School's folder went too"
 V "grep -q 'personas.work' $POL" && bad "Work still in her policy" || ok "Work out of her policy"
 shot persona-6
 
