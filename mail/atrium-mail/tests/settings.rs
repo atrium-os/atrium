@@ -251,6 +251,21 @@ fn settings_window() {
     assert!(!engine.prefs().single_keys);
     s.toggle_single_keys();
     assert!(engine.prefs().single_keys);
+    // Phishing reports: asked in a named persona (Work); kept once it reads
+    // as an address, off again when emptied.
+    app.tick();
+    assert!(!texts(&app).iter().any(|x| x == "PHISHING"));
+    *s.persona.borrow_mut() = Some("Work".into());
+    s.report_to.set(TextEdit::new("Phish@"));
+    s.tick();
+    assert_eq!(engine.prefs().report_to, None);
+    s.report_to.set(TextEdit::new("Phish@Acme.example"));
+    s.tick();
+    assert_eq!(engine.prefs().report_to.as_deref(), Some("phish@acme.example"));
+    drawn(&mut app, &["PHISHING", "Also send reports to"]);
+    s.report_to.set(TextEdit::new(""));
+    s.tick();
+    assert_eq!(engine.prefs().report_to, None);
 
     s.close();
     assert!(s.closed());

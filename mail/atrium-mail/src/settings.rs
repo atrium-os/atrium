@@ -161,6 +161,8 @@ pub struct Settings {
     pub digest_at: Mutable<TextEdit>,
     /// When the Later review comes: "09:00".
     pub review_at: Mutable<TextEdit>,
+    /// The company's address for phishing reports (Work, §7.7).
+    pub report_to: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
     pub mail_rule: Mutable<TextEdit>,
@@ -204,6 +206,7 @@ impl Settings {
             quiet_to: ui.sibling(TextEdit::new(&t)),
             digest_at: ui.sibling(TextEdit::new(&format_times(&prefs.digest))),
             review_at: ui.sibling(TextEdit::new(&format_hm(prefs.review))),
+            report_to: ui.sibling(TextEdit::new(prefs.report_to.as_deref().unwrap_or(""))),
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
             mail_rule: ui.sibling(TextEdit::new("")),
@@ -796,6 +799,14 @@ impl Settings {
                 self.set_prefs(|p| p.review = r);
             }
         }
+        // The report address once it reads as one; empty turns reports off.
+        let typed = self.report_to.get_cloned().text().trim().to_string();
+        let to = if typed.is_empty() { Some(None) } else { mail_engine::prefs::report_address(&typed).map(Some) };
+        if let Some(to) = to {
+            if to != p.report_to {
+                self.set_prefs(|p| p.report_to = to.clone());
+            }
+        }
     }
 }
 
@@ -1203,6 +1214,16 @@ impl SettingsView {
         switch(ctx, x, y + em(14.0), "Keep company link scanning", ui.prefs.keeps_scanning(named), move || s.toggle_link_scanning());
         y += em(32.0);
         y += para(ctx, x, y, inner, "A link through Safe Links, URL Defense or Mimecast opens through it, so your company's scanner still checks it. Mail shows where it goes either way.", type_size::XS, t.text_tertiary()) + em(8.0);
+
+        // Phishing reports (§7.7): a company's address, in a named persona.
+        if named || ui.prefs.report_to.is_some() {
+            y += em(8.0);
+            section(ctx, x, &mut y, "PHISHING");
+            text(ctx, x, y + em(14.0), "Also send reports to", type_size::SM, Weight::Regular, t.text_primary());
+            ctx.place(TextField::new(self.s.report_to.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("phishing@company.example"));
+            y += em(32.0);
+            y += para(ctx, x, y, inner, "Report phishing moves the message to Junk, and sends it here as it arrived, headers and all, so your security team can look. Empty: Junk only.", type_size::XS, t.text_tertiary()) + em(8.0);
+        }
 
         // Rules (§11.6): what happens to new inbox mail, in words.
         y += em(8.0);

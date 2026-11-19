@@ -116,3 +116,27 @@ fn a_reply_quoting_html() {
     assert!(raw.contains("<blockquote type=\"cite\""), "{raw}");
     assert!(raw.contains("<p>The <b>numbers</b></p>") && !raw.contains("r1"), "{raw}");
 }
+
+#[test]
+fn a_message_attached_as_it_is() {
+    let original = b"From: Bank <alerts@bank.example>\nTo: arun@acme.example\nSubject: Verify your account\nMessage-ID: <x1@bank.example>\n\nClick here.\n".to_vec();
+    let d = Draft {
+        from: Mailbox::new("", "arun@acme.example"),
+        to: vec![Mailbox::new("", "phish@acme.example")],
+        subject: "Phishing: Verify your account".into(),
+        text: "Reported.\n".into(),
+        attachments: vec![
+            Attachment { name: "message.eml".into(), mime: "message/rfc822".into(), bytes: original.clone() },
+            Attachment { name: "message-2.eml".into(), mime: "message/rfc822".into(), bytes: b"Subject: caf\xc3\xa9\n\nx\n".to_vec() },
+        ],
+        ..Draft::default()
+    };
+    let w = write(&d, &stamp()).unwrap();
+    let raw = String::from_utf8(w.bytes.clone()).unwrap();
+    // 7bit as it is, CRLF; not base64 (RFC 2046 §5.2.1).
+    assert!(raw.contains("Content-Type: message/rfc822; name=\"message.eml\"\r\nContent-Disposition: attachment; filename=\"message.eml\"\r\n\r\nFrom: Bank <alerts@bank.example>\r\nTo:"), "{raw}");
+    assert!(raw.contains("Click here.\r\n--"), "{raw}");
+    // Not 7bit: a file.
+    assert!(raw.contains("Content-Type: application/octet-stream; name=\"message-2.eml\""), "{raw}");
+    parse(&w.bytes, &Limits::default()).unwrap();
+}

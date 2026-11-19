@@ -224,6 +224,7 @@ impl Engine {
         let mut folder_names = std::collections::HashMap::new();
         let bits = q.conds.iter().fold(0, |b, c| if let Cond::Quick(x) = c { b | x } else { b });
         let mut quick = (bits != 0).then(|| self.quick(bits));
+        let files = q.conds.contains(&Cond::HasAttachment);
         let mut hits = Vec::new();
         for id in candidates {
             let Ok(m) = self.store.message(id) else { continue };
@@ -247,7 +248,9 @@ impl Engine {
             let ok = ok && quick.as_mut().is_none_or(|qk| qk.passes(id, None, unread, flags.iter().any(|f| f & flag::FLAGGED != 0)));
             if ok {
                 let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
-                hits.push(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), unread });
+                // Looking for files: each row says which (the Files view, §8.1).
+                let preview = if files { crate::files::files_line(&m.summary) } else { m.summary.preview.clone() };
+                hits.push(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview, unread });
             }
         }
         hits.sort_by(|a, b| b.date.cmp(&a.date).then(b.msg.cmp(&a.msg)));

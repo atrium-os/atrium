@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1159,7 +1159,7 @@ Stalwart in the cloud VM, and later a real account):
    filter, Scrinium save target and `create_new`, window strip and quick look, compose
    attach and forward. **Not yet**: Open with… (another app than the default), office
    files in quick look (Officina converters), encrypted ZIP/PDF passwords via Arca, "all
-   files in a thread / from a person" and the Files view (M6 search), the picker over home
+   files in a thread / from a person" and the Files view (built 2026-11-19), the picker over home
    places (homes.md W4: today it shows sticks and shares), attachment text from PDFs and
    office files, and a VM run with limend, Scrinium and portcullisd.
 7. **M6** search, smart folders, unsubscribe, newsletter lane, screener, snooze, follow-up,
@@ -1629,8 +1629,8 @@ Stalwart in the cloud VM, and later a real account):
    from there. The undo toast follows the column shown. The reader's text stays capped at
    about 80 characters and centred at every size (as before). The window can now be made
    as small as 320 pt wide. Tests: window 1 (the three sizes: what is drawn, ≡ and Escape,
-   the search box over the list, Back, j after Back). **Not yet**: icons on the rail
-   (short names stand in until Mail has folder icons), and a look at the narrow layout on
+   the search box over the list, Back, j after Back). Icons on the rail: built (see
+   the 2026-11-19 entries). **Not yet**: a look at the narrow layout on
    a real display in the VM.
 
    **The address book in Settings built on the host (2026-11-18, §14.2).** Settings has
@@ -1869,7 +1869,31 @@ Stalwart in the cloud VM, and later a real account):
    a press opening in the chosen app, none for a file whose name lies, closed; phishing
    reported with both keywords and undone, not offered in Junk), store (the keyword). The
    portcullisd change is checked for FreeBSD (`cargo check`); its run waits for the VM.
-   **Not yet**: Report phishing to the company in Work (a report address to forward to).
+   Report phishing to the company in Work: built below.
+
+   **Rail icons, phishing reports in Work, and files across mail (2026-11-19, §15.4,
+   §7.7, §8.1).** The medium window's rail draws the folders every account has as icons
+   (inbox, sent, drafts, archive, junk, trash, all mail, flagged: Phosphor tray, paper
+   plane, note, archive, warning octagon, trash, stack, star); the person's own folders
+   keep their two-letter short names, since one shared folder icon couldn't tell them
+   apart. In a named persona Settings asks for the company's phishing report address
+   (*Also send reports to*, kept once it reads as one address, lower case; empty turns it
+   off). With one set, *Report phishing* also sends the conversation's messages there,
+   each attached as it arrived (`message/rfc822`, 7bit as RFC 2046 asks; a message that
+   isn't 7bit goes as an `.eml` file), with a line saying so, through the outbox; Undo
+   takes the report back unsent along with the move. A message whose body isn't here
+   yet is said, not sent. Files: a *Files* view (every message with files, each row
+   listing them with sizes in place of the preview; any search with `has:attachment`
+   shows rows the same way), *Files from <sender>* in the palette while reading (that
+   search for the sender), and at the top of a conversation whose folded messages hold
+   files, "N files in this conversation: …" with *Show them*, which opens those messages
+   so their strips show (also *Show this conversation's files* in the palette). Tests:
+   compose 1 (a message attached as it is, and as a file when not 7bit), engine report 1
+   (sent from the account, headers kept, nothing for a headers-only message, refused
+   for a non-address, undone), prefs (the address kept, bad ones refused), files 1,
+   window 2 (rail icons; the report sent and undone; the conversation's files, Files from,
+   the Files view), settings (the field, asked in Work). **Not yet**: a grid of
+   thumbnails for the Files view (rows for now), and the Files view's counts.
 
 ## 17. Decisions, with recommendations
 

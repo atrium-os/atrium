@@ -25,6 +25,10 @@ pub enum Cmd {
     Junk,
     /// Report phishing: to Junk, marked `$Phishing` too (§7.7).
     Phishing,
+    /// Files from the open message's sender (§8.1).
+    FilesFrom,
+    /// Open the conversation's messages that have files.
+    ShowFiles,
     Later,
     Done,
     Drop,

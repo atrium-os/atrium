@@ -293,6 +293,14 @@ fn text_body(s: &str) -> (String, &'static str) {
     }
 }
 
+/// A message as 7bit lines ending in CRLF, when it is one: ASCII, no NUL,
+/// no line over 998 octets.
+fn seven_bit(b: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(b).ok().filter(|s| s.is_ascii() && !s.contains('\0'))?;
+    let t = crlf(s.trim_end_matches(['\r', '\n']));
+    t.split("\r\n").all(|l| l.len() <= 998 && !l.contains('\r') && !l.contains('\n')).then_some(t)
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -427,6 +435,31 @@ fn write_as(d: &Draft, stamp: &Stamp, draft: bool) -> Result<Written, Error> {
         let _ = write!(body, "--{b}\r\n{alt_head}{alt}");
         for a in &d.attachments {
             let name = if clean(&a.name).is_empty() { "attachment".to_string() } else { clean(&a.name) };
+            // A whole message (a report forwarding it, say) goes as it is:
+            // RFC 2046 §5.2.1 lets message/rfc822 be 7bit only. One that
+            // isn't 7bit goes as a file instead.
+            let mime = mime_type(&a.mime);
+            if mime == "message/rfc822" {
+                match seven_bit(&a.bytes) {
+                    Some(m) => {
+                        let _ = write!(body, "--{b}\r\nContent-Type: message/rfc822; {}\r\nContent-Disposition: attachment; {}\r\n\r\n{m}\r\n", param("name", &name), param("filename", &name));
+                        continue;
+                    }
+                    None => {
+                        let _ = write!(
+                            body,
+                            "--{b}\r\nContent-Type: application/octet-stream; {}\r\nContent-Disposition: attachment; {}\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+                            param("name", &name),
+                            param("filename", &name)
+                        );
+                        for chunk in base64(&a.bytes).as_bytes().chunks(76) {
+                            body.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+                            body.push_str("\r\n");
+                        }
+                        continue;
+                    }
+                }
+            }
             let _ = write!(
                 body,
                 "--{b}\r\nContent-Type: {}; {}\r\nContent-Disposition: attachment; {}\r\nContent-Transfer-Encoding: base64\r\n\r\n",

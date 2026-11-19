@@ -475,6 +475,20 @@ fn archive_delete_and_undo_from_the_keyboard() {
     assert!(pending.iter().any(|(_, o)| o.kind == mail_store::OpKind::Flags { add: mail_store::flag::JUNK | mail_store::flag::PHISHING, remove: mail_store::flag::NOT_JUNK }), "{pending:?}");
     assert!(mail.key(&key("z"), None));
     assert_eq!(subjects(&mail), ["Three", "Two"]);
+    // With the company's report address (Work): sent there too; Undo takes
+    // the report back unsent.
+    engine.set_prefs(&mail_engine::prefs::Prefs { report_to: Some("phish@acme.example".into()), ..engine.prefs() }).unwrap();
+    mail.open(0);
+    mail.run_cmd(report.cmd);
+    let undo = mail.ui.get_cloned().undo.unwrap();
+    assert_eq!(undo.label, "Message reported as phishing and sent to phish@acme.example");
+    let sent = engine.store.outbox().unwrap();
+    assert!(sent.iter().any(|(k, o)| Some(*k) == undo.report && o.rcpts == ["phish@acme.example"]), "{sent:?}");
+    assert!(mail.key(&key("z"), None));
+    assert!(engine.store.outbox().unwrap().iter().all(|(k, _)| Some(*k) != undo.report));
+    assert!(mail.take_composes().is_empty(), "nothing to compose");
+    assert_eq!(subjects(&mail), ["Three", "Two"]);
+    engine.set_prefs(&mail_engine::prefs::Prefs { report_to: None, ..engine.prefs() }).unwrap();
     // In Junk: the palette offers Not junk, and ! sends it to the inbox.
     let junk = engine.store.folder_id(account, "Junk", mail_store::Role::Junk).unwrap();
     mail.choose_folder(junk);
@@ -713,7 +727,7 @@ fn unsubscribe_block_and_the_screener() {
     use atrium_mail::view::Lane;
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 1, "the stranger waits");
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0), (Lane::NewSenders, 1)]);
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "Newsletters") && t.iter().any(|x| x == "New senders"), "{t:?}");
 
@@ -758,7 +772,7 @@ fn unsubscribe_block_and_the_screener() {
     mail.screen(0, true);
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 0);
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0), (Lane::NewSenders, 0)]);
     mail.end_search();
     assert_eq!(mail.ui.get_cloned().count, 2);
 }
@@ -1439,11 +1453,14 @@ fn wide_medium_and_narrow_windows() {
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "Receipts") && !t.iter().any(|x| x == "≡"), "{t:?}");
 
-    // Medium: the places fold to short names; ≡ shows them in full, Escape folds them.
+    // Medium: the places fold to icons (the person's own folders to short
+    // names); ≡ shows them in full, Escape folds them.
     mail.set_size(em(1000.0), 800.0);
     app.tick();
     let t = texts(&app);
-    assert!(t.iter().any(|x| x == "≡") && t.iter().any(|x| x == "Re") && !t.iter().any(|x| x == "Receipts"), "{t:?}");
+    let tray = atrium_mail::view::rail_icon(mail_store::Role::Inbox).unwrap().to_string();
+    assert!(t.iter().any(|x| x == "≡") && t.iter().any(|x| x == "Re") && t.contains(&tray) && !t.iter().any(|x| x == "In" || x == "Receipts"), "{t:?}");
+    assert_eq!(atrium_mail::view::rail_icon(mail_store::Role::Other), None);
     mail.toggle_side();
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "Receipts"));
@@ -1479,4 +1496,56 @@ fn wide_medium_and_narrow_windows() {
     mail.toggle_side();
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "Receipts"));
+}
+
+#[test]
+fn files_across_mail() {
+    use atrium_mail::view::Lane;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let with_file = |id: &str, from: &str, subject: &str, extra: &str, name: &str, t: &str| {
+        format!("From: {from}\r\nTo: priya@example.org\r\nSubject: {subject}\r\nDate: Mon, 23 Nov 2026 {t} +0000\r\nMessage-ID: <{id}>\r\n{extra}MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename={name}\r\n\r\n%PDF-1.7 a small one\r\n--B--\r\n").into_bytes()
+    };
+    let plan = with_file("p1@acme.example", "Arun <arun@acme.example>", "Plan", "", "plan.pdf", "08:00:00");
+    let reply = "From: Arun <arun@acme.example>\r\nTo: priya@example.org\r\nSubject: Re: Plan\r\nDate: Mon, 23 Nov 2026 09:00:00 +0000\r\nMessage-ID: <p2@acme.example>\r\nIn-Reply-To: <p1@acme.example>\r\nReferences: <p1@acme.example>\r\n\r\nDid you read it?\r\n".as_bytes().to_vec();
+    let photo = with_file("l1@x.example", "Lena <lena@x.example>", "Photos", "", "beach.pdf", "07:00:00");
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let f = |uid, bytes: Vec<u8>, seen: bool| Fetched { uid, flags: if seen { vec!["\\Seen".into()] } else { vec![] }, size: bytes.len() as u64, internal_date: Some(NOW), server_id: None, bytes, full: true };
+        sink.messages("INBOX", vec![f(1, photo, true), f(2, plan, true), f(3, reply, false)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+
+    // The conversation's files at its top while their message is folded.
+    mail.open(0);
+    assert_eq!(mail.ui.get_cloned().reading.unwrap().msgs.len(), 2);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "1 file in this conversation: plan.pdf") && t.iter().any(|x| x == "Show them"), "{t:?}");
+    assert!(mail.palette_entries().iter().any(|e| e.label == "Show this conversation's files"));
+    mail.show_files();
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "plan.pdf") && !t.iter().any(|x| x == "Show them"), "{t:?}");
+
+    // Files from the sender: a search for them, each row its files.
+    let from = mail.palette_entries().into_iter().find(|e| e.label == "Files from Arun").expect("offered");
+    mail.run_cmd(from.cmd);
+    let s = mail.ui.get_cloned().search.unwrap();
+    assert_eq!(s.query, "from:arun@acme.example has:attachment");
+    assert_eq!(s.hits.iter().map(|h| (h.subject.as_str(), h.preview.as_str())).collect::<Vec<_>>(), [("Plan", "plan.pdf · 20 bytes")]);
+
+    // The Files view: every message with files, newest first.
+    assert!(mail.ui.get_cloned().views.iter().any(|(l, _)| *l == Lane::Files));
+    mail.show_view(Lane::Files);
+    let s = mail.ui.get_cloned().search.unwrap();
+    assert_eq!(s.hits.iter().map(|h| h.preview.as_str()).collect::<Vec<_>>(), ["plan.pdf · 20 bytes", "beach.pdf · 20 bytes"]);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "beach.pdf · 20 bytes"));
 }

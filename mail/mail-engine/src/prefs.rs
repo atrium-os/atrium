@@ -25,6 +25,8 @@ pub const DIGEST_DEFAULT: [u16; 2] = [9 * 60, 17 * 60];
 pub const DIGEST_MAX: usize = 6;
 /// Newline-separated addresses, lower case.
 const VIPS: &str = "vips";
+/// Where Report phishing also sends the message (the company's address).
+const REPORT_TO: &str = "phishing_report_to";
 const ALL: u32 = 0;
 /// Most VIPs kept.
 pub const VIPS_MAX: usize = 200;
@@ -56,11 +58,14 @@ pub struct Prefs {
     /// URL Defense or Mimecast opens through it. `None`: the persona's
     /// default, on for a named persona (Work), off for Personal.
     pub link_scanning: Option<bool>,
+    /// The company's address for phishing reports (§7.7): Report phishing
+    /// also sends the message there, attached as it arrived.
+    pub report_to: Option<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None, report_to: None }
     }
 }
 
@@ -113,6 +118,7 @@ impl Engine {
                 None => DIGEST_DEFAULT.to_vec(),
                 Some(v) => clean_times(v.split(',').filter_map(|t| t.trim().parse().ok())),
             },
+            report_to: s.sync_state(ALL, REPORT_TO).ok().flatten(),
             vips: s.sync_state(ALL, VIPS).ok().flatten().map(|v| v.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
         }
     }
@@ -122,6 +128,7 @@ impl Engine {
         vips.sort();
         vips.dedup();
         vips.truncate(VIPS_MAX);
+        let report_to = p.report_to.as_deref().and_then(report_address);
         let quiet = p.quiet.filter(|(f, t)| *f < 1440 && *t < 1440).map(|(f, t)| f as u64 * 10_000 + t as u64 + 1);
         self.store.write(|w| {
             w.set_setting(ALL, NOTIFY_OFF, (!p.notify).then_some(1))?;
@@ -136,10 +143,19 @@ impl Engine {
             let times = clean_times(p.digest.iter().copied());
             let digest = if times == DIGEST_DEFAULT { None } else if times.is_empty() { Some("-".to_string()) } else { Some(times.iter().map(u16::to_string).collect::<Vec<_>>().join(",")) };
             w.set_sync_state(ALL, DIGEST, digest.as_deref())?;
+            w.set_sync_state(ALL, REPORT_TO, report_to.as_deref())?;
             w.set_sync_state(ALL, VIPS, (!vips.is_empty()).then(|| vips.join("\n")).as_deref())
         })?;
         Ok(())
     }
+}
+
+/// A report address as kept: trimmed, lower case, one address; `None` for
+/// anything else (an empty field turns reports off).
+pub fn report_address(a: &str) -> Option<String> {
+    let a = a.trim().to_ascii_lowercase();
+    let (local, domain) = a.split_once('@')?;
+    (!local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && a.len() <= 320 && !a.contains(|c: char| c.is_whitespace() || c.is_control() || "<>,;\"".contains(c)) && !domain.contains('@')).then_some(a)
 }
 
 /// Times of day kept: valid, ascending, each once, at most [`DIGEST_MAX`].
@@ -179,5 +195,13 @@ mod tests {
         assert!(!e.prefs().keeps_scanning(true));
         e.set_prefs(&Prefs { link_scanning: Some(true), ..e.prefs() }).unwrap();
         assert!(e.prefs().keeps_scanning(false));
+        // The report address: one address, kept lower case; anything else none.
+        e.set_prefs(&Prefs { report_to: Some(" Phish@Acme.example ".into()), ..e.prefs() }).unwrap();
+        assert_eq!(e.prefs().report_to.as_deref(), Some("phish@acme.example"));
+        for bad in ["", "phish", "a@b", "a@b.example, c@d.example", "a@b.example\r\nBcc: x@y.example"] {
+            assert_eq!(report_address(bad), None, "{bad}");
+        }
+        e.set_prefs(&Prefs { report_to: Some("".into()), ..e.prefs() }).unwrap();
+        assert_eq!(e.prefs().report_to, None);
     }
 }

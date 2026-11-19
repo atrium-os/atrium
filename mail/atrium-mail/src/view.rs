@@ -69,6 +69,8 @@ pub struct Place {
     /// Shown above an account's first folder when there is more than one.
     pub account: Option<String>,
     pub count: usize,
+    /// What the folder is for: the folded sidebar draws it as an icon.
+    pub role: Role,
 }
 
 /// One row of the list: a conversation or a message.
@@ -157,6 +159,8 @@ pub struct Msg {
     /// "First message from this address", or "Looks like example.com, but
     /// is examp1e.com" (§7.5), and whether it warns.
     pub who: Option<(String, bool)>,
+    /// Its files by name, from the index (the whole message need not be here).
+    pub files: Vec<String>,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -209,6 +213,8 @@ pub struct Undo {
     pub send: Option<u64>,
     /// Later items dropped after 30 days overdue (Undo brings them back).
     pub later: Vec<u64>,
+    /// A phishing report waiting in the outbox (Undo takes it back, unsent).
+    pub report: Option<u64>,
     /// "Message archived", "Conversation deleted".
     pub label: String,
     pub until: i64,
@@ -335,6 +341,8 @@ pub enum Lane {
     Newsletters,
     NewSenders,
     ScreenedOut,
+    /// Every message with files, each row its files (§8.1).
+    Files,
 }
 
 impl Lane {
@@ -347,6 +355,7 @@ impl Lane {
             Lane::Newsletters => "Newsletters",
             Lane::NewSenders => "New senders",
             Lane::ScreenedOut => "Screened out",
+            Lane::Files => "Files",
         }
     }
 }
@@ -878,6 +887,7 @@ impl Mail {
                     label: crate::folder_label(&f.name, f.role),
                     account: (many && first).then(|| a.name.clone()),
                     count: store.count(fid).unwrap_or(0),
+                    role: f.role,
                 });
                 first = false;
             }
@@ -908,7 +918,7 @@ impl Mail {
         match self.engine.later_drop_stale(now) {
             Ok(ids) if !ids.is_empty() => {
                 let label = if ids.len() == 1 { "1 item 30 days overdue dropped".to_string() } else { format!("{} items 30 days overdue dropped", ids.len()) };
-                ui.undo = Some(Undo { ops: Vec::new(), send: None, later: ids, label, until: now + mail_engine::UNDO_SECS });
+                ui.undo = Some(Undo { ops: Vec::new(), send: None, later: ids, report: None, label, until: now + mail_engine::UNDO_SECS });
             }
             Ok(_) => {}
             Err(e) => eprintln!("atrium-mail: Later: {e}"),
@@ -1054,6 +1064,7 @@ impl Mail {
             lane: self.engine.lane_of(msg).ok(),
             came_to: self.engine.came_to(msg),
             who: self.engine.sender_note(msg).ok().flatten().and_then(|n| who_line(&n, !m.held.is_empty())),
+            files: mail_engine::files::files_of(s).into_iter().map(|f| f.0).collect(),
         }
     }
 
@@ -1166,6 +1177,21 @@ impl Mail {
                 }
             }
         });
+    }
+
+    /// Open every folded message in the conversation that has files, so
+    /// their strips show (§8.1, "all files in a thread").
+    pub fn show_files(&self) {
+        let ks: Vec<usize> = self.ui.get_cloned().reading.map(|r| r.msgs.iter().enumerate().filter(|(_, m)| !m.open && !m.files.is_empty()).map(|(k, _)| k).collect()).unwrap_or_default();
+        for k in ks {
+            self.toggle(k);
+        }
+    }
+
+    /// Files from the open message's sender, across mail (§8.1).
+    pub fn files_from_sender(&self) {
+        let Some(from) = self.ui.get_cloned().reading.and_then(|r| r.current().or(r.msgs.last()).map(|m| m.from.clone())).filter(|f| !f.is_empty()) else { return };
+        self.search_for(&format!("from:{from} has:attachment"), None);
     }
 
     /// Show message `k`'s HTML body in the doc-viewer.
@@ -1444,7 +1470,7 @@ impl Mail {
         match r {
             Ok(ops) if !ops.is_empty() => {
                 let n = ops.len();
-                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: format!("Rule kept; {n} message{} {}", if n == 1 { "" } else { "s" }, match rule.then {
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), report: None, label: format!("Rule kept; {n} message{} {}", if n == 1 { "" } else { "s" }, match rule.then {
                     mail_engine::rules::Then::Move(_) => "moved",
                     mail_engine::rules::Then::Flag => "flagged",
                     _ => "marked read",
@@ -1485,9 +1511,23 @@ impl Mail {
             _ => "changed",
         };
         let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
+        let msgs: Vec<MsgId> = r.msgs.iter().filter(|m| m.here.is_some()).map(|m| m.msg).collect();
         match self.engine.act(folder, &uids, action) {
             Ok(ops) if !ops.is_empty() => {
-                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
+                let mut label = format!("{what} {label}");
+                // In Work, to the company's report address too (§7.7).
+                let mut report = None;
+                if let (mail_engine::Action::Phishing, Some(to)) = (action, self.engine.prefs().report_to) {
+                    match self.engine.report_phishing(&msgs, &to) {
+                        Ok(Some(id)) => {
+                            report = Some(id);
+                            label = format!("{label} and sent to {to}");
+                        }
+                        Ok(None) => ui.error = Some(format!("Not sent to {to}: only its headers are here")),
+                        Err(e) => ui.error = Some(format!("Couldn't send it to {to}: {e}")),
+                    }
+                }
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), report, label, until: (self.now)() + mail_engine::UNDO_SECS });
             }
             Ok(_) => return,
             Err(e) => {
@@ -1597,7 +1637,7 @@ impl Mail {
             out.push((Lane::Dropped, dropped));
         }
         if !accounts.is_empty() {
-            out.extend([(Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0)]);
+            out.extend([(Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0)]);
         }
         let (mut new, mut refused, mut on) = (0, 0, false);
         for a in accounts {
@@ -1650,10 +1690,13 @@ impl Mail {
                 Some(h)
             }).collect();
         }
+        if lane == Lane::Files {
+            return e.search(&mail_engine::search::parse("has:attachment", false)).unwrap_or_default();
+        }
         let mut ids = Vec::new();
         for (a, _) in e.store.accounts().unwrap_or_default() {
             match lane {
-                Lane::Later | Lane::Dropped => {}
+                Lane::Later | Lane::Dropped | Lane::Files => {}
                 Lane::People => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::People, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Updates => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Updates, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Newsletters => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Newsletters, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
@@ -2283,6 +2326,12 @@ impl Mail {
         if let Err(e) = self.engine.undo(&u.ops) {
             ui.error = Some(format!("Couldn't undo: {e}"));
         }
+        if let Some(id) = u.report {
+            // Taken back and dropped: nothing to compose.
+            if let Err(e) = self.engine.undo_send(id) {
+                ui.error = Some(format!("Couldn't undo: {e}"));
+            }
+        }
         for id in &u.later {
             if let Err(e) = self.engine.later_undrop(*id) {
                 ui.error = Some(format!("Couldn't undo: {e}"));
@@ -2351,7 +2400,7 @@ impl Mail {
         match self.engine.notification_action(msg, action) {
             Ok(Acted::Done { ops, label }) => {
                 let mut ui = self.ui.get_cloned();
-                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: label.into(), until: (self.now)() + mail_engine::UNDO_SECS });
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), report: None, label: label.into(), until: (self.now)() + mail_engine::UNDO_SECS });
                 // The one being read leaves the reader once archived.
                 if action == "archive" && ui.reading.as_ref().is_some_and(|r| r.msgs.iter().any(|m| m.msg == msg)) {
                     ui.reading = None;
@@ -2401,7 +2450,7 @@ impl Mail {
     /// window.
     pub fn sent(&self, send: u64, label: String) {
         let mut ui = self.ui.get_cloned();
-        ui.undo = Some(Undo { ops: Vec::new(), send: Some(send), later: Vec::new(), label, until: (self.now)() + mail_engine::send::UNDO_SEND_SECS });
+        ui.undo = Some(Undo { ops: Vec::new(), send: Some(send), later: Vec::new(), report: None, label, until: (self.now)() + mail_engine::send::UNDO_SEND_SECS });
         self.ui.set(ui);
     }
 
@@ -2757,6 +2806,13 @@ impl Mail {
             add("Reply".into(), "r", Cmd::Reply);
             add("Reply all".into(), "a", Cmd::ReplyAll);
             add("Forward".into(), "f", Cmd::Forward);
+            if let Some(m) = r.current().or(r.msgs.last()).filter(|m| !m.from.is_empty()) {
+                let who = if m.sender.name.is_empty() { m.from.clone() } else { m.sender.name.clone() };
+                add(format!("Files from {who}"), "", Cmd::FilesFrom);
+            }
+            if r.msgs.len() > 1 && r.msgs.iter().any(|m| !m.open && !m.files.is_empty()) {
+                add("Show this conversation's files".into(), "", Cmd::ShowFiles);
+            }
             if r.folder.is_some() {
                 add("Archive".into(), "e", Cmd::Archive);
                 add("Delete".into(), "#", Cmd::Delete);
@@ -2870,6 +2926,8 @@ impl Mail {
             Cmd::Delete => self.act(mail_engine::Action::Delete),
             Cmd::Junk => self.junk(),
             Cmd::Phishing => self.act(mail_engine::Action::Phishing),
+            Cmd::FilesFrom => self.files_from_sender(),
+            Cmd::ShowFiles => self.show_files(),
             Cmd::Later => self.ask_later(),
             Cmd::Done => {
                 self.later_done();
@@ -2961,6 +3019,9 @@ pub enum Item {
     CardLine(usize, usize),
     /// The conversation's Later item: what for, when, Done (§11.4).
     Later,
+    /// "3 files in this conversation: …" and Show them (§8.1), when some
+    /// are in folded messages.
+    Files,
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
     /// Quick look, Open, Save (§8.1).
     File { msg: usize, i: usize },
@@ -2972,6 +3033,10 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
     let mut out = Vec::new();
     if r.later.is_some() || r.dropped.is_some() {
         out.push(Item::Later);
+        out.push(Item::Gap);
+    }
+    if r.msgs.len() > 1 && r.msgs.iter().any(|m| !m.open && !m.files.is_empty()) {
+        out.push(Item::Files);
         out.push(Item::Gap);
     }
     let first_new = r.msgs.iter().position(|m| m.new).filter(|&k| k > 0);
@@ -3266,6 +3331,24 @@ impl View for MailView {
 
 /// A place's short name on the folded sidebar: its first two letters
 /// ("In", "Se"), or its initials when it has words ("Saved Mail": "SM").
+/// A folder's icon on the folded sidebar: the kinds every account has get
+/// one; the person's own folders keep their short name (two folders with
+/// the same icon couldn't be told apart).
+pub fn rail_icon(role: Role) -> Option<char> {
+    use crate::files::ph;
+    Some(match role {
+        Role::Inbox => ph::TRAY,
+        Role::Sent => ph::PAPER_PLANE_TILT,
+        Role::Drafts => ph::NOTE_PENCIL,
+        Role::Archive => ph::ARCHIVE,
+        Role::Junk => ph::WARNING_OCTAGON,
+        Role::Trash => ph::TRASH_SIMPLE,
+        Role::All => ph::STACK_SIMPLE,
+        Role::Flagged => ph::STAR,
+        Role::Other => return None,
+    })
+}
+
 pub fn short_name(label: &str) -> String {
     let words: Vec<&str> = label.split_whitespace().collect();
     if words.len() >= 2 {
@@ -3278,7 +3361,8 @@ pub fn short_name(label: &str) -> String {
 
 impl MailView {
     /// The folded sidebar (§15.4): ≡ for the places in full, Write, Search,
-    /// then each place by its short name, unread ones marked.
+    /// then each place by its icon (or its short name for the person's own
+    /// folders), unread ones marked.
     fn rail(&self, ctx: &mut Ctx, ui: &Ui, w: f32, h: f32) {
         let t = ctx.theme;
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
@@ -3306,7 +3390,16 @@ impl MailView {
             }
             let sel = ui.folder == Some(p.folder) && ui.search.is_none();
             let (m, f) = (self.mail.clone(), p.folder);
-            button(ctx, y, &short_name(&p.label), Color::TRANSPARENT, if sel { t.text_primary() } else { t.text_secondary() }, sel, Box::new(move || m.choose_folder(f)));
+            let color = if sel { t.text_primary() } else { t.text_secondary() };
+            match rail_icon(p.role) {
+                Some(g) => {
+                    area(ctx, Rect::new(bx, y, b, b), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.choose_folder(f));
+                    let gs = pergola::theme::icon::MD;
+                    pergola::widgets::Glyph::new(g).size(gs).color(color).at(bx + (b - em(gs)) / 2.0, y + b / 2.0 - em(gs) * 0.75).emit(ctx);
+                    ctx.pop();
+                }
+                None => button(ctx, y, &short_name(&p.label), Color::TRANSPARENT, color, sel, Box::new(move || m.choose_folder(f))),
+            }
             if p.count > 0 {
                 ctx.add(Node::Rect { rect: Rect::new(bx + b - em(9.0), y + em(3.0), em(6.0), em(6.0)), fill: t.accent_fg(), radius: em(3.0) });
             }
@@ -3615,6 +3708,7 @@ impl MailView {
                         Lane::Newsletters => "No newsletters",
                         Lane::NewSenders => "No one new is waiting",
                         Lane::ScreenedOut => "Nothing screened out",
+                        Lane::Files => "No files in your mail",
                     };
                     text(ctx, x0 + 16.0, top + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
                 }
@@ -4153,6 +4247,21 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::Note(l) => {
             text(ctx, x, cy, l, type_size::SM, Weight::Regular, t.text_secondary());
+        }
+        Item::Files => {
+            let names: Vec<&str> = s.msgs.iter().flat_map(|m| m.files.iter().map(String::as_str)).collect();
+            let label = format!("{} in this conversation: {}", if names.len() == 1 { "1 file".to_string() } else { format!("{} files", names.len()) }, names.join(", "));
+            let b = "Show them";
+            let bw = width(b, type_size::XS, Weight::Medium) + em(18.0);
+            let label = fit(&label, type_size::XS, Weight::Medium, (tw - bw - em(12.0)).max(em(60.0)));
+            pergola::widgets::Glyph::new(crate::files::ph::PAPERCLIP).size(type_size::SM).color(t.text_secondary()).at(x, cy - em(type_size::SM) * 0.75).emit(ctx);
+            let lx = x + em(20.0);
+            text(ctx, lx, cy, &label, type_size::XS, Weight::Medium, t.text_secondary());
+            let bx = lx + width(&label, type_size::XS, Weight::Medium) + em(12.0);
+            let m = mail.clone();
+            area(ctx, Rect::new(bx, cy - em(11.0), bw, em(22.0)), t.bg_window(), move || m.show_files());
+            text(ctx, bx + em(9.0), cy, b, type_size::XS, Weight::Medium, t.text_primary());
+            ctx.pop();
         }
         Item::Later => {
             let now = (mail.now)();

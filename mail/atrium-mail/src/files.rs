@@ -50,6 +50,13 @@ pub mod ph {
     pub const PRESENTATION: char = '\u{e654}';
     pub const ENVELOPE: char = '\u{e214}';
     pub const WARNING: char = '\u{e4e0}';
+    pub const TRAY: char = '\u{e4aa}';
+    pub const PAPER_PLANE_TILT: char = '\u{e398}';
+    pub const NOTE_PENCIL: char = '\u{e34c}';
+    pub const ARCHIVE: char = '\u{e00c}';
+    pub const WARNING_OCTAGON: char = '\u{e4e4}';
+    pub const STAR: char = '\u{e46a}';
+    pub const PAPERCLIP: char = '\u{e39a}';
 }
 
 /// The pictures the document worker decodes.
@@ -57,12 +64,7 @@ const PICTURES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"
 
 /// "12 bytes", "3 KB", "1.4 MB".
 pub fn size_words(n: u64) -> String {
-    match n {
-        0..=999 => format!("{n} bytes"),
-        1_000..=999_999 => format!("{} KB", (n + 500) / 1000),
-        1_000_000..=9_999_999 => format!("{:.1} MB", n as f64 / 1e6),
-        _ => format!("{} MB", (n + 500_000) / 1_000_000),
-    }
+    mail_engine::files::size_words(n)
 }
 
 fn icon(d: &Detected, mime: Option<&str>) -> char {
