@@ -298,6 +298,8 @@ pub struct Sheets {
     pub link_text: Mutable<TextEdit>,
     /// The exact-size bar: sheet, rows (else columns), first and last.
     pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
+    /// The Paste Special bar, open with its choices.
+    pub paste_bar: Mutable<Option<officina_grid::clip::Special>>,
     pub size_text: Mutable<TextEdit>,
     pub list: Mutable<ListPanel>,
     pub valid: Mutable<crate::validation::Panel>,
@@ -315,7 +317,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -829,6 +831,7 @@ impl Sheets {
         let sh = d.wb.sheet(d.sheet);
         let now = if rows { sh.row_sizes.size(g.cursor.0) } else { sh.col_sizes.size(g.cursor.1) };
         let s = d.sheet;
+        d.status = format!("{} px is {} in Excel. Type px, or a size with pt{}.", now.round(), excel_size(now.round(), rows), if rows { "" } else { " or ch (characters)" });
         drop(d);
         self.renaming.set(false);
         self.coloring.set(false);
@@ -1066,7 +1069,7 @@ impl Sheets {
                 let typed = self.size_text.get_cloned().text().trim().to_string();
                 let most = if rows { MAX_ROW_PX } else { MAX_COL_PX };
                 let mut d = self.doc.borrow_mut();
-                match typed.parse::<f64>() {
+                match typed_px(&typed, rows).ok_or(()) {
                     // A row 0 high is a hidden row, as Hide Rows makes it.
                     Ok(px) if rows && px == 0.0 && s == d.sheet => {
                         crate::data::run(&mut d, pergola::widgets::CellRange { r0: lo, c0: 0, r1: hi, c1: 0 }, (lo, 0), crate::data::DataCmd::HideRows);
@@ -1076,7 +1079,7 @@ impl Sheets {
                         d.size_done();
                     }
                     _ => {
-                        d.status = format!("Type a size from 0 to {most} pixels (0 hides).");
+                        d.status = format!("Type a size from 0 to {most} px (0 hides), or with pt{}.", if rows { "" } else { " or ch" });
                         drop(d);
                         self.changed();
                         return;
@@ -1084,6 +1087,38 @@ impl Sheets {
                 }
                 drop(d);
                 self.size_bar.set(None);
+                self.changed();
+            }
+            TabCmd::PasteWhat(_) | TabCmd::PasteOp(_) | TabCmd::PasteSkip | TabCmd::PasteTurn => {
+                use officina_grid::clip::{Arith, What};
+                let Some(mut sp) = self.paste_bar.get() else { return };
+                match c {
+                    TabCmd::PasteWhat(i) => sp.what = [What::All, What::Values, What::Formulas, What::Formats, What::Comments][(i as usize).min(4)],
+                    TabCmd::PasteOp(i) => sp.arith = [None, Some(Arith::Add), Some(Arith::Sub), Some(Arith::Mul), Some(Arith::Div)][(i as usize).min(4)],
+                    TabCmd::PasteSkip => sp.skip_blanks = !sp.skip_blanks,
+                    _ => sp.transpose = !sp.transpose,
+                }
+                self.paste_bar.set(Some(sp));
+                self.changed();
+            }
+            TabCmd::PasteDone => {
+                let Some(sp) = self.paste_bar.get() else { return };
+                let sel = self.grid.get_cloned().selection();
+                let mut d = self.doc.borrow_mut();
+                match crate::data::paste_with(&mut d, sel, sp, "Paste Special") {
+                    Ok(s) => {
+                        d.status = s;
+                        drop(d);
+                        self.paste_bar.set(None);
+                    }
+                    // The bar stays open to change a choice.
+                    Err(e) => d.status = e,
+                }
+                self.rev.set(self.rev.get().wrapping_add(1));
+                self.changed();
+            }
+            TabCmd::PasteCancel => {
+                self.paste_bar.set(None);
                 self.changed();
             }
             TabCmd::SizeCancel => {
@@ -1187,11 +1222,41 @@ impl Sheets {
             Button::secondary("Cancel").at(234.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::LinkCancel)).render(ctx);
             return;
         }
+        if let Some(sp) = self.paste_bar.get() {
+            use officina_grid::clip::{Arith, What};
+            let st = crate::tabs::style(t.text_primary(), true);
+            let mut x = 12.0;
+            ctx.add(Node::Text { rect: Rect::new(x, y + 6.0, 44.0, 18.0), content: "Paste".into(), style: st.clone() });
+            x += 46.0;
+            let chip = |ctx: &mut Ctx, label: &str, on: bool, x: f32, w: f32, c: TabCmd| {
+                let b = if on { Button::primary(label) } else { Button::secondary(label) };
+                b.at(x, y + 2.0).width(w).on_click(push(c)).render(ctx);
+            };
+            for (i, (label, what)) in [("All", What::All), ("Values", What::Values), ("Formulas", What::Formulas), ("Formats", What::Formats), ("Comments", What::Comments)].into_iter().enumerate() {
+                let w = 12.0 + 7.0 * label.len() as f32;
+                chip(ctx, label, sp.what == what, x, w, TabCmd::PasteWhat(i as u8));
+                x += w + 4.0;
+            }
+            x += 10.0;
+            for (i, (label, op)) in [("None", None), ("+", Some(Arith::Add)), ("−", Some(Arith::Sub)), ("×", Some(Arith::Mul)), ("÷", Some(Arith::Div))].into_iter().enumerate() {
+                let w = if i == 0 { 48.0 } else { 28.0 };
+                chip(ctx, label, sp.arith == op, x, w, TabCmd::PasteOp(i as u8));
+                x += w + 4.0;
+            }
+            x += 10.0;
+            chip(ctx, "Skip blanks", sp.skip_blanks, x, 92.0, TabCmd::PasteSkip);
+            x += 96.0;
+            chip(ctx, "Transpose", sp.transpose, x, 84.0, TabCmd::PasteTurn);
+            x += 98.0;
+            Button::primary("Paste").at(x, y + 2.0).width(64.0).on_click(push(TabCmd::PasteDone)).render(ctx);
+            Button::secondary("Cancel").at(x + 70.0, y + 2.0).width(64.0).on_click(push(TabCmd::PasteCancel)).render(ctx);
+            return;
+        }
         if let Some((_, rows, lo, hi)) = self.size_bar.get() {
             let st = crate::tabs::style(t.text_primary(), true);
             let name = |i: u32| if rows { (i + 1).to_string() } else { officina_grid::addr::col_name(i) };
             let span = if lo == hi { name(lo) } else { format!("{}–{}", name(lo), name(hi)) };
-            let label = if rows { format!("Height of row {span} (px)") } else { format!("Width of column {span} (px)") };
+            let label = if rows { format!("Height of row {span}") } else { format!("Width of column {span}") };
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 200.0, 18.0), content: label, style: st });
             let cmds = self.cmds.clone();
             TextField::new(self.size_text.clone()).autofocus(true).at(216.0, y + 2.0).width(90.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SizeDone))).render(ctx);
@@ -1343,6 +1408,33 @@ pub const MAX_SIZED: u32 = 16_384;
 /// 409 pt and 255 characters, roughly).
 pub const MAX_ROW_PX: f64 = 545.0;
 pub const MAX_COL_PX: f64 = 1790.0;
+
+/// A size typed in the size bar, in px: plain or `px`, `pt` (points, as
+/// Excel gives row heights: 0.75 pt a px), or for columns `ch` (Excel's
+/// characters of the default font: 7 px each and 5 px of padding).
+pub fn typed_px(text: &str, rows: bool) -> Option<f64> {
+    let t = text.trim().to_ascii_lowercase();
+    let (num, unit) = match t.find(|c: char| c.is_ascii_alphabetic()) {
+        Some(i) => (t[..i].trim(), t[i..].trim()),
+        None => (t.as_str(), ""),
+    };
+    let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0)?;
+    match unit {
+        "" | "px" => Some(n),
+        "pt" => Some(n / 0.75),
+        "ch" if !rows => Some(if n == 0.0 { 0.0 } else { n * 7.0 + 5.0 }),
+        _ => None,
+    }
+}
+
+/// `px` as Excel would give it: a row's height in points, a column's
+/// width in characters.
+pub fn excel_size(px: f64, rows: bool) -> String {
+    let v = if rows { px * 0.75 } else { ((px - 5.0) / 7.0).max(0.0) };
+    let s = format!("{:.2}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if rows { format!("{s} pt") } else { format!("{s} ch") }
+}
 
 /// The columns (`rows` false) or rows an edge of `i` sizes: the selected
 /// whole columns (rows) when `i` is one of them, else `i` alone.
@@ -1551,7 +1643,17 @@ impl View for Sheets {
         } else {
             status
         };
-        ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+        // Whether the editor is entering or editing, at the right, as Excel's
+        // status bar shows it (F2 switches).
+        let mode = self.grid.get_cloned().edit_mode().map(|m| match m {
+            pergola::widgets::EditMode::Enter => "Enter",
+            pergola::widgets::EditMode::Edit => "Edit",
+        });
+        let room = if mode.is_some() { 72.0 } else { 0.0 };
+        ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0 - room).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+        if let Some(m) = mode {
+            ctx.add(Node::Text { rect: Rect::new((w - 12.0 - 60.0).max(0.0), sy + 4.0, 60.0, 18.0), content: m.into(), style: st(type_size::XS, Weight::Semibold, t.text_primary()) });
+        }
 
         // The password bar, over the formula bar and the grid's top.
         let pb = self.password.get_cloned();
@@ -2133,6 +2235,16 @@ impl Sheets {
                 }
                 Cmd::Data(crate::data::DataCmd::Link) => {
                     self.tab_cmd(crate::tabs::TabCmd::Linking);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::PasteSpecial) => {
+                    self.size_bar.set(None);
+                    self.renaming.set(false);
+                    self.coloring.set(false);
+                    self.commenting.set(None);
+                    self.linking.set(None);
+                    self.paste_bar.set(Some(officina_grid::clip::Special::of(officina_grid::clip::What::All)));
+                    self.changed();
                     false
                 }
                 Cmd::Data(c @ (crate::data::DataCmd::RowHeight | crate::data::DataCmd::ColWidth)) => {
@@ -2914,6 +3026,45 @@ mod tests {
     }
 
     #[test]
+    fn the_paste_special_bar_pastes_its_choices_together() {
+        use crate::tabs::TabCmd;
+        let (d, _) = Doc::from_csv("t.csv", b"1,10\n2,20\n").unwrap();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        // A1:A2 copied; pasted onto B1 as values, added, turned: B1 11, C1 22.
+        s.doc.borrow_mut().take_clip(officina_grid::addr::Rect { sheet: 0, r0: 0, c0: 0, r1: 1, c1: 0 }, false, "1\n2".into());
+        let mut g = grid.get_cloned();
+        g.select(0, 1);
+        grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::PasteSpecial));
+        assert_eq!(s.paste_bar.get().map(|p| p.what), Some(officina_grid::clip::What::All));
+        for c in [TabCmd::PasteWhat(1), TabCmd::PasteOp(1), TabCmd::PasteTurn] {
+            run(Cmd::Tab(c));
+        }
+        run(Cmd::Tab(TabCmd::PasteDone));
+        assert!(s.paste_bar.get().is_none(), "{}", s.doc.borrow().status);
+        let v = |r, c| s.doc.borrow().wb.value(0, r, c).display();
+        assert_eq!((v(0, 1), v(0, 2), v(1, 1)), ("11".to_string(), "2".to_string(), "20".to_string()));
+        assert_eq!(s.doc.borrow().status, "Paste Special: done.");
+        // One undo step.
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(v(0, 1), "10");
+        // A refusal keeps the bar open: formats can't be added.
+        run(Cmd::Data(crate::data::DataCmd::PasteSpecial));
+        run(Cmd::Tab(TabCmd::PasteWhat(3)));
+        run(Cmd::Tab(TabCmd::PasteOp(2)));
+        run(Cmd::Tab(TabCmd::PasteDone));
+        assert!(s.paste_bar.get().is_some());
+        assert_eq!(s.doc.borrow().status, "Formats can't be added or multiplied.");
+        run(Cmd::Tab(TabCmd::PasteCancel));
+        assert!(s.paste_bar.get().is_none());
+    }
+
+    #[test]
     fn the_size_bar_sets_exact_heights_and_widths() {
         use crate::tabs::TabCmd;
         let (d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
@@ -2952,6 +3103,22 @@ mod tests {
         s.size_text.set(TextEdit::new("0"));
         run(Cmd::Tab(TabCmd::SizeDone));
         assert!(s.doc.borrow().wb.sheet(0).row_hidden(0));
+        // Excel's units: points for rows, characters for columns.
+        let mut g = grid.get_cloned();
+        g.select(1, 1);
+        g.cursor = (1, 2);
+        grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::RowHeight));
+        assert_eq!(s.doc.borrow().status, "20 px is 15 pt in Excel. Type px, or a size with pt.");
+        s.size_text.set(TextEdit::new("30 pt"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert_eq!(s.doc.borrow().wb.sheet(0).row_sizes.size(1), 40.0);
+        run(Cmd::Data(crate::data::DataCmd::ColWidth));
+        assert!(s.doc.borrow().status.starts_with("64 px is 8.43 ch in Excel"), "{}", s.doc.borrow().status);
+        s.size_text.set(TextEdit::new("10ch"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert_eq!(width(2), 75.0);
+        assert_eq!((typed_px("12 ch", true), typed_px("1.5in", false), typed_px("-3", false)), (None, None, None));
     }
 
     #[test]

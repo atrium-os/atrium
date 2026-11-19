@@ -473,7 +473,22 @@ pub struct GridState {
     pub picked: Option<u64>,
 }
 
+/// What the arrow keys do in the open editor ([`GridState::edit_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditMode {
+    /// Arrows finish the entry and move.
+    Enter,
+    /// Arrows move the caret.
+    Edit,
+}
+
 impl GridState {
+    /// While the editor is open: whether it is entering (started by typing:
+    /// arrows finish the entry, Excel's "Enter") or editing (arrows move the
+    /// caret, Excel's "Edit"). None when it is closed.
+    pub fn edit_mode(&self) -> Option<EditMode> {
+        self.edit.as_ref().map(|_| if self.entering { EditMode::Enter } else { EditMode::Edit })
+    }
     pub fn selection(&self) -> CellRange {
         CellRange::of(self.anchor, self.cursor)
     }
@@ -3160,11 +3175,14 @@ mod tests {
         assert_eq!(state.get_cloned().cursor, (1, 2));
         // Typed, F2, Left: the caret moves instead.
         key(&mut app, Key::Char, "cd", none);
+        assert_eq!(state.get_cloned().edit_mode(), Some(EditMode::Enter));
         key(&mut app, Key::F(2), "", none);
+        assert_eq!(state.get_cloned().edit_mode(), Some(EditMode::Edit));
         key(&mut app, Key::Left, "", none);
         let g = state.get_cloned();
         assert_eq!((g.cursor, g.edit.as_ref().map(|e| e.caret())), ((1, 2), Some(1)));
         key(&mut app, Key::Escape, "", none);
+        assert_eq!(state.get_cloned().edit_mode(), None);
         // F2 on a cell: its text, editing in place.
         grid.cells.borrow_mut().insert((1, 2), "=A1".into());
         key(&mut app, Key::F(2), "", none);

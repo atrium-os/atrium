@@ -51,6 +51,9 @@ pub enum DataCmd {
     PasteDivide,
     /// The copied cells, blank ones leaving what is under them.
     PasteSkipBlanks,
+    /// The Paste Special bar: what to paste, an operation, skipping blanks
+    /// and turning, together.
+    PasteSpecial,
     /// The bar for an exact height of the selection's rows, or width of
     /// its columns.
     RowHeight,
@@ -316,6 +319,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste and Subtract").enabled(special), Some(DataCmd::PasteSubtract)),
         (MenuItem::new("Paste and Multiply").enabled(special), Some(DataCmd::PasteMultiply)),
         (MenuItem::new("Paste and Divide").enabled(special), Some(DataCmd::PasteDivide)),
+        (MenuItem::new("Paste Special…").enabled(special), Some(DataCmd::PasteSpecial)),
         (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
@@ -434,6 +438,17 @@ pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid:
 }
 
 /// Runs `cmd`; says what happened (or why nothing did) in the status line.
+/// Paste the cells last copied here at the selection's top left, as `sp`
+/// says, as one undo step named `label`.
+pub fn paste_with(d: &mut Doc, sel: CellRange, sp: officina_grid::clip::Special, label: &str) -> Result<String, String> {
+    let Some((clip, _)) = d.clip.as_ref() else {
+        return Err("Copy some cells first.".into());
+    };
+    let (ops, _) = clip.paste_special(&d.wb, d.sheet, sel.r0, sel.c0, sp)?;
+    d.run(label, ops);
+    Ok(format!("{label}: done."))
+}
+
 pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
     // Sorting, filtering and pivots read values: finish recalculating first.
     if d.wb.recalc_pending() {
@@ -646,12 +661,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 DataCmd::PasteDivide => (math(Arith::Div), "Paste and Divide"),
                 _ => (Special { transpose: true, ..of(What::All) }, "Paste Transposed"),
             };
-            let Some((clip, _)) = d.clip.as_ref() else {
-                return Err("Copy some cells first.".into());
-            };
-            let (ops, _) = clip.paste_special(&d.wb, s, sel.r0, sel.c0, sp)?;
-            d.run(label, ops);
-            Ok(format!("{label}: done."))
+            paste_with(d, sel, sp, label)
         }
         DataCmd::CenterAcross => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -892,7 +902,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

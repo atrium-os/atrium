@@ -212,6 +212,8 @@ impl Clip {
                 }
             }
         }
+        // Copied formulas as they land, for arithmetic with them.
+        let pasted: std::collections::HashMap<(u32, u32), Arc<Expr>> = if arith.is_some() { exprs.iter().map(|(r, c, e)| ((*r, *c), e.clone())).collect() } else { Default::default() };
         // Copied formulas sharing a relative form stay one fill a column.
         crate::shift::fills_of(wb, exprs, &mut fills);
         values.sort_by_key(|v| (v.1, v.0));
@@ -265,31 +267,43 @@ impl Clip {
             }
         }
         if let (Some(op), true) = (arith, !matches!(what, What::Formats | What::Comments)) {
-            // Each copied number with the cell it lands on.
+            // Each copied number with the cell it lands on; a copied formula
+            // (pasting all or formulas) is combined with it as a formula, as
+            // Excel does: =(what was there)+(the copied formula).
+            let bop = match op {
+                Arith::Add => BinOp::Add,
+                Arith::Sub => BinOp::Sub,
+                Arith::Mul => BinOp::Mul,
+                Arith::Div => BinOp::Div,
+            };
             let mut cells = Vec::new();
             for (dr, dc, content) in &self.cells {
-                let n = match content {
-                    Content::Value(Value::Num(n)) | Content::Expr(_, Value::Num(n)) => *n,
+                let (r, c) = at(*dr, *dc);
+                let right = match content {
+                    Content::Expr(..) if what != What::Values => match pasted.get(&(r, c)) {
+                        Some(e) => Expr::Paren(Box::new((**e).clone())),
+                        None => continue,
+                    },
+                    Content::Value(Value::Num(n)) | Content::Expr(_, Value::Num(n)) => Expr::Num(*n),
                     _ => continue,
                 };
-                let (r, c) = at(*dr, *dc);
-                if let Some(g) = wb.group_at(sheet, r, c) {
-                    let bop = match op {
-                        Arith::Add => BinOp::Add,
-                        Arith::Sub => BinOp::Sub,
-                        Arith::Mul => BinOp::Mul,
-                        Arith::Div => BinOp::Div,
-                    };
-                    let e = Expr::Bin(bop, Box::new(Expr::Paren(Box::new((*wb.group(g).expr).clone()))), Box::new(Expr::Num(n)));
+                let left = match wb.group_at(sheet, r, c) {
+                    Some(g) => Some(Expr::Paren(Box::new((*wb.group(g).expr).clone()))),
+                    None => None,
+                };
+                let t = match (&left, wb.value(sheet, r, c)) {
+                    (Some(_), _) => 0.0,
+                    (None, Value::Empty) => 0.0,
+                    (None, Value::Num(t)) => t,
+                    _ => continue,
+                };
+                if left.is_some() || !matches!(right, Expr::Num(_)) {
+                    let e = Expr::Bin(bop, Box::new(left.unwrap_or(Expr::Num(t))), Box::new(right));
                     let src = crate::formula::to_a1(&e, r, c, &|id| wb.sheet_name(id));
                     cells.push((r, c, None, Some(Fill { col: c, r0: r, r1: r, src })));
                     continue;
                 }
-                let t = match wb.value(sheet, r, c) {
-                    Value::Empty => 0.0,
-                    Value::Num(t) => t,
-                    _ => continue,
-                };
+                let Expr::Num(n) = right else { continue };
                 let v = match op {
                     Arith::Add => Value::Num(t + n),
                     Arith::Sub => Value::Num(t - n),
@@ -757,6 +771,17 @@ mod tests {
         let (ops, _) = clip.paste_special(&wb, 0, 0, 3, sp(Some(Arith::Mul))).unwrap();
         run(&mut wb, ops);
         assert_eq!((shown(&wb, 0, 0, 3), shown(&wb, 0, 2, 3)), ("=(C2*2)*10".into(), "0".into()));
+        // Formulas pasted with arithmetic combine as formulas, moved as a
+        // copy moves them: onto 5, onto a formula, onto blank.
+        let one = Clip::take(&wb, rect(2, 0, 2, 0), false);
+        let fx = |arith| Special { arith, ..Special::of(What::Formulas) };
+        set(&mut wb, 2, 5, "5");
+        set(&mut wb, 2, 6, "=F3*2");
+        for (c, want) in [(5, "=5+(F1/2)"), (6, "=(F3*2)+(G1/2)"), (7, "=0+(H1/2)")] {
+            let (ops, _) = one.paste_special(&wb, 0, 2, c, fx(Some(Arith::Add))).unwrap();
+            run(&mut wb, ops);
+            assert_eq!(shown(&wb, 0, 2, c), want);
+        }
         // Divided by zero: #DIV/0!.
         set(&mut wb, 0, 4, "0");
         let clip0 = Clip::take(&wb, rect(0, 4, 0, 4), false);

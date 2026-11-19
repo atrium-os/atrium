@@ -18,6 +18,15 @@ const TAB_PAD: f32 = 24.0;
 /// A press on the strip or its rename bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabCmd {
+    /// The Paste Special bar: what to paste (0 all, 1 values, 2 formulas,
+    /// 3 formats, 4 comments), the operation (0 none, 1 add, 2 subtract,
+    /// 3 multiply, 4 divide), skipping blanks, turning; paste or close.
+    PasteWhat(u8),
+    PasteOp(u8),
+    PasteSkip,
+    PasteTurn,
+    PasteDone,
+    PasteCancel,
     /// Show this sheet.
     Go(u16),
     /// A new sheet at the end, shown.
