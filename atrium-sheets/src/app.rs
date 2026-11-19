@@ -85,6 +85,9 @@ pub enum Cmd {
     /// the cell; closed.
     ListPick(usize),
     ListCancel,
+    /// The custom lists panel: forget list `.0`; closed.
+    ListsForget(usize),
+    ListsClose,
     /// The conditional-format panel.
     Cond(CondCmd),
     /// The pivot field list.
@@ -259,6 +262,8 @@ pub struct Sheets {
     pub data_menu: Mutable<MenuState>,
     /// The fill options button's menu.
     pub fill_menu: Mutable<MenuState>,
+    /// The custom lists panel is open.
+    pub lists_open: Mutable<bool>,
     pub password: Mutable<PasswordBar>,
     pub password_text: Mutable<TextEdit>,
     pub chart_title: Mutable<TextEdit>,
@@ -321,7 +326,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -1812,6 +1817,39 @@ impl View for Sheets {
             Button::primary("Apply").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::FilterApply)).render(ctx);
         }
 
+        // The custom lists, at the right over the grid: each with Forget.
+        if self.lists_open.get() && !pb.open {
+            let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(160.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: "Custom lists".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let lists = officina_grid::autofill::custom_lists();
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            if lists.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 40.0, FILTER_W - 24.0, 40.0), content: "None yet. Select a row or column of entries, then Data ▸ Fill: Keep Selection as a List.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            let room = ((ph - 40.0 - 56.0) / FILTER_ROW_H).max(0.0) as usize;
+            for (i, l) in lists.iter().enumerate().take(room) {
+                let y = y0 + 40.0 + i as f32 * FILTER_ROW_H;
+                let mut text: String = l.join(", ").chars().take(80).collect();
+                if text.chars().count() >= 80 {
+                    text.push('…');
+                }
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 5.0, FILTER_W - 104.0, 18.0), content: text, style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+                Button::secondary("Forget").at(x0 + FILTER_W - 84.0, y + 2.0).width(72.0).on_click(push(Cmd::ListsForget(i))).render(ctx);
+            }
+            let by = y0 + ph - 44.0;
+            if !lists.is_empty() {
+                Button::secondary("Forget all").at(x0 + 12.0, by).width(96.0).on_click(push(Cmd::Data(crate::data::DataCmd::ClearCustomLists))).render(ctx);
+            }
+            Button::primary("Close").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::ListsClose)).render(ctx);
+        }
+
         // A validation list, at the right over the grid: a press types an item.
         let lp = self.list.get_cloned();
         if lp.open && !pb.open {
@@ -2377,6 +2415,23 @@ impl Sheets {
                 }
                 Cmd::ListPick(k) => {
                     self.list_pick(k);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::CustomLists) => {
+                    self.lists_open.set(true);
+                    self.changed();
+                    false
+                }
+                Cmd::ListsForget(i) => {
+                    if let Err(e) = crate::lists::forget(i) {
+                        self.doc.borrow_mut().status = e;
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::ListsClose => {
+                    self.lists_open.set(false);
                     self.changed();
                     false
                 }
@@ -3079,6 +3134,23 @@ mod tests {
         commit(4, "one\ntwo");
         Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Clear(pergola::widgets::CellRange { r0: 4, c0: 0, r1: 4, c1: 0 }));
         assert_eq!(height(4), 20.0);
+    }
+
+    #[test]
+    fn the_custom_lists_panel_opens_and_closes() {
+        let s = Sheets::new(Doc::new("l"), Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        let texts = || pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<_>>();
+        assert!(!texts().iter().any(|t| t == "Custom lists"));
+        run(Cmd::Data(crate::data::DataCmd::CustomLists));
+        assert!(s.lists_open.get() && texts().iter().any(|t| t == "Custom lists"));
+        // A list no longer there: nothing happens.
+        run(Cmd::ListsForget(999));
+        run(Cmd::ListsClose);
+        assert!(!s.lists_open.get());
     }
 
     #[test]

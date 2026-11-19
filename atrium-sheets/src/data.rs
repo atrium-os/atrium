@@ -57,6 +57,8 @@ pub enum DataCmd {
     AddCustomList,
     /// Forget the custom lists.
     ClearCustomLists,
+    /// The panel listing the custom lists, each with a way to forget it.
+    CustomLists,
     /// The Paste Special bar: what to paste, an operation, skipping blanks
     /// and turning, together.
     PasteSpecial,
@@ -317,7 +319,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
         (MenuItem::new("Flash Fill").shortcut("Ctrl+E"), Some(DataCmd::FlashFill)),
         (MenuItem::new("Fill: Keep Selection as a List").enabled(sel.r0 == sel.r1 || sel.c0 == sel.c1), Some(DataCmd::AddCustomList)),
-        (MenuItem::new("Fill: Forget Custom Lists").enabled(!officina_grid::autofill::custom_lists().is_empty()), Some(DataCmd::ClearCustomLists)),
+        (MenuItem::new("Fill: Custom Lists…"), Some(DataCmd::CustomLists)),
         (MenuItem::new("Paste Values").enabled(special).separated(), Some(DataCmd::PasteValues)),
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
@@ -932,7 +934,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

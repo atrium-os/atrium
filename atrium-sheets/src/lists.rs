@@ -65,6 +65,16 @@ pub fn add(entries: Vec<String>) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Forget custom list `i`.
+pub fn forget(i: usize) -> Result<(), String> {
+    let mut lists = custom_lists();
+    if i < lists.len() {
+        lists.remove(i);
+        set_custom_lists(lists);
+    }
+    keep()
+}
+
 /// Forget every custom list.
 pub fn clear() -> Result<(), String> {
     set_custom_lists(Vec::new());
