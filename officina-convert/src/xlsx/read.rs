@@ -1136,10 +1136,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         }
     }
 
-    // Charts and comments.
+    // Charts and comments. The threaded author directory belongs to the workbook.
+    let person_path = wb_rels.values().find(|(t, _)| t == super::threaded::PERSON_REL).map(|(_, path)| path.as_str());
+    let mut people = super::threaded::persons(&z, person_path, &mut rep)?;
     for (i, (_, part)) in sheets.iter().enumerate() {
         super::chart::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
-        super::comments::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
+        super::comments::read_sheet_with_people(&mut wb, i as u16, &z, part, &mut people, &mut rep)?;
         resolve_links(&mut wb, i as u16, &z, part)?;
     }
 

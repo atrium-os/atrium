@@ -248,7 +248,7 @@ impl Workbook {
             n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
             n += sh.hidden.len() as u64 * 8;
             n += sh.merges.len() as u64 * 20;
-            n += sh.comments.values().map(|k| 64 + k.author.len() as u64 + k.text.len() as u64).sum::<u64>();
+            n += sh.comments.values().map(crate::comments::Comment::estimated_bytes).sum::<u64>();
             n += sh.links.values().map(|k| 48 + k.target.len() as u64).sum::<u64>();
         }
         n += self.strings.bytes();

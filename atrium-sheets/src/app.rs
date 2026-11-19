@@ -989,10 +989,17 @@ impl Sheets {
             }
             TabCmd::Commenting => {
                 let (r, c) = self.grid.get_cloned().cursor;
-                let (s, edit) = {
-                    let d = self.doc.borrow();
-                    (d.sheet, crate::comment::edit(d.wb.comment(d.sheet, r, c)))
-                };
+                let mut doc = self.doc.borrow_mut();
+                let s = doc.sheet;
+                let comment = doc.wb.comment(s, r, c);
+                if comment.is_some_and(|c| !c.thread().is_empty()) {
+                    doc.status = "Imported comment threads can be viewed in the balloon.".into();
+                    drop(doc);
+                    self.changed();
+                    return;
+                }
+                let edit = crate::comment::edit(comment);
+                drop(doc);
                 self.renaming.set(false);
                 self.coloring.set(false);
                 self.comment_text.set(edit);
@@ -3516,6 +3523,31 @@ mod tests {
         assert_ne!(styled.runs(), changed.runs());
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(saved(), changed);
+    }
+
+    #[test]
+    fn imported_threads_can_be_deleted_and_undone_without_flattening() {
+        use crate::data::DataCmd;
+        use crate::tabs::TabCmd;
+        use officina_grid::comments::{Comment, ThreadMessage, ThreadPerson};
+
+        let (mut doc, _) = Doc::from_csv("t.csv", b"1\n").unwrap();
+        let author = Arc::new(ThreadPerson { id: 1, name: "Ana".into(), user_id: "ana".into(), provider_id: "".into() });
+        let note = Comment::threaded(vec![
+            ThreadMessage { id: 2, parent: None, author: author.clone(), timestamp: "".into(), done: false, text: "Root".into() },
+            ThreadMessage { id: 3, parent: Some(2), author, timestamp: "".into(), done: false, text: "Reply".into() },
+        ]).unwrap();
+        doc.wb.set_comments(0, vec![(0, 0, Some(note.clone()))]);
+        let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.tab_cmd(TabCmd::Commenting);
+        assert!(sheets.commenting.get().is_none());
+        assert_eq!(sheets.doc.borrow().wb.comment(0, 0, 0), Some(&note));
+        sheets.cmds.lock().unwrap().push(Cmd::Data(DataCmd::DeleteComments));
+        sheets.take_cmds();
+        assert!(sheets.doc.borrow().wb.comment(0, 0, 0).is_none());
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.comment(0, 0, 0), Some(&note));
     }
 
     #[test]

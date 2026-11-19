@@ -14,6 +14,7 @@ pub mod pivot;
 pub mod read;
 pub mod styles;
 pub mod validation;
+mod threaded;
 pub mod write;
 
 #[cfg(feature = "read")]

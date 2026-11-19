@@ -95,7 +95,7 @@ pub fn formula_out(f: &str) -> String {
     out
 }
 
-fn esc(out: &mut Vec<u8>, s: &str) {
+pub(super) fn esc(out: &mut Vec<u8>, s: &str) {
     for (i, ch) in s.char_indices() {
         match ch {
             '&' => out.extend_from_slice(b"&amp;"),
@@ -588,6 +588,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     let mut z = ZipWriter::new(out);
     let code_of = |s: usize| macros.and_then(|m| m.sheet_codes.iter().find(|(i, _)| *i as usize == s)).map(|(_, c)| &**c);
     let n = wb.sheet_count();
+    let threads = super::threaded::Export::new(wb);
     let mut strings = Strings { ids: HashMap::new(), list: Vec::new(), uses: 0 };
     let mut parts = Vec::with_capacity(n);
     for s in 0..n {
@@ -612,6 +613,14 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     for s in 0..n {
         if !wb.comments(s as u16).is_empty() {
             ct.push_str(&format!(r#"<Override PartName="/xl/comments{}.xml" ContentType="{}"/>"#, s + 1, super::comments::COMMENTS_TYPE));
+        }
+    }
+    if threads.has_people() {
+        ct.push_str(&format!(r#"<Override PartName="/xl/persons/person.xml" ContentType="{}"/>"#, super::threaded::PERSON_TYPE));
+    }
+    for (s, cells) in threads.sheets.iter().enumerate() {
+        if !cells.is_empty() {
+            ct.push_str(&format!(r#"<Override PartName="/xl/threadedComments/threadedComment{}.xml" ContentType="{}"/>"#, s + 1, super::threaded::THREAD_TYPE));
         }
     }
     for i in 0..wb.charts().len() {
@@ -692,6 +701,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         r.push_str(r#"<Relationship Id="rIdMeta" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/>"#);
         z.add("xl/metadata.xml", METADATA.as_bytes())?;
     }
+    if threads.has_people() {
+        r.push_str(&format!(r#"<Relationship Id="rIdPeople" Type="{}" Target="persons/person.xml"/>"#, super::threaded::PERSON_REL));
+        z.add("xl/persons/person.xml", threads.persons_xml().as_bytes())?;
+    }
     r.push_str("</Relationships>");
     z.add("xl/_rels/workbook.xml.rels", r.as_bytes())?;
     if let Some(m) = macros {
@@ -737,8 +750,12 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
             }
             if noted {
                 r.push_str(&format!(r#"<Relationship Id="rIdCm" Type="{}" Target="../comments{}.xml"/><Relationship Id="rIdVml" Type="{}" Target="../drawings/vmlDrawing{}.vml"/>"#, super::comments::COMMENTS_REL, s + 1, super::comments::VML_REL, s + 1));
-                z.add(&format!("xl/comments{}.xml", s + 1), super::comments::comments_xml(wb, s as u16).as_bytes())?;
+                z.add(&format!("xl/comments{}.xml", s + 1), super::comments::comments_xml_with_threads(wb, s as u16, &threads.sheets[s]).as_bytes())?;
                 z.add(&format!("xl/drawings/vmlDrawing{}.vml", s + 1), super::comments::vml(wb, s as u16).as_bytes())?;
+            }
+            if !threads.sheets[s].is_empty() {
+                r.push_str(&format!(r#"<Relationship Id="rIdTc" Type="{}" Target="../threadedComments/threadedComment{}.xml"/>"#, super::threaded::THREAD_REL, s + 1));
+                z.add(&format!("xl/threadedComments/threadedComment{}.xml", s + 1), threads.sheet_xml(wb, s as u16).as_bytes())?;
             }
             for i in &pivots {
                 r.push_str(&format!(r#"<Relationship Id="rIdPt{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable{0}.xml"/>"#, i + 1));
