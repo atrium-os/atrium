@@ -30,6 +30,8 @@ pub const STATUS_H: f32 = 26.0;
 /// What the toolbar asks the event loop for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
+    /// The fill options button pressed: its menu of ways to fill.
+    FillOptions,
     /// Set, change or remove the document's password.
     PasswordOpen,
     /// The password bar's field submitted (to set, or to open a file).
@@ -255,6 +257,8 @@ pub struct Sheets {
     pub size: Rc<Cell<(f32, f32)>>,
     /// The Data menu's open state.
     pub data_menu: Mutable<MenuState>,
+    /// The fill options button's menu.
+    pub fill_menu: Mutable<MenuState>,
     pub password: Mutable<PasswordBar>,
     pub password_text: Mutable<TextEdit>,
     pub chart_title: Mutable<TextEdit>,
@@ -317,7 +321,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -1307,6 +1311,36 @@ impl Sheets {
         }
     }
 
+    /// The fill options menu, hanging under its button: fill again by
+    /// copying, as a series, only the formats, or without them.
+    fn render_fill_menu(&self, ctx: &mut Ctx, w: f32, h: f32) {
+        use crate::data::DataCmd;
+        let at = {
+            let d = self.doc.borrow();
+            d.last_fill.filter(|_| d.can_refill()).and_then(|f| self.source.fill_button_at(f.1))
+        };
+        let Some(at) = at else {
+            self.fill_menu.set(MenuState::default());
+            return;
+        };
+        // Content px to window px, as the grid places its body.
+        use pergola::widgets::grid_view::{HEADER_H, TILE_ROWS};
+        let r = Self::grid_rect(w, h);
+        let st = self.scroll.get();
+        let (tiles_r, _) = GridView::tiles(&*self.source, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
+        let hw = GridView::header_width((tiles_r.1 + 1) * TILE_ROWS);
+        let x = r.x() + hw + (at[0] - st.physics_x.y) as f32;
+        let y = r.y() + HEADER_H + (at[1] + at[3] - st.physics.y) as f32;
+        let cmds = self.cmds.clone();
+        let picks = [DataCmd::FillCopy, DataCmd::FillSeries, DataCmd::FillFormats, DataCmd::FillNoFormats];
+        use pergola::widgets::{Menu, MenuItem};
+        let items = vec![MenuItem::new("Copy Cells"), MenuItem::new("Fill Series"), MenuItem::new("Fill Formats Only"), MenuItem::new("Fill Without Formatting")];
+        let menu = Menu::new(self.fill_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Data(picks[i.min(3)]))).width(200.0);
+        let (mw, mh) = (200.0, menu.height());
+        let (x, y) = (x.clamp(0.0, (w - mw).max(0.0)), y.min((h - mh).max(0.0)));
+        menu.at(x, y).anchored(Rect::new(x, y - at[3] as f32, at[2] as f32, at[3] as f32), pergola::popup::Side::Below, pergola::popup::Align::Start).render(ctx);
+    }
+
     /// Where the grid sits in a window of `w` × `h`.
     pub fn grid_rect(w: f32, h: f32) -> Rect {
         let top = TOOLBAR_H + FORMULA_H;
@@ -1558,6 +1592,7 @@ impl View for Sheets {
                     cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
                 }
                 // The cursor cell's list button, or Alt+Down: its list.
+                GridAction::PressFloat(crate::source::KEY_FILL) => cmds.lock().unwrap().push(Cmd::FillOptions),
                 GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
                 // A filter column's button: its value list.
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
@@ -1653,6 +1688,11 @@ impl View for Sheets {
         ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0 - room).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
         if let Some(m) = mode {
             ctx.add(Node::Text { rect: Rect::new((w - 12.0 - 60.0).max(0.0), sy + 4.0, 60.0, 18.0), content: m.into(), style: st(type_size::XS, Weight::Semibold, t.text_primary()) });
+        }
+
+        // The fill options button's menu, under the button.
+        if self.fill_menu.get().open {
+            self.render_fill_menu(ctx, w, h);
         }
 
         // The password bar, over the formula bar and the grid's top.
@@ -2384,6 +2424,11 @@ impl Sheets {
                     self.changed();
                     true
                 }
+                Cmd::FillOptions => {
+                    self.fill_menu.set(MenuState::opened(None));
+                    self.changed();
+                    false
+                }
                 Cmd::FilterCancel => {
                     self.filter.set(FilterPanel::default());
                     self.changed();
@@ -2768,6 +2813,15 @@ mod tests {
         assert_eq!(d.wb.formula_text(officina_grid::CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
         assert_eq!(d.wb.formula_text(officina_grid::CellAddr::new(0, 5, 1)), None);
         assert_eq!(s.grid.get_cloned().selection(), CellRange { r0: 0, c0: 1, r1: 4, c1: 1 });
+        drop(d);
+        // The fill options button under B5's right; pressed, it shows the ways.
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Rect { rect, radius, .. } if *radius == 3.0 && rect.w() == 16.0 && rect.h() == 16.0)), "the fill options button");
+        s.cmds.lock().unwrap().push(Cmd::FillOptions);
+        s.take_cmds();
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        let texts: Vec<String> = tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        assert!(texts.iter().any(|t| t == "Fill Series"), "{texts:?}");
     }
 
     #[test]
@@ -3023,6 +3077,33 @@ mod tests {
         commit(4, "one\ntwo");
         Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Clear(pergola::widgets::CellRange { r0: 4, c0: 0, r1: 4, c1: 0 }));
         assert_eq!(height(4), 20.0);
+    }
+
+    #[test]
+    fn a_fill_offers_its_options_by_the_filled_area() {
+        use pergola::widgets::GridSource;
+        let (d, _) = Doc::from_csv("t.csv", b"1\n2\n").unwrap();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        let button = || s.source.floats([0.0, 0.0, 2000.0, 2000.0], &pergola::theme::Semantic::default()).into_iter().find(|f| f.key == crate::source::KEY_FILL).map(|f| f.at);
+        assert!(button().is_none());
+        let r = |r0, r1| officina_grid::addr::Rect { sheet: 0, r0, c0: 0, r1, c1: 0 };
+        assert!(s.doc.borrow_mut().fill(r(0, 1), r(0, 4), false));
+        // Under the right of A5.
+        assert_eq!(button(), Some([65.0, 101.0, 16.0, 16.0]));
+        run(Cmd::FillOptions);
+        assert!(s.fill_menu.get().open);
+        // Copy Cells from it: 1, 2, 1.
+        run(Cmd::Data(crate::data::DataCmd::FillCopy));
+        assert_eq!(s.doc.borrow().wb.value(0, 2, 0).display(), "1");
+        assert!(button().is_some());
+        // Any other edit: gone.
+        s.doc.borrow_mut().type_into(9, 9, "x");
+        assert!(button().is_none());
     }
 
     #[test]

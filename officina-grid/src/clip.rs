@@ -391,7 +391,53 @@ impl Clip {
         if moved.iter().zip(&defs).any(|(a, b)| a.expr != b.expr) {
             ops.push(GridOp::names(wb, &moved));
         }
-        let cfs: Vec<_> = wb.cond_formats().iter().map(|f| {
+        // A list of areas some of which the cut takes part of (or takes some
+        // whole and leaves others): (the areas left, the parts taken, where
+        // they were). Empty parts taken when it doesn't, or takes them all.
+        let split = |own: u16, rs: &[Rect]| -> (Vec<Rect>, Vec<Rect>) {
+            if own != self.from.sheet {
+                return (Vec::new(), Vec::new());
+            }
+            let (mut stay, mut taken) = (Vec::new(), Vec::new());
+            for r in rs {
+                let r = Rect { sheet: own, ..*r };
+                match meet(r, self.from) {
+                    Some(i) => {
+                        taken.push(i);
+                        stay.extend(minus(r, i));
+                    }
+                    None => stay.push(r),
+                }
+            }
+            if taken.is_empty() || stay.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            (stay, taken)
+        };
+        let (dr, dc) = (row as i64 - self.from.r0 as i64, col as i64 - self.from.c0 as i64);
+        let there = |r: Rect| Rect { sheet, r0: (r.r0 as i64 + dr) as u32, c0: (r.c0 as i64 + dc) as u32, r1: (r.r1 as i64 + dr) as u32, c1: (r.c1 as i64 + dc) as u32 };
+        let cfs: Vec<_> = wb.cond_formats().iter().flat_map(|f| {
+            // Partly cut: the cells taken keep the rule where they go (a
+            // copy of it, after it), and the rest keep it here, as Excel
+            // splits a rule when some of its cells move.
+            let (stay, taken) = split(f.sheet, &f.ranges);
+            if !taken.is_empty() {
+                let ((or, oc), own) = (f.origin(), f.sheet);
+                let mut here = f.clone();
+                here.ranges = stay;
+                for r in &mut here.rules {
+                    r.kind = r.kind.map_exprs(&|e| m.expr(e, or, oc, own, or, oc, own));
+                }
+                let (a, b) = (taken[0].r0, taken[0].c0);
+                let mut gone = f.clone();
+                gone.sheet = sheet;
+                gone.ranges = taken.into_iter().map(there).collect();
+                let (na, nb) = (gone.ranges[0].r0, gone.ranges[0].c0);
+                for r in &mut gone.rules {
+                    r.kind = r.kind.map_exprs(&|e| m.expr(e, a, b, own, na, nb, sheet));
+                }
+                return vec![here, gone];
+            }
             let mut f = f.clone();
             let ((or, oc), own) = (f.origin(), f.sheet);
             let (to, ranges) = areas(f.sheet, &f.ranges);
@@ -401,19 +447,34 @@ impl Clip {
             for r in &mut f.rules {
                 r.kind = r.kind.map_exprs(&|e| m.expr(e, or, oc, own, nr, nc, to));
             }
-            f
+            vec![f]
         }).collect();
         if cfs != wb.cond_formats() {
             ops.push(GridOp::cond_formats(wb, &cfs));
         }
-        let vs: Vec<_> = wb.validations().iter().map(|v| {
+        let vs: Vec<_> = wb.validations().iter().flat_map(|v| {
+            // Partly cut: split as conditional formats are.
+            let (stay, taken) = split(v.sheet, &v.ranges);
+            if !taken.is_empty() {
+                let ((or, oc), own) = (v.origin(), v.sheet);
+                let mut here = v.clone();
+                here.ranges = stay;
+                let here = here.map_exprs(&|e| m.expr(e, or, oc, own, or, oc, own));
+                let (a, b) = (taken[0].r0, taken[0].c0);
+                let mut gone = v.clone();
+                gone.sheet = sheet;
+                gone.ranges = taken.into_iter().map(there).collect();
+                let (na, nb) = (gone.ranges[0].r0, gone.ranges[0].c0);
+                let gone = gone.map_exprs(&|e| m.expr(e, a, b, own, na, nb, sheet));
+                return vec![here, gone];
+            }
             let mut v = v.clone();
             let ((or, oc), own) = (v.origin(), v.sheet);
             let (to, ranges) = areas(v.sheet, &v.ranges);
             v.sheet = to;
             v.ranges = ranges;
             let (nr, nc) = v.origin();
-            v.map_exprs(&|e| m.expr(e, or, oc, own, nr, nc, to))
+            vec![v.map_exprs(&|e| m.expr(e, or, oc, own, nr, nc, to))]
         }).collect();
         if vs != wb.validations() {
             ops.push(GridOp::validations(wb, &vs));
@@ -494,6 +555,31 @@ struct Mover {
     /// Cells a move writes over: references to them (a cell, or a range
     /// wholly inside) become `#REF!`, as Excel's do.
     dead: Option<Rect>,
+}
+
+/// Where `a` and `b` (on one sheet) overlap.
+fn meet(a: Rect, b: Rect) -> Option<Rect> {
+    let r = Rect { sheet: a.sheet, r0: a.r0.max(b.r0), c0: a.c0.max(b.c0), r1: a.r1.min(b.r1), c1: a.c1.min(b.c1) };
+    (a.sheet == b.sheet && r.r0 <= r.r1 && r.c0 <= r.c1).then_some(r)
+}
+
+/// `r` without `i` (inside it): up to four areas, rows above and below
+/// whole, then left and right of `i`.
+fn minus(r: Rect, i: Rect) -> Vec<Rect> {
+    let mut v = Vec::new();
+    if i.r0 > r.r0 {
+        v.push(Rect { r1: i.r0 - 1, ..r });
+    }
+    if i.r1 < r.r1 {
+        v.push(Rect { r0: i.r1 + 1, ..r });
+    }
+    if i.c0 > r.c0 {
+        v.push(Rect { r0: i.r0, r1: i.r1, c1: i.c0 - 1, ..r });
+    }
+    if i.c1 < r.c1 {
+        v.push(Rect { r0: i.r0, r1: i.r1, c0: i.c1 + 1, ..r });
+    }
+    v
 }
 
 impl Mover {
@@ -847,6 +933,35 @@ mod tests {
         undo.apply(&mut wb);
         assert!(wb.comment(0, 0, 0).is_some() && wb.comment(0, 5, 2).is_none());
         assert_eq!(wb.validations()[0].ranges, vec![rect(0, 0, 1, 0)]);
+    }
+
+    #[test]
+    fn a_cut_of_part_of_a_rule_splits_it() {
+        use crate::condfmt::CmpOp;
+        use crate::validation::{Allow, Validation};
+        let mut wb = wb();
+        for r in 0..6 {
+            set(&mut wb, r, 0, &r.to_string());
+        }
+        // A1:A6 must be above B's cell beside it; A3:A4 move to D10.
+        let f = wb.validation_formula("A1>B1", 0, (0, 0)).unwrap();
+        wb.add_validation(Validation::new(0, vec![rect(0, 0, 5, 0)], Allow::Custom, CmpOp::Between, Some(f), None)).unwrap();
+        let cut = Clip::take(&wb, rect(2, 0, 3, 0), true);
+        let (ops, _) = cut.paste(&wb, 0, 9, 3).unwrap();
+        let undo = run(&mut wb, ops);
+        let vs = wb.validations().to_vec();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0].ranges, vec![rect(0, 0, 1, 0), rect(4, 0, 5, 0)]);
+        assert_eq!(vs[1].ranges, vec![rect(9, 3, 10, 3)]);
+        let at = |v: &Validation, r, c| crate::formula::to_a1(v.f1.as_ref().unwrap(), r, c, &|id| wb.sheet_name(id));
+        // Left behind: unchanged. Moved: reads its own cell, and B3 where it was.
+        assert_eq!(at(&vs[0], 0, 0), "=A1>B1");
+        assert_eq!(at(&vs[1], 9, 3), "=D10>B3");
+        assert_eq!(at(&vs[1], 10, 3), "=D11>B4");
+        // Undo: one rule again.
+        undo.apply(&mut wb);
+        assert_eq!(wb.validations().len(), 1);
+        assert_eq!(wb.validations()[0].ranges, vec![rect(0, 0, 5, 0)]);
     }
 
     #[test]
