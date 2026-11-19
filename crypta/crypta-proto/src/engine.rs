@@ -164,6 +164,15 @@ pub enum FromEngine {
 pub struct HipFacts {
     pub pf: Option<bool>,
     pub ipv6_forwarding: Option<bool>,
+    pub mounted_geli: Option<u32>,
+    pub patch_status: Option<HipPatchStatus>,
+    pub screen_locked: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HipPatchStatus {
+    pub last_check: u64,
+    pub pending: Option<u32>,
 }
 
 /// A prompt as cryptad passes it on (`crypta_ac::auth::Form` flattened).

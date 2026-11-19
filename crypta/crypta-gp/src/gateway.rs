@@ -670,6 +670,48 @@ impl HipReport {
             );
             let _ = writeln!(review, "Firewall  Atrium pf enabled: {value}");
         }
+        if let Some(count) = facts.mounted_geli {
+            let count = count.to_string();
+            categories = categories.with_child(
+                Element::new("entry")
+                    .with_attr("name", "disk-encryption")
+                    .with_child(
+                        Element::new("entry")
+                            .with_child(Element::new("product").with_text("FreeBSD GELI"))
+                            .with_child(
+                                Element::new("mounted-encrypted-providers").with_text(&count),
+                            ),
+                    ),
+            );
+            let _ = writeln!(review, "Mounted GELI encrypted providers  {count}");
+        }
+        if let Some(status) = facts.patch_status {
+            let last_check = status.last_check.to_string();
+            let mut patch = Element::new("entry")
+                .with_attr("name", "patch-management")
+                .with_child(Element::new("product").with_text("Atrium Opifex"))
+                .with_child(Element::new("last-check-unix").with_text(&last_check));
+            let _ = writeln!(review, "Opifex last check (Unix seconds)  {last_check}");
+            if let Some(pending) = status.pending {
+                let pending = pending.to_string();
+                patch =
+                    patch.with_child(Element::new("catalog-updates-listed").with_text(&pending));
+                let _ = writeln!(review, "Opifex catalog updates listed  {pending}");
+            } else {
+                patch = patch.with_child(Element::new("last-check-failed").with_text("yes"));
+                let _ = writeln!(review, "Opifex last check failed");
+            }
+            categories = categories.with_child(patch);
+        }
+        if let Some(locked) = facts.screen_locked {
+            let value = if locked { "yes" } else { "no" };
+            categories = categories.with_child(
+                Element::new("entry")
+                    .with_attr("name", "screen-lock")
+                    .with_child(Element::new("active-session-locked").with_text(value)),
+            );
+            let _ = writeln!(review, "Active session locked  {value}");
+        }
         root = root.with_child(categories);
         review.push_str("Other posture categories are omitted.");
         // MD5 is the protocol's report identifier, separate from the
@@ -761,6 +803,7 @@ mod tests {
         let facts = crypta_proto::engine::HipFacts {
             pf: Some(true),
             ipv6_forwarding: Some(false),
+            ..Default::default()
         };
         let report =
             HipReport::new("alice", "atrium", Ipv4Addr::LOCALHOST, "FreeBSD", facts).unwrap();
@@ -779,6 +822,46 @@ mod tests {
             hip_interval(b"<response><hip-report-interval>999999</hip-report-interval></response>"),
             Ok(Duration::from_secs(3600))
         );
+    }
+
+    #[test]
+    fn each_new_posture_fact_changes_the_report_and_review() {
+        use crypta_proto::engine::{HipFacts, HipPatchStatus};
+
+        let facts = HipFacts {
+            mounted_geli: Some(1),
+            patch_status: Some(HipPatchStatus {
+                last_check: 100,
+                pending: Some(2),
+            }),
+            screen_locked: Some(false),
+            ..Default::default()
+        };
+        let report = |facts| {
+            HipReport::new("alice", "atrium", Ipv4Addr::LOCALHOST, "FreeBSD", facts).unwrap()
+        };
+        let original = report(facts);
+        for changed in [
+            HipFacts {
+                mounted_geli: Some(0),
+                ..facts
+            },
+            HipFacts {
+                patch_status: Some(HipPatchStatus {
+                    last_check: 100,
+                    pending: None,
+                }),
+                ..facts
+            },
+            HipFacts {
+                screen_locked: Some(true),
+                ..facts
+            },
+        ] {
+            let changed = report(changed);
+            assert_ne!(changed.xml, original.xml);
+            assert_ne!(changed.review, original.review);
+        }
     }
 
     #[test]

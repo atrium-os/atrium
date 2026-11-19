@@ -432,6 +432,7 @@ dependencies = [
  "p256",
  "portcullis-identity",
  "portcullis-mounts",
+ "serde_json",
  "sha2",
  "tempfile",
  "zeroize",

@@ -779,7 +779,7 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
         lines
     };
     let msg = lines(&f.message, 4);
-    let banner = lines(&f.banner, 8);
+    let banner = lines(&f.banner, if reviewing_hip { 16 } else { 8 });
     let choosing_gateway = f.fields.iter().any(|x| x.kind == FieldKind::GatewayChoice);
     let fh: f32 = f.fields.iter().map(|x| {
         if x.kind == FieldKind::HipApproval {

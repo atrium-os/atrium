@@ -32,7 +32,48 @@ CRYPTA_GATE_LIB=1 . "$ROOT/scripts/crypta-v1-gate.sh"
 (cd "$ROOT/crypta" && cargo build -q --release --target "$T" -p crypta-engine --bin atrium-crypta-ac)
 (cd "$ROOT/arca/arcad" && cargo build -q --release --target "$T" --bin arca-probe)
 EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe"
+if [ "$hip" = posture ]; then
+    (cd "$ROOT/portcullis" && cargo build -q --release --target "$T" -p opifex --bin opifexd)
+    EXTRA="$EXTRA $ROOT/portcullis/target/$T/release/opifexd"
+fi
 setup
+
+posture_cleanup() {
+    "$V" 'G=/tmp/crypta-gate
+        if [ -f "$G/opifex.pid" ]; then kill "$(cat "$G/opifex.pid")" 2>/dev/null || true; fi
+        if [ -f "$G/hip-md" ]; then
+            md=$(cat "$G/hip-md")
+            umount "$G/hip-encrypted" 2>/dev/null || true
+            geli detach "$md.eli" 2>/dev/null || true
+            mdconfig -d -u "${md#md}" 2>/dev/null || true
+        fi' || true
+    cleanup
+    kill "$LANPID" 2>/dev/null || true
+}
+if [ "$hip" = posture ]; then
+    trap posture_cleanup EXIT
+    "$V" 'sh -s' <<'GUEST'
+set -eu
+G=/tmp/crypta-gate
+mkdir "$G/hip-encrypted" "$G/hip-seat" "$G/opifex-state" "$G/opifex-root"
+md=$(mdconfig -a -t malloc -s 32m)
+printf '%s\n' "$md" > "$G/hip-md"
+geli onetime -e AES-XTS -l 256 "$md"
+newfs -U "/dev/$md.eli" >/dev/null
+mount "/dev/$md.eli" "$G/hip-encrypted"
+printf 'alice\n' > "$G/hip-seat/active-session"
+printf '\n' > "$G/hip-seat/session-locked"
+# An isolated Opifex database seeded with a known prior successful check.
+printf 'last_sync = 1760000000\n' > "$G/opifex-state/updates.toml"
+env OPIFEX_SOCKET="$G/opifex.sock" OPIFEX_STATE="$G/opifex-state" OPIFEX_ROOT="$G/opifex-root" \
+    OPIFEX_DAILY=0 PRAECO_SOCKET=none daemon -f -p "$G/opifex.pid" -o "$G/opifex.log" "$G/opifexd"
+pkill -f '^/usr/local/bin/atrium-cryptad -v --sock /tmp/crypta-gate/crypta.sock'
+sleep 1
+env CRYPTA_HIP_OPIFEX_SOCKET="$G/opifex.sock" CRYPTA_HIP_SEAT="$G/hip-seat/active-session" \
+    daemon -f -o "$G/cryptad.log" /usr/local/bin/atrium-cryptad -v --sock "$G/crypta.sock" \
+        --state "$G/state" --net-sock "$G/net.sock" --arca "$G/arcad.sock"
+GUEST
+fi
 
 "$V" 'sh -s' <<'GUEST'
 set -eu
@@ -136,6 +177,13 @@ if [ -n "$hip" ]; then
         "Operating system  $("$V" 'uname -sr')" "IPv6 forwarding  $forwarded" 'Firewall  Atrium pf enabled: yes'; do
         case "$preview" in *"$(hex "$line")"*) ;; *) fail "HIP prompt omitted a report field" ;; esac
     done
+    if [ "$hip" = posture ]; then
+        for line in 'Mounted GELI encrypted providers  1' 'Opifex last check (Unix seconds)  1760000000' \
+            'Opifex catalog updates listed  0' 'Active session locked  no'; do
+            case "$preview" in *"$(hex "$line")"*) ;; *) fail "HIP review is missing $line" ;; esac
+        done
+        ok "review shows live GELI, Opifex and active-session lock facts"
+    fi
     ok "Settings prompt exposes the HIP facts before the data tunnel is up"
     if [ "$hip" = decline ]; then
         "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
@@ -166,6 +214,30 @@ probe() {
     "$V" 'ping -n -c 1 -t 5 -S 10.77.0.2 10.77.0.1' || fail "$1"
     ok "$1"
 }
+if [ "$hip" = posture ]; then
+    probe "IPv4 echo before screen-lock change"
+    for _ in $(seq 1 20); do
+        grep -q '^no ' "$receipts" && break
+        sleep 1
+    done
+    grep -q '^no ' "$receipts" || fail "initial posture report did not reach peer"
+    "$V" "printf '%s\n' alice > '$G/hip-seat/session-locked'"
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' | grep -q "$(hex 'Active session locked  yes')" ||
+        fail "review did not reflect the real seat lock marker"
+    if grep -q '^yes ' "$receipts"; then fail "screen-lock change was uploaded without approval"; fi
+    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+    for _ in $(seq 1 20); do
+        grep -q '^yes ' "$receipts" && break
+        sleep 1
+    done
+    grep -q '^yes ' "$receipts" || fail "approved screen-lock change did not reach peer"
+    ok "changed screen lock required fresh approval before upload"
+    probe "IPv4 echo after approved posture refresh"
+    "$V" "$CTL down name=gp-gate" >/dev/null
+    echo "$pass checks passed"
+    exit 0
+fi
 if [ "$hip" = refresh ]; then
     original=$("$V" 'sysctl -n net.inet6.ip6.forwarding')
     case "$original" in

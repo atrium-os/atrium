@@ -546,9 +546,9 @@ encryption, patch management, data loss prevention) and repeats every HIP interv
 | OS and version | Opifex / build info | `Linux` class (decision 14), version string Atrium's |
 | Host ID, hostname, MACs | cryptad | §9.5 |
 | Firewall | atrium-net (pf enabled, default deny for apps) | enabled, product "Atrium pf" |
-| Disk encryption | storage (Tessera / GELI volume status) | encrypted volumes, true state |
-| Patch management | Opifex (last update check, pending updates) | true state |
-| Screen lock | Vestibulum policy | true state |
+| Disk encryption | FreeBSD GEOM and kernel mount table | Count of mounted active GELI providers |
+| Patch management | Opifex catalog | Last check time and catalog update count, or last check failure |
+| Screen lock | Ostiarius active seat and lock marker | Whether the active seat is locked, when known |
 | Antivirus / anti-malware | none on Atrium | none listed |
 
 If the gateway's HIP policy requires an antivirus product, the gateway will quarantine or
@@ -767,9 +767,16 @@ another origin. An active portal-profile session stays in engine memory.
   shows the destination, VPN user, profile hostname, the assigned IPv4
   address, the kernel's actual OS and release, and the Atrium client name.
   The report also includes the host IPv6 forwarding state from the FreeBSD
-  kernel and the pf running flag from atrium-net. Settings displays both
-  verified values. Failed queries leave the fact out. Encryption, patch and
-  screen-lock state, antivirus, hardware IDs and MAC addresses remain omitted.
+  kernel and the pf running flag from atrium-net. For disk encryption,
+  cryptad counts mounted providers that FreeBSD GEOM reports as active GELI.
+  The count describes those mounts only. For patch status, cryptad reads the
+  last check and catalog update count from root-owned Opifex over its local
+  socket. A failed check reports the failure and omits the count. This covers
+  the Opifex catalog. For screen lock, cryptad reads Ostiarius's active seat
+  and its lock marker. A marker naming another session leaves lock state
+  unknown. Settings shows the same values sent to the gateway. Unknown facts,
+  device paths, seat identities, antivirus, hardware IDs and MAC addresses
+  are omitted.
   MD5 is the gateway's report identifier. Approval applies to the exact report
   content for that engine and gateway. The HIP timer runs on the active TLS or
   ESP tunnel independently of renewal. The interval defaults to 600 seconds
@@ -785,7 +792,11 @@ another origin. An active portal-profile session stays in engine memory.
   IPv6 forwarding sysctl, and checks that the changed report reaches the peer
   only after approval. IPv4 echo passes on the original connection both
   before and after refresh. The test restores the sysctl on exit. The arm64
-  gate passed 11/11 on TLS and 11/11 with `--esp`.
+  gate passed 11/11 on TLS and 11/11 with `--esp`. The `--hip posture` case
+  mounts a disposable GELI provider and runs Opifex against a seeded catalog
+  check. It changes an isolated Ostiarius lock marker during the tunnel,
+  verifies that the reviewed facts match the uploaded XML, and checks that
+  the changed report requires approval while echo works on either side.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

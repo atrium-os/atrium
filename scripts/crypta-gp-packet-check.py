@@ -204,10 +204,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
                         needed = "yes" if hip else "no"
-                        interval = "<hip-report-interval>5</hip-report-interval>" if hip == "refresh" else ""
+                        interval = "<hip-report-interval>5</hip-report-interval>" if hip in ("refresh", "posture") else ""
                         body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
                     elif path == "hipreport.esp":
-                        assert hip in ("approve", "refresh"), "HIP submitted without approval"
+                        assert hip in ("approve", "refresh", "posture"), "HIP submitted without approval"
                         assert fields["authcookie"] == [COOKIE]
                         report, = fields["report"]
                         doc = ET.fromstring(report)
@@ -217,7 +217,17 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("ip-address") == "10.77.0.2"
                         assert doc.findtext("hip-report-version") == "4"
                         categories = doc.findall("./categories/entry")
-                        assert [node.attrib for node in categories] == [{"name": "host-info"}, {"name": "firewall"}]
+                        assert [node.attrib for node in categories[:2]] == [{"name": "host-info"}, {"name": "firewall"}]
+                        if hip == "posture":
+                            assert [node.attrib for node in categories[2:]] == [
+                                {"name": "disk-encryption"}, {"name": "patch-management"}, {"name": "screen-lock"},
+                            ]
+                            assert categories[2].findtext("entry/product") == "FreeBSD GELI"
+                            assert categories[2].findtext("entry/mounted-encrypted-providers") == "1"
+                            assert categories[3].findtext("last-check-unix") == "1760000000"
+                            assert categories[3].findtext("catalog-updates-listed") == "0"
+                            locked = categories[4].findtext("active-session-locked")
+                            assert locked in ("yes", "no")
                         assert {node.tag for node in categories[0]} == {"os", "client-version", "ipv6-forwarding"}
                         forwarding = categories[0].findtext("ipv6-forwarding")
                         assert forwarding in ("yes", "no")
@@ -231,7 +241,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert hashlib.md5(original.encode()).hexdigest() == digest
                         if receipts:
                             with receipts.open("a") as receipt:
-                                print(f"{forwarding} {digest}", file=receipt)
+                                print(f"{locked if hip == 'posture' else forwarding} {digest}", file=receipt)
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
@@ -341,7 +351,7 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
-    parser.add_argument("--hip", choices=["approve", "decline", "refresh"], help="require a reviewed HIP report in the full gate")
+    parser.add_argument("--hip", choices=["approve", "decline", "refresh", "posture"], help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
@@ -376,7 +386,7 @@ def main():
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            receipts = tmp / "hip-receipts" if args.hip == "refresh" else None
+            receipts = tmp / "hip-receipts" if args.hip in ("refresh", "posture") else None
             if receipts:
                 receipts.touch()
             thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts}, daemon=True)
@@ -431,7 +441,7 @@ def main():
                 assert calls == ["prelogin.esp", "login.esp", *exchange], calls
                 print("Declining HIP sent no report and opened no data tunnel")
                 return
-            if args.hip == "refresh":
+            if args.hip in ("refresh", "posture"):
                 assert calls.count("getconfig.esp") == 1, calls
                 if esp:
                     assert not esp.errors, esp.errors
@@ -440,7 +450,7 @@ def main():
                 else:
                     assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
                 assert calls[-1] == "logout.esp", calls
-                print("HIP refreshed twice on the original data connection")
+                print("HIP refresh preserved the original data connection")
                 return
             if args.hip == "approve":
                 exchange.append("hipreport.esp")

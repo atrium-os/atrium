@@ -45,6 +45,7 @@ mod fd;
 mod key;
 mod net;
 mod profile;
+mod hip;
 #[cfg(target_os = "freebsd")]
 mod jail;
 
@@ -953,7 +954,13 @@ impl D {
                                 _ => None,
                             })
                         });
-                        let facts = engine::HipFacts { pf, ipv6_forwarding: hip_ipv6_forwarding() };
+                        let facts = engine::HipFacts {
+                            pf,
+                            ipv6_forwarding: hip_ipv6_forwarding(),
+                            mounted_geli: hip::mounted_geli(),
+                            patch_status: hip::patch_status(),
+                            screen_locked: hip::screen_locked(),
+                        };
                         let _ = self.to_engine(k, &ToEngine::HipFacts(facts));
                     }
                 }
