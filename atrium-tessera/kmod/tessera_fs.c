@@ -21425,6 +21425,30 @@ tessera_fs_gc_hash_touched(struct tessera_mount *tmp_, const tessera_hash_t h)
  * view of the filesystem without excluding writers from it, which is
  * the entire trick that lets the gate be dropped.
  */
+/*
+ * E4.7 scrub (tessera-encryption.md §13.1). A scrub's GC pass also notes
+ * every plain pack (no key group, unsealed volume) that is partly dead:
+ * some blobs live, some not. Whole-pack reclaim keeps such a pack whole,
+ * so a deleted file's bytes stay readable on disk for as long as one of its
+ * pack-mates lives. The apply phase rebuilds each one without its dead
+ * blobs (tessera_fs_scrub_compact).
+ */
+struct tessera_scrub_part {
+	uint8_t         pack_id[16];
+	uint64_t        start;          /* registry entry as the scan saw it */
+	uint64_t        len;
+	uint32_t        flags;
+	uint32_t        ndrop;
+	tessera_hash_t *drop;           /* the dead blobs */
+};
+struct tessera_scrub {
+	struct tessera_scrub_part *parts;
+	uint32_t        nparts, cap;
+	uint32_t        young;          /* partly dead, inside the grace period */
+	uint32_t        compacted;      /* rebuilt by the apply phase */
+	uint64_t        dropped;        /* blobs those rebuilds left out */
+};
+
 struct tessera_gc_scan {
 	int             concurrent;
 	uint64_t        inode_root;
@@ -21433,6 +21457,7 @@ struct tessera_gc_scan {
 	uint8_t         tags[3][16];  /* sealed: the three roots' tags */
 	tessera_hash_t *seeds;      /* in-flight refs, copied at activation */
 	uint32_t        nseeds;
+	struct tessera_scrub *scrub;  /* E4.7: set by tessera_fs_scrub only */
 };
 
 /*
@@ -21872,6 +21897,291 @@ tessera_fs_group_known(struct tessera_mount *tmp_, uint64_t g)
 	known = tessera_fs_group_find(tmp_, g) != NULL;
 	sx_sunlock(&tmp_->groups_sx);
 	return (known);
+}
+
+/* E4.7: pass 2 found pack `re` with all its hashes in hand (bh, nbh) and at
+ * least one live. Note it for compaction when some of the rest are dead.
+ * __noinline: pass 2's frame is already near the stack budget (#114). */
+static void __noinline
+tessera_gc_scrub_note(struct tessera_scrub *sc, const uint8_t pack_id[16],
+    const tessera_registry_entry_t *re, const tessera_hash_t *bh,
+    uint32_t nbh, const tessera_hash_t *live, uint32_t live_count)
+{
+	uint32_t ndead = 0;
+
+	for (uint32_t i = 0; i < nbh; i++)
+		if (live_count == 0 || bsearch(bh[i], live, live_count,
+		    sizeof(tessera_hash_t), tessera_cmp_hash) == NULL)
+			ndead++;
+	if (ndead == 0 || ndead == nbh)
+		return;
+	/* Same §11.3 grace as a dead pack: a blob that looks dead may be
+	 * one whose referencing inode hasn't committed yet. */
+	if (tessera_gc_grace_seconds > 0 && re->create_time != 0) {
+		const uint64_t now = (uint64_t)time_second;
+		if (now >= re->create_time && now - re->create_time <
+		    (uint64_t)tessera_gc_grace_seconds) {
+			sc->young++;
+			return;
+		}
+	}
+	if (sc->nparts == sc->cap) {
+		uint32_t ncap = sc->cap ? sc->cap * 2 : 16;
+		struct tessera_scrub_part *np = malloc(ncap * sizeof(*np),
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		if (sc->parts != NULL) {
+			memcpy(np, sc->parts, sc->nparts * sizeof(*np));
+			free(sc->parts, M_TESSERA);
+		}
+		sc->parts = np;
+		sc->cap = ncap;
+	}
+	struct tessera_scrub_part *p = &sc->parts[sc->nparts];
+	memcpy(p->pack_id, pack_id, 16);
+	p->start = re->start_sector;
+	p->len = re->length_sectors;
+	p->flags = re->flags;
+	p->drop = malloc((size_t)ndead * sizeof(tessera_hash_t), M_TESSERA,
+	    M_WAITOK);
+	p->ndrop = 0;
+	for (uint32_t i = 0; i < nbh; i++)
+		if (live_count == 0 || bsearch(bh[i], live, live_count,
+		    sizeof(tessera_hash_t), tessera_cmp_hash) == NULL)
+			memcpy(p->drop[p->ndrop++], bh[i],
+			    sizeof(tessera_hash_t));
+	sc->nparts++;
+}
+
+static void
+tessera_scrub_free(struct tessera_scrub *sc)
+{
+	for (uint32_t i = 0; i < sc->nparts; i++)
+		free(sc->parts[i].drop, M_TESSERA);
+	free(sc->parts, M_TESSERA);
+	sc->parts = NULL;
+	sc->nparts = sc->cap = 0;
+}
+
+/*
+ * E4.7: rebuild one partly-dead plain pack without its dead blobs. Gate
+ * held, apply window open (GC pass 3). Same moves as repack (which also
+ * reads under the gate; both are rare): read the body, build the new pack,
+ * write it elsewhere, point the registry at it, free the old extents.
+ *
+ * The rebuilt pack gets a NEW, random id. Pack ids are derived from what a
+ * pack first held (a manifest's hash, an aggregation's hash), and a publish
+ * that finds its id already registered writes nothing; keeping the id
+ * after dropping blobs would let a later publish of the same content dedup
+ * onto a pack that no longer holds it. So the old id goes from the
+ * registry, and the kept blobs are re-indexed under the new one.
+ *
+ * Returns 0 and the number of blobs left out, or an errno with nothing
+ * changed (the pack stays as it was).
+ */
+static int __noinline
+tessera_fs_scrub_compact_one(struct tessera_mount *tmp_,
+    const struct tessera_scrub_part *p, uint32_t *out_dropped)
+{
+	uint8_t regv[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	tessera_registry_entry_t re;
+	tessera_pack_extent_t *exts = NULL;
+	uint32_t nexts = 0;
+	uint8_t *body = NULL, *packb = NULL;
+	tessera_hash_t *kh = NULL;
+	size_t osz = 0;
+	uint32_t kept = 0, dropped = 0;
+	int rc = 0;
+
+	*out_dropped = 0;
+	if (tessera_btree_get(tmp_->pack_registry_tree, p->pack_id, regv)
+	    != TESSERA_OK)
+		return (ENOENT);
+	if (tessera_decode_registry_entry(regv, &re) != TESSERA_OK)
+		return (EIO);
+	/* Republished or moved since the scan, or not plain: leave it. */
+	if (re.start_sector != p->start || re.length_sectors != p->len ||
+	    re.flags != p->flags ||
+	    (re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) != 0 ||
+	    tmp_->seal != NULL || re.length_sectors == 0 ||
+	    re.length_sectors > 4096u)
+		return (ESTALE);
+	if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts, &nexts) != 0)
+		return (EIO);
+
+	const size_t body_len = (size_t)re.length_sectors * TESSERA_SECTOR_SIZE;
+	body = malloc(body_len, M_TESSERA, M_WAITOK);
+	uint64_t cursor = 0;
+	for (uint32_t e = 0; e < nexts && rc == 0; e++) {
+		for (uint64_t i = 0; i < exts[e].length_sectors; i++) {
+			struct buf *bp = NULL;
+			if (bread(tmp_->devvp, (exts[e].start_sector + i) *
+			    btodb(TESSERA_SECTOR_SIZE), TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+			    &bp) != 0) {
+				if (bp != NULL)
+					brelse(bp);
+				rc = EIO;
+				break;
+			}
+			memcpy(body + (cursor + i) * TESSERA_SECTOR_SIZE,
+			    bp->b_data, TESSERA_SECTOR_SIZE);
+			brelse(bp);
+		}
+		cursor += exts[e].length_sectors;
+	}
+	if (rc != 0)
+		goto out;
+
+	uint8_t new_id[16];
+	arc4random_buf(new_id, sizeof(new_id));
+	packb = malloc(body_len, M_TESSERA, M_WAITOK | M_ZERO);
+	int crc = tessera_pack_compact(body, body_len, p->drop, p->ndrop,
+	    new_id, packb, &osz, &kept, &dropped);
+	if (crc != TESSERA_OK || kept == 0 || osz == 0 || osz > body_len) {
+		/* ENOENT: none of the drops is in it (republished). kept 0:
+		 * all dead, which whole-pack reclaim handles. */
+		rc = crc == TESSERA_ENOENT || kept == 0 ? ESTALE : EIO;
+		goto out;
+	}
+	/* The kept blobs' hashes, for the blob index. */
+	kh = malloc((size_t)kept * sizeof(*kh), M_TESSERA,
+	    M_WAITOK);
+	{
+		tessera_pack_reader_t *pr = tessera_pack_open(packb, osz);
+		if (pr == NULL || tessera_pack_blob_count(pr) != kept) {
+			if (pr != NULL)
+				tessera_pack_close(pr);
+			rc = EIO;
+			goto out;
+		}
+		for (uint32_t i = 0; i < kept && rc == 0; i++)
+			if (tessera_pack_blob_hash_at(pr, i, kh[i]) !=
+			    TESSERA_OK)
+				rc = EIO;
+		tessera_pack_close(pr);
+		if (rc != 0)
+			goto out;
+	}
+
+	const uint64_t n_sectors = howmany(osz, TESSERA_SECTOR_SIZE);
+	struct tessera_pack_alloc_result pa;
+	if (tessera_fs_pack_alloc_and_write(tmp_, packb, n_sectors, &pa,
+	    0) != 0) {
+		rc = ENOSPC;
+		goto out;
+	}
+	tessera_registry_entry_t nre = re;
+	memcpy(nre.pack_id, new_id, 16);
+	nre.start_sector    = pa.start_sector;
+	nre.length_sectors  = pa.length_sectors;
+	nre.flags           = pa.flags | (re.flags &
+	    ~(TESSERA_REGISTRY_FLAG_MULTI_EXTENT | TESSERA_REGISTRY_FLAG_SEALED));
+	nre.blob_count      = kept;
+	nre.reachable_blobs = kept;
+	nre.total_bytes     = osz;
+	uint8_t nval[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	uint64_t root = tmp_->sb.pack_registry_root;
+	if (tessera_encode_registry_entry(&nre, nval) != TESSERA_OK ||
+	    tessera_btree_put(tmp_->pack_registry_tree, new_id, nval, &root)
+	    != TESSERA_OK) {
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
+		rc = EIO;
+		goto out;
+	}
+	tmp_->sb.pack_registry_root = root;
+	if (tessera_btree_delete(tmp_->pack_registry_tree, p->pack_id, &root)
+	    != TESSERA_OK) {
+		/* Both entries would name the kept blobs; take the new one
+		 * back out and keep the old pack. */
+		root = tmp_->sb.pack_registry_root;
+		if (tessera_btree_delete(tmp_->pack_registry_tree, new_id,
+		    &root) == TESSERA_OK) {
+			tmp_->sb.pack_registry_root = root;
+			tessera_fs_pack_alloc_rollback(tmp_, &pa);
+		}
+		rc = EIO;
+		goto out;
+	}
+	tmp_->sb.pack_registry_root = root;
+
+	/* Past the commit point. Readers that resolved the old extents
+	 * retry (as after a repack); the blob index learns the new id. */
+	tessera_cas_invalidate_pack(&tmp_->cas_cache, p->pack_id);
+	atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
+	for (uint32_t i = 0; i < kept; i++)
+		tessera_fs_blob_index_put_pending(tmp_, kh[i], new_id);
+
+	for (uint32_t e = 0; e < nexts; e++)
+		(void)tessera_extent_free(tmp_->extent_alloc,
+		    exts[e].start_sector, exts[e].length_sectors);
+	if ((re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
+		uint64_t pel_s = re.start_sector;
+		for (int d = 0; d < 64 && pel_s != 0; d++) {
+			struct buf *bp = NULL;
+			uint64_t next = 0;
+			if (bread(tmp_->devvp, pel_s *
+			    btodb(TESSERA_SECTOR_SIZE), TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+			    &bp) == 0) {
+				tessera_pack_extent_list_t *pel = malloc(
+				    sizeof(*pel), M_TESSERA, M_WAITOK);
+				if (tessera_decode_pack_extent_list(
+				    (const uint8_t *)bp->b_data, pel) ==
+				    TESSERA_OK)
+					next = pel->next_pel_sector;
+				free(pel, M_TESSERA);
+				brelse(bp);
+			}
+			(void)tessera_extent_free(tmp_->extent_alloc, pel_s, 1);
+			pel_s = next;
+		}
+		if (tmp_->multi_extent_pack_count > 0)
+			tmp_->multi_extent_pack_count--;
+	}
+	tessera_fs_mark_dirty(tmp_);
+	*out_dropped = dropped;
+out:
+	free(kh, M_TESSERA);
+	free(packb, M_TESSERA);
+	free(body, M_TESSERA);
+	free(exts, M_TESSERA);
+	return (rc);
+}
+
+/* E4.7: the apply phase's half. A blob a writer referenced mid-scan is
+ * kept (the touch filter is a superset, so this only ever keeps more).
+ * Returns the number of packs rebuilt. */
+static uint32_t __noinline
+tessera_fs_scrub_compact(struct tessera_mount *tmp_, struct tessera_scrub *sc,
+    int concurrent)
+{
+	uint32_t done = 0;
+
+	for (uint32_t i = 0; i < sc->nparts; i++) {
+		struct tessera_scrub_part *p = &sc->parts[i];
+		uint32_t k = 0, dropped = 0;
+
+		if (concurrent) {
+			for (uint32_t j = 0; j < p->ndrop; j++) {
+				if (tessera_fs_gc_hash_touched(tmp_,
+				    p->drop[j]))
+					continue;
+				if (k != j)
+					memcpy(p->drop[k], p->drop[j],
+					    sizeof(tessera_hash_t));
+				k++;
+			}
+			p->ndrop = k;
+		}
+		if (p->ndrop == 0)
+			continue;
+		if (tessera_fs_scrub_compact_one(tmp_, p, &dropped) == 0) {
+			done++;
+			sc->dropped += dropped;
+		}
+	}
+	sc->compacted += done;
+	return (done);
 }
 
 static int
@@ -22950,6 +23260,7 @@ snap_next:
 			uint32_t nbh = 0;
 			int dead = 0;
 			int erased = 0;    /* E4.5: an erased group's pack */
+			int all_hashes = 0; /* E4.7: bh_all holds every blob */
 
 			/* ★ #133: enumerate this pack's blob hashes from its
 			 * header + index (1 + index_blocks sectors) instead of
@@ -23031,6 +23342,7 @@ snap_next:
 					free(exts, M_TESSERA);
 					nbh = pn;
 					bh_all = pbh;
+					all_hashes = 1;
 					dead = 1;
 					for (uint32_t bi = 0; bi < pn; bi++) {
 						if (_GC_HASH_IS_LIVE(
@@ -23115,6 +23427,15 @@ snap_next:
 			if (pr) tessera_pack_close(pr);
 			free(packbuf, M_TESSERA);
 have_hashes:
+			/* E4.7: a scrub notes plain packs that are partly dead.
+			 * Only the prefix arm has every hash in hand (the
+			 * whole-pack arm stops at the first live blob). */
+			if (!dead && all_hashes && bh_all != NULL &&
+			    scan != NULL && scan->scrub != NULL &&
+			    tmp_->seal == NULL &&
+			    (re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) == 0)
+				tessera_gc_scrub_note(scan->scrub, pkey, &re,
+				    bh_all, nbh, live, live_count);
 			if (!dead && bh_all != NULL) {
 				free(bh_all, M_TESSERA);
 				bh_all = NULL;
@@ -23527,6 +23848,13 @@ next_p:
 	(void)tessera_fs_dead_extent_drain(tmp_);
 	free(deads, M_TESSERA);
 
+	/* E4.7: a scrub's partly-dead plain packs, rebuilt without their
+	 * dead blobs. Still gated and inside the apply window. */
+	uint32_t compacted = 0;
+	if (scan != NULL && scan->scrub != NULL && scan->scrub->nparts > 0)
+		compacted = tessera_fs_scrub_compact(tmp_, scan->scrub,
+		    concurrent);
+
 	/*
 	 * ── Retire snapshots the walk proved unreadable (task #86) ──
 	 *
@@ -23589,8 +23917,8 @@ next_p:
 	 * one wedged run. A pass that frees nothing must read as unproductive
 	 * so the caller's exponential backoff engages.
 	 */
-	if (gone_n > 0 || retired > 0) {
-		if (gone_n > 0) {
+	if (gone_n > 0 || retired > 0 || compacted > 0) {
+		if (gone_n > 0 || compacted > 0) {
 			(void)tessera_commit_extent(tmp_);
 			printf("tessera_fs: gc post commit_extent\n");
 		}
@@ -23773,7 +24101,19 @@ out:
  * Returns 0 and the reclaimed pack count in *out_reclaimed, or an errno.
  */
 static int
+tessera_fs_gc_now_ex(struct tessera_mount *tmp_, uint64_t *out_reclaimed,
+    struct tessera_scrub *scrub);
+
+static int
 tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
+{
+	return (tessera_fs_gc_now_ex(tmp_, out_reclaimed, NULL));
+}
+
+/* scrub: E4.7, non-NULL only from tessera_fs_scrub. */
+static int
+tessera_fs_gc_now_ex(struct tessera_mount *tmp_, uint64_t *out_reclaimed,
+    struct tessera_scrub *scrub)
 {
 	if (out_reclaimed != NULL) *out_reclaimed = 0;
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
@@ -23813,6 +24153,7 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 		atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
 		return (berr);
 	}
+	scan.scrub = scrub;
 
 	tessera_stat_gc_scans++;
 	sbintime_t t0 = TPROF_T0();
@@ -34551,6 +34892,204 @@ out:
 	return (err);
 }
 
+/*
+ * TESSERA_IOC_SCRUB (E4.7, tessera-encryption.md §13.1): make what was
+ * deleted unreadable from the disk. atrium-volumes runs it after moving a
+ * plain folder into a key group, so the folder's old plaintext doesn't stay
+ * in free space or in packs shared with live files.
+ *
+ *   1. Flush, then retire every retained snapshot (each pins the trees it
+ *      names, and with them the old files' packs) and commit.
+ *   2. A GC pass that also rebuilds partly-dead plain packs without their
+ *      dead blobs (tessera_gc_scrub_note, tessera_fs_scrub_compact).
+ *   3. Zero every free sector of the data zone, in disk order: take a run
+ *      out of the allocator (so nothing can be written there meanwhile),
+ *      write zeros, give it back. Gate held per batch of runs, with no
+ *      uncommitted state underneath: a sector freed but not yet committed
+ *      may still be named by the durable superblock (a repack frees before
+ *      the next commit), and zeroing it would break recovery from a crash.
+ *
+ *   4. Zero the journal past its last checkpoint (a plain directory's
+ *      dirent records hold names).
+ *
+ * The metadata zone's free sectors are not zeroed: they hold btree nodes
+ * (inode records, the registry, indexes), not file contents or names;
+ * names live in directory manifests, which are blobs in packs, and in the
+ * journal. On flash, overwriting
+ * reaches the logical sectors only (the drive may keep the old cells
+ * until it erases them); disk encryption is the answer there (§11).
+ */
+#define TESSERA_SCRUB_ZERO_CHUNK 256u  /* sectors per write: 1 MiB */
+#define TESSERA_SCRUB_ZERO_BATCH 16u   /* writes per hold of the gate */
+
+/* Caller holds the gate and commits. */
+static uint32_t
+tessera_fs_snapshot_retire_all(struct tessera_mount *tmp_)
+{
+	uint32_t n = 0;
+
+	while (tmp_->snapshots_tree != NULL && n < 1000000u) {
+		uint8_t key[8];
+		tessera_snapshot_record_t rec;
+		tessera_btree_cursor_t *c =
+		    tessera_btree_seek_first(tmp_->snapshots_tree);
+		if (c == NULL)
+			break;
+		int grc = tessera_btree_cursor_get(c, key, (uint8_t *)&rec);
+		tessera_btree_cursor_free(c);
+		if (grc != TESSERA_OK)
+			break;
+		uint64_t gen = 0;
+		for (int i = 0; i < 8; i++)
+			gen = (gen << 8) | key[i];
+		if (!tessera_fs_snapshot_retire_gen(tmp_, gen))
+			break;
+		n++;
+	}
+	return (n);
+}
+
+static int
+tessera_fs_scrub_zero_free(struct tessera_mount *tmp_, uint64_t *out_sectors)
+{
+	const size_t zlen = (size_t)TESSERA_SCRUB_ZERO_CHUNK *
+	    TESSERA_SECTOR_SIZE;
+	uint8_t *zero = malloc(zlen, M_TESSERA, M_WAITOK | M_ZERO);
+	uint64_t from = 0;
+	int err = 0, done = 0;
+
+	*out_sectors = 0;
+	while (!done && err == 0) {
+		if (tmp_->flush_unmounting) {
+			err = EINTR;
+			break;
+		}
+		if (tmp_->sb_dirty)
+			(void)tessera_fs_flush(tmp_);
+		tessera_fs_flush_gate_enter(tmp_);
+		if (tmp_->sb_dirty) {
+			/* Writers got in after the flush. Commit what they
+			 * left, the way a GC pass's apply does. */
+			if (tessera_commit_extent(tmp_) != 0 ||
+			    tessera_commit_sb(tmp_) != 0) {
+				tessera_fs_flush_gate_exit(tmp_);
+				err = EIO;
+				break;
+			}
+		}
+		for (uint32_t b = 0; b < TESSERA_SCRUB_ZERO_BATCH; b++) {
+			uint64_t s = 0, n = 0;
+			int trc = tessera_extent_take_next(tmp_->extent_alloc,
+			    from, TESSERA_SCRUB_ZERO_CHUNK, &s, &n);
+			if (trc == TESSERA_ENOENT) {
+				done = 1;
+				break;
+			}
+			if (trc != TESSERA_OK) {
+				err = ENOMEM;
+				break;
+			}
+			/* Synchronous either way: the run goes back to the
+			 * allocator only once the zeros are on the device. */
+			if (tessera_kbio_write_bulk(&tmp_->bio_ctx, s, zero,
+			    n) != 0) {
+				for (uint64_t i = 0; i < n; i++)
+					if (tessera_kbio_write(&tmp_->bio_ctx,
+					    s + i, zero) != 0) {
+						err = EIO;
+						break;
+					}
+			}
+			(void)tessera_extent_free(tmp_->extent_alloc, s, n);
+			if (err != 0)
+				break;
+			*out_sectors += n;
+			from = s + n;
+		}
+		tessera_fs_flush_gate_exit(tmp_);
+		maybe_yield();
+	}
+	free(zero, M_TESSERA);
+	return (err);
+}
+
+static int
+tessera_fs_scrub(struct tessera_mount *tmp_, struct tessera_ioc_scrub *o)
+{
+	struct tessera_scrub *sc;
+	uint64_t reclaimed = 0, zeroed = 0;
+	uint32_t retired;
+	int err;
+
+	if (tmp_->readonly_snapshot || tmp_->extent_alloc == NULL ||
+	    tmp_->pack_registry_tree == NULL || !tmp_->flush_mtx_init)
+		return (EROFS);
+	if (o->flags != 0)
+		return (EINVAL);
+
+	if (tessera_fs_flush(tmp_) != 0)
+		return (EIO);
+	tessera_fs_flush_gate_enter(tmp_);
+	retired = tessera_fs_snapshot_retire_all(tmp_);
+	if (retired > 0) {
+		tmp_->sb_dirty = 1;
+		tessera_meta_pin_bitmap_rebuild(tmp_);
+		(void)tessera_commit_extent(tmp_);
+		err = tessera_commit_sb(tmp_) != 0 ? EIO : 0;
+	} else
+		err = 0;
+	tessera_fs_flush_gate_exit(tmp_);
+	if (err != 0)
+		return (err);
+
+	sc = malloc(sizeof(*sc), M_TESSERA, M_WAITOK | M_ZERO);
+	/* A background pass may be running; wait it out. */
+	for (int tries = 0; tries < 60; tries++) {
+		err = tessera_fs_gc_now_ex(tmp_, &reclaimed, sc);
+		if (err != EBUSY)
+			break;
+		pause("tscrub", hz);
+	}
+	o->snapshots_retired = retired;
+	o->packs_freed       = reclaimed;
+	o->packs_compacted   = sc->compacted;
+	o->blobs_dropped     = sc->dropped;
+	o->packs_young       = sc->young;
+	tessera_scrub_free(sc);
+	free(sc, M_TESSERA);
+	if (err != 0)
+		return (err);
+
+	err = tessera_fs_scrub_zero_free(tmp_, &zeroed);
+	o->zeroed_sectors = zeroed;
+
+	/* 4. The journal. Every commit checkpoints it back to block 1, and
+	 * the records past what later commits overwrite stay on disk: in a
+	 * plain directory, a dirent record holds the name. Empty right after
+	 * a commit, which this gate hold makes sure of. */
+	if (err == 0 && tmp_->journal != NULL) {
+		if (tmp_->sb_dirty)
+			(void)tessera_fs_flush(tmp_);
+		tessera_fs_flush_gate_enter(tmp_);
+		int jr = tessera_journal_scrub(tmp_->journal);
+		if (jr == TESSERA_EBUSY && tessera_commit_extent(tmp_) == 0 &&
+		    tessera_commit_sb(tmp_) == 0)
+			jr = tessera_journal_scrub(tmp_->journal);
+		tessera_fs_flush_gate_exit(tmp_);
+		if (jr == TESSERA_OK && tmp_->seal == NULL)
+			o->journal_blocks = tmp_->sb.journal_length - 1;
+		else if (jr != TESSERA_OK)
+			err = EIO;
+	}
+	printf("tessera_fs: scrub: %u snapshot(s) retired, %ju pack(s) freed, "
+	    "%ju rebuilt (%ju blob(s) dropped, %ju too young), %ju free "
+	    "sector(s) and %ju journal block(s) zeroed, err %d\n", retired,
+	    (uintmax_t)reclaimed, (uintmax_t)o->packs_compacted,
+	    (uintmax_t)o->blobs_dropped, (uintmax_t)o->packs_young,
+	    (uintmax_t)zeroed, (uintmax_t)o->journal_blocks, err);
+	return (err);
+}
+
 static int
 tessera_vop_ioctl(struct vop_ioctl_args *ap)
 {
@@ -34590,7 +35129,8 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	case TESSERA_IOC_GROUP_CREATE:
 	case TESSERA_IOC_QUOTA_GROUP:
 	case TESSERA_IOC_GROUP_ERASE:
-	case TESSERA_IOC_GROUP_INFO: {
+	case TESSERA_IOC_GROUP_INFO:
+	case TESSERA_IOC_SCRUB: {
 		if (jailed(ap->a_cred))
 			return (EPERM);
 		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
@@ -34610,6 +35150,11 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 			atomic_add_rel_64(&tmp_->quota_gen, 1);
 		return (er);
 	}
+	/* SCRUB flushes, runs a GC pass and walks free space; it takes the
+	 * gate itself, a piece at a time. */
+	if (ap->a_command == TESSERA_IOC_SCRUB)
+		return (tessera_fs_scrub(tmp_,
+		    (struct tessera_ioc_scrub *)ap->a_data));
 	/* GROUP_INFO only reads; it takes groups_sx itself. */
 	if (ap->a_command == TESSERA_IOC_GROUP_INFO)
 		return (tessera_fs_group_info(ap->a_vp,

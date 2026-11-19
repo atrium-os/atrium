@@ -75,6 +75,14 @@ int tessera_extent_free(tessera_extent_alloc_t *,
                         uint64_t start, uint64_t n_sectors);
 
 /* Reachability stats. */
+/* Take the first free run at or after sector `from`, at most max_sectors
+ * long, out of the free set, as an allocation would. The scrub (E4.7) uses
+ * it to walk free space in disk order: take, zero, free, continue from the
+ * run's end. TESSERA_ENOENT: no free sector at or after `from`. */
+int tessera_extent_take_next(tessera_extent_alloc_t *, uint64_t from,
+                             uint64_t max_sectors, uint64_t *out_start,
+                             uint64_t *out_len);
+
 uint64_t tessera_extent_free_blocks(const tessera_extent_alloc_t *);
 uint64_t tessera_extent_largest_free_run(const tessera_extent_alloc_t *);
 

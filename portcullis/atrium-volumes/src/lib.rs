@@ -31,6 +31,7 @@ pub mod persona;
 pub mod plugin;
 pub mod policy;
 pub mod protocol;
+pub mod scrub;
 pub mod server;
 pub mod state;
 

@@ -93,6 +93,14 @@ int tessera_journal_tx_commit(tessera_journal_t *, uint64_t tx_id);
  * after every successful commit_sb. */
 int tessera_journal_checkpoint(tessera_journal_t *);
 
+/* The scrub (tessera-encryption.md E4.7): zero every record block of an
+ * empty journal (head == tail, as after a checkpoint). Records stay on disk
+ * after a checkpoint until a later append overwrites them, and a plain
+ * journal's dirent records name files in the clear. TESSERA_EBUSY if the
+ * journal holds records; a sealed journal is left as it is. Writes through
+ * the primary (synchronous) io. */
+int tessera_journal_scrub(tessera_journal_t *);
+
 /* Abort a transaction. Writes TX_ABORT (advisory). */
 int tessera_journal_tx_abort(tessera_journal_t *, uint64_t tx_id,
                               uint32_t reason_code);

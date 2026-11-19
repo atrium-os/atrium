@@ -20,6 +20,10 @@
 #      the files already in her plain Documents are moved in (same bytes,
 #      mode and owner; the old copy gone); her Work persona gets a group
 #      of its own; b logs in too;
+#   1b. the move-in's scrub (E4.7) runs in the background: none of the
+#      moved-in plaintext is left on the disk, contents or names, not in
+#      free space, not in the journal and not in a pack it shared with a
+#      plain file that lives on (which reads);
 #   2. dedup: a copy inside a's group costs nothing, the same bytes in b's
 #      group are written in full; nothing of either is in the clear on disk;
 #   3. b logs out: his key leaves the kernel, and root can read neither his
@@ -81,7 +85,7 @@ for u in e46a:1061 e46b:1062; do
 done
 GA=$(g "pw groupshow files-e46a | cut -d: -f3"); GB=$(g "pw groupshow files-e46b | cut -d: -f3")
 # Before encryption: a has plain folders with files in them, as today.
-g "mkdir -p $M/home/e46a/Documents/letters && jot -w 'a old letter line %06d' 20000 > $M/home/e46a/Documents/letters/old-letter-secret.txt && echo 'a old note' > $M/home/e46a/Documents/old-note.txt && chmod 640 $M/home/e46a/Documents/old-note.txt && chown -R e46a:$GA $M/home/e46a/Documents && chmod 2770 $M/home/e46a/Documents"
+g "mkdir -p $M/home/e46a/Documents/letters && jot -w 'a old letter line %06d' 20000 > $M/home/e46a/Documents/letters/old-letter-secret.txt && echo 'a old note' > $M/home/e46a/Documents/old-note.txt && chmod 640 $M/home/e46a/Documents/old-note.txt && chown -R e46a:$GA $M/home/e46a/Documents && chmod 2770 $M/home/e46a/Documents && echo 'plain neighbour stays' > $M/plain/neighbour.txt && sync"
 OLDSUM=$(g "md5 -q $M/home/e46a/Documents/letters/old-letter-secret.txt")
 g "daemon -f -o $T/v.log $V serve --socket $VS --state $T/state.toml --groups $T/groups.toml --policy /etc/atrium/volumes.policy.toml"
 sleep 2
@@ -129,6 +133,22 @@ check "the expectations are recorded" 3 "$(g "grep -c '^\[\[group\]\]' $T/groups
 r=$(ask e46a personal $GA $HA)
 check "a's next ask: ready, nothing moved again" yes "$(echo "$r" | grep -q '"moved":\[\]' && echo yes || echo no)"
 
+echo "=== 1b. the move-in's scrub"
+# Queued in $T/volumes.scrub before the plain copy went; the queue empties
+# when the scrub is done.
+for i in $(seq 1 120); do
+    [ "$(g "test -s $T/volumes.scrub && echo q || echo e")" = e ] && break
+    sleep 1
+done
+check "the scrub ran and its queue is empty" e "$(g "test -s $T/volumes.scrub && echo q || echo e")"
+echo "  $(g "grep 'scrub:' $T/v.log | tail -1")"
+check "it rebuilt at least one shared pack" yes "$(g "grep 'scrub:' $T/v.log | tail -1" | awk '{for (i = 1; i < NF; i++) if ($(i+1) == "rebuilt") print ($i > 0 ? "yes" : "no")}')"
+for w in 'a old letter line' 'a old note' old-letter-secret; do
+    check "moved-in '$w' not on the disk" 0 "$(g "grep -ac '$w' /dev/$MD")"
+done
+check "…the plain file that shared its pack reads" "plain neighbour stays" "$(g "cat $M/plain/neighbour.txt")"
+check "…and a's moved-in files read back" "$OLDSUM" "$(g "md5 -q $HA/Documents/letters/old-letter-secret.txt")"
+
 echo "=== 2. dedup and nothing in the clear"
 g "sysctl kern.tessera.snapshot_retention=1 >/dev/null"
 g "jot -w 'shared photo bytes %07d' 60000 > $T/photo && su -m e46a -c 'cp $T/photo $HA/Pictures/beach-photo-a.raw'"
@@ -146,11 +166,8 @@ check "the same bytes in b's group are written in full" yes "$([ $((f1 - f2)) -g
 g "su -m e46b -c 'mkdir $HB/Documents/bob-private-folder && jot -w \"b private line %06d\" 20000 > $HB/Documents/bob-private-folder/bob-diary-secret.txt'"
 BSUM=$(g "md5 -q $HB/Documents/bob-private-folder/bob-diary-secret.txt")
 ticks
-# What was moved in from a plain folder was on disk in the clear before
-# encryption; its old blocks stay in free space until reused (see the
-# spec's E4.6 notes). Shown, not checked.
-echo "  note: moved-in plaintext still in free space: $(g "grep -ac 'a old letter line' /dev/$MD") line(s)"
-for w in bob-diary-secret bob-private-folder 'b private line' 'shared photo bytes' beach-photo; do
+for w in 'a old letter line' 'a old note' \
+     bob-diary-secret bob-private-folder 'b private line' 'shared photo bytes' beach-photo; do
     check "'$w' not in the clear" 0 "$(g "grep -ac '$w' /dev/$MD")"
 done
 

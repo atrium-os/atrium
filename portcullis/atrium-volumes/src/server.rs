@@ -25,18 +25,22 @@ use crate::protocol::{
 use crate::arca::Arcad;
 use crate::groups::Groups;
 use crate::persona::{Folders, Tessera};
+use crate::scrub::Scrubber;
 use crate::state::{State, VolumeRecord};
 
 /// What the persona-folder requests need between requests.
 pub struct FolderCtx<'a> {
     arcad:  &'a Arcad,
+    scrub:  &'a Scrubber,
     groups: &'a mut Groups,
     path:   &'a Path,
 }
 
 impl FolderCtx<'_> {
     fn with(&mut self, f: impl FnOnce(&mut Folders<'_, Tessera, Arcad>) -> Response) -> Response {
-        let mut x = Folders { kernel: &Tessera, keys: self.arcad, groups: self.groups, path: self.path };
+        let mut x = Folders {
+            kernel: &Tessera, keys: self.arcad, scrub: self.scrub, groups: self.groups, path: self.path,
+        };
         f(&mut x)
     }
 }
@@ -51,7 +55,10 @@ pub fn serve(
     let mut state = State::load(state_path)?;
     let mut groups = Groups::load(groups_path)?;
     let arcad = Arcad::new()?;
-    let mut folders = FolderCtx { arcad: &arcad, groups: &mut groups, path: groups_path };
+    // Beside the expected groups, so a test's temporary state stays its own.
+    let scrub = Scrubber::start(groups_path.with_file_name(
+        Path::new(crate::scrub::DEFAULT_PATH).file_name().unwrap()), ffi::tessera_scrub);
+    let mut folders = FolderCtx { arcad: &arcad, scrub: &scrub, groups: &mut groups, path: groups_path };
     info!("atrium-volumes: ready ({} volume(s) known, {} backend(s) configured)",
         state.volumes.len(), policy.backends.len());
 

@@ -815,6 +815,7 @@ E4 is mostly kernel work, so it is built in steps that each pass on their own:
 | E4.4 | Locked groups and the rules: without the key, contents, names and xattrs answer `EACCES` (root can still `stat`); the parent-domain rule; rename into, out of or between groups is `EXDEV`; dropping a key flushes and invalidates the group's vnodes and pages | VM: root can't read B's files while B's key is dropped; an offline edit that moves a file out of the group is refused **Done** 2026-11-18 (34936eb, 6a01870c, ec474cee; check 13). |
 | E4.5 | GC: group packs are kept while the group is locked and collected by group when it's loaded; crypto-erase retires a group's packs without its key | VM: GC on a volume with a locked group frees nothing of it **Done** 2026-11-19 (89d2f896, 33254b47, 83a70340; check 14). |
 | E4.6 | atrium-volumes `encrypt = "persona"` with expected groups, arcad group keys (`VK_MINT`/`VK_LOAD` with a group scope) at login and dropped at logout | VM: two people, the §13 E4 gate **Done** 2026-11-19 (87d5f8ec, 74d59854, 486f4f03; `tessera-personas-vm.sh` 38/0, sealed 14/14, arca 124/0, sticks 74/0, sticks-ui 15/0). |
+| E4.7 | Scrub after a move-in (decision of 2026-11-19, "scrub them, as a next step"): `TESSERA_IOC_SCRUB` retires retained snapshots, rebuilds partly-dead plain packs without their dead blobs, zeroes the data zone's free space and the journal's old records; atrium-volumes queues one before it deletes a moved-in folder's plain copy and runs it in the background | VM: after a move-in, none of the old contents or names is anywhere on the device, and a plain file that shared a pack with them still reads (`tessera-personas-vm.sh` 1b) |
 
 **E4.3 as built (2026-11-18, kernel).** Every write carries a write context
 (`struct tessera_fs_wctx`): the keys of the domain of the inode it is for, taken
@@ -923,10 +924,52 @@ for the person's next ask. Limit: a mount holds at most 32 groups
 (`TESSERA_FS_MAX_GROUPS`), so 32 person-personas per volume for now. A
 locked group's folder can't be opened (E4.4), so `GROUP_INFO` is asked of
 the folder's parent with the folder's inode number (`inode`, from stat,
-which root may do on a locked inode); the ioctl is `_IOWR('T',10)`. Limit:
-files moved in from a plain folder were on disk in the clear before; their
-old blocks stay in free space until reused (the VM gate saw them after GC).
+which root may do on a locked inode); the ioctl is `_IOWR('T',10)`. Files moved in from a plain
+folder were on disk in the clear before; E4.7 scrubs what they leave behind.
 VM gate: `scripts/tessera-personas-vm.sh`.
+
+**E4.7 as built (2026-11-19).** A deleted file's bytes stay on the device
+until something overwrites them, so a moved-in folder's plain copy outlives
+its delete in four places: free space; plain packs it shared with files that
+still live (GC frees a pack only when every blob in it is dead, and small
+files are batched into shared packs); trees pinned by retained snapshots;
+and the journal, whose plain dirent records name files and which every
+commit checkpoints back to its first block, leaving later blocks as they
+were. `TESSERA_IOC_SCRUB` (`_IOWR('T',11)`, unjailed root, any directory of
+the volume; `tessera-keyload scrub DIR`) clears all four:
+
+1. Flush, retire every retained snapshot, commit.
+2. A GC pass that also notes each plain pack (no key group, unsealed
+   volume) that is partly dead, with its dead blobs. Its apply phase,
+   still gated, rebuilds each one without them (`tessera_pack_compact` in
+   core): reads it, writes the rebuild elsewhere, swaps the registry entry,
+   frees the old extents. A blob a writer touched during the scan is kept,
+   and a pack inside the GC grace period is left for the next scrub. The
+   rebuild gets a new random pack id and the kept blobs are re-indexed
+   under it: pack ids are derived from what a pack first held, and a
+   publish that finds its id registered writes nothing, so keeping the id
+   would let a later write of the dropped content dedup onto a pack that no
+   longer holds it.
+3. Zero the data zone's free space in disk order: take a run of up to
+   1 MiB out of the allocator (`tessera_extent_take_next`), write zeros,
+   give it back, 16 runs per hold of the gate and with nothing uncommitted
+   underneath (a sector freed since the last commit may still be named by
+   the durable superblock).
+4. Zero the journal's record blocks right after a commit
+   (`tessera_journal_scrub`; a sealed journal is left alone).
+
+It costs a write of the whole free space, so atrium-volumes runs it on a
+thread of its own and login doesn't wait. The ask is queued in
+`/var/db/atrium/volumes.scrub` (one directory per line) before the plain
+copy is deleted, so a crash in between still gets its scrub; the queue is
+read at start and after each move-in, a failed scrub stays queued, and one
+scrub serves every entry on its volume. Not covered: the metadata zone's
+free sectors (btree nodes: inode records, the registry and indexes, no
+contents or names), and the flash cells under the logical sectors (an SSD
+may keep the old data until it erases the block; disk encryption is the
+answer there, §11). Plain packs elsewhere on the volume are rebuilt too,
+which is the point: everything deleted becomes unreadable, not only the
+moved-in folder.
 
 ## 14. Decisions
 

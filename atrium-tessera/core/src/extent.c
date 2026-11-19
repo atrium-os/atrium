@@ -572,3 +572,54 @@ tessera_extent_free(tessera_extent_alloc_t *a, uint64_t start,
 	a->free_blocks += n_sectors;
 	return TESSERA_OK;
 }
+
+int
+tessera_extent_take_next(tessera_extent_alloc_t *a, uint64_t from,
+                         uint64_t max_sectors, uint64_t *out_start,
+                         uint64_t *out_len)
+{
+	if (a == NULL || out_start == NULL || out_len == NULL ||
+	    max_sectors == 0)
+		return TESSERA_EINVAL;
+	/* The first extent that ends after `from`: the one before
+	 * lower_bound(from) if it reaches past from, else lower_bound's. */
+	size_t i = lower_bound(a, from);
+	if (i > 0) {
+		const tessera_free_extent_t *p = &a->extents[i - 1];
+		if (p->start_sector + p->length_sectors > from)
+			i--;
+	}
+	if (i >= a->count)
+		return TESSERA_ENOENT;
+	tessera_free_extent_t *e = &a->extents[i];
+	const uint64_t e_end = e->start_sector + e->length_sectors;
+	const uint64_t s = e->start_sector > from ? e->start_sector : from;
+	const uint64_t n = e_end - s < max_sectors ? e_end - s : max_sectors;
+	const uint64_t t_end = s + n;
+
+	if (s > e->start_sector && t_end < e_end) {
+		/* Out of the middle: split in two. */
+		if (ensure_capacity(a, a->count + 1) != 0)
+			return TESSERA_ENOMEM;
+		e = &a->extents[i];
+		memmove(&a->extents[i + 2], &a->extents[i + 1],
+		    (a->count - i - 1) * sizeof *a->extents);
+		a->extents[i + 1].start_sector   = t_end;
+		a->extents[i + 1].length_sectors = e_end - t_end;
+		e->length_sectors = s - e->start_sector;
+		a->count++;
+	} else if (s > e->start_sector) {
+		e->length_sectors = s - e->start_sector;      /* tail */
+	} else if (t_end < e_end) {
+		e->start_sector   = t_end;                    /* head */
+		e->length_sectors = e_end - t_end;
+	} else {
+		memmove(e, e + 1, (a->count - i - 1) * sizeof *e);
+		a->count--;
+	}
+	a->free_blocks -= n;
+	a->dirty = 1;
+	*out_start = s;
+	*out_len = n;
+	return TESSERA_OK;
+}

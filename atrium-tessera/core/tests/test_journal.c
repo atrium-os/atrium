@@ -451,6 +451,54 @@ test_bad_head_tail_and_body_cap(void)
 	free(d);
 }
 
+/* The scrub: after a checkpoint the old records are still on disk; scrub
+ * zeroes them, refuses while records are live, and the journal still works
+ * after it. */
+static void
+test_scrub(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	tessera_block_io_t io = mk_io(d);
+	const uint64_t START = 4, LEN = 32;
+	CHECK(tessera_journal_format(&io, START, LEN) == TESSERA_OK);
+	tessera_journal_t *j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	uint64_t tx = 0;
+	const char name[] = "old-letter-secret.txt";
+	CHECK(tessera_journal_tx_begin(j, &tx, "scrubtest") == TESSERA_OK);
+	CHECK(tessera_journal_append(j, tx, TESSERA_DIR_INSERT, name,
+	    sizeof name) == TESSERA_OK);
+	CHECK(tessera_journal_tx_commit(j, tx) == TESSERA_OK);
+	CHECK(tessera_journal_scrub(j) == TESSERA_EBUSY);
+	CHECK(tessera_journal_checkpoint(j) == TESSERA_OK);
+
+	int found = 0;
+	for (uint64_t s = START + 1; s < START + LEN; s++)
+		for (size_t o = 0; o + sizeof name <= 4096 && !found; o++)
+			found = memcmp(d->blocks[s] + o, name, sizeof name) == 0;
+	CHECK(found);             /* a checkpoint alone leaves it */
+	CHECK(tessera_journal_scrub(j) == TESSERA_OK);
+	found = 0;
+	for (uint64_t s = START + 1; s < START + LEN; s++)
+		for (size_t o = 0; o + sizeof name <= 4096 && !found; o++)
+			found = memcmp(d->blocks[s] + o, name, sizeof name) == 0;
+	CHECK(!found);
+
+	CHECK(tessera_journal_tx_begin(j, &tx, "after") == TESSERA_OK);
+	CHECK(tessera_journal_append(j, tx, TESSERA_DIR_REMOVE, "x", 1) ==
+	    TESSERA_OK);
+	CHECK(tessera_journal_tx_commit(j, tx) == TESSERA_OK);
+	tessera_journal_close(j);
+	j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	struct cap_ctx cc = {0};
+	CHECK(tessera_journal_replay(j, cap_cb, &cc) == TESSERA_OK);
+	CHECK(cc.count == 1 && cc.recs[0].type == TESSERA_DIR_REMOVE);
+	cap_free(&cc);
+	tessera_journal_close(j);
+	free(d);
+}
+
 int
 main(void)
 {
@@ -463,6 +511,7 @@ main(void)
 	test_corrupt_block_count_terminates();
 	test_short_reason_tag();
 	test_bad_head_tail_and_body_cap();
+	test_scrub();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;
