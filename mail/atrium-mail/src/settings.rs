@@ -447,6 +447,12 @@ impl Settings {
         self.set_prefs(|p| p.replies_through = !p.replies_through);
     }
 
+    /// The single-key shortcuts (§15.5): off, only Ctrl-K, the arrows,
+    /// Enter, Escape and Delete remain.
+    pub fn toggle_single_keys(&self) {
+        self.set_prefs(|p| p.single_keys = !p.single_keys);
+    }
+
     pub fn toggle_vips_through(&self) {
         self.set_prefs(|p| p.vips_through = !p.vips_through);
     }
@@ -726,12 +732,15 @@ fn switch(ctx: &mut Ctx, x: f32, cy: f32, label: &str, on: bool, f: impl Fn() + 
 pub struct SettingsView {
     pub s: Settings,
     pub size: Mutable<(f32, f32)>,
+    /// Everything under the heading scrolls (the heading and Done stay).
+    pub scroll: Mutable<pergola::widgets::scroll_view::ScrollState>,
 }
 
 impl SettingsView {
     pub fn new(s: Settings, size: (f32, f32)) -> SettingsView {
         let size = s.ui.sibling(size);
-        SettingsView { s, size }
+        let scroll = s.ui.sibling(Default::default());
+        SettingsView { s, size, scroll }
     }
 }
 
@@ -748,9 +757,31 @@ impl View for SettingsView {
         let s = self.s.clone();
         let dw = measure("Done", type_size::SM, Weight::Medium) + em(24.0);
         button(ctx, w - 16.0 - dw, head / 2.0, "Done", true, true, move || s.close());
-        // Two columns: accounts on the left, the rest on the right.
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, w, 0.0), 0.0));
+            ctx.set_flex(g, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+            let end = self.body(ctx, &ui, w);
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = end;
+            }
+            ctx.pop();
+        });
+        pergola::widgets::ScrollView::new(self.scroll.clone(), Rect::new(0.0, head, w, (h - head).max(em(60.0))), content)
+            .key(71)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
+    }
+}
+
+impl SettingsView {
+    /// Everything under the heading, in two columns (accounts on the
+    /// left, the rest on the right), from the scroll view's top: how tall.
+    fn body(&self, ctx: &mut Ctx, ui: &SettingsUi, w: f32) -> f32 {
+        let t = ctx.theme;
+        // Nothing is cut off: the window scrolls.
+        let h = f32::INFINITY;
         let x = 20.0;
-        let mut y = head + em(12.0);
+        let mut y = em(12.0);
         if let Some(n) = &ui.note {
             let nw = w - 40.0;
             let nh = crate::compose::wrap(n, nw - em(24.0), &sans(type_size::SM, Weight::Regular, t.text_secondary())).len() as f32 * em(type_size::SM) * 1.5;
@@ -940,7 +971,7 @@ impl View for SettingsView {
                 }
             }
         }
-        let _left_end = y;
+        let left_end = y;
         // Notifications, lanes and VIPs, in the right column.
         let x = right + 20.0;
         let right = x + inner;
@@ -988,6 +1019,15 @@ impl View for SettingsView {
         switch(ctx, x, y + em(14.0), "Later: a weekly look on Friday afternoon", ui.prefs.weekly, move || s.toggle_weekly());
         y += em(32.0);
 
+        // The keyboard (§15.5).
+        y += em(8.0);
+        section(ctx, x, &mut y, "KEYBOARD");
+        let s = self.s.clone();
+        switch(ctx, x, y + em(14.0), "Single-key shortcuts (j, k, e, r, …)", ui.prefs.single_keys, move || s.toggle_single_keys());
+        y += em(32.0);
+        text(ctx, x, y + em(8.0), "Ctrl-K finds every command, on or off.", type_size::XS, Weight::Regular, t.text_tertiary());
+        y += em(22.0);
+
         // Lanes (E10): the person's rules, then what Mail does by itself.
         y += em(8.0);
         section(ctx, x, &mut y, "LANES");
@@ -1028,6 +1068,7 @@ impl View for SettingsView {
             button(ctx, right - rw, y + em(14.0), "Remove", false, true, move || s.remove_vip(&a));
             y += em(30.0);
         }
+        left_end.max(y) + em(24.0)
     }
 }
 

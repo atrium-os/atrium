@@ -11,6 +11,7 @@ const VIPS_THROUGH: &str = "vips_through_quiet";
 const WEEKLY_OFF: &str = "weekly_look_off";
 const QUIET_WEEKENDS: &str = "quiet_weekends";
 const REPLIES_THROUGH: &str = "replies_through_quiet";
+const SINGLE_KEYS_OFF: &str = "single_keys_off";
 /// The review's minute after local midnight, plus one; absent: 9:00.
 const REVIEW: &str = "review_minute";
 /// The digest's times, comma-separated minutes after local midnight; "-"
@@ -47,11 +48,13 @@ pub struct Prefs {
     pub digest: Vec<u16>,
     /// When the Later review comes, minutes after local midnight.
     pub review: u16,
+    /// The single-key shortcuts (j, k, e, r, …; §15.5), on unless turned off.
+    pub single_keys: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60 }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true }
     }
 }
 
@@ -88,6 +91,7 @@ impl Engine {
             weekly: s.setting(ALL, WEEKLY_OFF).ok().flatten().unwrap_or(0) == 0,
             quiet_weekends: s.setting(ALL, QUIET_WEEKENDS).ok().flatten().unwrap_or(0) != 0,
             replies_through: s.setting(ALL, REPLIES_THROUGH).ok().flatten().unwrap_or(0) != 0,
+            single_keys: s.setting(ALL, SINGLE_KEYS_OFF).ok().flatten().unwrap_or(0) == 0,
             review: s.setting(ALL, REVIEW).ok().flatten().filter(|v| (1..=1440).contains(v)).map_or(9 * 60, |v| (v - 1) as u16),
             digest: match s.sync_state(ALL, DIGEST).ok().flatten() {
                 None => DIGEST_DEFAULT.to_vec(),
@@ -110,6 +114,7 @@ impl Engine {
             w.set_setting(ALL, WEEKLY_OFF, (!p.weekly).then_some(1))?;
             w.set_setting(ALL, QUIET_WEEKENDS, p.quiet_weekends.then_some(1))?;
             w.set_setting(ALL, REPLIES_THROUGH, p.replies_through.then_some(1))?;
+            w.set_setting(ALL, SINGLE_KEYS_OFF, (!p.single_keys).then_some(1))?;
             w.set_setting(ALL, REVIEW, (p.review < 1440 && p.review != 9 * 60).then_some(p.review as u64 + 1))?;
             let times = clean_times(p.digest.iter().copied());
             let digest = if times == DIGEST_DEFAULT { None } else if times.is_empty() { Some("-".to_string()) } else { Some(times.iter().map(u16::to_string).collect::<Vec<_>>().join(",")) };
@@ -140,5 +145,16 @@ mod tests {
         assert!(!p.is_quiet(7 * 60) && !p.is_quiet(12 * 60));
         let d = Prefs { quiet: Some((13 * 60, 14 * 60)), ..Prefs::default() };
         assert!(d.is_quiet(13 * 60 + 30) && !d.is_quiet(14 * 60));
+    }
+
+    #[test]
+    fn single_keys_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(mail_store::Store::open(dir.path()).unwrap(), crate::Parser { program: "/nonexistent".into() });
+        assert!(e.prefs().single_keys);
+        e.set_prefs(&Prefs { single_keys: false, ..e.prefs() }).unwrap();
+        assert!(!e.prefs().single_keys);
+        e.set_prefs(&Prefs { single_keys: true, ..e.prefs() }).unwrap();
+        assert!(e.prefs().single_keys);
     }
 }

@@ -199,6 +199,18 @@ fn settings_window() {
     assert_eq!(s.ui.get_cloned().note.as_deref(), Some("Forgot grace@navy.example"));
     assert!(engine.store.complete("grace", now, 5).unwrap().is_empty());
     drawn(&mut app, &["1 person you've written to, completed as you type."]);
+    // Nothing is cut off: the window scrolls.
+    for i in 0..12 {
+        s.made_for.set(TextEdit::new(&format!("shop{i}.example")));
+        s.make_private(6 + i);
+    }
+    drawn(&mut app, &["for shop11.example", "for shop.example · off: its mail goes to Trash", "KEYBOARD", "Single-key shortcuts (j, k, e, r, …)"]);
+    assert!(!texts(&app).iter().any(|x| x == "…"));
+    // Single keys off and on.
+    s.toggle_single_keys();
+    assert!(!engine.prefs().single_keys);
+    s.toggle_single_keys();
+    assert!(engine.prefs().single_keys);
 
     s.close();
     assert!(s.closed());

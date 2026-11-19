@@ -1251,6 +1251,18 @@ fn the_command_palette() {
     typed("write");
     assert!(mail.palette_run(0));
     assert_eq!(mail.take_composes().len(), 1);
+    // Single keys off (§15.5): j and e do nothing; the arrows, Ctrl-K and
+    // the palette still work.
+    engine.set_prefs(&mail_engine::prefs::Prefs { single_keys: false, ..engine.prefs() }).unwrap();
+    mail.open(0);
+    assert!(!mail.key(&key("e"), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    assert!(mail.key(&press(Key::Down), None));
+    assert_eq!(mail.ui.get_cloned().cursor, Some(1));
+    assert!(mail.key(&ctrl_k, None));
+    typed("arch");
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(subjects(&mail), ["Two"]);
 }
 
 #[test]

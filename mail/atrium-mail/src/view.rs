@@ -2367,6 +2367,11 @@ impl Mail {
         if modifiers.ctrl || modifiers.alt || modifiers.meta {
             return false;
         }
+        // Single keys off (§15.5): a letter or sign is no shortcut, except
+        // inside the Later sheet, whose keys are its own.
+        if *key == Key::Char && ui.later_sheet.is_none() && !self.engine.prefs().single_keys {
+            return false;
+        }
         if ui.later_sheet.is_some() {
             use mail_engine::later::When;
             if ui.later_noting {

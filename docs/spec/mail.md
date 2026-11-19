@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1642,7 +1642,21 @@ Stalwart in the cloud VM, and later a real account):
    counted is seen again (a resync of Sent); only a new message to them puts them back.
    Tests: store 1 (forgotten, a resync, a new message), settings 1 (the section, finding,
    nothing found, Forget). **Not yet**: imported vCards and CardDAV (§17 D8), and a
-   scrolling Settings window (a long list of private addresses can be cut off with "…").
+   scrolling Settings window (built next, below).
+
+   **Settings scrolls, and single keys can be turned off (2026-11-19, §15.5).** Everything
+   under Settings' heading is in a Pergola scroll view (the heading and Done stay), so no
+   list is cut off any more: every private address, VIP and section is reachable by wheel,
+   touchpad or keys; Arca's password field scrolls with it (Pergola hides a credential slot
+   a scroll view clips, so a field half out of view can't be typed into). A new
+   **Keyboard** section has "Single-key shortcuts (j, k, e, r, …)", on by default as §15.5
+   says; off, a letter or sign is no shortcut in the main window (so nothing happens by a
+   stray key), while Ctrl-K and the palette, the arrows, Enter, Escape and Delete still work,
+   and the Later sheet keeps its own keys. Kept in the instance's settings like the rest.
+   Tests: engine 1 (kept), settings 1 (twelve private addresses and every section drawn
+   with nothing cut off, the switch), window 1 (e ignored when off, Down and the palette
+   still archive). **Not yet**: keys shown on buttons are still drawn when single keys
+   are off.
 
 ## 17. Decisions, with recommendations
 
