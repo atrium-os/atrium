@@ -286,7 +286,8 @@ without looking at it.
 ### 6.6 What the person sees while it prints
 
 - A **Forum status item** (forum-status-items.md) while any job is active: printer,
-  progress (page N of M once rendering knows), Cancel.
+  progress (page N of M once rendering knows), Cancel, and Release for held jobs.
+  Release retries the existing job through the same printer identity checks.
 - **Praeco notifications** cover out of paper, jams, sustained offline state,
   changed printer identity (§7.3), PIN requests, and failed jobs. “Printed”
   is a quiet success notice, on by default. The **Printed notices** control
@@ -843,7 +844,10 @@ the first share request and approves the retry, and the gate checks that the
 saved printer becomes shared only after approval. The R7 desktop check in §11.6
 covers the real Sigillum sheet and PAM passcode verification.
 
-The status item has no Release button for held jobs.
+The isolated arm64 FreeBSD Release gate held a job on a changed printer UUID.
+A Forum Release press retried the job and held it again without uploading.
+After the original UUID returned, Release completed the same job and the
+simulator received one PDF.
 
 ### 11.6 R7 in progress
 

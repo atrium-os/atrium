@@ -112,8 +112,33 @@ impl Notices {
     }
 }
 
+/// Forum's panel protocol uses 32-bit control IDs. Keep the lower half
+/// for Cancel and use the high bit to distinguish Release on the same job.
+const RELEASE_BIT: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobAction {
+    Cancel(u64),
+    Release(u64),
+}
+
+impl JobAction {
+    pub fn from_button(id: u32) -> Self {
+        let job = u64::from(id & !RELEASE_BIT);
+        if id & RELEASE_BIT == 0 { Self::Cancel(job) } else { Self::Release(job) }
+    }
+
+    fn button_id(self) -> Option<u32> {
+        let (job, action) = match self {
+            Self::Cancel(job) => (job, 0),
+            Self::Release(job) => (job, RELEASE_BIT),
+        };
+        u32::try_from(job).ok().filter(|id| *id < RELEASE_BIT).map(|id| id | action)
+    }
+}
+
 /// The status item's panel while any job is active, `None` when none is.
-/// Each job's Cancel button has the job's number as its id.
+/// Held jobs offer Release alongside Cancel.
 pub fn panel(jobs: &[Job], names: &HashMap<u32, String>) -> Option<(String, StatusContent)> {
     let active: Vec<&Job> = jobs.iter().filter(|j| !j.phase.ended()).collect();
     if active.is_empty() {
@@ -130,7 +155,14 @@ pub fn panel(jobs: &[Job], names: &HashMap<u32, String>) -> Option<(String, Stat
         if j.of > 0 {
             nodes.push(StatusNode::Progress { label: String::new(), value: j.sheets as f32 / j.of as f32 });
         }
-        nodes.push(StatusNode::Button { id: (j.id & 0xffff_ffff) as u32, label: "Cancel".into(), primary: false, enabled: true });
+        if j.phase == Phase::Held {
+            if let Some(id) = JobAction::Release(j.id).button_id() {
+                nodes.push(StatusNode::Button { id, label: "Release".into(), primary: true, enabled: true });
+            }
+        }
+        if let Some(id) = JobAction::Cancel(j.id).button_id() {
+            nodes.push(StatusNode::Button { id, label: "Cancel".into(), primary: false, enabled: true });
+        }
     }
     let tooltip = match active.len() {
         1 => format!("Printing \u{201c}{}\u{201d}", active[0].title),
@@ -225,6 +257,23 @@ mod tests {
         assert!(matches!(&a[..], [Action::Post { key: Key::Ended(2), urgency: NORMAL, .. }]));
         n.printed_notice = true;
         assert!(n.update(&[done], &names(), 2).is_empty());
+    }
+
+    #[test]
+    fn release_is_available_only_for_held_jobs_and_does_not_cancel() {
+        let (_, StatusContent::Panel(panel)) = panel(&[
+            job(7, Phase::Held, Some(Alert::IdentityChanged), 0),
+            job(8, Phase::Printing, None, 0),
+        ], &names()).unwrap() else { panic!("expected print panel") };
+        let buttons: Vec<_> = panel.nodes.iter().filter_map(|node| match node {
+            StatusNode::Button { id, label, .. } => Some((label.as_str(), JobAction::from_button(*id))),
+            _ => None,
+        }).collect();
+        assert_eq!(buttons, [
+            ("Release", JobAction::Release(7)),
+            ("Cancel", JobAction::Cancel(7)),
+            ("Cancel", JobAction::Cancel(8)),
+        ]);
     }
 
     #[test]

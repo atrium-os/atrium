@@ -16,14 +16,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use forum_ctl::{FromStatus, StatusValue, ToStatus};
 use prelum_proto::print::{client::Client, Job};
-use prelum_status::{panel, Action, Key, Notices, ICON};
+use prelum_status::{panel, Action, JobAction, Key, Notices, ICON};
 
 enum Ev {
     Jobs(Vec<Job>, bool),
     /// prelumd is away (why).
     Lost(String),
-    /// A Cancel pressed in the panel.
-    Cancel(u64),
+    /// A job control pressed in the panel.
+    JobAction(JobAction),
     /// The bar's connection closed or refused.
     BarGone(String),
 }
@@ -81,7 +81,7 @@ impl Bar {
                         std::thread::spawn(move || loop {
                             let m = forum_ctl::read_frame(&mut r).ok().and_then(|f| forum_ctl::decode::<FromStatus>(&f).ok());
                             let ev = match m {
-                                Some(FromStatus::Changed { id, value: StatusValue::Pressed }) => Ev::Cancel(id as u64),
+                                Some(FromStatus::Changed { id, value: StatusValue::Pressed }) => Ev::JobAction(JobAction::from_button(id)),
                                 Some(FromStatus::Denied { message }) => Ev::BarGone(format!("refused: {message}")),
                                 Some(_) => continue,
                                 None => Ev::BarGone("closed".into()),
@@ -143,11 +143,20 @@ fn main() {
                 eprintln!("prelum-status: {why}");
                 continue;
             }
-            Ok(Ev::Cancel(job)) => {
-                let r = Client::connect(&print_sock()).map_err(|e| e.to_string()).and_then(|mut c| c.cancel(job).map_err(|e| e.to_string()));
+            Ok(Ev::JobAction(action)) => {
+                let (job, verb, done) = match action {
+                    JobAction::Cancel(job) => (job, "cancel", "cancelled"),
+                    JobAction::Release(job) => (job, "release", "released"),
+                };
+                let r = Client::connect(&print_sock()).map_err(|e| e.to_string()).and_then(|mut c| {
+                    match action {
+                        JobAction::Cancel(_) => c.cancel(job),
+                        JobAction::Release(_) => c.release(job),
+                    }.map_err(|e| e.to_string())
+                });
                 match r {
-                    Ok(_) => eprintln!("prelum-status: cancelled job {job}"),
-                    Err(e) => eprintln!("prelum-status: cancel job {job}: {e}"),
+                    Ok(_) => eprintln!("prelum-status: {done} job {job}"),
+                    Err(e) => eprintln!("prelum-status: {verb} job {job}: {e}"),
                 }
                 continue;
             }
