@@ -294,6 +294,10 @@ impl Engine {
                 .hip_report(&self.st.hostname, addr, os, facts)
                 .map_err(refused)?;
             if self.approved_hip.as_deref() != Some(&report.xml) {
+                let mut nonce = [0u8; 16];
+                ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+                    .map_err(|_| refused("Could not create a HIP approval choice"))?;
+                let approval = format!("{:032x}", u128::from_be_bytes(nonce));
                 let review = Form {
                     id: "globalprotect-hip".into(),
                     title: "Review GlobalProtect device report".into(),
@@ -303,13 +307,23 @@ impl Engine {
                     fields: vec![Field {
                         name: "gp_hip_approval".into(),
                         label: "Device report".into(),
-                        kind: Kind::Choice(vec![("submit".into(), "Approve report".into())]),
+                        kind: Kind::Choice(vec![(approval.clone(), "Approve report".into())]),
                     }],
                 };
-                let answers = self.answers(&review, &mut false)?;
-                if gp_field(&answers, "gp_hip_approval")? != "submit" {
-                    return Err(refused("GlobalProtect device report was not approved"));
-                }
+                self.ctl.pending.retain(|message| !matches!(message, ToEngine::Answer(_)));
+                self.ctl.send(&FromEngine::Prompt(prompt_of(&review)));
+                let answer = self.ctl.wait(PROMPT_WAIT, |message| match message {
+                    ToEngine::Rebind => Some(Err(Stop::Again("the network changed".into()))),
+                    ToEngine::Answer(None) => Some(Err(refused("GlobalProtect device report was not approved"))),
+                    ToEngine::Answer(Some(fields)) => match fields.as_slice() {
+                        [(name, Value::Text(value))] if name == "gp_hip_approval" && value == &approval => {
+                            Some(Ok(()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })?;
+                answer.ok_or_else(|| refused("GlobalProtect device report was not approved"))??;
                 self.approved_hip = Some(report.xml.clone());
             }
             let (status, body) = self.gp_post(

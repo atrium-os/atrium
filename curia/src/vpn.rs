@@ -359,6 +359,12 @@ impl VpnPage {
         }
     }
 
+    fn hip_choice(&self) -> Option<&str> {
+        let Ask::Form(form) = &self.signin.as_ref()?.ask else { return None };
+        form.fields.iter().find(|field| field.kind == FieldKind::HipApproval)?
+            .choices.first().map(|(value, _)| value.as_str())
+    }
+
     /// Sign in pressed: the text fields' answers, in the form's order of
     /// text fields; a password or code is Arca's handle.
     pub fn sign_in(&mut self, texts: Vec<String>, now: std::time::Instant) {
@@ -861,9 +867,14 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     }
     let ready = !p.busy && p.armed.is_none();
     let (pg, fs, n) = (page.clone(), fields.clone(), f.fields.iter().filter(|x| x.kind == FieldKind::Text).count().min(MAX_TEXTS));
+    let hip_choice = p.hip_choice().map(str::to_owned);
     let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else if reviewing_hip { "Send device report" } else if choosing_gateway { "Connect" } else { "Sign in" }, Look::Primary, ready, move || {
         let texts: Vec<String> = (0..n).map(|k| fs[ANSWER_AT + k].get_cloned().text().to_string()).collect();
-        with_vpn(&pg, |a| a.sign_in(texts, std::time::Instant::now()));
+        with_vpn(&pg, |a| {
+            if a.hip_choice() == hip_choice.as_deref() {
+                a.sign_in(texts, std::time::Instant::now());
+            }
+        });
     });
     let pg = page.clone();
     button(ctx, fx + w + em(8.0), y + em(8.0), "Cancel", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.cancel_signin()));

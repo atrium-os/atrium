@@ -38,7 +38,7 @@ if [ "$hip" = posture ]; then
 fi
 case "$hip" in
     tessera) tessera_fact='Mounted sealed Tessera volumes' ;;
-    tessera-domain) tessera_fact='Tessera encrypted domains verified with active keys' ;;
+    tessera-domain|tessera-rebind) tessera_fact='Tessera encrypted domains verified with active keys' ;;
     *) tessera_fact= ;;
 esac
 if [ -n "$tessera_fact" ]; then
@@ -83,7 +83,7 @@ test "$(sysctl -n kern.tessera.sealed_mounts)" = 0
 mkdir "$G/tessera"
 umask 077
 head -c 32 /dev/random > "$G/tessera-key"
-if [ "$1" = tessera-domain ]; then
+if [ "$1" != tessera ]; then
     test -x "$tools/tessera-quota-set"
     uuid=a1b2c3d4e5f60718293a4b5c6d7e8f90
     "$tools/tessera-mkfs-sealed" --plain --create -s 64 -j 64 --uuid "$uuid" "$G/tessera.img" >/dev/null
@@ -191,6 +191,14 @@ wait_prompt() {
     done
     fail "missing prompt field $1"
 }
+hip_choice() {
+    printf '%s\n' "$prompt" | sed -n 's/^choice i=0 value=\([0-9a-f]*\) .*/\1/p'
+}
+approve_hip() {
+    approval_choice=$(hip_choice)
+    [ -n "$approval_choice" ] || fail "HIP approval choice missing"
+    "$V" "$CTL answer name=gp-gate t0=$approval_choice" >/dev/null
+}
 engine_jid() {
     "$V" 'p=$(pgrep -of "^/usr/local/bin/atrium-crypta-ac$") || exit 1
         procstat -s "$p" | awk "NR == 2 {print \$10}" | grep -q C || exit 1
@@ -270,7 +278,7 @@ if [ -n "$hip" ]; then
         echo "$pass checks passed"
         exit 0
     fi
-    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+    approve_hip
 fi
 wait_field handshake 1
 ok "GlobalProtect signed in using Arca's held password"
@@ -303,7 +311,7 @@ if [ "$hip" = posture ]; then
     printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' | grep -q "$(hex 'Active session locked  yes')" ||
         fail "review did not reflect the real seat lock marker"
     if grep -q '^yes ' "$receipts"; then fail "screen-lock change was uploaded without approval"; fi
-    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+    approve_hip
     for _ in $(seq 1 20); do
         grep -q '^yes ' "$receipts" && break
         sleep 1
@@ -321,13 +329,24 @@ if [ -n "$tessera_fact" ]; then
     approve_tessera_change() {
         expected_count=$1
         change=$2
-        wait_prompt gp_hip_approval
-        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-            grep -q "$(hex "$tessera_fact  $expected_count")" ||
-            fail "HIP review omitted the count after $change"
+        wait_tessera_review
+        if [ "${3:-}" = rebind ]; then
+            old_choice=$(hip_choice)
+            [ -n "$old_choice" ] || fail "missing original HIP choice"
+            "$V" "$CTL rebind name=gp-gate" >/dev/null
+            wait_field handshake 0
+            wait_tessera_review
+            [ "$(hip_choice)" != "$old_choice" ] || fail "rebind reused the original HIP choice"
+            if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$old_choice" 2>&1); then
+                fail "rebound tunnel accepted the stale approval choice"
+            fi
+            [ "$stale_reply" = 'error why=bad-choice' ] ||
+                fail "expected the rebound review to reject the stale choice: $stale_reply"
+            ok "rebind replaced the pending HIP review and rejected the stale choice"
+        fi
         sleep 1
         if new_tessera_receipt; then fail "$change was uploaded without approval"; fi
-        "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+        approve_hip
         for _ in $(seq 1 20); do
             new_tessera_receipt && break
             sleep 1
@@ -335,11 +354,17 @@ if [ -n "$tessera_fact" ]; then
         new_tessera_receipt || fail "approved report did not reach peer after $change"
         ok "$change required fresh approval before upload"
     }
+    wait_tessera_review() {
+        wait_prompt gp_hip_approval
+        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+            grep -q "$(hex "$tessera_fact  $expected_count")" ||
+            fail "HIP review omitted the count after $change"
+    }
     new_tessera_receipt() {
         tail -n "+$((receipt_offset + 1))" "$receipts" | grep -q "^$expected_count "
     }
     receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
-    if [ "$hip" = tessera-domain ]; then
+    if [ "$hip" != tessera ]; then
         "$V" 'G=/tmp/crypta-gate; set -e
             /root/sealed/tessera-keyload quota-group "$G/tessera/persona" 9
             /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
@@ -353,13 +378,18 @@ if [ -n "$tessera_fact" ]; then
     fi
     approve_tessera_change 1 "Tessera encryption change"
     probe "IPv4 echo after approved Tessera encryption change"
-    if [ "$hip" = tessera-domain ]; then
+    if [ "$hip" != tessera ]; then
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
         "$V" 'set -e
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
             /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
-        approve_tessera_change 0 "Tessera domain key lock"
+        if [ "$hip" = tessera-rebind ]; then
+            approve_tessera_change 0 "Tessera domain key lock" rebind
+            wait_field handshake 1
+        else
+            approve_tessera_change 0 "Tessera domain key lock"
+        fi
         probe "IPv4 echo after approved Tessera domain key lock"
 
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
@@ -404,7 +434,7 @@ if [ "$hip" = refresh ]; then
         fail "changed posture reached the gateway before approval"
     fi
     ok "verified posture change required fresh approval before upload"
-    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null || fail "approve changed HIP"
+    approve_hip || fail "approve changed HIP"
     for _ in $(seq 1 25); do
         if grep -q "^$changed_word " "$receipts"; then break; fi
         sleep 1

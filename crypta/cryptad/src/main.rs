@@ -835,7 +835,14 @@ impl D {
                     self.to_engine(k, &ToEngine::SsoDone(ok))
                 }).map(|_| vec![])
             }
-            ("rebind", Some(n)) => self.ac_run(&n).and_then(|k| self.to_engine(k, &ToEngine::Rebind)).map(|_| vec![]),
+            ("rebind", Some(n)) => self.ac_run(&n).and_then(|k| {
+                self.to_engine(k, &ToEngine::Rebind)?;
+                let prompt = &mut self.runs[k].ac.prompt;
+                if prompt.as_ref().is_some_and(|p| p.fields.iter().any(|f| f.name == "gp_hip_approval")) {
+                    *prompt = None;
+                }
+                Ok(vec![])
+            }),
             ("csr", Some(n)) => self.csr(&n, l),
             ("certificate", Some(n)) => self.certificate(&n, file),
             ("up", Some(n)) => self.up(&n).map(|_| vec![]),

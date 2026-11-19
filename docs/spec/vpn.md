@@ -787,6 +787,9 @@ another origin. An active portal-profile session stays in engine memory.
   and a gateway-supplied interval is clamped to 5–3600 seconds. Unchanged
   reports refresh without prompting. A changed report pauses packet processing
   while Settings waits for approval and keeps the data connection open.
+  A rebind during review cancels that review and refetches posture before the
+  rebound data connection opens. Each prompt has its own approval choice.
+  Settings and cryptad reject an approval from a superseded review.
 - The arm64 FreeBSD full gate passed approval (9/9) and decline (5/5) with
   `crypta-gp-packet-check.py --full-vm arm64 --hip approve|decline`. It
   inspects the Settings prompt data before the tunnel is up, checks the XML
@@ -815,6 +818,11 @@ another origin. An active portal-profile session stays in engine memory.
   echo resumes on the same TLS connection or ESP association after each
   approval. The arm64 domain gate passed 14/14 on TLS and 14/14 with
   `--esp`.
+  The `--hip tessera-rebind` variant requests a rebind during the key-lock
+  review. It checks that the old approval choice is rejected, the changed
+  count reaches the gateway only after fresh approval, and IPv4 echo
+  resumes on the rebound TLS connection or ESP association. The arm64
+  rebind gate passed 15/15 on each transport.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
