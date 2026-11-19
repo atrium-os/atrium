@@ -86,7 +86,8 @@ fn render(
     if attachment.bytes.len() > THUMBNAIL_INPUT_MAX {
         return None;
     }
-    let fd = atrium_mail::files::sealed(&attachment.bytes).ok()?;
+    // Limen must inspect the seals before it strips the descriptor's rights.
+    let fd = limen::fdpass::sealed_file("mail-thumbnail", &attachment.bytes).ok()?;
     if viewer.is_none() {
         let mut parent = Parent::connect().ok()?;
         let id = parent.request("doc-viewer", token).ok()?;
