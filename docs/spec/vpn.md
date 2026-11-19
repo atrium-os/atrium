@@ -596,9 +596,13 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
   engine and harness on an already booted FreeBSD VM with QEMU user networking.
   The harness runs the engine in a temporary jail, checks its jail ID and
   capability mode, and pings through a real tun before and after rebind. Its
-  control and Arca descriptors are harness fixtures. With
-  `--openconnect /path/to/openconnect` the same peer answers an ICMP echo sent
-  through OpenConnect's script-tun socket. Both modes validate wire traffic.
+  control and Arca descriptors are harness fixtures. With `--full-vm arm64` on
+  a dedicated, already-booted guest with the simulated LAN on vtnet1, the same
+  peer runs against jaild, cryptad, Arca, and atrium-net. Set `CRYPTA_GATE_VSSH`
+  to the dedicated guest's SSH wrapper if it uses another port. Eight checks
+  passed on FreeBSD arm64. The peer also verified one login, two TLS tunnels
+  carrying ICMP echo, and logout. With `--openconnect /path/to/openconnect` the
+  peer answers an ICMP echo through OpenConnect's script-tun socket.
 - **No real company gateway** (Shankar 2026-11-15): every gate runs on local servers.
   Free public services only add value for WireGuard (for example Proton VPN's free
   plan, which hands out WireGuard configs), as an optional real-internet check.
@@ -739,9 +743,9 @@ challenge forms are future work.
   before handing packets to tun. It refreshes the tunnel using the pushed timeout and
   tries to log out on disconnect. Required HIP, local-network lockdown and split
   exclusions are refused until Atrium can enforce those policies.
-- ESP, truthful HIP reporting with review in Curia, portal and challenge support, and
-  the full jaild/cryptad/atrium-net integration gate remain part of V5. Scripted SSO and passkeys
-  remain parked pending Navigator I3.
+- The direct gateway TLS integration gate passes on arm64 FreeBSD. ESP, truthful
+  HIP reporting with review in Curia, portal discovery, and challenge forms remain
+  part of V5. Scripted SSO and passkeys remain parked pending Navigator I3.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
 

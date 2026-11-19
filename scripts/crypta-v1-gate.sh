@@ -16,8 +16,8 @@
 # address only reachable through the tunnel) and DNS on 10.99.0.1:53.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-T=x86_64-unknown-freebsd
-V="$ROOT/scripts/vssh"
+T=${CRYPTA_GATE_TARGET:-x86_64-unknown-freebsd}
+V=${CRYPTA_GATE_VSSH:-"$ROOT/scripts/vssh"}
 export VSSH_CONNECT_TIMEOUT="${VSSH_CONNECT_TIMEOUT:-30}"
 LAN_LOG="${LAN_LOG:-$HOME/atrium-vm-amd64/lan.log}"
 G=/tmp/crypta-gate
@@ -103,8 +103,10 @@ EOF
 # the V2 gate (scripts/crypta-v2-gate.sh), which sources this file with
 # CRYPTA_GATE_LIB=1 and adds its files through EXTRA (paths to copy).
 setup() {
-    CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
-    export RUSTFLAGS="$CROSS_RUSTFLAGS"
+    if [ "${CRYPTA_GATE_CONFIGURED_TOOLCHAIN:-0}" != 1 ]; then
+        CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
+        export RUSTFLAGS="$CROSS_RUSTFLAGS"
+    fi
     (cd "$ROOT/atrium-net" && cargo build -q --release --target $T -p atrium-net -p atrium-lease -p atrium-mdns)
     (cd "$ROOT/crypta" && cargo build -q --release --target $T -p cryptad -p crypta-engine)
     (cd "$ROOT/arca/arcad" && cargo build -q --release --target $T --bin arcad)
@@ -116,14 +118,17 @@ setup() {
         "$ROOT/crypta/target/$T/release/atrium-cryptad" "$ROOT/crypta/target/$T/release/atrium-crypta-wg" \
         "$ROOT/arca/arcad/target/$T/release/arcad" "$ROOT/portcullis/target/$T/release/atrium-jaild" \
         "$ROOT/etc/jaild.policy.toml" "$ROOT/etc/atrium.pf" ${EXTRA:-} "$S/"
-    tar czf - -C "$S" . | "$V" "rm -rf $G && mkdir -p $G && tar xzf - -C $G"
+    COPYFILE_DISABLE=1 tar --no-xattrs -czf - -C "$S" . | "$V" "rm -rf $G && mkdir -p $G && tar xzf - -C $G"
     rm -rf "$S"
 
-    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    if [ "${CRYPTA_GATE_OWN_LAN:-0}" != 1 ]; then
+        pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    fi
     python3 "$ROOT/atrium-net/sim/lan.py" 60 > "$LAN_LOG" 2>&1 &
     LANPID=$!
-    trap 'cleanup; kill $LANPID 2>/dev/null || true' EXIT
     sleep 1
+    kill -0 "$LANPID" 2>/dev/null || fail "simulated LAN failed to start"
+    trap 'cleanup; kill $LANPID 2>/dev/null || true' EXIT
 
     echo "== install: jaild (crypta engines), pf base rules (atrium/vpn), the binaries"
     "$V" "set -e

@@ -142,6 +142,7 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--openconnect", metavar="PATH")
     group.add_argument("--vm", choices=["arm64", "amd64"])
+    group.add_argument("--full-vm", choices=["arm64", "amd64"])
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
@@ -158,7 +159,7 @@ def main():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
         with socket.create_server(("127.0.0.1", 0)) as listener:
-            listener.settimeout(110 if args.vm else 25)
+            listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
             thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), daemon=True)
@@ -187,6 +188,9 @@ def main():
                 assert not errors, errors
                 assert marker.exists(), "OpenConnect did not carry an echo reply"
                 print("OpenConnect received an ICMP echo reply with valid checksums and matching payload")
+            elif args.full_vm:
+                subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin],
+                               check=True, timeout=300)
             elif args.vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
                                check=True, timeout=110)

@@ -58,7 +58,7 @@ also at 172.16.47.1:447-448, a private address beyond the router, which Arca's
 couriers may reach under their test grant (a documentation address they may
 not), for the sign-in window's pages.
 """
-import json, random, socket, struct, sys
+import json, os, random, socket, struct, sys
 
 LAN = ("127.0.0.1", 7801)
 GUEST = ("127.0.0.1", 7802)
@@ -82,6 +82,8 @@ WG_PORT = 51820
 WG_RELAY = ("127.0.0.1", 51820)
 AC_GW = bytes([198, 51, 100, 52])  # AnyConnect gateways, beyond the router
 AC_PORTS = {443: 8443, 444: 8444, 445: 8445, 446: 8446, 447: 8447, 448: 8448}
+if "CRYPTA_GP_TEST_PORT" in os.environ:
+    AC_PORTS[449] = int(os.environ["CRYPTA_GP_TEST_PORT"])
 SSO_GW = bytes([172, 16, 47, 1])  # the SAML stand-in and Keycloak, privately
 GW_PORTS = {AC_GW: AC_PORTS, SSO_GW: {447: 8447, 448: 8448}}
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
