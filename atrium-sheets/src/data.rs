@@ -499,9 +499,24 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let inside = |c: u32| (sel.c0..=sel.c1).contains(&c);
             let mut over: Vec<(u32, f64)> = old.iter().copied().filter(|&(c, w)| !inside(c) || (cmd == DataCmd::UnhideCols && w > 0.0)).collect();
             if cmd == DataCmd::HideCols {
+                // Remember the widths, to show them again as they were.
+                for c in sel.c0..=sel.c1 {
+                    let w = d.wb.sheet(s).col_sizes.size(c);
+                    if w > 0.0 {
+                        d.hidden_widths.insert((s, c), w);
+                    }
+                }
                 over.extend((sel.c0..=sel.c1).map(|c| (c, 0.0)));
-                over.sort_by_key(|o| o.0);
+            } else {
+                for &(c, w) in &old {
+                    if inside(c) && w <= 0.0 {
+                        if let Some(&was) = d.hidden_widths.get(&(s, c)) {
+                            over.push((c, was));
+                        }
+                    }
+                }
             }
+            over.sort_by_key(|o| o.0);
             if over == old {
                 return Err(if cmd == DataCmd::HideCols { "Those columns are hidden already.".into() } else { "No hidden columns there. Select the columns around them.".into() });
             }
@@ -960,12 +975,14 @@ mod tests {
         run(&mut d, around, (1, 0), DataCmd::UnhideRows);
         assert_eq!(d.status, "2 rows shown.");
         assert!(d.wb.sheet(0).hidden.is_empty());
+        d.set_col_width(2, 120.0);
         run(&mut d, CellRange { r0: 0, c0: 1, r1: 0, c1: 2 }, (0, 1), DataCmd::HideCols);
         assert_eq!(d.status, "2 columns hidden.");
         assert_eq!(d.wb.sheet(0).col_sizes.size(1), 0.0);
         run(&mut d, CellRange { r0: 0, c0: 0, r1: 0, c1: 3 }, (0, 0), DataCmd::UnhideCols);
         assert_eq!(d.status, "2 columns shown.");
-        assert!(d.wb.sheet(0).col_sizes.size(2) > 0.0);
+        // C comes back as wide as it was; B at the default.
+        assert_eq!((d.wb.sheet(0).col_sizes.size(1), d.wb.sheet(0).col_sizes.size(2)), (64.0, 120.0));
         assert!(d.undo());
         assert_eq!(d.wb.sheet(0).col_sizes.size(2), 0.0);
         run(&mut d, one(0, 5), (0, 5), DataCmd::UnhideCols);

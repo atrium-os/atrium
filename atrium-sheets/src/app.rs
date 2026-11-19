@@ -1205,10 +1205,11 @@ impl Sheets {
                 d.type_into(row, col, &text);
             }
             GridAction::Clear(r) => d.clear(r.r0, r.c0, r.r1, r.c1),
-            GridAction::Fill { from, to, copy } => {
+            GridAction::Fill { from, to, copy, flip } => {
+                use officina_grid::autofill::Mode;
                 let rect = |r: CellRange| officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
                 let (from, to) = (rect(from), rect(to));
-                d.fill(from, to, copy);
+                d.fill_as(from, to, if copy { Mode::Copy } else if flip { Mode::Flip } else { Mode::Series });
             }
             GridAction::ResizeEnd => d.size_done(),
             GridAction::Undo => {
@@ -1227,9 +1228,10 @@ impl Sheets {
                     d.take_clip(rect, cut, text);
                 }
             }
-            GridAction::Paste { row, col } => match clipboard::paste_text() {
+            GridAction::Paste { row, col, sel } => match clipboard::paste_text() {
                 Ok(Some(t)) => {
-                    d.paste(row, col, &t);
+                    let area = officina_grid::addr::Rect { sheet: d.sheet, r0: row, c0: col, r1: sel.r1.max(row), c1: sel.c1.max(col) };
+                    d.paste_in(area, &t);
                 }
                 Ok(None) => d.status = "The clipboard holds no text.".into(),
                 Err(e) => d.status = format!("Couldn't paste: {e:?}"),

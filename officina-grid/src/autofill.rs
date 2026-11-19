@@ -27,6 +27,9 @@ pub enum Mode {
     Series,
     /// The selection repeated as it is.
     Copy,
+    /// The handle let go with Ctrl held, as Excel flips it: one number
+    /// counts up (or down) by one; anything else is copied.
+    Flip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +125,14 @@ pub fn fill(wb: &Workbook, src: Rect, to: Rect, mode: Mode) -> Result<GridOp, St
             })
             .collect();
         let back = matches!(dir, Dir::Up | Dir::Left);
-        let series = if mode == Mode::Series { series_of(&read, back) } else { Series::Repeat };
+        let series = match mode {
+            Mode::Series => series_of(&read, back),
+            Mode::Copy => Series::Repeat,
+            Mode::Flip => match &read[..] {
+                [(Src::Value(Value::Num(n)), _)] => Series::Days { first: *n, step: if back { -1.0 } else { 1.0 } },
+                _ => Series::Repeat,
+            },
+        };
         let count = if down { new.rows() } else { new.cols() } as u32;
         for i in 0..count {
             // Step along the line from the source's far end.
@@ -493,6 +503,18 @@ mod tests {
         wb.recalc();
         set(&mut wb, 0, 9, "1");
         assert_eq!(to_data_end(&wb, rect(0, 9, 0, 9)), Some(rect(0, 9, 99_999, 9)));
+    }
+
+    #[test]
+    fn ctrl_flips_series_and_copy() {
+        let mut wb = wb();
+        set(&mut wb, 0, 0, "5");
+        set(&mut wb, 0, 1, "1");
+        set(&mut wb, 1, 1, "3");
+        fill(&wb, rect(0, 0, 0, 0), rect(0, 0, 2, 0), Mode::Flip).unwrap().apply(&mut wb);
+        assert_eq!((shown(&wb, 1, 0), shown(&wb, 2, 0)), ("6".into(), "7".into()));
+        fill(&wb, rect(0, 1, 1, 1), rect(0, 1, 3, 1), Mode::Flip).unwrap().apply(&mut wb);
+        assert_eq!((shown(&wb, 2, 1), shown(&wb, 3, 1)), ("1".into(), "3".into()));
     }
 
     #[test]

@@ -376,6 +376,9 @@ pub struct Doc {
     /// While a column or row edge is dragged: the sheet, rows or columns,
     /// and their sizes before, to make one undo step when it is let go.
     pub sizing: Option<(u16, bool, Vec<(u32, f64)>)>,
+    /// Widths of columns hidden here, by (sheet, column), for showing them
+    /// again as they were (for this session; files keep only "hidden").
+    pub hidden_widths: std::collections::HashMap<(u16, u32), f64>,
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
@@ -433,7 +436,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, hidden_widths: Default::default() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -632,13 +635,19 @@ impl Doc {
     /// copy (Ctrl+D, Ctrl+R). One undo step; the reason goes to `status` if
     /// it can't.
     pub fn fill(&mut self, from: Rect, to: Rect, copy: bool) -> bool {
+        use officina_grid::autofill::Mode;
+        self.fill_as(from, to, if copy { Mode::Copy } else { Mode::Series })
+    }
+
+    /// As [`fill`](Self::fill), in `mode` (Ctrl on the handle: `Flip`).
+    pub fn fill_as(&mut self, from: Rect, to: Rect, mode: officina_grid::autofill::Mode) -> bool {
         use officina_grid::autofill::{fill, Mode};
         let from = Rect { sheet: self.sheet, ..from };
         let to = Rect { sheet: self.sheet, ..to };
-        match fill(&self.wb, from, to, if copy { Mode::Copy } else { Mode::Series }) {
+        match fill(&self.wb, from, to, mode) {
             Ok(GridOp::Batch(ops)) => {
                 self.status.clear();
-                self.run(if copy { "Fill" } else { "Fill Series" }, ops);
+                self.run(if mode == Mode::Series { "Fill Series" } else { "Fill" }, ops);
                 true
             }
             Ok(op) => {
@@ -663,13 +672,21 @@ impl Doc {
     /// is still its own, else as tab-separated values. The area pasted, if
     /// any.
     pub fn paste(&mut self, row: u32, col: u32, text: &str) -> Option<Rect> {
+        self.paste_in(Rect { sheet: self.sheet, r0: row, c0: col, r1: row, c1: col }, text)
+    }
+
+    /// As [`paste`](Self::paste) with `area` selected: a copy fills it with
+    /// copies when it holds a whole number of them.
+    pub fn paste_in(&mut self, area: Rect, text: &str) -> Option<Rect> {
+        let area = Rect { sheet: self.sheet, ..area };
+        let (row, col) = (area.r0, area.c0);
         let norm = |t: &str| t.replace("\r\n", "\n").trim_end_matches('\n').to_string();
         let ours = self.clip.as_ref().is_some_and(|(_, t)| norm(t) == norm(text));
         if !ours {
             return self.paste_tsv(row, col, text).then_some(Rect { sheet: self.sheet, r0: row, c0: col, r1: row, c1: col });
         }
         let (clip, _) = self.clip.as_ref()?;
-        match clip.paste(&self.wb, self.sheet, row, col) {
+        match clip.paste_into(&self.wb, area) {
             Ok((ops, to)) => {
                 let cut = clip.cut;
                 self.status.clear();
@@ -1013,6 +1030,20 @@ mod tests {
         assert_eq!(d.wb.sheet(0).row_sizes.size(3), d.wb.sheet(0).row_sizes.default);
         assert!(d.redo());
         assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
+    }
+
+    #[test]
+    fn a_copy_fills_a_bigger_selection_and_ctrl_flips_the_handle() {
+        let mut d = Doc::new("tiles");
+        d.type_into(0, 0, "7");
+        let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
+        let text = d.copy_tsv(0, 0, 0, 0);
+        d.take_clip(r(0, 0, 0, 0), false, text.clone());
+        assert_eq!(d.paste_in(r(2, 0, 4, 1), &text), Some(r(2, 0, 4, 1)));
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 4, 1)).text, "7");
+        // Ctrl on the handle: one number counts.
+        assert!(d.fill_as(r(0, 0, 0, 0), r(0, 0, 0, 2), officina_grid::autofill::Mode::Flip));
+        assert_eq!(d.wb.formatted(CellAddr::new(0, 0, 2)).text, "9");
     }
 
     #[test]

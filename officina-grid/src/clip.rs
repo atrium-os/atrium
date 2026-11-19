@@ -26,6 +26,11 @@ enum Content {
     Moved(Arc<Expr>),
 }
 
+/// The most copies one paste into a bigger area makes.
+pub const MAX_TILES: u64 = 10_000;
+/// The most cells one paste into a bigger area fills.
+pub const MAX_TILED_CELLS: u64 = 4_000_000;
+
 /// What a paste brings (Paste Special).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum What {
@@ -88,10 +93,32 @@ impl Clip {
         self.paste_as(wb, sheet, row, col, What::All, false)
     }
 
+    /// Pasted into `area`: when it is a whole number of copies of the clip
+    /// in each direction (more than one), the clip repeated to fill it, as
+    /// Excel does; otherwise once at its top-left. A cut pastes once.
+    pub fn paste_into(&self, wb: &Workbook, area: Rect) -> Result<(Vec<GridOp>, Rect), String> {
+        let (h, w) = (area.rows(), area.cols());
+        let (ch, cw) = (self.rows() as u64, self.cols() as u64);
+        let (nr, nc) = (h / ch, w / cw);
+        if self.cut || h % ch != 0 || w % cw != 0 || nr * nc <= 1 {
+            return self.paste(wb, area.sheet, area.r0, area.c0);
+        }
+        if nr * nc > MAX_TILES || area.cells() > MAX_TILED_CELLS {
+            return Err("That's too big an area to fill with copies; select a smaller one.".into());
+        }
+        let mut ops = Vec::new();
+        for i in 0..nr {
+            for j in 0..nc {
+                let (o, _) = self.paste(wb, area.sheet, area.r0 + (i * ch) as u32, area.c0 + (j * cw) as u32)?;
+                ops.extend(o);
+            }
+        }
+        Ok((ops, area))
+    }
+
     /// As [`paste`](Self::paste), bringing only `what`, and `transpose`d
-    /// (rows become columns). A cut pastes only whole and as it is. A
-    /// transposed formula comes as its value: turning its references is
-    /// not done yet.
+    /// (rows become columns: references into the copied cells turn with
+    /// them). A cut pastes only whole and as it is.
     pub fn paste_as(&self, wb: &Workbook, sheet: u16, row: u32, col: u32, what: What, transpose: bool) -> Result<(Vec<GridOp>, Rect), String> {
         if self.cut && (what != What::All || transpose) {
             return Err("Cut cells paste only as they are; copy them for Paste Special.".into());
@@ -115,10 +142,17 @@ impl Clip {
             let (r, c) = at(*dr, *dc);
             match content {
                 Content::Value(v) => values.push((r, c, v.clone())),
-                Content::Expr(_, v) if what == What::Values || transpose => {
+                Content::Expr(_, v) if what == What::Values => {
                     if !v.is_empty() {
                         values.push((r, c, v.clone()))
                     }
+                }
+                // Turned: references into the copied cells turn with them;
+                // others move as a copy moves them.
+                Content::Expr(e, _) if transpose => {
+                    let m = Mover { transpose: true, keep_outside: true, ..self.mover(sheet, row, col) };
+                    let e = m.expr(e, self.from.r0 + dr, self.from.c0 + dc, self.from.sheet, r, c, sheet);
+                    exprs.push((r, c, Arc::new(e)));
                 }
                 Content::Expr(e, _) => exprs.push((r, c, e.clone())),
                 Content::Moved(e) => {
@@ -192,7 +226,7 @@ impl Clip {
 
 impl Clip {
     fn mover(&self, sheet: u16, row: u32, col: u32) -> Mover {
-        Mover { from: self.from, sheet, dr: row as i64 - self.from.r0 as i64, dc: col as i64 - self.from.c0 as i64 }
+        Mover { from: self.from, sheet, dr: row as i64 - self.from.r0 as i64, dc: col as i64 - self.from.c0 as i64, transpose: false, keep_outside: false }
     }
 }
 
@@ -214,6 +248,12 @@ struct Mover {
     sheet: u16,
     dr: i64,
     dc: i64,
+    /// Rows become columns: a cell `k` rows down `from` lands `k` columns
+    /// right of where `from`'s corner goes.
+    transpose: bool,
+    /// References outside `from` keep their relative form (a copy), rather
+    /// than the cells they read (a move).
+    keep_outside: bool,
 }
 
 impl Mover {
@@ -228,10 +268,18 @@ impl Mover {
         // The sheet a reference names: kept bare when it stays the formula's own.
         let name = |old: Option<u16>, target: u16| if old.is_none() && target == new_own { None } else { Some(target) };
         let inside = |t: u16, r: u32, c: u32| t == self.from.sheet && self.from.contains(CellAddr::new(t, r, c));
+        // Where a cell inside `from` goes.
+        let to = |r: u32, c: u32| -> (u32, u32) {
+            let (r0, c0) = ((self.from.r0 as i64 + self.dr) as u32, (self.from.c0 as i64 + self.dc) as u32);
+            if self.transpose { (r0 + (c - self.from.c0), c0 + (r - self.from.r0)) } else { (r0 + (r - self.from.r0), c0 + (c - self.from.c0)) }
+        };
         let cell = |r: &CellRef| -> CellRef {
             let t = r.sheet.unwrap_or(own);
             let (Some(row), Some(col)) = (r.row.resolve(or, MAX_ROWS), r.col.resolve(oc, MAX_COLS)) else { return *r };
-            let (row, col, t) = if inside(t, row, col) { ((row as i64 + self.dr) as u32, (col as i64 + self.dc) as u32, self.sheet) } else { (row, col, t) };
+            if self.keep_outside && !inside(t, row, col) {
+                return *r;
+            }
+            let (row, col, t) = if inside(t, row, col) { let (a, b) = to(row, col); (a, b, self.sheet) } else { (row, col, t) };
             CellRef { sheet: name(r.sheet, t), row: enc(r.row, row, nr), col: enc(r.col, col, nc) }
         };
         let range = |r: &RangeRef| -> RangeRef {
@@ -239,9 +287,12 @@ impl Mover {
             let ends = (r.r0.resolve(or, MAX_ROWS), r.c0.resolve(oc, MAX_COLS), r.r1.resolve(or, MAX_ROWS), r.c1.resolve(oc, MAX_COLS));
             let (Some(r0), Some(c0), Some(r1), Some(c1)) = ends else { return *r };
             let whole = r.kind == RangeKind::Cells && inside(t, r0.min(r1), c0.min(c1)) && inside(t, r0.max(r1), c0.max(c1));
+            if self.keep_outside && !whole {
+                return *r;
+            }
             let (r0, c0, r1, c1, t) = if whole {
-                let (mr, mc) = (|v: u32| (v as i64 + self.dr) as u32, |v: u32| (v as i64 + self.dc) as u32);
-                (mr(r0), mc(c0), mr(r1), mc(c1), self.sheet)
+                let ((a0, b0), (a1, b1)) = (to(r0, c0), to(r1, c1));
+                (a0, b0, a1, b1, self.sheet)
             } else {
                 (r0, c0, r1, c1, t)
             };
@@ -370,11 +421,11 @@ mod tests {
         let (ops, _) = clip.paste_as(&wb, 0, 8, 0, What::Formats, false).unwrap();
         run(&mut wb, ops);
         assert_eq!((shown(&wb, 0, 8, 1), fmt(&wb, 8, 1)), ("=A9*10".into(), "0.00".into()));
-        // Transposed: 2 rows × 2 columns turned; B1 lands in A12 as its value.
+        // Transposed: 2 rows × 2 columns turned; B1 lands in A12, reading A1 where it went.
         let (ops, to) = clip.paste_as(&wb, 0, 10, 0, What::All, true).unwrap();
         assert_eq!(to, rect(10, 0, 11, 1));
         run(&mut wb, ops);
-        assert_eq!((shown(&wb, 0, 10, 0), shown(&wb, 0, 10, 1), shown(&wb, 0, 11, 0)), ("2".into(), "x".into(), "20".into()));
+        assert_eq!((shown(&wb, 0, 10, 0), shown(&wb, 0, 10, 1), shown(&wb, 0, 11, 0)), ("2".into(), "x".into(), "=A11*10".into()));
         assert_eq!((fmt(&wb, 11, 0), fmt(&wb, 10, 1)), ("0.00".into(), "General".into()));
         // A cut pastes only whole.
         assert!(Clip::take(&wb, rect(0, 0, 0, 0), true).paste_as(&wb, 0, 20, 0, What::Values, false).is_err());
@@ -412,6 +463,37 @@ mod tests {
         assert_eq!(shown(&wb, 1, 0, 0), "=Sheet2!D4*2");
         assert_eq!(shown(&wb, 0, 2, 4), "=SUM(A1:A3)");
         assert_eq!(shown(&wb, 0, 1, 4), "=SUM(A1:A2)");
+    }
+
+    #[test]
+    fn a_transposed_formula_reads_the_turned_cells() {
+        let mut wb = wb();
+        // A1:C1 = 1, 2, =A1+B1*$E$9+F1.
+        set(&mut wb, 0, 0, "1");
+        set(&mut wb, 0, 1, "2");
+        set(&mut wb, 0, 2, "=A1+B1*$E$9+F1+SUM(A1:B1)");
+        let clip = Clip::take(&wb, rect(0, 0, 0, 2), false);
+        let (ops, to) = clip.paste_as(&wb, 0, 4, 0, What::All, true).unwrap();
+        assert_eq!(to, rect(4, 0, 6, 0));
+        run(&mut wb, ops);
+        // A5:A7: the cells it read turned with it; $E$9 stays; F1 (outside) moves as a copy.
+        assert_eq!(shown(&wb, 0, 6, 0), "=A5+A6*$E$9+D7+SUM(A5:A6)");
+    }
+
+    #[test]
+    fn pasting_into_a_bigger_area_repeats_the_copy() {
+        let mut wb = wb();
+        set(&mut wb, 0, 0, "1");
+        set(&mut wb, 0, 1, "=A1*2");
+        let clip = Clip::take(&wb, rect(0, 0, 0, 1), false);
+        // Three rows by four columns: two copies across, three down.
+        let (ops, to) = clip.paste_into(&wb, rect(5, 0, 7, 3)).unwrap();
+        assert_eq!(to, rect(5, 0, 7, 3));
+        run(&mut wb, ops);
+        assert_eq!((shown(&wb, 0, 7, 2), shown(&wb, 0, 7, 3)), ("1".into(), "=C8*2".into()));
+        // Not a whole number of copies: once.
+        let (_, to) = clip.paste_into(&wb, rect(10, 0, 10, 2)).unwrap();
+        assert_eq!(to, rect(10, 0, 10, 1));
     }
 
     #[test]
