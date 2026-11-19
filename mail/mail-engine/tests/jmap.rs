@@ -393,6 +393,35 @@ fn jmap_sync_changes_and_send() {
     // The next pass doesn't list it twice.
     client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.store.list(archive, 0, 10).unwrap().iter().filter(|r| r.subject == "Old deal").count(), 1);
+
+    // Import (§6.5): an mbox into Archive; Lunch is already here and the
+    // new one is twice in the file, so one goes up, seen, and syncs back.
+    let mut mbox = Vec::new();
+    for m in [message(1, "Lunch", "Thursday?"), message(6, "From the old laptop", "From 2019:\r\nhello"), message(6, "From the old laptop", "x")] {
+        mail_engine::export::write_one(&mut mbox, &m, t0).unwrap();
+    }
+    let r = engine.import_mbox(archive, &mbox[..]).unwrap();
+    assert_eq!(r, mail_engine::import::Imported { queued: 1, already: 2, refused: 0 });
+    assert_eq!(r.line("Archive"), "Adding 1 message to Archive; they upload as mail syncs; 2 messages already there");
+    assert_eq!(engine.imports_waiting(account).unwrap(), 1);
+    assert_eq!(engine.upload_imports(account, &mut |f, m| client.import(f, m).map(|_| ()).map_err(|e| e.0)).unwrap(), 1);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 0);
+    client.sync(&mut engine.sink(account)).unwrap();
+    let got = engine.store.list(archive, 0, 10).unwrap().into_iter().find(|r| r.subject == "From the old laptop").unwrap();
+    assert!(got.flags & flag::SEEN != 0);
+    assert_eq!(engine.store.blob(&engine.store.message(got.msg).unwrap().full.unwrap()).unwrap(), message(6, "From the old laptop", "From 2019:\r\nhello"));
+    // Again: nothing new.
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 0);
+    // A folder the server doesn't have: kept, with why, until it gives up.
+    let gone = engine.store.folder_id(account, "Nowhere", Role::Other).unwrap();
+    let mut one = Vec::new();
+    mail_engine::export::write_one(&mut one, &message(7, "Lost", "x"), t0).unwrap();
+    assert_eq!(engine.import_mbox(gone, &one[..]).unwrap().queued, 1);
+    for _ in 0..mail_store::imports::TRIES_MAX {
+        assert_eq!(engine.upload_imports(account, &mut |f, m| client.import(f, m).map(|_| ()).map_err(|e| e.0)).unwrap(), 0);
+    }
+    assert_eq!(engine.imports_waiting(account).unwrap(), 0);
+    assert_eq!(engine.store.imports().unwrap()[0].1.why.as_deref(), Some("the server has no folder Nowhere"));
 }
 
 /// A session with an event source, and a scripted stream.

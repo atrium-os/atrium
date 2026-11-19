@@ -562,6 +562,8 @@ pub struct Mail {
     print: Rc<RefCell<Option<PrintAsk>>>,
     /// An export asked for (§6.5), for the app's picker.
     export: Rc<RefCell<Option<ExportAsk>>>,
+    /// An import asked for (§6.5): the folder it goes into and its name.
+    import: Rc<RefCell<Option<(FolderId, String)>>>,
     /// The search being typed.
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
@@ -1297,6 +1299,24 @@ impl Mail {
             Export::Everything => ExportAsk { what: What::Everything, name: "All mail.mbox".into() },
         };
         *self.export.borrow_mut() = Some(ask);
+    }
+
+    /// Import an mbox file into the folder shown (§6.5): the app opens the
+    /// picker, reads the file, and the messages go up to the server.
+    pub fn import(&self) {
+        let ui = self.ui.get_cloned();
+        if ui.saving {
+            self.file_note("Finish saving first, then import".into());
+            return;
+        }
+        let Some(f) = ui.folder.filter(|_| ui.search.is_none()) else { return };
+        let name = ui.places.iter().find(|p| p.folder == f).map(|p| p.label.clone()).unwrap_or_else(|| "this folder".into());
+        *self.import.borrow_mut() = Some((f, name));
+    }
+
+    /// The import asked for, for the app.
+    pub fn take_import(&self) -> Option<(FolderId, String)> {
+        self.import.borrow_mut().take()
     }
 
     /// The export asked for, for the app.
@@ -2640,6 +2660,7 @@ impl Mail {
         if let Some(f) = ui.folder.filter(|_| ui.search.is_none()) {
             let name = ui.places.iter().find(|p| p.folder == f).map(|p| p.label.clone()).unwrap_or_default();
             add(format!("Export {name} as mbox"), "", Cmd::Export(crate::palette::Export::Folder));
+            add(format!("Import an mbox file into {name}"), "", Cmd::Import);
         }
         if ui.search.as_ref().is_some_and(|s| !s.hits.is_empty()) {
             add("Export these results as mbox".into(), "", Cmd::Export(crate::palette::Export::Results));
@@ -2751,6 +2772,7 @@ impl Mail {
             }
             Cmd::View(lane) => self.show_view(lane),
             Cmd::Export(e) => self.export(e),
+            Cmd::Import => self.import(),
             Cmd::Saved(id) => {
                 let q = self.ui.get_cloned().saved.iter().find(|s| s.id == id).map(|s| s.query.clone());
                 if let Some(q) = q {
@@ -2984,6 +3006,7 @@ impl MailView {
             asks: Rc::default(),
             print: Rc::default(),
             export: Rc::default(),
+            import: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
             server_ask: Rc::default(),

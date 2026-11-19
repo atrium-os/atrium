@@ -39,6 +39,8 @@ pub enum Cmd {
     View(Lane),
     Saved(u32),
     Export(Export),
+    /// Import an mbox file into the folder shown (§6.5).
+    Import,
 }
 
 /// What an export covers (§6.5).

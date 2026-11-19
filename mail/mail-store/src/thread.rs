@@ -294,6 +294,25 @@ impl Writer<'_> {
 }
 
 impl Store {
+    /// Whether `account` has a message with Message-ID `mid` (an import
+    /// skips mail that is already there, §6.5).
+    pub fn has_message_id(&self, account: AccountId, mid: &str) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        let Some(t) = tx.open_table(MSGID_THREADS)?.get((account, mid))?.map(|v| v.value()) else { return Ok(false) };
+        let Some(th) = tx.open_table(THREADS)?.get(t)? else { return Ok(false) };
+        let th: Thread = dec(th.value())?;
+        let msgs = tx.open_table(MESSAGES)?;
+        for id in th.msgs {
+            if let Some(v) = msgs.get(id)? {
+                let m: Message = dec(v.value())?;
+                if m.summary.message_id.as_deref() == Some(mid) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Rows `offset..offset+limit` of a folder's conversation list, by
     /// each thread's newest message.
     pub fn conversations(&self, folder: FolderId, offset: usize, limit: usize) -> Result<Vec<Conversation>> {

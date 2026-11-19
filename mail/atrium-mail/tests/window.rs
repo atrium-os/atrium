@@ -1307,10 +1307,23 @@ fn the_command_palette() {
     typed("export all");
     assert!(mail.key(&press(Key::Enter), None));
     assert_eq!(mail.take_export().unwrap().what, What::Everything);
+    // Import (§6.5): into the folder shown, not from a search.
+    assert!(mail.key(&ctrl_k, None));
+    typed("import");
+    assert!(mail.palette_shown().is_empty(), "not from search results");
+    assert!(mail.key(&press(Key::Escape), None));
+    mail.end_search();
+    assert!(mail.key(&ctrl_k, None));
+    typed("import");
+    assert_eq!(mail.palette_shown()[0].label, "Import an mbox file into Inbox");
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(mail.take_import(), Some((inbox, "Inbox".to_string())));
     // Not while the picker is up for something else.
     mail.set_saving(true);
     mail.export(atrium_mail::palette::Export::Everything);
     assert!(mail.take_export().is_none());
+    mail.import();
+    assert!(mail.take_import().is_none());
 }
 
 #[test]

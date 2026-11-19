@@ -648,6 +648,17 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     let sent = engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.role == Role::Sent).unwrap().0;
     assert!(engine.store.list(sent, 0, 10).unwrap().iter().any(|r| r.subject == "From the pass"));
 
+    // An mbox imported into Sent (§6.5) goes up in the next pass by APPEND,
+    // seen, and is listed by the same pass.
+    let old = b"From: Priya Raman <priya@example.org>\r\nTo: lena@example.net\r\nSubject: Imported from 2019\r\nDate: 1 Mar 2019 10:00:00 +0000\r\nMessage-ID: <imp1@example.org>\r\n\r\nFrom the old laptop.\r\n".to_vec();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &old, 0).unwrap();
+    assert_eq!(engine.import_mbox(sent, &mbox[..]).unwrap().queued, 1);
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert_eq!(engine.imports_waiting(account).unwrap(), 0);
+    let row = engine.store.list(sent, 0, 10).unwrap().into_iter().find(|r| r.subject == "Imported from 2019").unwrap();
+    assert!(row.flags & mail_store::flag::SEEN != 0);
+
     // Removing the account takes its mail with it.
     engine.store.write(|w| w.remove_account(account)).unwrap();
     assert!(engine.store.accounts().unwrap().is_empty());
