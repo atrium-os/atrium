@@ -899,6 +899,10 @@ another origin. An active portal-profile session stays in engine memory.
   review on the recovered TLS tunnel. It verifies the changed report
   remains unsent, the profile and route go down, and IPv4 echo stops.
   The arm64 decline run passed 13/13.
+  With `--hip esp-loss-reconnect`, the gate starts the declined profile
+  again. The old approval choice is rejected, the changed report and
+  traffic wait for fresh approval, and echo returns on a new ESP association.
+  The arm64 reconnect run passed 16/16.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
