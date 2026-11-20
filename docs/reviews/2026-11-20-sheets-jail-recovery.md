@@ -49,4 +49,12 @@ The desktop test disconnected the Portcullis worker socket while Scrinium publis
 
 Portcullis now reconciles the marker with the durable autosave name after the jail releases its mounts and before the volume detaches. The same interruption on bounded UFS and native Tessera recovery volumes produced the chooser rows `Proof (2).osheet` and `Proof.osheet` after restart. An independent reader found `zebra,2` and `fox,2` in the recovered copies. The source CSV retained its SHA-256 digest, and both markers cleared after recovery. The native Tessera desktop also passed both recovery orders for a plain and a password-protected workbook, including password cancellation, Save As and subsequent Save. The broker tests checked a stale identity, a symlink, an oversized name, and an ambiguous autosave directory. [Desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh)
 
-The broker that supervised the jails completed teardown before the test restarted it. Broker loss while a document is still running remains open.
+The broker that supervised the jails completed teardown before the test restarted it.
+
+## Broker restart with an open workbook
+
+Two document jails opened `Proof.csv`. The second publication received the name `Proof (2).osheet` while its Portcullis worker connection was interrupted. The fixture restarted the broker while that workbook was still open. The workbook kept its jail and recovery mount, accepted a B1 edit, and was then killed.
+
+Before the fix the kernel released the jail, but its root, upper layer, socket mounts and recovery device remained attached. The chooser displayed `Proof.csv`. With the fix, Recover released those mounts and the device before selection. The chooser displayed `Proof (2).osheet` and `Proof.osheet`, and the recovery identity stayed stable. An independent reader verified A1/B1 as `zebra,2` and `fox,2` in the two recovered copies. The original CSV retained its SHA-256 digest.
+
+The desktop gate passed on native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. The UFS desktop also passed password cancellation, Save As and subsequent Save with plain and protected workbooks recovered in both orders. Cleanup runs when a subsequent workbook action examines the slot. [Desktop gate, run with `--live-broker-restart` and the private fixture broker executable](../../scripts/sheets-recovery-choices-vm-check.sh)

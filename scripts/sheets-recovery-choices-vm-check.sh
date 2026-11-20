@@ -4,6 +4,7 @@
 # Pass --save-as-labels for two copies of Proof.csv and collision-suffixed names.
 # --interrupted-labels /absolute/path/to/fixture-broker also disconnects the
 # workers socket during Save As and restarts that broker after document teardown.
+# --live-broker-restart takes the same path and restarts with the document open.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -114,9 +115,17 @@ publish() {
 check_name() {
     test "$(cat "$1/name")" = "$3" && grep -Fq "\"name\":\"$3\"" "$2"
 }
-if test "${1:-}" = --interrupted-labels || test "${1:-}" = --save-as-labels; then
+restart_broker() {
+    kill -TERM "$broker_pid"
+    stopped() { ! kill -0 "$broker_pid" 2>/dev/null; }
+    wait_for stopped
+    env PORTCULLISD_FRESCO_ACTIVATION="$PWD/activation.sock" daemon -f -o "$PWD/select-port.log" "$broker" --socket "$control"
+    ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
+    wait_for ready
+}
+if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels; then
     interrupted=false
-    if test "$1" = --interrupted-labels; then
+    if test "$1" != --save-as-labels; then
         interrupted=true
         broker=${2:?pass the running private fixture broker executable}
         workers=/atrium/sockets/workers/workers.sock
@@ -173,6 +182,13 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --save-as-labels; the
         fi
         sed 's/,"name":.*//' "$marker" > "$results/id"
         sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/id"
+        if test "$1" = --live-broker-restart && test "$slot" = 0; then
+            jail_root=$(root "$jid")
+            restart_broker
+            test "$(root "$jid")" = "$jail_root"
+            mount -p | awk -v path="$jail_root/atrium/recovery" '$2==path && $3=="nullfs" {found=1} END {exit !found}'
+            wait_for opened "$jid" "$name"
+        fi
         edit 129 0x1f
         sleep 2.2
         kill_doc "$jid"; wait_for count "$slot"
@@ -180,23 +196,31 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --save-as-labels; the
     wait_for pending 2
     if "$interrupted"; then
         detached() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
-        wait_for detached
-        kill -TERM "$broker_pid"
-        stopped() { ! kill -0 "$broker_pid" 2>/dev/null; }
-        wait_for stopped
-        env PORTCULLISD_FRESCO_ACTIVATION="$PWD/activation.sock" daemon -f -o "$PWD/select-port.log" "$broker" --socket "$control"
-        ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
-        wait_for ready
+        if test "$1" = --live-broker-restart; then
+            mount -p > "$results/after-crash.mounts"
+            mdconfig -lv > "$results/after-crash.devices"
+        else
+            wait_for detached
+            restart_broker
+        fi
     fi
-    click 213 24; sleep .6
-    cp selectscreen.png "$results/recovery-names.png"
+    click 213 24
     if "$interrupted"; then
         marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name '0.pending')
-        grep -Fq '"name":"Proof (2).osheet"' "$marker" || {
+        wait_for grep -Fq '"name":"Proof (2).osheet"' "$marker" || {
+            cp selectscreen.png "$results/recovery-names.png"
             echo "Stale chooser marker after broker restart. Frame: $results/recovery-names.png" >&2
             exit 1
         }
     fi
+    if test "$1" = --live-broker-restart; then
+        wait_for detached
+        sed 's/,"name":.*//' "$marker" | cmp -s - "$results/id"
+        mount -p | awk -v root="$jail_root" '$2 == root || $2 == root "-upper" || index($2, root "/")==1 {bad=1} END {exit bad}'
+    fi
+    # The chooser redraw follows the broker reply, after the volume detaches.
+    sleep .6
+    cp selectscreen.png "$results/recovery-names.png"
     # Slot zero is the copy with the suffix, although it was saved second.
     click 120 96; wait_for count 1; sleep .6
     publish 'Proof (2) (2).osheet' 'zebra,2'

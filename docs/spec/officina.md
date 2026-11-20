@@ -142,7 +142,9 @@ pending, the launcher lists their current names and opens the chosen one
 in a fresh jail. A confirmed Save As updates the chooser label and the
 autosave name to the filename Scrinium published, including any collision
 suffix. If Portcullis misses the update, it reconciles the chooser label from
-the durable autosave name after the document jail is torn down.
+the durable autosave name after the document jail is torn down. A workbook
+can remain open through a Portcullis restart. If it then crashes, Recover
+releases its abandoned mounts before presenting the workbook.
 Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
 closes that recovery window and leaves the generation available to try again.
 The recovery reader replays the base and journal. Save As obtains a new

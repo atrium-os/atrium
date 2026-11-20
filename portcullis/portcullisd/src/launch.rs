@@ -367,19 +367,23 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
             let mut choices = Vec::new();
             for (index, used) in active.iter_mut().enumerate() {
                 let pending = dir.join(format!("{index}.pending"));
-                if pending.try_exists()? != recover {
-                    continue;
-                }
+                let occupied = pending.try_exists()?;
+                if recover && !occupied { continue; }
                 if *used {
                     finishing |= recover;
                     continue;
                 }
                 if let Some(uid) = registry.uid_for_document(user, app, publisher.as_ref(), persona, Some(index as u8)) {
-                    let name = portcullis_jail::jail_name_for_instance(app, Some(&format!("document-{uid}")));
+                    let instance = format!("document-{uid}");
+                    let name = portcullis_jail::jail_name_for_instance(app, Some(&instance));
                     if Command::new("jls").args(["-j", &name, "jid"]).output()?.status.success() {
                         continue;
                     }
+                    if occupied && !reclaim_abandoned_workbook(&dir, index, &instance, &pending)? {
+                        continue;
+                    }
                 }
+                if pending.try_exists()? != recover { continue; }
                 if recover {
                     let book = pending_workbook(&pending, index)?;
                     if let WorkbookAction::Select(id) = action {
@@ -417,8 +421,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
         }
     };
     let name = name.to_owned();
-    let store = portcullis_overlay::Place { dir: dir.join(slot.0.to_string()),
-        img: dir.join(format!("{}.img", slot.0)), person: None };
+    let store = workbook_store(&dir, slot.0);
     let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
     std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
         let index = slot.0;
@@ -920,29 +923,67 @@ fn closed_workbook_name(data: &Path) -> std::io::Result<String> {
     Ok(label)
 }
 
+fn workbook_store(dir: &Path, index: usize) -> portcullis_overlay::Place {
+    portcullis_overlay::Place {
+        dir: dir.join(index.to_string()), img: dir.join(format!("{index}.img")), person: None,
+    }
+}
+
+/// A broker restart loses the launch thread that would normally detach this
+/// image. The caller holds the slot lock. A live or dying jail keeps the slot.
+fn reclaim_abandoned_workbook(dir: &Path, index: usize, instance: &str, pending: &Path) -> std::io::Result<bool> {
+    let store = workbook_store(dir, index);
+    if !portcullis_mounts::under(&[&store.dir]).contains(&store.dir) { return Ok(true); }
+    let root = Path::new(JAILS_DIR).join(instance);
+    let upper = Path::new(JAILS_DIR).join(format!("{instance}-upper"));
+    let jails = Command::new("jls").args(["-d", "path"]).output()?;
+    if !jails.status.success() {
+        return Err(std::io::Error::other("cannot verify closed workbook jail"));
+    }
+    if String::from_utf8_lossy(&jails.stdout).lines().any(|line| {
+        let path = Path::new(line.trim());
+        path.starts_with(&root) || path.starts_with(&upper)
+    }) { return Ok(false); }
+    let left = portcullis_mounts::converge(&[&root, &upper], portcullis_mounts::Force::No);
+    if !left.is_empty() {
+        return Err(std::io::Error::other("closed workbook still has busy mounts"));
+    }
+    let id = pending_workbook(pending, index)?.id;
+    finish_closed_recovery(&store, pending, id)?;
+    let _ = fs::remove_dir(&root);
+    let _ = fs::remove_dir(&upper);
+    Ok(true)
+}
+
+/// Called with the slot locked and all jail mounts released.
+fn finish_closed_recovery(store: &portcullis_overlay::Place, pending: &Path, id: [u8; 16]) -> std::io::Result<()> {
+    let data = store.dir.join("autosave");
+    let empty = fs::read_dir(&data).is_ok_and(|mut entries| entries.next().is_none());
+    if !empty {
+        let result = closed_workbook_name(&data).and_then(|name| rename_workbook_marker(pending, id, name));
+        if let Err(e) = result {
+            eprintln!("portcullisd: keeping previous workbook recovery label: {e}");
+        }
+    }
+    portcullis_overlay::unmount_recovery(store).map_err(std::io::Error::other)?;
+    if empty {
+        fs::remove_file(pending)?;
+        fs::File::open(pending.parent().unwrap())?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl Drop for RecoveryMount<'_> {
     fn drop(&mut self) {
         let doc = self.doc;
-        let empty = self.clean && fs::read_dir(doc.store.dir.join("autosave"))
-            .is_ok_and(|mut entries| entries.next().is_none());
-        if self.clean && !empty {
-            let result = closed_workbook_name(&doc.store.dir.join("autosave")).and_then(|name| {
-                let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
-                rename_workbook_marker(&doc.pending, self.id, name)
-            });
-            if let Err(e) = result {
-                eprintln!("portcullisd: keeping previous workbook recovery label: {e}");
-            }
-        }
-        if let Err(e) = portcullis_overlay::unmount_recovery(&doc.store) {
-            eprintln!("portcullisd: closing workbook recovery volume: {e}");
-        } else if empty {
+        let result = if self.clean {
             let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
-            let result = fs::remove_file(&doc.pending)
-                .and_then(|_| fs::File::open(doc.pending.parent().unwrap())?.sync_all());
-            if let Err(e) = result {
-                eprintln!("portcullisd: clearing workbook recovery marker: {e}");
-            }
+            finish_closed_recovery(&doc.store, &doc.pending, self.id)
+        } else {
+            portcullis_overlay::unmount_recovery(&doc.store).map_err(std::io::Error::other)
+        };
+        if let Err(e) = result {
+            eprintln!("portcullisd: closing workbook recovery volume: {e}");
         }
     }
 }

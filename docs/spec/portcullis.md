@@ -1236,6 +1236,14 @@ detaching a nonempty recovery volume. It accepts one autosave directory and
 one regular name file, reads at most 256 bytes and applies the live request’s
 filename and identity checks. An ambiguous or invalid name leaves the current
 marker in place.
+
+A restart can leave a workbook running without its launch thread. When Open,
+New or Recover examines an occupied slot with an attached volume, the broker
+checks the registry and kernel jail roots, including dying jails. Once the
+document root and upper layer have no jail, it releases their mounts under
+the slot lock, runs the same label reconciliation and detaches the recovery
+volume. A busy mount prevents the slot from being reused.
+
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads
 the base and journal. Workbook UIDs cannot request recovery.
