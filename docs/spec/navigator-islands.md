@@ -824,9 +824,28 @@ preservation of unrelated prompts and their guard when a widget disappears.
 The tests used the FreeBSD test binaries. Evidence is in
 `~/atrium-vm/evidence/navigator-i1-placement-20261120/`.
 
-Next, spend a guarded chrome activation for the selected source and current
-document, use the selected geometry to place the worker, and
-provide the origin-bound fetch channel through the production launcher.
+The I1 fetch-channel gate passed twice on an arm64 HVF overlay with a
+read-write Tessera root. Once the fixture parent received a press inside the
+document's slot, Limen created a private socketpair for that embed. Ladybird
+read the 460-byte counter page in one GET and ran its script with JIT off.
+An outside press caused no fetch. The visible count went from 0 to 1, stayed
+at 1 through a press on the covering window, then reached 2 after uncovering.
+Closing the fixture window ended the worker.
+
+The second run used a separate `_limen` daemon and Portcullis
+`ExecInstance`. Portcullis verified the installed worker manifest and ran it
+as `_navpage` (uid 65035). The worker reported capability mode and ECAPMODE
+on a pathname lookup. The jail had IPv4 and IPv6 disabled. This gate supplied
+a test launch-registry binding for the parent, a fixed worker uid rule and a
+local responder for the counter URL. The 22 FreeBSD Limen broker tests passed,
+including publisher refusal and endpoint isolation for two simultaneous
+embeds. Frames, launcher logs and executable hashes are in
+`~/atrium-vm/evidence/navigator-i1-fetch-channel-20261120/`.
+
+Next, have the installed Navigator broker spend a guarded chrome activation
+for the current document and selected widget. Use its tracked bounds to place
+the worker under the parent's instance, and serve the channel through the
+origin- and method-checked broker with the widget's cookie policy.
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and
 `~/atrium-vm/evidence/navigator-i1-counter-20261120/`.

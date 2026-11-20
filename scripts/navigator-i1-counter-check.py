@@ -12,7 +12,9 @@ parser.add_argument("ssh", help="guest SSH wrapper")
 parser.add_argument("stage", help="guest directory containing the parent's input.sock and screen.png")
 parser.add_argument("evidence", type=pathlib.Path)
 parser.add_argument("scene", type=pathlib.Path, help="parent NSG from nsg-render")
+parser.add_argument("--worker-log", help="guest log containing the externally launched worker's stderr")
 args = parser.parse_args()
+args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
 
 
@@ -85,9 +87,14 @@ screen("uncovered", r"Count\s*1\b")
 press(left + 60, top + 55)
 screen("resumed", r"Count\s*2\b")
 guest("touch close-page")
-marker("counter exited after parent closed")
+marker("counter parent closed" if args.worker_log else "counter exited after parent closed")
+deadline = time.monotonic() + 12
+while guest("pgrep -x counter || true").strip() and time.monotonic() < deadline:
+    time.sleep(0.1)
 log = guest("cat parent.log")
 require(log.count(b"broker GET 1 https://widget.example/counter.html") == 1, "unexpected widget fetch count")
-require(b"capmode=1 denied-path=ECAPMODE" in log, "worker did not verify Capsicum")
+worker_log = guest("cat " + shlex.quote(args.worker_log)) if args.worker_log else log
+(args.evidence / "worker.log").write_bytes(worker_log)
+require(b"capmode=1 denied-path=ECAPMODE" in worker_log, "worker did not verify Capsicum")
 guest("! pgrep -x counter")
 (args.evidence / "parent.log").write_bytes(log)

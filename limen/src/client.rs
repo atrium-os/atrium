@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -88,7 +89,7 @@ impl<E: for<'a> serde::Deserialize<'a>> Wire<E> {
 }
 
 /// The parent's end: one connection to limend for all of a window's embeds.
-pub struct Parent(Wire<ParentEvent>, VecDeque<std::os::fd::OwnedFd>);
+pub struct Parent(Wire<ParentEvent>, VecDeque<std::os::fd::OwnedFd>, Option<(EmbedId, UnixStream)>);
 
 impl Parent {
     /// `LIMEN_SOCKET`, else [`DEFAULT_SOCKET`].
@@ -102,7 +103,7 @@ impl Parent {
     }
 
     pub fn wrap(conn: Connection) -> Self {
-        Parent(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_PARENT }, VecDeque::new())
+        Parent(Wire { conn, queued: VecDeque::new(), ev_op: op::EV_PARENT }, VecDeque::new(), None)
     }
 
     /// Ask for a `role` embed in the window `window` names (its frescod
@@ -114,6 +115,16 @@ impl Parent {
     /// [`Self::request`] at stacking `z` among the window's slots.
     pub fn request_at(&mut self, role: &str, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
         match self.0.call(op::REQUEST, &proto::Request { role: role.into(), window, z })? {
+            Reply::Embed { embed } => Ok(embed),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
+    /// Request the fixed Navigator engine. IslandFetch supplies the broker
+    /// endpoint of this embed's transport before any child messages.
+    pub fn request_island(&mut self, window: WindowToken, z: u8) -> Result<EmbedId, Error> {
+        match self.0.call(op::REQUEST_ISLAND, &(window, z))? {
             Reply::Embed { embed } => Ok(embed),
             Reply::Refused { reason } => Err(Error::Refused(reason)),
             Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
@@ -152,12 +163,23 @@ impl Parent {
 
     pub fn poll(&mut self, wait: Duration) -> Result<Option<ParentEvent>, Error> {
         let ev = self.0.poll(wait)?;
+        self.2 = None;
+        if let Some(ParentEvent::IslandFetch { embed }) = ev {
+            let fd = self.0.conn.take_fds(1).and_then(|mut fds| fds.pop())
+                .ok_or_else(|| io::Error::other("missing island fetch channel"))?;
+            self.2 = Some((embed, UnixStream::from(fd)));
+        }
         if matches!(ev, Some(ParentEvent::MessageFd { .. })) {
             if let Some(fd) = self.0.conn.take_fds(1).and_then(|mut v| v.pop()) {
                 self.1.push_back(fd);
             }
         }
         Ok(ev)
+    }
+
+    /// Claim only the transport announced by the latest IslandFetch event.
+    pub fn take_island_fetch(&mut self, embed: EmbedId) -> Option<UnixStream> {
+        self.2.take_if(|(id, _)| *id == embed).map(|(_, socket)| socket)
     }
 
     /// The descriptor of the last [`ParentEvent::MessageFd`] polled (a

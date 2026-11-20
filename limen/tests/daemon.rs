@@ -72,6 +72,12 @@ impl Launcher for Launch {
         self.0.send((embed, ch)).unwrap();
         Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
+    fn launch_island(&mut self, embed: EmbedId, ch: UnixStream, _: u32, mut fetch: UnixStream) -> Result<u32, String> {
+        use std::io::Write;
+        fetch.write_all(&embed.to_le_bytes()).unwrap();
+        self.launch(catalogue::NAVIGATOR_ENGINE, embed, ch)
+    }
+
     /// A share across personas: this stand-in for portcullisd has the
     /// person's `share` switch on into Work only.
     fn launch_in(&mut self, app: &str, embed: EmbedId, ch: UnixStream, _parent: u32, persona: &str) -> Result<u32, String> {
@@ -765,6 +771,7 @@ fn a_choice_in_another_persona_goes_to_the_launcher_which_decides() {
     assert_eq!(refused(app.request("share-target", W_APP)), refusal::LAUNCH_FAILED);
 }
 
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
 #[test]
 fn the_print_sheet_takes_a_sealed_pdf_hands_back_save_as_pdf_and_opens_once_per_window() {
     use std::io::Read;
@@ -832,4 +839,31 @@ fn mail_sheet_requires_its_publisher_owner_and_persona() {
     assert!(w.parent(4111).request("mail-sign-in", W_APP).is_ok());
     assert_eq!(refused(w.parent(4112).request("mail-sign-in", W_APP)), refusal::NO_PROVIDER);
     assert_eq!(refused(w.parent(4113).request("mail-sign-in", W_APP)), refusal::NO_PROVIDER);
+}
+
+#[test]
+fn island_fetch_channels_are_private_to_the_signed_navigator_request() {
+    use std::io::Read;
+    let w = World::new();
+    let mut navigator = w.parent(4101);
+    assert_eq!(refused(navigator.request_island(W_APP, 1)), refusal::NOT_PROVIDER);
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101 || uid == OTHER));
+    assert_eq!(refused(w.parent(OTHER).request_island(W_APP, 1)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(w.parent(4102).request_island(W_APP, 1)), refusal::NOT_PROVIDER);
+
+    let first = navigator.request_island(W_APP, 1).unwrap();
+    let second = navigator.request_island(W_APP, 1).unwrap();
+    for id in [first, second] {
+        assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: id });
+        assert!(navigator.take_fd().is_none());
+        assert!(navigator.take_island_fetch(id + 9).is_none());
+        let mut stream = navigator.take_island_fetch(id).unwrap();
+        // The fake worker wrote its marker before launch returned.
+        stream.set_nonblocking(true).unwrap();
+        let mut message = [0; 8];
+        stream.read_exact(&mut message).unwrap();
+        assert_eq!(u64::from_le_bytes(message), id);
+        assert!(navigator.take_island_fetch(id).is_none());
+        navigator.detach(id).unwrap();
+    }
 }

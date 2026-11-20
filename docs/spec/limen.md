@@ -410,14 +410,21 @@ parent                    limend                 portcullisd       frescod      
 
 - **User roles**: limend asks portcullisd for an `ExecInstance` of the provider app, as
   frescod does for its renderers. That's one jail per embed, discarded at exit, with the
-  provider's own manifest capabilities. The child's stdin is its limend channel, its stdout
-  goes nowhere, and its stderr is limend's. Hanging up the request connection ends the jail.
+  provider's own manifest capabilities. The child's stdin is its limend channel, fd 1 normally opens on
+  /dev/null, and its stderr is limend's. Hanging up the request connection ends the jail.
   The parent's identity goes to the child as data (`Attach { parent_app, parent_uid }`: the uid limend read off the
   parent's connection, which frescod's bind confirmed owns the slot's window), never as
   authority. For the roles in `PERSONA_ROLES` (the picker) `ParentPersona { persona }`
   follows it: the persona the parent's uid runs in, from the launch registry (`None`:
   Personal), so the picker lists only that persona's folders (personas.md §4.1). Added
   2026-11-18 at the end of `ChildEvent`.
+- `REQUEST_ISLAND` (0x07) takes a window token and stacking order. Limen
+  checks the parent's installed embed permissions, Navigator app ID and
+  configured publisher, then creates a private socketpair for the fixed
+  `web-island` engine. Portcullis passes one endpoint on worker fd 1. The
+  requesting connection receives the other with `IslandFetch { embed }` and
+  claims it with `take_island_fetch(embed)` before its next poll. The
+  broker serving that endpoint enforces origin, method and cookie policy.
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch

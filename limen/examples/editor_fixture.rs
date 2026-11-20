@@ -93,15 +93,25 @@ impl Launcher for Fixture {
         if app != expected {
             return Err("unexpected worker".into());
         }
-        let stdout = if mail {
-            Stdio::inherit()
-        } else {
+        let stdout = if mail { Stdio::inherit() } else {
             let (fetcher, engine) = UnixStream::pair().map_err(|e| e.to_string())?;
             std::thread::spawn(move || {
                 if let Err(e) = serve_fixture(fetcher) { eprintln!("fixture broker: {e}"); }
             });
             Stdio::from(OwnedFd::from(engine))
         };
+        self.spawn(embed, channel, stdout)
+    }
+
+    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, _: u32, fetch: UnixStream) -> Result<u32, String> {
+        self.spawn(embed, channel, Stdio::from(OwnedFd::from(fetch)))
+    }
+
+    fn end(&mut self, _: EmbedId) {} // The one-shot process exits after its last acknowledged frame.
+}
+
+impl Fixture {
+    fn spawn(&self, embed: EmbedId, channel: UnixStream, stdout: Stdio) -> Result<u32, String> {
         let mut worker = Command::new("/usr/local/bin/portcullis")
             .args([
                 "exec",
@@ -122,10 +132,10 @@ impl Launcher for Fixture {
         });
         Ok(self.uid)
     }
-    fn end(&mut self, _: EmbedId) {} // The one-shot process exits after its last acknowledged frame.
+
 }
 
-fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
+fn fixture_parent(dir: &Path, bundle: PathBuf, counter: bool) -> Result<(limen::client::Parent, mpsc::Receiver<bool>), Box<dyn Error>> {
     let uid = Command::new("id").args(["-u", "alice"]).output()?;
     if !uid.status.success() {
         return Err("no fixture user".into());
@@ -139,14 +149,26 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             uid,
             exit: done,
         }),
-        Box::new(|uid| (uid == 0).then(|| ("fixture".into(), "org.test.i0parent".into()))),
+        Box::new(move |uid| (uid == 0).then(|| ("fixture".into(), if counter { "org.atrium.navigator" } else { "org.test.i0parent" }.into()))),
         Box::new(|_, _| None),
     );
+    if counter { shared.set_mail_sheet_provider(Box::new(|uid| uid == 0)); }
     let (parent, server) = UnixStream::pair()?;
     std::thread::spawn(move || {
         let _ = limen::daemon::serve(aqueduct::Connection::wrap(server).unwrap(), 0, shared);
     });
-    let mut parent = limen::client::Parent::wrap(aqueduct::Connection::wrap(parent)?);
+    Ok((limen::client::Parent::wrap(aqueduct::Connection::wrap(parent)?), exit))
+}
+
+fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
+    let counter = std::env::var_os("I1_COUNTER").is_some();
+    let (mut parent, exit) = match std::env::var_os("I1_LIMEND_SOCKET") {
+        Some(socket) if counter => (limen::client::Parent::at(socket).map_err(|e| format!("{e:?}"))?, None),
+        _ => {
+            let (parent, exit) = fixture_parent(dir, bundle, counter)?;
+            (parent, Some(exit))
+        }
+    };
     let mut display = fresco_client::Connection::connect(dir.join("app.sock"))?;
     display.set_read_timeout(Some(Duration::from_secs(10)))?;
     let window = display.window_create(
@@ -172,7 +194,7 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             }
         }
     };
-    if std::env::var_os("I1_COUNTER").is_some() {
+    if counter {
         return counter_gate(dir, display, window, token, parent, exit);
     }
     let document = std::env::var_os("I0_MAIL_DOCUMENT");
@@ -303,7 +325,7 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             .send(embed, b"advance".to_vec())
             .map_err(|e| format!("{e:?}"))?;
     }
-    if !exit.recv_timeout(Duration::from_secs(15))? {
+    if !exit.ok_or("missing fixture launcher")?.recv_timeout(Duration::from_secs(15))? {
         return Err("fixture worker failed".into());
     }
     // A late renderer row would shift the attribution of all following frames.
@@ -317,7 +339,7 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
 // The fixture parent uses the island rectangle from the normalised document scene. The driver sends
 // pointer input through frescod and reads the composed screen at each step.
 fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32, token: [u8; 16],
-    mut parent: limen::client::Parent, exit: mpsc::Receiver<bool>) -> Result<(), Box<dyn Error>> {
+    mut parent: limen::client::Parent, exit: Option<mpsc::Receiver<bool>>) -> Result<(), Box<dyn Error>> {
     let bounds = std::fs::read_to_string(dir.join("counter.rect"))?;
     let values = bounds.split_whitespace().map(str::parse::<u32>).collect::<Result<Vec<_>, _>>()?;
     let [x, y, w, h]: [u32; 4] = values.try_into().map_err(|_| "expected four rectangle coordinates")?;
@@ -339,13 +361,19 @@ fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32,
             if window_id == window && (left..left + width).contains(&x) && (top..top + height).contains(&y) { break; }
         }
     }
-    let id = parent.request("web-island", token).map_err(|e| format!("{e:?}"))?;
+    let id = parent.request_island(token, 1).map_err(|e| format!("{e:?}"))?;
     parent.place(id, Some([left, top, width, height])).map_err(|e| format!("{e:?}"))?;
     let mut cover = None;
     loop {
         if Instant::now() >= until { return Err("widget lifecycle timed out".into()); }
         if let Some(event) = parent.poll(Duration::from_millis(50)).map_err(|e| format!("{e:?}"))? {
             match event {
+                ParentEvent::IslandFetch { embed } if embed == id => {
+                    let socket = parent.take_island_fetch(id).ok_or("missing counter fetch channel")?;
+                    std::thread::spawn(move || {
+                        if let Err(e) = serve_fixture(socket) { eprintln!("counter fetch: {e}"); }
+                    });
+                }
                 ParentEvent::Attached { .. } => println!("counter attached"),
                 ParentEvent::Message { bytes, .. } if bytes == b"frame" => println!("counter frame"),
                 other => return Err(format!("unexpected widget event {other:?}").into()),
@@ -375,8 +403,12 @@ fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32,
     }
     display.window_destroy(window)?;
     drop(parent);
-    if !exit.recv_timeout(Duration::from_secs(12))? { return Err("widget did not exit cleanly".into()); }
-    println!("counter exited after parent closed");
+    if let Some(exit) = exit {
+        if !exit.recv_timeout(Duration::from_secs(12))? { return Err("widget did not exit cleanly".into()); }
+        println!("counter exited after parent closed");
+    } else {
+        println!("counter parent closed");
+    }
     Ok(())
 }
 

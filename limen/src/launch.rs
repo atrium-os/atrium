@@ -2,7 +2,8 @@
 //! `ExecInstance` (limen.md §4, §12 L3), the way frescod starts renderers.
 //!
 //! The child's channel is its stdin (a Unix socket, so it talks both ways);
-//! its stdout goes nowhere and its stderr is limend's. portcullisd ends the
+//! fd 1 carries the island fetch socket when requested and otherwise opens
+//! on /dev/null. Its stderr is limend's. portcullisd ends the
 //! jail when limend hangs up the request connection, which is how
 //! [`end`](crate::daemon::Launcher::end) works.
 //!
@@ -77,21 +78,25 @@ fn uid_of(name: &str) -> Option<u32> {
 
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        self.start(app, embed, channel, None, None)
+        self.start(app, embed, channel, None, None, None)
     }
 
     /// The child serves `parent_uid`: under a `per_instance` worker rule it
     /// runs as a uid of the parent's instance (its person and persona), and
     /// portcullisd says which.
     fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), None)
+        self.start(app, embed, channel, Some(parent_uid), None, None)
     }
 
     /// The child in another of the parent's person's personas: portcullisd
     /// starts it only while that person's `share` crossing switch from the
     /// parent's persona to `persona` is on (share-sheet.md §7).
     fn launch_in(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid), Some(persona))
+        self.start(app, embed, channel, Some(parent_uid), Some(persona), None)
+    }
+
+    fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream) -> Result<u32, String> {
+        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch))
     }
 
     fn end(&mut self, embed: EmbedId) {
@@ -102,7 +107,7 @@ impl Launcher for Portcullis {
 }
 
 impl Portcullis {
-    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>) -> Result<u32, String> {
+    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         // A provider from its manifest's [roles] implements has no system
         // rule: portcullisd runs it as a uid of the parent's instance (as a
@@ -113,7 +118,7 @@ impl Portcullis {
             Err(e) => return Err(e),
         };
         no_app_socket(app)?;
-        let mut go = || -> io::Result<UnixStream> {
+        let go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;
             let mut s = UnixStream::connect(path)?;
@@ -141,8 +146,11 @@ impl Portcullis {
                 Response::Error { message } => return Err(io::Error::other(message)),
                 other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
             }
-            let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
-            send_fds(&s, &[channel.as_raw_fd(), null.as_raw_fd(), 2])?;
+            let stdout: std::os::fd::OwnedFd = match fetch {
+                Some(socket) => socket.into(),
+                None => std::fs::OpenOptions::new().write(true).open("/dev/null")?.into(),
+            };
+            send_fds(&s, &[channel.as_raw_fd(), stdout.as_raw_fd(), 2])?;
             s.set_read_timeout(None)?;
             Ok(s)
         };

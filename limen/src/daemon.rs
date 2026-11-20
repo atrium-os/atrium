@@ -69,6 +69,10 @@ pub trait Launcher: Send {
         let _ = (app_id, embed, channel, parent_uid);
         Err(format!("this launcher starts nothing in another persona ({persona})"))
     }
+    /// Start the fixed Navigator engine with its private fetch transport.
+    fn launch_island(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32, _fetch: UnixStream) -> Result<u32, String> {
+        Err("this launcher does not support an island fetch channel".into())
+    }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
 }
@@ -315,7 +319,11 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     }
     let r = (|| -> Result<Reply, Reply> {
         match opc {
-            op::REQUEST => request(shared, conn, uid, de(payload)?),
+            op::REQUEST => request(shared, conn, uid, de(payload)?, false),
+            op::REQUEST_ISLAND => {
+                let (window, z) = de(payload)?;
+                request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, true)
+            }
             op::PLACE => {
                 let p: proto::Place = de(payload)?;
                 if p.rect.is_some_and(|r| !r.iter().all(|v| v.is_finite()) || r[2] <= 0.0 || r[3] <= 0.0) {
@@ -377,7 +385,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     r.unwrap_or_else(|e| e)
 }
 
-fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) -> Result<Reply, Reply> {
+fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, with_fetch: bool) -> Result<Reply, Reply> {
     let refuse = |reason| Err(Reply::Refused { reason });
     let print_pin = req.role == "credential"
         && shared.system_uids.lock().unwrap().get(catalogue::PRELUM) == Some(&uid);
@@ -400,7 +408,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     if st.embeds.values().filter(|e| e.parent == conn).count() >= catalogue::MAX_EMBEDS_PER_PARENT {
         return refuse(refusal::TOO_MANY);
     }
-    if role.name == "navigator-inbox-page" && (app != "org.atrium.navigator" ||
+    if (role.name == "navigator-inbox-page" || with_fetch) && (app != "org.atrium.navigator" ||
         !shared.mail_sheet_provider.lock().unwrap().as_ref().is_some_and(|check| check(uid))) {
         return refuse(refusal::NOT_PROVIDER);
     }
@@ -428,6 +436,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     }
     st.next_embed = st.next_embed.wrapping_add(1);
     let embed = st.next_embed;
+    let mut broker_fetch = None;
     let (child, child_uid, spawned) = match role.provider {
         Provider::System(_) if role.name == "mail-sign-in" => {
             if app != "org.atrium.mail" { return refuse(refusal::NOT_AN_APP); }
@@ -456,9 +465,16 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
             st.next_conn += 1;
             let id = st.next_conn;
             st.conns.insert(id, tx);
-            let launched = match &persona {
-                Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
-                None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
+            let launched = if with_fetch {
+                UnixStream::pair().map_err(|e| e.to_string()).and_then(|(broker, worker)| {
+                    broker_fetch = Some(broker);
+                    shared.launcher.lock().unwrap().launch_island(embed, theirs, uid, worker)
+                })
+            } else {
+                match &persona {
+                    Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
+                    None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
+                }
             };
             let child_uid = match launched {
                 Ok(u) => u,
@@ -508,6 +524,9 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     }
     if role.name == "print" {
         st.print_opens.entry(req.window).or_default().push(Instant::now());
+    }
+    if let Some(socket) = broker_fetch {
+        st.to_parent_fd(&e, ParentEvent::IslandFetch { embed }, socket.into());
     }
     st.embeds.insert(embed, e);
     Ok(Reply::Embed { embed })

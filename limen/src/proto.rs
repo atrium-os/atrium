@@ -21,6 +21,8 @@ pub mod op {
     /// [`Send`](super::Send) with one descriptor in the same frame, for a
     /// role that takes one (catalogue `takes_fd`).
     pub const SEND_FD: u16 = 0x06;
+    /// Signed Navigator requests its fixed engine with a fresh fetch channel.
+    pub const REQUEST_ISLAND: u16 = 0x07;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -163,6 +165,9 @@ pub enum ParentEvent {
     /// mode allows: take it with
     /// [`Parent::take_fd`](crate::client::Parent::take_fd).
     MessageFd { embed: EmbedId, bytes: Vec<u8> },
+    /// Limen's freshly paired endpoint for answering this worker's fetches.
+    /// Take the socket with Parent::take_island_fetch.
+    IslandFetch { embed: EmbedId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
