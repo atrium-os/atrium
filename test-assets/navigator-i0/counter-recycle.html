@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Counter</title>
+<style>
+body { margin: 16px; font: 18px sans-serif; background: white; color: black }
+button { font: inherit; padding: 8px }
+</style>
+<button type="button" id="increment">Increment</button>
+<p id="count">Count 0</p>
+<script>
+let count = 0;
+const retained = [];
+document.getElementById("increment").addEventListener("click", () => {
+    document.getElementById("count").textContent = "Count " + (++count);
+    if (count === 3) {
+        // Touch bounded chunks so RACCT observes resident pages, including on arm64.
+        for (let n = 0; n < 40; ++n) {
+            const chunk = new Uint8Array(8 * 1024 * 1024);
+            chunk.fill(1);
+            retained.push(chunk);
+        }
+    }
+});
+</script>

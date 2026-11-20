@@ -12,6 +12,7 @@ parser.add_argument("stage", help="guest directory containing input.sock and scr
 parser.add_argument("log", help="fresh Navigator log in that directory")
 parser.add_argument("evidence", type=Path)
 parser.add_argument("--tier", action="store_true", help="check live-part transitions with NAVIGATOR_UI_AX=1")
+parser.add_argument("--recycle", action="store_true", help="use counter-recycle.html, a 10-second idle timeout and UI AX")
 args = parser.parse_args()
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,7 @@ def log():
 
 
 def tier(attached):
-    if not args.tier:
+    if not (args.tier or args.recycle):
         return
     expected = (b'Static: The main document from parent.example is static text and pictures. '
                 b'1 live part from https://widget.example.' if attached else
@@ -84,6 +85,70 @@ def start(previous):
 
 def parent():
     return guest("pgrep -x navigator-ui && pgrep -x navigator-page")
+
+
+def recycle():
+    before = parent()
+    tier(False)
+    start(0)
+    count("initial", 0)
+    first = guest("pgrep -x counter")
+    for n in (1, 2):
+        time.sleep(6)
+        press(350, 118)
+        count(f"active-{n}", n)
+    if guest("pgrep -x counter") != first:
+        raise RuntimeError("active engine was replaced")
+    wait_for("idle retirement", lambda: b"live widget stopped" in log() and not guest("pgrep -x counter || true"))
+    tier(False)
+    if b"retired idle island" not in guest("cat frescod.log") or b"prompt=widget-failed" in log():
+        raise RuntimeError("idle retirement was not a compositor stop")
+    start(1)
+    count("restarted", 0)
+    tier(True)
+    second = guest("pgrep -x counter")
+    jid = int(guest("ps -o jid= -p " + str(int(second))))
+    jail = guest(f"jls -j {jid} name").decode().strip()
+    rules = guest("rctl -n " + shlex.quote("jail:" + jail))
+    (args.evidence / "rctl.txt").write_bytes(rules)
+    if b":memoryuse:sigkill=268435456" not in rules or first == second:
+        raise RuntimeError(f"unexpected counter limit or PID: {rules!r}")
+    # Add a diagnostic rule to this ephemeral jail. The signed kill rule stays in force.
+    witness = f"jail:{jail}:memoryuse:log=256M"
+    guest("rctl -a " + shlex.quote(witness))
+    for n in (1, 2):
+        press(350, 118)
+        count(f"before-pressure-{n}", n)
+    press(350, 118)
+    wait_for("memory pressure did not end worker", lambda: b"prompt=widget-failed" in log()
+             and not guest("pgrep -x counter || true"))
+    tier(False)
+    frame("memory-exit")
+    kernel = guest("dmesg")
+    messages = [line for line in kernel.splitlines() if jail.encode() in line and b"memoryuse:log=268435456" in line
+                and f"pid {int(second)} (counter)".encode() in line]
+    if not messages:
+        raise RuntimeError("missing kernel memory-pressure witness")
+    (args.evidence / "pressure.txt").write_bytes(b"\n".join(messages) + b"\n")
+    time.sleep(.65)  # The failure prompt has its own press guard.
+    press(1074, 60)
+    start(2)
+    count("recovered", 0)
+    tier(True)
+    third = guest("pgrep -x counter")
+    press(350, 118)
+    count("recovered-increment", 1)
+    if third in (first, second) or log().count(b"widget GET ") != 3:
+        raise RuntimeError("unexpected recovery worker or fetch count")
+    if parent() != before:
+        raise RuntimeError("parent changed on retirement")
+    print(f"Idle retired PID {int(first)} after two increments. Restarted PID {int(second)} in jail {jail}.")
+    print(rules.decode().strip())
+
+
+if args.recycle:
+    recycle()
+    raise SystemExit(0)
 
 
 # Geometry of the 1280x840 headless fixture with a 1120x740 Navigator window.

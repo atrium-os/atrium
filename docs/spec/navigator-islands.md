@@ -983,6 +983,41 @@ Tesseract and ImageMagick to check the rendered fixture.
 Guest service logs, executable hashes and composed frames are in
 `~/atrium-vm/evidence/navigator-i2-stop-20261120/`.
 
+### I2 idle retirement and the memory ceiling
+
+A visible web island gets 30 minutes from attachment or the last input Fresco
+routed to its window. Key, pointer, magnify and gamepad events renew that
+window’s deadline. Painting and page messages cannot renew it. Both display
+loops include the nearest island deadline in their sleep calculation. At
+expiry Fresco uses the same private stream as frame Stop. Limen retires the
+bound worker and Navigator clears its live part. A fresh Start reloads the
+widget with a new process. Unsaved widget state is lost.
+
+The engine manifest sets a 256 MiB resident-memory ceiling. Limen requires
+Portcullis to apply the limit at launch. FreeBSD enforces it with a per-jail
+RCTL SIGKILL rule. Navigator shows its ordinary worker-exit prompt when a
+worker reaches the ceiling.
+
+The installed arm64 Tessera gate shortened the compositor interval to ten
+seconds. Two increments six seconds apart kept the first worker alive past
+its original deadline. Leaving it idle retired it cleanly. Its replacement
+started at Count 0. On its third increment the fixture retained and touched
+8 MiB chunks. A diagnostic RCTL rule at the same threshold recorded the
+counter PID at 268435456 bytes, and the worker exited. The live count cleared.
+After closing the failure prompt, a guarded Start produced a third PID at
+Count 0 and Increment reached 1. The UI and parent viewer kept their PIDs.
+
+To repeat the installed counter gate, copy `test-assets/navigator-i0/counter-recycle.html`
+into a private fixture directory as `counter.html`. Use that directory for
+both the HTTP fixture’s widget response and `--embed-dir` when compiling
+the counter’s `editor-check.cpp` with `ATRIUM_I1_COUNTER`. Link and install
+the test binary with the normal counter manifest. Set `FRESCOD_ISLAND_IDLE_S=10`
+on Frescod and `NAVIGATOR_UI_AX=1` in the installed UI configuration.
+Run `scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR --recycle`
+from a fresh Navigator launch. The gate queries the kernel rule and adds a
+same-threshold logging rule only to the ephemeral worker jail. Guest logs,
+hashes and frames are in `~/atrium-vm/evidence/navigator-i2-recycling-20261120/`.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

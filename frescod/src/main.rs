@@ -365,7 +365,9 @@ fn main() -> std::io::Result<()> {
         .checked_sub(IDLE_HEARTBEAT)
         .unwrap_or_else(Instant::now);
     let mut last_present_ns = 0u64;
+    let island_idle = island_idle_timeout();
     loop {
+        let next_island = socket_server::retire_idle_islands(&comp, island_idle);
         let gen = reset_gen.load(std::sync::atomic::Ordering::SeqCst);
         let reset_due = gen != handled_gen;
         if reset_due {
@@ -681,6 +683,7 @@ fn main() -> std::io::Result<()> {
                     _ => video::VIDEOS.landed(video::monotonic_ns(), &comp),
                 }
             }
+            if let Some(left) = next_island { until_beat = until_beat.min(left); }
             redraw.wait_past(last_gen, until_beat);
             continue;
         }
@@ -1261,6 +1264,12 @@ fn publish_output0(frontend: &Arc<Mutex<EnvelopeFrontend>>, dpy: &Display, heads
     }
 }
 
+fn island_idle_timeout() -> Duration {
+    let secs = std::env::var("FRESCOD_ISLAND_IDLE_S").ok().and_then(|s| s.parse().ok())
+        .filter(|&secs| secs > 0).unwrap_or(30 * 60);
+    Duration::from_secs(secs)
+}
+
 /// Headless compositor: the same multi-window socket-server + compositing pipeline
 /// as the display path, but reads the composited screen back to a PNG each frame
 /// instead of scanning out. No GPU/display device needed — so the full jailed
@@ -1403,7 +1412,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let mut last_render = Instant::now()
         .checked_sub(HEADLESS_HEARTBEAT)
         .unwrap_or_else(Instant::now);
+    let island_idle = island_idle_timeout();
     loop {
+        let next_island = socket_server::retire_idle_islands(&comp, island_idle);
         let cur = redraw2.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
         let (now_ns, video_at) = (video::monotonic_ns(), video::VIDEOS.next_due());
@@ -1412,6 +1423,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             if let Some(t) = video_at {
                 until_beat = until_beat.min(Duration::from_nanos(t.saturating_sub(now_ns)));
             }
+            if let Some(left) = next_island { until_beat = until_beat.min(left); }
             redraw2.wait_past(last_gen, until_beat);
             continue;
         }

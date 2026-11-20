@@ -733,7 +733,7 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                     if c.is_island(id) && c.windows[&id].slot.is_some_and(|s| s.parent == p) {
                         let w = c.windows.get_mut(&id).unwrap();
                         if w.island_stop.is_none() {
-                            w.island_stop = Some(raw);
+                            w.island_stop = Some((raw, std::time::Instant::now()));
                             if let Some(r) = REDRAW.get() { r.wake(); }
                         }
                     }

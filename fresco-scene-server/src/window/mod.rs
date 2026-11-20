@@ -495,7 +495,8 @@ pub struct Window {
     pub kept_by: Option<WindowId>,
     /// Names the window to limend (limen.md §5); zero where none is minted.
     pub embed_token: [u8; 16],
-    pub island_stop: Option<std::os::unix::net::UnixStream>,
+    /// Limen retirement stream and the last routed input for this binding.
+    pub island_stop: Option<(std::os::unix::net::UnixStream, std::time::Instant)>,
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
     /// position in pixels relative to the title origin. Regenerated
     /// when title or theme changes; per-frame compose just translates

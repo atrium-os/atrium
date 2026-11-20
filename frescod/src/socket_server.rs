@@ -156,6 +156,7 @@ pub fn spawn_event_fanout(
                 if popup_gate(&ev, &comp) {
                     continue;
                 }
+                note_island_input(&ev, &comp);
                 /* A real press gets its activation token (tabula.md §2),
                  * bound to the window's app; only that app sees it, the
                  * WM gets the event without it. */
@@ -173,6 +174,41 @@ pub fn spawn_event_fanout(
             }
         })
         .expect("spawn event fan-out");
+}
+
+/// The engine cannot keep itself alive by painting or sending page messages.
+fn note_island_input(ev: &DisplayEvent, comp: &Mutex<Compositor>) {
+    use DisplayEvent as E;
+    let id = match *ev {
+        E::InputKey { window_id, .. } | E::InputPointerMotion { window_id, .. }
+        | E::InputPointerButton { window_id, .. } | E::InputPointerScroll { window_id, .. }
+        | E::InputPointerMagnify { window_id, .. } | E::Gamepad { window_id, .. } => window_id,
+        _ => return,
+    };
+    let Ok(id) = u16::try_from(id) else { return };
+    if let Some((_, last)) = comp.lock().unwrap().windows.get_mut(&id).and_then(|w| w.island_stop.as_mut()) {
+        *last = std::time::Instant::now();
+    }
+}
+
+pub fn retire_idle_islands(comp: &Mutex<Compositor>, idle: std::time::Duration) -> Option<std::time::Duration> {
+    use std::io::Write;
+    let mut next: Option<std::time::Duration> = None;
+    for (id, window) in &mut comp.lock().unwrap().windows {
+        let Some((_, last)) = &window.island_stop else { continue };
+        let left = idle.saturating_sub(last.elapsed());
+        if left.is_zero() {
+            let (mut stream, _) = window.island_stop.take().unwrap();
+            if let Err(err) = stream.write_all(&[1]) {
+                eprintln!("frescod: idle island {id} retirement: {err}");
+            } else {
+                eprintln!("frescod: retired idle island {id}");
+            }
+        } else {
+            next = Some(next.map_or(left, |prior| left.min(prior)));
+        }
+    }
+    next
 }
 
 /// Buttons whose press dismissed pop-ups: their releases are not
@@ -208,7 +244,7 @@ fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
     // routed to the engine must never become Stop while its frame is changing.
     if button == 1 && target == 0 && !crate::lock::locked() {
         if let Some(id) = island_stop_at(&c, x, y) {
-            if let Some(mut stream) = c.windows.get_mut(&id).and_then(|w| w.island_stop.take()) {
+            if let Some((mut stream, _)) = c.windows.get_mut(&id).and_then(|w| w.island_stop.take()) {
                 use std::io::Write;
                 let _ = stream.write_all(&[1]);
                 swallowed.push(button);
@@ -239,6 +275,29 @@ mod island_stop_tests {
     use std::io::Read;
 
     #[test]
+    fn only_input_to_the_watched_window_renews_its_idle_deadline() {
+        use std::time::{Duration, Instant};
+        let mut c = Compositor::new();
+        let first = c.create(1, (100, 100));
+        let other = c.create(2, (100, 100));
+        let mut readers = Vec::new();
+        for id in [first, other] {
+            let (write, read) = UnixStream::pair().unwrap();
+            c.windows.get_mut(&id).unwrap().island_stop = Some((write, Instant::now() - Duration::from_secs(2)));
+            readers.push(read);
+        }
+        let c = Mutex::new(c);
+        note_island_input(&DisplayEvent::WindowResized { window_id: first.into(), width: 100, height: 90, scale_milli: 1000 }, &c);
+        note_island_input(&DisplayEvent::InputPointerMotion { window_id: other.into(), x: 5., y: 6. }, &c);
+        let next = retire_idle_islands(&c, Duration::from_secs(1)).unwrap();
+        assert!(!next.is_zero() && next <= Duration::from_secs(1));
+        assert!(c.lock().unwrap().windows[&other].island_stop.is_some());
+        let mut stop = Vec::new();
+        readers[0].read_to_end(&mut stop).unwrap();
+        assert_eq!(stop, [1]);
+    }
+
+    #[test]
     fn stop_consumes_only_a_visible_chrome_press_and_its_release() {
         let mut c = Compositor::new();
         let parent = c.create(1, (800, 600));
@@ -246,7 +305,7 @@ mod island_stop_tests {
         let cover = c.create(3, (10, 10));
         c.bind_slot(child, parent, fresco_protocol::slot::kind::ISLAND, Some([100., 100., 200., 100.]), 1).unwrap();
         let (write, mut read) = UnixStream::pair().unwrap();
-        c.windows.get_mut(&child).unwrap().island_stop = Some(write);
+        c.windows.get_mut(&child).unwrap().island_stop = Some((write, std::time::Instant::now()));
         let layer = |id, rect| ShownLayer { id, rect, alpha: None };
         c.shown = Some(vec![layer(parent, [0,0,800,600]), layer(child,[100,100,300,200]), layer(cover,[100,180,110,190])]);
         let comp = Arc::new(Mutex::new(c));
