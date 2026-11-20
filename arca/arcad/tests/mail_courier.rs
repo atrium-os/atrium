@@ -290,20 +290,28 @@ fn start_exchange(s: &mut State, refs: Option<&[u8]>) -> ([u8; 16], Label) {
     (ticket, label)
 }
 
-#[test]
-fn cancelling_an_in_flight_renewal_preserves_the_retry_and_its_committed_grant() {
-    let (_dir, mut s) = setup();
+fn grant(ticket: &[u8; 16], value: &[u8]) -> Vec<u8> {
+    body(|w| { w.raw(ticket); w.bytes(value); })
+}
+
+fn result(ticket: &[u8; 16]) -> Vec<u8> {
+    body(|w| { w.raw(ticket); w.str("priya@example.org"); })
+}
+
+fn create_mail_account(s: &mut State) -> [u8; 32] {
     s.mail_sign_ins.mail_publisher = Some([7; 32]);
     s.mail_sign_ins.registration = Some("fixture".into());
-    let grant = |ticket: &[u8; 16], value: &[u8]| body(|w| { w.raw(ticket); w.bytes(value); });
-    let result = |ticket: &[u8; 16]| body(|w| { w.raw(ticket); w.str("priya@example.org"); });
-
-    let (first, provider) = start_exchange(&mut s, None);
+    let (first, provider) = start_exchange(s, None);
     assert_eq!(s.handle(&provider, cop::MAIL_GRANT, &grant(&first, b"original")).status, status::OK);
     let stored = s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&first));
     assert_eq!(stored.status, status::OK);
-    let refs: [u8; 32] = stored.body.bytes().try_into().unwrap();
+    stored.body.bytes().try_into().unwrap()
+}
 
+#[test]
+fn cancelling_an_in_flight_renewal_preserves_the_retry_and_its_committed_grant() {
+    let (_dir, mut s) = setup();
+    let refs = create_mail_account(&mut s);
     let (cancelled, old_provider) = start_exchange(&mut s, Some(&refs));
     assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_CANCEL, &cancelled).status, status::OK);
     let (retry, new_provider) = start_exchange(&mut s, Some(&refs));
@@ -323,4 +331,35 @@ fn cancelling_an_in_flight_renewal_preserves_the_retry_and_its_committed_grant()
     let refresh = s.handle(&endpoint, cop::MAIL_REFRESH_BEGIN, &body(|w| { w.raw(&refs); w.u8(1); }));
     assert_eq!(refresh.status, status::OK);
     assert_eq!(&refresh.body.bytes()[16..], b"oauth1 microsoft fixture renewed");
+}
+
+#[test]
+fn locking_the_vault_discards_in_flight_renewal_but_preserves_account_items() {
+    let (_dir, mut s) = setup();
+    let refs = create_mail_account(&mut s);
+    let (interrupted, provider) = start_exchange(&mut s, Some(&refs));
+    let delayed = grant(&interrupted, b"interrupted");
+    let user = body(|w| w.str("alice"));
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &user).status, status::OK);
+    assert_eq!(s.handle(&provider, cop::MAIL_GRANT, &delayed).status, status::LOCKED);
+
+    let unlock = body(|w| { w.str("alice"); w.raw(&[1; 32]); });
+    assert_eq!(s.handle(&Label::Vestibulum, op::V_UNLOCK, &unlock).status, status::OK);
+    assert_eq!(s.handle(&provider, cop::MAIL_GRANT, &delayed).status, status::DENIED);
+    assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&interrupted)).status, status::DENIED);
+    let endpoint = courier(Scheme::Https, "login.microsoftonline.com", 443);
+    let refresh = body(|w| { w.raw(&refs); w.u8(1); });
+    let original = s.handle(&endpoint, cop::MAIL_REFRESH_BEGIN, &refresh);
+    assert_eq!(original.status, status::OK);
+    assert_eq!(&original.body.bytes()[16..], b"oauth1 microsoft fixture original");
+
+    let (retry, new_provider) = start_exchange(&mut s, Some(&refs));
+    assert_ne!(retry, interrupted);
+    assert_eq!(s.handle(&new_provider, cop::MAIL_GRANT, &grant(&retry, b"renewed")).status, status::OK);
+    let saved = s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&retry));
+    assert_eq!(saved.status, status::OK);
+    assert_eq!(saved.body.bytes(), refs);
+    let renewed = s.handle(&endpoint, cop::MAIL_REFRESH_BEGIN, &refresh);
+    assert_eq!(renewed.status, status::OK);
+    assert_eq!(&renewed.body.bytes()[16..], b"oauth1 microsoft fixture renewed");
 }
