@@ -247,16 +247,18 @@ fn publish_name<T>(name: &str, mut create: impl FnMut(&str) -> io::Result<T>) ->
 /// Finish a staged Save As before publishing a name in the chosen folder.
 pub fn publish_workbook(dir: &Path, name: &str, source: &std::fs::File) -> io::Result<(std::fs::File, String)> {
     use std::io::Write;
-    stage_workbook(dir, name, |file| read_snapshot(source, |chunk| file.write_all(chunk)))
+    stage_workbook(dir, name, |file| read_snapshot(source, COPY_CHUNK_SIZE, |chunk| file.write_all(chunk)))
 }
 
+pub(crate) const COPY_CHUNK_SIZE: usize = 64 * 1024;
 pub(crate) const MAX_WORKBOOK_SIZE: u64 = 2 << 30;
 
-pub(crate) fn read_snapshot(source: &std::fs::File, mut consume: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn read_snapshot(source: &std::fs::File, chunk_size: usize, mut consume: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     let len = source.metadata()?.len();
     if len > MAX_WORKBOOK_SIZE { return Err(io::Error::other("invalid workbook size")); }
-    let mut buf = [0u8; 65536];
+    assert!(chunk_size > 0);
+    let mut buf = vec![0u8; len.min(chunk_size as u64) as usize];
     let mut offset = 0;
     while offset < len {
         let n = buf.len().min((len - offset) as usize);

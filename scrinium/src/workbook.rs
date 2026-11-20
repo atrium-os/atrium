@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 type Token = [u8; 16];
 type Grants = VecDeque<(Token, Arc<Mutex<Grant>>)>;
+const VERIFY_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_GRANTS: usize = 128;
 static GRANTS: OnceLock<Mutex<Grants>> = OnceLock::new();
 static PUBLISH: Mutex<()> = Mutex::new(());
@@ -34,9 +35,13 @@ fn ctime(m: &Metadata) -> (i64, i64) {
     (m.ctime(), m.ctime_nsec())
 }
 
-fn fingerprint(source: &File, output: &mut impl Write) -> io::Result<blake3::Hash> {
+fn fingerprint(
+    source: &File,
+    chunk_size: usize,
+    output: &mut impl Write,
+) -> io::Result<blake3::Hash> {
     let mut digest = blake3::Hasher::new();
-    crate::fs::read_snapshot(source, |chunk| {
+    crate::fs::read_snapshot(source, chunk_size, |chunk| {
         output.write_all(chunk)?;
         digest.update(chunk);
         Ok(())
@@ -50,7 +55,7 @@ impl Revision {
             let metadata = file.metadata()?;
             // Existing grants can also target workbooks larger than a save snapshot.
             let digest = (metadata.len() <= crate::fs::MAX_WORKBOOK_SIZE)
-                .then(|| fingerprint(file, &mut io::sink()))
+                .then(|| fingerprint(file, VERIFY_CHUNK_SIZE, &mut io::sink()))
                 .transpose()?;
             if ctime(&metadata) == ctime(&file.metadata()?) {
                 return Ok(Self { metadata, digest });
@@ -72,7 +77,9 @@ impl Revision {
         // UFS soft updates can advance ctime after publication. Compare the
         // pinned contents even if an outside writer restored the original mtime.
         match self.digest {
-            Some(expected) if fingerprint(file, &mut io::sink())? != expected => {
+            Some(expected)
+                if fingerprint(file, VERIFY_CHUNK_SIZE, &mut io::sink())? != expected =>
+            {
                 return Err(changed());
             }
             None if ctime(old) != ctime(now) => return Err(changed()),
@@ -140,7 +147,9 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
 }
 
 pub fn commit(token: Token, source: &File) -> io::Result<()> {
-    commit_with(token, |out| fingerprint(source, out))
+    commit_with(token, |out| {
+        fingerprint(source, crate::fs::COPY_CHUNK_SIZE, out)
+    })
 }
 
 fn commit_with(
@@ -302,15 +311,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("grant-revision-{}", std::process::id()));
         std::fs::create_dir(&dir)?;
         let path = dir.join("Budget.csv");
-        std::fs::write(&path, b"0,0\n")?;
+        // Put the external edit in the short final verification read.
+        let mut bytes = b"0,0\n".repeat(VERIFY_CHUNK_SIZE / 4 + 1);
+        std::fs::write(&path, &bytes)?;
         File::open(&path)?.sync_all()?;
         let handle = grant(&path, &File::options().read(true).write(true).open(&path)?)?;
         let source = dir.join("staged.csv");
         for n in 1..=4 {
-            let bytes = format!("{n},0\n");
+            bytes[0] = b'0' + n;
             std::fs::write(&source, &bytes)?;
             commit(handle, &File::open(&source)?)?;
-            assert_eq!(std::fs::read(&path)?, bytes.as_bytes());
+            assert_eq!(std::fs::read(&path)?, bytes);
             // A temporary second link changes ctime while leaving the final
             // link count, mode, mtime and workbook contents intact.
             let link = dir.join("temporary-link");
@@ -319,7 +330,9 @@ mod tests {
         }
         let external = File::options().write(true).open(&path)?;
         let old = external.metadata()?;
-        external.write_all_at(b"9", 2)?;
+        let tail = bytes.len() - 2;
+        external.write_all_at(b"9", tail as u64)?;
+        bytes[tail] = b'9';
         external.sync_all()?;
         external.set_modified(old.modified()?)?;
         assert_eq!(external.metadata()?.modified()?, old.modified()?);
@@ -331,7 +344,7 @@ mod tests {
                 .to_string(),
             changed().to_string()
         );
-        assert_eq!(std::fs::read(&path)?, b"4,9\n");
+        assert_eq!(std::fs::read(&path)?, bytes);
         std::fs::remove_dir_all(dir)
     }
 

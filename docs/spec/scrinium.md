@@ -143,7 +143,9 @@ includes a sealed snapshot of up to 2 GiB. Scrinium syncs it before publishing
 the new name with a no-replace rename and returns a session save grant.
 Scrinium keeps the last 128 grants. Each pins a directory and workbook inode.
 For workbooks within the 2 GiB snapshot limit, a grant records a BLAKE3
-digest of the opened bytes. Commit checks the pinned file’s size, modification
+digest of the opened bytes. Grant creation and commit verification read the pinned
+workbook in positioned reads of up to 1 MiB. Each pass uses a heap buffer
+capped at the smaller of the workbook length and 1 MiB. Commit checks the pinned file’s size, modification
 time, mode, owner, group and contents. It checks that the selected name still
 refers to that inode and that its change time stayed stable during validation
 before replacing it. UFS soft updates can advance change time after rename,
@@ -151,7 +153,7 @@ even after both directories have been synced. A later change time alone can
 therefore coexist with a valid grant. A same-size external write still fails
 the content check if the writer restores the modification time. For larger
 originals the grant retains the strict timestamp check. Scrinium hashes the
-replacement while staging it and syncs both directories after publication.
+replacement while staging it in 64 KiB chunks and syncs both directories after publication.
 On a Tessera-backed target, syncing the staged file commits a generation
 with the original workbook at its live name. Rename replaces that entry, and
 the directory sync commits the published workbook. VFS forwards these
