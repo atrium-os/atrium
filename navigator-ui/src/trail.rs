@@ -160,7 +160,7 @@ pub enum Prompt {
     NotPrivate { origin: String },
     FetchAgain,
     RunLive,
-    Widget { key: u32, origin: String, rect: [f32; 4] },
+    Widget { key: u32, src: String, origin: String, rect: [f32; 4] },
     Play { origin: String },
     /// A link for another program (`mailto:`, an allowlisted scheme;
     /// threat model §2.10).

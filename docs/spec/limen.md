@@ -418,6 +418,13 @@ parent                    limend                 portcullisd       frescod      
   follows it: the persona the parent's uid runs in, from the launch registry (`None`:
   Personal), so the picker lists only that persona's folders (personas.md §4.1). Added
   2026-11-18 at the end of `ChildEvent`.
+- Before navigatord passes a fresh Limen stream to Navigator UI, it sends
+  `DELEGATE_NAVIGATOR_UI` (0x08) and requires an explicit `Ok`. Limen
+  keeps the restriction on the server connection. The UI may request
+  `doc-viewer`, `credential` and `print`, and may place, message, show or
+  detach its own embeds. Other operations are refused on that stream. A
+  broker-owned island launch uses a separate connection. Deploy the updated
+  navigatord and limend together so the UI receives the restricted stream.
 - `REQUEST_ISLAND` (0x07) takes a window token and stacking order. Limen
   checks the parent's installed embed permissions, Navigator app ID and
   configured publisher, then creates a private socketpair for the fixed

@@ -23,6 +23,8 @@ pub mod op {
     pub const SEND_FD: u16 = 0x06;
     /// Signed Navigator requests its fixed engine with a fresh fetch channel.
     pub const REQUEST_ISLAND: u16 = 0x07;
+    /// Irreversibly restrict this fresh connection before handing it to Navigator UI.
+    pub const DELEGATE_NAVIGATOR_UI: u16 = 0x08;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;

@@ -88,6 +88,17 @@ impl<E: for<'a> serde::Deserialize<'a>> Wire<E> {
     }
 }
 
+/// Open a fresh channel and restrict it before passing it to Navigator UI.
+/// An older daemon that does not acknowledge the restriction fails closed.
+pub fn navigator_ui_channel(path: impl AsRef<Path>) -> io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    let mut parent = Parent::wrap(Connection::wrap(stream.try_clone()?)?);
+    match parent.0.call(op::DELEGATE_NAVIGATOR_UI, &()) {
+        Ok(Reply::Ok) => Ok(stream),
+        other => Err(io::Error::other(format!("Limen UI channel restriction: {other:?}"))),
+    }
+}
+
 /// The parent's end: one connection to limend for all of a window's embeds.
 pub struct Parent(Wire<ParentEvent>, VecDeque<std::os::fd::OwnedFd>, Option<(EmbedId, UnixStream)>);
 

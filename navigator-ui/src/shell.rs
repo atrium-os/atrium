@@ -732,8 +732,14 @@ impl Shell {
     /// the broker's metadata for this specific open.
     pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, island: u32, rect: [f32; 4], now: f64) -> bool {
         if self.history.is_some() || self.shown_key() != Some(key) { return false; }
-        let Some((_, origin)) = sources.iter().find(|(s, _)| s == src) else { return false };
-        self.ask_at(key, Prompt::Widget { key: island, origin: origin.clone(), rect }, now)
+        let Some(page) = self.store.trail().page() else { return false };
+        let replaced = page.asked.iter().map(|a| &a.prompt).chain(page.prompts.queued.iter())
+            .any(|p| matches!(p, Prompt::Widget { key, src: old, .. } if *key != island || old != src));
+        if replaced {
+            self.widget_placement(key, None, None, now);
+        }
+        let Some((_, origin)) = sources.iter().find(|(s, _)| s == src) else { return replaced };
+        self.ask_at(key, Prompt::Widget { key: island, src: src.into(), origin: origin.clone(), rect }, now) || replaced
     }
 
     /// Update only an existing widget row. Closing or hiding the page also
@@ -2328,6 +2334,25 @@ mod tests {
         assert!(s.outbox.is_empty());
         s.enter("https://parent.example/two");
         assert!(!s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], 1500.0));
+    }
+
+    #[test]
+    fn replacing_the_selected_source_with_the_same_key_retires_the_old_question() {
+        let mut s = shell();
+        s.enter("https://parent.example/");
+        let page = s.shown_key().unwrap();
+        let sources = vec![("/one".into(), "https://parent.example".into()),
+                           ("/two".into(), "https://parent.example".into())];
+        let rect = [2., 3., 100., 120.];
+        assert!(s.widget_pressed(page, &sources, "/one", 18, rect, 0.));
+        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, 100.));
+        assert!(s.store.trail().page().unwrap().asked.is_none());
+        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, 1500.));
+        let asked = s.store.trail().page().unwrap().asked.as_ref().unwrap();
+        assert!(matches!(&asked.prompt, Prompt::Widget { src, .. } if src == "/two"));
+        assert_eq!(asked.since_ms, 1500.);
+        assert!(s.widget_pressed(page, &sources, "/unrecorded", 18, rect, 1600.));
+        assert!(s.store.trail().page().unwrap().asked.is_none());
     }
 
     #[test]

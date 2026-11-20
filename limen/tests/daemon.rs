@@ -867,3 +867,29 @@ fn island_fetch_channels_are_private_to_the_signed_navigator_request() {
         navigator.detach(id).unwrap();
     }
 }
+
+#[test]
+fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
+    use std::os::unix::net::UnixListener;
+
+    let w = World::new();
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    let path = std::env::temp_dir().join(format!("limen-ui-{}.sock", std::process::id()));
+    let listener = UnixListener::bind(&path).unwrap();
+    let shared = w.shared.clone();
+    std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        let _ = serve(aqueduct::Connection::wrap(s).unwrap(), 4101, shared);
+    });
+    let socket = limen::client::navigator_ui_channel(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let mut ui = Parent::wrap(aqueduct::Connection::wrap(socket).unwrap());
+    assert_eq!(refused(ui.request_island(W_APP, 1)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(ui.request("web-island", W_APP)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(ui.request("navigator-inbox-page", W_APP)), refusal::NOT_PROVIDER);
+    assert_eq!(w.shared.embeds(), 0);
+    let doc = ui.request("doc-viewer", W_APP).unwrap();
+    ui.detach(doc).unwrap();
+    let broker = w.parent(4101).request_island(W_APP, 1).unwrap();
+    assert_ne!(doc, broker);
+}

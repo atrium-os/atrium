@@ -1038,11 +1038,15 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // channel (navigator-ui.md §2.3a), else the UI's own.
     let presenter = Arc::new(Mutex::new(press::peer_uid(&s)));
     let presenter_s = presenter.clone();
+    let press_strip = strip.clone();
     let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
     let mut spend = move |p: ctl::Press| -> Result<(), String> {
         let ui_uid = *presenter_s.lock().unwrap();
         match (&mut presses, ui_uid) {
-            (Some(f), Some(uid)) => f.spend(p, uid),
+            (Some(f), Some(uid)) => {
+                let window = press_strip.lock().unwrap().window.ok_or("the UI has no window")?;
+                f.spend(p, uid, window)
+            }
             (Some(_), None) => Err("the UI's uid is unknown".into()),
             // Testing only (Config refuses this otherwise).
             (None, _) => Ok(()),
@@ -1088,7 +1092,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 // limend, on the UI's behalf: the parent limend sees is then
                 // the owner of the UI's windows (us), whoever runs the UI.
                 if limen {
-                    let opened = cfg.limen.as_ref().map(|p| UnixStream::connect(p).map_err(|e| eprintln!("navigatord: limend {}: {e}", p.display())));
+                    let opened = cfg.limen.as_ref().map(|p| limen::client::navigator_ui_channel(p).map_err(|e| eprintln!("navigatord: limend {}: {e}", p.display())));
                     match opened {
                         Some(Ok(l)) => {
                             let s = w.lock().unwrap();

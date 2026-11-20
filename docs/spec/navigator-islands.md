@@ -842,6 +842,16 @@ including publisher refusal and endpoint isolation for two simultaneous
 embeds. Frames, launcher logs and executable hashes are in
 `~/atrium-vm/evidence/navigator-i1-fetch-channel-20261120/`.
 
+Navigator now restricts its UI's delegated Limen connection before handing
+over the descriptor. The UI can open its document viewer, credential field
+and print sheet. The private island fetch transport requires a separate
+broker connection. For guarded actions navigatord checks the window ID
+returned by frescod when it consumes the token against the UI connection's
+registered window. The widget question retains the exact recorded source
+alongside its origin and key. A replacement source retires the old question
+even when the UI's rate limit delays the replacement or the replacement is
+absent from the recording.
+
 Next, have the installed Navigator broker spend a guarded chrome activation
 for the current document and selected widget. Use its tracked bounds to place
 the worker under the parent's instance, and serve the channel through the

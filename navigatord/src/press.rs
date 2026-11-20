@@ -42,12 +42,13 @@ impl Frescod {
 
     /// Spend `press`, presented by the UI running as `uid`: `Ok` or why not,
     /// in words for the UI.
-    pub fn spend(&mut self, press: [u8; 16], uid: u32) -> Result<(), String> {
+    pub fn spend(&mut self, press: [u8; 16], uid: u32, window: u32) -> Result<(), String> {
         if press == NONE {
             return Err("no press from the screen came with it".into());
         }
         match self.ask(Consume { token: press, presenter_uid: uid, purpose: purpose::PROMPT }) {
-            Ok(ConsumeResult::Ok { .. }) => Ok(()),
+            Ok(ConsumeResult::Ok { window_id, .. }) if window_id == window => Ok(()),
+            Ok(ConsumeResult::Ok { .. }) => Err("the press belongs to another window".into()),
             Ok(ConsumeResult::Refused { reason }) => Err(match reason {
                 refusal::OBSCURED => "something was over the question, or it had just moved".into(),
                 refusal::EXPIRED => "the press was too long ago".into(),
@@ -78,5 +79,34 @@ pub fn peer_uid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
         // SAFETY: SO_PEERCRED into a ucred of the size given.
         let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut c as *mut libc::ucred).cast(), &mut n) };
         (r == 0).then_some(c.uid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn guarded_press_must_come_from_this_ui_window() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut conn = aqueduct::Connection::wrap(server).unwrap();
+            for token in [[1; 16], [2; 16]] {
+                let m = conn.recv_message().unwrap();
+                assert_eq!(m.op, op::CONSUME);
+                let c: Consume = postcard::from_bytes(&m.payload).unwrap();
+                assert_eq!((c.token, c.presenter_uid, c.purpose), (token, 4101, purpose::PROMPT));
+                let result = ConsumeResult::Ok { window_id: 17, kind: fresco_protocol::activation::kind::BUTTON,
+                    minted_ns: 42, drag_id: 0 };
+                conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, flag::IS_RESPONSE,
+                    &postcard::to_stdvec(&result).unwrap()).unwrap();
+            }
+        });
+        let mut fresco = Frescod { path: PathBuf::new(), conn: Some(aqueduct::Connection::wrap(client).unwrap()) };
+        assert!(fresco.spend(NONE, 4101, 17).is_err());
+        assert!(fresco.spend([1; 16], 4101, 18).is_err());
+        assert!(fresco.spend([2; 16], 4101, 17).is_ok());
+        worker.join().unwrap();
     }
 }

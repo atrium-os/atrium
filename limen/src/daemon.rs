@@ -282,6 +282,8 @@ pub fn serve(conn: Connection, uid: u32, shared: Arc<Shared>) -> io::Result<()> 
 }
 
 fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Arc<Shared>) -> io::Result<()> {
+    let mut fresh = true;
+    let mut navigator_ui = false;
     let r = (|| -> io::Result<()> {
         loop {
             while let Ok((op, payload, fd)) = rx.try_recv() {
@@ -304,13 +306,36 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Ar
             if !takes {
                 while conn.take_fds(1).is_some() {}
             }
-            let reply = handle(&shared, id, uid, m.op, &m.payload, fd);
+            let reply = if m.op == op::DELEGATE_NAVIGATOR_UI {
+                if fresh && m.payload.is_empty() {
+                    navigator_ui = true;
+                    Reply::Ok
+                } else {
+                    Reply::Refused { reason: refusal::MALFORMED }
+                }
+            } else if navigator_ui && !navigator_ui_operation(m.op, &m.payload) {
+                Reply::Refused { reason: refusal::NOT_PROVIDER }
+            } else {
+                handle(&shared, id, uid, m.op, &m.payload, fd)
+            };
+            fresh = false;
             // Events this request caused go after its reply.
             conn.send_message(proto::CLASS, m.op, flag::IS_RESPONSE, &postcard::to_stdvec(&reply).unwrap())?;
         }
     })();
     gone(&shared, id);
     r
+}
+
+// The UI receives a broker-opened stream. Keep the restriction on the
+// server end so it applies to every duplicate of the delegated descriptor.
+fn navigator_ui_operation(opc: u16, payload: &[u8]) -> bool {
+    match opc {
+        op::REQUEST => postcard::from_bytes::<proto::Request>(payload)
+            .is_ok_and(|req| matches!(req.role.as_str(), "doc-viewer" | "credential" | "print")),
+        op::PLACE | op::SEND | op::SEND_FD | op::DETACH | op::SET_VISIBLE => true,
+        _ => false,
+    }
 }
 
 fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8], fd: Option<OwnedFd>) -> Reply {
