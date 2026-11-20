@@ -936,6 +936,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                 fail "unchanged HIP did not refresh silently after ESP recovery"
                             ok "unchanged HIP refreshed silently after ESP recovery"
                             probe "IPv4 echo after silent refresh on recovered ESP"
+                            before_restore=$(awk 'END { print NR }' "$receipts")
+                            "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+                            wait_prompt gp_hip_approval
+                            printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" ||
+                                fail "recovered ESP did not review restored forwarding"
+                            [ "$(hip_choice)" != "$approval_choice" ] ||
+                                fail "recovered ESP reused the previous HIP choice"
+                            if tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report"; then
+                                fail "recovered ESP submitted restored forwarding before approval"
+                            fi
+                            before_approval=$(awk 'END { print NR }' "$receipts")
+                            touch "$receipts.recovery-approved"
+                            approve_hip
+                            wait_receipts "$((before_approval + 1))"
+                            [ "$(tail -n 1 "$receipts")" = "$initial_report" ] ||
+                                fail "approved forwarding report did not reach the gateway"
+                            ok "restoring IPv6 forwarding on recovered ESP required fresh approval"
+                            probe "IPv4 echo after fresh HIP approval on the same recovered ESP tunnel"
                         fi
                     fi
                 fi

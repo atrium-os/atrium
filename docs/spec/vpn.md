@@ -978,8 +978,10 @@ another origin. An active portal-profile session stays in engine memory.
   The `--hip esp-loss-hip-submit-final-recover` variant rebinds
   again after the TLS refresh. The fixture allows ESP probes on that
   rebind and checks that the unchanged report precedes ESP traffic and
-  later refreshes without prompting. The FreeBSD arm64 gate passed
-  36/36 using the shared Cargo cache.
+  later refreshes without prompting. Restoring IPv6 forwarding again
+  requires fresh approval before upload, and IPv4 traffic continues on
+  the same ESP association after approval. The extended FreeBSD arm64
+  gate passed 38/38 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

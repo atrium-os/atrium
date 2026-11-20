@@ -327,6 +327,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("md5-sum") == digest
                         original = report.replace(f"<md5-sum>{digest}</md5-sum>", "", 1)
                         assert hashlib.md5(original.encode()).hexdigest() == digest
+                        if hip == FINAL_HIP_RECOVER and calls.count("getconfig.esp") == 10:
+                            initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
+                            if forwarding == initial_forwarding:
+                                assert receipts.with_suffix(".recovery-approved").exists(), "recovered ESP uploaded restored forwarding before approval"
                         if receipts:
                             with receipts.open("a") as receipt:
                                 fact = forwarding
@@ -735,7 +739,7 @@ def main():
                         if final_rebind_retry and not final_fallback:
                             expected_spis.append(esp.configs[8][0][0])
                         if final_recover:
-                            expected_spis.extend([esp.configs[9][0][0]] * 2)
+                            expected_spis.extend([esp.configs[9][0][0]] * 3)
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -749,7 +753,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        allowed_echoes.append([*expected_spis[:-2], expected_spis[-3], *expected_spis[-2:]])
+                        allowed_echoes.append([*expected_spis[:-3], expected_spis[-4], *expected_spis[-3:]])
                     elif final_rebind_retry and not final_fallback:
                         allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
                     else:
@@ -819,11 +823,15 @@ def main():
                                 if rebind_recheck or rebind_reconnect:
                                     retry_report = final_rebind + 1
                                     assert set(reports[next_report:retry_report]) == {original}, reports
-                                    assert len(reports[retry_report:]) >= 2 and set(reports[retry_report:]) == {changed}, reports
+                                    assert reports[retry_report:retry_report + 2] == [changed, changed], reports
+                                    if not final_recover:
+                                        assert set(reports[retry_report:]) == {changed}, reports
                                     if final_rebind_retry:
                                         final_phase_report = calls[:configs[8]].count("hipreport.esp")
                                         assert final_phase_report >= retry_report + 2, reports
-                                        assert reports[final_phase_report:] and set(reports[final_phase_report:]) == {changed}, reports
+                                        final_reports = reports[final_phase_report:]
+                                        if not final_recover:
+                                            assert set(final_reports) == {changed}, reports
                                         if final_fallback:
                                             assert calls[configs[8]:configs[8] + 4] == [
                                                 *exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn",
@@ -832,8 +840,13 @@ def main():
                                             if final_recover:
                                                 recovery_report = calls[:configs[9]].count("hipreport.esp")
                                                 assert recovery_report >= final_phase_report + 2, reports
-                                                assert len(reports[recovery_report:]) >= 2, reports
-                                                print("Final rebind restored ESP after TLS fallback and refreshed unchanged HIP silently")
+                                                assert set(reports[final_phase_report:recovery_report]) == {changed}, reports
+                                                recovered_reports = reports[recovery_report:]
+                                                assert recovered_reports[:2] == [changed, changed], reports
+                                                first_restored = recovered_reports.index(original)
+                                                assert set(recovered_reports[:first_restored]) == {changed}, reports
+                                                assert set(recovered_reports[first_restored:]) == {original}, reports
+                                                print("Recovered ESP refreshed silently and sent restored forwarding only after fresh approval")
                                             else:
                                                 print("Final rebind fell back to TLS after unchanged HIP and refreshed without prompting")
                                         else:
