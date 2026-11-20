@@ -155,7 +155,7 @@ remote "cat '$guest/jobs.txt'" >"$D/desktop-jobs.txt"
 # Change only the advertised printer UUID. Keep the TLS listener and key.
 printf '%s\n' 12d7ac00-4bd5-4413-8da5-e6952965ffcf >"$D/printer-uuid"
 remote "cat >'$guest/identity-proof.pdf'" <"$D/fixtures/quicklook.pdf"
-if ! remote "sh -s -- '$guest' '$marker'" <"$scripts/prelum-r7-identity.sh" >"$D/identity-check.log" 2>&1; then
+if ! remote "sh -s -- '$guest' '$marker' hold" <"$scripts/prelum-r7-identity.sh" >"$D/identity-check.log" 2>&1; then
     cat "$D/identity-check.log" >&2
     exit 1
 fi
@@ -163,3 +163,14 @@ cat "$D/identity-check.log"
 # The transcript and spool checks below also reject any upload from the held job.
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/desktop-jobs.txt" >"$D/pdf-checks.log"
 cat "$D/pdf-checks.log"
+
+# The held-phase checks above prove there was no creation or upload before restoration.
+mv "$D/printer-uuid" "$D/held-printer-uuid.txt"
+if ! remote "sh -s -- '$guest' '$marker' release" <"$scripts/prelum-r7-identity.sh" >"$D/identity-release.log" 2>&1; then
+    cat "$D/identity-release.log" >&2
+    exit 1
+fi
+cat "$D/identity-release.log"
+remote "cat '$guest/identity-released-jobs.log'" >"$D/released-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/released-jobs.txt" "$D/fixtures/quicklook.pdf" >"$D/released-pdf-checks.log"
+cat "$D/released-pdf-checks.log"

@@ -7,16 +7,26 @@ cd "$P"
 test "$(cat .isolated-gate)" = "$marker"
 test "$(uname -s)" = FreeBSD
 
-"$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
-    --printer 1 --title "Changed printer UUID"
+case "$3" in
+  hold)
+    "$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
+        --printer 1 --title "Changed printer UUID"
+    snapshot=identity-jobs.log
+    expected="^ +12 +printer +1 +Held +0/0 +Changed printer UUID +.*alert IdentityChanged"
+    ;;
+  release)
+    "$P/prelumctl" --socket "$P/print.sock" release 12
+    snapshot=identity-released-jobs.log
+    expected="^ +12 +printer +1 +Done +2/2 +Changed printer UUID *$"
+    ;;
+  *) echo "Expected hold or release" >&2; exit 2 ;;
+esac
 for attempt in $(seq 35); do
-  "$P/prelumctl" --socket "$P/print.sock" jobs >identity-jobs.log
-  if grep -Eq "^ +12 +printer +1 +Held +0/0 +Changed printer UUID +.*alert IdentityChanged" identity-jobs.log; then
-    break
-  fi
+  "$P/prelumctl" --socket "$P/print.sock" jobs >"$snapshot"
+  if grep -Eq "$expected" "$snapshot"; then break; fi
   sleep 1
 done
-grep -E "^ +12 +printer +1 +Held +0/0 +Changed printer UUID +.*alert IdentityChanged" identity-jobs.log
+grep -E "$expected" "$snapshot" || { cat "$snapshot" >&2; exit 1; }
 
 # Include dying VNET jails. The daemon janitor also removes the worker roots
 # after outstanding sockets release their references.

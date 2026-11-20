@@ -6062,7 +6062,9 @@ The Mail PDF from the reopened preview must include the body
 and attachment filename while excluding the attachment payload. After the
 desktop jobs, the simulator changes its advertised UUID while retaining
 its TLS key. A diagnostic submission must be held with IdentityChanged
-without creating or uploading a job at the simulator.
+without creating or uploading a job at the simulator. After UUID restoration,
+the gate releases the same job and checks for one upload and both original
+pages.
 
 ### 13.9 Shared-checkout hygiene
 
