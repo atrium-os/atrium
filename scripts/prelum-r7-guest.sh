@@ -224,6 +224,16 @@ for i in $(seq 20); do grep -q 'reading="Mail print fixture"' mail.log && break;
 grep 'reading="Mail print fixture"' mail.log
 press 1234 34
 preview 'previews: 3 of 3' 1
+"$P/prelumctl" --socket "$P/print.sock" jobs >mail-before-cancel.txt
+press 816 552
+for i in 1 2 3; do
+  sleep 1
+  "$P/prelumctl" --socket "$P/print.sock" jobs >mail-after-cancel.txt
+  diff -u mail-before-cancel.txt mail-after-cancel.txt
+done
+echo "Mail: cancelling the print preview queued no job"
+press 1234 34
+preview 'previews: 3 of 3' 2
 cp screen.png mail-preview.png
 press 940 551
 wait_job 7

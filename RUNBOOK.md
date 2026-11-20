@@ -6044,7 +6044,8 @@ worker. Poppler checks the original Quick Look HTML and plain text after pathnam
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides
 three-slide handouts with Include Hidden Slides off on A4 and on after a
 Letter paper change, plus paginated
-speaker notes with Include Hidden Slides off and on. The Mail PDF must include the body
+speaker notes with Include Hidden Slides off and on. The gate cancels the first Mail preview and checks that no job is queued.
+The Mail PDF from the reopened preview must include the body
 and attachment filename while excluding the attachment payload.
 
 ### 13.9 Shared-checkout hygiene
