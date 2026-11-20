@@ -810,3 +810,10 @@ connection to the fixture failed. The launcher logged separate couriers for
 the provider on 443, IMAP on 993 and submission on 587. No live provider
 or mailbox was used. Guest and provider evidence is under
 `~/atrium-vm/evidence/mail-oauth-rotation-20261120/` on the Mac.
+
+
+The subsequent local Mail gate used the saved callback account in the
+production Mail window. IMAP synchronized the fixture message into the
+inbox and reader. A Send press produced one authenticated SMTP delivery
+with the expected envelope and MIME body. The guest ran the signed sync
+worker. [Fixture and results](mail.md#local-inbox-and-submission-gate).

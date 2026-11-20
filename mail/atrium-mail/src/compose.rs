@@ -999,9 +999,14 @@ impl View for ComposeView {
             }
             let fy = y + (row_h - pergola::theme::size::input_height()) / 2.0;
             let f = TextField::new(state.clone()).at(16.0 + label_w, fy).width(field_w).autofocus(i == 0 && state.get_cloned().text().is_empty());
-            let slot = ctx.place(f);
+            // These rows have explicit coordinates. A flow-layout slot
+            // would replace the field's frame with a slot at the origin.
+            let rect = f.rect;
+            let slot = ctx.push(Node::Rect { rect, fill: Color::TRANSPARENT, radius: 0.0 });
+            f.render(ctx);
+            ctx.pop();
             if let Some(n) = ["To", "Cc", "Bcc"].iter().position(|l| *l == label) {
-                slots.push((n, slot, Rect::new(16.0 + label_w, fy, field_w, pergola::theme::size::input_height())));
+                slots.push((n, slot, rect));
             }
             if label == "Cc" && !ui.show_bcc {
                 let c = self.c.clone();

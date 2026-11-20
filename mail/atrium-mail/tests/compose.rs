@@ -65,8 +65,16 @@ fn compose_send_undo() {
         assert!(t.iter().any(|x| x == s), "{s:?} not drawn: {t:?}");
     }
     // Fill the fields; type in the text (a press puts the caret there).
-    k.to.set(TextEdit::new("Arun <arun@acme.example>, lena@acme.example"));
-    k.subject.set(TextEdit::new("Q4 numbers"));
+    for (y, value) in [(108.0, "Arun <arun@acme.example>, lena@acme.example"), (188.0, "Q4 numbers")] {
+        let at = Point::new(180.0, y);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        app.handle_event(typed(value));
+        app.tick();
+    }
+    assert_eq!(k.to.get_cloned().text(), "Arun <arun@acme.example>, lena@acme.example");
+    assert_eq!(k.subject.get_cloned().text(), "Q4 numbers");
     app.tick();
     let body_at = Point::new(30.0, 48.0 + 40.0 * 4.0 + 36.0 + 1.0 + 8.0 + 4.0);
     app.handle_event(Event::PointerDown { at: body_at });
@@ -223,6 +231,7 @@ fn rich_text() {
 
 fn jail() -> std::path::PathBuf {
     use std::path::Path;
+    if let Some(parser) = std::env::var_os("MAIL_PARSE_JAIL") { return parser.into(); }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
     let st = std::process::Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());
@@ -350,16 +359,15 @@ fn files_are_attached_and_forwarded() {
 #[test]
 fn encrypt_needs_every_recipient_s_certificate() {
     use mail_sync::{Fetched, RemoteFolder, Role, Sink};
-    let data = |f: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
-    engine.set_roots(vec![data("ca.der")]);
+    engine.set_roots(vec![include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()]);
     let engine = Rc::new(engine);
     let account = engine.store.add_account("grace@example.net").unwrap();
     {
         let mut sink = engine.sink(account);
         sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
-        let bytes = data("signed.eml");
+        let bytes = include_bytes!("../../mail-smime/tests/data/signed.eml").to_vec();
         sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW), server_id: None, bytes, full: true }]).unwrap();
     }
     let dirty = Arc::new(AtomicBool::new(true));
@@ -394,11 +402,10 @@ fn encrypt_needs_every_recipient_s_certificate() {
 fn sign_through_sigillum() {
     use rsa::pkcs8::DecodePrivateKey;
     use sigillum_proto::client::{Reply, Request, CertPurpose, MAX_MESSAGE};
-    let data = |f: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sigillum.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let (cert, key) = (data("leaf.der"), rsa::RsaPrivateKey::from_pkcs8_der(&data("leaf.p8")).unwrap());
+    let (cert, key) = (include_bytes!("../../mail-smime/tests/data/leaf.der").to_vec(), rsa::RsaPrivateKey::from_pkcs8_der(&include_bytes!("../../mail-smime/tests/data/leaf.p8").to_vec()).unwrap());
     let server = std::thread::spawn(move || {
         let mut asked = Vec::new();
         for _ in 0..2 {
@@ -416,7 +423,7 @@ fn sign_through_sigillum() {
     });
 
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
-    engine.set_roots(vec![data("ca.der")]);
+    engine.set_roots(vec![include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()]);
     let engine = Rc::new(engine);
     engine.store.add_account("grace@example.net").unwrap();
     let view = MailView::new(engine.clone(), Arc::new(AtomicBool::new(true)), (1280.0, 800.0), || NOW);
@@ -438,7 +445,7 @@ fn sign_through_sigillum() {
     assert!(matches!(&asked[0], Request::ChooseCertificate(c) if c.purpose == CertPurpose::MailSign { from: "grace@example.net".into() }));
     let (_, o) = engine.store.outbox().unwrap().remove(0);
     let sent = engine.store.blob(&o.message).unwrap();
-    let opened = engine.parser.open(&sent, vec![], &[data("ca.der")], None, vec![]).unwrap().unwrap();
+    let opened = engine.parser.open(&sent, vec![], &[include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()], None, vec![]).unwrap().unwrap();
     assert_eq!(opened.summary.smime.unwrap().state, mail_schema::SmimeState::Valid);
     assert_eq!(opened.summary.text.as_deref().map(str::trim), Some("Hello Ada."));
 }

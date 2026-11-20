@@ -15,6 +15,7 @@ import threading
 import urllib.parse
 
 ROOT = pathlib.Path(sys.argv[1])
+MAILBOX = sys.argv[2:] == ["--mailbox"]
 CLIENT = "11111111-1111-4111-8111-111111111111"
 lock = threading.Lock()
 refresh = "demo-refresh"  # Seeded by the local callback fixture.
@@ -95,6 +96,9 @@ def imap(peer):
         peer.put(tag + " NO login refused")
         return
     peer.put(tag + " OK [CAPABILITY IMAP4rev1] authenticated")
+    if MAILBOX:
+        from mailbox_fixture import inbox
+        return inbox(peer)
     tag, cmd = peer.line().split(" ")
     if cmd == "NOOP":
         peer.put(tag + " OK NOOP")
@@ -118,7 +122,7 @@ def smtp(sock, ctx):
             return
         p.put("250-fixture")
         p.put("250-AUTH XOAUTH2")
-        p.put("250 SIZE 1000")
+        p.put("250 SIZE 1048576" if MAILBOX else "250 SIZE 1000")
         cmd = p.line()
         if not cmd.startswith("AUTH XOAUTH2 ") or not login(cmd.split(" ")[2], "SMTP"):
             p.put("535 login refused")
@@ -126,7 +130,10 @@ def smtp(sock, ctx):
         p.put("235 authenticated")
         if p.line().startswith("EHLO "):
             p.put("250-fixture")
-            p.put("250 SIZE 1000")
+            p.put("250 SIZE 1048576" if MAILBOX else "250 SIZE 1000")
+        if MAILBOX:
+            from mailbox_fixture import submission
+            return submission(p, ROOT)
         if p.line() == "NOOP":
             p.put("250 NOOP")
             print("SMTP NOOP", flush=True)

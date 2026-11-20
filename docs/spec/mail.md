@@ -276,6 +276,35 @@ connection path and requires an authenticated NOOP response from both
 servers. Restarting Arca between passes checks the durable grant. The
 fixture exercises authenticated protocol sessions without sending mail.
 
+#### Local inbox and submission gate
+
+The host TLS fixture accepts `--mailbox` after its run directory. Start
+from the callback snapshot containing the saved local account and its
+initial fixture grant. Serve the token endpoint, IMAP and SMTP on the
+restricted fixture network. Launch the production Mail bundle with its
+signed sync worker. The inbox contains one message from Robin Vale with
+subject “Greenhouse visit” and body “Please bring the blue notebook.”
+Verify both the list and the reader. In a new compose window enter
+`robin@school.test`, subject “Notebook confirmation”, and body
+“The blue notebook is packed.” Press Send and let the undo interval expire.
+
+The fixture saves the SMTP envelope and unstuffed DATA in a new
+`received-*` directory for every acceptance. Verify the envelope separately
+from the MIME headers and decoded plain-text part using:
+
+```sh
+python3 test-assets/mail-oauth/mailbox_fixture.py "$run" ada@outlook.com robin@school.test \
+    'Notebook confirmation' 'The blue notebook is packed.'
+```
+
+The 2026-11-20 arm64 Tessera run displayed the incoming body and accepted
+one matching submission. The test exposed overlapping To, Cc and Subject
+inputs. Compose now draws them at their row coordinates and retains their
+focus ancestry for address completion. The Send test clicks and types in
+the fields. The guest reported a private VNET with only loopback for Mail
+and `allow.nomount`. Screenshots, worker evidence and the captured message
+are under `~/atrium-vm/evidence/mail-inbox-send-20261120/` on the Mac.
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and
