@@ -312,6 +312,9 @@ pub(crate) fn stage_in<T>(folder: &std::fs::File, write: impl FnOnce(&mut std::f
         let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
         let saved = (|| {
             write(&mut file)?;
+            // On Tessera this fsync commits a mount generation while the live
+            // workbook name still points to its old bytes. Keep it before
+            // publication, including when a nullfs grant wraps the mount.
             file.sync_all()?;
             publish(stage.as_raw_fd(), leaf)
         })();

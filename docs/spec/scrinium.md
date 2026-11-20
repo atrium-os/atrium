@@ -146,6 +146,15 @@ Commit checks the selected entry and file revision immediately before rename.
 Scrinium syncs both directories involved in the rename before removing the
 private staging directory. This settles the source link removal on UFS with
 soft updates before a grant records the workbook’s new change timestamp.
+On a Tessera-backed target, syncing the staged file commits a generation
+with the original workbook at its live name. Rename replaces that entry, and
+the directory sync commits the published workbook. VFS forwards these
+operations through nullfs grants. The host can read each revision at
+`<mount>/.tessera/snapshots/<generation>/<relative workbook path>` while
+Tessera retains the generation. Scrinium leaves retention to the filesystem;
+the document jail needs only its existing workbook grant. Other filesystems
+continue to use their own sync and rename guarantees.
+
 Hard links, special permissions, filesystem flags and user extended attributes
 require Save As. Replacement preserves ownership, mode and supported access ACLs.
 A directory sync error after rename means publication could have succeeded.

@@ -183,6 +183,10 @@ publishes the completed file under an unused name and returns a new save grant.
 An interruption before publication leaves the previous workbook intact and can
 leave a hidden staging file. Neither operation exposes the directory to Sheets.
 
+On Tessera, the same save boundaries preserve the prior and published file
+in native filesystem generations under the volume’s retention policy
+(scrinium.md §4.2). Sheets does not need access to the snapshot namespace.
+
 ### 4.3 Recent files and reopening
 
 Reopening a file after a restart needs a grant that outlives the process, which Atrium has
