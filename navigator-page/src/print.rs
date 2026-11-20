@@ -86,6 +86,31 @@ pub fn sanitized_pdf(html: String, subs: Subresources, picture: &dyn Fn(&str) ->
     write_pdf(html, subs, "", Paper::new(595, 842), picture, true)
 }
 
+/// Print the decoded Quick Look image, fitted without changing its aspect ratio.
+pub fn picture_pdf(width: u32, height: u32, rgba: &[u8], paper: Paper) -> Result<Vec<u8>, String> {
+    struct NoFonts;
+    impl FontFiles for NoFonts {
+        fn face(&self, _: u16) -> Option<&[u8]> { None }
+    }
+
+    let margin = paper.margin_pt.min(paper.w_pt.min(paper.h_pt) / 4.0);
+    let (w, h) = (f64::from(width), f64::from(height));
+    if w == 0.0 || h == 0.0 { return Err("Empty picture".into()); }
+    let scale = ((paper.w_pt - 2.0 * margin) / w).min((paper.h_pt - 2.0 * margin) / h);
+    let (w, h) = (w * scale, h * scale);
+    let units = |v: f64| (v * officina_text::LU as f64).round() as i64;
+    let image = Item::Image { image: 0, x: units((paper.w_pt - w) / 2.0), y: units((paper.h_pt - h) / 2.0), w: units(w), h: units(h) };
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().and_then(|mut writer| writer.write_image_data(rgba)).map_err(|err| err.to_string())?;
+    let mut pdf = Painted::new(Vec::new()).map_err(|err| err.to_string())?;
+    let bytes = std::cell::RefCell::new(Some(bytes));
+    pdf.page(vec![image], paper.w_pt, paper.h_pt, None, &NoFonts, &|_| bytes.borrow_mut().take()).map_err(|err| err.to_string())?;
+    pdf.finish(&NoFonts, "", "Atrium Quick Look").map(|(pdf, _)| pdf).map_err(|err| err.to_string())
+}
+
 struct PdfBytes {
     bytes: Vec<u8>,
     limit: usize,

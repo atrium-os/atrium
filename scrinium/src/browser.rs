@@ -274,7 +274,11 @@ impl Look {
     }
 
     pub fn can_print(&self) -> bool {
-        self.is_pdf() || matches!(self.body, Some(LookBody::Text { .. }))
+        self.is_pdf() || self.is_picture() || matches!(self.body, Some(LookBody::Text { .. }))
+    }
+
+    pub fn is_picture(&self) -> bool {
+        matches!(&self.body, Some(LookBody::Embed { role: "doc-viewer", mime, .. }) if mime.starts_with("image/"))
     }
 }
 

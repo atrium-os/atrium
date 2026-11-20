@@ -667,7 +667,8 @@ struct Network {
     /// Quick look's viewer (opening-files.md §7), for this file.
     look_embed: Option<LookViewer>,
     printing: Option<pergola::print::Printing>,
-    text_pdf_pending: bool,
+    look_pdf_pending: bool,
+    picture_print: Option<EmbedId>,
     look_text_file: Option<(std::path::PathBuf, std::fs::File)>,
     /// The file read for the viewer, until it is handed over.
     look_file: Option<(std::path::PathBuf, std::fs::File)>,
@@ -700,7 +701,7 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, printing: None, text_pdf_pending: false, look_text_file: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, printing: None, look_pdf_pending: false, picture_print: None, look_text_file: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
     }
@@ -710,7 +711,20 @@ impl Network {
         use pergola::print::Printing;
 
         let Some(look) = b.look.as_ref().filter(|look| look.path == path && look.can_print()) else { return };
-        if self.printing.is_some() || self.text_pdf_pending {
+        if self.printing.is_some() || self.look_pdf_pending || self.picture_print.is_some() {
+            return;
+        }
+        if look.is_picture() {
+            let viewer = self.look_embed.as_ref().filter(|viewer| viewer.path == path);
+            if let (Some(viewer), Some(embeds)) = (viewer, &self.embeds) {
+                let paper = pergola::print::Paper::A4;
+                let request = limen::doc_viewer::ToChild::Print { w_pt: paper.w_pt, h_pt: paper.h_pt, margin_pt: 36 };
+                if embeds.borrow_mut().send(viewer.embed, request.encode()).is_ok() {
+                    self.picture_print = Some(viewer.embed);
+                    return;
+                }
+            }
+            b.notice = Some(scrinium::browser::Notice { text: "The picture preview isn't ready to print.".into(), error: true });
             return;
         }
         if !look.is_pdf() {
@@ -720,7 +734,7 @@ impl Network {
                 return;
             };
             let (path, name, tx) = (path.to_path_buf(), look.name.clone(), self.tx.clone());
-            self.text_pdf_pending = true;
+            self.look_pdf_pending = true;
             b.notice = Some(scrinium::browser::Notice { text: "Preparing the text to print…".into(), error: false });
             std::thread::spawn(move || {
                 let paper = pergola::print::Paper::A4;
@@ -759,6 +773,7 @@ impl Network {
         if let Some(viewer) = &self.look_embed {
             if want.as_ref() != Some(&viewer.path) {
                 let _ = embeds.borrow_mut().detach_embed(viewer.embed);
+                if self.picture_print == Some(viewer.embed) { self.picture_print = None; }
                 self.look_embed = None;
             }
         }
@@ -946,6 +961,41 @@ impl Network {
                     }
                 }
                 match ev {
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if Some(embed) == self.picture_print => {
+                        use std::io::Read;
+                        use limen::doc_viewer::{ToParent, DOC_MAX};
+                        self.picture_print = None;
+                        let fd = embeds.borrow_mut().take_fd();
+                        let viewer = self.look_embed.as_ref().filter(|viewer| viewer.embed == embed);
+                        let look = b.look.as_ref().filter(|look| look.is_picture() && viewer.is_some_and(|v| v.path == look.path));
+                        if let (Some(look), Some(fd), Some(ToParent::Printed { pages: 1, cut: false })) =
+                            (look, fd, ToParent::decode(&bytes))
+                        {
+                            let (path, name, tx) = (look.path.clone(), look.name.clone(), self.tx.clone());
+                            self.look_pdf_pending = true;
+                            std::thread::spawn(move || {
+                                // Limen narrowed the viewer's descriptor for reading.
+                                // Reseal the bounded copy before passing it to Prelum.
+                                let mut bytes = Vec::new();
+                                let result = std::fs::File::from(fd).take(DOC_MAX + 1).read_to_end(&mut bytes).and_then(|n| {
+                                    if n as u64 > DOC_MAX {
+                                        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "The picture PDF is too large to print"))
+                                    } else {
+                                        Ok(bytes)
+                                    }
+                                });
+                                let _ = tx.send(Job::LookPrint(path, name, result));
+                            });
+                        }
+                        changed = true;
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.picture_print => {
+                        if matches!(limen::doc_viewer::ToParent::decode(&bytes), Some(limen::doc_viewer::ToParent::Error { .. })) {
+                            self.picture_print = None;
+                            b.notice = Some(scrinium::browser::Notice { text: "Couldn't print the picture.".into(), error: true });
+                            changed = true;
+                        }
+                    }
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.cred_embed => {
                         if let Some(m) = limen::credential::ToParent::decode(&bytes) {
                             pane.cred.apply(m);
@@ -980,6 +1030,7 @@ impl Network {
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if self.look_embed.as_ref().is_some_and(|viewer| viewer.embed == embed) => {
                         let viewer = self.look_embed.take().unwrap();
+                        if self.picture_print == Some(embed) { self.picture_print = None; }
                         let words = look_words(&b);
                         b.looked(&viewer.path, Ok(scrinium::browser::LookBody::Info { words, why: Some("The viewer stopped".into()) }));
                         changed = true;
@@ -990,6 +1041,7 @@ impl Network {
                         eprintln!("scrinium: limend: {e:?}");
                         self.embeds = None;
                         self.printing = None;
+                        self.picture_print = None;
                         break;
                     }
                 }
@@ -1139,7 +1191,7 @@ impl Network {
                     Err(e) => b.looked(&path, Err(e)),
                 },
                 Job::LookPrint(path, name, pdf) => {
-                    self.text_pdf_pending = false;
+                    self.look_pdf_pending = false;
                     if b.look.as_ref().is_some_and(|look| look.path == path && look.can_print()) {
                         let result = pdf.map_err(|err| err.to_string()).and_then(|pdf| {
                             let (Some(embeds), Some(token)) = (&self.embeds, pane.win.embed_token()) else {

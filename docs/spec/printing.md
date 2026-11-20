@@ -811,7 +811,7 @@ can print PDFs from its Print button or a `PrintAsked` from the active PDF viewe
 It passes the read-only descriptor for that preview to the print sheet as a
 fixed-layout document. Quick Look can also print files shown as plain text.
 It formats the complete file up to the 4 MiB print limit with
-`officina_pdf::plain` on A4 and passes the PDF to the print sheet.
+`officina_pdf::plain` on A4 and passes the PDF to the print sheet. For images, the jailed Quick Look viewer fits the decoded preview to an A4 page, preserves its aspect ratio, and returns a sealed PDF descriptor.
 
 Next: R5.
 

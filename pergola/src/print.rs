@@ -78,7 +78,8 @@ impl Printing {
         let embed = embeds.borrow_mut().request("print", window, slot)?;
         let title: String = title.chars().filter(|c| !c.is_control()).take(limen::print::MAX_TITLE / 4).collect();
         let msg = ToChild::Print { title, page_size_hint: hint, can_relayout };
-        if let Err(e) = embeds.borrow_mut().send_fd(embed, msg.encode(), pdf) {
+        let sent = embeds.borrow_mut().send_fd(embed, msg.encode(), pdf);
+        if let Err(e) = sent {
             let _ = embeds.borrow_mut().detach_embed(embed);
             return Err(e);
         }
@@ -292,6 +293,24 @@ mod tests {
             }
         }
         panic!("printing said nothing");
+    }
+
+    #[test]
+    fn a_refused_document_descriptor_leaves_the_print_slot_reusable() {
+        let resolve = Box::new(|uid: u32| match uid {
+            APP => Some(("ana".into(), "org.example.write".into())),
+            SHEET => Some(("ana".into(), catalogue::PRELUM.into())),
+            _ => None,
+        });
+        let shared = limen::daemon::Shared::new(Box::new(Fresco), Box::new(NoLaunch), resolve, Box::new(|_: &str, _: &str| None));
+        let mut sheet = Child::wrap(conn(&shared, SHEET));
+        sheet.provide_role("print").unwrap();
+        let embeds = Embeds::wrap(limen::client::Parent::wrap(conn(&shared, APP)));
+        crate::slot::SlotBinder::place(&mut *Embeds::binder(&embeds), 0, SLOT, Some([0.0, 0.0, 100.0, 100.0]));
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        assert!(Printing::start(&embeds, W, SLOT, socket.as_fd(), "Invalid descriptor", false, None).is_err());
+        assert!(Printing::start_bytes(&embeds, W, SLOT, b"%PDF-1.7 fixture", "Retry", false, None).is_ok());
     }
 
     #[test]

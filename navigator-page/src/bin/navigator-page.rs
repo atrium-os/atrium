@@ -314,13 +314,31 @@ impl Run {
     /// The page shown printed on paper `w` × `h` points (navigator-ui.md
     /// "Printing"), handed to the parent as a sealed PDF.
     fn print(&mut self, out: &mut LimenOut, w: u32, h: u32, margin: u32, passive: bool) {
+        let paper = navigator_page::print::Paper { w_pt: w as f64, h_pt: h as f64, margin_pt: margin as f64 };
+        if !passive {
+            if let Some((image, _)) = self.view.picture.get_cloned() {
+                use std::os::fd::AsFd;
+                let data = image.data();
+                let pdf = navigator_page::print::picture_pdf(data.width, data.height, &data.rgba, paper)
+                    .and_then(|bytes| limen::fdpass::sealed_file("picture.pdf", &bytes).map_err(|err| err.to_string()));
+                match pdf {
+                    Ok(fd) => {
+                        let _ = out.0.emit_fd(out.1, ToParent::Printed { pages: 1, cut: false }.encode(), fd.as_fd());
+                    }
+                    Err(err) => {
+                        eprintln!("navigator-page: picture print: {err}");
+                        out.send(ToParent::Error { code: error::PRINT_FAILED });
+                    }
+                }
+                return;
+            }
+        }
         let Some(p) = self.view.page.get_cloned() else {
             eprintln!("navigator-page: nothing to print");
             out.send(ToParent::Error { code: error::PRINT_FAILED });
             return;
         };
         let t = Instant::now();
-        let paper = navigator_page::print::Paper { w_pt: w as f64, h_pt: h as f64, margin_pt: margin as f64 };
         let images = p.images.clone();
         let r = if passive {
             // Build a fresh image stream for each local resource. Original
