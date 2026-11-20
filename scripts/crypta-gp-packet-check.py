@@ -71,7 +71,8 @@ def frames(stream, reader, calls):
 
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
-ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline", "esp-loss-reconnect")
+ESP_LOSS_RECONNECT_HIP = ("esp-loss-reconnect", "esp-loss-rebind-decline")
+ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline", *ESP_LOSS_RECONNECT_HIP)
 REFRESH_HIP = ("refresh", "posture", *ESP_LOSS_HIP, *TESSERA_HIP)
 
 
@@ -254,7 +255,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert fields["authcookie"] == [COOKIE]
                         if hip in RECONNECT_HIP:
                             require_reconnect_approval(receipts, calls.count("getconfig.esp") - 1)
-                        if hip == "esp-loss-reconnect" and calls.count("getconfig.esp") >= 3:
+                        if hip in ESP_LOSS_RECONNECT_HIP and calls.count("getconfig.esp") >= 3:
                             assert receipts.with_suffix(".approved").exists(), calls
                         report, = fields["report"]
                         doc = ET.fromstring(report)
@@ -312,7 +313,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 elif hip in TESSERA_HIP:
                                     fact = tessera_count
                                 print(f"{fact} {digest}", file=receipt)
-                        if esp and (hip in RECONNECT_HIP or hip == "esp-loss-reconnect"):
+                        if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
@@ -474,7 +475,7 @@ def main():
                 udp.settimeout(300)
                 esp = EspPeer(udp, args.drop_esp, reconnect_approval, drop_config_indices,
                               lose_active=args.hip in ESP_LOSS_HIP,
-                              loss_reconnect_approval=receipts.with_suffix(".approved") if args.hip == "esp-loss-reconnect" else None)
+                              loss_reconnect_approval=receipts.with_suffix(".approved") if args.hip in ESP_LOSS_RECONNECT_HIP else None)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
@@ -656,7 +657,8 @@ def main():
                 return
             if args.hip in ESP_LOSS_HIP:
                 declined = args.hip == "esp-loss-decline"
-                reconnected = args.hip == "esp-loss-reconnect"
+                declined_rebind = args.hip == "esp-loss-rebind-decline"
+                reconnected = args.hip in ESP_LOSS_RECONNECT_HIP
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
                 assert len(esp.configs) == len(configs) == (4 if reconnected else 2), calls
@@ -666,7 +668,7 @@ def main():
                     expected_spis.extend([esp.configs[2][0][0]] * 2 + [esp.configs[3][0][0]])
                 assert esp.echo == expected_spis and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == set(expected_spis), esp.received_spis
-                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined else "logout.esp"), calls
+                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind else "logout.esp"), calls
                 recovery = configs[1]
                 assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
                 assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == (1 if declined or reconnected else 2), calls
@@ -693,7 +695,10 @@ def main():
                         reports[reconnect_report:rebind_report], key=lambda report: report == original), reports
                     assert set(reports[reconnect_report:rebind_report]) == {changed, original}, reports
                     assert reports[rebind_report:] and set(reports[rebind_report:]) == {original}, reports
-                    print("Restored ESP verified silent refresh, fresh approval for restored IPv6 forwarding, and rebind")
+                    if declined_rebind:
+                        print("Declining the changed HIP report stopped rebound ESP without uploading it")
+                    else:
+                        print("Restored ESP verified silent refresh, fresh approval for restored IPv6 forwarding, and rebind")
                 else:
                     changed = reports[-1]
                     assert original.split()[0] != changed.split()[0], reports

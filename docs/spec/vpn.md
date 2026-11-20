@@ -907,6 +907,10 @@ another origin. An active portal-profile session stays in engine memory.
   the original report can be sent again. Rebind sends that unchanged
   report without another prompt, before IPv4 echo on the new association.
   The extended arm64 reconnect gate passed 21/21.
+  The `--hip esp-loss-rebind-decline` variant changes IPv6 forwarding
+  again on rebound ESP and declines that review. It checks that the
+  changed report stays unsent, the profile and route go down, and
+  IPv4 echo stops. The arm64 decline run passed 21/21.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

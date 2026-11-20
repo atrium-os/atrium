@@ -602,7 +602,24 @@ decline_after_esp_loss=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-rebind-decline) hip=esp-loss; decline_after_esp_loss=3 ;;
 esac
+decline_esp_loss_review() {
+    [ "$(field handshake)" = 1 ] || fail "the tunnel was down before decline"
+    "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+    wait_field up 0
+    [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+        fail "declining HIP did not stop the profile"
+    sleep 6
+    [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+        fail "the profile restarted after decline"
+    [ "$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")" = "$1" ] ||
+        fail "the connection count changed after decline"
+    "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $2$'; then exit 1; fi" ||
+        fail "the declined tunnel retained its route"
+    "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+        fail "IPv4 echo passed after decline"
+}
 if [ "$hip" = esp-loss ]; then
     initial_report=$(head -n 1 "$receipts")
     reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
@@ -661,20 +678,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
     if [ "$decline_after_esp_loss" != 0 ]; then
         declined_choice=$(hip_choice)
         [ -n "$declined_choice" ] || fail "missing declined approval choice"
-        [ "$(field handshake)" = 1 ] || fail "recovered TLS was down before decline"
-        "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
-        wait_field up 0
-        [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
-            fail "declining HIP did not stop the recovered profile"
-        sleep 6
-        [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
-            fail "the recovered profile restarted after decline"
-        [ "$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")" = 2 ] ||
-            fail "expected only the initial ESP and recovered TLS connections after decline"
-        "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $iface$'; then exit 1; fi" ||
-            fail "the declined TLS tunnel retained its route"
-        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
-            fail "IPv4 echo passed after decline"
+        decline_esp_loss_review 2 "$iface"
         if grep -q "^$changed_word " "$receipts"; then
             fail "changed posture reached the gateway after decline"
         fi
@@ -708,12 +712,12 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         sleep 1
     done
     grep -q "^$changed_word " "$receipts" || fail "changed HIP did not reach the gateway"
-    if [ "$decline_after_esp_loss" = 2 ]; then
+    if [ "$decline_after_esp_loss" -ge 2 ]; then
         wait_field handshake 1
     fi
     probe "IPv4 echo after approved HIP refresh"
     [ "$(field starts)" = 1 ] || fail "HIP refresh restarted the engine"
-    if [ "$decline_after_esp_loss" = 2 ]; then
+    if [ "$decline_after_esp_loss" -ge 2 ]; then
         changed_report=$(tail -n 1 "$receipts")
         before_refresh=$(awk 'END { print NR }' "$receipts")
         wait_receipts "$((before_refresh + 1))"
@@ -753,6 +757,22 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             fail "rebind issued another HIP review"
         ok "rebind reused approval for unchanged restored posture"
         probe "IPv4 echo after restored ESP rebind"
+        if [ "$decline_after_esp_loss" = 3 ]; then
+            rebound_iface=$(field iface)
+            [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
+            before_decline=$(awk 'END { print NR }' "$receipts")
+            "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+            wait_prompt gp_hip_approval
+            printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                grep -q "$(hex "IPv6 forwarding  $changed_word")" || fail "review omitted the second change"
+            decline_esp_loss_review 4 "$rebound_iface"
+            if tail -n "+$((before_decline + 1))" "$receipts" | grep -q "^$changed_word "; then
+                fail "the second changed report reached the gateway despite decline"
+            fi
+            ok "decline shut down rebound ESP without sending the changed report"
+            echo "$pass checks passed"
+            exit 0
+        fi
     fi
     "$V" "$CTL down name=gp-gate" >/dev/null
     ok "HIP refreshed on the active tunnel"
