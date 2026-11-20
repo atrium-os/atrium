@@ -1211,6 +1211,21 @@ Sheets process with a valid press in its window and a current launch grant.
 Portcullis starts a separate workbook jail in the caller's persona. A blank
 launch carries no file descriptor.
 
+Each slot has a private recovery image under the owner's persona app data,
+scoped to the verified Sheets publisher. Portcullis mounts only its autosave
+directory read-write in the document jail. It uses the quota-limited Tessera
+volume machinery (128 MiB), with a bounded UFS vnode image for guests where
+a new Tessera volume cannot be provisioned. An existing image keeps its
+format. The broker records the occupied slot before launch. Clean teardown
+unmounts the image; an empty autosave directory clears the pending marker.
+New and Open skip occupied slots.
+
+A launcher press authorizes `RecoverWorkbook` for one inactive pending slot
+of that owner, persona and publisher. A workbook UID cannot request recovery.
+Portcullis checks live jails and reserves the slot through teardown. The
+launcher receives neither file contents nor the original file grant.
+
+
 ### 6.5.1 Names must carry an instance — and the failure was silent
 
 `jail_name_from_app_id` derives the name from the app id alone. Two concurrent workers get

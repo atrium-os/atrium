@@ -802,6 +802,54 @@ pub fn parse_size(s: &str) -> Option<u64> {
     digits.trim().parse::<u64>().ok()?.checked_mul(mult)
 }
 
+/// Workbook journals always get a size-limited volume. Minimal guests without
+/// the Tessera formatter can still put a bounded UFS vnode image in app data.
+pub fn mount_recovery(pl: &Place, bytes: u64) -> Result<(), String> {
+    let ufs = pl.img.with_extension("ufs");
+    let fresh = !ufs.try_exists().map_err(|e| e.to_string())?;
+    if fresh && matches!(ensure_mounted(pl, "Sheets recovery", bytes)?, Backing::Volume { .. }) {
+        return Ok(());
+    }
+    if let Some((kind, _)) = mount_at(&pl.dir) {
+        return if kind == "ufs" { Ok(()) } else { Err("unexpected recovery mount".into()) };
+    }
+    if fresh {
+        let tmp = ufs.with_extension("creating");
+        // The staging image has never contained a document.
+        let f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.set_len(bytes).map_err(|e| e.to_string())?;
+        let unit = attach(&tmp)?;
+        let status = Command::new("newfs").arg("-U").arg(format!("/dev/{unit}")).output();
+        detach(&unit);
+        let output = status.map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!("newfs {unit}: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+        fs::rename(&tmp, &ufs).map_err(|e| e.to_string())?;
+    }
+    let unit = attach(&ufs)?;
+    let device = format!("/dev/{unit}");
+    let status = Command::new("mount").args(["-t", "ufs", "-o", "nosuid,noexec", &device]).arg(&pl.dir).status();
+    if status.is_ok_and(|s| s.success()) { Ok(()) } else {
+        detach(&unit);
+        Err(format!("could not mount recovery volume {}", ufs.display()))
+    }
+}
+
+pub fn unmount_recovery(pl: &Place) -> Result<(), String> {
+    if let Some((kind, device)) = mount_at(&pl.dir) {
+        if kind == "ufs" {
+            let unit = device.strip_prefix("/dev/md").ok_or("unexpected recovery device")?;
+            if !Command::new("umount").arg(&pl.dir).status().is_ok_and(|s| s.success()) {
+                return Err(format!("could not unmount {}", pl.dir.display()));
+            }
+            detach(unit);
+            return Ok(());
+        }
+    }
+    teardown(pl)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -149,18 +149,19 @@ fn save_name(name: &str) -> String {
     format!("{}.osheet", &stem[..end])
 }
 
-fn new_workbook(activation: Option<fresco_protocol::activation::Token>) -> Result<(), String> {
+fn request_workbook(recover: bool, activation: Option<fresco_protocol::activation::Token>) -> Result<(), String> {
     use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION, WORKERS_SOCKET_PATH};
     use std::os::unix::net::UnixStream;
-    let activation = activation.ok_or("Choose New in the Sheets window")?;
+    let activation = activation.ok_or("Use the workbook button in the Sheets window")?;
     let mut socket = UnixStream::connect(WORKERS_SOCKET_PATH).map_err(|e| e.to_string())?;
-    let timeout = Some(Duration::from_secs(2));
+    let timeout = Some(Duration::from_secs(if recover { 5 } else { 2 }));
     socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
     match round_trip(&mut socket, &Request::Hello { version: PROTO_VERSION }).map_err(|e| e.to_string())? {
         Response::Hello { .. } => {}
         response => return Err(format!("The workbook broker answered {response:?}")),
     }
-    match round_trip(&mut socket, &Request::NewWorkbook { activation }).map_err(|e| e.to_string())? {
+    let request = if recover { Request::RecoverWorkbook { activation } } else { Request::NewWorkbook { activation } };
+    match round_trip(&mut socket, &request).map_err(|e| e.to_string())? {
         Response::Opened { .. } => Ok(()),
         Response::Error { message } => Err(message),
         response => Err(format!("The workbook broker answered {response:?}")),
@@ -440,11 +441,17 @@ fn main() {
     } else {
         None
     };
-    let dedicated = workbook.is_some() || args.get(1).is_some_and(|arg| arg == "--blank-document");
+    let recover = args.get(1).is_some_and(|arg| arg == "--recover-document");
+    let dedicated = recover || workbook.is_some() || args.get(1).is_some_and(|arg| arg == "--blank-document");
     officina_convert::pictures::install();
-    let root = state_root();
+    let private = Path::new("/atrium/recovery");
+    if recover && !private.is_dir() {
+        eprintln!("atrium-sheets: missing private recovery mount");
+        std::process::exit(1);
+    }
+    let root = if dedicated && private.is_dir() { private.to_owned() } else { state_root() };
     // The custom lists fills follow, kept beside the autosaves.
-    if let Some(dir) = root.parent() {
+    if let Some(dir) = state_root().parent() {
         atrium_sheets::lists::init(dir);
     }
     let _ = fs::create_dir_all(&root);
@@ -453,7 +460,7 @@ fn main() {
     let mut locked: Option<(PathBuf, String)> = None;
     let mut restore: Option<(PathBuf, String)> = None;
     let mut start_file: Option<(String, Vec<u8>, Target)> = None;
-    if let Some((dir, name)) = (!dedicated).then(|| doc::pending(&root).pop()).flatten() {
+    if let Some((dir, name)) = (!dedicated || recover).then(|| doc::pending(&root).pop()).flatten() {
         if doc::recovery_locked(&dir) {
             locked = Some((dir, name));
         } else {
@@ -485,7 +492,7 @@ fn main() {
     let mut next_limen_attempt = Instant::now();
     let dirty = Arc::new(AtomicBool::new(true));
     let mut sheets = Sheets::new(
-        Doc::new(""),
+        Doc::new(if recover { "Pending workbook" } else { "Untitled" }),
         Mutable::with_dirty(ScrollState::default(), dirty.clone()),
         Mutable::with_dirty(GridState::default(), dirty.clone()),
         Mutable::with_dirty(Ui::default(), dirty.clone()),
@@ -494,7 +501,7 @@ fn main() {
     );
     sheets.launcher = launcher;
     let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
-    if !launcher {
+    if !launcher && !recover {
         run.show(doc, target);
     }
     if let Some(file) = workbook {
@@ -511,6 +518,8 @@ fn main() {
             }
             Err(e) => eprintln!("atrium-sheets: couldn't restore {name}: {e}"),
         }
+    } else if recover {
+        run.set_status("The recovery volume contains no complete workbook. Close and choose Don’t Save to discard it.");
     } else if let Some((name, data, t)) = start_file {
         run.open_bytes(name, data, Some(t), false, None);
     }
@@ -562,9 +571,13 @@ fn main() {
         });
         if stepped.is_err() { break; }
         if close_requested || matches!(stepped, Ok(StepResult::Closed)) {
+            let needs_decision = {
+                let mut doc = run.sheets.doc.borrow_mut();
+                doc.dirty || (recover && doc.autosave().is_none())
+            };
             if matches!(asking, Some(Asking::Commit | Asking::SaveAs)) {
                 close_after_save = true;
-            } else if run.sheets.doc.borrow().dirty && asking.is_none() && !run.sheets.closing.get() {
+            } else if needs_decision && asking.is_none() && !run.sheets.closing.get() {
                 run.sheets.closing.set(true);
                 run.sheets.changed();
             } else {
@@ -587,9 +600,9 @@ fn main() {
         }
         for c in run.sheets.take_cmds() {
             match c {
-                Cmd::NewWorkbook(activation) => {
-                    if let Err(why) = new_workbook(activation) {
-                        run.set_status(format!("Couldn't start a workbook: {why}"));
+                Cmd::NewWorkbook(activation) | Cmd::RecoverWorkbook(activation) => {
+                    if let Err(why) = request_workbook(matches!(c, Cmd::RecoverWorkbook(_)), activation) {
+                        run.set_status(why);
                     }
                 }
                 Cmd::Open => want_picker = Some(Asking::Open),
@@ -625,6 +638,25 @@ fn main() {
                     }
                 }
                 Cmd::CloseDiscard => {
+                    if recover && run.sheets.doc.borrow_mut().autosave().is_none() {
+                        // An interrupted first generation or unreadable base.
+                        // This process has only its own slot mounted here.
+                        let clear = || -> io::Result<()> {
+                            for entry in fs::read_dir(private)? {
+                                let entry = entry?;
+                                if entry.file_type()?.is_dir() {
+                                    fs::remove_dir_all(entry.path())?;
+                                } else {
+                                    fs::remove_file(entry.path())?;
+                                }
+                            }
+                            Ok(())
+                        };
+                        if let Err(e) = clear() {
+                            run.set_status(format!("Couldn't discard recovery: {e}"));
+                            continue;
+                        }
+                    }
                     discard = true;
                     break 'main;
                 }

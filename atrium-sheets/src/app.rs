@@ -44,6 +44,7 @@ pub enum Cmd {
     /// Closing with unsaved changes: keep the window open.
     CloseCancel,
     Open,
+    RecoverWorkbook(Option<fresco_protocol::activation::Token>),
     NewWorkbook(Option<fresco_protocol::activation::Token>),
     Save,
     SaveAs,
@@ -1902,6 +1903,10 @@ impl View for Sheets {
         new_button(ctx, x);
         x += 72.0;
         if self.launcher {
+            let cmds = self.cmds.clone();
+            Button::secondary("Recover…").at(x, 8.0).width(96.0).on_click(move || {
+                cmds.lock().unwrap().push(Cmd::RecoverWorkbook(pergola::clipboard::current_activation()));
+            }).render(ctx);
             ctx.add(Node::Text { rect: Rect::new(12.0, 54.0, w - 24.0, 22.0),
                 content: self.doc.borrow().status.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
             self.picker_slot(ctx, w, h);

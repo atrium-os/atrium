@@ -209,10 +209,14 @@ fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_
 struct WorkbookLaunch {
     slot: u8,
     blank: bool,
+    recover: bool,
+    publisher: Option<[u8; 32]>,
+    store: portcullis_overlay::Place,
+    pending: PathBuf,
 }
 
-pub fn new_workbook(user: &str, persona: Option<&str>) -> std::io::Result<()> {
-    launch_workbook(user, persona, None)
+pub fn new_workbook(user: &str, persona: Option<&str>, recover: bool, publisher: Option<[u8; 32]>) -> std::io::Result<()> {
+    launch_workbook(user, persona, None, recover, Some(publisher))
 }
 pub fn open_workbook(
     user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd, commit: Option<[u8; 16]>,
@@ -221,20 +225,23 @@ pub fn open_workbook(
     let (sender, receiver) = std::os::unix::net::UnixStream::pair()?;
     atrium_open::send_with_commit(&sender, name, mime, write, fd.as_raw_fd(), commit)?;
     drop(sender);
-    launch_workbook(user, persona, Some(receiver.into()))
+    launch_workbook(user, persona, Some(receiver.into()), false, None)
 }
 
 /// Reserve a document slot until its launch thread has torn down the jail.
-fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>) -> std::io::Result<()> {
+fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>, recover: bool, caller_key: Option<Option<[u8; 32]>>) -> std::io::Result<()> {
     use std::os::fd::AsFd;
 
     const DOCUMENT_LIMIT: usize = 8;
     static ACTIVE: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
 
+    static SLOT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
     struct Slot(usize);
     impl Drop for Slot {
         fn drop(&mut self) {
             ACTIVE.lock().unwrap()[self.0] = false;
+            SLOT_RELEASED.notify_all();
         }
     }
 
@@ -246,18 +253,79 @@ fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>) 
             std::io::stderr().as_fd().try_clone_to_owned()?,
         ])
     }).transpose()?;
-    let slot = {
-        let mut active = ACTIVE.lock().unwrap();
-        let slot = active.iter().position(|used| !used)
-            .ok_or_else(|| std::io::Error::other("Too many Sheets workbooks are open"))?;
-        active[slot] = true;
-        Slot(slot)
+    let app = portcullis_policy::opens::SHEETS;
+    let tree = Path::new(APPS_DIR).join(app);
+    let publisher = crate::manifest_trust::verify_publisher(&tree, &fs::read_to_string(tree.join("atrium.toml"))?).map_err(std::io::Error::other)?;
+    if caller_key.is_some_and(|key| key != publisher) {
+        return Err(std::io::Error::other("Sheets publisher changed; reopen the launcher"));
+    }
+    portcullisd::home::ensure_app_data(user, persona).map_err(std::io::Error::other)?;
+    let home = portcullis_overlay::home_of(user).ok_or_else(|| std::io::Error::other("missing workbook owner's home"))?;
+    let parent = match persona {
+        None => portcullis_overlay::apps_root(&home).map_err(std::io::Error::other)?,
+        Some(p) => portcullis_overlay::persona_apps_dir(&home, p),
     };
+    let key = publisher.map(hex::encode).unwrap_or_else(|| "unsigned".into());
+    let dir = parent.join(format!(".sheets-recovery-{key}"));
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if !parent.exists() {
+        fs::DirBuilder::new().mode(0o700).create(&parent)?;
+    }
+    let parent_meta = fs::symlink_metadata(&parent)?;
+    if !parent_meta.is_dir() || parent_meta.uid() != 0 || parent_meta.mode() & 0o022 != 0 {
+        return Err(std::io::Error::other("invalid workbook recovery parent"));
+    }
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::other("invalid workbook recovery directory"));
+    }
+    let (slot, pending) = {
+        let mut active = ACTIVE.lock().unwrap();
+        let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        'reserve: loop {
+            let mut finishing = false;
+            for (index, used) in active.iter_mut().enumerate() {
+                let pending = dir.join(format!("{index}.pending"));
+                if pending.try_exists()? != recover {
+                    continue;
+                }
+                if *used {
+                    finishing |= recover;
+                    continue;
+                }
+                if let Some(uid) = registry.uid_for_document(user, app, publisher.as_ref(), persona, Some(index as u8)) {
+                    let name = portcullis_jail::jail_name_for_instance(app, Some(&format!("document-{uid}")));
+                    if Command::new("jls").args(["-j", &name, "jid"]).output()?.status.success() {
+                        continue;
+                    }
+                }
+                *used = true;
+                break 'reserve (Slot(index), pending);
+            }
+            // The window can vanish before jail teardown and disk detach finish.
+            // The releasing thread wakes Recover after the volume is safe to reopen.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !finishing || left.is_zero() {
+                return Err(std::io::Error::other(if recover {
+                    "No closed workbook is waiting for recovery"
+                } else { "All workbook slots are open or awaiting recovery" }));
+            }
+            active = SLOT_RELEASED.wait_timeout(active, left).unwrap().0;
+        }
+    };
+    let store = portcullis_overlay::Place { dir: dir.join(slot.0.to_string()),
+        img: dir.join(format!("{}.img", slot.0)), person: None };
     let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
     std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
         let index = slot.0;
         let result = launch_inner(portcullis_policy::opens::SHEETS, persona.as_deref(),
-                                  &user, stdio, None, None, Some(WorkbookLaunch { slot: index as u8, blank }));
+                                  &user, stdio, None, None, Some(WorkbookLaunch { slot: index as u8, blank, recover, store, pending, publisher }));
         if let Err(e) = result {
             eprintln!("portcullisd: Sheets workbook launch: {e:?}");
         }
@@ -294,6 +362,9 @@ fn launch_inner(
      * user-app launch vector goes through one gate, not a per-path copy). */
     let publisher = crate::manifest_trust::verify_publisher(&tree, &text)
         .map_err(|m| LaunchError::Failed("signature", m))?;
+    if document.as_ref().is_some_and(|d| d.publisher != publisher) {
+        return Err(LaunchError::Failed("signature", "Sheets publisher changed".into()));
+    }
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("parse error: {e}")))?;
@@ -579,8 +650,10 @@ fn launch_inner(
     /* A named persona's instance has a channel of its own, keyed
      * `<id>@<persona>`: what reaches it comes from its own persona
      * (personas.md §3; crossing is P3, off by default). */
-    if let Some(doc) = document {
-        let option = if doc.blank { "--blank-document" } else { "--document" };
+    let mut recovery_mount = None;
+    if let Some(doc) = &document {
+        recovery_mount = Some(RecoveryMount::attach(doc, app_uid, &jail_path, &mut jc)?);
+        let option = if doc.recover { "--recover-document" } else if doc.blank { "--blank-document" } else { "--document" };
         jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option}", manifest.entry())));
     } else if (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
         || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
@@ -676,7 +749,64 @@ fn launch_inner(
         return Err(LaunchError::Failed("teardown", "Files' old mounts are still in use".into()));
     }
 
+    if let Some(mount) = &mut recovery_mount {
+        mount.clean = clean;
+    }
     outcome.map(|exit_code| LaunchOutcome { exit_code })
+}
+
+struct RecoveryMount<'a> {
+    doc: &'a WorkbookLaunch,
+    clean: bool,
+}
+
+impl<'a> RecoveryMount<'a> {
+    fn attach(doc: &'a WorkbookLaunch, app_uid: u32, jail_path: &Path, jc: &mut JailConfig) -> Result<Self, LaunchError> {
+        let fail = |e: String| LaunchError::Failed("recovery", e);
+        portcullis_overlay::mount_recovery(&doc.store, 128 << 20).map_err(fail)?;
+        let mount = Self { doc, clean: false };
+        // The root of the image belongs to the broker. Only this child
+        // directory is ever writable or visible inside the workbook jail.
+        let data = doc.store.dir.join("autosave");
+        fs::create_dir_all(&data).map_err(|e| fail(e.to_string()))?;
+        if !doc.recover && fs::read_dir(&data).map_err(|e| fail(e.to_string()))?.next().is_some() {
+            fs::File::create(&doc.pending).map_err(|e| fail(e.to_string()))?;
+            return Err(fail("slot contains a previous recovery".into()));
+        }
+        // Across boots the registry may assign this slot a different UID.
+        // The detached private volume has no external hard links. Walk it
+        // physically so even app-created symlinks stay inside the operation.
+        use std::os::unix::fs::MetadataExt;
+        if doc.recover && fs::metadata(&data).map_err(|e| fail(e.to_string()))?.uid() != app_uid {
+            run("chown", &["-RhxP", &format!("{app_uid}:{app_uid}"), data.to_str().unwrap()])
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        std::os::unix::fs::chown(&data, Some(app_uid), Some(app_uid))
+            .and_then(|_| fs::set_permissions(&data, fs::Permissions::from_mode(0o700)))
+            .map_err(|e| fail(e.to_string()))?;
+        fs::File::create(&doc.pending).and_then(|f| f.sync_all())
+            .and_then(|_| fs::File::open(doc.pending.parent().unwrap())?.sync_all())
+            .map_err(|e| fail(e.to_string()))?;
+        jc.add_mount(&data, &jail_path.join("atrium/recovery"), "nullfs", &["rw", "nosuid", "noexec"]);
+        Ok(mount)
+    }
+}
+
+impl Drop for RecoveryMount<'_> {
+    fn drop(&mut self) {
+        let doc = self.doc;
+        let empty = self.clean && fs::read_dir(doc.store.dir.join("autosave"))
+            .is_ok_and(|mut entries| entries.next().is_none());
+        if let Err(e) = portcullis_overlay::unmount_recovery(&doc.store) {
+            eprintln!("portcullisd: closing workbook recovery volume: {e}");
+        } else if empty {
+            let result = fs::remove_file(&doc.pending)
+                .and_then(|_| fs::File::open(doc.pending.parent().unwrap())?.sync_all());
+            if let Err(e) = result {
+                eprintln!("portcullisd: clearing workbook recovery marker: {e}");
+            }
+        }
+    }
 }
 
 struct DocumentMounts<'a> {

@@ -397,6 +397,8 @@ pub enum Request {
 
     /// Start an empty workbook in a fresh Sheets jail on a Sheets press.
     NewWorkbook { activation: [u8; 16] },
+    /// Restore a pending workbook in its own jail on a launcher press.
+    RecoverWorkbook { activation: [u8; 16] },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with

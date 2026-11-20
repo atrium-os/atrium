@@ -135,8 +135,12 @@ The embedded Open picker gives the selected file directly from Scrinium to
 Portcullis with the picker's own press and the parent persona from Limen.
 Files, downloads and attachments use the same document launcher. Each live
 workbook slot has its own jail root, UID and temporary writable layer. The
-layer keeps autosaves private while the jail runs and is discarded at
-teardown. Review pickers give comparison inputs to the current workbook.
+temporary layer is discarded at teardown. Each workbook journals into its
+own size-limited recovery volume at `/atrium/recovery`. After a crash,
+**Recover…** in the launcher opens a pending workbook in a fresh jail.
+The recovery reader replays its base and journal there. Saving requires
+a new picker grant. Don’t Save discards that workbook’s recovery.
+Review pickers give comparison inputs to the current workbook.
 
 **The converter jail.** Built the way the Navigator's converter is (threat model §2,
 portcullis §6.5.2e′): a fresh jail per conversion, rctl `memoryuse` and `pcpu` limits plus
