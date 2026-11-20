@@ -25,6 +25,24 @@ impl Arcad {
         Arcad { path: path.into() }
     }
 
+    pub fn redeem_mail(&self, request: &[u8], net: &(dyn navigator_fetch::Connect + Sync),
+        tls: &std::sync::Arc<rustls::ClientConfig>, policy: navigator_fetch::addr::Policy) -> Result<(), Refusal> {
+        let ticket = request.get(..16).ok_or(Refusal::Malformed)?;
+        let (code, form) = self.call(courier_op::MAIL_CODE, request)?;
+        if code != status::OK { return Err(Refusal::Denied); }
+        let tokens = crate::oauth::exchange_body(&crate::oauth::MICROSOFT, form, net, tls, policy)
+            .map_err(|_| Refusal::Http)?;
+        let refresh = tokens.refresh.ok_or(Refusal::Http)?;
+        let mut grant = LockedBuf::zeroed(20 + refresh.len()).map_err(|_| Refusal::Internal)?;
+        grant.as_mut()[..16].copy_from_slice(ticket);
+        grant.as_mut()[16..20].copy_from_slice(&(refresh.len() as u32).to_le_bytes());
+        grant.as_mut()[20..].copy_from_slice(refresh.as_ref());
+        match self.call(courier_op::MAIL_GRANT, grant.as_ref())? {
+            (status::OK, b) if b.is_empty() => Ok(()),
+            _ => Err(Refusal::Denied),
+        }
+    }
+
     fn call(&self, op: u16, body: &[u8]) -> Result<(u8, LockedBuf), Refusal> {
         let mut s = UnixStream::connect(&self.path).map_err(|_| Refusal::Internal)?;
         // A FILL of a verify-each-use item waits while the user answers

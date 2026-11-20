@@ -245,7 +245,12 @@ requires it). Until Google verification exists, Gmail works with an app password
 Development decision (2026-11-20): defer project registration. Test the
 first screen against the local TLS provider; a future operator can supply
 a public native-client ID for a live test. Mail asks Arca for an opaque
-session ticket and sends it to Navigator's sheet. See the
+session ticket and sends it to Navigator's sheet. The local callback gate
+also exercises account creation. When the sheet signals completion, Mail
+presents its ticket and account address to Arca, then stores the returned
+IMAP and SMTP item references. The fixture uses a fixed demo identity.
+An operator testing real accounts must verify which account the provider
+authorized when the user changes accounts in the sign-in sheet. See the
 [development gate](navigator-islands.md#development-registration-and-mails-first-screen).
 
 ### 5.4 What Mail knows about an account

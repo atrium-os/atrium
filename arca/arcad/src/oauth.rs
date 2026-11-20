@@ -166,7 +166,9 @@ pub enum SignInError {
 pub fn code_from_redirect(p: &Provider, url: &str, state: &str) -> Result<String, SignInError> {
     let rest = url.strip_prefix(p.redirect).ok_or(SignInError::NotTheRedirect)?;
     let q = rest.strip_prefix('?').ok_or(SignInError::NotTheRedirect)?;
-    let q = q.split('#').next().unwrap_or("");
+    if q.len() > 8192 || q.contains('#') || q.split('&').count() > 32 {
+        return Err(SignInError::NotTheRedirect);
+    }
     let mut code = None;
     let mut got_state = None;
     let mut error = None;
@@ -174,9 +176,10 @@ pub fn code_from_redirect(p: &Provider, url: &str, state: &str) -> Result<String
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         let v = unescape(v).ok_or(SignInError::NotTheRedirect)?;
         match k {
-            "code" => code = Some(v),
-            "state" => got_state = Some(v),
-            "error" => error = Some(v),
+            "code" if code.is_none() => code = Some(v),
+            "state" if got_state.is_none() => got_state = Some(v),
+            "error" if error.is_none() => error = Some(v),
+            "code" | "state" | "error" => return Err(SignInError::NotTheRedirect),
             _ => {}
         }
     }
@@ -205,12 +208,20 @@ pub struct Sessions {
 struct Pending {
     user: String,
     session: SignIn,
-    claimed: bool,
+    phase: Phase,
+    account: String,
     expires: std::time::Instant,
 }
 
+enum Phase { Waiting, Claimed, Exchanging, Complete([u8; 32]) }
+
+pub fn mail_partition(handle: &[u8; 16]) -> String {
+    let jar = u64::from_le_bytes(handle[..8].try_into().unwrap());
+    format!("u-{jar:016x}.{}", crate::cookie::site(MICROSOFT.token_host))
+}
+
 impl Sessions {
-    pub(crate) fn begin(&mut self, user: &str) -> Result<[u8; 16], u8> {
+    pub(crate) fn begin(&mut self, user: &str, account: &str) -> Result<[u8; 16], u8> {
         use crate::proto::status;
         let id = self.registration.as_deref().ok_or(status::UNSUPPORTED)?;
         let now = std::time::Instant::now();
@@ -218,22 +229,55 @@ impl Sessions {
         if self.pending.len() >= 128 {
             return Err(status::FULL);
         }
-        let session = SignIn::start(&MICROSOFT, id, "").map_err(|_| status::INTERNAL)?;
+        let session = SignIn::start(&MICROSOFT, id, account).map_err(|_| status::INTERNAL)?;
         let mut handle = [0; 16];
         getrandom::getrandom(&mut handle).map_err(|_| status::INTERNAL)?;
         if self.pending.contains_key(&handle) {
             return Err(status::INTERNAL);
         }
-        self.pending.insert(handle, Pending { user: user.into(), session, claimed: false, expires: now + crate::handles::TTL });
+        self.pending.insert(handle, Pending { user: user.into(), session, account: account.into(), phase: Phase::Waiting, expires: now + crate::handles::TTL });
         Ok(handle)
     }
 
     pub(crate) fn claim(&mut self, user: &str, handle: &[u8; 16]) -> Option<&str> {
         self.pending.retain(|_, entry| entry.expires > std::time::Instant::now());
         let entry = self.pending.get_mut(handle)?;
-        if entry.claimed || entry.user != user { return None; }
-        entry.claimed = true;
+        if !matches!(entry.phase, Phase::Waiting) || entry.user != user { return None; }
+        entry.phase = Phase::Claimed;
         Some(&entry.session.url)
+    }
+
+    fn active(&mut self, user: &str, handle: &[u8; 16]) -> Option<&mut Pending> {
+        let entry = self.pending.get_mut(handle)?;
+        (entry.user == user && entry.expires > std::time::Instant::now()).then_some(entry)
+    }
+
+    pub(crate) fn exchange(&mut self, user: &str, handle: &[u8; 16], url: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        let client = self.registration.clone()?;
+        let entry = self.active(user, handle)?;
+        if !matches!(entry.phase, Phase::Claimed) || entry.account.is_empty() { return None; }
+        let code = code_from_redirect(&MICROSOFT, url, &entry.session.state).ok()?;
+        let body = entry.session.code_request(&MICROSOFT, &client, &code);
+        entry.session.verifier.zeroize();
+        entry.phase = Phase::Exchanging;
+        Some(zeroize::Zeroizing::new(body))
+    }
+
+    pub(crate) fn exchanging_account(&mut self, user: &str, handle: &[u8; 16]) -> Option<&str> {
+        let entry = self.active(user, handle)?;
+        matches!(entry.phase, Phase::Exchanging).then_some(entry.account.as_str())
+    }
+
+    pub(crate) fn complete(&mut self, handle: &[u8; 16], ids: [u8; 32]) {
+        if let Some(entry) = self.pending.get_mut(handle) { entry.phase = Phase::Complete(ids); }
+    }
+
+    pub(crate) fn result(&mut self, user: &str, handle: &[u8; 16], account: &str) -> Option<[u8; 32]> {
+        let entry = self.active(user, handle)?;
+        if entry.account != account { return None; }
+        let Phase::Complete(ids) = entry.phase else { return None };
+        self.pending.remove(handle);
+        Some(ids)
     }
 
     pub(crate) fn lock(&mut self, user: &str) {
@@ -246,17 +290,41 @@ mod session_tests {
     use super::*;
 
     #[test]
+    fn callback_is_bound_to_claim_state_user_and_account_and_redeemed_once() {
+        let mut sessions = Sessions { registration: Some("test-registration".into()), ..Default::default() };
+        let account = "ada@example.test";
+        let handle = sessions.begin("alice", account).unwrap();
+        let state = sessions.pending[&handle].session.state.clone();
+        let url = format!("{}?state={state}&code=fixture", MICROSOFT.redirect);
+        assert!(sessions.exchange("alice", &handle, &url).is_none());
+        sessions.claim("alice", &handle).unwrap();
+        for bad in [url.replace(&state, "wrong"), format!("{url}&state={state}"), format!("{url}&code=second"),
+            url.replace(MICROSOFT.token_host, "example.test"), format!("{url}#fragment")] {
+            assert!(sessions.exchange("alice", &handle, &bad).is_none());
+        }
+        assert!(sessions.exchange("bob", &handle, &url).is_none());
+        let body = sessions.exchange("alice", &handle, &url).unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("&code_verifier="));
+        assert!(sessions.exchange("alice", &handle, &url).is_none());
+        sessions.complete(&handle, [7; 32]);
+        assert!(sessions.result("bob", &handle, account).is_none());
+        assert!(sessions.result("alice", &handle, "other@example.test").is_none());
+        assert_eq!(sessions.result("alice", &handle, account), Some([7; 32]));
+        assert!(sessions.result("alice", &handle, account).is_none());
+    }
+
+    #[test]
     fn handles_are_owned_single_use_expiring_and_cleared_on_lock() {
         let mut sessions = Sessions { registration: Some("test-registration".into()), ..Default::default() };
-        let first = sessions.begin("alice").unwrap();
-        let second = sessions.begin("alice").unwrap();
+        let first = sessions.begin("alice", "ada@example.test").unwrap();
+        let second = sessions.begin("alice", "ada@example.test").unwrap();
         assert_ne!(first, second);
         assert!(sessions.claim("bob", &first).is_none());
         assert!(sessions.claim("alice", &first).unwrap().contains("code_challenge_method=S256"));
         assert!(sessions.claim("alice", &first).is_none());
         sessions.pending.get_mut(&second).unwrap().expires = std::time::Instant::now();
         assert!(sessions.claim("alice", &second).is_none());
-        let third = sessions.begin("alice").unwrap();
+        let third = sessions.begin("alice", "ada@example.test").unwrap();
         sessions.lock("alice");
         assert!(sessions.claim("alice", &third).is_none());
     }

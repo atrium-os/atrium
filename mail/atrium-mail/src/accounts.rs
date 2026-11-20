@@ -355,11 +355,11 @@ pub fn sieve_server(c: &AccountConfig) -> Option<Server> {
 }
 
 /// Start a PKCE session. Only the sheet ticket crosses into Mail.
-pub fn microsoft_sign_in(arca: &std::path::Path) -> Result<[u8; 16], String> {
+pub fn microsoft_sign_in(arca: &std::path::Path, address: &str) -> Result<[u8; 16], String> {
     let mut socket = UnixStream::connect(arca).map_err(|e| format!("Arca is unavailable: {e}"))?;
     let timeout = Some(Duration::from_secs(10));
     socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
-    arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN, &[]).map_err(|e| e.to_string())?;
+    arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN, address.as_bytes()).map_err(|e| e.to_string())?;
     let (code, body) = arcad::proto::read_app_reply(&mut socket, arcad::proto::AppReply::Ticket).map_err(|e| e.to_string())?;
     match code {
         status::OK => body.as_slice().try_into().map_err(|_| "Arca returned an invalid sign-in ticket.".into()),
@@ -367,6 +367,21 @@ pub fn microsoft_sign_in(arca: &std::path::Path) -> Result<[u8; 16], String> {
         status::LOCKED => Err("Unlock Arca and try again.".into()),
         _ => Err(format!("Arca refused Microsoft sign-in ({code}).")),
     }
+}
+
+pub fn microsoft_result(arca: &std::path::Path, ticket: &[u8; 16], cfg: &mut AccountConfig) -> Result<(), String> {
+    let mut socket = UnixStream::connect(arca).map_err(|e| e.to_string())?;
+    let timeout = Some(Duration::from_secs(10));
+    socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
+    let mut request = arca_store::codec::Writer::new();
+    request.raw(ticket);
+    request.str(&cfg.address);
+    arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN_RESULT, &request.buf).map_err(|e| e.to_string())?;
+    let (status, items) = arcad::proto::read_app_reply(&mut socket, arcad::proto::AppReply::MailItems).map_err(|e| e.to_string())?;
+    if status != status::OK || items.len() != 32 { return Err("Arca could not complete this account’s sign-in.".into()); }
+    cfg.incoming_item = Some(items[..16].try_into().unwrap());
+    cfg.outgoing_item = Some(items[16..].try_into().unwrap());
+    Ok(())
 }
 
 /// Have Arca keep what the person typed into its field (`handle`) for the

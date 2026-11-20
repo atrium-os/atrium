@@ -442,3 +442,6 @@ impl Response {
         Some(out)
     }
 }
+
+/// Dedicated request on a Microsoft sign-in courier stream.
+pub const MAIL_REDEEM: &[u8] = b"\xffMailPKCE1";

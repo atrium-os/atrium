@@ -156,12 +156,13 @@ impl State {
     }
 
     fn mail_begin(&mut self, user: &str, publisher: &[u8; 32], app: &str, body: &[u8]) -> Reply {
-        if !body.is_empty() { return malformed(); }
+        let Ok(address) = std::str::from_utf8(body) else { return malformed() };
+        if !address.is_empty() && (address.len() > caps::ACCOUNT || !address.contains('@') || address.chars().any(|c| c.is_control() || c.is_whitespace())) { return malformed(); }
         if app != "org.atrium.mail" { return reply(status::DENIED); }
         if self.mail_sign_ins.registration.is_none() { return reply(status::UNSUPPORTED); }
         if self.mail_sign_ins.mail_publisher.as_ref() != Some(publisher) { return reply(status::DENIED); }
         if !self.stores.get(user).is_some_and(|s| s.state() == LockState::Unlocked) { return reply(status::LOCKED); }
-        match self.mail_sign_ins.begin(user) {
+        match self.mail_sign_ins.begin(user, address) {
             Ok(handle) => ok(handle.to_vec()),
             Err(code) => reply(code),
         }
@@ -249,6 +250,13 @@ impl State {
         let mut item: Option<ItemId> = None;
         let r = match who {
             Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN => self.mail_begin(user, publisher, app_id, body),
+            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_RESULT => {
+                if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
+                let mut r = Reader::new(body);
+                let (Ok(ticket), Ok(address)) = (r.array::<16>(), r.str(caps::ACCOUNT)) else { return malformed() };
+                if r.end().is_err() { return malformed(); }
+                self.mail_sign_ins.result(user, &ticket, address).map_or_else(|| reply(status::DENIED), |ids| ok(ids.to_vec()))
+            }
             Label::WebBroker { user, .. } if op == broker_op::W_MAIL_SIGN_IN => self.mail_claim(user, body),
             Label::App { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
@@ -2246,7 +2254,53 @@ impl State {
     /// A courier asks only after its TLS handshake with its endpoint, and
     /// only for its own label's (persona, endpoint): the store's access
     /// check and the handle's binding both use the registry's label.
+    fn mail_exchange(&mut self, c: &CourierLabel, op: u16, body: &[u8]) -> Reply {
+        use crate::oauth::{mail_partition, MICROSOFT};
+        let mut r = Reader::new(body);
+        let Ok(ticket) = r.array::<16>() else { return malformed() };
+        let expected = Recipient::endpoint(Scheme::Https, MICROSOFT.token_host, 443, Some(&mail_partition(&ticket)));
+        if c.persona != "web" || expected.ok().as_ref() != Some(&c.endpoint) { return reply(status::DENIED); }
+        let Some(store) = self.stores.get_mut(&c.user).filter(|s| s.state() == LockState::Unlocked) else { return reply(status::LOCKED) };
+        if op == courier_op::MAIL_CODE {
+            let Ok(url) = r.str(8192) else { return malformed() };
+            if r.end().is_err() { return malformed(); }
+            let Some(form) = self.mail_sign_ins.exchange(&c.user, &ticket, url) else { return reply(status::DENIED) };
+            return match LockedBuf::from_slice(&form) {
+                Ok(buf) => Reply { status: status::OK, body: Body::Secret(buf) },
+                Err(_) => reply(status::INTERNAL),
+            };
+        }
+        let Ok(token) = r.bytes(crate::oauth::MAX_TOKEN) else { return malformed() };
+        if r.end().is_err() || token.is_empty() || !token.iter().all(u8::is_ascii_graphic) { return malformed(); }
+        let Some(client) = self.mail_sign_ins.registration.clone() else { return reply(status::DENIED) };
+        let Some(publisher) = self.mail_sign_ins.mail_publisher else { return reply(status::DENIED) };
+        let Some(account) = self.mail_sign_ins.exchanging_account(&c.user, &ticket) else { return reply(status::DENIED) };
+        let persona = app_persona(&publisher, "org.atrium.mail");
+        let head = format!("oauth1 microsoft {client} ");
+        let mut grant = tri!(LockedBuf::zeroed(head.len() + token.len()).map_err(Error::Io));
+        grant.as_mut()[..head.len()].copy_from_slice(head.as_bytes());
+        grant.as_mut()[head.len()..].copy_from_slice(token);
+        let imap = tri!(Recipient::endpoint(Scheme::Imaps, MICROSOFT.imap.0, MICROSOFT.imap.1, None));
+        let smtp = tri!(Recipient::endpoint(Scheme::Submission, MICROSOFT.smtp.0, MICROSOFT.smtp.1, None));
+        let mut add = |recipient| store.add(NewItem { persona: &persona, recipient, class: Class::AfterFirstUnlock,
+            kind: Kind::OAuthToken, provenance: Provenance::AppMinted, account, scope: b"", value: grant.as_ref() });
+        let incoming = tri!(add(imap.clone())).id;
+        let outgoing = match add(smtp) {
+            Ok(meta) => meta.id,
+            Err(err) => {
+                tri!(store.delete(&incoming, &Access { persona: &persona, recipient: &imap }));
+                return map_err(err);
+            }
+        };
+        let mut ids = [0; 32];
+        ids[..16].copy_from_slice(&incoming.0);
+        ids[16..].copy_from_slice(&outgoing.0);
+        self.mail_sign_ins.complete(&ticket, ids);
+        ok(vec![])
+    }
+
     fn courier_op(&mut self, c: &CourierLabel, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        if matches!(op, courier_op::MAIL_CODE | courier_op::MAIL_GRANT) { return self.mail_exchange(c, op, body); }
         let verified = std::mem::take(&mut self.verified);
         let mut r = Reader::new(body);
         let who = Access { persona: &c.persona, recipient: &c.endpoint };

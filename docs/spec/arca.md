@@ -26,6 +26,14 @@ authorization URL. Ordinary app jails can read these without memory-lock
 privileges. Secret-bearing Arca replies still require locked memory.
 [Development configuration and gate](navigator-islands.md#development-registration-and-mails-first-screen).
 
+The local Mail callback binds the pending session to the Mail account
+address and user at creation. Only the Microsoft HTTPS courier for the
+ticket’s cookie partition may request the token POST body and submit its
+refresh grant. Arca validates the registered redirect and state before
+issuing that body once. It stores an OAuth item for each Outlook endpoint
+in the signed Mail publisher’s app persona. The same user’s Mail app
+receives the two 16-byte item references through `MAIL_SIGN_IN_RESULT`.
+
 ## 1. The three promises
 
 1. **Use without read.** Wherever the protocol allows, a secret is *used* for the app

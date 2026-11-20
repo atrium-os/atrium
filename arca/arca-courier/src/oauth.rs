@@ -255,8 +255,12 @@ pub enum RefreshError {
 /// Trade the refresh token for an access token at `p`'s token endpoint,
 /// over TLS through the fetch rules (one request, `Connection: close`).
 pub fn refresh(p: &Provider, client_id: &str, refresh: &[u8], net: &(dyn Connect + Sync), tls: &Arc<rustls::ClientConfig>, policy: addr::Policy) -> Result<Tokens, RefreshError> {
+    let body = refresh_body(p, client_id, refresh).map_err(RefreshError::Failed)?;
+    exchange_body(p, body, net, tls, policy)
+}
+
+pub(crate) fn exchange_body(p: &Provider, body: LockedBuf, net: &(dyn Connect + Sync), tls: &Arc<rustls::ClientConfig>, policy: addr::Policy) -> Result<Tokens, RefreshError> {
     let fail = RefreshError::Failed;
-    let body = refresh_body(p, client_id, refresh).map_err(fail)?;
     let mut conv = Conversation::new(net, tls.clone(), policy);
     let addrs = conv.resolve_checked(p.token_host, 443).map_err(|_| fail(Refusal::Connect))?;
     let tcp: TcpStream = addrs.iter().find_map(|a| net.connect_addr(*a).ok()).ok_or(fail(Refusal::Connect))?;

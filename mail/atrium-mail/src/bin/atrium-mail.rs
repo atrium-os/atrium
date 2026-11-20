@@ -297,7 +297,7 @@ struct SettingsWin {
     size: pergola::Mutable<(f32, f32)>,
     /// Arca's field, while an account is being added.
     cred: Option<limen::proto::EmbedId>,
-    microsoft: Option<limen::proto::EmbedId>,
+    microsoft: Option<(limen::proto::EmbedId, [u8; 16])>,
     next_ask: Instant,
 }
 
@@ -681,7 +681,7 @@ fn main() {
                     let mut e = e.borrow_mut();
                     match e.request("mail-sign-in", token, atrium_mail::settings::MICROSOFT_SHEET_SLOT) {
                         Ok(id) if e.send(id, ticket.to_vec()).is_ok() => {
-                            sw.microsoft = Some(id);
+                            sw.microsoft = Some((id, ticket));
                             sw.s.microsoft_sheet_open.set(true);
                             sw.s.sign_in_note("Continue in the Microsoft sign-in sheet.");
                         }
@@ -693,7 +693,7 @@ fn main() {
                 }
             }
             if close_settings {
-                if let (Some(e), Some(id)) = (&embeds, sw.microsoft.take()) {
+                if let (Some(e), Some((id, _))) = (&embeds, sw.microsoft.take()) {
                     let _ = e.borrow_mut().detach_embed(id);
                 }
             }
@@ -1212,18 +1212,19 @@ fn main() {
                         mail.look_failed("The viewer went away");
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed } | limen::proto::ParentEvent::Detached { embed }))
-                        if settings.as_ref().is_some_and(|s| s.microsoft == Some(embed)) => {
+                        if settings.as_ref().is_some_and(|s| s.microsoft.is_some_and(|(id, _)| id == embed)) => {
                         if let Some(sw) = settings.as_mut() {
                             sw.microsoft = None;
                             sw.s.microsoft_sheet_open.set(false);
                             sw.s.sign_in_note("The Microsoft sign-in sheet closed.");
                         }
                     }
-                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if bytes == b"failed" && settings.as_ref().is_some_and(|s| s.microsoft == Some(embed)) => {
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if (bytes == b"failed" || bytes == b"complete") && settings.as_ref().is_some_and(|s| s.microsoft.is_some_and(|(id, _)| id == embed)) => {
                         if let Some(sw) = settings.as_mut() {
-                            sw.microsoft = None;
+                            let (_, ticket) = sw.microsoft.take().unwrap();
                             sw.s.microsoft_sheet_open.set(false);
-                            sw.s.sign_in_note("Navigator could not display the Microsoft sign-in page.");
+                            if bytes == b"complete" { sw.s.complete_microsoft(ticket); }
+                            else { sw.s.sign_in_note("Navigator could not complete Microsoft sign-in."); }
                             let _ = embeds.borrow_mut().detach_embed(embed);
                         }
                     }

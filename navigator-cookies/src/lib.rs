@@ -355,15 +355,21 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// [`Refused::NotCookied`] before anything is asked of Arca: the caller
     /// sends it the plain way, and it carries no cookie.
     pub fn fetch(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
-        self.fetch_with_redirects(view, f, MAX_REDIRECTS)
+        self.fetch_with_redirects(view, f, Some(MAX_REDIRECTS))
     }
 
     /// Fetch exactly the URL granted for an embedded resource.
     pub fn fetch_once(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
-        self.fetch_with_redirects(view, f, 0)
+        self.fetch_with_redirects(view, f, Some(0))
     }
 
-    fn fetch_with_redirects(&mut self, view: ViewId, f: &Fetch, limit: usize) -> Result<Fetched, Refused> {
+    pub fn mail_continuation(&mut self, view: ViewId) -> Result<Fetched, Refused> {
+        if !self.views.get(&view).is_some_and(|v| v.microsoft) { return Err(Refused::NotCookied); }
+        let f = Fetch::subresource("https://login.microsoftonline.com/atrium-fixture/continue", "login.microsoftonline.com");
+        self.fetch_with_redirects(view, &f, None)
+    }
+
+    fn fetch_with_redirects(&mut self, view: ViewId, f: &Fetch, limit: Option<usize>) -> Result<Fetched, Refused> {
         let Some(View { partition, cookied: Some(_), sign_in, microsoft }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
         // A form only from a sign-in window, and only as a form.
         let form = sign_in.is_some() && f.method == Method::Post && f.reason == Reason::Form;
@@ -442,6 +448,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             let location = headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
             match (status, location) {
                 (301 | 302 | 303 | 307 | 308, Some(loc)) => {
+                    let Some(limit) = limit else { return Ok(Fetched { status, headers, body, url: url.to_string(), redirects }); };
                     redirects += 1;
                     if redirects > limit { return Err(Refused::Redirect(format!("more than {limit} redirects"))) }
                     let next = url.join(&loc).map_err(|e| Refused::Redirect(e.to_string()))?;
@@ -607,6 +614,24 @@ pub struct Launcher { pub socket: String, open: HashMap<(String, u16, String), U
 
 impl Launcher {
     pub fn new(socket: impl Into<String>) -> Self { Launcher { socket: socket.into(), open: HashMap::new() } }
+
+    pub fn redeem_mail(&mut self, ticket: &[u8; 16], url: &str) -> io::Result<()> {
+        let provider = &arcad::oauth::MICROSOFT;
+        if url.len() > 8192 || !url.strip_prefix(provider.redirect).is_some_and(|q| q.starts_with('?')) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let key = (provider.token_host.to_string(), 443, arcad::oauth::mail_partition(ticket));
+        let stream = self.open.get_mut(&key).ok_or(io::ErrorKind::NotConnected)?;
+        let mut request = arca_courier::schema::MAIL_REDEEM.to_vec();
+        request.extend_from_slice(ticket);
+        request.extend_from_slice(&(url.len() as u32).to_le_bytes());
+        request.extend_from_slice(url.as_bytes());
+        arca_courier::send::write_frame(stream, &request)?;
+        match arca_courier::send::read_frame(stream)?.as_deref() {
+            Some([1]) => Ok(()),
+            _ => Err(io::ErrorKind::PermissionDenied.into()),
+        }
+    }
 
     fn exchange(s: &mut UnixStream, req: &Request) -> io::Result<Response> {
         s.set_read_timeout(Some(Duration::from_secs(60))).ok();

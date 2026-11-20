@@ -94,6 +94,8 @@ pub mod op {
     pub const TAKE_PRINT_LOGIN: u16 = 0x13;
     /// Signed Mail: empty → opaque handle[16] for the person's Navigator sheet.
     pub const MAIL_SIGN_IN: u16 = 0x14;
+    /// Ticket and account address → IMAP and SMTP item ids after a successful exchange.
+    pub const MAIL_SIGN_IN_RESULT: u16 = 0x15;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -451,6 +453,9 @@ pub mod courier_op {
     /// §5.3), for the item it just logged in with, and only an OAuth one:
     /// `u8 source (1 item) | ref[16] | bytes grant` → nothing.
     pub const REFRESHED: u16 = 0x85;
+    /// Only the Microsoft HTTPS courier in the session's partition.
+    pub const MAIL_CODE: u16 = 0x86;
+    pub const MAIL_GRANT: u16 = 0x87;
     /// A courier reports an exact anomaly (arca.md §10) before it ends its
     /// client: `u8 code | str detail` → nothing. Logged, never a value.
     pub const ANOMALY: u16 = 0x84;
@@ -590,6 +595,7 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<(u8, LockedBuf)> {
 /// Replies ordinary app jails may receive without the privilege to lock memory.
 /// The verifier, credentials and cookie values are never among these replies.
 pub enum AppReply {
+    MailItems,
     Ticket,
     Count,
     AuthorizationUrl,
@@ -601,6 +607,7 @@ pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<
         len == 0
     } else {
         match kind {
+            AppReply::MailItems => len == 32,
             AppReply::Ticket => len == 16,
             AppReply::Count => len == 4,
             AppReply::AuthorizationUrl => (1..=8192).contains(&len),

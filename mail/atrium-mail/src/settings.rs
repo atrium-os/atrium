@@ -450,7 +450,7 @@ impl Settings {
             if !self.can_add() { return; }
             let path = (*self.arca).clone();
             let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || { let _ = tx.send(crate::accounts::microsoft_sign_in(&path)); });
+            std::thread::spawn(move || { let _ = tx.send(crate::accounts::microsoft_sign_in(&path, &s.cfg.address)); });
             *self.microsoft.borrow_mut() = Some(rx);
             self.update(|u| u.note = Some("Requesting Microsoft sign-in…".into()));
             return;
@@ -472,6 +472,18 @@ impl Settings {
             u.adding = Adding::Keeping(s);
             u.note = None;
         });
+    }
+
+    pub fn complete_microsoft(&self, ticket: [u8; 16]) {
+        let Adding::Found(s) = self.ui.get_cloned().adding else { return };
+        if s.cfg.oauth.as_deref() != Some("microsoft") { return; }
+        let (arca, mut cfg) = ((*self.arca).clone(), s.cfg.clone());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::accounts::microsoft_result(&arca, &ticket, &mut cfg).map(|_| (cfg, None)));
+        });
+        *self.kept.borrow_mut() = Some(rx);
+        self.update(|u| { u.adding = Adding::Keeping(s); u.note = None; });
     }
 
     pub fn take_microsoft_ticket(&self) -> Option<[u8; 16]> {

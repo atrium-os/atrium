@@ -750,3 +750,40 @@ alongside I0.
 | **D4** ✓ | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
 | **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
+
+### Local Mail callback and account storage
+
+On 2026-11-20 the local provider’s `mail-callback` mode passed on a fresh
+arm64 HVF overlay. The guest mounted `/dev/vtbd1p1` at `/` as Tessera.
+The Mail settings window started with zero accounts. Its Microsoft action
+opened the development form in the JIT-off Ladybird worker. The worker
+matched the SHA-256 above, had Capsicum active and had IPv4 and IPv6 disabled.
+
+After one Continue click, the provider recorded the following sequence.
+
+```text
+authorized
+first-screen-cookie-ok
+stylesheet
+script
+callback-issued
+pkce-redeemed
+```
+
+In this fixture mode Navigator intercepts the local continuation’s 302
+before forwarding a response to the page. It passes the registered redirect
+to the courier for the sheet’s partition. Arca checks the state and permits
+one code exchange. The courier posts the verifier over TLS, checks the
+token response and gives the refresh grant to Arca. Navigator signals
+completion to Mail, which retrieves two opaque references from Arca.
+
+The guest reopened a copy of Mail’s persisted store and verified one
+Microsoft account for `ada@outlook.com`, distinct nonzero references,
+and the Outlook IMAP (993) and SMTP submission (587) endpoints. Separate
+arm64 controls rejected a foreign user, wrong state, duplicate callback
+parameters, wrong redirect, incorrect verifier and replay. Background
+sync could not reach Outlook on the restricted fixture network. Live
+Microsoft sign-in and rotated refresh-token use remain unverified.
+
+Screenshots, stage markers, confinement evidence and guest checks are under
+`~/atrium-vm/evidence/navigator-mail-callback-20261120/` on the Mac.

@@ -101,7 +101,8 @@ fn main() -> ExitCode {
     if scheme.is_mail() {
         return mail(MailEndpoint { scheme, host, port }, net, tls, policy);
     }
-    let mut courier = Courier::new(Endpoint { host, port }, net, tls, policy);
+    let microsoft = scheme == arca_store::Scheme::Https && port == 443 && host == arcad::oauth::MICROSOFT.token_host;
+    let mut courier = Courier::new(Endpoint { host, port }, net, tls.clone(), policy);
     let mut vault = Arcad::new(env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock"));
     let (mut input, mut output) = (std::io::stdin().lock(), std::io::stdout().lock());
     for _ in 0..MAX_REQUESTS {
@@ -110,6 +111,11 @@ fn main() -> ExitCode {
             Ok(None) => return ExitCode::SUCCESS,
             Err(_) => return ExitCode::FAILURE,
         };
+        if let Some(request) = frame.strip_prefix(arca_courier::schema::MAIL_REDEEM) {
+            let ok = microsoft && vault.redeem_mail(request, net, &tls, policy).is_ok();
+            if arca_courier::send::write_frame(&mut output, &[u8::from(ok)]).is_err() { return ExitCode::FAILURE; }
+            continue;
+        }
         if courier.handle_to(&frame, &mut vault, &mut output).is_err() {
             return ExitCode::FAILURE;
         }
