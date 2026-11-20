@@ -6,6 +6,17 @@ import zlib
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+def chunk(t,b):
+    return struct.pack('>I',len(b))+t+b+struct.pack('>I',zlib.crc32(t+b))
+def png(width, height, left, right):
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\0" + left * (width // 2) + right * (width - width // 2)
+    return (
+        b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b"")
+    )
+
+
 def sheets(output):
     dest = output / 'sheets-proof.xlsx'
     m='http://schemas.openxmlformats.org/spreadsheetml/2006/main'
@@ -14,16 +25,6 @@ def sheets(output):
     d='http://schemas.openxmlformats.org/drawingml/2006'
     def rel(*parts):
         return '<Relationships xmlns="'+p+'">'+''.join(f'<Relationship Id="{i}" Type="{r}/{kind}" Target="{dst}"/>' for i,kind,dst in parts)+'</Relationships>'
-    def chunk(t,b):
-        return struct.pack('>I',len(b))+t+b+struct.pack('>I',zlib.crc32(t+b))
-    def png(width, height, left, right):
-        header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-        row = b"\0" + left * (width // 2) + right * (width - width // 2)
-        return (
-            b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
-            + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b"")
-        )
-
     def corner(tag,col,row):
         return f'<xdr:{tag}><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:{tag}>'
     def picture(col,row,w,h,ref="image"):
@@ -90,3 +91,6 @@ if __name__ == "__main__":
     lines.extend(f"Print fixture line {n:03d}" for n in range(1, 121))
     lines.append("FINAL QUICK LOOK LINE")
     (output / "quicklook-proof.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (output / "quicklook-picture.png").write_bytes(
+        png(120, 60, bytes.fromhex("ff0033"), bytes.fromhex("0044ff"))
+    )

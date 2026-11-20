@@ -234,5 +234,20 @@ preview 'previews: 5 of 5' 1
 cp screen.png text-preview.png
 press 779 534
 wait_job 8
+sleep 3
+kill -TERM "$(cat scrinium-text.pid)"
+sleep 2
+daemon -f -p "$P/scrinium-image.pid" -o "$P/image-app.log" -u prelusheets env HOME="$P/home" LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" SCRINIUM_TRACE=1 SCRINIUM_PLACES="Proof=$P/image-files" "$P/scrinium" --no-picker
+for i in $(seq 20); do grep -q 'entries=\[quicklook-picture.png\]' image-app.log 2>/dev/null && break; sleep 1; done
+grep -q 'entries=\[quicklook-picture.png\]' image-app.log
+press 300 130
+key 44 0
+for i in $(seq 20); do grep -q 'picture 120x60' limend.log && break; sleep 1; done
+grep 'picture 120x60' limend.log
+press 915 112
+preview 'previews: 1 of 1' 2
+cp screen.png image-preview.png
+press 779 534
+wait_job 9
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 8
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 9

@@ -6041,7 +6041,7 @@ a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
 log, build hashes and verdicts under the printed artifact directory.
 Prelum must reach Done for each desktop job with an observed jailed IPP
 worker. Poppler checks the original Quick Look HTML and plain text after pathname
-replacement, the Sheets print area with chart and pictures, Slides
+replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides
 three-slide handouts with Include Hidden Slides off on A4 and on after a
 Letter paper change, plus paginated
 speaker notes with Include Hidden Slides off and on. The Mail PDF must include the body

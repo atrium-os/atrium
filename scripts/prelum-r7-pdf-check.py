@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 9)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 10)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text = expected
+html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -90,3 +90,33 @@ assert numbered_lines(r"Print fixture line (\d+)", body) == list(range(1, 121)),
 assert "FIRST QUICK LOOK LINE" in pages[0] and "FINAL QUICK LOOK LINE" in pages[-1], pages
 assert "REPLACEMENT" not in body
 print("Quick Look plain text: five pages with all 122 original lines after pathname replacement")
+
+
+assert len(pages_of(picture)) == 1
+raster = subprocess.check_output(["pdftoppm", "-f", "1", "-l", "1", "-r", "72", str(picture)])
+magic, dimensions, depth, pixels = raster.split(b"\n", 3)
+assert magic == b"P6" and depth == b"255"
+width, height = map(int, dimensions.split())
+assert len(pixels) == 3 * width * height
+
+
+def color_bounds(color):
+    points = [
+        (i // 3 % width, i // 3 // width)
+        for i in range(0, len(pixels), 3)
+        if pixels[i:i + 3] == color
+    ]
+    assert points, color.hex()
+    x, y = zip(*points)
+    return min(x), min(y), max(x), max(y)
+
+
+left = color_bounds(bytes.fromhex("ff0033"))
+right = color_bounds(bytes.fromhex("0044ff"))
+assert left[2] + 1 == right[0] and left[1::2] == right[1::2], (left, right)
+image_width = right[2] - left[0] + 1
+image_height = left[3] - left[1] + 1
+assert abs(image_width - 2 * image_height) <= 3, (left, right)
+assert abs(left[0] + right[2] + 1 - width) <= 3, (left, right)
+assert abs(left[1] + left[3] + 1 - height) <= 3, (left, right)
+print(f"Quick Look image: both colors in a centered {image_width} x {image_height} raster")

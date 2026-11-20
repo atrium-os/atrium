@@ -18,7 +18,7 @@ guest=/tmp/prelum-r7-desktop-gate
 for path in "$base" "$code" "$vars" "$key"; do
     test -f "$path" || { echo "Missing gate input: $path" >&2; exit 2; }
 done
-for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages pdfinfo cargo clang; do
+for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages pdfinfo pdftoppm cargo clang; do
     command -v "$program" >/dev/null || { echo "Missing host tool: $program" >&2; exit 2; }
 done
 python3 - "$ssh_port" "$ipps_port" <<'PY'
@@ -117,8 +117,10 @@ for file in quicklook.html sheets-proof.xlsx slides-proof.pptx; do
 done
 remote "mkdir '$guest/text-files' && cat >'$guest/text-files/quicklook-proof.txt'" \
     <"$D/fixtures/quicklook-proof.txt"
+remote "mkdir '$guest/image-files' && cat >'$guest/image-files/quicklook-picture.png'" \
+    <"$D/fixtures/quicklook-picture.png"
 if ! remote "sh -s -- '$guest' '$ipps_port' '$marker'" <"$scripts/prelum-r7-guest.sh" >"$D/results.log" 2>&1; then
-    remote "cd '$guest' && tail -60 app.log limend.log portcullis.log sheet.log mail.log" >"$D/guest-errors.log" 2>&1 || :
+    remote "cd '$guest' && tail -60 app.log text-app.log image-app.log limend.log portcullis.log sheet.log mail.log" >"$D/guest-errors.log" 2>&1 || :
     cat "$D/results.log" >&2
     exit 1
 fi
