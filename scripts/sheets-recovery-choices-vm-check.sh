@@ -888,10 +888,11 @@ SH
         reject_password() {
             open_row 273
             input 'MOVE 48 24'
-            wait_for frame_is 9fae5ab4237b1265a50395c66d05c8eb10091f1abc514e31837cc998bee83ed3
+            wait_for frame_is a7ba8f30ff86bc518db45915b88dd91ab0e7e3ce2629d23775d3c633dc8664d7
             type_keys 0x05 0x04 0x07 0x28 # bad
-            # The prompt names Untitled.osheet and displays the wrong-password error.
-            wait_for frame_is 504cf0aad02355cb99af121371076063d8f4201bdf1d97e528812ecacda0eea8
+            # At 1100 px the filename and the full “Try again” guidance
+            # fit beside the password field.
+            wait_for frame_is 7e8b4da6aafa57384385354e48afe7aa772e6436072ff9e83b30cf5730f5c89c
             test "$(docs)" = "$reopened"
             if opened "$reopened" Untitled.osheet; then echo "Wrong password opened the workbook" >&2; return 1; fi
         }

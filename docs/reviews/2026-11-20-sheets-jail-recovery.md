@@ -241,3 +241,9 @@ The `external-edit` desktop gate selects `Untitled.osheet` from the Sheets Open 
 After each path the gate checks all three published files against their pre-prompt bytes or digests. It then reopens both plain workbooks through the picker and reads their loaded cells.
 
 Both password paths passed on native Tessera and bounded UFS recovery volumes. The reopened external revision held A1=`zebra` with B1 blank, and the Save As copy held `zebra,4,7`. Each window closed cleanly and released its recovery volume. The fixture window clips the last words of the wrong-password retry guidance.
+
+## Password prompt width
+
+In the 1100 px document window, the previous 300 px label clipped the end of “Try again”. Sheets now measures the prompt with Pergola using the same semibold style it draws. The retry frame shows the complete message `Wrong password for “Untitled.osheet”. Try again`. The input starts at x=360, with a gap after the final letter. Open and Cancel retain their positions. The desktop gate matches the initial and retry frames before entering the correct password or cancelling.
+
+The visual checks, correct-password retry, cancellation and plain-file integrity checks passed with both Tessera and UFS recovery volumes in the isolated VM.

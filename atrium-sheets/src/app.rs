@@ -2108,9 +2108,11 @@ impl View for Sheets {
                 let cmds = self.cmds.clone();
                 move || cmds.lock().unwrap().push(c)
             };
-            let lw = 300.0f32.min(w * 0.4);
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
-            let fw = (w - 24.0 - lw - 160.0).max(120.0);
+            let prompt_style = st(type_size::MD, Weight::Semibold, t.text_primary());
+            let available = w - 20.0 - 164.0; // space before the Open/Set and Cancel buttons
+            let lw = Node::measure_text(&pb.prompt, &prompt_style).w.ceil().min((available - 120.0).max(0.0));
+            let fw = (available - lw).max(0.0);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt, style: prompt_style });
             let cmds = self.cmds.clone();
             TextField::new(self.password_text.clone()).placeholder("Password").autofocus(true).at(lw + 20.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
             Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordDone)).render(ctx);
