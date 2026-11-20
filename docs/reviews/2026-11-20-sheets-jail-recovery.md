@@ -215,3 +215,11 @@ Run the interleaved-save gate with `stale-refresh interleave published-save`. Bo
 After the two original Sheets processes and Scrinium reconnect, the protected sibling saves `fox,3` while the plain file still contains `zebra,2`. Pressing Save in the plain window without re-entering B1 must publish `zebra,4` and leave the protected file byte-identical. Two further alternating saves exercise both grants. Each turn checks the caller UID, reads both copies and verifies the idle sibling’s digest.
 
 Both the native Tessera and bounded UFS recovery-volume runs passed in the private Tessera-root VM. They finished with `zebra,6` and `fox,5` in the respective files. Both jails closed, both markers cleared, and both recovery devices detached.
+
+## External edit after reconnect
+
+Run the interleaved-save gate with `stale-refresh interleave external-edit`. Scrinium publishes B1=2 in the plain workbook while Limen is paused. Sheets retains the later B1=4 edit. Once both original Sheets processes and Scrinium reconnect, a fixture process restores the earlier plain workbook bytes in place. This clears B1 on disk while keeping A1=`zebra`.
+
+The test retries ordinary Save and matches the desktop frame showing B1=4 and the warning “The workbook changed since it was opened. Reopen it or use Save As.” The protected sibling then saves B1=3. Without retyping the pending edit, the plain workbook uses Save As in its tiled window. The independent reader checks `zebra,4` in `Proof (2).osheet` and `fox,3` in the protected sibling. The test also compares the external file byte-for-byte with the outside writer’s copy and checks that Save As leaves the sibling’s digest unchanged.
+
+The gate passed on both native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. After both jails closed, all three archived workbooks from each run passed the independent reader checks. Both markers cleared and both recovery devices detached.

@@ -18,6 +18,7 @@
 # Append restart-limen after interleave to restart the private Limen between Save As and Save.
 # Use pending-save instead of restart-limen to interrupt an ordinary Save before delivery.
 # Use published-save to interrupt confirmation after publication (requires guest LLDB).
+# Use external-edit to change the published file after reconnect and recover the pending edit via Save As.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -657,7 +658,7 @@ SH
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
         tiled() { test "$(win_at 125 24)" = "$plain_win" && test "$(win_at 765 24)" = "$sibling_win"; }
         case "${5:-}" in
-        restart-limen|pending-save|published-save)
+        restart-limen|pending-save|published-save|external-edit)
             plain_pid=$(pgrep -x -j "$jid" atrium-sheets)
             sibling_pid=$(pgrep -x -j "$sibling" atrium-sheets)
             files_pid=$(pgrep -x -U sheetsfiles bench-scrinium)
@@ -673,7 +674,8 @@ SH
             test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
             stopped_limen() { ps -p "$old_limen" -o state= | grep -q '^T'; }
-            if test "$5" = published-save; then
+            if test "$5" = published-save || test "$5" = external-edit; then
+                if test "$5" = external-edit; then cp "$books/Proof.osheet" "$results/external.osheet"; fi
                 /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
                 wait_for tiled
                 edit 129 0x1f # First snapshot contains B1=2.
@@ -762,23 +764,58 @@ SH
             /tmp/check-recovered-copy "$books/Proof.osheet" "$plain_cells" plain
             /tmp/check-recovered-copy "$books/Untitled.osheet" "$protected_cells" protected
         }
-        plain_input=0x21
-        plain_published=zebra
-        if test "${5:-}" = published-save; then plain_published=zebra,2; fi
-        if test "${5:-}" = pending-save || test "${5:-}" = published-save; then
+        if test "${5:-}" = external-edit; then
+            # An outside writer clears B1 in place by restoring the valid
+            # revision saved before B1=2. The live plain window still has B1=4.
             test "$(sha256 -q "$books/Proof.osheet")" = "$plain_hash"
+            test "$(sha256 -q "$results/external.osheet")" != "$plain_hash"
+            cat "$results/external.osheet" > "$books/Proof.osheet"
+            /tmp/check-recovered-copy "$books/Proof.osheet" zebra plain
+            /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
+            wait_for tiled
+            click 125 24
+            input 'MOVE 120 96'
+            # Both windows tiled, B1=4 still visible and the status reads
+            # “The workbook changed since it was opened. Reopen it or use Save As.”
+            conflict_visible() { test "$(sha256 -q selectscreen.png)" = 3946787817a18a200dbf2f8f35f1ca710093ef012c658a92252f29a1dac4c428; }
+            wait_for conflict_visible
+            cp selectscreen.png "$results/conflict.png"
+            cmp "$books/Proof.osheet" "$results/external.osheet"
             test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
-            plain_input=retry
+            save_turn protected 0x20 zebra fox,3
+            sibling_saved=$(sha256 -q "$books/Untitled.osheet")
+            /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
+            wait_for tiled
+            copy='Proof (2).osheet'
+            test ! -e "$books/$copy"
+            click 205 24
+            wait_for different_window 611 457 "$plain_win"
+            click 611 457
+            wait_for test -s "$books/$copy"
+            /tmp/check-recovered-copy "$books/$copy" zebra,4 plain
+            wait_for opened "$jid" "$copy"
+            cmp "$books/Proof.osheet" "$results/external.osheet"
+            test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
+        else
+            plain_input=0x21
+            plain_published=zebra
+            if test "${5:-}" = published-save; then plain_published=zebra,2; fi
+            if test "${5:-}" = pending-save || test "${5:-}" = published-save; then
+                test "$(sha256 -q "$books/Proof.osheet")" = "$plain_hash"
+                test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
+                plain_input=retry
+            fi
+            save_turn protected 0x20 "$plain_published" fox,3
+            save_turn plain "$plain_input" zebra,4 fox,3
+            save_turn protected 0x22 zebra,4 fox,5
+            save_turn plain 0x23 zebra,6 fox,5
         fi
-        save_turn protected 0x20 "$plain_published" fox,3
-        save_turn plain "$plain_input" zebra,4 fox,3
-        save_turn protected 0x22 zebra,4 fox,5
-        save_turn plain 0x23 zebra,6 fox,5
         count 2; key 0x1a 1; wait_for count 1
         test "$(docs)" = "$sibling"
         /tmp/tile-recovery-windows --clear-focus
         key 0x1a 1; wait_for count 0
         /tmp/tile-recovery-windows --clear-focus
+        if test "${5:-}" = external-edit; then mv "$books/$copy" "$results/"; fi
         mv "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"
         test "$(cat "$books/Proof.csv")" = Original
     else
