@@ -598,6 +598,11 @@ if [ -n "$tessera_fact" ]; then
     echo "$pass checks passed"
     exit 0
 fi
+decline_after_esp_loss=0
+if [ "$hip" = esp-loss-decline ]; then
+    hip=esp-loss
+    decline_after_esp_loss=1
+fi
 if [ "$hip" = esp-loss ]; then
     initial_report=$(head -n 1 "$receipts")
     reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
@@ -653,6 +658,28 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         fail "changed posture reached the gateway before approval"
     fi
     ok "verified posture change required fresh approval before upload"
+    if [ "$decline_after_esp_loss" = 1 ]; then
+        [ "$(field handshake)" = 1 ] || fail "recovered TLS was down before decline"
+        "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+        wait_field up 0
+        [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+            fail "declining HIP did not stop the recovered profile"
+        sleep 6
+        [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+            fail "the recovered profile restarted after decline"
+        [ "$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")" = 2 ] ||
+            fail "expected only the initial ESP and recovered TLS connections after decline"
+        "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $iface$'; then exit 1; fi" ||
+            fail "the declined TLS tunnel retained its route"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed after decline"
+        if grep -q "^$changed_word " "$receipts"; then
+            fail "changed posture reached the gateway after decline"
+        fi
+        ok "decline stopped recovered TLS and withheld changed HIP"
+        echo "$pass checks passed"
+        exit 0
+    fi
     approve_hip || fail "approve changed HIP"
     for _ in $(seq 1 25); do
         if grep -q "^$changed_word " "$receipts"; then break; fi

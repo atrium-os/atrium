@@ -895,6 +895,10 @@ another origin. An active portal-profile session stays in engine memory.
   login, unchanged HIP submission and refresh without prompting, and
   fresh approval before sending changed IPv6 forwarding posture. IPv4
   echo continues on the recovered TLS tunnel. The arm64 run passed 14/14.
+  With `--hip esp-loss-decline`, the gate declines the changed posture
+  review on the recovered TLS tunnel. It verifies the changed report
+  remains unsent, the profile and route go down, and IPv4 echo stops.
+  The arm64 decline run passed 13/13.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

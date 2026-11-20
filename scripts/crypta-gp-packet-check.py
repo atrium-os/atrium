@@ -71,7 +71,8 @@ def frames(stream, reader, calls):
 
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
-REFRESH_HIP = ("refresh", "posture", "esp-loss", *TESSERA_HIP)
+ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline")
+REFRESH_HIP = ("refresh", "posture", *ESP_LOSS_HIP, *TESSERA_HIP)
 
 
 def require_reconnect_approval(receipts, config_index):
@@ -461,12 +462,12 @@ def main():
         reconnect_approval = receipts.with_suffix(".approved") if args.hip in RECONNECT_HIP else None
         with ExitStack() as stack:
             esp = None
-            if args.esp or args.drop_esp or drop_config_indices or args.hip == "esp-loss":
+            if args.esp or args.drop_esp or drop_config_indices or args.hip in ESP_LOSS_HIP:
                 udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 udp.bind(("127.0.0.1", 4501))
                 udp.settimeout(300)
                 esp = EspPeer(udp, args.drop_esp, reconnect_approval, drop_config_indices,
-                              lose_active=args.hip == "esp-loss")
+                              lose_active=args.hip in ESP_LOSS_HIP)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
@@ -646,18 +647,23 @@ def main():
                     assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
                 print("Declining the rebound review sent no changed HIP count and opened no rebound data tunnel")
                 return
-            if args.hip == "esp-loss":
+            if args.hip in ESP_LOSS_HIP:
+                declined = args.hip == "esp-loss-decline"
                 assert not esp.errors, esp.errors
                 assert len(esp.configs) == 2 and calls.count("getconfig.esp") == 2, calls
                 original_spi = esp.configs[0][0][0]
                 assert esp.echo == [original_spi] and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == {original_spi}, esp.received_spis
-                assert calls.count("login.esp") == 1 and calls[-1] == "logout.esp", calls
+                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined else "logout.esp"), calls
                 recovery = len(calls) - 1 - calls[::-1].index("getconfig.esp")
                 assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
-                assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
+                assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == (1 if declined else 2), calls
                 reports = receipts.read_text().splitlines()
                 report_index = calls[:recovery].count("hipreport.esp")
+                if declined:
+                    assert len(reports) >= report_index + 2 and len(set(reports)) == 1, reports
+                    print("Declining changed HIP after ESP loss stopped the recovered TLS tunnel")
+                    return
                 original, changed = reports[0], reports[-1]
                 assert original.split()[0] != changed.split()[0], reports
                 assert reports[report_index:report_index + 2] == [original, original], reports
