@@ -1009,6 +1009,11 @@ another origin. An active portal-profile session stays in engine memory.
   traffic until fresh approval. After acknowledgement, ESP resumes and
   the new report refreshes silently. The FreeBSD arm64 gate passed
   55/55 using the shared Cargo cache.
+  The `--hip esp-loss-hip-active-refresh-decline` variant declines
+  that fresh review. Crypta surfaces the refusal and stops the profile.
+  The pending report stays unsent, the retry association carries no
+  packets, and IPv4 echo stays blocked. The FreeBSD arm64 gate passed
+  52/52 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
