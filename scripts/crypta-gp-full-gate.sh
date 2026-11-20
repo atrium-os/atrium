@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-final-fallback) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=10 ;;
     esp-loss-hip-submit-final-rebind) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=9 ;;
     esp-loss-hip-submit-rebind-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=8 ;;
     esp-loss-hip-submit-rebind-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=7 ;;
@@ -909,8 +910,20 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             if [ "$retry_hip_submit" -ge 2 ]; then
                 [ "$changed_report" = "$initial_report" ] || fail "retry submitted stale posture"
                 rebind_restored_forwarding 4
-                if [ "$retry_hip_submit" = 9 ]; then
+                if [ "$retry_hip_submit" -ge 9 ]; then
                     rebind_restored_forwarding 5 "$rebound_report"
+                    if [ "$retry_hip_submit" = 10 ]; then
+                        [ "$("$V" "grep -o 'GlobalProtect data transport: TLS' $G/cryptad.log | wc -l | tr -d ' '")" = 2 ] ||
+                            fail "final rebind did not select TLS"
+                        before_refresh=$(awk 'END { print NR }' "$receipts")
+                        wait_receipts "$((before_refresh + 1))"
+                        [ "$(field signin)" = in ] &&
+                            [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$rebound_report" ] &&
+                            [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                            fail "unchanged HIP did not refresh silently after final TLS fallback"
+                        ok "unchanged HIP refreshed silently after final TLS fallback"
+                        probe "IPv4 echo after silent refresh on fallback TLS"
+                    fi
                 fi
             fi
             "$V" "$CTL down name=gp-gate" >/dev/null

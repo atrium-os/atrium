@@ -73,7 +73,8 @@ RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 REBIND_HIP_RECHECK = "esp-loss-hip-submit-rebind-recheck"
 REBIND_HIP_DECLINE = "esp-loss-hip-submit-rebind-decline"
-REBIND_HIP_RECONNECT = ("esp-loss-hip-submit-rebind-reconnect", "esp-loss-hip-submit-final-rebind")
+FINAL_HIP_FALLBACK = "esp-loss-hip-submit-final-fallback"
+REBIND_HIP_RECONNECT = ("esp-loss-hip-submit-rebind-reconnect", "esp-loss-hip-submit-final-rebind", FINAL_HIP_FALLBACK)
 REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, *REBIND_HIP_RECONNECT)
 ESP_LOSS_RECONNECT_HIP = (
     *REBIND_HIP_RETRY, "esp-loss-hip-submit-retry-reconnect", "esp-loss-hip-submit-retry-decline", "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
@@ -511,6 +512,8 @@ def main():
         ctx.load_cert_chain(cert, key)
         receipts = tmp / "hip-receipts" if args.hip in REFRESH_HIP else None
         reconnect_approval = receipts.with_suffix(".approved") if args.hip in RECONNECT_HIP else None
+        if args.hip == FINAL_HIP_FALLBACK:
+            drop_config_indices = (8,)
         with ExitStack() as stack:
             esp = None
             if args.esp or args.drop_esp or drop_config_indices or args.hip in ESP_LOSS_HIP:
@@ -710,7 +713,8 @@ def main():
                 rebind_recheck = args.hip == REBIND_HIP_RECHECK
                 rebind_decline = args.hip == REBIND_HIP_DECLINE
                 rebind_reconnect = args.hip in REBIND_HIP_RECONNECT
-                final_rebind_retry = args.hip == "esp-loss-hip-submit-final-rebind"
+                final_fallback = args.hip == FINAL_HIP_FALLBACK
+                final_rebind_retry = final_fallback or args.hip == "esp-loss-hip-submit-final-rebind"
                 retry_reconnect = rebind_retry or args.hip == "esp-loss-hip-submit-retry-reconnect"
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
@@ -726,7 +730,7 @@ def main():
                             expected_spis.append(successful_spi)
                         if rebind_recheck or rebind_reconnect:
                             expected_spis.append(successful_spi)
-                        if final_rebind_retry:
+                        if final_rebind_retry and not final_fallback:
                             expected_spis.append(esp.configs[8][0][0])
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
@@ -740,16 +744,23 @@ def main():
                 # ESP retry starts. It must use the successful association.
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
-                    if final_rebind_retry:
+                    if final_rebind_retry and not final_fallback:
                         allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
                     else:
                         allowed_echoes.append([*expected_spis, expected_spis[-1]])
-                assert esp.echo in allowed_echoes and esp.dropped_probe_spis == {original_spi}, esp.echo
-                assert esp.received_spis == set(expected_spis), esp.received_spis
+                dropped_spis = {original_spi}
+                received_spis = set(expected_spis)
+                if final_fallback:
+                    fallback_spi = esp.configs[8][0][0]
+                    dropped_spis.add(fallback_spi)
+                    received_spis.add(fallback_spi)
+                assert esp.echo in allowed_echoes and esp.dropped_probe_spis == dropped_spis, esp.echo
+                assert esp.received_spis == received_spis, esp.received_spis
                 assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind or retry_decline or rebind_decline else "logout.esp"), calls
                 recovery = configs[1]
                 assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
-                assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == (1 if declined or reconnected else 2), calls
+                assert calls.count("ssl-tunnel-connect.sslvpn") == (2 if final_fallback else 1), calls
+                assert calls.count("echo") == (3 if final_fallback else 1 if declined or reconnected else 2), calls
                 reports = receipts.read_text().splitlines()
                 report_index = calls[:recovery].count("hipreport.esp")
                 if declined:
@@ -807,7 +818,14 @@ def main():
                                         final_phase_report = calls[:configs[8]].count("hipreport.esp")
                                         assert final_phase_report >= retry_report + 2, reports
                                         assert reports[final_phase_report:] and set(reports[final_phase_report:]) == {changed}, reports
-                                        print("The final rebind submitted unchanged HIP before new ESP traffic")
+                                        if final_fallback:
+                                            assert calls[configs[8]:configs[8] + 4] == [
+                                                *exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn",
+                                            ], calls
+                                            assert len(reports[final_phase_report:]) >= 2, reports
+                                            print("Final rebind fell back to TLS after unchanged HIP and refreshed without prompting")
+                                        else:
+                                            print("The final rebind submitted unchanged HIP before new ESP traffic")
                                     else:
                                         print("Rebind retry required fresh approval and refreshed the approved change over ESP")
                                 else:
