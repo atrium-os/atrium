@@ -852,6 +852,17 @@ alongside its origin and key. A replacement source retires the old question
 even when the UI's rate limit delays the replacement or the replacement is
 absent from the recording.
 
+On 2026-11-20 the restricted-channel and widget-selection regressions passed
+on a fresh arm64 HVF overlay with Tessera mounted read-write at `/`. The
+guest ran all 23 Limen daemon tests, 22 navigatord tests and 65 Navigator UI
+tests. The delegated socket opened a document viewer and refused engine
+launches. A separate broker connection could request an island. With a test
+compositor reply, the broker rejected a press from a different window and
+accepted one from the registered window. UI tests exercised same-key source
+replacement, withdrawal and the current recording's origin. The three guest
+executables matched their staged SHA-256 hashes. Test logs and shutdown
+evidence are in `~/atrium-vm/evidence/navigator-i1-delegation-20261120/`.
+
 Next, have the installed Navigator broker spend a guarded chrome activation
 for the current document and selected widget. Use its tracked bounds to place
 the worker under the parent's instance, and serve the channel through the
