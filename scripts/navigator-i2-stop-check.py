@@ -31,7 +31,11 @@ parser.add_argument("--broker-restart", type=Path, metavar="TLS_LOG",
                     help="use a fresh persistent broker without NAVIGATOR_UI_OPEN and relaunch on the saved trail")
 parser.add_argument("--unrecorded-restart", type=Path, metavar="TLS_LOG",
                     help="restart with an Unrecorded widget page selected alongside the saved Personal trail")
+parser.add_argument("--multiple-personal", type=Path, metavar="TLS_LOG",
+                    help="restart with two recorded trails at different cursors and Unrecorded selected")
 args = parser.parse_args()
+if args.multiple_personal:
+    args.unrecorded_restart = args.multiple_personal
 if args.unrecorded_restart:
     args.broker_restart = args.unrecorded_restart
 if args.broker_restart:
@@ -406,6 +410,28 @@ def open_unrecorded_widget():
     frame("private-selected")
 
 
+def open_second_personal():
+    before = len(log())
+    guest("nc -N -U input.sock", b"KEY 23 1 1\nKEY 23 0 1\n")  # Ctrl-T
+    wait_for("second Personal trail did not open", lambda: b'trails=2 ' in log()[before:])
+    open_address("parent.example/pond.html", "Pond notes")
+    link = wait_for("missing flowerbeds link",
+                    lambda: page_word("pond", "flowerbeds", 41, 160))
+    press(*link)
+    wait_for("flowerbed did not open", lambda: b'the page child laid out "Flowerbed 1"' in log())
+    back_to("pond.html")
+    wait_for("second trail did not return to Pond",
+             lambda: page_word("second-cursor", "tadpoles", 41, 150))
+
+
+def switch_recorded_trail(path, word):
+    before = len(log())
+    guest("nc -N -U input.sock", b"KEY 43 1 1\nKEY 43 0 1\n")  # Ctrl-Tab
+    expected = f" url=https://parent.example/{path} live=shown ".encode()
+    wait_for(f"trail switch did not open {path}", lambda: expected in log()[before:])
+    wait_for(f"missing page text in {path}", lambda: page_word("switched-" + word, word, 41, 150))
+
+
 def check_recorded_files(root):
     # The ordinary page record must be discoverable by the same probe.
     store = shlex.quote(root + "/var/db/navigatord/store")
@@ -426,9 +452,18 @@ def restart_on_garden():
         if not data:
             return False
         record = json.loads(data)
-        if args.unrecorded_restart and (len(record["trails"]) != 1 or record["earlier"]
+        expected_count = 2 if args.multiple_personal else 1
+        if args.unrecorded_restart and (len(record["trails"]) != expected_count or record["earlier"]
                                        or b"private-counter.html" in data or b"Private counter" in data):
             raise RuntimeError("Unrecorded material was written to the trail file")
+        if args.multiple_personal:
+            second = record["trails"][1]
+            pages = second["pages"]
+            if (record["current"] != 0 or second["current"] != 0 or len(pages) != 2
+                    or pages[1].get("parent") != 0 or not all(page.get("saved") for page in pages)
+                    or [page["url"] for page in pages] != ["https://parent.example/pond.html",
+                                                           "https://parent.example/bed-1.html"]):
+                return False
         trail = record["trails"][record["current"]]
         pages = trail["pages"]
         if (len(pages) != 2 or trail["current"] != 1 or pages[1].get("parent") != 0
@@ -480,8 +515,14 @@ def navigate_away():
              and not guest("pgrep -x counter || true"))
     wait_for("old question still painted on destination", lambda: not visible_question("away"))
     existing = return_from_pond(original_viewer) if args.parked_viewer else set()
+    if args.multiple_personal:
+        open_second_personal()
     if args.unrecorded_restart:
         open_unrecorded_widget()
+        if args.multiple_personal:
+            tree = log().split(b'navigator-ui: ax window "Navigator"')[-1]
+            if b'trails=3 ' not in tree or b'Pond notes' not in tree:
+                raise RuntimeError("missing second Personal trail while Unrecorded was selected")
         private_traffic = traffic_log.read_bytes()
         private_get = b'"GET /private-counter.html HTTP/1.1"'
         if private_traffic[len(requests):].count(private_get) != 1:
@@ -491,8 +532,20 @@ def navigate_away():
         if args.unrecorded_restart:
             post = log()
             if (b"private-counter.html" in post or b"Private counter" in post or b"widget GET " in post
-                    or b"trails=1 " not in post or guest("pgrep -x counter || true")):
+                    or (b"trails=2 " if args.multiple_personal else b"trails=1 ") not in post or guest("pgrep -x counter || true")):
                 raise RuntimeError("private page, trail or worker returned on relaunch")
+        if args.multiple_personal:
+            switch_recorded_trail("pond.html", "tadpoles")
+            before = len(log())
+            press(303, 30)  # Forward from the saved Pond cursor.
+            wait_for("second trail lost its forward page", lambda:
+                     b" url=https://parent.example/bed-1.html live=shown " in log()[before:])
+            back_to("pond.html")
+            switch_recorded_trail("away.html", "marigolds")
+            if traffic_log.read_bytes() != private_traffic:
+                raise RuntimeError("restoring recorded trails made a network request")
+            print("Unrecorded selected at restart. First Personal reopened at Garden (2/2); "
+                  "second reopened at Pond (1/2), with Flowerbed 1 still forward.")
         new_ui = guest("pgrep -x navigator-ui").strip()
         if new_ui == original_ui:
             raise RuntimeError("expected a new Navigator UI")

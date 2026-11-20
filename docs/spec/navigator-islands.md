@@ -297,6 +297,23 @@ the Personal counter page from disk, and fresh Start consent launched a new
 working counter. Both broker logs, frames and the saved Personal trail are
 in `~/atrium-vm/evidence/navigator-i2-unrecorded-restart-20261121/`.
 
+With multiple Personal trails, saving while Unrecorded is selected makes
+the first recorded trail current on restart. Each recorded trail keeps its
+own page cursor. The installed gate opened Embedded counter → Garden notes
+in the first trail and Pond notes → Flowerbed 1 in the second, then went
+Back to Pond before opening and selecting Unrecorded. The saved file
+contained the two Personal trails, with Garden and Pond current respectively.
+
+After restart the UI showed Garden (page 2 of 2). Switching trails showed
+Pond (page 1 of 2). Forward opened Flowerbed 1, Back returned to Pond, and
+switching back showed Garden. These steps made no fixture requests.
+The private page, widget notice and worker stayed gone.
+
+Use the Unrecorded restart setup with `--multiple-personal TLS_LOG` and
+serve `/pond.html` and `/bed-1.html` from the garden fixtures described
+above. The saved trail file, screenshots and broker logs are in
+`~/atrium-vm/evidence/navigator-i2-multiple-personal-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
