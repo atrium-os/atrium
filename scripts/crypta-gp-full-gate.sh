@@ -1218,6 +1218,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                     if [ "$retry_hip_submit" = 23 ]; then
                                                         reconnect_after_esp_loss_decline "$before_change" rebound-reconnect-approved
                                                         finish_hip_reconnect "$rebound_report" rebound-reconnect-ack
+                                                        rebind_restored_forwarding 17 "$rebound_report" post-decline-rebind
                                                         "$V" "$CTL down name=gp-gate" >/dev/null
                                                     fi
                                                     echo "$pass checks passed"
