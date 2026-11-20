@@ -24,6 +24,7 @@ pub struct Widget {
     pub press: navigator_control::Press,
     parent: Arc<Mutex<Option<Parent>>>,
     embed: u64,
+    pub answers: std::sync::mpsc::SyncSender<limen::web_island::UnloadAnswer>,
 }
 
 impl Widget {
@@ -35,6 +36,7 @@ impl Widget {
         rect: [u32; 4],
         cfg: Arc<Config>,
         attached: impl FnOnce() + Send + 'static,
+        unload: impl Fn(u32, bool) + Send + 'static,
         finished: impl FnOnce(Option<navigator_control::WidgetFailure>) + Send + 'static,
     ) -> Result<Self, String> {
         let rect = bounds(rect)?;
@@ -64,6 +66,7 @@ impl Widget {
             .map_err(|e| format!("place: {e:?}"))?;
         let parent = Arc::new(Mutex::new(Some(parent)));
         let watched = parent.clone();
+        let (answers, received) = std::sync::mpsc::sync_channel::<limen::web_island::UnloadAnswer>(1);
         // A slow document GET must not delay Stop or placement retirement.
         let (done, fetched) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -76,12 +79,28 @@ impl Widget {
             use limen::web_island::{EndReason, Lifecycle, Report};
             let granted_origin = crate::origin(COUNTER);
             let mut reports = Lifecycle::default();
+            let mut question = None;
             let mut first_title = true;
             let mut first_resize = true;
             let mut attached = Some(attached);
             let failure = loop {
                 let mut slot = watched.lock().unwrap();
                 let Some(connection) = slot.as_mut() else { return };
+                let answer = received.try_recv().ok();
+                if let Some((query, deadline)) = question {
+                    let choice = if Instant::now() >= deadline { Some(false) } else {
+                        answer.filter(|a| a.query == query).map(|a| a.leave)
+                    };
+                    if let Some(leave) = choice {
+                        let reply = limen::web_island::UnloadAnswer { query, leave };
+                        if !reports.answer(reply) || connection.send(embed, reply.encode()).is_err() {
+                            break Some(WidgetFailure::Exit);
+                        }
+                        question = None;
+                        unload(query, false);
+                        eprintln!("navigatord: widget unload {query} leave={leave}");
+                    }
+                }
                 match connection.poll(Duration::from_millis(40)) {
                     Ok(Some(ParentEvent::Attached { embed: id })) if id == embed => {
                         if let Some(report) = attached.take() { report(); }
@@ -90,6 +109,10 @@ impl Widget {
                         match reports.receive(&bytes) {
                             Some(Report::Started { origin }) if granted_origin.as_deref() == Some(origin) => {
                                 eprintln!("navigatord: widget reported start for {origin}");
+                            }
+                            Some(Report::BeforeUnload { query }) => {
+                                question = Some((query, Instant::now() + Duration::from_secs(30)));
+                                unload(query, true);
                             }
                             Some(Report::Title(title)) if first_title => {
                                 eprintln!("navigatord: initial widget title received ({} bytes)", title.len());
@@ -131,6 +154,7 @@ impl Widget {
             document,
             press,
             parent,
+            answers,
             embed,
         })
     }

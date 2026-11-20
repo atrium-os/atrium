@@ -263,6 +263,7 @@ pub enum Out {
     Discard { id: u32 },
     /// Open that file in the person's app for it (§6.4), with the press.
     OpenFile { id: u32, press: navigator_control::Press },
+    AnswerUnload { start: navigator_control::Press, query: u32, leave: bool, press: navigator_control::Press },
     StartWidget { page: (u64, PageId), key: u32, src: String, press: navigator_control::Press },
     RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
     /// Hand a link to its program (§6.4, threat model §2.10).
@@ -748,7 +749,7 @@ impl Shell {
     /// removes queued rows, leaving unrelated questions in their original order.
     pub fn widget_placement(&mut self, page: (u64, PageId), island: Option<u32>, rect: Option<[f32; 4]>, now: f64) -> bool {
         let Some(page) = self.store.page_by_key_mut(page.0, page.1) else { return false };
-        let matches = |p: &Prompt| matches!(p, Prompt::Widget { key, .. } | Prompt::WidgetFailed { key, .. } if island.is_none_or(|id| id == *key));
+        let matches = |p: &Prompt| matches!(p, Prompt::Widget { key, .. } | Prompt::WidgetUnload { key, .. } | Prompt::WidgetFailed { key, .. } if island.is_none_or(|id| id == *key));
         if let Some(new_rect) = rect {
             let rows = page.asked.iter_mut().map(|a| &mut a.prompt).chain(page.prompts.queued.iter_mut());
             for row in rows {
@@ -770,6 +771,15 @@ impl Shell {
             return true;
         }
         before != page.prompts.queued.len()
+    }
+
+    pub fn clear_unload(&mut self, key: (u64, PageId), start: navigator_control::Press, query: Option<u32>, now: f64) {
+        let Some(page) = self.store.page_by_key_mut(key.0, key.1) else { return };
+        let matches = |p: &Prompt| matches!(p, Prompt::WidgetUnload { start: id, query: q, .. } if *id == start && query.is_none_or(|n| n == *q));
+        page.prompts.queued.retain(|p| !matches(p));
+        if page.asked.as_ref().is_some_and(|a| matches(&a.prompt)) {
+            page.asked = (!page.prompts.queued.is_empty()).then(|| Asked { prompt: page.prompts.queued.remove(0), since_ms: now });
+        }
     }
 
     /// Whether something of the UI's own covers the prompt row (the
@@ -847,6 +857,9 @@ impl Shell {
                 if let Some(page) = key {
                     self.outbox.push(Out::StartWidget { page, key: *island, src: src.clone(), press });
                 }
+            }
+            (Prompt::WidgetUnload { start, query, .. }, "Leave" | "Stay") if live => {
+                self.outbox.push(Out::AnswerUnload { start: *start, query: *query, leave: what == "Leave", press });
             }
             (Prompt::RunLive, "Run live") if live => {
                 if let Some(url) = self.shown_url() {

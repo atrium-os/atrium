@@ -15,8 +15,9 @@ parser.add_argument("--tier", action="store_true", help="check live-part transit
 parser.add_argument("--recycle", action="store_true", help="use counter-recycle.html, a 10-second idle timeout and UI AX")
 parser.add_argument("--reports", action="store_true", help="verify the counter's typed origin and title on both launches")
 parser.add_argument("--lifecycle", action="store_true", help="use the pinned counter-lifecycle fixture with UI AX")
+parser.add_argument("--unload", action="store_true", help="use the pinned counter-unload fixture with UI AX")
 args = parser.parse_args()
-if args.reports or args.lifecycle:
+if args.reports or args.lifecycle or args.unload:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -31,8 +32,8 @@ def press(x, y):
     guest("nc -N -U input.sock", f"MOVE {x} {y}\nBTN 1 1\nBTN 1 0\n".encode())
 
 
-def wait_for(label, check):
-    deadline = time.monotonic() + 12
+def wait_for(label, check, timeout=12):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if check():
             return
@@ -191,6 +192,45 @@ def lifecycle():
         raise RuntimeError("unexpected worker or parent identity after restart")
     print(f"Requested {int(match[1])}x{int(match[2])}. The compositor kept the 640x360 slot.")
     print("Finish retired the worker. Guarded Start reopened Count 0 on the same parent.")
+
+
+def unload():
+    before = parent()
+    start(0)
+    count("opened", 0)
+    tier(True)
+    worker = guest("pgrep -x counter")
+    for n, answer in [(1, "Stay"), (2, "Timeout"), (3, "Leave")]:
+        press(350, 118)
+        count(f"count-{n}", n)
+        time.sleep(1.05)  # The page prompt rate limit is one per second.
+        press(434, 118)
+        wait_for("missing signed unload prompt", lambda: log().count(b"prompt=widget-unload ") >= n
+                 and b"Leave the widget from https://widget.example?" in log())
+        time.sleep(.65)
+        frame(f"question-{n}")
+        if answer != "Timeout":
+            press(1074 if answer == "Stay" else 1008, 60)
+        expected = f"widget unload {n} leave={str(answer == 'Leave').lower()}".encode()
+        wait_for("missing broker decision", lambda: expected in log(), 35 if answer == "Timeout" else 12)
+        if answer != "Leave":
+            count(f"stayed-{n}", n)
+            tier(True)
+            if guest("pgrep -x counter") != worker or b"widget reported voluntary close" in log():
+                raise RuntimeError("Stay retired or replaced the worker")
+    wait_for("worker remained after Leave", lambda: not guest("pgrep -x counter || true"))
+    tier(False)
+    frame("closed")
+    report = log()
+    if (parent() != before or report.count(b"widget reported voluntary close") != 1
+            or report.count(b"widget GET ") != 1 or b"prompt=widget-failed" in report):
+        raise RuntimeError("unexpected parent, reload or retirement outcome")
+    print(f"Stay preserved worker {int(worker)} at Count 1; timeout preserved Count 2. Increment reached 3, then Leave retired it exactly once.")
+
+
+if args.unload:
+    unload()
+    raise SystemExit(0)
 
 
 if args.lifecycle:

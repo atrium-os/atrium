@@ -54,7 +54,7 @@ document and an embed-only Fresco connection. See
 - **Not a pixel channel.** The parent never receives the child's pixels, and the child never
   receives the parent's.
 
-The broker-fetched web-island role validates child reports against the attachment and session state. Its wire limits and message directions are in [Navigator islands §5](navigator-islands.md#i2-installed-island-reports).
+The broker-fetched web-island role validates child reports against the attachment and session state. Its parent may answer one outstanding unload question using the matching number. Its wire limits and message directions are in [Navigator islands §5](navigator-islands.md#i2-installed-island-reports).
 
 ## 1. Architecture
 

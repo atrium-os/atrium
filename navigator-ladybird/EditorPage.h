@@ -6,6 +6,8 @@
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #endif
 
+struct NavigatorScene;
+
 namespace Navigator {
 
 // A single-page client for the offline I0 fixture. Its owner drives the event
@@ -34,6 +36,8 @@ public:
 #ifdef ATRIUM_I1_COUNTER
     void page_did_request_unload_check(Web::HTML::CrossProcessId, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;
     void page_did_request_history_operation(Web::HTML::CrossProcessId, Web::HistoryOperationParameters) override;
+    void page_did_request_before_unload(String const&) override;
+    ::NavigatorScene* island_scene { nullptr };
     void page_did_close() override { closed = true; }
     bool closed { false };
 #endif

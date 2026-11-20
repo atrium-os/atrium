@@ -94,6 +94,7 @@ struct ActiveWidget {
 
 impl ActiveWidget {
     fn set_origin(self, shell: &mut Shell, origin: Option<String>) {
+        if origin.is_none() { shell.clear_unload(self.page, self.press, None, crate::ui::now_ms()); }
         if let Some(page) = shell.store.page_by_key_mut(self.page.0, self.page.1) {
             page.attached_origin = origin;
         }
@@ -699,6 +700,21 @@ impl Live {
                         active.set_origin(s, Some(origin));
                     }
                 }
+                Event::WidgetUnload { document, start, query, pending } => {
+                    if let Some(active) = self.widget.filter(|w| w.document == document && w.press == start) {
+                        if pending {
+                            let origin = s.store.page_by_key_mut(active.page.0, active.page.1)
+                                .and_then(|page| page.attached_origin.clone());
+                            let shown = self.shown == Some(active.page) && origin.is_some_and(|origin| s.ask_at(active.page,
+                                crate::trail::Prompt::WidgetUnload { key: active.key, start, query, origin }, crate::ui::now_ms()));
+                            if !shown {
+                                send(&mut self.w, &Request::WidgetUnloadAnswer { document, start, query, leave: false, press: [0; 16] });
+                            }
+                        } else {
+                            s.clear_unload(active.page, start, Some(query), crate::ui::now_ms());
+                        }
+                    }
+                }
                 Event::WidgetStopped { document, press } => {
                     if let Some(active) = retire_widget(&mut self.widget, document, press) {
                         active.set_origin(s, None);
@@ -978,6 +994,11 @@ impl Live {
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                Out::AnswerUnload { start, query, leave, press } => {
+                    if let Some(a) = self.widget.filter(|a| a.press == start && self.shown == Some(a.page)) {
+                        send(&mut self.w, &Request::WidgetUnloadAnswer { document: a.document, start, query, leave, press });
+                    }
+                }
                 Out::StartWidget { page, key, src, press } => {
                     if let Some((document, rect)) = self.widget_bounds(s, page, key, Some(&src)) {
                         send(&mut self.w, &Request::StartWidget { document, source: src, rect, press });

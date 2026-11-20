@@ -198,6 +198,7 @@ pub enum Request {
     StartWidget { document: Ticket, source: String, rect: [u32; 4], press: Press },
     PlaceWidget { document: Ticket, rect: Option<[u32; 4]> },
     ShowDocument { url: String, document: Ticket },
+    WidgetUnloadAnswer { document: Ticket, start: Press, query: u32, leave: bool, press: Press },
 }
 
 /// The single whole-page fixture granted during I0.
@@ -357,6 +358,7 @@ pub enum Event {
     WidgetStopped { document: Ticket, press: Press },
     /// Limen confirmed the slot bind. Origin comes from the broker’s fetch grant.
     WidgetAttached { document: Ticket, press: Press, origin: String },
+    WidgetUnload { document: Ticket, start: Press, query: u32, pending: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

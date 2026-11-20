@@ -113,14 +113,15 @@ from the island (threat model §2.9).
 
 ### I2 installed island reports
 
-For a broker-fetched web island, Limen accepts four reports from the
+For a broker-fetched web island, Limen accepts lifecycle reports from the
 bound child. A session opens with one `Started { origin }`. While running,
 it may report `Title` and `Resize { width, height }` and can finish once with
 `Ended(Closed | Failed)`. Frames use postcard, consume the whole payload,
 and fit in 512 bytes. The HTTPS origin field is limited to 255 ASCII bytes,
 the title to 256 UTF-8 bytes without control characters, and each dimension
-to 1 through 16384. Limen refuses descriptors and parent-to-child data
-messages on this channel. Its existing per-embed message rate limit applies.
+to 1 through 16384. A running worker may also issue one numbered
+`BeforeUnload` question at a time. Its matching unload answer is the only
+parent-to-child payload. Limen refuses descriptors. Its existing per-embed message rate limit applies.
 The older editor measurement fixture uses a separate request without a fetch
 channel and retains its exact child `frame` and parent `advance` markers.
 
@@ -166,6 +167,31 @@ This check reads compositor frames with Pillow. The Limen unit tests also
 check all 7,776 length-five sequences over six representative reports and
 title lengths 0–513, including truncated frames. Evidence is in
 `~/atrium-vm/evidence/navigator-i2-worker-lifecycle-20261120/`.
+
+### I2 cancelling a widget unload
+
+After placement and brokered fetch, the single-document host initializes the
+counter’s LibWeb page as visible. LibWeb applies its own eligibility checks,
+including prior user interaction, before it requests a before-unload dialog.
+The engine sends only a question number. Navigator’s signed prompt row uses
+the attached widget’s broker-confirmed origin and offers **Leave** and **Stay**.
+The broker requires a fresh compositor press for Leave. The answer is scoped
+to the document, the original Start receipt and the outstanding question.
+Limen rejects unsolicited answers and duplicate or reused question numbers.
+
+Stay resumes the pending LibWeb unload check with a negative answer. An
+unavailable prompt or 30 seconds without an answer also chooses Stay.
+The engine bounds its wait at 45 seconds. Leave resumes the same check
+with an affirmative answer and the normal close traversal sends `Ended(Closed)`.
+
+The installed arm64 Tessera gate used a dirty counter whose real
+`beforeunload` handler called `preventDefault()`. Stay preserved Count 1,
+the unanswered prompt preserved Count 2, and a subsequent Increment reached
+3 on the same PID. Leave retired the worker once. The page used one widget
+GET, the tier returned to Static, and the parent and viewer kept their PIDs.
+To repeat, pin and serve `counter-unload.html` as `counter.html` using the
+worker lifecycle setup above and pass `--unload` to the installed gate.
+Evidence is in `~/atrium-vm/evidence/navigator-i2-unload-cancel-20261121/`.
 
 ## 6. Media
 

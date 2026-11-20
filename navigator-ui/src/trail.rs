@@ -169,6 +169,7 @@ pub enum Prompt {
     FetchAgain,
     RunLive,
     Widget { runnable: bool, key: u32, src: String, origin: String, rect: [f32; 4] },
+    WidgetUnload { key: u32, start: navigator_control::Press, query: u32, origin: String },
     WidgetFailed { key: u32, failure: navigator_control::WidgetFailure },
     Play { origin: String },
     /// A link for another program (`mailto:`, an allowlisted scheme;
@@ -207,6 +208,7 @@ impl Prompt {
             // Open: in the person's app for it, through portcullisd.
             Prompt::Download { .. } => &["Cancel", "Open", "Save"],
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
+            Prompt::WidgetUnload { .. } => &["Leave", "Stay"],
             Prompt::Widget { runnable: true, .. } => &["Not now", "Start"],
             Prompt::Widget { .. } | Prompt::WidgetFailed { .. } => &["Close"],
             Prompt::RunLive => &["Not now", "Run live"],
@@ -225,6 +227,7 @@ impl Prompt {
             Prompt::Download { file, origin, .. } => format!("download {origin} {file}"),
             Prompt::NotPrivate { origin } => format!("not-private {origin}"),
             Prompt::RunLive => "run-live".into(),
+            Prompt::WidgetUnload { key, .. } => format!("widget unload {key}"),
             Prompt::Widget { key, .. } | Prompt::WidgetFailed { key, .. } => format!("widget {key}"),
             Prompt::FetchAgain => "fetch-again".into(),
             Prompt::Play { origin } => format!("play {origin}"),

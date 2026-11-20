@@ -673,7 +673,7 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     if s.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
-    if e.role.name == "web-island" && (e.island.is_some() || s.bytes != b"advance") {
+    if e.role.name == "web-island" && e.island.is_none() && s.bytes != b"advance" {
         return Err(Reply::Refused { reason: refusal::MALFORMED });
     }
     if fd.is_some() && !e.role.takes_fd {
@@ -699,6 +699,10 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     // A descriptor counts like any message.
     if !e.to_child.take(Instant::now()).0 {
         return Err(Reply::Refused { reason: refusal::RATE });
+    }
+    if let Some(state) = &mut e.island {
+        let accepted = e.bound && crate::web_island::UnloadAnswer::decode(&s.bytes).is_some_and(|a| state.answer(a));
+        if !accepted { return Err(Reply::Refused { reason: refusal::MALFORMED }); }
     }
     let e = &st.embeds[&s.embed];
     match fd {

@@ -766,6 +766,7 @@ pub mod host {
         previous: NodeTree,
         pointer: Option<(f32, f32)>,
         interactive_island: bool,
+        unload_query: u32,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -852,6 +853,29 @@ pub mod host {
             }
         }
         true
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_counter_before_unload(state: &mut SceneState) -> bool {
+        use limen::proto::ChildEvent;
+        use limen::web_island::{Report, UnloadAnswer};
+        let Some((child, embed, _)) = &state.embed else { return false };
+        let Some(query) = state.unload_query.checked_add(1) else { return false };
+        state.unload_query = query;
+        let Some(bytes) = (Report::BeforeUnload { query }).encode() else { return false };
+        let mut child = child.borrow_mut();
+        if child.emit(*embed, bytes).is_err() { return false; }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match child.poll(left) {
+                Ok(Some(ChildEvent::Message { embed: id, bytes })) if id == *embed => {
+                    if let Some(a) = UnloadAnswer::decode(&bytes).filter(|a| a.query == query) { return a.leave; }
+                }
+                Ok(Some(ChildEvent::Resumed { .. })) => {}
+                _ => break,
+            }
+        }
+        false
     }
 
     #[unsafe(no_mangle)]

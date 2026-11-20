@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Counter</title>
+<style>
+body { margin: 0; padding: 16px; font: 18px sans-serif; background: white; color: black }
+button { font: inherit; padding: 8px }
+</style>
+<button type="button" id="increment">Increment</button>
+<button type="button" id="finish">Finish</button>
+<p id="count">Count 0</p>
+
+<script>
+let count = 0;
+document.getElementById("increment").addEventListener("click", () => {
+    document.body.style.width = "884px";
+    document.getElementById("count").textContent = "Count " + (++count);
+});
+window.addEventListener("beforeunload", event => {
+    if (count > 0) event.preventDefault();
+});
+document.getElementById("finish").onclick = () => window.close();
+</script>

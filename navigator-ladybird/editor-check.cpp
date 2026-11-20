@@ -104,6 +104,8 @@ int main(int argc, char** argv)
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
     if (!fetch_fixture(client->page(), URL::Parser::basic_parse(location).value()))
         return 4;
+    // The broker placed this counter before delivering its granted document.
+    client->page().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
     auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);
     if (result.is_error()) return 4;
     auto document = client->page().local_traversable()->active_document();
@@ -111,6 +113,7 @@ int main(int argc, char** argv)
     auto title = document->title().to_well_formed_utf8();
     if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count()))
         return 4;
+    client->island_scene = scene;
     auto status = Navigator::drive_page(*client, scene, loop);
     navigator_counter_ended(scene, status != 0);
     return status;

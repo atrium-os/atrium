@@ -919,7 +919,20 @@ fn fetched_island_reports_follow_attachment_direction_and_lifecycle() {
     let mut padded = started.clone();
     padded.push(0);
     assert_eq!(refused(child.emit(id, padded)), refusal::MALFORMED);
-    for bytes in [started.clone(), title.clone(), Report::Resize { width: 640, height: 360 }.encode().unwrap(),
+    child.emit(id, started.clone()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes: started.clone() });
+    let ask = Report::BeforeUnload { query: 3 }.encode().unwrap();
+    let reply = limen::web_island::UnloadAnswer { query: 3, leave: false }.encode();
+    assert_eq!(refused(app.send(id, reply.clone())), refusal::MALFORMED);
+    child.emit(id, ask.clone()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes: ask.clone() });
+    assert_eq!(refused(child.emit(id, ask)), refusal::MALFORMED);
+    assert_eq!(refused(app.send(id, limen::web_island::UnloadAnswer { query: 2, leave: true }.encode())), refusal::MALFORMED);
+    app.send(id, reply.clone()).unwrap();
+    assert_eq!(next_c(&mut child), ChildEvent::Message { embed: id, bytes: reply.clone() });
+    assert_eq!(refused(app.send(id, reply)), refusal::MALFORMED);
+    assert_eq!(refused(child.emit(id, Report::BeforeUnload { query: 3 }.encode().unwrap())), refusal::MALFORMED);
+    for bytes in [title.clone(), Report::Resize { width: 640, height: 360 }.encode().unwrap(),
                   Report::Ended(EndReason::Closed).encode().unwrap()] {
         child.emit(id, bytes.clone()).unwrap();
         assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes });

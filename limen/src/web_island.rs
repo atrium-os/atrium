@@ -12,6 +12,7 @@ pub enum Report<'a> {
     Title(&'a str),
     Resize { width: u16, height: u16 },
     Ended(EndReason),
+    BeforeUnload { query: u32 },
 }
 
 impl Report<'_> {
@@ -22,6 +23,7 @@ impl Report<'_> {
             Self::Title(text) => text.len() <= 256 && !text.chars().any(char::is_control),
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
             Self::Ended(_) => true,
+            Self::BeforeUnload { query } => *query != 0,
         }
     }
 
@@ -35,20 +37,45 @@ impl Report<'_> {
 pub enum Lifecycle {
     #[default]
     Waiting,
-    Running,
+    Running { last_query: u32 },
+    AwaitingUnload(u32),
     Ended,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UnloadAnswer { pub query: u32, pub leave: bool }
+
+impl UnloadAnswer {
+    pub fn encode(self) -> Vec<u8> {
+        let mut bytes = vec![b'U'];
+        bytes.extend(self.query.to_le_bytes());
+        bytes.push(u8::from(self.leave));
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let &[b'U', a, b, c, d, flag @ 0..=1] = bytes else { return None };
+        Some(Self { query: u32::from_le_bytes([a, b, c, d]), leave: flag == 1 })
+    }
+}
+
 impl Lifecycle {
+    pub fn answer(&mut self, answer: UnloadAnswer) -> bool {
+        if !matches!(*self, Self::AwaitingUnload(query) if query == answer.query) { return false; }
+        *self = Self::Running { last_query: answer.query };
+        true
+    }
+
     /// Reject malformed or out-of-order reports without changing the session.
     pub fn receive<'a>(&mut self, bytes: &'a [u8]) -> Option<Report<'a>> {
         if bytes.len() > MAX_FRAME { return None; }
         let (report, rest) = postcard::take_from_bytes::<Report>(bytes).ok()?;
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
-            (Self::Waiting, Report::Started { .. }) => Self::Running,
-            (Self::Running, Report::Title(_) | Report::Resize { .. }) => Self::Running,
-            (Self::Running, Report::Ended(_)) => Self::Ended,
+            (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. }) => running,
+            (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
+            (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
         };
         Some(report)
@@ -65,7 +92,7 @@ mod tests {
         for report in [Report::Title(&long), Report::Title("a\nb"), Report::Resize { width: 0, height: 1 },
                        Report::Resize { width: 1, height: 16385 }, Report::Started { origin: "https://a/path" }] {
             assert!(report.encode().is_none());
-            let mut state = if matches!(report, Report::Started { .. }) { Lifecycle::Waiting } else { Lifecycle::Running };
+            let mut state = if matches!(report, Report::Started { .. }) { Lifecycle::Waiting } else { Lifecycle::Running { last_query: 0 } };
             assert!(state.receive(&postcard::to_stdvec(&report).unwrap()).is_none());
         }
         assert!(Report::Title(&"x".repeat(256)).encode().is_some());
@@ -101,8 +128,8 @@ mod tests {
             let text = "x".repeat(n);
             let report = Report::Title(&text);
             let bytes = postcard::to_stdvec(&report).unwrap();
-            assert_eq!(Lifecycle::Running.receive(&bytes), (n <= 256).then_some(report));
-            assert!(Lifecycle::Running.receive(&bytes[..bytes.len()-1]).is_none());
+            assert_eq!((Lifecycle::Running { last_query: 0 }).receive(&bytes), (n <= 256).then_some(report));
+            assert!((Lifecycle::Running { last_query: 0 }).receive(&bytes[..bytes.len()-1]).is_none());
         }
     }
 

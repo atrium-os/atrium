@@ -1574,9 +1574,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     widget = None;
                     let granted_origin = origin(widget::COUNTER).ok_or("invalid island grant origin")?;
                     let on_attach = w.clone();
+                    let on_unload = w.clone();
                     let writer = w.clone();
                     widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, press, rect, cfg.clone(),
                         move || send(&on_attach, &Event::WidgetAttached { document, press, origin: granted_origin }),
+                        move |query, pending| send(&on_unload, &Event::WidgetUnload { document, start: press, query, pending }),
                         move |failure| send(&writer, &match failure {
                             Some(failure) => Event::WidgetFailed { document, press, failure },
                             None => Event::WidgetStopped { document, press },
@@ -1587,6 +1589,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     Err(why) => {
                         eprintln!("navigatord: widget start: {why}");
                         send(&w, &Event::WidgetFailed { document, press, failure: ctl::WidgetFailure::Start });
+                    }
+                }
+            }
+            Request::WidgetUnloadAnswer { document, start, query, leave, press } => {
+                if let Some(active) = widget.as_ref().filter(|a| a.document == document && a.press == start) {
+                    let accepted = leave && spend(press).is_ok();
+                    if let Err(err) = active.answers.try_send(limen::web_island::UnloadAnswer { query, leave: accepted }) {
+                        eprintln!("navigatord: widget unload answer: {err}");
                     }
                 }
             }

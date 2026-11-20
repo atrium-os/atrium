@@ -39,6 +39,12 @@ EditorPage::EditorPage(Gfx::Palette palette)
 }
 
 #ifdef ATRIUM_I1_COUNTER
+extern "C" bool navigator_counter_before_unload(NavigatorScene*);
+void EditorPage::page_did_request_before_unload(String const&)
+{
+    page().before_unload_closed(island_scene && navigator_counter_before_unload(island_scene));
+}
+
 void EditorPage::page_did_request_unload_check(Web::HTML::CrossProcessId id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>> done)
 {
     // The counter hosts one local document. LibWeb checks its unload handlers.
