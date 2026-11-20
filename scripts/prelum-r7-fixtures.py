@@ -16,7 +16,14 @@ def sheets(output):
         return '<Relationships xmlns="'+p+'">'+''.join(f'<Relationship Id="{i}" Type="{r}/{kind}" Target="{dst}"/>' for i,kind,dst in parts)+'</Relationships>'
     def chunk(t,b):
         return struct.pack('>I',len(b))+t+b+struct.pack('>I',zlib.crc32(t+b))
-    png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',24,18,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(b''.join(b'\0'+b'\xff\x00\xdd'*12+b'\x00\xcd\xad'*12 for _ in range(18))))+chunk(b'IEND',b'')
+    def png(width, height, left, right):
+        header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        row = b"\0" + left * (width // 2) + right * (width - width // 2)
+        return (
+            b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(row * height)) + chunk(b"IEND", b"")
+        )
+
     def corner(tag,col,row):
         return f'<xdr:{tag}><xdr:col>{col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:{tag}>'
     def picture(col,row,w,h,ref="image"):
@@ -28,14 +35,17 @@ def sheets(output):
         z.writestr('_rels/.rels',rel(('book','officeDocument','xl/workbook.xml')))
         z.writestr('xl/workbook.xml',f'<workbook xmlns="{m}" xmlns:r="{r}"><sheets><sheet name="Data" sheetId="1" r:id="data"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">Data!$A$1:$I$26</definedName></definedNames></workbook>')
         z.writestr('xl/_rels/workbook.xml.rels',rel(('data','worksheet','worksheets/sheet1.xml')))
-        rows='<row r="1"><c r="A1" t="inlineStr"><is><t>Proof</t></is></c></row>'+''.join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>{label}</t></is></c><c r="B{i}"><v>{val}</v></c></row>' for i,label,val in [(2,'North',4),(3,'South',7),(4,'West',5)])
+        rows='<row r="1"><c r="A1" t="inlineStr"><is><t>Proof</t></is></c><c r="J1" t="inlineStr"><is><t>OUTRIGHT</t></is></c></row>'+''.join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>{label}</t></is></c><c r="B{i}"><v>{val}</v></c></row>' for i,label,val in [(2,'North',4),(3,'South',7),(4,'West',5)])
+        rows += '<row r="27"><c r="A27" t="inlineStr"><is><t>OUTBELOW</t></is></c></row>'
         z.writestr('xl/worksheets/sheet1.xml',f'<worksheet xmlns="{m}" xmlns:r="{r}"><sheetData>{rows}</sheetData><drawing r:id="d"/></worksheet>')
         z.writestr('xl/worksheets/_rels/sheet1.xml.rels',rel(('d','drawing','../drawings/drawing1.xml')))
-        z.writestr('xl/drawings/drawing1.xml',f'<xdr:wsDr xmlns:xdr="{d}/spreadsheetDrawing" xmlns:a="{d}/main" xmlns:c="{d}/chart" xmlns:r="{r}">{chart_anchor}{picture(2,18,144,72)}{picture(5,18,96,72,"photo")}{picture(12,18,144,72)}</xdr:wsDr>')
-        z.writestr('xl/drawings/_rels/drawing1.xml.rels',rel(('chart','chart','../charts/chart1.xml'),('image','image','../media/picture.png'),('photo','image','../media/photo.png')))
+        z.writestr('xl/drawings/drawing1.xml',f'<xdr:wsDr xmlns:xdr="{d}/spreadsheetDrawing" xmlns:a="{d}/main" xmlns:c="{d}/chart" xmlns:r="{r}">{chart_anchor}{picture(2,18,144,72)}{picture(5,18,96,72,"photo")}{picture(12,18,144,72,"outside")}</xdr:wsDr>')
+        z.writestr('xl/drawings/_rels/drawing1.xml.rels',rel(('chart','chart','../charts/chart1.xml'),('image','image','../media/picture.png'),('photo','image','../media/photo.png'),('outside','image','../media/outside.png')))
         z.writestr('xl/charts/chart1.xml',chart)
-        z.writestr('xl/media/picture.png',png)
-        z.writestr('xl/media/photo.png', png)
+        z.writestr("xl/media/picture.png", png(24, 18, bytes.fromhex("ff00dd"), bytes.fromhex("00cdad")))
+        z.writestr("xl/media/photo.png", png(31, 19, bytes.fromhex("ff9900"), bytes.fromhex("2060ff")))
+        z.writestr("xl/media/outside.png", png(17, 13, bytes.fromhex("111111"), bytes.fromhex("eeeeee")))
+
 
 
 def slides(output):

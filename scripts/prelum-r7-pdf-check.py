@@ -31,9 +31,11 @@ pages = pages_of(sheets)
 assert len(pages) == 1, len(pages)
 for token in ("Quarterly Chart Proof", "North 4", "South 7", "West 5"):
     assert token in pages[0], pages[0]
+assert "OUTRIGHT" not in pages[0] and "OUTBELOW" not in pages[0], pages[0]
 images = subprocess.check_output(["pdfimages", "-list", str(sheets)], text=True)
-assert len(re.findall(r"^\s*1\s+\d+\s+image\s+", images, re.M)) == 2, images
-print("Sheets: one page with saved-area cells, chart title, and two images")
+sizes = re.findall(r"^\s*1\s+\d+\s+image\s+(\d+)\s+(\d+)\s+", images, re.M)
+assert sorted(sizes) == [("24", "18"), ("31", "19")], images
+print("Sheets: saved-area cells, chart and both distinct pictures; outside cells and picture omitted")
 
 groups = [
     re.findall(r"(FIRST|SECOND|THIRD|FOURTH|HIDDEN) SLIDE", page)
