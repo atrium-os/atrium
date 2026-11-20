@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-rebind-tls) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=18 ;;
     esp-loss-hip-active-refresh-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=17 ;;
     esp-loss-hip-active-refresh-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=16 ;;
     esp-loss-hip-active-refresh-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=15 ;;
@@ -1071,8 +1072,12 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                         fail "active refresh retry prompted or changed the report"
                                     ok "unchanged HIP refreshed silently after active refresh retry"
                                     probe "IPv4 echo after silent refresh on the retry ESP association"
-                                    if [ "$retry_hip_submit" = 17 ]; then
+                                    if [ "$retry_hip_submit" -ge 17 ]; then
                                         rebind_restored_forwarding 11 "$retry_report"
+                                        if [ "$retry_hip_submit" = 18 ]; then
+                                            [ "$("$V" "grep -o 'GlobalProtect data transport: TLS' $G/cryptad.log | wc -l | tr -d ' '")" = 3 ] ||
+                                                fail "the rebound timer-refresh retry did not select TLS"
+                                        fi
                                         before_refresh=$(awk 'END { print NR }' "$receipts")
                                         wait_receipts "$((before_refresh + 1))"
                                         [ "$(field signin)" = in ] &&

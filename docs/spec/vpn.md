@@ -1023,6 +1023,11 @@ another origin. An active portal-profile session stays in engine memory.
   resumes on another ESP association. The next timer refresh is
   silent and IPv4 traffic continues. The extended FreeBSD arm64 gate
   passed 61/61 using the shared Cargo cache.
+  The `--hip esp-loss-hip-active-refresh-rebind-tls` variant drops
+  the last rebind's ESP probes. The gateway acknowledges the same report
+  before opening TLS, and the next refresh stays silent while IPv4
+  traffic continues over TLS. The FreeBSD arm64 gate passed 61/61
+  using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
