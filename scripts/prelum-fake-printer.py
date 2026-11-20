@@ -22,6 +22,7 @@ import time
 import uuid
 
 A = argparse.ArgumentParser()
+A.add_argument("--bind", default="0.0.0.0")
 A.add_argument("--port", type=int, required=True)
 A.add_argument("--state", required=True)
 A.add_argument("--spool", required=True)
@@ -222,7 +223,7 @@ class H(http.server.BaseHTTPRequestHandler):
 
 os.makedirs(ARGS.spool, exist_ok=True)
 http.server.ThreadingHTTPServer.allow_reuse_address = True
-srv = http.server.ThreadingHTTPServer(("0.0.0.0", ARGS.port), H)
+srv = http.server.ThreadingHTTPServer((ARGS.bind, ARGS.port), H)
 if ARGS.tls_cert:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(ARGS.tls_cert, ARGS.tls_key)

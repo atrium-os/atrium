@@ -6007,6 +6007,47 @@ Print service (R2, spec §11.2), against the same oracle:
   then `prelumctl --socket S add ipps://HOST/ipp/print`, `print FILE
   --printer 1 [--wait]`, `jobs`, `cancel N`, `repin 1`.
 
+#### R7 four-app desktop IPPS gate
+
+Run from a checkout of the revision under test:
+
+```sh
+sh scripts/prelum-r7-vm.sh BASE_QCOW2 EFI_CODE EFI_VARS SSH_KEY ARM64_BIN_DIR
+```
+
+Use an idle, bootable Atrium arm64 qcow2 with root SSH, the Atrium jaild,
+network and Prelum worker services installed, and a test bundle signing
+key at `/root/of-key.pem` whose publisher is trusted in that image. The
+service accounts `_limen` (65022) and `_prelum-sheet` (65046) must exist.
+The harness provisions the synthetic app identities and viewer inside
+the overlay. The base image stays read-only. Supply separate EFI variable
+storage from the base image and its matching EFI firmware.
+
+Build on the host using §4. For each crate below, use
+`cargo build --locked --release --target aarch64-unknown-freebsd` with the
+indicated binary or example selector. Copy the resulting executables
+(or symlink them) into one flat directory named by `ARM64_BIN_DIR`.
+
+| Crate directory | Executables |
+|---|---|
+| `scrinium`, `atrium-sheets`, `atrium-slides`, `mail/atrium-mail` | `scrinium`, `atrium-sheets`, `atrium-slides`, `atrium-mail` |
+| `mail/atrium-mail` | `--example prelum-print-fixture` (under `release/examples/`) |
+| `mail/mail-parse` | `mail-parse-jail` |
+| `officina-convert`, `navigator-page`, `frescod`, `limen` | `officina-convert`, `navigator-page`, `frescod`, `limend` |
+| `prelum`, `prelum-sheet` | `atrium-prelumd`, `prelumctl`, `atrium-prelum-sheet` |
+
+The host needs QEMU, Python 3, OpenSSL and Poppler. The default QEMU
+settings are HVF and `-cpu host`. Set `PRELUM_R7_ACCEL` and `PRELUM_R7_CPU`
+for another arm64 host. `PRELUM_R7_SSH_PORT` and `PRELUM_R7_IPPS_PORT` default
+to 6329 and 19329. The gate starts and powers down its own guest and uses
+a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
+log, build hashes and verdicts under the printed artifact directory.
+Prelum must reach Done for each desktop job with an observed jailed IPP
+worker. Poppler checks the original Quick Look document after pathname
+replacement, the Sheets print area with chart and pictures, Slides
+handout ordering and hidden-slide exclusion, and Mail body and
+attachment filename without the attachment payload.
+
 ### 13.9 Shared-checkout hygiene
 
 Several threads push to `main` from the cloud and from the Mac.
