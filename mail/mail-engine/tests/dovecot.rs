@@ -710,11 +710,63 @@ fn imap_inbox_append_from_another_client_is_unverified() {
     let mut writer = Session::start(courier(&dc)).unwrap();
     let uid = writer.append("INBOX", &[], raw).unwrap().expect("Dovecot APPENDUID");
     writer.logout().unwrap();
+    assert_inbox_message_unverified(&dc, uid, "Appended by another client", raw);
+}
 
+#[test]
+fn imap_inbox_uid_copy_from_another_client_is_unverified() {
+    use std::io::{BufRead, BufReader, Write};
+    use mail_proto::imap::{Code, Decoder, Limits, Response, Status};
+
+    let Some(dc) = start_dovecot_with_inbox(0) else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let raw = b"Authentication-Results: edge.example; dmarc=pass header.from=example.net\r\n\
+        From: sender@example.net\r\nSubject: Copied by another client\r\n\r\nFrom Sent.\r\n";
+    let mut source = Session::start(courier(&dc)).unwrap();
+    let source_uid = source.append("Sent", &[], raw).unwrap().expect("Dovecot APPENDUID");
+    source.logout().unwrap();
+
+    // Speak IMAP as an independent writer. Mail's public session API does
+    // not expose copy on its own, and MOVE would exercise a different path.
+    let mut writer = BufReader::new(courier(&dc));
+    let mut decoder = Decoder::new(Limits::default());
+    let mut read = |writer: &mut BufReader<UnixStream>| {
+        let mut line = Vec::new();
+        assert_ne!(writer.read_until(b'\n', &mut line).unwrap(), 0, "unexpected IMAP EOF");
+        decoder.feed(&line);
+        decoder.next().expect("complete IMAP response").unwrap()
+    };
+    assert!(matches!(read(&mut writer), Response::State { status: Status::PreAuth, .. }));
+    let mut command = |tag: &str, request: &str| {
+        write!(writer.get_mut(), "{tag} {request}\r\n").unwrap();
+        for _ in 0..32 {
+            if let Response::Tagged { tag: actual, status, code, text } = read(&mut writer) {
+                assert_eq!(actual, tag);
+                assert_eq!(status, Status::Ok, "{request}: {text}");
+                return code;
+            }
+        }
+        panic!("no tagged IMAP response to {request}");
+    };
+    let _ = command("A1", "SELECT Sent");
+    let Some(Code::CopyUid { validity, from, to }) =
+        command("A2", &format!("UID COPY {source_uid} INBOX"))
+    else {
+        panic!("Dovecot did not return COPYUID");
+    };
+    assert_ne!(validity, 0);
+    assert_eq!(from, source_uid.to_string());
+    let destination_uid = to.parse().expect("one destination UID");
+    assert_inbox_message_unverified(&dc, destination_uid, "Copied by another client", raw);
+}
+
+fn assert_inbox_message_unverified(dc: &Dovecot, uid: u32, subject: &str, raw: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
     let account = engine.store.add_account("priya@example.org").unwrap();
-    let mut reader = mail_engine::accounts::open_imap(courier(&dc)).unwrap();
+    let mut reader = mail_engine::accounts::open_imap(courier(dc)).unwrap();
     reader.sync(&mut engine.sink(account)).unwrap();
     reader.logout().unwrap();
 
@@ -722,7 +774,7 @@ fn imap_inbox_append_from_another_client_is_unverified() {
     let rows = engine.store.list(inbox, 0, 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].uid, uid);
-    assert_eq!(rows[0].subject, "Appended by another client");
+    assert_eq!(rows[0].subject, subject);
     let id = rows[0].msg;
     let stored = engine.store.message(id).unwrap();
     assert_eq!(engine.store.blob(&stored.full.unwrap()).unwrap(), raw);
