@@ -1648,7 +1648,8 @@ fn render_one_frame(
     let island_at = |id: u32, origin: Option<String>| -> Option<chrome::Island> {
         let r = rects.iter().find(|(l, _)| *l == id)?.1;
         let covered = fresco_scene_server::window::island_covered(rects.iter().map(|&(l, r)| (l as u16, r)), id as u16);
-        Some(chrome::Island { rect: r, covered, origin })
+        let can_stop = comp.lock().unwrap().windows.get(&(id as u16)).is_some_and(|w| w.island_stop.is_some());
+        Some(chrome::Island { rect: r, covered, can_stop, origin })
     };
     /* Trusted chrome (F4d), split mode: frescod's own layer, on top. */
     if let Some(b) = split {

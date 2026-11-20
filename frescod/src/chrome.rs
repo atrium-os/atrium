@@ -291,6 +291,7 @@ const LABEL_H: i32 = 20;
 pub struct Island {
     pub rect: [i32; 4],
     pub covered: bool,
+    pub can_stop: bool,
     pub origin: Option<String>,
 }
 
@@ -309,6 +310,13 @@ const ISLAND_COLOR: [f32; 4] = [0.96, 0.62, 0.12, 1.0];
 /// A covered island's frame: dashes this long, gaps this long.
 const DASH: i32 = 6;
 const GAP: i32 = 4;
+
+/// Top-right control inside the visible frame, clear of the trusted strip.
+pub fn island_stop_rect(px: Px, [left, top, right, bottom]: [i32; 4]) -> Option<[i32; 4]> {
+    let (w, h) = (px.p(44), px.p(LABEL_H));
+    let top = top.max(px.strip());
+    (right - left >= w && bottom - top >= h).then_some([right - w, top, right, top + h])
+}
 
 /// A 1 px frame just outside the island, dashed while it is covered,
 /// and its tag in a pill above its top left corner (below it when there
@@ -334,6 +342,12 @@ fn island_frame(out: &mut Vec<SceneNode>, px: Px, i: &Island, top: i32) -> i32 {
     edge(fx0, fx1, true, fy1 - t);
     edge(fy0 + t, fy1 - t, false, fx0);
     edge(fy0 + t, fy1 - t, false, fx1 - t);
+    if i.can_stop && !i.covered {
+        if let Some([x, y, r, b]) = island_stop_rect(px, i.rect) {
+            out.push(rect(x, y, r-x, b-y, ISLAND_COLOR));
+            text(out, px, "stop", x + px.p(PAD), y + (b-y-line(px))/2, r-x-px.p(PAD));
+        }
+    }
     let tag = i.tag();
     let w = text_width(px, &tag) + px.p(2 * PAD + 6);
     let above = fy0 - label_h;
@@ -678,7 +692,7 @@ mod tests {
     #[test]
     fn an_island_is_framed_and_tagged_and_dashed_while_covered() {
         let at = [200, 300, 600, 500];
-        let clear = Island { rect: at, covered: false, origin: Some("media.example".into()) };
+        let clear = Island { rect: at, covered: false, can_stop: false, origin: Some("media.example".into()) };
         assert_eq!(clear.tag(), "live code: media.example");
         assert_eq!(Island { origin: None, ..clear.clone() }.tag(), "live code");
         let sides = |f: &WindowFrame| f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).count();

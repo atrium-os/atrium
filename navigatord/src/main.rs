@@ -1574,7 +1574,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     widget = None;
                     let writer = w.clone();
                     widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, press, rect, cfg.clone(),
-                        move |failure| send(&writer, &Event::WidgetFailed { document, press, failure }))
+                        move |failure| send(&writer, &match failure {
+                            Some(failure) => Event::WidgetFailed { document, press, failure },
+                            None => Event::WidgetStopped { document, press },
+                        }))
                 })();
                 match result {
                     Ok(started) => { widget = Some(started); eprintln!("navigatord: widget started"); }

@@ -495,6 +495,7 @@ pub struct Window {
     pub kept_by: Option<WindowId>,
     /// Names the window to limend (limen.md §5); zero where none is minted.
     pub embed_token: [u8; 16],
+    pub island_stop: Option<std::os::unix::net::UnixStream>,
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
     /// position in pixels relative to the title origin. Regenerated
     /// when title or theme changes; per-frame compose just translates
@@ -544,6 +545,7 @@ impl Window {
             embed_pending: false,
             kept_by: None,
             embed_token: [0; 16],
+            island_stop: None,
             min_size: (0, 0),
             full_screen_on: None,
             guard: None,
@@ -569,6 +571,7 @@ impl Window {
             embed_pending: false,
             kept_by: None,
             embed_token: [0; 16],
+            island_stop: None,
             min_size: (0, 0),
             full_screen_on: None,
             guard: None,
@@ -1683,6 +1686,7 @@ impl Compositor {
                 if w.slot.is_none() || w.hidden {
                     return Err(refusal::INVALID);
                 }
+                w.island_stop = None;
                 w.slot = None;
                 w.kept_by = Some(parent);
                 if !self.z_order.contains(&child) {
@@ -1692,6 +1696,7 @@ impl Compositor {
             }
             None => {
                 let w = self.windows.get_mut(&child).unwrap();
+                w.island_stop = None;
                 w.slot = None;
                 w.kept_by = None;
                 self.release_slots_in(child);
@@ -1708,6 +1713,7 @@ impl Compositor {
             .map(|(&id, _)| id).collect();
         for id in kids {
             let w = self.windows.get_mut(&id).unwrap();
+            w.island_stop = None;
             w.slot = None;
             w.kept_by = None;
             self.release_slots_in(id);

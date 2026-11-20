@@ -725,7 +725,23 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
         }
         // A binder's new stream may become an embed-only client with its
         // first message (S1); later in a stream it is refused by silence.
-        if std::mem::take(&mut first) && msg.op == fresco_protocol::slot::op::EMBED_CONNECT && binder.is_some() {
+        let initial = std::mem::take(&mut first);
+        if initial && msg.op == fresco_protocol::slot::op::WATCH_ISLAND_STOP {
+            if let (Some(comp), Ok((parent, child))) = (binder, fresco_protocol::decode::<([u8; 16], [u8; 16])>(&msg.payload)) {
+                let mut c = comp.lock().unwrap();
+                if let (Some(p), Some(id)) = (c.window_by_token(&parent), c.window_by_token(&child)) {
+                    if c.is_island(id) && c.windows[&id].slot.is_some_and(|s| s.parent == p) {
+                        let w = c.windows.get_mut(&id).unwrap();
+                        if w.island_stop.is_none() {
+                            w.island_stop = Some(raw);
+                            if let Some(r) = REDRAW.get() { r.wake(); }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if initial && msg.op == fresco_protocol::slot::op::EMBED_CONNECT && binder.is_some() {
             return embed_connect(conn, raw, &msg.payload, binders);
         }
         let payload = match msg.op {

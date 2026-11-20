@@ -354,6 +354,7 @@ pub enum Event {
     RunnableWidget { id: u32, source: String },
     /// The original Start receipt distinguishes retries of the same island.
     WidgetFailed { document: Ticket, press: Press, failure: WidgetFailure },
+    WidgetStopped { document: Ticket, press: Press },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

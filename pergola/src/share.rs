@@ -115,7 +115,7 @@ impl Sharing {
             | ParentEvent::Suspended { embed } | ParentEvent::Resumed { embed } | ParentEvent::ChildLost { embed }
             | ParentEvent::Detached { embed } | ParentEvent::FocusOut { embed, .. } | ParentEvent::Dropped { embed }
             | ParentEvent::Pip { embed, .. } => *embed,
-            ParentEvent::IslandFetch { .. } => return false,
+            ParentEvent::IslandFetch { .. } | ParentEvent::IslandStopped { .. } => return false,
         };
         matches!(self.step, Step::Choosing(e) | Step::Sending(e) if e == embed)
     }

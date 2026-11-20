@@ -935,6 +935,35 @@ Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and
 `~/atrium-vm/evidence/navigator-i1-counter-20261120/`.
 
+### I2 stopping a running island
+
+Frescod draws Stop inside the upper-right edge of an uncovered island when
+the visible frame has room for the control. Limen registers a dedicated
+stream with frescod after checking the parent and child window owners.
+The compositor consumes the primary press and release. Limen withdraws
+the bound slot, tells the child to detach, and ends the worker through
+its launcher. Navigator clears the placement for the matching Start
+receipt and leaves the document viewer in place. Selecting the box
+again requires a fresh guarded Start.
+
+The installed gate passed on arm64 HVF with Tessera at `/`. Stop retired
+the counter at Count 1. The UI and document viewer kept their PIDs. The
+placeholder opened a new prompt without fetching. Start launched a
+different engine PID at Count 0, and Increment advanced it to 1. The
+fixture served the parent once and the counter once per accepted Start.
+A compositor regression checked a covered frame, an engine-targeted
+press, a press outside Stop, and consumption of the matching release.
+
+To repeat on the staged 1280 × 840 TLS fixture, open the counter parent in
+a fresh 1120 × 740 Navigator window and pass its fresh log to the driver:
+
+```sh
+python3 scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR
+```
+
+Guest service logs, executable hashes and composed frames are in
+`~/atrium-vm/evidence/navigator-i2-stop-20261120/`.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

@@ -184,7 +184,7 @@ static SWALLOWED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// its release. Every press is noted, so the pressed window may open a
 /// pop-up even when it does not take focus (the bar). `true`: drop `ev`.
 fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
-    let DisplayEvent::InputPointerButton { window_id, button, pressed, .. } = *ev else { return false };
+    let DisplayEvent::InputPointerButton { window_id, button, pressed, x, y, .. } = *ev else { return false };
     let mut swallowed = SWALLOWED.lock().unwrap();
     if !pressed {
         return match swallowed.iter().position(|&b| b == button) {
@@ -204,7 +204,65 @@ fn popup_gate(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> bool {
         }
         return true;
     }
+    // Chrome hits carry global coordinates and target 0. A press already
+    // routed to the engine must never become Stop while its frame is changing.
+    if button == 1 && target == 0 && !crate::lock::locked() {
+        if let Some(id) = island_stop_at(&c, x, y) {
+            if let Some(mut stream) = c.windows.get_mut(&id).and_then(|w| w.island_stop.take()) {
+                use std::io::Write;
+                let _ = stream.write_all(&[1]);
+                swallowed.push(button);
+                return true;
+            }
+        }
+    }
     false
+}
+
+fn island_stop_at(comp: &Compositor, x: f32, y: f32) -> Option<u16> {
+    let px = crate::chrome::Px::new(comp.new_scale_milli);
+    comp.shown.as_ref()?.iter().rev().find_map(|layer| {
+        let [left, top, right, bottom] = crate::chrome::island_stop_rect(px, layer.rect)?;
+        if !(x >= left as f32 && x < right as f32 && y >= top as f32 && y < bottom as f32) {
+            return None;
+        }
+        let id = layer.id;
+        (comp.windows.get(&id)?.island_stop.is_some() && comp.is_island(id)
+            && !comp.held(id) && !comp.island_held(id)).then_some(id)
+    })
+}
+
+#[cfg(test)]
+mod island_stop_tests {
+    use super::*;
+    use fresco_scene_server::window::ShownLayer;
+    use std::io::Read;
+
+    #[test]
+    fn stop_consumes_only_a_visible_chrome_press_and_its_release() {
+        let mut c = Compositor::new();
+        let parent = c.create(1, (800, 600));
+        let child = c.create(2, (200, 100));
+        let cover = c.create(3, (10, 10));
+        c.bind_slot(child, parent, fresco_protocol::slot::kind::ISLAND, Some([100., 100., 200., 100.]), 1).unwrap();
+        let (write, mut read) = UnixStream::pair().unwrap();
+        c.windows.get_mut(&child).unwrap().island_stop = Some(write);
+        let layer = |id, rect| ShownLayer { id, rect, alpha: None };
+        c.shown = Some(vec![layer(parent, [0,0,800,600]), layer(child,[100,100,300,200]), layer(cover,[100,180,110,190])]);
+        let comp = Arc::new(Mutex::new(c));
+        let button = |id, x, down| DisplayEvent::InputPointerButton { window_id: id, x, y: 105., button: 1,
+            pressed: down, modifiers: 0, activation: [0;16] };
+        assert!(!popup_gate(&button(0, 295., true), &comp));
+        comp.lock().unwrap().shown.as_mut().unwrap().pop();
+        assert!(!popup_gate(&button(child.into(), 195., true), &comp));
+        assert!(!popup_gate(&button(0, 250., true), &comp));
+        assert!(popup_gate(&button(0, 295., true), &comp));
+        assert!(popup_gate(&button(0, 295., false), &comp));
+        assert!(!popup_gate(&button(0, 295., true), &comp));
+        let mut result = vec![];
+        read.read_to_end(&mut result).unwrap();
+        assert_eq!(result, [1]);
+    }
 }
 
 /// Send `ev` to every subscriber its route reaches; `bare` (the event

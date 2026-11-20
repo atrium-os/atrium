@@ -170,6 +170,7 @@ pub enum ParentEvent {
     /// Limen's freshly paired endpoint for answering this worker's fetches.
     /// Take the socket with Parent::take_island_fetch.
     IslandFetch { embed: EmbedId },
+    IslandStopped { embed: EmbedId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

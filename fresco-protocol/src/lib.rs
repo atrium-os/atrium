@@ -2544,6 +2544,10 @@ pub mod slot {
         /// gesture check for picture-in-picture (atrium-player-pip-keys.md
         /// §3.1): frescod routed the press, so the app can't fake one.
         pub const PRESSED: u16 = 0x0912;
+        /// First message on a dedicated binder stream: (parent, child) embed tokens.
+        /// A byte of value 1 means the compositor's Stop control was pressed.
+        /// Unbinding or destroying the window closes the stream.
+        pub const WATCH_ISLAND_STOP: u16 = 0x0913;
     }
 
     /// The longest look back `PressedQuery` takes.

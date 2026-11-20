@@ -685,6 +685,11 @@ impl Live {
                         }
                     }
                 }
+                Event::WidgetStopped { document, press } => {
+                    if retire_widget(&mut self.widget, document, press).is_some() {
+                        s.last_note = Some("live widget stopped".into());
+                    }
+                }
                 Event::WidgetFailed { document, press, failure } => {
                     if let Some(active) = retire_widget(&mut self.widget, document, press) {
                         if let Some(page) = self.shown.filter(|&p| self.widget_bounds(s, p, active.key, None)

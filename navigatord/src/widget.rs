@@ -34,7 +34,7 @@ impl Widget {
         press: navigator_control::Press,
         rect: [u32; 4],
         cfg: Arc<Config>,
-        failed: impl FnOnce(navigator_control::WidgetFailure) + Send + 'static,
+        finished: impl FnOnce(Option<navigator_control::WidgetFailure>) + Send + 'static,
     ) -> Result<Self, String> {
         let rect = bounds(rect)?;
         let mut parent = Parent::at(socket).map_err(|e| format!("Limen: {e:?}"))?;
@@ -63,35 +63,37 @@ impl Widget {
             .map_err(|e| format!("place: {e:?}"))?;
         let parent = Arc::new(Mutex::new(Some(parent)));
         let watched = parent.clone();
+        // A slow document GET must not delay Stop or placement retirement.
+        let (done, fetched) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fetch(channel, &cfg);
+            if let Err(e) = &result { eprintln!("navigatord: widget fetch: {e}"); }
+            let _ = done.send(result);
+        });
         std::thread::spawn(move || {
             use navigator_control::WidgetFailure;
-            let failure = match fetch(channel, &cfg) {
-                Err(e) => {
-                    eprintln!("navigatord: widget fetch: {e}");
-                    WidgetFailure::Fetch
-                }
-                Ok(()) => loop {
-                    let mut slot = watched.lock().unwrap();
-                    let Some(connection) = slot.as_mut() else {
-                        return;
-                    };
-                    match connection.poll(Duration::from_millis(40)) {
-                        Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. }))
-                        | Err(_) => break WidgetFailure::Exit,
-                        Ok(Some(ParentEvent::MessageFd { .. })) => {
-                            drop(connection.take_fd());
-                        }
-                        _ => {}
+            let failure = loop {
+                let mut slot = watched.lock().unwrap();
+                let Some(connection) = slot.as_mut() else { return };
+                match connection.poll(Duration::from_millis(40)) {
+                    Ok(Some(ParentEvent::IslandStopped { embed: id })) if id == embed => break None,
+                    Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {
+                        // Fetch closes the child channel on refusal. The exit and
+                        // the fetch result may reach these two sockets in either order.
+                        let refused = matches!(fetched.recv_timeout(Duration::from_millis(100)), Ok(Err(_)));
+                        break Some(if refused { WidgetFailure::Fetch } else { WidgetFailure::Exit });
                     }
-                    drop(slot);
-                    // Allow withdrawal and placement to acquire this connection.
-                    std::thread::sleep(Duration::from_millis(5));
-                },
+                    Ok(Some(ParentEvent::MessageFd { .. })) => { drop(connection.take_fd()); }
+                    _ => {}
+                }
+                if let Ok(Err(_)) = fetched.try_recv() { break Some(WidgetFailure::Fetch); }
+                drop(slot);
+                std::thread::sleep(Duration::from_millis(5));
             };
             let retired = watched.lock().unwrap().take();
             if retired.is_some() {
                 drop(retired);
-                failed(failure);
+                finished(failure);
             }
         });
         Ok(Self {

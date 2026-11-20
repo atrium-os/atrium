@@ -79,6 +79,14 @@ impl Compositor for Frescod {
         }
     }
 
+    fn watch_island_stop(&mut self, parent: WindowToken, child: WindowToken) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+        let mut stream = atrium_listen::connect(&self.path, Some(CONNECT_WAIT))?;
+        let body = postcard::to_stdvec(&(parent, child)).map_err(std::io::Error::other)?;
+        let header = aqueduct::Header::new(aqueduct::CLASS_DISPLAY, slot::op::WATCH_ISLAND_STOP, 0, body.len() as u32);
+        aqueduct::envelope::write_message(&mut stream, header, &body)?;
+        Ok(Some(stream))
+    }
+
     fn pressed_within(&mut self, window: WindowToken, ms: u32) -> bool {
         let q = PressedQuery { window, within_ms: ms.min(slot::PRESSED_MAX_MS) };
         match self.call::<_, PressedResult>(slot::op::PRESSED, &q) {

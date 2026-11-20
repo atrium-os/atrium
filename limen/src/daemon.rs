@@ -36,6 +36,11 @@ pub trait Compositor: Send {
     /// hidden until bound, so a child can't put a top-level window on screen.
     fn embed_connection(&mut self, owner_uid: u32) -> Result<UnixStream, u8>;
 
+    /// One compositor-owned control for the currently bound island.
+    fn watch_island_stop(&mut self, _parent: WindowToken, _child: WindowToken) -> io::Result<Option<UnixStream>> {
+        Ok(None)
+    }
+
     /// Whether frescod routed a pointer or key press to `window` in the
     /// last `ms` (the PiP gesture check). No frescod support: never.
     fn pressed_within(&mut self, _window: WindowToken, _ms: u32) -> bool {
@@ -119,6 +124,7 @@ struct Embed {
     rect: Option<[f32; 4]>,
     visible: bool,
     bound: bool,
+    binding_generation: u64,
     attached: bool,
     /// In picture-in-picture: out of the slot, in Forum's `pip` layer.
     pip: bool,
@@ -383,7 +389,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             op::PROVIDE => provide(shared, conn, uid, de(payload)?),
             op::READY => {
                 let r: proto::Ready = de(payload)?;
-                as_child(shared, conn, r.embed, |e| e.child_window = Some(r.window))
+                ready(shared, conn, r.embed, r.window)
             }
             op::EMIT => emit(shared, conn, de(payload)?, None),
             op::EMIT_FD => {
@@ -536,7 +542,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         .flatten();
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
-        child_window: None, rect: None, visible: true, bound: false, attached: false, pip: false,
+        child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, attached: false, pip: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -567,10 +573,15 @@ fn as_parent(shared: &Arc<Shared>, conn: ConnId, embed: EmbedId, f: impl FnOnce(
     Ok(Reply::Ok)
 }
 
-fn as_child(shared: &Arc<Shared>, conn: ConnId, embed: EmbedId, f: impl FnOnce(&mut Embed)) -> Result<Reply, Reply> {
+fn ready(shared: &Arc<Shared>, conn: ConnId, embed: EmbedId, window: WindowToken) -> Result<Reply, Reply> {
     let mut st = shared.state.lock().unwrap();
     match st.embeds.get_mut(&embed) {
-        Some(e) if e.child == conn => f(e),
+        Some(e) if e.child == conn => {
+            if e.role.name == "web-island" && e.child_window.is_some_and(|old| old != window) {
+                return Err(Reply::Refused { reason: refusal::MALFORMED });
+            }
+            e.child_window = Some(window);
+        }
         _ => return Err(Reply::Refused { reason: refusal::NOT_YOURS }),
     }
     rebind(shared, &mut st, embed);
@@ -596,9 +607,31 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
             Ok((pu, cu)) if pu == e.parent_uid && cu == e.child_uid => {
                 let e = st.embeds.get_mut(&embed).unwrap();
                 let (was_bound, was_attached) = (e.bound, e.attached);
+                if !was_bound { e.binding_generation += 1; }
+                let generation = e.binding_generation;
                 e.bound = true;
                 e.attached = true;
                 let e = &st.embeds[&embed];
+                if !was_bound && e.role.name == "web-island" {
+                    match comp.watch_island_stop(e.parent_window, child) {
+                        Ok(Some(mut stop)) => {
+                            let shared = shared.clone();
+                            std::thread::spawn(move || {
+                                use std::io::Read;
+                                let mut byte = [0];
+                                if stop.read_exact(&mut byte).is_err() || byte != [1] { return; }
+                                let mut st = shared.state.lock().unwrap();
+                                if st.embeds.get(&embed).is_some_and(|e| e.bound && e.binding_generation == generation && e.child_window == Some(child)) {
+                                    let e = st.embeds.remove(&embed).unwrap();
+                                    st.to_parent(&e, ParentEvent::IslandStopped { embed });
+                                    end(&shared, &st, embed, e, false);
+                                }
+                            });
+                        }
+                        Err(err) => eprintln!("limend: island stop control: {err}"),
+                        Ok(None) => {}
+                    }
+                }
                 if !was_attached {
                     st.to_parent(e, ParentEvent::Attached { embed });
                 } else if !was_bound {
