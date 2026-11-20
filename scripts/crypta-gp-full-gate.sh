@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=17 ;;
     esp-loss-hip-active-refresh-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=16 ;;
     esp-loss-hip-active-refresh-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=15 ;;
     esp-loss-hip-active-refresh-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=14 ;;
@@ -1039,11 +1040,16 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                             [ "$(field handshake)" = 0 ] &&
                                             [ "$(awk 'END { print NR }' "$receipts")" = "$before_retry" ] ||
                                             fail "active HIP retry failed to withhold upload or traffic before fresh approval"
-                                        if [ "$retry_hip_submit" = 16 ]; then
+                                        if [ "$retry_hip_submit" -ge 16 ]; then
+                                            declined_choice=$(hip_choice)
                                             decline_failed_hip_retry "$before_retry"
                                             ok "declining the active refresh retry withheld the report and kept ESP down"
-                                            echo "$pass checks passed"
-                                            exit 0
+                                            if [ "$retry_hip_submit" = 16 ]; then
+                                                echo "$pass checks passed"
+                                                exit 0
+                                            fi
+                                            reconnect_after_esp_loss_decline "$before_retry" active-refresh-reconnect "${initial_report%% *}"
+                                            reviews=$((reviews + 1))
                                         fi
                                         reviews=$((reviews + 1))
                                         retry_report=$initial_report
