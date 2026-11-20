@@ -72,7 +72,7 @@ def frames(stream, reader, calls):
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 ESP_LOSS_RECONNECT_HIP = (
-    "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
+    "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
 )
 ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline", *ESP_LOSS_RECONNECT_HIP)
 REFRESH_HIP = ("refresh", "posture", *ESP_LOSS_HIP, *TESSERA_HIP)
@@ -155,7 +155,7 @@ class EspPeer:
                         assert spi_in in self.hip_reported_spis, "ESP opened before HIP submission"
                 if self.loss_reconnect_approval and pair in self.configs[2:]:
                     assert self.loss_reconnect_approval.exists(), "ESP resumed before fresh approval"
-                    if pair in self.configs[4:]:
+                    if pair in self.configs[4:] and not self.loss_reconnect_approval.with_suffix(".posture-restored").exists():
                         assert self.loss_reconnect_approval.with_suffix(".rebind-approved").exists(), "ESP resumed before rebound reconnect approval"
                     assert spi_in in self.hip_reported_spis, "ESP resumed before the approved HIP report"
                 plain = self.cipher(ekey, wire[8:24], wire[24:-12], decrypt=True)
@@ -251,6 +251,11 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 + (esp.offer() if esp else '') + '</response>')
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
+                        if hip == "esp-loss-hip-submit-retry-recheck" and calls.count("getconfig.esp") == 4:
+                            deadline = time.monotonic() + 25
+                            while not receipts.with_suffix(".posture-restored").exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            assert receipts.with_suffix(".posture-restored").exists(), "retry posture did not change"
                         needed = "yes" if hip else "no"
                         interval = "<hip-report-interval>5</hip-report-interval>" if hip in REFRESH_HIP else ""
                         body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
@@ -261,7 +266,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             require_reconnect_approval(receipts, calls.count("getconfig.esp") - 1)
                         if hip in ESP_LOSS_RECONNECT_HIP and calls.count("getconfig.esp") >= 3:
                             assert receipts.with_suffix(".approved").exists(), calls
-                            if calls.count("getconfig.esp") >= 5:
+                            if calls.count("getconfig.esp") >= 5 and hip != "esp-loss-hip-submit-retry-recheck":
                                 assert receipts.with_suffix(".rebind-approved").exists(), calls
                         report, = fields["report"]
                         doc = ET.fromstring(report)
@@ -319,11 +324,13 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 elif hip in TESSERA_HIP:
                                     fact = tessera_count
                                 print(f"{fact} {digest}", file=receipt)
-                        if hip == "esp-loss-hip-submit-retry":
+                        if hip in ("esp-loss-hip-submit-retry", "esp-loss-hip-submit-retry-recheck"):
                             config_count = calls.count("getconfig.esp")
                             if config_count == 3:
                                 calls.append("hip-submit-response-dropped")
                                 return
+                            if config_count == 4 and hip == "esp-loss-hip-submit-retry-recheck":
+                                assert receipts.with_suffix(".retry").exists(), "retry submitted HIP before fresh approval"
                             if config_count == 4:
                                 deadline = time.monotonic() + 25
                                 while not receipts.with_suffix(".retry").exists() and time.monotonic() < deadline:
@@ -676,14 +683,17 @@ def main():
                 declined_rebind = args.hip == "esp-loss-rebind-decline"
                 reconnected = args.hip in ESP_LOSS_RECONNECT_HIP
                 reconnected_after_rebind = args.hip == "esp-loss-rebind-reconnect"
-                submit_retry = args.hip == "esp-loss-hip-submit-retry"
+                retry_recheck = args.hip == "esp-loss-hip-submit-retry-recheck"
+                submit_retry = retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (6 if reconnected_after_rebind else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (6 if reconnected_after_rebind else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
                     expected_spis.extend([esp.configs[3][0][0]] * 2)
+                    if retry_recheck:
+                        expected_spis.append(esp.configs[4][0][0])
                 elif reconnected:
                     expected_spis.extend([esp.configs[2][0][0]] * 2 + [esp.configs[3][0][0]])
                 if reconnected_after_rebind:
@@ -717,7 +727,13 @@ def main():
                             *exchange, "hipreport.esp", "hip-submit-response-dropped",
                         ], calls
                         assert reports[reconnect_report:next_report] == [changed], reports
-                        assert len(reports[next_report:]) >= 2 and set(reports[next_report:]) == {changed}, reports
+                        if retry_recheck:
+                            final_rebind = calls[:configs[4]].count("hipreport.esp")
+                            assert final_rebind >= next_report + 2, reports
+                            assert set(reports[next_report:]) == {original}, reports
+                            print("Retry reviewed new posture, refreshed silently, and rebound on ESP")
+                        else:
+                            assert len(reports[next_report:]) >= 2 and set(reports[next_report:]) == {changed}, reports
                         print("HIP submit response dropped on ESP reconnect. Retry restored ESP and refreshed unchanged HIP.")
                         return
                     assert reports[reconnect_report:reconnect_report + 2] == [changed, changed], reports

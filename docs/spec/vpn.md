@@ -931,6 +931,12 @@ another origin. An active portal-profile session stays in engine memory.
   after acknowledgement, and refreshes the unchanged report without
   prompting.
   The arm64 gate passed 18/18 using the shared Cargo cache.
+  The `--hip esp-loss-hip-submit-retry-recheck` variant restores IPv6
+  forwarding after the response is dropped. The retry reviews the current
+  report, rejects the stale choice, and waits for fresh approval before
+  upload and ESP traffic. The unchanged report refreshes silently and
+  is acknowledged on rebind before IPv4 traffic resumes on a new ESP
+  association. The arm64 gate passed 21/21 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

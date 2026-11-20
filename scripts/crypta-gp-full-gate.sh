@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-retry-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=2 ;;
     esp-loss-hip-submit-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=1 ;;
     esp-loss-rebind-decline) hip=esp-loss; decline_after_esp_loss=3 ;;
     esp-loss-rebind-reconnect) hip=esp-loss; decline_after_esp_loss=4 ;;
@@ -662,6 +663,9 @@ restore_forwarding_and_rebind() {
         fail "the approved restored report did not reach the gateway"
     ok "restoring IPv6 forwarding required fresh approval"
     probe "IPv4 echo on reconnected ESP after restored posture approval"
+    rebind_restored_forwarding "$1"
+}
+rebind_restored_forwarding() {
     reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
     before_rebind=$(awk 'END { print NR }' "$receipts")
     "$V" "$CTL rebind name=gp-gate" >/dev/null
@@ -750,11 +754,11 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         fi
         reconnect_after_esp_loss_decline 0 approved
     fi
-    if [ "$retry_hip_submit" = 1 ]; then
+    if [ "$retry_hip_submit" -ne 0 ]; then
         retry_reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
     fi
     approve_hip || fail "approve changed HIP"
-    if [ "$retry_hip_submit" = 1 ]; then
+    if [ "$retry_hip_submit" -ne 0 ]; then
         for _ in $(seq 1 25); do
             if "$V" "grep -q 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log"; then
                 break
@@ -767,7 +771,28 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
             fail "IPv4 echo passed before the retry was acknowledged"
         ok "HIP submission failure was logged and kept the tunnel blocked"
-        touch "$receipts.retry"
+        if [ "$retry_hip_submit" = 2 ]; then
+            previous_choice=$approval_choice
+            before_retry=$(wc -l < "$receipts" | tr -d ' ')
+            "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+            touch "$receipts.posture-restored"
+            wait_prompt gp_hip_approval
+            printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" || fail "retry reviewed stale posture"
+            [ "$(hip_choice)" != "$previous_choice" ] || fail "retry reused the old choice"
+            if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$previous_choice" 2>&1); then
+                fail "retry accepted the old HIP choice"
+            fi
+            [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected stale approval reply: $stale_reply"
+            [ "$(wc -l < "$receipts" | tr -d ' ')" = "$before_retry" ] &&
+                [ "$(field handshake)" = 0 ] || fail "retry submitted HIP or opened before fresh approval"
+            ok "retry reviewed restored posture and rejected stale approval"
+            retry_reviews=$((retry_reviews + 1))
+            touch "$receipts.retry"
+            approve_hip
+        else
+            touch "$receipts.retry"
+        fi
     fi
     for _ in $(seq 1 25); do
         if grep -q "^$changed_word " "$receipts"; then break; fi
@@ -787,10 +812,14 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$changed_report" ] ||
             fail "unchanged HIP did not refresh silently on restored ESP"
         ok "unchanged HIP refreshed on restored ESP without prompting"
-        if [ "$retry_hip_submit" = 1 ]; then
+        if [ "$retry_hip_submit" -ne 0 ]; then
             [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$retry_reviews" ] ||
                 fail "HIP retry or refresh opened an extra review"
             probe "IPv4 echo on restored ESP after silent HIP refresh"
+            if [ "$retry_hip_submit" = 2 ]; then
+                [ "$changed_report" = "$initial_report" ] || fail "retry submitted stale posture"
+                rebind_restored_forwarding 4
+            fi
             "$V" "$CTL down name=gp-gate" >/dev/null
             echo "$pass checks passed"
             exit 0
