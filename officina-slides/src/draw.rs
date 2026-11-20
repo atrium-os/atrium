@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use officina_text::layout::{layout_para, Fonts};
+use officina_text::layout::{layout_para, size_lu, Fonts, ParaLayout};
 use officina_text::model::{CharAttrs, CharFormat, ListKind, ListRef, Para, ParaProps, Style, StyleKind, StyleSheet, TextDoc};
-use officina_text::paint::{paint_para, Item};
+use officina_text::paint::{list_label_format, paint_para, Item};
 
 use crate::geom;
 use crate::model::*;
@@ -401,12 +401,22 @@ pub struct FrameLayout {
 }
 
 pub fn layout_frame(doc: TextDoc, width: i64, fonts: &dyn Fonts) -> FrameLayout {
+    layout_frame_with(doc, width, fonts, |_, _, _| {})
+}
+
+fn layout_frame_with(
+    doc: TextDoc,
+    width: i64,
+    fonts: &dyn Fonts,
+    mut adjust: impl FnMut(&TextDoc, &Para, &mut ParaLayout),
+) -> FrameLayout {
     let mut paras = Vec::new();
     let mut y = 0;
     let n = doc.blocks.len();
     for i in 0..n {
         let Some(p) = doc.para(i) else { continue };
-        let l = layout_para(&doc, p, width.max(officina_text::LU), fonts);
+        let mut l = layout_para(&doc, p, width.max(officina_text::LU), fonts);
+        adjust(&doc, p, &mut l);
         if i > 0 {
             y += l.space_before;
         }
@@ -426,6 +436,7 @@ pub struct FrameGeom {
     pub layout: FrameLayout,
     pub xf: Xform,
     pub resolved: Resolved,
+    labels: Vec<Option<(String, CharFormat)>>,
 }
 
 /// The geometry of `shape`'s text frame (owned as `owner`, inside groups
@@ -457,7 +468,16 @@ fn frame_geom(deck: &Deck, r: Resolved, body: &TextBody, txf: &Xform, slide_no: 
     let [l, t, rt, b] = r.inset;
     let width_emu = (r.frame.w - l - rt).max(0);
     let width = if r.wrap { crate::emu_to_lu(width_emu) } else { i64::MAX / 4 };
-    let fl = layout_frame(doc, width, fonts);
+    let width = width.max(officina_text::LU);
+    let mut labels = Vec::new();
+    let mut counters = [0; MAX_LEVELS];
+    let fl = layout_frame_with(doc, width, fonts, |doc, para, layout| {
+        let label = paragraph_label(&deck.theme, &r.levels, body, para, layout, &mut counters);
+        if let Some((text, format)) = &label {
+            reserve_label_gap(doc, para, layout, width, fonts, text, format);
+        }
+        labels.push(label);
+    });
     let avail = crate::emu_to_lu((r.frame.h - t - b).max(0));
     let dy = match r.anchor {
         Anchor::Top => 0,
@@ -466,7 +486,7 @@ fn frame_geom(deck: &Deck, r: Resolved, body: &TextBody, txf: &Xform, slide_no: 
     };
     let k = crate::EMU_PER_PT as f64 / officina_text::LU as f64;
     let local = [k, 0.0, 0.0, k, l as f64, t as f64 + dy as f64 * k];
-    FrameGeom { layout: fl, xf: mul(txf, &local), resolved: r }
+    FrameGeom { layout: fl, xf: mul(txf, &local), resolved: r, labels }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -480,45 +500,10 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
         notes.incomplete_text = true;
     }
     let mut items = Vec::new();
-    let mut counters = [0u32; MAX_LEVELS];
-    for (i, (pl, top)) in fl.paras.iter().enumerate() {
+    for (i, ((pl, top), label)) in fl.paras.iter().zip(&g.labels).enumerate() {
         let Some(p) = fl.doc.para(i) else { continue };
-        let lvl = (p.style as usize).min(MAX_LEVELS - 1);
-        // Which bullet: styled_doc named it in the paragraph's list.
-        let b = match &p.props.list {
-            Some(Some(lr)) if lr.id > 1 => body.bullets.get(lr.id as usize - 2),
-            Some(Some(_)) => r.levels[lvl].bullet.as_ref(),
-            _ => None,
-        };
-        let label = match (b, p.text.is_empty()) {
-            (Some(Bullet::Char { ch, font, color: c, size_pct }), false) => {
-                counters = [0; MAX_LEVELS];
-                let mut f = pl.glyphs.first().map_or(&pl.formats[0], |g| &pl.formats[g.fmt as usize]).clone();
-                f.underline = false;
-                f.strike = false;
-                f.link = None;
-                if let Some(fam) = font {
-                    f.family = resolve::font(&deck.theme, fam);
-                }
-                if let Some(c) = c {
-                    f.color = color(&deck.theme, c) >> 8;
-                }
-                if let Some(pct) = size_pct {
-                    f.size = ((f.size as u64 * *pct as u64 / 100_000) as u16).max(2);
-                }
-                Some((ch.to_string(), Some(f)))
-            }
-            (Some(Bullet::Number { scheme, start }), false) => {
-                counters[lvl] += 1;
-                for c in counters.iter_mut().skip(lvl + 1) {
-                    *c = 0;
-                }
-                Some((number_label(scheme, start.saturating_add(counters[lvl] - 1)), None))
-            }
-            _ => None,
-        };
         let start = items.len();
-        paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, *top, label.as_ref().map(|(s, f)| (s.as_str(), f.clone())));
+        paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, *top, label.as_ref().map(|(s, f)| (s.as_str(), Some(f.clone()))));
         if notes.verify_text {
             let painted = items[start..].iter().filter_map(|item| match item {
                 Item::Glyphs(run) => Some(run.text.as_str()),
@@ -535,6 +520,75 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
         return;
     }
     out.push(DrawItem::Text { xf: g.xf, shape: id, items });
+}
+
+fn paragraph_label(
+    theme: &Theme,
+    levels: &ListStyle,
+    body: &TextBody,
+    p: &Para,
+    layout: &ParaLayout,
+    counters: &mut [u32; MAX_LEVELS],
+) -> Option<(String, CharFormat)> {
+    let lvl = (p.style as usize).min(MAX_LEVELS - 1);
+    // styled_doc reserves list 1 for the inherited level style.
+    let bullet = match &p.props.list {
+        Some(Some(list)) if list.id > 1 => body.bullets.get(list.id as usize - 2),
+        Some(Some(_)) => levels[lvl].bullet.as_ref(),
+        _ => None,
+    };
+    let bullet = bullet?;
+    let mut format = list_label_format(layout);
+    let text = match bullet {
+        Bullet::Char { ch, font, color: c, size_pct } => {
+            counters.fill(0);
+            if let Some(family) = font {
+                format.family = resolve::font(theme, family);
+            }
+            if let Some(c) = c {
+                format.color = color(theme, c) >> 8;
+            }
+            if let Some(pct) = size_pct {
+                format.size = ((format.size as u64 * *pct as u64 / 100_000) as u16).max(2);
+            }
+            ch.to_string()
+        }
+        Bullet::Number { scheme, start } => {
+            counters[lvl] += 1;
+            counters[lvl + 1..].fill(0);
+            number_label(scheme, start.saturating_add(counters[lvl] - 1))
+        }
+        Bullet::None => return None,
+    };
+    Some((text, format))
+}
+
+fn reserve_label_gap(
+    doc: &TextDoc,
+    para: &Para,
+    layout: &mut ParaLayout,
+    width: i64,
+    fonts: &dyn Fonts,
+    label: &str,
+    format: &CharFormat,
+) {
+    if layout.rtl {
+        return;
+    }
+    let label_width: i64 = fonts.shape(label, format).iter().map(|g| g.adv).sum();
+    // Keep the label at the saved position and reserve a quarter em after it.
+    let room = (label_width + size_lu(format) / 4).max(0);
+    let hang = ((room * 20 + officina_text::LU - 1) / officina_text::LU) as i32;
+    let first = layout.format.first_line;
+    let label_start = layout.format.indent_start.saturating_add(first);
+    let body_start = label_start.saturating_add(hang);
+    if first <= -hang {
+        return;
+    }
+    let mut adjusted = para.clone();
+    adjusted.props.indent_start = Some(body_start);
+    adjusted.props.first_line = Some(-hang);
+    *layout = layout_para(doc, &adjusted, width, fonts);
 }
 
 /// Replaces `from` with `to` in a paragraph, keeping the run each piece is in.

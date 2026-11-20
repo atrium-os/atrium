@@ -133,6 +133,40 @@ fn slides_draw_with_master_layout_and_own_text() {
 }
 
 #[test]
+fn wide_numbered_label_reserves_room_before_wrapping() {
+    use officina_text::model::{ListKind, ListRef};
+
+    let mut deck = deck_with(2);
+    let slide = deck.slide_mut(1).unwrap();
+    let shape = slide.shapes.iter_mut().find(|s| s.ph.is_some_and(|p| p.kind == PhKind::Body)).unwrap();
+    let id = shape.id;
+    shape.frame = Some(Rect::new(838_200, 1_825_625, 2_540_000, 4_351_338));
+    let body = shape.text_mut().unwrap();
+    set_plain(&mut body.doc, "Revenue grew again in April");
+    body.bullets.push(Bullet::Number { scheme: "arabicPeriod".into(), start: 123 });
+    body.doc.blocks.update(0, |block| {
+        block.as_para_mut().unwrap().props.list = Some(Some(ListRef { id: 1, kind: ListKind::Numbered, level: 0 }));
+    });
+
+    let items = draw_slide(&mut deck, 1, &FixedFonts, &mut Notes::default()).unwrap();
+    let runs = items.iter().find_map(|item| match item {
+        DrawItem::Text { shape, items, .. } if *shape == id => Some(items),
+        _ => None,
+    }).unwrap();
+    let runs: Vec<_> = runs.iter().filter_map(|item| match item {
+        Item::Glyphs(run) => Some(run),
+        _ => None,
+    }).collect();
+    let label = runs[0];
+    let first = runs[1];
+    assert_eq!(label.text, "123.");
+    assert_eq!(label.y, first.y);
+    assert!(first.x > label.x + label.glyphs.last().unwrap().x + label.size / 2);
+    assert!(runs[2..].iter().any(|run| run.y > first.y));
+    assert!(runs[1..].iter().all(|run| run.x == first.x));
+}
+
+#[test]
 fn groups_map_their_children() {
     let mut d = deck_with(1);
     let sid = d.slide_ids().next().unwrap();

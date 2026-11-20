@@ -649,13 +649,18 @@ fn list_label(out: &mut Vec<Item>, l: &ParaLayout, label: &str, fonts: &dyn Font
     if l.lines.is_empty() {
         return;
     }
+    let x0 = twips((l.format.indent_start + l.format.first_line) as i64);
+    runs(out, fonts, label, &list_label_format(l), left + x0, baseline_of(l, 0, top));
+}
+
+/// The default format for a list label, shared by measurement and painting.
+pub fn list_label_format(l: &ParaLayout) -> CharFormat {
     let mut f = l.glyphs.first().map_or(&l.formats[0], |g| &l.formats[g.fmt as usize]).clone();
     f.underline = false;
     f.strike = false;
     f.link = None;
     f.object = None;
-    let x0 = twips((l.format.indent_start + l.format.first_line) as i64);
-    runs(out, fonts, label, &f, left + x0, baseline_of(l, 0, top));
+    f
 }
 
 /// One line of text in `fmt`, aligned in a box `width` wide from `left`.

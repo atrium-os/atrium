@@ -2364,7 +2364,10 @@ log, thumbnails and the native file's chunks name it across moves.
   layout decorations unless hidden, the slide's shapes): paths with paint and
   stroke, pictures, video posters and text items, each with the affine transform
   that puts it on the slide (rotation about the middle, flips, group mapping).
-  Editing, thumbnails, presenting and PDF will all draw from it.
+  Editing, thumbnails, presenting and PDF will all draw from it. For
+  left-to-right lists, the renderer measures the shaped label and widens a
+  narrow hanging indent before wrapping the paragraph. The label keeps its
+  saved position and the paragraph wraps within the adjusted text margins.
 - **Native `.oslides`.** One chunk per slide, media in pieces of at most 16 MiB
   stored once whatever uses them (unused pieces are dropped on save), masters
   and layouts in one chunk, and a deck chunk with the theme, the slide order and
