@@ -185,7 +185,7 @@ fn settings_window() {
     assert!(s.ui.get_cloned().keys.is_empty() && engine.known_pgp_keys().is_empty());
     // S/MIME (§10.1): a CA pasted is listed and can be forgotten.
     drawn(&mut app, &["S/MIME", "Paste a CA"]);
-    let ca = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../mail-smime/tests/data/ca.der")).unwrap();
+    let ca = include_bytes!("../../mail-smime/tests/data/ca.der");
     let b64 = {
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut o = String::new();
