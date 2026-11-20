@@ -6050,7 +6050,8 @@ newly observed jailed IPP worker between submission and Done for each job.
 Its real and effective UID and GID must match an ID in Prelum’s worker pool
 (62000–62499). After all jobs finish, the gate waits up to 90 seconds for
 Prelum's worker jails, including dying VNET jails, and jail roots to disappear. The simulator log must record exactly one creation, document upload,
-and completion for each job in that order. Upload sizes and SHA-256 hashes must match the
+and completion for each job in that order. Each upload must declare
+`application/pdf` and use TLS 1.2 or 1.3. Upload sizes and SHA-256 hashes must match the
 saved PDFs. The simulator's titles and the received PDF page counts must
 match the final desktop job list. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides

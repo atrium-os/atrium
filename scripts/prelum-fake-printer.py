@@ -196,7 +196,13 @@ class H(http.server.BaseHTTPRequestHandler):
             else:
                 open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
                 digest = hashlib.sha256(doc).hexdigest()
-                print(f"fake printer: got job {jid} ({len(doc)} bytes) {j['name']} sha256={digest}", flush=True)
+                document_format = (a.get("document-format") or ["missing"])[0]
+                tls = self.connection.version() if isinstance(self.connection, ssl.SSLSocket) else "none"
+                print(
+                    f"fake printer: got job {jid} ({len(doc)} bytes) {j['name']} "
+                    f"sha256={digest} format={document_format} tls={tls}",
+                    flush=True,
+                )
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", 5)
         elif op == 0x09:
             with LOCK:

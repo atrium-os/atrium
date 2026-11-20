@@ -28,7 +28,8 @@ for line in transcript.splitlines():
     elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
         events.append(("send", int(send[1])))
     elif receipt := re.fullmatch(
-        r"fake printer: got job (\d+) \((\d+) bytes\) (.*) sha256=([a-f0-9]{64})", line
+        r"fake printer: got job (\d+) \((\d+) bytes\) (.*) sha256=([a-f0-9]{64}) format=(\S+) tls=(\S+)",
+        line,
     ):
         events.append(("receipt", int(receipt[1])))
         receipts.append(receipt.groups())
@@ -48,16 +49,19 @@ completed_jobs = re.findall(
     re.M,
 )
 assert [(job, title) for job, _, _, title in completed_jobs] == [
-    (job, title) for job, _, title, _ in receipts
+    (job, title) for job, _, title, _, _, _ in receipts
 ], (completed_jobs, receipts)
-for pdf, (job, size, _title, digest), (_, completed, total, _) in zip(expected, receipts, completed_jobs):
+for pdf, receipt, (_, completed, total, _) in zip(expected, receipts, completed_jobs):
+    job, size, _title, digest, document_format, tls = receipt
+    assert document_format == "application/pdf", (job, document_format)
+    assert tls in ("TLSv1.2", "TLSv1.3"), (job, tls)
     payload = pdf.read_bytes()
     assert len(payload) == int(size), (job, size, len(payload))
     assert hashlib.sha256(payload).hexdigest() == digest, (job, "upload SHA-256 mismatch")
     info = subprocess.check_output(["pdfinfo", str(pdf)], text=True)
     page_count = re.search(r"^Pages: +([0-9]+)$", info, re.M)
     assert page_count and completed == total == page_count[1], (job, completed, total, info)
-print(f"IPPS simulator: {len(job_ids)} ordered job lifecycles; desktop titles, sheet counts and upload hashes match")
+print(f"IPPS simulator: {len(job_ids)} ordered job lifecycles; PDF format and TLS verified; desktop titles, sheet counts and upload hashes match")
 
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 
