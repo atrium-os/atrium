@@ -214,15 +214,23 @@ fn write_workbook_marker(path: &Path, name: &str) -> std::io::Result<PendingWork
     let mut id = [0; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
     let book = PendingWorkbook { id, name: name.chars().filter(|c| !c.is_control()).take(255).collect() };
-    store_workbook_marker(path, &book)?;
+    store_workbook_marker(path, &book, false)?;
     Ok(book)
 }
 
-fn store_workbook_marker(path: &Path, book: &PendingWorkbook) -> std::io::Result<()> {
+#[derive(serde::Deserialize, serde::Serialize)]
+struct WorkbookMarker {
+    #[serde(flatten)]
+    book: PendingWorkbook,
+    #[serde(default)]
+    confirmed_nonempty: bool,
+}
+
+fn store_workbook_marker(path: &Path, book: &PendingWorkbook, confirmed_nonempty: bool) -> std::io::Result<()> {
     use std::io::Write;
     let temp = path.with_extension("pending.tmp");
     let mut file = fs::File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(book)?)?;
+    file.write_all(&serde_json::to_vec(&WorkbookMarker { book: book.clone(), confirmed_nonempty })?)?;
     file.sync_all()?;
     fs::rename(temp, path)?;
     fs::File::open(path.parent().unwrap())?.sync_all()
@@ -324,7 +332,7 @@ fn rename_workbook_marker(path: &Path, id: [u8; 16], name: String) -> std::io::R
     }
     if book.name == name { return Ok(()); }
     book.name = name;
-    store_workbook_marker(path, &book)
+    store_workbook_marker(path, &book, false)
 }
 
 /// Reserve a document slot until its launch thread has torn down the jail.
@@ -373,14 +381,28 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                     finishing |= recover;
                     continue;
                 }
-                if let Some(uid) = registry.uid_for_document(user, app, publisher.as_ref(), persona, Some(index as u8)) {
+                let uid = registry.uid_for_document(user, app, publisher.as_ref(), persona, Some(index as u8));
+                if let Some(uid) = uid {
                     let instance = format!("document-{uid}");
                     let name = portcullis_jail::jail_name_for_instance(app, Some(&instance));
                     if workbook_jail_active(&name, &instance, &dir, index, occupied)? {
                         continue;
                     }
-                    if occupied && !reclaim_abandoned_workbook(&dir, index, &instance, &pending)? {
-                        continue;
+                }
+                let mut inspection = Ok(());
+                if occupied {
+                    let store = workbook_store(&dir, index);
+                    if portcullis_mounts::under(&[&store.dir]).contains(&store.dir) {
+                        let Some(uid) = uid else {
+                            continue; // An attached volume needs a known jail root for teardown.
+                        };
+                        if !reclaim_abandoned_workbook(&store, index, &format!("document-{uid}"), &pending)? {
+                            continue;
+                        }
+                    } else if let Err(e) = check_detached_workbook(&store, &pending, index) {
+                        // An unreadable slot stays occupied. Other workbooks can still open.
+                        eprintln!("portcullisd: checking detached workbook slot {index}: {e}");
+                        inspection = Err(e);
                     }
                 }
                 if pending.try_exists()? != recover { continue; }
@@ -388,8 +410,9 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                     let book = pending_workbook(&pending, index)?;
                     if let WorkbookAction::Select(id) = action {
                         if book.id != id { continue; }
+                        inspection?;
                     } else {
-                        choices.push((index, book));
+                        choices.push((index, book, inspection));
                         continue;
                     }
                 }
@@ -402,9 +425,10 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                 continue;
             }
             if choices.len() > 1 {
-                return Ok(choices.into_iter().map(|(_, book)| book).collect());
+                return Ok(choices.into_iter().map(|(_, book, _)| book).collect());
             }
-            if let Some((index, _)) = choices.pop() {
+            if let Some((index, _, inspection)) = choices.pop() {
+                inspection?;
                 active[index] = true;
                 break 'reserve (Slot(index), dir.join(format!("{index}.pending")));
             }
@@ -868,7 +892,11 @@ struct RecoveryMount<'a> {
 impl<'a> RecoveryMount<'a> {
     fn attach(doc: &'a WorkbookLaunch, app_uid: u32, jail_path: &Path, jc: &mut JailConfig) -> Result<Self, LaunchError> {
         let fail = |e: String| LaunchError::Failed("recovery", e);
-        portcullis_overlay::mount_recovery(&doc.store, 128 << 20).map_err(fail)?;
+        if doc.recover {
+            mount_existing_workbook(&doc.store).map_err(|e| fail(e.to_string()))?;
+        } else {
+            portcullis_overlay::mount_recovery(&doc.store, 128 << 20).map_err(fail)?;
+        }
         let mut mount = Self { doc, clean: false, id: [0; 16] };
         // The root of the image belongs to the broker. Only this child
         // directory is ever writable or visible inside the workbook jail.
@@ -892,7 +920,10 @@ impl<'a> RecoveryMount<'a> {
         mount.id = {
             let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
             let book = if doc.recover {
-                pending_workbook(&doc.pending, doc.slot as usize)
+                pending_workbook(&doc.pending, doc.slot as usize).and_then(|book| {
+                    store_workbook_marker(&doc.pending, &book, false)?;
+                    Ok(book)
+                })
             } else {
                 write_workbook_marker(&doc.pending, &doc.name)
             };
@@ -962,11 +993,40 @@ fn workbook_jail_active(name: &str, instance: &str, dir: &Path, index: usize, oc
     Ok(active)
 }
 
+fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result<()> {
+    if !store.img.try_exists()? && !store.img.with_extension("ufs").try_exists()? {
+        return Err(std::io::Error::other("missing workbook recovery image"));
+    }
+    portcullis_overlay::mount_recovery(store, 128 << 20).map_err(std::io::Error::other)
+}
+
+/// After reboot the old jail and mounts are gone. Older markers also lack
+/// a confirmed directory state. Inspect only the existing private volume.
+fn check_detached_workbook(store: &portcullis_overlay::Place, pending: &Path, index: usize) -> std::io::Result<()> {
+    let bytes = fs::read(pending)?;
+    if !bytes.is_empty() && serde_json::from_slice::<WorkbookMarker>(&bytes)?.confirmed_nonempty {
+        return Ok(());
+    }
+    mount_existing_workbook(store)?;
+    // DirEntry retains the directory descriptor. Drop it before unmounting.
+    let nonempty = fs::read_dir(store.dir.join("autosave"))
+        .and_then(|mut entries| entries.next().transpose().map(|entry| entry.is_some()));
+    portcullis_overlay::unmount_recovery(store).map_err(std::io::Error::other)?;
+    if nonempty? {
+        store_workbook_marker(pending, &pending_workbook(pending, index)?, true)
+    } else {
+        remove_workbook_marker(pending)
+    }
+}
+
+fn remove_workbook_marker(pending: &Path) -> std::io::Result<()> {
+    fs::remove_file(pending)?;
+    fs::File::open(pending.parent().unwrap())?.sync_all()
+}
+
 /// A broker restart loses the launch thread that would normally detach this
 /// image. The caller holds the slot lock. A live or dying jail keeps the slot.
-fn reclaim_abandoned_workbook(dir: &Path, index: usize, instance: &str, pending: &Path) -> std::io::Result<bool> {
-    let store = workbook_store(dir, index);
-    if !portcullis_mounts::under(&[&store.dir]).contains(&store.dir) { return Ok(true); }
+fn reclaim_abandoned_workbook(store: &portcullis_overlay::Place, index: usize, instance: &str, pending: &Path) -> std::io::Result<bool> {
     let root = Path::new(JAILS_DIR).join(instance);
     let upper = Path::new(JAILS_DIR).join(format!("{instance}-upper"));
     let jails = Command::new("jls").args(["-d", "path"]).output()?;
@@ -982,7 +1042,7 @@ fn reclaim_abandoned_workbook(dir: &Path, index: usize, instance: &str, pending:
         return Err(std::io::Error::other("closed workbook still has busy mounts"));
     }
     let id = pending_workbook(pending, index)?.id;
-    finish_closed_recovery(&store, pending, id)?;
+    finish_closed_recovery(store, pending, id)?;
     let _ = fs::remove_dir(&root);
     let _ = fs::remove_dir(&upper);
     Ok(true)
@@ -1000,8 +1060,7 @@ fn finish_closed_recovery(store: &portcullis_overlay::Place, pending: &Path, id:
     }
     portcullis_overlay::unmount_recovery(store).map_err(std::io::Error::other)?;
     if empty {
-        fs::remove_file(pending)?;
-        fs::File::open(pending.parent().unwrap())?.sync_all()?;
+        remove_workbook_marker(pending)?;
     }
     Ok(())
 }
@@ -1959,6 +2018,19 @@ pub fn is_single_instance(app_id: &str) -> bool {
 #[cfg(test)]
 mod recovery_name_tests {
     use super::*;
+
+    #[test]
+    fn missing_detached_image_preserves_the_legacy_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let store = workbook_store(root.path(), 0);
+        let path = root.path().join("0.pending");
+        let marker = br#"{"id":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],"name":"Proof.csv"}"#;
+        fs::write(&path, marker).unwrap();
+        assert!(check_detached_workbook(&store, &path, 0).is_err());
+        assert_eq!(fs::read(&path).unwrap(), marker);
+        assert!(!store.img.exists());
+        assert!(!store.img.with_extension("ufs").exists());
+    }
 
     #[test]
     fn reconciliation_reads_only_one_regular_bounded_name() {

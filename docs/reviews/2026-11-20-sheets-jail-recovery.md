@@ -66,3 +66,11 @@ The original broker left an empty persistent jail when a workbook closed cleanly
 With the updated broker, a clean close released the jail while its sibling stayed open. New reused the same slot and root with a different JID and recovery identity. The new workbook started with blank A1. An independent reader checked all three saved copies: the closed workbook contained `fox`, the new workbook contained only B1=`2`, and the sibling retained A1=`zebra` and accepted B1=`2`. The source CSV retained its SHA-256 digest. After the last close and Recover, there were no document jails, pending markers or recovery devices.
 
 The clean-close desktop gate passed on native Tessera and bounded UFS recovery volumes. On Tessera it also passed when the legacy broker launched both workbooks and the updated broker took over before close. On UFS the live-restart crash regression passed as well. Both focused FreeBSD recovery-marker tests passed. [Desktop gate, run with `--clean-close-reuse` and the private fixture broker executable](../../scripts/sheets-recovery-choices-vm-check.sh)
+
+## Reboot before a cleanly closed slot is reclaimed
+
+Two jails opened `Proof.csv`. Slot 0 held an unsaved A1 edit of `zebra`. Slot 1 saved `fox` as `Proof.osheet` and closed cleanly after Portcullis restarted. The test then killed the sibling and powered down the guest before another workbook action. Both markers persisted. The old broker opened a blank workbook in slot 2 after boot, leaving the empty slot 1 reserved.
+
+The corrected broker inspected the existing images after boot. New reused slot 1 with a fresh recovery ID and published a copy with blank A1 and B1 set to `2`. Recover opened slot 0 directly with its original ID. An independent reader verified `zebra` in its published copy and `fox` in the previously saved workbook. The original CSV retained its SHA-256 digest. Both pending markers cleared and all recovery devices detached.
+
+The two-stage check passed on native Tessera and bounded UFS volumes in a Tessera-root VM. The native check also exercised markers from the old broker. Both plain and password-protected recovery orders passed on UFS. Three focused FreeBSD broker tests passed, including keeping a legacy marker and leaving the backing files absent when its image is missing. [Two-stage desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh)

@@ -7,10 +7,16 @@
 # --live-broker-restart and --clean-close-reuse take the same path and restart
 # with a document open, then exercise crash recovery or clean close and New.
 # For a clean-close upgrade test, pass the legacy executable then its replacement.
+# --prepare-reboot-reuse takes the broker path. Power-cycle the private VM and
+# restart the fixture, then pass the printed directory to --verify-reboot-reuse.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
-results=$(mktemp -d /var/tmp/sheets-select-results.XXXXXX)
+if test "${1:-}" = --verify-reboot-reuse; then
+    results=${2:?pass the result directory printed before shutdown}
+else
+    results=$(mktemp -d /var/tmp/sheets-select-results.XXXXXX)
+fi
 test "$(cat "$books/Proof.csv")" = Original
 input() { printf '%s\n' "$@" | nc -N -U inject.sock >/dev/null; }
 click() { input "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'; }
@@ -133,7 +139,40 @@ restart_broker() {
     ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
     wait_for ready
 }
-if test "${1:-}" = --clean-close-reuse; then
+if test "${1:-}" = --verify-reboot-reuse; then
+    test "$(sysctl -n kern.boottime)" != "$(cat "$results/boot")"
+    wait_for count 0; wait_for pending 2
+    target_marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 1.pending)
+    sibling_marker="$(dirname "$target_marker")/0.pending"
+    cmp "$target_marker" "$results/closed.marker"
+    cmp "$sibling_marker" "$results/sibling.marker"
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    click 119 24; wait_for count 1
+    replacement=$(docs); wait_for opened "$replacement" Untitled
+    grep -Fq '"name":"Untitled"' "$target_marker" || { echo "New skipped the closed slot" >&2; exit 1; }
+    sed 's/,"name":.*//' "$results/closed.marker" > "$results/closed.id"
+    sed 's/,"name":.*//' "$target_marker" > "$results/replacement.id"
+    if cmp -s "$results/closed.id" "$results/replacement.id"; then exit 1; fi
+    wait_for pending 2
+    grep -Fq '"confirmed_nonempty":true' "$sibling_marker"
+    sleep .6; edit 129 0x1f
+    publish Untitled.osheet ',2'
+    key 0x1a 1; wait_for count 0; wait_for pending 1
+    click 213 24; wait_for count 1
+    restored=$(docs); wait_for opened "$restored" Proof.csv
+    grep -Fq '"confirmed_nonempty":false' "$sibling_marker"
+    sed 's/,"name":.*//' "$sibling_marker" > "$results/restored.id"
+    sed 's/,"name":.*//' "$results/sibling.marker" | cmp -s - "$results/restored.id"
+    sleep .6; publish 'Proof (2).osheet' zebra
+    key 0x1a 1; wait_for count 0; wait_for pending 0
+    /tmp/check-recovered-copy "$books/Proof.osheet" fox plain
+    test "$(sha256 -q "$books/Proof.csv")" = "$(cat "$results/source.sha256")"
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
+    echo "Reused the closed slot and recovered the sibling after reboot. Copies: $results"
+    exit 0
+fi
+if test "${1:-}" = --clean-close-reuse || test "${1:-}" = --prepare-reboot-reuse; then
     fixture_broker "${2:-}"
     wait_for count 0; wait_for pending 0
     test "$(ls -A "$books")" = Proof.csv
@@ -168,6 +207,16 @@ if test "${1:-}" = --clean-close-reuse; then
     doc_process "$sibling"
     contents=$(ls -A "$(dirname "$target_marker")/1/autosave")
     test -z "$contents"
+    if test "$1" = --prepare-reboot-reuse; then
+        kill_doc "$sibling"; wait_for count 0; wait_for pending 2
+        cmp "$target_marker" "$results/closed.marker"
+        cmp "$sibling_marker" "$results/sibling.marker"
+        sysctl -n kern.boottime > "$results/boot"
+        echo "$original" > "$results/source.sha256"
+        sync
+        echo "Reboot and run --verify-reboot-reuse $results"
+        exit 0
+    fi
     click 515 24
     new_jail() { replacement=$(docs | grep -vx "$closing" | grep -vx "$sibling"); test -n "$replacement"; }
     wait_for new_jail; wait_for count 2

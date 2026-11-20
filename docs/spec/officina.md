@@ -146,7 +146,9 @@ the durable autosave name after the document jail is torn down. A workbook
 can remain open through a Portcullis restart. If it then crashes, Recover
 releases its abandoned mounts before presenting the workbook. A clean close
 ends the document jail. New can reuse that slot with a fresh recovery identity
-while other workbooks remain open.
+while other workbooks remain open. If the computer restarts before cleanup,
+New can still reuse the cleanly closed slot and Recover can reopen a sibling
+with its unsaved edits.
 Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
 closes that recovery window and leaves the generation available to try again.
 The recovery reader replays the base and journal. Save As obtains a new

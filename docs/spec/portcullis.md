@@ -1251,6 +1251,15 @@ persistence flag, the new broker checks the registered slot, kernel jail root,
 attached recovery volume, empty autosave directory and absence of processes.
 The next workbook in the slot gets a fresh recovery identity.
 
+After reboot an occupied slot may have neither a mount nor a current registry
+UID. Under the slot lock the broker mounts its existing Tessera or UFS image
+and checks for an entry in the autosave directory. A successful detach after
+an empty read clears the marker. A nonempty read preserves the recovery ID
+and records the observation in the private marker, so subsequent scans can
+skip the mount. Opening that recovery clears the observation before the jail
+can change the directory. Older markers begin unconfirmed. A missing or
+unreadable image keeps its slot reserved.
+
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads
 the base and journal. Workbook UIDs cannot request recovery.
