@@ -1,7 +1,7 @@
-//! One warm-cache workbook measurement. Build against the Scrinium revision
-//! being measured, then run as an unprivileged user on a private test volume.
-//! Arguments: new CSV path, size in MiB, paired trial seed, optional published-pair.
-//! In published-pair mode the final four columns are commit/total for Save 1 and Save 2.
+//! Workbook timing probe for a private test volume. Arguments: path, MiB, seed,
+//! and an optional mode. The default measures Open and one Save of a fresh CSV.
+//! `published-pair` times two saves on one grant. `publish-only` prepares the
+//! fixture for a later `open-only`, which first touches the file inside the timer.
 use atrium_sheets::doc::Doc;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -9,14 +9,20 @@ use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
-    let (args, published_pair) = match args.split_last() {
-        Some((mode, rest)) if mode == "published-pair" => (rest, true),
-        _ => (args.as_slice(), false),
+    let [_, path, mib, seed, rest @ ..] = args.as_slice() else {
+        return Err("expected a CSV path, size in MiB, seed and optional mode".into());
     };
-    let [_, path, mib, seed] = args else {
-        return Err(
-            "expected a new CSV path, size in MiB, seed and optional published-pair".into(),
-        );
+    let mode = match rest {
+        [] => "fresh",
+        [mode]
+            if matches!(
+                mode.as_str(),
+                "published-pair" | "publish-only" | "open-only"
+            ) =>
+        {
+            mode
+        }
+        _ => return Err("invalid probe mode".into()),
     };
     let path = std::path::absolute(path)?;
     let rows = mib
@@ -38,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         expected.extend_from_slice(b"\r\n");
     }
-    if published_pair {
+    if matches!(mode, "published-pair" | "publish-only") {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -46,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = File::from(limen::fdpass::sealed_file(name, &expected)?);
         let (_, chosen) = scrinium::fs::publish_workbook(path.parent().unwrap(), name, &snapshot)?;
         assert_eq!(chosen, name);
-    } else {
+    } else if mode == "fresh" {
         let mut original = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -54,7 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         original.write_all(&expected)?;
         original.sync_all()?;
     }
-    assert_eq!(fs::read(&path)?, expected);
+    if mode != "open-only" {
+        assert_eq!(fs::read(&path)?, expected);
+    }
+    if mode == "publish-only" {
+        return Ok(());
+    }
 
     let start = Instant::now();
     let mut file = File::options().read(true).write(true).open(&path)?;
@@ -62,9 +73,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let granted = start.elapsed();
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    let loaded = start.elapsed();
     let (mut doc, _) = Doc::from_csv("Book.csv", &bytes)?;
     let opened = start.elapsed();
-    let revisions = if published_pair {
+    if mode == "open-only" {
+        assert_eq!(bytes, expected);
+        assert_eq!(doc.write_csv(Vec::new())?, expected);
+        println!(
+            "{mib} {seed} {} {} {} {}",
+            granted.as_micros(),
+            (loaded - granted).as_micros(),
+            (opened - loaded).as_micros(),
+            opened.as_micros()
+        );
+        return Ok(());
+    }
+    let revisions = if mode == "published-pair" {
         &b"23"[..]
     } else {
         &b"2"[..]
