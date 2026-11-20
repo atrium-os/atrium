@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 6)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 7)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides_hidden_off, slides_hidden_on, mail = expected
+html, sheets, slides_hidden_off, slides_hidden_on, slides_notes, mail = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -41,12 +41,27 @@ for pdf, setting, expected_groups in (
     (slides_hidden_off, "off", [["FIRST", "SECOND", "THIRD"], ["FOURTH"]]),
     (slides_hidden_on, "on", [["FIRST", "HIDDEN", "SECOND"], ["THIRD", "FOURTH"]]),
 ):
+    pages = pages_of(pdf)
+    assert all("SPEAKER" not in page and "Speaker line" not in page for page in pages), setting
     groups = [
         re.findall(r"(FIRST|SECOND|THIRD|FOURTH|HIDDEN) SLIDE", page)
-        for page in pages_of(pdf)
+        for page in pages
     ]
     assert groups == expected_groups, (setting, groups)
     print(f"Slides: Include Hidden Slides {setting}, handout groups {groups}")
+
+pages = pages_of(slides_notes)
+body = "\n".join(pages)
+assert len(pages) == 10, len(pages)
+assert numbered_lines(r"Speaker line (\d+)", body) == list(range(1, 91)), body
+for slide, note in (
+    ("FIRST SLIDE", "FINAL SPEAKER LINE"),
+    ("HIDDEN SLIDE", "HIDDEN SPEAKER NOTE"),
+    ("SECOND SLIDE", "SECOND SPEAKER NOTE"),
+    ("FOURTH SLIDE", "FOURTH SPEAKER NOTE"),
+):
+    assert body.count(note) == 1 and any(slide in page and note in page for page in pages), note
+print("Slides speaker notes: all 90 numbered lines, the final line, and the hidden slide's note")
 
 pages = pages_of(mail)
 body = "\n".join(pages)

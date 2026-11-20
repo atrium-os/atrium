@@ -181,6 +181,14 @@ cp screen.png slides-hidden-on-preview.png
 press 899 553
 wait_job 4
 sleep 3
+# Keep Include Hidden Slides enabled for speaker notes.
+press 286 23
+press 332 90
+preview 'previews: 8 of 10' 1
+cp screen.png slides-notes-preview.png
+press 899 553
+wait_job 5
+sleep 3
 kill -TERM "$(cat atrium-slides.pid)"
 sleep 2
 daemon -f -p "$P/mail.pid" -o "$P/mail.log" -u prelumail env HOME=/nonexistent LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" "$P/prelum-print-fixture" "$P"
@@ -195,6 +203,6 @@ press 1234 34
 preview 'previews: 3 of 3' 1
 cp screen.png mail-preview.png
 press 940 551
-wait_job 5
+wait_job 6
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 5
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 6
