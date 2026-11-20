@@ -24,7 +24,11 @@ parser.add_argument("--navigate-away", action="store_true",
                     help="follow the parent link while the unload prompt is open, then go Back")
 parser.add_argument("--parked-viewer", action="store_true",
                     help="continue to the pond with NAVIGATOR_UI_IDLE_S=5, then go Back twice")
+parser.add_argument("--saved-record", type=Path, metavar="TLS_LOG",
+                    help="fill the broker cache after parking and verify a saved-record restore against the fixture log")
 args = parser.parse_args()
+if args.saved_record:
+    args.parked_viewer = True
 if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
     args.tier = True
 args.evidence = args.evidence.resolve()
@@ -326,6 +330,27 @@ def page_word(name, word, top, height):
     return None
 
 
+def back_to(path):
+    before = len(log())
+    press(270, 30)
+    expected = f" url=https://parent.example/{path} live=shown ".encode()
+    wait_for(f"Back did not show {path}", lambda: expected in log()[before:])
+
+
+def fill_cache_and_return():
+    # Each page has its own URL and sends a real link activation through the viewer.
+    for number in range(1, 17):
+        link = page_word("flowerbeds", "flowerbeds", 41, 160)
+        if not link:
+            raise RuntimeError(f"missing link to flowerbed {number}")
+        press(*link)
+        title = f'the page child laid out "Flowerbed {number}"'.encode()
+        wait_for(f"flowerbed {number} failed to load", lambda: title in log())
+    for number in range(15, 0, -1):
+        back_to(f"bed-{number}.html")
+    back_to("pond.html")
+
+
 def return_from_pond(original_viewer):
     pond = page_word("garden", "pond", 41, 180)
     if not pond:
@@ -337,14 +362,19 @@ def return_from_pond(original_viewer):
              and original_viewer not in guest("pgrep -x navigator-page").splitlines(), 20)
     if guest("pgrep -x counter || true"):
         raise RuntimeError("parking restarted the widget")
-    press(270, 30)
-    wait_for("first Back did not restore the garden", lambda:
-             b"showed live page https://parent.example/away.html" in log()
-             and page_word("garden-back", "marigolds", 41, 150))
+    if args.saved_record:
+        fill_cache_and_return()
+    back_to("away.html")
+    wait_for("Back did not render the garden", lambda: page_word("garden-back", "marigolds", 41, 150))
     return set(guest("pgrep -x navigator-page").splitlines())
 
 
 def navigate_away():
+    if args.saved_record:
+        parent_get = b'"GET /counter-parent.html HTTP/1.1"'
+        requests = args.saved_record.read_bytes()
+        if parent_get not in requests:
+            raise RuntimeError("fixture log did not record the initial parent GET")
     original_ui, original_viewer = parent().splitlines()
     start(0)
     count("first", 0)
@@ -364,11 +394,11 @@ def navigate_away():
     press(270, 30)  # Back, below the headless shell strip
     url = b"https://parent.example/counter-parent.html"
     if args.parked_viewer:
+        source = b" brought back from the store" if args.saved_record else b" opened from navigatord's cache"
         def rebuilt():
             report = log()
             return (report.count(b'the page child laid out "Embedded counter"') == 2
-                    and any(b"page " + url + source in report for source in
-                            (b" opened from navigatord's cache", b" brought back from the store")))
+                    and b"page " + url + source in report)
         wait_for("Back did not rebuild the parked page from its recorded content", rebuilt)
         new_viewers = set(guest("pgrep -x navigator-page").splitlines()) - existing
         if len(new_viewers) != 1 or original_viewer in new_viewers:
@@ -399,6 +429,14 @@ def navigate_away():
             or report.count(b"widget GET ") != 2 or report.count(b"widget reported voluntary close") != 1
             or b"prompt=widget-failed" in report or b"widget unload 1 leave=false" in report):
         raise RuntimeError("unexpected parent reload, widget fetch, timeout, or worker retirement")
+    if args.saved_record:
+        traffic = args.saved_record.read_bytes()
+        if not traffic.startswith(requests):
+            raise RuntimeError("fixture log changed during the run")
+        delta = traffic[len(requests):]
+        if parent_get in delta or any(f'"GET /bed-{n}.html HTTP/1.1"'.encode() not in delta for n in range(1, 17)):
+            raise RuntimeError("unexpected parent refetch or missing cache-fill request")
+        print("All 16 flowerbeds fetched. Back rebuilt the parent from its saved record without a parent GET.")
     print(f"Navigation retired {int(first)} with its question open. Original viewer {int(original_viewer)}, viewer after Back {int(viewer)}."
           f" Guarded Start opened worker {int(second)} at Count 0; it incremented and closed on its own Leave.")
 

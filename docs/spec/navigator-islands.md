@@ -240,6 +240,15 @@ fixtures above, set the five-second UI idle timeout and pass `--parked-viewer`
 to the installed gate. Evidence is in
 `~/atrium-vm/evidence/navigator-i2-parked-viewer-20261121/`.
 
+To exercise saved-record restore, generate the sixteen linked fixture pages
+with `python3 test-assets/navigator-i0/make-flowerbeds.py DIRECTORY` and serve
+them as `/bed-1.html` through `/bed-16.html` on the parent origin. Use
+`--saved-record TLS_LOG` in the parked-viewer setup. The gate visits all
+sixteen pages after the park acknowledgement to fill the broker’s 16-entry
+cache. On Back it requires the store as the source, a new viewer, and no
+second parent GET in the fixture’s HTTP request log. It then checks the
+restored prompt and Start consent through the production UI.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
