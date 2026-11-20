@@ -980,8 +980,10 @@ another origin. An active portal-profile session stays in engine memory.
   rebind and checks that the unchanged report precedes ESP traffic and
   later refreshes without prompting. Restoring IPv6 forwarding again
   requires fresh approval before upload, and IPv4 traffic continues on
-  the same ESP association after approval. The extended FreeBSD arm64
-  gate passed 38/38 using the shared Cargo cache.
+  the same ESP association after approval. The restored report then
+  refreshes silently, and rebind submits it without another prompt
+  before IPv4 traffic resumes on a new ESP association. The extended
+  FreeBSD arm64 gate passed 41/41 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

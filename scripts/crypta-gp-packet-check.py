@@ -725,7 +725,7 @@ def main():
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (10 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -739,7 +739,7 @@ def main():
                         if final_rebind_retry and not final_fallback:
                             expected_spis.append(esp.configs[8][0][0])
                         if final_recover:
-                            expected_spis.extend([esp.configs[9][0][0]] * 3)
+                            expected_spis.extend([esp.configs[9][0][0]] * 3 + [esp.configs[10][0][0]])
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -753,7 +753,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        allowed_echoes.append([*expected_spis[:-3], expected_spis[-4], *expected_spis[-3:]])
+                        allowed_echoes.append([*expected_spis[:-4], expected_spis[-5], *expected_spis[-4:]])
                     elif final_rebind_retry and not final_fallback:
                         allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
                     else:
@@ -846,7 +846,10 @@ def main():
                                                 first_restored = recovered_reports.index(original)
                                                 assert set(recovered_reports[:first_restored]) == {changed}, reports
                                                 assert set(recovered_reports[first_restored:]) == {original}, reports
-                                                print("Recovered ESP refreshed silently and sent restored forwarding only after fresh approval")
+                                                restored_rebind_report = calls[:configs[10]].count("hipreport.esp")
+                                                assert restored_rebind_report >= recovery_report + first_restored + 2, reports
+                                                assert reports[restored_rebind_report:] and set(reports[restored_rebind_report:]) == {original}, reports
+                                                print("Recovered ESP required fresh approval, refreshed silently, and rebound with the unchanged report")
                                             else:
                                                 print("Final rebind fell back to TLS after unchanged HIP and refreshed without prompting")
                                         else:
