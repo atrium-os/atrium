@@ -568,6 +568,20 @@ What Mail shows comes from what was checked, never from what the message says ab
   such as IMAP APPEND and JMAP import, or supplies authenticated delivery
   metadata separately from the message bytes.
   [RFC 8601 §§4.1 and 5](https://www.rfc-editor.org/rfc/rfc8601.html#section-4.1)
+
+  Base JMAP returns message headers and accepts uploaded raw messages through
+  `Email/import`. Gmail documents a direct mailbox insert path alongside
+  its scanned import path. These interfaces provide no documented guarantee
+  that a returned `Authentication-Results` field came from delivery.
+  [RFC 8621 §§4.1.3 and 4.8](https://datatracker.ietf.org/doc/html/rfc8621#section-4.8),
+  [Gmail message methods](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages#methods)
+
+  To qualify a deployment for provider trust, confirm that a real SMTP
+  delivery supplies a protected verdict. Check that attempts to put a new
+  message with an untrusted claim in the same Inbox by import or copy are
+  rejected or leave it unverified. Cover every enabled mailbox write path
+  and sync from a fresh index to represent writes made by another client.
+
 - Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
   index across restarts. Positive answers are valid for six hours and empty
   answers for one hour. The index holds up to 4,096 names, sharing answers

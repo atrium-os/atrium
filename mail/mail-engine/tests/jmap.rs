@@ -12,6 +12,7 @@ use std::rc::Rc;
 use mail_compose::{Draft, Mailbox};
 use mail_engine::send::{Delivery, When};
 use mail_engine::{Action, Engine, Parser};
+use mail_schema::SenderCheck;
 use mail_store::flag;
 use mail_store::{Role, Store};
 use mail_sync::jmap::{Client, Http};
@@ -346,6 +347,34 @@ fn jmap_snoozes_until_due_and_preserves_existing_labels() {
     assert!(!server.borrow().mails[&id].keywords.contains("$snoozed"));
     assert_eq!(engine.store.list(inbox, 0, 10).unwrap()[0].msg, msg);
     assert!(engine.store.parked(account).unwrap().is_empty());
+}
+
+#[test]
+fn jmap_inbox_import_from_another_client_is_unverified() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut importer = Client::connect(Fake(server.clone()), SESSION).unwrap();
+    let mut raw =
+        b"Authentication-Results: edge.example; dmarc=pass header.from=example.net\r\n".to_vec();
+    raw.extend(message(1, "Imported by another client", "From an archive."));
+    let imported = importer.import("Inbox", &raw).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut reader = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    reader.sync(&mut engine.sink(account)).unwrap();
+
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].subject, "Imported by another client");
+    let id = rows[0].msg;
+    let stored = engine.store.message(id).unwrap();
+    assert_eq!(server.borrow().mails[&imported].bytes, raw);
+    assert_eq!(engine.store.blob(&stored.full.unwrap()).unwrap(), raw);
+    assert_eq!(stored.summary.sender_check, SenderCheck::NotVerified);
+    let opened = engine.open(id).unwrap();
+    assert_eq!(opened.summary.sender_check, SenderCheck::NotVerified);
 }
 
 #[test]
