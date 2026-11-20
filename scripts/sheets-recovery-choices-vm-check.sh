@@ -10,6 +10,8 @@
 # --prepare-reboot-reuse takes the broker path. Power-cycle the private VM and
 # restart the fixture, then pass the printed directory to --verify-reboot-reuse.
 # --prepare-reboot-labels and --verify-reboot-labels exercise a missed rename.
+# --retry-recovery-label takes the fixture broker path. Its optional third argument
+# selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -143,7 +145,7 @@ restart_broker() {
 recover_named_pair() {
     # Slot zero is the copy with the suffix, although it was saved second.
     click 120 96; wait_for count 1; sleep .6
-    publish 'Proof (2) (2).osheet' 'zebra,2'
+    publish 'Proof (2) (2).osheet' "${1:-zebra,2}"
     key 0x1a 1; wait_for count 0; wait_for pending 1
     click 213 24; wait_for count 1; sleep .6
     publish 'Proof (3).osheet' 'fox,2'
@@ -152,6 +154,32 @@ recover_named_pair() {
     for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
     echo "Both recovered names, identities, edits and suggested Save As names verified. Frames and copies: $results"
 }
+# Repair this fixture's private name with no workbook or broker mount open.
+repair_fixture_name() (
+    count 0; detached
+    store=$(dirname "$marker")
+    if test -f "$store/0.ufs"; then
+        image="$store/0.ufs"; fs=ufs; options=nosuid,noexec
+    else
+        image="$store/0.img"; fs=tessera; options=tessera.quota_bytes=134217728
+    fi
+    repair="$results/repair"
+    mkdir "$repair"
+    unit=$(mdconfig -a -t vnode -f "$image")
+    trap 'mdconfig -d -u "$unit"' EXIT
+    mount -t "$fs" -o "$options" "/dev/$unit" "$repair"
+    trap 'umount "$repair" && mdconfig -d -u "$unit"' EXIT
+    saved=$(find "$repair/autosave" -name name.saved -type f)
+    test "$(cat "$saved")" = 'Proof (2).osheet'
+    if test "$fault" = missing; then
+        test ! -e "${saved%/*}/name"
+    else
+        cmp "$results/unreadable-name" "${saved%/*}/name"
+    fi
+    mv "$saved" "${saved%/*}/name"
+    umount "$repair"; mdconfig -d -u "$unit"; trap - EXIT
+    rmdir "$repair"
+)
 if test "${1:-}" = --verify-reboot-labels; then
     test "$(sysctl -n kern.boottime)" != "$(cat "$results/boot")"
     original=$(cat "$results/source.sha256")
@@ -285,8 +313,16 @@ if test "${1:-}" = --clean-close-reuse || test "${1:-}" = --prepare-reboot-reuse
     echo "Clean close reused the slot with a fresh identity and preserved the live sibling. Copies: $results"
     exit 0
 fi
-if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels || test "${1:-}" = --prepare-reboot-labels; then
+if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels || test "${1:-}" = --prepare-reboot-labels || test "${1:-}" = --retry-recovery-label; then
     interrupted=false
+    if test "$1" = --retry-recovery-label; then
+        fault=${3:-missing}
+        case "$fault" in
+            missing) ;;
+            invalid-utf8) printf '\377' > "$results/unreadable-name" ;;
+            *) echo "Expected missing or invalid-utf8" >&2; exit 1 ;;
+        esac
+    fi
     if test "$1" != --save-as-labels; then
         interrupted=true
         fixture_broker "${2:-}"
@@ -348,6 +384,11 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
         fi
         edit 129 0x1f
         sleep 2.2
+        if test "$1" = --retry-recovery-label && test "$slot" = 0; then
+            test "$(cat "$dir/name")" = "$name"
+            mv "$dir/name" "$dir/name.saved"
+            if test "$fault" = invalid-utf8; then cp "$results/unreadable-name" "$dir/name"; fi
+        fi
         kill_doc "$jid"; wait_for count "$slot"
     done
     wait_for pending 2
@@ -371,6 +412,28 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
         fi
     fi
     click 213 24
+    if test "$1" = --retry-recovery-label; then
+        sibling="$(dirname "$marker")/1.pending"
+        wait_for grep -Fq '"checked_detached":true' "$sibling"
+        wait_for detached
+        cmp "$results/0.before" "$marker"
+        cp "$sibling" "$results/healthy.marker"
+        sleep .6; cp selectscreen.png "$results/fallback-chooser.png"
+        click 120 96; wait_for count 1
+        fallback=$(docs)
+        wait_for test -f "$(root "$fallback")/atrium/recovery/$(basename "$dir")/name.saved"
+        sleep .6; edit 129 0x20 # commit B1=3 via the fallback row
+        sleep 2.2; kill_doc "$fallback"; wait_for count 0; wait_for detached
+        warnings() { awk '/keeping previous workbook recovery label/ {n++} END {print n+0}' select-port.log; }
+        before=$(warnings)
+        click 213 24
+        retried() { test "$(warnings)" -gt "$before"; }
+        wait_for retried; wait_for detached
+        cmp "$results/0.before" "$marker"
+        repair_fixture_name
+        cmp "$results/0.before" "$marker"
+        click 213 24
+    fi
     if "$interrupted"; then
         marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name '0.pending')
         wait_for grep -Fq '"name":"Proof (2).osheet"' "$marker" || {
@@ -387,7 +450,18 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     # The chooser redraw follows the broker reply, after the volume detaches.
     sleep .6
     cp selectscreen.png "$results/recovery-names.png"
-    recover_named_pair
+    if test "$1" = --retry-recovery-label; then
+        grep -Fq '"checked_detached":true' "$marker"
+        cmp "$results/healthy.marker" "$sibling"
+        for slot in 0 1; do
+            sed 's/,"name":.*//' "$(dirname "$marker")/$slot.pending" > "$results/after.id"
+            sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/after.id"
+        done
+        recover_named_pair 'zebra,3'
+        wait_for detached
+    else
+        recover_named_pair
+    fi
     exit 0
 fi
 for first in protected plain; do

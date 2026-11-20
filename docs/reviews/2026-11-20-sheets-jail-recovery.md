@@ -82,3 +82,11 @@ Two jails opened `Proof.csv` and published `Proof.osheet` and `Proof (2).osheet`
 After boot the old chooser displayed `Proof.csv` alongside `Proof.osheet` and marked both slots nonempty. The updated broker rechecked those same Tessera images, including the slot the old broker had already inspected. The rendered chooser displayed `Proof (2).osheet` and `Proof.osheet`. The two-stage test also passed with bounded UFS recovery images.
 
 Each selection kept its original ID. An independent reader found `zebra,2` in `Proof (2) (2).osheet` and `fox,2` in `Proof (3).osheet` after recovery and Save As. The source CSV retained its SHA-256 digest. Four focused FreeBSD broker tests passed. [Two-stage desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh)
+
+## Retry after repairing unreadable name metadata
+
+The desktop gate starts with two pending copies. The damaged workbook published `Proof (2).osheet` while its broker name update was interrupted. Its marker still says `Proof.csv`. The fixture saves the original name file and either removes it from its usual path or puts invalid UTF-8 there. The workbook base and journal stay intact.
+
+The chooser displayed `Proof.csv` beside the healthy `Proof.osheet`. Selecting the fallback row restored the damaged workbook and accepted a new B1 edit of `3`. After a second crash and Recover, the broker retried the name read and kept the marker. With both workbooks closed, the fixture restored only the original name file and detached the image. The next Recover displayed `Proof (2).osheet`. Both recovery IDs matched their original values.
+
+An independent reader verified `zebra,3` in the first recovered copy and `fox,2` in its sibling. The source CSV retained its SHA-256 digest. Both faults passed on native Tessera and bounded UFS recovery images in the isolated Tessera-root VM. All recovery devices detached after the copies closed. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-recovery-label`, the fixture broker executable, and either `missing` or `invalid-utf8`.
