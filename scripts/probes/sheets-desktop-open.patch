@@ -1,12 +1,39 @@
 diff --git a/atrium-sheets/src/bin/atrium_sheets.rs b/atrium-sheets/src/bin/atrium_sheets.rs
-index 179598e5..b3d16577 100644
+index 179598e5..0ebffd54 100644
 --- a/atrium-sheets/src/bin/atrium_sheets.rs
 +++ b/atrium-sheets/src/bin/atrium_sheets.rs
-@@ -425,0 +426,4 @@ fn main() {
+@@ -208,0 +209,2 @@ impl Run {
++        let trace = target.is_some();
++        if trace { atrium_sheets::files::scene_probe("autosave-start"); }
+@@ -213,0 +216 @@ impl Run {
++        if trace { atrium_sheets::files::scene_probe("autosave-end"); }
+@@ -276,0 +280 @@ impl Run {
++        atrium_sheets::files::scene_probe("read-start");
+@@ -352,0 +357 @@ impl Run {
++                atrium_sheets::files::scene_probe("adopt-start");
+@@ -353,0 +359 @@ impl Run {
++                atrium_sheets::files::scene_probe("adopted");
+@@ -425,0 +432,4 @@ fn main() {
 +    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
 +    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
 +        eprintln!("desktop-open entry {} {}", ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64, std::process::id());
 +    }
+diff --git a/atrium-sheets/src/files.rs b/atrium-sheets/src/files.rs
+index 521d8482..454e08ef 100644
+--- a/atrium-sheets/src/files.rs
++++ b/atrium-sheets/src/files.rs
+@@ -55,0 +56,7 @@ pub struct Loading {
++pub fn scene_probe(label: &str) {
++    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) }, 0);
++    eprintln!("scene-stage {} {} {}", std::process::id(), label,
++        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64);
++}
++
+@@ -60,0 +68 @@ impl Loading {
++            scene_probe("parse-start");
+@@ -61,0 +70 @@ impl Loading {
++            if r.is_ok() { scene_probe("loaded"); }
 diff --git a/frescod/src/injector_reader.rs b/frescod/src/injector_reader.rs
 index adb9e7e7..15d848ec 100644
 --- a/frescod/src/injector_reader.rs
@@ -32,3 +59,32 @@ index 58a04f92..12cb2908 100644
 +        eprintln!("desktop-open frame {frame_ns} {frame_no} {signature:016x}");
 @@ -1449,0 +1459 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 +                let _ = std::fs::hard_link(&out, format!("{png}-sig-{signature:016x}.png"));
+diff --git a/pergola/src/window.rs b/pergola/src/window.rs
+index f70fdd8b..001c54b8 100644
+--- a/pergola/src/window.rs
++++ b/pergola/src/window.rs
+@@ -331,0 +332,20 @@ impl Window {
++                use crate::node::{Node, NodeDelta};
++                let mut has_a = false;
++                let mut has_b = false;
++                for delta in &batch {
++                    if let NodeDelta::Added { node, .. } | NodeDelta::Changed { node, .. } = delta {
++                        if let Node::Text { content, rect, .. } = node {
++                            has_a |= content == "1" && (40.0..96.0).contains(&rect.x());
++                            has_b |= content.starts_with("lxqtneioqf");
++                        }
++                    }
++                }
++                let mark = |label: &str| {
++                    if has_a || has_b {
++                        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++                        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) }, 0);
++                        eprintln!("scene-batch {} {} {} {} {} {}", std::process::id(), label,
++                            t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64, win, has_a, has_b);
++                    }
++                };
++                mark("begin");
+@@ -332,0 +353 @@ impl Window {
++                mark("commit-return");
+@@ -333,0 +355 @@ impl Window {
++                mark("present-sent");
