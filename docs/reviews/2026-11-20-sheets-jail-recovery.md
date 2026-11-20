@@ -158,3 +158,11 @@ The launcher showed the startup notice for `Proof.csv` with `Untitled` still sel
 With the sibling image still offline, releasing the first launch reopened `Proof.csv` once, in its original slot and with the same recovery ID. An independent reader verified `zebra` after Save As and `zebra,2` after Save. Restoring the sibling image with its original SHA-256 digest allowed the protected workbook to recover and save `fox,2`. Both markers and recovery devices cleared after close. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `unavailable`.
 
 The gate passed on native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs matched the same named-error screenshot.
+
+## A listed sibling’s recovery ID changes during a delayed launch
+
+After the chooser showed `Untitled` beneath the startup notice for `Proof.csv`, the fixture atomically changed only the sibling marker’s ID. Its label, slot, and autosave contents stayed the same. Selecting the cached row displayed “That recovery is no longer available. Choose Recover again.” Both markers remained pending, the replacement marker stayed byte-identical, and the runtime launch log contained only the held start for `Proof.csv`.
+
+Releasing the hold opened the first workbook once in its original jail slot with its original ID. An independent reader checked `zebra` after Save As and `zebra,2` after Save. Once the first workbook closed, a fresh Recover started the protected sibling. Its running Sheets process received the replacement ID, `41`. The saved sibling copy contained `fox,2`. Both recovery devices detached and both markers cleared. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `stale-id`.
+
+The stale-selection gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM.

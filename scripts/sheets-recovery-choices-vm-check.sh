@@ -13,7 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
-# --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, or unavailable after the broker path.
+# --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, or stale-id after the broker path.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -491,6 +491,9 @@ if test "${1:-}" = --delayed-runtime-start || test "${1:-}" = --delayed-start-si
 #!/bin/sh
 set -eu
 dir=${0%/*}
+if test "$#" = 5 && test "$1" = -q && test "$2" = -c; then
+    echo "$5" >> "$dir/starts"
+fi
 if test "$#" = 5 && test "$1" = -q && test "$2" = -c && test "$5" = "$(cat "$dir/target")"; then
     echo "$$" >> "$dir/attempts"
     for i in $(jot 450); do
@@ -547,11 +550,29 @@ SH
             cp selectscreen.png "$results/repeated.png"
             cmp "$results/starting.png" "$results/repeated.png"
             ;;
-        direct|unavailable) test "$1" = --delayed-start-sibling ;;
+        direct|unavailable|stale-id) test "$1" = --delayed-start-sibling ;;
         *) exit 2 ;;
     esac
     count 0; test "$(wc -l < "$bin/attempts")" -eq 1
-    if test "${3:-}" = unavailable; then
+    if test "${3:-}" = stale-id; then
+        sibling_marker="$(dirname "$marker")/1.pending"
+        cp "$sibling_marker" "$results/listed.marker"
+        # Change only the opaque ID; the old row still has the same name and slot.
+        replacement='"id":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,41]'
+        sed "s/\"id\":\[[^]]*\]/$replacement/" "$results/listed.marker" > "$results/replacement.marker"
+        grep -Fq "$replacement" "$results/replacement.marker"
+        if grep -Fq "$replacement" "$marker" "$results/listed.marker"; then exit 1; fi
+        cp -p "$sibling_marker" "$sibling_marker.tmp"
+        cat "$results/replacement.marker" > "$sibling_marker.tmp"
+        mv "$sibling_marker.tmp" "$sibling_marker"
+        click 120 96
+        stale_notice() { test "$(sha256 -q selectscreen.png)" = 45ce0e5ef6dc104f5e1845eeebdf96c7b7003d7c7b6a2f80b5733038d03c7a62; }
+        wait_for stale_notice
+        cp selectscreen.png "$results/stale-selection.png"
+        cmp "$sibling_marker" "$results/replacement.marker"
+        test -f "$bin/hold"; count 0; pending 2
+        cmp "$bin/starts" "$bin/target"
+    elif test "${3:-}" = unavailable; then
         store=$(dirname "$marker")
         sibling_image="$store/1.img"
         if test -f "$store/1.ufs"; then sibling_image="$store/1.ufs"; fi
@@ -594,6 +615,17 @@ SH
         click 213 24; wait_for count 1
         wait_for opened "$(docs)" Untitled
         sleep .6; save_copy protected
+    fi
+    if test "${3:-}" = stale-id; then
+        wait_for pending 1
+        cmp "$bin/starts" "$bin/target"
+        cmp "$sibling_marker" "$results/replacement.marker"
+        click 213 24; wait_for count 1
+        sibling=$(docs)
+        wait_for opened "$sibling" Untitled
+        wait_for pgrep -f -j "$sibling" -- 'atrium-sheets --recover-document 41$'
+        sleep .6; save_copy protected
+        test "$(wc -l < "$bin/starts")" -eq 2
     fi
     wait_for pending 0
     test "$(wc -l < "$bin/attempts")" -eq 1
