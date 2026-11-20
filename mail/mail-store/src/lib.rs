@@ -293,6 +293,8 @@ impl Store {
             tx.open_table(senders::LANES)?;
             tx.open_table(certs::CERTS)?;
             tx.open_table(dns::DNS_TXT)?;
+            // Legacy rows have no resolver lifetime and must be fetched again.
+            tx.delete_table(dns::DNS_LEGACY)?;
             tx.open_table(pgp::PGP_KEYS)?;
             tx.open_table(later::LATER)?;
             tx.open_table(later::LATER_BY_THREAD)?;

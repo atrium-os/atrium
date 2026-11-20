@@ -602,10 +602,13 @@ What Mail shows comes from what was checked, never from what the message says ab
   and sync from a fresh index to represent writes made by another client.
 
 - Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
-  index across restarts. Positive answers are valid for six hours and empty
-  answers for one hour. The index holds up to 4,096 names, sharing answers
-  between the reader and sync. Expired answers, resolver failures and records
-  timestamped ahead of the current clock trigger a fresh lookup.
+  index across restarts until their remaining DNS lifetime expires, capped
+  at six hours for positive answers and one hour for empty answers. Mail
+  uses zero-lifetime answers for the current check only. Opening an older
+  index drops cache rows that lack DNS lifetimes. The cache holds up to
+  4,096 names and is shared by the reader and sync. Expired answers,
+  resolver failures and records timestamped ahead of the current clock
+  trigger a fresh lookup.
 - **The header** shows the name, and always the verified domain next to it: "Priya Nair ·
   example.com ✓". A failing or missing check shows the address in full with "not verified".
   A display name that contains an address or a domain different from the real one is shown

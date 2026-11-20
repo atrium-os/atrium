@@ -62,13 +62,13 @@ struct Answers {
 struct Fake(Rc<RefCell<Answers>>);
 
 impl Dns for Fake {
-    fn txt(&self, name: &str) -> Result<Vec<String>, String> {
+    fn txt(&self, name: &str) -> Result<(Vec<String>, u32), String> {
         let mut s = self.0.borrow_mut();
         s.queried.push(name.to_string());
         if s.failed.contains(name) {
             return Err("timed out".into());
         }
-        Ok(s.records.get(name).cloned().unwrap_or_default())
+        Ok((s.records.get(name).cloned().unwrap_or_default(), 120))
     }
 }
 

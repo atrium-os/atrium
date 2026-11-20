@@ -26,6 +26,7 @@ pub enum WireEvent {
     Done { id: u32, bytes: u64 },
     Error { id: u32, code: ErrorCode },
     Records { id: u32, records: Vec<Record>, secure: bool },
+    RecordsWithTtl { id: u32, records: Vec<Record>, secure: bool, ttl: u32 },
 }
 
 fn text_ok(s: &str, max: usize) -> bool { s.len() <= max && !s.chars().any(|c| c.is_control()) }
@@ -52,7 +53,7 @@ impl Request {
                     (Method::Get | Method::Head, None) => true,
                     _ => false,
                 },
-            Request::Lookup(l) => name_ok(&l.name),
+            Request::Lookup(l) | Request::LookupWithTtl(l) => name_ok(&l.name),
             Request::Cancel { .. } | Request::Budget { .. } => true,
         }
     }
@@ -69,7 +70,7 @@ impl WireEvent {
                 text_ok(final_url, URL_MAX) && content_type.as_deref().is_none_or(|c| text_ok(c, TEXT_MAX)) && validator_ok(validator),
             WireEvent::Data { bytes, .. } => bytes.len() <= DATA_MAX,
             WireEvent::Retrying { reason, .. } => text_ok(reason, TEXT_MAX),
-            WireEvent::Records { records, .. } => records.len() <= RECORDS_MAX && records.iter().all(Record::valid),
+            WireEvent::Records { records, .. } | WireEvent::RecordsWithTtl { records, .. } => records.len() <= RECORDS_MAX && records.iter().all(Record::valid),
             _ => true,
         };
         ok.then_some(e)
@@ -99,10 +100,15 @@ impl WireEvent {
             Event::Retrying { id, attempt, reason } => (WireEvent::Retrying { id, attempt, reason: cut(reason, TEXT_MAX) }, None),
             Event::Done { id, bytes } => (WireEvent::Done { id, bytes }, None),
             Event::Error { id, code } => (WireEvent::Error { id, code }, None),
-            Event::Records { id, mut records, secure } => {
+            Event::Records { id, mut records, secure, ttl } => {
                 records.retain(Record::valid);
                 records.truncate(RECORDS_MAX);
-                (WireEvent::Records { id, records, secure }, None)
+                let wire = if ttl == 0 {
+                    WireEvent::Records { id, records, secure }
+                } else {
+                    WireEvent::RecordsWithTtl { id, records, secure, ttl }
+                };
+                (wire, None)
             }
         }
     }
@@ -118,7 +124,8 @@ impl WireEvent {
             WireEvent::Retrying { id, attempt, reason } => Event::Retrying { id, attempt, reason },
             WireEvent::Done { id, bytes } => Event::Done { id, bytes },
             WireEvent::Error { id, code } => Event::Error { id, code },
-            WireEvent::Records { id, records, secure } => Event::Records { id, records, secure },
+            WireEvent::Records { id, records, secure } => Event::Records { id, records, secure, ttl: 0 },
+            WireEvent::RecordsWithTtl { id, records, secure, ttl } => Event::Records { id, records, secure, ttl },
         })
     }
 }

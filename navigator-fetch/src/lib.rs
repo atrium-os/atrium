@@ -213,7 +213,7 @@ impl<'a> Conversation<'a> {
     pub fn with_dns(mut self, ex: Arc<dyn dns::Exchange>) -> Self { self.dns = Some(ex); self }
 
     /// ★ A DNS lookup, held to the app's site list like a fetch.
-    pub fn lookup(&self, name: &str, kind: ::nuntius::RecordKind) -> Result<(Vec<::nuntius::Record>, bool), ::nuntius::ErrorCode> {
+    pub fn lookup(&self, name: &str, kind: ::nuntius::RecordKind) -> Result<(Vec<::nuntius::Record>, bool, u32), ::nuntius::ErrorCode> {
         if self.site_check(name).is_err() {
             return Err(::nuntius::ErrorCode::Policy);
         }

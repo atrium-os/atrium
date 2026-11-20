@@ -32,6 +32,7 @@ impl Client {
     pub fn cancel(&mut self, id: u32) -> io::Result<()> { self.requests.send(&Request::Cancel { id }) }
     pub fn budget(&mut self, bytes: u64) -> io::Result<()> { self.requests.send(&Request::Budget { bytes }) }
     pub fn lookup(&mut self, l: Lookup) -> io::Result<()> { self.requests.send(&Request::Lookup(l)) }
+    pub fn lookup_with_ttl(&mut self, l: Lookup) -> io::Result<()> { self.requests.send(&Request::LookupWithTtl(l)) }
     pub fn recv(&mut self) -> io::Result<Event> { self.events.recv() }
     pub fn recv_timeout(&mut self, t: Duration) -> io::Result<Option<Event>> { self.events.recv_timeout(t) }
 }

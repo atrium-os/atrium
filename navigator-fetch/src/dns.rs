@@ -191,9 +191,39 @@ fn name_at(m: &[u8], mut i: usize) -> Option<(String, usize)> {
     }
 }
 
-/// The records of `kind` in answer `m` to query `id` for `name`, and
-/// whether the resolver validated them. No such name is no records.
-pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Record>, bool), ErrorCode> {
+fn ttl_at(message: &[u8], offset: usize) -> Option<u32> {
+    let ttl = u32::from_be_bytes(message.get(offset..offset + 4)?.try_into().ok()?);
+    Some(if ttl > i32::MAX as u32 { 0 } else { ttl })
+}
+
+fn negative_ttl(message: &[u8], mut offset: usize, count: u16, name: &str) -> Result<u32, ErrorCode> {
+    let bad = ErrorCode::Malformed;
+    let mut ttl = None::<u32>;
+    for _ in 0..count {
+        let (zone, header) = name_at(message, offset).ok_or(bad)?;
+        let len = u16_at(message, header + 8).ok_or(bad)? as usize;
+        let start = header + 10;
+        offset = start + len;
+        message.get(start..offset).ok_or(bad)?;
+        let encloses_name = zone.is_empty() || name == zone
+            || name.strip_suffix(&zone).is_some_and(|prefix| prefix.ends_with('.'));
+        if !encloses_name || u16_at(message, header) != Some(6) || u16_at(message, header + 2) != Some(1) {
+            continue;
+        }
+        let (_, rname) = name_at(message, start).ok_or(bad)?;
+        let (_, numbers) = name_at(message, rname).ok_or(bad)?;
+        if numbers + 20 != offset {
+            return Err(bad);
+        }
+        let bound = ttl_at(message, header + 4).ok_or(bad)?.min(ttl_at(message, numbers + 16).ok_or(bad)?);
+        ttl = Some(ttl.map_or(bound, |value| value.min(bound)));
+    }
+    Ok(ttl.unwrap_or(0))
+}
+
+/// The records of `kind` in answer `m` to query `id` for `name`, the AD bit,
+/// and the cache lifetime in seconds. An unknown lifetime is zero.
+pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Record>, bool, u32), ErrorCode> {
     let bad = ErrorCode::Malformed;
     let flags = u16_at(m, 2).ok_or(bad)?;
     if u16_at(m, 0) != Some(id) || flags & 0x8000 == 0 || flags & 0x7800 != 0 {
@@ -211,11 +241,11 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
         return Err(bad);
     }
     let secure = flags & 0x0020 != 0;
-    match flags & 0x000F {
-        0 => {}
-        3 => return Ok((Vec::new(), secure)),
+    let absent = match flags & 0x000F {
+        0 => false,
+        3 => true,
         _ => return Err(ErrorCode::Dns),
-    }
+    };
 
     i += 4;
     let mut aliases = Vec::new();
@@ -229,38 +259,48 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
         if class != 1 {
             continue;
         }
+        let ttl = ttl_at(m, j + 4).ok_or(bad)?;
         if t == 5 {
             let (target, end) = name_at(m, at).ok_or(bad)?;
             if end != i || target.is_empty() {
                 return Err(bad);
             }
-            aliases.push((owner, target));
+            aliases.push((owner, target, ttl));
         } else if t == qtype(kind) {
-            records.push((owner, at, data));
+            records.push((owner, at, data, ttl));
         }
     }
 
     // Resolve the chain from the question before choosing records, so the
     // result is independent of the order of the answer records.
     let mut chain = vec![qname.as_str()];
+    let mut ttl = u32::MAX;
     let terminal = loop {
         let owner = *chain.last().unwrap();
-        let mut targets = aliases.iter().filter(|(alias, _)| alias == owner);
-        let Some((_, target)) = targets.next() else { break owner };
-        if targets.any(|(_, other)| other != target) || chain.contains(&target.as_str()) || chain.len() == 9 {
+        let mut targets = aliases.iter().filter(|(alias, _, _)| alias == owner);
+        let Some((_, target, lifetime)) = targets.next() else { break owner };
+        if chain.contains(&target.as_str()) || chain.len() == 9 {
             return Err(bad);
+        }
+        ttl = ttl.min(*lifetime);
+        for (_, other, lifetime) in targets {
+            if other != target {
+                return Err(bad);
+            }
+            ttl = ttl.min(*lifetime);
         }
         chain.push(target);
     };
 
     let mut out = Vec::new();
-    let mut matching = records.iter().filter(|(owner, _, _)| owner == terminal).peekable();
-    if !records.is_empty() && matching.peek().is_none() {
+    let matching = records.iter().filter(|(owner, _, _, _)| owner == terminal);
+    if !records.is_empty() && (absent || matching.clone().next().is_none()) {
         return Err(bad);
     }
-    for &(_, at, data) in matching {
+    for &(_, at, data, lifetime) in matching {
+        ttl = ttl.min(lifetime);
         if out.len() >= RECORDS_MAX {
-            break;
+            continue;
         }
         let r = match kind {
             RecordKind::Txt => {
@@ -287,7 +327,12 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
         };
         out.push(r);
     }
-    Ok((out, secure))
+    if records.is_empty() {
+        ttl = ttl.min(negative_ttl(m, i, u16_at(m, 8).ok_or(bad)?, terminal)?);
+    } else if out.is_empty() {
+        ttl = 0;
+    }
+    Ok((out, secure, ttl))
 }
 
 /// At most this many addresses from one answer.
@@ -470,7 +515,7 @@ fn fresh_id() -> u16 {
 }
 
 /// Look `name` up through `ex`.
-pub fn lookup(ex: &dyn Exchange, name: &str, kind: RecordKind) -> Result<(Vec<Record>, bool), ErrorCode> {
+pub fn lookup(ex: &dyn Exchange, name: &str, kind: RecordKind) -> Result<(Vec<Record>, bool, u32), ErrorCode> {
     if !nuntius::name_ok(name) {
         return Err(ErrorCode::Malformed);
     }
@@ -524,7 +569,13 @@ mod tests {
             for (owner, kind, data) in records {
                 packet.extend(encode_name(owner));
                 packet.extend(kind.to_be_bytes());
-                packet.extend([0, 1, 0, 0, 0, 60]);
+                let ttl = match *owner {
+                    "alias.example" => 15,
+                    "other.example" => 0,
+                    _ => 60u32,
+                };
+                packet.extend([0, 1]);
+                packet.extend(ttl.to_be_bytes());
                 packet.extend((data.len() as u16).to_be_bytes());
                 packet.extend(data);
             }
@@ -538,13 +589,36 @@ mod tests {
             (alias, 5, encode_name(target)),
             (name, 5, encode_name(alias)),
         ]);
-        assert_eq!(read(&linked), Ok((vec![Record::Txt("key".into())], false)));
+        assert_eq!(read(&linked), Ok((vec![Record::Txt("key".into())], false, 15)));
         assert_eq!(read(&reply_with_owners(&[unrelated])), Err(ErrorCode::Malformed));
 
         let cyclic = reply_with_owners(&[(name, 5, encode_name(alias)), (alias, 5, encode_name(name))]);
         assert_eq!(read(&cyclic), Err(ErrorCode::Malformed));
         let competing = reply_with_owners(&[(name, 5, encode_name(alias)), (name, 5, encode_name(target))]);
         assert_eq!(read(&competing), Err(ErrorCode::Malformed));
+    }
+
+    #[test]
+    fn negative_answers_take_the_soa_lifetime() {
+        let name = "lookup.example";
+        let q = query(4, name, RecordKind::Txt);
+        for status in [0, 3] {
+            let mut m = reply(&q, status, &[]);
+            m[8..10].copy_from_slice(&1u16.to_be_bytes());
+            m.extend_from_slice(b"\x07example\0");
+            m.extend([0, 6, 0, 1]);
+            m.extend(40u32.to_be_bytes()); // SOA TTL
+            m.extend(24u16.to_be_bytes());
+            m.extend([0xC0, 12, 0xC0, 12]); // primary and contact names
+            m.extend([0; 16]);
+            m.extend(25u32.to_be_bytes()); // SOA MINIMUM
+            assert_eq!(answer(&m, 4, name, RecordKind::Txt), Ok((vec![], false, 25)));
+        }
+
+        let mut m = reply(&q, 0, &[(16, b"\x03key".to_vec())]);
+        let header = m.len() - 4 - 10;
+        m[header + 4] = 0x80;
+        assert_eq!(answer(&m, 4, name, RecordKind::Txt), Ok((vec![Record::Txt("key".into())], false, 0)));
     }
 
     #[test]
@@ -558,11 +632,11 @@ mod tests {
         txt.push(4);
         txt.extend_from_slice(b"M1;x");
         let m = reply(&q, 0x0020, &[(16, txt)]);
-        assert_eq!(answer(&m, 0x1234, "SEL._domainkey.example.com", RecordKind::Txt), Ok((vec![Record::Txt("v=DKIM1;x".into())], true)));
+        assert_eq!(answer(&m, 0x1234, "SEL._domainkey.example.com", RecordKind::Txt), Ok((vec![Record::Txt("v=DKIM1;x".into())], true, 3600)));
         assert_eq!(answer(&m, 0x1235, "sel._domainkey.example.com", RecordKind::Txt), Err(ErrorCode::Malformed), "another id");
         assert_eq!(answer(&m, 0x1234, "other.example.com", RecordKind::Txt), Err(ErrorCode::Malformed), "another question");
         // No such name.
-        assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Ok((vec![], false)));
+        assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Ok((vec![], false, 0)));
         assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "other.example.com", RecordKind::Txt), Err(ErrorCode::Malformed));
         assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Mx), Err(ErrorCode::Malformed));
         assert_eq!(answer(&reply(&q, 2, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Err(ErrorCode::Dns));
@@ -607,7 +681,7 @@ mod tests {
         });
         let u = Udp::to(&[at]).unwrap();
         for _ in 0..2 {
-            assert_eq!(lookup(&u, "_dmarc.example.com", RecordKind::Txt), Ok((vec![Record::Txt("abc".into())], true)));
+            assert_eq!(lookup(&u, "_dmarc.example.com", RecordKind::Txt), Ok((vec![Record::Txt("abc".into())], true, 3600)));
         }
         assert_eq!(lookup(&u, "nodots", RecordKind::Txt), Err(ErrorCode::Malformed));
     }

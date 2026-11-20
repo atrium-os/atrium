@@ -90,7 +90,12 @@ impl Nuntius {
                     self.inner.credit.notify_all();
                 }
             }
-            Request::Lookup(l) => {
+            request @ (Request::Lookup(_) | Request::LookupWithTtl(_)) => {
+                let (l, with_ttl) = match request {
+                    Request::Lookup(l) => (l, false),
+                    Request::LookupWithTtl(l) => (l, true),
+                    _ => unreachable!(),
+                };
                 let mut live = self.inner.live.lock().unwrap();
                 if live.len() >= MAX_REQUESTS || live.contains_key(&l.id) {
                     let _ = self.events.send(Event::Error { id: l.id, code: ErrorCode::Malformed });
@@ -101,7 +106,7 @@ impl Nuntius {
                 let (conv, inner, events) = (self.conv.sibling(), self.inner.clone(), self.events.clone());
                 std::thread::spawn(move || {
                     let last = match conv.lookup(&l.name, l.kind) {
-                        Ok((records, secure)) => Event::Records { id: l.id, records, secure },
+                        Ok((records, secure, ttl)) => Event::Records { id: l.id, records, secure, ttl: if with_ttl { ttl } else { 0 } },
                         Err(code) => Event::Error { id: l.id, code },
                     };
                     inner.live.lock().unwrap().remove(&l.id);

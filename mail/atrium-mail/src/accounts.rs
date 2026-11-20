@@ -219,11 +219,15 @@ impl mail_sync::jmap::Http for CourierHttp {
 
 // ── settings discovery through Nuntius ──────────────────────────────
 
-/// One lookup through a fetcher (nuntius.md §3.6): its records, waiting
+/// One lookup through a fetcher (nuntius.md §3.6): records and their TTL, waiting
 /// at most 8 s; other events (none are expected) are passed over.
-pub fn lookup(c: &mut nuntius::Client, id: u32, name: &str, kind: nuntius::RecordKind) -> Result<Vec<nuntius::Record>, String> {
+pub fn lookup(c: &mut nuntius::Client, id: u32, name: &str, kind: nuntius::RecordKind) -> Result<(Vec<nuntius::Record>, u32), String> {
     use nuntius::{Event, Lookup};
-    c.lookup(Lookup { id, name: name.to_string(), kind }).map_err(|e| e.to_string())?;
+    let request = Lookup { id, name: name.to_string(), kind };
+    match kind {
+        nuntius::RecordKind::Txt => c.lookup_with_ttl(request),
+        _ => c.lookup(request),
+    }.map_err(|e| e.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -231,7 +235,7 @@ pub fn lookup(c: &mut nuntius::Client, id: u32, name: &str, kind: nuntius::Recor
             return Err("no answer in time".into());
         }
         match c.recv_timeout(left) {
-            Ok(Some(Event::Records { id: i, records, .. })) if i == id => return Ok(records),
+            Ok(Some(Event::Records { id: i, records, ttl, .. })) if i == id => return Ok((records, ttl)),
             Ok(Some(Event::Error { id: i, code })) if i == id => return Err(format!("{code:?}")),
             Ok(_) => {}
             Err(e) => return Err(e.to_string()),
@@ -248,7 +252,7 @@ pub struct NuntiusDns {
 }
 
 impl mail_engine::dns::Dns for NuntiusDns {
-    fn txt(&self, name: &str) -> Result<Vec<String>, String> {
+    fn txt(&self, name: &str) -> Result<(Vec<String>, u32), String> {
         let mut f = self.fetcher.borrow_mut();
         if f.as_ref().is_some_and(|(_, g)| g.exited()) {
             *f = None;
@@ -260,7 +264,7 @@ impl mail_engine::dns::Dns for NuntiusDns {
         self.next.set(id);
         let (c, _) = f.as_mut().unwrap();
         match lookup(c, id, name, nuntius::RecordKind::Txt) {
-            Ok(r) => Ok(r.into_iter().filter_map(|r| match r { nuntius::Record::Txt(t) => Some(t), _ => None }).collect()),
+            Ok((records, ttl)) => Ok((records.into_iter().filter_map(|r| match r { nuntius::Record::Txt(t) => Some(t), _ => None }).collect(), ttl)),
             Err(e) => {
                 // A fetcher that went quiet is not asked again.
                 *f = None;
@@ -303,6 +307,7 @@ impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
     }
     fn srv(&mut self, name: &str) -> Vec<(u16, u16, u16, String)> {
         lookup(self.0, 2, name, nuntius::RecordKind::Srv)
+            .map(|(records, _)| records)
             .unwrap_or_default()
             .into_iter()
             .filter_map(|r| match r { nuntius::Record::Srv { priority, weight, port, target } => Some((priority, weight, port, target)), _ => None })
@@ -310,6 +315,7 @@ impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
     }
     fn mx(&mut self, domain: &str) -> Vec<String> {
         let mut v: Vec<(u16, String)> = lookup(self.0, 3, domain, nuntius::RecordKind::Mx)
+            .map(|(records, _)| records)
             .unwrap_or_default()
             .into_iter()
             .filter_map(|r| match r { nuntius::Record::Mx { preference, host } => Some((preference, host)), _ => None })

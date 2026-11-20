@@ -3,8 +3,8 @@
 //! those by mail-schema) and the engine answers through the caller's
 //! [`Dns`] (Mail's Nuntius, which asks the system's resolver).
 //!
-//! Answers are kept in the instance’s index for hours, so a sender's DNS can't count
-//! messages: it sees one lookup per key per few hours, from the resolver.
+//! Answers are kept in the instance’s index up to the resolver’s TTL and
+//! Mail’s own caps so repeated messages can reuse a fresh answer.
 //! A name that exists with no record is answered with an empty record,
 //! which the jail reads as no key (not verified); a lookup that failed is
 //! answered with nothing, so the check stays pending and is tried again.
@@ -15,8 +15,9 @@ use crate::Engine;
 
 /// TXT lookups, by whoever has the network.
 pub trait Dns {
-    /// The TXT records at `name`; `Err` when the lookup itself failed.
-    fn txt(&self, name: &str) -> Result<Vec<String>, String>;
+    /// The TXT records at `name` and their remaining TTL in seconds.
+    /// A zero TTL permits use for the current lookup only.
+    fn txt(&self, name: &str) -> Result<(Vec<String>, u32), String>;
 }
 
 /// The one record the jail gets from `records` at `name`: a DMARC record,
@@ -56,13 +57,13 @@ impl Engine {
             return Some(answer);
         }
         self.dns_lookups.set(self.dns_lookups.get() + 1);
-        let records = dns.txt(&name).ok()?;
+        let (records, ttl) = dns.txt(&name).ok()?;
         let answer = pick(&name, &records);
         // The live result can still be used if the optional cache cannot be
         // written. Do not cache resolver errors or use expired records.
-        let _ = self
-            .store
-            .write(|w| w.cache_dns(&name, &answer, now, crate::now()));
+        if ttl != 0 {
+            let _ = self.store.write(|w| w.cache_dns(&name, &answer, now, crate::now(), ttl));
+        }
         Some(answer)
     }
 }
@@ -99,11 +100,11 @@ mod persistent {
     struct Answer(&'static str);
 
     impl Dns for Answer {
-        fn txt(&self, _: &str) -> Result<Vec<String>, String> {
+        fn txt(&self, _: &str) -> Result<(Vec<String>, u32), String> {
             if self.0 == "error" {
                 return Err("resolver offline".into());
             }
-            Ok(vec![self.0.to_string()])
+            Ok((vec![self.0.to_string()], 120))
         }
     }
 
@@ -140,13 +141,13 @@ mod persistent {
     fn expired_rows_refresh_and_resolver_failures_are_not_saved() {
         let dir = tempfile::tempdir().unwrap();
         let now = crate::now();
-        let old = now - KEEP_FOUND.as_secs() as i64;
-        let missing = now - KEEP_NONE.as_secs() as i64;
+        let old = now - 120;
+        let missing = now - 60;
         let store = Store::open(dir.path()).unwrap();
         store
             .write(|w| {
-                w.cache_dns(KEY, "v=DKIM1; p=old", old, old)?;
-                w.cache_dns(POLICY, "", missing, missing)
+                w.cache_dns(KEY, "v=DKIM1; p=old", old, old, 120)?;
+                w.cache_dns(POLICY, "", missing, missing, 60)
             })
             .unwrap();
         assert_eq!(

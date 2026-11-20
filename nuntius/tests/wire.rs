@@ -109,9 +109,9 @@ fn lookups_and_records_on_the_wire() {
     }
     let recs = vec![Record::Txt("v=DKIM1; k=ed25519; p=abc".into()), Record::Srv { priority: 0, weight: 5, port: 993, target: "imap.example.com".into() },
                     Record::Mx { preference: 10, host: "mx.example.com".into() }];
-    let (w, _) = WireEvent::from_event(Event::Records { id: 9, records: recs.clone(), secure: true });
+    let (w, _) = WireEvent::from_event(Event::Records { id: 9, records: recs.clone(), secure: true, ttl: 60 });
     let back = WireEvent::decode(&w.encode()).unwrap().into_event(None).unwrap();
-    assert!(matches!(&back, Event::Records { id: 9, records, secure: true } if *records == recs));
+    assert!(matches!(&back, Event::Records { id: 9, records, secure: true, ttl: 60 } if *records == recs));
     assert!(back.is_last());
     // Too many, or too long, from a fetcher: refused whole by the client.
     let many = WireEvent::Records { id: 1, records: vec![Record::Txt(String::new()); RECORDS_MAX + 1], secure: false };

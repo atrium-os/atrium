@@ -261,11 +261,13 @@ fn lookups_over_the_channel() {
         .with_dns(Arc::new(navigator_fetch::dns::Udp::to(&[at]).unwrap()));
     std::thread::spawn(move || serve_channel(b, conv, 0));
     let mut c = Client::from_stream(a).unwrap();
-    c.lookup(Lookup { id: 3, name: "_dmarc.example.com".into(), kind: RecordKind::Txt }).unwrap();
+    c.lookup_with_ttl(Lookup { id: 3, name: "_dmarc.example.com".into(), kind: RecordKind::Txt }).unwrap();
     match next(&mut c) {
-        Event::Records { id: 3, records, secure: true } => assert_eq!(records, vec![Record::Txt("v=DMARC1".into())]),
+        Event::Records { id: 3, records, secure: true, ttl: 60 } => assert_eq!(records, vec![Record::Txt("v=DMARC1".into())]),
         e => panic!("{e:?}"),
     }
+    c.lookup(Lookup { id: 5, name: "_dmarc.example.com".into(), kind: RecordKind::Txt }).unwrap();
+    assert!(matches!(next(&mut c), Event::Records { id: 5, ttl: 0, .. }));
     assert!(c.lookup(Lookup { id: 4, name: "not a name".into(), kind: RecordKind::Txt }).is_err(), "refused before it is sent");
 
     // No resolver given: Dns.

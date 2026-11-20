@@ -176,6 +176,8 @@ pub enum Request {
     /// Answered by one `Records` (no such name or no records: empty), or
     /// `Error` with `Dns`, `Policy` or `Timeout`.
     Lookup(Lookup),
+    /// Same lookup with a remaining lifetime in the answer.
+    LookupWithTtl(Lookup),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +197,7 @@ pub enum Event {
     Done { id: u32, bytes: u64 },
     Error { id: u32, code: ErrorCode },
     /// A lookup's answer. `secure`: the resolver validated it with DNSSEC.
-    Records { id: u32, records: Vec<Record>, secure: bool },
+    Records { id: u32, records: Vec<Record>, secure: bool, ttl: u32 },
 }
 
 impl Event {

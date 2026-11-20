@@ -152,6 +152,16 @@ needs beside addresses (a fetch resolves addresses itself). The answer is one
 `Records { id, records, secure }` (no such name, or no records: empty; `secure`: the
 resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout` or `Policy`.
 
+`LookupWithTtl` can also return `RecordsWithTtl`, carrying the remaining
+lifetime in seconds. A legacy `Records` reply to this request means there
+is no usable lifetime. Positive replies use the shortest TTL of the
+matching records and their CNAME chain. Negative replies also cap the TTL
+by the matching authority SOA’s TTL and MINIMUM. Negative replies without
+a matching SOA have no usable lifetime.
+[RFC 2181 §8](https://www.rfc-editor.org/rfc/rfc2181.html#section-8),
+[RFC 2308 §5](https://www.rfc-editor.org/rfc/rfc2308.html#section-5)
+
+
 - Names are letters, digits, `-` and `_`, labels of 1–63, at least two, at most 253
   characters. The site list (§4) applies to the name as to a host.
 - At most 32 records; a TXT record's strings are joined and kept up to 4 KiB.
@@ -174,7 +184,7 @@ resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout`
   place. A portal fetcher uses the portal’s resolver, and a VPN-bound fetcher
   uses its route domain’s resolver.
 - The site list applies before the query reaches any resolver. Mail caches
-  answers for hours (mail.md §7.5).
+  answers up to their remaining DNS lifetime (mail.md §7.5).
 
 ## 4. Who decides what a client may reach
 

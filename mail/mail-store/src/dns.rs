@@ -6,20 +6,21 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::{Error, Result, Store, Writer};
 
-pub(crate) const DNS_TXT: TableDefinition<&str, (i64, &str)> = TableDefinition::new("dns_txt");
+pub(crate) const DNS_LEGACY: TableDefinition<&str, (i64, &str)> = TableDefinition::new("dns_txt");
+pub(crate) const DNS_TXT: TableDefinition<&str, (i64, i64, &str)> = TableDefinition::new("dns_txt_ttl");
 
 pub const KEEP_FOUND: Duration = Duration::from_secs(6 * 3600);
 pub const KEEP_NONE: Duration = Duration::from_secs(3600);
 pub const CACHE_MAX: usize = 4096;
 const TXT_MAX: usize = 4096;
 
-fn expires(observed: i64, answer: &str) -> i64 {
+fn expires(observed: i64, answer: &str, ttl: u32) -> i64 {
     let keep = if answer.is_empty() {
         KEEP_NONE
     } else {
         KEEP_FOUND
     };
-    observed.saturating_add(keep.as_secs() as i64)
+    observed.saturating_add(i64::from(ttl).min(keep.as_secs() as i64))
 }
 
 impl Store {
@@ -30,20 +31,21 @@ impl Store {
         let table = tx.open_table(DNS_TXT)?;
         let entry = table.get(name.to_ascii_lowercase().as_str())?;
         Ok(entry.and_then(|entry| {
-            let (observed, answer) = entry.value();
-            (observed <= now && now < expires(observed, answer)).then(|| answer.to_owned())
+            let (observed, expires, answer) = entry.value();
+            (observed <= now && now < expires).then(|| answer.to_owned())
         }))
     }
 }
 
 impl Writer<'_> {
     /// Keep a successful lookup, including an empty answer. Resolver errors
-    /// never reach this table. observed is the lookup's start in Unix seconds.
-    pub fn cache_dns(&mut self, name: &str, answer: &str, observed: i64, now: i64) -> Result<()> {
+    /// never reach this table. Expiry is the lookup's start plus the capped TTL.
+    pub fn cache_dns(&mut self, name: &str, answer: &str, observed: i64, now: i64, ttl: u32) -> Result<()> {
         if !mail_schema::query_allowed(name) || answer.len() > TXT_MAX || observed < 0 {
             return Err(Error::Corrupt("invalid DNS cache entry"));
         }
-        if observed > now || expires(observed, answer) <= now {
+        let expiry = expires(observed, answer, ttl);
+        if observed > now || expiry <= now {
             return Ok(());
         }
         let name = name.to_ascii_lowercase();
@@ -60,11 +62,11 @@ impl Writer<'_> {
             let mut victim = None;
             for entry in table.iter()? {
                 let (key, value) = entry?;
-                let (seen, txt) = value.value();
+                let (seen, expiry, _) = value.value();
                 let rank = if seen > now {
                     i64::MIN
                 } else {
-                    expires(seen, txt)
+                    expiry
                 };
                 if victim.as_ref().is_none_or(|(best, _)| rank < *best) {
                     victim = Some((rank, key.value().to_owned()));
@@ -74,7 +76,7 @@ impl Writer<'_> {
                 table.remove(victim.as_str())?;
             }
         }
-        table.insert(name.as_str(), (observed, answer))?;
+        table.insert(name.as_str(), (observed, expiry, answer))?;
         Ok(())
     }
 }
@@ -90,8 +92,8 @@ mod tests {
         let name = "_dmarc.example.com";
         store
             .write(|w| {
-                w.cache_dns(name, "v=DMARC1; p=reject", 110, 113)?;
-                w.cache_dns(name, "v=DMARC1; p=none", 100, 114)
+                w.cache_dns(name, "v=DMARC1; p=reject", 110, 113, 60)?;
+                w.cache_dns(name, "v=DMARC1; p=none", 100, 114, 60)
             })
             .unwrap();
         assert_eq!(
@@ -101,7 +103,7 @@ mod tests {
         // After the clock moves backwards, a live answer can replace the
         // future-dated row rather than leaving the cache permanently cold.
         store
-            .write(|w| w.cache_dns(name, "v=DMARC1; p=none", 80, 81))
+            .write(|w| w.cache_dns(name, "v=DMARC1; p=none", 80, 81, 60))
             .unwrap();
         assert_eq!(
             store.cached_dns(name, 81).unwrap().as_deref(),
@@ -110,13 +112,34 @@ mod tests {
     }
 
     #[test]
+    fn zero_ttl_does_not_cache_and_long_lifetimes_respect_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = "sel._domainkey.example.com";
+        let policy = "_dmarc.example.com";
+        store.write(|w| w.cache_dns(key, "p=key", 100, 100, 0)).unwrap();
+        assert_eq!(store.cached_dns(key, 100).unwrap(), None);
+        store.write(|w| {
+            w.cache_dns(key, "p=key", 100, 100, u32::MAX)?;
+            w.cache_dns(policy, "", 100, 100, u32::MAX)
+        }).unwrap();
+        let key_expiry = 100 + KEEP_FOUND.as_secs() as i64;
+        let policy_expiry = 100 + KEEP_NONE.as_secs() as i64;
+        assert!(store.cached_dns(key, key_expiry - 1).unwrap().is_some());
+        assert!(store.cached_dns(policy, policy_expiry - 1).unwrap().is_some());
+        assert_eq!(store.cached_dns(key, key_expiry).unwrap(), None);
+        assert_eq!(store.cached_dns(policy, policy_expiry).unwrap(), None);
+    }
+
+    #[test]
     fn an_existing_index_opens_with_the_new_cache_table() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let account = store.add_account("reader@example.com").unwrap();
-        // Simulate the same index schema before the additive cache table.
+        // The legacy table stored only observation time and text.
         let tx = store.db.begin_write().unwrap();
         assert!(tx.delete_table(DNS_TXT).unwrap());
+        tx.open_table(DNS_LEGACY).unwrap().insert("_dmarc.example.com", (0, "v=DMARC1; p=reject")).unwrap();
         tx.commit().unwrap();
         drop(store);
         let store = Store::open(dir.path()).unwrap();
