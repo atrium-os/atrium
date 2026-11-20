@@ -1558,8 +1558,12 @@ Stalwart in the cloud VM, and later a real account):
    body, an absent key and a strict alignment mismatch, and confirmed cache
    reuse. The private guest firewall blocked direct jail-to-host DNS. The gate
    used a temporary UDP/53 redirect scoped to the fixture fetcher and resolver.
-   Deployment resolver reachability, cache persistence across restarts, and
-   trusted-provider Authentication-Results remain open.
+   A follow-up run passed all six cases with the stock PF and NAT rules and an
+   upstream resolver on a separate LAN. With the commissioned local-unbound
+   setup, the copied 127.0.0.1 resolver address refers to the fetcher’s own
+   VNET loopback and TXT lookup fails. A deployed path to host local-unbound,
+   cache persistence across restarts, and trusted-provider
+   Authentication-Results remain open.
    **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
    gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
    waiting in `IDLE` on the inbox and renewing it every 25 minutes (RFC 2177's 29, the
