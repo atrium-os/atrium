@@ -558,8 +558,11 @@ What Mail shows comes from what was checked, never from what the message says ab
   (RFC 7489) and **ARC** (RFC 8617) from forwarders the person trusts.
   Mail selects key records by their `p` tag. A signature or key record
   with duplicate tag names cannot verify. A key’s declared type must match
-  the signature algorithm.
-  [RFC 6376 §§3.2 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.2)
+  the signature algorithm. The key’s `h` and `s` tags must permit SHA-256
+  and email respectively when present. A signature’s `i` domain must match
+  or be a subdomain of its `d` domain. The key’s `t=s` flag requires an
+  exact match.
+  [RFC 6376 §§3.2 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.6.1)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup
   leaves the sender check pending and Mail retries when the message is opened
   again. Mail checks the organizational domain after a successful lookup

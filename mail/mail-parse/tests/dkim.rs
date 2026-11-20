@@ -116,6 +116,30 @@ fn duplicate_or_malformed_tag_lists_cannot_verify() {
 }
 
 #[test]
+fn published_key_restrictions_apply_to_valid_signatures() {
+    let (kp, rec) = ed();
+    let signed_with = |extra| signed("ed25519-sha256", "example.com", extra, &ed_sign(&kp), HEADERS, BODY);
+    let cases = [
+        ("", "; h=sha1:sha256; s=other:email; t=s", Outcome::Pass),
+        ("", "; s=*", Outcome::Pass),
+        ("", "; h=sha1", Outcome::PermError("key hash")),
+        ("", "; s=other", Outcome::PermError("key service")),
+        (" i=@EXAMPLE.COM;", "; t=s", Outcome::Pass),
+        (" i=@mail.example.com;", "", Outcome::Pass),
+        (" i=@mail.example.com;", "; t=other:s", Outcome::PermError("key signing identity")),
+    ];
+    for (signature_tags, key_tags, expected) in cases {
+        let key = |_: &str, _: &str| Some(format!("{rec}{key_tags}"));
+        assert_eq!(dkim::verify(&signed_with(signature_tags), &key, 0)[0].outcome, expected);
+    }
+
+    for identity in [" i=@notexample.com;", " i=@mail..example.com;"] {
+        let result = dkim::verify(&signed_with(identity), &|_, _| panic!("invalid identity reached DNS"), 0);
+        assert_eq!(result[0].outcome, Outcome::PermError("signing identity"));
+    }
+}
+
+#[test]
 fn length_limit_and_expiry() {
     let (kp, rec) = ed();
     let key = |_: &str, _: &str| Some(rec.clone());

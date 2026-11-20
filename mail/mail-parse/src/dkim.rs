@@ -253,6 +253,15 @@ pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) 
     out
 }
 
+fn dns_domain(name: &str) -> bool {
+    name.len() <= 253 && name.contains('.') && name.split('.').all(|label| {
+        label.len() <= 63
+            && label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+            && label.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64, partial: &mut bool) -> Outcome {
     let _ = raw;
@@ -262,9 +271,23 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     let (Some(d), Some(s), Some(h), Some(bh), Some(b)) = (tag(t, "d"), tag(t, "s"), tag(t, "h"), tag(t, "bh"), tag(t, "b")) else {
         return Outcome::PermError("missing tag");
     };
-    if d.is_empty() || s.is_empty() || !d.contains('.') || d.len() > 253 || s.len() > 63 {
+    if !dns_domain(d) || s.is_empty() || s.len() > 63 {
         return Outcome::PermError("domain or selector");
     }
+    let d = d.to_ascii_lowercase();
+    let identity_domain = match tag(t, "i") {
+        Some(identity) => {
+            let Some((_, domain)) = identity.rsplit_once('@') else { return Outcome::PermError("signing identity") };
+            let domain = domain.to_ascii_lowercase();
+            if !dns_domain(&domain)
+                || (domain != d && !domain.strip_suffix(&d).is_some_and(|prefix| prefix.ends_with('.')))
+            {
+                return Outcome::PermError("signing identity");
+            }
+            domain
+        }
+        None => d.clone(),
+    };
     let alg = tag(t, "a").unwrap_or("");
     if alg != "rsa-sha256" && alg != "ed25519-sha256" {
         return Outcome::PermError("algorithm"); // rsa-sha1 is not accepted
@@ -302,7 +325,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         return Outcome::Fail("body hash");
     }
     // the key
-    let Some(rec) = key(s, &d.to_ascii_lowercase()) else { return Outcome::NoKey };
+    let Some(rec) = key(s, &d) else { return Outcome::NoKey };
     if rec.is_empty() {
         return Outcome::Fail("key absent");
     }
@@ -317,6 +340,16 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     let k = tag(&kt, "k").unwrap_or("rsa");
     if !matches!((k, alg), ("rsa", "rsa-sha256") | ("ed25519", "ed25519-sha256")) {
         return Outcome::PermError("key type");
+    }
+    // Both supported signature algorithms use SHA-256.
+    if tag(&kt, "h").is_some_and(|hashes| !hashes.split(':').any(|hash| hash == "sha256")) {
+        return Outcome::PermError("key hash");
+    }
+    if tag(&kt, "s").is_some_and(|services| !services.split(':').any(|service| matches!(service, "*" | "email"))) {
+        return Outcome::PermError("key service");
+    }
+    if identity_domain != d && tag(&kt, "t").is_some_and(|flags| flags.split(':').any(|flag| flag == "s")) {
+        return Outcome::PermError("key signing identity");
     }
     let pk = base64(p.as_bytes(), 4096);
     // the signed header data: chosen fields bottom-up, then this signature without b=
