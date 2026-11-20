@@ -930,6 +930,7 @@ another origin. An active portal-profile session stays in engine memory.
   stays down. The retry reuses approval for the same report, opens ESP
   after acknowledgement, and refreshes the unchanged report without
   prompting.
+  The arm64 gate passed 18/18 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
