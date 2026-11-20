@@ -869,8 +869,14 @@ In split mode a renderer assigns local IDs and the compositor assigns global
 IDs. The window-token request removes that numeric comparison. The live
 activation probe submits a press for a second live window of the same uid,
 then submits the same press for the intended window and checks replay. It
-prints the local and compositor IDs for the successful receipt. The broker
-regression passed on the Mac. The split-renderer guest run is pending.
+prints the local and compositor IDs for the successful receipt. On a fresh Tessera-root arm64 HVF overlay the guarded window was local
+ID 1 and compositor ID 10. A press presented against another live window
+of the same uid was refused. The intended window accepted the same press
+once and refused replay. A covering window and an absent guard each caused
+refusal. Uncovering the row restored acceptance. All 28 live probe checks
+and all 22 Navigator broker tests passed. The three guest binary hashes
+matched staging. Logs and a composed frame are in
+`~/atrium-vm/evidence/navigator-i1-split-window-20261120/`.
 
 Next, have the installed Navigator broker spend a guarded chrome activation
 for the current document and selected widget. Use its tracked bounds to place
