@@ -17,6 +17,9 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 fn jail() -> PathBuf {
+    if let Some(path) = std::env::var_os("MAIL_PARSE_JAIL") {
+        return path.into();
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());

@@ -40,7 +40,9 @@ struct Engine { child: std::process::Child, r: BufReader<std::process::ChildStdo
 
 impl Engine {
     fn start() -> Engine {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_mail-parse-jail")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let binary = std::env::var_os("MAIL_PARSE_JAIL")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_mail-parse-jail").into());
+        let mut child = Command::new(binary).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
         let r = BufReader::new(child.stdout.take().unwrap());
         let w = BufWriter::new(child.stdin.take().unwrap());
         Engine { child, r, w, queries: Vec::new() }
