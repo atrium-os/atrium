@@ -701,6 +701,19 @@ rebind_restored_forwarding() {
     reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
     before_rebind=$(awk 'END { print NR }' "$receipts")
     "$V" "$CTL rebind name=gp-gate" >/dev/null
+    if [ "$#" = 3 ]; then
+        for _ in $(seq 1 25); do
+            [ ! -f "$receipts.$3-pending" ] || break
+            sleep 1
+        done
+        [ -f "$receipts.$3-pending" ] && [ "$(tail -n 1 "$receipts")" = "$2" ] &&
+            [ "$(field handshake)" = 0 ] ||
+            fail "rebind did not hold the tunnel down while awaiting acknowledgement of unchanged HIP"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed before rebound HIP acknowledgement"
+        ok "rebind kept IPv4 blocked until acknowledgement of unchanged HIP"
+        touch "$receipts.$3-ack"
+    fi
     if [ "$#" = 1 ] && [ "$retry_hip_submit" -ge 5 ]; then
         for _ in $(seq 1 25); do
             failures=$("$V" "grep -o 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log | wc -l | tr -d ' '")
@@ -1168,6 +1181,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                     fail "the approved reconnect report did not refresh silently"
                                                 ok "the reconnected ESP report refreshed silently"
                                                 probe "IPv4 echo after silent HIP refresh on reconnected ESP"
+                                                rebind_restored_forwarding 15 "$initial_report" timer-rebind
                                             fi
                                         fi
                                     fi
