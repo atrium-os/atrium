@@ -9,10 +9,11 @@
 # For a clean-close upgrade test, pass the legacy executable then its replacement.
 # --prepare-reboot-reuse takes the broker path. Power-cycle the private VM and
 # restart the fixture, then pass the printed directory to --verify-reboot-reuse.
+# --prepare-reboot-labels and --verify-reboot-labels exercise a missed rename.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
-if test "${1:-}" = --verify-reboot-reuse; then
+if test "${1:-}" = --verify-reboot-reuse || test "${1:-}" = --verify-reboot-labels; then
     results=${2:?pass the result directory printed before shutdown}
 else
     results=$(mktemp -d /var/tmp/sheets-select-results.XXXXXX)
@@ -139,6 +140,40 @@ restart_broker() {
     ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
     wait_for ready
 }
+recover_named_pair() {
+    # Slot zero is the copy with the suffix, although it was saved second.
+    click 120 96; wait_for count 1; sleep .6
+    publish 'Proof (2) (2).osheet' 'zebra,2'
+    key 0x1a 1; wait_for count 0; wait_for pending 1
+    click 213 24; wait_for count 1; sleep .6
+    publish 'Proof (3).osheet' 'fox,2'
+    key 0x1a 1; wait_for count 0; wait_for pending 0
+    test "$(sha256 -q "$books/Proof.csv")" = "$original"
+    for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
+    echo "Both recovered names, identities, edits and suggested Save As names verified. Frames and copies: $results"
+}
+if test "${1:-}" = --verify-reboot-labels; then
+    test "$(sysctl -n kern.boottime)" != "$(cat "$results/boot")"
+    original=$(cat "$results/source.sha256")
+    wait_for count 0; wait_for pending 2
+    marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 0.pending)
+    sibling="$(dirname "$marker")/1.pending"
+    grep -Fq '"name":"Proof.csv"' "$marker"
+    grep -Fq '"name":"Proof.osheet"' "$sibling"
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    click 213 24
+    if ! wait_for grep -Fq '"name":"Proof (2).osheet"' "$marker"; then
+        cp selectscreen.png "$results/stale-boot-chooser.png"
+        exit 1
+    fi
+    for slot in 0 1; do
+        sed 's/,"name":.*//' "$(dirname "$marker")/$slot.pending" > "$results/after.id"
+        sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/after.id"
+    done
+    sleep .6; cp selectscreen.png "$results/recovery-names.png"
+    recover_named_pair
+    exit 0
+fi
 if test "${1:-}" = --verify-reboot-reuse; then
     test "$(sysctl -n kern.boottime)" != "$(cat "$results/boot")"
     wait_for count 0; wait_for pending 2
@@ -154,13 +189,13 @@ if test "${1:-}" = --verify-reboot-reuse; then
     sed 's/,"name":.*//' "$target_marker" > "$results/replacement.id"
     if cmp -s "$results/closed.id" "$results/replacement.id"; then exit 1; fi
     wait_for pending 2
-    grep -Fq '"confirmed_nonempty":true' "$sibling_marker"
+    grep -Fq '"checked_detached":true' "$sibling_marker"
     sleep .6; edit 129 0x1f
     publish Untitled.osheet ',2'
     key 0x1a 1; wait_for count 0; wait_for pending 1
     click 213 24; wait_for count 1
     restored=$(docs); wait_for opened "$restored" Proof.csv
-    grep -Fq '"confirmed_nonempty":false' "$sibling_marker"
+    grep -Fq '"checked_detached":false' "$sibling_marker"
     sed 's/,"name":.*//' "$sibling_marker" > "$results/restored.id"
     sed 's/,"name":.*//' "$results/sibling.marker" | cmp -s - "$results/restored.id"
     sleep .6; publish 'Proof (2).osheet' zebra
@@ -250,7 +285,7 @@ if test "${1:-}" = --clean-close-reuse || test "${1:-}" = --prepare-reboot-reuse
     echo "Clean close reused the slot with a fresh identity and preserved the live sibling. Copies: $results"
     exit 0
 fi
-if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels; then
+if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels || test "${1:-}" = --prepare-reboot-labels; then
     interrupted=false
     if test "$1" != --save-as-labels; then
         interrupted=true
@@ -304,7 +339,7 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
         fi
         sed 's/,"name":.*//' "$marker" > "$results/id"
         sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/id"
-        if test "$1" = --live-broker-restart && test "$slot" = 0; then
+        if test "$slot" = 0 && { test "$1" = --live-broker-restart || test "$1" = --prepare-reboot-labels; }; then
             jail_root=$(root "$jid")
             restart_broker
             test "$(root "$jid")" = "$jail_root"
@@ -316,6 +351,15 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
         kill_doc "$jid"; wait_for count "$slot"
     done
     wait_for pending 2
+    if test "$1" = --prepare-reboot-labels; then
+        cmp "$marker" "$results/0.before"
+        mdconfig -lv | grep -F sheets-recovery >/dev/null
+        sysctl -n kern.boottime > "$results/boot"
+        echo "$original" > "$results/source.sha256"
+        sync
+        echo "Reboot and run --verify-reboot-labels $results"
+        exit 0
+    fi
     if "$interrupted"; then
         detached() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
         if test "$1" = --live-broker-restart; then
@@ -343,16 +387,7 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     # The chooser redraw follows the broker reply, after the volume detaches.
     sleep .6
     cp selectscreen.png "$results/recovery-names.png"
-    # Slot zero is the copy with the suffix, although it was saved second.
-    click 120 96; wait_for count 1; sleep .6
-    publish 'Proof (2) (2).osheet' 'zebra,2'
-    key 0x1a 1; wait_for count 0; wait_for pending 1
-    click 213 24; wait_for count 1; sleep .6
-    publish 'Proof (3).osheet' 'fox,2'
-    key 0x1a 1; wait_for count 0; wait_for pending 0
-    test "$(sha256 -q "$books/Proof.csv")" = "$original"
-    for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
-    echo "Both recovered names, identities, edits and suggested Save As names verified. Frames and copies: $results"
+    recover_named_pair
     exit 0
 fi
 for first in protected plain; do

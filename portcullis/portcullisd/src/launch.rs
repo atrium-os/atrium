@@ -223,14 +223,14 @@ struct WorkbookMarker {
     #[serde(flatten)]
     book: PendingWorkbook,
     #[serde(default)]
-    confirmed_nonempty: bool,
+    checked_detached: bool,
 }
 
-fn store_workbook_marker(path: &Path, book: &PendingWorkbook, confirmed_nonempty: bool) -> std::io::Result<()> {
+fn store_workbook_marker(path: &Path, book: &PendingWorkbook, checked_detached: bool) -> std::io::Result<()> {
     use std::io::Write;
     let temp = path.with_extension("pending.tmp");
     let mut file = fs::File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(&WorkbookMarker { book: book.clone(), confirmed_nonempty })?)?;
+    file.write_all(&serde_json::to_vec(&WorkbookMarker { book: book.clone(), checked_detached })?)?;
     file.sync_all()?;
     fs::rename(temp, path)?;
     fs::File::open(path.parent().unwrap())?.sync_all()
@@ -322,10 +322,15 @@ pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry,
     rename_workbook_marker(&path, id, name)
 }
 
-fn rename_workbook_marker(path: &Path, id: [u8; 16], name: String) -> std::io::Result<()> {
+fn valid_workbook_name(name: String) -> std::io::Result<String> {
     if name.is_empty() || name.len() > 255 || name.contains('/') || name.chars().any(char::is_control) {
         return Err(std::io::Error::other("invalid workbook display name"));
     }
+    Ok(name)
+}
+
+fn rename_workbook_marker(path: &Path, id: [u8; 16], name: String) -> std::io::Result<()> {
+    let name = valid_workbook_name(name)?;
     let mut book: PendingWorkbook = serde_json::from_slice(&fs::read(path)?)?;
     if book.id != id {
         return Err(std::io::Error::other("this workbook recovery has been replaced"));
@@ -1000,20 +1005,34 @@ fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result
     portcullis_overlay::mount_recovery(store, 128 << 20).map_err(std::io::Error::other)
 }
 
-/// After reboot the old jail and mounts are gone. Older markers also lack
-/// a confirmed directory state. Inspect only the existing private volume.
+/// After reboot the old jail and mounts are gone. Occupancy-only markers
+/// from older brokers also need their label checked.
 fn check_detached_workbook(store: &portcullis_overlay::Place, pending: &Path, index: usize) -> std::io::Result<()> {
     let bytes = fs::read(pending)?;
-    if !bytes.is_empty() && serde_json::from_slice::<WorkbookMarker>(&bytes)?.confirmed_nonempty {
+    if !bytes.is_empty() && serde_json::from_slice::<WorkbookMarker>(&bytes)?.checked_detached {
         return Ok(());
     }
     mount_existing_workbook(store)?;
     // DirEntry retains the directory descriptor. Drop it before unmounting.
-    let nonempty = fs::read_dir(store.dir.join("autosave"))
+    let data = store.dir.join("autosave");
+    let nonempty = fs::read_dir(&data)
         .and_then(|mut entries| entries.next().transpose().map(|entry| entry.is_some()));
+    // An empty legacy marker has no prior identity or label. Keep its numbered
+    // fallback. For named markers, read only the bounded name before detach.
+    let name = (matches!(nonempty, Ok(true)) && !bytes.is_empty())
+        .then(|| closed_workbook_name(&data).and_then(valid_workbook_name));
     portcullis_overlay::unmount_recovery(store).map_err(std::io::Error::other)?;
     if nonempty? {
-        store_workbook_marker(pending, &pending_workbook(pending, index)?, true)
+        let mut book = pending_workbook(pending, index)?;
+        match name {
+            Some(Ok(name)) => book.name = name,
+            Some(Err(e)) => {
+                eprintln!("portcullisd: keeping previous workbook recovery label: {e}");
+                return Ok(());
+            }
+            None => {}
+        }
+        store_workbook_marker(pending, &book, true)
     } else {
         remove_workbook_marker(pending)
     }
@@ -2018,6 +2037,14 @@ pub fn is_single_instance(app_id: &str) -> bool {
 #[cfg(test)]
 mod recovery_name_tests {
     use super::*;
+
+    #[test]
+    fn an_old_occupancy_check_still_needs_a_detached_label_check() {
+        let old = br#"{"id":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],"name":"Proof.csv","confirmed_nonempty":true}"#;
+        let marker: WorkbookMarker = serde_json::from_slice(old).unwrap();
+        assert!(!marker.checked_detached);
+        assert_eq!(marker.book.name, "Proof.csv");
+    }
 
     #[test]
     fn missing_detached_image_preserves_the_legacy_marker() {

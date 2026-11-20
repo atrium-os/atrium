@@ -1254,9 +1254,12 @@ The next workbook in the slot gets a fresh recovery identity.
 After reboot an occupied slot may have neither a mount nor a current registry
 UID. Under the slot lock the broker mounts its existing Tessera or UFS image
 and checks for an entry in the autosave directory. A successful detach after
-an empty read clears the marker. A nonempty read preserves the recovery ID
-and records the observation in the private marker, so subsequent scans can
-skip the mount. Opening that recovery clears the observation before the jail
+an empty read clears the marker. For a nonempty named recovery, the broker reads and validates the durable
+display name while the volume is mounted. After detach it records the name
+and completed check together, preserving the recovery ID. Subsequent scans
+can skip the mount. A marker from a broker that checked only occupancy needs
+one label check. An unreadable or invalid label leaves the prior name in
+place and the check can be retried. Opening that recovery clears the observation before the jail
 can change the directory. Older markers begin unconfirmed. A missing or
 unreadable image keeps its slot reserved.
 

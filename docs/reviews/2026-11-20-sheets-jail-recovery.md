@@ -74,3 +74,11 @@ Two jails opened `Proof.csv`. Slot 0 held an unsaved A1 edit of `zebra`. Slot 1 
 The corrected broker inspected the existing images after boot. New reused slot 1 with a fresh recovery ID and published a copy with blank A1 and B1 set to `2`. Recover opened slot 0 directly with its original ID. An independent reader verified `zebra` in its published copy and `fox` in the previously saved workbook. The original CSV retained its SHA-256 digest. Both pending markers cleared and all recovery devices detached.
 
 The two-stage check passed on native Tessera and bounded UFS volumes in a Tessera-root VM. The native check also exercised markers from the old broker. Both plain and password-protected recovery orders passed on UFS. Three focused FreeBSD broker tests passed, including keeping a legacy marker and leaving the backing files absent when its image is missing. [Two-stage desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh)
+
+## Reboot after a missed Save As name update
+
+Two jails opened `Proof.csv` and published `Proof.osheet` and `Proof (2).osheet`. The second publication completed while the Portcullis worker socket was unavailable. Sheets recorded its collision-suffixed name locally. The fixture restarted the broker before that document exited, verified its marker still said `Proof.csv`, and powered down before another workbook action could reconcile it.
+
+After boot the old chooser displayed `Proof.csv` alongside `Proof.osheet` and marked both slots nonempty. The updated broker rechecked those same Tessera images, including the slot the old broker had already inspected. The rendered chooser displayed `Proof (2).osheet` and `Proof.osheet`. The two-stage test also passed with bounded UFS recovery images.
+
+Each selection kept its original ID. An independent reader found `zebra,2` in `Proof (2) (2).osheet` and `fox,2` in `Proof (3).osheet` after recovery and Save As. The source CSV retained its SHA-256 digest. Four focused FreeBSD broker tests passed. [Two-stage desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh)
