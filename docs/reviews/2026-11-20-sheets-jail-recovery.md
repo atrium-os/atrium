@@ -191,3 +191,11 @@ The fixture tiled the documents and gave keyboard focus to the target window bef
 Each turn checked both live jails, the caller UID in Scrinium’s trace, a changed digest for the intended destination, and an unchanged digest for its sibling. The reader checked the protected file with the fixture password and confirmed that a wrong password failed. The source CSV still contained `Original`. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the fixture broker path, and `stale-refresh interleave`. Cross-build the [window tiling helper](../../atrium-sheets/examples/tile_recovery_windows.rs) on the host and stage it as `/tmp/tile-recovery-windows` in the private guest.
 
 The interleaved-save gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs cleared the pending markers and detached their recovery devices.
+
+## Restarting Limen with both recovered workbooks open
+
+Append `restart-limen` to the interleaved-save gate above. After both Save As operations complete, the test records both Sheets PIDs in their original jails and the Scrinium PID. It verifies that all three are connected to the fixture Limen, stops it, waits for the process and listener to disappear, then starts a new Limen. The four ordinary saves begin only after the new broker has accepted connections from all three original processes.
+
+The same per-turn checks apply across the restart. Each Scrinium request carries the saving jail’s UID. An independent reader checks the contents of both files, including password protection, and the idle sibling’s digest stays unchanged. The final copies contain `zebra,6` in Proof.osheet and `fox,5` in Untitled.osheet.
+
+Both runs passed in the isolated Tessera-root VM, one with native Tessera recovery volumes and one with bounded UFS volumes. Both document jails closed cleanly and released their recovery devices.

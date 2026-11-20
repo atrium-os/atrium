@@ -15,6 +15,7 @@
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
 # --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, stale-id, or stale-refresh after the broker path.
 # With stale-refresh, append interleave to keep both documents open. Stage the tile_recovery_windows example at /tmp/tile-recovery-windows.
+# Append restart-limen after interleave to restart the private Limen between Save As and Save.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -653,6 +654,30 @@ SH
         plain_win=$parent
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
         tiled() { test "$(win_at 125 24)" = "$plain_win" && test "$(win_at 765 24)" = "$sibling_win"; }
+        if test "${5:-}" = restart-limen; then
+            plain_pid=$(pgrep -x -j "$jid" atrium-sheets)
+            sibling_pid=$(pgrep -x -j "$sibling" atrium-sheets)
+            files_pid=$(pgrep -x -U sheetsfiles bench-scrinium)
+            limen_socket=/atrium/sockets/limen/limend.sock
+            listener() { sockstat -ulw | awk -v path="$limen_socket" '$6==path {print $3}'; }
+            # Check the server end of each connection, pinned to the original
+            # document and file-provider processes on both sides of the restart.
+            connected() {
+                sockstat -ucw | awk -v server="$1" -v peer="$2" \
+                    '$3==server && index($0, "-> [" peer " ") {found=1} END {exit !found}'
+            }
+            old_limen=$(listener)
+            test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
+            for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
+            kill -TERM "$old_limen"
+            offline() { ! kill -0 "$old_limen" 2>/dev/null && test -z "$(listener)"; }
+            wait_for offline
+            env LIMEN_SOCKET="$limen_socket" LIMEN_FRESCOD_ACTIVATION="$PWD/activation.sock" \
+                daemon -f -u _limen -o "$PWD/bench-limen.log" "$PWD/limend"
+            listening() { new_limen=$(listener); test -n "$new_limen" && test "$new_limen" != "$old_limen"; }
+            wait_for listening
+            for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
+        fi
         # Each ordinary Save must update its own Save As destination in place.
         # Keep the other file's digest and independently read both copies.
         save_turn() {
