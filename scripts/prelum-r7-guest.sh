@@ -8,6 +8,11 @@ cd "$P"
 test "$(cat .isolated-gate)" = "$marker"
 test "$(uname -s)" = FreeBSD
 test "$(uname -m)" = arm64
+# jaild's print worker policy names these entry points.
+for worker in atrium-prelum-ipp atrium-prelum-render; do
+    install -m 0555 "$P/$worker" "/usr/local/bin/$worker"
+    test "$(sha256 -q "$P/$worker")" = "$(sha256 -q "/usr/local/bin/$worker")"
+done
 for entry in prelumail:58641 prelusheets:58642; do
     user=${entry%:*}
     uid=${entry#*:}

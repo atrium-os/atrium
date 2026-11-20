@@ -1,28 +1,24 @@
 #!/bin/sh
 # Prelum R7's desktop-to-IPPS gate. Starts its own disposable FreeBSD guest.
 set -eu
-if [ "$#" -ne 5 ]; then
-    echo "usage: $0 BASE_QCOW2 EFI_CODE EFI_VARS SSH_KEY ARM64_BIN_DIR" >&2
+if [ "$#" -ne 4 ]; then
+    echo "usage: $0 BASE_QCOW2 EFI_CODE EFI_VARS SSH_KEY" >&2
     exit 2
 fi
 scripts=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo=$(git -C "$scripts" rev-parse --show-toplevel)
 base=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 code=$2
 vars=$3
 key=$4
-binaries=$5
 qemu=${QEMU:-qemu-system-aarch64}
 ssh_port=${PRELUM_R7_SSH_PORT:-6329}
 ipps_port=${PRELUM_R7_IPPS_PORT:-19329}
 guest=/tmp/prelum-r7-desktop-gate
-programs='scrinium atrium-sheets atrium-slides atrium-mail prelum-print-fixture mail-parse-jail officina-convert navigator-page frescod limend atrium-prelumd prelumctl atrium-prelum-sheet'
 for path in "$base" "$code" "$vars" "$key"; do
     test -f "$path" || { echo "Missing gate input: $path" >&2; exit 2; }
 done
-for program in $programs; do
-    test -x "$binaries/$program" || { echo "Missing executable: $binaries/$program" >&2; exit 2; }
-done
-for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages; do
+for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages cargo clang; do
     command -v "$program" >/dev/null || { echo "Missing host tool: $program" >&2; exit 2; }
 done
 python3 - "$ssh_port" "$ipps_port" <<'PY'
@@ -38,7 +34,14 @@ PY
 D=$(mktemp -d "${TMPDIR:-/tmp}/prelum-r7.XXXXXX")
 marker=$(openssl rand -hex 16)
 echo "Gate artifacts: $D"
-git -C "$scripts" rev-parse HEAD >"$D/revision"
+if ! git -C "$repo" diff HEAD --quiet; then
+    echo "Commit tracked changes before running the gate so the revision identifies the build inputs." >&2
+    exit 2
+fi
+git -C "$repo" rev-parse HEAD >"$D/revision"
+sh "$scripts/prelum-r7-build.sh" "$repo" "$D"
+test "$(git -C "$repo" rev-parse HEAD)" = "$(cat "$D/revision")"
+git -C "$repo" diff HEAD --quiet
 qemu_pid=
 sim_pid=
 guest_connected=
@@ -102,11 +105,11 @@ kill -0 "$qemu_pid"
 remote "umask 022; mkdir '$guest' && printf '%s\n' '$marker' >'$guest/.isolated-gate' && mkdir '$guest/files'"
 guest_connected=1
 kill -0 "$sim_pid"
-for program in $programs; do
-    digest=$(openssl dgst -sha256 <"$binaries/$program" | awk '{print $NF}')
-    remote "cd '$guest' && cat >'$program' && chmod 755 '$program' && test \$(sha256 -q '$program') = '$digest'" <"$binaries/$program"
+while read -r digest program; do
+    remote "cd '$guest' && cat >'$program' && chmod 755 '$program' && test \$(sha256 -q '$program') = '$digest'" <"$D/bin/$program"
     printf '%s  %s\n' "$digest" "$program"
-done >"$D/staged.sha256"
+done <"$D/built.sha256" >"$D/staged.sha256"
+cmp "$D/built.sha256" "$D/staged.sha256"
 for file in quicklook.html sheets-proof.xlsx slides-proof.pptx; do
     target=$file
     [ "$file" != quicklook.html ] || target=files/$file

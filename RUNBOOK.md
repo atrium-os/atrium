@@ -6012,7 +6012,7 @@ Print service (R2, spec §11.2), against the same oracle:
 Run from a checkout of the revision under test:
 
 ```sh
-sh scripts/prelum-r7-vm.sh BASE_QCOW2 EFI_CODE EFI_VARS SSH_KEY ARM64_BIN_DIR
+sh scripts/prelum-r7-vm.sh BASE_QCOW2 EFI_CODE EFI_VARS SSH_KEY
 ```
 
 Use an idle, bootable Atrium arm64 qcow2 with root SSH, the Atrium jaild,
@@ -6023,18 +6023,15 @@ The harness provisions the synthetic app identities and viewer inside
 the overlay. The base image stays read-only. Supply separate EFI variable
 storage from the base image and its matching EFI firmware.
 
-Build on the host using §4. For each crate below, use
-`cargo build --locked --release --target aarch64-unknown-freebsd` with the
-indicated binary or example selector. Copy the resulting executables
-(or symlink them) into one flat directory named by `ARM64_BIN_DIR`.
-
-| Crate directory | Executables |
-|---|---|
-| `scrinium`, `atrium-sheets`, `atrium-slides`, `mail/atrium-mail` | `scrinium`, `atrium-sheets`, `atrium-slides`, `atrium-mail` |
-| `mail/atrium-mail` | `--example prelum-print-fixture` (under `release/examples/`) |
-| `mail/mail-parse` | `mail-parse-jail` |
-| `officina-convert`, `navigator-page`, `frescod`, `limen` | `officina-convert`, `navigator-page`, `frescod`, `limend` |
-| `prelum`, `prelum-sheet` | `atrium-prelumd`, `prelumctl`, `atrium-prelum-sheet` |
+Set up host cross-compilation as in §4 before running this gate, including
+the FreeBSD sysroot and pinned Rust toolchain. The gate requires a clean
+tracked checkout and builds the four apps, fixtures, helper daemons and
+Prelum workers on the host with Cargo's locked release profile. Use
+`CC_aarch64_unknown_freebsd`, `CFLAGS_aarch64_unknown_freebsd` and
+`AR_aarch64_unknown_freebsd` to override the native cross tools when needed.
+The artifact directory records the checkout SHA in `revision`, per-binary
+build logs, and SHA-256 manifests `built.sha256` and `staged.sha256`.
+The gate checks the staged hashes before starting the desktop tests.
 
 The host needs QEMU, Python 3, OpenSSL and Poppler. The default QEMU
 settings are HVF and `-cpu host`. Set `PRELUM_R7_ACCEL` and `PRELUM_R7_CPU`
