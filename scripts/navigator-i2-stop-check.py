@@ -3,6 +3,7 @@
 import argparse
 import csv
 import io
+import json
 from pathlib import Path
 import shlex
 import subprocess
@@ -26,7 +27,11 @@ parser.add_argument("--parked-viewer", action="store_true",
                     help="continue to the pond with NAVIGATOR_UI_IDLE_S=5, then go Back twice")
 parser.add_argument("--saved-record", type=Path, metavar="TLS_LOG",
                     help="fill the broker cache after parking and verify a saved-record restore against the fixture log")
+parser.add_argument("--broker-restart", type=Path, metavar="TLS_LOG",
+                    help="use a fresh persistent broker without NAVIGATOR_UI_OPEN and relaunch on the saved trail")
 args = parser.parse_args()
+if args.broker_restart:
+    args.navigate_away = True
 if args.saved_record:
     args.parked_viewer = True
 if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
@@ -369,10 +374,59 @@ def return_from_pond(original_viewer):
     return set(guest("pgrep -x navigator-page").splitlines())
 
 
+def open_counter_from_start():
+    punct = {".": 55, "/": 56, "-": 45}
+    address = "parent.example/counter-parent.html"
+    codes = [punct[c] if c in punct else ord(c) - ord("a") + 4 for c in address]
+    # Focus the address field and type as a user would, so relaunch has no forced URL.
+    events = "KEY 15 1 1\nKEY 15 0 1\n"
+    for key in codes + [40]:
+        events += f"KEY {key} 1\nKEY {key} 0\n"
+    guest("nc -N -U input.sock", events.encode())
+    wait_for("initial parent did not open", lambda: b'the page child laid out "Embedded counter"' in log())
+
+
+def restart_on_garden():
+    broker = int(guest("pgrep -x navigatord"))
+    root = guest(f'jls -j $(ps -o jid= -p {broker}) path').decode().strip()
+    trail_path = shlex.quote(root + "/var/db/navigatord/trails.json")
+
+    def saved():
+        data = guest(f"cat {trail_path} 2>/dev/null || true")
+        if not data:
+            return False
+        record = json.loads(data)
+        trail = record["trails"][record["current"]]
+        pages = trail["pages"]
+        if (len(pages) != 2 or trail["current"] != 1 or pages[1].get("parent") != 0
+                or [page["url"] for page in pages] != ["https://parent.example/counter-parent.html",
+                                                       "https://parent.example/away.html"]
+                or not all(page.get("saved") for page in pages)):
+            return False
+        (args.evidence / "saved-trail.json").write_bytes(data)
+        return True
+
+    wait_for("trail cursor and page record addresses were not persisted", saved)
+    guest(f"kill -TERM {broker}")
+    wait_for("old broker or UI remained", lambda: not guest("pgrep -x 'navigatord|navigator-ui' || true"))
+    args.log += ".restart"
+    guest("daemon -f -o " + shlex.quote(args.log) +
+          ' su -m mailgate -c "/tmp/mail-button/portcullis launch --no-prompt org.atrium.navigator"')
+    wait_for("new broker did not restore garden from the store", lambda:
+             b"page https://parent.example/away.html brought back from the store" in log())
+    if int(guest("pgrep -x navigatord")) == broker or not prompt(False):
+        raise RuntimeError("broker identity or restored garden prompt is wrong")
+    wait_for("restored garden not visible", lambda: page_word("relaunched", "marigolds", 41, 150))
+    print(f"Persistent trail reopened at Garden in new broker {int(guest('pgrep -x navigatord'))} (was {broker}).")
+
+
 def navigate_away():
-    if args.saved_record:
+    if args.broker_restart:
+        open_counter_from_start()
+    traffic_log = args.saved_record or args.broker_restart
+    if traffic_log:
         parent_get = b'"GET /counter-parent.html HTTP/1.1"'
-        requests = args.saved_record.read_bytes()
+        requests = traffic_log.read_bytes()
         if parent_get not in requests:
             raise RuntimeError("fixture log did not record the initial parent GET")
     original_ui, original_viewer = parent().splitlines()
@@ -391,13 +445,22 @@ def navigate_away():
              and not guest("pgrep -x counter || true"))
     wait_for("old question still painted on destination", lambda: not visible_question("away"))
     existing = return_from_pond(original_viewer) if args.parked_viewer else set()
+    if args.broker_restart:
+        restart_on_garden()
+        new_ui = guest("pgrep -x navigator-ui").strip()
+        if new_ui == original_ui:
+            raise RuntimeError("expected a new Navigator UI")
+        existing = set(guest("pgrep -x navigator-page").splitlines())
+    else:
+        new_ui = original_ui
     press(270, 30)  # Back, below the headless shell strip
     url = b"https://parent.example/counter-parent.html"
-    if args.parked_viewer:
-        source = b" brought back from the store" if args.saved_record else b" opened from navigatord's cache"
+    expected_layouts = 2 if args.parked_viewer else 1
+    if args.parked_viewer or args.broker_restart:
+        source = b" brought back from the store" if traffic_log else b" opened from navigatord's cache"
         def rebuilt():
             report = log()
-            return (report.count(b'the page child laid out "Embedded counter"') == 2
+            return (report.count(b'the page child laid out "Embedded counter"') == expected_layouts
                     and b"page " + url + source in report)
         wait_for("Back did not rebuild the parked page from its recorded content", rebuilt)
         new_viewers = set(guest("pgrep -x navigator-page").splitlines()) - existing
@@ -412,7 +475,7 @@ def navigate_away():
     if (not prompt(False) or visible_question("restored") or guest("pgrep -x counter || true")
             or viewer not in guest("pgrep -x navigator-page").splitlines()):
         raise RuntimeError("Back failed to restore the idle page without its old prompt")
-    start(1)
+    start(0 if args.broker_restart else 1)
     count("fresh", 0)
     second = guest("pgrep -x counter")
     tier(True)
@@ -424,19 +487,19 @@ def navigate_away():
              and prompt(False) and not guest("pgrep -x counter || true"))
     tier(False)
     report = log()
-    if (first == second or guest("pgrep -x navigator-ui").strip() != original_ui
-            or report.count(b'the page child laid out "Embedded counter"') != (2 if args.parked_viewer else 1)
-            or report.count(b"widget GET ") != 2 or report.count(b"widget reported voluntary close") != 1
+    if (first == second or guest("pgrep -x navigator-ui").strip() != new_ui
+            or report.count(b'the page child laid out "Embedded counter"') != expected_layouts
+            or report.count(b"widget GET ") != (1 if args.broker_restart else 2) or report.count(b"widget reported voluntary close") != 1
             or b"prompt=widget-failed" in report or b"widget unload 1 leave=false" in report):
         raise RuntimeError("unexpected parent reload, widget fetch, timeout, or worker retirement")
-    if args.saved_record:
-        traffic = args.saved_record.read_bytes()
+    if traffic_log:
+        traffic = traffic_log.read_bytes()
         if not traffic.startswith(requests):
             raise RuntimeError("fixture log changed during the run")
         delta = traffic[len(requests):]
-        if parent_get in delta or any(f'"GET /bed-{n}.html HTTP/1.1"'.encode() not in delta for n in range(1, 17)):
+        if parent_get in delta or (args.saved_record and any(f'"GET /bed-{n}.html HTTP/1.1"'.encode() not in delta for n in range(1, 17))):
             raise RuntimeError("unexpected parent refetch or missing cache-fill request")
-        print("All 16 flowerbeds fetched. Back rebuilt the parent from its saved record without a parent GET.")
+        print("Back rebuilt the parent from its saved record without a parent GET.")
     print(f"Navigation retired {int(first)} with its question open. Original viewer {int(original_viewer)}, viewer after Back {int(viewer)}."
           f" Guarded Start opened worker {int(second)} at Count 0; it incremented and closed on its own Leave.")
 

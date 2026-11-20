@@ -259,6 +259,28 @@ GET and a fresh counter that advanced from 0 to 1 and closed on its own
 Leave. Evidence is in
 `~/atrium-vm/evidence/navigator-i2-saved-record-20261121/`.
 
+The broker-restart gate starts a fresh Personal trail by typing the counter
+URL in the installed UI. Follow **Visit garden** with the widget’s unload
+question visible. Before stopping navigatord, the gate checks the persisted
+trail for both page record addresses, the parent link and the current page.
+It sends TERM to the broker, waits for the broker and UI to exit, and
+relaunches Navigator through Portcullis as the same user.
+
+On arm64 Tessera the new broker restored Garden from the store. Back opened
+the saved counter page in a new viewer. The TLS fixture received one GET for
+each page across both processes. The old question was absent from the frame
+and accessibility tree. The widget stayed idle through the Start prompt,
+then opened at 0, incremented to 1 and closed on its own Leave.
+
+To repeat, use the counter unload fixture (`counter-unload.html`) and the
+same garden link as the navigation-away gate. Start with an empty app overlay,
+omit `NAVIGATOR_UI_OPEN`, enable UI accessibility and trace logging, and set
+`NAVIGATORD_TRAILS=/var/db/navigatord/trails.json` and
+`NAVIGATORD_STORE=/var/db/navigatord/store` in the broker bundle. Pass
+`--broker-restart TLS_LOG` to the installed gate. Both broker logs, the
+pre-restart trail file and frames are in
+`~/atrium-vm/evidence/navigator-i2-broker-restart-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
