@@ -118,6 +118,36 @@ fn malformed_signed_header_lists_do_not_reach_dns() {
 }
 
 #[test]
+fn dkim_base64_requires_a_complete_valid_value() {
+    let (kp, record) = ed();
+    let normal = signed("ed25519-sha256", "example.com", "", &ed_sign(&kp), HEADERS, BODY);
+    let normal = String::from_utf8(normal).unwrap();
+    let (signature_header, rest) = normal.split_once("\r\n").unwrap();
+    let key = |_: &str, _: &str| Some(record.clone());
+    assert_eq!(dkim::verify(normal.as_bytes(), &key, 0)[0].outcome, Outcome::Pass);
+
+    let unpadded = format!("{}\r\n{rest}", signature_header.trim_end_matches('='));
+    let unpadded_key = |_: &str, _: &str| Some(record.trim_end_matches('=').to_owned());
+    assert_eq!(dkim::verify(unpadded.as_bytes(), &unpadded_key, 0)[0].outcome, Outcome::Pass);
+
+    let malformed = [
+        (signature_header.replacen("b=", "b=!", 1), "signature encoding"),
+        (signature_header.replacen("b=", "b=_", 1), "signature encoding"),
+        (format!("{signature_header}extra"), "signature encoding"),
+        (format!("{signature_header}\u{a0}"), "signature encoding"),
+        (signature_header.replacen("bh=", "bh=!", 1), "body hash encoding"),
+    ];
+    for (header, reason) in malformed {
+        let message = format!("{header}\r\n{rest}");
+        let result = dkim::verify(message.as_bytes(), &|_, _| panic!("invalid encoding reached DNS"), 0);
+        assert_eq!(result[0].outcome, Outcome::PermError(reason));
+    }
+    let bad_key = format!("{record}extra");
+    let result = dkim::verify(normal.as_bytes(), &|_, _| Some(bad_key.clone()), 0);
+    assert_eq!(result[0].outcome, Outcome::PermError("key encoding"));
+}
+
+#[test]
 fn no_key_pending_and_revoked() {
     let (kp, _) = ed();
     let m = signed("ed25519-sha256", "example.com", "", &ed_sign(&kp), HEADERS, BODY);

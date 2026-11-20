@@ -567,6 +567,9 @@ What Mail shows comes from what was checked, never from what the message says ab
   The signed-header list must contain complete field names and at most
   64 entries. Mail accepts folding around the separators. A malformed or
   over-limit list cannot verify against a partial set of headers.
+  The signature, body hash and public key must decode completely as
+  standard Base64. DKIM allows folding whitespace and optional padding.
+  Malformed encodings and trailing data cannot verify.
   [RFC 6376 §§3.2, 3.5 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup
   leaves the sender check pending and Mail retries when the message is opened

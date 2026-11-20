@@ -7,7 +7,8 @@
 //! `_dmarc.<domain>` through the system resolver. The caller passes them in
 //! through a lookup function.
 
-use crate::decode::base64;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine as _;
 use crate::header::memchr;
 use ring::{digest, signature};
 
@@ -155,10 +156,25 @@ fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
     out
 }
 
+/// DKIM permits folding whitespace and optional padding. Reject an
+/// invalid or oversized value in full.
+fn decode_dkim_base64(value: &str, cap: usize) -> Option<Vec<u8>> {
+    let limit = cap.div_ceil(3) * 4;
+    let encoded: Vec<_> = value.bytes()
+        .filter(|&byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .take(limit + 1)
+        .collect();
+    if encoded.is_empty() || encoded.len() > limit {
+        return None;
+    }
+    let decoder = if encoded.ends_with(b"=") { &STANDARD } else { &STANDARD_NO_PAD };
+    decoder.decode(&encoded).ok().filter(|bytes| bytes.len() <= cap)
+}
+
 /// Parse a bounded DKIM tag list (§3.2). Duplicate names invalidate the
 /// list, including tags that are unknown to this verifier.
 fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
-    let text = std::str::from_utf8(raw).ok()?.trim();
+    let text = std::str::from_utf8(raw).ok()?.trim_matches([' ', '\t', '\r', '\n']);
     let text = text.strip_suffix(';').unwrap_or(text);
     let mut tags = Vec::new();
     for tag in text.split(';') {
@@ -172,11 +188,12 @@ fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
         {
             return None;
         }
-        // These tags have tokens that must not be joined across whitespace.
-        let value = if matches!(name, "c" | "h" | "q" | "t" | "x") {
-            value.trim().to_owned()
-        } else {
-            value.chars().filter(|c| !c.is_whitespace()).collect()
+        let value = match name {
+            // The decoder checks whitespace inside the encoded value.
+            "b" | "bh" | "p" => value.trim_matches([' ', '\t', '\r', '\n']).to_owned(),
+            // These tags have tokens that must not be joined across whitespace.
+            "c" | "h" | "q" | "t" | "x" => value.trim().to_owned(),
+            _ => value.chars().filter(|c| !c.is_whitespace()).collect(),
         };
         tags.push((name, value));
     }
@@ -333,6 +350,12 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     if expiry.is_some_and(|x| u64::try_from(now).is_ok_and(|now| x < now)) {
         return Outcome::PermError("expired");
     }
+    let Some(body_hash) = decode_dkim_base64(bh, 32) else {
+        return Outcome::PermError("body hash encoding");
+    };
+    let Some(sigbytes) = decode_dkim_base64(b, 1024) else {
+        return Outcome::PermError("signature encoding");
+    };
     // the body
     let mut cb = canon_body(body, bc);
     if let Some(l) = tag(t, "l") {
@@ -346,7 +369,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         }
     }
     let got = digest::digest(&digest::SHA256, &cb);
-    if base64(bh.as_bytes(), 64) != got.as_ref() {
+    if body_hash != got.as_ref() {
         return Outcome::Fail("body hash");
     }
     // the key
@@ -376,7 +399,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     if identity_domain != d && tag(&kt, "t").is_some_and(|flags| flags.split(':').any(|flag| flag.trim() == "s")) {
         return Outcome::PermError("key signing identity");
     }
-    let pk = base64(p.as_bytes(), 4096);
+    let Some(pk) = decode_dkim_base64(p, 4096) else { return Outcome::PermError("key encoding") };
     // the signed header data: chosen fields bottom-up, then this signature without b=
     let mut data = Vec::new();
     let mut used = vec![false; fields.len()];
@@ -391,7 +414,6 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         me.pop();
     }
     data.extend_from_slice(&me);
-    let sigbytes = base64(b.as_bytes(), 1024);
     let ok = if alg == "rsa-sha256" {
         let Some(rsa) = rsa_key(&pk) else { return Outcome::PermError("key") };
         signature::UnparsedPublicKey::new(&signature::RSA_PKCS1_1024_8192_SHA256_FOR_LEGACY_USE_ONLY, rsa).verify(&data, &sigbytes).is_ok()
