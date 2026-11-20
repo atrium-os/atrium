@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-post-decline-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=25 ;;
     esp-loss-hip-active-refresh-post-decline-refuse) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=24 ;;
     esp-loss-hip-active-refresh-rebound-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=23 ;;
     esp-loss-hip-active-refresh-rebound-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=22 ;;
@@ -1239,7 +1240,8 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                         if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^${initial_report%% *} "; then
                                                             fail "post-decline rebound submitted restored forwarding before approval"
                                                         fi
-                                                        if [ "$retry_hip_submit" = 24 ]; then
+                                                        if [ "$retry_hip_submit" -ge 24 ]; then
+                                                            declined_choice=$(hip_choice)
                                                             rebound_iface=$(field iface)
                                                             [ -n "$rebound_iface" ] || fail "the post-decline rebound ESP tunnel has no interface"
                                                             decline_esp_loss_review 17 "$rebound_iface"
@@ -1247,6 +1249,11 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                                 fail "post-decline rebound submitted the declined forwarding report"
                                                             fi
                                                             ok "declining restored forwarding on post-decline rebound ESP withheld HIP and stopped IPv4"
+                                                            if [ "$retry_hip_submit" = 25 ]; then
+                                                                reconnect_after_esp_loss_decline "$before_change" post-decline-reconnect-approved "${initial_report%% *}"
+                                                                finish_hip_reconnect "$initial_report" post-decline-reconnect-ack
+                                                                "$V" "$CTL down name=gp-gate" >/dev/null
+                                                            fi
                                                             echo "$pass checks passed"
                                                             exit 0
                                                         fi
