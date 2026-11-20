@@ -381,7 +381,7 @@ impl Engine {
         let pgp_keys = self.pgp_keys_of(&m.summary);
         // Kept from a parse that had no key for the signer, while there is
         // one now: parse again.
-        // A sender check that waited for a key: check again now lookups can run.
+        // Retry sender checks that waited for a DKIM key or DMARC policy.
         let recheck = m.summary.sender_check == wire::SenderCheck::Pending && self.dns.is_some();
         // A signature from an issuer not trusted, once the person has added
         // CAs: checked again (against them too).

@@ -232,11 +232,16 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     // DMARC only decides strict alignment, so it is looked up only when a
     // signature passed and could count.
     let dmarc = if sigs.iter().any(|g| g.outcome == dkim::Outcome::Pass) && !from_domain.is_empty() {
-        let rec = |d: &str| lookup(format!("_dmarc.{d}")).filter(|t| t.trim_start().starts_with("v=DMARC1"));
-        rec(&from_domain).or_else(|| {
-            let org = dkim::org_domain(&from_domain);
-            if org != from_domain { rec(&org) } else { None }
-        })
+        let rec = |d: &str| lookup(format!("_dmarc.{d}"));
+        match rec(&from_domain) {
+            // A successful empty response permits fallback. An error leaves the
+            // policy unknown because the From domain may publish an override.
+            Some(record) if record.is_empty() => {
+                let org = dkim::org_domain(&from_domain);
+                if org != from_domain { rec(&org) } else { Some(record) }
+            }
+            record => record,
+        }
     } else { None };
     let provider = ctx.authserv_id
         .filter(|_| s.from.len() == 1)

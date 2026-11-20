@@ -55,7 +55,8 @@ fn ed25519_pass_and_tamper() {
     let r = dkim::verify(&m, &key, 0);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].outcome, Outcome::Pass);
-    assert_eq!(dkim::verdict("mail.example.com", &r, None, None), Verdict::Verified { domain: "mail.example.com".into(), by_provider: false });
+    assert_eq!(dkim::verdict("mail.example.com", &r, None, None), Verdict::Pending);
+    assert_eq!(dkim::verdict("mail.example.com", &r, Some(""), None), Verdict::Verified { domain: "mail.example.com".into(), by_provider: false });
     // strict alignment refuses a subdomain From
     assert_eq!(dkim::verdict("mail.example.com", &r, Some("v=DMARC1; p=reject; adkim=s"), None), Verdict::NotVerified);
     // a different organisation can't borrow it

@@ -3,6 +3,7 @@
 //! check that waited for a key is done again when the message is opened.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -34,9 +35,13 @@ fn b64(data: &[u8]) -> String {
 
 /// An Ed25519-signed message from `from` (simple/simple), selector `sel`.
 fn signed(kp: &Ed25519KeyPair, from: &str, subject: &str) -> Vec<u8> {
+    let domain = from.rsplit('@').next().unwrap();
+    signed_as(kp, from, domain, subject)
+}
+
+fn signed_as(kp: &Ed25519KeyPair, from: &str, domain: &str, subject: &str) -> Vec<u8> {
     let headers = format!("From: Priya <{from}>\r\nSubject: {subject}\r\nContent-Type: text/plain\r\n");
     let body = "Hello.\r\n";
-    let domain = from.rsplit('@').next().unwrap();
     let bh = b64(ring::digest::digest(&ring::digest::SHA256, body.as_bytes()).as_ref());
     let field = format!("DKIM-Signature: v=1; a=ed25519-sha256; c=simple/simple; d={domain}; s=sel; h=from:subject:content-type; bh={bh}; b=");
     let mut data = headers.as_bytes().to_vec();
@@ -46,17 +51,24 @@ fn signed(kp: &Ed25519KeyPair, from: &str, subject: &str) -> Vec<u8> {
 }
 
 /// DNS as a test says: records per name, or a failed lookup; every name asked.
+#[derive(Default)]
+struct Answers {
+    records: HashMap<String, Vec<String>>,
+    failed: HashSet<String>,
+    queried: Vec<String>,
+}
+
 #[derive(Clone, Default)]
-struct Fake(Rc<RefCell<(std::collections::HashMap<String, Vec<String>>, bool, Vec<String>)>>);
+struct Fake(Rc<RefCell<Answers>>);
 
 impl Dns for Fake {
     fn txt(&self, name: &str) -> Result<Vec<String>, String> {
         let mut s = self.0.borrow_mut();
-        s.2.push(name.to_string());
-        if s.1 {
+        s.queried.push(name.to_string());
+        if s.failed.contains(name) {
             return Err("timed out".into());
         }
-        Ok(s.0.get(name).cloned().unwrap_or_default())
+        Ok(s.records.get(name).cloned().unwrap_or_default())
     }
 }
 
@@ -73,8 +85,8 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
     let rec = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
-    dns.0.borrow_mut().0.insert("sel._domainkey.example.com".into(), vec!["unrelated".into(), rec.clone()]);
-    dns.0.borrow_mut().0.insert("_dmarc.example.com".into(), vec!["v=DMARC1; p=reject".into()]);
+    dns.0.borrow_mut().records.insert("sel._domainkey.example.com".into(), vec!["unrelated".into(), rec.clone()]);
+    dns.0.borrow_mut().records.insert("_dmarc.example.com".into(), vec!["v=DMARC1; p=reject".into()]);
 
     let account = engine.store.add_account("ada@example.org").unwrap();
     let mut sink = engine.sink(account);
@@ -86,19 +98,19 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     sink.messages("INBOX", vec![fetched(1, signed(&kp, "priya@example.com", "One")), fetched(2, signed(&kp, "priya@example.com", "Two"))]).unwrap();
     assert_eq!(check(1), SenderCheck::Verified { domain: "example.com".into(), by_provider: false });
     assert_eq!(check(2), check(1));
-    assert_eq!(engine.dns_lookups(), 2, "{:?}", dns.0.borrow().2);
+    assert_eq!(engine.dns_lookups(), 2, "{:?}", dns.0.borrow().queried);
 
     // A domain with no key published: not verified (not pending forever).
     sink.messages("INBOX", vec![fetched(3, signed(&kp, "x@nokey.example", "Three"))]).unwrap();
     assert_eq!(check(3), SenderCheck::NotVerified);
 
     // The resolver doesn't answer: pending, and checked again on opening.
-    dns.0.borrow_mut().1 = true;
+    dns.0.borrow_mut().failed.insert("sel._domainkey.later.example".into());
     let other = Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref()).unwrap();
     sink.messages("INBOX", vec![fetched(4, signed(&other, "bob@later.example", "Four"))]).unwrap();
     assert_eq!(check(4), SenderCheck::Pending);
-    dns.0.borrow_mut().1 = false;
-    dns.0.borrow_mut().0.insert("sel._domainkey.later.example".into(), vec![format!("v=DKIM1; k=ed25519; p={}", b64(other.public_key().as_ref()))]);
+    dns.0.borrow_mut().failed.clear();
+    dns.0.borrow_mut().records.insert("sel._domainkey.later.example".into(), vec![format!("v=DKIM1; k=ed25519; p={}", b64(other.public_key().as_ref()))]);
     let id4 = engine.store.at(inbox, 4).unwrap().unwrap().0;
     let r = engine.open(id4).unwrap();
     assert!(matches!(r.summary.sender_check, SenderCheck::Verified { .. }));
@@ -107,6 +119,67 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     let n = engine.dns_lookups();
     engine.open(id4).unwrap();
     assert_eq!(engine.dns_lookups(), n);
+}
+
+#[test]
+fn relaxed_alignment_waits_for_dmarc_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let dns = Fake::default();
+    engine.set_dns(Box::new(dns.clone()));
+    let kp = Ed25519KeyPair::from_pkcs8(
+        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap().as_ref(),
+    ).unwrap();
+    let key = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let child = "_dmarc.mail.example.com";
+    let parent = "_dmarc.example.com";
+    {
+        let mut answers = dns.0.borrow_mut();
+        answers.records.insert("sel._domainkey.example.com".into(), vec![key.clone()]);
+        answers.records.insert("sel._domainkey.mail.example.com".into(), vec![key]);
+        answers.failed.insert(child.into());
+    }
+
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder {
+        name: "INBOX".into(),
+        role: mail_sync::Role::Inbox,
+        selectable: true,
+    }]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let from = "priya@mail.example.com";
+    sink.messages("INBOX", vec![
+        fetched(1, signed_as(&kp, from, "example.com", "Needs relaxed alignment")),
+        fetched(2, signed(&kp, from, "Exact alignment")),
+    ]).unwrap();
+    let first = engine.store.at(inbox, 1).unwrap().unwrap().0;
+    let second = engine.store.at(inbox, 2).unwrap().unwrap().0;
+    assert_eq!(engine.store.message(first).unwrap().summary.sender_check, SenderCheck::Pending);
+    assert_eq!(engine.store.message(second).unwrap().summary.sender_check, SenderCheck::Verified {
+        domain: "mail.example.com".into(),
+        by_provider: false,
+    });
+    assert!(!dns.0.borrow().queried.iter().any(|name| name == parent));
+
+    // Once absence is confirmed at the From domain, a failed organizational
+    // lookup still leaves the alignment policy unknown.
+    {
+        let mut answers = dns.0.borrow_mut();
+        answers.failed.remove(child);
+        answers.failed.insert(parent.into());
+    }
+    assert_eq!(engine.open(first).unwrap().summary.sender_check, SenderCheck::Pending);
+    assert!(dns.0.borrow().queried.iter().any(|name| name == parent));
+
+    // Retry on the next open, enforcing the now-known strict policy.
+    {
+        let mut answers = dns.0.borrow_mut();
+        answers.failed.remove(parent);
+        answers.records.insert(parent.into(), vec!["v=DMARC1; p=reject; adkim=s".into()]);
+    }
+    assert_eq!(engine.open(first).unwrap().summary.sender_check, SenderCheck::NotVerified);
+    assert_eq!(engine.store.message(first).unwrap().summary.sender_check, SenderCheck::NotVerified);
 }
 
 #[test]

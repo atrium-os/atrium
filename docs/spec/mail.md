@@ -556,6 +556,11 @@ What Mail shows comes from what was checked, never from what the message says ab
   through the system resolver (only `TXT` for `<selector>._domainkey.<domain>` and
   `_dmarc.<domain>`, DNSSEC-validated by local-unbound where signed). **DMARC** alignment
   (RFC 7489) and **ARC** (RFC 8617) from forwarders the person trusts.
+  If a valid DKIM signature needs relaxed alignment, a failed policy lookup
+  leaves the sender check pending and Mail retries when the message is opened
+  again. Mail checks the organizational domain after a successful lookup
+  finds no policy at the From domain. A valid signature from the exact From
+  domain aligns under either mode.
 - **Provider results** require explicit trust in the account’s delivery
   boundary. The receiving MTA must remove outside claims to its own
   `authserv-id` before delivery, and Mail must obtain that ID independently

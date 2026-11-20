@@ -378,7 +378,7 @@ pub enum Verdict {
     Verified { domain: String, by_provider: bool },
     /// The checks failed, or nothing could be checked.
     NotVerified,
-    /// Waiting for key records from sync.
+    /// Waiting for a key or alignment policy.
     Pending,
 }
 
@@ -404,16 +404,23 @@ pub fn aligned(from_domain: &str, dkim_domain: &str, strict: bool) -> bool {
 }
 
 /// The verdict for one message. `dmarc_record` is the TXT at
-/// `_dmarc.<from domain>` (or its organizational domain); `provider` is
-/// the Authentication-Results result from the account's own server, if the
+/// `_dmarc.<from domain>` (or its organizational domain). An empty record
+/// means confirmed absence, while `None` means no policy answer. `provider`
+/// is the Authentication-Results result from the account's own server, if the
 /// message carried one (see [`provider_result`]).
 pub fn verdict(from_domain: &str, sigs: &[Signature], dmarc_record: Option<&str>, provider: Option<&ProviderResult>) -> Verdict {
     if from_domain.is_empty() {
         return Verdict::NotVerified;
     }
     let strict = dmarc_record.map(|r| tags(r.as_bytes())).map(|t| tag(&t, "adkim") == Some("s")).unwrap_or(false);
-    if sigs.iter().any(|s| s.outcome == Outcome::Pass && !s.partial_body && aligned(from_domain, &s.domain, strict)) {
+    let passed = |strict| {
+        sigs.iter().any(|s| s.outcome == Outcome::Pass && !s.partial_body && aligned(from_domain, &s.domain, strict))
+    };
+    if passed(strict || dmarc_record.is_none()) {
         return Verdict::Verified { domain: from_domain.to_ascii_lowercase(), by_provider: false };
+    }
+    if dmarc_record.is_none() && passed(false) {
+        return Verdict::Pending;
     }
     let missing_key = sigs.iter().any(|s| s.outcome == Outcome::NoKey && aligned(from_domain, &s.domain, strict));
     let local_failure = sigs.iter().any(|s| {
