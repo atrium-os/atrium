@@ -1071,6 +1071,17 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                         fail "active refresh retry prompted or changed the report"
                                     ok "unchanged HIP refreshed silently after active refresh retry"
                                     probe "IPv4 echo after silent refresh on the retry ESP association"
+                                    if [ "$retry_hip_submit" = 17 ]; then
+                                        rebind_restored_forwarding 11 "$retry_report"
+                                        before_refresh=$(awk 'END { print NR }' "$receipts")
+                                        wait_receipts "$((before_refresh + 1))"
+                                        [ "$(field signin)" = in ] &&
+                                            [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$retry_report" ] &&
+                                            [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                                            fail "HIP refreshed differently or prompted after rebind of the retry tunnel"
+                                        ok "the approved retry report refreshed silently after rebind"
+                                        probe "IPv4 echo after silent refresh on the rebound retry tunnel"
+                                    fi
                                 fi
                             fi
                         fi

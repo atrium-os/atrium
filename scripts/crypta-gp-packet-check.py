@@ -758,7 +758,7 @@ def main():
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (15 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (16 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -776,7 +776,10 @@ def main():
                         if recovered_reconnect:
                             expected_spis.extend([esp.configs[11][0][0]] * 2 + [esp.configs[12][0][0]] * 2)
                         if active_refresh_retry and not active_refresh_decline:
-                            expected_spis.extend([esp.configs[-1][0][0]] * 2)
+                            retry_spi = esp.configs[14 if active_refresh_reconnect else 13][0][0]
+                            expected_spis.extend([retry_spi] * 2)
+                            if active_refresh_reconnect:
+                                expected_spis.extend([esp.configs[15][0][0]] * 2)
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -790,7 +793,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        recovery_echoes = 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
+                        recovery_echoes = 12 if active_refresh_reconnect else 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
                         allowed_echoes.append([
                             *expected_spis[:-recovery_echoes], expected_spis[-recovery_echoes - 1],
                             *expected_spis[-recovery_echoes:],
@@ -799,7 +802,9 @@ def main():
                         allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
                     else:
                         allowed_echoes.append([*expected_spis, expected_spis[-1]])
-                if active_refresh_retry and not active_refresh_decline:
+                if active_refresh_reconnect:
+                    allowed_echoes.extend([*echoes[:-2], retry_spi, *echoes[-2:]] for echoes in allowed_echoes[:])
+                elif active_refresh_retry and not active_refresh_decline:
                     allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 dropped_spis = {original_spi}
                 received_spis = set(expected_spis)
@@ -915,6 +920,9 @@ def main():
                                                         if active_refresh_reconnect:
                                                             assert calls[configs[13]:configs[14]] == exchange, calls
                                                             assert calls[:configs[14]].count("hipreport.esp") == active_retry_report, reports
+                                                            rebind_report = calls[:configs[15]].count("hipreport.esp")
+                                                            assert rebind_report >= active_retry_report + 2, reports
+                                                            assert len(reports[rebind_report:]) >= 2, reports
                                                         assert len(reports[active_retry_report:]) >= 2, reports
                                                         assert set(reports[reconnected_report:active_retry_report]) == {changed}, reports
                                                         assert set(reports[active_retry_report:]) == {
