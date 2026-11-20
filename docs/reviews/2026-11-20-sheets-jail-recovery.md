@@ -174,3 +174,20 @@ The fixture kept the first runtime launch on hold after Sheets rejected the stal
 Before releasing the first launch, the gate unlocked the sibling, saved it under a new name, added a cell edit, saved again, and closed it. The first workbook then opened once with its original ID. An independent reader verified `fox` followed by `fox,2` in the sibling copy and `zebra` followed by `zebra,2` in the first copy. Both pending markers cleared and both recovery devices detached. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `stale-refresh`.
 
 The refreshed-row gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM.
+
+## Interleaved saves from two live recovered workbooks
+
+The replacement sibling opened with recovery ID `41`, unlocked, and used Save As to publish `Untitled.osheet`. With that document still open, the fixture released the held launch. `Proof.csv` opened in a second jail under its original recovery ID and published `Proof.osheet`. Its Save As left the sibling file byte-identical.
+
+The fixture tiled the documents and gave keyboard focus to the target window before each B1 edit. It then alternated ordinary Save four times. An independent reader checked both published files after every turn.
+
+| Document saved | Plain copy (A1, B1) | Protected copy (A1, B1) |
+| --- | --- | --- |
+| Protected | zebra, empty | fox, 3 |
+| Plain | zebra, 4 | fox, 3 |
+| Protected | zebra, 4 | fox, 5 |
+| Plain | zebra, 6 | fox, 5 |
+
+Each turn checked both live jails, the caller UID in Scrinium’s trace, a changed digest for the intended destination, and an unchanged digest for its sibling. The reader checked the protected file with the fixture password and confirmed that a wrong password failed. The source CSV still contained `Original`. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the fixture broker path, and `stale-refresh interleave`. Cross-build the [window tiling helper](../../atrium-sheets/examples/tile_recovery_windows.rs) on the host and stage it as `/tmp/tile-recovery-windows` in the private guest.
+
+The interleaved-save gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs cleared the pending markers and detached their recovery devices.

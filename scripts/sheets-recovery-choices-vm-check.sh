@@ -14,6 +14,7 @@
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
 # --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, stale-id, or stale-refresh after the broker path.
+# With stale-refresh, append interleave to keep both documents open. Stage the tile_recovery_windows example at /tmp/tile-recovery-windows.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -126,7 +127,7 @@ publish() {
     wait_for different_window 824 457 "$parent"
     click 824 457
     wait_for test -s "$books/$1"
-    /tmp/check-recovered-copy "$books/$1" "$2" plain
+    /tmp/check-recovered-copy "$books/$1" "$2" "${3:-plain}"
     back_in_document() { test "$(win_at 824 457)" = "$parent"; }
     wait_for back_in_document
 }
@@ -473,6 +474,12 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
 fi
 if test "${1:-}" = --delayed-runtime-start || test "${1:-}" = --delayed-start-sibling; then
     first=delayed-start
+    interleave=false
+    if test "${4:-}" = interleave; then
+        test "$1" = --delayed-start-sibling && test "$3" = stale-refresh
+        test -x /tmp/tile-recovery-windows
+        interleave=true
+    fi
     fixture_broker "${2:?pass the private fixture broker executable}"
     test "$(ls -A "$books")" = Proof.csv
     make_pair
@@ -615,17 +622,73 @@ SH
         if test "${3:-}" = stale-refresh; then
             wait_for pgrep -f -j "$sibling" -- 'atrium-sheets --recover-document 41$'
         fi
-        sleep .6; save_copy protected
-        wait_for pending 1; count 0; test -f "$bin/hold"
+        sleep .6
+        if "$interleave"; then
+            type_keys 0x17 0x08 0x16 0x17 0x28
+            sleep .6; publish Untitled.osheet fox protected
+            sibling_win=$parent
+            sibling_root=$(root "$sibling")
+            sibling_hash=$(sha256 -q "$books/Untitled.osheet")
+            count 1; pending 2
+        else
+            save_copy protected; wait_for pending 1; count 0
+        fi
+        test -f "$bin/hold"
         test "$(wc -l < "$bin/starts")" -eq 2
         ;;
     esac
     unlink "$bin/hold"
-    wait_for count 1; jid=$(docs)
+    if "$interleave"; then
+        wait_for count 2
+        jid=$(docs | grep -vx "$sibling")
+    else
+        wait_for count 1; jid=$(docs)
+    fi
     wait_for pgrep -x -j "$jid" atrium-sheets
     test "$(root "$jid")" = "$plain_root"
     sed 's/,"name":.*//' "$marker" | cmp -s - "$results/original.id"
-    save_copy plain
+    if "$interleave"; then
+        wait_for different_window 205 24 "$sibling_win"
+        sleep .6; publish Proof.osheet zebra
+        plain_win=$parent
+        test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
+        tiled() { test "$(win_at 125 24)" = "$plain_win" && test "$(win_at 765 24)" = "$sibling_win"; }
+        # Each ordinary Save must update its own Save As destination in place.
+        # Keep the other file's digest and independently read both copies.
+        save_turn() {
+            mode=$1; usage=$2; plain_cells=$3; protected_cells=$4
+            if test "$mode" = protected; then
+                x=640; focus=$sibling_win; uid=${sibling_root##*-}; target_file=Untitled; other_file=Proof
+            else
+                x=0; focus=$plain_win; uid=${plain_root##*-}; target_file=Proof; other_file=Untitled
+            fi
+            /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$focus"
+            count 2; pending 2; wait_for tiled
+            before=$(sha256 -q "$books/$target_file.osheet")
+            other=$(sha256 -q "$books/$other_file.osheet")
+            trace_offset=$(wc -l < select-files.log)
+            edit "$((x + 129))" "$usage"; click "$((x + 125))" 24
+            saved() { test "$(sha256 -q "$books/$target_file.osheet")" != "$before"; }
+            wait_for saved
+            tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid $uid)"
+            test "$(sha256 -q "$books/$other_file.osheet")" = "$other"
+            /tmp/check-recovered-copy "$books/Proof.osheet" "$plain_cells" plain
+            /tmp/check-recovered-copy "$books/Untitled.osheet" "$protected_cells" protected
+        }
+        save_turn protected 0x20 zebra fox,3
+        save_turn plain 0x21 zebra,4 fox,3
+        save_turn protected 0x22 zebra,4 fox,5
+        save_turn plain 0x23 zebra,6 fox,5
+        count 2; key 0x1a 1; wait_for count 1
+        test "$(docs)" = "$sibling"
+        /tmp/tile-recovery-windows --clear-focus
+        key 0x1a 1; wait_for count 0
+        /tmp/tile-recovery-windows --clear-focus
+        mv "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"
+        test "$(cat "$books/Proof.csv")" = Original
+    else
+        save_copy plain
+    fi
     if test "${3:-}" = unavailable; then
         wait_for pending 1
         test ! -e "$sibling_image"
