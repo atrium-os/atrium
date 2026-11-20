@@ -6038,7 +6038,9 @@ settings are HVF and `-cpu host`. Set `PRELUM_R7_ACCEL` and `PRELUM_R7_CPU`
 for another arm64 host. `PRELUM_R7_SSH_PORT` and `PRELUM_R7_IPPS_PORT` default
 to 6329 and 19329. The gate starts and powers down its own guest and uses
 a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
-log, build hashes and verdicts under the printed artifact directory.
+log, build hashes and verdicts under the printed artifact directory. Before
+power-down it also collects available guest service logs, screenshots and
+job-list snapshots into `guest-artifacts.tar.gz`, including after a failed check.
 Prelum must reach Done for each desktop job with an observed jailed IPP
 worker. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides

@@ -50,11 +50,25 @@ remote() {
         -o "UserKnownHostsFile=$D/known_hosts" -o StrictHostKeyChecking=accept-new \
         -p "$ssh_port" root@127.0.0.1 "$@"
 }
+collect_guest_artifacts() {
+    remote "cd '$guest' && test \$(cat .isolated-gate) = '$marker' && sh -s" <<'GUEST'
+set -eu
+set --
+for artifact in *.log *-preview.png screen.png jobs.txt mail-before-cancel.txt mail-after-cancel.txt; do
+    if [ -f "$artifact" ] && [ ! -L "$artifact" ]; then set -- "$@" "$artifact"; fi
+done
+if [ "$#" -gt 0 ]; then tar -czf - "$@"; fi
+GUEST
+}
 cleanup() {
     status=$?
     trap - EXIT
     if [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; then
         if [ -n "$guest_connected" ]; then
+            if ! collect_guest_artifacts >"$D/guest-artifacts.tar.gz" 2>"$D/guest-artifacts.log"; then
+                echo "Could not collect guest artifacts; see $D/guest-artifacts.log" >&2
+                status=1
+            fi
             remote "test \$(cat '$guest/.isolated-gate') = '$marker' && shutdown -p now" \
                 >"$D/shutdown.log" 2>&1 || status=1
         fi
