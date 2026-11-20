@@ -16,6 +16,7 @@ use arca_courier::schema::Refusal;
 use arca_store::secret::LockedBuf;
 use arca_store::Scheme;
 use mail_engine::{Action, Engine, Parser};
+use mail_schema::SenderCheck;
 use mail_store::{flag, Role, Store};
 use mail_sync::{FolderState, Session, Sink};
 use navigator_fetch::{addr, Connect};
@@ -696,6 +697,38 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     assert!(engine.store.accounts().unwrap().is_empty());
     assert!(engine.configured().is_empty());
     assert!(engine.store.account_config(account).unwrap().is_none());
+}
+
+#[test]
+fn imap_inbox_append_from_another_client_is_unverified() {
+    let Some(dc) = start_dovecot_with_inbox(0) else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let raw = b"Authentication-Results: edge.example; dmarc=pass header.from=example.net\r\n\
+        From: sender@example.net\r\nSubject: Appended by another client\r\n\r\nFrom an archive.\r\n";
+    let mut writer = Session::start(courier(&dc)).unwrap();
+    let uid = writer.append("INBOX", &[], raw).unwrap().expect("Dovecot APPENDUID");
+    writer.logout().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let mut reader = mail_engine::accounts::open_imap(courier(&dc)).unwrap();
+    reader.sync(&mut engine.sink(account)).unwrap();
+    reader.logout().unwrap();
+
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].uid, uid);
+    assert_eq!(rows[0].subject, "Appended by another client");
+    let id = rows[0].msg;
+    let stored = engine.store.message(id).unwrap();
+    assert_eq!(engine.store.blob(&stored.full.unwrap()).unwrap(), raw);
+    assert_eq!(stored.summary.sender_check, SenderCheck::NotVerified);
+    let opened = engine.open(id).unwrap();
+    assert_eq!(opened.summary.sender_check, SenderCheck::NotVerified);
 }
 
 /// Junk and Not junk (§7.7): the message moves, and carries `$Junk` or
