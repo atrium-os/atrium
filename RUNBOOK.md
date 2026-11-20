@@ -6080,7 +6080,8 @@ through both holds and increases by one after UUID restoration. Finally, the
 gate resubmits that exact redeemed handle with the original identity active.
 Arca must deny the replay, Prelum must mark it Failed with zero completed
 sheets, and the simulator
-must receive no new job or PDF.
+must receive no new job or PDF. A subsequent job using a fresh handle
+must redeem it once and upload both original pages in one PDF.
 
 ### 13.9 Shared-checkout hygiene
 

@@ -55,8 +55,15 @@ completed_jobs = re.findall(
     jobs,
     re.M,
 )
-assert [(job, title) for job, _, _, title in completed_jobs] == [
-    (job, title) for job, _, title, _, _, _ in receipts
+desktop_job_ids = job_ids
+if len(sys.argv) > 6:
+    # A rejected desktop job consumes a local ID without creating an IPP job.
+    skipped = int(sys.argv[6])
+    desktop_job_ids = [job if job < skipped else job + 1 for job in job_ids]
+    assert re.search(rf"^ +{skipped} +printer [0-9]+ +Failed +0/2 ", jobs, re.M), jobs
+assert [int(job) for job, _, _, _ in completed_jobs] == desktop_job_ids, completed_jobs
+assert [title for _, _, _, title in completed_jobs] == [
+    title for _, _, title, _, _, _ in receipts
 ], (completed_jobs, receipts)
 for pdf, receipt, (_, completed, total, _) in zip(expected, receipts, completed_jobs):
     job, size, _title, digest, document_format, tls = receipt
@@ -182,6 +189,6 @@ for path, action in ((pdf_button, "Print button"), (pdf_shortcut, "viewer Ctrl+P
 
 
 if original:
-    for job, pdf in enumerate(expected[11:], start=12):
+    for job, pdf in zip(desktop_job_ids[11:], expected[11:]):
         assert pages_of(pdf) == pages_of(original), (job, "Released job PDF differs from its input")
-        print(f"Identity recovery: released job {job} printed both original pages")
+        print(f"Diagnostic job {job}: both original pages printed")

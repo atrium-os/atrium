@@ -119,6 +119,7 @@ check_served_key() {
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
+    --test-pin-job "Fresh PIN after replay refusal" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -301,3 +302,18 @@ test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-replay-audit.log")" 
 grep -E 'op=0x0011' "$D/pin-replay-audit.log" | tail -1 | grep -E 'prelum-ipp op=0x0011 .*status=1$'
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-uuid-released-jobs.txt" "$D/fixtures/quicklook.pdf" 15 >"$D/pin-replay-pdf-checks.log"
 cat "$D/pin-replay-pdf-checks.log"
+
+
+# Fresh issuance must still work after the denied replay.
+remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
+    <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-fresh-stage.log" 2>&1
+remote "sh -s -- '$guest' '$marker' fresh pin-fresh" <"$scripts/prelum-r7-identity.sh" >"$D/pin-fresh.log" 2>&1 || { cat "$D/pin-fresh.log" >&2; exit 1; }
+cat "$D/pin-fresh.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-fresh-audit.log"
+test "$(grep -cE 'ui op=0x0068 .*status=0$' "$D/pin-fresh-audit.log")" -eq 3
+test "$(grep -c 'op=0x0011' "$D/pin-fresh-audit.log")" -eq 4
+test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-fresh-audit.log")" -eq 3
+grep -E 'op=0x0011' "$D/pin-fresh-audit.log" | tail -1 | grep -E 'prelum-ipp op=0x0011 .*status=0$'
+remote "cat '$guest/pin-fresh-jobs.log'" >"$D/pin-fresh-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16 >"$D/pin-fresh-pdf-checks.log"
+cat "$D/pin-fresh-pdf-checks.log"

@@ -14,7 +14,8 @@ case "$kind" in
   tls) job=13; title="Changed printer TLS key"; prefix=tls-identity ;;
   pin) job=14; title="PIN after TLS key restoration"; prefix=pin-identity ;;
   pin-uuid) job=15; title="PIN after UUID restoration"; prefix=pin-uuid-identity ;;
-  *) echo "Expected uuid, tls, pin, or pin-uuid" >&2; exit 2 ;;
+  pin-fresh) job=17; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
+  *) echo "Expected uuid, tls, pin, pin-uuid, or pin-fresh" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
 previous_hold=
@@ -56,7 +57,16 @@ case "$phase" in
     snapshot=pin-replay-jobs.log
     expected="^ +16 +printer +1 +Failed +0/2 +$title +Arca did not supply a usable PIN for this job *$"
     ;;
-  *) echo "Expected hold, retry, release, or replay" >&2; exit 2 ;;
+  fresh)
+    test "$kind" = pin-fresh
+    exec 3<pin-handle
+    rm -f pin-handle
+    "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
+    exec 3<&-
+    snapshot=$prefix-jobs.log
+    expected="^ +$job +printer +1 +Done +2/2 +$title *$"
+    ;;
+  *) echo "Expected hold, retry, release, replay, or fresh" >&2; exit 2 ;;
 esac
 matches_snapshot() {
   if [ -n "$previous_hold" ]; then
