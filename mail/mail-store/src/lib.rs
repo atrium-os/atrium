@@ -15,9 +15,10 @@
 //! checked before they get here (mail-schema).
 
 use std::io::Write as _;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 
-use mail_schema::Summary;
+use mail_schema::{SenderCheck, Summary};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,9 +44,8 @@ pub mod sieve;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
-/// The index's layout; an index of another layout is rebuilt from the blobs
-/// by sync (the store refuses to open it).
-const SCHEMA: u64 = 7;
+/// The index's format and the invariants expected by this Mail build.
+const SCHEMA: u64 = 8;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -309,6 +309,10 @@ impl Store {
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();
             match schema {
                 Some(SCHEMA) => {}
+                Some(7) => {
+                    reset_sender_verdicts(&tx)?;
+                    meta.insert("schema", SCHEMA)?;
+                }
                 None if empty => {
                     meta.insert("schema", SCHEMA)?;
                 }
@@ -519,6 +523,33 @@ impl Store {
     pub fn message_count(&self) -> Result<u64> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(MESSAGES)?.len()?)
+    }
+}
+
+/// Old verified verdicts predate the current From and DMARC policy checks.
+fn reset_sender_verdicts(tx: &redb::WriteTransaction) -> Result<()> {
+    const PAGE: usize = 256;
+    let mut messages = tx.open_table(MESSAGES)?;
+    let mut next = Unbounded;
+    loop {
+        let mut verified = Vec::new();
+        let mut last = None;
+        for entry in messages.range((next, Unbounded))?.take(PAGE) {
+            let (key, bytes) = entry?;
+            let id = key.value();
+            last = Some(id);
+            let message: Message = dec(bytes.value())?;
+            if matches!(message.summary.sender_check, SenderCheck::Verified { .. }) {
+                verified.push(id);
+            }
+        }
+        let Some(last) = last else { return Ok(()) };
+        next = Excluded(last);
+        for id in verified {
+            let mut message: Message = dec(messages.get(id)?.ok_or(Error::NotFound)?.value())?;
+            message.summary.sender_check = SenderCheck::Pending;
+            messages.insert(id, enc(&message).as_slice())?;
+        }
     }
 }
 
@@ -737,5 +768,63 @@ impl Writer<'_> {
             self.remove(folder, u)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn version_seven_sender_verdicts_are_reset_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let account = store.add_account("reader@example.org").unwrap();
+        let inbox = store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+        let raw = b"Subject: Example\r\n\r\nBody\r\n";
+        let blob = store.put_blob(raw).unwrap();
+        let document = store.put_blob(b"cached document").unwrap();
+        let verified = SenderCheck::Verified { domain: "example.org".into(), by_provider: false };
+        let end = 257;
+        let ids = store.write(|w| {
+            let mut ids = Vec::new();
+            for uid in 1..=end {
+                let sender_check = if uid == 1 || uid == end {
+                    verified.clone()
+                } else {
+                    SenderCheck::NotVerified
+                };
+                let id = w.put(inbox, account, uid, Incoming {
+                    server_id: None,
+                    size: raw.len() as u64,
+                    internal_date: None,
+                    flags: flag::FLAGGED,
+                    blob,
+                    full: true,
+                    summary: Summary { sender_check, ..Default::default() },
+                })?;
+                ids.push(id);
+            }
+            w.set_document(ids[0], Some(document))?;
+            w.tx.open_table(META)?.insert("schema", 7)?;
+            Ok(ids)
+        }).unwrap();
+        let before: Vec<_> = ids.iter().map(|&id| store.message(id).unwrap()).collect();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+        for (i, (&id, mut expected)) in ids.iter().zip(before).enumerate() {
+            if matches!(expected.summary.sender_check, SenderCheck::Verified { .. }) {
+                expected.summary.sender_check = SenderCheck::Pending;
+            }
+            assert_eq!(store.message(id).unwrap(), expected);
+            assert_eq!(store.at(inbox, i as u32 + 1).unwrap(), Some((id, flag::FLAGGED)));
+        }
+        assert_eq!(store.blob(&blob).unwrap(), raw);
+        assert_eq!(store.blob(&document).unwrap(), b"cached document");
+
+        store.write(|w| w.set_sender_check(ids[0], verified.clone())).unwrap();
+        drop(store);
+        assert_eq!(Store::open(dir.path()).unwrap().message(ids[0]).unwrap().summary.sender_check, verified);
     }
 }

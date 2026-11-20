@@ -565,6 +565,11 @@ What Mail shows comes from what was checked, never from what the message says ab
   a verified-sender badge. Multiple authors or duplicate From fields leave
   the sender unverified while the message stays readable.
   [RFC 5322 §3.6.2](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.2)
+
+  The version 7 index upgrade marks saved verified verdicts pending in one
+  transaction. On opening a downloaded message, Mail checks it again even
+  if it already has a cached document. The upgrade reads index summaries
+  and makes no DNS queries.
 - **Provider results** require explicit trust in the account’s delivery
   boundary. The receiving MTA must remove outside claims to its own
   `authserv-id` before delivery, and Mail must obtain that ID independently

@@ -211,3 +211,28 @@ fn inbox_import_round_trip_does_not_establish_provider_provenance() {
     assert_eq!(engine.store.message(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
     assert_eq!(engine.open(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
 }
+
+#[test]
+fn a_pending_verdict_is_rechecked_even_with_a_cached_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    engine.set_dns(Box::new(Fake::default()));
+    let account = engine.store.add_account("reader@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder {
+        name: "INBOX".into(),
+        role: mail_sync::Role::Inbox,
+        selectable: true,
+    }]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let raw = b"From: sender@example.com\r\nSubject: Example\r\n\r\nHello\r\n";
+    sink.messages("INBOX", vec![fetched(1, raw.to_vec())]).unwrap();
+
+    let id = engine.store.at(inbox, 1).unwrap().unwrap().0;
+    engine.open(id).unwrap();
+    assert!(engine.store.message(id).unwrap().document.is_some());
+    engine.store.write(|w| w.set_sender_check(id, SenderCheck::Pending)).unwrap();
+
+    assert_eq!(engine.open(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
+    assert_eq!(engine.store.message(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
+}
