@@ -199,3 +199,11 @@ Append `restart-limen` to the interleaved-save gate above. After both Save As op
 The same per-turn checks apply across the restart. Each Scrinium request carries the saving jail’s UID. An independent reader checks the contents of both files, including password protection, and the idle sibling’s digest stays unchanged. The final copies contain `zebra,6` in Proof.osheet and `fox,5` in Untitled.osheet.
 
 Both runs passed in the isolated Tessera-root VM, one with native Tessera recovery volumes and one with bounded UFS volumes. Both document jails closed cleanly and released their recovery devices.
+
+## Restarting Limen during a pending Save
+
+Run the interleaved-save gate with `stale-refresh interleave pending-save`. After both Save As operations, the fixture enters B1=4 in the plain workbook, pauses Limen, and checks that its receive queue for that document is empty. It presses Save and waits for bytes on that connection before terminating Limen. This puts the interruption after Sheets submitted the request and before Scrinium could publish it.
+
+After the same two Sheets processes and Scrinium reconnect, the gate checks both file digests against their pre-restart values. It saves B1=3 in the protected sibling first. The independent reader must see `fox,3` there and only `zebra` in the plain copy. Pressing ordinary Save again in the plain window, without re-entering the edit, must produce `zebra,4` and preserve the sibling byte-for-byte. Two more alternating saves exercise both grants again.
+
+The pending Save test passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs finished with the plain copy at `zebra,6`, the protected copy at `fox,5`, and the source CSV intact. Both jails closed and released their recovery devices.

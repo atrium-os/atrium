@@ -16,6 +16,7 @@
 # --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, stale-id, or stale-refresh after the broker path.
 # With stale-refresh, append interleave to keep both documents open. Stage the tile_recovery_windows example at /tmp/tile-recovery-windows.
 # Append restart-limen after interleave to restart the private Limen between Save As and Save.
+# Use pending-save instead of restart-limen to interrupt an ordinary Save before delivery.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -654,7 +655,7 @@ SH
         plain_win=$parent
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
         tiled() { test "$(win_at 125 24)" = "$plain_win" && test "$(win_at 765 24)" = "$sibling_win"; }
-        if test "${5:-}" = restart-limen; then
+        if test "${5:-}" = restart-limen || test "${5:-}" = pending-save; then
             plain_pid=$(pgrep -x -j "$jid" atrium-sheets)
             sibling_pid=$(pgrep -x -j "$sibling" atrium-sheets)
             files_pid=$(pgrep -x -U sheetsfiles bench-scrinium)
@@ -669,7 +670,32 @@ SH
             old_limen=$(listener)
             test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
-            kill -TERM "$old_limen"
+            if test "$5" = pending-save; then
+                /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
+                wait_for tiled
+                edit 129 0x21 # Commit B1=4 once. The retry presses only Save.
+                plain_hash=$(sha256 -q "$books/Proof.osheet")
+                # The server-side receive queue proves this document sent its
+                # request before the broker died, while Scrinium could not see it.
+                pcb=$(sockstat -Aucw | awk -v server="$old_limen" -v peer="$plain_pid" \
+                    '$3==server && index($0, "-> [" peer " ") {sub(/^0x/,"",$NF); print $NF; exit}')
+                test -n "$pcb"
+                recv_bytes() { netstat -an -f unix | awk -v pcb="$pcb" '$1==pcb {print $3}'; }
+                (
+                    trap 'kill -CONT "$old_limen" 2>/dev/null || :' EXIT
+                    kill -STOP "$old_limen"
+                    stopped_limen() { ps -p "$old_limen" -o state= | grep -q '^T'; }
+                    wait_for stopped_limen
+                    test "$(recv_bytes)" = 0
+                    click 125 24
+                    queued() { test "$(recv_bytes)" -gt 0; }
+                    wait_for queued
+                    kill -KILL "$old_limen"
+                    trap - EXIT
+                )
+            else
+                kill -TERM "$old_limen"
+            fi
             offline() { ! kill -0 "$old_limen" 2>/dev/null && test -z "$(listener)"; }
             wait_for offline
             env LIMEN_SOCKET="$limen_socket" LIMEN_FRESCOD_ACTIVATION="$PWD/activation.sock" \
@@ -692,7 +718,8 @@ SH
             before=$(sha256 -q "$books/$target_file.osheet")
             other=$(sha256 -q "$books/$other_file.osheet")
             trace_offset=$(wc -l < select-files.log)
-            edit "$((x + 129))" "$usage"; click "$((x + 125))" 24
+            if test "$usage" != retry; then edit "$((x + 129))" "$usage"; fi
+            click "$((x + 125))" 24
             saved() { test "$(sha256 -q "$books/$target_file.osheet")" != "$before"; }
             wait_for saved
             tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid $uid)"
@@ -700,8 +727,14 @@ SH
             /tmp/check-recovered-copy "$books/Proof.osheet" "$plain_cells" plain
             /tmp/check-recovered-copy "$books/Untitled.osheet" "$protected_cells" protected
         }
+        plain_input=0x21
+        if test "${5:-}" = pending-save; then
+            test "$(sha256 -q "$books/Proof.osheet")" = "$plain_hash"
+            test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
+            plain_input=retry
+        fi
         save_turn protected 0x20 zebra fox,3
-        save_turn plain 0x21 zebra,4 fox,3
+        save_turn plain "$plain_input" zebra,4 fox,3
         save_turn protected 0x22 zebra,4 fox,5
         save_turn plain 0x23 zebra,6 fox,5
         count 2; key 0x1a 1; wait_for count 1
