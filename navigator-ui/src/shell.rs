@@ -263,6 +263,7 @@ pub enum Out {
     Discard { id: u32 },
     /// Open that file in the person's app for it (§6.4), with the press.
     OpenFile { id: u32, press: navigator_control::Press },
+    StartWidget { page: (u64, PageId), key: u32, src: String, press: navigator_control::Press },
     RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
@@ -730,7 +731,7 @@ impl Shell {
 
     /// The child names a source. The signed row takes its origin only from
     /// the broker's metadata for this specific open.
-    pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, island: u32, rect: [f32; 4], now: f64) -> bool {
+    pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, island: u32, rect: [f32; 4], runnable: bool, now: f64) -> bool {
         if self.history.is_some() || self.shown_key() != Some(key) { return false; }
         let Some(page) = self.store.trail().page() else { return false };
         let replaced = page.asked.iter().map(|a| &a.prompt).chain(page.prompts.queued.iter())
@@ -739,7 +740,7 @@ impl Shell {
             self.widget_placement(key, None, None, now);
         }
         let Some((_, origin)) = sources.iter().find(|(s, _)| s == src) else { return replaced };
-        self.ask_at(key, Prompt::Widget { key: island, src: src.into(), origin: origin.clone(), rect }, now) || replaced
+        self.ask_at(key, Prompt::Widget { runnable, key: island, src: src.into(), origin: origin.clone(), rect }, now) || replaced
     }
 
     /// Update only an existing widget row. Closing or hiding the page also
@@ -840,6 +841,11 @@ impl Shell {
             (Prompt::Download { id, .. }, "Open") if live => self.outbox.push(Out::OpenFile { id: *id, press }),
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
+            }
+            (Prompt::Widget { runnable: true, key: island, src, .. }, "Start") if live => {
+                if let Some(page) = key {
+                    self.outbox.push(Out::StartWidget { page, key: *island, src: src.clone(), press });
+                }
             }
             (Prompt::RunLive, "Run live") if live => {
                 if let Some(url) = self.shown_url() {
@@ -2325,15 +2331,15 @@ mod tests {
         s.enter("https://parent.example/one");
         let key = s.shown_key().unwrap();
         let sources = vec![("/counter".into(), "https://parent.example".into())];
-        assert!(!s.widget_pressed(key, &sources, "https://other.example", 17, [1., 2., 30., 40.], 0.0));
-        assert!(s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], 0.0));
+        assert!(!s.widget_pressed(key, &sources, "https://other.example", 17, [1., 2., 30., 40.], false, 0.0));
+        assert!(s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], false, 0.0));
         let prompt = &s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt;
         assert_eq!(crate::ax::prompt_text(prompt), "Live widget from https://parent.example is unavailable");
         assert_eq!(prompt.answers(), &["Close"]);
         assert!(s.answer_pressed(0, 700.0, Some([3; 16])));
         assert!(s.outbox.is_empty());
         s.enter("https://parent.example/two");
-        assert!(!s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], 1500.0));
+        assert!(!s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], false, 1500.0));
     }
 
     #[test]
@@ -2344,14 +2350,14 @@ mod tests {
         let sources = vec![("/one".into(), "https://parent.example".into()),
                            ("/two".into(), "https://parent.example".into())];
         let rect = [2., 3., 100., 120.];
-        assert!(s.widget_pressed(page, &sources, "/one", 18, rect, 0.));
-        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, 100.));
+        assert!(s.widget_pressed(page, &sources, "/one", 18, rect, false, 0.));
+        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, false, 100.));
         assert!(s.store.trail().page().unwrap().asked.is_none());
-        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, 1500.));
+        assert!(s.widget_pressed(page, &sources, "/two", 18, rect, false, 1500.));
         let asked = s.store.trail().page().unwrap().asked.as_ref().unwrap();
         assert!(matches!(&asked.prompt, Prompt::Widget { src, .. } if src == "/two"));
         assert_eq!(asked.since_ms, 1500.);
-        assert!(s.widget_pressed(page, &sources, "/unrecorded", 18, rect, 1600.));
+        assert!(s.widget_pressed(page, &sources, "/unrecorded", 18, rect, false, 1600.));
         assert!(s.store.trail().page().unwrap().asked.is_none());
     }
 
@@ -2362,7 +2368,7 @@ mod tests {
         let page = s.shown_key().unwrap();
         let sources = vec![("/counter".into(), "https://parent.example".into())];
         let rect = [2., 3., 100., 120.];
-        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, 0.));
+        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, false, 0.));
         assert!(s.ask(Prompt::RunLive, 1200.));
         assert!(!s.widget_placement(page, Some(11), None, 1400.));
         let moved = [3., 0., 100., 90.];
@@ -2373,7 +2379,7 @@ mod tests {
         let next = s.store.trail().page().unwrap().asked.as_ref().unwrap();
         assert_eq!(next.prompt, Prompt::RunLive);
         assert_eq!(next.since_ms, 1500.);
-        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, 2500.));
+        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, false, 2500.));
         assert!(s.widget_placement(page, Some(18), None, 2600.));
         assert!(s.store.trail().page().unwrap().prompts.queued.is_empty());
         assert!(!s.widget_placement(page, Some(18), Some(moved), 2700.));

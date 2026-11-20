@@ -75,6 +75,9 @@ struct Child {
     /// Its page's sections, from `Loaded` (§7 "Jump to section").
     sections: Vec<(String, String)>,
     island_sources: Vec<(String, String)>,
+    document: Option<Ticket>,
+    runnable: Option<String>,
+    selected_widget: Option<(u32, String, [f32; 4])>,
     /// Its page's plain forms (limen `Forms`), for the sign-in window's
     /// form panel.
     forms: Vec<limen::doc_viewer::Form>,
@@ -85,6 +88,7 @@ pub struct Live {
     rx: mpsc::Receiver<Event>,
     embeds: Option<Rc<RefCell<Embeds>>>,
     window: Option<WindowToken>,
+    widget: Option<(Ticket, u32, [u32; 4])>,
     children: Vec<Child>,
     /// The page whose child is in the slot (`None`: Start).
     shown: Option<Key>,
@@ -245,6 +249,7 @@ impl Live {
                 rx,
                 embeds: None,
                 window: None,
+                widget: None,
                 children: vec![],
                 shown: None,
                 started: false,
@@ -280,6 +285,21 @@ impl Live {
     /// How many page children are live (not being parked).
     pub fn live(&self) -> usize {
         self.children.iter().filter(|c| c.parking.is_none()).count()
+    }
+
+    fn widget_bounds(&self, s: &Shell, page: Key, key: u32, source: Option<&str>) -> Option<(Ticket, [u32; 4])> {
+        if s.history.is_some() || self.shown != Some(page) || s.shown_key() != Some(page) { return None; }
+        let child = self.children.iter().find(|c| c.key == page)?;
+        let (id, src, [x,y,w,h]) = child.selected_widget.as_ref()?;
+        if *id != key || child.runnable.as_ref() != Some(src) || source.is_some_and(|v| v != src) { return None; }
+        let slot = s.geo().page;
+        let left = x.max(0.).ceil();
+        let top = y.max(0.).ceil();
+        let right = (x+w).min(slot.w()).floor();
+        let bottom = (y+h).min(slot.h()).floor();
+        if right <= left || bottom <= top { return None; }
+        Some((child.document?, [(slot.x()+left).ceil() as u32, (slot.y()+top).ceil() as u32,
+            (right-left) as u32, (bottom-top) as u32]))
     }
 
     fn id(&mut self) -> u32 {
@@ -457,6 +477,7 @@ impl Live {
             reading,
             sections: Vec::new(),
             island_sources: Vec::new(),
+            document: None, runnable: None, selected_widget: None,
             forms: Vec::new(),
         });
         s.live = Some(LivePage::Loading(url.clone()));
@@ -516,6 +537,9 @@ impl Live {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
+                Event::RunnableWidget { id, source } => {
+                    if let Some(c) = self.children.iter_mut().find(|c| c.asked == Some(id)) { c.runnable = Some(source); }
+                }
                 Event::IslandSources { id, sources } => {
                     if let Some(child) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
                         child.island_sources = sources;
@@ -542,6 +566,7 @@ impl Live {
                         self.children[i].knows = true;
                     }
                     let c = &mut self.children[i];
+                    c.document = Some(ticket);
                     c.asked = None;
                     if let Some((_, f)) = &mut c.since {
                         *f = Some(from);
@@ -757,12 +782,20 @@ impl Live {
                     }
                     Some(ToParent::LinkActivated { .. } | ToParent::LinkHover { .. }) => {}
                     Some(ToParent::IslandPressed { key, src, rect }) if on_screen => {
-                        let child = &self.children[i];
-                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, key, rect, crate::ui::now_ms());
+                        let child = &mut self.children[i];
+                        let runnable = child.runnable.as_deref() == Some(&src);
+                        child.selected_widget = Some((key, src.clone(), rect));
+                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, key, rect, runnable, crate::ui::now_ms());
                     }
                     Some(ToParent::IslandPressed { .. }) => {}
                     Some(ToParent::IslandPlacement { key, rect }) => {
-                        changed |= s.widget_placement(self.children[i].key, Some(key), rect, crate::ui::now_ms());
+                        let child = &mut self.children[i];
+                        if let Some((id, _, bounds)) = &mut child.selected_widget {
+                            if *id == key {
+                                if let Some(r) = rect { *bounds = r; } else { child.selected_widget = None; }
+                            }
+                        }
+                        changed |= s.widget_placement(child.key, Some(key), rect, crate::ui::now_ms());
                     }
                     Some(ToParent::Loaded { title, sections, .. }) => {
                         let c = &mut self.children[i];
@@ -898,6 +931,12 @@ impl Live {
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                Out::StartWidget { page, key, src, press } => {
+                    if let Some((document, rect)) = self.widget_bounds(s, page, key, Some(&src)) {
+                        send(&mut self.w, &Request::StartWidget { document, source: src, rect, press });
+                        self.widget = Some((document, key, rect));
+                    }
+                }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
@@ -1035,7 +1074,10 @@ impl Live {
                                 eprintln!("navigator-ui: limend: {err:?}");
                             }
                         }
-                        send(&mut self.w, &Request::Show { url: url.clone() });
+                        match c.document {
+                            Some(document) => send(&mut self.w, &Request::ShowDocument { url: url.clone(), document }),
+                            None => send(&mut self.w, &Request::Show { url: url.clone() }),
+                        }
                         eprintln!("navigator-ui: showed live page {url} in {} ms", ms(t));
                         s.live = Some(if loading { LivePage::Loading(url) } else { LivePage::Shown(url) });
                     }
@@ -1046,6 +1088,14 @@ impl Live {
         if let Some(key) = self.shown {
             if let Some(c) = self.children.iter_mut().find(|c| c.key == key) {
                 c.seen = Instant::now();
+            }
+        }
+        if let Some((document, key, old)) = self.widget {
+            let rect = self.shown.and_then(|p| self.widget_bounds(s, p, key, None))
+                .filter(|(d, _)| *d == document).map(|(_, r)| r);
+            if rect != Some(old) {
+                send(&mut self.w, &Request::PlaceWidget { document, rect });
+                self.widget = rect.map(|r| (document, key, r));
             }
         }
         // Reading choices changed (Aa, or the system appearance): the live

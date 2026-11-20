@@ -627,6 +627,18 @@ pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration
             // may pull (prefetch::DEFAULT_BUDGET until told).
             if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }
             if url == "--gate" { let _ = out.flush(); gate(&mut out); continue }
+            // One anonymous widget document, without following redirects.
+            if let Some(u) = url.strip_prefix("I ") {
+                match pf.widget_document(u) {
+                    Ok(body) => {
+                        let _ = writeln!(out, "ok 200 0 {} {u}", body.len());
+                        let _ = out.write_all(&body);
+                    }
+                    Err(e) => { let _ = writeln!(out, "err {}", e.replace(['\n','\r'], " ")); }
+                }
+                let _ = out.flush();
+                continue;
+            }
             // `N <url>`: the page itself (a navigation), answered as a fetch
             // is, then `hops <n>\n` and n lines `<status> <0|1 set-cookie> <url>`.
             if let Some(u) = url.strip_prefix("N ") {

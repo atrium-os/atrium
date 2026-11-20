@@ -878,10 +878,25 @@ and all 22 Navigator broker tests passed. The three guest binary hashes
 matched staging. Logs and a composed frame are in
 `~/atrium-vm/evidence/navigator-i1-split-window-20261120/`.
 
-Next, have the installed Navigator broker spend a guarded chrome activation
-for the current document and selected widget. Use its tracked bounds to place
-the worker under the parent's instance, and serve the channel through the
-origin- and method-checked broker with the widget's cookie policy.
+The installed Navigator gate ran on arm64 HVF with Tessera at `/`. With
+`NAVIGATORD_I1_COUNTER=https://widget.example/counter.html` in the broker
+bundle, the recorded parent offered **Not now** and **Start** for that
+source. The broker checked the recording ticket, source and compositor
+press before requesting the island. A separate signed fetch fixture served
+one anonymous 460-byte GET on the worker's brokered channel. Two presses
+on Increment produced Count 1 and Count 2. Opening History withdrew the
+island and the engine exited. Portcullis verified the engine signature
+and allocated uid 50007 under a per-instance worker rule. FreeBSD reported
+Capsicum mode and both IP families disabled. Screenshots, engine hash and
+service logs are in `~/atrium-vm/evidence/navigator-i1-installed-start-20261120/`.
+
+The guest fixture fetcher served local bytes. On the Mac the production fetch service
+loop accepted a 200 HTML document from a local TLS server and refused a 302.
+The server saw neither cookies nor authorization headers and received no
+request for the redirect target. All 80 host fetch tests passed. The remaining integration gate is
+to run the installed fetch daemon against a local TLS origin, verify
+redirect refusal, and repeat the guarded Start from the installed window.
+
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and
 `~/atrium-vm/evidence/navigator-i1-counter-20261120/`.

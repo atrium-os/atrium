@@ -311,6 +311,19 @@ impl<'a> Prefetcher<'a> {
         self.conv.fetch(url)
     }
 
+    pub fn widget_document(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        let u = url::Url::parse(url).map_err(|e| e.to_string())?;
+        if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
+            return Err("widget requires an HTTPS address".into());
+        }
+        let r = self.conv.get_once(&u, None).map_err(|e| e.to_string())?;
+        if r.status != 200 || !r.header("content-type").is_some_and(|s| s.split(';').next()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/html"))) || r.body.len() > 65536 {
+            return Err("widget requires a bounded HTML response".into());
+        }
+        Ok(r.body)
+    }
+
     /// A navigation (`N`): fetched on the asking thread with its chain.
     pub fn fetch_traced(&mut self, url: &str) -> (Result<Fetched, FetchError>, Vec<crate::Hop>) {
         self.conv.fetch_traced(url)

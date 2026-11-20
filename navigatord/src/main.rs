@@ -56,6 +56,7 @@ mod inbox_fixture;
 mod press;
 mod settings;
 mod worker;
+mod widget;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
@@ -913,6 +914,9 @@ struct Strip {
     window: Option<u32>,
     window_token: Option<[u8; 16]>,
     latest: u32,
+    widget_document: Option<Ticket>,
+    // A live page can be reshown after its redemption ticket has been spent.
+    widget_records: std::collections::VecDeque<(Ticket, String, String)>,
 }
 
 impl Strip {
@@ -1040,6 +1044,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     let presenter = Arc::new(Mutex::new(press::peer_uid(&s)));
     let presenter_s = presenter.clone();
     let press_strip = strip.clone();
+    let mut widget: Option<widget::Widget> = None;
     let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
     let mut spend = move |p: ctl::Press| -> Result<(), String> {
         let ui_uid = *presenter_s.lock().unwrap();
@@ -1173,14 +1178,19 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
             }
             Request::Blank => {
+                widget = None;
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;
+                st.widget_document = None;
                 st.set("");
             }
-            Request::Show { url } => {
+            Request::Show { ref url } | Request::ShowDocument { ref url, .. } => {
+                widget = None;
+                let doc = match req { Request::ShowDocument { document, .. } => Some(document), _ => None };
                 let p = state.lock().unwrap().page(&url);
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;
+                st.widget_document = doc.filter(|t| st.widget_records.iter().any(|(d,u,_)| t == d && u == url));
                 st.set(&p.and_then(|p| origin(&p.url)).unwrap_or_default());
             }
             Request::Forget { jar, url } => {
@@ -1263,7 +1273,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
                 }
-                strip.lock().unwrap().latest = id;
+                widget = None;
+                {
+                    let mut st = strip.lock().unwrap();
+                    st.latest = id;
+                    st.widget_document = None;
+                }
                 let (cfg, state, w, strip, cookies, waiting) = (cfg.clone(), state.clone(), w.clone(), strip.clone(), cookies.clone(), waiting.clone());
                 std::thread::spawn(move || {
                     let t = Instant::now();
@@ -1396,6 +1411,19 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                             }
                             if wants_islands {
                                 let sources = island_sources(&p.recording, &p.url);
+                                if ctx == Ctx::ANON && cfg.vpn.is_none() && cfg.portal.is_none()
+                                    && settings::get("NAVIGATORD_I1_COUNTER").as_deref() == Some(widget::COUNTER) {
+                                    let base = url::Url::parse(&p.url).ok();
+                                    if let Some((source, _)) = sources.iter().find(|(src, _)|
+                                        base.as_ref().and_then(|b| b.join(src).ok()).is_some_and(|u| u.as_str() == widget::COUNTER)) {
+                                        let mut st = strip.lock().unwrap();
+                                        if st.widget_records.len() >= 64 { st.widget_records.pop_front(); }
+                                        st.widget_records.push_back((ticket, p.url.clone(), source.clone()));
+                                        if st.latest == id { st.widget_document = Some(ticket); }
+                                        drop(st);
+                                        send(&w, &Event::RunnableWidget { id, source: source.clone() });
+                                    }
+                                }
                                 if !sources.is_empty() { send(&w, &Event::IslandSources { id, sources }); }
                             }
                             send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
@@ -1531,6 +1559,36 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     };
                     send(&w, &Event::Link { id, action });
                 });
+            }
+            Request::StartWidget { document, source, rect, press } => {
+                let window = {
+                    let st = strip.lock().unwrap();
+                    st.window_token.filter(|_| st.widget_document == Some(document)
+                        && st.widget_records.iter().any(|(d, _, src)| *d == document && src == &source))
+                };
+                let result = (|| {
+                    let window = window.ok_or("widget no longer belongs to the displayed recording")?;
+                    widget::bounds(rect)?;
+                    if cfg.activation.is_none() { return Err("no compositor guard".into()); }
+                    spend(press)?;
+                    widget = None;
+                    widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, rect, cfg.clone())
+                })();
+                match result {
+                    Ok(started) => { widget = Some(started); eprintln!("navigatord: widget started"); }
+                    Err(why) => send(&w, &Event::LivePageFailed { why }),
+                }
+            }
+            Request::PlaceWidget { document, rect } => {
+                if let Some(active) = widget.as_mut().filter(|a| a.document == document) {
+                    match rect {
+                        None => widget = None,
+                        Some(r) => if let Err(why) = active.place(r) {
+                            widget = None;
+                            send(&w, &Event::LivePageFailed { why });
+                        }
+                    }
+                }
             }
             Request::RunLive { url, jar, press } => {
                 if !cfg.inbox_enabled() || url != ctl::INBOX_FIXTURE_URL || jar != ctl::Jar::Personal {

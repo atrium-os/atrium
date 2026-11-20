@@ -195,6 +195,9 @@ pub enum Request {
     OpenWithIslands { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
     /// Renderer-local ID for the origin strip and compositor token for guarded actions.
     RegisterWindow { window: u32, token: [u8; 16] },
+    StartWidget { document: Ticket, source: String, rect: [u32; 4], press: Press },
+    PlaceWidget { document: Ticket, rect: Option<[u32; 4]> },
+    ShowDocument { url: String, document: Ticket },
 }
 
 /// The single whole-page fixture granted during I0.
@@ -348,6 +351,7 @@ pub enum Event {
     LivePageFailed { why: String },
     /// Source spelling and resolved web origin from the opened recording.
     IslandSources { id: u32, sources: Vec<(String, String)> },
+    RunnableWidget { id: u32, source: String },
 }
 
 /// The most accounts an `Accounts` names, and the longest name.

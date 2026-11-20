@@ -116,6 +116,7 @@ pub fn prompt_text(p: &Prompt) -> String {
     match p {
         Prompt::Download { file, size, origin, kind, .. } => format!("{file}, {size} {kind} from {origin}"),
         Prompt::NotPrivate { origin } => format!("This form is on {origin} over http: anyone on the network can read it"),
+        Prompt::Widget { origin, runnable: true, .. } => format!("Start live widget from {origin}?"),
         Prompt::Widget { origin, .. } => format!("Live widget from {origin} is unavailable"),
         Prompt::RunLive => "Open inbox.example in a live window using its cookies?".into(),
         Prompt::FetchAgain => "This page could not be restored and will be fetched again".into(),

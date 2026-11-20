@@ -339,6 +339,15 @@ impl FetchdFetcher {
     /// Kept in step with navigator-fetch's body limit.
     pub const MAX_BODY: usize = 8 * 1024 * 1024;
     const MAX_HEADER: usize = 16 * 1024;
+    /// A single anonymous HTML GET. The fetch worker validates MIME and never follows a redirect.
+    pub fn widget_document(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        match self.exchange_line(url, "", "I ")? {
+            Reply::Ok { status: 200, rest, body } if rest == format!("0 {} {url}", body.len()) && body.len() <= 65536 => Ok(body),
+            Reply::Err(why) => Err(why),
+            _ => Err("unexpected widget document reply".into()),
+        }
+    }
+
     /// A chain is at most navigator-fetch's redirects, the last response
     /// and a loop's repeated target.
     const MAX_HOPS: usize = 16;
