@@ -1528,9 +1528,15 @@ Stalwart in the cloud VM, and later a real account):
    fetched headers-only asks nothing. Both the sync thread and the window have a fetcher
    for this, opened when first needed. Account setup now gets SRV and MX through the same
    request. Tests: engine 1 (verified with one lookup for two messages, no key published,
-   a resolver that doesn't answer then a recheck on opening), fetcher 3, wire 1. **Not
-   yet**: a VM run against local-unbound, keeping answers across restarts, the provider's
-   own verdict (Authentication-Results) for accounts at known providers.
+   a resolver that doesn't answer then a recheck on opening), fetcher 3, wire 1.
+   **Tessera verification (2026-11-20)** used the Work persona, jailed Nuntius,
+   and the parser worker against local-unbound with synthetic records. The gate
+   verified a split Ed25519 TXT key and relaxed alignment, rejected a tampered
+   body, an absent key and a strict alignment mismatch, and confirmed cache
+   reuse. The private guest firewall blocked direct jail-to-host DNS. The gate
+   used a temporary UDP/53 redirect scoped to the fixture fetcher and resolver.
+   Deployment resolver reachability, cache persistence across restarts, and
+   trusted-provider Authentication-Results remain open.
    **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
    gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
    waiting in `IDLE` on the inbox and renewing it every 25 minutes (RFC 2177's 29, the
