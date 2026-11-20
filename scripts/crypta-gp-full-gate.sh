@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=14 ;;
     esp-loss-hip-submit-recovered-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=13 ;;
     esp-loss-hip-submit-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=12 ;;
     esp-loss-hip-submit-final-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=11 ;;
@@ -1007,6 +1008,32 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                     fail "reconnected and rebound ESP did not refresh silently"
                                 ok "unchanged forwarding refreshed silently after reconnected ESP rebound"
                                 probe "IPv4 echo after silent refresh on the final rebound ESP"
+                                if [ "$retry_hip_submit" = 14 ]; then
+                                    touch "$receipts.drop-active-refresh"
+                                    for _ in $(seq 1 25); do
+                                        failures=$("$V" "grep -o 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log | wc -l | tr -d ' '")
+                                        [ "$failures" != 3 ] || break
+                                        sleep 1
+                                    done
+                                    [ "$failures" = 3 ] && [ "$(field handshake)" = 0 ] ||
+                                        fail "the active HIP refresh failure did not take ESP down"
+                                    "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+                                        fail "IPv4 echo passed before the active refresh retry was acknowledged"
+                                    ok "active HIP refresh failure kept traffic blocked until retry"
+                                    touch "$receipts.active-refresh-retry"
+                                    wait_field handshake 1
+                                    [ "$(tail -n 1 "$receipts")" = "$rebound_report" ] ||
+                                        fail "active refresh retry submitted a different report"
+                                    probe "IPv4 echo after active HIP refresh retry"
+                                    before_refresh=$(awk 'END { print NR }' "$receipts")
+                                    wait_receipts "$((before_refresh + 1))"
+                                    [ "$(field signin)" = in ] &&
+                                        [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$rebound_report" ] &&
+                                        [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                                        fail "active refresh retry prompted or changed the report"
+                                    ok "unchanged HIP refreshed silently after active refresh retry"
+                                    probe "IPv4 echo after silent refresh on the retry ESP association"
+                                fi
                             fi
                         fi
                     fi
