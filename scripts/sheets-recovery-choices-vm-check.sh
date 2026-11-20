@@ -13,6 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
+# --retry-unmountable-image leaves an unformatted fixture file at the image path.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -465,7 +466,7 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     fi
     exit 0
 fi
-if test "${1:-}" = --retry-missing-image; then
+if test "${1:-}" = --retry-missing-image || test "${1:-}" = --retry-unmountable-image; then
     first=missing-image
     timing=${2:-after-list}
     case "$timing" in before-list|after-list) ;; *) exit 2 ;; esac
@@ -487,16 +488,27 @@ if test "${1:-}" = --retry-missing-image; then
     image="$store/0.img"
     if test -f "$store/0.ufs"; then image="$store/0.ufs"; fi
     digest=$(sha256 -q "$image")
+    restore_image() {
+        if test "$image" -ef "$results/unformatted.image"; then unlink "$image"; fi
+        if test -f "$results/offline.image"; then
+            test ! -e "$image" && mv "$results/offline.image" "$image" || return 1
+        fi
+        if test -e "$results/unformatted.image"; then unlink "$results/unformatted.image"; fi
+    }
+    trap restore_image EXIT
     mv "$image" "$results/offline.image"
-    trap 'test -e "$image" || mv "$results/offline.image" "$image"' EXIT
-    test ! -e "$store/0.img"; test ! -e "$store/0.ufs"
+    if test "$1" = --retry-unmountable-image; then
+        # Use a hard link to a separate blank file so teardown can verify its identity.
+        truncate -s 8m "$results/unformatted.image"
+        ln "$results/unformatted.image" "$image"
+    fi
     if test "$timing" = before-list; then
         click 213 24
         wait_for grep -Fq '"checked_detached":true' "$store/1.pending"
         wait_for detached_images
     fi
     cp "$store/1.pending" "$results/sibling.marker"
-    errors() { awk '/checking detached workbook slot 0: missing workbook recovery image/ {n++} END {print n+0}' select-port.log; }
+    errors() { awk '/checking detached workbook slot 0:|could not mount selected workbook slot 0:/ {n++} END {print n+0}' select-port.log; }
     refused() { test "$(errors)" -gt "$before"; }
     before=$(errors)
     sleep .6; click 120 96
@@ -511,8 +523,13 @@ if test "${1:-}" = --retry-missing-image; then
     sleep .6; cp selectscreen.png "$results/only-unavailable.png"
     count 0; pending 1
     cmp "$marker" "$results/unavailable.marker"
-    test ! -e "$store/0.img"; test ! -e "$store/0.ufs"
-    mv "$results/offline.image" "$image"; trap - EXIT
+    wait_for detached_images
+    if test "$1" = --retry-unmountable-image; then
+        test "$image" -ef "$results/unformatted.image"
+    else
+        test ! -e "$store/0.img"; test ! -e "$store/0.ufs"
+    fi
+    restore_image; trap - EXIT
     test "$(sha256 -q "$image")" = "$digest"
     click 213 24; wait_for count 1; wait_for opened "$(docs)" Proof.csv
     sed 's/,"name":.*//' "$marker" > "$results/restored.id"

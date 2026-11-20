@@ -1262,7 +1262,10 @@ one label check. An unreadable or invalid label leaves the prior name in
 place and the check can be retried. Opening that recovery clears the observation before the jail
 can change the directory. Older markers begin unconfirmed. A missing or
 unreadable image keeps its slot reserved. Even with a cached label, each scan
-checks that the backing image exists. Recover reports an unavailable image
+checks that the backing image exists. Recover reserves the selected slot and
+mounts its image outside the slot lock before acknowledging the launcher.
+The launch thread takes ownership of that mount for the document jail. A
+failed mount releases the reservation and reports an unavailable image
 for the requested workbook, including when it is the only pending recovery.
 Other workbooks can still be selected.
 
