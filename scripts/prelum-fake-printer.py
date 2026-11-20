@@ -34,7 +34,7 @@ A.add_argument("--uuid-override-file", help="read an alternate printer UUID from
 A.add_argument("--tls-alt-cert")
 A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
-A.add_argument("--test-pin-job", help="title of the synthetic job that must supply the fixture PIN")
+A.add_argument("--test-pin-job", action="append", default=[], help="title of a job that must supply the fixture PIN")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
@@ -194,7 +194,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if op == 0x0B:
             out += printer_attrs(host)
         elif op in (0x05, 0x02):
-            pin_job = ARGS.test_pin_job and a.get("job-name") == [ARGS.test_pin_job]
+            pin_job = (a.get("job-name") or [""])[0] in ARGS.test_pin_job
             if pin_job and (op != 0x05 or a.get("job-password") != ["0427"]
                             or a.get("ipp-attribute-fidelity") != ["\x01"] or doc):
                 self.send_error(400, "Invalid fixture PIN submission")

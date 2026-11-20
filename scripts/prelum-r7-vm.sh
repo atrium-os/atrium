@@ -118,7 +118,7 @@ check_served_key() {
 }
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
-    --test-pin-job "PIN after TLS key restoration" \
+    --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -229,7 +229,7 @@ pin_spki=$(openssl x509 -in "$D/ipps.pem" -pubkey -noout |
 printer_uuid=$(sed -nE 's/^fake printer: listening on [0-9]+ \(urn:uuid:([a-f0-9-]+)\)$/\1/p' "$D/simulator.log")
 test "${#pin_spki}" -eq 64
 test "${#printer_uuid}" -eq 36
-remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid'" \
+remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' start" \
     <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-stage.log" 2>&1
 
 touch "$D/use-alt-key"
@@ -239,20 +239,20 @@ cat "$D/pin-held.log"
 check_pin_blocked() {
     audit="$D/pin-$1-audit.log"
     remote "cat '$guest/fixture-arca/audit.log'" >"$audit"
-    grep -Eq 'ui op=0x0068 .*status=0$' "$audit"
-    if grep -q 'op=0x0011' "$audit"; then
+    test "$(grep -cE 'ui op=0x0068 .*status=0$' "$audit")" -eq "$2"
+    if [ "$(grep -c 'op=0x0011' "$audit" || :)" -ne "$(($2 - 1))" ]; then
         echo "Arca received an unexpected PIN redemption request during the $1 check" >&2
         return 1
     fi
     python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
-        "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/pin-$1-pdf-checks.log"
+        "$3" "$D/fixtures/quicklook.pdf" "$4" >"$D/pin-$1-pdf-checks.log"
 }
-check_pin_blocked held
+check_pin_blocked held 1 "$D/tls-released-jobs.txt" 13
 
 check_served_key pin-retry "$alternate_key"
 remote "sh -s -- '$guest' '$marker' retry pin" <"$scripts/prelum-r7-identity.sh" >"$D/pin-retry.log" 2>&1 || { cat "$D/pin-retry.log" >&2; exit 1; }
 cat "$D/pin-retry.log"
-check_pin_blocked retry
+check_pin_blocked retry 1 "$D/tls-released-jobs.txt" 13
 
 mv "$D/use-alt-key" "$D/pin-held-alt-key.txt"
 check_served_key pin-restored "$original_key"
@@ -264,3 +264,27 @@ grep -E 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-released-audit.log"
 remote "cat '$guest/pin-identity-released-jobs.log'" >"$D/pin-released-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-released-jobs.txt" "$D/fixtures/quicklook.pdf" 14 >"$D/pin-released-pdf-checks.log"
 cat "$D/pin-released-pdf-checks.log"
+
+
+# Stage a fresh PIN in the same Arca store, then change only the printer UUID.
+remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
+    <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-uuid-stage.log" 2>&1
+printf '%s\n' 12d7ac00-4bd5-4413-8da5-e6952965ffcf >"$D/printer-uuid"
+check_served_key pin-uuid-held "$original_key"
+remote "sh -s -- '$guest' '$marker' hold pin-uuid" <"$scripts/prelum-r7-identity.sh" >"$D/pin-uuid-held.log" 2>&1 || { cat "$D/pin-uuid-held.log" >&2; exit 1; }
+cat "$D/pin-uuid-held.log"
+check_pin_blocked uuid-held 2 "$D/pin-released-jobs.txt" 14
+
+remote "sh -s -- '$guest' '$marker' retry pin-uuid" <"$scripts/prelum-r7-identity.sh" >"$D/pin-uuid-retry.log" 2>&1 || { cat "$D/pin-uuid-retry.log" >&2; exit 1; }
+cat "$D/pin-uuid-retry.log"
+check_pin_blocked uuid-retry 2 "$D/pin-released-jobs.txt" 14
+
+mv "$D/printer-uuid" "$D/pin-held-printer-uuid.txt"
+remote "sh -s -- '$guest' '$marker' release pin-uuid" <"$scripts/prelum-r7-identity.sh" >"$D/pin-uuid-release.log" 2>&1 || { cat "$D/pin-uuid-release.log" >&2; exit 1; }
+cat "$D/pin-uuid-release.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-uuid-released-audit.log"
+test "$(grep -c 'op=0x0011' "$D/pin-uuid-released-audit.log")" -eq 2
+test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-uuid-released-audit.log")" -eq 2
+remote "cat '$guest/pin-uuid-identity-released-jobs.log'" >"$D/pin-uuid-released-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-uuid-released-jobs.txt" "$D/fixtures/quicklook.pdf" 15 >"$D/pin-uuid-released-pdf-checks.log"
+cat "$D/pin-uuid-released-pdf-checks.log"

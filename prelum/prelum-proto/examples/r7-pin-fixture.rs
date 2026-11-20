@@ -52,12 +52,7 @@ fn main() {
             let mut c = Client::connect(Path::new(&a[2])).unwrap();
             println!(
                 "{}",
-                c.print_pin(
-                    &Print::new(1, "PIN after TLS key restoration"),
-                    handle,
-                    &pdf
-                )
-                .unwrap()
+                c.print_pin(&Print::new(1, &a[4]), handle, &pdf).unwrap()
             );
         }
         _ => panic!("unknown command"),
