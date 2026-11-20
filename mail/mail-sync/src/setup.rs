@@ -10,6 +10,8 @@
 //! The lookups are the caller's ([`Lookup`]: Nuntius and the system
 //! resolver); everything read back is bounded and checked here.
 
+use std::fmt::Write as _;
+
 /// The network, as discovery sees it.
 pub trait Lookup {
     /// GET `url` (https only); the body of a 2xx answer, at most 256 KiB.
@@ -151,8 +153,21 @@ pub fn domain_of(address: &str) -> Result<String, &'static str> {
     Ok(domain)
 }
 
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").unwrap();
+        }
+    }
+    encoded
+}
+
 /// Find the servers for `address`.
 pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str> {
+    let address = address.trim();
     let domain = domain_of(address)?;
     if let Some(p) = PROVIDERS.iter().find(|p| p.domains.contains(&domain.as_str())) {
         return Ok(from_provider(p, &domain, false));
@@ -162,9 +177,10 @@ pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str
     if l.get(&url).filter(|b| b.len() <= MAX_ANSWER).is_some_and(|b| mail_proto::jmap::session(&b).is_ok()) {
         return Ok(Found { settings: Settings::Jmap { session: url }, via: Via::Jmap, oauth: None, handled_by: None, note: None });
     }
-    for url in [format!("https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={}", address.trim()), format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml")] {
+    let query_address = encode_query_value(address);
+    for url in [format!("https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress={query_address}"), format!("https://{domain}/.well-known/autoconfig/mail/config-v1.1.xml")] {
         if let Some(b) = l.get(&url).filter(|b| b.len() <= MAX_ANSWER) {
-            if let Some((imap, smtp, oauth)) = autoconfig(&b, address.trim(), &domain) {
+            if let Some((imap, smtp, oauth)) = autoconfig(&b, address, &domain) {
                 let outside = [&imap.host, &smtp.host].into_iter().find(|h| !under(h, &domain)).cloned();
                 return Ok(Found { settings: Settings::Imap { imap, smtp }, via: Via::Autoconfig, oauth, handled_by: outside, note: None });
             }
@@ -315,6 +331,20 @@ mod tests {
         assert!(f.note.unwrap().contains("app password"));
         assert!(discover("not an address", &mut n).is_err());
         assert!(discover("a@b", &mut n).is_err());
+    }
+
+    #[test]
+    fn autoconfig_passes_the_complete_address_as_one_query_value() {
+        let mut n = Net::default();
+        let url = "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=Ada%2Bops%26tag%23x%40Example.Test";
+        n.pages.insert(url.into(), br#"<clientConfig>
+<incomingServer type="imap"><hostname>imap.%EMAILDOMAIN%</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer type="smtp"><hostname>smtp.%EMAILDOMAIN%</hostname><port>465</port><socketType>SSL</socketType></outgoingServer>
+</clientConfig>"#.to_vec());
+        let f = discover(" Ada+ops&tag#x@Example.Test ", &mut n).unwrap();
+        assert_eq!(f.via, Via::Autoconfig);
+        assert_eq!(n.asked, ["https://example.test/.well-known/jmap", url]);
+        assert!(matches!(f.settings, Settings::Imap { imap, .. } if imap.host == "imap.example.test"));
     }
 
     #[test]
