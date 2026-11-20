@@ -141,6 +141,34 @@ Limen, navigatord and counter builds, enable `NAVIGATOR_UI_AX=1`, and run
 `scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR --reports`.
 Evidence is in `~/atrium-vm/evidence/navigator-i2-channel-20261120/`.
 
+### I2 generated channel and lifecycle tests
+
+Limen’s `island_channel` integration test uses a fixed seed to generate
+32,768 cases for the five report variants and the unload answer. It tests
+each report against a lifecycle state, checks rejection preserves that state,
+and checks matching, stale and duplicate answers. Mutations cover truncated
+reports, trailing bytes, oversized frames and single-bit changes. A mutated
+report that is still valid must survive re-encoding with the same transition.
+Both Stay and Leave and all five accepted report variants must be exercised.
+
+The installed gate uses the pinned `counter-unload.html` fixture, UI
+accessibility tracing and a fresh window without a forced start URL. Pass
+`--channel-seed 7331` to `scripts/navigator-i2-stop-check.py` to reproduce
+the live sequence. The seed varies edits and unload questions across four
+workers. Each session exercises Stay before ending on either a guarded
+Leave or compositor Stop with a question pending. The gate checks the
+painted counter, worker identity and Capsicum state, broker decisions,
+fetch count and the return to the static tier.
+
+On arm64 Tessera all 32,768 generated wire cases passed. The live run with
+seed 7331 recorded four distinct JIT-off counter processes in four jails,
+each with the kernel’s Capsicum flag. Across 18 increments and eight unload
+questions, four Stay replies preserved the count and PID, two Leave replies
+produced one voluntary close each, and two compositor Stops retired a worker
+with a question outstanding. All four sessions cleared the prompt and live
+part. Guest logs, frames and binary hashes are in
+`~/atrium-vm/evidence/navigator-i2-channel-corpus-20261121/`.
+
 ### I2 worker resize and voluntary close
 
 The embedded counter reports changes to its laid-out document’s scroll width

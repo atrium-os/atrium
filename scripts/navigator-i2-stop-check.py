@@ -3,6 +3,7 @@
 import argparse
 import csv
 import io
+import random
 import json
 from pathlib import Path
 import shlex
@@ -35,6 +36,8 @@ parser.add_argument("--multiple-personal", type=Path, metavar="TLS_LOG",
                     help="restart with two recorded trails at different cursors and Unrecorded selected")
 parser.add_argument("--second-personal", type=Path, metavar="TLS_LOG",
                     help="select the second Personal trail with Unrecorded still open before restart")
+parser.add_argument("--channel-seed", type=int,
+                    help="exercise generated unload and retirement sequences on the installed JIT-off fixture")
 args = parser.parse_args()
 if args.second_personal:
     args.multiple_personal = args.second_personal
@@ -46,7 +49,7 @@ if args.broker_restart:
     args.navigate_away = True
 if args.saved_record:
     args.parked_viewer = True
-if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
+if args.channel_seed is not None or args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -619,6 +622,59 @@ def navigate_away():
         print("Back rebuilt the parent from its saved record without a parent GET.")
     print(f"Navigation retired {int(first)} with its question open. Original viewer {int(original_viewer)}, viewer after Back {int(viewer)}."
           f" Guarded Start opened worker {int(second)} at Count 0; it incremented and closed on its own Leave.")
+
+
+def channel_sequences(seed):
+    rng = random.Random(seed)
+    open_address("parent.example/counter-parent.html", "Embedded counter")
+    parents = parent()
+    workers = set()
+    endings = ["stop", "leave"] * 2
+    rng.shuffle(endings)
+    print(f"Channel seed {seed}", flush=True)
+    for session, ending in enumerate(endings):
+        begin = len(log())
+        start(session)
+        count(f"opened-{session}", 0)
+        worker = int(guest("pgrep -x counter"))
+        jail = guest(f"ps -o jid= -o state= -p {worker}").decode().split()
+        if worker in workers or int(jail[0]) <= 0 or "C" not in jail[1]:
+            raise RuntimeError(f"expected a fresh Capsicum worker in a jail, got {worker} {jail}")
+        workers.add(worker)
+        total = 0
+        questions = rng.randint(2, 4)
+        for query in range(1, questions + 1):
+            label = f"{session}-{query}"
+            for _ in range(rng.randint(1, 3)):
+                press(350, 118)
+                total += 1
+                count(f"edit-{label}", total)
+            question("question-" + label)
+            if query == questions and ending == "stop":
+                press(905, 135)
+                break
+            leave = query == questions
+            press(1008 if leave else 1074, 60)
+            decision = f"widget unload {query} leave={str(leave).lower()}".encode()
+            wait_for(f"missing {decision!r}", lambda: decision in log()[begin:] and prompt(False))
+            if not leave:
+                count("stayed-" + label, total)
+                if int(guest("pgrep -x counter")) != worker:
+                    raise RuntimeError("Stay replaced the active worker")
+        wait_for("worker or question remained", lambda: prompt(False) and not guest("pgrep -x counter || true"))
+        tier(False)
+        events = log()[begin:]
+        if (events.count(b"widget unload ") != questions - int(ending == "stop")
+                or events.count(b"widget reported voluntary close") != int(ending == "leave")
+                or events.count(b"widget GET ") != 1 or b"prompt=widget-failed" in events
+                or parent() != parents):
+            raise RuntimeError("unexpected channel decision, exit, fetch or parent change")
+        print(f"Worker {worker} jail {jail[0]} state {jail[1]}: {total} edits, {questions} questions, {ending}", flush=True)
+
+
+if args.channel_seed is not None:
+    channel_sequences(args.channel_seed)
+    raise SystemExit(0)
 
 
 if args.navigate_away or args.parked_viewer:
