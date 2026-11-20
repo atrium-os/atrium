@@ -400,6 +400,11 @@ impl Window {
         self.binder = Some(b);
     }
 
+    /// Release the slot binder when its embed connection is lost.
+    pub fn clear_slot_binder(&mut self) {
+        self.binder = None;
+    }
+
     /// Window lifecycle the toolkit handles itself: a resize re-lays
     /// out; a scale change rescales every node on the wire (layout stays
     /// in points, the surface multiplies at emission). frescod sends

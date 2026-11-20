@@ -178,6 +178,11 @@ after confirmation if the workbook is clean. A later edit or missing
 confirmation keeps the document open. A stale or expired grant requires
 reopening the workbook or Save As.
 
+If Limen restarts, each open Sheets window drops its old picker or print
+session and reconnects to the broker. The workbook remains editable during
+the outage. An interrupted save must be requested again. Save As opens a
+fresh picker for the current revision, including edits made while offline.
+
 Save As sends a sealed native workbook to Scrinium’s Save picker. Scrinium
 publishes the completed file under an unused name and returns a new save grant.
 An interruption before publication leaves the previous workbook intact and can

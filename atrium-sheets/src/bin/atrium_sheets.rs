@@ -10,10 +10,8 @@
 //!                                 per pattern and exits
 //!
 //! Open asks Scrinium to launch the picked workbook in its own jail. Save
-//! writes through the granted descriptor. Save As asks Scrinium for a new
-//! native workbook descriptor, which becomes the target for subsequent saves.
-//! FRESCO_SOCKET and LIMEN_SOCKET as usual; without limend the app runs, and Open and
-//! Save As say the picker is not available.
+//! sends the encoded revision to Scrinium. Save As obtains a new workbook grant.
+//! The window uses FRESCO_SOCKET and reconnects to LIMEN_SOCKET across broker restarts.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -483,16 +481,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let embeds = match Embeds::connect() {
-        Ok(e) => Some(e),
-        Err(e) => {
-            eprintln!("atrium-sheets: no limend ({e:?}); the picker is not available");
-            None
-        }
-    };
-    if let Some(e) = &embeds {
-        win.set_slot_binder(Embeds::binder(e));
-    }
+    let mut embeds = None;
+    let mut next_limen_attempt = Instant::now();
     let dirty = Arc::new(AtomicBool::new(true));
     let mut sheets = Sheets::new(
         Doc::new(""),
@@ -544,6 +534,15 @@ fn main() {
     let mut printing: Option<Printing> = None;
     let mut want_print = false;
     'main: loop {
+        if embeds.is_none() && Instant::now() >= next_limen_attempt {
+            match Embeds::connect() {
+                Ok(connection) => {
+                    win.set_slot_binder(Embeds::binder(&connection));
+                    embeds = Some(connection);
+                }
+                Err(_) => next_limen_attempt = Instant::now() + Duration::from_secs(1),
+            }
+        }
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
         let opening = run.poll_open(&mut want_picker);
@@ -758,11 +757,37 @@ fn main() {
             }
         }
         if let Some(e) = &embeds {
-            let ev = e.borrow_mut().poll(Duration::from_millis(0));
+            let polled = e.borrow_mut().poll(Duration::ZERO);
+            let ev = match polled {
+                Ok(event) => event,
+                Err(err) => {
+                    eprintln!("atrium-sheets: lost Limen connection: {err:?}");
+                    if staged_save.take().is_some() {
+                        run.set_status("Lost contact with the picker before save confirmation.");
+                    } else if asking.is_some() || print_snap.is_some() {
+                        run.set_status("Lost contact with Limen. Please try again.");
+                    }
+                    // Embed IDs, queued requests and save acknowledgements belong
+                    // to the old broker. Only a new user action may retry a save.
+                    win.clear_slot_binder();
+                    embeds = None;
+                    next_limen_attempt = Instant::now();
+                    asking = None;
+                    embed = None;
+                    close_after_save = false;
+                    want_picker = None;
+                    run.merge_base = None;
+                    printing = None;
+                    print_snap = None;
+                    print_pdf = None;
+                    run.sheets.ui.set(Ui { asking: false });
+                    continue;
+                }
+            };
             let mut finish = false;
             let mut supplied_picture = false;
             let step = match (&mut printing, &ev) {
-                (Some(p), Ok(Some(pev))) => p.handle(e, pev),
+                (Some(p), Some(pev)) => p.handle(e, pev),
                 _ => None,
             };
             let ours = step.is_some();
@@ -792,7 +817,7 @@ fn main() {
             }
             if !ours {
             match ev {
-                Ok(Some(ParentEvent::MessageFd { embed: event, bytes })) => {
+                Some(ParentEvent::MessageFd { embed: event, bytes }) => {
                     let fd = e.borrow_mut().take_fd();
                     if embed == Some(event) {
                     match (ToParent::decode(&bytes), fd) {
@@ -819,7 +844,7 @@ fn main() {
                     }
                     }
                 }
-                Ok(Some(ParentEvent::Message { embed: event, bytes })) if embed == Some(event) => match ToParent::decode(&bytes) {
+                Some(ParentEvent::Message { embed: event, bytes }) if embed == Some(event) => match ToParent::decode(&bytes) {
                     Some(ToParent::Committed) if asking == Some(Asking::Commit) => {
                         if let Some((edits, _)) = staged_save.take() {
                             let mut d = run.sheets.doc.borrow_mut();
@@ -848,16 +873,11 @@ fn main() {
                     }
                     _ => {}
                 },
-                Ok(Some(ParentEvent::ChildLost { embed: event })) if embed == Some(event) => {
+                Some(ParentEvent::ChildLost { embed: event }) if embed == Some(event) => {
                     if staged_save.is_some() { run.set_status("Scrinium disconnected before confirming the save."); }
                     finish = true;
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    eprintln!("atrium-sheets: limend: {err:?}");
-                    if staged_save.is_some() { run.set_status("Lost contact with the picker before save confirmation."); }
-                    finish = asking.is_some();
-                }
+                _ => {}
             }
             }
             if finish {
