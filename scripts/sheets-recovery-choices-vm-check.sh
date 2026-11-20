@@ -860,8 +860,8 @@ SH
     if test "${5:-}" = external-edit; then
         # Open from the launcher after the recovered jails and their mounts are
         # gone. Read the autosave snapshot created from each newly loaded model.
-        reopen_copy() {
-            name=$1; row=$2; cells=$3; mode=$4
+        open_row() {
+            row=$1
             count 0; pending 0
             launcher=$(win_at 48 24)
             click 48 24; wait_for different_window 488 "$row" "$launcher"
@@ -874,19 +874,47 @@ SH
                 different_window 48 24 "$launcher" && test "$win" != "$picker"
             }
             wait_for document_visible
-            if test "$mode" = protected; then
-                type_keys 0x17 0x08 0x16 0x17 0x28 # fixture password: test
-            fi
+        }
+        loaded_cells() {
+            name=$1; cells=$2; mode=$3
             wait_for opened "$reopened" "$name"
             directory=$(dirname "$(find "$(root "$reopened")/atrium/recovery" -name name -exec grep -lx "$name" {} +)")
             wait_for test -s "$directory/current"
             generation=$(cat "$directory/current")
             /tmp/check-recovered-copy "$directory/base.$generation.osheet" "$cells" "$mode"
-            key 0x1a 1; wait_for count 0; wait_for pending 0; wait_for detached
         }
-        reopen_copy Proof.osheet 243 zebra plain
-        reopen_copy Untitled.osheet 273 fox,3 protected
-        reopen_copy "$copy" 183 zebra,4,7 plain
+        close_reopened() { key 0x1a 1; wait_for count 0; wait_for pending 0; wait_for detached; }
+        frame_is() { test "$(sha256 -q selectscreen.png)" = "$1"; }
+        reject_password() {
+            open_row 273
+            input 'MOVE 48 24'
+            wait_for frame_is 9fae5ab4237b1265a50395c66d05c8eb10091f1abc514e31837cc998bee83ed3
+            type_keys 0x05 0x04 0x07 0x28 # bad
+            # The prompt names Untitled.osheet and displays the wrong-password error.
+            wait_for frame_is 504cf0aad02355cb99af121371076063d8f4201bdf1d97e528812ecacda0eea8
+            test "$(docs)" = "$reopened"
+            if opened "$reopened" Untitled.osheet; then echo "Wrong password opened the workbook" >&2; return 1; fi
+        }
+        files_intact() {
+            cmp "$books/Proof.osheet" "$results/external.osheet" &&
+                test "$(sha256 -q "$books/$copy")" = "$copy_saved_hash" &&
+                test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
+        }
+        copy_saved_hash=$(sha256 -q "$books/$copy")
+        reject_password
+        type_keys 0x17 0x08 0x16 0x17 0x28 # test
+        loaded_cells Untitled.osheet fox,3 protected
+        close_reopened; files_intact
+
+        reject_password
+        click 1067 70; input 'MOVE 48 24'
+        # Cancel leaves the empty window showing “Untitled.osheet” stayed closed.
+        wait_for frame_is dc795b9a753bdc6692a51a0f5be989dfecdddb087ebf83a1fb4a7ded9255986f
+        loaded_cells Untitled '' plain
+        close_reopened; files_intact
+
+        open_row 243; loaded_cells Proof.osheet zebra plain; close_reopened
+        open_row 183; loaded_cells "$copy" zebra,4,7 plain; close_reopened
         cmp "$books/Proof.osheet" "$results/external.osheet"
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
         mv "$books/$copy" "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"

@@ -233,3 +233,11 @@ After closing both recovered windows and detaching their devices, the gate uses 
 The first desktop run reproduced a picker refusal for the sealed `Untitled.osheet`. The shared file-type table now recognizes the version-one sealed envelope when the filename has the workbook suffix. The envelope is common to Officina documents, so suffix-free sealed bytes alone do not identify a spreadsheet. All nine host file-type tests passed, including checks for a truncated header and an unsupported envelope version.
 
 The full desktop test passed with both native Tessera and bounded UFS recovery volumes in the private Tessera-root VM. Fresh document jails reopened `Proof.osheet` with A1=`zebra` and blank B1, `Untitled.osheet` with `fox,3`, and `Proof (2).osheet` with `zebra,4,7`. Each close cleared its recovery marker and detached its volume.
+
+## Wrong password, retry and cancellation from Open
+
+The `external-edit` desktop gate selects `Untitled.osheet` from the Sheets Open picker twice. Each time it submits a wrong password and checks the rendered retry prompt names the file. On the first open it submits the correct password in the same jail and reads the loaded protected snapshot to verify A1=`fox` and B1=`3`. On the second it clicks Cancel at the retry prompt, checks the status says the file stayed closed, and reads the empty Untitled window’s snapshot before closing it.
+
+After each path the gate checks all three published files against their pre-prompt bytes or digests. It then reopens both plain workbooks through the picker and reads their loaded cells.
+
+Both password paths passed on native Tessera and bounded UFS recovery volumes. The reopened external revision held A1=`zebra` with B1 blank, and the Save As copy held `zebra,4,7`. Each window closed cleanly and released its recovery volume. The fixture window clips the last words of the wrong-password retry guidance.
