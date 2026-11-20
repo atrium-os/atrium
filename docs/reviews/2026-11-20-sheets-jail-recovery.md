@@ -207,3 +207,11 @@ Run the interleaved-save gate with `stale-refresh interleave pending-save`. Afte
 After the same two Sheets processes and Scrinium reconnect, the gate checks both file digests against their pre-restart values. It saves B1=3 in the protected sibling first. The independent reader must see `fox,3` there and only `zebra` in the plain copy. Pressing ordinary Save again in the plain window, without re-entering the edit, must produce `zebra,4` and preserve the sibling byte-for-byte. Two more alternating saves exercise both grants again.
 
 The pending Save test passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs finished with the plain copy at `zebra,6`, the protected copy at `fox,5`, and the source CSV intact. Both jails closed and released their recovery devices.
+
+## Restarting Limen after publication and before confirmation
+
+Run the interleaved-save gate with `stale-refresh interleave published-save`. Both recovered workbooks first use Save As. The plain workbook then submits B1=2. The fixture uses guest LLDB to stop Scrinium at the atomic rename, pauses Limen, and releases Scrinium to publish. An independent reader verifies `zebra,2` on disk while Limen is still paused. The fixture enters B1=4 in the same window and terminates Limen before it can deliver confirmation.
+
+After the two original Sheets processes and Scrinium reconnect, the protected sibling saves `fox,3` while the plain file still contains `zebra,2`. Pressing Save in the plain window without re-entering B1 must publish `zebra,4` and leave the protected file byte-identical. Two further alternating saves exercise both grants. Each turn checks the caller UID, reads both copies and verifies the idle sibling’s digest.
+
+Both the native Tessera and bounded UFS recovery-volume runs passed in the private Tessera-root VM. They finished with `zebra,6` and `fox,5` in the respective files. Both jails closed, both markers cleared, and both recovery devices detached.

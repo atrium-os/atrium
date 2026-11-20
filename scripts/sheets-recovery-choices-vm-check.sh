@@ -17,6 +17,7 @@
 # With stale-refresh, append interleave to keep both documents open. Stage the tile_recovery_windows example at /tmp/tile-recovery-windows.
 # Append restart-limen after interleave to restart the private Limen between Save As and Save.
 # Use pending-save instead of restart-limen to interrupt an ordinary Save before delivery.
+# Use published-save to interrupt confirmation after publication (requires guest LLDB).
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -655,7 +656,8 @@ SH
         plain_win=$parent
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
         tiled() { test "$(win_at 125 24)" = "$plain_win" && test "$(win_at 765 24)" = "$sibling_win"; }
-        if test "${5:-}" = restart-limen || test "${5:-}" = pending-save; then
+        case "${5:-}" in
+        restart-limen|pending-save|published-save)
             plain_pid=$(pgrep -x -j "$jid" atrium-sheets)
             sibling_pid=$(pgrep -x -j "$sibling" atrium-sheets)
             files_pid=$(pgrep -x -U sheetsfiles bench-scrinium)
@@ -670,7 +672,40 @@ SH
             old_limen=$(listener)
             test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
-            if test "$5" = pending-save; then
+            stopped_limen() { ps -p "$old_limen" -o state= | grep -q '^T'; }
+            if test "$5" = published-save; then
+                /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
+                wait_for tiled
+                edit 129 0x1f # First snapshot contains B1=2.
+                (
+                    # Stop the provider at the atomic rename. Freeze the broker
+                    # before releasing the provider so confirmation cannot pass.
+                    release="$results/release-rename"
+                    trap 'touch "$release"; kill -CONT "$old_limen" 2>/dev/null || :' EXIT
+                    timeout 30 lldb -b -p "$files_pid" \
+                        -o 'breakpoint set -n renameat' \
+                        -o "platform shell touch $results/debugger-ready" -o continue \
+                        -o "platform shell touch $results/at-rename" \
+                        -o "platform shell timeout 15 sh -c 'until test -f $release; do sleep .1; done'" \
+                        -o 'process detach' </dev/null > "$results/rename.log" 2>&1 &
+                    debugger=$!
+                    wait_for test -f "$results/debugger-ready"
+                    click 125 24
+                    wait_for test -f "$results/at-rename"
+                    grep -q 'stop reason = breakpoint 1' "$results/rename.log"
+                    kill -STOP "$old_limen"
+                    wait_for stopped_limen
+                    /tmp/check-recovered-copy "$books/Proof.osheet" zebra plain
+                    touch "$release"; wait "$debugger"
+                    published() { /tmp/check-recovered-copy "$books/Proof.osheet" zebra,2 plain; }
+                    wait_for published
+                    test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
+                    edit 129 0x21 # B1=4 stays in Sheets until the retry.
+                    kill -KILL "$old_limen"
+                    trap - EXIT
+                )
+                plain_hash=$(sha256 -q "$books/Proof.osheet")
+            elif test "$5" = pending-save; then
                 /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
                 wait_for tiled
                 edit 129 0x21 # Commit B1=4 once. The retry presses only Save.
@@ -684,7 +719,6 @@ SH
                 (
                     trap 'kill -CONT "$old_limen" 2>/dev/null || :' EXIT
                     kill -STOP "$old_limen"
-                    stopped_limen() { ps -p "$old_limen" -o state= | grep -q '^T'; }
                     wait_for stopped_limen
                     test "$(recv_bytes)" = 0
                     click 125 24
@@ -703,7 +737,8 @@ SH
             listening() { new_limen=$(listener); test -n "$new_limen" && test "$new_limen" != "$old_limen"; }
             wait_for listening
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
-        fi
+            ;;
+        esac
         # Each ordinary Save must update its own Save As destination in place.
         # Keep the other file's digest and independently read both copies.
         save_turn() {
@@ -728,12 +763,14 @@ SH
             /tmp/check-recovered-copy "$books/Untitled.osheet" "$protected_cells" protected
         }
         plain_input=0x21
-        if test "${5:-}" = pending-save; then
+        plain_published=zebra
+        if test "${5:-}" = published-save; then plain_published=zebra,2; fi
+        if test "${5:-}" = pending-save || test "${5:-}" = published-save; then
             test "$(sha256 -q "$books/Proof.osheet")" = "$plain_hash"
             test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
             plain_input=retry
         fi
-        save_turn protected 0x20 zebra fox,3
+        save_turn protected 0x20 "$plain_published" fox,3
         save_turn plain "$plain_input" zebra,4 fox,3
         save_turn protected 0x22 zebra,4 fox,5
         save_turn plain 0x23 zebra,6 fox,5
