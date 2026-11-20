@@ -6044,8 +6044,8 @@ job-list snapshots into `guest-artifacts.tar.gz`, including after a failed check
 Successful runs remove the disposable disk overlay and EFI variables after
 QEMU exits cleanly. Set `PRELUM_R7_KEEP_VM=1` to keep them. Failed runs keep
 the overlay and EFI variables for diagnosis.
-Prelum must reach Done for each desktop job with an observed jailed IPP
-worker. The simulator log must record exactly one creation, document upload,
+Prelum must reach Done for each desktop job. The gate also requires a
+newly observed jailed IPP worker between submission and Done for each job. The simulator log must record exactly one creation, document upload,
 and completion for each job. Upload sizes and SHA-256 hashes must match the
 saved PDFs. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides
