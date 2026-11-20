@@ -17,7 +17,7 @@ def numbered_lines(pattern, body):
 
 spool = Path(sys.argv[1])
 original = Path(sys.argv[4]) if len(sys.argv) > 4 else None
-job_count = 12 if original else 11
+job_count = int(sys.argv[5]) if original else 11
 expected = [spool / f"job-{job}.pdf" for job in range(1, job_count + 1)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
 transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
@@ -177,5 +177,6 @@ for path, action in ((pdf_button, "Print button"), (pdf_shortcut, "viewer Ctrl+P
 
 
 if original:
-    assert pages_of(expected[-1]) == pages_of(original), "Released job PDF differs from its input"
-    print("Changed printer UUID: released job 12 printed both original pages after UUID restoration")
+    for job, pdf in enumerate(expected[11:], start=12):
+        assert pages_of(pdf) == pages_of(original), (job, "Released job PDF differs from its input")
+        print(f"Identity recovery: released job {job} printed both original pages")

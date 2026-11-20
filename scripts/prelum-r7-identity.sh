@@ -3,33 +3,40 @@
 set -eu
 P=$1
 marker=$2
+phase=$3
+kind=$4
 cd "$P"
 test "$(cat .isolated-gate)" = "$marker"
 test "$(uname -s)" = FreeBSD
 
-held="^ +12 +printer +1 +Held +0/0 +Changed printer UUID +.*alert IdentityChanged since "
+case "$kind" in
+  uuid) job=12; title="Changed printer UUID"; prefix=identity ;;
+  tls) job=13; title="Changed printer TLS key"; prefix=tls-identity ;;
+  *) echo "Expected uuid or tls" >&2; exit 2 ;;
+esac
+held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
 previous_hold=
 
-case "$3" in
+case "$phase" in
   hold)
     "$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
-        --printer 1 --title "Changed printer UUID"
-    snapshot=identity-jobs.log
+        --printer 1 --title "$title"
+    snapshot=$prefix-jobs.log
     expected="${held}[0-9]+$"
     ;;
   retry)
-    previous_hold=$(sed -nE "s|${held}([0-9]+)$|\1|p" identity-jobs.log)
+    previous_hold=$(sed -nE "s|${held}([0-9]+)$|\1|p" "$prefix-jobs.log")
     test -n "$previous_hold"
     # Alert timestamps have one-second resolution.
     sleep 1
-    "$P/prelumctl" --socket "$P/print.sock" release 12
-    snapshot=identity-reheld-jobs.log
+    "$P/prelumctl" --socket "$P/print.sock" release "$job"
+    snapshot=$prefix-reheld-jobs.log
     expected="${held}[0-9]+$"
     ;;
   release)
-    "$P/prelumctl" --socket "$P/print.sock" release 12
-    snapshot=identity-released-jobs.log
-    expected="^ +12 +printer +1 +Done +2/2 +Changed printer UUID *$"
+    "$P/prelumctl" --socket "$P/print.sock" release "$job"
+    snapshot=$prefix-released-jobs.log
+    expected="^ +$job +printer +1 +Done +2/2 +$title *$"
     ;;
   *) echo "Expected hold, retry, or release" >&2; exit 2 ;;
 esac

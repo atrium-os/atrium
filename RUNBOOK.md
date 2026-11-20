@@ -6065,7 +6065,9 @@ its TLS key. A diagnostic submission must be held with IdentityChanged
 without creating or uploading a job at the simulator. Releasing it while the
 UUID still differs must produce a fresh hold. After UUID restoration,
 the gate releases the same job and checks for one upload and both original
-pages.
+pages. It repeats the hold and recovery with a changed TLS key while
+keeping the original UUID. Loopback TLS probes confirm the changed and
+restored public keys.
 
 ### 13.9 Shared-checkout hygiene
 

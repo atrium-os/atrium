@@ -31,9 +31,15 @@ A.add_argument("--name", default="Fake Printer")
 A.add_argument("--tls-cert")
 A.add_argument("--tls-key")
 A.add_argument("--uuid-override-file", help="read an alternate printer UUID from this file when present")
+A.add_argument("--tls-alt-cert")
+A.add_argument("--tls-alt-key")
+A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
+alt_tls = (ARGS.tls_alt_cert, ARGS.tls_alt_key, ARGS.tls_alt_flag)
+if any(alt_tls) and not (all(alt_tls) and ARGS.tls_cert):
+    A.error("alternate TLS requires a cert, key and flag in addition to the original cert and key")
 UUID = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, "prelum-fake-%d" % ARGS.port))
 
 # Value tags.
@@ -242,6 +248,16 @@ srv = http.server.ThreadingHTTPServer((ARGS.bind, ARGS.port), H)
 if ARGS.tls_cert:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(ARGS.tls_cert, ARGS.tls_key)
+    if ARGS.tls_alt_cert:
+        alternate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        alternate.load_cert_chain(ARGS.tls_alt_cert, ARGS.tls_alt_key)
+
+        def select_key(connection, _name, _context):
+            # The callback also runs for IP clients that send no SNI.
+            if os.path.exists(ARGS.tls_alt_flag):
+                connection.context = alternate
+
+        context.sni_callback = select_key
     srv.socket = context.wrap_socket(srv.socket, server_side=True)
 print("fake printer: listening on %d (%s)" % (ARGS.port, UUID), flush=True)
 srv.serve_forever()

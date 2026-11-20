@@ -105,8 +105,20 @@ python3 "$scripts/prelum-r7-fixtures.py" "$D/fixtures"
 printf 'idle\n' >"$D/state"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=prelum-r7-test \
     -keyout "$D/ipps.key" -out "$D/ipps.pem" >"$D/cert.log" 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=prelum-r7-test \
+    -keyout "$D/ipps-alt.key" -out "$D/ipps-alt.pem" >"$D/alt-cert.log" 2>&1
+original_key=$(openssl x509 -in "$D/ipps.pem" -pubkey -noout | openssl dgst -sha256 | awk '{print $NF}')
+alternate_key=$(openssl x509 -in "$D/ipps-alt.pem" -pubkey -noout | openssl dgst -sha256 | awk '{print $NF}')
+test "$original_key" != "$alternate_key"
+check_served_key() {
+    actual=$(openssl s_client -connect "127.0.0.1:$ipps_port" -noservername </dev/null 2>>"$D/tls-probe.log" |
+        openssl x509 -pubkey -noout | openssl dgst -sha256 | awk '{print $NF}')
+    printf '%s %s\n' "$1" "$actual" >>"$D/tls-key-checks.log"
+    test "$actual" = "$2"
+}
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
+    --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
 qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$D/vm.qcow2"
@@ -155,12 +167,12 @@ remote "cat '$guest/jobs.txt'" >"$D/desktop-jobs.txt"
 # Change only the advertised printer UUID. Keep the TLS listener and key.
 printf '%s\n' 12d7ac00-4bd5-4413-8da5-e6952965ffcf >"$D/printer-uuid"
 remote "cat >'$guest/identity-proof.pdf'" <"$D/fixtures/quicklook.pdf"
-if ! remote "sh -s -- '$guest' '$marker' hold" <"$scripts/prelum-r7-identity.sh" >"$D/identity-check.log" 2>&1; then
+if ! remote "sh -s -- '$guest' '$marker' hold uuid" <"$scripts/prelum-r7-identity.sh" >"$D/identity-check.log" 2>&1; then
     cat "$D/identity-check.log" >&2
     exit 1
 fi
 cat "$D/identity-check.log"
-if ! remote "sh -s -- '$guest' '$marker' retry" <"$scripts/prelum-r7-identity.sh" >"$D/identity-retry.log" 2>&1; then
+if ! remote "sh -s -- '$guest' '$marker' retry uuid" <"$scripts/prelum-r7-identity.sh" >"$D/identity-retry.log" 2>&1; then
     cat "$D/identity-retry.log" >&2
     exit 1
 fi
@@ -171,11 +183,33 @@ cat "$D/pdf-checks.log"
 
 # The held-phase checks above prove there was no creation or upload before restoration.
 mv "$D/printer-uuid" "$D/held-printer-uuid.txt"
-if ! remote "sh -s -- '$guest' '$marker' release" <"$scripts/prelum-r7-identity.sh" >"$D/identity-release.log" 2>&1; then
+if ! remote "sh -s -- '$guest' '$marker' release uuid" <"$scripts/prelum-r7-identity.sh" >"$D/identity-release.log" 2>&1; then
     cat "$D/identity-release.log" >&2
     exit 1
 fi
 cat "$D/identity-release.log"
 remote "cat '$guest/identity-released-jobs.log'" >"$D/released-jobs.txt"
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/released-jobs.txt" "$D/fixtures/quicklook.pdf" >"$D/released-pdf-checks.log"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/released-jobs.txt" "$D/fixtures/quicklook.pdf" 12 >"$D/released-pdf-checks.log"
 cat "$D/released-pdf-checks.log"
+
+
+# Rotate the certificate key without changing the restored printer UUID.
+touch "$D/use-alt-key"
+check_served_key changed "$alternate_key"
+if ! remote "sh -s -- '$guest' '$marker' hold tls" <"$scripts/prelum-r7-identity.sh" >"$D/tls-identity-check.log" 2>&1; then
+    cat "$D/tls-identity-check.log" >&2
+    exit 1
+fi
+cat "$D/tls-identity-check.log"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/released-jobs.txt" "$D/fixtures/quicklook.pdf" 12 >"$D/tls-held-pdf-checks.log"
+
+mv "$D/use-alt-key" "$D/held-alt-key.txt"
+check_served_key restored "$original_key"
+if ! remote "sh -s -- '$guest' '$marker' release tls" <"$scripts/prelum-r7-identity.sh" >"$D/tls-identity-release.log" 2>&1; then
+    cat "$D/tls-identity-release.log" >&2
+    exit 1
+fi
+cat "$D/tls-identity-release.log"
+remote "cat '$guest/tls-identity-released-jobs.log'" >"$D/tls-released-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/tls-released-pdf-checks.log"
+cat "$D/tls-released-pdf-checks.log"
