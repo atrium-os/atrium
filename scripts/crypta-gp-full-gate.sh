@@ -1116,6 +1116,14 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                 fail "gateway did not receive the approved forwarding change"
                                             ok "changed forwarding on recovered timer-retry ESP required fresh approval"
                                             probe "IPv4 echo on the same recovered timer-retry ESP after approval"
+                                            before_refresh=$(awk 'END { print NR }' "$receipts")
+                                            wait_receipts "$((before_refresh + 1))"
+                                            [ "$(field signin)" = in ] &&
+                                                [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$rebound_report" ] &&
+                                                [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$((reviews + 1))" ] ||
+                                                fail "newly approved timer-retry HIP did not refresh silently"
+                                            ok "newly approved timer-retry HIP refreshed silently"
+                                            rebind_restored_forwarding 13 "$rebound_report"
                                         fi
                                     fi
                                 fi
