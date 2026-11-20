@@ -1227,6 +1227,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                             fail "unchanged HIP did not refresh silently after the post-decline rebind"
                                                         ok "unchanged HIP refreshed silently after the post-decline rebind"
                                                         probe "IPv4 echo after HIP refresh on the same post-decline rebound ESP"
+                                                        before_change=$(awk 'END { print NR }' "$receipts")
+                                                        "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+                                                        wait_prompt gp_hip_approval
+                                                        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                                            grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" ||
+                                                            fail "post-decline rebound review omitted restored forwarding"
+                                                        [ "$(hip_choice)" != "$approval_choice" ] ||
+                                                            fail "post-decline rebound reused the prior approval choice"
+                                                        if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^${initial_report%% *} "; then
+                                                            fail "post-decline rebound submitted restored forwarding before approval"
+                                                        fi
+                                                        before_approval=$(awk 'END { print NR }' "$receipts")
+                                                        touch "$receipts.post-decline-forwarding-approved"
+                                                        approve_hip
+                                                        wait_receipts "$((before_approval + 1))"
+                                                        [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$initial_report" ] ||
+                                                            fail "gateway did not receive the freshly approved forwarding report"
+                                                        ok "restored forwarding on post-decline rebound ESP required fresh approval"
+                                                        probe "IPv4 echo after fresh approval on the same post-decline rebound ESP"
                                                         "$V" "$CTL down name=gp-gate" >/dev/null
                                                     fi
                                                     echo "$pass checks passed"
