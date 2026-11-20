@@ -199,6 +199,8 @@ pub enum Request {
     PlaceWidget { document: Ticket, rect: Option<[u32; 4]> },
     ShowDocument { url: String, document: Ticket },
     WidgetUnloadAnswer { document: Ticket, start: Press, query: u32, leave: bool, press: Press },
+    /// Like OpenWithIslands, also report a tier-two recording before Opened.
+    OpenWithRecordingTier { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
 }
 
 /// The single whole-page fixture granted during I0.
@@ -359,6 +361,7 @@ pub enum Event {
     /// Limen confirmed the slot bind. Origin comes from the broker’s fetch grant.
     WidgetAttached { document: Ticket, press: Press, origin: String },
     WidgetUnload { document: Ticket, start: Press, query: u32, pending: bool },
+    ReplayedRecording { id: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

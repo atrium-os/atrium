@@ -38,6 +38,7 @@ parser.add_argument("--second-personal", type=Path, metavar="TLS_LOG",
                     help="select the second Personal trail with Unrecorded still open before restart")
 parser.add_argument("--channel-seed", type=int,
                     help="exercise generated unload and retirement sequences on the installed JIT-off fixture")
+parser.add_argument("--replayed-parent", action="store_true", help="verify a recorded scripted parent around Start and Stop")
 args = parser.parse_args()
 if args.second_personal:
     args.multiple_personal = args.second_personal
@@ -49,7 +50,7 @@ if args.broker_restart:
     args.navigate_away = True
 if args.saved_record:
     args.parked_viewer = True
-if args.channel_seed is not None or args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
+if args.replayed_parent or args.channel_seed is not None or args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -61,6 +62,8 @@ def guest(command, data=None):
 
 
 def press(x, y):
+    if args.replayed_parent:
+        y += 40
     guest("nc -N -U input.sock", f"MOVE {x} {y}\nBTN 1 1\nBTN 1 0\n".encode())
 
 
@@ -104,8 +107,14 @@ def tier(attached):
     expected = (b'Static: The main document from parent.example is static text and pictures. '
                 b'1 live part from https://widget.example.' if attached else
                 b'Static: This page is text and pictures. No code from parent.example ran to make it, and none runs now.')
+    if args.replayed_parent:
+        expected = (b'Replayed: The main document replays a recording of parent.example. '
+                    b'1 live part from https://widget.example.' if attached else
+                    b"Replayed: parent.example's scripts ran once, sealed off, to record what this page can do. "
+                    b"What you click now replays those recordings. None of the site's code runs now.")
     def matches():
-        labels = [line for line in log().splitlines() if b'button "Static:' in line]
+        labels = [line for line in log().splitlines()
+                  if any(label in line for label in (b'button "Static:', b'button "Replayed:', b'button "Live code:'))]
         return labels and expected + b'"' in labels[-1]
     wait_for("unexpected tier chip: " + expected.decode(), matches)
 
@@ -670,6 +679,51 @@ def channel_sequences(seed):
                 or parent() != parents):
             raise RuntimeError("unexpected channel decision, exit, fetch or parent change")
         print(f"Worker {worker} jail {jail[0]} state {jail[1]}: {total} edits, {questions} questions, {ending}", flush=True)
+
+
+def painted_replayed_chip(name, attached):
+    def read_segment(path, rect):
+        crop = subprocess.run(["magick", str(path), "-crop", rect, "+repage", "-resize", "500%",
+                               "-colorspace", "Gray", "-auto-level", "png:-"],
+                              capture_output=True, check=True, timeout=5).stdout
+        return subprocess.run(["tesseract", "stdin", "stdout", "--psm", "7"], input=crop,
+                              capture_output=True, check=True, timeout=5).stdout.strip()
+
+    def matches():
+        path = frame(name)
+        return (read_segment(path, "53x18+411+51") == b"Replayed"
+                and (read_segment(path, "60x20+498+50") == b"1 live part") == attached)
+    wait_for(f"unexpected painted tier in {name}", matches)
+
+
+if args.replayed_parent:
+    guest("./place_navigator_fixture")
+    open_address("parent.example/replayed-parent.html", "Replayed counter")
+    wait_for("script output missing from recorded parent", lambda: page_word("recorded", "amaryllis", 480, 120))
+    parents = parent()
+    tier(False)
+    painted_replayed_chip("idle-chip", False)
+    start(0)
+    count("attached", 0)
+    tier(True)
+    painted_replayed_chip("attached-chip", True)
+    pid = int(guest("pgrep -x counter"))
+    jid, state = guest(f"ps -o jid= -o state= -p {pid}").decode().split()
+    if int(jid) <= 0 or "C" not in state:
+        raise RuntimeError(f"expected jailed Capsicum worker, got {jid} {state}")
+    press(350, 118)
+    count("increment", 1)
+    press(905, 91)
+    wait_for("Stop did not retire worker", lambda: b"live widget stopped" in log()
+             and not guest("pgrep -x counter || true"))
+    tier(False)
+    wait_for("parent content lost after Stop", lambda: page_word("stopped", "amaryllis", 480, 120))
+    painted_replayed_chip("stopped-chip", False)
+    if parent() != parents or log().count(b"widget GET ") != 1 or b"prompt=widget-failed" in log():
+        raise RuntimeError("unexpected parent replacement, fetch count or widget failure")
+    print(f"Replayed throughout. Live parts 0, 1, 0. Worker {pid}, jail {jid}, state {state}. "
+          "Count advanced to 1. Same recorded parent after Stop.")
+    raise SystemExit(0)
 
 
 if args.channel_seed is not None:

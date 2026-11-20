@@ -1230,6 +1230,34 @@ Tesseract and ImageMagick to check the rendered fixture.
 Guest service logs, executable hashes and composed frames are in
 `~/atrium-vm/evidence/navigator-i2-stop-20261120/`.
 
+### I2 Replayed parent
+
+The converter writes the chosen document tier into the recording. On a
+tier-aware open, navigatord reads its top-level `tier` and reports tier 2
+to the requesting UI before delivering the page ticket. The UI applies
+that result to the opened trail entry. A confirmed island attachment
+changes only the live-part count. Older open requests keep their existing
+wire replies.
+
+The installed arm64 Tessera gate opened `replayed-parent.html` in a fresh
+Navigator window. An inline script replaced “Waiting” with “Amaryllis blooms”
+during conversion. The composed frame showed that output before Start and
+after Stop. OCR read “Replayed” throughout and “1 live part” only while the
+counter was attached. The accessibility label named `https://widget.example`
+during attachment. The JIT-off Ladybird worker (PID 5454, jail 32, kernel
+state `SCJ`) advanced from Count 0 to Count 1. Stop removed the worker and
+the UI and viewer kept their PIDs. All 147 regression tests passed.
+
+To repeat, serve the parent fixture on `parent.example` and the existing
+counter fixture at `https://widget.example/counter.html`. Stage the
+`forum-wm` example `place_navigator_fixture` in the guest test directory
+beside the fixture WM socket. Start with an empty window and
+`NAVIGATOR_UI_AX=1`, then pass `--replayed-parent` to
+`scripts/navigator-i2-stop-check.py`. The placement helper moves the window
+below Fresco’s trusted strip so both chip labels are visible. Screenshots,
+logs and binary hashes are in
+`~/atrium-vm/evidence/navigator-i2-replayed-parent-20261121/`.
+
 ### I2 idle retirement and the memory ceiling
 
 A visible web island gets 30 minutes from attachment or the last input Fresco

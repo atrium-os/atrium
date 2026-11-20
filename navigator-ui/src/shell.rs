@@ -430,21 +430,20 @@ impl Shell {
         t.current.map(|c| (t.id, c))
     }
 
-    /// navigatord opened `asked` (as `url`, after any redirect) for the
+    /// navigatord opened `url` (after any redirect) for the
     /// page `key`, as the version at `saved`.
-    pub fn opened(&mut self, key: (u64, PageId), asked: &str, url: &str, title: &str, insecure: bool, saved: &str) {
-        for t in &mut self.store.trails {
-            for p in t.pages.iter_mut().filter(|p| p.url == asked) {
-                p.url = url.to_string();
-                if !title.is_empty() {
-                    p.title = title.to_string();
-                }
-                p.facts = live_spec(url).facts;
-                p.facts.insecure |= insecure;
-                p.facts = p.facts.clone().settle();
-            }
-        }
+    pub fn opened(&mut self, key: (u64, PageId), url: &str, title: &str, insecure: bool, saved: &str, replayed: bool) {
         if let Some(p) = self.store.page_by_key_mut(key.0, key.1) {
+            p.url = url.to_string();
+            if !title.is_empty() {
+                p.title = title.to_string();
+            }
+            let mut facts = live_spec(url).facts;
+            if replayed {
+                facts.tier = crate::trail::Tier::Replayed;
+            }
+            facts.insecure |= insecure;
+            p.facts = facts.settle();
             p.saved = navigator_control::is_address(saved).then(|| saved.to_string());
         }
     }
@@ -1827,9 +1826,10 @@ mod tests {
         // Redirected to https, and named.
         let key = s.shown_key().unwrap();
         let saved = "0f".repeat(32);
-        s.opened(key, "http://atlas.example/wiki/Atrium", "https://atlas.example/wiki/Atrium", "Atrium", false, &saved);
+        s.opened(key, "https://atlas.example/wiki/Atrium", "Atrium", false, &saved, true);
         let p = s.store.trail().page().unwrap();
         assert_eq!((p.url.as_str(), p.title.as_str(), p.facts.light), ("https://atlas.example/wiki/Atrium", "Atrium", Light::Green));
+        assert_eq!(p.facts.tier, crate::trail::Tier::Replayed);
         assert_eq!(p.saved.as_deref(), Some(saved.as_str()), "the version navigatord keeps, for parking");
         // A press in the page goes to navigatord; its answer moves the trail.
         s.link_pressed("/wiki/Impluvium");

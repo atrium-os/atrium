@@ -1069,7 +1069,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 return;
             }
         };
-        let wants_islands = matches!(req, Request::OpenWithIslands { .. });
+        let wants_tier = matches!(req, Request::OpenWithRecordingTier { .. });
+        let wants_islands = wants_tier || matches!(req, Request::OpenWithIslands { .. });
         match req {
             Request::Hello { chrome, limen, measure, trails } => {
                 let opened = match (&cfg.chrome, chrome) {
@@ -1268,7 +1269,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 eprintln!("navigatord: cleared {r} page records and {o} objects from the store");
             }
             Request::Open { id, url, saved, jar, knows, fresh }
-            | Request::OpenWithIslands { id, url, saved, jar, knows, fresh } => {
+            | Request::OpenWithIslands { id, url, saved, jar, knows, fresh }
+            | Request::OpenWithRecordingTier { id, url, saved, jar, knows, fresh } => {
                 if !ctl::clean(&url, ctl::URL_MAX) {
                     send(&w, &Event::Failed { id, url: String::new(), why: "not an address".into() });
                     continue;
@@ -1410,7 +1412,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                 }
                             }
                             if wants_islands {
-                                let sources = island_sources(&p.recording, &p.url);
+                                let meta = serde_json::from_slice::<RecordingMetadata>(&p.recording).ok();
+                                if wants_tier && meta.as_ref().is_some_and(|m| m.tier == Some(2)) {
+                                    send(&w, &Event::ReplayedRecording { id });
+                                }
+                                let sources = meta.map_or_else(Vec::new, |m| m.island_sources(&p.url));
                                 if ctx == Ctx::ANON && cfg.vpn.is_none() && cfg.portal.is_none()
                                     && settings::get("NAVIGATORD_I1_COUNTER").as_deref() == Some(widget::COUNTER) {
                                     let base = url::Url::parse(&p.url).ok();
@@ -1844,31 +1850,34 @@ fn form_target(page: &Page, action: &str, fields: &[ctl::FormField], schemes: &S
     }
 }
 
-fn island_sources(recording: &[u8], page: &str) -> Vec<(String, String)> {
-    #[derive(serde::Deserialize)]
-    struct Metadata<'a> {
-        url: String,
-        #[serde(borrow)]
-        island_sources: Option<&'a serde_json::value::RawValue>,
+#[derive(serde::Deserialize)]
+struct RecordingMetadata<'a> {
+    url: String,
+    tier: Option<u8>,
+    #[serde(borrow)]
+    island_sources: Option<&'a serde_json::value::RawValue>,
+}
+
+impl RecordingMetadata<'_> {
+    fn island_sources(self, page: &str) -> Vec<(String, String)> {
+        // No HTML or script parsing in the broker. Only the converter writes
+        // this top-level field. Old recordings contain no eligible sources.
+        let Some(raw) = self.island_sources else { return vec![] };
+        // A redirect alias in the cache must not rebase a frame onto another site.
+        if self.url != page { return vec![]; }
+        // Up to sixteen JSON-escaped source strings. Bound allocation before decoding.
+        if raw.get().len() > 16 * (6 * 2048 + 4) { return vec![]; }
+        let Ok(sources) = serde_json::from_str::<Vec<String>>(raw.get()) else { return vec![] };
+        if sources.len() > 16 { return vec![]; }
+        let Ok(base) = url::Url::parse(page) else { return vec![] };
+        sources.into_iter().filter_map(|src| {
+            if src.is_empty() || src.len() > 2048 || src.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') { return None; }
+            let target = base.join(&src).ok()?;
+            if !matches!(target.scheme(), "http" | "https") || !target.username().is_empty() || target.password().is_some() { return None; }
+            let origin = origin(target.as_str())?;
+            (origin.len() <= 512).then_some((src, origin))
+        }).collect()
     }
-    // No HTML or script parsing in the broker. Only the converter writes
-    // this top-level field. Old recordings contain no eligible sources.
-    let Ok(meta) = serde_json::from_slice::<Metadata>(recording) else { return vec![] };
-    let Some(raw) = meta.island_sources else { return vec![] };
-    // A redirect alias in the cache must not rebase a frame onto another site.
-    if meta.url != page { return vec![]; }
-    // Up to sixteen JSON-escaped source strings. Bound allocation before decoding.
-    if raw.get().len() > 16 * (6 * 2048 + 4) { return vec![]; }
-    let Ok(sources) = serde_json::from_str::<Vec<String>>(raw.get()) else { return vec![] };
-    if sources.len() > 16 { return vec![]; }
-    let Ok(base) = url::Url::parse(page) else { return vec![] };
-    sources.into_iter().filter_map(|src| {
-        if src.is_empty() || src.len() > 2048 || src.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\') { return None; }
-        let target = base.join(&src).ok()?;
-        if !matches!(target.scheme(), "http" | "https") || !target.username().is_empty() || target.password().is_some() { return None; }
-        let origin = origin(target.as_str())?;
-        (origin.len() <= 512).then_some((src, origin))
-    }).collect()
 }
 
 fn activate(page: &Page, href: &str, schemes: &SchemeAllowlist) -> LinkAction {
@@ -2392,12 +2401,15 @@ mod tests {
 
 #[cfg(test)]
 mod island_metadata_tests {
-    use super::island_sources;
+    use super::RecordingMetadata;
 
     #[test]
     fn only_top_level_recorded_web_sources_can_supply_the_label() {
         let base = "https://parent.example:8443/docs/";
         let doc = br#"{"url":"https://parent.example:8443/docs/","document":"https://mentioned.example/","other":{"island_sources":["https://nested.example/"]}}"#;
+        fn island_sources(recording: &[u8], page: &str) -> Vec<(String, String)> {
+            serde_json::from_slice::<RecordingMetadata>(recording).unwrap().island_sources(page)
+        }
         assert!(island_sources(doc, base).is_empty());
         let rec = br#"{"url":"https://parent.example:8443/docs/","island_sources":["../widget","//frame.example/box","file:///etc","https://user@private.example/","broken path"]}"#;
         assert_eq!(island_sources(rec, base), vec![

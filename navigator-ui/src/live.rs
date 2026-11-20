@@ -77,6 +77,7 @@ struct Child {
     island_sources: Vec<(String, String)>,
     document: Option<Ticket>,
     runnable: Option<String>,
+    replayed: bool,
     selected_widget: Option<(u32, String, [f32; 4])>,
     /// Its page's plain forms (limen `Forms`), for the sign-in window's
     /// form panel.
@@ -499,7 +500,7 @@ impl Live {
             reading,
             sections: Vec::new(),
             island_sources: Vec::new(),
-            document: None, runnable: None, selected_widget: None,
+            document: None, replayed: false, runnable: None, selected_widget: None,
             forms: Vec::new(),
         });
         s.live = Some(LivePage::Loading(url.clone()));
@@ -507,7 +508,7 @@ impl Live {
         if fresh {
             eprintln!("navigator-ui: fetching the current version of {url}");
         }
-        send(&mut self.w, &Request::OpenWithIslands { id, url, saved, jar, knows, fresh });
+        send(&mut self.w, &Request::OpenWithRecordingTier { id, url, saved, jar, knows, fresh });
     }
 
     /// Park the least recently seen pages past the budget.
@@ -559,6 +560,11 @@ impl Live {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
+                Event::ReplayedRecording { id } => {
+                    if let Some(c) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
+                        c.replayed = true;
+                    }
+                }
                 Event::RunnableWidget { id, source } => {
                     if let Some(c) = self.children.iter_mut().find(|c| c.asked == Some(id)) { c.runnable = Some(source); }
                 }
@@ -593,8 +599,9 @@ impl Live {
                     if let Some((_, f)) = &mut c.since {
                         *f = Some(from);
                     }
-                    let (key, asked) = (c.key, std::mem::replace(&mut c.url, url.clone()));
-                    s.opened(key, &asked, &url, &title, insecure, &saved);
+                    let key = c.key;
+                    c.url = url.clone();
+                    s.opened(key, &url, &title, insecure, &saved, c.replayed);
                     if self.shown == Some(key) {
                         s.live = Some(LivePage::Shown(url));
                     }
