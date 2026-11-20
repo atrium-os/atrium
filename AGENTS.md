@@ -89,9 +89,12 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 - Most subsystems have a VM check script in `scripts/` (`*-vm-check.sh`,
   `*-gate.sh`, `*-vm.sh`). Run the one for the area you changed; the RUNBOOK
   section for that subsystem names it.
-- Scratch worktrees: make them with `scripts/scratch-worktree.sh` (shared
-  Cargo build-dir, parent outside `~/src` itself) and remove them with
-  `--remove`, never `rm -r`.
+- Cargo intermediates share `$CARGO_HOME/atrium-build` (default
+  `~/.cargo/atrium-build`) across the main checkout and scratch worktrees.
+  Final binaries are still in each crate's `target/` directory. Concurrent
+  builds may wait on the shared directory lock.
+- Scratch worktrees: make them with `scripts/scratch-worktree.sh` under a
+  dedicated parent and remove them with `--remove`, never `rm -r`.
 
 ## The dev VM
 

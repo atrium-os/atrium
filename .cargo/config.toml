@@ -11,6 +11,11 @@
 # - --dynamic-linker is FreeBSD's rtld, NOT Linux's /lib/ld-linux-*.
 # - build-std rebuilds Rust std for the target (Tier-3 has no prebuilt std).
 
+[build]
+# Share intermediate artifacts across Atrium checkouts. Keep final binaries
+# in each crate's target/ directory for scripts that stage them from there.
+build-dir = "{cargo-cache-home}/atrium-build"
+
 [target.aarch64-unknown-freebsd]
 linker = "rust-lld"
 rustflags = [

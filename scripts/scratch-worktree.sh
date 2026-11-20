@@ -9,28 +9,19 @@
 # rebuilds every dependency from scratch, 15-33 GB per worktree. On
 # 2026-11-06 idle scratch worktrees held ~117 GB of the Mac's disk.
 #
-# How: we write <dest>/../.cargo/config.toml setting Cargo's build-dir to one
-# shared folder (ATRIUM_SCRATCH_BUILD_DIR, default ~/.cache/atrium-scratch-build).
-# Cargo reads config from every ancestor directory, so it applies to builds in
-# the worktree without touching any tracked file. Intermediate artifacts
-# (deps, fingerprints, incremental) go to the shared folder; each crate's
-# target/ keeps only final binaries, so two arms never overwrite each other's
-# output. A dependency compiled once is reused by every scratch worktree. A
-# workspace crate from a different checkout path gets its own hash, so arms
-# never share each other's own code.
+# The repo config shares Cargo intermediates via CARGO_HOME/atrium-build.
+# For historical revisions, an ancestor config supplies the same setting.
+# Each crate keeps its own final binaries in target/ for staging and tests.
 #
-# Cost: Cargo locks the build-dir, so two scratch builds running at the same
-# time may wait for each other ("Blocking waiting for file lock"). The main
-# checkout is NOT affected; it keeps its own target/ dirs. For that to hold,
-# <dest>'s parent must not be ~/src, $HOME, or an ancestor of this repo; the
-# script refuses those.
+# Cargo locks the shared build directory, so concurrent builds may wait.
+# Keep the parent config scoped to the worktrees it serves.
 #
 # Remove scratch worktrees with --remove (git worktree remove, which never
 # follows symlinks), not rm -r.
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-SHARED="${ATRIUM_SCRATCH_BUILD_DIR:-$HOME/.cache/atrium-scratch-build}"
+SHARED='{cargo-cache-home}/atrium-build'
 
 if [ "${1:-}" = "--remove" ]; then
     [ $# -eq 2 ] || { echo "usage: $0 --remove <dest>" >&2; exit 2; }
@@ -66,10 +57,11 @@ for ANC in "$REPO" "$HOME" "$HOME/src"; do
             exit 1 ;;
     esac
 done
-mkdir -p "$PARENT/.cargo" "$SHARED"
+mkdir -p "$PARENT/.cargo"
 CFG="$PARENT/.cargo/config.toml"
-if [ -f "$CFG" ] && ! grep -q '^build-dir' "$CFG"; then
-    echo "error: $CFG exists without a build-dir; add  [build] build-dir = \"$SHARED\"  by hand" >&2
+if [ -f "$CFG" ] && ! grep -Fxq "build-dir = \"$SHARED\"" "$CFG"; then
+    echo "error: set build-dir = \"$SHARED\" under [build] in $CFG first" >&2
+    git -C "$REPO" worktree remove "$DEST"
     exit 1
 fi
 [ -f "$CFG" ] || printf '# written by %s\n[build]\nbuild-dir = "%s"\n' "scripts/scratch-worktree.sh" "$SHARED" > "$CFG"
