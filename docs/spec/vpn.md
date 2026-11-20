@@ -1018,7 +1018,8 @@ another origin. An active portal-profile session stays in engine memory.
   reconnects after that decline. The fixture checks that the declined
   choice remains invalid and that fresh approval and gateway
   acknowledgement precede ESP traffic. It then checks silent refresh
-  and IPv4 echo on the new association. The FreeBSD run is pending.
+  and IPv4 echo on the new association. The FreeBSD arm64 gate passed
+  57/57 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
