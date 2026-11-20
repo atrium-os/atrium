@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Verify Stop in an installed Navigator window on the staged I1 counter fixture."""
 import argparse
+import csv
+import io
 from pathlib import Path
 import shlex
 import subprocess
@@ -18,8 +20,10 @@ parser.add_argument("--lifecycle", action="store_true", help="use the pinned cou
 parser.add_argument("--unload", action="store_true", help="use the pinned counter-unload fixture with UI AX")
 parser.add_argument("--pending-stop", action="store_true",
                     help="use counter-unload and the retired-unload-ui.patch gate build with UI AX")
+parser.add_argument("--navigate-away", action="store_true",
+                    help="follow the parent link while the unload prompt is open, then go Back")
 args = parser.parse_args()
-if args.reports or args.lifecycle or args.unload or args.pending_stop:
+if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -230,33 +234,36 @@ def unload():
     print(f"Stay preserved worker {int(worker)} at Count 1; timeout preserved Count 2. Increment reached 3, then Leave retired it exactly once.")
 
 
+def prompt(opened):
+    report = log()
+    traces = [line for line in report.splitlines() if line.startswith(b"navigator-ui: trace ")]
+    trees = report.split(b'navigator-ui: ax window "Navigator"')
+    if not traces or len(trees) == 1:
+        return False
+    expected = b" prompt=widget-unload " if opened else b" prompt=- "
+    return expected in traces[-1] and all(
+        (item in trees[-1]) == opened for item in
+        (b'ax   region "Leave the widget', b'ax     button "Leave"', b'ax     button "Stay"'))
+
+
+def visible_question(name):
+    image = subprocess.run(["magick", str(frame(name)), "-crop", "900x45+240+41",
+                            "+repage", "-resize", "240%", "png:-"],
+                           capture_output=True, check=True, timeout=5).stdout
+    words = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "6"], input=image,
+                           capture_output=True, check=True, timeout=5).stdout.lower()
+    return b"leave the widget" in words
+
+
+def question(name):
+    time.sleep(1.05)
+    press(434, 118)
+    wait_for(name, lambda: prompt(True))
+    time.sleep(.65)
+    wait_for("unload question missing from frame", lambda: visible_question(name))
+
+
 def pending_stop():
-    def prompt(opened):
-        report = log()
-        traces = [line for line in report.splitlines() if line.startswith(b"navigator-ui: trace ")]
-        trees = report.split(b'navigator-ui: ax window "Navigator"')
-        if not traces or len(trees) == 1:
-            return False
-        expected = b" prompt=widget-unload " if opened else b" prompt=- "
-        return expected in traces[-1] and all(
-            (item in trees[-1]) == opened for item in
-            (b'ax   region "Leave the widget', b'ax     button "Leave"', b'ax     button "Stay"'))
-
-    def visible_question(name):
-        image = subprocess.run(["magick", str(frame(name)), "-crop", "900x45+240+41",
-                                "+repage", "-resize", "240%", "png:-"],
-                               capture_output=True, check=True, timeout=5).stdout
-        words = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "6"], input=image,
-                               capture_output=True, check=True, timeout=5).stdout.lower()
-        return b"leave the widget" in words
-
-    def question(name):
-        time.sleep(1.05)
-        press(434, 118)
-        wait_for(name, lambda: prompt(True))
-        time.sleep(.65)
-        wait_for("unload question missing from frame", lambda: visible_question(name))
-
     parents = parent()
     start(0)
     count("first", 0)
@@ -299,6 +306,71 @@ def pending_stop():
         raise RuntimeError("unexpected parent, fetch or retirement outcome")
     print(f"Stop withdrew query 1 and worker {int(first)}. Replacement {int(second)} stayed on query 1,"
           " reached Count 2 after the retired Leave, and closed once on its own query 2.")
+
+
+def page_word(name, word, top, height):
+    # Restrict OCR to the document slot so rail and toolbar labels cannot satisfy it.
+    image = subprocess.run(["magick", str(frame(name)), "-crop", f"870x{height}+249+{top}",
+                            "+repage", "-resize", "300%", "png:-"],
+                           capture_output=True, check=True, timeout=5).stdout
+    data = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "11", "tsv"], input=image,
+                          capture_output=True, check=True, timeout=5).stdout.decode()
+    for row in csv.DictReader(io.StringIO(data), delimiter="\t"):
+        if row["text"].lower() == word:
+            x = int(row["left"]) + int(row["width"]) // 2
+            y = int(row["top"]) + int(row["height"]) // 2
+            return 249 + x // 3, top + y // 3
+    return None
+
+
+def navigate_away():
+    original_ui, original_viewer = parent().splitlines()
+    start(0)
+    count("first", 0)
+    first = guest("pgrep -x counter")
+    press(350, 118)
+    count("first-edited", 1)
+    question("pending")
+    link = page_word("pending", "garden", 485, 80)
+    if not link:
+        raise RuntimeError("missing Visit garden link below the counter")
+    press(*link)
+    wait_for("destination failed to render", lambda: page_word("away", "marigolds", 41, 150))
+    wait_for("navigation left the worker or its prompt", lambda: prompt(False)
+             and not guest("pgrep -x counter || true"))
+    wait_for("old question still painted on destination", lambda: not visible_question("away"))
+    press(270, 30)  # Back, below the headless shell strip
+    wait_for("Back did not restore the existing viewer", lambda:
+             b"showed live page https://parent.example/counter-parent.html" in log()
+             and page_word("restored", "garden", 441, 80))
+    tier(False)
+    if (not prompt(False) or visible_question("restored") or guest("pgrep -x counter || true")
+            or original_viewer not in guest("pgrep -x navigator-page").splitlines()):
+        raise RuntimeError("Back failed to restore the idle page without its old prompt")
+    start(1)
+    count("fresh", 0)
+    second = guest("pgrep -x counter")
+    tier(True)
+    press(350, 118)
+    count("fresh-edited", 1)
+    question("fresh-question")
+    press(1008, 60)
+    wait_for("fresh Leave failed", lambda: b"widget unload 1 leave=true" in log()
+             and prompt(False) and not guest("pgrep -x counter || true"))
+    tier(False)
+    report = log()
+    if (first == second or guest("pgrep -x navigator-ui").strip() != original_ui
+            or report.count(b'the page child laid out "Embedded counter"') != 1
+            or report.count(b"widget GET ") != 2 or report.count(b"widget reported voluntary close") != 1
+            or b"prompt=widget-failed" in report or b"widget unload 1 leave=false" in report):
+        raise RuntimeError("unexpected parent reload, widget fetch, timeout, or worker retirement")
+    print(f"Navigation retired {int(first)} with its question open. Back restored viewer {int(original_viewer)}."
+          f" Guarded Start opened worker {int(second)} at Count 0; it incremented and closed on its own Leave.")
+
+
+if args.navigate_away:
+    navigate_away()
+    raise SystemExit(0)
 
 
 if args.pending_stop:

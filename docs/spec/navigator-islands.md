@@ -210,6 +210,20 @@ pass `--pending-stop` to `scripts/navigator-i2-stop-check.py`. Guest logs,
 frames and binary hashes are in
 `~/atrium-vm/evidence/navigator-i2-pending-stop-20261121/`.
 
+The navigation-away gate uses the production UI. With the counter at 1 and
+its unload question visible, following **Visit garden** opened a second static
+page and retired the worker. Back showed the original viewer again without a
+second parent GET. The question was absent from both the frame and the
+accessibility tree on the destination and after Back. The widget stayed idle
+until a new Start press. Its new worker opened at 0, incremented to 1 and
+closed on its own Leave.
+
+To repeat, serve `away.html` alongside `counter-parent.html` on the parent
+origin, serve the unload fixture on the widget origin, and run the installed
+gate with `--navigate-away` and UI accessibility tracing. Frames, guest logs
+and fixture requests are in
+`~/atrium-vm/evidence/navigator-i2-navigation-away-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
