@@ -194,13 +194,27 @@ fn transitions_block(c: &Conversion, tier: Tier) -> (String, bool, usize) {
     (s, !templates.is_empty(), dropped)
 }
 
-/// `"media": { "mse_scripts": n, "videos": [...] },` or nothing.
+/// Optional island source list and video metadata from the published document.
 pub fn media_block(document: &str, mse_scripts: usize) -> String {
     use navigator_dom::media::{video_source, VideoSource};
     let dom = navigator_dom::parse(document);
     let videos = dom.by_tag_anywhere("video");
-    if videos.is_empty() { return String::new() }
-    let mut s = format!("  \"media\": {{ \"mse_scripts\": {mse_scripts}, \"videos\": [");
+    // Keep the eligible sources of this published DOM alongside its media.
+    // Raw page-authored atrium-island attributes never enter this list.
+    let mut sources = Vec::new();
+    for h in dom.by_tag("iframe") {
+        if let Some(src) = navigator_dom::media::iframe_source(&dom, h) {
+            if !sources.contains(&src) { sources.push(src); }
+            if sources.len() == 16 { break; }
+        }
+    }
+    let mut s = String::new();
+    if !sources.is_empty() {
+        let values: Vec<_> = sources.iter().map(|src| json_str(src)).collect();
+        s.push_str(&format!("  \"island_sources\": [{}],\n", values.join(", ")));
+    }
+    if videos.is_empty() { return s; }
+    s += &format!("  \"media\": {{ \"mse_scripts\": {mse_scripts}, \"videos\": [");
     for (i, v) in videos.iter().enumerate() {
         s.push_str(if i == 0 { "\n" } else { ",\n" });
         let sources = dom.element_children(*v).into_iter().filter(|c| dom.tag(*c) == Some("source")).count();

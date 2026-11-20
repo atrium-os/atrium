@@ -2,6 +2,7 @@
 //!
 //!   navctl <socket> open <id> <url> <p|u:HEX> <0|1> [forget <p|u:HEX> [url]] …
 //!
+//! `open-islands` also prints each converter-recorded widget source and its resolved origin.
 //! Each `open` waits for its answer and prints one line:
 //! `opened <id> <url> knows=<bool> from=<Source>` or `failed <id> <why>`.
 //! `forget` sends `Forget` (no answer) and waits a second.
@@ -32,11 +33,19 @@ fn main() {
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
-            "open" => {
+            "open" | "open-islands" => {
                 let (id, url, j, knows) = (a[i + 1].parse().unwrap(), a[i + 2].clone(), jar(&a[i + 3]), a[i + 4] == "1");
-                write_frame(&mut s, &Request::Open { id, url, saved: None, jar: j, knows, fresh: false }).unwrap();
+                let request = if a[i] == "open-islands" {
+                    Request::OpenWithIslands { id, url, saved: None, jar: j, knows, fresh: false }
+                } else {
+                    Request::Open { id, url, saved: None, jar: j, knows, fresh: false }
+                };
+                write_frame(&mut s, &request).unwrap();
                 loop {
                     match read_frame::<Event>(&mut s) {
+                        Ok(Some(Event::IslandSources { id: got, sources })) if got == id => {
+                            for (src, origin) in sources { println!("island {id} {src} {origin}"); }
+                        }
                         Ok(Some(Event::Opened { id: got, url, knows, from, note, .. })) if got == id => {
                             println!("opened {id} {url} knows={knows} from={from:?}{}", note.map(|n| format!(" note={n}")).unwrap_or_default());
                             break;

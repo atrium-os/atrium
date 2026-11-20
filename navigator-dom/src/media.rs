@@ -79,6 +79,17 @@ pub fn island_url(raw: &str) -> Option<String> {
     ok.then(|| s.to_string())
 }
 
+/// The iframe source shared by the converter's recording and the normalizer.
+pub fn iframe_source(dom: &Dom, h: Handle) -> Option<String> {
+    if dom.tag(h) != Some("iframe") || dom.attr(h, "srcdoc").is_some() { return None; }
+    let dim = |name| dom.attr(h, name)?.trim().trim_end_matches("px").parse::<i64>().ok();
+    if dim("width").is_some_and(|w| w < ISLAND_MIN_W) || dim("height").is_some_and(|h| h < ISLAND_MIN_H) {
+        return None;
+    }
+    ["src", "data-src", "data-lazy-src", "data-delayed-url"].iter()
+        .find_map(|attr| dom.attr(h, attr).and_then(island_url))
+}
+
 /// The longest island URL kept.
 pub const ISLAND_URL_MAX: usize = 2048;
 /// ★ The smallest box that is content, in CSS px. Below it a frame is a

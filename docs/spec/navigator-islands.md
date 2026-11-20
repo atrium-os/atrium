@@ -778,8 +778,14 @@ The document viewer now retains island keys and sources with each resident
 scene band. A primary press on an island reports its key, source and visible
 rectangle in viewer-local pixels to Navigator over Limen. The rectangle is
 clipped to the band and viewport. The signed UI treats the message as advisory
-and shows a status note for the visible page. It grants no worker or fetch
-authority on receipt.
+and checks it against metadata for the same open request. Opening a page with
+widget support asks the broker for its recorded iframe sources. The jailed
+converter records the first 16 distinct eligible sources from the published
+DOM, using the normalizer's iframe rules. The broker resolves web origins
+against the recording URL and supplies the source/origin pairs to chrome.
+A matching press on the current page opens a dismissible row identifying
+the origin. Older recordings without the field and unmatched presses produce
+no row. The row carries no engine or fetch grant.
 
 On a fresh arm64 Tessera overlay the viewer event-handler test loaded the
 counter parent and reported a single rectangle of (40, 40, 640, 360). A
@@ -789,8 +795,8 @@ geometry at 2× zoom after scrolling. These tests injected viewer events.
 The earlier compositor and JIT-off worker test used the fixture parent and
 its bounded GET responder.
 
-Next, bind a trusted activation to the current document and verified island
-source, maintain a whole slot across band, scroll and page changes, and
+Next, spend a guarded chrome activation for the selected source and current
+document, maintain a whole slot across band, scroll and page changes, and
 provide the origin-bound fetch channel through the production launcher.
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and

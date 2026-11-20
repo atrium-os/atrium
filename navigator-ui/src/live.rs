@@ -74,6 +74,7 @@ struct Child {
     reading: Reading,
     /// Its page's sections, from `Loaded` (§7 "Jump to section").
     sections: Vec<(String, String)>,
+    island_sources: Vec<(String, String)>,
     /// Its page's plain forms (limen `Forms`), for the sign-in window's
     /// form panel.
     forms: Vec<limen::doc_viewer::Form>,
@@ -454,6 +455,7 @@ impl Live {
             knows,
             reading,
             sections: Vec::new(),
+            island_sources: Vec::new(),
             forms: Vec::new(),
         });
         s.live = Some(LivePage::Loading(url.clone()));
@@ -461,7 +463,7 @@ impl Live {
         if fresh {
             eprintln!("navigator-ui: fetching the current version of {url}");
         }
-        send(&mut self.w, &Request::Open { id, url, saved, jar, knows, fresh });
+        send(&mut self.w, &Request::OpenWithIslands { id, url, saved, jar, knows, fresh });
     }
 
     /// Park the least recently seen pages past the budget.
@@ -513,6 +515,11 @@ impl Live {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
+                Event::IslandSources { id, sources } => {
+                    if let Some(child) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
+                        child.island_sources = sources;
+                    }
+                }
                 Event::Opened { id, url, title, insecure, ticket, ms: took, saved, from, knows, asked, note } => {
                     let Some(i) = self.children.iter().position(|c| c.asked == Some(id)) else { continue };
                     eprintln!("navigator-ui: opened {url} in {took} ms ({from:?}{})", if knows { ", the site knowing you" } else { "" });
@@ -748,12 +755,11 @@ impl Live {
                         changed = true;
                     }
                     Some(ToParent::LinkActivated { .. } | ToParent::LinkHover { .. }) => {}
-                    Some(ToParent::IslandPressed { .. }) => {
-                        if on_screen {
-                            s.last_note = Some("Live widgets are unavailable in this viewer.".into());
-                            changed = true;
-                        }
+                    Some(ToParent::IslandPressed { src, .. }) if on_screen => {
+                        let child = &self.children[i];
+                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, crate::ui::now_ms());
                     }
+                    Some(ToParent::IslandPressed { .. }) => {}
                     Some(ToParent::Loaded { title, sections, .. }) => {
                         let c = &mut self.children[i];
                         c.sections = sections;

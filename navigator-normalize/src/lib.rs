@@ -945,22 +945,8 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // `<iframe>` and whether it is a recognised embed (see `embedded`).
     let frames: Vec<(Handle, Option<String>, Option<u32>, Option<u32>)> = dom.by_tag_anywhere("iframe").into_iter().map(|h| {
         let dim = |a: &str| dom.attr(h, a).and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok()).filter(|v| (1..=8192).contains(v));
-        // ★ Real embeds mostly arrive LAZY: the URL sits in a data attribute
-        // a script copies to `src` (LinkedIn's `data-delayed-url`, wikiHow's
-        // `data-src`), and that script is another origin's, so it no longer
-        // runs at conversion (legacy-web §5.4.1f). Read those too.
-        // An inline `srcdoc` frame has no URL to open (and wins over `src`).
-        let island = if dom.attr(h, "srcdoc").is_some() { None } else {
-            ["src", "data-src", "data-lazy-src", "data-delayed-url"].iter()
-                .find_map(|a| dom.attr(h, a).and_then(navigator_dom::media::island_url))
-        };
-        // A frame that DECLARES itself smaller than content (the 0×0 and
-        // 1×1 beacons) is dropped here; one sized by CSS, at render.
+        let island = navigator_dom::media::iframe_source(&dom, h);
         let (w, ht) = (dim("width"), dim("height"));
-        let raw = |a: &str| dom.attr(h, a).and_then(|v| v.trim().trim_end_matches("px").parse::<i64>().ok());
-        let small = raw("width").is_some_and(|v| v < navigator_dom::media::ISLAND_MIN_W)
-            || raw("height").is_some_and(|v| v < navigator_dom::media::ISLAND_MIN_H);
-        let island = island.filter(|_| !small);
         (h, island, w, ht)
     }).collect();
     // 6. Rewrite the document: generated classes on, `style=` off, `<link>`

@@ -35,3 +35,16 @@ fn mse_use_is_found_in_script_text() {
     assert!(uses_mse("const ms = new ManagedMediaSource();"));
     assert!(!uses_mse("video.src = 'clip.mp4'; video.play();"));
 }
+
+#[test]
+fn only_eligible_frames_declare_widget_sources() {
+    let doc = r#"<iframe data-src="/counter"></iframe><iframe src="/counter"></iframe>
+        <iframe srcdoc="inline" src="/inline"></iframe><iframe src="/pixel" width="1"></iframe>
+        <video atrium-island="/forged"></video><a href="/link">link</a>"#;
+    let block = media_block(doc, 0);
+    assert_eq!(block.lines().next(), Some("  \"island_sources\": [\"/counter\"],"));
+    let many: String = (0..32).map(|i| format!("<iframe src='/w{i}'></iframe>")).collect();
+    let block = media_block(&many, 0);
+    assert!(block.contains("\"/w15\""));
+    assert!(!block.contains("\"/w16\""));
+}

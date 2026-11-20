@@ -728,6 +728,14 @@ impl Shell {
         true
     }
 
+    /// The child names a source. The signed row takes its origin only from
+    /// the broker's metadata for this specific open.
+    pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, now: f64) -> bool {
+        if self.shown_key() != Some(key) { return false; }
+        let Some((_, origin)) = sources.iter().find(|(s, _)| s == src) else { return false };
+        self.ask_at(key, Prompt::Widget { origin: origin.clone() }, now)
+    }
+
     /// Whether something of the UI's own covers the prompt row (the
     /// suggestion list, the tier popover).
     pub fn prompt_obscured(&self) -> bool {
@@ -2275,6 +2283,23 @@ mod tests {
         s.apply(Action::NextRegion, 0.0);
         assert!(s.rail_focus && !s.focus_page, "the page is skipped while history is up");
         assert!(s.escape() && !s.rail_focus);
+    }
+
+    #[test]
+    fn widget_row_uses_only_the_current_documents_recorded_origin() {
+        let mut s = shell();
+        s.enter("https://parent.example/one");
+        let key = s.shown_key().unwrap();
+        let sources = vec![("/counter".into(), "https://parent.example".into())];
+        assert!(!s.widget_pressed(key, &sources, "https://other.example", 0.0));
+        assert!(s.widget_pressed(key, &sources, "/counter", 0.0));
+        let prompt = &s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt;
+        assert_eq!(crate::ax::prompt_text(prompt), "Live widget from https://parent.example is unavailable");
+        assert_eq!(prompt.answers(), &["Close"]);
+        assert!(s.answer_pressed(0, 700.0, Some([3; 16])));
+        assert!(s.outbox.is_empty());
+        s.enter("https://parent.example/two");
+        assert!(!s.widget_pressed(key, &sources, "/counter", 1500.0));
     }
 
     #[test]

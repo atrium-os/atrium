@@ -191,6 +191,8 @@ pub enum Request {
     /// Answered by `Link` with the same `id`: `Navigate` to the answer.
     SubmitForm { id: u32, page: String, jar: Jar, action: String, post: bool, fields: Vec<FormField>, press: Press },
     RunLive { url: String, jar: Jar, press: Press },
+    /// Open and send the recorded island sources before Opened, with the same id.
+    OpenWithIslands { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
 }
 
 /// The single whole-page fixture granted during I0.
@@ -342,6 +344,8 @@ pub enum Event {
     /// dropped either way).
     FileOpened { id: u32, app: Option<String>, why: Option<String> },
     LivePageFailed { why: String },
+    /// Source spelling and resolved web origin from the opened recording.
+    IslandSources { id: u32, sources: Vec<(String, String)> },
 }
 
 /// The most accounts an `Accounts` names, and the longest name.
