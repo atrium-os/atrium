@@ -155,22 +155,30 @@ fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
     out
 }
 
-/// `tag=value; …` lists (§3.2), whitespace removed from values.
-fn tags(v: &[u8]) -> Vec<(String, String)> {
-    let s = String::from_utf8_lossy(v);
-    s.split(';')
-        .filter_map(|t| {
-            let (k, v) = t.split_once('=')?;
-            let k = k.trim().to_string();
-            let v: String = v.chars().filter(|c| !c.is_whitespace()).collect();
-            (!k.is_empty()).then_some((k, v))
-        })
-        .take(64)
-        .collect()
+/// Parse a bounded DKIM tag list (§3.2). Duplicate names invalidate the
+/// list, including tags that are unknown to this verifier.
+fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    let text = text.strip_suffix(';').unwrap_or(text);
+    let mut tags = Vec::new();
+    for tag in text.split(';') {
+        let (name, value) = tag.split_once('=')?;
+        let name = name.trim();
+        let mut chars = name.bytes();
+        if !chars.next().is_some_and(|b| b.is_ascii_alphabetic())
+            || !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || tags.len() == 64
+            || tags.iter().any(|(seen, _)| *seen == name)
+        {
+            return None;
+        }
+        tags.push((name, value.chars().filter(|c| !c.is_whitespace()).collect()));
+    }
+    Some(tags)
 }
 
-fn tag<'a>(t: &'a [(String, String)], k: &str) -> Option<&'a str> {
-    t.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+fn tag<'a>(t: &'a [(&str, String)], k: &str) -> Option<&'a str> {
+    t.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str())
 }
 
 /// The DKIM-Signature field with its `b=` value removed (§3.7).
@@ -227,7 +235,15 @@ pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) 
             break;
         }
         let colon = memchr(b':', f.bytes).unwrap_or(0);
-        let t = tags(&f.bytes[colon + 1..]);
+        let Some(t) = tags(&f.bytes[colon + 1..]) else {
+            out.push(Signature {
+                domain: String::new(),
+                selector: String::new(),
+                outcome: Outcome::PermError("signature tags"),
+                partial_body: false,
+            });
+            continue;
+        };
         let domain = tag(&t, "d").unwrap_or("").to_ascii_lowercase();
         let selector = tag(&t, "s").unwrap_or("").to_string();
         let mut sig = Signature { domain: domain.clone(), selector: selector.clone(), outcome: Outcome::PermError("malformed"), partial_body: false };
@@ -238,7 +254,7 @@ pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(String, String)], body: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64, partial: &mut bool) -> Outcome {
+fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64, partial: &mut bool) -> Outcome {
     let _ = raw;
     if tag(t, "v") != Some("1") {
         return Outcome::PermError("version");
@@ -287,16 +303,19 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(String, String)], bo
     }
     // the key
     let Some(rec) = key(s, &d.to_ascii_lowercase()) else { return Outcome::NoKey };
-    let kt = tags(rec.as_bytes());
-    if tag(&kt, "v").is_some_and(|v| v != "DKIM1") {
+    if rec.is_empty() {
+        return Outcome::Fail("key absent");
+    }
+    let Some(kt) = tags(rec.as_bytes()) else { return Outcome::PermError("key tags") };
+    if tag(&kt, "v").is_some() && !kt.first().is_some_and(|(name, v)| *name == "v" && v == "DKIM1") {
         return Outcome::PermError("key version");
     }
-    let p = tag(&kt, "p").unwrap_or("");
+    let Some(p) = tag(&kt, "p") else { return Outcome::PermError("key tags") };
     if p.is_empty() {
         return Outcome::Fail("key revoked");
     }
     let k = tag(&kt, "k").unwrap_or("rsa");
-    if (k == "rsa") != (alg == "rsa-sha256") {
+    if !matches!((k, alg), ("rsa", "rsa-sha256") | ("ed25519", "ed25519-sha256")) {
         return Outcome::PermError("key type");
     }
     let pk = base64(p.as_bytes(), 4096);

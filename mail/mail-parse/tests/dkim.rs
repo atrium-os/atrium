@@ -90,6 +90,32 @@ fn no_key_pending_and_revoked() {
 }
 
 #[test]
+fn duplicate_or_malformed_tag_lists_cannot_verify() {
+    let (kp, rec) = ed();
+    let normal = signed("ed25519-sha256", "example.com", " x_extra=note;", &ed_sign(&kp), HEADERS, BODY);
+    let key = |_: &str, _: &str| Some(rec.clone());
+    assert_eq!(dkim::verify(&normal, &key, 0)[0].outcome, Outcome::Pass);
+
+    let repeated = signed("ed25519-sha256", "example.com", " x_extra=one; x_extra=two;", &ed_sign(&kp), HEADERS, BODY);
+    assert_eq!(
+        dkim::verify(&repeated, &|_, _| panic!("malformed signature should not need DNS"), 0)[0].outcome,
+        Outcome::PermError("signature tags"),
+    );
+
+    let extra_tags = (0..64).map(|n| format!("extra_{n}=x;")).collect::<String>();
+    for bad_key in [format!("{rec}; p="), format!("{rec}; extra"), format!("{rec}; {extra_tags}")] {
+        assert_eq!(
+            dkim::verify(&normal, &|_, _| Some(bad_key.clone()), 0)[0].outcome,
+            Outcome::PermError("key tags"),
+        );
+    }
+    let bad_version = rec.replacen("v=DKIM1; ", "x_extra=note; v=DKIM1; ", 1);
+    assert_eq!(dkim::verify(&normal, &|_, _| Some(bad_version.clone()), 0)[0].outcome, Outcome::PermError("key version"));
+    let bad_type = rec.replacen("k=ed25519", "k=unsupported", 1);
+    assert_eq!(dkim::verify(&normal, &|_, _| Some(bad_type.clone()), 0)[0].outcome, Outcome::PermError("key type"));
+}
+
+#[test]
 fn length_limit_and_expiry() {
     let (kp, rec) = ed();
     let key = |_: &str, _: &str| Some(rec.clone());

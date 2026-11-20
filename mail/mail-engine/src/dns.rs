@@ -24,7 +24,9 @@ pub trait Dns {
 /// record. None means a DMARC reply does not establish an alignment policy.
 fn pick(name: &str, records: &[String]) -> Option<String> {
     if !name.starts_with("_dmarc.") {
-        return Some(records.iter().find(|record| record.contains("p=")).cloned().unwrap_or_default());
+        return Some(records.iter().find(|record| {
+            record.split(';').any(|tag| tag.split_once('=').is_some_and(|(name, _)| name.trim() == "p"))
+        }).cloned().unwrap_or_default());
     }
     let mut policies = records.iter().filter(|record| mail_schema::is_dmarc_policy(record));
     let Some(policy) = policies.next() else { return Some(String::new()) };
@@ -83,7 +85,6 @@ mod tests {
         }
         let long_policy = format!("v=DMARC1; p=reject; {}adkim=s", "other=v; ".repeat(70));
         assert_eq!(mail_schema::dmarc_strict(&long_policy), Some(true));
-
     }
 
     #[test]

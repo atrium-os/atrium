@@ -85,7 +85,7 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
     let rec = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
-    dns.0.borrow_mut().records.insert("sel._domainkey.example.com".into(), vec!["unrelated".into(), rec.clone()]);
+    dns.0.borrow_mut().records.insert("sel._domainkey.example.com".into(), vec!["unrelated=p=placeholder".into(), rec.replace("p=", "p = ")]);
     dns.0.borrow_mut().records.insert("_dmarc.example.com".into(), vec!["v=DMARC1; p=reject".into()]);
 
     let account = engine.store.add_account("ada@example.org").unwrap();
