@@ -236,13 +236,23 @@ touch "$D/use-alt-key"
 check_served_key pin-changed "$alternate_key"
 remote "sh -s -- '$guest' '$marker' hold pin" <"$scripts/prelum-r7-identity.sh" >"$D/pin-held.log" 2>&1 || { cat "$D/pin-held.log" >&2; exit 1; }
 cat "$D/pin-held.log"
-remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-held-audit.log"
-grep -Eq 'ui op=0x0068 .*status=0$' "$D/pin-held-audit.log"
-if grep -q 'op=0x0011' "$D/pin-held-audit.log"; then
-    echo "Arca received an unexpected PIN redemption request while the alternate key was active" >&2
-    exit 1
-fi
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/pin-held-pdf-checks.log"
+check_pin_blocked() {
+    audit="$D/pin-$1-audit.log"
+    remote "cat '$guest/fixture-arca/audit.log'" >"$audit"
+    grep -Eq 'ui op=0x0068 .*status=0$' "$audit"
+    if grep -q 'op=0x0011' "$audit"; then
+        echo "Arca received an unexpected PIN redemption request during the $1 check" >&2
+        return 1
+    fi
+    python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
+        "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/pin-$1-pdf-checks.log"
+}
+check_pin_blocked held
+
+check_served_key pin-retry "$alternate_key"
+remote "sh -s -- '$guest' '$marker' retry pin" <"$scripts/prelum-r7-identity.sh" >"$D/pin-retry.log" 2>&1 || { cat "$D/pin-retry.log" >&2; exit 1; }
+cat "$D/pin-retry.log"
+check_pin_blocked retry
 
 mv "$D/use-alt-key" "$D/pin-held-alt-key.txt"
 check_served_key pin-restored "$original_key"

@@ -6070,8 +6070,9 @@ keeping the original UUID. A release with the alternate key still active
 must hold the same job again without creating or uploading a job. Loopback
 TLS probes confirm the alternate key before the initial hold and retry,
 and the original key before the final release. A separate Arca fixture stages a one-use
-PIN bound to the original printer identity. The changed-key hold must have
-zero Arca redemption requests and zero uploads. After restoring the key,
+PIN bound to the original printer identity. The initial changed-key hold
+and a fresh hold after retry must each have zero Arca redemption requests
+and zero uploads. After restoring the key,
 the same job must redeem the PIN once and send it in Create-Job before
 uploading both original PDF pages.
 
