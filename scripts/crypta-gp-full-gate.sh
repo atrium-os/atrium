@@ -1219,6 +1219,14 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                         reconnect_after_esp_loss_decline "$before_change" rebound-reconnect-approved
                                                         finish_hip_reconnect "$rebound_report" rebound-reconnect-ack
                                                         rebind_restored_forwarding 17 "$rebound_report" post-decline-rebind
+                                                        before_refresh=$(awk 'END { print NR }' "$receipts")
+                                                        wait_receipts "$((before_refresh + 1))"
+                                                        [ "$(field signin)" = in ] &&
+                                                            [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$rebound_report" ] &&
+                                                            [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                                                            fail "unchanged HIP did not refresh silently after the post-decline rebind"
+                                                        ok "unchanged HIP refreshed silently after the post-decline rebind"
+                                                        probe "IPv4 echo after HIP refresh on the same post-decline rebound ESP"
                                                         "$V" "$CTL down name=gp-gate" >/dev/null
                                                     fi
                                                     echo "$pass checks passed"

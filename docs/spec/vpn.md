@@ -1067,7 +1067,9 @@ another origin. An active portal-profile session stays in engine memory.
   the fixture withholds acknowledgement of the same report to verify
   IPv4 stays blocked. Crypta reuses approval without prompting, and
   IPv4 resumes on a new ESP association after acknowledgement. The
-  FreeBSD arm64 gate passed 90/90 using the shared Cargo cache.
+  next timer refresh submits the identical report without prompting,
+  and IPv4 echo continues on the same association. The FreeBSD arm64
+  gate passed 92/92 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
