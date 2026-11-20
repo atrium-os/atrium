@@ -230,7 +230,16 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
         _ => "",
     };
     let sigs = if !from_domain.is_empty() && s.dkim_signatures > 0 && !ctx.headers_only {
-        dkim::verify(raw, &|sel, dom| lookup(format!("{sel}._domainkey.{dom}")), ctx.now)
+        let org = dkim::org_domain(from_domain);
+        let answers = RefCell::new(BTreeMap::new());
+        dkim::verify(raw, &|sel, dom| {
+            // A key from another organization cannot authenticate this From.
+            if dom != from_domain && dkim::org_domain(dom) != org {
+                return None;
+            }
+            let name = format!("{sel}._domainkey.{dom}").to_ascii_lowercase();
+            answers.borrow_mut().entry(name.clone()).or_insert_with(|| lookup(name)).clone()
+        }, ctx.now)
     } else { Vec::new() };
     // DMARC only decides strict alignment, so it is looked up only when a
     // signature passed and could count.

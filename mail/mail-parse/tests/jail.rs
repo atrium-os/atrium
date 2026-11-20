@@ -21,8 +21,12 @@ fn b64(data: &[u8]) -> String {
 
 /// An Ed25519-signed message (simple/simple, so the signed bytes are literal).
 fn signed(kp: &Ed25519KeyPair, headers: &str, body: &str) -> Vec<u8> {
+    signed_by(kp, "example.com", headers, body)
+}
+
+fn signed_by(kp: &Ed25519KeyPair, domain: &str, headers: &str, body: &str) -> Vec<u8> {
     let bh = b64(ring::digest::digest(&ring::digest::SHA256, body.as_bytes()).as_ref());
-    let field = format!("DKIM-Signature: v=1; a=ed25519-sha256; c=simple/simple; d=example.com; s=sel; h=from:subject:content-type; bh={bh}; b=");
+    let field = format!("DKIM-Signature: v=1; a=ed25519-sha256; c=simple/simple; d={domain}; s=sel; h=from:subject:content-type; bh={bh}; b=");
     let mut data = headers.as_bytes().to_vec();
     data.extend_from_slice(field.as_bytes());
     let sig = kp.sign(ring::digest::digest(&ring::digest::SHA256, &data).as_ref());
@@ -92,6 +96,48 @@ fn a_batch_is_summarized_with_keys_from_the_engine() {
     // Only key and DMARC lookups, and the unsigned message asked for none.
     assert!(e.queries.iter().all(|q| q == "sel._domainkey.example.com" || q == "_dmarc.example.com"), "{:?}", e.queries);
     e.finish();
+}
+
+#[test]
+fn sender_verification_only_looks_up_relevant_distinct_keys() {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let key = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let mut raw = Vec::new();
+    for i in 1..=6 {
+        let other = signed_by(&kp, &format!("relay{i}.example.net"), HEADERS, BODY);
+        let header_end = other.iter().position(|&byte| byte == b'\n').unwrap();
+        raw.extend_from_slice(&other[..=header_end]);
+    }
+    let aligned = signed_by(&kp, "outbound.example.com", HEADERS, BODY);
+    let header_end = aligned.iter().position(|&byte| byte == b'\n').unwrap();
+    raw.extend_from_slice(&aligned[..=header_end]);
+    raw.extend_from_slice(&aligned);
+
+    let raw_len = raw.len() as u64;
+    let mut engine = Engine::start();
+    engine.send(&ToJail::Summarize {
+        authserv_id: None,
+        me: vec![],
+        now: 0,
+        headers_only: false,
+        roots: vec![],
+        batch: vec![wire::Raw { id: 1, bytes: raw }],
+    });
+    let output = engine.run(raw_len, &|name| match name {
+        "sel._domainkey.outbound.example.com" => Some(key.clone()),
+        "_dmarc.example.com" => Some("v=DMARC1; p=reject; adkim=r".into()),
+        _ => panic!("unexpected DNS lookup: {name}"),
+    });
+    let [FromJail::Summary { id: 1, result: Ok(summary) }] = output.as_slice() else {
+        panic!("unexpected frames: {output:?}");
+    };
+    assert_eq!(summary.sender_check, wire::SenderCheck::Verified {
+        domain: "example.com".into(),
+        by_provider: false,
+    });
+    assert_eq!(engine.queries, ["sel._domainkey.outbound.example.com", "_dmarc.example.com"]);
+    engine.finish();
 }
 
 #[test]

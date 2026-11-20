@@ -572,6 +572,9 @@ What Mail shows comes from what was checked, never from what the message says ab
   Malformed encodings and trailing data cannot verify.
   A selector may contain multiple DNS labels. Mail checks each label and
   rejects lookup names longer than 253 characters before requesting a key.
+  For the sender badge, Mail looks up only DKIM keys whose signing domain
+  could align with the From domain. Repeated queries for the same key reuse
+  the first answer within the message.
   [RFC 6376 §3.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.1)
   [RFC 6376 §§3.2, 3.5 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup
