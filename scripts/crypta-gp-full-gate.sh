@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-rebound-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=22 ;;
     esp-loss-hip-active-refresh-recovered-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=21 ;;
     esp-loss-hip-active-refresh-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=20 ;;
     esp-loss-hip-active-refresh-rebind-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=19 ;;
@@ -1200,6 +1201,17 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                     fail "rebound ESP reused the prior HIP choice"
                                                 if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
                                                     fail "rebound ESP submitted changed HIP before approval"
+                                                fi
+                                                if [ "$retry_hip_submit" = 22 ]; then
+                                                    rebound_iface=$(field iface)
+                                                    [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
+                                                    decline_esp_loss_review 15 "$rebound_iface"
+                                                    if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
+                                                        fail "rebound ESP submitted the declined forwarding report"
+                                                    fi
+                                                    ok "declining changed forwarding on rebound ESP withheld HIP and stopped IPv4"
+                                                    echo "$pass checks passed"
+                                                    exit 0
                                                 fi
                                                 before_approval=$(awk 'END { print NR }' "$receipts")
                                                 touch "$receipts.rebound-forwarding-approved"
