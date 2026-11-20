@@ -6044,7 +6044,8 @@ job-list snapshots into `guest-artifacts.tar.gz`, including after a failed check
 Successful runs remove the disposable disk overlay and EFI variables after
 QEMU exits cleanly. Set `PRELUM_R7_KEEP_VM=1` to keep them. Failed runs keep
 the overlay and EFI variables for diagnosis.
-Prelum must reach Done for each desktop job. The gate also requires a
+Prelum must reach Done and report the expected completed and total sheet
+counts for each desktop job. The gate also requires a
 newly observed jailed IPP worker between submission and Done for each job.
 Its real and effective UID and GID must match an ID in Prelum’s worker pool
 (62000–62499). After all jobs finish, the gate waits up to 90 seconds for

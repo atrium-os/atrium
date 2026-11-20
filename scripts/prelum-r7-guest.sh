@@ -118,7 +118,16 @@ key() { printf '%s\n' "KEY $1 1 $2" "KEY $1 0 $2" | nc -N -U inject.sock; }
 wait_job() {
   for i in $(seq 35); do
     "$P/prelumctl" --socket "$P/print.sock" jobs > jobs.txt
-    if grep -Eq "^ +$1 +printer .*Done" jobs.txt; then cat jobs.txt; return; fi
+    completed=$(awk -v job="$1" '$1 == job && $2 == "printer" && $4 == "Done" { print $5 }' jobs.txt)
+    if [ -n "$completed" ]; then
+      cat jobs.txt
+      if [ "$completed" != "$2/$2" ]; then
+        echo "Job $1 reported $completed sheets; expected $2/$2" >&2
+        return 1
+      fi
+      printf 'job %s: verified %s completed sheets\n' "$1" "$completed" >>job-sheets.log
+      return
+    fi
     sleep 1
   done
   cat jobs.txt sheet.log
@@ -127,7 +136,7 @@ wait_job() {
 submit_job() {
   sample_offset=$(wc -l < worker.log)
   press "$2" "$3"
-  wait_job "$1"
+  wait_job "$1" "$4"
   if ! awk -v offset="$sample_offset" -v job="$1" '
     NR <= offset { seen[$1] = 1; next }
     !($1 in seen) {
@@ -180,7 +189,7 @@ mv replacement files/quicklook.html
 press 915 112
 preview 'previews: 4 of 4' 1
 cp screen.png html-preview.png
-submit_job 1 779 534
+submit_job 1 779 534 4
 sleep 3
 kill -TERM "$(cat scrinium.pid)"
 sleep 2
@@ -188,7 +197,7 @@ start_app atrium-sheets sheets-proof.xlsx
 key 19 1
 preview 'previews: 1 of 1' 1
 cp screen.png sheets-preview.png
-submit_job 2 849 553
+submit_job 2 849 553 1
 sleep 3
 kill -TERM "$(cat atrium-sheets.pid)"
 sleep 2
@@ -198,7 +207,7 @@ sleep 2
 press 332 145
 preview 'previews: 2 of 2' 1
 cp screen.png slides-hidden-off-preview.png
-submit_job 3 899 553
+submit_job 3 899 553 2
 sleep 3
 # Toggle Include Hidden Slides in the Print menu and pick the same handout.
 press 286 23
@@ -210,14 +219,14 @@ preview 'previews: 2 of 2' 2
 press 885 306
 sleep 7
 cp screen.png slides-hidden-on-letter-preview.png
-submit_job 4 899 553
+submit_job 4 899 553 2
 sleep 3
 # Keep Include Hidden Slides enabled for speaker notes.
 press 286 23
 press 332 90
 preview 'previews: 8 of 10' 1
 cp screen.png slides-notes-hidden-on-preview.png
-submit_job 5 899 553
+submit_job 5 899 553 10
 sleep 3
 # Turn Include Hidden Slides off and print the same deck's notes again.
 press 286 23
@@ -226,7 +235,7 @@ press 286 23
 press 332 90
 preview 'previews: 8 of 9' 1
 cp screen.png slides-notes-hidden-off-preview.png
-submit_job 6 899 553
+submit_job 6 899 553 9
 sleep 3
 kill -TERM "$(cat atrium-slides.pid)"
 sleep 2
@@ -251,7 +260,7 @@ echo "Mail: cancelling the print preview queued no job"
 press 1234 34
 preview 'previews: 3 of 3' 2
 cp screen.png mail-preview.png
-submit_job 7 940 551
+submit_job 7 940 551 3
 sleep 3
 kill -TERM "$(cat mail.pid)"
 sleep 2
@@ -267,7 +276,7 @@ mv text-replacement text-files/quicklook-proof.txt
 press 915 112
 preview 'previews: 5 of 5' 1
 cp screen.png text-preview.png
-submit_job 8 779 534
+submit_job 8 779 534 5
 sleep 3
 kill -TERM "$(cat scrinium-text.pid)"
 sleep 2
@@ -281,7 +290,7 @@ grep 'picture 120x60' limend.log
 press 915 112
 preview 'previews: 1 of 1' 2
 cp screen.png image-preview.png
-submit_job 9 779 534
+submit_job 9 779 534 1
 sleep 3
 kill -TERM "$(cat scrinium-image.pid)"
 sleep 2
@@ -296,14 +305,14 @@ mv replacement.pdf pdf-files/quicklook.pdf
 press 915 112
 preview 'previews: 2 of 2' 3
 cp screen.png pdf-preview.png
-submit_job 10 779 534
+submit_job 10 779 534 2
 sleep 3
 # Focus the PDF viewer and use its print shortcut on the retained preview.
 press 748 304
 key 19 1
 preview 'previews: 2 of 2' 4
 cp screen.png pdf-shortcut-preview.png
-submit_job 11 779 534
+submit_job 11 779 534 2
 cat worker-jobs.log
 
 
