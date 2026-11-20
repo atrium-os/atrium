@@ -150,3 +150,11 @@ With two edited workbooks pending, the fixture held the runtime launch for `Proo
 Releasing the hold opened `Proof.csv` in its original slot with the same recovery ID. The reader verified `zebra` and then `zebra,2`. The fixture counted one start for the delayed jail. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `direct` or `refresh`.
 
 Direct and refreshed selection passed on native Tessera. Refreshed selection passed with bounded UFS volumes in the same isolated Tessera-root VM. The single-pending-workbook regression, all seven IPC tests, and five focused recovery-marker tests also passed.
+
+## A listed sibling goes offline during a delayed launch
+
+The launcher showed the startup notice for `Proof.csv` with `Untitled` still selectable. The fixture confirmed that only the first recovery image was attached, moved the sibling’s image aside, and selected its existing row. The launcher displayed “The recovery image for ‘Untitled’ is unavailable.” Both recoveries remained pending, the sibling marker stayed byte-identical, and no document jail had opened while the first launch was held.
+
+With the sibling image still offline, releasing the first launch reopened `Proof.csv` once, in its original slot and with the same recovery ID. An independent reader verified `zebra` after Save As and `zebra,2` after Save. Restoring the sibling image with its original SHA-256 digest allowed the protected workbook to recover and save `fox,2`. Both markers and recovery devices cleared after close. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `unavailable`.
+
+The gate passed on native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both runs matched the same named-error screenshot.

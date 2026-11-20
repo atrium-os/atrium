@@ -13,7 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
-# --delayed-start-sibling keeps the protected workbook selectable; pass direct or refresh after the broker path.
+# --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, or unavailable after the broker path.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -503,7 +503,13 @@ exec /usr/sbin/jail "$@"
 SH
     chmod 755 "$bin/jail"
     touch "$bin/hold"
+    restore_sibling() {
+        if test -f "$results/offline.image"; then
+            test ! -e "$sibling_image" && mv "$results/offline.image" "$sibling_image"
+        fi
+    }
     restore_broker() {
+        restore_sibling
         if test -e "$bin/hold"; then unlink "$bin/hold"; fi
         fixture_broker "$broker"
         restart_broker
@@ -541,11 +547,31 @@ SH
             cp selectscreen.png "$results/repeated.png"
             cmp "$results/starting.png" "$results/repeated.png"
             ;;
-        direct) test "$1" = --delayed-start-sibling ;;
+        direct|unavailable) test "$1" = --delayed-start-sibling ;;
         *) exit 2 ;;
     esac
     count 0; test "$(wc -l < "$bin/attempts")" -eq 1
-    if test "$1" = --delayed-start-sibling; then
+    if test "${3:-}" = unavailable; then
+        store=$(dirname "$marker")
+        sibling_image="$store/1.img"
+        if test -f "$store/1.ufs"; then sibling_image="$store/1.ufs"; fi
+        mdconfig -lv > "$results/held.devices"
+        grep -F "$store/0." "$results/held.devices" >/dev/null
+        if grep -F "$sibling_image" "$results/held.devices"; then exit 1; fi
+        digest=$(sha256 -q "$sibling_image")
+        cp "$store/1.pending" "$results/sibling.marker"
+        mv "$sibling_image" "$results/offline.image"
+        offset=$(wc -l < select-port.log)
+        click 120 96
+        refused() { tail -n "+$((offset+1))" select-port.log | grep -Fq 'checking detached workbook slot 1:'; }
+        wait_for refused
+        # The headless launcher reads “The recovery image for ‘Untitled’ is unavailable.”
+        sibling_error() { test "$(sha256 -q selectscreen.png)" = 4b53bd18aab2d35e4d5ff6918b5b25b1847ff63bd11224e0d2bd734c0fd19f71; }
+        wait_for sibling_error
+        cp selectscreen.png "$results/unavailable.png"
+        test -f "$bin/hold"; count 0; pending 2
+        cmp "$store/1.pending" "$results/sibling.marker"
+    elif test "$1" = --delayed-start-sibling; then
         click 120 96; wait_for count 1
         sibling=$(docs)
         test "$(root "$sibling")" != "$plain_root"
@@ -558,7 +584,18 @@ SH
     wait_for pgrep -x -j "$jid" atrium-sheets
     test "$(root "$jid")" = "$plain_root"
     sed 's/,"name":.*//' "$marker" | cmp -s - "$results/original.id"
-    save_copy plain; wait_for pending 0
+    save_copy plain
+    if test "${3:-}" = unavailable; then
+        wait_for pending 1
+        test ! -e "$sibling_image"
+        cmp "$store/1.pending" "$results/sibling.marker"
+        restore_sibling
+        test "$(sha256 -q "$sibling_image")" = "$digest"
+        click 213 24; wait_for count 1
+        wait_for opened "$(docs)" Untitled
+        sleep .6; save_copy protected
+    fi
+    wait_for pending 0
     test "$(wc -l < "$bin/attempts")" -eq 1
     test -z "$(mdconfig -lv | grep sheets-recovery)"
     restore_broker; trap - EXIT
