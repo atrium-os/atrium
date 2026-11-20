@@ -845,9 +845,10 @@ embeds. Frames, launcher logs and executable hashes are in
 Navigator now restricts its UI's delegated Limen connection before handing
 over the descriptor. The UI can open its document viewer, credential field
 and print sheet. The private island fetch transport requires a separate
-broker connection. For guarded actions navigatord checks the window ID
-returned by frescod when it consumes the token against the UI connection's
-registered window. The widget question retains the exact recorded source
+broker connection. For guarded actions the UI registers its renderer-local ID for the origin
+strip and its compositor-issued embed token for the prompt. Frescod resolves
+the window token and checks the press against that compositor window before
+spending it. The widget question retains the exact recorded source
 alongside its origin and key. A replacement source retires the old question
 even when the UI's rate limit delays the replacement or the replacement is
 absent from the recording.
@@ -862,6 +863,14 @@ accepted one from the registered window. UI tests exercised same-key source
 replacement, withdrawal and the current recording's origin. The three guest
 executables matched their staged SHA-256 hashes. Test logs and shutdown
 evidence are in `~/atrium-vm/evidence/navigator-i1-delegation-20261120/`.
+
+The earlier broker test supplied the same numeric window ID on both sides.
+In split mode a renderer assigns local IDs and the compositor assigns global
+IDs. The window-token request removes that numeric comparison. The live
+activation probe submits a press for a second live window of the same uid,
+then submits the same press for the intended window and checks replay. It
+prints the local and compositor IDs for the successful receipt. The broker
+regression passed on the Mac. The split-renderer guest run is pending.
 
 Next, have the installed Navigator broker spend a guarded chrome activation
 for the current document and selected widget. Use its tracked bounds to place

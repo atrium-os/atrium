@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aqueduct::flag;
-use fresco_protocol::activation::{op, purpose, refusal, Consume, ConsumeResult, NONE};
+use fresco_protocol::activation::{op, refusal, ConsumePrompt, ConsumeResult, NONE};
 
 pub struct Frescod {
     path: PathBuf,
@@ -24,17 +24,17 @@ impl Frescod {
         Frescod { path: path.into(), conn: None }
     }
 
-    fn ask(&mut self, c: Consume) -> std::io::Result<ConsumeResult> {
+    fn ask(&mut self, c: ConsumePrompt) -> std::io::Result<ConsumeResult> {
         if self.conn.is_none() {
             self.conn = Some(aqueduct::Connection::connect(&self.path)?);
         }
         let conn = self.conn.as_mut().unwrap();
         let bad = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
         let payload = postcard::to_stdvec(&c).map_err(|e| bad(e.to_string()))?;
-        conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, flag::RESPONSE_EXPECTED, &payload)?;
+        conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME_PROMPT, flag::RESPONSE_EXPECTED, &payload)?;
         conn.set_read_timeout(Some(Duration::from_millis(500)))?;
         let m = conn.recv_message()?;
-        if m.op != op::CONSUME || m.flags & flag::IS_RESPONSE == 0 {
+        if m.op != op::CONSUME_PROMPT || m.flags & flag::IS_RESPONSE == 0 {
             return Err(bad("unexpected reply".into()));
         }
         postcard::from_bytes(&m.payload).map_err(|e| bad(e.to_string()))
@@ -42,14 +42,14 @@ impl Frescod {
 
     /// Spend `press`, presented by the UI running as `uid`: `Ok` or why not,
     /// in words for the UI.
-    pub fn spend(&mut self, press: [u8; 16], uid: u32, window: u32) -> Result<(), String> {
+    pub fn spend(&mut self, press: [u8; 16], uid: u32, window: [u8; 16]) -> Result<(), String> {
         if press == NONE {
             return Err("no press from the screen came with it".into());
         }
-        match self.ask(Consume { token: press, presenter_uid: uid, purpose: purpose::PROMPT }) {
-            Ok(ConsumeResult::Ok { window_id, .. }) if window_id == window => Ok(()),
-            Ok(ConsumeResult::Ok { .. }) => Err("the press belongs to another window".into()),
+        match self.ask(ConsumePrompt { press, presenter_uid: uid, window }) {
+            Ok(ConsumeResult::Ok { .. }) => Ok(()),
             Ok(ConsumeResult::Refused { reason }) => Err(match reason {
+                refusal::WRONG_WINDOW => "the press belongs to another window".into(),
                 refusal::OBSCURED => "something was over the question, or it had just moved".into(),
                 refusal::EXPIRED => "the press was too long ago".into(),
                 refusal::NOT_FOCUSED => "the window lost the focus".into(),
@@ -94,19 +94,22 @@ mod tests {
             let mut conn = aqueduct::Connection::wrap(server).unwrap();
             for token in [[1; 16], [2; 16]] {
                 let m = conn.recv_message().unwrap();
-                assert_eq!(m.op, op::CONSUME);
-                let c: Consume = postcard::from_bytes(&m.payload).unwrap();
-                assert_eq!((c.token, c.presenter_uid, c.purpose), (token, 4101, purpose::PROMPT));
-                let result = ConsumeResult::Ok { window_id: 17, kind: fresco_protocol::activation::kind::BUTTON,
-                    minted_ns: 42, drag_id: 0 };
-                conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME, flag::IS_RESPONSE,
+                assert_eq!(m.op, op::CONSUME_PROMPT);
+                let c: ConsumePrompt = postcard::from_bytes(&m.payload).unwrap();
+                assert_eq!((c.press, c.presenter_uid), (token, 4101));
+                let result = if c.window == [18; 16] { ConsumeResult::Refused { reason: refusal::WRONG_WINDOW } } else {
+                    assert_eq!(c.window, [17; 16]);
+                    ConsumeResult::Ok { window_id: 42, kind: fresco_protocol::activation::kind::BUTTON,
+                    minted_ns: 42, drag_id: 0 }
+                };
+                conn.send_message(aqueduct::classes::CLASS_DISPLAY, op::CONSUME_PROMPT, flag::IS_RESPONSE,
                     &postcard::to_stdvec(&result).unwrap()).unwrap();
             }
         });
         let mut fresco = Frescod { path: PathBuf::new(), conn: Some(aqueduct::Connection::wrap(client).unwrap()) };
-        assert!(fresco.spend(NONE, 4101, 17).is_err());
-        assert!(fresco.spend([1; 16], 4101, 18).is_err());
-        assert!(fresco.spend([2; 16], 4101, 17).is_ok());
+        assert!(fresco.spend(NONE, 4101, [17; 16]).is_err());
+        assert!(fresco.spend([1; 16], 4101, [18; 16]).is_err());
+        assert!(fresco.spend([2; 16], 4101, [17; 16]).is_ok());
         worker.join().unwrap();
     }
 }

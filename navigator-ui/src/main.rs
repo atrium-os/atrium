@@ -208,7 +208,6 @@ fn main() -> std::io::Result<()> {
     match &mut live {
         Some(l) => {
             l.dark = theme == Some(Semantic::DARK);
-            l.window(window.id());
             // limend over navigatord's connection when it opened one for us.
             let embeds = match limen_fd.take() {
                 Some(fd) => aqueduct::Connection::wrap(std::os::unix::net::UnixStream::from(fd))
@@ -227,7 +226,9 @@ fn main() -> std::io::Result<()> {
                     return Ok(());
                 }
             }
-            l.embed(embeds, window.embed_token().unwrap());
+            let token = window.embed_token().unwrap();
+            l.window(window.id(), token);
+            l.embed(embeds, token);
         }
         None => window.set_slot_binder(Box::new(LogBinder)),
     }

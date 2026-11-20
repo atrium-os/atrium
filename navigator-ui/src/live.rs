@@ -267,8 +267,8 @@ impl Live {
     }
 
     /// The window navigatord names: its id on the connection it opened.
-    pub fn window(&mut self, id: u32) {
-        send(&mut self.w, &Request::Window { window: id });
+    pub fn window(&mut self, id: u32, token: WindowToken) {
+        send(&mut self.w, &Request::RegisterWindow { window: id, token });
     }
 
     /// limend, and the window's token for it.

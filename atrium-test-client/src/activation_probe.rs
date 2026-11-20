@@ -467,6 +467,9 @@ fn main() {
     // press in its window is spent on PROMPT only while frescod sees the
     // rect whole, uncovered and still for 500 ms, whoever's window covers it.
     let (mut gw, gid) = window(sock, (100, 620), (500, 120), [0.85, 0.9, 0.95, 1.0]);
+    let guarded_window = token_of(&mut gw);
+    assert_ne!(guarded_window, [0; 16]);
+    assert_ne!(guarded_window, et);
     gw.window_guard(gid, Some([0, 20, 500, 44])).unwrap(); // screen (100, 640) to (600, 684)
     let prompt = |p: &mut Probe, c: &mut Connection, x: i32, y: i32| -> u8 {
         while let Ok(Some(_)) = c.wait_event(Some(Duration::from_millis(50))) {}
@@ -477,7 +480,18 @@ fn main() {
             let until = Instant::now() + Duration::from_millis(100);
             while Instant::now() < until {
                 if let Ok(Some(Event::PointerButton { pressed: true, activation, .. })) = c.wait_event(Some(Duration::from_millis(20))) {
-                    return refused(p.consume(activation, p.uid, purpose::PROMPT));
+                    let mut spend = |window| {
+                        let ask = fresco_protocol::activation::ConsumePrompt { press: activation, presenter_uid: p.uid, window };
+                        let bytes = p.ask(op::CONSUME_PROMPT, fresco_protocol::encode(&ask).unwrap());
+                        fresco_protocol::decode::<ConsumeResult>(&bytes).unwrap()
+                    };
+                    assert_eq!(refused(spend(et)), refusal::WRONG_WINDOW, "another live window of this uid");
+                    let receipt = spend(guarded_window);
+                    if let ConsumeResult::Ok { window_id, .. } = receipt {
+                        println!("guarded receipt: local={gid} compositor={window_id}");
+                        assert_eq!(refused(spend(guarded_window)), refusal::WRONG_WINDOW);
+                    }
+                    return refused(receipt);
                 }
             }
         }

@@ -2670,6 +2670,8 @@ pub mod activation {
         /// by the caller that spent it, once per press, within
         /// five seconds; frescod writes the words.
         pub const NOTE: u16 = 0x0903;
+        /// Spend a PROMPT press only in the window identified by its embed token.
+        pub const CONSUME_PROMPT: u16 = 0x0904;
     }
 
     /// What a strip note says; frescod words it.
@@ -2735,6 +2737,13 @@ pub mod activation {
         pub purpose: u8,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ConsumePrompt {
+        pub press: Token,
+        pub presenter_uid: u32,
+        pub window: Token,
+    }
+
     /// Refusal reasons, for the broker's audit log.
     pub mod refusal {
         pub const UNKNOWN: u8 = 1;
@@ -2745,6 +2754,7 @@ pub mod activation {
         pub const NOT_ALLOWED: u8 = 6;
         /// `FILL`: the slot was not fully visible and still (arca-autofill.md §4).
         pub const OBSCURED: u8 = 7;
+        pub const WRONG_WINDOW: u8 = 8;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

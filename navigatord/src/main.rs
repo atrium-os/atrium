@@ -911,6 +911,7 @@ fn origin(url: &str) -> Option<String> {
 struct Strip {
     chan: Option<(fresco_split::chan::Chan, u32)>,
     window: Option<u32>,
+    window_token: Option<[u8; 16]>,
     latest: u32,
 }
 
@@ -1044,7 +1045,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
         let ui_uid = *presenter_s.lock().unwrap();
         match (&mut presses, ui_uid) {
             (Some(f), Some(uid)) => {
-                let window = press_strip.lock().unwrap().window.ok_or("the UI has no window")?;
+                let window = press_strip.lock().unwrap().window_token.ok_or("the UI has no window")?;
                 f.spend(p, uid, window)
             }
             (Some(_), None) => Err("the UI's uid is unknown".into()),
@@ -1160,7 +1161,17 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
-            Request::Window { window } => strip.lock().unwrap().window = Some(window),
+            Request::Window { window } => {
+                let mut st = strip.lock().unwrap();
+                if st.window_token.is_none() { st.window = Some(window); }
+            }
+            Request::RegisterWindow { window, token } => {
+                let mut st = strip.lock().unwrap();
+                if st.window_token.is_none() && token != [0; 16] {
+                    st.window = Some(window);
+                    st.window_token = Some(token);
+                }
+            }
             Request::Blank => {
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;

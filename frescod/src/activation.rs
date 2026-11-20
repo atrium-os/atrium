@@ -751,6 +751,22 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                 Ok(_) => refused(refusal::NOT_ALLOWED),
                 Err(_) => refused(refusal::UNKNOWN),
             }),
+            op::CONSUME_PROMPT => fresco_protocol::encode(&match fresco_protocol::decode::<fresco_protocol::activation::ConsumePrompt>(&msg.payload) {
+                Ok(q) if may_consume.as_ref().is_some_and(|m| may_spend(m, purpose::PROMPT))
+                    || self_spend(uid, &Consume { token: q.press, presenter_uid: q.presenter_uid, purpose: purpose::PROMPT }) => {
+                    let window = comp.lock().unwrap().window_by_token(&q.window);
+                    let now = now_ns();
+                    let mut tokens = table().lock().unwrap();
+                    match window {
+                        Some(w) if tokens.live.get(&q.press).is_some_and(|e| e.window_id == u32::from(w)) =>
+                            tokens.consume(now, &q.press, q.presenter_uid, purpose::PROMPT, focused,
+                                |w, minted| crate::credential::visible_for_purpose(purpose::PROMPT, w, minted, now)),
+                        _ => refused(refusal::WRONG_WINDOW),
+                    }
+                }
+                Ok(_) => refused(refusal::NOT_ALLOWED),
+                Err(_) => refused(refusal::UNKNOWN),
+            }),
             op::GRANT => fresco_protocol::encode(&match fresco_protocol::decode::<Grant>(&msg.payload) {
                 Ok(g) if may_grant => table().lock().unwrap().grant(now_ns(), &g.token, uid, g.for_uid, g.purpose),
                 Ok(_) => GrantResult::Refused { reason: refusal::NOT_ALLOWED },

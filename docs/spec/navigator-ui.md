@@ -1396,7 +1396,11 @@ Each step runs in the VM on headless frescod before the next.
      and Open go to navigatord with the press's activation token, and navigatord
      (a consumer on frescod's activation socket, `NAVIGATORD_ACTIVATION`, required unless
      testing) spends it with the new purpose `PROMPT`, which frescod grants only if the
-     row was so for 500 ms up to the press. A refused press does nothing (the file and
+     row was so for 500 ms up to the press. The UI registers its renderer-local window ID and compositor
+     embed token together. The broker sends the embed token with the press
+     and presenter uid in `CONSUME_PROMPT` (0x0904). Frescod resolves the
+     live window and matches it to the press before consumption, preserving
+     the press on a window mismatch. A refused press does nothing (the file and
      the hand-off stay held), navigatord answers `PressRefused`, and the question comes
      back in front with its own 500 ms. Checked by frescod unit tests
      (`a_windows_guard_is_watched_like_a_slot`,

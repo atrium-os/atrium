@@ -193,6 +193,8 @@ pub enum Request {
     RunLive { url: String, jar: Jar, press: Press },
     /// Open and send the recorded island sources before Opened, with the same id.
     OpenWithIslands { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
+    /// Renderer-local ID for the origin strip and compositor token for guarded actions.
+    RegisterWindow { window: u32, token: [u8; 16] },
 }
 
 /// The single whole-page fixture granted during I0.
