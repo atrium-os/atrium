@@ -202,11 +202,6 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
     if flags & 0x0200 != 0 {
         return Err(ErrorCode::Dns); // truncated
     }
-    match flags & 0x000F {
-        0 => {}
-        3 => return Ok((Vec::new(), flags & 0x0020 != 0)),
-        _ => return Err(ErrorCode::Dns),
-    }
     let (qd, an) = (u16_at(m, 4).ok_or(bad)?, u16_at(m, 6).ok_or(bad)?);
     if qd != 1 {
         return Err(bad);
@@ -215,17 +210,57 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
     if !qname.eq_ignore_ascii_case(name) || u16_at(m, i) != Some(qtype(kind)) || u16_at(m, i + 2) != Some(1) {
         return Err(bad);
     }
+    let secure = flags & 0x0020 != 0;
+    match flags & 0x000F {
+        0 => {}
+        3 => return Ok((Vec::new(), secure)),
+        _ => return Err(ErrorCode::Dns),
+    }
+
     i += 4;
-    let mut out = Vec::new();
+    let mut aliases = Vec::new();
+    let mut records = Vec::new();
     for _ in 0..an {
-        let (_, j) = name_at(m, i).ok_or(bad)?;
+        let (owner, j) = name_at(m, i).ok_or(bad)?;
         let (t, class, len) = (u16_at(m, j).ok_or(bad)?, u16_at(m, j + 2).ok_or(bad)?, u16_at(m, j + 8).ok_or(bad)? as usize);
         let at = j + 10;
         let data = m.get(at..at + len).ok_or(bad)?;
         i = at + len;
-        // Others (a CNAME the resolver followed, say) are passed over.
-        if t != qtype(kind) || class != 1 || out.len() >= RECORDS_MAX {
+        if class != 1 {
             continue;
+        }
+        if t == 5 {
+            let (target, end) = name_at(m, at).ok_or(bad)?;
+            if end != i || target.is_empty() {
+                return Err(bad);
+            }
+            aliases.push((owner, target));
+        } else if t == qtype(kind) {
+            records.push((owner, at, data));
+        }
+    }
+
+    // Resolve the chain from the question before choosing records, so the
+    // result is independent of the order of the answer records.
+    let mut chain = vec![qname.as_str()];
+    let terminal = loop {
+        let owner = *chain.last().unwrap();
+        let mut targets = aliases.iter().filter(|(alias, _)| alias == owner);
+        let Some((_, target)) = targets.next() else { break owner };
+        if targets.any(|(_, other)| other != target) || chain.contains(&target.as_str()) || chain.len() == 9 {
+            return Err(bad);
+        }
+        chain.push(target);
+    };
+
+    let mut out = Vec::new();
+    let mut matching = records.iter().filter(|(owner, _, _)| owner == terminal).peekable();
+    if !records.is_empty() && matching.peek().is_none() {
+        return Err(bad);
+    }
+    for &(_, at, data) in matching {
+        if out.len() >= RECORDS_MAX {
+            break;
         }
         let r = match kind {
             RecordKind::Txt => {
@@ -252,7 +287,7 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
         };
         out.push(r);
     }
-    Ok((out, flags & 0x0020 != 0))
+    Ok((out, secure))
 }
 
 /// At most this many addresses from one answer.
@@ -467,21 +502,69 @@ mod tests {
     }
 
     #[test]
+    fn lookup_follows_only_the_questions_alias_chain() {
+        fn encode_name(name: &str) -> Vec<u8> {
+            let mut out = Vec::new();
+            for label in name.split('.') {
+                out.push(label.len() as u8);
+                out.extend_from_slice(label.as_bytes());
+            }
+            out.push(0);
+            out
+        }
+
+        let name = "key.example";
+        let alias = "alias.example";
+        let target = "records.example";
+        let other = "other.example";
+        let q = query(1, name, RecordKind::Txt);
+        let reply_with_owners = |records: &[(&str, u16, Vec<u8>)]| {
+            let mut packet = reply(&q, 0, &[]);
+            packet[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+            for (owner, kind, data) in records {
+                packet.extend(encode_name(owner));
+                packet.extend(kind.to_be_bytes());
+                packet.extend([0, 1, 0, 0, 0, 60]);
+                packet.extend((data.len() as u16).to_be_bytes());
+                packet.extend(data);
+            }
+            packet
+        };
+        let read = |packet: &[u8]| answer(packet, 1, name, RecordKind::Txt);
+        let unrelated = (other, 16, b"\x05other".to_vec());
+        let linked = reply_with_owners(&[
+            unrelated.clone(),
+            (target, 16, b"\x03key".to_vec()),
+            (alias, 5, encode_name(target)),
+            (name, 5, encode_name(alias)),
+        ]);
+        assert_eq!(read(&linked), Ok((vec![Record::Txt("key".into())], false)));
+        assert_eq!(read(&reply_with_owners(&[unrelated])), Err(ErrorCode::Malformed));
+
+        let cyclic = reply_with_owners(&[(name, 5, encode_name(alias)), (alias, 5, encode_name(name))]);
+        assert_eq!(read(&cyclic), Err(ErrorCode::Malformed));
+        let competing = reply_with_owners(&[(name, 5, encode_name(alias)), (name, 5, encode_name(target))]);
+        assert_eq!(read(&competing), Err(ErrorCode::Malformed));
+    }
+
+    #[test]
     fn queries_and_answers() {
         assert_eq!(nameservers("# x\nnameserver 127.0.0.1\nsearch a\nnameserver fe80::1%em0\n"), vec!["127.0.0.1".parse::<IpAddr>().unwrap(), "fe80::1".parse().unwrap()]);
         let q = query(0x1234, "sel._domainkey.example.com", RecordKind::Txt);
         assert_eq!(&q[..4], &[0x12, 0x34, 0x01, 0x20]);
-        // A TXT split into two strings, a CNAME passed over, AD set.
+        // A TXT split into two strings, with AD set.
         let mut txt = vec![5];
         txt.extend_from_slice(b"v=DKI");
         txt.push(4);
         txt.extend_from_slice(b"M1;x");
-        let m = reply(&q, 0x0020, &[(5, vec![0xC0, 12]), (16, txt)]);
+        let m = reply(&q, 0x0020, &[(16, txt)]);
         assert_eq!(answer(&m, 0x1234, "SEL._domainkey.example.com", RecordKind::Txt), Ok((vec![Record::Txt("v=DKIM1;x".into())], true)));
         assert_eq!(answer(&m, 0x1235, "sel._domainkey.example.com", RecordKind::Txt), Err(ErrorCode::Malformed), "another id");
         assert_eq!(answer(&m, 0x1234, "other.example.com", RecordKind::Txt), Err(ErrorCode::Malformed), "another question");
         // No such name.
         assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Ok((vec![], false)));
+        assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "other.example.com", RecordKind::Txt), Err(ErrorCode::Malformed));
+        assert_eq!(answer(&reply(&q, 3, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Mx), Err(ErrorCode::Malformed));
         assert_eq!(answer(&reply(&q, 2, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Err(ErrorCode::Dns));
         assert_eq!(answer(&reply(&q, 0x0200, &[]), 0x1234, "sel._domainkey.example.com", RecordKind::Txt), Err(ErrorCode::Dns), "truncated");
 

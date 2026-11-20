@@ -159,8 +159,13 @@ resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout`
   127.0.0.1) and connects it **before** `cap_enter`; in capability mode a connected socket
   can still send and receive, and nothing else can be reached. Queries ask for recursion
   and AD, with EDNS0 at 4 KiB; a truncated answer is `Dns` (TCP would need a new
-  connection). Answers must match the id and the question; names are decompressed with a
-  jump limit.
+  connection). Positive and negative answers must match the id and the
+  question. Only records at the queried name or the endpoint of its CNAME
+  chain can answer the lookup. Nuntius follows up to eight aliases and
+  rejects loops and conflicting targets. Name decompression also has a jump
+  limit.
+  [RFC 5452 §9.1](https://www.rfc-editor.org/rfc/rfc5452.html#section-9.1),
+  [RFC 1034 §3.6.2](https://www.rfc-editor.org/rfc/rfc1034.html#section-3.6.2)
 - For an ordinary fetcher with no VPN route domain, Portcullis checks the
   primary nameserver in the host’s resolver configuration. If it is 127.0.0.1
   or ::1, Portcullis connects one UDP socket to port 53 in the host network
