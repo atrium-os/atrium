@@ -49,6 +49,11 @@ grant owner and address, and records the owner version in the PKCE session. At r
 it repeats the checks, rejects a changed version, updates the owner in place, discards
 outstanding refresh leases for it and returns the original references.
 
+Signed Mail can discard its own pending sign-in using `MAIL_SIGN_IN_CANCEL` and
+the 16-byte ticket. Arca removes that session and its verifier. Account data
+and the stored endpoint references survive cancellation. A completed exchange
+cannot be undone by a late cancel.
+
 ## 1. The three promises
 
 1. **Use without read.** Wherever the protocol allows, a secret is *used* for the app

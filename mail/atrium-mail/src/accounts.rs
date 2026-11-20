@@ -404,6 +404,17 @@ pub fn microsoft_sign_in(arca: &std::path::Path, address: &str, renewal: Option<
     }
 }
 
+pub fn cancel_microsoft(arca: &std::path::Path, ticket: &[u8; 16]) -> std::io::Result<()> {
+    let mut socket = UnixStream::connect(arca)?;
+    let timeout = Some(Duration::from_secs(2));
+    socket.set_read_timeout(timeout)?;
+    socket.set_write_timeout(timeout)?;
+    arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN_CANCEL, ticket)?;
+    let (code, _) = arcad::proto::read_app_reply(&mut socket, arcad::proto::AppReply::Empty)?;
+    if code != status::OK { return Err(std::io::Error::other(format!("Arca refused cancellation ({code})"))); }
+    Ok(())
+}
+
 pub fn microsoft_result(arca: &std::path::Path, ticket: &[u8; 16], cfg: &mut AccountConfig) -> Result<(), String> {
     let mut socket = UnixStream::connect(arca).map_err(|e| e.to_string())?;
     let timeout = Some(Duration::from_secs(10));

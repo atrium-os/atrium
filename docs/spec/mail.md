@@ -325,6 +325,22 @@ port and CA in `callback.port` and `callback-ca.pem`. After UID 41 is visible, c
 empty `revoke` file there and request sync. Complete the sign-in sheet, check UID 42,
 and use the inbox gate’s envelope verifier after the fixture records SMTP acceptance.
 
+#### Cancelling and retrying a revoked account
+
+With the development provider, revoke the grant after UID 41 is cached. Open **Sign in
+again**, wait for the first screen, and press **Cancel sign-in** in Navigator’s sheet.
+The sheet owns this control outside the page worker’s bounds. Mail invalidates the
+ticket with Arca and returns to the account list. A new attempt gets a fresh ticket.
+
+On the arm64 Tessera guest the page jail disappeared after Cancel. The provider log
+contained no authorization callback or code redemption at that point. A manual sync
+was refused again, and opening “Greenhouse visit” displayed “Please bring the blue
+notebook.” After retry, one callback and one PKCE redemption unlocked UID 42, and both
+messages appeared in the inbox. SMTP accepted one “Retry report” from `ada@outlook.com`
+to `robin@school.test` with the decoded body “Sent after cancelling sign-in.” Database
+copies from before revocation, after cancellation and after delivery each contained one
+account with the same account ID and the same IMAP and submission item references.
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and

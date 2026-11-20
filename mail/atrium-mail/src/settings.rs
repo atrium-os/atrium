@@ -394,6 +394,17 @@ impl Settings {
         });
     }
 
+    pub fn cancelled_sheet(&self) -> bool {
+        self.ui.get_cloned().adding == Adding::Closed
+    }
+
+    pub fn dismiss_microsoft(&self, ticket: [u8; 16]) {
+        self.microsoft_sheet_open.set(false);
+        let result = crate::accounts::cancel_microsoft(&self.arca, &ticket);
+        self.cancel_adding();
+        self.sign_in_note(if result.is_ok() { "Microsoft sign-in cancelled." } else { "Sheet closed. Arca could not confirm cancellation." });
+    }
+
     pub fn cancel_adding(&self) {
         *self.found.borrow_mut() = None;
         *self.microsoft.borrow_mut() = None;

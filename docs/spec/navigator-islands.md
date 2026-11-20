@@ -573,6 +573,11 @@ and native painter, and sign the mail-page manifest. Deployment needs a
 Limen per-instance worker rule for `org.atrium.navigator.mail-page`, with
 `_limen` as caller. Navigator opens the trusted sheet with its Fresco grant.
 
+Navigator draws **Cancel sign-in** in the sheet outside the nested page. A press there
+disposes of the sheet and its page and tells Mail to cancel the Arca ticket. The
+[revoked-account cancel/retry gate](mail.md#cancelling-and-retrying-a-revoked-account)
+checks both the cancelled attempt and the subsequent successful exchange.
+
 The development provider requires a Secure HttpOnly session cookie on its
 redirect before serving a page whose inline script labels an account field.
 The TLS test checks the cookie at the provider, its absence from script

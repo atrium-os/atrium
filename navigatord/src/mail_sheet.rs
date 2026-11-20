@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 struct Sheet {
-    _window: Connection,
+    window: Connection,
     token: [u8; 16],
     page: Option<(Parent, u64)>,
     ticket: Option<[u8; 16]>,
@@ -30,20 +30,44 @@ impl Drop for Sheet {
     }
 }
 
+// The sheet owns this control outside the page worker’s rectangle.
+const CANCEL_X: f32 = 24.;
+const CANCEL_Y: f32 = 448.;
+const CANCEL_W: f32 = 146.;
+const CANCEL_H: f32 = 40.;
+
+fn cancel_requested(window: &mut Connection) -> std::io::Result<bool> {
+    for _ in 0..32 {
+        match window.poll_event()? {
+            Some(Event::CloseRequested { .. } | Event::Key { hid_usage: 41, pressed: true, .. }) => return Ok(true),
+            Some(Event::PointerButton { x, y, button: 1, pressed: true, .. })
+                if (CANCEL_X..CANCEL_X + CANCEL_W).contains(&x) && (CANCEL_Y..CANCEL_Y + CANCEL_H).contains(&y) => return Ok(true),
+            None => break,
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     let mut window = Connection::connect_default().map_err(|_| ())?;
     window.set_read_timeout(Some(Duration::from_secs(3))).map_err(|_| ())?;
     let id = window.window_create(720, 540, "Microsoft sign-in", WindowHints { embed_pending: true, ..Default::default() }).map_err(|_| ())?;
     window.set_default_window(u16::try_from(id).map_err(|_| ())?);
+    let font = window.font_open("system-sans").map_err(|_| ())?.font_id;
     let mut frame = window.frame().map_err(|_| ())?;
     frame.rect(fresco_protocol::RectParams {
         x: 0., y: 0., w: 720., h: 540., r: 1., g: 1., b: 1., a: 1., radius: 0.,
     }).map_err(|_| ())?;
+    frame.rect(fresco_protocol::RectParams {
+        x: CANCEL_X, y: CANCEL_Y, w: CANCEL_W, h: CANCEL_H, r: 0.92, g: 0.94, b: 0.95, a: 1., radius: 5.,
+    }).map_err(|_| ())?;
+    frame.text_run(font, 16., CANCEL_X + 15., CANCEL_Y + 24., [0.08, 0.12, 0.15, 1.], "Cancel sign-in").map_err(|_| ())?;
     frame.finish().map_err(|_| ())?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
         if let Some(Event::EmbedToken { window_id, token }) = window.wait_event(Some(Duration::from_millis(100))).map_err(|_| ())? {
-            if window_id == id { return Ok(Sheet { _window: window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
+            if window_id == id { return Ok(Sheet { window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
         }
     }
     Err(())
@@ -128,8 +152,14 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
             _ => {}
         }
         let mut closed = Vec::new();
+        let mut cancelled = Vec::new();
         let mut completed = Vec::new();
         for (&id, sheet) in &mut sheets {
+            match cancel_requested(&mut sheet.window) {
+                Ok(true) => { cancelled.push(id); continue; }
+                Err(_) => { closed.push(id); continue; }
+                Ok(false) => {}
+            }
             if sheet.started.elapsed() >= Duration::from_secs(600) { closed.push(id); continue; }
             if let Some((parent, worker)) = &mut sheet.page {
                 match parent.poll(Duration::ZERO) {
@@ -150,6 +180,10 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
                     _ => {}
                 }
             }
+        }
+        for id in cancelled {
+            child.emit(id, b"cancelled".to_vec()).map_err(|_| ())?;
+            sheets.remove(&id);
         }
         for id in completed {
             child.emit(id, b"complete".to_vec()).map_err(|_| ())?;

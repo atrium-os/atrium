@@ -285,6 +285,14 @@ impl Sessions {
         Some(ids)
     }
 
+    pub(crate) fn cancel(&mut self, user: &str, handle: &[u8; 16]) -> bool {
+        if !self.active(user, handle).is_some_and(|entry| !matches!(entry.phase, Phase::Complete(_))) {
+            return false;
+        }
+        self.pending.remove(handle);
+        true
+    }
+
     pub(crate) fn lock(&mut self, user: &str) {
         self.pending.retain(|_, entry| entry.user != user);
     }
@@ -293,6 +301,20 @@ impl Sessions {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    #[test]
+    fn cancelling_a_claimed_session_invalidates_only_that_users_ticket() {
+        let mut s = Sessions { registration: Some("fixture".into()), ..Default::default() };
+        let t = s.begin("ada", "ada@example.org").unwrap();
+        s.claim("ada", &t).unwrap();
+        assert!(!s.cancel("other", &t));
+        assert!(s.cancel("ada", &t));
+        assert!(!s.cancel("ada", &t));
+        assert!(s.active("ada", &t).is_none());
+        let retry = s.begin("ada", "ada@example.org").unwrap();
+        assert_ne!(retry, t);
+        assert!(s.claim("ada", &retry).is_some());
+    }
 
     #[test]
     fn callback_is_bound_to_claim_state_user_and_account_and_redeemed_once() {

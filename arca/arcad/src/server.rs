@@ -262,6 +262,11 @@ impl State {
         let mut item: Option<ItemId> = None;
         let r = match who {
             Label::App { user, publisher, app_id } if matches!(op, op::MAIL_SIGN_IN | op::MAIL_REAUTH) => self.mail_begin(user, publisher, app_id, body, op == op::MAIL_REAUTH),
+            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_CANCEL => {
+                if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
+                let Ok(ticket) = body.try_into() else { return malformed() };
+                if self.mail_sign_ins.cancel(user, ticket) { ok(vec![]) } else { reply(status::DENIED) }
+            }
             Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_RESULT => {
                 if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
                 let mut r = Reader::new(body);

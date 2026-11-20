@@ -98,6 +98,7 @@ pub mod op {
     pub const MAIL_SIGN_IN_RESULT: u16 = 0x15;
     /// Reauthorize existing IMAP/submission items: two ids followed by the account address.
     pub const MAIL_REAUTH: u16 = 0x16;
+    pub const MAIL_SIGN_IN_CANCEL: u16 = 0x17;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -601,6 +602,7 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<(u8, LockedBuf)> {
 /// Replies ordinary app jails may receive without the privilege to lock memory.
 /// The verifier, credentials and cookie values are never among these replies.
 pub enum AppReply {
+    Empty,
     MailItems,
     Ticket,
     Count,
@@ -613,6 +615,7 @@ pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<
         len == 0
     } else {
         match kind {
+            AppReply::Empty => len == 0,
             AppReply::MailItems => len == 32,
             AppReply::Ticket => len == 16,
             AppReply::Count => len == 4,
