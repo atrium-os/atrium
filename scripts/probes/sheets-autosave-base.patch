@@ -1,0 +1,67 @@
+diff --git a/atrium-sheets/src/doc.rs b/atrium-sheets/src/doc.rs
+index c999b89e..1d00d8d1 100644
+--- a/atrium-sheets/src/doc.rs
++++ b/atrium-sheets/src/doc.rs
+@@ -301,0 +302,23 @@ pub struct Autosave {
++// Measurement-only writer below the normal native serializer and BufWriter.
++struct BaseWrites<'a> {
++    file: &'a mut File,
++    ns: u128,
++    calls: usize,
++}
++impl Write for BaseWrites<'_> {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        let start = std::time::Instant::now();
++        let result = self.file.write(bytes);
++        self.ns += start.elapsed().as_nanos();
++        self.calls += 1;
++        result
++    }
++    fn flush(&mut self) -> io::Result<()> { self.file.flush() }
++}
++
++fn measured_sync(file: &File) -> io::Result<u128> {
++    let start = std::time::Instant::now();
++    file.sync_all()?;
++    Ok(start.elapsed().as_nanos())
++}
++
+@@ -315 +338,4 @@ impl Autosave {
+-        let f = File::create(&tmp)?;
++        let mut f = File::create(&tmp)?;
++        let mut write_ns = 0;
++        let mut calls = 0;
++        let serial_start = std::time::Instant::now();
+@@ -322 +348,7 @@ impl Autosave {
+-            None => native::save(wb, io::BufWriter::new(f))?.into_inner().map_err(|e| e.into_error())?,
++            None => {
++                let writer = BaseWrites { file: &mut f, ns: 0, calls: 0 };
++                let w = native::save(wb, io::BufWriter::new(writer))?.into_inner().map_err(|e| e.into_error())?;
++                write_ns = w.ns;
++                calls = w.calls;
++                f
++            }
+@@ -324 +356,2 @@ impl Autosave {
+-        f.sync_all()?;
++        let stream_ns = serial_start.elapsed().as_nanos();
++        let base_sync = measured_sync(&f)?;
+@@ -327 +360 @@ impl Autosave {
+-        j.sync_all()?;
++        let journal_sync = measured_sync(&j)?;
+@@ -329,0 +363 @@ impl Autosave {
++        let current_sync;
+@@ -333 +367 @@ impl Autosave {
+-            c.sync_all()?;
++            current_sync = measured_sync(&c)?;
+@@ -335 +369 @@ impl Autosave {
+-        sync_dir(dir);
++        let pre_dir_sync = measured_sync(&File::open(dir)?)?;
+@@ -338 +372 @@ impl Autosave {
+-        sync_dir(dir);
++        let post_dir_sync = measured_sync(&File::open(dir)?)?;
+@@ -342,0 +377,5 @@ impl Autosave {
++        if name.ends_with(".csv") {
++            eprintln!("autosave-base {} {} {} {} {} {} {} {} {} {} {} {} {}", std::process::id(),
++                name, g, f.metadata()?.len(), calls, stream_ns, write_ns, base_sync, journal_sync,
++                current_sync, pre_dir_sync, post_dir_sync, dir.canonicalize()?.display());
++        }
