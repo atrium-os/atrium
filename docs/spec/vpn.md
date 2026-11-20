@@ -923,6 +923,13 @@ another origin. An active portal-profile session stays in engine memory.
   restored report without prompting, before traffic on a new ESP
   association.
   The arm64 gate passed 30/30 using the shared Cargo cache.
+  With `--hip esp-loss-hip-submit-retry`, the fixture receives the
+  changed report on ESP reconnect and closes the HTTPS connection
+  before acknowledging it. Crypta logs the HIP submission failure and
+  retries. Until the gateway acknowledges the report, the data tunnel
+  stays down. The retry reuses approval for the same report, opens ESP
+  after acknowledgement, and refreshes the unchanged report without
+  prompting.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

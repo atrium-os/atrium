@@ -71,7 +71,9 @@ def frames(stream, reader, calls):
 
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
-ESP_LOSS_RECONNECT_HIP = ("esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect")
+ESP_LOSS_RECONNECT_HIP = (
+    "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
+)
 ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline", *ESP_LOSS_RECONNECT_HIP)
 REFRESH_HIP = ("refresh", "posture", *ESP_LOSS_HIP, *TESSERA_HIP)
 
@@ -317,6 +319,16 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 elif hip in TESSERA_HIP:
                                     fact = tessera_count
                                 print(f"{fact} {digest}", file=receipt)
+                        if hip == "esp-loss-hip-submit-retry":
+                            config_count = calls.count("getconfig.esp")
+                            if config_count == 3:
+                                calls.append("hip-submit-response-dropped")
+                                return
+                            if config_count == 4:
+                                deadline = time.monotonic() + 25
+                                while not receipts.with_suffix(".retry").exists() and time.monotonic() < deadline:
+                                    time.sleep(0.05)
+                                assert receipts.with_suffix(".retry").exists(), "HIP retry was never released"
                         if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
@@ -664,12 +676,15 @@ def main():
                 declined_rebind = args.hip == "esp-loss-rebind-decline"
                 reconnected = args.hip in ESP_LOSS_RECONNECT_HIP
                 reconnected_after_rebind = args.hip == "esp-loss-rebind-reconnect"
+                submit_retry = args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
                 assert len(esp.configs) == len(configs) == (6 if reconnected_after_rebind else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
-                if reconnected:
+                if submit_retry:
+                    expected_spis.extend([esp.configs[3][0][0]] * 2)
+                elif reconnected:
                     expected_spis.extend([esp.configs[2][0][0]] * 2 + [esp.configs[3][0][0]])
                 if reconnected_after_rebind:
                     expected_spis.extend([esp.configs[4][0][0]] * 3 + [esp.configs[5][0][0]])
@@ -693,18 +708,26 @@ def main():
                     for config in configs[2:]:
                         assert calls[config:config + 3] == [*exchange, "hipreport.esp"], calls
                     reconnect_report = calls[:configs[2]].count("hipreport.esp")
-                    rebind_report = calls[:configs[3]].count("hipreport.esp")
+                    next_report = calls[:configs[3]].count("hipreport.esp")
                     assert all(report == original for report in reports[:reconnect_report]), reports
                     changed = reports[reconnect_report]
                     assert changed.split()[0] != original.split()[0], reports
+                    if submit_retry:
+                        assert calls[configs[2]:configs[3]] == [
+                            *exchange, "hipreport.esp", "hip-submit-response-dropped",
+                        ], calls
+                        assert reports[reconnect_report:next_report] == [changed], reports
+                        assert len(reports[next_report:]) >= 2 and set(reports[next_report:]) == {changed}, reports
+                        print("HIP submit response dropped on ESP reconnect. Retry restored ESP and refreshed unchanged HIP.")
+                        return
                     assert reports[reconnect_report:reconnect_report + 2] == [changed, changed], reports
-                    assert reports[reconnect_report:rebind_report] == sorted(
-                        reports[reconnect_report:rebind_report], key=lambda report: report == original), reports
-                    assert set(reports[reconnect_report:rebind_report]) == {changed, original}, reports
+                    assert reports[reconnect_report:next_report] == sorted(
+                        reports[reconnect_report:next_report], key=lambda report: report == original), reports
+                    assert set(reports[reconnect_report:next_report]) == {changed, original}, reports
                     if reconnected_after_rebind:
                         assert calls[configs[4] - 1] == "hipreportcheck.esp", calls
                         last_report = calls[:configs[4]].count("hipreport.esp")
-                        assert set(reports[rebind_report:last_report]) == {original}, reports
+                        assert set(reports[next_report:last_report]) == {original}, reports
                         final_rebind_report = calls[:configs[5]].count("hipreport.esp")
                         reports_before_rebind = reports[last_report:final_rebind_report]
                         assert reports_before_rebind[:2] == [changed, changed], reports
@@ -715,7 +738,7 @@ def main():
                         print("After rebound ESP decline, reconnect and forwarding restoration each required fresh approval")
                         print("The final rebind submitted unchanged HIP before ESP traffic")
                     else:
-                        assert set(reports[rebind_report:]) == {original}, reports
+                        assert set(reports[next_report:]) == {original}, reports
                     if declined_rebind:
                         print("Declining the changed HIP report stopped rebound ESP without uploading it")
                     elif not reconnected_after_rebind:

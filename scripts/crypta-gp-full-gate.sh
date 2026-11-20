@@ -599,9 +599,11 @@ if [ -n "$tessera_fact" ]; then
     exit 0
 fi
 decline_after_esp_loss=0
+retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=1 ;;
     esp-loss-rebind-decline) hip=esp-loss; decline_after_esp_loss=3 ;;
     esp-loss-rebind-reconnect) hip=esp-loss; decline_after_esp_loss=4 ;;
 esac
@@ -748,7 +750,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         fi
         reconnect_after_esp_loss_decline 0 approved
     fi
+    if [ "$retry_hip_submit" = 1 ]; then
+        retry_reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
+    fi
     approve_hip || fail "approve changed HIP"
+    if [ "$retry_hip_submit" = 1 ]; then
+        for _ in $(seq 1 25); do
+            if "$V" "grep -q 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log"; then
+                break
+            fi
+            sleep 1
+        done
+        "$V" "grep -q 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log" ||
+            fail "the dropped HIP response did not produce a visible failure"
+        [ "$(field handshake)" = 0 ] || fail "the tunnel opened after the dropped HIP response"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed before the retry was acknowledged"
+        ok "HIP submission failure was logged and kept the tunnel blocked"
+        touch "$receipts.retry"
+    fi
     for _ in $(seq 1 25); do
         if grep -q "^$changed_word " "$receipts"; then break; fi
         sleep 1
@@ -767,6 +787,14 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$changed_report" ] ||
             fail "unchanged HIP did not refresh silently on restored ESP"
         ok "unchanged HIP refreshed on restored ESP without prompting"
+        if [ "$retry_hip_submit" = 1 ]; then
+            [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$retry_reviews" ] ||
+                fail "HIP retry or refresh opened an extra review"
+            probe "IPv4 echo on restored ESP after silent HIP refresh"
+            "$V" "$CTL down name=gp-gate" >/dev/null
+            echo "$pass checks passed"
+            exit 0
+        fi
         restore_forwarding_and_rebind 4
         if [ "$decline_after_esp_loss" -ge 3 ]; then
             rebound_iface=$(field iface)

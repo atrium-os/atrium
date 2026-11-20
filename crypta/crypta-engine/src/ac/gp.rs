@@ -330,7 +330,11 @@ impl Engine {
                 jar,
                 gp::HIP_REPORT,
                 &session.hip(&self.st.hostname, addr, Some(&report)),
-            )?;
+            )
+            .map_err(|stop| match stop {
+                Stop::Again(why) => Stop::Again(format!("GlobalProtect HIP submission failed: {why}")),
+                stop => stop,
+            })?;
             if status != 200 {
                 return Err(refused("GlobalProtect gateway refused the HIP report"));
             }
