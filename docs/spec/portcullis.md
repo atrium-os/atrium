@@ -1261,7 +1261,10 @@ can skip the mount. A marker from a broker that checked only occupancy needs
 one label check. An unreadable or invalid label leaves the prior name in
 place and the check can be retried. Opening that recovery clears the observation before the jail
 can change the directory. Older markers begin unconfirmed. A missing or
-unreadable image keeps its slot reserved.
+unreadable image keeps its slot reserved. Even with a cached label, each scan
+checks that the backing image exists. Recover reports an unavailable image
+for the requested workbook, including when it is the only pending recovery.
+Other workbooks can still be selected.
 
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads

@@ -12,6 +12,7 @@
 # --prepare-reboot-labels and --verify-reboot-labels exercise a missed rename.
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
+# --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -462,6 +463,64 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     else
         recover_named_pair
     fi
+    exit 0
+fi
+if test "${1:-}" = --retry-missing-image; then
+    first=missing-image
+    timing=${2:-after-list}
+    case "$timing" in before-list|after-list) ;; *) exit 2 ;; esac
+    original=$(sha256 -q "$books/Proof.csv")
+    test "$(ls -A "$books")" = Proof.csv
+    make_pair
+    marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 0.pending)
+    store=$(dirname "$marker")
+    detached_images() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
+    wait_for detached_images
+    if test "$timing" = after-list; then
+        click 213 24
+        for slot in 0 1; do wait_for grep -Fq '"checked_detached":true' "$store/$slot.pending"; done
+        wait_for detached_images
+    else
+        grep -Fq '"checked_detached":false' "$marker"
+    fi
+    cp "$marker" "$results/unavailable.marker"
+    image="$store/0.img"
+    if test -f "$store/0.ufs"; then image="$store/0.ufs"; fi
+    digest=$(sha256 -q "$image")
+    mv "$image" "$results/offline.image"
+    trap 'test -e "$image" || mv "$results/offline.image" "$image"' EXIT
+    test ! -e "$store/0.img"; test ! -e "$store/0.ufs"
+    if test "$timing" = before-list; then
+        click 213 24
+        wait_for grep -Fq '"checked_detached":true' "$store/1.pending"
+        wait_for detached_images
+    fi
+    cp "$store/1.pending" "$results/sibling.marker"
+    errors() { awk '/checking detached workbook slot 0: missing workbook recovery image/ {n++} END {print n+0}' select-port.log; }
+    refused() { test "$(errors)" -gt "$before"; }
+    before=$(errors)
+    sleep .6; click 120 96
+    if ! wait_for refused; then cp selectscreen.png "$results/selection-failed.png"; exit 1; fi
+    sleep .6; cp selectscreen.png "$results/unavailable.png"
+    count 0; pending 2
+    cmp "$marker" "$results/unavailable.marker"
+    cmp "$store/1.pending" "$results/sibling.marker"
+    choose protected; save_copy protected
+    wait_for pending 1; cmp "$marker" "$results/unavailable.marker"
+    before=$(errors); click 213 24; wait_for refused
+    sleep .6; cp selectscreen.png "$results/only-unavailable.png"
+    count 0; pending 1
+    cmp "$marker" "$results/unavailable.marker"
+    test ! -e "$store/0.img"; test ! -e "$store/0.ufs"
+    mv "$results/offline.image" "$image"; trap - EXIT
+    test "$(sha256 -q "$image")" = "$digest"
+    click 213 24; wait_for count 1; wait_for opened "$(docs)" Proof.csv
+    sed 's/,"name":.*//' "$marker" > "$results/restored.id"
+    sed 's/,"name":.*//' "$results/unavailable.marker" | cmp -s - "$results/restored.id"
+    save_copy plain; wait_for pending 0
+    test "$(sha256 -q "$books/Proof.csv")" = "$original"
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    echo "Recovered the healthy workbook and retried the restored image. Frames and copies: $results"
     exit 0
 fi
 for first in protected plain; do

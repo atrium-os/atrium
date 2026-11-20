@@ -413,6 +413,8 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                 if pending.try_exists()? != recover { continue; }
                 if recover {
                     let book = pending_workbook(&pending, index)?;
+                    let inspection = inspection.map_err(|e| std::io::Error::new(e.kind(),
+                        format!("The recovery image for “{}” is unavailable.", book.name)));
                     if let WorkbookAction::Select(id) = action {
                         if book.id != id { continue; }
                         inspection?;
@@ -998,10 +1000,15 @@ fn workbook_jail_active(name: &str, instance: &str, dir: &Path, index: usize, oc
     Ok(active)
 }
 
-fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result<()> {
+fn require_workbook_image(store: &portcullis_overlay::Place) -> std::io::Result<()> {
     if !store.img.try_exists()? && !store.img.with_extension("ufs").try_exists()? {
-        return Err(std::io::Error::other("missing workbook recovery image"));
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing workbook recovery image"));
     }
+    Ok(())
+}
+
+fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result<()> {
+    require_workbook_image(store)?;
     portcullis_overlay::mount_recovery(store, 128 << 20).map_err(std::io::Error::other)
 }
 
@@ -1010,7 +1017,8 @@ fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result
 fn check_detached_workbook(store: &portcullis_overlay::Place, pending: &Path, index: usize) -> std::io::Result<()> {
     let bytes = fs::read(pending)?;
     if !bytes.is_empty() && serde_json::from_slice::<WorkbookMarker>(&bytes)?.checked_detached {
-        return Ok(());
+        // The cached name remains useful when the image goes offline.
+        return require_workbook_image(store);
     }
     mount_existing_workbook(store)?;
     // DirEntry retains the directory descriptor. Drop it before unmounting.
@@ -2055,6 +2063,21 @@ mod recovery_name_tests {
         fs::write(&path, marker).unwrap();
         assert!(check_detached_workbook(&store, &path, 0).is_err());
         assert_eq!(fs::read(&path).unwrap(), marker);
+        assert!(!store.img.exists());
+        assert!(!store.img.with_extension("ufs").exists());
+    }
+
+    #[test]
+    fn cached_label_does_not_hide_a_missing_image() {
+        let root = tempfile::tempdir().unwrap();
+        let store = workbook_store(root.path(), 0);
+        let path = root.path().join("0.pending");
+        let book = write_workbook_marker(&path, "Proof.csv").unwrap();
+        store_workbook_marker(&path, &book, true).unwrap();
+        let before = fs::read(&path).unwrap();
+        let error = check_detached_workbook(&store, &path, 0).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&path).unwrap(), before);
         assert!(!store.img.exists());
         assert!(!store.img.with_extension("ufs").exists());
     }
