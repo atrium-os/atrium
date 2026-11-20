@@ -73,8 +73,8 @@ RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 REBIND_HIP_RECHECK = "esp-loss-hip-submit-rebind-recheck"
 REBIND_HIP_DECLINE = "esp-loss-hip-submit-rebind-decline"
-REBIND_HIP_RECONNECT = "esp-loss-hip-submit-rebind-reconnect"
-REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT)
+REBIND_HIP_RECONNECT = ("esp-loss-hip-submit-rebind-reconnect", "esp-loss-hip-submit-final-rebind")
+REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, *REBIND_HIP_RECONNECT)
 ESP_LOSS_RECONNECT_HIP = (
     *REBIND_HIP_RETRY, "esp-loss-hip-submit-retry-reconnect", "esp-loss-hip-submit-retry-decline", "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
 )
@@ -260,7 +260,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             while not receipts.with_suffix(".posture-restored").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".posture-restored").exists(), "retry posture did not change"
-                        if hip in (REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT) and calls.count("getconfig.esp") == 7:
+                        if hip in (REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, *REBIND_HIP_RECONNECT) and calls.count("getconfig.esp") == 7:
                             deadline = time.monotonic() + 25
                             while not receipts.with_suffix(".rebind-posture").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
@@ -348,14 +348,14 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                     time.sleep(0.05)
                                 assert receipts.with_suffix(".retry").exists(), "HIP retry was never released"
                         if hip in REBIND_HIP_RETRY and config_count == 7:
-                            assert hip not in (REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT), "declined rebind retry submitted HIP"
+                            assert hip not in (REBIND_HIP_DECLINE, *REBIND_HIP_RECONNECT), "declined rebind retry submitted HIP"
                             if hip == REBIND_HIP_RECHECK:
                                 assert receipts.with_suffix(".rebind-retry").exists(), "rebind uploaded before fresh approval"
                             deadline = time.monotonic() + 25
                             while not receipts.with_suffix(".rebind-retry").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".rebind-retry").exists(), "rebind retry was never released"
-                        if hip == REBIND_HIP_RECONNECT and config_count == 8:
+                        if hip in REBIND_HIP_RECONNECT and config_count >= 8:
                             assert receipts.with_suffix(".rebind-retry").exists(), "reconnect uploaded before fresh approval"
                         if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
@@ -709,21 +709,25 @@ def main():
                 rebind_retry = args.hip in REBIND_HIP_RETRY
                 rebind_recheck = args.hip == REBIND_HIP_RECHECK
                 rebind_decline = args.hip == REBIND_HIP_DECLINE
-                rebind_reconnect = args.hip == REBIND_HIP_RECONNECT
+                rebind_reconnect = args.hip in REBIND_HIP_RECONNECT
+                final_rebind_retry = args.hip == "esp-loss-hip-submit-final-rebind"
                 retry_reconnect = rebind_retry or args.hip == "esp-loss-hip-submit-retry-reconnect"
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
                     if retry_reconnect:
                         expected_spis.extend([esp.configs[4][0][0]] * 2)
                         if not rebind_decline:
-                            expected_spis.append(esp.configs[-1][0][0])
+                            successful_spi = esp.configs[7 if rebind_reconnect else 6][0][0]
+                            expected_spis.append(successful_spi)
                         if rebind_recheck or rebind_reconnect:
-                            expected_spis.append(esp.configs[-1][0][0])
+                            expected_spis.append(successful_spi)
+                        if final_rebind_retry:
+                            expected_spis.append(esp.configs[8][0][0])
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -736,7 +740,10 @@ def main():
                 # ESP retry starts. It must use the successful association.
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
-                    allowed_echoes.append([*expected_spis, expected_spis[-1]])
+                    if final_rebind_retry:
+                        allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
+                    else:
+                        allowed_echoes.append([*expected_spis, expected_spis[-1]])
                 assert esp.echo in allowed_echoes and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == set(expected_spis), esp.received_spis
                 assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind or retry_decline or rebind_decline else "logout.esp"), calls
@@ -796,7 +803,13 @@ def main():
                                     retry_report = final_rebind + 1
                                     assert set(reports[next_report:retry_report]) == {original}, reports
                                     assert len(reports[retry_report:]) >= 2 and set(reports[retry_report:]) == {changed}, reports
-                                    print("Rebind retry required fresh approval and refreshed the approved change over ESP")
+                                    if final_rebind_retry:
+                                        final_phase_report = calls[:configs[8]].count("hipreport.esp")
+                                        assert final_phase_report >= retry_report + 2, reports
+                                        assert reports[final_phase_report:] and set(reports[final_phase_report:]) == {changed}, reports
+                                        print("The final rebind submitted unchanged HIP before new ESP traffic")
+                                    else:
+                                        print("Rebind retry required fresh approval and refreshed the approved change over ESP")
                                 else:
                                     assert set(reports[next_report:]) == {original}, reports
                                     print("Rebind retried unchanged HIP and opened ESP only after acknowledgement")
