@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 7)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 8)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides_hidden_off, slides_hidden_on, slides_notes, mail = expected
+html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -50,18 +50,24 @@ for pdf, setting, expected_groups in (
     assert groups == expected_groups, (setting, groups)
     print(f"Slides: Include Hidden Slides {setting}, handout groups {groups}")
 
-pages = pages_of(slides_notes)
-body = "\n".join(pages)
-assert len(pages) == 10, len(pages)
-assert numbered_lines(r"Speaker line (\d+)", body) == list(range(1, 91)), body
-for slide, note in (
-    ("FIRST SLIDE", "FINAL SPEAKER LINE"),
-    ("HIDDEN SLIDE", "HIDDEN SPEAKER NOTE"),
-    ("SECOND SLIDE", "SECOND SPEAKER NOTE"),
-    ("FOURTH SLIDE", "FOURTH SPEAKER NOTE"),
-):
-    assert body.count(note) == 1 and any(slide in page and note in page for page in pages), note
-print("Slides speaker notes: all 90 numbered lines, the final line, and the hidden slide's note")
+for pdf, include_hidden in ((notes_hidden_on, True), (notes_hidden_off, False)):
+    pages = pages_of(pdf)
+    body = "\n".join(pages)
+    assert len(pages) == (10 if include_hidden else 9), len(pages)
+    assert numbered_lines(r"Speaker line (\d+)", body) == list(range(1, 91)), body
+    notes = [
+        ("FIRST SLIDE", "FINAL SPEAKER LINE"),
+        ("SECOND SLIDE", "SECOND SPEAKER NOTE"),
+        ("FOURTH SLIDE", "FOURTH SPEAKER NOTE"),
+    ]
+    if include_hidden:
+        notes.append(("HIDDEN SLIDE", "HIDDEN SPEAKER NOTE"))
+    else:
+        assert "HIDDEN SLIDE" not in body and "HIDDEN SPEAKER NOTE" not in body, body
+    for slide, note in notes:
+        assert body.count(note) == 1 and any(slide in page and note in page for page in pages), note
+    setting = "on" if include_hidden else "off"
+    print(f"Slides speaker notes: {len(pages)} pages, all 90 numbered lines and the final line, hidden slides {setting}")
 
 pages = pages_of(mail)
 body = "\n".join(pages)

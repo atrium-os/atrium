@@ -185,9 +185,19 @@ sleep 3
 press 286 23
 press 332 90
 preview 'previews: 8 of 10' 1
-cp screen.png slides-notes-preview.png
+cp screen.png slides-notes-hidden-on-preview.png
 press 899 553
 wait_job 5
+sleep 3
+# Turn Include Hidden Slides off and print the same deck's notes again.
+press 286 23
+press 332 266
+press 286 23
+press 332 90
+preview 'previews: 8 of 9' 1
+cp screen.png slides-notes-hidden-off-preview.png
+press 899 553
+wait_job 6
 sleep 3
 kill -TERM "$(cat atrium-slides.pid)"
 sleep 2
@@ -203,6 +213,6 @@ press 1234 34
 preview 'previews: 3 of 3' 1
 cp screen.png mail-preview.png
 press 940 551
-wait_job 6
+wait_job 7
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 6
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 7

@@ -6043,7 +6043,7 @@ Prelum must reach Done for each desktop job with an observed jailed IPP
 worker. Poppler checks the original Quick Look document after pathname
 replacement, the Sheets print area with chart and pictures, Slides
 three-slide handouts with Include Hidden Slides off and on, and paginated
-speaker notes with hidden slides included. The Mail PDF must include the body
+speaker notes with Include Hidden Slides off and on. The Mail PDF must include the body
 and attachment filename while excluding the attachment payload.
 
 ### 13.9 Shared-checkout hygiene
