@@ -38,6 +38,7 @@ build mail/atrium-mail --example prelum-print-fixture
 build mail/mail-parse --bin mail-parse-jail
 build officina-convert --bin officina-convert
 build navigator-page --bin navigator-page
+build atrium-pdf --bin atrium-pdf
 build frescod --bin frescod
 build limen --bin limend
 build prelum-sheet --bin atrium-prelum-sheet

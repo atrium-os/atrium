@@ -77,6 +77,36 @@ def slides(output):
                 tx=''.join(para(line,1200) for line in body)
                 z.writestr(f'ppt/notesSlides/notesSlide{i}.xml',f'<p:notes {ns}><p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/>{tx}</p:txBody></p:sp></p:spTree></p:cSld></p:notes>')
 
+def write_pdf(path, labels):
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    kids = []
+    for label in labels:
+        page_id = len(objects) + 1
+        kids.append(f"{page_id} 0 R")
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {page_id + 1} 0 R >>".encode("ascii")
+        )
+        stream = f"BT /F1 24 Tf 72 720 Td ({label}) Tj ET".encode("ascii")
+        objects.append(f"<< /Length {len(stream)} >>\nstream\n".encode("ascii") + stream + b"\nendstream")
+    objects[1] = f"<< /Type /Pages /Count {len(kids)} /Kids [{' '.join(kids)}] >>".encode("ascii")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n".encode("ascii") + obj + b"\nendobj\n")
+    xref = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("ascii"))
+    for offset in offsets:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
+    path.write_bytes(pdf)
+
+
 if __name__ == "__main__":
     output = Path(sys.argv[1])
     output.mkdir(parents=True, exist_ok=True)
@@ -94,3 +124,5 @@ if __name__ == "__main__":
     (output / "quicklook-picture.png").write_bytes(
         png(120, 60, bytes.fromhex("ff0033"), bytes.fromhex("0044ff"))
     )
+    write_pdf(output / "quicklook.pdf", ["ORIGINAL PDF FIRST PAGE", "ORIGINAL PDF FINAL PAGE"])
+    write_pdf(output / "replacement.pdf", ["REPLACEMENT PDF MUST NOT PRINT"])

@@ -119,8 +119,10 @@ remote "mkdir '$guest/text-files' && cat >'$guest/text-files/quicklook-proof.txt
     <"$D/fixtures/quicklook-proof.txt"
 remote "mkdir '$guest/image-files' && cat >'$guest/image-files/quicklook-picture.png'" \
     <"$D/fixtures/quicklook-picture.png"
+remote "mkdir '$guest/pdf-files' && cat >'$guest/pdf-files/quicklook.pdf'" <"$D/fixtures/quicklook.pdf"
+remote "cat >'$guest/replacement.pdf'" <"$D/fixtures/replacement.pdf"
 if ! remote "sh -s -- '$guest' '$ipps_port' '$marker'" <"$scripts/prelum-r7-guest.sh" >"$D/results.log" 2>&1; then
-    remote "cd '$guest' && tail -60 app.log text-app.log image-app.log limend.log portcullis.log sheet.log mail.log" >"$D/guest-errors.log" 2>&1 || :
+    remote "cd '$guest' && tail -60 app.log text-app.log image-app.log pdf-app.log limend.log portcullis.log sheet.log mail.log" >"$D/guest-errors.log" 2>&1 || :
     cat "$D/results.log" >&2
     exit 1
 fi

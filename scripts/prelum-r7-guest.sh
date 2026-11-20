@@ -45,30 +45,35 @@ for sock in print fresco act inject; do
     test -S "$P/$sock.sock"
     chmod 666 "$P/$sock.sock"
 done
-env LIMEN_DEFAULTS=doc-viewer=org.test.prelum.quickhtml LIMEN_SOCKET="$P/limen/limend.sock" LIMEN_FRESCOD_ACTIVATION="$P/act.sock" LIMEN_APP_REGISTRY="$P/registry" daemon -f -p "$P/limend.pid" -o "$P/limend.log" -u _limen "$P/limend"
+env LIMEN_DEFAULTS=doc-viewer=org.test.prelum.quickhtml,pdf-viewer=org.test.prelum.quickpdf LIMEN_SOCKET="$P/limen/limend.sock" LIMEN_FRESCOD_ACTIVATION="$P/act.sock" LIMEN_APP_REGISTRY="$P/registry" daemon -f -p "$P/limend.pid" -o "$P/limend.log" -u _limen "$P/limend"
 for i in $(seq 30); do [ -S "$P/limen/limend.sock" ] && break; sleep 1; done
 test -S "$P/limen/limend.sock"
 chmod 666 "$P/limen/limend.sock"
 "$P/prelumctl" --socket "$P/print.sock" add "ipps://1.2.3.2:$port/ipp/print"
 daemon -f -p "$P/sheet.pid" -o "$P/sheet.log" -u _prelum-sheet env HOME=/nonexistent LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" PRELUM_SOCKET="$P/print.sock" PRELUM_SHEET_ACTIVATION="$P/act.sock" PRELUM_SHEET_NEARBY=0 "$P/atrium-prelum-sheet"
 
-test -f "$P/navigator-page"
-mkdir -p bundle/bin
-cp navigator-page bundle/bin/
-cat > bundle/atrium.toml <<'TOML'
+install_viewer() {
+    viewer_id=$1
+    viewer_exec=$2
+    mkdir -p "$viewer_id/bin"
+    cp "$viewer_exec" "$viewer_id/bin/"
+    cat >"$viewer_id/atrium.toml" <<TOML
 [app]
-id = "org.test.prelum.quickhtml"
-name = "Prelum test document viewer"
+id = "$viewer_id"
+name = "Prelum test viewer"
 version = "1"
-entry = "bin/navigator-page"
+entry = "bin/$viewer_exec"
 
 [resources]
 memory = "512M"
 cpu = 100
 TOML
-openssl dgst -sha256 -sign /root/of-key.pem -out bundle/atrium.toml.sig bundle/atrium.toml
-opifex install bundle
-portcullis policy grant --system org.test.prelum.quickhtml
+    openssl dgst -sha256 -sign /root/of-key.pem -out "$viewer_id/atrium.toml.sig" "$viewer_id/atrium.toml"
+    opifex install "$viewer_id"
+    portcullis policy grant --system "$viewer_id"
+}
+install_viewer org.test.prelum.quickhtml navigator-page
+install_viewer org.test.prelum.quickpdf atrium-pdf
 pw usershow _viewer >/dev/null 2>&1 || {
   pw groupadd _viewer -g 50650
   pw useradd _viewer -u 50650 -g _viewer -d /nonexistent -s /usr/sbin/nologin
@@ -76,6 +81,11 @@ pw usershow _viewer >/dev/null 2>&1 || {
 cat >> /etc/atrium/policy.toml <<'TOML'
 
 [workers."org.test.prelum.quickhtml"]
+callers = ["_limen"]
+run_as = "_viewer"
+concurrent = 4
+
+[workers."org.test.prelum.quickpdf"]
 callers = ["_limen"]
 run_as = "_viewer"
 concurrent = 4
@@ -95,7 +105,7 @@ name = "Prelum print fixture"
 version = "1"
 entry = "bin/scrinium"
 [capabilities]
-embeds = ["print", "doc-viewer", "picker"]
+embeds = ["print", "doc-viewer", "pdf-viewer", "picker"]
 TOML
 
 daemon -f -p "$P/scrinium.pid" -o "$P/app.log" -u prelusheets env HOME="$P/home" LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" SCRINIUM_TRACE=1 SCRINIUM_PLACES="Proof=$P/files" "$P/scrinium" --no-picker
@@ -249,5 +259,21 @@ preview 'previews: 1 of 1' 2
 cp screen.png image-preview.png
 press 779 534
 wait_job 9
+sleep 3
+kill -TERM "$(cat scrinium-image.pid)"
+sleep 2
+daemon -f -p "$P/scrinium-pdf.pid" -o "$P/pdf-app.log" -u prelusheets env HOME="$P/home" LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" SCRINIUM_TRACE=1 SCRINIUM_PLACES="Proof=$P/pdf-files" "$P/scrinium" --no-picker
+for i in $(seq 20); do grep -q 'entries=\[quicklook.pdf\]' pdf-app.log 2>/dev/null && break; sleep 1; done
+grep -q 'entries=\[quicklook.pdf\]' pdf-app.log
+press 300 130
+key 44 0
+for i in $(seq 20); do jls -n name | grep -q quickpdf && break; sleep 1; done
+jls -n name | grep quickpdf
+mv replacement.pdf pdf-files/quicklook.pdf
+press 915 112
+preview 'previews: 2 of 2' 3
+cp screen.png pdf-preview.png
+press 779 534
+wait_job 10
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 9
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 10
