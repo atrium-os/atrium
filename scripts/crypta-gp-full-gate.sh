@@ -1190,6 +1190,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                     fail "unchanged HIP did not refresh silently on the rebound ESP tunnel"
                                                 ok "unchanged HIP refreshed silently on the rebound ESP tunnel"
                                                 probe "IPv4 echo after timer refresh on the same rebound ESP tunnel"
+                                                before_change=$(awk 'END { print NR }' "$receipts")
+                                                "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+                                                wait_prompt gp_hip_approval
+                                                printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                                    grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+                                                    fail "rebound ESP review omitted changed forwarding"
+                                                [ "$(hip_choice)" != "$approval_choice" ] ||
+                                                    fail "rebound ESP reused the prior HIP choice"
+                                                if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
+                                                    fail "rebound ESP submitted changed HIP before approval"
+                                                fi
+                                                before_approval=$(awk 'END { print NR }' "$receipts")
+                                                touch "$receipts.rebound-forwarding-approved"
+                                                approve_hip
+                                                wait_receipts "$((before_approval + 1))"
+                                                [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$rebound_report" ] ||
+                                                    fail "gateway did not receive the approved rebound forwarding report"
+                                                ok "changed forwarding on rebound ESP stayed unsent until fresh approval"
+                                                probe "IPv4 echo after fresh approval on the same rebound ESP association"
                                             fi
                                         fi
                                     fi
