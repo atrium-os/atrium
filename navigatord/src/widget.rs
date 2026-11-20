@@ -34,6 +34,7 @@ impl Widget {
         press: navigator_control::Press,
         rect: [u32; 4],
         cfg: Arc<Config>,
+        attached: impl FnOnce() + Send + 'static,
         finished: impl FnOnce(Option<navigator_control::WidgetFailure>) + Send + 'static,
     ) -> Result<Self, String> {
         let rect = bounds(rect)?;
@@ -72,10 +73,14 @@ impl Widget {
         });
         std::thread::spawn(move || {
             use navigator_control::WidgetFailure;
+            let mut attached = Some(attached);
             let failure = loop {
                 let mut slot = watched.lock().unwrap();
                 let Some(connection) = slot.as_mut() else { return };
                 match connection.poll(Duration::from_millis(40)) {
+                    Ok(Some(ParentEvent::Attached { embed: id })) if id == embed => {
+                        if let Some(report) = attached.take() { report(); }
+                    }
                     Ok(Some(ParentEvent::IslandStopped { embed: id })) if id == embed => break None,
                     Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {
                         // Fetch closes the child channel on refusal. The exit and

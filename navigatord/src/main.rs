@@ -1572,8 +1572,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if cfg.activation.is_none() { return Err("no compositor guard".into()); }
                     spend(press)?;
                     widget = None;
+                    let granted_origin = origin(widget::COUNTER).ok_or("invalid island grant origin")?;
+                    let on_attach = w.clone();
                     let writer = w.clone();
                     widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, press, rect, cfg.clone(),
+                        move || send(&on_attach, &Event::WidgetAttached { document, press, origin: granted_origin }),
                         move |failure| send(&writer, &match failure {
                             Some(failure) => Event::WidgetFailed { document, press, failure },
                             None => Event::WidgetStopped { document, press },

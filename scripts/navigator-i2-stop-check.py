@@ -11,7 +11,9 @@ parser.add_argument("ssh", help="SSH wrapper for the private gate guest")
 parser.add_argument("stage", help="guest directory containing input.sock and screen.png")
 parser.add_argument("log", help="fresh Navigator log in that directory")
 parser.add_argument("evidence", type=Path)
+parser.add_argument("--tier", action="store_true", help="check live-part transitions with NAVIGATOR_UI_AX=1")
 args = parser.parse_args()
+args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
 
 
@@ -35,7 +37,13 @@ def wait_for(label, check):
 
 def frame(name):
     path = args.evidence / (name + ".png")
-    path.write_bytes(guest("cat screen.png"))
+    def read_frame():
+        data = guest("cat screen.png")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n") or not data.endswith(b"IEND\xaeB`\x82"):
+            return False
+        path.write_bytes(data)
+        return True
+    wait_for("incomplete headless frame", read_frame)
     return path
 
 
@@ -51,12 +59,25 @@ def log():
     return guest("cat " + shlex.quote(args.log))
 
 
+def tier(attached):
+    if not args.tier:
+        return
+    expected = (b'Static: The main document from parent.example is static text and pictures. '
+                b'1 live part from https://widget.example.' if attached else
+                b'Static: This page is text and pictures. No code from parent.example ran to make it, and none runs now.')
+    def matches():
+        labels = [line for line in log().splitlines() if b'button "Static:' in line]
+        return labels and expected + b'"' in labels[-1]
+    wait_for("unexpected tier chip: " + expected.decode(), matches)
+
+
 def start(previous):
     press(390, 180)
     wait_for("missing Start prompt", lambda: log().count(b"prompt=widget ") > previous)
     time.sleep(.65)  # Wait for the 500 ms chrome guard.
     if guest("pgrep -x counter || true") or log().count(b"widget GET ") != previous:
         raise RuntimeError("the placeholder started an engine before consent")
+    tier(False)
     frame(f"start-{previous + 1}")
     press(1074, 60)
 
@@ -67,19 +88,34 @@ def parent():
 
 # Geometry of the 1280x840 headless fixture with a 1120x740 Navigator window.
 parent_before = parent()
+tier(False)
 start(0)
 count("initial", 0)
+tier(True)
+if args.tier:
+    press(418, 27)
+    def details_visible():
+        region = subprocess.run(["magick", str(frame("details")), "-crop", "360x65+372+112",
+                                 "+repage", "-resize", "300%", "-colorspace", "Gray", "-auto-level", "png:-"],
+                                capture_output=True, check=True, timeout=5).stdout
+        words = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "6"], input=region,
+                               capture_output=True, check=True, timeout=5).stdout
+        return b"widget.example" in words and b"embedded part" in words
+    wait_for("visible details did not name the embedded origin", details_visible)
+    press(418, 27)
 worker = guest("pgrep -x counter")
 press(350, 118)
 count("running", 1)
 press(905, 91)
 wait_for("Stop did not withdraw the engine", lambda: b"live widget stopped" in log()
          and not guest("pgrep -x counter || true"))
+tier(False)
 frame("stopped")
 if parent() != parent_before or b"prompt=widget-failed" in log():
     raise RuntimeError("Stop disturbed the parent or reported a crash")
 start(1)
 count("restarted", 0)
+tier(True)
 replacement = guest("pgrep -x counter")
 press(350, 118)
 count("incremented", 1)
@@ -88,3 +124,12 @@ if (worker == replacement or parent() != parent_before or report.count(b"widget 
         or report.count(b'the page child laid out "Embedded counter"') != 1):
     raise RuntimeError("unexpected worker, fetch count or parent reload")
 print(f"Stop retired PID {worker.decode().strip()}. Guarded Start launched PID {replacement.decode().strip()}.")
+
+if args.tier:
+    guest("kill -TERM " + str(int(replacement)))
+    wait_for("missing widget failure prompt", lambda: b"prompt=widget-failed" in log())
+    tier(False)
+    frame("failed")
+    if parent() != parent_before:
+        raise RuntimeError("engine failure disturbed the parent")
+    print("Static parent retained. Live-part count: idle 0, offered 0, attached 1, stopped 0, restarted 1, failed 0.")

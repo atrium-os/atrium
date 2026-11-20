@@ -206,7 +206,12 @@ pub fn tree(s: &Shell) -> Node {
     bar.push(where_);
     if let Some(p) = page {
         let site = trail::site(&p.url);
-        bar.push(Node::new(id::TIER, "button", format!("{}: {}", tier_name(p.facts.tier), crate::ui::tier_sentence(p.facts.tier, site))).with(if s.popover { state::EXPANDED } else { 0 }));
+        let facts = p.display_facts();
+        let mut label = format!("{}: {}", tier_name(facts.tier), crate::ui::tier_sentence(&facts, site));
+        if let Some(count) = facts.live_count_label() {
+            label.push_str(&format!(" {count} from {}.", facts.live_parts.join(", ")));
+        }
+        bar.push(Node::new(id::TIER, "button", label).with(if s.popover { state::EXPANDED } else { 0 }));
         let knows = store.knows(site);
         let words = if knows { format!("{site} knows you") } else { format!("{site} doesn't know you") };
         bar.push(Node::new(id::PRESENCE, "button", words).with(if s.presence_open { state::EXPANDED } else { 0 }));

@@ -49,6 +49,14 @@ pub struct Facts {
 }
 
 impl Facts {
+    pub fn live_count_label(&self) -> Option<String> {
+        match self.live_parts.len() {
+            0 => None,
+            1 => Some("1 live part".into()),
+            n => Some(format!("{n} live parts")),
+        }
+    }
+
     pub fn green(connection: &str) -> Self {
         Facts { tier: Tier::Static, live_parts: vec![], light: Light::Green, insecure: false, reasons: vec![], connection: connection.into() }
     }
@@ -268,6 +276,8 @@ pub struct Page {
     /// False for a page opened beside until it is looked at (the dot).
     pub seen: bool,
     pub facts: Facts,
+    /// Process-local confirmation for the one supported embedded engine.
+    pub attached_origin: Option<String>,
     pub media: Media,
     pub asked: Option<Asked>,
     pub prompts: Prompts,
@@ -282,6 +292,13 @@ pub struct Page {
 }
 
 impl Page {
+    pub fn display_facts(&self) -> std::borrow::Cow<'_, Facts> {
+        let Some(origin) = &self.attached_origin else { return std::borrow::Cow::Borrowed(&self.facts) };
+        let mut facts = self.facts.clone();
+        facts.live_parts.push(origin.clone());
+        std::borrow::Cow::Owned(facts.settle())
+    }
+
     /// Cleared from history (§5.5): an empty record kept for its index.
     pub fn cleared(&self) -> bool {
         self.url.is_empty()
@@ -370,6 +387,7 @@ impl Trail {
             children: vec![],
             seen,
             facts: spec.facts,
+            attached_origin: None,
             media: spec.media,
             asked: None,
             prompts: Prompts::default(),

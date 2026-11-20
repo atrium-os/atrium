@@ -85,10 +85,19 @@ struct Child {
 
 #[derive(Clone, Copy)]
 struct ActiveWidget {
+    page: Key,
     document: Ticket,
     press: ctl::Press,
     key: u32,
     rect: [u32; 4],
+}
+
+impl ActiveWidget {
+    fn set_origin(self, shell: &mut Shell, origin: Option<String>) {
+        if let Some(page) = shell.store.page_by_key_mut(self.page.0, self.page.1) {
+            page.attached_origin = origin;
+        }
+    }
 }
 
 fn retire_widget(active: &mut Option<ActiveWidget>, document: Ticket, press: ctl::Press) -> Option<ActiveWidget> {
@@ -685,13 +694,20 @@ impl Live {
                         }
                     }
                 }
+                Event::WidgetAttached { document, press, origin } => {
+                    if let Some(active) = self.widget.filter(|w| w.document == document && w.press == press) {
+                        active.set_origin(s, Some(origin));
+                    }
+                }
                 Event::WidgetStopped { document, press } => {
-                    if retire_widget(&mut self.widget, document, press).is_some() {
+                    if let Some(active) = retire_widget(&mut self.widget, document, press) {
+                        active.set_origin(s, None);
                         s.last_note = Some("live widget stopped".into());
                     }
                 }
                 Event::WidgetFailed { document, press, failure } => {
                     if let Some(active) = retire_widget(&mut self.widget, document, press) {
+                        active.set_origin(s, None);
                         if let Some(page) = self.shown.filter(|&p| self.widget_bounds(s, p, active.key, None)
                             .is_some_and(|(d, _)| d == document)) {
                             s.ask_at(page, crate::trail::Prompt::WidgetFailed { key: active.key, failure }, crate::ui::now_ms());
@@ -965,7 +981,8 @@ impl Live {
                 Out::StartWidget { page, key, src, press } => {
                     if let Some((document, rect)) = self.widget_bounds(s, page, key, Some(&src)) {
                         send(&mut self.w, &Request::StartWidget { document, source: src, rect, press });
-                        self.widget = Some(ActiveWidget { document, key, rect, press });
+                        if let Some(old) = self.widget { old.set_origin(s, None); }
+                        self.widget = Some(ActiveWidget { page, document, key, rect, press });
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
@@ -1127,6 +1144,7 @@ impl Live {
                 .filter(|(d, _)| *d == document).map(|(_, r)| r);
             if rect != Some(old) {
                 send(&mut self.w, &Request::PlaceWidget { document, rect });
+                if rect.is_none() { active.set_origin(s, None); changed = true; }
                 self.widget = rect.map(|rect| ActiveWidget { rect, ..active });
             }
         }
@@ -1157,7 +1175,7 @@ mod widget_lifecycle_tests {
 
     #[test]
     fn late_failure_cannot_retire_a_replacement_in_the_same_slot() {
-        let mut active = Some(ActiveWidget { document: [1; 16], press: [3; 16], key: 9, rect: [0, 0, 20, 20] });
+        let mut active = Some(ActiveWidget { page: (1, 1), document: [1; 16], press: [3; 16], key: 9, rect: [0, 0, 20, 20] });
         assert!(retire_widget(&mut active, [1; 16], [2; 16]).is_none());
         assert!(retire_widget(&mut active, [0; 16], [3; 16]).is_none());
         assert_eq!(retire_widget(&mut active, [1; 16], [3; 16]).unwrap().key, 9);

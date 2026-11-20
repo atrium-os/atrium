@@ -170,6 +170,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
         let scroll = if p.scroll.is_finite() { p.scroll.clamp(0.0, 1.0e7) } else { 0.0 };
         t.pages.push(Page {
             facts: facts(&p.url),
+            attached_origin: None,
             url: p.url,
             title: cut(&p.title, MAX_TITLE),
             search: p.search,

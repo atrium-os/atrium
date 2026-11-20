@@ -355,6 +355,8 @@ pub enum Event {
     /// The original Start receipt distinguishes retries of the same island.
     WidgetFailed { document: Ticket, press: Press, failure: WidgetFailure },
     WidgetStopped { document: Ticket, press: Press },
+    /// Limen confirmed the slot bind. Origin comes from the broker’s fetch grant.
+    WidgetAttached { document: Ticket, press: Press, origin: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

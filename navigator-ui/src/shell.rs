@@ -1742,11 +1742,11 @@ pub fn drop_height(v: &[Suggestion]) -> f32 {
 /// line falls out of the box at any text size.
 pub fn popover_height(s: &Shell, w: f32) -> f32 {
     let Some(p) = s.store.trail().page() else { return 0.0 };
-    let f = &p.facts;
+    let f = &*p.display_facts();
     let tw = w - em(32.0);
     let lines = |t: &str| wrap(t, tw).len() as f32;
     let site = crate::trail::site(&p.url);
-    let mut n = lines(&popover_connection(f, site)) + lines(&crate::ui::tier_sentence(f.tier, site)) + lines(popover_last(f));
+    let mut n = lines(&popover_connection(f, site)) + lines(&crate::ui::tier_sentence(f, site)) + lines(popover_last(f));
     for o in &f.live_parts {
         n += lines(&popover_live_part(o));
     }
@@ -1764,7 +1764,7 @@ pub fn popover_connection(f: &Facts, site: &str) -> String {
 
 /// A live part's line in the popover.
 pub fn popover_live_part(o: &str) -> String {
-    format!("1 part of this page runs live code: {o}.")
+    format!("Live code runs in an embedded part from {o}.")
 }
 
 /// The popover's closing line.

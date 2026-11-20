@@ -272,8 +272,10 @@ fn media_glyph(m: RowMedia) -> char {
 }
 
 /// The tier sentence (§6.3), as the popover and the chip's tooltip say it.
-pub fn tier_sentence(tier: Tier, site: &str) -> String {
-    match tier {
+pub fn tier_sentence(facts: &trail::Facts, site: &str) -> String {
+    match facts.tier {
+        Tier::Static if !facts.live_parts.is_empty() => format!("The main document from {site} is static text and pictures."),
+        Tier::Replayed if !facts.live_parts.is_empty() => format!("The main document replays a recording of {site}."),
         Tier::Static => format!("This page is text and pictures. No code from {site} ran to make it, and none runs now."),
         Tier::Replayed => format!("{site}'s scripts ran once, sealed off, to record what this page can do. What you click now replays those recordings. None of the site's code runs now."),
         Tier::Live => format!("{site}'s JavaScript is running now, in a jail of its own. It can't see your other pages, your files or other sites' logins. It can see what you type into this page and send it to its own site."),
@@ -770,17 +772,14 @@ fn where_at_rest(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
 /// its width. A click opens the popover.
 fn tier_chip(ctx: &mut Ctx, s: &Shell, x: f32, y: f32, p: &trail::Page, st: &Mutable<Shell>) -> f32 {
     let t = ctx.theme;
-    let f = &p.facts;
+    let f = &*p.display_facts();
     let segs: Vec<(char, String, bool)> = match f.tier {
         Tier::Static => vec![(ph::FILE_TEXT, "Static".into(), false)],
         Tier::Replayed => vec![(ph::FILM_STRIP, "Replayed".into(), false)],
         Tier::Live => vec![(ph::LIGHTNING, "Live code".into(), true)],
     }
     .into_iter()
-    .chain((!f.live_parts.is_empty() && f.tier != Tier::Live).then(|| {
-        let n = f.live_parts.len();
-        (ph::LIGHTNING, if n == 1 { "1 live part".to_string() } else { format!("{n} live parts") }, true)
-    }))
+    .chain(f.live_count_label().filter(|_| f.tier != Tier::Live).map(|label| (ph::LIGHTNING, label, true)))
     .collect();
     let ls = sans(type_size::XS, Weight::Semibold, t.text_secondary());
     let total: f32 = em(24.0) + segs.iter().map(|(_, l, _)| width(l, &ls) + em(36.0) + 4.0).sum::<f32>();
@@ -911,7 +910,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
-    let f = &p.facts;
+    let f = &*p.display_facts();
     let site = trail::site(&p.url);
     let x = r.x() + em(16.0);
     let w = r.w() - em(32.0);
@@ -931,7 +930,7 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page) {
     y += em(6.0);
     text(ctx, x, y + em(6.0), "WHAT RUNS", type_size::XXS, Weight::Semibold, t.text_tertiary());
     y += em(16.0);
-    y = wrapped(ctx, x, y, w, &tier_sentence(f.tier, site), t.text_secondary());
+    y = wrapped(ctx, x, y, w, &tier_sentence(f, site), t.text_secondary());
     for o in &f.live_parts {
         y = wrapped(ctx, x, y, w, &shell::popover_live_part(o), t.warning_fg());
     }

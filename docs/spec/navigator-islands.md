@@ -94,8 +94,8 @@ As navigator-ui §6.5 already specifies:
 
 - The box reads the frame's origin with the registrable domain emphasised, and a press
   starts it.
-- While it runs, the tier chip reads "Replayed · 1 live part" and the island carries
-  frescod's frame and tag.
+- While it runs, the chip keeps the main document’s tier and adds “1 live part”.
+  A replayed document reads “Replayed · 1 live part”. Frescod frames and tags the island.
 - A **Stop** control on the frame ends the island and leaves the box.
 
 Whole-page live code (§9 D5) would use the chip's **Live code** state, already drawn.
@@ -960,6 +960,25 @@ a fresh 1120 × 740 Navigator window and pass its fresh log to the driver:
 ```sh
 python3 scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR
 ```
+
+### I2 live parts in the tier chip
+
+Navigatord reports an attachment when Limen confirms the expected embed. It
+supplies the origin from the granted widget URL. Navigator applies the event
+only to the document and Start receipt that requested the widget. The visible
+chip, its details and its accessibility label use the same page-local facts.
+An offered widget contributes zero. A confirmed attachment contributes one.
+Stop, failure and withdrawal clear the attachment. Trail storage omits it.
+
+In the installed arm64 Tessera gate the static parent gained one live part
+from `https://widget.example`. The details named the parent as static and
+identified the embedded code separately. Stop cleared the count. A fresh
+Start restored one part with a different counter PID. Terminating that
+worker cleared the count and showed the failure prompt. The UI and document
+viewer kept their PIDs. To repeat, set `NAVIGATOR_UI_AX=1` in the fixture’s UI
+configuration and append `--tier` to the command above. The host driver uses
+Tesseract and ImageMagick to check the rendered fixture.
+
 
 Guest service logs, executable hashes and composed frames are in
 `~/atrium-vm/evidence/navigator-i2-stop-20261120/`.
