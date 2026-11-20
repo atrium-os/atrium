@@ -74,8 +74,9 @@ TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-de
 REBIND_HIP_RECHECK = "esp-loss-hip-submit-rebind-recheck"
 REBIND_HIP_DECLINE = "esp-loss-hip-submit-rebind-decline"
 RECOVERED_HIP_DECLINE = "esp-loss-hip-submit-recovered-decline"
-ACTIVE_HIP_REFRESH_RETRY = "esp-loss-hip-active-refresh-retry"
-RECOVERED_HIP_RECONNECT = ("esp-loss-hip-submit-recovered-reconnect", ACTIVE_HIP_REFRESH_RETRY)
+ACTIVE_HIP_REFRESH_RECHECK = "esp-loss-hip-active-refresh-recheck"
+ACTIVE_HIP_REFRESH_RETRY = ("esp-loss-hip-active-refresh-retry", ACTIVE_HIP_REFRESH_RECHECK)
+RECOVERED_HIP_RECONNECT = ("esp-loss-hip-submit-recovered-reconnect", *ACTIVE_HIP_REFRESH_RETRY)
 FINAL_HIP_RECOVER = ("esp-loss-hip-submit-final-recover", RECOVERED_HIP_DECLINE, *RECOVERED_HIP_RECONNECT)
 FINAL_HIP_FALLBACK = ("esp-loss-hip-submit-final-fallback", *FINAL_HIP_RECOVER)
 REBIND_HIP_RECONNECT = ("esp-loss-hip-submit-rebind-reconnect", "esp-loss-hip-submit-final-rebind", *FINAL_HIP_FALLBACK)
@@ -270,6 +271,11 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             while not receipts.with_suffix(".rebind-posture").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".rebind-posture").exists(), "rebind posture did not change"
+                        if hip == ACTIVE_HIP_REFRESH_RECHECK and calls.count("getconfig.esp") == 14:
+                            deadline = time.monotonic() + 25
+                            while not receipts.with_suffix(".active-refresh-posture").exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            assert receipts.with_suffix(".active-refresh-posture").exists(), "active refresh posture did not change"
                         needed = "yes" if hip else "no"
                         interval = "<hip-report-interval>5</hip-report-interval>" if hip in REFRESH_HIP else ""
                         body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
@@ -368,11 +374,13 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             assert receipts.with_suffix(".rebind-retry").exists(), "rebind retry was never released"
                         if hip in REBIND_HIP_RECONNECT and config_count >= 8:
                             assert receipts.with_suffix(".rebind-retry").exists(), "reconnect uploaded before fresh approval"
-                        if hip == ACTIVE_HIP_REFRESH_RETRY:
+                        if hip in ACTIVE_HIP_REFRESH_RETRY:
                             if config_count == 13 and receipts.with_suffix(".drop-active-refresh").exists():
                                 calls.append("active-hip-response-dropped")
                                 return
                             if config_count == 14:
+                                if hip == ACTIVE_HIP_REFRESH_RECHECK:
+                                    assert receipts.with_suffix(".active-refresh-retry").exists(), "active refresh retried before fresh approval"
                                 deadline = time.monotonic() + 25
                                 while not receipts.with_suffix(".active-refresh-retry").exists() and time.monotonic() < deadline:
                                     time.sleep(0.05)
@@ -736,7 +744,8 @@ def main():
                 final_recover = args.hip in FINAL_HIP_RECOVER
                 recovered_decline = args.hip == RECOVERED_HIP_DECLINE
                 recovered_reconnect = args.hip in RECOVERED_HIP_RECONNECT
-                active_refresh_retry = args.hip == ACTIVE_HIP_REFRESH_RETRY
+                active_refresh_retry = args.hip in ACTIVE_HIP_REFRESH_RETRY
+                active_refresh_recheck = args.hip == ACTIVE_HIP_REFRESH_RECHECK
                 final_rebind_retry = final_fallback or args.hip == "esp-loss-hip-submit-final-rebind"
                 retry_reconnect = rebind_retry or args.hip == "esp-loss-hip-submit-retry-reconnect"
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
@@ -879,7 +888,8 @@ def main():
                                                 assert set(reports[restored_rebind_report:reconnected_report]) == {original}, reports
                                                 if recovered_reconnect:
                                                     assert calls[configs[11] - 1] == "hipreportcheck.esp", calls
-                                                    assert len(reports[reconnected_report:]) >= 2 and set(reports[reconnected_report:]) == {changed}, reports
+                                                    if not active_refresh_recheck:
+                                                        assert set(reports[reconnected_report:]) == {changed}, reports
                                                     last_rebind_report = calls[:configs[12]].count("hipreport.esp")
                                                     assert last_rebind_report >= reconnected_report + 2, reports
                                                     assert len(reports[last_rebind_report:]) >= 2, reports
@@ -889,6 +899,10 @@ def main():
                                                         active_retry_report = calls[:configs[13]].count("hipreport.esp")
                                                         assert active_retry_report >= last_rebind_report + 3, reports
                                                         assert len(reports[active_retry_report:]) >= 2, reports
+                                                        assert set(reports[reconnected_report:active_retry_report]) == {changed}, reports
+                                                        assert set(reports[active_retry_report:]) == {
+                                                            original if active_refresh_recheck else changed,
+                                                        }, reports
                                                         print("Active HIP refresh loss blocked traffic until silent ESP retry was acknowledged")
                                                     else:
                                                         print("Recovered ESP reconnected with fresh approval, then rebound and refreshed silently")
