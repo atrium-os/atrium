@@ -167,9 +167,19 @@ press 286 23
 sleep 2
 press 332 145
 preview 'previews: 2 of 2' 1
-cp screen.png slides-preview.png
+cp screen.png slides-hidden-off-preview.png
 press 899 553
 wait_job 3
+sleep 3
+# Toggle Include Hidden Slides in the Print menu and pick the same handout.
+press 286 23
+press 332 266
+press 286 23
+press 332 145
+preview 'previews: 2 of 2' 2
+cp screen.png slides-hidden-on-preview.png
+press 899 553
+wait_job 4
 sleep 3
 kill -TERM "$(cat atrium-slides.pid)"
 sleep 2
@@ -185,6 +195,6 @@ press 1234 34
 preview 'previews: 3 of 3' 1
 cp screen.png mail-preview.png
 press 940 551
-wait_job 4
+wait_job 5
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 4
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 5

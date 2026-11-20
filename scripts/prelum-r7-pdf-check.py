@@ -1,4 +1,4 @@
-"""Check the four PDFs received by the isolated IPPS simulator."""
+"""Check the PDFs received by the isolated IPPS simulator."""
 import re
 import subprocess
 import sys
@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 5)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 6)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides, mail = expected
+html, sheets, slides_hidden_off, slides_hidden_on, mail = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -37,12 +37,16 @@ sizes = re.findall(r"^\s*1\s+\d+\s+image\s+(\d+)\s+(\d+)\s+", images, re.M)
 assert sorted(sizes) == [("24", "18"), ("31", "19")], images
 print("Sheets: saved-area cells, chart and both distinct pictures; outside cells and picture omitted")
 
-groups = [
-    re.findall(r"(FIRST|SECOND|THIRD|FOURTH|HIDDEN) SLIDE", page)
-    for page in pages_of(slides)
-]
-assert groups == [["FIRST", "SECOND", "THIRD"], ["FOURTH"]], groups
-print("Slides: two handout pages, visible slides grouped 3 + 1")
+for pdf, setting, expected_groups in (
+    (slides_hidden_off, "off", [["FIRST", "SECOND", "THIRD"], ["FOURTH"]]),
+    (slides_hidden_on, "on", [["FIRST", "HIDDEN", "SECOND"], ["THIRD", "FOURTH"]]),
+):
+    groups = [
+        re.findall(r"(FIRST|SECOND|THIRD|FOURTH|HIDDEN) SLIDE", page)
+        for page in pages_of(pdf)
+    ]
+    assert groups == expected_groups, (setting, groups)
+    print(f"Slides: Include Hidden Slides {setting}, handout groups {groups}")
 
 pages = pages_of(mail)
 body = "\n".join(pages)
