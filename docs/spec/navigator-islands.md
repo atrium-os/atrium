@@ -795,6 +795,18 @@ geometry at 2× zoom after scrolling. These tests injected viewer events.
 The earlier compositor and JIT-off worker test used the fixture parent and
 its bounded GET responder.
 
+The widget-origin gate ran on a fresh arm64 HVF overlay with Tessera mounted
+read-write at `/`. All five guest executable hashes matched staging. Against
+the broker's fixture socket, the converter reported the counter iframe on a
+fresh fetch and a cache hit. The link, forged video attribute, inline frame
+and one-pixel frame in the negative page produced no source. An ordinary
+open of the cached positive page also produced no source message. The broker
+metadata and UI shell regressions passed, including rejection after navigation.
+This gate used an ordinary converter process and exercised the UI shell in a
+test binary. The installed window and jailed worker launch remain to be tested
+together. Logs and executable hashes are in
+`~/atrium-vm/evidence/navigator-i1-widget-origin-20261120/`.
+
 Next, spend a guarded chrome activation for the selected source and current
 document, maintain a whole slot across band, scroll and page changes, and
 provide the origin-bound fetch channel through the production launcher.
