@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-rebind-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=8 ;;
     esp-loss-hip-submit-rebind-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=7 ;;
     esp-loss-hip-submit-rebind-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=6 ;;
     esp-loss-hip-submit-rebind-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=5 ;;
@@ -713,11 +714,16 @@ rebind_restored_forwarding() {
             [ "$(field handshake)" = 0 ] &&
                 [ "$(awk 'END { print NR }' "$receipts")" = "$before_approval" ] ||
                 fail "rebind retry submitted HIP or opened before fresh approval"
-            if [ "$retry_hip_submit" = 7 ]; then
+            if [ "$retry_hip_submit" -ge 7 ]; then
+                declined_choice=$(hip_choice)
                 decline_failed_hip_retry "$before_approval"
                 ok "declining the rebind retry kept the changed report unsent and ESP down"
-                echo "$pass checks passed"
-                exit 0
+                if [ "$retry_hip_submit" = 7 ]; then
+                    echo "$pass checks passed"
+                    exit 0
+                fi
+                reconnect_after_esp_loss_decline "$before_approval" rebind-retry
+                reviews=$((reviews + 1))
             fi
             reviews=$((reviews + 1))
             touch "$receipts.rebind-retry"
@@ -740,7 +746,7 @@ rebind_restored_forwarding() {
     [ "$(field signin)" = in ] &&
         [ "$(sed -n "$((before_rebind + 1))p" "$receipts")" = "$initial_report" ] ||
         fail "the rebound ESP tunnel did not submit the unchanged restored report"
-    if [ "$retry_hip_submit" = 6 ]; then
+    if [ "$retry_hip_submit" -ge 6 ]; then
         rebound_report=$(sed -n "$((before_approval + 1))p" "$receipts")
         [ "${rebound_report%% *}" = "$changed_word" ] || fail "rebind retry omitted the approved change"
         probe "IPv4 echo after fresh approval on rebound ESP"

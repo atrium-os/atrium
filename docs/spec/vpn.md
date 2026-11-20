@@ -961,6 +961,11 @@ another origin. An active portal-profile session stays in engine memory.
   receives neither the pending report nor packets from the failed
   or declined ESP associations. The arm64 gate passed 23/23 using the
   shared Cargo cache.
+  The `--hip esp-loss-hip-submit-rebind-reconnect` variant reconnects
+  after that decline. It rejects the declined choice and withholds the
+  changed report and traffic until fresh approval. ESP resumes after
+  acknowledgement and the same report refreshes without a prompt.
+  The arm64 gate passed 28/28 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

@@ -73,7 +73,8 @@ RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 REBIND_HIP_RECHECK = "esp-loss-hip-submit-rebind-recheck"
 REBIND_HIP_DECLINE = "esp-loss-hip-submit-rebind-decline"
-REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE)
+REBIND_HIP_RECONNECT = "esp-loss-hip-submit-rebind-reconnect"
+REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT)
 ESP_LOSS_RECONNECT_HIP = (
     *REBIND_HIP_RETRY, "esp-loss-hip-submit-retry-reconnect", "esp-loss-hip-submit-retry-decline", "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
 )
@@ -259,7 +260,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             while not receipts.with_suffix(".posture-restored").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".posture-restored").exists(), "retry posture did not change"
-                        if hip in (REBIND_HIP_RECHECK, REBIND_HIP_DECLINE) and calls.count("getconfig.esp") == 7:
+                        if hip in (REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT) and calls.count("getconfig.esp") == 7:
                             deadline = time.monotonic() + 25
                             while not receipts.with_suffix(".rebind-posture").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
@@ -347,13 +348,15 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                     time.sleep(0.05)
                                 assert receipts.with_suffix(".retry").exists(), "HIP retry was never released"
                         if hip in REBIND_HIP_RETRY and config_count == 7:
-                            assert hip != REBIND_HIP_DECLINE, "declined rebind retry submitted HIP"
+                            assert hip not in (REBIND_HIP_DECLINE, REBIND_HIP_RECONNECT), "declined rebind retry submitted HIP"
                             if hip == REBIND_HIP_RECHECK:
                                 assert receipts.with_suffix(".rebind-retry").exists(), "rebind uploaded before fresh approval"
                             deadline = time.monotonic() + 25
                             while not receipts.with_suffix(".rebind-retry").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".rebind-retry").exists(), "rebind retry was never released"
+                        if hip == REBIND_HIP_RECONNECT and config_count == 8:
+                            assert receipts.with_suffix(".rebind-retry").exists(), "reconnect uploaded before fresh approval"
                         if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
@@ -706,11 +709,12 @@ def main():
                 rebind_retry = args.hip in REBIND_HIP_RETRY
                 rebind_recheck = args.hip == REBIND_HIP_RECHECK
                 rebind_decline = args.hip == REBIND_HIP_DECLINE
+                rebind_reconnect = args.hip == REBIND_HIP_RECONNECT
                 retry_reconnect = rebind_retry or args.hip == "esp-loss-hip-submit-retry-reconnect"
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -718,7 +722,7 @@ def main():
                         expected_spis.extend([esp.configs[4][0][0]] * 2)
                         if not rebind_decline:
                             expected_spis.append(esp.configs[-1][0][0])
-                        if rebind_recheck:
+                        if rebind_recheck or rebind_reconnect:
                             expected_spis.append(esp.configs[-1][0][0])
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
@@ -753,7 +757,7 @@ def main():
                     for config in configs[2:]:
                         if config == configs[3] and (retry_decline or retry_reconnect):
                             continue
-                        if rebind_decline and config == configs[-1]:
+                        if (rebind_decline or rebind_reconnect) and config == configs[6]:
                             continue
                         assert calls[config:config + 3] == [*exchange, "hipreport.esp"], calls
                     reconnect_report = calls[:configs[2]].count("hipreport.esp")
@@ -786,7 +790,9 @@ def main():
                                     assert set(reports[next_report:]) == {original}, reports
                                     print("Declining the rebind retry withheld changed HIP and kept ESP down")
                                     return
-                                if rebind_recheck:
+                                if rebind_reconnect:
+                                    assert calls[configs[6]:configs[7]] == exchange, calls
+                                if rebind_recheck or rebind_reconnect:
                                     retry_report = final_rebind + 1
                                     assert set(reports[next_report:retry_report]) == {original}, reports
                                     assert len(reports[retry_report:]) >= 2 and set(reports[retry_report:]) == {changed}, reports
