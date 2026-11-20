@@ -658,6 +658,23 @@ requires the provider's `continued` marker and “Demo account confirmed” on
 screen. The public demo uses no user credential. OAuth callback redemption
 and token storage are separate milestones.
 
+On 2026-11-20 this gate passed twice from cold Mail and Navigator launches
+on a private arm64 HVF overlay with Tessera mounted at `/`. Each press of
+Mail’s Microsoft action produced the four pre-Continue markers above. On
+the first run the sheet had 21,814 pixels in the external stylesheet’s
+heading color (`#b4cfee`). A Fresco pointer press and release on Continue
+produced exactly one authenticated continuation request and displayed
+“Demo account confirmed”. Pressing the disabled button again left the
+request count unchanged. The two post-click screenshots had identical
+SHA-256 hashes. All four unauthenticated control requests returned 403.
+
+The installed worker matched the host build at SHA-256
+`227c740c194219ad01c6b8df0821a6b505f97eb8cca9043d4c6306535c7b1c7d`.
+FreeBSD reported uid 50006, Capsicum flag `C` and both IP families disabled.
+The arm64 build dependency tree contained the Rust JS and Wasm engines and
+neither JIT crate. Screenshots, provider stages and confinement evidence
+are in `~/atrium-vm/evidence/navigator-mail-continue-20261120/`.
+
 ### Direct Navigator inbox fixture
 
 On 2026-11-20 the installed Navigator app opened a 640 × 360 whole-page
