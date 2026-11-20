@@ -221,7 +221,7 @@ viewer. Scrinium keeps the read-only descriptor used for that preview and
 passes it to the system print sheet. The sheet handles paper selection and
 submission without reopening the file by pathname. For a plain-text preview,
 **Print…** formats the complete file from the retained descriptor, up to 4 MiB.
-Files over that limit show an error and queue no job. Image previews print the decoded image on a single centered page at its original aspect ratio. The jailed viewer produces the PDF and Scrinium passes its descriptor to the print sheet.
+Files over that limit show an error and queue no job. Image previews print the decoded image on a single centered page at its original aspect ratio. The jailed viewer produces the PDF and Scrinium passes its descriptor to the print sheet. HTML previews use the same viewer handoff. The viewer paginates the loaded document for A4 using the resources already available to that preview. Scrinium reports an error if the viewer returns a truncated document.
 
 ## 8. What never runs
 

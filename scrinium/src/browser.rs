@@ -274,11 +274,11 @@ impl Look {
     }
 
     pub fn can_print(&self) -> bool {
-        self.is_pdf() || self.is_picture() || matches!(self.body, Some(LookBody::Text { .. }))
+        self.is_pdf() || self.is_printable_document() || matches!(self.body, Some(LookBody::Text { .. }))
     }
 
-    pub fn is_picture(&self) -> bool {
-        matches!(&self.body, Some(LookBody::Embed { role: "doc-viewer", mime, .. }) if mime.starts_with("image/"))
+    pub fn is_printable_document(&self) -> bool {
+        matches!(&self.body, Some(LookBody::Embed { role: "doc-viewer", mime, .. }) if mime.starts_with("image/") || mime == "text/html" || mime == "application/xhtml+xml")
     }
 }
 
@@ -1714,6 +1714,18 @@ mod tests {
         assert!(b.pick().is_err());
         assert!(Path::new(&d).exists());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn quick_look_prints_html_and_images_through_the_document_viewer() {
+        let printable = |name: &str, head: &[u8]| {
+            let look = Look { path: name.into(), name: name.into(), size: head.len() as u64, body: Some(look_kind(name, head)) };
+            look.is_printable_document()
+        };
+        assert!(printable("page.html", b"<!doctype html><html><p>Hello</p>"));
+        assert!(printable("image.png", b"\x89PNG\r\n\x1a\n"));
+        assert!(!printable("invoice.pdf", b"<!doctype html><html><p>Hello</p>"));
+        assert!(!printable("script.sh", b"#!/bin/sh\necho hello"));
     }
 
     #[test]
