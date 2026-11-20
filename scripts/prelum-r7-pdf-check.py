@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 8)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 9)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail = expected
+html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -81,3 +81,12 @@ assert "Mail print fixture" in pages[0], pages[0]
 assert numbered_lines(r"Message body line (\d+)", body) == list(range(1, 76)), body
 assert "synthetic-receipt.bin" in pages[-1] and "SECRET_ATTACHMENT_PAYLOAD" not in body
 print("Mail: three pages with all 75 body lines and the attachment filename")
+
+
+pages = pages_of(plain_text)
+body = "\n".join(pages)
+assert len(pages) == 5, len(pages)
+assert numbered_lines(r"Print fixture line (\d+)", body) == list(range(1, 121)), body
+assert "FIRST QUICK LOOK LINE" in pages[0] and "FINAL QUICK LOOK LINE" in pages[-1], pages
+assert "REPLACEMENT" not in body
+print("Quick Look plain text: five pages with all 122 original lines after pathname replacement")

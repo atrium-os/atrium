@@ -132,7 +132,7 @@ start_app() {
   sleep 4
 }
 (
-  for i in $(seq 1800); do
+  for i in $(seq 3600); do
     ps ax -o jid,comm | awk '/atrium-prelum-ipp/ && $1 > 0'
     sleep 0.1
   done
@@ -217,5 +217,22 @@ preview 'previews: 3 of 3' 1
 cp screen.png mail-preview.png
 press 940 551
 wait_job 7
+sleep 3
+kill -TERM "$(cat mail.pid)"
+sleep 2
+daemon -f -p "$P/scrinium-text.pid" -o "$P/text-app.log" -u prelusheets env HOME="$P/home" LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" SCRINIUM_TRACE=1 SCRINIUM_PLACES="Proof=$P/text-files" "$P/scrinium" --no-picker
+for i in $(seq 20); do grep -q 'entries=\[quicklook-proof.txt\]' text-app.log 2>/dev/null && break; sleep 1; done
+grep -q 'entries=\[quicklook-proof.txt\]' text-app.log
+press 300 130
+key 44 0
+for i in $(seq 20); do grep -q 'look=quicklook-proof.txt:text:' text-app.log && break; sleep 1; done
+grep 'look=quicklook-proof.txt:text:' text-app.log
+printf 'REPLACEMENT MUST NOT PRINT\n' >text-replacement
+mv text-replacement text-files/quicklook-proof.txt
+press 915 112
+preview 'previews: 5 of 5' 1
+cp screen.png text-preview.png
+press 779 534
+wait_job 8
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 7
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 8

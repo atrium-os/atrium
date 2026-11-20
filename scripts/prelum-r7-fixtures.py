@@ -86,3 +86,7 @@ if __name__ == "__main__":
         "<!doctype html><title>Quick Look proof</title><style>h1{color:#1653ab}</style>"
         "<h1>HTML FIRST HEADING</h1>" + paragraphs + "<h2>HTML FINAL HEADING</h2>"
     )
+    lines = ["FIRST QUICK LOOK LINE"]
+    lines.extend(f"Print fixture line {n:03d}" for n in range(1, 121))
+    lines.append("FINAL QUICK LOOK LINE")
+    (output / "quicklook-proof.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")

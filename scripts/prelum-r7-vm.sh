@@ -115,6 +115,8 @@ for file in quicklook.html sheets-proof.xlsx slides-proof.pptx; do
     [ "$file" != quicklook.html ] || target=files/$file
     remote "cat >'$guest/$target'" <"$D/fixtures/$file"
 done
+remote "mkdir '$guest/text-files' && cat >'$guest/text-files/quicklook-proof.txt'" \
+    <"$D/fixtures/quicklook-proof.txt"
 if ! remote "sh -s -- '$guest' '$ipps_port' '$marker'" <"$scripts/prelum-r7-guest.sh" >"$D/results.log" 2>&1; then
     remote "cd '$guest' && tail -60 app.log limend.log portcullis.log sheet.log mail.log" >"$D/guest-errors.log" 2>&1 || :
     cat "$D/results.log" >&2

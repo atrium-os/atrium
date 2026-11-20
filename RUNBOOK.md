@@ -6040,7 +6040,7 @@ to 6329 and 19329. The gate starts and powers down its own guest and uses
 a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
 log, build hashes and verdicts under the printed artifact directory.
 Prelum must reach Done for each desktop job with an observed jailed IPP
-worker. Poppler checks the original Quick Look document after pathname
+worker. Poppler checks the original Quick Look HTML and plain text after pathname
 replacement, the Sheets print area with chart and pictures, Slides
 three-slide handouts with Include Hidden Slides off on A4 and on after a
 Letter paper change, plus paginated
