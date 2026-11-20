@@ -376,3 +376,37 @@ fn sanitized_copy_rejects_oversize_html_and_supplies_only_local_resources() {
     assert!(matches!(&result[..], [FromJail::Opened { result: Err(wire::Refusal::TooLarge), .. }]));
     engine.finish();
 }
+
+#[test]
+fn provider_verdict_requires_parent_supplied_identity_and_one_from_mailbox() {
+    for (trust, from, verified) in [
+        (None, "sender@example.com", false),
+        (Some("edge.example"), "sender@example.com", true),
+        (Some("edge.example"), "sender@other.example", false),
+        (Some("edge.example"), "sender@example.com, other@example.com", false),
+    ] {
+        let message = format!(
+            "Authentication-Results: edge.example; dmarc=pass header.from=example.com\r\nFrom: {from}\r\n\r\nHello\r\n"
+        ).into_bytes();
+        let mut engine = Engine::start();
+        engine.send(&ToJail::Summarize {
+            authserv_id: trust.map(str::to_owned),
+            me: vec![],
+            now: 0,
+            headers_only: false,
+            roots: vec![],
+            batch: vec![wire::Raw { id: 1, bytes: message.clone() }],
+        });
+        let output = engine.run(message.len() as u64, &|_| None);
+        let [FromJail::Summary { result: Ok(summary), .. }] = output.as_slice() else {
+            panic!("{output:?}");
+        };
+        let expected = if verified {
+            wire::SenderCheck::Verified { domain: "example.com".into(), by_provider: true }
+        } else {
+            wire::SenderCheck::NotVerified
+        };
+        assert_eq!(summary.sender_check, expected);
+        engine.finish();
+    }
+}

@@ -415,12 +415,17 @@ pub fn verdict(from_domain: &str, sigs: &[Signature], dmarc_record: Option<&str>
     if sigs.iter().any(|s| s.outcome == Outcome::Pass && !s.partial_body && aligned(from_domain, &s.domain, strict)) {
         return Verdict::Verified { domain: from_domain.to_ascii_lowercase(), by_provider: false };
     }
-    if let Some(p) = provider {
+    let missing_key = sigs.iter().any(|s| s.outcome == Outcome::NoKey && aligned(from_domain, &s.domain, strict));
+    let local_failure = sigs.iter().any(|s| {
+        aligned(from_domain, &s.domain, strict)
+            && (s.partial_body || matches!(s.outcome, Outcome::Fail(_)))
+    });
+    if let Some(p) = provider.filter(|_| !local_failure && (sigs.is_empty() || missing_key)) {
         if p.dmarc_pass && p.header_from.eq_ignore_ascii_case(from_domain) {
             return Verdict::Verified { domain: from_domain.to_ascii_lowercase(), by_provider: true };
         }
     }
-    if sigs.iter().any(|s| s.outcome == Outcome::NoKey && aligned(from_domain, &s.domain, strict)) {
+    if missing_key {
         return Verdict::Pending;
     }
     Verdict::NotVerified
@@ -432,31 +437,108 @@ pub struct ProviderResult {
     pub header_from: String,
 }
 
-/// The topmost `Authentication-Results` whose authserv-id is the account
-/// provider's (`authserv_id`, configured per account; RFC 8601 §5). Any
-/// other instance, or one below a forged copy, is ignored.
+/// The first Authentication-Results header. The caller must supply a trusted
+/// authserv-id from outside the message. Never search past an untrusted field.
 pub fn provider_result(raw: &[u8], authserv_id: &str) -> Option<ProviderResult> {
     let (fields, _) = raw_fields(raw);
-    let f = fields.iter().find(|f| f.name.eq_ignore_ascii_case(b"Authentication-Results"))?;
-    let colon = memchr(b':', f.bytes)?;
-    let v = String::from_utf8_lossy(&f.bytes[colon + 1..]);
-    let v: String = v.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
-    let mut parts = v.split(';');
-    let id = parts.next()?.split_whitespace().next()?.to_ascii_lowercase();
-    if id != authserv_id.to_ascii_lowercase() {
+    if fields.iter().filter(|f| f.name.eq_ignore_ascii_case(b"From")).count() != 1 {
         return None;
     }
-    for p in parts {
-        let p = p.trim();
-        let mut words = p.split_whitespace();
-        let Some(first) = words.next() else { continue };
-        if first.to_ascii_lowercase().starts_with("dmarc=") {
-            let pass = first.eq_ignore_ascii_case("dmarc=pass");
-            let from = words.find_map(|w| w.strip_prefix("header.from=")).unwrap_or("").trim_matches(|c| c == '"' || c == ';').to_string();
-            return Some(ProviderResult { dmarc_pass: pass, header_from: from });
+    let field = fields.iter().find(|f| f.name.eq_ignore_ascii_case(b"Authentication-Results"))?;
+    let colon = memchr(b':', field.bytes)?;
+    let raw = field.bytes[colon + 1..].strip_suffix(b"\n").unwrap_or(&field.bytes[colon + 1..]);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let parts = auth_result_parts(raw)?;
+    let mut identity = parts.first()?.split_ascii_whitespace();
+    if !identity.next()?.eq_ignore_ascii_case(authserv_id)
+        || !matches!(identity.next(), None | Some("1"))
+        || identity.next().is_some()
+    {
+        return None;
+    }
+    let mut result = None;
+    for part in &parts[1..] {
+        let mut words = part.split_ascii_whitespace();
+        let Some(method_result) = words.next() else { return None };
+        let (method, value) = method_result.split_once('=')?;
+        let (name, version) = method.split_once('/').unwrap_or((method, "1"));
+        if !name.eq_ignore_ascii_case("dmarc") {
+            continue;
+        }
+        if version != "1" || result.is_some() {
+            return None;
+        }
+        let mut from = None;
+        for word in words {
+            let (key, value) = word.split_once('=')?;
+            if key.eq_ignore_ascii_case("header.from") {
+                if from.is_some() {
+                    return None;
+                }
+                let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+                if !auth_result_domain(value) {
+                    return None;
+                }
+                from = Some(value.to_ascii_lowercase());
+            }
+        }
+        result = Some(ProviderResult {
+            dmarc_pass: value.eq_ignore_ascii_case("pass"),
+            header_from: from?,
+        });
+    }
+    result
+}
+
+fn auth_result_domain(name: &str) -> bool {
+    name.len() <= 253 && name.contains('.') && name.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Split a bounded ASCII trace field on real semicolons. Remove comments
+/// without promoting their contents to properties. Reject unsupported forms.
+fn auth_result_parts(raw: &[u8]) -> Option<Vec<String>> {
+    if raw.len() > 16 * 1024 || !raw.is_ascii() {
+        return None;
+    }
+    let mut raw = raw.iter().copied().peekable();
+    let mut parts = vec![String::new()];
+    let mut comment = 0u8;
+    let mut quoted = false;
+    while let Some(mut b) = raw.next() {
+        if b == b'\r' || b == b'\n' {
+            if b == b'\r' && raw.next()? != b'\n' { return None; }
+            if !raw.peek().copied().is_some_and(is_wsp) { return None; }
+            b = b' ';
+        }
+        if !(is_wsp(b) || b.is_ascii_graphic()) || (quoted && is_wsp(b)) {
+            return None;
+        }
+        let output = parts.last_mut()?;
+        if b == b'\\' && (comment > 0 || quoted) {
+            let escaped = raw.next()?;
+            if !escaped.is_ascii_graphic() && !is_wsp(escaped) { return None; }
+            if quoted { return None; }
+            continue;
+        }
+        if !quoted && b == b'(' {
+            if comment == 0 { output.push(' '); }
+            comment = comment.checked_add(1)?;
+        } else if !quoted && b == b')' {
+            comment = comment.checked_sub(1)?;
+        } else if comment == 0 {
+            if b == b';' && !quoted {
+                parts.push(String::new());
+            } else {
+                if b == b'"' { quoted = !quoted; }
+                output.push(b as char);
+            }
         }
     }
-    None
+    (comment == 0 && !quoted).then_some(parts)
 }
 
 #[cfg(test)]
@@ -497,4 +579,48 @@ mod tests {
         assert_eq!(provider_result(raw, "mx.google.com"), Some(ProviderResult { dmarc_pass: true, header_from: "example.com".into() }));
         assert_eq!(provider_result(raw, "evil.example"), None);
     }
+    #[test]
+    fn provider_accepts_a_folded_result_with_comments_and_one_domain() {
+        let raw = b"Authentication-Results: edge.example 1;\r\n dmarc/1=pass (receiver note; policy=accept) HEADER.FROM=\"Example.com\"\r\nFrom: A <a@example.com>\r\n\r\n";
+        assert_eq!(
+            provider_result(raw, "edge.example"),
+            Some(ProviderResult { dmarc_pass: true, header_from: "example.com".into() })
+        );
+    }
+
+    #[test]
+    fn provider_ignores_ambiguous_fields() {
+        for result in [
+            "outside.example; dmarc=pass header.from=example.com\r\nAuthentication-Results: edge.example; dmarc=pass header.from=example.com",
+            "edge.example; dmarc=pass header.from=example.com header.from=other.example",
+            "edge.example; dmarc=pass header.from=example.com; dmarc=fail header.from=example.com",
+            "edge.example; dmarc=pass (header.from=example.com)",
+            "edge.example; dmarc=pass header.from=example.com (unfinished",
+            "edge.example; dmarc=pass header.from=example.com\r\nFrom: B <b@example.com>",
+        ] {
+            let raw = format!("Authentication-Results: {result}\r\nFrom: A <a@example.com>\r\n\r\n");
+            assert_eq!(provider_result(raw.as_bytes(), "edge.example"), None, "{result}");
+        }
+    }
+
+    #[test]
+    fn local_verification_takes_precedence_over_a_provider_pass() {
+        let provider = ProviderResult { dmarc_pass: true, header_from: "example.com".into() };
+        let mut sig = Signature {
+            domain: "example.com".into(),
+            selector: "sel".into(),
+            outcome: Outcome::NoKey,
+            partial_body: false,
+        };
+        let check = |sig: &Signature| verdict("example.com", std::slice::from_ref(sig), None, Some(&provider));
+        assert!(matches!(check(&sig), Verdict::Verified { by_provider: true, .. }));
+        sig.outcome = Outcome::Fail("body hash");
+        assert_eq!(check(&sig), Verdict::NotVerified);
+        sig.outcome = Outcome::Pass;
+        assert!(matches!(check(&sig), Verdict::Verified { by_provider: false, .. }));
+        sig.partial_body = true;
+        assert_eq!(check(&sig), Verdict::NotVerified);
+        assert_eq!(verdict("other.example", &[], None, Some(&provider)), Verdict::NotVerified);
+    }
+
 }

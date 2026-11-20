@@ -534,9 +534,17 @@ What Mail shows comes from what was checked, never from what the message says ab
 - **DKIM** (RFC 6376) verified in the parse jail, with the keys looked up by `mail-sync`
   through the system resolver (only `TXT` for `<selector>._domainkey.<domain>` and
   `_dmarc.<domain>`, DNSSEC-validated by local-unbound where signed). **DMARC** alignment
-  (RFC 7489) and **ARC** (RFC 8617) from forwarders the person trusts. For accounts where
-  the provider adds `Authentication-Results` (Gmail, 365, Fastmail), the topmost one whose
-  `authserv-id` is the account's provider is used when our own check can't run (key gone).
+  (RFC 7489) and **ARC** (RFC 8617) from forwarders the person trusts.
+- **Provider results** require explicit trust in the account’s delivery
+  boundary. The receiving MTA must remove outside claims to its own
+  `authserv-id` before delivery, and Mail must obtain that ID independently
+  of message headers. The parse worker accepts only the first
+  `Authentication-Results` field, a single DMARC result, and one
+  `header.from` domain matching the message’s sole From mailbox. A local
+  verified signature takes precedence. A provider pass can cover a missing
+  key or an unsigned message, but cannot override a failed aligned signature.
+  Mail currently leaves provider trust disabled for configured accounts.
+  [RFC 8601 §§4.1 and 5](https://www.rfc-editor.org/rfc/rfc8601.html#section-4.1)
 - Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
   index across restarts. Positive answers are valid for six hours and empty
   answers for one hour. The index holds up to 4,096 names, sharing answers
@@ -1618,7 +1626,9 @@ Stalwart in the cloud VM, and later a real account):
    host UDP socket to ordinary non-VPN fetchers for record lookups
    (nuntius.md §3.6). The six-case gate passed against local-unbound on
    127.0.0.1 with the stock firewall and NAT rules and no redirect.
-   Trusted-provider Authentication-Results remain open.
+   Provider-header validation and worker tests are in place. The account
+   path still needs a verified delivery boundary and an explicitly trusted
+   authentication service ID before it can enable provider results.
    **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
    gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
    waiting in `IDLE` on the inbox and renewing it every 25 minutes (RFC 2177's 29, the
