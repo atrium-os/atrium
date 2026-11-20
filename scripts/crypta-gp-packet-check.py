@@ -346,6 +346,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 assert receipts.with_suffix(".recovery-approved").exists(), "recovered ESP uploaded restored forwarding before approval"
                         if hip in RECOVERED_HIP_RECONNECT and calls.count("getconfig.esp") >= 12:
                             assert receipts.with_suffix(".recovered-reconnect-approved").exists(), "recovered ESP reconnected before fresh approval"
+                        if hip == ACTIVE_HIP_REBIND_RECOVER and calls.count("getconfig.esp") == 17:
+                            initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
+                            if forwarding != initial_forwarding:
+                                assert receipts.with_suffix(".timer-recovery-approved").exists(), "timer-retry ESP submitted changed HIP before approval"
                         if receipts:
                             with receipts.open("a") as receipt:
                                 fact = forwarding
@@ -787,7 +791,7 @@ def main():
                             if active_refresh_reconnect and not active_rebind_tls:
                                 expected_spis.extend([esp.configs[15][0][0]] * 2)
                             if active_rebind_recover:
-                                expected_spis.extend([esp.configs[16][0][0]] * 2)
+                                expected_spis.extend([esp.configs[16][0][0]] * 3)
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -801,7 +805,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        recovery_echoes = 12 if active_refresh_reconnect and (not active_rebind_tls or active_rebind_recover) else 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
+                        recovery_echoes = 13 if active_rebind_recover else 12 if active_refresh_reconnect and (not active_rebind_tls or active_rebind_recover) else 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
                         allowed_echoes.append([
                             *expected_spis[:-recovery_echoes], expected_spis[-recovery_echoes - 1],
                             *expected_spis[-recovery_echoes:],
@@ -810,7 +814,9 @@ def main():
                         allowed_echoes.append([*expected_spis[:-1], expected_spis[-2], expected_spis[-1]])
                     else:
                         allowed_echoes.append([*expected_spis, expected_spis[-1]])
-                if active_refresh_reconnect and (not active_rebind_tls or active_rebind_recover):
+                if active_rebind_recover:
+                    allowed_echoes.extend([*echoes[:-3], retry_spi, *echoes[-3:]] for echoes in allowed_echoes[:])
+                elif active_refresh_reconnect and not active_rebind_tls:
                     allowed_echoes.extend([*echoes[:-2], retry_spi, *echoes[-2:]] for echoes in allowed_echoes[:])
                 elif active_refresh_retry and not active_refresh_decline:
                     allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
@@ -946,9 +952,17 @@ def main():
                                                                 assert len(reports[recovery_report:]) >= 2, reports
                                                         assert len(reports[active_retry_report:]) >= 2, reports
                                                         assert set(reports[reconnected_report:active_retry_report]) == {changed}, reports
-                                                        assert set(reports[active_retry_report:]) == {
-                                                            original if active_refresh_recheck else changed,
-                                                        }, reports
+                                                        if active_rebind_recover:
+                                                            assert set(reports[active_retry_report:recovery_report]) == {original}, reports
+                                                            recovered_reports = reports[recovery_report:]
+                                                            assert recovered_reports[:2] == [original, original], reports
+                                                            changed_at = recovered_reports.index(changed)
+                                                            assert set(recovered_reports[:changed_at]) == {original}, reports
+                                                            assert set(recovered_reports[changed_at:]) == {changed}, reports
+                                                        else:
+                                                            assert set(reports[active_retry_report:]) == {
+                                                                original if active_refresh_recheck else changed,
+                                                            }, reports
                                                         print("Active HIP refresh loss blocked traffic until silent ESP retry was acknowledged")
                                                     else:
                                                         print("Recovered ESP reconnected with fresh approval, then rebound and refreshed silently")

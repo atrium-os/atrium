@@ -1097,6 +1097,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                 fail "HIP refreshed differently or prompted after ESP recovery"
                                             ok "the approved timer-retry report refreshed silently on recovered ESP"
                                             probe "IPv4 echo after silent refresh on recovered timer-retry ESP"
+                                            before_change=$(awk 'END { print NR }' "$receipts")
+                                            "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+                                            wait_prompt gp_hip_approval
+                                            printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                                grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+                                                fail "recovered timer-retry review omitted changed forwarding"
+                                            [ "$(hip_choice)" != "$approval_choice" ] ||
+                                                fail "recovered timer-retry ESP reused the previous approval choice"
+                                            if tail -n "+$((before_change + 1))" "$receipts" | grep -Fxq "$rebound_report"; then
+                                                fail "recovered timer-retry ESP submitted changed HIP before approval"
+                                            fi
+                                            before_approval=$(awk 'END { print NR }' "$receipts")
+                                            touch "$receipts.timer-recovery-approved"
+                                            approve_hip
+                                            wait_receipts "$((before_approval + 1))"
+                                            [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$rebound_report" ] ||
+                                                fail "gateway did not receive the approved forwarding change"
+                                            ok "changed forwarding on recovered timer-retry ESP required fresh approval"
+                                            probe "IPv4 echo on the same recovered timer-retry ESP after approval"
                                         fi
                                     fi
                                 fi
