@@ -736,7 +736,9 @@ fn main() {
                         Ok(id) => {
                             embed = Some(id);
                             asking = Some(what);
-                            run.sheets.ui.set(Ui { asking: true });
+                            // A commit only awaits an acknowledgement. A picker slot here
+                            // would intercept input to the workbook during the save.
+                            run.sheets.ui.set(Ui { asking: what != Asking::Commit });
                         }
                         Err(err) => {
                             close_after_save = false;

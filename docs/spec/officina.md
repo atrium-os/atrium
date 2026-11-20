@@ -171,8 +171,8 @@ For a workbook opened through Scrinium, Sheets encodes the current revision and
 sends a sealed snapshot and its session save grant through Limen. Scrinium
 stages the bytes in the selected directory, syncs the file, checks the original
 entry and revision, atomically replaces it and syncs the directory. Sheets
-marks the revision saved after confirmation. Edits made in the meantime stay
-pending. A stale or expired grant requires reopening the workbook or Save As.
+keeps the grid interactive while waiting for confirmation and marks only the
+acknowledged revision saved. Later edits stay pending. A stale or expired grant requires reopening the workbook or Save As.
 
 Save As sends a sealed native workbook to Scrinium’s Save picker. Scrinium
 publishes the completed file under an unused name and returns a new save grant.
