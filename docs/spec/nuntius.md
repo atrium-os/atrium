@@ -161,8 +161,15 @@ resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout`
   and AD, with EDNS0 at 4 KiB; a truncated answer is `Dns` (TCP would need a new
   connection). Answers must match the id and the question; names are decompressed with a
   jump limit.
-- A lookup adds no reach: an app with `net-fetch` can already send any name to the
-  resolver by fetching it. Mail caches answers for hours (mail.md §7.5).
+- For an ordinary fetcher with no VPN route domain, Portcullis checks the
+  primary nameserver in the host’s resolver configuration. If it is 127.0.0.1
+  or ::1, Portcullis connects one UDP socket to port 53 in the host network
+  namespace. It limits the descriptor to send, receive, and fstat before jaild
+  passes it to Nuntius for `Lookup`. This keeps the VNET host-address block in
+  place. A portal fetcher uses the portal’s resolver, and a VPN-bound fetcher
+  uses its route domain’s resolver.
+- The site list applies before the query reaches any resolver. Mail caches
+  answers for hours (mail.md §7.5).
 
 ## 4. Who decides what a client may reach
 

@@ -52,6 +52,12 @@ impl Udp {
         Udp::to(&ns.into_iter().map(|a| SocketAddr::new(a, 53)).collect::<Vec<_>>())
     }
 
+    /// A connected socket supplied by the broker, with its timeout already
+    /// set. The caller needs only the rights to send and receive.
+    pub fn from_connected(socket: UdpSocket) -> Udp {
+        Udp { socks: Mutex::new(vec![socket]) }
+    }
+
     /// Resolvers at `addrs` (tests use one of their own).
     /// A server this machine cannot reach (an IPv6 one in a jail without
     /// IPv6) is passed over; only none at all is an error.
@@ -80,10 +86,15 @@ impl Exchange for Udp {
         let mut last = io::Error::new(io::ErrorKind::TimedOut, "no answer");
         for s in socks.iter() {
             // Whatever an earlier, abandoned query left behind.
+            use std::os::fd::AsRawFd;
             let mut junk = [0u8; 1];
-            s.set_nonblocking(true)?;
-            while s.recv(&mut junk).is_ok() {}
-            s.set_nonblocking(false)?;
+            // Drain a bounded number of stale replies without changing the
+            // descriptor. A host resolver descriptor only grants send/recv.
+            for _ in 0..32 {
+                // SAFETY: junk is writable for the single byte requested.
+                let n = unsafe { libc::recv(s.as_raw_fd(), junk.as_mut_ptr().cast(), junk.len(), libc::MSG_DONTWAIT) };
+                if n < 0 { break }
+            }
             if let Err(e) = s.send(query) {
                 last = e;
                 continue;

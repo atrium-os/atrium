@@ -128,10 +128,25 @@ fn main() {
     let portal = portal_resolvers();
     // The machine's own addresses, read while getifaddrs still works.
     let own = navigator_fetch::dns::own_addresses();
-    let dns = match &portal {
-        Some(p) => Some(p.clone()),
-        None => navigator_fetch::dns::Udp::system().map(std::sync::Arc::new).map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok(),
+    let host = match std::env::var_os(nuntius::HOST_DNS_FD_ENV) {
+        None => None,
+        Some(value) if value == "3" && portal.is_none() => {
+            use std::os::fd::FromRawFd;
+            // SAFETY: fstat writes into st and checks that fd 3 is live.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(3, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+                fail("host resolver descriptor is missing or is not a socket".into());
+            }
+            // SAFETY: fd 3 is live and the broker transfers ownership to us.
+            let socket = unsafe { std::net::UdpSocket::from_raw_fd(3) };
+            Some(std::sync::Arc::new(navigator_fetch::dns::Udp::from_connected(socket)))
+        }
+        _ => fail("invalid host resolver descriptor for this fetcher".into()),
     };
+    let dns = portal.clone().or(host).or_else(|| {
+        navigator_fetch::dns::Udp::system().map(std::sync::Arc::new)
+            .map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok()
+    });
     let net = sandbox::enter().unwrap_or_else(|e| fail(format!("sandbox: {e}")));
     if !sandbox::in_capability_mode() { fail("kernel reports NOT in capability mode — refusing to serve".into()) }
     let locked: &'static navigator_fetch::Locked<sandbox::Net> = Box::leak(Box::new(navigator_fetch::Locked(std::sync::Mutex::new(net))));

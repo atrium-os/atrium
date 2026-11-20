@@ -30,6 +30,9 @@ pub mod wire;
 
 pub use client::{Client, Events, Requests};
 
+/// Portcullis placed a rights-limited host resolver socket at FD 3.
+pub const HOST_DNS_FD_ENV: &str = "ATRIUM_NUNTIUS_HOST_DNS_FD";
+
 /// Most bytes in one `Data` event.
 pub const DATA_MAX: usize = 60 * 1024;
 /// Caps per instance (§3.5); asked values past them are clamped.

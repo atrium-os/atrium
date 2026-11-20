@@ -56,6 +56,7 @@ mod dev;
 mod egress;
 mod empty;
 mod ide;
+mod host_dns;
 mod launch;
 mod ssh_agent;
 mod workspace;
@@ -510,7 +511,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
             } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain, false)?;
             continue;
         }
         /* ★ WorkerCall (app-composition.md §4, dev-tools-plan.md M5): one
@@ -564,7 +565,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             };
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
                                  &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
-                                 Some((person.clone(), persona.clone())))?;
+                                 Some((person.clone(), persona.clone())), false)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -608,7 +609,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid))?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid), true)?;
             continue;
         }
         /* ★ OpenPortalFetcher (atrium-net.md §8.1): a captive portal's
@@ -665,7 +666,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             portcullisd::portal::watch(true);
             // The sign-in page is the network's own: never in a tunnel.
             let r = handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None);
+                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false);
             portcullisd::portal::watch(false);
             r?;
             continue;
@@ -715,7 +716,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid))?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid), false)?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -1029,7 +1030,7 @@ fn handle_exec_instance(
     tmpfs_mb: u32,
     limits:   (Option<u64>, Option<u32>, bool),
     rule:     Option<portcullis_policy::WorkerRule>,
-    extra_env: Vec<(String, String)>,
+    mut extra_env: Vec<(String, String)>,
     user:     &str,
     shared:   &Mutex<Tenants>,
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
@@ -1048,6 +1049,7 @@ fn handle_exec_instance(
      * (vpn.md §5.4): its caller's, so a Work app's helpers leave by Work's
      * tunnel. None: the host's own table (the portal's sign-in fetcher). */
     domain:   Option<(String, Option<String>)>,
+    ordinary_fetcher: bool,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -1143,6 +1145,18 @@ fn handle_exec_instance(
             }
         },
     };
+    // The ordinary fetcher may talk to the host's configured loopback
+    // resolver, but a VPN-bound or portal fetcher must keep its own DNS path.
+    let host_resolver = if ordinary_fetcher && fib.is_none() {
+        match host_dns::socket() {
+            Ok(socket) => socket,
+            Err(e) => return write_response(writer, &Response::LaunchFailed {
+                stage: "resolver".into(), message: e.to_string(),
+            }),
+        }
+    } else {
+        None
+    };
     write_response(writer, &match as_uid {
         Some(uid) => Response::ReadyForFdsAs { uid },
         None => Response::ReadyForFds,
@@ -1173,7 +1187,12 @@ fn handle_exec_instance(
     }
     let mut it = fds.into_iter();
     let stdio = [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()];
-    let extra_fds: Vec<OwnedFd> = it.collect();
+    let mut extra_fds: Vec<OwnedFd> = it.collect();
+    if let Some(socket) = host_resolver {
+        debug_assert!(extra_fds.is_empty());
+        extra_fds.push(socket);
+        extra_env.push((nuntius::HOST_DNS_FD_ENV.into(), "3".into()));
+    }
     let stdio = match prepare {
         None => stdio,
         Some(f) => match f(stdio) {

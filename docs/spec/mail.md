@@ -1590,8 +1590,11 @@ Stalwart in the cloud VM, and later a real account):
    A follow-up run passed all six cases with the stock PF and NAT rules and an
    upstream resolver on a separate LAN. With the commissioned local-unbound
    setup, the copied 127.0.0.1 resolver address refers to the fetcher’s own
-   VNET loopback and TXT lookup fails. A deployed path to host local-unbound,
-   cache persistence across restarts, and trusted-provider
+   VNET loopback and TXT lookup failed. Portcullis now passes a restricted
+   host UDP socket to ordinary non-VPN fetchers for record lookups
+   (nuntius.md §3.6). The six-case gate passed against local-unbound on
+   127.0.0.1 with the stock firewall and NAT rules and no redirect.
+   Cache persistence across restarts and trusted-provider
    Authentication-Results remain open.
    **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
    gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
