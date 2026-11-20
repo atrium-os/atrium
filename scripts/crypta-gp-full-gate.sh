@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-rebind-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=19 ;;
     esp-loss-hip-active-refresh-rebind-tls) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=18 ;;
     esp-loss-hip-active-refresh-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=17 ;;
     esp-loss-hip-active-refresh-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=16 ;;
@@ -1074,7 +1075,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                     probe "IPv4 echo after silent refresh on the retry ESP association"
                                     if [ "$retry_hip_submit" -ge 17 ]; then
                                         rebind_restored_forwarding 11 "$retry_report"
-                                        if [ "$retry_hip_submit" = 18 ]; then
+                                        if [ "$retry_hip_submit" -ge 18 ]; then
                                             [ "$("$V" "grep -o 'GlobalProtect data transport: TLS' $G/cryptad.log | wc -l | tr -d ' '")" = 3 ] ||
                                                 fail "the rebound timer-refresh retry did not select TLS"
                                         fi
@@ -1086,6 +1087,17 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                             fail "HIP refreshed differently or prompted after rebind of the retry tunnel"
                                         ok "the approved retry report refreshed silently after rebind"
                                         probe "IPv4 echo after silent refresh on the rebound retry tunnel"
+                                        if [ "$retry_hip_submit" = 19 ]; then
+                                            rebind_restored_forwarding 12 "$retry_report"
+                                            before_refresh=$(awk 'END { print NR }' "$receipts")
+                                            wait_receipts "$((before_refresh + 1))"
+                                            [ "$(field signin)" = in ] &&
+                                                [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$retry_report" ] &&
+                                                [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                                                fail "HIP refreshed differently or prompted after ESP recovery"
+                                            ok "the approved timer-retry report refreshed silently on recovered ESP"
+                                            probe "IPv4 echo after silent refresh on recovered timer-retry ESP"
+                                        fi
                                     fi
                                 fi
                             fi
