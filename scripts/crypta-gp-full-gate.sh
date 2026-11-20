@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-retry-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=4 ;;
     esp-loss-hip-submit-retry-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=3 ;;
     esp-loss-hip-submit-retry-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=2 ;;
     esp-loss-hip-submit-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=1 ;;
@@ -629,7 +630,7 @@ reconnect_after_esp_loss_decline() {
     "$V" "$CTL up name=gp-gate" >/dev/null
     wait_prompt gp_hip_approval
     printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-        grep -q "$(hex "IPv6 forwarding  $changed_word")" || fail "reconnect reviewed different posture"
+        grep -q "$(hex "IPv6 forwarding  ${3:-$changed_word}")" || fail "reconnect reviewed different posture"
     [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined approval"
     if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
         fail "reconnect accepted the declined approval"
@@ -639,7 +640,7 @@ reconnect_after_esp_loss_decline() {
     [ "$(field handshake)" = 0 ] || fail "the reconnect opened before approval"
     "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
         fail "IPv4 echo passed before reconnect approval"
-    if tail -n "+$(($1 + 1))" "$receipts" | grep -q "^$changed_word "; then
+    if tail -n "+$(($1 + 1))" "$receipts" | grep -q "^${3:-$changed_word} "; then
         fail "changed posture reached the gateway before reconnect approval"
     fi
     ok "reconnect rejected the declined approval and withheld changed HIP and traffic"
@@ -788,7 +789,8 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$(wc -l < "$receipts" | tr -d ' ')" = "$before_retry" ] &&
                 [ "$(field handshake)" = 0 ] || fail "retry submitted HIP or opened before fresh approval"
             ok "retry reviewed restored posture and rejected stale approval"
-            if [ "$retry_hip_submit" = 3 ]; then
+            if [ "$retry_hip_submit" -ge 3 ]; then
+                declined_choice=$(hip_choice)
                 "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
                 wait_field up 0
                 [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
@@ -801,8 +803,12 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                 "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
                     fail "IPv4 echo passed after declining retry HIP"
                 ok "declining retry HIP withheld the restored report and kept ESP down"
-                echo "$pass checks passed"
-                exit 0
+                if [ "$retry_hip_submit" = 3 ]; then
+                    echo "$pass checks passed"
+                    exit 0
+                fi
+                reconnect_after_esp_loss_decline "$before_retry" rebind-approved "${initial_report%% *}"
+                retry_reviews=$((retry_reviews + 1))
             fi
             retry_reviews=$((retry_reviews + 1))
             touch "$receipts.retry"
@@ -833,7 +839,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$retry_reviews" ] ||
                 fail "HIP retry or refresh opened an extra review"
             probe "IPv4 echo on restored ESP after silent HIP refresh"
-            if [ "$retry_hip_submit" = 2 ]; then
+            if [ "$retry_hip_submit" -ge 2 ]; then
                 [ "$changed_report" = "$initial_report" ] || fail "retry submitted stale posture"
                 rebind_restored_forwarding 4
             fi
