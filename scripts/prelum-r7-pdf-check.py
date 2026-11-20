@@ -20,32 +20,44 @@ expected = [spool / f"job-{job}.pdf" for job in range(1, 12)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
 transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
 job_ids = list(range(1, len(expected) + 1))
-creates = re.findall(r"^fake printer: Create-Job job ", transcript, re.M)
-sends = numbered_lines(r"^fake printer: Send-Document job (\d+) ", transcript)
-receipts = re.findall(
-    r"^fake printer: got job (\d+) \((\d+) bytes\) (.*) sha256=([a-f0-9]{64})$",
-    transcript,
-    re.M,
-)
-completions = numbered_lines(r"^fake printer: job (\d+) completed$", transcript)
-assert len(creates) == len(job_ids), len(creates)
-assert sends == job_ids, sends
-assert [int(job) for job, _, _, _ in receipts] == job_ids, receipts
+events = []
+receipts = []
+for line in transcript.splitlines():
+    if line.startswith("fake printer: Create-Job job "):
+        events.append(("create", None))
+    elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
+        events.append(("send", int(send[1])))
+    elif receipt := re.fullmatch(
+        r"fake printer: got job (\d+) \((\d+) bytes\) (.*) sha256=([a-f0-9]{64})", line
+    ):
+        events.append(("receipt", int(receipt[1])))
+        receipts.append(receipt.groups())
+    elif completed := re.fullmatch(r"fake printer: job (\d+) completed", line):
+        events.append(("complete", int(completed[1])))
+expected_events = [
+    event
+    for job in job_ids
+    for event in (("create", None), ("send", job), ("receipt", job), ("complete", job))
+]
+assert events == expected_events, events
+
 jobs = Path(sys.argv[3]).read_text(encoding="utf-8")
-completed_titles = re.findall(
-    r"^ +([0-9]+) +printer [0-9]+ +Done +[0-9]+/[0-9]+ +(.+?) *$",
+completed_jobs = re.findall(
+    r"^ +([0-9]+) +printer [0-9]+ +Done +([0-9]+)/([0-9]+) +(.+?) *$",
     jobs,
     re.M,
 )
-assert [(int(job), title) for job, title in completed_titles] == [
-    (int(job), title) for job, _, title, _ in receipts
-], (completed_titles, receipts)
-for pdf, (job, size, _title, digest) in zip(expected, receipts):
+assert [(job, title) for job, _, _, title in completed_jobs] == [
+    (job, title) for job, _, title, _ in receipts
+], (completed_jobs, receipts)
+for pdf, (job, size, _title, digest), (_, completed, total, _) in zip(expected, receipts, completed_jobs):
     payload = pdf.read_bytes()
     assert len(payload) == int(size), (job, size, len(payload))
     assert hashlib.sha256(payload).hexdigest() == digest, (job, "upload SHA-256 mismatch")
-assert completions == job_ids, completions
-print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs; desktop titles and upload hashes match")
+    info = subprocess.check_output(["pdfinfo", str(pdf)], text=True)
+    page_count = re.search(r"^Pages: +([0-9]+)$", info, re.M)
+    assert page_count and completed == total == page_count[1], (job, completed, total, info)
+print(f"IPPS simulator: {len(job_ids)} ordered job lifecycles; desktop titles, sheet counts and upload hashes match")
 
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 
