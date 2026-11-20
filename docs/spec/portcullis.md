@@ -1220,11 +1220,15 @@ format. The broker records the occupied slot before launch. Clean teardown
 unmounts the image; an empty autosave directory clears the pending marker.
 New and Open skip occupied slots.
 
-A launcher press authorizes `RecoverWorkbook` for one inactive pending slot
-of that owner, persona and publisher. A workbook UID cannot request recovery.
-Portcullis checks live jails and reserves the slot through teardown. The
-launcher receives neither file contents nor the original file grant.
-
+A launcher press authorizes `RecoverWorkbook` for inactive pending slots of
+that owner, persona and publisher. One candidate opens directly. For several,
+`PendingWorkbooks` returns up to eight launch-time display names and opaque
+identifiers. A second launcher press sends `RecoverSelectedWorkbook` with the
+chosen identifier. Portcullis validates it against the current broker-owned
+marker while reserving the slot. Reuse of the slot creates a new identifier.
+Older empty markers receive a numbered label and an identifier on first use.
+The launcher receives only this metadata. The selected document jail reads
+the base and journal. Workbook UIDs cannot request recovery.
 
 ### 6.5.1 Names must carry an instance — and the failure was silent
 

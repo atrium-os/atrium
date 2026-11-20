@@ -149,7 +149,7 @@ fn save_name(name: &str) -> String {
     format!("{}.osheet", &stem[..end])
 }
 
-fn request_workbook(recover: bool, activation: Option<fresco_protocol::activation::Token>) -> Result<(), String> {
+fn request_workbook(recover: bool, selected: Option<[u8; 16]>, activation: Option<fresco_protocol::activation::Token>) -> Result<Vec<portcullis_ipc::PendingWorkbook>, String> {
     use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION, WORKERS_SOCKET_PATH};
     use std::os::unix::net::UnixStream;
     let activation = activation.ok_or("Use the workbook button in the Sheets window")?;
@@ -160,9 +160,14 @@ fn request_workbook(recover: bool, activation: Option<fresco_protocol::activatio
         Response::Hello { .. } => {}
         response => return Err(format!("The workbook broker answered {response:?}")),
     }
-    let request = if recover { Request::RecoverWorkbook { activation } } else { Request::NewWorkbook { activation } };
+    let request = match selected {
+        Some(id) => Request::RecoverSelectedWorkbook { activation, id },
+        None if recover => Request::RecoverWorkbook { activation },
+        None => Request::NewWorkbook { activation },
+    };
     match round_trip(&mut socket, &request).map_err(|e| e.to_string())? {
-        Response::Opened { .. } => Ok(()),
+        Response::Opened { .. } => Ok(Vec::new()),
+        Response::PendingWorkbooks { books } if recover && books.len() <= 8 => Ok(books),
         Response::Error { message } => Err(message),
         response => Err(format!("The workbook broker answered {response:?}")),
     }
@@ -600,18 +605,30 @@ fn main() {
         }
         for c in run.sheets.take_cmds() {
             match c {
-                Cmd::NewWorkbook(activation) | Cmd::RecoverWorkbook(activation) => {
-                    if let Err(why) = request_workbook(matches!(c, Cmd::RecoverWorkbook(_)), activation) {
-                        run.set_status(why);
+                Cmd::NewWorkbook(activation) | Cmd::RecoverWorkbook(_, activation) => {
+                    let selected = match c { Cmd::RecoverWorkbook(id, _) => id, _ => None };
+                    let result = request_workbook(matches!(c, Cmd::RecoverWorkbook(..)), selected, activation);
+                    run.sheets.pending_books.set(Vec::new());
+                    match result {
+                        Ok(books) if !books.is_empty() => {
+                            run.sheets.pending_books.set(books);
+                            run.set_status("Choose a workbook to recover.");
+                        }
+                        Ok(_) => run.set_status(""),
+                        Err(why) => run.set_status(why),
                     }
                 }
-                Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::Open => {
+                    run.sheets.pending_books.set(Vec::new());
+                    want_picker = Some(Asking::Open);
+                }
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
                 Cmd::Data(atrium_sheets::data::DataCmd::MergeCopies) => {
                     run.merge_base = None;
                     want_picker = Some(Asking::MergeBase);
                 }
                 Cmd::PasswordDone => run.password_done(),
+                Cmd::PasswordClose if recover && matches!(run.locked, Some(Locked::Recovery { .. })) => break 'main,
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::Save | Cmd::CloseSave if matches!(asking, Some(Asking::Commit | Asking::SaveAs)) && close_after_save => {}
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),

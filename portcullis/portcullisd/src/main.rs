@@ -366,22 +366,28 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        if let Request::NewWorkbook { activation } | Request::RecoverWorkbook { activation } = req {
-            let recover = matches!(req, Request::RecoverWorkbook { .. });
+        if let Request::NewWorkbook { activation } | Request::RecoverWorkbook { activation }
+            | Request::RecoverSelectedWorkbook { activation, .. } = req {
+            let action = match req {
+                Request::RecoverSelectedWorkbook { id, .. } => launch::WorkbookAction::Select(id),
+                Request::RecoverWorkbook { .. } => launch::WorkbookAction::Recover,
+                _ => launch::WorkbookAction::New,
+            };
             let result = (|| {
                 if !registry.resolve(uid).is_some_and(|(_, app)| app == portcullis_policy::opens::SHEETS) {
                     return Err("Only Sheets can request a new workbook".into());
                 }
                 may_run_unasked(portcullis_policy::opens::SHEETS, &owner, &shared)?;
                 portcullisd::opens::spend_press(&portcullisd::opens::activation_socket(), activation, uid)?;
-                if recover && registry.document_slot(uid).is_some() {
+                if action != launch::WorkbookAction::New && registry.document_slot(uid).is_some() {
                     return Err("Choose Recover in the Sheets launcher".into());
                 }
-                launch::new_workbook(&owner, registry.persona(uid).flatten(), recover, registry.publisher(uid).flatten())
+                launch::new_workbook(&owner, registry.persona(uid).flatten(), action, registry.publisher(uid).flatten())
                     .map_err(|e| e.to_string())
             })();
             let response = match result {
-                Ok(()) => Response::Opened { app: "Sheets".into(), name: "Untitled".into() },
+                Ok(books) if !books.is_empty() => Response::PendingWorkbooks { books },
+                Ok(_) => Response::Opened { app: "Sheets".into(), name: "Untitled".into() },
                 Err(message) => Response::Error { message },
             };
             write_response(&mut writer, &response)?;
@@ -3827,7 +3833,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

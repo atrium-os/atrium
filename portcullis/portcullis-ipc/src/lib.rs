@@ -84,6 +84,13 @@ pub const VPN_PERSONA: &str = "vpn";
 /// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
 pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 
+/// A broker-owned pending generation and its launch-time display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWorkbook {
+    pub id: [u8; 16],
+    pub name: String,
+}
+
 /// The bounded reclaim signal a memory governor may request — mirrors jaild's
 /// `ReapSignal` but keeps this app-protocol crate free of a jaild dependency
 /// (portcullisd maps one to the other). No raw signal numbers cross the wire.
@@ -399,6 +406,8 @@ pub enum Request {
     NewWorkbook { activation: [u8; 16] },
     /// Restore a pending workbook in its own jail on a launcher press.
     RecoverWorkbook { activation: [u8; 16] },
+    /// A fresh launcher press for a particular pending generation.
+    RecoverSelectedWorkbook { activation: [u8; 16], id: [u8; 16] },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with
@@ -988,6 +997,7 @@ pub enum Response {
     Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
+    PendingWorkbooks { books: Vec<PendingWorkbook> },
     /// A download saved: the name it has, and its folder in words
     /// ("Downloads", "Work's Downloads").
     Downloaded { name: String, place: String },

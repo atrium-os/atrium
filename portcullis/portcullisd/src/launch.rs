@@ -206,6 +206,32 @@ fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_
     }))
 }
 
+use portcullis_ipc::PendingWorkbook;
+
+// Broker-owned marker. The document jail never sees the marker or its siblings.
+fn write_workbook_marker(path: &Path, name: &str) -> std::io::Result<PendingWorkbook> {
+    use std::io::{Read, Write};
+    let mut id = [0; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
+    let book = PendingWorkbook { id, name: name.chars().filter(|c| !c.is_control()).take(255).collect() };
+    let temp = path.with_extension("pending.tmp");
+    let mut file = fs::File::create(&temp)?;
+    file.write_all(&serde_json::to_vec(&book)?)?;
+    file.sync_all()?;
+    fs::rename(temp, path)?;
+    fs::File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(book)
+}
+
+fn pending_workbook(path: &Path, index: usize) -> std::io::Result<PendingWorkbook> {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        // A marker from before recovery choices had names.
+        return write_workbook_marker(path, &format!("Recovered workbook {}", index + 1));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 struct WorkbookLaunch {
     slot: u8,
     blank: bool,
@@ -213,10 +239,18 @@ struct WorkbookLaunch {
     publisher: Option<[u8; 32]>,
     store: portcullis_overlay::Place,
     pending: PathBuf,
+    name: String,
 }
 
-pub fn new_workbook(user: &str, persona: Option<&str>, recover: bool, publisher: Option<[u8; 32]>) -> std::io::Result<()> {
-    launch_workbook(user, persona, None, recover, Some(publisher))
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WorkbookAction {
+    New,
+    Recover,
+    Select([u8; 16]),
+}
+
+pub fn new_workbook(user: &str, persona: Option<&str>, action: WorkbookAction, publisher: Option<[u8; 32]>) -> std::io::Result<Vec<PendingWorkbook>> {
+    launch_workbook(user, persona, "Untitled", None, action, Some(publisher))
 }
 pub fn open_workbook(
     user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd, commit: Option<[u8; 16]>,
@@ -225,11 +259,11 @@ pub fn open_workbook(
     let (sender, receiver) = std::os::unix::net::UnixStream::pair()?;
     atrium_open::send_with_commit(&sender, name, mime, write, fd.as_raw_fd(), commit)?;
     drop(sender);
-    launch_workbook(user, persona, Some(receiver.into()), false, None)
+    launch_workbook(user, persona, name, Some(receiver.into()), WorkbookAction::New, None).map(|_| ())
 }
 
 /// Reserve a document slot until its launch thread has torn down the jail.
-fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>, recover: bool, caller_key: Option<Option<[u8; 32]>>) -> std::io::Result<()> {
+fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Option<OwnedFd>, action: WorkbookAction, caller_key: Option<Option<[u8; 32]>>) -> std::io::Result<Vec<PendingWorkbook>> {
     use std::os::fd::AsFd;
 
     const DOCUMENT_LIMIT: usize = 8;
@@ -245,6 +279,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>, 
         }
     }
 
+    let recover = action != WorkbookAction::New;
     let blank = startup.is_none();
     let stdio = startup.map(|receiver| -> std::io::Result<_> {
         Ok([
@@ -290,6 +325,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>, 
         let deadline = Instant::now() + Duration::from_secs(2);
         'reserve: loop {
             let mut finishing = false;
+            let mut choices = Vec::new();
             for (index, used) in active.iter_mut().enumerate() {
                 let pending = dir.join(format!("{index}.pending"));
                 if pending.try_exists()? != recover {
@@ -305,33 +341,56 @@ fn launch_workbook(user: &str, persona: Option<&str>, startup: Option<OwnedFd>, 
                         continue;
                     }
                 }
+                if recover {
+                    let book = pending_workbook(&pending, index)?;
+                    if let WorkbookAction::Select(id) = action {
+                        if book.id != id { continue; }
+                    } else {
+                        choices.push((index, book));
+                        continue;
+                    }
+                }
                 *used = true;
                 break 'reserve (Slot(index), pending);
             }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !choices.is_empty() && finishing && !left.is_zero() {
+                active = SLOT_RELEASED.wait_timeout(active, left).unwrap().0;
+                continue;
+            }
+            if choices.len() > 1 {
+                return Ok(choices.into_iter().map(|(_, book)| book).collect());
+            }
+            if let Some((index, _)) = choices.pop() {
+                active[index] = true;
+                break 'reserve (Slot(index), dir.join(format!("{index}.pending")));
+            }
             // The window can vanish before jail teardown and disk detach finish.
             // The releasing thread wakes Recover after the volume is safe to reopen.
-            let left = deadline.saturating_duration_since(Instant::now());
             if !finishing || left.is_zero() {
-                return Err(std::io::Error::other(if recover {
+                return Err(std::io::Error::other(if matches!(action, WorkbookAction::Select(_)) {
+                    "That recovery is no longer available. Choose Recover again."
+                } else if recover {
                     "No closed workbook is waiting for recovery"
                 } else { "All workbook slots are open or awaiting recovery" }));
             }
             active = SLOT_RELEASED.wait_timeout(active, left).unwrap().0;
         }
     };
+    let name = name.to_owned();
     let store = portcullis_overlay::Place { dir: dir.join(slot.0.to_string()),
         img: dir.join(format!("{}.img", slot.0)), person: None };
     let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
     std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
         let index = slot.0;
         let result = launch_inner(portcullis_policy::opens::SHEETS, persona.as_deref(),
-                                  &user, stdio, None, None, Some(WorkbookLaunch { slot: index as u8, blank, recover, store, pending, publisher }));
+                                  &user, stdio, None, None, Some(WorkbookLaunch { slot: index as u8, blank, recover, store, pending, publisher, name }));
         if let Err(e) = result {
             eprintln!("portcullisd: Sheets workbook launch: {e:?}");
         }
         drop(slot);
     })?;
-    Ok(())
+    Ok(Vec::new())
 }
 
 fn launch_inner(
@@ -784,9 +843,9 @@ impl<'a> RecoveryMount<'a> {
         std::os::unix::fs::chown(&data, Some(app_uid), Some(app_uid))
             .and_then(|_| fs::set_permissions(&data, fs::Permissions::from_mode(0o700)))
             .map_err(|e| fail(e.to_string()))?;
-        fs::File::create(&doc.pending).and_then(|f| f.sync_all())
-            .and_then(|_| fs::File::open(doc.pending.parent().unwrap())?.sync_all())
-            .map_err(|e| fail(e.to_string()))?;
+        if !doc.recover {
+            write_workbook_marker(&doc.pending, &doc.name).map_err(|e| fail(e.to_string()))?;
+        }
         jc.add_mount(&data, &jail_path.join("atrium/recovery"), "nullfs", &["rw", "nosuid", "noexec"]);
         Ok(mount)
     }
