@@ -1,6 +1,7 @@
 #!/bin/sh
 # Private 1280x720 Sheets headless fixture. The single Scrinium place holds
 # Proof.csv, with A1=Original. Stage the check_recovered_copy example locally.
+# Pass --save-as-labels for two copies of Proof.csv and collision-suffixed names.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -89,6 +90,83 @@ save_copy() {
     mv "$out" "$results/$first-$stem.osheet"
     test "$(cat "$books/Proof.csv")" = Original
 }
+# Open the same file twice. The first published copy takes the suggested
+# name and the second gets Scrinium's collision suffix.
+open_proof() {
+    parent=$(win_at 48 24)
+    click 48 24
+    wait_for different_window 488 183 "$parent"
+    click 488 183; sleep .5; key 0x28
+    wait_for count "$1"
+}
+publish() {
+    parent=$(win_at 205 24)
+    click 205 24
+    wait_for different_window 824 457 "$parent"
+    click 824 457
+    wait_for test -s "$books/$1"
+    /tmp/check-recovered-copy "$books/$1" "$2" plain
+    back_in_document() { test "$(win_at 824 457)" = "$parent"; }
+    wait_for back_in_document
+}
+check_name() {
+    test "$(cat "$1/name")" = "$3" && grep -Fq "\"name\":\"$3\"" "$2"
+}
+if test "${1:-}" = --save-as-labels; then
+    wait_for count 0
+    wait_for pending 0
+    test "$(ls -A "$books")" = Proof.csv
+    original=$(sha256 -q "$books/Proof.csv")
+    open_proof 1; first=$(docs)
+    wait_for opened "$first" Proof.csv
+    sleep .6
+    edit 62 0x1d 0x08 0x05 0x15 0x04 # zebra
+    open_proof 2; second=$(docs | grep -vx "$first")
+    wait_for opened "$second" Proof.csv
+    sleep .6
+    edit 62 0x09 0x12 0x1b # fox
+    for slot in 0 1; do
+        marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name "$slot.pending")
+        grep -Fq '"name":"Proof.csv"' "$marker"
+        cp "$marker" "$results/$slot.before"
+    done
+    for slot in 1 0; do
+        if test "$slot" = 1; then
+            jid=$second; name=Proof.osheet; a1=fox
+        else
+            jid=$first; name='Proof (2).osheet'; a1=zebra
+        fi
+        dir=$(dirname "$(find "$(root "$jid")/atrium/recovery" -name current)")
+        marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name "$slot.pending")
+        # Dismissing Save As must preserve both old names and the identity.
+        parent=$(win_at 205 24); click 205 24
+        wait_for different_window 824 457 "$parent"
+        key 0x29; sleep .5
+        check_name "$dir" "$marker" Proof.csv
+        cmp "$marker" "$results/$slot.before"
+        publish "$name" "$a1"
+        wait_for check_name "$dir" "$marker" "$name"
+        sed 's/,"name":.*//' "$marker" > "$results/id"
+        sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/id"
+        edit 129 0x1f
+        sleep 2.2
+        kill_doc "$jid"; wait_for count "$slot"
+    done
+    wait_for pending 2
+    click 213 24; sleep .6
+    cp selectscreen.png "$results/recovery-names.png"
+    # Slot zero is the copy with the suffix, although it was saved second.
+    click 120 96; wait_for count 1; sleep .6
+    publish 'Proof (2) (2).osheet' 'zebra,2'
+    key 0x1a 1; wait_for count 0; wait_for pending 1
+    click 213 24; wait_for count 1; sleep .6
+    publish 'Proof (3).osheet' 'fox,2'
+    key 0x1a 1; wait_for count 0; wait_for pending 0
+    test "$(sha256 -q "$books/Proof.csv")" = "$original"
+    for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
+    echo "Both recovered names, identities, edits and suggested Save As names verified. Frames and copies: $results"
+    exit 0
+fi
 for first in protected plain; do
     make_pair
     if test "$first" = plain; then

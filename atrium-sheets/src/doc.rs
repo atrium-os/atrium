@@ -377,6 +377,16 @@ impl Autosave {
         &self.dir
     }
 
+    /// Record the filename the picker actually published, including any collision suffix.
+    pub fn set_display_name(&self, name: &str) -> io::Result<()> {
+        let tmp = self.dir.join(".name.tmp");
+        let mut file = File::create(&tmp)?;
+        file.write_all(name.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(tmp, self.dir.join(META))?;
+        File::open(&self.dir)?.sync_all()
+    }
+
     /// A clean close: nothing to recover.
     pub fn remove(self) -> io::Result<()> {
         fs::remove_dir_all(&self.dir)

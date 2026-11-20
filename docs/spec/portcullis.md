@@ -1222,10 +1222,15 @@ New and Open skip occupied slots.
 
 A launcher press authorizes `RecoverWorkbook` for inactive pending slots of
 that owner, persona and publisher. One candidate opens directly. For several,
-`PendingWorkbooks` returns up to eight launch-time display names and opaque
+`PendingWorkbooks` returns up to eight current display names and opaque
 identifiers. A second launcher press sends `RecoverSelectedWorkbook` with the
 chosen identifier. Portcullis validates it against the current broker-owned
 marker while reserving the slot. Reuse of the slot creates a new identifier.
+After a confirmed Save As, the live document can send `NameWorkbookRecovery`
+on the worker socket. The broker derives the marker location from the peer
+UID's owner, persona, publisher and document slot. Under the slot lock it
+checks the recovery identifier supplied at launch and atomically replaces
+the display name. The identifier stays stable through repeated saves.
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads
 the base and journal. Workbook UIDs cannot request recovery.

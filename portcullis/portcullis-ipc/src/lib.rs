@@ -84,7 +84,7 @@ pub const VPN_PERSONA: &str = "vpn";
 /// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
 pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 
-/// A broker-owned pending generation and its launch-time display name.
+/// A broker-owned pending generation and its current display name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWorkbook {
     pub id: [u8; 16],
@@ -408,6 +408,8 @@ pub enum Request {
     RecoverWorkbook { activation: [u8; 16] },
     /// A fresh launcher press for a particular pending generation.
     RecoverSelectedWorkbook { activation: [u8; 16], id: [u8; 16] },
+    /// Update only this document's display name after a confirmed Save As.
+    NameWorkbookRecovery { id: [u8; 16], name: String },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with

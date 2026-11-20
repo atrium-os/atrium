@@ -149,23 +149,28 @@ fn save_name(name: &str) -> String {
     format!("{}.osheet", &stem[..end])
 }
 
-fn request_workbook(recover: bool, selected: Option<[u8; 16]>, activation: Option<fresco_protocol::activation::Token>) -> Result<Vec<portcullis_ipc::PendingWorkbook>, String> {
+fn workbook_broker(request: &portcullis_ipc::Request, seconds: u64) -> Result<portcullis_ipc::Response, String> {
     use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION, WORKERS_SOCKET_PATH};
     use std::os::unix::net::UnixStream;
-    let activation = activation.ok_or("Use the workbook button in the Sheets window")?;
     let mut socket = UnixStream::connect(WORKERS_SOCKET_PATH).map_err(|e| e.to_string())?;
-    let timeout = Some(Duration::from_secs(if recover { 5 } else { 2 }));
+    let timeout = Some(Duration::from_secs(seconds));
     socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
     match round_trip(&mut socket, &Request::Hello { version: PROTO_VERSION }).map_err(|e| e.to_string())? {
         Response::Hello { .. } => {}
         response => return Err(format!("The workbook broker answered {response:?}")),
     }
+    round_trip(&mut socket, request).map_err(|e| e.to_string())
+}
+
+fn request_workbook(recover: bool, selected: Option<[u8; 16]>, activation: Option<fresco_protocol::activation::Token>) -> Result<Vec<portcullis_ipc::PendingWorkbook>, String> {
+    use portcullis_ipc::{Request, Response};
+    let activation = activation.ok_or("Use the workbook button in the Sheets window")?;
     let request = match selected {
         Some(id) => Request::RecoverSelectedWorkbook { activation, id },
         None if recover => Request::RecoverWorkbook { activation },
         None => Request::NewWorkbook { activation },
     };
-    match round_trip(&mut socket, &request).map_err(|e| e.to_string())? {
+    match workbook_broker(&request, if recover { 5 } else { 2 })? {
         Response::Opened { .. } => Ok(Vec::new()),
         Response::PendingWorkbooks { books } if recover && books.len() <= 8 => Ok(books),
         Response::Error { message } => Err(message),
@@ -182,6 +187,7 @@ enum Locked {
 }
 
 struct Run {
+    recovery_id: Option<[u8; 16]>,
     sheets: Sheets,
     target: Option<Target>,
     locked: Option<Locked>,
@@ -274,6 +280,25 @@ impl Run {
         } else {
             format!("Saved as “{name}”. More recent edits are still pending.")
         };
+        // A publication acknowledgement changes the name even if another edit
+        // arrived while the picker was writing. Keep the original recovery ID.
+        if let Some(autosave) = doc.autosave() {
+            if let Err(e) = autosave.set_display_name(&name) {
+                doc.status.push_str(&format!(" Couldn't update the autosave name: {e}."));
+            }
+        }
+        if let Some(id) = self.recovery_id {
+            use portcullis_ipc::{Request, Response};
+            let result = workbook_broker(&Request::NameWorkbookRecovery { id, name }, 2);
+            let error = match result {
+                Ok(Response::Ok) => None,
+                Ok(Response::Error { message }) | Err(message) => Some(message),
+                Ok(other) => Some(format!("{other:?}")),
+            };
+            if let Some(error) = error {
+                doc.status.push_str(&format!(" Couldn't update the recovery chooser: {error}."));
+            }
+        }
         drop(doc);
         self.sheets.changed();
     }
@@ -505,7 +530,8 @@ fn main() {
         (win.width, win.height),
     );
     sheets.launcher = launcher;
-    let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
+    let recovery_id = args.get(2).filter(|_| dedicated).and_then(|arg| arg.parse::<u128>().ok()).map(u128::to_be_bytes);
+    let mut run = Run { recovery_id, sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
     if !launcher && !recover {
         run.show(doc, target);
     }

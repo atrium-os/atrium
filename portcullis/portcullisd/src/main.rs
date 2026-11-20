@@ -366,6 +366,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        if let Request::NameWorkbookRecovery { id, name } = req {
+            let response = match launch::name_workbook_recovery(uid, &registry, id, name) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: e.to_string() },
+            };
+            write_response(&mut writer, &response)?;
+            continue;
+        }
         if let Request::NewWorkbook { activation } | Request::RecoverWorkbook { activation }
             | Request::RecoverSelectedWorkbook { activation, .. } = req {
             let action = match req {
@@ -3833,7 +3841,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

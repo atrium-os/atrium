@@ -210,17 +210,22 @@ use portcullis_ipc::PendingWorkbook;
 
 // Broker-owned marker. The document jail never sees the marker or its siblings.
 fn write_workbook_marker(path: &Path, name: &str) -> std::io::Result<PendingWorkbook> {
-    use std::io::{Read, Write};
+    use std::io::Read;
     let mut id = [0; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
     let book = PendingWorkbook { id, name: name.chars().filter(|c| !c.is_control()).take(255).collect() };
+    store_workbook_marker(path, &book)?;
+    Ok(book)
+}
+
+fn store_workbook_marker(path: &Path, book: &PendingWorkbook) -> std::io::Result<()> {
+    use std::io::Write;
     let temp = path.with_extension("pending.tmp");
     let mut file = fs::File::create(&temp)?;
-    file.write_all(&serde_json::to_vec(&book)?)?;
+    file.write_all(&serde_json::to_vec(book)?)?;
     file.sync_all()?;
     fs::rename(temp, path)?;
-    fs::File::open(path.parent().unwrap())?.sync_all()?;
-    Ok(book)
+    fs::File::open(path.parent().unwrap())?.sync_all()
 }
 
 fn pending_workbook(path: &Path, index: usize) -> std::io::Result<PendingWorkbook> {
@@ -262,39 +267,7 @@ pub fn open_workbook(
     launch_workbook(user, persona, name, Some(receiver.into()), WorkbookAction::New, None).map(|_| ())
 }
 
-/// Reserve a document slot until its launch thread has torn down the jail.
-fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Option<OwnedFd>, action: WorkbookAction, caller_key: Option<Option<[u8; 32]>>) -> std::io::Result<Vec<PendingWorkbook>> {
-    use std::os::fd::AsFd;
-
-    const DOCUMENT_LIMIT: usize = 8;
-    static ACTIVE: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
-
-    static SLOT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
-
-    struct Slot(usize);
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            ACTIVE.lock().unwrap()[self.0] = false;
-            SLOT_RELEASED.notify_all();
-        }
-    }
-
-    let recover = action != WorkbookAction::New;
-    let blank = startup.is_none();
-    let stdio = startup.map(|receiver| -> std::io::Result<_> {
-        Ok([
-            receiver,
-            std::io::stdout().as_fd().try_clone_to_owned()?,
-            std::io::stderr().as_fd().try_clone_to_owned()?,
-        ])
-    }).transpose()?;
-    let app = portcullis_policy::opens::SHEETS;
-    let tree = Path::new(APPS_DIR).join(app);
-    let publisher = crate::manifest_trust::verify_publisher(&tree, &fs::read_to_string(tree.join("atrium.toml"))?).map_err(std::io::Error::other)?;
-    if caller_key.is_some_and(|key| key != publisher) {
-        return Err(std::io::Error::other("Sheets publisher changed; reopen the launcher"));
-    }
-    portcullisd::home::ensure_app_data(user, persona).map_err(std::io::Error::other)?;
+fn workbook_marker_dir(user: &str, persona: Option<&str>, publisher: Option<[u8; 32]>) -> std::io::Result<PathBuf> {
     let home = portcullis_overlay::home_of(user).ok_or_else(|| std::io::Error::other("missing workbook owner's home"))?;
     let parent = match persona {
         None => portcullis_overlay::apps_root(&home).map_err(std::io::Error::other)?,
@@ -319,8 +292,73 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
     if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
         return Err(std::io::Error::other("invalid workbook recovery directory"));
     }
+    Ok(dir)
+}
+
+const DOCUMENT_LIMIT: usize = 8;
+static ACTIVE_WORKBOOKS: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
+
+pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry, id: [u8; 16], name: String) -> std::io::Result<()> {
+    let Some((user, app)) = registry.resolve(uid) else {
+        return Err(std::io::Error::other("unknown workbook identity"));
+    };
+    let Some(slot) = registry.document_slot(uid) else {
+        return Err(std::io::Error::other("only a Sheets document can update its recovery name"));
+    };
+    if app != portcullis_policy::opens::SHEETS || usize::from(slot) >= DOCUMENT_LIMIT {
+        return Err(std::io::Error::other("only a Sheets document can update its recovery name"));
+    }
+    if name.is_empty() || name.len() > 255 || name.contains('/') || name.chars().any(char::is_control) {
+        return Err(std::io::Error::other("invalid workbook display name"));
+    }
+    let dir = workbook_marker_dir(user, registry.persona(uid).flatten(), registry.publisher(uid).flatten())?;
+    let path = dir.join(format!("{slot}.pending"));
+    let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
+    rename_workbook_marker(&path, id, name)
+}
+
+fn rename_workbook_marker(path: &Path, id: [u8; 16], name: String) -> std::io::Result<()> {
+    let mut book: PendingWorkbook = serde_json::from_slice(&fs::read(path)?)?;
+    if book.id != id {
+        return Err(std::io::Error::other("this workbook recovery has been replaced"));
+    }
+    book.name = name;
+    store_workbook_marker(path, &book)
+}
+
+/// Reserve a document slot until its launch thread has torn down the jail.
+fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Option<OwnedFd>, action: WorkbookAction, caller_key: Option<Option<[u8; 32]>>) -> std::io::Result<Vec<PendingWorkbook>> {
+    use std::os::fd::AsFd;
+
+    static SLOT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+    struct Slot(usize);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE_WORKBOOKS.lock().unwrap()[self.0] = false;
+            SLOT_RELEASED.notify_all();
+        }
+    }
+
+    let recover = action != WorkbookAction::New;
+    let blank = startup.is_none();
+    let stdio = startup.map(|receiver| -> std::io::Result<_> {
+        Ok([
+            receiver,
+            std::io::stdout().as_fd().try_clone_to_owned()?,
+            std::io::stderr().as_fd().try_clone_to_owned()?,
+        ])
+    }).transpose()?;
+    let app = portcullis_policy::opens::SHEETS;
+    let tree = Path::new(APPS_DIR).join(app);
+    let publisher = crate::manifest_trust::verify_publisher(&tree, &fs::read_to_string(tree.join("atrium.toml"))?).map_err(std::io::Error::other)?;
+    if caller_key.is_some_and(|key| key != publisher) {
+        return Err(std::io::Error::other("Sheets publisher changed; reopen the launcher"));
+    }
+    portcullisd::home::ensure_app_data(user, persona).map_err(std::io::Error::other)?;
+    let dir = workbook_marker_dir(user, persona, publisher)?;
     let (slot, pending) = {
-        let mut active = ACTIVE.lock().unwrap();
+        let mut active = ACTIVE_WORKBOOKS.lock().unwrap();
         let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         'reserve: loop {
@@ -711,9 +749,11 @@ fn launch_inner(
      * (personas.md §3; crossing is P3, off by default). */
     let mut recovery_mount = None;
     if let Some(doc) = &document {
-        recovery_mount = Some(RecoveryMount::attach(doc, app_uid, &jail_path, &mut jc)?);
+        let mount = RecoveryMount::attach(doc, app_uid, &jail_path, &mut jc)?;
+        let recovery_id = u128::from_be_bytes(mount.id);
+        recovery_mount = Some(mount);
         let option = if doc.recover { "--recover-document" } else if doc.blank { "--blank-document" } else { "--document" };
-        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option}", manifest.entry())));
+        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option} {recovery_id}", manifest.entry())));
     } else if (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
         || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))
@@ -815,6 +855,7 @@ fn launch_inner(
 }
 
 struct RecoveryMount<'a> {
+    id: [u8; 16],
     doc: &'a WorkbookLaunch,
     clean: bool,
 }
@@ -823,7 +864,7 @@ impl<'a> RecoveryMount<'a> {
     fn attach(doc: &'a WorkbookLaunch, app_uid: u32, jail_path: &Path, jc: &mut JailConfig) -> Result<Self, LaunchError> {
         let fail = |e: String| LaunchError::Failed("recovery", e);
         portcullis_overlay::mount_recovery(&doc.store, 128 << 20).map_err(fail)?;
-        let mount = Self { doc, clean: false };
+        let mut mount = Self { doc, clean: false, id: [0; 16] };
         // The root of the image belongs to the broker. Only this child
         // directory is ever writable or visible inside the workbook jail.
         let data = doc.store.dir.join("autosave");
@@ -843,9 +884,15 @@ impl<'a> RecoveryMount<'a> {
         std::os::unix::fs::chown(&data, Some(app_uid), Some(app_uid))
             .and_then(|_| fs::set_permissions(&data, fs::Permissions::from_mode(0o700)))
             .map_err(|e| fail(e.to_string()))?;
-        if !doc.recover {
-            write_workbook_marker(&doc.pending, &doc.name).map_err(|e| fail(e.to_string()))?;
-        }
+        mount.id = {
+            let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
+            let book = if doc.recover {
+                pending_workbook(&doc.pending, doc.slot as usize)
+            } else {
+                write_workbook_marker(&doc.pending, &doc.name)
+            };
+            book.map_err(|e| fail(e.to_string()))?.id
+        };
         jc.add_mount(&data, &jail_path.join("atrium/recovery"), "nullfs", &["rw", "nosuid", "noexec"]);
         Ok(mount)
     }
@@ -859,6 +906,7 @@ impl Drop for RecoveryMount<'_> {
         if let Err(e) = portcullis_overlay::unmount_recovery(&doc.store) {
             eprintln!("portcullisd: closing workbook recovery volume: {e}");
         } else if empty {
+            let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
             let result = fs::remove_file(&doc.pending)
                 .and_then(|_| fs::File::open(doc.pending.parent().unwrap())?.sync_all());
             if let Err(e) = result {
@@ -1801,6 +1849,25 @@ pub fn is_single_instance(app_id: &str) -> bool {
         m.supervision.as_ref().and_then(|s| s.instances),
         Some(portcullis_toml::InstancesPolicy::Multi)
     )
+}
+
+#[cfg(test)]
+mod recovery_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_rename_leaves_the_replacement_marker_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.pending");
+        let original = write_workbook_marker(&path, "Proof.csv").unwrap();
+        let replacement = write_workbook_marker(&path, "Proof.csv").unwrap();
+        assert!(rename_workbook_marker(&path, original.id, "Stale.osheet".into()).is_err());
+        assert_eq!(pending_workbook(&path, 0).unwrap(), replacement);
+        rename_workbook_marker(&path, replacement.id, "Proof (2).osheet".into()).unwrap();
+        let renamed = pending_workbook(&path, 0).unwrap();
+        assert_eq!(renamed.id, replacement.id);
+        assert_eq!(renamed.name, "Proof (2).osheet");
+    }
 }
 
 #[cfg(test)]
