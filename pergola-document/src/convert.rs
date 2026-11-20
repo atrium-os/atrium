@@ -95,6 +95,28 @@ fn cut(r: Rect, clip: Option<[f32; 4]>) -> Option<Rect> {
     (rr > l && bb > t).then(|| Rect::new(l, t, rr - l, bb - t))
 }
 
+/// Resident island hit regions in paint order. The compositor's embed slot is
+/// axis-aligned, so a rotated or scaled CSS box cannot use its layout bounds.
+pub(crate) fn island_regions(scene: &Scene, band: Option<(U, U)>) -> Vec<(Rect, u32, String)> {
+    let ctx = Ctx { scene };
+    scene.order.iter().filter_map(|&(kind, i)| {
+        if kind != 7 { return None; }
+        let e = scene.embeds.get(i)?;
+        let navigator_render::EmbedSource::Island { src } = &e.source else { return None };
+        let attrs = *scene.embed_attrs.get(i)?;
+        if e.role != "island" || ctx.alpha(attrs) == 0.0 { return None; }
+        let mut rect = Rect::new(px(e.x), px(e.y), px(e.w), px(e.h));
+        if let Some(t) = ctx.xform(attrs) {
+            if !is_translate(&t) { return None; }
+            rect.origin.x += t[4];
+            rect.origin.y += t[5];
+        }
+        let rect = cut(rect, ctx.clip(attrs))?;
+        let rect = cut(rect, band.map(|(a,b)| [rect.x(), px(a), rect.max_x(), px(b)]))?;
+        Some((rect, e.key, src.clone()))
+    }).collect()
+}
+
 /// A rounded rectangle as fill verbs and points (cubic corners).
 fn round_rect(out: &mut (Vec<u8>, Vec<[f32; 2]>), x: f32, y: f32, w: f32, h: f32, r: [f32; 4]) {
     const K: f32 = 0.552_284_8;

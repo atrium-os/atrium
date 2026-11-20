@@ -748,6 +748,12 @@ impl Live {
                         changed = true;
                     }
                     Some(ToParent::LinkActivated { .. } | ToParent::LinkHover { .. }) => {}
+                    Some(ToParent::IslandPressed { .. }) => {
+                        if on_screen {
+                            s.last_note = Some("Live widgets are unavailable in this viewer.".into());
+                            changed = true;
+                        }
+                    }
                     Some(ToParent::Loaded { title, sections, .. }) => {
                         let c = &mut self.children[i];
                         c.sections = sections;

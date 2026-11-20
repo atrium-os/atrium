@@ -29,6 +29,7 @@ struct Group {
     nodes: Rc<Vec<Node>>,
     /// The scene's link areas, document px, and where they go.
     links: Vec<(Rect, String)>,
+    islands: Vec<(Rect, u32, String)>,
     placed: Option<(Point, Rc<Vec<Node>>)>,
 }
 
@@ -61,7 +62,8 @@ impl SceneSink for Sink<'_> {
             .filter(|l| clip.map_or(true, |(a, b)| l.y + l.h > a && l.y < b))
             .map(|l| (Rect::new(l.x as f32 / 64.0, l.y as f32 / 64.0, l.w as f32 / 64.0, l.h as f32 / 64.0), l.href.clone()))
             .collect();
-        self.groups.insert(group, Group { nodes: Rc::new(nodes), links, placed: None });
+        let islands = crate::convert::island_regions(scene, clip);
+        self.groups.insert(group, Group { nodes: Rc::new(nodes), links, islands, placed: None });
     }
     fn clear(&mut self, group: GroupId) {
         self.groups.remove(&group);
@@ -192,6 +194,30 @@ impl DocumentView {
         let x = (p.x - self.rect.x()) / z;
         let y = (p.y - self.rect.y()) / z + st.physics.y as f32;
         self.doc.borrow().link_at(x, y).map(str::to_string)
+    }
+
+    /// The visible portion of the resident island under a window-local press.
+    pub fn island_at(&self, p: Point) -> Option<(u32, String, Rect)> {
+        if !self.rect.contains(p) { return None; }
+        let st = self.state.get();
+        let z = st.zoom.live as f32;
+        if !z.is_finite() || z <= 0.0 { return None; }
+        let dx = self.rect.x() - st.physics_x.y as f32 * z;
+        let dy = self.rect.y() - st.physics.y as f32 * z;
+        let at = Point::new((p.x - dx) / z, (p.y - dy) / z);
+        let doc = self.doc.borrow();
+        for group in doc.groups.values().rev() {
+            for (rect, key, src) in group.islands.iter().rev() {
+                if rect.contains(at) {
+                    let x = (dx + rect.x() * z).max(self.rect.x());
+                    let y = (dy + rect.y() * z).max(self.rect.y());
+                    let right = (dx + rect.max_x() * z).min(self.rect.max_x());
+                    let bottom = (dy + rect.max_y() * z).min(self.rect.max_y());
+                    return Some((*key, src.clone(), Rect::new(x, y, right - x, bottom - y)));
+                }
+            }
+        }
+        None
     }
 
     pub fn emit(&self, ctx: &mut Ctx) -> NodeId {

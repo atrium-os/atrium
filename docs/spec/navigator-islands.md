@@ -774,12 +774,26 @@ Tesseract on PATH.
 python3 scripts/navigator-i1-counter-check.py SSH_WRAPPER GUEST_SOCKET_DIR EVIDENCE_DIR PARENT_NSG
 ```
 
-The installed viewer currently forwards link presses only. Its Pergola document
-view retains links but drops island geometry when converting a resident scene
-band. The next step is to carry the visible slot through that conversion and
-the signed Navigator UI, keep its placement in sync with scrolling and page
-changes, and supply its origin-bound fetch channel through the production
-launcher. The fixture used an in-process bounded GET responder. Evidence is in
+The document viewer now retains island keys and sources with each resident
+scene band. A primary press on an island reports its key, source and visible
+rectangle in viewer-local pixels to Navigator over Limen. The rectangle is
+clipped to the band and viewport. The signed UI treats the message as advisory
+and shows a status note for the visible page. It grants no worker or fetch
+authority on receipt.
+
+On a fresh arm64 Tessera overlay the viewer event-handler test loaded the
+counter parent and reported a single rectangle of (40, 40, 640, 360). A
+secondary press, a release, an outside press and a press after document
+replacement produced no island message. A separate document test checked
+geometry at 2× zoom after scrolling. These tests injected viewer events.
+The earlier compositor and JIT-off worker test used the fixture parent and
+its bounded GET responder.
+
+Next, bind a trusted activation to the current document and verified island
+source, maintain a whole slot across band, scroll and page changes, and
+provide the origin-bound fetch channel through the production launcher.
+Evidence for the two gates is in
+`~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and
 `~/atrium-vm/evidence/navigator-i1-counter-20261120/`.
 
 ## 9. Decisions, with recommendations

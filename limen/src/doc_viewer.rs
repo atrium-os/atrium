@@ -170,6 +170,9 @@ pub enum ToParent {
     Forms { forms: Vec<Form> },
     /// A bounded, tightly packed RGBA8 raster. No encoded image crosses back.
     Thumbnail { width: u16, height: u16, rgba: Vec<u8> },
+    /// Advisory geometry at press time, in viewer-local pixels. The parent
+    /// owns launch policy and must independently verify the destination.
+    IslandPressed { key: u32, src: String, rect: [f32; 4] },
 }
 
 /// One `<form>` (at most [`FORMS_MAX`] a document): its `action` as the
@@ -310,6 +313,9 @@ impl ToParent {
                     && sections.len() <= SECTIONS_MAX
                     && sections.iter().all(|(a, t)| anchors.contains(a) && !t.is_empty() && clean_text(t, SECTION_TITLE_MAX))
             }
+            ToParent::IslandPressed { src, rect, .. } => !src.is_empty() && clean_text(src, URL_MAX)
+                && rect.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= SCROLL_MAX)
+                && rect[2] > 0.0 && rect[3] > 0.0,
             ToParent::LinkActivated { url } => !url.is_empty() && clean_text(url, URL_MAX),
             ToParent::LinkHover { url } => url.as_ref().is_none_or(|u| clean_text(u, URL_MAX)),
             ToParent::Error { .. } => true,
@@ -356,6 +362,20 @@ pub fn cut(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn island_presses_have_a_source_and_visible_bounds() {
+        let press = |src: &str, rect| ToParent::IslandPressed { key: 19, src: src.into(), rect };
+        let valid = press("/counter", [0., 1., 200., 80.]);
+        assert_eq!(ToParent::decode(&valid.encode()), Some(valid));
+        for bad in [
+            press("", [0., 0., 1., 1.]), press("/a\nb", [0., 0., 1., 1.]),
+            press("/w", [0., 0., 0., 1.]), press("/w", [-1., 0., 1., 1.]),
+            press("/w", [0., f32::NAN, 1., 1.]), press("/w", [0., 0., 1., SCROLL_MAX * 2.]),
+        ] {
+            assert_eq!(ToParent::decode(&bad.encode()), None);
+        }
+    }
 
     #[test]
     fn thumbnail_messages_have_bounded_rgba() {

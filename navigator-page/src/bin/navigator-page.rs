@@ -595,6 +595,11 @@ impl Run {
                 }
             }
             Some(Event::PointerDown { at }) => {
+                if let Some((key, src, r)) = self.view.view().and_then(|view| view.island_at(at)) {
+                    if !matches!(ev, fresco_client::Event::PointerButton { button: 1, pressed: true, .. }) { return false; }
+                    out.send(ToParent::IslandPressed { key, src, rect: [r.x(), r.y(), r.w(), r.h()] });
+                    return false;
+                }
                 // Unresolved: the parent checks the page carries it.
                 if let Some(url) = self.href(at).filter(|h| !h.is_empty() && h.len() <= limen::doc_viewer::URL_MAX) {
                     out.send(ToParent::LinkActivated { url });
@@ -821,5 +826,47 @@ fn embedded() {
             run.relayout(None);
         }
         run.zoom_settled(&mut out);
+    }
+}
+
+#[cfg(test)]
+mod island_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Messages(Vec<ToParent>);
+    impl Out for Messages {
+        fn send(&mut self, msg: ToParent) {
+            self.0.push(ToParent::decode(&msg.encode()).expect("valid viewer message"));
+        }
+    }
+
+    #[test]
+    fn document_press_reports_current_island_and_expires_on_navigation() {
+        let (mut app, view) = new_app((720., 420.));
+        let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
+        let mut messages = Messages::default();
+        let load = |run: &mut Run, out: &mut Messages, bytes: &[u8]| {
+            run.load(out, DocKind::Html, "https://parent.example/".into(), Reading::plain(false), 0., Ok(bytes.to_vec()), vec![]);
+        };
+        load(&mut run, &mut messages, include_bytes!("../../../test-assets/navigator-i0/counter-parent.html"));
+        app.tick();
+        messages.0.clear();
+        let button = |x, y, button, pressed| fresco_client::Event::PointerButton {
+            window_id: 2, x, y, button, pressed, modifiers: 0, activation: [0; 16],
+        };
+        for event in [button(39., 50., 1, true), button(50., 50., 2, true), button(50., 50., 1, false)] {
+            run.window_event(&mut messages, &event);
+        }
+        assert!(messages.0.is_empty());
+        let press = button(50., 50., 1, true);
+        run.window_event(&mut messages, &press);
+        assert!(matches!(messages.0.as_slice(), [ToParent::IslandPressed { src, rect, .. }]
+            if src == "https://widget.example/counter.html" && *rect == [40., 40., 640., 360.]), "{:?}", messages.0);
+        load(&mut run, &mut messages, b"<html><body>Next page</body></html>");
+        app.tick();
+        messages.0.clear();
+        run.window_event(&mut messages, &press);
+        assert!(messages.0.is_empty());
     }
 }

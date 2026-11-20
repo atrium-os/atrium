@@ -172,3 +172,37 @@ fn an_image_with_no_bytes_holds_its_place() {
     let held = count(&first, |n| matches!(n, Node::Rect { rect, fill, .. } if (rect.w(), rect.h()) == (120.0, 80.0) && fill.a > 0.0 && fill.a < 0.3));
     assert_eq!(held, 1, "one placeholder the image's size");
 }
+
+#[test]
+fn island_press_tracks_viewport_scroll_zoom_and_document_replacement() {
+    use pergola::geom::Point;
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+    let more = Mutable::with_dirty(0u64, dirty.clone());
+    let page = r#"<html><head><style>body { margin: 8px } video { display: block; width: 160px; height: 90px }</style></head><body><video atrium-island="https://widget.example/counter.html"></video></body></html>"#;
+    let doc = Rc::new(RefCell::new(Doc::html(page.into(), Default::default(), 400., 300., false, |_| None).unwrap()));
+    let bounds = Rect::new(10., 20., 400., 300.);
+    let view = DocumentView::new(state.clone(), bounds, doc.clone(), more.clone());
+    let probe = DocumentView::new(state.clone(), bounds, doc, more.clone());
+    let mut app = App::new_with_flag(Page { view }, dirty);
+    app.tick();
+    let (id, src, r) = probe.island_at(Point::new(51., 61.)).unwrap();
+    assert_eq!(src, "https://widget.example/counter.html");
+    assert_eq!(r, Rect::new(18., 28., 160., 90.));
+    assert!(probe.island_at(Point::new(179., 61.)).is_none());
+    let mut st = state.get();
+    st.zoom.live = 2.;
+    st.zoom.settled = 2.;
+    st.physics.y = 70.;
+    state.set(st);
+    let (same, _, cropped) = probe.island_at(Point::new(91., 22.)).unwrap();
+    assert_eq!(same, id);
+    assert_eq!(cropped, Rect::new(26., 20., 320., 56.));
+    assert!(probe.island_at(Point::new(91., 19.)).is_none());
+    st.physics.y = 150.;
+    state.set(st);
+    assert!(probe.island_at(Point::new(91., 22.)).is_none());
+    let next = Rc::new(RefCell::new(Doc::html("<p>Next page</p>".into(), Default::default(), 400., 300., false, |_| None).unwrap()));
+    let replacement = DocumentView::new(state, bounds, next, more);
+    assert!(replacement.island_at(Point::new(51., 61.)).is_none());
+}
