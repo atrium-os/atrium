@@ -224,6 +224,22 @@ gate with `--navigate-away` and UI accessibility tracing. Frames, guest logs
 and fixture requests are in
 `~/atrium-vm/evidence/navigator-i2-navigation-away-20261121/`.
 
+The parked-viewer gate follows **Visit garden** with the unload prompt open,
+then **Visit pond**. Navigator keeps the visible page and its immediate parent
+live, so the second link makes the original counter page eligible to park.
+With `NAVIGATOR_UI_IDLE_S=5`, the viewer acknowledged Park and exited.
+Two Back presses returned to the counter page. A new viewer laid it out from
+the broker’s cache, and the fixture recorded just one parent GET across the
+run. The restored page showed no unload question on screen or in the
+accessibility tree. Even with the new Start prompt open, there was no
+counter process or additional widget GET. Confirming Start launched a fresh
+counter at 0. It incremented to 1 and closed on its own Leave.
+
+To repeat, serve `pond.html` on the parent origin alongside the navigation
+fixtures above, set the five-second UI idle timeout and pass `--parked-viewer`
+to the installed gate. Evidence is in
+`~/atrium-vm/evidence/navigator-i2-parked-viewer-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`

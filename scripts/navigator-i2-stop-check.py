@@ -22,8 +22,10 @@ parser.add_argument("--pending-stop", action="store_true",
                     help="use counter-unload and the retired-unload-ui.patch gate build with UI AX")
 parser.add_argument("--navigate-away", action="store_true",
                     help="follow the parent link while the unload prompt is open, then go Back")
+parser.add_argument("--parked-viewer", action="store_true",
+                    help="continue to the pond with NAVIGATOR_UI_IDLE_S=5, then go Back twice")
 args = parser.parse_args()
-if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away:
+if args.reports or args.lifecycle or args.unload or args.pending_stop or args.navigate_away or args.parked_viewer:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -84,8 +86,9 @@ def tier(attached):
 
 
 def start(previous):
+    before = len(log())
     press(390, 180)
-    wait_for("missing Start prompt", lambda: log().count(b"prompt=widget ") > previous)
+    wait_for("missing Start prompt", lambda: b"prompt=widget " in log()[before:])
     time.sleep(.65)  # Wait for the 500 ms chrome guard.
     if guest("pgrep -x counter || true") or log().count(b"widget GET ") != previous:
         raise RuntimeError("the placeholder started an engine before consent")
@@ -323,6 +326,24 @@ def page_word(name, word, top, height):
     return None
 
 
+def return_from_pond(original_viewer):
+    pond = page_word("garden", "pond", 41, 180)
+    if not pond:
+        raise RuntimeError("missing Visit pond link")
+    press(*pond)
+    wait_for("pond page did not render", lambda: page_word("pond", "tadpoles", 41, 150))
+    parked = b"navigator-ui: parked https://parent.example/counter-parent.html at y="
+    wait_for("counter page did not finish parking", lambda: parked in log()
+             and original_viewer not in guest("pgrep -x navigator-page").splitlines(), 20)
+    if guest("pgrep -x counter || true"):
+        raise RuntimeError("parking restarted the widget")
+    press(270, 30)
+    wait_for("first Back did not restore the garden", lambda:
+             b"showed live page https://parent.example/away.html" in log()
+             and page_word("garden-back", "marigolds", 41, 150))
+    return set(guest("pgrep -x navigator-page").splitlines())
+
+
 def navigate_away():
     original_ui, original_viewer = parent().splitlines()
     start(0)
@@ -339,13 +360,27 @@ def navigate_away():
     wait_for("navigation left the worker or its prompt", lambda: prompt(False)
              and not guest("pgrep -x counter || true"))
     wait_for("old question still painted on destination", lambda: not visible_question("away"))
+    existing = return_from_pond(original_viewer) if args.parked_viewer else set()
     press(270, 30)  # Back, below the headless shell strip
-    wait_for("Back did not restore the existing viewer", lambda:
-             b"showed live page https://parent.example/counter-parent.html" in log()
-             and page_word("restored", "garden", 441, 80))
+    url = b"https://parent.example/counter-parent.html"
+    if args.parked_viewer:
+        def rebuilt():
+            report = log()
+            return (report.count(b'the page child laid out "Embedded counter"') == 2
+                    and any(b"page " + url + source in report for source in
+                            (b" opened from navigatord's cache", b" brought back from the store")))
+        wait_for("Back did not rebuild the parked page from its recorded content", rebuilt)
+        new_viewers = set(guest("pgrep -x navigator-page").splitlines()) - existing
+        if len(new_viewers) != 1 or original_viewer in new_viewers:
+            raise RuntimeError(f"expected one new viewer after Back, got {new_viewers!r}")
+        viewer = new_viewers.pop()
+    else:
+        wait_for("Back did not restore the existing viewer", lambda: b"showed live page " + url in log())
+        viewer = original_viewer
+    wait_for("restored page content missing", lambda: page_word("restored", "garden", 441, 80))
     tier(False)
     if (not prompt(False) or visible_question("restored") or guest("pgrep -x counter || true")
-            or original_viewer not in guest("pgrep -x navigator-page").splitlines()):
+            or viewer not in guest("pgrep -x navigator-page").splitlines()):
         raise RuntimeError("Back failed to restore the idle page without its old prompt")
     start(1)
     count("fresh", 0)
@@ -360,15 +395,15 @@ def navigate_away():
     tier(False)
     report = log()
     if (first == second or guest("pgrep -x navigator-ui").strip() != original_ui
-            or report.count(b'the page child laid out "Embedded counter"') != 1
+            or report.count(b'the page child laid out "Embedded counter"') != (2 if args.parked_viewer else 1)
             or report.count(b"widget GET ") != 2 or report.count(b"widget reported voluntary close") != 1
             or b"prompt=widget-failed" in report or b"widget unload 1 leave=false" in report):
         raise RuntimeError("unexpected parent reload, widget fetch, timeout, or worker retirement")
-    print(f"Navigation retired {int(first)} with its question open. Back restored viewer {int(original_viewer)}."
+    print(f"Navigation retired {int(first)} with its question open. Original viewer {int(original_viewer)}, viewer after Back {int(viewer)}."
           f" Guarded Start opened worker {int(second)} at Count 0; it incremented and closed on its own Leave.")
 
 
-if args.navigate_away:
+if args.navigate_away or args.parked_viewer:
     navigate_away()
     raise SystemExit(0)
 
