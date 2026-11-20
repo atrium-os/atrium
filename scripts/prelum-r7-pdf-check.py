@@ -11,12 +11,26 @@ def pages_of(pdf):
 
 
 def numbered_lines(pattern, body):
-    return [int(number) for number in re.findall(pattern, body)]
+    return [int(number) for number in re.findall(pattern, body, re.M)]
 
 
 spool = Path(sys.argv[1])
 expected = [spool / f"job-{job}.pdf" for job in range(1, 12)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
+transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
+job_ids = list(range(1, len(expected) + 1))
+creates = re.findall(r"^fake printer: Create-Job job ", transcript, re.M)
+sends = numbered_lines(r"^fake printer: Send-Document job (\d+) ", transcript)
+receipts = re.findall(r"^fake printer: got job (\d+) \((\d+) bytes\) ", transcript, re.M)
+completions = numbered_lines(r"^fake printer: job (\d+) completed$", transcript)
+assert len(creates) == len(job_ids), len(creates)
+assert sends == job_ids, sends
+assert [(int(job), int(size)) for job, size in receipts] == [
+    (job, pdf.stat().st_size) for job, pdf in zip(job_ids, expected)
+], receipts
+assert completions == job_ids, completions
+print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs")
+
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 
 pages = pages_of(html)

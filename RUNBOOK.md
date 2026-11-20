@@ -6045,7 +6045,8 @@ Successful runs remove the disposable disk overlay and EFI variables after
 QEMU exits cleanly. Set `PRELUM_R7_KEEP_VM=1` to keep them. Failed runs keep
 the overlay and EFI variables for diagnosis.
 Prelum must reach Done for each desktop job with an observed jailed IPP
-worker. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
+worker. The simulator log must record exactly one creation, document upload,
+and completion for each job. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides
 three-slide handouts with Include Hidden Slides off on A4 and on after a
 Letter paper change, plus paginated

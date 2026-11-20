@@ -134,12 +134,13 @@ def tick():
     st, _ = state()
     now = time.time()
     with LOCK:
-        for j in JOBS.values():
+        for jid, j in JOBS.items():
             if j["state"] == 5 and st == "idle" and j["data"]:
                 if j["done_at"] is None:
                     j["done_at"] = now + 3
                 elif now >= j["done_at"]:
                     j["state"], j["impressions"] = 9, 1
+                    print(f"fake printer: job {jid} completed", flush=True)
             elif j["state"] == 5 and st != "idle":
                 j["done_at"] = None
 
@@ -206,8 +207,6 @@ class H(http.server.BaseHTTPRequestHandler):
                     js, jr = 6, ["printer-stopped"]
                 else:
                     jr = {9: ["job-completed-successfully"], 7: ["job-canceled-by-user"]}.get(js, ["job-printing"])
-                if js == 9:
-                    print("fake printer: job %d completed" % jid, flush=True)
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", js) + attr(KEYWORD, "job-state-reasons", jr) + attr(INT, "job-impressions-completed", j["impressions"])
         elif op == 0x08:
             with LOCK:
