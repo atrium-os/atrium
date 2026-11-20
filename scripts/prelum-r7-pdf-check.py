@@ -15,9 +15,9 @@ def numbered_lines(pattern, body):
 
 
 spool = Path(sys.argv[1])
-expected = [spool / f"job-{job}.pdf" for job in range(1, 11)]
+expected = [spool / f"job-{job}.pdf" for job in range(1, 12)]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
-html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, quicklook_pdf = expected
+html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 
 pages = pages_of(html)
 body = "\n".join(pages)
@@ -122,6 +122,7 @@ assert abs(left[1] + left[3] + 1 - height) <= 3, (left, right)
 print(f"Quick Look image: both colors in a centered {image_width} x {image_height} raster")
 
 
-pages = [page.strip() for page in pages_of(quicklook_pdf)]
-assert pages == ["ORIGINAL PDF FIRST PAGE", "ORIGINAL PDF FINAL PAGE"], pages
-print("Quick Look PDF: both original pages in order after pathname replacement")
+for path, action in ((pdf_button, "Print button"), (pdf_shortcut, "viewer Ctrl+P")):
+    pages = [page.strip() for page in pages_of(path)]
+    assert pages == ["ORIGINAL PDF FIRST PAGE", "ORIGINAL PDF FINAL PAGE"], (action, pages)
+    print(f"Quick Look PDF {action}: both original pages in order after pathname replacement")

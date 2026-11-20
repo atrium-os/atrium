@@ -275,5 +275,13 @@ preview 'previews: 2 of 2' 3
 cp screen.png pdf-preview.png
 press 779 534
 wait_job 10
+sleep 3
+# Focus the PDF viewer and use its print shortcut on the retained preview.
+press 748 304
+key 19 1
+preview 'previews: 2 of 2' 4
+cp screen.png pdf-shortcut-preview.png
+press 779 534
+wait_job 11
 sort -u worker.log
-test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 10
+test "$(sort -u worker.log | wc -l | tr -d ' ')" -ge 11
