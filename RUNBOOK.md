@@ -6042,7 +6042,8 @@ log, build hashes and verdicts under the printed artifact directory.
 Prelum must reach Done for each desktop job with an observed jailed IPP
 worker. Poppler checks the original Quick Look document after pathname
 replacement, the Sheets print area with chart and pictures, Slides
-three-slide handouts with Include Hidden Slides off and on, and paginated
+three-slide handouts with Include Hidden Slides off on A4 and on after a
+Letter paper change, plus paginated
 speaker notes with Include Hidden Slides off and on. The Mail PDF must include the body
 and attachment filename while excluding the attachment payload.
 

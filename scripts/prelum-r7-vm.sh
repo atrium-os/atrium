@@ -18,7 +18,7 @@ guest=/tmp/prelum-r7-desktop-gate
 for path in "$base" "$code" "$vars" "$key"; do
     test -f "$path" || { echo "Missing gate input: $path" >&2; exit 2; }
 done
-for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages cargo clang; do
+for program in "$qemu" qemu-img ssh python3 openssl pdftotext pdfimages pdfinfo cargo clang; do
     command -v "$program" >/dev/null || { echo "Missing host tool: $program" >&2; exit 2; }
 done
 python3 - "$ssh_port" "$ipps_port" <<'PY'

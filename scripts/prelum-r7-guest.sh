@@ -177,7 +177,10 @@ press 332 266
 press 286 23
 press 332 145
 preview 'previews: 2 of 2' 2
-cp screen.png slides-hidden-on-preview.png
+# Select Letter in the print sheet after opening the A4 handout preview.
+press 885 306
+sleep 7
+cp screen.png slides-hidden-on-letter-preview.png
 press 899 553
 wait_job 4
 sleep 3

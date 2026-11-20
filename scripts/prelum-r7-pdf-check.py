@@ -37,9 +37,9 @@ sizes = re.findall(r"^\s*1\s+\d+\s+image\s+(\d+)\s+(\d+)\s+", images, re.M)
 assert sorted(sizes) == [("24", "18"), ("31", "19")], images
 print("Sheets: saved-area cells, chart and both distinct pictures; outside cells and picture omitted")
 
-for pdf, setting, expected_groups in (
-    (slides_hidden_off, "off", [["FIRST", "SECOND", "THIRD"], ["FOURTH"]]),
-    (slides_hidden_on, "on", [["FIRST", "HIDDEN", "SECOND"], ["THIRD", "FOURTH"]]),
+for pdf, setting, paper, expected_groups in (
+    (slides_hidden_off, "off", "a4", [["FIRST", "SECOND", "THIRD"], ["FOURTH"]]),
+    (slides_hidden_on, "on", "letter", [["FIRST", "HIDDEN", "SECOND"], ["THIRD", "FOURTH"]]),
 ):
     pages = pages_of(pdf)
     assert all("SPEAKER" not in page and "Speaker line" not in page for page in pages), setting
@@ -48,7 +48,12 @@ for pdf, setting, expected_groups in (
         for page in pages
     ]
     assert groups == expected_groups, (setting, groups)
-    print(f"Slides: Include Hidden Slides {setting}, handout groups {groups}")
+    info = subprocess.check_output(
+        ["pdfinfo", "-f", "1", "-l", str(len(pages)), str(pdf)], text=True
+    )
+    sizes = re.findall(r"^Page\s+\d+ size:.*\((A4|letter)\)$", info, re.M | re.I)
+    assert [size.lower() for size in sizes] == [paper] * len(pages), (setting, info)
+    print(f"Slides: Include Hidden Slides {setting}, {paper.upper()} handout groups {groups}")
 
 for pdf, include_hidden in ((notes_hidden_on, True), (notes_hidden_off, False)):
     pages = pages_of(pdf)
