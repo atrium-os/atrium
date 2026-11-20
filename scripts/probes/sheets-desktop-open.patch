@@ -1,0 +1,34 @@
+diff --git a/atrium-sheets/src/bin/atrium_sheets.rs b/atrium-sheets/src/bin/atrium_sheets.rs
+index 179598e5..b3d16577 100644
+--- a/atrium-sheets/src/bin/atrium_sheets.rs
++++ b/atrium-sheets/src/bin/atrium_sheets.rs
+@@ -425,0 +426,4 @@ fn main() {
++    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
++        eprintln!("desktop-open entry {} {}", ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64, std::process::id());
++    }
+diff --git a/frescod/src/injector_reader.rs b/frescod/src/injector_reader.rs
+index adb9e7e7..15d848ec 100644
+--- a/frescod/src/injector_reader.rs
++++ b/frescod/src/injector_reader.rs
+@@ -111,0 +112,3 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
++                if hid_usage == 0x28 && pressed {
++                    eprintln!("desktop-open confirm {} {target}", crate::video::monotonic_ns());
++                }
+diff --git a/frescod/src/main.rs b/frescod/src/main.rs
+index 58a04f92..12cb2908 100644
+--- a/frescod/src/main.rs
++++ b/frescod/src/main.rs
+@@ -1428,0 +1429 @@ fn run_headless(png: &str) -> std::io::Result<()> {
++        let frame_ns = video::monotonic_ns();
+@@ -1444,0 +1446,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
++        // Hash the first two visible cell rows, before PNG encoding.
++        let mut signature = 0xcbf29ce484222325u64;
++        for y in 104..144 {
++            for &b in &rgba[(y * W as usize + 42) * 4..(y * W as usize + 300) * 4] {
++                signature = (signature ^ u64::from(b)).wrapping_mul(0x100000001b3);
++            }
++        }
++        eprintln!("desktop-open frame {frame_ns} {frame_no} {signature:016x}");
+@@ -1449,0 +1459 @@ fn run_headless(png: &str) -> std::io::Result<()> {
++                let _ = std::fs::hard_link(&out, format!("{png}-sig-{signature:016x}.png"));
