@@ -173,6 +173,8 @@ pub enum ToParent {
     /// Advisory geometry at press time, in viewer-local pixels. The parent
     /// owns launch policy and must independently verify the destination.
     IslandPressed { key: u32, src: String, rect: [f32; 4] },
+    /// Visible placement of the last pressed island changed. None ends tracking.
+    IslandPlacement { key: u32, rect: Option<[f32; 4]> },
 }
 
 /// One `<form>` (at most [`FORMS_MAX`] a document): its `action` as the
@@ -304,6 +306,10 @@ impl ToChild {
     }
 }
 
+fn visible_rect(rect: &[f32; 4]) -> bool {
+    rect.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= SCROLL_MAX) && rect[2] > 0.0 && rect[3] > 0.0
+}
+
 impl ToParent {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
@@ -313,9 +319,8 @@ impl ToParent {
                     && sections.len() <= SECTIONS_MAX
                     && sections.iter().all(|(a, t)| anchors.contains(a) && !t.is_empty() && clean_text(t, SECTION_TITLE_MAX))
             }
-            ToParent::IslandPressed { src, rect, .. } => !src.is_empty() && clean_text(src, URL_MAX)
-                && rect.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= SCROLL_MAX)
-                && rect[2] > 0.0 && rect[3] > 0.0,
+            ToParent::IslandPressed { src, rect, .. } => !src.is_empty() && clean_text(src, URL_MAX) && visible_rect(rect),
+            ToParent::IslandPlacement { rect, .. } => rect.as_ref().is_none_or(visible_rect),
             ToParent::LinkActivated { url } => !url.is_empty() && clean_text(url, URL_MAX),
             ToParent::LinkHover { url } => url.as_ref().is_none_or(|u| clean_text(u, URL_MAX)),
             ToParent::Error { .. } => true,
@@ -366,6 +371,12 @@ mod tests {
     #[test]
     fn island_presses_have_a_source_and_visible_bounds() {
         let press = |src: &str, rect| ToParent::IslandPressed { key: 19, src: src.into(), rect };
+        for rect in [None, Some([0., 2., 20., 4.])] {
+            let update = ToParent::IslandPlacement { key: 19, rect };
+            assert_eq!(ToParent::decode(&update.encode()), Some(update));
+        }
+        let empty = ToParent::IslandPlacement { key: 19, rect: Some([0.; 4]) };
+        assert_eq!(ToParent::decode(&empty.encode()), None);
         let valid = press("/counter", [0., 1., 200., 80.]);
         assert_eq!(ToParent::decode(&valid.encode()), Some(valid));
         for bad in [

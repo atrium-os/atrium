@@ -95,9 +95,16 @@ fn cut(r: Rect, clip: Option<[f32; 4]>) -> Option<Rect> {
     (rr > l && bb > t).then(|| Rect::new(l, t, rr - l, bb - t))
 }
 
+pub(crate) struct IslandRegion {
+    pub key: u32,
+    pub src: String,
+    pub bounds: Rect,
+    pub hit: Rect,
+}
+
 /// Resident island hit regions in paint order. The compositor's embed slot is
 /// axis-aligned, so a rotated or scaled CSS box cannot use its layout bounds.
-pub(crate) fn island_regions(scene: &Scene, band: Option<(U, U)>) -> Vec<(Rect, u32, String)> {
+pub(crate) fn island_regions(scene: &Scene, band: Option<(U, U)>) -> Vec<IslandRegion> {
     let ctx = Ctx { scene };
     scene.order.iter().filter_map(|&(kind, i)| {
         if kind != 7 { return None; }
@@ -112,8 +119,8 @@ pub(crate) fn island_regions(scene: &Scene, band: Option<(U, U)>) -> Vec<(Rect, 
             rect.origin.y += t[5];
         }
         let rect = cut(rect, ctx.clip(attrs))?;
-        let rect = cut(rect, band.map(|(a,b)| [rect.x(), px(a), rect.max_x(), px(b)]))?;
-        Some((rect, e.key, src.clone()))
+        let hit = cut(rect, band.map(|(a, b)| [rect.x(), px(a), rect.max_x(), px(b)]))?;
+        Some(IslandRegion { key: e.key, src: src.clone(), bounds: rect, hit })
     }).collect()
 }
 
@@ -337,5 +344,28 @@ mod tests {
         assert!((x0 - 50.0).abs() < 1e-3 && (y0 - 0.0).abs() < 1e-3 && (x1 - 50.0).abs() < 1e-3 && (y1 - 100.0).abs() < 1e-3, "to bottom");
         let [x0, y0, x1, y1] = gradient_line(&t, 45 * 64);
         assert!(x0 < 1e-3 && (y0 - 100.0).abs() < 1e-3 && (x1 - 100.0).abs() < 1e-3 && y1.abs() < 1e-3, "to top right");
+    }
+}
+
+#[cfg(test)]
+mod island_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_bands_report_the_same_css_clipped_widget_bounds() {
+        let mut scene = Scene::default();
+        scene.embeds.push(navigator_render::Embed { x: 0, y: 0, w: 120*64, h: 350*64, key: 4,
+            role: "island", source: navigator_render::EmbedSource::Island { src: "/frame".into() },
+            flags: 0, tracks: vec![] });
+        scene.clips.push((8*64, 10*64, 100*64, 245*64));
+        scene.embed_attrs.push((Some(0), None, None));
+        scene.order.push((7, 0));
+        for (start, top, height) in [(0, 10., 90.), (100, 100., 100.), (200, 200., 55.)] {
+            let part = island_regions(&scene, Some((start*64, (start+100)*64)));
+            assert_eq!(part.len(), 1);
+            assert_eq!(part[0].hit, Rect::new(8., top, 100., height));
+            assert_eq!(part[0].bounds, Rect::new(8., 10., 100., 245.));
+        }
+        assert!(island_regions(&scene, Some((300*64, 400*64))).is_empty());
     }
 }

@@ -776,8 +776,14 @@ python3 scripts/navigator-i1-counter-check.py SSH_WRAPPER GUEST_SOCKET_DIR EVIDE
 
 The document viewer now retains island keys and sources with each resident
 scene band. A primary press on an island reports its key, source and visible
-rectangle in viewer-local pixels to Navigator over Limen. The rectangle is
-clipped to the band and viewport. The signed UI treats the message as advisory
+rectangle in viewer-local pixels to Navigator over Limen. The hit must land
+inside the resident band. Placement uses the widget's full CSS-clipped bounds
+intersected with the viewport, so adjacent bands agree on the rectangle.
+The viewer tracks one selected key and source. It sends a placement message
+only when the visible rectangle changes, and withdraws it when the widget
+leaves view or a new document loads. Returning to view requires a fresh press.
+Chrome updates only a matching row and drops widget rows on page switch,
+history, reload or child loss. The signed UI treats the message as advisory
 and checks it against metadata for the same open request. Opening a page with
 widget support asks the broker for its recorded iframe sources. The jailed
 converter records the first 16 distinct eligible sources from the published
@@ -808,7 +814,7 @@ together. Logs and executable hashes are in
 `~/atrium-vm/evidence/navigator-i1-widget-origin-20261120/`.
 
 Next, spend a guarded chrome activation for the selected source and current
-document, maintain a whole slot across band, scroll and page changes, and
+document, use the selected geometry to place the worker, and
 provide the origin-bound fetch channel through the production launcher.
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and

@@ -234,6 +234,7 @@ impl Out for LogOut {
 }
 
 struct Run {
+    selected_island: Option<(u32, String, [f32; 4])>,
     view: PageView,
     hover: Option<String>,
     finding: Option<Finding>,
@@ -246,6 +247,7 @@ struct Run {
 
 impl Run {
     fn load(&mut self, out: &mut dyn Out, kind: DocKind, base: String, reading: Reading, scroll: f32, bytes: Result<Vec<u8>, u16>, images: Vec<(String, Vec<u8>)>) {
+        self.withdraw_island(out);
         self.view.picture.set(None);
         if kind == DocKind::Picture {
             self.view.page.set(None);
@@ -557,6 +559,24 @@ impl Run {
     }
 
     /// The href under `at`, as the document spells it.
+    fn withdraw_island(&mut self, out: &mut dyn Out) {
+        if let Some((key, _, _)) = self.selected_island.take() {
+            out.send(ToParent::IslandPlacement { key, rect: None });
+        }
+    }
+
+    fn update_island(&mut self, out: &mut dyn Out) {
+        let Some((key, src, last)) = &mut self.selected_island else { return };
+        let Some(r) = self.view.view().and_then(|v| v.island_bounds(*key, src)) else {
+            return self.withdraw_island(out);
+        };
+        let rect = [r.x(), r.y(), r.w(), r.h()];
+        if rect != *last {
+            *last = rect;
+            out.send(ToParent::IslandPlacement { key: *key, rect: Some(rect) });
+        }
+    }
+
     fn href(&self, at: pergola::geom::Point) -> Option<String> {
         self.view.view()?.link_at(at)
     }
@@ -597,7 +617,12 @@ impl Run {
             Some(Event::PointerDown { at }) => {
                 if let Some((key, src, r)) = self.view.view().and_then(|view| view.island_at(at)) {
                     if !matches!(ev, fresco_client::Event::PointerButton { button: 1, pressed: true, .. }) { return false; }
-                    out.send(ToParent::IslandPressed { key, src, rect: [r.x(), r.y(), r.w(), r.h()] });
+                    if self.selected_island.as_ref().is_some_and(|(k, s, _)| *k != key || s != &src) {
+                        self.withdraw_island(out);
+                    }
+                    let rect = [r.x(), r.y(), r.w(), r.h()];
+                    self.selected_island = Some((key, src.clone(), rect));
+                    out.send(ToParent::IslandPressed { key, src, rect });
                     return false;
                 }
                 // Unresolved: the parent checks the page carries it.
@@ -664,12 +689,15 @@ fn main() {
 fn standalone(path: &str, kind: DocKind, dark: bool) {
     let mut window = Window::open(&WindowDesc::new("Page", SizeSpec::Fixed(1000, 700))).unwrap_or_else(|e| die(e));
     let (mut app, view) = new_app((window.width, window.height));
-    let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
+    let mut run = Run { view, selected_island: None, hover: None, finding: None, provided: Default::default(), html: None };
     let bytes = std::fs::File::open(path).map_err(|_| error::NO_DOCUMENT).and_then(read_bounded);
     let base = std::env::var("NAVIGATOR_PAGE_BASE").unwrap_or_else(|_| "https://a.test/".into());
     run.load(&mut LogOut, kind, base, Reading::plain(dark), 0.0, bytes, vec![]);
     loop {
-        match window.step(&mut app, Some(TICK)) {
+        let step = window.step(&mut app, Some(TICK));
+        // Read the bands just painted, before a resize creates a fresh layout.
+        if step.is_ok() { run.update_island(&mut LogOut); }
+        match step {
             Ok(StepResult::Event(ev)) => {
                 run.window_event(&mut LogOut, &ev);
             }
@@ -696,7 +724,7 @@ fn embedded() {
     let mut window = Window::open_on(conn, &desc).unwrap_or_else(|e| die(format_args!("window: {e}")));
     window.follow_appearance(false);
     let (mut app, view) = new_app((window.width, window.height));
-    let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
+    let mut run = Run { view, selected_island: None, hover: None, finding: None, provided: Default::default(), html: None };
     // Resizes that come before the token are the slot's size.
     let until = Instant::now() + Duration::from_secs(10);
     let token = loop {
@@ -807,7 +835,10 @@ fn embedded() {
                 Err(e) => die(format_args!("limend: {e:?}")),
             }
         }
-        match window.step(&mut app, Some(TICK)) {
+        let step = window.step(&mut app, Some(TICK));
+        // Read the bands just painted, before a resize creates a fresh layout.
+        if step.is_ok() { run.update_island(&mut out); }
+        match step {
             Ok(StepResult::Event(ev)) => {
                 if run.window_event(&mut out, &ev) {
                     let id = window.id();
@@ -844,7 +875,7 @@ mod island_tests {
     #[test]
     fn document_press_reports_current_island_and_expires_on_navigation() {
         let (mut app, view) = new_app((720., 420.));
-        let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
+        let mut run = Run { view, selected_island: None, hover: None, finding: None, provided: Default::default(), html: None };
         let mut messages = Messages::default();
         let load = |run: &mut Run, out: &mut Messages, bytes: &[u8]| {
             run.load(out, DocKind::Html, "https://parent.example/".into(), Reading::plain(false), 0., Ok(bytes.to_vec()), vec![]);
@@ -863,7 +894,31 @@ mod island_tests {
         run.window_event(&mut messages, &press);
         assert!(matches!(messages.0.as_slice(), [ToParent::IslandPressed { src, rect, .. }]
             if src == "https://widget.example/counter.html" && *rect == [40., 40., 640., 360.]), "{:?}", messages.0);
+        let key = run.selected_island.as_ref().unwrap().0;
+        messages.0.clear();
+        run.update_island(&mut messages);
+        assert!(messages.0.is_empty());
+        let mut st = run.view.scroll.get();
+        st.physics.y = 80.;
+        run.view.scroll.set(st);
+        run.update_island(&mut messages);
+        run.update_island(&mut messages);
+        assert_eq!(messages.0, vec![ToParent::IslandPlacement { key, rect: Some([40., 0., 640., 320.]) }]);
+        messages.0.clear();
+        st.physics.y = 500.;
+        run.view.scroll.set(st);
+        run.update_island(&mut messages);
+        run.update_island(&mut messages);
+        assert_eq!(messages.0, vec![ToParent::IslandPlacement { key, rect: None }]);
+        st.physics.y = 0.;
+        run.view.scroll.set(st);
+        messages.0.clear();
+        run.update_island(&mut messages);
+        assert!(messages.0.is_empty());
+        run.window_event(&mut messages, &press);
+        messages.0.clear();
         load(&mut run, &mut messages, b"<html><body>Next page</body></html>");
+        assert_eq!(messages.0.first(), Some(&ToParent::IslandPlacement { key, rect: None }));
         app.tick();
         messages.0.clear();
         run.window_event(&mut messages, &press);

@@ -353,7 +353,8 @@ impl Live {
         }
     }
 
-    fn close(&mut self, i: usize) {
+    fn close(&mut self, s: &mut Shell, i: usize) {
+        s.widget_placement(self.children[i].key, None, None, crate::ui::now_ms());
         let c = self.children.remove(i);
         if self.shown == Some(c.key) {
             self.shown = None;
@@ -471,7 +472,7 @@ impl Live {
     /// not looked at for `idle` (§4.4: an idle expiry is a park, never a
     /// loss: the UI parks a page well before a broker's idle timeout).
     /// Never the page on screen or its parent.
-    fn park(&mut self, s: &Shell) {
+    fn park(&mut self, s: &mut Shell) {
         let parent = self.shown.and_then(|(t, p)| (s.store.trail().id == t).then(|| s.store.trail().pages.get(p).and_then(|q| q.parent)).flatten().map(|q| (t, q)));
         let (shown, idle) = (self.shown, self.idle);
         let parkable = move |c: &Child| c.parking.is_none() && Some(c.key) != shown && Some(c.key) != parent;
@@ -479,15 +480,15 @@ impl Live {
             let pick = self.children.iter().enumerate().filter(|(_, c)| parkable(c)).min_by_key(|(_, c)| c.seen).map(|(i, _)| i);
             let Some(i) = pick else { break };
             let why = format!("{} live, budget {}", self.live(), self.budget);
-            self.park_one(i, &why);
+            self.park_one(s, i, &why);
         }
         while let Some(i) = self.children.iter().position(|c| parkable(c) && c.seen.elapsed() > idle) {
             let why = format!("not looked at for {} s", self.children[i].seen.elapsed().as_secs());
-            self.park_one(i, &why);
+            self.park_one(s, i, &why);
         }
     }
 
-    fn park_one(&mut self, i: usize, why: &str) {
+    fn park_one(&mut self, s: &mut Shell, i: usize, why: &str) {
         let c = &mut self.children[i];
         c.parking = Some(Instant::now());
         eprintln!("navigator-ui: parking {} ({why})", c.url);
@@ -495,7 +496,7 @@ impl Live {
             let embed = self.children[i].embed;
             self.to_child(embed, &ToChild::Park);
         } else {
-            self.close(i);
+            self.close(s, i);
         }
     }
 
@@ -559,7 +560,7 @@ impl Live {
                         s.live = Some(LivePage::Failed { url, why });
                     }
                     let shown = self.shown;
-                    self.close(i);
+                    self.close(s, i);
                     // Keep Failed on screen rather than trying again.
                     self.shown = shown;
                 }
@@ -591,7 +592,7 @@ impl Live {
                     };
                     let key = self.children[i].key;
                     eprintln!("navigator-ui: {url} is a file ({kind}, {size} bytes); asking");
-                    self.close(i);
+                    self.close(s, i);
                     let prompt = crate::trail::Prompt::Download { id, file: name.clone(), size: human(size), origin, kind };
                     let now = crate::ui::now_ms();
                     let parent = s.store.trails.iter_mut().find(|t| t.id == key.0).and_then(|t| t.retract(key.1));
@@ -755,11 +756,14 @@ impl Live {
                         changed = true;
                     }
                     Some(ToParent::LinkActivated { .. } | ToParent::LinkHover { .. }) => {}
-                    Some(ToParent::IslandPressed { src, .. }) if on_screen => {
+                    Some(ToParent::IslandPressed { key, src, rect }) if on_screen => {
                         let child = &self.children[i];
-                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, crate::ui::now_ms());
+                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, key, rect, crate::ui::now_ms());
                     }
                     Some(ToParent::IslandPressed { .. }) => {}
+                    Some(ToParent::IslandPlacement { key, rect }) => {
+                        changed |= s.widget_placement(self.children[i].key, Some(key), rect, crate::ui::now_ms());
+                    }
                     Some(ToParent::Loaded { title, sections, .. }) => {
                         let c = &mut self.children[i];
                         c.sections = sections;
@@ -781,7 +785,7 @@ impl Live {
                         match c.parking {
                             Some(t) => {
                                 eprintln!("navigator-ui: parked {} at y={scroll:.0} in {} ms", c.url, ms(t));
-                                self.close(i);
+                                self.close(s, i);
                             }
                             // Shown again while it was being parked: keep it.
                             None => {}
@@ -849,6 +853,7 @@ impl Live {
                     if self.print_ask.as_ref().is_some_and(|a| a.0 == embed) {
                         self.print_done(s, Outcome::Failed("the page closed".into()));
                     }
+                    s.widget_placement(self.children[i].key, None, None, crate::ui::now_ms());
                     self.children.remove(i);
                     if on_screen {
                         self.shown = None;
@@ -861,7 +866,7 @@ impl Live {
         // Children slow to answer `Park` are closed anyway.
         while let Some(i) = self.children.iter().position(|c| c.parking.is_some_and(|t| t.elapsed() > PARK_WAIT)) {
             eprintln!("navigator-ui: {} did not answer Park; closed", self.children[i].url);
-            self.close(i);
+            self.close(s, i);
         }
         // Links the shell wants decided. Taking them is a change: the
         // caller writes the shell back only when this returns true, and an
@@ -905,7 +910,7 @@ impl Live {
                 Out::Reload { key } => {
                     // Its child closes; the page opens again, fetched.
                     if let Some(i) = self.children.iter().position(|c| c.key == key) {
-                        self.close(i);
+                        self.close(s, i);
                     }
                     self.fresh.insert(key);
                     if s.shown_key() == Some(key) {
@@ -914,7 +919,7 @@ impl Live {
                 }
                 Out::Clear { keys, records } => {
                     while let Some(i) = self.children.iter().position(|c| keys.contains(&c.key) && Some(c.key) != self.shown) {
-                        self.close(i);
+                        self.close(s, i);
                     }
                     eprintln!("navigator-ui: history cleared: {} pages, {} stored versions to take out", keys.len(), records.len());
                     for chunk in records.chunks(navigator_control::CLEAR_MAX) {
@@ -981,7 +986,7 @@ impl Live {
         }) {
             eprintln!("navigator-ui: {} opens again: its site {} you now", self.children[i].url, if self.children[i].knows { "forgot" } else { "knows" });
             let on_screen = self.shown == Some(self.children[i].key);
-            self.close(i);
+            self.close(s, i);
             if on_screen {
                 self.started = false;
             }
@@ -992,6 +997,7 @@ impl Live {
             self.history = s.history.is_some();
             changed = true;
             if self.history {
+                if let Some(old) = self.shown { s.widget_placement(old, None, None, crate::ui::now_ms()); }
                 if let Some(e) = &self.embeds {
                     let _ = e.borrow_mut().hide(PAGE_SLOT);
                 }
@@ -1005,6 +1011,9 @@ impl Live {
         if want != self.shown || !self.started {
             changed = true;
             self.started = true;
+            if let Some(old) = self.shown.filter(|k| Some(*k) != want) {
+                s.widget_placement(old, None, None, crate::ui::now_ms());
+            }
             self.shown = want;
             match want {
                 None => {

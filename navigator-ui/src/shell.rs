@@ -730,10 +730,38 @@ impl Shell {
 
     /// The child names a source. The signed row takes its origin only from
     /// the broker's metadata for this specific open.
-    pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, now: f64) -> bool {
-        if self.shown_key() != Some(key) { return false; }
+    pub fn widget_pressed(&mut self, key: (u64, PageId), sources: &[(String, String)], src: &str, island: u32, rect: [f32; 4], now: f64) -> bool {
+        if self.history.is_some() || self.shown_key() != Some(key) { return false; }
         let Some((_, origin)) = sources.iter().find(|(s, _)| s == src) else { return false };
-        self.ask_at(key, Prompt::Widget { origin: origin.clone() }, now)
+        self.ask_at(key, Prompt::Widget { key: island, origin: origin.clone(), rect }, now)
+    }
+
+    /// Update only an existing widget row. Closing or hiding the page also
+    /// removes queued rows, leaving unrelated questions in their original order.
+    pub fn widget_placement(&mut self, page: (u64, PageId), island: Option<u32>, rect: Option<[f32; 4]>, now: f64) -> bool {
+        let Some(page) = self.store.page_by_key_mut(page.0, page.1) else { return false };
+        let matches = |p: &Prompt| matches!(p, Prompt::Widget { key, .. } if island.is_none_or(|id| id == *key));
+        if let Some(new_rect) = rect {
+            let rows = page.asked.iter_mut().map(|a| &mut a.prompt).chain(page.prompts.queued.iter_mut());
+            for row in rows {
+                if matches(row) {
+                    if let Prompt::Widget { rect, .. } = row {
+                        *rect = new_rect;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let before = page.prompts.queued.len();
+        page.prompts.queued.retain(|p| !matches(p));
+        if page.asked.as_ref().is_some_and(|a| matches(&a.prompt)) {
+            page.asked = (!page.prompts.queued.is_empty()).then(|| Asked {
+                prompt: page.prompts.queued.remove(0), since_ms: now,
+            });
+            return true;
+        }
+        before != page.prompts.queued.len()
     }
 
     /// Whether something of the UI's own covers the prompt row (the
@@ -2291,15 +2319,39 @@ mod tests {
         s.enter("https://parent.example/one");
         let key = s.shown_key().unwrap();
         let sources = vec![("/counter".into(), "https://parent.example".into())];
-        assert!(!s.widget_pressed(key, &sources, "https://other.example", 0.0));
-        assert!(s.widget_pressed(key, &sources, "/counter", 0.0));
+        assert!(!s.widget_pressed(key, &sources, "https://other.example", 17, [1., 2., 30., 40.], 0.0));
+        assert!(s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], 0.0));
         let prompt = &s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt;
         assert_eq!(crate::ax::prompt_text(prompt), "Live widget from https://parent.example is unavailable");
         assert_eq!(prompt.answers(), &["Close"]);
         assert!(s.answer_pressed(0, 700.0, Some([3; 16])));
         assert!(s.outbox.is_empty());
         s.enter("https://parent.example/two");
-        assert!(!s.widget_pressed(key, &sources, "/counter", 1500.0));
+        assert!(!s.widget_pressed(key, &sources, "/counter", 17, [1., 2., 30., 40.], 1500.0));
+    }
+
+    #[test]
+    fn withdrawing_a_widget_preserves_unrelated_questions_and_their_guard() {
+        let mut s = shell();
+        s.enter("https://parent.example/one");
+        let page = s.shown_key().unwrap();
+        let sources = vec![("/counter".into(), "https://parent.example".into())];
+        let rect = [2., 3., 100., 120.];
+        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, 0.));
+        assert!(s.ask(Prompt::RunLive, 1200.));
+        assert!(!s.widget_placement(page, Some(11), None, 1400.));
+        let moved = [3., 0., 100., 90.];
+        assert!(s.widget_placement(page, Some(18), Some(moved), 1400.));
+        assert!(matches!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt,
+            Prompt::Widget { rect, .. } if rect == moved));
+        assert!(s.widget_placement(page, None, None, 1500.));
+        let next = s.store.trail().page().unwrap().asked.as_ref().unwrap();
+        assert_eq!(next.prompt, Prompt::RunLive);
+        assert_eq!(next.since_ms, 1500.);
+        assert!(s.widget_pressed(page, &sources, "/counter", 18, rect, 2500.));
+        assert!(s.widget_placement(page, Some(18), None, 2600.));
+        assert!(s.store.trail().page().unwrap().prompts.queued.is_empty());
+        assert!(!s.widget_placement(page, Some(18), Some(moved), 2700.));
     }
 
     #[test]

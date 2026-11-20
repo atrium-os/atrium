@@ -29,7 +29,7 @@ struct Group {
     nodes: Rc<Vec<Node>>,
     /// The scene's link areas, document px, and where they go.
     links: Vec<(Rect, String)>,
-    islands: Vec<(Rect, u32, String)>,
+    islands: Vec<crate::convert::IslandRegion>,
     placed: Option<(Point, Rc<Vec<Node>>)>,
 }
 
@@ -206,18 +206,30 @@ impl DocumentView {
         let dy = self.rect.y() - st.physics.y as f32 * z;
         let at = Point::new((p.x - dx) / z, (p.y - dy) / z);
         let doc = self.doc.borrow();
-        for group in doc.groups.values().rev() {
-            for (rect, key, src) in group.islands.iter().rev() {
-                if rect.contains(at) {
-                    let x = (dx + rect.x() * z).max(self.rect.x());
-                    let y = (dy + rect.y() * z).max(self.rect.y());
-                    let right = (dx + rect.max_x() * z).min(self.rect.max_x());
-                    let bottom = (dy + rect.max_y() * z).min(self.rect.max_y());
-                    return Some((*key, src.clone(), Rect::new(x, y, right - x, bottom - y)));
-                }
-            }
-        }
-        None
+        let island = doc.groups.values().rev().flat_map(|g| g.islands.iter().rev())
+            .find(|island| island.hit.contains(at))?;
+        Some((island.key, island.src.clone(), self.visible_bounds(island.bounds)?))
+    }
+
+    /// Follow the same island across resident band changes and scrolling.
+    pub fn island_bounds(&self, key: u32, src: &str) -> Option<Rect> {
+        let doc = self.doc.borrow();
+        let island = doc.groups.values().flat_map(|g| &g.islands)
+            .find(|i| i.key == key && i.src == src && self.visible_bounds(i.hit).is_some())?;
+        self.visible_bounds(island.bounds)
+    }
+
+    fn visible_bounds(&self, rect: Rect) -> Option<Rect> {
+        let st = self.state.get();
+        let z = st.zoom.live as f32;
+        let dx = self.rect.x() - st.physics_x.y as f32 * z;
+        let dy = self.rect.y() - st.physics.y as f32 * z;
+        let x = (dx + rect.x() * z).max(self.rect.x());
+        let y = (dy + rect.y() * z).max(self.rect.y());
+        let right = (dx + rect.max_x() * z).min(self.rect.max_x());
+        let bottom = (dy + rect.max_y() * z).min(self.rect.max_y());
+        (z.is_finite() && z > 0.0 && right > x && bottom > y)
+            .then(|| Rect::new(x, y, right - x, bottom - y))
     }
 
     pub fn emit(&self, ctx: &mut Ctx) -> NodeId {
