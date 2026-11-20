@@ -1244,6 +1244,13 @@ document root and upper layer have no jail, it releases their mounts under
 the slot lock, runs the same label reconciliation and detaches the recovery
 volume. A busy mount prevents the slot from being reused.
 
+Sheets document jails use `persist=false`. When the workbook exits cleanly,
+its jail can disappear even if the original broker has exited. An older
+broker may have left a persistent, processless jail. Before clearing its
+persistence flag, the new broker checks the registered slot, kernel jail root,
+attached recovery volume, empty autosave directory and absence of processes.
+The next workbook in the slot gets a fresh recovery identity.
+
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads
 the base and journal. Workbook UIDs cannot request recovery.

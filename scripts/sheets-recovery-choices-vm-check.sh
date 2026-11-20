@@ -4,7 +4,9 @@
 # Pass --save-as-labels for two copies of Proof.csv and collision-suffixed names.
 # --interrupted-labels /absolute/path/to/fixture-broker also disconnects the
 # workers socket during Save As and restarts that broker after document teardown.
-# --live-broker-restart takes the same path and restarts with the document open.
+# --live-broker-restart and --clean-close-reuse take the same path and restart
+# with a document open, then exercise crash recovery or clean close and New.
+# For a clean-close upgrade test, pass the legacy executable then its replacement.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -115,6 +117,14 @@ publish() {
 check_name() {
     test "$(cat "$1/name")" = "$3" && grep -Fq "\"name\":\"$3\"" "$2"
 }
+fixture_broker() {
+    broker=${1:?pass the running private fixture broker executable}
+    workers=/atrium/sockets/workers/workers.sock
+    control=/atrium/sockets/portcullis/portcullis.sock
+    test -x "$broker" && test -S "$workers"
+    broker_pid=$(pgrep -f "^$broker --socket $control$")
+    test "$(procstat -b "$broker_pid" | awk 'NR==2 {print $NF}')" = "$broker"
+}
 restart_broker() {
     kill -TERM "$broker_pid"
     stopped() { ! kill -0 "$broker_pid" 2>/dev/null; }
@@ -123,16 +133,79 @@ restart_broker() {
     ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
     wait_for ready
 }
+if test "${1:-}" = --clean-close-reuse; then
+    fixture_broker "${2:-}"
+    wait_for count 0; wait_for pending 0
+    test "$(ls -A "$books")" = Proof.csv
+    original=$(sha256 -q "$books/Proof.csv")
+    open_proof 1; sibling=$(docs)
+    wait_for opened "$sibling" Proof.csv
+    sleep .6; edit 62 0x1d 0x08 0x05 0x15 0x04 # zebra
+    open_proof 2; closing=$(docs | grep -vx "$sibling")
+    wait_for opened "$closing" Proof.csv
+    sleep .6; edit 62 0x09 0x12 0x1b # fox
+    publish Proof.osheet fox
+    old_root=$(root "$closing")
+    target_marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 1.pending)
+    sibling_marker="$(dirname "$target_marker")/0.pending"
+    wait_for grep -Fq '"name":"Proof.osheet"' "$target_marker"
+    cp "$target_marker" "$results/closed.marker"
+    cp "$sibling_marker" "$results/sibling.marker"
+    if test -n "${3:-}"; then broker=$3; test -x "$broker"; fi
+    restart_broker
+    test "$(root "$closing")" = "$old_root"
+    # The desktop process can exit before a legacy persistent jail is released.
+    doc_process() { ps -axo jid,comm | awk -v j="$1" '$1==j && $2~/atrium-sheets$/ {found=1} END {exit !found}'; }
+    doc_process "$closing"
+    key 0x1a 1
+    closed() { ! doc_process "$closing"; }
+    wait_for closed
+    if test -n "${3:-}"; then
+        test "$(jls -j "$closing" persist)" = true
+    else
+        wait_for count 1
+    fi
+    doc_process "$sibling"
+    contents=$(ls -A "$(dirname "$target_marker")/1/autosave")
+    test -z "$contents"
+    click 515 24
+    new_jail() { replacement=$(docs | grep -vx "$closing" | grep -vx "$sibling"); test -n "$replacement"; }
+    wait_for new_jail; wait_for count 2
+    test "$replacement" != "$closing"
+    test "$(root "$replacement")" = "$old_root"
+    wait_for opened "$replacement" Untitled
+    wait_for grep -Fq '"name":"Untitled"' "$target_marker"
+    sed 's/,"name":.*//' "$results/closed.marker" > "$results/closed.id"
+    sed 's/,"name":.*//' "$target_marker" > "$results/replacement.id"
+    if cmp -s "$results/closed.id" "$results/replacement.id"; then
+        echo "Replacement workbook inherited the previous recovery identity" >&2
+        exit 1
+    fi
+    wait_for pending 2
+    cmp "$results/sibling.marker" "$sibling_marker"
+    sleep .6; edit 129 0x1f # blank A1, B1=2
+    publish Untitled.osheet ',2'
+    key 0x1a 1; wait_for count 1; wait_for pending 1
+    test "$(docs)" = "$sibling"
+    cmp "$results/sibling.marker" "$sibling_marker"
+    edit 129 0x1f
+    publish 'Proof (2).osheet' 'zebra,2'
+    key 0x1a 1
+    sibling_closed() { ! doc_process "$sibling"; }
+    wait_for sibling_closed
+    click 213 24; wait_for pending 0; wait_for count 0
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    /tmp/check-recovered-copy "$books/Proof.osheet" fox plain
+    test "$(sha256 -q "$books/Proof.csv")" = "$original"
+    for copy in "$books"/*.osheet; do mv "$copy" "$results/"; done
+    echo "Clean close reused the slot with a fresh identity and preserved the live sibling. Copies: $results"
+    exit 0
+fi
 if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart || test "${1:-}" = --save-as-labels; then
     interrupted=false
     if test "$1" != --save-as-labels; then
         interrupted=true
-        broker=${2:?pass the running private fixture broker executable}
-        workers=/atrium/sockets/workers/workers.sock
-        control=/atrium/sockets/portcullis/portcullis.sock
-        test -x "$broker" && test -S "$workers"
-        broker_pid=$(pgrep -f "^$broker --socket $control$")
-        test "$(procstat -b "$broker_pid" | awk 'NR==2 {print $NF}')" = "$broker"
+        fixture_broker "${2:-}"
     fi
     wait_for count 0
     wait_for pending 0

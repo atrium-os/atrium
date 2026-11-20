@@ -376,7 +376,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                 if let Some(uid) = registry.uid_for_document(user, app, publisher.as_ref(), persona, Some(index as u8)) {
                     let instance = format!("document-{uid}");
                     let name = portcullis_jail::jail_name_for_instance(app, Some(&instance));
-                    if Command::new("jls").args(["-j", &name, "jid"]).output()?.status.success() {
+                    if workbook_jail_active(&name, &instance, &dir, index, occupied)? {
                         continue;
                     }
                     if occupied && !reclaim_abandoned_workbook(&dir, index, &instance, &pending)? {
@@ -550,7 +550,8 @@ fn launch_inner(
          * concurrent jail here would share both. Concurrency belongs to the
          * one-shot piped path, which gets its own root per instance. */
         instance: instance.clone().or_else(|| persona.map(|p| format!("p-{p}"))),
-        persist: true,
+        // A workbook jail ends with its document, even if its launch thread is gone.
+        persist: document.is_none(),
         host_identity,
         sysfil,
     };
@@ -927,6 +928,38 @@ fn workbook_store(dir: &Path, index: usize) -> portcullis_overlay::Place {
     portcullis_overlay::Place {
         dir: dir.join(index.to_string()), img: dir.join(format!("{index}.img")), person: None,
     }
+}
+
+/// A previous broker may have left a persistent jail after a clean close.
+fn workbook_jail_active(name: &str, instance: &str, dir: &Path, index: usize, occupied: bool) -> std::io::Result<bool> {
+    let jail = Command::new("jls").args(["-j", name, "jid", "path", "persist"]).output()?;
+    if !jail.status.success() { return Ok(false); }
+    let row = String::from_utf8_lossy(&jail.stdout);
+    let fields: Vec<_> = row.split_whitespace().collect();
+    let [jid, path, "true"] = fields.as_slice() else { return Ok(true); };
+    if !occupied || Path::new(path) != Path::new(JAILS_DIR).join(instance) {
+        return Ok(true);
+    }
+    let store = workbook_store(dir, index);
+    if !fs::read_dir(store.dir.join("autosave")).is_ok_and(|mut entries| entries.next().is_none())
+        || !portcullis_mounts::under(&[&store.dir]).contains(&store.dir)
+    {
+        return Ok(true);
+    }
+    let jid = jid.parse::<u32>().map_err(std::io::Error::other)?.to_string();
+    let processes = Command::new("pgrep").args(["-j", &jid, ".*"]).output()?;
+    match processes.status.code() {
+        Some(0) => return Ok(true),
+        Some(1) => {}
+        _ => return Err(std::io::Error::other("cannot verify empty workbook jail")),
+    }
+    // Drop the persistence flag. Any remaining process still holds its jail.
+    let result = Command::new("jail").args(["-m", &format!("jid={jid}"), "nopersist"]).output()?;
+    let active = Command::new("jls").args(["-j", name, "jid"]).output()?.status.success();
+    if active && !result.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&result.stderr).into_owned()));
+    }
+    Ok(active)
 }
 
 /// A broker restart loses the launch thread that would normally detach this

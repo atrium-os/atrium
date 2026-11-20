@@ -58,3 +58,11 @@ Two document jails opened `Proof.csv`. The second publication received the name 
 Before the fix the kernel released the jail, but its root, upper layer, socket mounts and recovery device remained attached. The chooser displayed `Proof.csv`. With the fix, Recover released those mounts and the device before selection. The chooser displayed `Proof (2).osheet` and `Proof.osheet`, and the recovery identity stayed stable. An independent reader verified A1/B1 as `zebra,2` and `fox,2` in the two recovered copies. The original CSV retained its SHA-256 digest.
 
 The desktop gate passed on native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. The UFS desktop also passed password cancellation, Save As and subsequent Save with plain and protected workbooks recovered in both orders. Cleanup runs when a subsequent workbook action examines the slot. [Desktop gate, run with `--live-broker-restart` and the private fixture broker executable](../../scripts/sheets-recovery-choices-vm-check.sh)
+
+## Clean close and slot reuse with a sibling open
+
+The original broker left an empty persistent jail when a workbook closed cleanly after the broker had restarted. The window and process had gone, its autosave directory was empty, and the kernel still reported `persist` on the registered document root.
+
+With the updated broker, a clean close released the jail while its sibling stayed open. New reused the same slot and root with a different JID and recovery identity. The new workbook started with blank A1. An independent reader checked all three saved copies: the closed workbook contained `fox`, the new workbook contained only B1=`2`, and the sibling retained A1=`zebra` and accepted B1=`2`. The source CSV retained its SHA-256 digest. After the last close and Recover, there were no document jails, pending markers or recovery devices.
+
+The clean-close desktop gate passed on native Tessera and bounded UFS recovery volumes. On Tessera it also passed when the legacy broker launched both workbooks and the updated broker took over before close. On UFS the live-restart crash regression passed as well. Both focused FreeBSD recovery-marker tests passed. [Desktop gate, run with `--clean-close-reuse` and the private fixture broker executable](../../scripts/sheets-recovery-choices-vm-check.sh)
