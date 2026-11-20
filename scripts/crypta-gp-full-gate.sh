@@ -713,6 +713,47 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
     fi
     probe "IPv4 echo after approved HIP refresh"
     [ "$(field starts)" = 1 ] || fail "HIP refresh restarted the engine"
+    if [ "$decline_after_esp_loss" = 2 ]; then
+        changed_report=$(tail -n 1 "$receipts")
+        before_refresh=$(awk 'END { print NR }' "$receipts")
+        wait_receipts "$((before_refresh + 1))"
+        [ "$(field signin)" = in ] &&
+            [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$changed_report" ] ||
+            fail "unchanged HIP did not refresh silently on restored ESP"
+        ok "unchanged HIP refreshed on restored ESP without prompting"
+        before_restore=$(awk 'END { print NR }' "$receipts")
+        "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+        wait_prompt gp_hip_approval
+        original_word=${initial_report%% *}
+        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+            grep -q "$(hex "IPv6 forwarding  $original_word")" || fail "review omitted restored IPv6 forwarding"
+        if tail -n "+$((before_restore + 1))" "$receipts" | grep -q "^$original_word "; then
+            fail "restored posture reached the gateway before fresh approval"
+        fi
+        approve_hip
+        for _ in $(seq 1 20); do
+            if tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report"; then break; fi
+            sleep 1
+        done
+        tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report" ||
+            fail "the approved restored report did not reach the gateway"
+        ok "restoring IPv6 forwarding required fresh approval"
+        probe "IPv4 echo on reconnected ESP after restored posture approval"
+        reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
+        "$V" "$CTL rebind name=gp-gate" >/dev/null
+        for _ in $(seq 1 30); do
+            [ "$(field signin)" != prompt ] || fail "unchanged restored HIP prompted on rebind"
+            connected=$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")
+            [ "$connected" != 4 ] || break
+            sleep 1
+        done
+        [ "$connected" = 4 ] || fail "the restored ESP tunnel did not rebind"
+        wait_field handshake 1
+        [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+            fail "rebind issued another HIP review"
+        ok "rebind reused approval for unchanged restored posture"
+        probe "IPv4 echo after restored ESP rebind"
+    fi
     "$V" "$CTL down name=gp-gate" >/dev/null
     ok "HIP refreshed on the active tunnel"
     echo "$pass checks passed"

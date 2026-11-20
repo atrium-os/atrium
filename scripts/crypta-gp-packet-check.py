@@ -659,9 +659,11 @@ def main():
                 reconnected = args.hip == "esp-loss-reconnect"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (3 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
-                expected_spis = [original_spi] + ([esp.configs[2][0][0]] if reconnected else [])
+                expected_spis = [original_spi]
+                if reconnected:
+                    expected_spis.extend([esp.configs[2][0][0]] * 2 + [esp.configs[3][0][0]])
                 assert esp.echo == expected_spis and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == set(expected_spis), esp.received_spis
                 assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined else "logout.esp"), calls
@@ -674,19 +676,30 @@ def main():
                     assert len(reports) >= report_index + 2 and len(set(reports)) == 1, reports
                     print("Declining changed HIP after ESP loss stopped the recovered TLS tunnel")
                     return
-                original, changed = reports[0], reports[-1]
-                assert original.split()[0] != changed.split()[0], reports
+                original = reports[0]
                 assert reports[report_index:report_index + 2] == [original, original], reports
                 assert all(report == original for report in reports[:report_index]), reports
-                assert reports[report_index:] == sorted(reports[report_index:],
-                                                         key=lambda report: report != original), reports
-                assert set(reports) == {original, changed}, reports
                 if reconnected:
                     assert calls[configs[1]:configs[2]][-1] == "hipreportcheck.esp", calls
-                    assert calls[configs[2]:configs[2] + 3] == [*exchange, "hipreport.esp"], calls
-                    assert all(report == original for report in reports[:calls[:configs[2]].count("hipreport.esp")]), reports
-                    print("Fresh approval after decline preceded changed HIP and traffic on restored ESP")
+                    for config in configs[2:]:
+                        assert calls[config:config + 3] == [*exchange, "hipreport.esp"], calls
+                    reconnect_report = calls[:configs[2]].count("hipreport.esp")
+                    rebind_report = calls[:configs[3]].count("hipreport.esp")
+                    assert all(report == original for report in reports[:reconnect_report]), reports
+                    changed = reports[reconnect_report]
+                    assert changed.split()[0] != original.split()[0], reports
+                    assert reports[reconnect_report:reconnect_report + 2] == [changed, changed], reports
+                    assert reports[reconnect_report:rebind_report] == sorted(
+                        reports[reconnect_report:rebind_report], key=lambda report: report == original), reports
+                    assert set(reports[reconnect_report:rebind_report]) == {changed, original}, reports
+                    assert reports[rebind_report:] and set(reports[rebind_report:]) == {original}, reports
+                    print("Restored ESP verified silent refresh, fresh approval for restored IPv6 forwarding, and rebind")
                 else:
+                    changed = reports[-1]
+                    assert original.split()[0] != changed.split()[0], reports
+                    assert reports[report_index:] == sorted(reports[report_index:],
+                                                             key=lambda report: report != original), reports
+                    assert set(reports) == {original, changed}, reports
                     print("Active ESP loss recovered on TLS, with silent unchanged HIP and approval for the changed report")
                 return
             if args.hip in ("refresh", "posture", "tessera", "tessera-domain", "tessera-rebind"):

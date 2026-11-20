@@ -902,7 +902,11 @@ another origin. An active portal-profile session stays in engine memory.
   With `--hip esp-loss-reconnect`, the gate starts the declined profile
   again. The old approval choice is rejected, the changed report and
   traffic wait for fresh approval, and echo returns on a new ESP association.
-  The arm64 reconnect run passed 16/16.
+  On restored ESP, the timer resends the identical report without
+  prompting. Restoring IPv6 forwarding then requires fresh approval before
+  the original report can be sent again. Rebind sends that unchanged
+  report without another prompt, before IPv4 echo on the new association.
+  The extended arm64 reconnect gate passed 21/21.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
