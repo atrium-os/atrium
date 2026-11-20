@@ -621,6 +621,33 @@ impl Opened {
     }
 }
 
+/// Whether the first tag marks a TXT record as DMARC version 1.
+pub fn is_dmarc_policy(record: &str) -> bool {
+    record.split(';').next().and_then(|tag| tag.split_once('='))
+        .is_some_and(|(name, value)| name.trim() == "v" && value.trim() == "DMARC1")
+}
+
+/// Strict vs. relaxed DKIM alignment. An empty string denotes a confirmed
+/// absence. None means the record does not establish a usable mode.
+pub fn dmarc_strict(record: &str) -> Option<bool> {
+    if record.is_empty() {
+        return Some(false);
+    }
+    if !is_dmarc_policy(record) {
+        return None;
+    }
+    let mut modes = record.split(';').filter_map(|tag| {
+        let (name, value) = tag.split_once('=').unwrap_or((tag, ""));
+        (name.trim() == "adkim").then_some(value.trim())
+    });
+    let strict = match modes.next() {
+        Some("s") => true,
+        None | Some("r") => false,
+        _ => return None,
+    };
+    modes.next().is_none().then_some(strict)
+}
+
 /// Is `name` a lookup the jail may ask for? (`<sel>._domainkey.<domain>` or
 /// `_dmarc.<domain>`, each label a DNS label.)
 pub fn query_allowed(name: &str) -> bool {

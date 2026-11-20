@@ -249,7 +249,7 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     let provider = ctx.authserv_id
         .filter(|_| !from_domain.is_empty())
         .and_then(|id| dkim::provider_result(raw, id));
-    let sender_check = match dkim::verdict(from_domain, &sigs, dmarc.as_deref(), provider.as_ref()) {
+    let sender_check = match dkim::verdict(from_domain, &sigs, dmarc.as_deref().and_then(wire::dmarc_strict), provider.as_ref()) {
         dkim::Verdict::Verified { domain, by_provider } => wire::SenderCheck::Verified { domain, by_provider },
         // Signed, but the body isn't here yet: checked when it is.
         dkim::Verdict::NotVerified if ctx.headers_only && s.dkim_signatures > 0 && !from_domain.is_empty() => wire::SenderCheck::Pending,

@@ -164,7 +164,9 @@ a matching SOA have no usable lifetime.
 
 - Names are letters, digits, `-` and `_`, labels of 1–63, at least two, at most 253
   characters. The site list (§4) applies to the name as to a host.
-- At most 32 records; a TXT record's strings are joined and kept up to 4 KiB.
+- At most 32 records. Nuntius refuses an oversized TXT reply as a whole.
+  This lets callers detect competing records even when a set reaches the
+  limit. A TXT record's joined strings may occupy up to 4 KiB.
 - `nuntiusd` opens a UDP socket to each resolver in `/etc/resolv.conf` (up to 3, else
   127.0.0.1) and connects it **before** `cap_enter`; in capability mode a connected socket
   can still send and receive, and nothing else can be reached. Queries ask for recursion

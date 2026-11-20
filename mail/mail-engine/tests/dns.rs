@@ -172,12 +172,19 @@ fn relaxed_alignment_waits_for_dmarc_policy() {
     assert_eq!(engine.open(first).unwrap().summary.sender_check, SenderCheck::Pending);
     assert!(dns.0.borrow().queried.iter().any(|name| name == parent));
 
-    // Retry on the next open, enforcing the now-known strict policy.
+    // Two policies do not establish an alignment mode, even when the first
+    // would allow the signature. They cannot enter the persistent cache.
     {
         let mut answers = dns.0.borrow_mut();
         answers.failed.remove(parent);
-        answers.records.insert(parent.into(), vec!["v=DMARC1; p=reject; adkim=s".into()]);
+        answers.records.insert(parent.into(), vec![
+            "v=DMARC1; p=reject; adkim=r".into(),
+            "v=DMARC1; p=reject; adkim=s".into(),
+        ]);
     }
+    assert_eq!(engine.open(first).unwrap().summary.sender_check, SenderCheck::Pending);
+
+    dns.0.borrow_mut().records.insert(parent.into(), vec!["v=DMARC1; p=reject; adkim=s".into()]);
     assert_eq!(engine.open(first).unwrap().summary.sender_check, SenderCheck::NotVerified);
     assert_eq!(engine.store.message(first).unwrap().summary.sender_check, SenderCheck::NotVerified);
 }

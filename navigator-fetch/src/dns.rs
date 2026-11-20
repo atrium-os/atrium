@@ -300,6 +300,10 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
     for &(_, at, data, lifetime) in matching {
         ttl = ttl.min(lifetime);
         if out.len() >= RECORDS_MAX {
+            // TXT consumers need the entire RRset to detect ambiguous policy.
+            if kind == RecordKind::Txt {
+                return Err(ErrorCode::TooBig);
+            }
             continue;
         }
         let r = match kind {
@@ -312,9 +316,13 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
                     k += 1 + l;
                 }
                 if s.len() > TXT_MAX {
-                    continue;
+                    return Err(ErrorCode::TooBig);
                 }
-                Record::Txt(String::from_utf8_lossy(&s).chars().filter(|c| !c.is_control()).collect())
+                let txt: String = String::from_utf8_lossy(&s).chars().filter(|c| !c.is_control()).collect();
+                if txt.len() > TXT_MAX {
+                    return Err(ErrorCode::TooBig);
+                }
+                Record::Txt(txt)
             }
             RecordKind::Srv => {
                 let (target, _) = name_at(m, at + 6).ok_or(bad)?;
@@ -596,6 +604,17 @@ mod tests {
         assert_eq!(read(&cyclic), Err(ErrorCode::Malformed));
         let competing = reply_with_owners(&[(name, 5, encode_name(alias)), (name, 5, encode_name(target))]);
         assert_eq!(read(&competing), Err(ErrorCode::Malformed));
+    }
+
+    #[test]
+    fn an_oversized_txt_rrset_is_refused_whole() {
+        let name = "_dmarc.example.com";
+        let q = query(3, name, RecordKind::Txt);
+        let oversized: Vec<_> = (0..=RECORDS_MAX)
+            .map(|n| (16, vec![1, b'A' + (n % 26) as u8]))
+            .collect();
+        let m = reply(&q, 0, &oversized);
+        assert_eq!(answer(&m, 3, name, RecordKind::Txt), Err(ErrorCode::TooBig));
     }
 
     #[test]

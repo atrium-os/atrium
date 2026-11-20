@@ -559,8 +559,10 @@ What Mail shows comes from what was checked, never from what the message says ab
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup
   leaves the sender check pending and Mail retries when the message is opened
   again. Mail checks the organizational domain after a successful lookup
-  finds no policy at the From domain. A valid signature from the exact From
-  domain aligns under either mode.
+  finds no policy at the From domain. Multiple DMARC records or duplicate
+  or invalid `adkim` tags leave the alignment mode unknown. Mail retries
+  those checks on open. A valid signature from the exact From domain aligns
+  under either mode.
   Mail requires a single From field with one parsed mailbox before showing
   a verified-sender badge. Multiple authors or duplicate From fields leave
   the sender unverified while the message stays readable.

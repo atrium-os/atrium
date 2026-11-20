@@ -405,25 +405,24 @@ pub fn aligned(from_domain: &str, dkim_domain: &str, strict: bool) -> bool {
     }
 }
 
-/// The verdict for one message. `dmarc_record` is the TXT at
-/// `_dmarc.<from domain>` (or its organizational domain). An empty record
-/// means confirmed absence, while `None` means no policy answer. `provider`
+/// The verdict for one message. `alignment` is true for strict, false for
+/// relaxed, and None when Mail could not establish the mode. `provider`
 /// is the Authentication-Results result from the account's own server, if the
 /// message carried one (see [`provider_result`]).
-pub fn verdict(from_domain: &str, sigs: &[Signature], dmarc_record: Option<&str>, provider: Option<&ProviderResult>) -> Verdict {
+pub fn verdict(from_domain: &str, sigs: &[Signature], alignment: Option<bool>, provider: Option<&ProviderResult>) -> Verdict {
     if from_domain.is_empty() {
         return Verdict::NotVerified;
     }
-    let strict = dmarc_record.map(|r| tags(r.as_bytes())).map(|t| tag(&t, "adkim") == Some("s")).unwrap_or(false);
     let passed = |strict| {
         sigs.iter().any(|s| s.outcome == Outcome::Pass && !s.partial_body && aligned(from_domain, &s.domain, strict))
     };
-    if passed(strict || dmarc_record.is_none()) {
+    if passed(alignment.unwrap_or(true)) {
         return Verdict::Verified { domain: from_domain.to_ascii_lowercase(), by_provider: false };
     }
-    if dmarc_record.is_none() && passed(false) {
+    if alignment.is_none() && passed(false) {
         return Verdict::Pending;
     }
+    let strict = alignment.unwrap_or(false);
     let missing_key = sigs.iter().any(|s| s.outcome == Outcome::NoKey && aligned(from_domain, &s.domain, strict));
     let local_failure = sigs.iter().any(|s| {
         aligned(from_domain, &s.domain, strict)

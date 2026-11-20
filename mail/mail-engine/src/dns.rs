@@ -20,21 +20,18 @@ pub trait Dns {
     fn txt(&self, name: &str) -> Result<(Vec<String>, u32), String>;
 }
 
-/// The one record the jail gets from `records` at `name`: a DMARC record,
-/// or the DKIM key record (the first with a key); `""` for none.
-pub fn pick(name: &str, records: &[String]) -> String {
-    let dmarc = name.starts_with("_dmarc.");
-    records
-        .iter()
-        .find(|r| {
-            if dmarc {
-                r.trim_start().starts_with("v=DMARC1")
-            } else {
-                r.contains("p=")
-            }
-        })
-        .cloned()
-        .unwrap_or_default()
+/// Select the record used by the parser. An empty string means no matching
+/// record. None means a DMARC reply does not establish an alignment policy.
+fn pick(name: &str, records: &[String]) -> Option<String> {
+    if !name.starts_with("_dmarc.") {
+        return Some(records.iter().find(|record| record.contains("p=")).cloned().unwrap_or_default());
+    }
+    let mut policies = records.iter().filter(|record| mail_schema::is_dmarc_policy(record));
+    let Some(policy) = policies.next() else { return Some(String::new()) };
+    if policies.next().is_some() {
+        return None;
+    }
+    mail_schema::dmarc_strict(policy).map(|_| policy.clone())
 }
 
 impl Engine {
@@ -58,7 +55,7 @@ impl Engine {
         }
         self.dns_lookups.set(self.dns_lookups.get() + 1);
         let (records, ttl) = dns.txt(&name).ok()?;
-        let answer = pick(&name, &records);
+        let answer = pick(&name, &records)?;
         // The live result can still be used if the optional cache cannot be
         // written. Do not cache resolver errors or use expired records.
         if ttl != 0 {
@@ -73,21 +70,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_selection_rejects_ambiguity() {
+        let name = "_dmarc.example.com";
+        let strict = "v = DMARC1; p=reject; adkim=s".to_string();
+        let relaxed = "v=DMARC1; p=reject; adkim=r".to_string();
+        let other = "v=DMARC10; adkim=r".to_string();
+        assert_eq!(pick(name, &[strict.clone(), other]), Some(strict.clone()));
+        assert_eq!(pick(name, &[relaxed.clone(), strict.clone()]), None);
+        assert_eq!(pick(name, &[strict, relaxed]), None);
+        for invalid in ["adkim=r; adkim=s", "adkim=x", "adkim", "adkim="] {
+            assert_eq!(pick(name, &[format!("v=DMARC1; p=reject; {invalid}")]), None);
+        }
+        let long_policy = format!("v=DMARC1; p=reject; {}adkim=s", "other=v; ".repeat(70));
+        assert_eq!(mail_schema::dmarc_strict(&long_policy), Some(true));
+
+    }
+
+    #[test]
     fn picks() {
         let r = vec![
             "google-site-verification=x".to_string(),
             "v=DMARC1; p=reject".to_string(),
         ];
-        assert_eq!(pick("_dmarc.example.com", &r), "v=DMARC1; p=reject");
-        assert_eq!(pick("_dmarc.example.com", &[]), "");
+        assert_eq!(pick("_dmarc.example.com", &r).as_deref(), Some("v=DMARC1; p=reject"));
+        assert_eq!(pick("_dmarc.example.com", &[]).as_deref(), Some(""));
         assert_eq!(
             pick(
                 "s._domainkey.example.com",
                 &["v=DKIM1; k=ed25519; p=abc".into()]
-            ),
-            "v=DKIM1; k=ed25519; p=abc"
+            ).as_deref(),
+            Some("v=DKIM1; k=ed25519; p=abc")
         );
-        assert_eq!(pick("s._domainkey.example.com", &["junk".into()]), "");
+        assert_eq!(pick("s._domainkey.example.com", &["junk".into()]).as_deref(), Some(""));
     }
 }
 
