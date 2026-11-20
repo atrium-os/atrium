@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=12 ;;
     esp-loss-hip-submit-final-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=11 ;;
     esp-loss-hip-submit-final-fallback) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=10 ;;
     esp-loss-hip-submit-final-rebind) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=9 ;;
@@ -924,7 +925,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                             fail "unchanged HIP did not refresh silently after final TLS fallback"
                         ok "unchanged HIP refreshed silently after final TLS fallback"
                         probe "IPv4 echo after silent refresh on fallback TLS"
-                        if [ "$retry_hip_submit" = 11 ]; then
+                        if [ "$retry_hip_submit" -ge 11 ]; then
                             rebind_restored_forwarding 6 "$rebound_report"
                             [ "$("$V" "grep -o 'GlobalProtect data transport: ESP' $G/cryptad.log | wc -l | tr -d ' '")" = 4 ] ||
                                 fail "final recovery rebind did not restore ESP"
@@ -963,6 +964,23 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                 fail "freshly approved forwarding did not refresh silently"
                             ok "freshly approved forwarding refreshed silently on recovered ESP"
                             rebind_restored_forwarding 7 "$initial_report"
+                            if [ "$retry_hip_submit" = 12 ]; then
+                                rebound_iface=$(field iface)
+                                [ -n "$rebound_iface" ] || fail "recovered ESP has no rebound interface"
+                                before_decline=$(awk 'END { print NR }' "$receipts")
+                                "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+                                wait_prompt gp_hip_approval
+                                printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                    grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+                                    fail "final rebound review omitted changed forwarding"
+                                decline_esp_loss_review 7 "$rebound_iface"
+                                if tail -n "+$((before_decline + 1))" "$receipts" | grep -q "^$changed_word "; then
+                                    fail "the final rebound submitted declined forwarding posture"
+                                fi
+                                ok "declining changed forwarding stopped recovered ESP without submitting HIP"
+                                echo "$pass checks passed"
+                                exit 0
+                            fi
                         fi
                     fi
                 fi

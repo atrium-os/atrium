@@ -73,8 +73,9 @@ RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 REBIND_HIP_RECHECK = "esp-loss-hip-submit-rebind-recheck"
 REBIND_HIP_DECLINE = "esp-loss-hip-submit-rebind-decline"
-FINAL_HIP_RECOVER = "esp-loss-hip-submit-final-recover"
-FINAL_HIP_FALLBACK = ("esp-loss-hip-submit-final-fallback", FINAL_HIP_RECOVER)
+RECOVERED_HIP_DECLINE = "esp-loss-hip-submit-recovered-decline"
+FINAL_HIP_RECOVER = ("esp-loss-hip-submit-final-recover", RECOVERED_HIP_DECLINE)
+FINAL_HIP_FALLBACK = ("esp-loss-hip-submit-final-fallback", *FINAL_HIP_RECOVER)
 REBIND_HIP_RECONNECT = ("esp-loss-hip-submit-rebind-reconnect", "esp-loss-hip-submit-final-rebind", *FINAL_HIP_FALLBACK)
 REBIND_HIP_RETRY = ("esp-loss-hip-submit-rebind-retry", REBIND_HIP_RECHECK, REBIND_HIP_DECLINE, *REBIND_HIP_RECONNECT)
 ESP_LOSS_RECONNECT_HIP = (
@@ -327,7 +328,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("md5-sum") == digest
                         original = report.replace(f"<md5-sum>{digest}</md5-sum>", "", 1)
                         assert hashlib.md5(original.encode()).hexdigest() == digest
-                        if hip == FINAL_HIP_RECOVER and calls.count("getconfig.esp") == 10:
+                        if hip in FINAL_HIP_RECOVER and calls.count("getconfig.esp") == 10:
                             initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
                             if forwarding == initial_forwarding:
                                 assert receipts.with_suffix(".recovery-approved").exists(), "recovered ESP uploaded restored forwarding before approval"
@@ -719,7 +720,8 @@ def main():
                 rebind_decline = args.hip == REBIND_HIP_DECLINE
                 rebind_reconnect = args.hip in REBIND_HIP_RECONNECT
                 final_fallback = args.hip in FINAL_HIP_FALLBACK
-                final_recover = args.hip == FINAL_HIP_RECOVER
+                final_recover = args.hip in FINAL_HIP_RECOVER
+                recovered_decline = args.hip == RECOVERED_HIP_DECLINE
                 final_rebind_retry = final_fallback or args.hip == "esp-loss-hip-submit-final-rebind"
                 retry_reconnect = rebind_retry or args.hip == "esp-loss-hip-submit-retry-reconnect"
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
@@ -766,7 +768,7 @@ def main():
                     received_spis.add(fallback_spi)
                 assert esp.echo in allowed_echoes and esp.dropped_probe_spis == dropped_spis, esp.echo
                 assert esp.received_spis == received_spis, esp.received_spis
-                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind or retry_decline or rebind_decline else "logout.esp"), calls
+                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind or retry_decline or rebind_decline or recovered_decline else "logout.esp"), calls
                 recovery = configs[1]
                 assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
                 assert calls.count("ssl-tunnel-connect.sslvpn") == (2 if final_fallback else 1), calls
@@ -849,7 +851,10 @@ def main():
                                                 restored_rebind_report = calls[:configs[10]].count("hipreport.esp")
                                                 assert restored_rebind_report >= recovery_report + first_restored + 2, reports
                                                 assert reports[restored_rebind_report:] and set(reports[restored_rebind_report:]) == {original}, reports
-                                                print("Recovered ESP required fresh approval, refreshed silently, and rebound with the unchanged report")
+                                                if recovered_decline:
+                                                    print("Declining changed HIP after recovered ESP rebind kept the report unsent and shut down ESP")
+                                                else:
+                                                    print("Recovered ESP required fresh approval, refreshed silently, and rebound with the unchanged report")
                                             else:
                                                 print("Final rebind fell back to TLS after unchanged HIP and refreshed without prompting")
                                         else:
