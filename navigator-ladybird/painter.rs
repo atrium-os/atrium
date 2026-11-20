@@ -834,6 +834,38 @@ pub mod host {
     }
 
     /// # Safety
+    /// LibWeb owns both UTF-8 buffers for the duration of this call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_counter_started(state: &SceneState, origin: *const u8, origin_len: usize,
+        title: *const u8, title_len: usize) -> bool {
+        use limen::web_island::Report;
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if origin_len == 0 || origin_len > 255 { return false; }
+        let Ok(origin) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(origin, origin_len) }) else { return false };
+        let Some(start) = (Report::Started { origin }).encode() else { return false };
+        if child.borrow_mut().emit(*embed, start).is_err() { return false; }
+        if (1..=256).contains(&title_len) {
+            if let Ok(title) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(title, title_len) }) {
+                if let Some(bytes) = Report::Title(title).encode() {
+                    return child.borrow_mut().emit(*embed, bytes).is_ok();
+                }
+            }
+        }
+        true
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_counter_ended(state: &SceneState, failed: bool) {
+        use limen::web_island::{Report, EndReason};
+        if let Some((child, embed, _)) = &state.embed {
+            if let Some(bytes) = Report::Ended(if failed { EndReason::Failed } else { EndReason::Closed }).encode() {
+                // An external Stop may already have removed this embed.
+                let _ = child.borrow_mut().emit(*embed, bytes);
+            }
+        }
+    }
+
+    /// # Safety
     /// The trusted Navigator sheet supplies the final document URL and the
     /// sealed response body. Only this embed can send the document.
     #[unsafe(no_mangle)]
@@ -1028,10 +1060,14 @@ pub mod host {
                         "editor outbound wire bytes={}",
                         surface.connection().encoded_bytes() - before
                     );
+                    if state.interactive_island {
+                        state.previous = next;
+                        return true;
+                    }
                     if child.borrow_mut().emit(*embed, b"frame".to_vec()).is_err() {
                         return false;
                     }
-                    if state.interactive_island || state.mail_document.is_some() { state.previous = next; return true; }
+                    if state.mail_document.is_some() { state.previous = next; return true; }
                     let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
                     loop {
                         if std::time::Instant::now() >= until {

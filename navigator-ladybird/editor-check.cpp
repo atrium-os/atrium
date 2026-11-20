@@ -30,6 +30,8 @@ static constexpr char fixture[] = {
 
 extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
+extern "C" bool navigator_counter_started(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
+extern "C" void navigator_counter_ended(NavigatorScene*, bool);
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" NavigatorScene* navigator_mail_scene_open(bool, u8 const**, size_t*, u8 const**, size_t*);
 extern "C" void navigator_mail_scene_wait(NavigatorScene*);
@@ -104,7 +106,14 @@ int main(int argc, char** argv)
         return 4;
     auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);
     if (result.is_error()) return 4;
-    return Navigator::drive_page(*client, scene, loop);
+    auto document = client->page().local_traversable()->active_document();
+    auto origin = document->origin().serialize();
+    auto title = document->title().to_well_formed_utf8();
+    if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count()))
+        return 4;
+    auto status = Navigator::drive_page(*client, scene, loop);
+    navigator_counter_ended(scene, status != 0);
+    return status;
 #elif defined(ATRIUM_I0_SIGN_IN)
 #ifdef ATRIUM_MAIL_PAGE
     if (!embedded) return 1;

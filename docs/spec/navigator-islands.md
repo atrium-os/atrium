@@ -111,6 +111,35 @@ from the island (threat model §2.9).
 - Video adds `Play`, `Pause`, `Seek { s }`, `Time { s, duration }`, so chapter links in the
   document can seek a YouTube island.
 
+### I2 installed island reports
+
+For a broker-fetched web island, Limen accepts four reports from the
+bound child. A session opens with one `Started { origin }`. While running,
+it may report `Title` and `Resize { width, height }` and can finish once with
+`Ended(Closed | Failed)`. Frames use postcard, consume the whole payload,
+and fit in 512 bytes. The HTTPS origin field is limited to 255 ASCII bytes,
+the title to 256 UTF-8 bytes without control characters, and each dimension
+to 1 through 16384. Limen refuses descriptors and parent-to-child data
+messages on this channel. Its existing per-embed message rate limit applies.
+The older editor measurement fixture uses a separate request without a fetch
+channel and retains its exact child `frame` and parent `advance` markers.
+
+The installed Ladybird counter takes its initial origin and title from the
+loaded LibWeb document after first paint. Navigatord checks report order
+and matches the claimed origin against its own grant. The compositor
+attachment still determines the live badge. Title is informational and
+the parent keeps the widget at its assigned rectangle. Stop and process
+loss retire the worker even when it cannot send an Ended report.
+
+On the arm64 Tessera fixture, two guarded launches each reported
+`https://widget.example` followed by the seven-byte document title. Stop
+and worker loss cleared the chip, and the UI and parent viewer kept their
+PIDs. The Limen integration test exercised Resize and Ended, including
+rejection of later reports. To repeat the installed gate, stage matching
+Limen, navigatord and counter builds, enable `NAVIGATOR_UI_AX=1`, and run
+`scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR --reports`.
+Evidence is in `~/atrium-vm/evidence/navigator-i2-channel-20261120/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`

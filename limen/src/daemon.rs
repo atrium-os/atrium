@@ -125,6 +125,7 @@ struct Embed {
     visible: bool,
     bound: bool,
     binding_generation: u64,
+    island: Option<crate::web_island::Lifecycle>,
     attached: bool,
     /// In picture-in-picture: out of the slot, in Forum's `pip` layer.
     pip: bool,
@@ -542,7 +543,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         .flatten();
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
-        child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, attached: false, pip: false,
+        child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, island: with_fetch.then(Default::default), attached: false, pip: false,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -672,6 +673,9 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     if s.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
+    if e.role.name == "web-island" && (e.island.is_some() || s.bytes != b"advance") {
+        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    }
     if fd.is_some() && !e.role.takes_fd {
         return Err(Reply::Refused { reason: refusal::MALFORMED });
     }
@@ -728,7 +732,23 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
             _ => return Err(Reply::Refused { reason: refusal::BAD_FD }),
         }
     }
+    if e.role.name == "web-island" {
+        if e.island.is_some() && !e.bound {
+            return Err(Reply::Refused { reason: refusal::NOT_ATTACHED });
+        }
+        if e.island.is_some() && m.bytes.len() > crate::web_island::MAX_FRAME {
+            return Err(Reply::Refused { reason: refusal::TOO_BIG });
+        }
+        if e.island.is_none() && m.bytes != b"frame" {
+            return Err(Reply::Refused { reason: refusal::MALFORMED });
+        }
+    }
     let (ok, first_drop) = e.to_parent.take(Instant::now());
+    if ok {
+        if let Some(lifecycle) = &mut e.island {
+            if lifecycle.receive(&m.bytes).is_none() { return Err(Reply::Refused { reason: refusal::MALFORMED }); }
+        }
+    }
     let e = &st.embeds[&m.embed];
     if !ok {
         if first_drop {

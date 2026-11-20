@@ -893,3 +893,37 @@ fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
     let broker = w.parent(4101).request_island(W_APP, 1).unwrap();
     assert_ne!(doc, broker);
 }
+
+#[test]
+fn fetched_island_reports_follow_attachment_direction_and_lifecycle() {
+    use limen::web_island::{EndReason, Report, MAX_FRAME};
+    let w = World::new();
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    w.fresco.0.lock().unwrap().0.insert(W_APP, 4101);
+    let mut app = w.parent(4101);
+    let id = app.request_island(W_APP, 1).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::IslandFetch { embed: id });
+    let _fetch = app.take_island_fetch(id).unwrap();
+    let (_, mut child) = w.spawned();
+    let _ = next_c(&mut child);
+    let started = Report::Started { origin: "https://widget.example" }.encode().unwrap();
+    let title = Report::Title("Counter").encode().unwrap();
+    assert_eq!(refused(child.emit(id, started.clone())), refusal::NOT_ATTACHED);
+    app.place(id, Some([0., 0., 640., 360.])).unwrap();
+    child.ready(id, W_VIEWER).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: id });
+    assert_eq!(refused(app.send(id, started.clone())), refusal::MALFORMED);
+    assert_eq!(refused(child.emit(id, vec![0; MAX_FRAME + 1])), refusal::TOO_BIG);
+    assert_eq!(refused(child.emit(id, title.clone())), refusal::MALFORMED);
+    assert_eq!(refused(child.emit(id, b"frame".to_vec())), refusal::MALFORMED);
+    let mut padded = started.clone();
+    padded.push(0);
+    assert_eq!(refused(child.emit(id, padded)), refusal::MALFORMED);
+    for bytes in [started.clone(), title.clone(), Report::Resize { width: 640, height: 360 }.encode().unwrap(),
+                  Report::Ended(EndReason::Closed).encode().unwrap()] {
+        child.emit(id, bytes.clone()).unwrap();
+        assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes });
+        assert_eq!(refused(child.emit(id, started.clone())), refusal::MALFORMED);
+    }
+    assert_eq!(refused(child.emit(id, title)), refusal::MALFORMED);
+}

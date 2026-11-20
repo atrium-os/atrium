@@ -73,6 +73,10 @@ impl Widget {
         });
         std::thread::spawn(move || {
             use navigator_control::WidgetFailure;
+            use limen::web_island::{EndReason, Lifecycle, Report};
+            let granted_origin = crate::origin(COUNTER);
+            let mut reports = Lifecycle::default();
+            let mut first_title = true;
             let mut attached = Some(attached);
             let failure = loop {
                 let mut slot = watched.lock().unwrap();
@@ -80,6 +84,20 @@ impl Widget {
                 match connection.poll(Duration::from_millis(40)) {
                     Ok(Some(ParentEvent::Attached { embed: id })) if id == embed => {
                         if let Some(report) = attached.take() { report(); }
+                    }
+                    Ok(Some(ParentEvent::Message { embed: id, bytes })) if id == embed => {
+                        match reports.receive(&bytes) {
+                            Some(Report::Started { origin }) if granted_origin.as_deref() == Some(origin) => {
+                                eprintln!("navigatord: widget reported start for {origin}");
+                            }
+                            Some(Report::Title(title)) if first_title => {
+                                eprintln!("navigatord: initial widget title received ({} bytes)", title.len());
+                                first_title = false;
+                            }
+                            Some(Report::Title(_) | Report::Resize { .. }) => {}
+                            Some(Report::Ended(EndReason::Closed)) => break None,
+                            _ => break Some(WidgetFailure::Exit),
+                        }
                     }
                     Ok(Some(ParentEvent::IslandStopped { embed: id })) if id == embed => break None,
                     Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {

@@ -13,7 +13,10 @@ parser.add_argument("log", help="fresh Navigator log in that directory")
 parser.add_argument("evidence", type=Path)
 parser.add_argument("--tier", action="store_true", help="check live-part transitions with NAVIGATOR_UI_AX=1")
 parser.add_argument("--recycle", action="store_true", help="use counter-recycle.html, a 10-second idle timeout and UI AX")
+parser.add_argument("--reports", action="store_true", help="verify the counter's typed origin and title on both launches")
 args = parser.parse_args()
+if args.reports:
+    args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
 
@@ -198,3 +201,11 @@ if args.tier:
     if parent() != parent_before:
         raise RuntimeError("engine failure disturbed the parent")
     print("Static parent retained. Live-part count: idle 0, offered 0, attached 1, stopped 0, restarted 1, failed 0.")
+
+if args.reports:
+    started = b"navigatord: widget reported start for https://widget.example"
+    title = b"navigatord: initial widget title received (7 bytes)"
+    sequence = [line for line in log().splitlines() if line.startswith((started, title))]
+    if sequence != [started, title, started, title]:
+        raise RuntimeError(f"unexpected counter reports: {sequence!r}")
+    print("Both guarded launches reported the document origin and seven-byte title in order.")

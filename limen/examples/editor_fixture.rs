@@ -363,6 +363,7 @@ fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32,
     }
     let id = parent.request_island(token, 1).map_err(|e| format!("{e:?}"))?;
     parent.place(id, Some([left, top, width, height])).map_err(|e| format!("{e:?}"))?;
+    let mut reports = limen::web_island::Lifecycle::default();
     let mut cover = None;
     loop {
         if Instant::now() >= until { return Err("widget lifecycle timed out".into()); }
@@ -375,7 +376,11 @@ fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32,
                     });
                 }
                 ParentEvent::Attached { .. } => println!("counter attached"),
-                ParentEvent::Message { bytes, .. } if bytes == b"frame" => println!("counter frame"),
+                ParentEvent::Message { embed, bytes } if embed == id => match reports.receive(&bytes) {
+                    Some(limen::web_island::Report::Started { origin: "https://widget.example" }) => println!("counter frame"),
+                    Some(limen::web_island::Report::Title(_) | limen::web_island::Report::Resize { .. }) => {}
+                    other => return Err(format!("unexpected counter report {other:?}").into()),
+                },
                 other => return Err(format!("unexpected widget event {other:?}").into()),
             }
         }
