@@ -813,6 +813,17 @@ test binary. The installed window and jailed worker launch remain to be tested
 together. Logs and executable hashes are in
 `~/atrium-vm/evidence/navigator-i1-widget-origin-20261120/`.
 
+Four placement and withdrawal regressions passed on an arm64 HVF overlay
+with Tessera mounted read-write at `/`. Adjacent layout bands agreed on the
+CSS-clipped bounds. In the viewer event-handler test the initial counter
+rectangle was (40, 40, 640, 360). Setting the scroll offset to 80 px produced
+one update to (40, 0, 640, 320). At 500 px the viewer withdrew the widget
+once. Scrolling back required another press, and replacing the document
+withdrew the selection. The two shell tests checked the recorded origin and
+preservation of unrelated prompts and their guard when a widget disappears.
+The tests used the FreeBSD test binaries. Evidence is in
+`~/atrium-vm/evidence/navigator-i1-placement-20261120/`.
+
 Next, spend a guarded chrome activation for the selected source and current
 document, use the selected geometry to place the worker, and
 provide the origin-bound fetch channel through the production launcher.
