@@ -130,13 +130,19 @@ submit_job() {
   wait_job "$1"
   if ! awk -v offset="$sample_offset" -v job="$1" '
     NR <= offset { seen[$1] = 1; next }
-    !seen[$1]++ {
-      printf "job %d: observed IPP worker in jail %d\n", job, $1
-      found = 1
+    !($1 in seen) {
+      if ($2 < 62000 || $2 > 62499 || $2 != $3 || $2 != $4 || $2 != $5) {
+        printf "job %d: unexpected IPP worker credentials: %s\n", job, $0
+        invalid = 1
+      } else if (!reported[$1]++) {
+        printf "job %d: observed IPP worker in jail %d with UID/GID %d\n", job, $1, $2
+        found = 1
+      }
     }
-    END { if (!found) exit 1 }
+    END { if (!found || invalid) exit 1 }
   ' worker.log >>worker-jobs.log; then
-    echo "No new jailed IPP worker observed after submitting job $1" >&2
+    cat worker-jobs.log >&2
+    echo "No valid new jailed IPP worker evidence for job $1" >&2
     return 1
   fi
 }
@@ -159,7 +165,7 @@ start_app() {
 }
 (
   for i in $(seq 3600); do
-    ps ax -o jid,comm | awk '/atrium-prelum-ipp/ && $1 > 0'
+    ps ax -o jid,uid,ruid,gid,rgid,comm | awk '$6 == "atrium-prelum-ipp" && $1 > 0'
     sleep 0.1
   done
 ) > worker.log &
