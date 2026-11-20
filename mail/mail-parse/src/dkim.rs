@@ -172,8 +172,8 @@ fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
         {
             return None;
         }
-        // Preserve the token boundaries in query methods, timestamps and key flags.
-        let value = if matches!(name, "q" | "t" | "x") {
+        // These tags have tokens that must not be joined across whitespace.
+        let value = if matches!(name, "c" | "h" | "q" | "t" | "x") {
             value.trim().to_owned()
         } else {
             value.chars().filter(|c| !c.is_whitespace()).collect()
@@ -305,8 +305,14 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         "simple/relaxed" => (false, true),
         _ => return Outcome::PermError("canonicalization"),
     };
-    let names: Vec<String> = h.split(':').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).take(64).collect();
-    if !names.iter().any(|n| n == "from") {
+    const MAX_SIGNED_HEADERS: usize = 64;
+    let names: Vec<_> = h.split(':').map(str::trim).take(MAX_SIGNED_HEADERS + 1).collect();
+    if names.len() > MAX_SIGNED_HEADERS || names.iter().any(|name| {
+        name.is_empty() || !name.bytes().all(|byte| (33..=126).contains(&byte))
+    }) {
+        return Outcome::PermError("signed header list");
+    }
+    if !names.iter().any(|name| name.eq_ignore_ascii_case("From")) {
         return Outcome::PermError("From not signed");
     }
     if tag(t, "q").is_some_and(|methods| !methods.split(':').any(|method| method.trim() == "dns/txt")) {
@@ -361,7 +367,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         return Outcome::PermError("key type");
     }
     // Both supported signature algorithms use SHA-256.
-    if tag(&kt, "h").is_some_and(|hashes| !hashes.split(':').any(|hash| hash == "sha256")) {
+    if tag(&kt, "h").is_some_and(|hashes| !hashes.split(':').any(|hash| hash.trim() == "sha256")) {
         return Outcome::PermError("key hash");
     }
     if tag(&kt, "s").is_some_and(|services| !services.split(':').any(|service| matches!(service, "*" | "email"))) {

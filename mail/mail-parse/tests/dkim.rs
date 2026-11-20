@@ -76,6 +76,48 @@ fn ed25519_pass_and_tamper() {
 }
 
 #[test]
+fn folded_headers_verify_with_relaxed_shorthand() {
+    let (kp, record) = ed();
+    let key = |_: &str, _: &str| Some(record.clone());
+    let headers = "fRoM:\tPriya Nair <priya@mail.example.com>\r\nSUBJECT:\tAutumn\r\n\t sale \t\r\n";
+    let canonical_headers = "from:Priya Nair <priya@mail.example.com>\r\nsubject:Autumn sale\r\n";
+    let body = "A\t B \r\n\r\n";
+    for (mode, canonical_body) in [
+        ("relaxed", "A\t B \r\n"),
+        ("relaxed/simple", "A\t B \r\n"),
+        ("relaxed/relaxed", "A B\r\n"),
+    ] {
+        let hash = ring::digest::digest(&ring::digest::SHA256, canonical_body.as_bytes());
+        let bh = b64(hash.as_ref());
+        let prefix = format!("v=1; a=ed25519-sha256; c={mode}; d=example.com; s=sel;");
+        let suffix = format!("h=From : Subject; bh={bh}; b=");
+        let canonical = format!("{canonical_headers}dkim-signature:{prefix} {suffix}; z_extra=kept");
+        let signature = b64(&ed_sign(&kp)(canonical.as_bytes()));
+        let (first, rest) = signature.split_at(40);
+        let suffix = suffix.replacen(" :", "\r\n\t:", 1);
+        let message = format!(
+            "DKIM-Signature:\t{prefix}\r\n\t{suffix}\r\n  {first}\r\n\t{rest} \t; z_extra=kept\r\n{headers}\r\n{body}"
+        );
+        assert_eq!(dkim::verify(message.as_bytes(), &key, 0)[0].outcome, Outcome::Pass, "{mode}");
+        let changed = message.replace("z_extra=kept", "z_extra=changed");
+        assert_eq!(dkim::verify(changed.as_bytes(), &key, 0)[0].outcome, Outcome::Fail("signature"));
+    }
+}
+
+#[test]
+fn malformed_signed_header_lists_do_not_reach_dns() {
+    let (kp, _) = ed();
+    let message = signed("ed25519-sha256", "example.com", "", &ed_sign(&kp), HEADERS, BODY);
+    let message = String::from_utf8(message).unwrap();
+    let over_limit = format!("from:subject{}", ":unused".repeat(63));
+    for headers in ["fr om:subject", "from::subject", &over_limit] {
+        let invalid = message.replace("h=from:subject", &format!("h={headers}"));
+        let result = dkim::verify(invalid.as_bytes(), &|_, _| panic!("invalid header list reached DNS"), 0);
+        assert_eq!(result[0].outcome, Outcome::PermError("signed header list"));
+    }
+}
+
+#[test]
 fn no_key_pending_and_revoked() {
     let (kp, _) = ed();
     let m = signed("ed25519-sha256", "example.com", "", &ed_sign(&kp), HEADERS, BODY);
