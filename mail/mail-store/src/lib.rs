@@ -31,6 +31,7 @@ pub use outbox::{retry_after, Outgoing, SendState};
 pub mod search;
 pub mod senders;
 pub mod certs;
+pub mod dns;
 pub mod pgp;
 pub mod config;
 pub use config::{AccountConfig, Protocol, Reached, Server};
@@ -291,6 +292,7 @@ impl Store {
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
             tx.open_table(certs::CERTS)?;
+            tx.open_table(dns::DNS_TXT)?;
             tx.open_table(pgp::PGP_KEYS)?;
             tx.open_table(later::LATER)?;
             tx.open_table(later::LATER_BY_THREAD)?;

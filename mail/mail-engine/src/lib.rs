@@ -286,7 +286,7 @@ pub struct Engine {
     keys: std::cell::RefCell<std::collections::HashMap<mail_store::MsgId, Vec<u8>>>,
     /// DKIM/DMARC lookups ([`dns`]), and what they answered.
     dns: Option<Box<dyn dns::Dns>>,
-    dns_cache: std::cell::RefCell<dns::Cache>,
+    dns_lookups: std::cell::Cell<usize>,
 }
 
 /// What the reading pane shows (§7.2, §7.3).
@@ -334,7 +334,7 @@ fn verified_card(s: &Summary, card: Option<wire::Card>) -> Option<wire::Card> {
 
 impl Engine {
     pub fn new(store: Store, parser: Parser) -> Engine {
-        Engine { store, parser, roots: smime::system_roots(), keys: Default::default(), dns: None, dns_cache: Default::default() }
+        Engine { store, parser, roots: smime::system_roots(), keys: Default::default(), dns: None, dns_lookups: Default::default() }
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {

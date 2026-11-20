@@ -537,6 +537,11 @@ What Mail shows comes from what was checked, never from what the message says ab
   (RFC 7489) and **ARC** (RFC 8617) from forwarders the person trusts. For accounts where
   the provider adds `Authentication-Results` (Gmail, 365, Fastmail), the topmost one whose
   `authserv-id` is the account's provider is used when our own check can't run (key gone).
+- Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
+  index across restarts. Positive answers are valid for six hours and empty
+  answers for one hour. The index holds up to 4,096 names, sharing answers
+  between the reader and sync. Expired answers, resolver failures and records
+  timestamped ahead of the current clock trigger a fresh lookup.
 - **The header** shows the name, and always the verified domain next to it: "Priya Nair ·
   example.com ✓". A failing or missing check shows the address in full with "not verified".
   A display name that contains an address or a domain different from the real one is shown
@@ -1594,10 +1599,9 @@ Stalwart in the cloud VM, and later a real account):
    engine answers the jail's `Query` through it (`mail_engine::dns`): the DKIM record with
    a key, or the `v=DMARC1` record; a name with none is answered empty, so the sender is
    *not verified* rather than pending forever; a failed lookup leaves it *pending*, and a
-   pending message is checked again when opened (the new verdict is kept). Answers are
-   kept in memory for 6 hours (1 hour when there is none), so a sender's DNS sees at most
-   one lookup per key every few hours, from the resolver, never one per message; mail
-   fetched headers-only asks nothing. Both the sync thread and the window have a fetcher
+   pending message is checked again when opened (the new verdict is kept). The
+   per-persona index reuses fresh answers even after restart. Mail fetched
+   headers-only asks nothing. Both the sync thread and the window have a fetcher
    for this, opened when first needed. Account setup now gets SRV and MX through the same
    request. Tests: engine 1 (verified with one lookup for two messages, no key published,
    a resolver that doesn't answer then a recheck on opening), fetcher 3, wire 1.
@@ -1614,8 +1618,7 @@ Stalwart in the cloud VM, and later a real account):
    host UDP socket to ordinary non-VPN fetchers for record lookups
    (nuntius.md §3.6). The six-case gate passed against local-unbound on
    127.0.0.1 with the stock firewall and NAT rules and no redirect.
-   Cache persistence across restarts and trusted-provider
-   Authentication-Results remain open.
+   Trusted-provider Authentication-Results remain open.
    **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
    gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
    waiting in `IDLE` on the inbox and renewing it every 25 minutes (RFC 2177's 29, the
