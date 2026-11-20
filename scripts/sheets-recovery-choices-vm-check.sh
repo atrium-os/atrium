@@ -2,6 +2,8 @@
 # Private 1280x720 Sheets headless fixture. The single Scrinium place holds
 # Proof.csv, with A1=Original. Stage the check_recovered_copy example locally.
 # Pass --save-as-labels for two copies of Proof.csv and collision-suffixed names.
+# --interrupted-labels /absolute/path/to/fixture-broker also disconnects the
+# workers socket during Save As and restarts that broker after document teardown.
 set -eu
 cd /var/tmp/sheets-desktop
 books=/var/tmp/sheets-select-input
@@ -112,7 +114,17 @@ publish() {
 check_name() {
     test "$(cat "$1/name")" = "$3" && grep -Fq "\"name\":\"$3\"" "$2"
 }
-if test "${1:-}" = --save-as-labels; then
+if test "${1:-}" = --interrupted-labels || test "${1:-}" = --save-as-labels; then
+    interrupted=false
+    if test "$1" = --interrupted-labels; then
+        interrupted=true
+        broker=${2:?pass the running private fixture broker executable}
+        workers=/atrium/sockets/workers/workers.sock
+        control=/atrium/sockets/portcullis/portcullis.sock
+        test -x "$broker" && test -S "$workers"
+        broker_pid=$(pgrep -f "^$broker --socket $control$")
+        test "$(procstat -b "$broker_pid" | awk 'NR==2 {print $NF}')" = "$broker"
+    fi
     wait_for count 0
     wait_for pending 0
     test "$(ls -A "$books")" = Proof.csv
@@ -144,8 +156,21 @@ if test "${1:-}" = --save-as-labels; then
         key 0x29; sleep .5
         check_name "$dir" "$marker" Proof.csv
         cmp "$marker" "$results/$slot.before"
-        publish "$name" "$a1"
-        wait_for check_name "$dir" "$marker" "$name"
+        if "$interrupted" && test "$slot" = 0; then
+            # Leave Scrinium and Limen available, and interrupt only the
+            # document's connection to Portcullis during publication.
+            test ! -e "$workers.held"
+            mv "$workers" "$workers.held"
+            trap 'mv "$workers.held" "$workers"' EXIT
+            publish "$name" "$a1"
+            wait_for opened "$jid" "$name"
+            cmp "$marker" "$results/$slot.before"
+            mv "$workers.held" "$workers"
+            trap - EXIT
+        else
+            publish "$name" "$a1"
+            wait_for check_name "$dir" "$marker" "$name"
+        fi
         sed 's/,"name":.*//' "$marker" > "$results/id"
         sed 's/,"name":.*//' "$results/$slot.before" | cmp -s - "$results/id"
         edit 129 0x1f
@@ -153,8 +178,25 @@ if test "${1:-}" = --save-as-labels; then
         kill_doc "$jid"; wait_for count "$slot"
     done
     wait_for pending 2
+    if "$interrupted"; then
+        detached() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
+        wait_for detached
+        kill -TERM "$broker_pid"
+        stopped() { ! kill -0 "$broker_pid" 2>/dev/null; }
+        wait_for stopped
+        env PORTCULLISD_FRESCO_ACTIVATION="$PWD/activation.sock" daemon -f -o "$PWD/select-port.log" "$broker" --socket "$control"
+        ready() { sockstat -ulw | grep -F "$workers" >/dev/null; }
+        wait_for ready
+    fi
     click 213 24; sleep .6
     cp selectscreen.png "$results/recovery-names.png"
+    if "$interrupted"; then
+        marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name '0.pending')
+        grep -Fq '"name":"Proof (2).osheet"' "$marker" || {
+            echo "Stale chooser marker after broker restart. Frame: $results/recovery-names.png" >&2
+            exit 1
+        }
+    fi
     # Slot zero is the copy with the suffix, although it was saved second.
     click 120 96; wait_for count 1; sleep .6
     publish 'Proof (2) (2).osheet' 'zebra,2'

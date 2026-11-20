@@ -308,9 +308,6 @@ pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry,
     if app != portcullis_policy::opens::SHEETS || usize::from(slot) >= DOCUMENT_LIMIT {
         return Err(std::io::Error::other("only a Sheets document can update its recovery name"));
     }
-    if name.is_empty() || name.len() > 255 || name.contains('/') || name.chars().any(char::is_control) {
-        return Err(std::io::Error::other("invalid workbook display name"));
-    }
     let dir = workbook_marker_dir(user, registry.persona(uid).flatten(), registry.publisher(uid).flatten())?;
     let path = dir.join(format!("{slot}.pending"));
     let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
@@ -318,10 +315,14 @@ pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry,
 }
 
 fn rename_workbook_marker(path: &Path, id: [u8; 16], name: String) -> std::io::Result<()> {
+    if name.is_empty() || name.len() > 255 || name.contains('/') || name.chars().any(char::is_control) {
+        return Err(std::io::Error::other("invalid workbook display name"));
+    }
     let mut book: PendingWorkbook = serde_json::from_slice(&fs::read(path)?)?;
     if book.id != id {
         return Err(std::io::Error::other("this workbook recovery has been replaced"));
     }
+    if book.name == name { return Ok(()); }
     book.name = name;
     store_workbook_marker(path, &book)
 }
@@ -898,11 +899,41 @@ impl<'a> RecoveryMount<'a> {
     }
 }
 
+/// Only after the jail and its mounts are gone. The image root is owned by
+/// the broker. Everything below autosave is document-controlled.
+fn closed_workbook_name(data: &Path) -> std::io::Result<String> {
+    use std::io::{Error, Read};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut entries = fs::read_dir(data)?;
+    let entry = entries.next().transpose()?.ok_or_else(|| Error::other("missing autosave"))?;
+    if entries.next().is_some() || !entry.file_type()?.is_dir() {
+        return Err(Error::other("expected one private workbook autosave directory"));
+    }
+    let name = entry.path().join("name");
+    if !fs::symlink_metadata(&name)?.is_file() {
+        return Err(Error::other("expected a regular workbook name file"));
+    }
+    let file = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(name)?;
+    let mut label = String::new();
+    file.take(256).read_to_string(&mut label)?;
+    Ok(label)
+}
+
 impl Drop for RecoveryMount<'_> {
     fn drop(&mut self) {
         let doc = self.doc;
         let empty = self.clean && fs::read_dir(doc.store.dir.join("autosave"))
             .is_ok_and(|mut entries| entries.next().is_none());
+        if self.clean && !empty {
+            let result = closed_workbook_name(&doc.store.dir.join("autosave")).and_then(|name| {
+                let _guard = ACTIVE_WORKBOOKS.lock().unwrap();
+                rename_workbook_marker(&doc.pending, self.id, name)
+            });
+            if let Err(e) = result {
+                eprintln!("portcullisd: keeping previous workbook recovery label: {e}");
+            }
+        }
         if let Err(e) = portcullis_overlay::unmount_recovery(&doc.store) {
             eprintln!("portcullisd: closing workbook recovery volume: {e}");
         } else if empty {
@@ -1854,6 +1885,30 @@ pub fn is_single_instance(app_id: &str) -> bool {
 #[cfg(test)]
 mod recovery_name_tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_reads_only_one_regular_bounded_name() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("autosave");
+        let doc = data.join("doc");
+        fs::create_dir_all(&doc).unwrap();
+        let name = doc.join("name");
+        let marker = root.path().join("0.pending");
+        let original = write_workbook_marker(&marker, "Proof.csv").unwrap();
+        symlink(&marker, &name).unwrap();
+        assert!(closed_workbook_name(&data).is_err());
+        fs::remove_file(&name).unwrap();
+        fs::write(&name, vec![b'x'; 4096]).unwrap();
+        let oversized = closed_workbook_name(&data).unwrap();
+        assert_eq!(oversized.len(), 256);
+        assert!(rename_workbook_marker(&marker, original.id, oversized).is_err());
+        assert_eq!(pending_workbook(&marker, 0).unwrap(), original);
+        fs::write(name, "Proof (2).osheet").unwrap();
+        assert_eq!(closed_workbook_name(&data).unwrap(), "Proof (2).osheet");
+        symlink(&doc, data.join("other")).unwrap();
+        assert!(closed_workbook_name(&data).is_err());
+    }
 
     #[test]
     fn a_stale_rename_leaves_the_replacement_marker_intact() {

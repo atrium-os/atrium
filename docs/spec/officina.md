@@ -141,7 +141,9 @@ own size-limited recovery volume at `/atrium/recovery`. After a crash,
 pending, the launcher lists their current names and opens the chosen one
 in a fresh jail. A confirmed Save As updates the chooser label and the
 autosave name to the filename Scrinium published, including any collision
-suffix. Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
+suffix. If Portcullis misses the update, it reconciles the chooser label from
+the durable autosave name after the document jail is torn down.
+Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
 closes that recovery window and leaves the generation available to try again.
 The recovery reader replays the base and journal. Save As obtains a new
 picker grant, which subsequent saves use. Don’t Save discards that workbook’s recovery.

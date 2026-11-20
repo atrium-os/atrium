@@ -1231,6 +1231,11 @@ on the worker socket. The broker derives the marker location from the peer
 UID's owner, persona, publisher and document slot. Under the slot lock it
 checks the recovery identifier supplied at launch and atomically replaces
 the display name. The identifier stays stable through repeated saves.
+After the jail releases its mounts, Portcullis checks the durable name before
+detaching a nonempty recovery volume. It accepts one autosave directory and
+one regular name file, reads at most 256 bytes and applies the live request’s
+filename and identity checks. An ambiguous or invalid name leaves the current
+marker in place.
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads
 the base and journal. Workbook UIDs cannot request recovery.
