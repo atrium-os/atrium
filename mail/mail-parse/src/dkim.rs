@@ -118,42 +118,77 @@ fn crlf(b: &[u8]) -> Vec<u8> {
 
 /// Body canonicalization (§3.4.3, §3.4.4).
 fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
-    let body = crlf(body);
-    let mut lines: Vec<Vec<u8>> = body.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l).to_vec()).collect();
-    // the split leaves an empty last element after a final CRLF
-    if body.ends_with(b"\n") {
-        lines.pop();
-    }
-    if relaxed {
-        for l in lines.iter_mut() {
-            let mut out = Vec::with_capacity(l.len());
-            let mut ws = false;
-            for &c in l.iter() {
-                if is_wsp(c) {
-                    ws = true;
-                } else {
-                    if ws {
-                        out.push(b' ');
-                    }
-                    ws = false;
-                    out.push(c);
-                }
-            }
-            *l = out; // trailing whitespace dropped
+    let mut out = Vec::new();
+    let mut blank_lines = 0;
+    for raw in body.split_inclusive(|&byte| byte == b'\n') {
+        let line = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = if relaxed {
+            let end = line.iter().rposition(|&byte| !is_wsp(byte)).map_or(0, |i| i + 1);
+            &line[..end]
+        } else {
+            line
+        };
+        if line.is_empty() {
+            blank_lines += 1;
+            continue;
         }
+        if out.is_empty() {
+            out.reserve(body.len());
+        }
+        // A later nonempty line makes these internal, rather than trailing.
+        for _ in 0..blank_lines {
+            out.extend_from_slice(b"\r\n");
+        }
+        blank_lines = 0;
+        if relaxed {
+            let mut was_space = false;
+            for &byte in line {
+                let space = is_wsp(byte);
+                if !space || !was_space {
+                    out.push(if space { b' ' } else { byte });
+                }
+                was_space = space;
+            }
+        } else {
+            out.extend_from_slice(line);
+        }
+        out.extend_from_slice(b"\r\n");
     }
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    if lines.is_empty() {
-        return if relaxed { Vec::new() } else { b"\r\n".to_vec() };
-    }
-    let mut out = Vec::with_capacity(body.len());
-    for l in lines {
-        out.extend_from_slice(&l);
+    if out.is_empty() && !relaxed {
         out.extend_from_slice(b"\r\n");
     }
     out
+}
+
+/// Keep whole-body hashes while examining the signatures on one message.
+struct BodyHashes<'a> {
+    raw: &'a [u8],
+    full: [Option<(usize, digest::Digest)>; 2],
+}
+
+impl BodyHashes<'_> {
+    fn hash(&mut self, relaxed: bool, limit: Option<usize>) -> Result<(digest::Digest, bool), Outcome> {
+        let cached = &mut self.full[usize::from(relaxed)];
+        if let Some((len, hash)) = *cached {
+            let signed_len = limit.unwrap_or(len);
+            if signed_len == len {
+                return Ok((hash, false));
+            }
+            if signed_len > len {
+                return Err(Outcome::Fail("body shorter than l="));
+            }
+        }
+        let canonical = canon_body(self.raw, relaxed);
+        let len = canonical.len();
+        let signed = canonical.get(..limit.unwrap_or(len)).ok_or(Outcome::Fail("body shorter than l="))?;
+        let hash = digest::digest(&digest::SHA256, signed);
+        let partial = signed.len() < len;
+        if !partial {
+            *cached = Some((len, hash));
+        }
+        Ok((hash, partial))
+    }
 }
 
 /// DKIM permits folding whitespace and optional padding. Reject an
@@ -248,7 +283,7 @@ fn without_b(field: &[u8]) -> Vec<u8> {
 /// the TXT record for `(selector, domain)` if sync has it.
 pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) -> Vec<Signature> {
     let (fields, body_at) = raw_fields(raw);
-    let body = &raw[body_at.min(raw.len())..];
+    let mut body = BodyHashes { raw: &raw[body_at.min(raw.len())..], full: [None; 2] };
     let mut out = Vec::new();
     for (idx, f) in fields.iter().enumerate() {
         if !f.name.eq_ignore_ascii_case(b"DKIM-Signature") {
@@ -270,7 +305,7 @@ pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) 
         let domain = tag(&t, "d").unwrap_or("").to_ascii_lowercase();
         let selector = tag(&t, "s").unwrap_or("").to_string();
         let mut sig = Signature { domain: domain.clone(), selector: selector.clone(), outcome: Outcome::PermError("malformed"), partial_body: false };
-        sig.outcome = check(raw, &fields, idx, &t, body, key, now, &mut sig.partial_body);
+        sig.outcome = check(&fields, idx, &t, &mut body, key, now, &mut sig.partial_body);
         out.push(sig);
     }
     out
@@ -286,8 +321,7 @@ fn dns_labels(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64, partial: &mut bool) -> Outcome {
-    let _ = raw;
+fn check(fields: &[RawField], idx: usize, t: &[(&str, String)], body: &mut BodyHashes<'_>, key: &dyn Fn(&str, &str) -> Option<String>, now: i64, partial: &mut bool) -> Outcome {
     if tag(t, "v") != Some("1") {
         return Outcome::PermError("version");
     }
@@ -358,19 +392,14 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     let Some(sigbytes) = decode_dkim_base64(b, 1024) else {
         return Outcome::PermError("signature encoding");
     };
-    // the body
-    let mut cb = canon_body(body, bc);
-    if let Some(l) = tag(t, "l") {
-        let Ok(l) = l.parse::<usize>() else { return Outcome::PermError("l=") };
-        if l > cb.len() {
-            return Outcome::Fail("body shorter than l=");
-        }
-        if l < cb.len() {
-            *partial = true;
-            cb.truncate(l);
-        }
-    }
-    let got = digest::digest(&digest::SHA256, &cb);
+    let Ok(limit) = tag(t, "l").map(str::parse::<usize>).transpose() else {
+        return Outcome::PermError("l=");
+    };
+    let (got, is_partial) = match body.hash(bc, limit) {
+        Ok(result) => result,
+        Err(outcome) => return outcome,
+    };
+    *partial = is_partial;
     if body_hash != got.as_ref() {
         return Outcome::Fail("body hash");
     }
@@ -683,6 +712,37 @@ mod tests {
         assert_eq!(canon_body(b"", true), b"");
         assert_eq!(canon_header(b"A: X\r\n", true), b"a:X\r\n");
         assert_eq!(canon_header(b"B : Y\t\r\n\tZ  \r\n", true), b"b:Y Z\r\n");
+    }
+
+    #[test]
+    fn body_canonicalization_preserves_internal_blank_lines() {
+        let body = b"\n  A \tB \r\n \t\nZ\n\t \r\n\n";
+        assert_eq!(canon_body(body, false), b"\r\n  A \tB \r\n \t\r\nZ\r\n\t \r\n");
+        assert_eq!(canon_body(body, true), b"\r\n A B\r\n\r\nZ\r\n");
+        assert_eq!(canon_body(b"body", false), b"body\r\n");
+        assert_eq!(canon_body(b"body", true), b"body\r\n");
+        assert!(canon_body(&b" \t\n".repeat(100_000), true).is_empty());
+    }
+
+    #[test]
+    fn body_hashes_reuse_only_full_hashes_in_the_same_mode() {
+        let mut body = BodyHashes { raw: b"A  B\r\n", full: [None; 2] };
+        for (relaxed, expected) in [(false, &b"A  B\r\n"[..]), (true, &b"A B\r\n"[..])] {
+            let algorithm = &digest::SHA256;
+            let (full, partial) = body.hash(relaxed, None).unwrap();
+            assert!(!partial);
+            assert_eq!(full.as_ref(), digest::digest(algorithm, expected).as_ref());
+            let (prefix, partial) = body.hash(relaxed, Some(1)).unwrap();
+            assert!(partial);
+            assert_eq!(prefix.as_ref(), digest::digest(algorithm, b"A").as_ref());
+            let exact = body.hash(relaxed, Some(expected.len())).unwrap();
+            assert!(!exact.1);
+            assert_eq!(exact.0.as_ref(), full.as_ref());
+            assert!(matches!(
+                body.hash(relaxed, Some(expected.len() + 1)),
+                Err(Outcome::Fail("body shorter than l="))
+            ));
+        }
     }
 
     #[test]
