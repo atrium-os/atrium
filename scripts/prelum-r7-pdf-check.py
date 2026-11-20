@@ -23,20 +23,29 @@ job_ids = list(range(1, len(expected) + 1))
 creates = re.findall(r"^fake printer: Create-Job job ", transcript, re.M)
 sends = numbered_lines(r"^fake printer: Send-Document job (\d+) ", transcript)
 receipts = re.findall(
-    r"^fake printer: got job (\d+) \((\d+) bytes\) .* sha256=([a-f0-9]{64})$",
+    r"^fake printer: got job (\d+) \((\d+) bytes\) (.*) sha256=([a-f0-9]{64})$",
     transcript,
     re.M,
 )
 completions = numbered_lines(r"^fake printer: job (\d+) completed$", transcript)
 assert len(creates) == len(job_ids), len(creates)
 assert sends == job_ids, sends
-assert [int(job) for job, _, _ in receipts] == job_ids, receipts
-for pdf, (job, size, digest) in zip(expected, receipts):
+assert [int(job) for job, _, _, _ in receipts] == job_ids, receipts
+jobs = Path(sys.argv[3]).read_text(encoding="utf-8")
+completed_titles = re.findall(
+    r"^ +([0-9]+) +printer [0-9]+ +Done +[0-9]+/[0-9]+ +(.+?) *$",
+    jobs,
+    re.M,
+)
+assert [(int(job), title) for job, title in completed_titles] == [
+    (int(job), title) for job, _, title, _ in receipts
+], (completed_titles, receipts)
+for pdf, (job, size, _title, digest) in zip(expected, receipts):
     payload = pdf.read_bytes()
     assert len(payload) == int(size), (job, size, len(payload))
     assert hashlib.sha256(payload).hexdigest() == digest, (job, "upload SHA-256 mismatch")
 assert completions == job_ids, completions
-print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs; all upload hashes match")
+print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs; desktop titles and upload hashes match")
 
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 

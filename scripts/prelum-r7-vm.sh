@@ -151,5 +151,6 @@ if ! remote "sh -s -- '$guest' '$ipps_port' '$marker'" <"$scripts/prelum-r7-gues
     exit 1
 fi
 cat "$D/results.log"
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" >"$D/pdf-checks.log"
+remote "cat '$guest/jobs.txt'" >"$D/desktop-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/desktop-jobs.txt" >"$D/pdf-checks.log"
 cat "$D/pdf-checks.log"
