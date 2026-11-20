@@ -192,7 +192,7 @@ fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
             // The decoder checks whitespace inside the encoded value.
             "b" | "bh" | "p" => value.trim_matches([' ', '\t', '\r', '\n']).to_owned(),
             // These tags have tokens that must not be joined across whitespace.
-            "c" | "h" | "q" | "t" | "x" => value.trim().to_owned(),
+            "c" | "d" | "h" | "q" | "s" | "t" | "x" => value.trim().to_owned(),
             _ => value.chars().filter(|c| !c.is_whitespace()).collect(),
         };
         tags.push((name, value));
@@ -276,8 +276,8 @@ pub fn verify(raw: &[u8], key: &dyn Fn(&str, &str) -> Option<String>, now: i64) 
     out
 }
 
-fn dns_domain(name: &str) -> bool {
-    name.len() <= 253 && name.contains('.') && name.split('.').all(|label| {
+fn dns_labels(name: &str) -> bool {
+    name.len() <= 253 && name.split('.').all(|label| {
         label.len() <= 63
             && label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
             && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
@@ -294,7 +294,9 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     let (Some(d), Some(s), Some(h), Some(bh), Some(b)) = (tag(t, "d"), tag(t, "s"), tag(t, "h"), tag(t, "bh"), tag(t, "b")) else {
         return Outcome::PermError("missing tag");
     };
-    if !dns_domain(d) || s.is_empty() || s.len() > 63 {
+    if !d.contains('.') || !dns_labels(d) || !dns_labels(s)
+        || s.len() + "._domainkey.".len() + d.len() > 253
+    {
         return Outcome::PermError("domain or selector");
     }
     let d = d.to_ascii_lowercase();
@@ -302,7 +304,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
         Some(identity) => {
             let Some((_, domain)) = identity.rsplit_once('@') else { return Outcome::PermError("signing identity") };
             let domain = domain.to_ascii_lowercase();
-            if !dns_domain(&domain)
+            if !domain.contains('.') || !dns_labels(&domain)
                 || (domain != d && !domain.strip_suffix(&d).is_some_and(|prefix| prefix.ends_with('.')))
             {
                 return Outcome::PermError("signing identity");
@@ -393,7 +395,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     if tag(&kt, "h").is_some_and(|hashes| !hashes.split(':').any(|hash| hash.trim() == "sha256")) {
         return Outcome::PermError("key hash");
     }
-    if tag(&kt, "s").is_some_and(|services| !services.split(':').any(|service| matches!(service, "*" | "email"))) {
+    if tag(&kt, "s").is_some_and(|services| !services.split(':').any(|service| matches!(service.trim(), "*" | "email"))) {
         return Outcome::PermError("key service");
     }
     if identity_domain != d && tag(&kt, "t").is_some_and(|flags| flags.split(':').any(|flag| flag.trim() == "s")) {

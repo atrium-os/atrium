@@ -40,10 +40,14 @@ fn signed(kp: &Ed25519KeyPair, from: &str, subject: &str) -> Vec<u8> {
 }
 
 fn signed_as(kp: &Ed25519KeyPair, from: &str, domain: &str, subject: &str) -> Vec<u8> {
+    signed_with_selector(kp, from, domain, "sel", subject)
+}
+
+fn signed_with_selector(kp: &Ed25519KeyPair, from: &str, domain: &str, selector: &str, subject: &str) -> Vec<u8> {
     let headers = format!("From: Priya <{from}>\r\nSubject: {subject}\r\nContent-Type: text/plain\r\n");
     let body = "Hello.\r\n";
     let bh = b64(ring::digest::digest(&ring::digest::SHA256, body.as_bytes()).as_ref());
-    let field = format!("DKIM-Signature: v=1; a=ed25519-sha256; c=simple/simple; d={domain}; s=sel; h=from:subject:content-type; bh={bh}; b=");
+    let field = format!("DKIM-Signature: v=1; a=ed25519-sha256; c=simple/simple; d={domain}; s={selector}; h=from:subject:content-type; bh={bh}; b=");
     let mut data = headers.as_bytes().to_vec();
     data.extend_from_slice(field.as_bytes());
     let sig = kp.sign(ring::digest::digest(&ring::digest::SHA256, &data).as_ref());
@@ -119,6 +123,56 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     let n = engine.dns_lookups();
     engine.open(id4).unwrap();
     assert_eq!(engine.dns_lookups(), n);
+}
+
+#[test]
+fn long_selectors_work_across_the_worker_dns_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let dns = Fake::default();
+    engine.set_dns(Box::new(dns.clone()));
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let key = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let domain = "example.com";
+    let policy_name = format!("_dmarc.{domain}");
+    let selector = ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(38)].join(".");
+    let key_name = format!("{selector}._domainkey.{domain}");
+    assert_eq!(key_name.len(), 253);
+    dns.0.borrow_mut().records.insert(key_name.clone(), vec![key]);
+
+    let account = engine.store.add_account("reader@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder {
+        name: "INBOX".into(),
+        role: mail_sync::Role::Inbox,
+        selectable: true,
+    }]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let selectors = [
+        selector.clone(),
+        format!("{selector}x"),
+        "x".repeat(64),
+        "a..b".into(),
+        "a. b".into(),
+        "a.-b".into(),
+        "a._b".into(),
+    ];
+    let messages = selectors.iter().enumerate().map(|(offset, selector)| {
+        let message = signed_with_selector(&kp, "sender@example.com", domain, selector, &format!("Fixture {offset}"));
+        fetched(offset as u32 + 1, message)
+    }).collect();
+    sink.messages("INBOX", messages).unwrap();
+
+    let check = |uid| {
+        let id = engine.store.at(inbox, uid).unwrap().unwrap().0;
+        engine.store.message(id).unwrap().summary.sender_check
+    };
+    assert_eq!(check(1), SenderCheck::Verified { domain: domain.into(), by_provider: false });
+    for uid in 2..=selectors.len() as u32 {
+        assert_eq!(check(uid), SenderCheck::NotVerified);
+    }
+    assert_eq!(dns.0.borrow().queried, [key_name, policy_name]);
 }
 
 #[test]

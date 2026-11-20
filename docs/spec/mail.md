@@ -570,6 +570,9 @@ What Mail shows comes from what was checked, never from what the message says ab
   The signature, body hash and public key must decode completely as
   standard Base64. DKIM allows folding whitespace and optional padding.
   Malformed encodings and trailing data cannot verify.
+  A selector may contain multiple DNS labels. Mail checks each label and
+  rejects lookup names longer than 253 characters before requesting a key.
+  [RFC 6376 §3.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.1)
   [RFC 6376 §§3.2, 3.5 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup
   leaves the sender check pending and Mail retries when the message is opened
