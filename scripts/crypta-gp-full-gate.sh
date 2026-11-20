@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-recovered-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=21 ;;
     esp-loss-hip-active-refresh-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=20 ;;
     esp-loss-hip-active-refresh-rebind-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=19 ;;
     esp-loss-hip-active-refresh-rebind-tls) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=18 ;;
@@ -1125,7 +1126,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                 fail "newly approved timer-retry HIP did not refresh silently"
                                             ok "newly approved timer-retry HIP refreshed silently"
                                             rebind_restored_forwarding 13 "$rebound_report"
-                                            if [ "$retry_hip_submit" = 20 ]; then
+                                            if [ "$retry_hip_submit" -ge 20 ]; then
                                                 rebound_iface=$(field iface)
                                                 [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
                                                 before_decline=$(awk 'END { print NR }' "$receipts")
@@ -1136,13 +1137,37 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                     fail "the rebound review omitted the forwarding change"
                                                 [ "$(hip_choice)" != "$approval_choice" ] ||
                                                     fail "the rebound review reused the previous approval choice"
+                                                declined_choice=$(hip_choice)
                                                 decline_esp_loss_review 13 "$rebound_iface"
                                                 if tail -n "+$((before_decline + 1))" "$receipts" | grep -Fxq "$initial_report"; then
                                                     fail "the rebound ESP tunnel submitted declined HIP"
                                                 fi
                                                 ok "declining the rebound review withheld changed HIP and stopped IPv4 traffic"
-                                                echo "$pass checks passed"
-                                                exit 0
+                                                if [ "$retry_hip_submit" = 20 ]; then
+                                                    echo "$pass checks passed"
+                                                    exit 0
+                                                fi
+                                                reconnect_after_esp_loss_decline "$before_decline" timer-reconnect-approved "${initial_report%% *}"
+                                                before_approval=$(awk 'END { print NR }' "$receipts")
+                                                approve_hip
+                                                wait_receipts "$((before_approval + 1))"
+                                                [ "$(tail -n 1 "$receipts")" = "$initial_report" ] &&
+                                                    [ "$(field handshake)" = 0 ] ||
+                                                    fail "reconnect opened before HIP acknowledgement or submitted different posture"
+                                                "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+                                                    fail "IPv4 echo passed before HIP acknowledgement"
+                                                ok "approved reconnect kept IPv4 blocked until gateway acknowledgement"
+                                                touch "$receipts.timer-reconnect-ack"
+                                                wait_field handshake 1
+                                                probe "IPv4 echo after HIP acknowledgement on reconnected ESP"
+                                                before_refresh=$(awk 'END { print NR }' "$receipts")
+                                                wait_receipts "$((before_refresh + 1))"
+                                                [ "$(field signin)" = in ] &&
+                                                    [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$initial_report" ] &&
+                                                    [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$((reviews + 2))" ] ||
+                                                    fail "the approved reconnect report did not refresh silently"
+                                                ok "the reconnected ESP report refreshed silently"
+                                                probe "IPv4 echo after silent HIP refresh on reconnected ESP"
                                             fi
                                         fi
                                     fi

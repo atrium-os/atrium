@@ -1042,6 +1042,12 @@ another origin. An active portal-profile session stays in engine memory.
   fresh review. The changed report stays unsent, the profile and route
   go down, and IPv4 echo stops. The FreeBSD arm64 gate passed 71/71
   using the shared Cargo cache.
+  The `--hip esp-loss-hip-active-refresh-recovered-reconnect` variant
+  reconnects after that decline and rejects the old choice. The fixture
+  withholds acknowledgement of the freshly approved report while the
+  guest confirms IPv4 stays blocked. Traffic then resumes on the new ESP
+  association and the identical report refreshes without a prompt. The
+  FreeBSD arm64 gate passed 76/76 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
