@@ -54,7 +54,7 @@ case "$phase" in
     "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
     exec 3<&-
     snapshot=pin-replay-jobs.log
-    expected="^ +16 +printer +1 +Failed +[0-9]+/[0-9]+ +$title +Arca did not supply a usable PIN for this job *$"
+    expected="^ +16 +printer +1 +Failed +0/2 +$title +Arca did not supply a usable PIN for this job *$"
     ;;
   *) echo "Expected hold, retry, release, or replay" >&2; exit 2 ;;
 esac

@@ -293,8 +293,9 @@ pub struct Job {
     pub printer: u32,
     pub title: String,
     pub phase: Phase,
-    /// Sheets drawn so far, and of how many (0 until known).
+    /// Sheets prepared during rendering, then sheets completed at the printer.
     pub sheets: u32,
+    /// Total sheets (0 until known).
     pub of: u32,
     /// Why it waits, failed or is held (plain text).
     pub message: String,

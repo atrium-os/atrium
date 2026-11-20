@@ -1273,15 +1273,22 @@ impl Daemon {
             let prog = prog.clone();
             let d_job = job;
             let d = self.clone();
+            let progress_daemon = d.clone();
             let set_sheets: Arc<dyn Fn(u32, u32) + Send + Sync> = Arc::new(move |n, of| {
-                d.set(d_job, |j| {
+                progress_daemon.set(d_job, |j| {
                     j.view.sheets = n;
                     if of > 0 {
                         j.view.of = of;
                     }
                 });
             });
-            std::thread::spawn(move || read_render(r.sock, spool_file, prog, set_sheets))
+            std::thread::spawn(move || {
+                let result = read_render(r.sock, spool_file, prog, set_sheets);
+                // Render progress is only preparation. Once the renderer
+                // exits, only the printer can establish completed sheets.
+                d.set(d_job, |j| j.view.sheets = 0);
+                result
+            })
         };
         let format = {
             let (m, cv) = &*prog;

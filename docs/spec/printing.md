@@ -587,7 +587,10 @@ New crates in `prelum/`:
   into a spool file (`<spool>/<uid>/<job>.spool`, 0600, 2 GB cap) while a
   second loop sends what is there to prelum-ipp as it grows, then polling
   `Get-Job-Attributes` every 2 s for a minute and every 10 s after, until the
-  printer says completed, canceled or aborted. Cancel stops the workers and
+  printer says completed, canceled or aborted. The job counter shows render
+  progress during preparation. When rendering ends, the total stays known
+  and the completed count starts at zero until the printer reports progress.
+  A PIN rejection before upload leaves zero completed sheets. Cancel stops the workers and
   sends `Cancel-Job` once the printer has an id for the job. "Use the new
   identity" (`repin`) learns the printer again at its saved address and
   releases its held jobs. A printer's answer is cut again in prelumd (text,
