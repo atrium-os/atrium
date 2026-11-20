@@ -937,6 +937,10 @@ another origin. An active portal-profile session stays in engine memory.
   upload and ESP traffic. The unchanged report refreshes silently and
   is acknowledged on rebind before IPv4 traffic resumes on a new ESP
   association. The arm64 gate passed 21/21 using the shared Cargo cache.
+  The `--hip esp-loss-hip-submit-retry-decline` variant declines that
+  fresh review. Crypta surfaces the refusal, leaves the profile down,
+  and sends neither the restored report nor any ESP packets for the
+  retry. The arm64 gate passed 17/17 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

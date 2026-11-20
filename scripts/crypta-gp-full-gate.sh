@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-retry-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=3 ;;
     esp-loss-hip-submit-retry-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=2 ;;
     esp-loss-hip-submit-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=1 ;;
     esp-loss-rebind-decline) hip=esp-loss; decline_after_esp_loss=3 ;;
@@ -771,7 +772,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
         "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
             fail "IPv4 echo passed before the retry was acknowledged"
         ok "HIP submission failure was logged and kept the tunnel blocked"
-        if [ "$retry_hip_submit" = 2 ]; then
+        if [ "$retry_hip_submit" -ge 2 ]; then
             previous_choice=$approval_choice
             before_retry=$(wc -l < "$receipts" | tr -d ' ')
             "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
@@ -787,6 +788,22 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$(wc -l < "$receipts" | tr -d ' ')" = "$before_retry" ] &&
                 [ "$(field handshake)" = 0 ] || fail "retry submitted HIP or opened before fresh approval"
             ok "retry reviewed restored posture and rejected stale approval"
+            if [ "$retry_hip_submit" = 3 ]; then
+                "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+                wait_field up 0
+                [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+                    fail "declining retry HIP did not report the refusal"
+                sleep 6
+                [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+                    fail "the profile restarted after declining retry HIP"
+                [ "$(wc -l < "$receipts" | tr -d ' ')" = "$before_retry" ] ||
+                    fail "declining retry HIP submitted the restored report"
+                "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+                    fail "IPv4 echo passed after declining retry HIP"
+                ok "declining retry HIP withheld the restored report and kept ESP down"
+                echo "$pass checks passed"
+                exit 0
+            fi
             retry_reviews=$((retry_reviews + 1))
             touch "$receipts.retry"
             approve_hip

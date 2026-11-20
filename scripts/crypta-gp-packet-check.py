@@ -72,7 +72,7 @@ def frames(stream, reader, calls):
 RECONNECT_HIP = ("tessera-reconnect", "tessera-relock-decline", "tessera-relock-reconnect", "tessera-final-lock-decline", "tessera-cycle")
 TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", *RECONNECT_HIP)
 ESP_LOSS_RECONNECT_HIP = (
-    "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
+    "esp-loss-hip-submit-retry-decline", "esp-loss-hip-submit-retry-recheck", "esp-loss-reconnect", "esp-loss-rebind-decline", "esp-loss-rebind-reconnect", "esp-loss-hip-submit-retry",
 )
 ESP_LOSS_HIP = ("esp-loss", "esp-loss-decline", *ESP_LOSS_RECONNECT_HIP)
 REFRESH_HIP = ("refresh", "posture", *ESP_LOSS_HIP, *TESSERA_HIP)
@@ -251,7 +251,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 + (esp.offer() if esp else '') + '</response>')
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
-                        if hip == "esp-loss-hip-submit-retry-recheck" and calls.count("getconfig.esp") == 4:
+                        if hip in ("esp-loss-hip-submit-retry-recheck", "esp-loss-hip-submit-retry-decline") and calls.count("getconfig.esp") == 4:
                             deadline = time.monotonic() + 25
                             while not receipts.with_suffix(".posture-restored").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
@@ -324,7 +324,9 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 elif hip in TESSERA_HIP:
                                     fact = tessera_count
                                 print(f"{fact} {digest}", file=receipt)
-                        if hip in ("esp-loss-hip-submit-retry", "esp-loss-hip-submit-retry-recheck"):
+                        if hip == "esp-loss-hip-submit-retry-decline":
+                            assert calls.count("getconfig.esp") < 4, "declined retry submitted HIP"
+                        if hip in ("esp-loss-hip-submit-retry-decline", "esp-loss-hip-submit-retry", "esp-loss-hip-submit-retry-recheck"):
                             config_count = calls.count("getconfig.esp")
                             if config_count == 3:
                                 calls.append("hip-submit-response-dropped")
@@ -684,14 +686,16 @@ def main():
                 reconnected = args.hip in ESP_LOSS_RECONNECT_HIP
                 reconnected_after_rebind = args.hip == "esp-loss-rebind-reconnect"
                 retry_recheck = args.hip == "esp-loss-hip-submit-retry-recheck"
-                submit_retry = retry_recheck or args.hip == "esp-loss-hip-submit-retry"
+                retry_decline = args.hip == "esp-loss-hip-submit-retry-decline"
+                submit_retry = retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
                 assert len(esp.configs) == len(configs) == (6 if reconnected_after_rebind else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
-                    expected_spis.extend([esp.configs[3][0][0]] * 2)
+                    if not retry_decline:
+                        expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
                         expected_spis.append(esp.configs[4][0][0])
                 elif reconnected:
@@ -700,7 +704,7 @@ def main():
                     expected_spis.extend([esp.configs[4][0][0]] * 3 + [esp.configs[5][0][0]])
                 assert esp.echo == expected_spis and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == set(expected_spis), esp.received_spis
-                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind else "logout.esp"), calls
+                assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind or retry_decline else "logout.esp"), calls
                 recovery = configs[1]
                 assert calls[recovery:recovery + 4] == [*exchange, "hipreport.esp", "ssl-tunnel-connect.sslvpn"], calls
                 assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == (1 if declined or reconnected else 2), calls
@@ -715,7 +719,7 @@ def main():
                 assert all(report == original for report in reports[:report_index]), reports
                 if reconnected:
                     assert calls[configs[1]:configs[2]][-1] == "hipreportcheck.esp", calls
-                    for config in configs[2:]:
+                    for config in configs[2:-1] if retry_decline else configs[2:]:
                         assert calls[config:config + 3] == [*exchange, "hipreport.esp"], calls
                     reconnect_report = calls[:configs[2]].count("hipreport.esp")
                     next_report = calls[:configs[3]].count("hipreport.esp")
@@ -727,6 +731,11 @@ def main():
                             *exchange, "hipreport.esp", "hip-submit-response-dropped",
                         ], calls
                         assert reports[reconnect_report:next_report] == [changed], reports
+                        if retry_decline:
+                            assert calls[configs[3]:] == exchange, calls
+                            assert next_report == len(reports), reports
+                            print("Declining the retry review withheld restored HIP and kept ESP down")
+                            return
                         if retry_recheck:
                             final_rebind = calls[:configs[4]].count("hipreport.esp")
                             assert final_rebind >= next_report + 2, reports
