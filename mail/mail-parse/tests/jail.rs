@@ -343,13 +343,16 @@ fn attachments_are_listed_and_handed_over() {
     e.finish();
 }
 
+// Embed the S/MIME fixtures in the test binary for staged FreeBSD runs.
+const SMIME_CA: &[u8] = include_bytes!("../../mail-smime/tests/data/ca.der");
+const SMIME_LEAF: &[u8] = include_bytes!("../../mail-smime/tests/data/leaf.der");
+
 /// An S/MIME signed message (OpenSSL's, kept with bare LFs as some stores
 /// do): checked against the roots the engine sends; the signature part
 /// isn't listed as a file.
 #[test]
 fn smime_signature_is_checked_against_the_engine_s_roots() {
-    let d = |f: &str| std::fs::read(format!("{}/../mail-smime/tests/data/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    let raw = d("signed.eml");
+    let raw: &[u8] = include_bytes!("../../mail-smime/tests/data/signed.eml");
     let now = 1_800_000_000;
     let run = |roots: Vec<Vec<u8>>, raw: &[u8]| {
         let mut e = Engine::start();
@@ -358,26 +361,26 @@ fn smime_signature_is_checked_against_the_engine_s_roots() {
         e.finish();
         match f.into_iter().next() { Some(FromJail::Opened { result: Ok(o), .. }) => o, other => panic!("{other:?}") }
     };
-    let o = run(vec![d("ca.der")], &raw);
+    let o = run(vec![SMIME_CA.to_vec()], raw);
     let m = o.summary.smime.clone().expect("signed");
     assert_eq!(m.state, wire::SmimeState::Valid);
     let s = m.signer.unwrap();
     assert_eq!(s.name, "Grace Hopper");
     assert_eq!(s.issuer, "Fixture");
-    assert_eq!(s.der, d("leaf.der"));
+    assert_eq!(s.der, SMIME_LEAF);
     assert_eq!(m.issuers, vec!["OpenSSL Test Root".to_string()]);
     assert!(o.attachments.is_empty(), "{:?}", o.attachments);
     assert!(o.summary.parts.iter().any(|p| p.kind == wire::PartKind::Signature));
     assert_eq!(o.summary.text.as_deref().map(str::trim), Some("From OpenSSL."));
 
     // Not a root here.
-    assert!(matches!(run(vec![], &raw).summary.smime.unwrap().state, wire::SmimeState::NotTrusted(_)));
+    assert!(matches!(run(vec![], raw).summary.smime.unwrap().state, wire::SmimeState::NotTrusted(_)));
     // Changed in transit.
-    let changed = String::from_utf8(raw.clone()).unwrap().replace("From OpenSSL.", "From 0penSSL.").into_bytes();
-    assert!(matches!(run(vec![d("ca.der")], &changed).summary.smime.unwrap().state, wire::SmimeState::Invalid(_)));
+    let changed = std::str::from_utf8(raw).unwrap().replace("From OpenSSL.", "From 0penSSL.").into_bytes();
+    assert!(matches!(run(vec![SMIME_CA.to_vec()], &changed).summary.smime.unwrap().state, wire::SmimeState::Invalid(_)));
     // Someone else in From.
-    let other = String::from_utf8(raw.clone()).unwrap().replace("<grace@example.net>", "<ceo@example.net>").into_bytes();
-    assert_eq!(run(vec![d("ca.der")], &other).summary.smime.unwrap().state, wire::SmimeState::WrongAddress(vec!["grace@example.net".into()]));
+    let other = std::str::from_utf8(raw).unwrap().replace("<grace@example.net>", "<ceo@example.net>").into_bytes();
+    assert_eq!(run(vec![SMIME_CA.to_vec()], &other).summary.smime.unwrap().state, wire::SmimeState::WrongAddress(vec!["grace@example.net".into()]));
 }
 
 /// A lying jail can't claim a signature for From with someone else's
@@ -402,10 +405,9 @@ fn the_engine_checks_smime_claims() {
 #[test]
 fn encrypted_mail_is_read_with_a_key_unwrapped_outside() {
     use rsa::pkcs8::DecodePrivateKey;
-    let d = |f: &str| std::fs::read(format!("{}/../mail-smime/tests/data/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    let raw = d("encrypted.eml");
+    let raw: &[u8] = include_bytes!("../../mail-smime/tests/data/encrypted.eml");
     let len = raw.len() as u64;
-    let msg = || wire::Raw { id: 1, bytes: raw.clone() };
+    let msg = || wire::Raw { id: 1, bytes: raw.to_vec() };
 
     let mut e = Engine::start();
     e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, headers_only: false, roots: vec![], batch: vec![msg()] });
@@ -413,10 +415,11 @@ fn encrypted_mail_is_read_with_a_key_unwrapped_outside() {
     let FromJail::Summary { result: Ok(s), .. } = &f[0] else { panic!("{f:?}") };
     assert!(s.encrypted && s.text.is_none() && s.subject == "Encrypted plan");
 
-    e.send(&ToJail::KeyFor { message: msg(), certs: vec![d("ca.der"), d("leaf.der")] });
+    e.send(&ToJail::KeyFor { message: msg(), certs: vec![SMIME_CA.to_vec(), SMIME_LEAF.to_vec()] });
     let f = e.run(len, &|_| None);
     let Some(FromJail::KeyFor { which: Some((1, wrapped)), .. }) = f.into_iter().next() else { panic!() };
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(&d("leaf.p8")).unwrap().decrypt(rsa::Pkcs1v15Encrypt, &wrapped).unwrap();
+    let fixture_key = include_bytes!("../../mail-smime/tests/data/leaf.p8");
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(fixture_key).unwrap().decrypt(rsa::Pkcs1v15Encrypt, &wrapped).unwrap();
 
     e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: Some(key.clone()), message: msg(), loaded: vec![], pgp_keys: vec![] });
     let f = e.run(len, &|_| None);
