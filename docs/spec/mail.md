@@ -575,8 +575,8 @@ What Mail shows comes from what was checked, never from what the message says ab
   For the sender badge, Mail looks up only DKIM keys whose signing domain
   could align with the From domain. Repeated queries for the same key reuse
   the first answer within the message.
-  The parser reuses whole-body DKIM hashes for signatures using the same
-  body canonicalization. A signature with a shorter signed length is checked
+  The parser streams canonicalized body bytes into the DKIM digest and
+  reuses whole-body hashes for signatures using the same canonicalization. A signature with a shorter signed length is checked
   against its own prefix and cannot grant a verified-sender badge.
   Each message can use up to six distinct DKIM key lookups. The parse
   worker reserves up to two separate DMARC lookups for the From domain

@@ -116,10 +116,11 @@ fn crlf(b: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Body canonicalization (§3.4.3, §3.4.4).
-fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Emit canonical body bytes (§3.4.3, §3.4.4) without keeping a body copy.
+fn write_canonical_body(body: &[u8], relaxed: bool, mut write: impl FnMut(&[u8])) {
+    const BLANK_LINES: [[u8; 2]; 64] = [*b"\r\n"; 64];
     let mut blank_lines = 0;
+    let mut wrote_line = false;
     for raw in body.split_inclusive(|&byte| byte == b'\n') {
         let line = raw.strip_suffix(b"\n").unwrap_or(raw);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -133,32 +134,47 @@ fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
             blank_lines += 1;
             continue;
         }
-        if out.is_empty() {
-            out.reserve(body.len());
-        }
+
         // A later nonempty line makes these internal, rather than trailing.
-        for _ in 0..blank_lines {
-            out.extend_from_slice(b"\r\n");
+        while blank_lines != 0 {
+            let count = blank_lines.min(BLANK_LINES.len());
+            write(BLANK_LINES[..count].as_flattened());
+            blank_lines -= count;
         }
-        blank_lines = 0;
+        wrote_line = true;
+
         if relaxed {
-            let mut was_space = false;
-            for &byte in line {
-                let space = is_wsp(byte);
-                if !space || !was_space {
-                    out.push(if space { b' ' } else { byte });
-                }
-                was_space = space;
-            }
+            write_relaxed_line(line, &mut write);
+            write(b"\r\n");
+        } else if raw.ends_with(b"\r\n") {
+            write(raw);
         } else {
-            out.extend_from_slice(line);
+            write(line);
+            write(b"\r\n");
         }
-        out.extend_from_slice(b"\r\n");
     }
-    if out.is_empty() && !relaxed {
-        out.extend_from_slice(b"\r\n");
+    if !wrote_line && !relaxed {
+        write(b"\r\n");
     }
-    out
+}
+
+/// Collapse whitespace within a line whose trailing whitespace is gone.
+fn write_relaxed_line(line: &[u8], write: &mut impl FnMut(&[u8])) {
+    let mut start = 0;
+    let mut was_space = false;
+    for (index, &byte) in line.iter().enumerate() {
+        let space = is_wsp(byte);
+        match (was_space, space) {
+            (false, true) => {
+                write(&line[start..index]);
+                write(b" ");
+            }
+            (true, false) => start = index,
+            _ => {}
+        }
+        was_space = space;
+    }
+    write(&line[start..]);
 }
 
 /// Keep whole-body hashes while examining the signatures on one message.
@@ -179,11 +195,30 @@ impl BodyHashes<'_> {
                 return Err(Outcome::Fail("body shorter than l="));
             }
         }
-        let canonical = canon_body(self.raw, relaxed);
-        let len = canonical.len();
-        let signed = canonical.get(..limit.unwrap_or(len)).ok_or(Outcome::Fail("body shorter than l="))?;
-        let hash = digest::digest(&digest::SHA256, signed);
-        let partial = signed.len() < len;
+        const CHUNK: usize = 4096;
+        let mut context = digest::Context::new(&digest::SHA256);
+        let mut pending = Vec::with_capacity(CHUNK);
+        let mut len = 0;
+        write_canonical_body(self.raw, relaxed, |bytes| {
+            let signed = limit.map_or(bytes.len(), |limit| limit.saturating_sub(len).min(bytes.len()));
+            let prefix = &bytes[..signed];
+            if signed >= CHUNK || pending.len() + signed >= CHUNK {
+                context.update(&pending);
+                pending.clear();
+            }
+            if signed >= CHUNK {
+                context.update(prefix);
+            } else {
+                pending.extend_from_slice(prefix);
+            }
+            len += bytes.len();
+        });
+        if limit.is_some_and(|limit| limit > len) {
+            return Err(Outcome::Fail("body shorter than l="));
+        }
+        context.update(&pending);
+        let hash = context.finish();
+        let partial = limit.is_some_and(|limit| limit < len);
         if !partial {
             *cached = Some((len, hash));
         }
@@ -702,6 +737,12 @@ fn auth_result_parts(raw: &[u8]) -> Option<Vec<String>> {
 mod tests {
     use super::*;
 
+    fn canon_body(body: &[u8], relaxed: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_canonical_body(body, relaxed, |bytes| out.extend_from_slice(bytes));
+        out
+    }
+
     #[test]
     fn body_canon_rfc_examples() {
         // RFC 6376 §3.4.5
@@ -742,6 +783,34 @@ mod tests {
                 body.hash(relaxed, Some(expected.len() + 1)),
                 Err(Outcome::Fail("body shorter than l="))
             ));
+        }
+    }
+
+    #[test]
+    fn streamed_hash_can_stop_at_any_prefix_boundary() {
+        let mut raw = b"A \t B\n".to_vec();
+        raw.extend_from_slice(&b"\n".repeat(70));
+        raw.extend_from_slice(b"C       D\r\n\n");
+        let mut expected = b"A B\r\n".to_vec();
+        expected.extend_from_slice(&b"\r\n".repeat(70));
+        expected.extend_from_slice(b"C D\r\n");
+        let mut body = BodyHashes { raw: &raw, full: [None; 2] };
+        for limit in 0..=expected.len() {
+            let (hash, partial) = body.hash(true, Some(limit)).unwrap();
+            assert_eq!(hash.as_ref(), digest::digest(&digest::SHA256, &expected[..limit]).as_ref());
+            assert_eq!(partial, limit < expected.len());
+        }
+    }
+
+    #[test]
+    fn streamed_hash_handles_partial_and_full_digest_buffers() {
+        let raw = b"A \t B\n".repeat(1_000);
+        let expected = b"A B\r\n".repeat(1_000);
+        let mut body = BodyHashes { raw: &raw, full: [None; 2] };
+        for limit in [4095, 4096, 4097, expected.len()] {
+            let (hash, partial) = body.hash(true, Some(limit)).unwrap();
+            assert_eq!(hash.as_ref(), digest::digest(&digest::SHA256, &expected[..limit]).as_ref());
+            assert_eq!(partial, limit < expected.len());
         }
     }
 
