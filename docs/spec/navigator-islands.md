@@ -314,6 +314,22 @@ serve `/pond.html` and `/bed-1.html` from the garden fixtures described
 above. The saved trail file, screenshots and broker logs are in
 `~/atrium-vm/evidence/navigator-i2-multiple-personal-20261121/`.
 
+The complementary gate uses `--second-personal TLS_LOG` with the same
+fixtures. After opening Unrecorded, switch to the second Personal trail at
+Pond. Before stopping the broker, the gate checks the selected Pond rail
+entry, the still-open Unrecorded entry, and both Personal cursors in the
+saved trail file. After launch it checks the first displayed page before
+sending any navigation input, then exercises Forward in the Pond trail and
+switches to the Garden trail.
+
+On arm64 Tessera the saved file selected recorded trail 2 and contained
+only the two Personal trails. The replacement broker opened Pond (page 1
+of 2) from the store. Forward reached Flowerbed 1, Back returned to Pond,
+and switching to the first trail showed Garden (page 2 of 2). These actions
+made no fixture requests. Unrecorded’s private page, notice and worker
+stayed gone. Evidence is in
+`~/atrium-vm/evidence/navigator-i2-second-personal-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
