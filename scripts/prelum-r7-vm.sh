@@ -201,6 +201,13 @@ if ! remote "sh -s -- '$guest' '$marker' hold tls" <"$scripts/prelum-r7-identity
     exit 1
 fi
 cat "$D/tls-identity-check.log"
+check_served_key retry "$alternate_key"
+if ! remote "sh -s -- '$guest' '$marker' retry tls" <"$scripts/prelum-r7-identity.sh" >"$D/tls-identity-retry.log" 2>&1; then
+    cat "$D/tls-identity-retry.log" >&2
+    exit 1
+fi
+cat "$D/tls-identity-retry.log"
+# Require the same twelve uploads after both holds, before restoring the key.
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/released-jobs.txt" "$D/fixtures/quicklook.pdf" 12 >"$D/tls-held-pdf-checks.log"
 
 mv "$D/use-alt-key" "$D/held-alt-key.txt"

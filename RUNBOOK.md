@@ -6066,8 +6066,10 @@ without creating or uploading a job at the simulator. Releasing it while the
 UUID still differs must produce a fresh hold. After UUID restoration,
 the gate releases the same job and checks for one upload and both original
 pages. It repeats the hold and recovery with a changed TLS key while
-keeping the original UUID. Loopback TLS probes confirm the changed and
-restored public keys.
+keeping the original UUID. A release with the alternate key still active
+must hold the same job again without creating or uploading a job. Loopback
+TLS probes confirm the alternate key before the initial hold and retry,
+and the original key before the final release.
 
 ### 13.9 Shared-checkout hygiene
 
