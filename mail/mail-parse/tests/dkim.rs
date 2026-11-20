@@ -140,6 +140,31 @@ fn published_key_restrictions_apply_to_valid_signatures() {
 }
 
 #[test]
+fn lookup_and_timestamp_metadata_is_checked_before_dns() {
+    let (kp, rec) = ed();
+    let signed_with = |extra| signed("ed25519-sha256", "example.com", extra, &ed_sign(&kp), HEADERS, BODY);
+    let key = |_: &str, _: &str| Some(rec.clone());
+    let valid = signed_with(" q=other : dns/txt; t=100; x=300;");
+    assert_eq!(dkim::verify(&valid, &key, 200)[0].outcome, Outcome::Pass);
+    assert_eq!(dkim::verify(&valid, &key, 300)[0].outcome, Outcome::Pass);
+    let cases = [
+        (" q=other;", "key lookup method"),
+        (" q=dns/ txt;", "key lookup method"),
+        (" t=1 00;", "signature timestamp"),
+        (" t=-1;", "signature timestamp"),
+        (" x=invalid;", "signature timestamp"),
+        (" x=18446744073709551616;", "signature timestamp"),
+        (" t=300; x=299;", "signature time range"),
+        (" t=300; x=300;", "signature time range"),
+        (" t=100; x=199;", "expired"),
+    ];
+    for (tags, reason) in cases {
+        let result = dkim::verify(&signed_with(tags), &|_, _| panic!("invalid signature reached DNS"), 200);
+        assert_eq!(result[0].outcome, Outcome::PermError(reason));
+    }
+}
+
+#[test]
 fn length_limit_and_expiry() {
     let (kp, rec) = ed();
     let key = |_: &str, _: &str| Some(rec.clone());

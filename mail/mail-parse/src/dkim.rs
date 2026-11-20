@@ -172,7 +172,13 @@ fn tags(raw: &[u8]) -> Option<Vec<(&str, String)>> {
         {
             return None;
         }
-        tags.push((name, value.chars().filter(|c| !c.is_whitespace()).collect()));
+        // Preserve the token boundaries in query methods, timestamps and key flags.
+        let value = if matches!(name, "q" | "t" | "x") {
+            value.trim().to_owned()
+        } else {
+            value.chars().filter(|c| !c.is_whitespace()).collect()
+        };
+        tags.push((name, value));
     }
     Some(tags)
 }
@@ -303,10 +309,23 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     if !names.iter().any(|n| n == "from") {
         return Outcome::PermError("From not signed");
     }
-    if let Some(x) = tag(t, "x").and_then(|x| x.parse::<i64>().ok()) {
-        if x < now {
-            return Outcome::PermError("expired");
+    if tag(t, "q").is_some_and(|methods| !methods.split(':').any(|method| method.trim() == "dns/txt")) {
+        return Outcome::PermError("key lookup method");
+    }
+    let timestamp = |name| tag(t, name).map(|value| {
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(());
         }
+        value.parse::<u64>().map_err(|_| ())
+    }).transpose();
+    let (Ok(created), Ok(expiry)) = (timestamp("t"), timestamp("x")) else {
+        return Outcome::PermError("signature timestamp");
+    };
+    if expiry.zip(created).is_some_and(|(x, t)| x <= t) {
+        return Outcome::PermError("signature time range");
+    }
+    if expiry.is_some_and(|x| u64::try_from(now).is_ok_and(|now| x < now)) {
+        return Outcome::PermError("expired");
     }
     // the body
     let mut cb = canon_body(body, bc);
@@ -348,7 +367,7 @@ fn check(raw: &[u8], fields: &[RawField], idx: usize, t: &[(&str, String)], body
     if tag(&kt, "s").is_some_and(|services| !services.split(':').any(|service| matches!(service, "*" | "email"))) {
         return Outcome::PermError("key service");
     }
-    if identity_domain != d && tag(&kt, "t").is_some_and(|flags| flags.split(':').any(|flag| flag == "s")) {
+    if identity_domain != d && tag(&kt, "t").is_some_and(|flags| flags.split(':').any(|flag| flag.trim() == "s")) {
         return Outcome::PermError("key signing identity");
     }
     let pk = base64(p.as_bytes(), 4096);
