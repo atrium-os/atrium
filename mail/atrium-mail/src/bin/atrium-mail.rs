@@ -685,16 +685,16 @@ fn main() {
                             sw.s.microsoft_sheet_open.set(true);
                             sw.s.sign_in_note("Continue in the Microsoft sign-in sheet.");
                         }
-                        Ok(id) => { let _ = e.detach_embed(id); sw.s.sign_in_note("Navigator could not open the sign-in session."); }
-                        Err(_) => sw.s.sign_in_note("Navigator's sign-in sheet is unavailable."),
+                        Ok(id) => { let _ = e.detach_embed(id); sw.s.dismiss_microsoft(ticket, "Navigator could not open the sign-in session."); }
+                        Err(_) => sw.s.dismiss_microsoft(ticket, "Navigator's sign-in sheet is unavailable."),
                     }
                 } else if sw.microsoft.is_none() {
-                    sw.s.sign_in_note("The sign-in sheet is unavailable.");
+                    sw.s.dismiss_microsoft(ticket, "The sign-in sheet is unavailable.");
                 }
             }
             if close_settings || sw.s.cancelled_sheet() {
                 if let (Some(e), Some((id, ticket))) = (&embeds, sw.microsoft.take()) {
-                    sw.s.dismiss_microsoft(ticket);
+                    sw.s.dismiss_microsoft(ticket, "Microsoft sign-in cancelled.");
                     let _ = e.borrow_mut().detach_embed(id);
                 }
             }
@@ -1215,9 +1215,8 @@ fn main() {
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed } | limen::proto::ParentEvent::Detached { embed }))
                         if settings.as_ref().is_some_and(|s| s.microsoft.is_some_and(|(id, _)| id == embed)) => {
                         if let Some(sw) = settings.as_mut() {
-                            sw.microsoft = None;
-                            sw.s.microsoft_sheet_open.set(false);
-                            sw.s.sign_in_note("The Microsoft sign-in sheet closed.");
+                            let (_, ticket) = sw.microsoft.take().unwrap();
+                            sw.s.dismiss_microsoft(ticket, "The Microsoft sign-in sheet closed.");
                         }
                     }
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if (bytes == b"failed" || bytes == b"complete" || bytes == b"cancelled") && settings.as_ref().is_some_and(|s| s.microsoft.is_some_and(|(id, _)| id == embed)) => {
@@ -1225,8 +1224,8 @@ fn main() {
                             let (_, ticket) = sw.microsoft.take().unwrap();
                             sw.s.microsoft_sheet_open.set(false);
                             if bytes == b"complete" { sw.s.complete_microsoft(ticket); }
-                            else if bytes == b"cancelled" { sw.s.dismiss_microsoft(ticket); }
-                            else { sw.s.sign_in_note("Navigator could not complete Microsoft sign-in."); }
+                            else if bytes == b"cancelled" { sw.s.dismiss_microsoft(ticket, "Microsoft sign-in cancelled."); }
+                            else { sw.s.dismiss_microsoft(ticket, "Navigator could not complete Microsoft sign-in."); }
                             let _ = embeds.borrow_mut().detach_embed(embed);
                         }
                     }
@@ -1250,6 +1249,11 @@ fn main() {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(e) => {
+                        if let Some(sw) = settings.as_mut() {
+                            if let Some((_, ticket)) = sw.microsoft.take() {
+                                sw.s.dismiss_microsoft(ticket, "Lost the connection to the Microsoft sign-in sheet.");
+                            }
+                        }
                         eprintln!("atrium-mail: limend: {e:?}");
                         break;
                     }

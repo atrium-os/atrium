@@ -341,6 +341,11 @@ to `robin@school.test` with the decoded body â€œSent after cancelling sign-in.â€
 copies from before revocation, after cancellation and after delivery each contained one
 account with the same account ID and the same IMAP and submission item references.
 
+If Navigator cannot open the sheet, reports a failure, or loses its Limen connection
+during sign-in, Mail asks Arca to discard the pending ticket and closes the account
+setup form. It displays the cause and reports when Arca cannot confirm cancellation.
+Retrying from the existing account requests a new ticket for the same two item references.
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and

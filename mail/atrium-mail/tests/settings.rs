@@ -336,3 +336,75 @@ fn settings_window() {
     s.close();
     assert!(s.closed());
 }
+
+#[test]
+fn lost_microsoft_sheet_releases_ticket_and_retries_existing_account() {
+    use arcad::proto::{op, read_frame, status, write_reply};
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: "/nonexistent".into() }));
+    let address = "ada@outlook.com";
+    let cfg = AccountConfig {
+        address: address.into(), name: "Ada".into(), oauth: Some("microsoft".into()),
+        incoming_item: Some([1; 16]), outgoing_item: Some([2; 16]),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: "outlook.office365.com".into(), port: 993 },
+            smtp: Server { scheme: "submission".into(), host: "smtp.office365.com".into(), port: 587 },
+        },
+        reached: Reached::SignInAgain { at: 1 },
+    };
+    let id = engine.store.add_configured(&cfg).unwrap();
+    let path = dir.path().join("arca.sock");
+    let socket = UnixListener::bind(&path).unwrap();
+    let server = std::thread::spawn(move || {
+        let refs = [[1; 16], [2; 16]].concat();
+        let renewal = [refs.as_slice(), address.as_bytes()].concat();
+        let mut result = arca_store::codec::Writer::new();
+        result.raw(&[4; 16]);
+        result.str(address);
+        for (opcode, request, response) in [
+            (op::MAIL_REAUTH, renewal.clone(), vec![3; 16]),
+            (op::MAIL_SIGN_IN_CANCEL, vec![3; 16], vec![]),
+            (op::MAIL_REAUTH, renewal, vec![4; 16]),
+            (op::MAIL_SIGN_IN_RESULT, result.buf, refs),
+        ] {
+            let (mut stream, _) = socket.accept().unwrap();
+            let frame = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(frame.as_ref(), [opcode.to_le_bytes().as_slice(), &request].concat());
+            write_reply(&mut stream, status::OK, &response).unwrap();
+        }
+    });
+    let settings = Settings::new(engine.clone(), Arc::new(AtomicBool::new(true)), path);
+    let retry = || {
+        settings.renew_microsoft(id);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(ticket) = settings.take_microsoft_ticket() { break ticket; }
+            assert!(Instant::now() < until, "sign-in ticket timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let first = retry();
+    settings.microsoft_sheet_open.set(true);
+    settings.dismiss_microsoft(first, "The Microsoft sign-in sheet closed.");
+    assert!(!settings.microsoft_sheet_open.get());
+    assert_eq!(settings.ui.get_cloned().adding, Adding::Closed);
+    assert_eq!(settings.ui.get_cloned().note.as_deref(), Some("The Microsoft sign-in sheet closed."));
+    assert!(!settings.take_added());
+    let second = retry();
+    assert_ne!(first, second);
+    settings.complete_microsoft(second);
+    let until = Instant::now() + Duration::from_secs(5);
+    while !settings.take_added() {
+        assert!(Instant::now() < until, "retry did not wake sync");
+        settings.tick();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.join().unwrap();
+    let accounts = engine.configured();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].0, id);
+    assert_eq!(accounts[0].1.incoming_item, cfg.incoming_item);
+    assert_eq!(accounts[0].1.outgoing_item, cfg.outgoing_item);
+}
