@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-rebind-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=7 ;;
     esp-loss-hip-submit-rebind-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=6 ;;
     esp-loss-hip-submit-rebind-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=5 ;;
     esp-loss-hip-submit-retry-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=4 ;;
@@ -669,6 +670,19 @@ restore_forwarding_and_rebind() {
     probe "IPv4 echo on reconnected ESP after restored posture approval"
     rebind_restored_forwarding "$1"
 }
+decline_failed_hip_retry() {
+    "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+    wait_field up 0
+    [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+        fail "declining retry HIP did not report the refusal"
+    sleep 6
+    [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+        fail "the profile restarted after declining retry HIP"
+    [ "$(wc -l < "$receipts" | tr -d ' ')" = "$1" ] ||
+        fail "declining retry HIP submitted the pending report"
+    "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+        fail "IPv4 echo passed after declining retry HIP"
+}
 rebind_restored_forwarding() {
     reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
     before_rebind=$(awk 'END { print NR }' "$receipts")
@@ -684,7 +698,7 @@ rebind_restored_forwarding() {
         "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
             fail "IPv4 echo passed before the rebound HIP retry was acknowledged"
         ok "rebound ESP stayed down after the dropped HIP response"
-        if [ "$retry_hip_submit" = 6 ]; then
+        if [ "$retry_hip_submit" -ge 6 ]; then
             stale_choice=$approval_choice
             before_approval=$(awk 'END { print NR }' "$receipts")
             "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
@@ -699,6 +713,12 @@ rebind_restored_forwarding() {
             [ "$(field handshake)" = 0 ] &&
                 [ "$(awk 'END { print NR }' "$receipts")" = "$before_approval" ] ||
                 fail "rebind retry submitted HIP or opened before fresh approval"
+            if [ "$retry_hip_submit" = 7 ]; then
+                decline_failed_hip_retry "$before_approval"
+                ok "declining the rebind retry kept the changed report unsent and ESP down"
+                echo "$pass checks passed"
+                exit 0
+            fi
             reviews=$((reviews + 1))
             touch "$receipts.rebind-retry"
             approve_hip
@@ -841,17 +861,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             ok "retry reviewed restored posture and rejected stale approval"
             if [ "$retry_hip_submit" -ge 3 ]; then
                 declined_choice=$(hip_choice)
-                "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
-                wait_field up 0
-                [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
-                    fail "declining retry HIP did not report the refusal"
-                sleep 6
-                [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
-                    fail "the profile restarted after declining retry HIP"
-                [ "$(wc -l < "$receipts" | tr -d ' ')" = "$before_retry" ] ||
-                    fail "declining retry HIP submitted the restored report"
-                "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
-                    fail "IPv4 echo passed after declining retry HIP"
+                decline_failed_hip_retry "$before_retry"
                 ok "declining retry HIP withheld the restored report and kept ESP down"
                 if [ "$retry_hip_submit" = 3 ]; then
                     echo "$pass checks passed"
