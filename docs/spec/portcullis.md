@@ -1278,8 +1278,11 @@ progress at the deadline, the launcher reports that it is still starting.
 The reserved slot records the delayed launch and its recovery path. On a
 repeat request for that recovery the broker checks for the Sheets process
 in its assigned jail and UID. Until it starts, the launcher receives the
-same named notice. The worker continues supervising the jail until exit. Other workbooks can
-still be selected.
+same named notice. A chooser reply marks an in-flight workbook with
+`starting: true`. A general Recover request includes the remaining closed
+workbooks alongside it. A selected request reports the state of its chosen
+ID. The launcher keeps the other choices available, and each selection is
+validated against the current marker. The worker supervises the jail until exit.
 
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads

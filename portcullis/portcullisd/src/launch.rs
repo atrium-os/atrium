@@ -213,7 +213,7 @@ fn write_workbook_marker(path: &Path, name: &str) -> std::io::Result<PendingWork
     use std::io::Read;
     let mut id = [0; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut id)?;
-    let book = PendingWorkbook { id, name: name.chars().filter(|c| !c.is_control()).take(255).collect() };
+    let book = PendingWorkbook { id, starting: false, name: name.chars().filter(|c| !c.is_control()).take(255).collect() };
     store_workbook_marker(path, &book, false)?;
     Ok(book)
 }
@@ -314,10 +314,6 @@ enum SlotState {
 
 static ACTIVE_WORKBOOKS: Mutex<[SlotState; DOCUMENT_LIMIT]> = Mutex::new([const { SlotState::Free }; DOCUMENT_LIMIT]);
 
-fn starting_notice(name: &str) -> String {
-    format!("Sheets is still starting recovery for “{name}”.")
-}
-
 pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry, id: [u8; 16], name: String) -> std::io::Result<()> {
     let Some((user, app)) = registry.resolve(uid) else {
         return Err(std::io::Error::other("unknown workbook identity"));
@@ -383,7 +379,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
     }
     portcullisd::home::ensure_app_data(user, persona).map_err(std::io::Error::other)?;
     let dir = workbook_marker_dir(user, persona, publisher)?;
-    let (slot, pending, name) = {
+    let (slot, pending, recovery) = {
         let mut active = ACTIVE_WORKBOOKS.lock().unwrap();
         let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)?;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -399,10 +395,14 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                         if recovery_process_running(jail, *uid) {
                             *used = SlotState::Active;
                         } else {
-                            let book = pending_workbook(&pending, index)?;
-                            if !matches!(action, WorkbookAction::Select(id) if id != book.id) {
-                                return Err(std::io::Error::other(starting_notice(&book.name)));
+                            let mut book = pending_workbook(&pending, index)?;
+                            book.starting = true;
+                            match action {
+                                WorkbookAction::Recover => choices.push((index, book, Ok(()))),
+                                WorkbookAction::Select(id) if id == book.id => return Ok(vec![book]),
+                                _ => {}
                             }
+                            continue;
                         }
                     }
                 }
@@ -443,27 +443,27 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                         if book.id != id { continue; }
                         inspection?;
                         *used = SlotState::Active;
-                        break 'reserve (WorkbookSlot(index), pending, book.name);
+                        break 'reserve (WorkbookSlot(index), pending, Some(book));
                     } else {
                         choices.push((index, book, inspection));
                         continue;
                     }
                 }
                 *used = SlotState::Active;
-                break 'reserve (WorkbookSlot(index), pending, name.to_owned());
+                break 'reserve (WorkbookSlot(index), pending, None);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if !choices.is_empty() && finishing && !left.is_zero() {
                 active = SLOT_RELEASED.wait_timeout(active, left).unwrap().0;
                 continue;
             }
-            if choices.len() > 1 {
+            if choices.len() > 1 || choices.iter().any(|(_, book, _)| book.starting) {
                 return Ok(choices.into_iter().map(|(_, book, _)| book).collect());
             }
             if let Some((index, book, inspection)) = choices.pop() {
                 inspection?;
                 active[index] = SlotState::Active;
-                break 'reserve (WorkbookSlot(index), dir.join(format!("{index}.pending")), book.name);
+                break 'reserve (WorkbookSlot(index), dir.join(format!("{index}.pending")), Some(book));
             }
             // The window can vanish before jail teardown and disk detach finish.
             // The releasing thread wakes Recover after the volume is safe to reopen.
@@ -479,6 +479,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
     };
     // The reservation survives the handoff to the launch thread. Mount once,
     // outside the slot lock, while an actual failure can still reach the picker.
+    let name = recovery.as_ref().map_or(name, |book| &book.name).to_owned();
     let prepared = if recover {
         let store = workbook_store(&dir, slot.0);
         mount_existing_workbook(&store).map_err(|e| {
@@ -487,9 +488,9 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
         })?;
         Some(RecoveryMount { store, pending: pending.clone(), clean: false, id: [0; 16] })
     } else { None };
-    let (setup_ready, setup_result) = recover.then(|| {
+    let (setup_ready, setup_result) = recovery.map(|book| {
         let (sender, receiver) = mpsc::sync_channel(0);
-        (sender, (receiver, name.clone()))
+        (sender, (receiver, book))
     }).unzip();
     let document = WorkbookLaunch { blank, recover, pending, publisher, name, prepared, slot, setup_ready };
     let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
@@ -500,15 +501,21 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
             eprintln!("portcullisd: Sheets workbook launch: {e:?}");
         }
     })?;
-    if let Some((result, name)) = setup_result {
+    if let Some((result, mut book)) = setup_result {
+        let name = &book.name;
         // Dropping the receiver on timeout also cancels a worker still in setup.
         let deadline = Instant::now() + Duration::from_secs(2);
         let started = result.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|_| std::io::Error::other(
             format!("Could not prepare a recovery window for “{name}”. Try Recover again.")))?;
-        started.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|why| std::io::Error::other(match why {
-            mpsc::RecvTimeoutError::Disconnected => format!("Could not start Sheets for “{name}”. Try Recover again."),
-            mpsc::RecvTimeoutError::Timeout => starting_notice(&name),
-        }))?;
+        match started.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(std::io::Error::other(
+                format!("Could not start Sheets for “{name}”. Try Recover again."))),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                book.starting = true;
+                return Ok(vec![book]);
+            }
+        }
     }
     Ok(Vec::new())
 }

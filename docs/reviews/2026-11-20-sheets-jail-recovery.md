@@ -142,3 +142,11 @@ The gate passed with native Tessera and bounded UFS recovery volumes in the isol
 The broker now remembers a delayed recovery in its reserved slot and checks for the Sheets process when Recover is pressed again. The desktop gate waits for the second press to reach the broker and compares the resulting launcher screenshot byte for byte with the first. Both frames displayed “Sheets is still starting recovery for ‘Proof.csv’.”
 
 Native Tessera and bounded UFS recovery volumes each recorded one runtime jail start across the two presses. Releasing the hold opened the original recovery ID in its previous jail slot. An independent reader verified `zebra` after Save As and `zebra,2` after Save. The execution-failure desktop regression and five focused FreeBSD broker tests also passed.
+
+## Recovering a sibling during a delayed launch
+
+With two edited workbooks pending, the fixture held the runtime launch for `Proof.csv`. Its startup notice stayed visible with a selectable `Untitled` row beneath it. The protected sibling opened directly from that row and also after a fresh Recover press in a separate run. An independent reader verified `fox` after Save As and `fox,2` after Save. The sibling closed with the first launch still held.
+
+Releasing the hold opened `Proof.csv` in its original slot with the same recovery ID. The reader verified `zebra` and then `zebra,2`. The fixture counted one start for the delayed jail. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `direct` or `refresh`.
+
+Direct and refreshed selection passed on native Tessera. Refreshed selection passed with bounded UFS volumes in the same isolated Tessera-root VM. The single-pending-workbook regression, all seven IPC tests, and five focused recovery-marker tests also passed.

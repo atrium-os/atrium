@@ -89,6 +89,9 @@ pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 pub struct PendingWorkbook {
     pub id: [u8; 16],
     pub name: String,
+    /// Transient chooser state. Omitted from ordinary choices and recovery markers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starting: bool,
 }
 
 /// The bounded reclaim signal a memory governor may request — mirrors jaild's
@@ -1153,6 +1156,21 @@ use std::io::Read;
 mod tests {
     use super::*;
     use portcullis_toml::NetworkCap;
+
+    #[test]
+    fn pending_workbook_starting_is_optional_on_the_wire() {
+        let ordinary = serde_json::json!({"id": vec![0u8; 16], "name": "Proof.csv"});
+        let mut book: PendingWorkbook = serde_json::from_value(ordinary.clone()).unwrap();
+        assert!(!book.starting);
+        assert_eq!(serde_json::to_value(&book).unwrap(), ordinary);
+        book.starting = true;
+        let mut frame = Vec::new();
+        write_response(&mut frame, &Response::PendingWorkbooks { books: vec![book.clone()] }).unwrap();
+        match read_response(&mut frame.as_slice()).unwrap() {
+            Response::PendingWorkbooks { books } => assert_eq!(books, vec![book]),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn exec_instance_limits_are_optional_on_the_wire() {

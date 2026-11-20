@@ -634,11 +634,26 @@ fn main() {
                 Cmd::NewWorkbook(activation) | Cmd::RecoverWorkbook(_, activation) => {
                     let selected = match c { Cmd::RecoverWorkbook(id, _) => id, _ => None };
                     let result = request_workbook(matches!(c, Cmd::RecoverWorkbook(..)), selected, activation);
+                    let previous = run.sheets.pending_books.get_cloned();
                     run.sheets.pending_books.set(Vec::new());
                     match result {
-                        Ok(books) if !books.is_empty() => {
+                        Ok(mut books) if !books.is_empty() => {
+                            let starting: Vec<_> = books.iter().filter(|b| b.starting)
+                                .map(|b| format!("“{}”", b.name)).collect();
+                            // A selected launch replies only for its own ID. Keep the
+                            // other chooser rows; the broker revalidates each selection.
+                            if let Some(id) = selected {
+                                if books.iter().any(|b| b.id == id && b.starting) {
+                                    books.extend(previous.into_iter().filter(|b| b.id != id));
+                                }
+                            }
+                            books.retain(|b| !b.starting);
                             run.sheets.pending_books.set(books);
-                            run.set_status("Choose a workbook to recover.");
+                            if starting.is_empty() {
+                                run.set_status("Choose a workbook to recover.");
+                            } else {
+                                run.set_status(format!("Sheets is still starting recovery for {}.", starting.join(", ")));
+                            }
                         }
                         Ok(_) => run.set_status(""),
                         Err(why) => run.set_status(why),

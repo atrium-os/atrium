@@ -13,6 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
+# --delayed-start-sibling keeps the protected workbook selectable; pass direct or refresh after the broker path.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -470,12 +471,14 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     fi
     exit 0
 fi
-if test "${1:-}" = --delayed-runtime-start; then
+if test "${1:-}" = --delayed-runtime-start || test "${1:-}" = --delayed-start-sibling; then
     first=delayed-start
     fixture_broker "${2:?pass the private fixture broker executable}"
     test "$(ls -A "$books")" = Proof.csv
     make_pair
-    choose protected; save_copy protected; wait_for pending 1
+    if test "$1" = --delayed-runtime-start; then
+        choose protected; save_copy protected; wait_for pending 1
+    fi
     marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 0.pending)
     sed 's/,"name":.*//' "$marker" > "$results/original.id"
 
@@ -490,7 +493,7 @@ set -eu
 dir=${0%/*}
 if test "$#" = 5 && test "$1" = -q && test "$2" = -c && test "$5" = "$(cat "$dir/target")"; then
     echo "$$" >> "$dir/attempts"
-    for i in $(jot 200); do
+    for i in $(jot 450); do
         test ! -e "$dir/hold" && break
         sleep .1
     done
@@ -505,25 +508,51 @@ SH
         fixture_broker "$broker"
         restart_broker
     }
+    detached() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
+    wait_for detached
     trap restore_broker EXIT
     PATH="$bin:$PATH" restart_broker
     click 213 24
+    if test "$1" = --delayed-start-sibling; then
+        wait_for grep -Fq '"checked_detached":true' "$(dirname "$marker")/1.pending"
+        sleep .6; click 120 96
+    fi
     wait_for test -s "$bin/attempts"
     input "MOVE 120 96"
-    # Headless launcher frame with “Sheets is still starting recovery for ‘Proof.csv’.”
-    starting() { test "$(sha256 -q selectscreen.png)" = 9eab724e5b8afc69816b69e78b42f336ff7998adda5cb52f01c365def052fb38; }
+    # Compare the named notice and all selectable rows in the headless frame.
+    frame=9eab724e5b8afc69816b69e78b42f336ff7998adda5cb52f01c365def052fb38
+    if test "$1" = --delayed-start-sibling; then
+        frame=0e41a5a8ee7dfee56af903f203271fc4884ba1981924cac5f1a800d895e2f900
+        pending 2
+    else
+        pending 1
+    fi
+    starting() { test "$(sha256 -q selectscreen.png)" = "$frame"; }
     wait_for starting
     cp selectscreen.png "$results/starting.png"
-    count 0; pending 1
-    # A repeated press while jail -c is held must leave one launch in flight.
-    offset=$(wc -l < select-port.log)
-    click 213 24
-    repeat_received() { tail -n "+$((offset+1))" select-port.log | grep -Fq 'is app org.atrium.sheets'; }
-    wait_for repeat_received
-    input "MOVE 120 96"; sleep 2.5
-    cp selectscreen.png "$results/repeated.png"
-    cmp "$results/starting.png" "$results/repeated.png"
+    count 0
+    case "${3:-refresh}" in
+        refresh)
+            offset=$(wc -l < select-port.log)
+            click 213 24
+            repeat_received() { tail -n "+$((offset+1))" select-port.log | grep -Fq 'is app org.atrium.sheets'; }
+            wait_for repeat_received
+            input "MOVE 120 96"; sleep 2.5
+            cp selectscreen.png "$results/repeated.png"
+            cmp "$results/starting.png" "$results/repeated.png"
+            ;;
+        direct) test "$1" = --delayed-start-sibling ;;
+        *) exit 2 ;;
+    esac
     count 0; test "$(wc -l < "$bin/attempts")" -eq 1
+    if test "$1" = --delayed-start-sibling; then
+        click 120 96; wait_for count 1
+        sibling=$(docs)
+        test "$(root "$sibling")" != "$plain_root"
+        wait_for opened "$sibling" Untitled
+        sleep .6; save_copy protected
+        wait_for pending 1; count 0; test -f "$bin/hold"
+    fi
     unlink "$bin/hold"
     wait_for count 1; jid=$(docs)
     wait_for pgrep -x -j "$jid" atrium-sheets
