@@ -456,6 +456,10 @@ pub mod courier_op {
     /// Only the Microsoft HTTPS courier in the session's partition.
     pub const MAIL_CODE: u16 = 0x86;
     pub const MAIL_GRANT: u16 = 0x87;
+    pub const MAIL_REFRESH_BEGIN: u16 = 0x88;
+    pub const MAIL_REFRESH_FINISH: u16 = 0x89;
+    pub const MAIL_REFRESH_CANCEL: u16 = 0x8a;
+    pub const LOGIN_ACCESS: u8 = 3;
     /// A courier reports an exact anomaly (arca.md §10) before it ends its
     /// client: `u8 code | str detail` → nothing. Logged, never a value.
     pub const ANOMALY: u16 = 0x84;

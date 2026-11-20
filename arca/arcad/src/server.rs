@@ -29,6 +29,7 @@ pub const MACHINE_USER: &str = "_machine";
 pub const MACHINE_PERSONA: &str = "machine";
 
 pub struct State {
+    mail_leases: HashMap<[u8; 16], mail_refresh::Lease>,
     dir: PathBuf,
     /// The parameters new users get. Tests lower it; shipped builds use
     /// [`KdfParams::NO_TPM`] until TPM sealing lands (A4).
@@ -147,12 +148,14 @@ fn print_pin_binding<'a>(r: &mut Reader<'a>) -> Result<(&'a str, &'a str, [u8; 3
     Ok((user, persona, key, uuid))
 }
 
+mod mail_refresh;
+
 impl State {
     /// `dir` holds one store directory per user, plus `audit.log`.
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { mail_sign_ins: Default::default(), dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
+        Ok(State { mail_leases: Default::default(), mail_sign_ins: Default::default(), dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
     }
 
     fn mail_begin(&mut self, user: &str, publisher: &[u8; 32], app: &str, body: &[u8]) -> Reply {
@@ -1399,6 +1402,7 @@ impl State {
                     }
                 }
                 self.mail_sign_ins.lock(&user);
+                self.mail_leases.retain(|_, l| !l.belongs_to(&user));
                 self.handles.lock_user(&user);
                 self.jars.lock(&user);
                 ok(Vec::new())
@@ -2282,10 +2286,10 @@ impl State {
         grant.as_mut()[head.len()..].copy_from_slice(token);
         let imap = tri!(Recipient::endpoint(Scheme::Imaps, MICROSOFT.imap.0, MICROSOFT.imap.1, None));
         let smtp = tri!(Recipient::endpoint(Scheme::Submission, MICROSOFT.smtp.0, MICROSOFT.smtp.1, None));
-        let mut add = |recipient| store.add(NewItem { persona: &persona, recipient, class: Class::AfterFirstUnlock,
-            kind: Kind::OAuthToken, provenance: Provenance::AppMinted, account, scope: b"", value: grant.as_ref() });
-        let incoming = tri!(add(imap.clone())).id;
-        let outgoing = match add(smtp) {
+        let mut add = |recipient, value: &[u8], scope: &[u8]| store.add(NewItem { persona: &persona, recipient, class: Class::AfterFirstUnlock,
+            kind: Kind::OAuthToken, provenance: Provenance::AppMinted, account, scope, value });
+        let incoming = tri!(add(imap.clone(), grant.as_ref(), mail_refresh::OWNER)).id;
+        let outgoing = match add(smtp, &mail_refresh::link(incoming), b"") {
             Ok(meta) => meta.id,
             Err(err) => {
                 tri!(store.delete(&incoming, &Access { persona: &persona, recipient: &imap }));
@@ -2300,12 +2304,16 @@ impl State {
     }
 
     fn courier_op(&mut self, c: &CourierLabel, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        if matches!(op, courier_op::MAIL_REFRESH_BEGIN | courier_op::MAIL_REFRESH_FINISH | courier_op::MAIL_REFRESH_CANCEL) { return self.refresh_mail(c, op, body); }
         if matches!(op, courier_op::MAIL_CODE | courier_op::MAIL_GRANT) { return self.mail_exchange(c, op, body); }
         let verified = std::mem::take(&mut self.verified);
         let mut r = Reader::new(body);
         let who = Access { persona: &c.persona, recipient: &c.endpoint };
         match op {
             courier_op::FILL => {
+                if matches!(&c.endpoint, Recipient::Endpoint { scheme, .. } if scheme.is_mail()) {
+                    return reply(status::DENIED);
+                }
                 let Ok(n) = r.u8() else { return malformed() };
                 let n = n as usize;
                 if n == 0 || n > courier_op::MAX_SLOTS {
@@ -2384,6 +2392,9 @@ impl State {
                 if src != courier_op::SOURCE_ITEM {
                     return malformed();
                 }
+                if let Some(login) = self.handles.take_mail_login(&x, &c.user, &c.persona, &c.endpoint) {
+                    return Reply { status: status::OK, body: Body::Secret(login) };
+                }
                 // Only a mail courier logs in; an https courier fills slots.
                 let Recipient::Endpoint { scheme, .. } = &c.endpoint else { return reply(status::DENIED) };
                 if !scheme.is_mail() {
@@ -2401,6 +2412,7 @@ impl State {
                 }
                 let uv = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
                 let (_, v) = tri!(store.release(&id, &who, uv));
+                if m.kind == Kind::OAuthToken && (m.scope == mail_refresh::OWNER || v.as_ref().starts_with(mail_refresh::LINK)) { return reply(status::DENIED); }
                 let acct = m.account.as_bytes();
                 let total = 4 + acct.len() + 4 + v.len() + 1;
                 let mut out = tri!(LockedBuf::zeroed(total).map_err(Error::Io));
@@ -2440,6 +2452,7 @@ impl State {
                     return reply(status::DENIED);
                 }
                 let (_, old) = tri!(store.release(&id, &who, None));
+                if m.scope == mail_refresh::OWNER || old.as_ref().starts_with(mail_refresh::LINK) { return reply(status::DENIED); }
                 let head = |g: &[u8]| -> Option<usize> {
                     let g = g.strip_prefix(b"oauth1 ")?;
                     let last = g.iter().rposition(|&b| b == b' ')?;

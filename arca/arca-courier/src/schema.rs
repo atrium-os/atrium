@@ -444,4 +444,5 @@ impl Response {
 }
 
 /// Dedicated request on a Microsoft sign-in courier stream.
+pub const MAIL_REFRESH: &[u8] = b"\xffMailRefresh1";
 pub const MAIL_REDEEM: &[u8] = b"\xffMailPKCE1";

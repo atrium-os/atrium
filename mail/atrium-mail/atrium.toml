@@ -15,6 +15,7 @@ icon        = "envelope"
 
 [capabilities]
 graphics  = "fresco"
+arca-courier = true  # brokered IMAP, submission and HTTPS under Mail’s identity
 arca      = true  # begin the PKCE session under Mail’s signed identity
 network   = "none"
 net-fetch = true   # remote pictures, only when asked

@@ -253,6 +253,29 @@ An operator testing real accounts must verify which account the provider
 authorized when the user changes accounts in the sign-in sheet. See the
 [development gate](navigator-islands.md#development-registration-and-mails-first-screen).
 
+#### Local refresh-rotation gate
+
+Mail requests the `arca-courier` capability in its signed manifest. After
+consent, Portcullis mounts the launcher’s socket directory into the jail.
+Mail connects to that socket and requests a courier. It runs with
+`network = "none"` and needs no mount privilege.
+
+For Microsoft accounts the sync, search, push and submission paths pass both
+stored item references to a courier restricted to the provider’s TLS token
+endpoint. Arca binds the exchange to the signed Mail persona. The app gets
+a short-lived, single-use handle for a specific IMAP or submission endpoint.
+That endpoint’s courier exchanges the handle for an access token after TLS
+and uses XOAUTH2. The submission courier negotiates STARTTLS first.
+
+The arm64 gate uses `test-assets/mail-oauth/rotation.py` on the host. The
+local callback account supplies the initial synthetic refresh grant. The
+fixture invalidates each previous grant immediately, generates a fresh
+bearer on each exchange and accepts each bearer once. Under the Mail fixture
+identity, `rotation-check` opens the persisted account through the production
+connection path and requires an authenticated NOOP response from both
+servers. Restarting Arca between passes checks the durable grant. The
+fixture exercises authenticated protocol sessions without sending mail.
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and

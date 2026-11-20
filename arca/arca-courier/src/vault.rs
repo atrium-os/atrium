@@ -25,6 +25,41 @@ impl Arcad {
         Arcad { path: path.into() }
     }
 
+    /// Return only an endpoint-bound login handle to Mail. Serialize
+    /// exchanges for the same account, including its background IDLE worker.
+    pub fn refresh_mail(&self, ids: &[u8], net: &(dyn navigator_fetch::Connect + Sync),
+        tls: &std::sync::Arc<rustls::ClientConfig>, policy: navigator_fetch::addr::Policy) -> Result<Vec<u8>, Refusal> {
+        if ids.len() != 33 { return Err(Refusal::Malformed); }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let start = loop {
+            let (st, body) = self.call(courier_op::MAIL_REFRESH_BEGIN, ids)?;
+            if st == status::OK { break body; }
+            if st != status::FULL || std::time::Instant::now() >= deadline { return Err(Refusal::Denied); }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let (nonce, grant) = start.as_ref().split_at_checked(16).ok_or(Refusal::Malformed)?;
+        let exchange = (|| {
+            let g = crate::oauth::parse_grant(grant).filter(|g| g.provider == "microsoft").ok_or(Refusal::Denied)?;
+            let tokens = crate::oauth::refresh(&crate::oauth::MICROSOFT, g.client_id, g.refresh, net, tls, policy)
+                .map_err(|e| match e { crate::oauth::RefreshError::Failed(r) => r, crate::oauth::RefreshError::SignInAgain => Refusal::SignInAgain })?;
+            let refresh = tokens.refresh.as_ref().map_or(&[][..], |v| v.as_ref());
+            let access = tokens.access.as_ref();
+            let mut body = LockedBuf::zeroed(32 + refresh.len() + access.len()).map_err(|_| Refusal::Internal)?;
+            let mut w = std::io::Cursor::new(body.as_mut());
+            use std::io::Write;
+            for part in [nonce, &(refresh.len() as u32).to_le_bytes(), refresh, &(access.len() as u32).to_le_bytes(),
+                access, &tokens.expires_in.to_le_bytes()] {
+                w.write_all(part).map_err(|_| Refusal::Internal)?;
+            }
+            match self.call(courier_op::MAIL_REFRESH_FINISH, body.as_ref())? {
+                (status::OK, ticket) if ticket.len() == 16 => Ok(ticket.as_ref().to_vec()),
+                _ => Err(Refusal::Denied),
+            }
+        })();
+        if exchange.is_err() { let _ = self.call(courier_op::MAIL_REFRESH_CANCEL, nonce); }
+        exchange
+    }
+
     pub fn redeem_mail(&self, request: &[u8], net: &(dyn navigator_fetch::Connect + Sync),
         tls: &std::sync::Arc<rustls::ClientConfig>, policy: navigator_fetch::addr::Policy) -> Result<(), Refusal> {
         let ticket = request.get(..16).ok_or(Refusal::Malformed)?;
@@ -128,6 +163,7 @@ impl crate::mail::MailVault for Arcad {
         r.end().map_err(|_| Refusal::Internal)?;
         match kind {
             courier_op::LOGIN_PASSWORD => Ok((account, crate::mail::Secret::Password(v))),
+            courier_op::LOGIN_ACCESS => Ok((account, crate::mail::Secret::Access(v))),
             courier_op::LOGIN_OAUTH => Ok((account, crate::mail::Secret::OAuth(v))),
             _ => Err(Refusal::Internal),
         }

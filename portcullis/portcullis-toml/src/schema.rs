@@ -530,6 +530,9 @@ pub struct Capabilities {
     /// Arca's API for the app's own items (app-composition.md §3, C8): it
     /// keeps secrets in Arca and reads back only its own. Asks consent.
     pub arca: Option<bool>,
+    /// Open endpoint-bound HTTPS and mail couriers under the app's identity.
+    #[serde(rename = "arca-courier")]
+    pub arca_courier: Option<bool>,
     /// ★ The system call filter class the app's jail gets
     /// (docs/spec/jail-sysfil.md §5): a profile name from the `[sysfil]`
     /// section of jaild's policy, e.g. `renderer`. Absent: `networked` if the
@@ -793,6 +796,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         network_portal:   ovr.network_portal.or(base.network_portal),
         embeds:           ovr.embeds.clone().or_else(|| base.embeds.clone()),
         arca:             ovr.arca.or(base.arca),
+        arca_courier:     ovr.arca_courier.or(base.arca_courier),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
         input:            InputCaps::merge(base.input, ovr.input),
         extra:            {

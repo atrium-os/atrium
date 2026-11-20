@@ -89,6 +89,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         ("audio-control = true\n", ["audio-control"].as_slice()),
         ("media-control = true\n", ["media-control"].as_slice()),
         ("removable-media = true\n", ["removable-media"].as_slice()),
+        ("arca-courier = true\n", ["arca-courier"].as_slice()),
         ("session-lock = true\n", ["ostiarius-lock"].as_slice()),
         ("device-list = true\n", ["device-list"].as_slice()),
         ("display-settings = true\n", ["display-settings"].as_slice()),

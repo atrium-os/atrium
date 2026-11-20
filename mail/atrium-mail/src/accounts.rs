@@ -45,6 +45,34 @@ impl Connect for Couriers {
         Ok(c)
     }
 
+    fn account_mail(&self, cfg: &AccountConfig, server: &Server, item: &[u8; 16]) -> std::io::Result<UnixStream> {
+        if cfg.oauth.as_deref() != Some("microsoft") { return self.mail(server, item); }
+        let invalid = || std::io::Error::other("Microsoft account has incomplete server references");
+        let (incoming, outgoing) = (cfg.incoming_item.ok_or_else(invalid)?, cfg.outgoing_item.ok_or_else(invalid)?);
+        let p = &arcad::oauth::MICROSOFT;
+        let direction = match (server.scheme.as_str(), server.host.as_str(), server.port) {
+            ("imaps", h, n) if (h, n) == p.imap && item == &incoming => 0,
+            ("submission", h, n) if (h, n) == p.smtp && item == &outgoing => 1,
+            _ => return Err(invalid()),
+        };
+        let mut token = arca_courierd::open(&self.socket, p.token_host, 443, None)
+            .map_err(|code| std::io::Error::other(format!("token courier refused ({code})")))?;
+        token.set_read_timeout(Some(Duration::from_secs(120)))?;
+        token.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let mut request = arca_courier::schema::MAIL_REFRESH.to_vec();
+        request.extend_from_slice(&incoming);
+        request.extend_from_slice(&outgoing);
+        request.push(direction);
+        arca_courier::send::write_frame(&mut token, &request)?;
+        let reply = arca_courier::send::read_frame(&mut token)?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        drop(token);
+        if reply.as_slice() == [arca_courier::schema::Refusal::SignInAgain as u8] {
+            return Err(std::io::Error::other("sign in again"));
+        }
+        let ticket = reply.as_slice().try_into().map_err(|_| std::io::Error::other("Arca could not refresh the Microsoft grant"))?;
+        self.mail(server, ticket)
+    }
+
     fn jmap(&self, session: &str, item: &[u8; 16]) -> Result<Box<dyn mail_sync::jmap::Http>, String> {
         let (host, port, _) = split_url(session).ok_or("the JMAP address isn't an https URL")?;
         Ok(Box::new(CourierHttp { socket: self.socket.clone(), host, port, item: *item, conn: None }))

@@ -111,6 +111,12 @@ fn main() -> ExitCode {
             Ok(None) => return ExitCode::SUCCESS,
             Err(_) => return ExitCode::FAILURE,
         };
+        if let Some(request) = frame.strip_prefix(arca_courier::schema::MAIL_REFRESH) {
+            let reply = if microsoft { vault.refresh_mail(request, net, &tls, policy) } else { Err(arca_courier::schema::Refusal::Denied) };
+            let body = reply.unwrap_or_else(|err| vec![err as u8]);
+            if arca_courier::send::write_frame(&mut output, &body).is_err() { return ExitCode::FAILURE; }
+            continue;
+        }
         if let Some(request) = frame.strip_prefix(arca_courier::schema::MAIL_REDEEM) {
             let ok = microsoft && vault.redeem_mail(request, net, &tls, policy).is_ok();
             if arca_courier::send::write_frame(&mut output, &[u8::from(ok)]).is_err() { return ExitCode::FAILURE; }

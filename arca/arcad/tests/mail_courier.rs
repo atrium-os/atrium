@@ -210,3 +210,39 @@ fn removing_an_account_deletes_its_kept_passwords() {
     assert_eq!(delete_for(&mut s, &app(), smtp, ids[1]), status::OK);
     assert_eq!(delete_for(&mut s, &app(), smtp, ids[1]), status::DENIED);
 }
+
+#[test]
+fn legacy_outlook_pair_shares_one_rotation_and_issues_endpoint_bound_access() {
+    let (_dir, mut s) = setup();
+    s.mail_sign_ins.mail_publisher = Some([7; 32]);
+    let old = b"oauth1 microsoft fixture first";
+    let incoming = store_value(&mut s, 3, Scheme::Imaps, "outlook.office365.com", 993, old);
+    let outgoing = store_value(&mut s, 3, Scheme::Submission, "smtp.office365.com", 587, old);
+    let provider = courier(Scheme::Https, "login.microsoftonline.com", 443);
+    let imap = courier(Scheme::Imaps, "outlook.office365.com", 993);
+    let smtp = courier(Scheme::Submission, "smtp.office365.com", 587);
+    let ask = body(|w| { w.raw(&incoming); w.raw(&outgoing); w.u8(1); });
+    assert_eq!(s.handle(&smtp, cop::MAIL_REFRESH_BEGIN, &ask).status, status::DENIED);
+    let first = s.handle(&provider, cop::MAIL_REFRESH_BEGIN, &ask);
+    assert_eq!(&first.body.bytes()[16..], old);
+    assert_eq!(s.handle(&provider, cop::MAIL_REFRESH_BEGIN, &ask).status, status::FULL);
+    let commit = body(|w| { w.raw(&first.body.bytes()[..16]); w.bytes(b"second"); w.bytes(b"access"); w.u64(3600); });
+    let done = s.handle(&provider, cop::MAIL_REFRESH_FINISH, &commit);
+    assert_eq!(done.status, status::OK);
+    assert_eq!(s.handle(&provider, cop::MAIL_REFRESH_FINISH, &commit).status, status::DENIED);
+    let hello = body(|w| { w.u8(cop::SOURCE_ITEM); w.raw(done.body.bytes()); });
+    assert_eq!(s.handle(&imap, cop::LOGIN, &hello).status, status::DENIED);
+    let logged = s.handle(&smtp, cop::LOGIN, &hello);
+    assert_eq!(logged.status, status::OK);
+    let mut r = Reader::new(logged.body.bytes());
+    assert_eq!(r.str(256).unwrap(), "priya@example.org");
+    assert_eq!(r.bytes(256).unwrap(), b"access");
+    assert_eq!(r.u8().unwrap(), cop::LOGIN_ACCESS);
+    assert_eq!(s.handle(&smtp, cop::LOGIN, &hello).status, status::DENIED);
+    assert_eq!(login(&mut s, &imap, incoming).0, status::DENIED);
+    assert_eq!(login(&mut s, &smtp, outgoing).0, status::DENIED);
+    let fill = body(|w| { w.u8(1); w.u8(cop::SOURCE_ITEM); w.raw(&incoming); });
+    assert_eq!(s.handle(&imap, cop::FILL, &fill).status, status::DENIED);
+    let next = s.handle(&provider, cop::MAIL_REFRESH_BEGIN, &ask);
+    assert_eq!(&next.body.bytes()[16..], b"oauth1 microsoft fixture second");
+}

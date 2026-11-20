@@ -17,6 +17,9 @@ pub trait Connect {
     /// A logged-in IMAP or SMTP session to `server` with Arca item `item`
     /// (the mail courier's relay).
     fn mail(&self, server: &Server, item: &[u8; 16]) -> std::io::Result<UnixStream>;
+    fn account_mail(&self, _cfg: &AccountConfig, server: &Server, item: &[u8; 16]) -> std::io::Result<UnixStream> {
+        self.mail(server, item)
+    }
     /// HTTP to a JMAP account whose `Authorization` is item `item`.
     fn jmap(&self, session: &str, item: &[u8; 16]) -> Result<Box<dyn mail_sync::jmap::Http>, String>;
 }
@@ -268,7 +271,7 @@ pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(
             }
         }
     };
-    let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+    let s = net.account_mail(&cfg, imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
     held(s.try_clone().map_err(|e| e.to_string())?);
     let mut session = open_imap(s)?;
     if !session.capabilities().iter().any(|c| c.eq_ignore_ascii_case("IDLE")) {
@@ -307,7 +310,7 @@ impl Engine {
 
     fn pass_imap(&self, account: AccountId, cfg: &AccountConfig, imap: &Server, smtp: &Server, net: &dyn Connect) -> Result<Pass, String> {
         let item = cfg.incoming_item.ok_or("no sign-in for the incoming server")?;
-        let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+        let s = net.account_mail(&cfg, imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
         let mut s = open_imap(s)?;
         let mut pass = Pass::default();
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
@@ -322,7 +325,7 @@ impl Engine {
                 if o.account != account {
                     continue;
                 }
-                match self.deliver(id, || net.mail(smtp, &out), files_sent_itself(smtp)).map_err(|e| e.to_string())? {
+                match self.deliver(id, || net.account_mail(cfg, smtp, &out), files_sent_itself(smtp)).map_err(|e| e.to_string())? {
                     Delivery::Sent { copy, .. } => {
                         pass.sent += 1;
                         copies.extend(copy);
@@ -373,7 +376,7 @@ impl Engine {
         let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
         match &cfg.protocol {
             Protocol::Imap { imap, .. } => {
-                let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+                let s = net.account_mail(&cfg, imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
                 let mut s = open_imap(s)?;
                 let n = self.search_imap(account, s.as_mut(), query)?;
                 let _ = s.logout();

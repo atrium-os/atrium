@@ -2696,3 +2696,12 @@ D2.5 is "complete" when an end-to-end demo works:
   it might re-check on launch and re-pkg-install if outdated.
   Atrium might surface a "no app has been re-installed in 90
   days" warning via the prompt UI. Operations-layer policy.
+
+
+### Arca courier launcher capability
+
+`arca-courier = true` requests access to the courier launcher separately
+from the `arca` vault capability. Portcullis shows the connection grant in
+consent, then mounts `/atrium/sockets/arca-courier` into the app jail.
+The app calls `connect(2)` on the launcher socket. Portcullis owns the
+mount operation. Each launched courier has its own endpoint-limited jail.

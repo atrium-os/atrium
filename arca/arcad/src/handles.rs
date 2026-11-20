@@ -17,6 +17,7 @@ pub const TTL: Duration = Duration::from_secs(600);
 pub const MAX: usize = 1024;
 pub const HOLD_PRINT_PIN: u8 = 4;
 pub const HOLD_PRINT_LOGIN: u8 = 5;
+pub const HOLD_MAIL_LOGIN: u8 = 6;
 
 pub enum Source {
     /// A stored item, read at redeem time (so a lock in between voids it).
@@ -83,6 +84,16 @@ impl Handles {
         let e = self.map.remove(h)?;
         (e.hold == HOLD_PRINT_PIN && e.expires > Instant::now() && e.user == user && e.persona == persona
             && e.printer.as_ref().is_some_and(|(k, id)| k == key && id == uuid)).then_some(e)
+    }
+
+    pub fn take_mail_login(&mut self, h: &Handle, user: &str, persona: &str, recipient: &Recipient) -> Option<LockedBuf> {
+        let e = self.map.get(h)?;
+        if e.hold != HOLD_MAIL_LOGIN || e.user != user || e.persona != persona || &e.recipient != recipient { return None; }
+        let e = self.map.remove(h)?;
+        match e.source {
+            Source::Pending(v) if e.expires > Instant::now() => Some(v),
+            _ => None,
+        }
     }
 
     pub fn take_print_login(&mut self, h: &Handle, recipient: &Recipient) -> Option<Entry> {

@@ -787,3 +787,26 @@ Microsoft sign-in and rotated refresh-token use remain unverified.
 
 Screenshots, stage markers, confinement evidence and guest checks are under
 `~/atrium-vm/evidence/navigator-mail-callback-20261120/` on the Mac.
+
+
+### Stored Mail account refresh rotation
+
+On 2026-11-20 a fresh writable arm64 HVF overlay booted from the completed
+callback snapshot with Tessera at `/`. The fixture launcher restored the
+original signed Mail UID binding (50005) in the guest’s volatile app
+registry. The saved database retained its original ownership and account
+references. No second sign-in was performed.
+
+A fixture client under Mail’s identity used its production connection code
+to authenticate four IMAP sessions and four SMTP submission sessions.
+Each accepted XOAUTH2 login answered NOOP. The local provider rotated the
+refresh token eight times. After the first two rotations, Arca restarted
+and reopened its store. The next IMAP session used the stored successor,
+and the original refresh token returned HTTP 400 `invalid_grant`.
+
+The running Mail jail reported `vnet=new`, only `lo0`, and `allow.nomount`.
+Portcullis supplied the launcher directory as a nullfs mount. Mail’s direct
+connection to the fixture failed. The launcher logged separate couriers for
+the provider on 443, IMAP on 993 and submission on 587. No live provider
+or mailbox was used. Guest and provider evidence is under
+`~/atrium-vm/evidence/mail-oauth-rotation-20261120/` on the Mac.

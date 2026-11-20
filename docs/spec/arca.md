@@ -30,9 +30,18 @@ The local Mail callback binds the pending session to the Mail account
 address and user at creation. Only the Microsoft HTTPS courier for the
 ticket’s cookie partition may request the token POST body and submit its
 refresh grant. Arca validates the registered redirect and state before
-issuing that body once. It stores an OAuth item for each Outlook endpoint
-in the signed Mail publisher’s app persona. The same user’s Mail app
+issuing that body once. It stores two endpoint-bound items in the signed Mail publisher’s app
+persona. The IMAP item holds the grant and the submission item refers to it.
+For accounts created before rotation support, Arca links the two items
+before the first refresh only if both have the correct endpoint, owner,
+account name and identical grant bytes. The same user’s Mail app
 receives the two 16-byte item references through `MAIL_SIGN_IN_RESULT`.
+
+Arca admits one in-flight refresh per account. Only Mail’s courier for
+the exact token endpoint can finish that exchange. Arca saves a rotated
+refresh token before issuing a one-use login handle bound to the user,
+persona and mail endpoint. A mail courier can redeem it for the access
+token after TLS. Vault lock discards outstanding exchanges and handles.
 
 ## 1. The three promises
 

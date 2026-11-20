@@ -43,6 +43,7 @@ pub trait MailVault {
 /// What an item holds.
 pub enum Secret {
     Password(LockedBuf),
+    Access(LockedBuf),
     /// An [`oauth::grant`] record: traded for an access token first.
     OAuth(LockedBuf),
 }
@@ -67,6 +68,10 @@ struct Ctx<'a> {
 fn credential(cx: &Ctx<'_>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<(String, Cred), Refusal> {
     let (account, secret) = vault.login(item)?;
     match secret {
+        Secret::Access(token) => {
+            if !sendable(&account, &token) { return Err(Refusal::Unsendable); }
+            Ok((account, Cred::Bearer(token)))
+        }
         Secret::Password(p) => {
             if !sendable(&account, &p) {
                 return Err(Refusal::Unsendable);

@@ -462,6 +462,7 @@ pub struct CapabilityDelta {
     pub tessera_cas_read: bool,
     /// `arca`: keep secrets in Arca, its own items only.
     pub arca:            bool,
+    pub arca_courier:    bool,
     /// `embeds` roles not yet granted.
     pub embeds_added:    Vec<String>,
     /// The manifest asks for the `terminal` system call class, which is
@@ -532,6 +533,7 @@ impl CapabilityDelta {
             && !self.network_portal
             && !self.tessera_cas_read
             && !self.arca
+            && !self.arca_courier
             && self.embeds_added.is_empty()
             && !self.syscalls_terminal
             && !self.input_gamepad_exclusive
@@ -595,6 +597,7 @@ impl CapabilityDelta {
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
         if self.network_portal  { out.push("Open sign-in pages of public Wi-Fi networks (captive portals) on the network's own DNS".into()); }
+        if self.arca_courier    { out.push("Connect to HTTPS and mail servers through Arca couriers".into()); }
         if self.arca            { out.push("Keep its own passwords and keys in Arca".into()); }
         for r in &self.embeds_added {
             // Roles read as what the person sees.
@@ -725,6 +728,7 @@ pub fn compute_delta(
     bool_cap!(network_portal);
     bool_cap!(tessera_cas_read);
     bool_cap!(arca);
+    bool_cap!(arca_courier);
     if let Some(req) = &requested.embeds {
         let granted: Vec<&String> = g.and_then(|c| c.embeds.as_ref()).map(|v| v.iter().collect()).unwrap_or_default();
         for r in req {
@@ -1030,6 +1034,7 @@ run_as = "_navpage"
             tessera_cas_read: None,
             embeds:     None,
             arca:       None,
+            arca_courier: None,
             usb_hid:    None,
             camera:     None,
             microphone: None,
