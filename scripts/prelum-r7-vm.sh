@@ -106,7 +106,7 @@ printf 'idle\n' >"$D/state"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=prelum-r7-test \
     -keyout "$D/ipps.key" -out "$D/ipps.pem" >"$D/cert.log" 2>&1
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
-    --state "$D/state" --spool "$D/spool" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
+    --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
 qemu-img create -q -f qcow2 -F qcow2 -b "$base" "$D/vm.qcow2"
@@ -152,5 +152,14 @@ if ! remote "sh -s -- '$guest' '$ipps_port' '$marker'" <"$scripts/prelum-r7-gues
 fi
 cat "$D/results.log"
 remote "cat '$guest/jobs.txt'" >"$D/desktop-jobs.txt"
+# Change only the advertised printer UUID. Keep the TLS listener and key.
+printf '%s\n' 12d7ac00-4bd5-4413-8da5-e6952965ffcf >"$D/printer-uuid"
+remote "cat >'$guest/identity-proof.pdf'" <"$D/fixtures/quicklook.pdf"
+if ! remote "sh -s -- '$guest' '$marker'" <"$scripts/prelum-r7-identity.sh" >"$D/identity-check.log" 2>&1; then
+    cat "$D/identity-check.log" >&2
+    exit 1
+fi
+cat "$D/identity-check.log"
+# The transcript and spool checks below also reject any upload from the held job.
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/desktop-jobs.txt" >"$D/pdf-checks.log"
 cat "$D/pdf-checks.log"

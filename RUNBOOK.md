@@ -6059,7 +6059,10 @@ three-slide handouts with Include Hidden Slides off on A4 and on after a
 Letter paper change, plus paginated
 speaker notes with Include Hidden Slides off and on. The gate cancels the first Mail preview and checks that no job is queued.
 The Mail PDF from the reopened preview must include the body
-and attachment filename while excluding the attachment payload.
+and attachment filename while excluding the attachment payload. After the
+desktop jobs, the simulator changes its advertised UUID while retaining
+its TLS key. A diagnostic submission must be held with IdentityChanged
+without creating or uploading a job at the simulator.
 
 ### 13.9 Shared-checkout hygiene
 

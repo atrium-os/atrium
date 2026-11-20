@@ -30,6 +30,7 @@ A.add_argument("--spool", required=True)
 A.add_argument("--name", default="Fake Printer")
 A.add_argument("--tls-cert")
 A.add_argument("--tls-key")
+A.add_argument("--uuid-override-file", help="read an alternate printer UUID from this file when present")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
@@ -110,10 +111,17 @@ def head(status, rid):
 def printer_attrs(host):
     st, reasons = state()
     uri = "%s://%s/ipp/print" % ("ipps" if ARGS.tls_cert else "ipp", host)
+    printer_uuid = UUID
+    if ARGS.uuid_override_file:
+        try:
+            with open(ARGS.uuid_override_file, encoding="ascii") as override:
+                printer_uuid = "urn:uuid:" + str(uuid.UUID(override.read().strip()))
+        except FileNotFoundError:
+            pass
     return bytes([PRG]) + b"".join([
         attr(URI, "printer-uri-supported", uri),
         attr(KEYWORD, "uri-security-supported", "tls" if ARGS.tls_cert else "none"),
-        attr(URI, "printer-uuid", UUID),
+        attr(URI, "printer-uuid", printer_uuid),
         attr(TEXT, "printer-info", ARGS.name),
         attr(TEXT, "printer-make-and-model", "Prelum Fake"),
         attr(TEXT, "printer-location", "the test bench"),
