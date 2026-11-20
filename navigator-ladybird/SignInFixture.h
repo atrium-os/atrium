@@ -26,7 +26,7 @@ namespace Navigator {
 
 // The development provider sets this field from an inline script after a
 // cookie-authenticated redirect. Exercise DOM, script, layout and scene building.
-inline ErrorOr<void> paint_mail_document(EditorPage& client, NavigatorScene* scene, StringView location, StringView html, bool check_fixture)
+inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, StringView location, StringView html, bool check_fixture)
 {
     auto nav = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(client.page(), nullptr);
     client.page().set_top_level_traversable(nav);
@@ -53,7 +53,7 @@ inline ErrorOr<void> paint_mail_document(EditorPage& client, NavigatorScene* sce
     return {};
 }
 
-#ifdef ATRIUM_MAIL_PAGE
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I1_COUNTER)
 extern "C" int navigator_page_pointer(NavigatorScene*, float*, float*);
 
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
@@ -84,6 +84,7 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 }
 #endif
 
+#ifdef ATRIUM_I0_SIGN_IN
 inline ErrorOr<void> run_sign_in(Gfx::Palette palette, Function<ErrorOr<StringView>(Web::Page&, URL::URL const&)> fetch)
 {
     // The fixture launcher owns navigation. Each accepted replacement gets a fresh
@@ -145,4 +146,5 @@ inline ErrorOr<void> run_sign_in(Gfx::Palette palette, Function<ErrorOr<StringVi
     }
     return Error::from_string_literal("sign-in callback missing");
 }
+#endif
 }

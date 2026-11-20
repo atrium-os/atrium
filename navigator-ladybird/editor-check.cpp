@@ -4,7 +4,7 @@
 #include "EditorPage.h"
 #include "PinnedFonts.h"
 #include <LibCore/EventLoop.h>
-#ifdef ATRIUM_I0_SIGN_IN
+#if defined(ATRIUM_I0_SIGN_IN) || defined(ATRIUM_I1_COUNTER)
 #include "SignInFixture.h"
 #endif
 #include <LibURL/Parser.h>
@@ -19,13 +19,16 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 
 static constexpr char fixture[] = {
-#ifdef ATRIUM_I0_SIGN_IN
+#if defined(ATRIUM_I1_COUNTER)
+#embed "counter.html"
+#elif defined(ATRIUM_I0_SIGN_IN)
 #embed "sign-in.html"
 #else
 #embed "editor.html"
 #endif
 };
 
+extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" NavigatorScene* navigator_mail_scene_open(bool, u8 const**, size_t*, u8 const**, size_t*);
@@ -91,7 +94,18 @@ int main(int argc, char** argv)
         return 3;
     auto palette = Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value()));
     auto client = Navigator::EditorPage::create(move(palette));
-#ifdef ATRIUM_I0_SIGN_IN
+#if defined(ATRIUM_I1_COUNTER)
+    if (!embedded) return 1;
+    constexpr auto location = "https://widget.example/counter.html"sv;
+    auto* scene = navigator_counter_scene_create();
+    if (!scene) return 4;
+    ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+    if (!fetch_fixture(client->page(), URL::Parser::basic_parse(location).value()))
+        return 4;
+    auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);
+    if (result.is_error()) return 4;
+    return Navigator::drive_page(*client, scene, loop);
+#elif defined(ATRIUM_I0_SIGN_IN)
 #ifdef ATRIUM_MAIL_PAGE
     if (!embedded) return 1;
     u8 const* url = nullptr;
@@ -107,7 +121,7 @@ int main(int argc, char** argv)
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
     if (!Web::ResourceLoader::is_initialized())
         Web::ResourceLoader::initialize(GC::Heap::the());
-    auto painted = Navigator::paint_mail_document(*client, scene, { url, url_len }, { body, body_len }, false);
+    auto painted = Navigator::paint_document(*client, scene, { url, url_len }, { body, body_len }, false);
     if (painted.is_error()) return 4;
     return Navigator::drive_page(*client, scene, loop);
 #endif
@@ -121,7 +135,7 @@ int main(int argc, char** argv)
         auto* scene = navigator_scene_create(false);
         if (!scene) return 4;
         ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
-        auto probe = Navigator::paint_mail_document(*client, scene, "https://login.microsoftonline.com/first"sv, { html, size }, true);
+        auto probe = Navigator::paint_document(*client, scene, "https://login.microsoftonline.com/first"sv, { html, size }, true);
         if (probe.is_error()) {
             warnln("Mail development document: {}", probe.error());
             return 4;

@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 fn serve_fixture(stream: UnixStream) -> std::io::Result<()> {
     use nuntius::{Event, Request};
     let signin = std::env::var_os("I0_SIGN_IN").is_some();
-    let urls: &[&str] = if signin {
+    let counter = std::env::var_os("I1_COUNTER").is_some();
+    let urls: &[&str] = if counter {
+        &["https://widget.example/counter.html"]
+    } else if signin {
         &[
             "https://idp.example/sign-in.html",
             "https://idp.example/sign-in.html?step=authorize",
@@ -24,7 +27,9 @@ fn serve_fixture(stream: UnixStream) -> std::io::Result<()> {
     } else {
         &["https://editor.example/editor.html"]
     };
-    let bytes: &[u8] = if signin {
+    let bytes: &[u8] = if counter {
+        include_bytes!("../../test-assets/navigator-i0/counter.html")
+    } else if signin {
         include_bytes!("../../test-assets/navigator-i0/sign-in.html")
     } else {
         include_bytes!("../../test-assets/navigator-i0/editor.html")
@@ -167,6 +172,9 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             }
         }
     };
+    if std::env::var_os("I1_COUNTER").is_some() {
+        return counter_gate(dir, display, window, token, parent, exit);
+    }
     let document = std::env::var_os("I0_MAIL_DOCUMENT");
     let start = Instant::now();
     let embed = parent
@@ -303,6 +311,72 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
     if std::str::from_utf8(&log[cursor..])?.contains("i0_raster width=640 height=360") {
         return Err("extra raster after the final acknowledged frame".into());
     }
+    Ok(())
+}
+
+// The fixture parent uses the island rectangle from the normalised document scene. The driver sends
+// pointer input through frescod and reads the composed screen at each step.
+fn counter_gate(dir: &Path, mut display: fresco_client::Connection, window: u32, token: [u8; 16],
+    mut parent: limen::client::Parent, exit: mpsc::Receiver<bool>) -> Result<(), Box<dyn Error>> {
+    let bounds = std::fs::read_to_string(dir.join("counter.rect"))?;
+    let values = bounds.split_whitespace().map(str::parse::<u32>).collect::<Result<Vec<_>, _>>()?;
+    let [x, y, w, h]: [u32; 4] = values.try_into().map_err(|_| "expected four rectangle coordinates")?;
+    if w == 0 || h == 0 || x.saturating_add(w) > 720 || y.saturating_add(h) > 420 {
+        return Err("counter rectangle outside the parent".into());
+    }
+    let [left, top, width, height] = [x, y, w, h].map(|n| n as f32);
+    let font = display.font_open("system-sans")?.font_id;
+    display.set_default_window(window.try_into()?);
+    let mut frame = display.frame()?;
+    frame.rect(fresco_protocol::RectParams { x: left, y: top, w: width, h: height, r: 0.92, g: 0.92, b: 0.92, a: 1., radius: 0. })?;
+    frame.text_run(font, 20., left + 30., top + 60., [0.1, 0.1, 0.1, 1.], "Start widget.example counter")?;
+    frame.finish()?;
+    let until = Instant::now() + Duration::from_secs(100);
+    loop {
+        if Instant::now() >= until { return Err("widget press timed out".into()); }
+        if let Some(fresco_client::Event::PointerButton { window_id, x, y, button: 1, pressed: true, .. }) =
+            display.wait_event(Some(Duration::from_millis(100)))? {
+            if window_id == window && (left..left + width).contains(&x) && (top..top + height).contains(&y) { break; }
+        }
+    }
+    let id = parent.request("web-island", token).map_err(|e| format!("{e:?}"))?;
+    parent.place(id, Some([left, top, width, height])).map_err(|e| format!("{e:?}"))?;
+    let mut cover = None;
+    loop {
+        if Instant::now() >= until { return Err("widget lifecycle timed out".into()); }
+        if let Some(event) = parent.poll(Duration::from_millis(50)).map_err(|e| format!("{e:?}"))? {
+            match event {
+                ParentEvent::Attached { .. } => println!("counter attached"),
+                ParentEvent::Message { bytes, .. } if bytes == b"frame" => println!("counter frame"),
+                other => return Err(format!("unexpected widget event {other:?}").into()),
+            }
+        }
+        if dir.join("cover").exists() && cover.is_none() {
+            let mut c = fresco_client::Connection::connect(dir.join("app.sock"))?;
+            let w = c.window_create(720, 420, "Cover", fresco_protocol::WindowHints {
+                initial_position: Some((0, 0)), server_decorations: Some(false), ..Default::default() })?;
+            c.set_default_window(w.try_into()?);
+            let font = c.font_open("system-sans")?.font_id;
+            let mut f = c.frame()?;
+            f.rect(fresco_protocol::RectParams { x: 0., y: 0., w: 720., h: 420., r: 1., g: 1., b: 1., a: 1., radius: 0. })?;
+            f.text_run(font, 24., 80., 120., [0., 0., 0., 1.], "Cover window")?;
+            f.finish()?;
+            cover = Some((c, w));
+        }
+        if let Some((c, _)) = cover.as_mut() {
+            if matches!(c.poll_event()?, Some(fresco_client::Event::PointerButton { pressed: true, button: 1, .. })) {
+                println!("cover received press");
+            }
+        }
+        if !dir.join("cover").exists() {
+            if let Some((mut c,w)) = cover.take() { c.window_destroy(w)?; }
+        }
+        if dir.join("close-page").exists() { break; }
+    }
+    display.window_destroy(window)?;
+    drop(parent);
+    if !exit.recv_timeout(Duration::from_secs(12))? { return Err("widget did not exit cleanly".into()); }
+    println!("counter exited after parent closed");
     Ok(())
 }
 

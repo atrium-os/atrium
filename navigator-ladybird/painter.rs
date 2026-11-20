@@ -765,6 +765,7 @@ pub mod host {
         faces: PinnedFaces,
         previous: NodeTree,
         pointer: Option<(f32, f32)>,
+        interactive_island: bool,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -823,6 +824,13 @@ pub mod host {
             }
         }
         Box::into_raw(Box::new(state))
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_counter_scene_create() -> *mut SceneState {
+        let Ok((child, id, surface)) = attach("web-island") else { return std::ptr::null_mut() };
+        let embed = Some((std::rc::Rc::new(std::cell::RefCell::new(child)), id, surface));
+        Box::into_raw(Box::new(SceneState { embed, interactive_island: true, ..Default::default() }))
     }
 
     /// # Safety
@@ -903,7 +911,14 @@ pub mod host {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_page_pointer(state: &mut SceneState, x: &mut f32, y: &mut f32) -> i32 {
-        let Some((_, _, surface)) = &mut state.embed else { return -1 };
+        let Some((child, embed, surface)) = &mut state.embed else { return -1 };
+        if state.interactive_island {
+            match child.borrow_mut().poll(std::time::Duration::ZERO) {
+                Ok(Some(limen::proto::ChildEvent::Detaching { embed: id })) if id == *embed => return -1,
+                Err(_) => return -1,
+                _ => {}
+            }
+        }
         match surface.connection().wait_event(Some(std::time::Duration::from_millis(20))) {
             Ok(Some(fresco_client::Event::PointerButton {x: px, y: py, button: 1, pressed, ..})) => {
                 *x = px; *y = py; if pressed { 1 } else { 2 }
@@ -1016,7 +1031,7 @@ pub mod host {
                     if child.borrow_mut().emit(*embed, b"frame".to_vec()).is_err() {
                         return false;
                     }
-                    if state.mail_document.is_some() { state.previous = next; return true; }
+                    if state.interactive_island || state.mail_document.is_some() { state.previous = next; return true; }
                     let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
                     loop {
                         if std::time::Instant::now() >= until {

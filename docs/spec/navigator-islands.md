@@ -740,6 +740,48 @@ The arm64 engine dependency tree included the Rust JS and Wasm engines and
 neither JIT crate. The evidence is in
 `~/atrium-vm/evidence/navigator-inbox-20261120/`.
 
+### I1 embedded counter gate
+
+On 2026-11-20 the counter passed twice on an arm64 HVF guest with Tessera at
+`/`. Navigator’s normalizer converted the iframe in `counter-parent.html` into
+an island. The document renderer emitted the slot at (40, 40), 640 × 360 CSS
+pixels. A fixture parent used that rectangle for both hit testing and Limen
+placement. An outside press left the placeholder visible and the broker log
+empty. Pressing the box launched the signed `org.atrium.navigator.engine`
+worker and made one GET of `https://widget.example/counter.html` through
+a preconnected Nuntius protocol fixture.
+
+The page’s inline JavaScript updated the counter in Ladybird. The composed
+Fresco screen showed 0, then 1 on the first click. A covering window received
+the next press. Uncovering showed 1, and a further visible click produced 2.
+Closing the parent window and its Limen connection ended the engine process.
+FreeBSD reported UID 1011, Capsicum flag C, IPv4 and IPv6 disabled. The worker
+verified capability mode and a denied path lookup. The target dependency tree
+contained the JS and Wasm interpreters with both JIT crates absent.
+
+To repeat, cross-build the editor host with `I1_COUNTER=ON`, other fixture
+options off, and the interpreter-only painter with the editor feature. Stage
+the stripped binary as `bin/counter` with the counter manifest. Use the I0
+split-renderer setup with a 720 × 420 headless screen. Normalize
+`test-assets/navigator-i0/counter-parent.html` with `navigator-normalize` and
+render its output with `nsg-render`. Write the resulting island rectangle
+(x y width height, divided by 64) to `counter.rect` in a fresh guest socket
+directory. Start the `editor_fixture` example with `I1_COUNTER=1`, that directory
+and the signed bundle, logging to `parent.log`. Run the driver on the Mac with
+Tesseract on PATH.
+
+```sh
+python3 scripts/navigator-i1-counter-check.py SSH_WRAPPER GUEST_SOCKET_DIR EVIDENCE_DIR PARENT_NSG
+```
+
+The installed viewer currently forwards link presses only. Its Pergola document
+view retains links but drops island geometry when converting a resident scene
+band. The next step is to carry the visible slot through that conversion and
+the signed Navigator UI, keep its placement in sync with scrolling and page
+changes, and supply its origin-bound fetch channel through the production
+launcher. The fixture used an in-process bounded GET responder. Evidence is in
+`~/atrium-vm/evidence/navigator-i1-counter-20261120/`.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

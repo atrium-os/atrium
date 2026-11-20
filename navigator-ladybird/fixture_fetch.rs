@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const URL: &str = "https://editor.example/editor.html";
+const COUNTER: &str = "https://widget.example/counter.html";
 const SIGN_IN: [&str; 4] = [
     "https://idp.example/sign-in.html",
     "https://idp.example/sign-in.html?step=authorize",
@@ -51,7 +52,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
     let Some((mut client, step)) = state.take() else {
         return 0;
     };
-    if !(step == 0 && url == URL) && SIGN_IN.get(step).copied() != Some(url) {
+    if !(step == 0 && matches!(url, URL | COUNTER)) && SIGN_IN.get(step).copied() != Some(url) {
         return 0;
     }
     let request_id = step as u32 + 1;
@@ -94,7 +95,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
             Ok(Some(Event::Done { id, bytes }))
                 if id == request_id && total == Some(used) && bytes == used as u64 =>
             {
-                if url != URL && step + 1 < SIGN_IN.len() {
+                if SIGN_IN.get(step).copied() == Some(url) && step + 1 < SIGN_IN.len() {
                     *state = Some((client, step + 1));
                 }
                 return used;

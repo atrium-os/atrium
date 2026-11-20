@@ -1,0 +1,12 @@
+[app]
+id = "org.atrium.navigator.engine"
+name = "Navigator counter fixture"
+version = "0.1.0"
+entry = "bin/counter"
+
+[capabilities]
+network = "none"
+
+[resources]
+memory = "256M"
+cpu = 100
