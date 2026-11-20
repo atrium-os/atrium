@@ -23,7 +23,8 @@ case "$phase" in
   hold)
     if [ "$kind" = pin ] || [ "$kind" = pin-uuid ]; then
       "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <pin-handle
-      rm -f pin-handle
+      # Keep the UUID fixture's root-only handle for the final replay check.
+      if [ "$kind" = pin ]; then rm -f pin-handle; fi
     else
       "$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
           --printer 1 --title "$title"
@@ -45,7 +46,17 @@ case "$phase" in
     snapshot=$prefix-released-jobs.log
     expected="^ +$job +printer +1 +Done +2/2 +$title *$"
     ;;
-  *) echo "Expected hold, retry, or release" >&2; exit 2 ;;
+  replay)
+    test "$kind" = pin-uuid
+    # Open the exact handle staged for job 15, then unlink it before submitting.
+    exec 3<pin-handle
+    rm -f pin-handle
+    "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
+    exec 3<&-
+    snapshot=pin-replay-jobs.log
+    expected="^ +16 +printer +1 +Failed +[0-9]+/[0-9]+ +$title +Arca did not supply a usable PIN for this job *$"
+    ;;
+  *) echo "Expected hold, retry, release, or replay" >&2; exit 2 ;;
 esac
 matches_snapshot() {
   if [ -n "$previous_hold" ]; then

@@ -288,3 +288,16 @@ test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-uuid-released-audit.
 remote "cat '$guest/pin-uuid-identity-released-jobs.log'" >"$D/pin-uuid-released-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-uuid-released-jobs.txt" "$D/fixtures/quicklook.pdf" 15 >"$D/pin-uuid-released-pdf-checks.log"
 cat "$D/pin-uuid-released-pdf-checks.log"
+
+
+# Replay job 15's consumed handle with the original printer identity active.
+check_served_key pin-replay "$original_key"
+remote "sh -s -- '$guest' '$marker' replay pin-uuid" <"$scripts/prelum-r7-identity.sh" >"$D/pin-replay.log" 2>&1 || { cat "$D/pin-replay.log" >&2; exit 1; }
+cat "$D/pin-replay.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-replay-audit.log"
+test "$(grep -cE 'ui op=0x0068 .*status=0$' "$D/pin-replay-audit.log")" -eq 2
+test "$(grep -c 'op=0x0011' "$D/pin-replay-audit.log")" -eq 3
+test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-replay-audit.log")" -eq 2
+grep -E 'op=0x0011' "$D/pin-replay-audit.log" | tail -1 | grep -E 'prelum-ipp op=0x0011 .*status=1$'
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-uuid-released-jobs.txt" "$D/fixtures/quicklook.pdf" 15 >"$D/pin-replay-pdf-checks.log"
+cat "$D/pin-replay-pdf-checks.log"

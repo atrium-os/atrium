@@ -6076,7 +6076,10 @@ and zero uploads. After restoring the key,
 the same job must redeem the PIN once and send it in Create-Job before
 uploading both original PDF pages. A second PIN job repeats the hold, retry, and release
 while changing only the printer UUID. Arca's redemption count stays flat
-through both holds and increases by one after UUID restoration.
+through both holds and increases by one after UUID restoration. Finally, the
+gate resubmits that exact redeemed handle with the original identity active.
+Arca must deny the replay, Prelum must mark it Failed, and the simulator
+must receive no new job or PDF.
 
 ### 13.9 Shared-checkout hygiene
 
