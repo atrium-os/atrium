@@ -34,6 +34,7 @@ A.add_argument("--uuid-override-file", help="read an alternate printer UUID from
 A.add_argument("--tls-alt-cert")
 A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
+A.add_argument("--test-pin-job", help="title of the synthetic job that must supply the fixture PIN")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
@@ -126,6 +127,7 @@ def printer_attrs(host):
             pass
     return bytes([PRG]) + b"".join([
         attr(URI, "printer-uri-supported", uri),
+        attr(INT, "job-password-supported", 8) if ARGS.test_pin_job else b"",
         attr(KEYWORD, "uri-security-supported", "tls" if ARGS.tls_cert else "none"),
         attr(URI, "printer-uuid", printer_uuid),
         attr(TEXT, "printer-info", ARGS.name),
@@ -192,15 +194,25 @@ class H(http.server.BaseHTTPRequestHandler):
         if op == 0x0B:
             out += printer_attrs(host)
         elif op in (0x05, 0x02):
+            pin_job = ARGS.test_pin_job and a.get("job-name") == [ARGS.test_pin_job]
+            if pin_job and (op != 0x05 or a.get("job-password") != ["0427"]
+                            or a.get("ipp-attribute-fidelity") != ["\x01"] or doc):
+                self.send_error(400, "Invalid fixture PIN submission")
+                return
             with LOCK:
                 jid = NEXT[0]
                 NEXT[0] += 1
                 JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
                              "name": (a.get("job-name") or ["?"])[0]}
+            if pin_job:
+                print(f"fake printer: accepted fixture PIN for job {jid} before document", flush=True)
             if op == 0x02:
                 open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
             out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(URI, "job-uri", "ipp://%s/ipp/print/%d" % (host, jid)) + attr(ENUM, "job-state", 3)
         elif op == 0x06:
+            if "job-password" in a:
+                self.send_error(400, "PIN in document request")
+                return
             with LOCK:
                 j = JOBS.get(jid)
                 if j:

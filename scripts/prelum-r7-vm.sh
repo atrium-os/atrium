@@ -118,6 +118,7 @@ check_served_key() {
 }
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
+    --test-pin-job "PIN after TLS key restoration" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -220,3 +221,36 @@ cat "$D/tls-identity-release.log"
 remote "cat '$guest/tls-identity-released-jobs.log'" >"$D/tls-released-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/tls-released-pdf-checks.log"
 cat "$D/tls-released-pdf-checks.log"
+
+
+# Bind a one-use synthetic PIN to the original key and UUID before rotating.
+pin_spki=$(openssl x509 -in "$D/ipps.pem" -pubkey -noout |
+    openssl pkey -pubin -outform DER | openssl dgst -sha256 | awk '{print $NF}')
+printer_uuid=$(sed -nE 's/^fake printer: listening on [0-9]+ \(urn:uuid:([a-f0-9-]+)\)$/\1/p' "$D/simulator.log")
+test "${#pin_spki}" -eq 64
+test "${#printer_uuid}" -eq 36
+remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid'" \
+    <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-stage.log" 2>&1
+
+touch "$D/use-alt-key"
+check_served_key pin-changed "$alternate_key"
+remote "sh -s -- '$guest' '$marker' hold pin" <"$scripts/prelum-r7-identity.sh" >"$D/pin-held.log" 2>&1 || { cat "$D/pin-held.log" >&2; exit 1; }
+cat "$D/pin-held.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-held-audit.log"
+grep -Eq 'ui op=0x0068 .*status=0$' "$D/pin-held-audit.log"
+if grep -q 'op=0x0011' "$D/pin-held-audit.log"; then
+    echo "Arca received an unexpected PIN redemption request while the alternate key was active" >&2
+    exit 1
+fi
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/tls-released-jobs.txt" "$D/fixtures/quicklook.pdf" 13 >"$D/pin-held-pdf-checks.log"
+
+mv "$D/use-alt-key" "$D/pin-held-alt-key.txt"
+check_served_key pin-restored "$original_key"
+remote "sh -s -- '$guest' '$marker' release pin" <"$scripts/prelum-r7-identity.sh" >"$D/pin-release.log" 2>&1 || { cat "$D/pin-release.log" >&2; exit 1; }
+cat "$D/pin-release.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-released-audit.log"
+test "$(grep -c 'op=0x0011' "$D/pin-released-audit.log")" -eq 1
+grep -E 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-released-audit.log"
+remote "cat '$guest/pin-identity-released-jobs.log'" >"$D/pin-released-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-released-jobs.txt" "$D/fixtures/quicklook.pdf" 14 >"$D/pin-released-pdf-checks.log"
+cat "$D/pin-released-pdf-checks.log"

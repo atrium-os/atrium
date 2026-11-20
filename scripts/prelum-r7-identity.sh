@@ -12,15 +12,21 @@ test "$(uname -s)" = FreeBSD
 case "$kind" in
   uuid) job=12; title="Changed printer UUID"; prefix=identity ;;
   tls) job=13; title="Changed printer TLS key"; prefix=tls-identity ;;
-  *) echo "Expected uuid or tls" >&2; exit 2 ;;
+  pin) job=14; title="PIN after TLS key restoration"; prefix=pin-identity ;;
+  *) echo "Expected uuid, tls, or pin" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
 previous_hold=
 
 case "$phase" in
   hold)
-    "$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
-        --printer 1 --title "$title"
+    if [ "$kind" = pin ]; then
+      "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" <pin-handle
+      rm -f pin-handle
+    else
+      "$P/prelumctl" --socket "$P/print.sock" print identity-proof.pdf \
+          --printer 1 --title "$title"
+    fi
     snapshot=$prefix-jobs.log
     expected="${held}[0-9]+$"
     ;;

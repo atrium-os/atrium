@@ -45,3 +45,5 @@ build prelum-sheet --bin atrium-prelum-sheet
 for program in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render; do
     build prelum --bin "$program"
 done
+build arca/arcad --bin arcad
+build prelum/prelum-proto --example r7-pin-fixture

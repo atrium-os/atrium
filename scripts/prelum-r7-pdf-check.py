@@ -37,6 +37,11 @@ for line in transcript.splitlines():
         receipts.append(receipt.groups())
     elif completed := re.fullmatch(r"fake printer: job (\d+) completed", line):
         events.append(("complete", int(completed[1])))
+if job_count == 14:
+    pin_accept = "fake printer: accepted fixture PIN for job 14 before document"
+    assert transcript.count(pin_accept) == 1
+    assert transcript.index(pin_accept) < transcript.index("fake printer: Send-Document job 14 ")
+
 expected_events = [
     event
     for job in job_ids
