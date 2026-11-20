@@ -268,11 +268,16 @@ fn autoconfig(b: &[u8], address: &str, domain: &str) -> Option<(Server, Server, 
             if attr(attrs, "type") != Some(kind) {
                 continue;
             }
-            let host = fill(text(body, "hostname")?);
-            let port: u16 = text(body, "port")?.parse().ok()?;
-            let scheme = match text(body, "socketType")? {
-                "SSL" => tls,
-                "STARTTLS" => starttls,
+            let (Some(hostname), Some(port_text)) = (text(body, "hostname"), text(body, "port")) else {
+                continue;
+            };
+            let host = fill(hostname);
+            let Ok(port) = port_text.parse::<u16>() else {
+                continue;
+            };
+            let scheme = match text(body, "socketType") {
+                Some("SSL") => tls,
+                Some("STARTTLS") => starttls,
                 _ => continue,
             };
             if !host_ok(&host) || port == 0 {
@@ -345,6 +350,30 @@ mod tests {
         assert_eq!(f.via, Via::Autoconfig);
         assert_eq!(n.asked, ["https://example.test/.well-known/jmap", url]);
         assert!(matches!(f.settings, Settings::Imap { imap, .. } if imap.host == "imap.example.test"));
+    }
+
+    #[test]
+    fn autoconfig_skips_unusable_servers_before_valid_tls_endpoints() {
+        let mut n = Net::default();
+        let url = "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=ada%40example.test";
+        n.pages.insert(url.into(), br#"<clientConfig>
+<incomingServer type="imap"><port>993</port><socketType>SSL</socketType></incomingServer>
+<incomingServer type="imap"><hostname>imap.bad.example.test</hostname><port>bad</port><socketType>SSL</socketType></incomingServer>
+<incomingServer type="imap"><hostname>imap.clear.example.test</hostname><port>143</port><socketType>plain</socketType></incomingServer>
+<incomingServer type="imap"><hostname>imap.good.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer type="smtp"><hostname>smtp.bad.example.test</hostname><port>465</port></outgoingServer>
+<outgoingServer type="smtp"><hostname>smtp.zero.example.test</hostname><port>0</port><socketType>SSL</socketType></outgoingServer>
+<outgoingServer type="smtp"><hostname>smtp.good.example.test</hostname><port>587</port><socketType>STARTTLS</socketType></outgoingServer>
+</clientConfig>"#.to_vec());
+
+        let found = discover("ada@example.test", &mut n).unwrap();
+
+        assert_eq!(found.via, Via::Autoconfig);
+        assert_eq!(found.settings, Settings::Imap {
+            imap: Server { scheme: "imaps", host: "imap.good.example.test".into(), port: 993 },
+            smtp: Server { scheme: "submission", host: "smtp.good.example.test".into(), port: 587 },
+        });
+        assert_eq!(n.asked, ["https://example.test/.well-known/jmap", url]);
     }
 
     #[test]
