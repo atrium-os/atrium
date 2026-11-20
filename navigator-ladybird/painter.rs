@@ -850,9 +850,7 @@ pub mod host {
         if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
             || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 { return std::ptr::null_mut(); }
         let child = std::rc::Rc::new(std::cell::RefCell::new(child));
-        if inbox {
-            INBOX.with(|slot| slot.replace(Some((child.clone(), embed))));
-        }
+        RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed))));
         let state = Box::new(SceneState { embed: Some((child, embed, surface)), mail_document: Some((location, bytes)), ..Default::default() });
         let (location, bytes) = state.mail_document.as_ref().unwrap();
         unsafe { *out_url = location.as_ptr(); *url_len = location.len(); *html = bytes.as_ptr(); *html_len = bytes.len(); }
@@ -872,15 +870,15 @@ pub mod host {
     }
 
     type ResourceChannel = (std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64);
-    thread_local! { static INBOX: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
+    thread_local! { static RESOURCE_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
 
     /// Returns the body length only after receiving the reply for this exact URL.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn navigator_inbox_get(url: *const u8, len: usize, out: *mut u8, cap: usize) -> usize {
+    pub unsafe extern "C" fn navigator_page_get(url: *const u8, len: usize, out: *mut u8, cap: usize) -> usize {
         use std::io::Read;
         let bytes = unsafe { std::slice::from_raw_parts(url, len) };
         if len > 512 || cap > 65536 { return 0; }
-        INBOX.with(|slot| {
+        RESOURCE_CHANNEL.with(|slot| {
             let binding = slot.borrow();
             let (child, id) = binding.as_ref()?;
             let mut channel = child.borrow_mut();
@@ -904,7 +902,7 @@ pub mod host {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn navigator_inbox_pointer(state: &mut SceneState, x: &mut f32, y: &mut f32) -> i32 {
+    pub extern "C" fn navigator_page_pointer(state: &mut SceneState, x: &mut f32, y: &mut f32) -> i32 {
         let Some((_, _, surface)) = &mut state.embed else { return -1 };
         match surface.connection().wait_event(Some(std::time::Duration::from_millis(20))) {
             Ok(Some(fresco_client::Event::PointerButton {x: px, y: py, button: 1, pressed, ..})) => {

@@ -6,13 +6,13 @@
  #include <LibWebCommon/Loader/UserAgent.h>
 +
 +#ifdef ATRIUM_I0_EDITOR
-+extern "C" size_t navigator_inbox_get(u8 const*, size_t, u8*, size_t);
++extern "C" size_t navigator_page_get(u8 const*, size_t, u8*, size_t);
 +extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
 +#endif
  
  namespace Web {
  
-@@ -507,6 +512,38 @@
+@@ -507,6 +512,39 @@
          return nullptr;
      }
  
@@ -26,11 +26,12 @@
 +            auto body = buffer.release_value();
 +            StringView mime = "text/html"sv;
 +            size_t length = 0;
-+            if (name == "https://inbox.example/inbox.js"sv || name == "https://inbox.example/inbox.css"sv
-+                || (name == "https://inbox.example/api/inbox"sv && request.include_credentials() == HTTP::Cookie::IncludeCredentials::Yes)) {
-+                mime = name == "https://inbox.example/inbox.js"sv ? "text/javascript"sv
-+                    : name == "https://inbox.example/inbox.css"sv ? "text/css"sv : "application/json"sv;
-+                length = navigator_inbox_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
++            bool script = name == "https://inbox.example/inbox.js"sv || name == "https://login.microsoftonline.com/atrium-fixture/account.js"sv;
++            bool stylesheet = name == "https://inbox.example/inbox.css"sv || name == "https://login.microsoftonline.com/atrium-fixture/account.css"sv;
++            bool json = name == "https://inbox.example/api/inbox"sv || name == "https://login.microsoftonline.com/atrium-fixture/continue"sv;
++            if (script || stylesheet || (json && request.include_credentials() == HTTP::Cookie::IncludeCredentials::Yes)) {
++                mime = script ? "text/javascript"sv : stylesheet ? "text/css"sv : "application/json"sv;
++                length = navigator_page_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            } else {
 +                length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            }

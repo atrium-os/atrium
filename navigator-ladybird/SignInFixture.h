@@ -53,30 +53,27 @@ inline ErrorOr<void> paint_mail_document(EditorPage& client, NavigatorScene* sce
     return {};
 }
 
-#ifdef ATRIUM_INBOX_PAGE
-extern "C" int navigator_inbox_pointer(NavigatorScene*, float*, float*);
+#ifdef ATRIUM_MAIL_PAGE
+extern "C" int navigator_page_pointer(NavigatorScene*, float*, float*);
 
-inline int drive_inbox(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
+inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
 {
     auto doc = client.page().local_traversable()->active_document();
-    auto draft = doc->get_element_by_id(u"draft"sv);
-    auto messages = doc->get_element_by_id(u"messages"sv);
-    if (!draft || !messages)
-        return 5;
-    auto previous = messages->text_content();
-    auto previous_draft = draft->text_content();
+    auto tree = doc->dom_tree_version();
+    auto text = doc->character_data_version();
     for (unsigned tick = 0; tick < 15000; ++tick) {
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
         float x = 0, y = 0;
-        auto action = navigator_inbox_pointer(scene, &x, &y);
+        auto action = navigator_page_pointer(scene, &x, &y);
         if (action < 0) break;
         Web::DevicePixelPoint point { static_cast<int>(x), static_cast<int>(y) };
         if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);
         if (action == 2) client.page().handle_mouseup(point, point, Web::UIEvents::MouseButton::Primary, 0, 0);
-        if (messages->text_content() == previous && draft->text_content() == previous_draft && !client.take_frame_request())
+        bool requested = client.take_frame_request();
+        if (!requested && !action && tree == doc->dom_tree_version() && text == doc->character_data_version())
             continue;
-        previous = messages->text_content();
-        previous_draft = draft->text_content();
+        tree = doc->dom_tree_version();
+        text = doc->character_data_version();
         Web::Layout::ForcedReadScope read { *doc };
         doc->update_layout(Web::DOM::UpdateLayoutReason::DumpDisplayList);
         if (!doc->record_display_list(read, Web::HTML::PaintConfig {}, Web::Painting::PaintCommandCacheMode::ReadWrite)

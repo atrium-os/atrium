@@ -43,6 +43,7 @@ fn main() {
     // authority in that courier jail is this throwaway fixture CA.
     let mail_address = a.get(5);
     let mail = mail_address.is_some();
+    let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
     std::fs::write(port_out, l.local_addr().unwrap().port().to_string()).unwrap();
@@ -90,6 +91,18 @@ fn main() {
                     });
                     let (marker, reply) = if authorization {
                         ("authorized", "HTTP/1.1 302 Found\r\nSet-Cookie: flow=dev; Secure; HttpOnly; Path=/\r\nLocation: /first\r\nContent-Length: 0\r\n\r\n".to_string())
+                    } else if continuation && first.starts_with("GET ") && cookie.split("; ").any(|v| v == "flow=dev") {
+                        let resource = match target {
+                            "/first" => Some(("first-screen-cookie-ok", "text/html", include_str!("../../../test-assets/navigator-i0/mail/first.html"))),
+                            "/atrium-fixture/account.css" => Some(("stylesheet", "text/css", include_str!("../../../test-assets/navigator-i0/mail/account.css"))),
+                            "/atrium-fixture/account.js" => Some(("script", "text/javascript", include_str!("../../../test-assets/navigator-i0/mail/account.js"))),
+                            "/atrium-fixture/continue" => Some(("continued", "application/json", r#"{"message":"Demo account confirmed"}"#)),
+                            _ => None,
+                        };
+                        match resource {
+                            Some((marker, mime, body)) => (marker, format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\r\n{body}", body.len())),
+                            None => ("refused", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".into()),
+                        }
                     } else if target == "/first" && cookie.split("; ").any(|v| v == "flow=dev") {
                         let html = "<!doctype html><label id=prompt for=account></label><input id=account><script>document.getElementById('prompt').textContent='Enter your account'</script>";
                         ("first-screen-cookie-ok", format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{html}", html.len()))

@@ -635,6 +635,29 @@ script and stylesheet loading from LibWeb, interactive continuation, redirect
 redemption and first-grant storage still need separate verification. The
 development gate does not establish Microsoft's behavior in an embedded engine.
 
+### Local Mail continuation fixture
+
+The local provider accepts a final `mail-continue` argument after its
+loopback listen address. The first fixture document then contains a
+read-only demo account, an external stylesheet, an external script and a
+Continue button. Its click handler requests the next step as same-origin
+JSON and displays the returned message. The provider requires the redirect
+cookie on all four GETs and records only stage names.
+
+Set `NAVIGATORD_MAIL_CONTINUATION_FIXTURE=1` in the test broker bundle.
+Navigator enables the three exact resources only after the ticket-bound
+navigation returns `https://login.microsoftonline.com/first`. It uses
+the existing sheet view and Arca partition for every GET. Redirects are
+refused, response type and size are checked, and only a sealed body and
+its resource URL go to Ladybird. The worker pumps the engine event loop,
+dispatches pointer input through LibWeb and submits updated Fresco scenes.
+
+The gate starts in Mail and requires `authorized`, `first-screen-cookie-ok`,
+`stylesheet` and `script` before pressing Continue. After that press it
+requires the provider's `continued` marker and “Demo account confirmed” on
+screen. The public demo uses no user credential. OAuth callback redemption
+and token storage are separate milestones.
+
 ### Direct Navigator inbox fixture
 
 On 2026-11-20 the installed Navigator app opened a 640 × 360 whole-page

@@ -15,6 +15,7 @@ struct Sheet {
     _window: Connection,
     token: [u8; 16],
     page: Option<(Parent, u64)>,
+    fixture_requests: Option<u8>,
     started: Instant,
     view: u64,
     cookies: Cookies,
@@ -41,7 +42,7 @@ fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
         if let Some(Event::EmbedToken { window_id, token }) = window.wait_event(Some(Duration::from_millis(100))).map_err(|_| ())? {
-            if window_id == id { return Ok(Sheet { _window: window, token, page: None, started, view, cookies }); }
+            if window_id == id { return Ok(Sheet { _window: window, token, page: None, fixture_requests: None, started, view, cookies }); }
         }
     }
     Err(())
@@ -62,9 +63,31 @@ fn page(sheet: &mut Sheet, view: u64, ticket: [u8; 16], cookies: &Cookies, socke
     let mut parent = Parent::wrap(aqueduct::Connection::wrap(channel).map_err(|_| ())?);
     let worker = parent.request("mail-sign-in-page", sheet.token).map_err(|_| ())?;
     parent.place(worker, Some([24., 36., 640., 360.])).map_err(|_| ())?;
+    if result.url == "https://login.microsoftonline.com/first"
+        && crate::settings::get("NAVIGATORD_MAIL_CONTINUATION_FIXTURE").as_deref() == Some("1") {
+        sheet.fixture_requests = Some(0);
+    }
     parent.send_fd(worker, result.url.into_bytes(), body.as_fd()).map_err(|_| ())?;
     sheet.page = Some((parent, worker));
     Ok(())
+}
+
+fn fixture_resource(cookies: &Cookies, view: u64, url: &[u8]) -> Result<std::os::fd::OwnedFd, ()> {
+    let url = std::str::from_utf8(url).map_err(|_| ())?;
+    let mime = match url {
+        "https://login.microsoftonline.com/atrium-fixture/account.js" => "text/javascript",
+        "https://login.microsoftonline.com/atrium-fixture/account.css" => "text/css",
+        "https://login.microsoftonline.com/atrium-fixture/continue" => "application/json",
+        _ => return Err(()),
+    };
+    let ask = navigator_cookies::Fetch::subresource(url, "login.microsoftonline.com");
+    let result = cookies.lock().map_err(|_| ())?.fetch_once(view, &ask).map_err(|_| ())?;
+    if result.status != 200 || result.body.is_empty() || result.body.len() > 65536
+        || !result.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type")
+            && v.split(';').next().is_some_and(|v| v.trim().eq_ignore_ascii_case(mime))) {
+        return Err(());
+    }
+    limen::fdpass::sealed_file("sign-in-resource", &result.body).map_err(|_| ())
 }
 
 fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
@@ -100,6 +123,15 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
             if let Some((parent, worker)) = &mut sheet.page {
                 match parent.poll(Duration::ZERO) {
                     Ok(Some(ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed })) if embed == *worker => closed.push(id),
+                    Ok(Some(ParentEvent::Message { embed, bytes })) if embed == *worker && bytes != b"frame" => {
+                        let sent = sheet.fixture_requests.as_mut().filter(|count| **count < 16)
+                            .is_some_and(|count| {
+                                *count += 1;
+                                fixture_resource(cookies, sheet.view, &bytes).is_ok_and(|fd|
+                                    parent.send_fd(embed, bytes, fd.as_fd()).is_ok())
+                            });
+                        if !sent { closed.push(id); }
+                    }
                     Err(_) => closed.push(id),
                     _ => {}
                 }

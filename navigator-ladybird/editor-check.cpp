@@ -12,7 +12,7 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#ifdef ATRIUM_INBOX_PAGE
+#ifdef ATRIUM_MAIL_PAGE
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #endif
@@ -82,7 +82,7 @@ int main(int argc, char** argv)
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
-#ifdef ATRIUM_INBOX_PAGE
+#ifdef ATRIUM_MAIL_PAGE
     auto& agent = Web::HTML::surrounding_agent();
     agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 #endif
@@ -105,16 +105,11 @@ int main(int argc, char** argv)
     auto* scene = navigator_mail_scene_open(inbox, &url, &url_len, &body, &body_len);
     if (!scene) return 4;
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
-    if (inbox && !Web::ResourceLoader::is_initialized())
+    if (!Web::ResourceLoader::is_initialized())
         Web::ResourceLoader::initialize(GC::Heap::the());
     auto painted = Navigator::paint_mail_document(*client, scene, { url, url_len }, { body, body_len }, false);
     if (painted.is_error()) return 4;
-#ifdef ATRIUM_INBOX_PAGE
-    return Navigator::drive_inbox(*client, scene, loop);
-#else
-    navigator_mail_scene_wait(scene);
-#endif
-    return 0;
+    return Navigator::drive_page(*client, scene, loop);
 #endif
     if (mail_probe) {
         // The development gate pipes the HTML that came back through the
