@@ -627,11 +627,44 @@ What Mail shows comes from what was checked, never from what the message says ab
   [RFC 8621 §§4.1.3 and 4.8](https://datatracker.ietf.org/doc/html/rfc8621#section-4.8),
   [Gmail message methods](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages#methods)
 
-  To qualify a deployment for provider trust, confirm that a real SMTP
-  delivery supplies a protected verdict. Check that attempts to put a new
-  message with an untrusted claim in the same Inbox by import or copy are
-  rejected or leave it unverified. Cover every enabled mailbox write path
-  and sync from a fresh index to represent writes made by another client.
+  **Qualifying a deployment.** Use a dedicated receiving test mailbox on
+  the intended provider or tenant, an authorized external sender under a
+  controlled domain, and a fresh Mail index. Obtain the accepted
+  `authserv-id` and the authoritative ingress route from the receiving
+  operator or deployment configuration. Record which inbound connectors
+  and authenticated mailbox-write paths are enabled for that account.
+
+  1. Send a message with one From mailbox through the normal external SMTP
+     ingress. Use an aligned DMARC pass carried by SPF alone, with no aligned
+     DKIM signature, so Mail's local DKIM check cannot account for a positive
+     provider result. Match the SMTP acceptance and receiving-side delivery
+     record to the Inbox copy using a unique Message-ID and, when available,
+     the receiver's queue ID. Fetch the original bytes through the same
+     IMAP or JMAP path Mail will use.
+  2. Confirm that the receiver added the first `Authentication-Results`
+     field, with the independently configured identity, exactly one
+     `dmarc=pass` result, and a `header.from` matching the sole From mailbox.
+     In an isolated parser check, replay those bytes with and without the
+     configured identity. Expect a provider-attributed verification only
+     with the identity. Keep account-level trust disabled during qualification.
+  3. Run an external-ingress negative control with an untrusted claim to the
+     receiver's identity and no aligned authentication. Check the receiver's
+     own rejection or quarantine record, or confirm in the retrieved bytes
+     that the receiver removed or replaced the outside claim and supplied no
+     trusted pass. Correlate the result with receiving-side evidence.
+  4. Exercise every enabled mailbox-write path from a separate client,
+     including IMAP APPEND and COPY or MOVE into Inbox, JMAP import and
+     mailbox changes, and any provider-specific write API in scope. Confirm
+     from a fresh index and the fetched bytes or protected metadata that
+     these writes cannot acquire the verdict reserved for SMTP delivery.
+     A matching header that survives a direct write disqualifies header-only
+     trust even while current Mail correctly displays the message as unverified.
+
+  Retain test message IDs, the SMTP and delivery outcomes, and only the
+  synthetic evidence needed to compare the controls. If a route or write
+  path cannot be qualified, keep trust disabled for that account until the
+  deployment exposes a way to prove delivery provenance independently of
+  the message bytes.
 
 - Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
   index across restarts until their remaining DNS lifetime expires, capped
