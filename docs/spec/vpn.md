@@ -917,7 +917,12 @@ another origin. An active portal-profile session stays in engine memory.
   The peer receives the approved report before the first packet on the
   new ESP association, then receives an identical timer refresh without
   another prompt. IPv4 echo passes on the same association after refresh.
-  The arm64 gate passed 26/26 using the shared Cargo cache.
+  Restoring IPv6 forwarding on that association prompts for fresh
+  approval and withholds the restored report until approval. Echo then
+  passes on the same association. The final rebind sends the identical
+  restored report without prompting, before traffic on a new ESP
+  association.
+  The arm64 gate passed 30/30 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

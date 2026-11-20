@@ -666,13 +666,13 @@ def main():
                 reconnected_after_rebind = args.hip == "esp-loss-rebind-reconnect"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (5 if reconnected_after_rebind else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (6 if reconnected_after_rebind else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if reconnected:
                     expected_spis.extend([esp.configs[2][0][0]] * 2 + [esp.configs[3][0][0]])
                 if reconnected_after_rebind:
-                    expected_spis.extend([esp.configs[4][0][0]] * 2)
+                    expected_spis.extend([esp.configs[4][0][0]] * 3 + [esp.configs[5][0][0]])
                 assert esp.echo == expected_spis and esp.dropped_probe_spis == {original_spi}, esp.echo
                 assert esp.received_spis == set(expected_spis), esp.received_spis
                 assert calls.count("login.esp") == 1 and calls[-1] == ("hipreportcheck.esp" if declined or declined_rebind else "logout.esp"), calls
@@ -705,8 +705,15 @@ def main():
                         assert calls[configs[4] - 1] == "hipreportcheck.esp", calls
                         last_report = calls[:configs[4]].count("hipreport.esp")
                         assert set(reports[rebind_report:last_report]) == {original}, reports
-                        assert len(reports[last_report:]) >= 2 and set(reports[last_report:]) == {changed}, reports
-                        print("Rebound ESP decline withheld changed HIP until fresh approval and the new ESP tunnel refreshed silently")
+                        final_rebind_report = calls[:configs[5]].count("hipreport.esp")
+                        reports_before_rebind = reports[last_report:final_rebind_report]
+                        assert reports_before_rebind[:2] == [changed, changed], reports
+                        assert reports_before_rebind[-1] == original and reports_before_rebind == sorted(
+                            reports_before_rebind, key=lambda report: report == original), reports
+                        assert set(reports_before_rebind) == {changed, original}, reports
+                        assert set(reports[final_rebind_report:]) == {original}, reports
+                        print("After rebound ESP decline, reconnect and forwarding restoration each required fresh approval")
+                        print("The final rebind submitted unchanged HIP before ESP traffic")
                     else:
                         assert set(reports[rebind_report:]) == {original}, reports
                     if declined_rebind:

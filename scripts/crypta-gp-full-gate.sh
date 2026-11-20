@@ -641,17 +641,55 @@ reconnect_after_esp_loss_decline() {
     ok "reconnect rejected the declined approval and withheld changed HIP and traffic"
     touch "$receipts.$2"
 }
+restore_forwarding_and_rebind() {
+    before_restore=$(awk 'END { print NR }' "$receipts")
+    "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+    wait_prompt gp_hip_approval
+    original_word=${initial_report%% *}
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+        grep -q "$(hex "IPv6 forwarding  $original_word")" || fail "review omitted restored IPv6 forwarding"
+    if tail -n "+$((before_restore + 1))" "$receipts" | grep -q "^$original_word "; then
+        fail "restored posture reached the gateway before fresh approval"
+    fi
+    approve_hip
+    for _ in $(seq 1 20); do
+        if tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report"; then break; fi
+        sleep 1
+    done
+    tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report" ||
+        fail "the approved restored report did not reach the gateway"
+    ok "restoring IPv6 forwarding required fresh approval"
+    probe "IPv4 echo on reconnected ESP after restored posture approval"
+    reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
+    before_rebind=$(awk 'END { print NR }' "$receipts")
+    "$V" "$CTL rebind name=gp-gate" >/dev/null
+    for _ in $(seq 1 30); do
+        [ "$(field signin)" != prompt ] || fail "unchanged restored HIP prompted on rebind"
+        connected=$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")
+        [ "$connected" != "$1" ] || break
+        sleep 1
+    done
+    [ "$connected" = "$1" ] || fail "the restored ESP tunnel did not rebind"
+    wait_field handshake 1
+    [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+        fail "rebind issued another HIP review"
+    [ "$(field signin)" = in ] &&
+        [ "$(sed -n "$((before_rebind + 1))p" "$receipts")" = "$initial_report" ] ||
+        fail "the rebound ESP tunnel did not submit the unchanged restored report"
+    ok "rebind reused approval for unchanged restored posture"
+    probe "IPv4 echo after restored ESP rebind"
+}
 if [ "$hip" = esp-loss ]; then
     initial_report=$(head -n 1 "$receipts")
     reviews=$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")
     probe "IPv4 echo on active ESP before outage"
     for _ in $(seq 1 50); do
         [ "$(field signin)" != prompt ] || fail "ESP loss prompted for unchanged HIP"
-        if "$V" "grep -q 'GlobalProtect data transport: TLS$' $G/cryptad.log"; then break; fi
+        if "$V" "grep -q 'GlobalProtect data transport: TLS' $G/cryptad.log"; then break; fi
         sleep 1
     done
     "$V" "grep -q 'not connected (GlobalProtect ESP lost; reconnecting over TLS)' $G/cryptad.log &&
-          grep -q 'GlobalProtect data transport: TLS$' $G/cryptad.log" ||
+          grep -q 'GlobalProtect data transport: TLS' $G/cryptad.log" ||
         fail "the active ESP tunnel did not recover over TLS"
     wait_field handshake 1
     [ "$("$V" "grep -c 'gp-gate: the gateway asks' $G/cryptad.log")" = "$reviews" ] ||
@@ -729,38 +767,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$changed_report" ] ||
             fail "unchanged HIP did not refresh silently on restored ESP"
         ok "unchanged HIP refreshed on restored ESP without prompting"
-        before_restore=$(awk 'END { print NR }' "$receipts")
-        "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
-        wait_prompt gp_hip_approval
-        original_word=${initial_report%% *}
-        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-            grep -q "$(hex "IPv6 forwarding  $original_word")" || fail "review omitted restored IPv6 forwarding"
-        if tail -n "+$((before_restore + 1))" "$receipts" | grep -q "^$original_word "; then
-            fail "restored posture reached the gateway before fresh approval"
-        fi
-        approve_hip
-        for _ in $(seq 1 20); do
-            if tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report"; then break; fi
-            sleep 1
-        done
-        tail -n "+$((before_restore + 1))" "$receipts" | grep -Fxq "$initial_report" ||
-            fail "the approved restored report did not reach the gateway"
-        ok "restoring IPv6 forwarding required fresh approval"
-        probe "IPv4 echo on reconnected ESP after restored posture approval"
-        reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
-        "$V" "$CTL rebind name=gp-gate" >/dev/null
-        for _ in $(seq 1 30); do
-            [ "$(field signin)" != prompt ] || fail "unchanged restored HIP prompted on rebind"
-            connected=$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")
-            [ "$connected" != 4 ] || break
-            sleep 1
-        done
-        [ "$connected" = 4 ] || fail "the restored ESP tunnel did not rebind"
-        wait_field handshake 1
-        [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
-            fail "rebind issued another HIP review"
-        ok "rebind reused approval for unchanged restored posture"
-        probe "IPv4 echo after restored ESP rebind"
+        restore_forwarding_and_rebind 4
         if [ "$decline_after_esp_loss" -ge 3 ]; then
             rebound_iface=$(field iface)
             [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
@@ -793,6 +800,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                 fail "the new ESP tunnel did not refresh unchanged HIP silently"
             ok "unchanged HIP refreshed silently on the new ESP tunnel"
             probe "IPv4 echo after silent HIP refresh on new ESP"
+            restore_forwarding_and_rebind 6
         fi
     fi
     "$V" "$CTL down name=gp-gate" >/dev/null
