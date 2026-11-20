@@ -29,7 +29,11 @@ parser.add_argument("--saved-record", type=Path, metavar="TLS_LOG",
                     help="fill the broker cache after parking and verify a saved-record restore against the fixture log")
 parser.add_argument("--broker-restart", type=Path, metavar="TLS_LOG",
                     help="use a fresh persistent broker without NAVIGATOR_UI_OPEN and relaunch on the saved trail")
+parser.add_argument("--unrecorded-restart", type=Path, metavar="TLS_LOG",
+                    help="restart with an Unrecorded widget page selected alongside the saved Personal trail")
 args = parser.parse_args()
+if args.unrecorded_restart:
+    args.broker_restart = args.unrecorded_restart
 if args.broker_restart:
     args.navigate_away = True
 if args.saved_record:
@@ -374,16 +378,42 @@ def return_from_pond(original_viewer):
     return set(guest("pgrep -x navigator-page").splitlines())
 
 
-def open_counter_from_start():
+def open_address(address, title):
     punct = {".": 55, "/": 56, "-": 45}
-    address = "parent.example/counter-parent.html"
     codes = [punct[c] if c in punct else ord(c) - ord("a") + 4 for c in address]
     # Focus the address field and type as a user would, so relaunch has no forced URL.
     events = "KEY 15 1 1\nKEY 15 0 1\n"
     for key in codes + [40]:
         events += f"KEY {key} 1\nKEY {key} 0\n"
     guest("nc -N -U input.sock", events.encode())
-    wait_for("initial parent did not open", lambda: b'the page child laid out "Embedded counter"' in log())
+    wait_for(f"{title} did not open", lambda: f'the page child laid out "{title}"'.encode() in log())
+
+
+def open_unrecorded_widget():
+    before = len(log())
+    guest("nc -N -U input.sock", b"KEY 17 1 3\nKEY 17 0 3\n")  # Ctrl-Shift-N
+    wait_for("Unrecorded trail did not open", lambda: b'Start, Unrecorded' in log()[before:])
+    open_address("parent.example/private-counter.html", "Private counter")
+    wait_for("private page content missing", lambda: page_word("private-page", "marionette", 441, 100))
+    press(390, 180)
+    def unavailable():
+        tree = log().split(b'navigator-ui: ax window "Navigator"')[-1]
+        return all(label in tree for label in (b'Private counter, Unrecorded', b'Garden notes',
+                   b'Live widget from https://widget.example is unavailable', b'button "Close"')) and b'button "Start"' not in tree
+    wait_for("missing Unrecorded widget notice or Personal trail", unavailable)
+    if guest("pgrep -x counter || true") or log().count(b"widget GET ") != 1:
+        raise RuntimeError("Unrecorded widget started or fetched")
+    frame("private-selected")
+
+
+def check_recorded_files(root):
+    # The ordinary page record must be discoverable by the same probe.
+    store = shlex.quote(root + "/var/db/navigatord/store")
+    for marker, expected in (("https://parent.example/away.html", 0),
+                             ("private-counter.html", 1), ("Private marionette", 1)):
+        status = guest(f"grep -aRFq {shlex.quote(marker)} {store}; echo $?")
+        if int(status) != expected:
+            raise RuntimeError(f"unexpected persistent store search result for {marker}: {status!r}")
 
 
 def restart_on_garden():
@@ -396,6 +426,9 @@ def restart_on_garden():
         if not data:
             return False
         record = json.loads(data)
+        if args.unrecorded_restart and (len(record["trails"]) != 1 or record["earlier"]
+                                       or b"private-counter.html" in data or b"Private counter" in data):
+            raise RuntimeError("Unrecorded material was written to the trail file")
         trail = record["trails"][record["current"]]
         pages = trail["pages"]
         if (len(pages) != 2 or trail["current"] != 1 or pages[1].get("parent") != 0
@@ -407,6 +440,8 @@ def restart_on_garden():
         return True
 
     wait_for("trail cursor and page record addresses were not persisted", saved)
+    if args.unrecorded_restart:
+        check_recorded_files(root)
     guest(f"kill -TERM {broker}")
     wait_for("old broker or UI remained", lambda: not guest("pgrep -x 'navigatord|navigator-ui' || true"))
     args.log += ".restart"
@@ -422,7 +457,7 @@ def restart_on_garden():
 
 def navigate_away():
     if args.broker_restart:
-        open_counter_from_start()
+        open_address("parent.example/counter-parent.html", "Embedded counter")
     traffic_log = args.saved_record or args.broker_restart
     if traffic_log:
         parent_get = b'"GET /counter-parent.html HTTP/1.1"'
@@ -445,8 +480,19 @@ def navigate_away():
              and not guest("pgrep -x counter || true"))
     wait_for("old question still painted on destination", lambda: not visible_question("away"))
     existing = return_from_pond(original_viewer) if args.parked_viewer else set()
+    if args.unrecorded_restart:
+        open_unrecorded_widget()
+        private_traffic = traffic_log.read_bytes()
+        private_get = b'"GET /private-counter.html HTTP/1.1"'
+        if private_traffic[len(requests):].count(private_get) != 1:
+            raise RuntimeError("expected one private page GET")
     if args.broker_restart:
         restart_on_garden()
+        if args.unrecorded_restart:
+            post = log()
+            if (b"private-counter.html" in post or b"Private counter" in post or b"widget GET " in post
+                    or b"trails=1 " not in post or guest("pgrep -x counter || true")):
+                raise RuntimeError("private page, trail or worker returned on relaunch")
         new_ui = guest("pgrep -x navigator-ui").strip()
         if new_ui == original_ui:
             raise RuntimeError("expected a new Navigator UI")
@@ -496,6 +542,10 @@ def navigate_away():
         traffic = traffic_log.read_bytes()
         if not traffic.startswith(requests):
             raise RuntimeError("fixture log changed during the run")
+        if args.unrecorded_restart and (not traffic.startswith(private_traffic)
+                                        or private_get in traffic[len(private_traffic):]
+                                        or b"private-counter.html" in report):
+            raise RuntimeError("Unrecorded page returned after restart")
         delta = traffic[len(requests):]
         if parent_get in delta or (args.saved_record and any(f'"GET /bed-{n}.html HTTP/1.1"'.encode() not in delta for n in range(1, 17))):
             raise RuntimeError("unexpected parent refetch or missing cache-fill request")

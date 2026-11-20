@@ -281,6 +281,22 @@ omit `NAVIGATOR_UI_OPEN`, enable UI accessibility and trace logging, and set
 pre-restart trail file and frames are in
 `~/atrium-vm/evidence/navigator-i2-broker-restart-20261121/`.
 
+The two-trail restart gate adds `private-counter.html` on the parent origin.
+Use the broker-restart setup with `--unrecorded-restart TLS_LOG`. The gate
+opens an Unrecorded trail with Ctrl-Shift-N while the Personal Garden trail
+remains open. It renders the private page, presses its counter placeholder,
+and leaves its widget-unavailable notice visible while stopping the broker.
+The current counter fixture offers Start only in the ordinary Personal context.
+
+On arm64 Tessera the saved trail file contained only the Personal pages.
+A search of the broker’s on-disk page store found the Garden URL and found
+neither the private URL marker nor its distinctive page text. The replacement
+broker restored one trail at Garden. The private page had one GET before
+restart and none afterward. Its notice and worker were absent. Back reopened
+the Personal counter page from disk, and fresh Start consent launched a new
+working counter. Both broker logs, frames and the saved Personal trail are
+in `~/atrium-vm/evidence/navigator-i2-unrecorded-restart-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
