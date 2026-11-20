@@ -907,10 +907,29 @@ Authorization header. Restoring the 200 response and pressing Start
 again in the same window produced a working counter without reloading
 the parent. The guest hashes of the content-signed fetcher and interpreter
 matched staging. Ladybird ran as uid 50007 in Capsicum mode with both IP
-families disabled. The current refusal is logged by the broker. A later
-placement can still address the exited worker before the next Start.
+families disabled. In that build only the broker reported the refusal, and a later
+placement could still address the exited worker.
 Screenshots, server requests, hashes and service logs are in
 `~/atrium-vm/evidence/navigator-i1-installed-tls-20261120/`.
+
+Navigator now matches a widget failure to both its recording ticket and the
+compositor receipt for that attempt. The broker retires its Limen connection
+on a fetch failure, detach or child exit. The shell clears the matching
+placement and shows a dismissible notice. Closing the notice allows a fresh
+Start. Pressing the placeholder again during a pending Start leaves that
+request in flight.
+
+The installed arm64 Tessera gate exercised a TLS 302 and termination of a
+running counter. The window showed “The live widget could not load its
+page.” and “The live widget stopped.” respectively. For the replacement
+case the fixture held the first GET open. Opening History withdrew that
+worker. Returning to the same recording and pressing Start fetched the
+counter again. The replacement reached Count 1 before the first GET
+returned its 302, retained the same PID and reached Count 2 afterward.
+The broker logged the old refusal and the window stayed on the counter.
+The FreeBSD broker and UI suites passed, including the same-slot stale
+receipt regression. Screenshots and logs are in
+`~/atrium-vm/evidence/navigator-i1-widget-lifecycle-20261120/`.
 
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and

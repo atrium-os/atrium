@@ -161,6 +161,7 @@ pub enum Prompt {
     FetchAgain,
     RunLive,
     Widget { runnable: bool, key: u32, src: String, origin: String, rect: [f32; 4] },
+    WidgetFailed { key: u32, failure: navigator_control::WidgetFailure },
     Play { origin: String },
     /// A link for another program (`mailto:`, an allowlisted scheme;
     /// threat model §2.10).
@@ -199,7 +200,7 @@ impl Prompt {
             Prompt::Download { .. } => &["Cancel", "Open", "Save"],
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
             Prompt::Widget { runnable: true, .. } => &["Not now", "Start"],
-            Prompt::Widget { .. } => &["Close"],
+            Prompt::Widget { .. } | Prompt::WidgetFailed { .. } => &["Close"],
             Prompt::RunLive => &["Not now", "Run live"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
@@ -216,7 +217,7 @@ impl Prompt {
             Prompt::Download { file, origin, .. } => format!("download {origin} {file}"),
             Prompt::NotPrivate { origin } => format!("not-private {origin}"),
             Prompt::RunLive => "run-live".into(),
-            Prompt::Widget { key, .. } => format!("widget {key}"),
+            Prompt::Widget { key, .. } | Prompt::WidgetFailed { key, .. } => format!("widget {key}"),
             Prompt::FetchAgain => "fetch-again".into(),
             Prompt::Play { origin } => format!("play {origin}"),
             Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. } => format!("hand {url}"),

@@ -714,7 +714,8 @@ impl Shell {
         let Some(page) = self.store.page_by_key_mut(key.0, key.1) else { return false };
         let k = p.key();
         let q = &mut page.prompts;
-        if q.dismissed.contains(&k) || q.last_ms.is_some_and(|t| now - t < PROMPT_EVERY_MS) {
+        let broker_notice = matches!(p, Prompt::WidgetFailed { .. });
+        if !broker_notice && (q.dismissed.contains(&k) || q.last_ms.is_some_and(|t| now - t < PROMPT_EVERY_MS)) {
             return false;
         }
         if page.asked.as_ref().is_some_and(|a| a.prompt.key() == k) || q.queued.iter().any(|x| x.key() == k) {
@@ -725,7 +726,7 @@ impl Shell {
             Some(_) if q.queued.len() < PROMPTS_QUEUED => q.queued.push(p),
             Some(_) => return false,
         }
-        q.last_ms = Some(now);
+        if !broker_notice { q.last_ms = Some(now); }
         true
     }
 
@@ -747,7 +748,7 @@ impl Shell {
     /// removes queued rows, leaving unrelated questions in their original order.
     pub fn widget_placement(&mut self, page: (u64, PageId), island: Option<u32>, rect: Option<[f32; 4]>, now: f64) -> bool {
         let Some(page) = self.store.page_by_key_mut(page.0, page.1) else { return false };
-        let matches = |p: &Prompt| matches!(p, Prompt::Widget { key, .. } if island.is_none_or(|id| id == *key));
+        let matches = |p: &Prompt| matches!(p, Prompt::Widget { key, .. } | Prompt::WidgetFailed { key, .. } if island.is_none_or(|id| id == *key));
         if let Some(new_rect) = rect {
             let rows = page.asked.iter_mut().map(|a| &mut a.prompt).chain(page.prompts.queued.iter_mut());
             for row in rows {

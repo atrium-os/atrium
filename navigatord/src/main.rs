@@ -1572,11 +1572,16 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if cfg.activation.is_none() { return Err("no compositor guard".into()); }
                     spend(press)?;
                     widget = None;
-                    widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, rect, cfg.clone())
+                    let writer = w.clone();
+                    widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, press, rect, cfg.clone(),
+                        move |failure| send(&writer, &Event::WidgetFailed { document, press, failure }))
                 })();
                 match result {
                     Ok(started) => { widget = Some(started); eprintln!("navigatord: widget started"); }
-                    Err(why) => send(&w, &Event::LivePageFailed { why }),
+                    Err(why) => {
+                        eprintln!("navigatord: widget start: {why}");
+                        send(&w, &Event::WidgetFailed { document, press, failure: ctl::WidgetFailure::Start });
+                    }
                 }
             }
             Request::PlaceWidget { document, rect } => {
@@ -1584,8 +1589,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     match rect {
                         None => widget = None,
                         Some(r) => if let Err(why) = active.place(r) {
+                            let press = active.press;
                             widget = None;
-                            send(&w, &Event::LivePageFailed { why });
+                            eprintln!("navigatord: {why}");
+                            send(&w, &Event::WidgetFailed { document, press, failure: ctl::WidgetFailure::Exit });
                         }
                     }
                 }

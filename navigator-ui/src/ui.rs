@@ -109,6 +109,7 @@ pub fn trace(s: &mut Shell) {
                 Prompt::NotPrivate { .. } => "not-private",
                 Prompt::RunLive => "run-live",
                 Prompt::Widget { .. } => "widget",
+                Prompt::WidgetFailed { .. } => "widget-failed",
                 Prompt::FetchAgain => "fetch-again",
                 Prompt::Play { .. } => "play",
                 Prompt::Handoff { .. } => "handoff",
@@ -1403,7 +1404,7 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),
             ("over http: anyone on the network can read it".into(), body(t.text_secondary(), Weight::Regular)),
         ]),
-        Prompt::RunLive | Prompt::Widget { .. } => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
+        Prompt::RunLive | Prompt::Widget { .. } | Prompt::WidgetFailed { .. } => (ph::LIGHTNING, vec![(crate::ax::prompt_text(p), body(t.text_primary(), Weight::Regular))]),
         Prompt::FetchAgain => (ph::ARROW_CLOCKWISE, vec![("This page could not be restored and will be fetched again".into(), body(t.text_secondary(), Weight::Regular))]),
         Prompt::Stored { at_s } => (ph::CLOCK, vec![
             ("The version you saw".into(), body(t.text_secondary(), Weight::Regular)),

@@ -5,6 +5,7 @@ use navigator_control::Ticket;
 use std::{
     os::unix::net::UnixStream,
     path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -20,7 +21,8 @@ pub fn bounds(r: [u32; 4]) -> Result<[f32; 4], String> {
 
 pub struct Widget {
     pub document: Ticket,
-    parent: Parent,
+    pub press: navigator_control::Press,
+    parent: Arc<Mutex<Option<Parent>>>,
     embed: u64,
 }
 
@@ -29,8 +31,10 @@ impl Widget {
         socket: &Path,
         window: [u8; 16],
         document: Ticket,
+        press: navigator_control::Press,
         rect: [u32; 4],
-        cfg: std::sync::Arc<Config>,
+        cfg: Arc<Config>,
+        failed: impl FnOnce(navigator_control::WidgetFailure) + Send + 'static,
     ) -> Result<Self, String> {
         let rect = bounds(rect)?;
         let mut parent = Parent::at(socket).map_err(|e| format!("Limen: {e:?}"))?;
@@ -57,22 +61,59 @@ impl Widget {
         parent
             .place(embed, Some(rect))
             .map_err(|e| format!("place: {e:?}"))?;
+        let parent = Arc::new(Mutex::new(Some(parent)));
+        let watched = parent.clone();
         std::thread::spawn(move || {
-            if let Err(e) = fetch(channel, &cfg) {
-                eprintln!("navigatord: widget fetch: {e}");
+            use navigator_control::WidgetFailure;
+            let failure = match fetch(channel, &cfg) {
+                Err(e) => {
+                    eprintln!("navigatord: widget fetch: {e}");
+                    WidgetFailure::Fetch
+                }
+                Ok(()) => loop {
+                    let mut slot = watched.lock().unwrap();
+                    let Some(connection) = slot.as_mut() else {
+                        return;
+                    };
+                    match connection.poll(Duration::from_millis(40)) {
+                        Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. }))
+                        | Err(_) => break WidgetFailure::Exit,
+                        Ok(Some(ParentEvent::MessageFd { .. })) => {
+                            drop(connection.take_fd());
+                        }
+                        _ => {}
+                    }
+                    drop(slot);
+                    // Allow withdrawal and placement to acquire this connection.
+                    std::thread::sleep(Duration::from_millis(5));
+                },
+            };
+            let retired = watched.lock().unwrap().take();
+            if retired.is_some() {
+                drop(retired);
+                failed(failure);
             }
         });
         Ok(Self {
             document,
+            press,
             parent,
             embed,
         })
     }
 
     pub fn place(&mut self, rect: [u32; 4]) -> Result<(), String> {
-        self.parent
-            .place(self.embed, Some(bounds(rect)?))
-            .map_err(|e| format!("place widget: {e:?}"))
+        if let Some(p) = self.parent.lock().unwrap().as_mut() {
+            p.place(self.embed, Some(bounds(rect)?))
+                .map_err(|e| format!("place widget: {e:?}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Widget {
+    fn drop(&mut self) {
+        self.parent.lock().unwrap().take();
     }
 }
 

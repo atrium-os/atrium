@@ -352,7 +352,12 @@ pub enum Event {
     /// Source spelling and resolved web origin from the opened recording.
     IslandSources { id: u32, sources: Vec<(String, String)> },
     RunnableWidget { id: u32, source: String },
+    /// The original Start receipt distinguishes retries of the same island.
+    WidgetFailed { document: Ticket, press: Press, failure: WidgetFailure },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WidgetFailure { Start, Fetch, Exit }
 
 /// The most accounts an `Accounts` names, and the longest name.
 pub const ACCOUNTS_MAX: usize = 16;

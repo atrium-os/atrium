@@ -83,12 +83,24 @@ struct Child {
     forms: Vec<limen::doc_viewer::Form>,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveWidget {
+    document: Ticket,
+    press: ctl::Press,
+    key: u32,
+    rect: [u32; 4],
+}
+
+fn retire_widget(active: &mut Option<ActiveWidget>, document: Ticket, press: ctl::Press) -> Option<ActiveWidget> {
+    active.take_if(|w| w.document == document && w.press == press)
+}
+
 pub struct Live {
     w: UnixStream,
     rx: mpsc::Receiver<Event>,
     embeds: Option<Rc<RefCell<Embeds>>>,
     window: Option<WindowToken>,
-    widget: Option<(Ticket, u32, [u32; 4])>,
+    widget: Option<ActiveWidget>,
     children: Vec<Child>,
     /// The page whose child is in the slot (`None`: Start).
     shown: Option<Key>,
@@ -673,6 +685,14 @@ impl Live {
                         }
                     }
                 }
+                Event::WidgetFailed { document, press, failure } => {
+                    if let Some(active) = retire_widget(&mut self.widget, document, press) {
+                        if let Some(page) = self.shown.filter(|&p| self.widget_bounds(s, p, active.key, None)
+                            .is_some_and(|(d, _)| d == document)) {
+                            s.ask_at(page, crate::trail::Prompt::WidgetFailed { key: active.key, failure }, crate::ui::now_ms());
+                        }
+                    }
+                }
                 Event::LivePageFailed { why } => s.last_note = Some(why),
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
@@ -785,7 +805,13 @@ impl Live {
                         let child = &mut self.children[i];
                         let runnable = child.runnable.as_deref() == Some(&src);
                         child.selected_widget = Some((key, src.clone(), rect));
-                        changed |= s.widget_pressed(child.key, &child.island_sources, &src, key, rect, runnable, crate::ui::now_ms());
+                        // A slow engine may still leave the viewer's placeholder exposed.
+                        // Only offer Start once for the current slot while its request is live.
+                        let starting = self.widget.is_some_and(|w| child.document == Some(w.document)
+                            && w.key == key && runnable);
+                        if !starting {
+                            changed |= s.widget_pressed(child.key, &child.island_sources, &src, key, rect, runnable, crate::ui::now_ms());
+                        }
                     }
                     Some(ToParent::IslandPressed { .. }) => {}
                     Some(ToParent::IslandPlacement { key, rect }) => {
@@ -934,7 +960,7 @@ impl Live {
                 Out::StartWidget { page, key, src, press } => {
                     if let Some((document, rect)) = self.widget_bounds(s, page, key, Some(&src)) {
                         send(&mut self.w, &Request::StartWidget { document, source: src, rect, press });
-                        self.widget = Some((document, key, rect));
+                        self.widget = Some(ActiveWidget { document, key, rect, press });
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
@@ -1090,12 +1116,13 @@ impl Live {
                 c.seen = Instant::now();
             }
         }
-        if let Some((document, key, old)) = self.widget {
+        if let Some(active) = self.widget {
+            let ActiveWidget { document, key, rect: old, .. } = active;
             let rect = self.shown.and_then(|p| self.widget_bounds(s, p, key, None))
                 .filter(|(d, _)| *d == document).map(|(_, r)| r);
             if rect != Some(old) {
                 send(&mut self.w, &Request::PlaceWidget { document, rect });
-                self.widget = rect.map(|r| (document, key, r));
+                self.widget = rect.map(|rect| ActiveWidget { rect, ..active });
             }
         }
         // Reading choices changed (Aa, or the system appearance): the live
@@ -1116,5 +1143,19 @@ impl Live {
         }
         self.park(s);
         changed
+    }
+}
+
+#[cfg(test)]
+mod widget_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn late_failure_cannot_retire_a_replacement_in_the_same_slot() {
+        let mut active = Some(ActiveWidget { document: [1; 16], press: [3; 16], key: 9, rect: [0, 0, 20, 20] });
+        assert!(retire_widget(&mut active, [1; 16], [2; 16]).is_none());
+        assert!(retire_widget(&mut active, [0; 16], [3; 16]).is_none());
+        assert_eq!(retire_widget(&mut active, [1; 16], [3; 16]).unwrap().key, 9);
+        assert!(retire_widget(&mut active, [1; 16], [3; 16]).is_none());
     }
 }
