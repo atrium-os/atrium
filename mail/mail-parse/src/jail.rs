@@ -15,8 +15,7 @@ struct Port<R, W> {
     r: R,
     w: W,
     next: u32,
-    dkim_remaining: u32,
-    dmarc_remaining: u32,
+    budget: wire::DnsBudget,
 }
 
 impl<R: Read, W: Write> Port<R, W> {
@@ -24,15 +23,9 @@ impl<R: Read, W: Write> Port<R, W> {
 
     /// One TXT lookup through the engine; `None` past the per-message budget.
     fn query(&mut self, name: String) -> io::Result<Option<String>> {
-        let remaining = if name.starts_with("_dmarc.") {
-            &mut self.dmarc_remaining
-        } else {
-            &mut self.dkim_remaining
-        };
-        if *remaining == 0 || !wire::query_allowed(&name) {
+        if !wire::query_allowed(&name) || !self.budget.take(&name) {
             return Ok(None);
         }
-        *remaining -= 1;
         let q = self.next;
         self.next = self.next.wrapping_add(1);
         self.send(&wire::FromJail::Query { query: q, name })?;
@@ -45,7 +38,7 @@ impl<R: Read, W: Write> Port<R, W> {
 
 /// Serve requests until the engine closes the stream.
 pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<()> {
-    let port = RefCell::new(Port { r, w, next: 0, dkim_remaining: 0, dmarc_remaining: 0 });
+    let port = RefCell::new(Port { r, w, next: 0, budget: wire::DnsBudget::default() });
     loop {
         let req = { let mut p = port.borrow_mut(); wire::read_frame::<wire::ToJail>(&mut p.r)? };
         let Some(req) = req else { return Ok(()) };
@@ -233,11 +226,7 @@ fn refusal(r: Refused) -> wire::Refusal {
 
 fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>) -> Result<(wire::Summary, crate::Summary), wire::Refusal> {
     let s = crate::parse(raw, &Limits::default()).map_err(refusal)?;
-    {
-        let mut port = port.borrow_mut();
-        port.dkim_remaining = wire::MAX_DKIM_QUERIES_PER_MESSAGE;
-        port.dmarc_remaining = wire::MAX_DMARC_QUERIES_PER_MESSAGE;
-    }
+    port.borrow_mut().budget = wire::DnsBudget::default();
     // A failed exchange with the engine is not this message's fault; the
     // engine sees the broken stream and retires the jail either way.
     let lookup = |name: String| port.borrow_mut().query(name).ok().flatten();

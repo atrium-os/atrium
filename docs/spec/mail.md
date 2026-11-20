@@ -578,6 +578,9 @@ What Mail shows comes from what was checked, never from what the message says ab
   Each message can use up to six distinct DKIM key lookups. The parse
   worker reserves up to two separate DMARC lookups for the From domain
   and its organizational domain.
+  The engine enforces the same limits independently and allows a fresh
+  budget only for the next submitted message. Header-only and attachment
+  requests grant no resolver lookups.
   [RFC 6376 §3.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.1)
   [RFC 6376 §§3.2, 3.5 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup

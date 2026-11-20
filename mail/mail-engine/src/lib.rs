@@ -157,11 +157,19 @@ impl Parser {
     }
 
     /// Frames until `Done`, answering DKIM and DMARC lookups.
-    fn exchange(j: &mut Jail, lens: &dyn Fn(u64) -> Option<u64>, dns: &dyn Fn(&str) -> Option<String>) -> Result<Vec<FromJail>, Error> {
+    fn exchange(
+        reader: &mut impl std::io::Read,
+        writer: &mut impl std::io::Write,
+        lens: &dyn Fn(u64) -> Option<u64>,
+        mut lookup_ids: &[u64],
+        dns: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Vec<FromJail>, Error> {
         let caps = Caps::default();
         let mut out = Vec::new();
+        let allow_lookups = !lookup_ids.is_empty();
+        let mut budget = wire::DnsBudget::default();
         loop {
-            let f: FromJail = wire::read_frame(&mut j.r).map_err(|e| Error::Jail(e.to_string()))?.ok_or_else(|| Error::Jail("closed".into()))?;
+            let f: FromJail = wire::read_frame(reader).map_err(|e| Error::Jail(e.to_string()))?.ok_or_else(|| Error::Jail("closed".into()))?;
             let raw_len = match &f {
                 FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
                 _ => 0,
@@ -172,11 +180,23 @@ impl Parser {
                 FromJail::Opened { result: Ok(o), .. } => check_local_sender_verdict(&o.summary.sender_check)?,
                 _ => {}
             }
+            if let FromJail::Summary { id, .. } | FromJail::Opened { id, .. } = &f {
+                if allow_lookups {
+                    if lookup_ids.first() != Some(id) {
+                        return Err(Error::Jail("answers out of order".into()));
+                    }
+                    lookup_ids = &lookup_ids[1..];
+                    budget = wire::DnsBudget::default();
+                }
+            }
             match f {
                 FromJail::Query { query, name } => {
                     // mail-schema's check held the name to DKIM and DMARC records.
+                    if lookup_ids.is_empty() || !budget.take(&name) {
+                        return Err(Error::Jail("DNS lookup outside the parse request budget".into()));
+                    }
                     let txt = dns(&name).filter(|t| t.len() <= 4096);
-                    wire::write_frame(&mut j.w, &ToJail::Answer { query, txt }).map_err(|e| Error::Jail(e.to_string()))?;
+                    wire::write_frame(writer, &ToJail::Answer { query, txt }).map_err(|e| Error::Jail(e.to_string()))?;
                 }
                 FromJail::Done => return Ok(out),
                 other => out.push(other),
@@ -203,7 +223,8 @@ impl Parser {
         wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let lens = |id: u64| batch.iter().find(|(i, _)| *i == id).map(|(_, b)| b.len() as u64);
-        let frames = Self::exchange(&mut j, &lens, dns)?;
+        let lookup_ids: Vec<_> = if headers_only { Vec::new() } else { batch.iter().map(|(id, _)| *id).collect() };
+        let frames = Self::exchange(&mut j.r, &mut j.w, &lens, &lookup_ids, dns)?;
         let mut out = vec![None; batch.len()];
         let mut keys = Vec::new();
         let mut seen = 0;
@@ -246,7 +267,7 @@ impl Parser {
         wire::write_frame(&mut j.w, &ToJail::Attachment { message: wire::Raw { id: 1, bytes: raw.to_vec() }, which: which.clone(), key })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
-        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len), &|_| None)?;
+        let frames = Self::exchange(&mut j.r, &mut j.w, &|id| (id == 1).then_some(len), &[], &|_| None)?;
         match frames.into_iter().next() {
             Some(FromJail::Attachment { result, .. }) => Ok(result.ok()),
             _ => Err(Error::Jail("no answer".into())),
@@ -259,7 +280,7 @@ impl Parser {
         let certs: Vec<Vec<u8>> = certs.iter().take(wire::MY_CERTS_MAX).cloned().collect();
         let mut j = self.start()?;
         wire::write_frame(&mut j.w, &ToJail::KeyFor { message: wire::Raw { id: 1, bytes: raw.to_vec() }, certs: certs.clone() }).map_err(|e| Error::Jail(e.to_string()))?;
-        let frames = Self::exchange(&mut j, &|_| Some(raw.len() as u64), &|_| None)?;
+        let frames = Self::exchange(&mut j.r, &mut j.w, &|_| Some(raw.len() as u64), &[], &|_| None)?;
         match frames.into_iter().next() {
             Some(FromJail::KeyFor { which, .. }) => match which {
                 Some((i, w)) if (i as usize) < certs.len() => Ok(Some((i as usize, w))),
@@ -281,7 +302,7 @@ impl Parser {
         wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), key, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded, pgp_keys })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
-        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len), dns)?;
+        let frames = Self::exchange(&mut j.r, &mut j.w, &|id| (id == 1).then_some(len), &[1], dns)?;
         match frames.into_iter().next() {
             Some(FromJail::Opened { result, .. }) => Ok(result.ok()),
             _ => Err(Error::Jail("no answer".into())),
@@ -841,5 +862,72 @@ mod provider_boundary_tests {
         let provider = wire::SenderCheck::Verified { domain, by_provider: true };
         assert!(check_local_sender_verdict(&local).is_ok());
         assert!(matches!(check_local_sender_verdict(&provider), Err(Error::Jail(_))));
+    }
+}
+
+#[cfg(test)]
+mod dns_boundary_tests {
+    use super::*;
+
+    fn query(name: &str) -> FromJail {
+        FromJail::Query { query: 1, name: name.into() }
+    }
+
+    fn summary(id: u64) -> FromJail {
+        FromJail::Summary { id, result: Ok(Summary::default()) }
+    }
+
+    fn exercise(ids: &[u64], frames: Vec<FromJail>) -> (Result<Vec<FromJail>, Error>, usize) {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            wire::write_frame(&mut bytes, &frame).unwrap();
+        }
+        wire::write_frame(&mut bytes, &FromJail::Done).unwrap();
+        let requests = std::cell::Cell::new(0);
+        let result = Parser::exchange(&mut bytes.as_slice(), &mut Vec::new(), &|_| Some(100), ids, &|_| {
+            requests.set(requests.get() + 1);
+            None
+        });
+        (result, requests.get())
+    }
+
+    const KEY: &str = "sel._domainkey.example.com";
+    const POLICY: &str = "_DMARC.example.com";
+
+    #[test]
+    fn only_completed_messages_reset_the_resolver_budget() {
+        let mut frames = Vec::new();
+        for id in [1, 2] {
+            frames.extend((0..6).map(|_| query(KEY)));
+            frames.extend((0..2).map(|_| query(POLICY)));
+            frames.push(summary(id));
+        }
+        let (result, requests) = exercise(&[1, 2], frames);
+        assert!(result.is_ok());
+        assert_eq!(requests, 16);
+
+        let duplicated = vec![summary(1), summary(1), query(KEY)];
+        let (result, requests) = exercise(&[1, 2], duplicated);
+        assert!(matches!(result, Err(Error::Jail(reason)) if reason == "answers out of order"));
+        assert_eq!(requests, 0);
+    }
+
+    #[test]
+    fn excess_and_unrequested_lookups_never_reach_the_resolver() {
+        for (name, limit) in [(KEY, 6), (POLICY, 2)] {
+            let frames = (0..=limit).map(|_| query(name)).collect();
+            let (result, forwarded) = exercise(&[1], frames);
+            assert!(matches!(result, Err(Error::Jail(reason)) if reason == "DNS lookup outside the parse request budget"));
+            assert_eq!(forwarded, limit);
+        }
+
+        for (ids, frames) in [
+            (&[][..], vec![query(KEY)]),
+            (&[1][..], vec![summary(1), query(KEY)]),
+        ] {
+            let (result, forwarded) = exercise(ids, frames);
+            assert!(matches!(result, Err(Error::Jail(reason)) if reason == "DNS lookup outside the parse request budget"));
+            assert_eq!(forwarded, 0);
+        }
     }
 }

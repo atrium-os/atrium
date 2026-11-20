@@ -43,6 +43,36 @@ pub const MAX_BATCH_BYTES: usize = 32 << 20;
 pub const MAX_DKIM_QUERIES_PER_MESSAGE: u32 = 6;
 pub const MAX_DMARC_QUERIES_PER_MESSAGE: u32 = 2;
 
+/// Counts TXT lookups for one message. The parser and engine each keep
+/// their own counter.
+pub struct DnsBudget {
+    dkim: u32,
+    dmarc: u32,
+}
+
+impl Default for DnsBudget {
+    fn default() -> Self {
+        Self { dkim: MAX_DKIM_QUERIES_PER_MESSAGE, dmarc: MAX_DMARC_QUERIES_PER_MESSAGE }
+    }
+}
+
+impl DnsBudget {
+    /// Consume one lookup for an already validated query name.
+    pub fn take(&mut self, name: &str) -> bool {
+        let remaining = if name.split_once('.').is_some_and(|(first, _)| first.eq_ignore_ascii_case("_dmarc")) {
+            &mut self.dmarc
+        } else {
+            &mut self.dkim
+        };
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
+    }
+}
+
+
 // ---- engine → jail ----
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

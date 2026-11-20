@@ -70,7 +70,7 @@ impl Engine {
             mail_schema::write_frame(&mut jail.w, &mail_schema::ToJail::HtmlAttachment {
                 message: mail_schema::Raw { id: 1, bytes: raw }, which, key,
             }).map_err(|e| Error::Jail(e.to_string()))?;
-            let frames = super::Parser::exchange(&mut jail, &|id| (id == 1).then_some(len), &|_| None)?;
+            let frames = super::Parser::exchange(&mut jail.r, &mut jail.w, &|id| (id == 1).then_some(len), &[], &|_| None)?;
             match frames.into_iter().next() {
                 Some(mail_schema::FromJail::Opened { result: Ok(opened), .. }) => opened.document.map(ExportSource::Html).ok_or(Error::NotFound),
                 _ => Err(Error::Refused("Could not convert the HTML attachment")),
