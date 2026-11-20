@@ -603,6 +603,7 @@ case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
     esp-loss-rebind-decline) hip=esp-loss; decline_after_esp_loss=3 ;;
+    esp-loss-rebind-reconnect) hip=esp-loss; decline_after_esp_loss=4 ;;
 esac
 decline_esp_loss_review() {
     [ "$(field handshake)" = 1 ] || fail "the tunnel was down before decline"
@@ -619,6 +620,26 @@ decline_esp_loss_review() {
         fail "the declined tunnel retained its route"
     "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
         fail "IPv4 echo passed after decline"
+}
+reconnect_after_esp_loss_decline() {
+    "$V" "$CTL up name=gp-gate" >/dev/null
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+        grep -q "$(hex "IPv6 forwarding  $changed_word")" || fail "reconnect reviewed different posture"
+    [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined approval"
+    if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
+        fail "reconnect accepted the declined approval"
+    fi
+    [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected stale approval reply: $stale_reply"
+    sleep 1
+    [ "$(field handshake)" = 0 ] || fail "the reconnect opened before approval"
+    "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+        fail "IPv4 echo passed before reconnect approval"
+    if tail -n "+$(($1 + 1))" "$receipts" | grep -q "^$changed_word "; then
+        fail "changed posture reached the gateway before reconnect approval"
+    fi
+    ok "reconnect rejected the declined approval and withheld changed HIP and traffic"
+    touch "$receipts.$2"
 }
 if [ "$hip" = esp-loss ]; then
     initial_report=$(head -n 1 "$receipts")
@@ -687,24 +708,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             echo "$pass checks passed"
             exit 0
         fi
-        "$V" "$CTL up name=gp-gate" >/dev/null
-        wait_prompt gp_hip_approval
-        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-            grep -q "$(hex "IPv6 forwarding  $changed_word")" || fail "reconnect reviewed different posture"
-        [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined approval"
-        if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
-            fail "reconnect accepted the declined approval"
-        fi
-        [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected stale approval reply: $stale_reply"
-        sleep 1
-        [ "$(field handshake)" = 0 ] || fail "the reconnect opened before approval"
-        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
-            fail "IPv4 echo passed before reconnect approval"
-        if grep -q "^$changed_word " "$receipts"; then
-            fail "changed posture reached the gateway before reconnect approval"
-        fi
-        ok "reconnect rejected the declined approval and withheld changed HIP and traffic"
-        touch "$receipts.approved"
+        reconnect_after_esp_loss_decline 0 approved
     fi
     approve_hip || fail "approve changed HIP"
     for _ in $(seq 1 25); do
@@ -757,7 +761,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             fail "rebind issued another HIP review"
         ok "rebind reused approval for unchanged restored posture"
         probe "IPv4 echo after restored ESP rebind"
-        if [ "$decline_after_esp_loss" = 3 ]; then
+        if [ "$decline_after_esp_loss" -ge 3 ]; then
             rebound_iface=$(field iface)
             [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
             before_decline=$(awk 'END { print NR }' "$receipts")
@@ -765,13 +769,30 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
             wait_prompt gp_hip_approval
             printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
                 grep -q "$(hex "IPv6 forwarding  $changed_word")" || fail "review omitted the second change"
+            declined_choice=$(hip_choice)
+            [ -n "$declined_choice" ] || fail "missing declined rebound choice"
             decline_esp_loss_review 4 "$rebound_iface"
             if tail -n "+$((before_decline + 1))" "$receipts" | grep -q "^$changed_word "; then
                 fail "the second changed report reached the gateway despite decline"
             fi
             ok "decline shut down rebound ESP without sending the changed report"
-            echo "$pass checks passed"
-            exit 0
+            if [ "$decline_after_esp_loss" = 3 ]; then
+                echo "$pass checks passed"
+                exit 0
+            fi
+            reconnect_after_esp_loss_decline "$before_decline" rebind-approved
+            approve_hip
+            wait_field handshake 1
+            [ "$(tail -n 1 "$receipts")" = "$changed_report" ] ||
+                fail "rebound reconnect did not submit the approved changed report"
+            probe "IPv4 echo after approval on the new ESP tunnel"
+            before_refresh=$(awk 'END { print NR }' "$receipts")
+            wait_receipts "$((before_refresh + 1))"
+            [ "$(field signin)" = in ] &&
+                [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$changed_report" ] ||
+                fail "the new ESP tunnel did not refresh unchanged HIP silently"
+            ok "unchanged HIP refreshed silently on the new ESP tunnel"
+            probe "IPv4 echo after silent HIP refresh on new ESP"
         fi
     fi
     "$V" "$CTL down name=gp-gate" >/dev/null

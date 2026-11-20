@@ -911,6 +911,13 @@ another origin. An active portal-profile session stays in engine memory.
   again on rebound ESP and declines that review. It checks that the
   changed report stays unsent, the profile and route go down, and
   IPv4 echo stops. The arm64 decline run passed 21/21.
+  With `--hip esp-loss-rebind-reconnect`, the gate starts the profile
+  after that second decline. It rejects the stale approval choice and
+  verifies that the changed report and IPv4 echo wait for fresh approval.
+  The peer receives the approved report before the first packet on the
+  new ESP association, then receives an identical timer refresh without
+  another prompt. IPv4 echo passes on the same association after refresh.
+  The arm64 gate passed 26/26 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
