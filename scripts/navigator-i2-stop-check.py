@@ -47,8 +47,9 @@ def press(x, y):
 def wait_for(label, check, timeout=12):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if check():
-            return
+        result = check()
+        if result:
+            return result
         time.sleep(.15)
     raise RuntimeError(label)
 
@@ -340,9 +341,8 @@ def back_to(path):
 def fill_cache_and_return():
     # Each page has its own URL and sends a real link activation through the viewer.
     for number in range(1, 17):
-        link = page_word("flowerbeds", "flowerbeds", 41, 160)
-        if not link:
-            raise RuntimeError(f"missing link to flowerbed {number}")
+        link = wait_for(f"missing link to flowerbed {number}",
+                        lambda: page_word("flowerbeds", "flowerbeds", 41, 160))
         press(*link)
         title = f'the page child laid out "Flowerbed {number}"'.encode()
         wait_for(f"flowerbed {number} failed to load", lambda: title in log())

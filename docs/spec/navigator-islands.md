@@ -249,6 +249,16 @@ cache. On Back it requires the store as the source, a new viewer, and no
 second parent GET in the fixture’s HTTP request log. It then checks the
 restored prompt and Start consent through the production UI.
 
+The installed saved-record run passed on arm64 Tessera with JIT off. The
+original viewer exited after parking. After sixteen distinct fixture pages
+were fetched, Back created a new viewer and Navigator reported the store
+as the source. The parent had one GET for the run. The rebuilt page had no
+unload question on screen or in the accessibility tree. Its widget stayed
+idle through the Start prompt. Confirming Start produced the second widget
+GET and a fresh counter that advanced from 0 to 1 and closed on its own
+Leave. Evidence is in
+`~/atrium-vm/evidence/navigator-i2-saved-record-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`
