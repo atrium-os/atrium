@@ -160,6 +160,11 @@ if ! remote "sh -s -- '$guest' '$marker' hold" <"$scripts/prelum-r7-identity.sh"
     exit 1
 fi
 cat "$D/identity-check.log"
+if ! remote "sh -s -- '$guest' '$marker' retry" <"$scripts/prelum-r7-identity.sh" >"$D/identity-retry.log" 2>&1; then
+    cat "$D/identity-retry.log" >&2
+    exit 1
+fi
+cat "$D/identity-retry.log"
 # The transcript and spool checks below also reject any upload from the held job.
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/desktop-jobs.txt" >"$D/pdf-checks.log"
 cat "$D/pdf-checks.log"
