@@ -333,7 +333,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
                             if forwarding == initial_forwarding:
                                 assert receipts.with_suffix(".recovery-approved").exists(), "recovered ESP uploaded restored forwarding before approval"
-                        if hip == RECOVERED_HIP_RECONNECT and calls.count("getconfig.esp") == 12:
+                        if hip == RECOVERED_HIP_RECONNECT and calls.count("getconfig.esp") >= 12:
                             assert receipts.with_suffix(".recovered-reconnect-approved").exists(), "recovered ESP reconnected before fresh approval"
                         if receipts:
                             with receipts.open("a") as receipt:
@@ -731,7 +731,7 @@ def main():
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (12 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -747,7 +747,7 @@ def main():
                         if final_recover:
                             expected_spis.extend([esp.configs[9][0][0]] * 3 + [esp.configs[10][0][0]])
                         if recovered_reconnect:
-                            expected_spis.extend([esp.configs[11][0][0]] * 2)
+                            expected_spis.extend([esp.configs[11][0][0]] * 2 + [esp.configs[12][0][0]] * 2)
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -761,7 +761,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        recovery_echoes = 6 if recovered_reconnect else 4
+                        recovery_echoes = 8 if recovered_reconnect else 4
                         allowed_echoes.append([
                             *expected_spis[:-recovery_echoes], expected_spis[-recovery_echoes - 1],
                             *expected_spis[-recovery_echoes:],
@@ -865,7 +865,10 @@ def main():
                                                 if recovered_reconnect:
                                                     assert calls[configs[11] - 1] == "hipreportcheck.esp", calls
                                                     assert len(reports[reconnected_report:]) >= 2 and set(reports[reconnected_report:]) == {changed}, reports
-                                                    print("Reconnect after recovered ESP decline required fresh approval and refreshed silently")
+                                                    last_rebind_report = calls[:configs[12]].count("hipreport.esp")
+                                                    assert last_rebind_report >= reconnected_report + 2, reports
+                                                    assert len(reports[last_rebind_report:]) >= 2, reports
+                                                    print("Recovered ESP reconnected with fresh approval, then rebound and refreshed silently")
                                                 elif recovered_decline:
                                                     print("Declining changed HIP after recovered ESP rebind kept the report unsent and shut down ESP")
                                                 else:
