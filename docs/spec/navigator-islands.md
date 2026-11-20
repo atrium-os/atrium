@@ -193,6 +193,23 @@ To repeat, pin and serve `counter-unload.html` as `counter.html` using the
 worker lifecycle setup above and pass `--unload` to the installed gate.
 Evidence is in `~/atrium-vm/evidence/navigator-i2-unload-cancel-20261121/`.
 
+The Stop-and-replacement gate runs with the same worker and production broker.
+Stop withdrew the first worker while its unload question was visible. Both
+answer buttons disappeared from the accessibility tree and the tier returned
+to Static. Guarded Start opened a fresh counter on the same document. With
+query 1 pending again, a gate-only UI sent Leave for the retired Start using
+a fresh compositor press, then sent Stay for the replacement. The replacement
+kept its PID and advanced to Count 2. Its own Leave on query 2 closed it once.
+The parent and page PIDs stayed unchanged across the two widget fetches.
+
+To repeat, apply `test-assets/navigator-i0/retired-unload-ui.patch` to a
+disposable copy of the UI source before cross-building and staging the UI
+bundle. The patch captures the first pending question and writes the delayed
+answer over the usual broker connection. Use the unload fixture above and
+pass `--pending-stop` to `scripts/navigator-i2-stop-check.py`. Guest logs,
+frames and binary hashes are in
+`~/atrium-vm/evidence/navigator-i2-pending-stop-20261121/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`

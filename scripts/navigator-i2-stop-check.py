@@ -16,8 +16,10 @@ parser.add_argument("--recycle", action="store_true", help="use counter-recycle.
 parser.add_argument("--reports", action="store_true", help="verify the counter's typed origin and title on both launches")
 parser.add_argument("--lifecycle", action="store_true", help="use the pinned counter-lifecycle fixture with UI AX")
 parser.add_argument("--unload", action="store_true", help="use the pinned counter-unload fixture with UI AX")
+parser.add_argument("--pending-stop", action="store_true",
+                    help="use counter-unload and the retired-unload-ui.patch gate build with UI AX")
 args = parser.parse_args()
-if args.reports or args.lifecycle or args.unload:
+if args.reports or args.lifecycle or args.unload or args.pending_stop:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -226,6 +228,82 @@ def unload():
             or report.count(b"widget GET ") != 1 or b"prompt=widget-failed" in report):
         raise RuntimeError("unexpected parent, reload or retirement outcome")
     print(f"Stay preserved worker {int(worker)} at Count 1; timeout preserved Count 2. Increment reached 3, then Leave retired it exactly once.")
+
+
+def pending_stop():
+    def prompt(opened):
+        report = log()
+        traces = [line for line in report.splitlines() if line.startswith(b"navigator-ui: trace ")]
+        trees = report.split(b'navigator-ui: ax window "Navigator"')
+        if not traces or len(trees) == 1:
+            return False
+        expected = b" prompt=widget-unload " if opened else b" prompt=- "
+        return expected in traces[-1] and all(
+            (item in trees[-1]) == opened for item in
+            (b'ax   region "Leave the widget', b'ax     button "Leave"', b'ax     button "Stay"'))
+
+    def visible_question(name):
+        image = subprocess.run(["magick", str(frame(name)), "-crop", "900x45+240+41",
+                                "+repage", "-resize", "240%", "png:-"],
+                               capture_output=True, check=True, timeout=5).stdout
+        words = subprocess.run(["tesseract", "stdin", "stdout", "--psm", "6"], input=image,
+                               capture_output=True, check=True, timeout=5).stdout.lower()
+        return b"leave the widget" in words
+
+    def question(name):
+        time.sleep(1.05)
+        press(434, 118)
+        wait_for(name, lambda: prompt(True))
+        time.sleep(.65)
+        wait_for("unload question missing from frame", lambda: visible_question(name))
+
+    parents = parent()
+    start(0)
+    count("first", 0)
+    first = guest("pgrep -x counter")
+    press(350, 118)
+    count("first-edited", 1)
+    question("retiring-question")
+    press(905, 135)  # The prompt moves the compositor's Stop button down 44 px.
+    wait_for("Stop left the old worker or its prompt", lambda: prompt(False)
+             and b"live widget stopped" in log() and not guest("pgrep -x counter || true"))
+    tier(False)
+    wait_for("retired question still painted", lambda: not visible_question("prompt-withdrawn"))
+    start(1)
+    count("replacement", 0)
+    second = guest("pgrep -x counter")
+    if first == second:
+        raise RuntimeError("guarded Start did not create a new worker")
+    press(350, 118)
+    count("replacement-edited", 1)
+    question("replacement-question")
+    press(1008, 60)  # Gate UI writes the retired Leave first, followed by the current Stay.
+    wait_for("retired answer affected replacement query 1", lambda:
+             b"sent retired Leave for matching document and query 1" in log()
+             and b"widget unload 1 leave=false" in log() and prompt(False), 8)
+    tier(True)
+    press(350, 118)
+    count("replacement-survived", 2)
+    if guest("pgrep -x counter") != second:
+        raise RuntimeError("replacement changed after the retired Leave")
+    question("current-question")
+    press(1008, 60)
+    wait_for("current Leave failed", lambda: b"widget unload 2 leave=true" in log()
+             and not guest("pgrep -x counter || true") and prompt(False))
+    tier(False)
+    frame("closed")
+    report = log()
+    if (parent() != parents or report.count(b"widget GET ") != 2
+            or report.count(b"widget reported voluntary close") != 1
+            or b"prompt=widget-failed" in report or b"widget unload 1 leave=true" in report):
+        raise RuntimeError("unexpected parent, fetch or retirement outcome")
+    print(f"Stop withdrew query 1 and worker {int(first)}. Replacement {int(second)} stayed on query 1,"
+          " reached Count 2 after the retired Leave, and closed once on its own query 2.")
+
+
+if args.pending_stop:
+    pending_stop()
+    raise SystemExit(0)
 
 
 if args.unload:

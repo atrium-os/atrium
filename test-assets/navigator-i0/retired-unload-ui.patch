@@ -1,0 +1,49 @@
+--- a/navigator-ui/src/live.rs
++++ b/navigator-ui/src/live.rs
+@@ -111,6 +111,7 @@
+     embeds: Option<Rc<RefCell<Embeds>>>,
+     window: Option<WindowToken>,
+     widget: Option<ActiveWidget>,
++    first_unload: Option<(Ticket, ctl::Press, u32)>,
+     children: Vec<Child>,
+     /// The page whose child is in the slot (`None`: Start).
+     shown: Option<Key>,
+@@ -272,6 +273,7 @@
+                 embeds: None,
+                 window: None,
+                 widget: None,
++                first_unload: None,
+                 children: vec![],
+                 shown: None,
+                 started: false,
+@@ -703,6 +705,7 @@
+                 Event::WidgetUnload { document, start, query, pending } => {
+                     if let Some(active) = self.widget.filter(|w| w.document == document && w.press == start) {
+                         if pending {
++                            self.first_unload.get_or_insert((document, start, query));
+                             let origin = s.store.page_by_key_mut(active.page.0, active.page.1)
+                                 .and_then(|page| page.attached_origin.clone());
+                             let shown = self.shown == Some(active.page) && origin.is_some_and(|origin| s.ask_at(active.page,
+@@ -996,6 +999,22 @@
+                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                 Out::AnswerUnload { start, query, leave, press } => {
+                     if let Some(a) = self.widget.filter(|a| a.press == start && self.shown == Some(a.page)) {
++                        // The gate presses Leave with a genuine fresh activation. Replay the
++                        // retired question first, then keep the replacement open with Stay.
++                        if let Some((document, retired_start, retired_query)) = self.first_unload {
++                            if leave && document == a.document && retired_start != start && retired_query == query {
++                                assert_ne!(press, [0; 16]);
++                                ctl::write_frame(&mut self.w, &Request::WidgetUnloadAnswer {
++                                    document, start: retired_start, query, leave: true, press,
++                                }).expect("write retired Leave");
++                                self.first_unload = None;
++                                eprintln!("navigator-ui fixture: sent retired Leave for matching document and query {query}");
++                                send(&mut self.w, &Request::WidgetUnloadAnswer {
++                                    document, start, query, leave: false, press,
++                                });
++                                continue;
++                            }
++                        }
+                         send(&mut self.w, &Request::WidgetUnloadAnswer { document: a.document, start, query, leave, press });
+                     }
+                 }
