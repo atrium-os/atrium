@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-rebind-retry) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=5 ;;
     esp-loss-hip-submit-retry-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=4 ;;
     esp-loss-hip-submit-retry-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=3 ;;
     esp-loss-hip-submit-retry-recheck) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=2 ;;
@@ -671,6 +672,19 @@ rebind_restored_forwarding() {
     reviews=$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")
     before_rebind=$(awk 'END { print NR }' "$receipts")
     "$V" "$CTL rebind name=gp-gate" >/dev/null
+    if [ "$retry_hip_submit" = 5 ]; then
+        for _ in $(seq 1 25); do
+            failures=$("$V" "grep -o 'gp-gate: not connected (GlobalProtect HIP submission failed:' $G/cryptad.log | wc -l | tr -d ' '")
+            [ "$failures" != 2 ] || break
+            sleep 1
+        done
+        [ "$failures" = 2 ] && [ "$(field handshake)" = 0 ] ||
+            fail "the dropped rebind HIP response did not keep ESP down"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed before the rebound HIP retry was acknowledged"
+        ok "rebound ESP stayed down after the dropped HIP response"
+        touch "$receipts.rebind-retry"
+    fi
     for _ in $(seq 1 30); do
         [ "$(field signin)" != prompt ] || fail "unchanged restored HIP prompted on rebind"
         connected=$("$V" "grep -o 'gp-gate: connected' $G/cryptad.log | wc -l | tr -d ' '")
