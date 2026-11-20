@@ -223,3 +223,13 @@ Run the interleaved-save gate with `stale-refresh interleave external-edit`. Scr
 The test retries ordinary Save and matches the desktop frame showing B1=4 and the warning “The workbook changed since it was opened. Reopen it or use Save As.” The protected sibling then saves B1=3. Without retyping the pending edit, the plain workbook uses Save As in its tiled window. The independent reader checks `zebra,4` in `Proof (2).osheet` and `fox,3` in the protected sibling. The test also compares the external file byte-for-byte with the outside writer’s copy and checks that Save As leaves the sibling’s digest unchanged.
 
 The gate passed on both native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. After both jails closed, all three archived workbooks from each run passed the independent reader checks. Both markers cleared and both recovery devices detached.
+
+## Ordinary Save on the conflict copy and desktop reopen
+
+The `external-edit` gate continues in the same plain window after Save As. It enters C1=7 and presses ordinary Save. Scrinium must see the plain jail’s UID and only `Proof (2).osheet` may change. The gate checks the new copy contains `zebra,4,7`, compares the external file with the outside writer’s bytes, and checks the protected sibling’s digest.
+
+After closing both recovered windows and detaching their devices, the gate uses the launcher's Open picker for each file. It unlocks the protected sibling with its fixture password. For each open it checks the document jail, the loaded filename and the active autosave snapshot created by that jail from the newly loaded workbook.
+
+The first desktop run reproduced a picker refusal for the sealed `Untitled.osheet`. The shared file-type table now recognizes the version-one sealed envelope when the filename has the workbook suffix. The envelope is common to Officina documents, so suffix-free sealed bytes alone do not identify a spreadsheet. All nine host file-type tests passed, including checks for a truncated header and an unsupported envelope version.
+
+The full desktop test passed with both native Tessera and bounded UFS recovery volumes in the private Tessera-root VM. Fresh document jails reopened `Proof.osheet` with A1=`zebra` and blank B1, `Untitled.osheet` with `fox,3`, and `Proof (2).osheet` with `zebra,4,7`. Each close cleared its recovery marker and detached its volume.

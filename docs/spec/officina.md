@@ -192,7 +192,9 @@ every length bounded.
 Sheets asks for one workbook using the picker’s `Workbook` mode. The file
 descriptor goes to the new jail. The window that requested Open receives
 completion and keeps its own workbook. Opening from the Files window uses
-the same Portcullis launcher.
+the same Portcullis launcher. A version-one sealed Officina envelope confirms the
+`.osheet` suffix for a protected workbook. Sheets asks for the password inside
+the new document jail.
 
 ### 4.2 Save and Save As
 

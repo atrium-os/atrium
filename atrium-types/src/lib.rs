@@ -112,7 +112,8 @@ pub static TYPES: &[Type] = &[
     // Atrium app bundles (atrium-bundle-format.md §8).
     t!("application/vnd.atrium.insula", "Atrium app", Bundle, ["insula"], [Bytes(&[(0, b"INSB")])], []),
     // Documents.
-    t!("application/vnd.atrium.osheet", "Sheets workbook", Spreadsheet, ["osheet"], [Bytes(&[(0, b"OFFICINA"), (10, b"\x01\x00")])], []),
+    // The sealed envelope is shared across Officina formats and only confirms the suffix.
+    t!("application/vnd.atrium.osheet", "Sheets workbook", Spreadsheet, ["osheet"], [Bytes(&[(0, b"OFFICINA"), (10, b"\x01\x00")])], [Bytes(&[(0, b"OFFICINA-SEALED\0\x01\0\0\0")])]),
     t!("application/pdf", "PDF document", Document, ["pdf"], [Bytes(&[(0, b"%PDF-")])], []),
     t!("application/vnd.oasis.opendocument.text", "OpenDocument text", Document, ["odt"], [Bytes(&[(0, b"PK\x03\x04"), (30, b"mimetypeapplication/vnd.oasis.opendocument.text")])], [Bytes(ZIP)]),
     t!("application/vnd.oasis.opendocument.spreadsheet", "OpenDocument spreadsheet", Spreadsheet, ["ods"], [Bytes(&[(0, b"PK\x03\x04"), (30, b"mimetypeapplication/vnd.oasis.opendocument.spreadsheet")])], [Bytes(ZIP)]),
@@ -367,6 +368,11 @@ mod tests {
     #[test]
     fn sheets_native_kind_is_distinct() {
         assert_eq!(mime(detect("book.osheet", b"OFFICINA\0\0\x01\0\0\0\0\0")), "application/vnd.atrium.osheet");
+        let sealed = b"OFFICINA-SEALED\0\x01\0\0\0";
+        assert_eq!(mime(detect("book.osheet", sealed)), "application/vnd.atrium.osheet");
+        assert!(by_bytes(sealed).is_none());
+        assert!(detect("book.osheet", &sealed[..16]).known().is_none());
+        assert!(detect("book.osheet", b"OFFICINA-SEALED\0\x02\0\0\0").known().is_none());
         assert!(!matches!(detect("book.osheet", b"OFFICINA\0\0\x02\0\0\0\0\0"), Detected::Known(_)));
     }
 

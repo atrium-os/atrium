@@ -18,7 +18,7 @@
 # Append restart-limen after interleave to restart the private Limen between Save As and Save.
 # Use pending-save instead of restart-limen to interrupt an ordinary Save before delivery.
 # Use published-save to interrupt confirmation after publication (requires guest LLDB).
-# Use external-edit to change the published file after reconnect and recover the pending edit via Save As.
+# Use external-edit to exercise the conflict, save another cell on the new grant, and reopen all three files.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -796,6 +796,18 @@ SH
             wait_for opened "$jid" "$copy"
             cmp "$books/Proof.osheet" "$results/external.osheet"
             test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
+            /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
+            wait_for tiled
+            copy_hash=$(sha256 -q "$books/$copy")
+            trace_offset=$(wc -l < select-files.log)
+            edit 191 0x24 # C1=7, retaining B1=4 from Save As.
+            click 125 24
+            copy_saved() { test "$(sha256 -q "$books/$copy")" != "$copy_hash"; }
+            wait_for copy_saved
+            tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid ${plain_root##*-})"
+            /tmp/check-recovered-copy "$books/$copy" zebra,4,7 plain
+            cmp "$books/Proof.osheet" "$results/external.osheet"
+            test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
         else
             plain_input=0x21
             plain_published=zebra
@@ -815,8 +827,7 @@ SH
         /tmp/tile-recovery-windows --clear-focus
         key 0x1a 1; wait_for count 0
         /tmp/tile-recovery-windows --clear-focus
-        if test "${5:-}" = external-edit; then mv "$books/$copy" "$results/"; fi
-        mv "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"
+        if test "${5:-}" != external-edit; then mv "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"; fi
         test "$(cat "$books/Proof.csv")" = Original
     else
         save_copy plain
@@ -846,6 +857,40 @@ SH
     test "$(wc -l < "$bin/attempts")" -eq 1
     test -z "$(mdconfig -lv | grep sheets-recovery)"
     restore_broker; trap - EXIT
+    if test "${5:-}" = external-edit; then
+        # Open from the launcher after the recovered jails and their mounts are
+        # gone. Read the autosave snapshot created from each newly loaded model.
+        reopen_copy() {
+            name=$1; row=$2; cells=$3; mode=$4
+            count 0; pending 0
+            launcher=$(win_at 48 24)
+            click 48 24; wait_for different_window 488 "$row" "$launcher"
+            picker=$win
+            click 488 "$row"; sleep .5; key 0x28
+            wait_for count 1
+            reopened=$(docs)
+            test "$reopened" != "$jid" && test "$reopened" != "$sibling"
+            document_visible() {
+                different_window 48 24 "$launcher" && test "$win" != "$picker"
+            }
+            wait_for document_visible
+            if test "$mode" = protected; then
+                type_keys 0x17 0x08 0x16 0x17 0x28 # fixture password: test
+            fi
+            wait_for opened "$reopened" "$name"
+            directory=$(dirname "$(find "$(root "$reopened")/atrium/recovery" -name name -exec grep -lx "$name" {} +)")
+            wait_for test -s "$directory/current"
+            generation=$(cat "$directory/current")
+            /tmp/check-recovered-copy "$directory/base.$generation.osheet" "$cells" "$mode"
+            key 0x1a 1; wait_for count 0; wait_for pending 0; wait_for detached
+        }
+        reopen_copy Proof.osheet 243 zebra plain
+        reopen_copy Untitled.osheet 273 fox,3 protected
+        reopen_copy "$copy" 183 zebra,4,7 plain
+        cmp "$books/Proof.osheet" "$results/external.osheet"
+        test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
+        mv "$books/$copy" "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"
+    fi
     echo "Recovered one delayed workbook. Frame and copies: $results"
     exit 0
 fi
