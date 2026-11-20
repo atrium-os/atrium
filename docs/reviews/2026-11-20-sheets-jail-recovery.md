@@ -106,3 +106,11 @@ After the chooser cached both names, the fixture replaced the detached image for
 Both before-list and after-list substitutions passed with native Tessera and bounded UFS images in the isolated Tessera-root VM. Launcher screenshots confirmed the named error in both selection paths. An independent reader checked the protected sibling’s `fox` edit after Save As and `fox,2` after Save. Restoring the original image with its SHA-256 digest intact allowed Recover to reopen the original ID and save `zebra`, then `zebra,2`. Both workbooks closed with no pending marker or attached recovery device. The UFS missing-image case also passed after listing. Five focused broker tests passed on FreeBSD.
 
 Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-unmountable-image after-list` or `--retry-unmountable-image before-list`.
+
+## Jail setup fails after the recovery image mounts
+
+The desktop gate opened and edited two workbooks, crashed both document processes and listed their pending recoveries. The fixture placed a regular file where Portcullis needed to create the selected workbook’s writable jail layer. Selecting that workbook reached jail setup and the broker logged the expected file-exists error. Both markers remained byte-identical. The recovery device detached, and the failed launch left no document jail or mounts at the jail root or upper layer.
+
+While that path was still blocked, the protected sibling recovered and saved. After the fixture removed the file, the same broker reopened the selected workbook with its original recovery ID and jail path. An independent reader verified A1 after Save As and A1/B1 after a subsequent Save for each workbook (`fox,2` and `zebra,2`). Both copies closed with no pending markers or attached recovery devices.
+
+Both native Tessera and bounded UFS recovery volumes passed in the isolated Tessera-root VM. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-jail-setup`. The setup failure is currently reported in the broker log.

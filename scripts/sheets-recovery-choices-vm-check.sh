@@ -13,6 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
+# --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
 # --retry-unmountable-image leaves an unformatted fixture file at the image path.
 set -eu
 cd /var/tmp/sheets-desktop
@@ -55,6 +56,7 @@ make_pair() {
     wait_for different_window 488 183 "$launcher"
     click 488 183; sleep .5; key 0x28
     wait_for count 1; plain=$(docs)
+    plain_root=$(root "$plain")
     wait_for opened "$plain" Proof.csv
     sleep .6
     edit 62 0x1d 0x08 0x05 0x15 0x04 # zebra
@@ -464,6 +466,49 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     else
         recover_named_pair
     fi
+    exit 0
+fi
+if test "${1:-}" = --retry-jail-setup; then
+    first=setup-retry
+    broker_pid=$(sockstat -ulw | awk '$6=="/atrium/sockets/portcullis/portcullis.sock" {print $3}')
+    test -n "$broker_pid"
+    test "$(ls -A "$books")" = Proof.csv
+    make_pair
+    marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 0.pending)
+    store=$(dirname "$marker")
+    click 213 24
+    for slot in 0 1; do wait_for grep -Fq '"checked_detached":true' "$store/$slot.pending"; done
+    detached() { test -z "$(mdconfig -lv | grep sheets-recovery)"; }
+    wait_for detached
+    cp "$marker" "$results/selected.marker"
+    cp "$store/1.pending" "$results/sibling.marker"
+    upper="$plain_root-upper"
+    # A regular file at the tmpfs mountpoint makes create_dir_all fail with EEXIST.
+    # Link without replacement so teardown only unlinks the exact fixture inode.
+    touch "$results/blocked-upper"
+    unblock() { if test "$upper" -ef "$results/blocked-upper"; then unlink "$upper"; fi; }
+    trap unblock EXIT
+    test ! -e "$upper"
+    ln "$results/blocked-upper" "$upper"
+    start=$(wc -l < select-port.log)
+    click 120 96
+    failed() { tail -n "+$((start+1))" select-port.log | grep -Fq 'Sheets workbook launch: Failed("document", "File exists'; }
+    wait_for failed
+    wait_for detached; count 0; pending 2
+    mount -p | awk -v root="$plain_root" -v upper="$upper" '$2==root || index($2,root "/")==1 || $2==upper {found=1} END {exit found}'
+    cmp "$marker" "$results/selected.marker"
+    cmp "$store/1.pending" "$results/sibling.marker"
+    choose protected; save_copy protected; wait_for pending 1
+    cmp "$marker" "$results/selected.marker"
+    unblock; trap - EXIT
+    click 213 24; wait_for count 1; wait_for opened "$(docs)" Proof.csv
+    test "$(root "$(docs)")" = "$plain_root"
+    kill -0 "$broker_pid"
+    mdconfig -lv | grep -F "$store/0." >/dev/null
+    sed 's/,"name":.*//' "$marker" > "$results/retried.id"
+    sed 's/,"name":.*//' "$results/selected.marker" | cmp -s - "$results/retried.id"
+    save_copy plain; wait_for pending 0; wait_for detached
+    echo "Retried the same workbook after jail setup failed. Copies: $results"
     exit 0
 fi
 if test "${1:-}" = --retry-missing-image || test "${1:-}" = --retry-unmountable-image; then
