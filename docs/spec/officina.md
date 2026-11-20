@@ -194,7 +194,8 @@ descriptor goes to the new jail. The window that requested Open receives
 completion and keeps its own workbook. Opening from the Files window uses
 the same Portcullis launcher. A version-one sealed Officina envelope confirms the
 `.osheet` suffix for a protected workbook. Sheets asks for the password inside
-the new document jail.
+the new document jail. When the prompt would crowd the password field, Sheets
+wraps the full prompt above the field and its Open and Cancel buttons.
 
 ### 4.2 Save and Save As
 

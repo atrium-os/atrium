@@ -794,6 +794,8 @@ SH
             wait_for test -s "$books/$copy"
             /tmp/check-recovered-copy "$books/$copy" zebra,4 plain
             wait_for opened "$jid" "$copy"
+            picker_dismissed() { test "$(win_at 611 457)" = "$plain_win"; }
+            wait_for picker_dismissed
             cmp "$books/Proof.osheet" "$results/external.osheet"
             test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
             /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
@@ -915,7 +917,35 @@ SH
         close_reopened; files_intact
 
         open_row 243; loaded_cells Proof.osheet zebra plain; close_reopened
-        open_row 183; loaded_cells "$copy" zebra,4,7 plain; close_reopened
+        open_row 183; loaded_cells "$copy" zebra,4,7 plain
+
+        # Open a long-named protected copy from the plain document, then put
+        # both windows into 640 px tiles on the 1280 px fixture desktop.
+        long_name='Year End Consolidated Financial Statements and Regional Revenue Reconciliation - Final Audit Committee Review.osheet'
+        test ! -e "$books/$long_name"
+        install -o sheetsfiles -m 600 "$books/Untitled.osheet" "$books/$long_name"
+        left_jail=$reopened; left_window=$(win_at 48 24)
+        click 48 24; wait_for different_window 488 303 "$left_window"
+        picker_window=$win
+        click 488 303; sleep .5; key 0x28
+        wait_for count 2; reopened=$(docs | grep -vx "$left_jail")
+        protected_visible() { different_window 48 24 "$left_window" && test "$win" != "$picker_window"; }
+        wait_for protected_visible
+        /tmp/tile-recovery-windows "$left_window" "$win" "$win"
+        input 'MOVE 688 24'
+        wait_for frame_is f8a508c84809a8200efd35035e5559b40b10bb1eb0c1823ac36e625c39e7a725
+        cp selectscreen.png "$results/tiled-password.png"
+        type_keys 0x05 0x04 0x07 0x28 # bad
+        wait_for frame_is 2fe24233ccb855c86ec86a34af959fffe97822bc8baccb43054f5738ce501407
+        cp selectscreen.png "$results/tiled-retry.png"
+        type_keys 0x17 0x08 0x16 0x17 0x28 # test
+        loaded_cells "$long_name" fox,3 protected
+        key 0x1a 1; wait_for count 1
+        /tmp/tile-recovery-windows --clear-focus
+        test "$(docs)" = "$left_jail"
+        close_reopened
+        cmp "$books/Untitled.osheet" "$books/$long_name"
+        mv "$books/$long_name" "$results/"
         cmp "$books/Proof.osheet" "$results/external.osheet"
         test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_saved"
         mv "$books/$copy" "$books/Proof.osheet" "$books/Untitled.osheet" "$results/"

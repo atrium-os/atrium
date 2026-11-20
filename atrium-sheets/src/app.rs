@@ -2102,21 +2102,35 @@ impl View for Sheets {
         // The password bar, over the formula bar and the grid's top.
         let pb = self.password.get_cloned();
         if pb.open {
-            let (y, bh) = (TOOLBAR_H, 48.0);
-            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            let y = TOOLBAR_H;
             let push = |c: Cmd| {
                 let cmds = self.cmds.clone();
                 move || cmds.lock().unwrap().push(c)
             };
             let prompt_style = st(type_size::MD, Weight::Semibold, t.text_primary());
-            let available = w - 20.0 - 164.0; // space before the Open/Set and Cancel buttons
-            let lw = Node::measure_text(&pb.prompt, &prompt_style).w.ceil().min((available - 120.0).max(0.0));
-            let fw = (available - lw).max(0.0);
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, lw, 20.0), content: pb.prompt, style: prompt_style });
+            let prompt_width = Node::measure_text(&pb.prompt, &prompt_style).w.ceil();
+            let field_right = w - 164.0; // leave room for Open/Set and Cancel
+            let stacked = prompt_width + 20.0 + 120.0 > field_right || pb.prompt.contains('\n');
+            let line_height = if stacked { pergola::text::line_height(&prompt_style) } else { 20.0 };
+            let (lines, label_width, field_x, extra_height) = if stacked {
+                let width = (w - 24.0).max(1.0);
+                let lines = pergola::text::lines(&pb.prompt, &prompt_style, width);
+                let height = lines.len() as f32 * line_height;
+                (lines, width, 12.0, height)
+            } else {
+                (vec![pb.prompt], prompt_width, prompt_width + 20.0, 0.0)
+            };
+            let bh = 48.0 + extra_height;
+            let field_y = y + 8.0 + extra_height;
+            let label_y = if stacked { y + 6.0 } else { y + 14.0 };
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            for (i, content) in lines.into_iter().enumerate() {
+                ctx.add(Node::Text { rect: Rect::new(12.0, label_y + i as f32 * line_height, label_width, line_height), content, style: prompt_style.clone() });
+            }
             let cmds = self.cmds.clone();
-            TextField::new(self.password_text.clone()).placeholder("Password").autofocus(true).at(lw + 20.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
-            Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordDone)).render(ctx);
-            Button::secondary("Cancel").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::PasswordClose)).render(ctx);
+            TextField::new(self.password_text.clone()).key(0x5348_5057).placeholder("Password").autofocus(true).at(field_x, field_y).width((field_right - field_x).max(0.0)).on_submit(move |_| cmds.lock().unwrap().push(Cmd::PasswordDone)).render(ctx);
+            Button::primary(if pb.setting { "Set" } else { "Open" }).at(w - 148.0, field_y).width(64.0).on_click(push(Cmd::PasswordDone)).render(ctx);
+            Button::secondary("Cancel").at(w - 76.0, field_y).width(64.0).on_click(push(Cmd::PasswordClose)).render(ctx);
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 

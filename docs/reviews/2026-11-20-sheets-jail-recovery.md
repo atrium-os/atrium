@@ -247,3 +247,11 @@ Both password paths passed on native Tessera and bounded UFS recovery volumes. T
 In the 1100 px document window, the previous 300 px label clipped the end of “Try again”. Sheets now measures the prompt with Pergola using the same semibold style it draws. The retry frame shows the complete message `Wrong password for “Untitled.osheet”. Try again`. The input starts at x=360, with a gap after the final letter. Open and Cancel retain their positions. The desktop gate matches the initial and retry frames before entering the correct password or cancelling.
 
 The visual checks, correct-password retry, cancellation and plain-file integrity checks passed with both Tessera and UFS recovery volumes in the isolated VM.
+
+## Long workbook name in a tiled password prompt
+
+The original single-line retry prompt ran behind the password field and buttons in a 640 px tile. The regression opens a protected workbook named `Year End Consolidated Financial Statements and Regional Revenue Reconciliation - Final Audit Committee Review.osheet` and tiles it beside the plain workbook. When the text would crowd the field, Sheets uses Pergola’s measured line breaks across the tile and places the controls below the last line. Short prompts still use the single-row layout.
+
+The retry frame shows the name through `Review.osheet` and ends with “Try again” on the second line. The test compares both the initial and retry frames, then types the correct password without clicking the field after tiling. The loaded protected workbook must contain `fox,3`. The password field has a stable focus ID across changes to the number of prompt lines.
+
+The final desktop gate passed on native Tessera and bounded UFS recovery volumes, including the existing 1100 px prompt checks and the two new 640 px frames.
