@@ -151,7 +151,10 @@ New can still reuse the cleanly closed slot and Recover can reopen a sibling
 with its unsaved edits. If a Save As name update was interrupted, the first
 post-reboot chooser reads the published name from the detached autosave.
 If a recovery image is missing or fails to mount, the launcher shows the
-workbook name in the error, including when the chooser already listed it. Other pending workbooks can be recovered independently. Once the
+workbook name in the error, including when the chooser already listed it.
+If the image mounts but preparing the document jail fails, the launcher
+names the workbook and prompts the user to try Recover again.
+Other pending workbooks can be recovered independently. Once the
 image is available, Recover can reopen it with its original identity.
 Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
 closes that recovery window and leaves the generation available to try again.

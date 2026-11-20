@@ -254,6 +254,7 @@ struct WorkbookLaunch {
     prepared: Option<RecoveryMount>,
     // Drop any prepared mount before making the slot available again.
     slot: WorkbookSlot,
+    setup_ready: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -464,7 +465,11 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
         })?;
         Some(RecoveryMount { store, pending: pending.clone(), clean: false, id: [0; 16] })
     } else { None };
-    let document = WorkbookLaunch { blank, recover, pending, publisher, name, prepared, slot };
+    let (setup_ready, setup_result) = recover.then(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+        (sender, (receiver, name.clone()))
+    }).unzip();
+    let document = WorkbookLaunch { blank, recover, pending, publisher, name, prepared, slot, setup_ready };
     let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
     std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
         let result = launch_inner(portcullis_policy::opens::SHEETS, persona.as_deref(),
@@ -473,6 +478,11 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
             eprintln!("portcullisd: Sheets workbook launch: {e:?}");
         }
     })?;
+    if let Some((result, name)) = setup_result {
+        // Dropping the receiver on timeout also cancels a worker still in setup.
+        result.recv_timeout(Duration::from_secs(2)).map_err(|_| std::io::Error::other(
+            format!("Could not prepare a recovery window for “{name}”. Try Recover again.")))?;
+    }
     Ok(Vec::new())
 }
 
@@ -886,6 +896,9 @@ fn launch_inner(
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
         return Err(e);
+    }
+    if let Some(ready) = document.as_mut().and_then(|doc| doc.setup_ready.take()) {
+        ready.send(()).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
     }
     let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid));
 

@@ -1267,7 +1267,11 @@ mounts its image outside the slot lock before acknowledging the launcher.
 The launch thread takes ownership of that mount for the document jail. A
 failed mount releases the reservation and reports an unavailable image
 for the requested workbook, including when it is the only pending recovery.
-Other workbooks can still be selected.
+Once the image has mounted, the recovery request waits up to two seconds for
+the worker to prepare the jail root and mountpoints. If preparation fails
+or expires, the launcher receives the selected workbook’s name and a retry
+message. A worker that misses the deadline releases its mounts and slot
+before retry and cannot proceed to run the jail. Other workbooks can still be selected.
 
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads

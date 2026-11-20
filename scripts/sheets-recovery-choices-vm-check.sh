@@ -494,11 +494,22 @@ if test "${1:-}" = --retry-jail-setup; then
     click 120 96
     failed() { tail -n "+$((start+1))" select-port.log | grep -Fq 'Sheets workbook launch: Failed("document", "File exists'; }
     wait_for failed
+    # Verified against the rendered launcher text in this fixed headless fixture:
+    # Could not prepare a recovery window for “Proof.csv”. Try Recover again.
+    named_error() { test "$(sha256 -q selectscreen.png)" = b484989308608aba88ef7e66cc5c2d8ee83dabdd93f4f578cabf77416b0e2249; }
+    wait_for named_error
+    cp selectscreen.png "$results/setup-failed.png"
     wait_for detached; count 0; pending 2
     mount -p | awk -v root="$plain_root" -v upper="$upper" '$2==root || index($2,root "/")==1 || $2==upper {found=1} END {exit found}'
     cmp "$marker" "$results/selected.marker"
     cmp "$store/1.pending" "$results/sibling.marker"
     choose protected; save_copy protected; wait_for pending 1
+    cmp "$marker" "$results/selected.marker"
+    start=$(wc -l < select-port.log)
+    click 213 24; wait_for failed
+    input "MOVE 120 96" # Clear the Recover button hover before comparing frames.
+    wait_for named_error
+    wait_for detached; count 0; pending 1
     cmp "$marker" "$results/selected.marker"
     unblock; trap - EXIT
     click 213 24; wait_for count 1; wait_for opened "$(docs)" Proof.csv

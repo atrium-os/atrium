@@ -114,3 +114,9 @@ The desktop gate opened and edited two workbooks, crashed both document processe
 While that path was still blocked, the protected sibling recovered and saved. After the fixture removed the file, the same broker reopened the selected workbook with its original recovery ID and jail path. An independent reader verified A1 after Save As and A1/B1 after a subsequent Save for each workbook (`fox,2` and `zebra,2`). Both copies closed with no pending markers or attached recovery devices.
 
 Both native Tessera and bounded UFS recovery volumes passed in the isolated Tessera-root VM. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-jail-setup`. The setup failure is currently reported in the broker log.
+
+## The launcher identifies the workbook after jail preparation fails
+
+The broker now waits for the document worker to prepare the jail root and mountpoints before acknowledging recovery. With the same blocked upper layer, the launcher displayed “Could not prepare a recovery window for ‘Proof.csv’. Try Recover again.” The desktop gate checks the rendered frame both when the user selects that workbook from two choices and when Recover selects the only remaining workbook.
+
+The gate passed on native Tessera and bounded UFS recovery volumes. The protected sibling saved while the fault was present. After the fixture cleared the fault, retry recovered the original ID in the same jail slot, and the saved copy contained the original edit and a subsequent edit. The source CSV retained its original contents. Both recovery devices detached and both markers cleared. Five focused broker tests passed on FreeBSD.
