@@ -128,3 +128,11 @@ The fixture cached both pending workbook names, then temporarily removed execute
 With execute permission restored, the protected sibling recovered and saved. After the second failure, retry reopened the original workbook in its prior jail slot under the same broker, with its recovery ID intact. An independent reader verified the recovered A1 values and subsequent B1 edits in both saved copies. Both markers and devices cleared on close. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-runtime-start`.
 
 Both native Tessera and bounded UFS recovery volumes passed in the isolated Tessera-root VM. The earlier jail preparation failure case and all five focused FreeBSD broker tests also passed. The launcher cleared the error after successful recovery.
+
+## A recovery takes longer than the startup acknowledgement
+
+The private fixture held the selected document’s runtime jail command after the broker had prepared the mountpoints. With the jail still held and no document process running, the launcher displayed “Sheets is still starting recovery for ‘Proof.csv’.” A second Recover press reached the broker and changed the launcher text to “No closed workbook is waiting for recovery”. The original request remained active.
+
+Releasing the command started exactly one document jail. Its path and recovery ID matched the original workbook. An independent reader verified A1 was `zebra` after Save As and A1/B1 were `zebra,2` after Save. The protected sibling had already recovered and saved `fox,2`. Both documents closed with no pending markers or recovery devices. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-runtime-start` and the private fixture broker path.
+
+The gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both produced the same initial and repeated-press messages.

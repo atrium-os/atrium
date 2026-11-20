@@ -13,6 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
+# --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
 # --retry-unmountable-image leaves an unformatted fixture file at the image path.
@@ -467,6 +468,71 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     else
         recover_named_pair
     fi
+    exit 0
+fi
+if test "${1:-}" = --delayed-runtime-start; then
+    first=delayed-start
+    fixture_broker "${2:?pass the private fixture broker executable}"
+    test "$(ls -A "$books")" = Proof.csv
+    make_pair
+    choose protected; save_copy protected; wait_for pending 1
+    marker=$(find /home/alice/.atrium/apps -maxdepth 2 -name 0.pending)
+    sed 's/,"name":.*//' "$marker" > "$results/original.id"
+
+    # Only the private broker gets this PATH. Hold its runtime jail -c for the
+    # selected UID after the recovery mount and setup handshake have completed.
+    bin="$results/bin"; mkdir "$bin"
+    target="org_atrium_sheets__document_${plain_root##*-}"
+    printf '%s\n' "$target" > "$bin/target"
+    cat > "$bin/jail" <<'SH'
+#!/bin/sh
+set -eu
+dir=${0%/*}
+if test "$#" = 5 && test "$1" = -q && test "$2" = -c && test "$5" = "$(cat "$dir/target")"; then
+    echo "$$" >> "$dir/attempts"
+    for i in $(jot 200); do
+        test ! -e "$dir/hold" && break
+        sleep .1
+    done
+    test ! -e "$dir/hold" || exit 1
+fi
+exec /usr/sbin/jail "$@"
+SH
+    chmod 755 "$bin/jail"
+    touch "$bin/hold"
+    restore_broker() {
+        if test -e "$bin/hold"; then unlink "$bin/hold"; fi
+        fixture_broker "$broker"
+        restart_broker
+    }
+    trap restore_broker EXIT
+    PATH="$bin:$PATH" restart_broker
+    click 213 24
+    wait_for test -s "$bin/attempts"
+    input "MOVE 120 96"
+    # Headless launcher frame with “Sheets is still starting recovery for ‘Proof.csv’.”
+    starting() { test "$(sha256 -q selectscreen.png)" = 9eab724e5b8afc69816b69e78b42f336ff7998adda5cb52f01c365def052fb38; }
+    wait_for starting
+    cp selectscreen.png "$results/starting.png"
+    count 0; pending 1
+    # A repeated press while jail -c is held must leave one launch in flight.
+    offset=$(wc -l < select-port.log)
+    click 213 24
+    repeat_received() { tail -n "+$((offset+1))" select-port.log | grep -Fq 'is app org.atrium.sheets'; }
+    wait_for repeat_received
+    input "MOVE 120 96"; sleep 2.5
+    cp selectscreen.png "$results/repeated.png"
+    count 0; test "$(wc -l < "$bin/attempts")" -eq 1
+    unlink "$bin/hold"
+    wait_for count 1; jid=$(docs)
+    wait_for pgrep -x -j "$jid" atrium-sheets
+    test "$(root "$jid")" = "$plain_root"
+    sed 's/,"name":.*//' "$marker" | cmp -s - "$results/original.id"
+    save_copy plain; wait_for pending 0
+    test "$(wc -l < "$bin/attempts")" -eq 1
+    test -z "$(mdconfig -lv | grep sheets-recovery)"
+    restore_broker; trap - EXIT
+    echo "Recovered one delayed workbook. Frame and copies: $results"
     exit 0
 fi
 if test "${1:-}" = --retry-jail-setup || test "${1:-}" = --retry-runtime-start; then
