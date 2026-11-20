@@ -532,7 +532,7 @@ fn main() {
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
     let mut last_sync = Instant::now();
-    // Closing waits on Save As (true), and Don't Save drops the changes.
+    // A close intent belongs to the active save and expires when it finishes.
     let mut close_after_save = false;
     let mut staged_save = None;
     let mut discard = false;
@@ -549,23 +549,28 @@ fn main() {
         let opening = run.poll_open(&mut want_picker);
         let wait = if recalculating { 1 } else if asking.is_some() || opening { 20 } else { 250 };
         let wait = if printing.is_some() || print_pdf.is_some() { wait.min(20) } else { wait };
-        // Ctrl+P prints, as the toolbar's Print… does.
+        let mut close_requested = false;
         let stepped = win.step_with(&mut app, Some(Duration::from_millis(wait)), |ev| match ev {
             fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
                 want_print = true;
                 true
             }
+            fresco_client::Event::Key { hid_usage: 0x1a, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
+                close_requested = true;
+                true
+            }
             _ => false,
         });
-        match stepped {
-            // Unsaved changes: ask first. Asked to close again while asking (or
-            // while picking), the changes stay in the autosave folder.
-            Ok(StepResult::Closed) if run.sheets.doc.borrow().dirty && !run.sheets.closing.get() && asking.is_none() => {
+        if stepped.is_err() { break; }
+        if close_requested || matches!(stepped, Ok(StepResult::Closed)) {
+            if matches!(asking, Some(Asking::Commit | Asking::SaveAs)) {
+                close_after_save = true;
+            } else if run.sheets.doc.borrow().dirty && asking.is_none() && !run.sheets.closing.get() {
                 run.sheets.closing.set(true);
                 run.sheets.changed();
+            } else {
+                break;
             }
-            Ok(StepResult::Closed) | Err(_) => break,
-            _ => {}
         }
         {
             let mut d = run.sheets.doc.borrow_mut();
@@ -596,6 +601,7 @@ fn main() {
                 }
                 Cmd::PasswordDone => run.password_done(),
                 Cmd::PasswordClose => run.password_cancelled(),
+                Cmd::Save | Cmd::CloseSave if matches!(asking, Some(Asking::Commit | Asking::SaveAs)) && close_after_save => {}
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Print => want_print = true,
                 Cmd::Save | Cmd::CloseSave if matches!(run.target, Some(Target::Picked { .. })) => {

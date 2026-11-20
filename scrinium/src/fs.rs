@@ -316,7 +316,13 @@ pub(crate) fn stage_in<T>(folder: &std::fs::File, write: impl FnOnce(&mut std::f
             publish(stage.as_raw_fd(), leaf)
         })();
         unsafe { libc::unlinkat(stage.as_raw_fd(), leaf.as_ptr(), 0); }
-        Ok((file, saved?))
+        let published = saved?;
+        // A cross-directory rename changes both directories. On UFS with
+        // soft updates, a delayed removal of the source link can advance the
+        // workbook's ctime after the caller records its revision.
+        folder.sync_all()?;
+        stage.sync_all()?;
+        Ok((file, published))
     })();
     unsafe { libc::unlinkat(fd, tmp.as_ptr(), libc::AT_REMOVEDIR); }
     result

@@ -172,7 +172,11 @@ sends a sealed snapshot and its session save grant through Limen. Scrinium
 stages the bytes in the selected directory, syncs the file, checks the original
 entry and revision, atomically replaces it and syncs the directory. Sheets
 keeps the grid interactive while waiting for confirmation and marks only the
-acknowledged revision saved. Later edits stay pending. A stale or expired grant requires reopening the workbook or Save As.
+acknowledged revision saved. Later edits stay pending. Closing the window or
+pressing Ctrl+W during Save waits for the active request. Sheets closes only
+after confirmation if the workbook is clean. A later edit or missing
+confirmation keeps the document open. A stale or expired grant requires
+reopening the workbook or Save As.
 
 Save As sends a sealed native workbook to Scrinium’s Save picker. Scrinium
 publishes the completed file under an unused name and returns a new save grant.
@@ -3457,8 +3461,9 @@ Save.
   don't come back at the next start.
 * Cancel puts the bar away.
 
-A second close request while the bar shows (or while the picker is up)
-closes as before. The changes stay in the autosave folder and come back
+For Sheets, a pending Save or Save As follows §4.2, including on repeated
+close requests. Otherwise a second close request while the bar shows (or
+while the picker is up) closes as before. The changes stay in the autosave folder and come back
 at the next start, so nothing is lost when the window has to go.
 
 ### 16.58 Paragraph direction in Write (2026-11-17)

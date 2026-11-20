@@ -143,6 +143,9 @@ includes a sealed snapshot of up to 2 GiB. Scrinium syncs it before publishing
 the new name with a no-replace rename and returns a session save grant.
 Scrinium keeps the last 128 grants. Each pins a directory and workbook inode.
 Commit checks the selected entry and file revision immediately before rename.
+Scrinium syncs both directories involved in the rename before removing the
+private staging directory. This settles the source link removal on UFS with
+soft updates before a grant records the workbook’s new change timestamp.
 Hard links, special permissions, filesystem flags and user extended attributes
 require Save As. Replacement preserves ownership, mode and supported access ACLs.
 A directory sync error after rename means publication could have succeeded.
