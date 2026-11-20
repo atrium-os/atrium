@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-submit-recovered-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=13 ;;
     esp-loss-hip-submit-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=12 ;;
     esp-loss-hip-submit-final-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=11 ;;
     esp-loss-hip-submit-final-fallback) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=10 ;;
@@ -964,7 +965,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                 fail "freshly approved forwarding did not refresh silently"
                             ok "freshly approved forwarding refreshed silently on recovered ESP"
                             rebind_restored_forwarding 7 "$initial_report"
-                            if [ "$retry_hip_submit" = 12 ]; then
+                            if [ "$retry_hip_submit" -ge 12 ]; then
                                 rebound_iface=$(field iface)
                                 [ -n "$rebound_iface" ] || fail "recovered ESP has no rebound interface"
                                 before_decline=$(awk 'END { print NR }' "$receipts")
@@ -973,13 +974,30 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                 printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
                                     grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
                                     fail "final rebound review omitted changed forwarding"
+                                declined_choice=$(hip_choice)
                                 decline_esp_loss_review 7 "$rebound_iface"
                                 if tail -n "+$((before_decline + 1))" "$receipts" | grep -q "^$changed_word "; then
                                     fail "the final rebound submitted declined forwarding posture"
                                 fi
                                 ok "declining changed forwarding stopped recovered ESP without submitting HIP"
-                                echo "$pass checks passed"
-                                exit 0
+                                if [ "$retry_hip_submit" = 12 ]; then
+                                    echo "$pass checks passed"
+                                    exit 0
+                                fi
+                                reconnect_after_esp_loss_decline "$before_decline" recovered-reconnect-approved
+                                approve_hip
+                                wait_field handshake 1
+                                [ "$(tail -n 1 "$receipts")" = "$rebound_report" ] ||
+                                    fail "reconnect submitted a different forwarding report"
+                                probe "IPv4 echo after approval on reconnected recovered ESP"
+                                before_refresh=$(awk 'END { print NR }' "$receipts")
+                                wait_receipts "$((before_refresh + 1))"
+                                [ "$(field signin)" = in ] &&
+                                    [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$rebound_report" ] &&
+                                    [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$((reviews + 2))" ] ||
+                                    fail "reconnected recovered ESP did not refresh silently"
+                                ok "unchanged forwarding refreshed silently after reconnect"
+                                probe "IPv4 echo after silent refresh on reconnected ESP"
                             fi
                         fi
                     fi
