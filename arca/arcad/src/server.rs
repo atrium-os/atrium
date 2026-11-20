@@ -158,14 +158,23 @@ impl State {
         Ok(State { mail_leases: Default::default(), mail_sign_ins: Default::default(), dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
     }
 
-    fn mail_begin(&mut self, user: &str, publisher: &[u8; 32], app: &str, body: &[u8]) -> Reply {
+    fn mail_begin(&mut self, user: &str, publisher: &[u8; 32], app: &str, body: &[u8], renewing: bool) -> Reply {
+        let (ids, body) = if renewing {
+            let Some((ids, address)) = body.split_first_chunk::<32>() else { return malformed() };
+            (Some(*ids), address)
+        } else { (None, body) };
         let Ok(address) = std::str::from_utf8(body) else { return malformed() };
         if !address.is_empty() && (address.len() > caps::ACCOUNT || !address.contains('@') || address.chars().any(|c| c.is_control() || c.is_whitespace())) { return malformed(); }
         if app != "org.atrium.mail" { return reply(status::DENIED); }
         if self.mail_sign_ins.registration.is_none() { return reply(status::UNSUPPORTED); }
         if self.mail_sign_ins.mail_publisher.as_ref() != Some(publisher) { return reply(status::DENIED); }
         if !self.stores.get(user).is_some_and(|s| s.state() == LockState::Unlocked) { return reply(status::LOCKED); }
-        match self.mail_sign_ins.begin(user, address) {
+        let start = if let Some(ids) = ids {
+            let persona = app_persona(publisher, app);
+            let (_, version) = tri!(mail_refresh::renewal_owner(&self.stores[user], &persona, address, &ids));
+            self.mail_sign_ins.begin_for(user, address, Some((ids, version)))
+        } else { self.mail_sign_ins.begin(user, address) };
+        match start {
             Ok(handle) => ok(handle.to_vec()),
             Err(code) => reply(code),
         }
@@ -252,7 +261,7 @@ impl State {
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
-            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN => self.mail_begin(user, publisher, app_id, body),
+            Label::App { user, publisher, app_id } if matches!(op, op::MAIL_SIGN_IN | op::MAIL_REAUTH) => self.mail_begin(user, publisher, app_id, body, op == op::MAIL_REAUTH),
             Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_RESULT => {
                 if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
                 let mut r = Reader::new(body);
@@ -2278,7 +2287,7 @@ impl State {
         if r.end().is_err() || token.is_empty() || !token.iter().all(u8::is_ascii_graphic) { return malformed(); }
         let Some(client) = self.mail_sign_ins.registration.clone() else { return reply(status::DENIED) };
         let Some(publisher) = self.mail_sign_ins.mail_publisher else { return reply(status::DENIED) };
-        let Some(account) = self.mail_sign_ins.exchanging_account(&c.user, &ticket) else { return reply(status::DENIED) };
+        let Some((account, renewal)) = self.mail_sign_ins.exchanging_account(&c.user, &ticket) else { return reply(status::DENIED) };
         let persona = app_persona(&publisher, "org.atrium.mail");
         let head = format!("oauth1 microsoft {client} ");
         let mut grant = tri!(LockedBuf::zeroed(head.len() + token.len()).map_err(Error::Io));
@@ -2286,6 +2295,14 @@ impl State {
         grant.as_mut()[head.len()..].copy_from_slice(token);
         let imap = tri!(Recipient::endpoint(Scheme::Imaps, MICROSOFT.imap.0, MICROSOFT.imap.1, None));
         let smtp = tri!(Recipient::endpoint(Scheme::Submission, MICROSOFT.smtp.0, MICROSOFT.smtp.1, None));
+        if let Some((ids, expected_version)) = renewal {
+            let (owner, version) = tri!(mail_refresh::renewal_owner(store, &persona, account, &ids));
+            if version != expected_version { return reply(status::DENIED); }
+            tri!(store.update(&owner, &Access { persona: &persona, recipient: &imap }, grant.as_ref(), None));
+            self.mail_leases.retain(|_, lease| !lease.uses(&c.user, owner));
+            self.mail_sign_ins.complete(&ticket, ids);
+            return ok(vec![]);
+        }
         let mut add = |recipient, value: &[u8], scope: &[u8]| store.add(NewItem { persona: &persona, recipient, class: Class::AfterFirstUnlock,
             kind: Kind::OAuthToken, provenance: Provenance::AppMinted, account, scope, value });
         let incoming = tri!(add(imap.clone(), grant.as_ref(), mail_refresh::OWNER)).id;

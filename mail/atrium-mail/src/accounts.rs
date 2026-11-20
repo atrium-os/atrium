@@ -383,11 +383,18 @@ pub fn sieve_server(c: &AccountConfig) -> Option<Server> {
 }
 
 /// Start a PKCE session. Only the sheet ticket crosses into Mail.
-pub fn microsoft_sign_in(arca: &std::path::Path, address: &str) -> Result<[u8; 16], String> {
+pub fn microsoft_sign_in(arca: &std::path::Path, address: &str, renewal: Option<([u8; 16], [u8; 16])>) -> Result<[u8; 16], String> {
     let mut socket = UnixStream::connect(arca).map_err(|e| format!("Arca is unavailable: {e}"))?;
     let timeout = Some(Duration::from_secs(10));
     socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
-    arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN, address.as_bytes()).map_err(|e| e.to_string())?;
+    let mut body = Vec::new();
+    let op = if let Some((incoming, outgoing)) = renewal {
+        body.extend_from_slice(&incoming);
+        body.extend_from_slice(&outgoing);
+        op::MAIL_REAUTH
+    } else { op::MAIL_SIGN_IN };
+    body.extend_from_slice(address.as_bytes());
+    arcad::proto::write_request(&mut socket, op, &body).map_err(|e| e.to_string())?;
     let (code, body) = arcad::proto::read_app_reply(&mut socket, arcad::proto::AppReply::Ticket).map_err(|e| e.to_string())?;
     match code {
         status::OK => body.as_slice().try_into().map_err(|_| "Arca returned an invalid sign-in ticket.".into()),

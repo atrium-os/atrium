@@ -209,6 +209,7 @@ struct Pending {
     user: String,
     session: SignIn,
     phase: Phase,
+    renewal: Option<([u8; 32], u64)>,
     account: String,
     expires: std::time::Instant,
 }
@@ -222,6 +223,10 @@ pub fn mail_partition(handle: &[u8; 16]) -> String {
 
 impl Sessions {
     pub(crate) fn begin(&mut self, user: &str, account: &str) -> Result<[u8; 16], u8> {
+        self.begin_for(user, account, None)
+    }
+
+    pub(crate) fn begin_for(&mut self, user: &str, account: &str, renewal: Option<([u8; 32], u64)>) -> Result<[u8; 16], u8> {
         use crate::proto::status;
         let id = self.registration.as_deref().ok_or(status::UNSUPPORTED)?;
         let now = std::time::Instant::now();
@@ -235,7 +240,7 @@ impl Sessions {
         if self.pending.contains_key(&handle) {
             return Err(status::INTERNAL);
         }
-        self.pending.insert(handle, Pending { user: user.into(), session, account: account.into(), phase: Phase::Waiting, expires: now + crate::handles::TTL });
+        self.pending.insert(handle, Pending { user: user.into(), session, account: account.into(), renewal, phase: Phase::Waiting, expires: now + crate::handles::TTL });
         Ok(handle)
     }
 
@@ -263,9 +268,9 @@ impl Sessions {
         Some(zeroize::Zeroizing::new(body))
     }
 
-    pub(crate) fn exchanging_account(&mut self, user: &str, handle: &[u8; 16]) -> Option<&str> {
+    pub(crate) fn exchanging_account(&mut self, user: &str, handle: &[u8; 16]) -> Option<(&str, Option<([u8; 32], u64)>)> {
         let entry = self.active(user, handle)?;
-        matches!(entry.phase, Phase::Exchanging).then_some(entry.account.as_str())
+        matches!(entry.phase, Phase::Exchanging).then_some((entry.account.as_str(), entry.renewal))
     }
 
     pub(crate) fn complete(&mut self, handle: &[u8; 16], ids: [u8; 32]) {

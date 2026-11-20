@@ -11,27 +11,34 @@ HEADERS = (
 MESSAGE = HEADERS + b"Please bring the blue notebook.\r\n"
 
 
-def inbox(peer):
+def inbox(peer, renewed=False):
+    messages = {41: (HEADERS, MESSAGE)}
+    if renewed:
+        new = HEADERS.replace(b"Greenhouse visit", b"Greenhouse reopened").replace(b"greenhouse-visit@", b"greenhouse-reopened@")
+        messages[42] = (new, new + b"The second tray is ready.\r\n")
     for _ in range(256):
         tag, command = peer.line().split(" ", 1)
         words = command.upper().split()
         if words[0] == "LIST":
             peer.put('* LIST (\\HasNoChildren) "/" "INBOX"')
         elif words[0] in ("SELECT", "EXAMINE") and words[1].strip('"') == "INBOX":
-            peer.put("* 1 EXISTS")
+            peer.put(f"* {len(messages)} EXISTS")
             peer.put("* OK [UIDVALIDITY 11] stable")
-            peer.put("* OK [UIDNEXT 42] next")
+            peer.put(f"* OK [UIDNEXT {max(messages) + 1}] next")
         elif words[:2] == ["UID", "SEARCH"]:
-            peer.put("* SEARCH 41")
-        elif words[:2] == ["UID", "FETCH"] and words[2] in ("1:*", "41"):
+            peer.put("* SEARCH " + " ".join(map(str, messages)))
+        elif words[:2] == ["UID", "FETCH"]:
             section = next((s for s in ("HEADER", "") if "BODY.PEEK[" + s + "]" in command.upper()), None)
-            if section is None:
-                peer.put("* 1 FETCH (UID 41 FLAGS ())")
-            else:
-                data = HEADERS if section else MESSAGE
-                peer.put(f'* 1 FETCH (UID 41 FLAGS () RFC822.SIZE {len(MESSAGE)} INTERNALDATE "20-Nov-2026 08:00:00 +0000" BODY[{section}] {{{len(data)}}}')
-                peer.sock.sendall(data + b")\r\n")
-                print("IMAP supplied", "headers" if section else "message", flush=True)
+            for seq, (uid, (header, message)) in enumerate(messages.items(), 1):
+                if words[2] != "1:*" and str(uid) not in words[2].split(","):
+                    continue
+                if section is None:
+                    peer.put(f"* {seq} FETCH (UID {uid} FLAGS ())")
+                else:
+                    data = header if section else message
+                    peer.put(f'* {seq} FETCH (UID {uid} FLAGS () RFC822.SIZE {len(message)} INTERNALDATE "20-Nov-2026 08:00:00 +0000" BODY[{section}] {{{len(data)}}}')
+                    peer.sock.sendall(data + b")\r\n")
+                    print("IMAP supplied", "headers" if section else "message", uid, flush=True)
         elif words[0] == "LOGOUT":
             peer.put("* BYE")
             peer.put(tag + " OK logout")

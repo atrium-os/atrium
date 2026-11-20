@@ -305,6 +305,26 @@ the fields. The guest reported a private VNET with only loopback for Mail
 and `allow.nomount`. Screenshots, worker evidence and the captured message
 are under `~/atrium-vm/evidence/mail-inbox-send-20261120/` on the Mac.
 
+#### Reauthentication with a populated inbox
+
+On the arm64 Tessera guest the local provider accepted two refreshes for the stored account,
+then revoked its current grant and returned `invalid_grant`. Mail kept “Greenhouse visit”
+(UID 41) readable, including its cached body. **Settings → Sign in again** opened Navigator’s
+development sign-in sheet. Its page jail had IPv4 and IPv6 disabled. The fixture verified
+the sign-in cookie and PKCE exchange. Arca replaced the existing account’s grant and Mail
+checked that both endpoint references matched before waking sync.
+
+The fixture exposed “Greenhouse reopened” (UID 42) only after redemption. Both messages
+appeared together and the original reader stayed open. A Compose send from
+`ada@outlook.com` to `robin@school.test` produced one SMTP delivery. The independent
+MIME and envelope check matched the subject “Reconnected report” and body “Mail works again.”
+
+To repeat with the stored development account, run the local callback provider and the
+rotation fixture with `--reauth` in the same run directory. Supply the callback server’s
+port and CA in `callback.port` and `callback-ca.pem`. After UID 41 is visible, create the
+empty `revoke` file there and request sync. Complete the sign-in sheet, check UID 42,
+and use the inbox gate’s envelope verifier after the fixture records SMTP acceptance.
+
 ### 5.4 What Mail knows about an account
 
 The address, display name, server names, which protocol, a colour, the persona, and

@@ -246,3 +246,25 @@ fn legacy_outlook_pair_shares_one_rotation_and_issues_endpoint_bound_access() {
     let next = s.handle(&provider, cop::MAIL_REFRESH_BEGIN, &ask);
     assert_eq!(&next.body.bytes()[16..], b"oauth1 microsoft fixture second");
 }
+
+#[test]
+fn reauthorization_requires_the_linked_pair_and_its_stored_address() {
+    let (_dir, mut s) = setup();
+    s.mail_sign_ins.mail_publisher = Some([7; 32]);
+    s.mail_sign_ins.registration = Some("fixture".into());
+    let old = b"oauth1 microsoft fixture first";
+    let incoming = store_value(&mut s, 3, Scheme::Imaps, "outlook.office365.com", 993, old);
+    let outgoing = store_value(&mut s, 3, Scheme::Submission, "smtp.office365.com", 587, old);
+    let provider = courier(Scheme::Https, "login.microsoftonline.com", 443);
+    let refresh = body(|w| { w.raw(&incoming); w.raw(&outgoing); w.u8(1); });
+    assert_eq!(s.handle(&provider, cop::MAIL_REFRESH_BEGIN, &refresh).status, status::OK);
+    let renew = |imap: &[u8], smtp: &[u8], address: &str| body(|w| {
+        w.raw(imap); w.raw(smtp); w.raw(address.as_bytes());
+    });
+    assert_eq!(s.handle(&app(), op::MAIL_REAUTH, &renew(&incoming, &outgoing, "other@example.org")).status, status::DENIED);
+    assert_ne!(s.handle(&app(), op::MAIL_REAUTH, &renew(&outgoing, &incoming, "priya@example.org")).status, status::OK);
+    let good = renew(&incoming, &outgoing, "priya@example.org");
+    let other = Label::App { user: "alice".into(), publisher: [8; 32], app_id: MAIL.into() };
+    assert_eq!(s.handle(&other, op::MAIL_REAUTH, &good).status, status::DENIED);
+    assert_eq!(s.handle(&app(), op::MAIL_REAUTH, &good).status, status::OK);
+}

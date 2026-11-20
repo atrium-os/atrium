@@ -15,7 +15,9 @@ import threading
 import urllib.parse
 
 ROOT = pathlib.Path(sys.argv[1])
-MAILBOX = sys.argv[2:] == ["--mailbox"]
+REAUTH = sys.argv[2:] == ["--reauth"]
+MAILBOX = REAUTH or sys.argv[2:] == ["--mailbox"]
+renewed = False
 CLIENT = "11111111-1111-4111-8111-111111111111"
 lock = threading.Lock()
 refresh = "demo-refresh"  # Seeded by the local callback fixture.
@@ -38,10 +40,18 @@ class Peer:
         self.sock.sendall(data.encode("ascii") + b"\r\n")
 
 
+def issue_grant():
+    global refresh, renewed
+    with lock:
+        refresh = secrets.token_urlsafe(32)
+        renewed = True
+        print("fresh sign-in grant issued", flush=True)
+        return refresh
+
+
 def token(peer):
     global refresh, generation
-    if peer.line() != "POST /common/oauth2/v2.0/token HTTP/1.1":
-        return
+    request = peer.line()
     headers = {}
     for _ in range(64):
         line = peer.line()
@@ -49,12 +59,23 @@ def token(peer):
             break
         k, v = line.split(":", 1)
         headers[k.lower()] = v.strip()
-    length = int(headers["content-length"])
-    if not 0 < length <= 8192:
+    length = int(headers.get("content-length", "0"))
+    if not 0 <= length <= 8192:
         return
-    body = urllib.parse.parse_qs(peer.reader.read(length).decode("ascii"), max_num_fields=8)
+    raw = peer.reader.read(length)
+    body = urllib.parse.parse_qs(raw.decode("ascii"), max_num_fields=8)
+    if REAUTH and (request.startswith("GET ") or body.get("grant_type") == ["authorization_code"]):
+        from reauth_fixture import callback
+        return callback(peer, ROOT, request, headers, raw, issue_grant)
+    if request != "POST /common/oauth2/v2.0/token HTTP/1.1":
+        return
     with lock:
-        ok = (headers.get("host") == "login.microsoftonline.com"
+        if REAUTH and (ROOT / "revoke").exists():
+            (ROOT / "revoke").unlink()
+            refresh = None
+            access.clear()
+            print("current refresh grant revoked", flush=True)
+        ok = (refresh is not None and headers.get("host") == "login.microsoftonline.com"
               and body.get("client_id") == [CLIENT] and body.get("grant_type") == ["refresh_token"]
               and body.get("refresh_token") == [refresh])
         if ok:
@@ -98,7 +119,7 @@ def imap(peer):
     peer.put(tag + " OK [CAPABILITY IMAP4rev1] authenticated")
     if MAILBOX:
         from mailbox_fixture import inbox
-        return inbox(peer)
+        return inbox(peer, renewed)
     tag, cmd = peer.line().split(" ")
     if cmd == "NOOP":
         peer.put(tag + " OK NOOP")

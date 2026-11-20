@@ -96,6 +96,8 @@ pub mod op {
     pub const MAIL_SIGN_IN: u16 = 0x14;
     /// Ticket and account address → IMAP and SMTP item ids after a successful exchange.
     pub const MAIL_SIGN_IN_RESULT: u16 = 0x15;
+    /// Reauthorize existing IMAP/submission items: two ids followed by the account address.
+    pub const MAIL_REAUTH: u16 = 0x16;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the

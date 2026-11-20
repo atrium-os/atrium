@@ -21,6 +21,18 @@ pub(super) struct Lease {
     expires: Instant,
 }
 
+/// A reauthorization is valid only for this signed persona’s linked Outlook pair.
+pub(super) fn renewal_owner(store: &Store, persona: &str, address: &str, ids: &[u8; 32]) -> Result<(ItemId, u64), Error> {
+    let id = ItemId(ids[..16].try_into().unwrap());
+    let imap = Recipient::endpoint(Scheme::Imaps, MICROSOFT.imap.0, MICROSOFT.imap.1, None)?;
+    let smtp = Recipient::endpoint(Scheme::Submission, MICROSOFT.smtp.0, MICROSOFT.smtp.1, None)?;
+    let im = store.meta(&id, &Access { persona, recipient: &imap })?;
+    let (sm, alias) = store.release(&ItemId(ids[16..].try_into().unwrap()), &Access { persona, recipient: &smtp }, None)?;
+    if im.kind != Kind::OAuthToken || im.scope != OWNER || im.account != address || sm.kind != Kind::OAuthToken
+        || sm.account != address || alias.as_ref() != link(id) { return Err(Error::Denied); }
+    Ok((id, im.version))
+}
+
 impl State {
     pub(super) fn refresh_mail(&mut self, c: &CourierLabel, op: u16, body: &[u8]) -> Reply {
         let provider = tri!(Recipient::endpoint(Scheme::Https, MICROSOFT.token_host, 443, None));
@@ -94,5 +106,6 @@ impl State {
 }
 
 impl Lease {
+    pub(super) fn uses(&self, user: &str, id: ItemId) -> bool { self.owner.user == user && self.incoming == id }
     pub(super) fn belongs_to(&self, user: &str) -> bool { self.owner.user == user }
 }

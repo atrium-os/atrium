@@ -29,6 +29,7 @@ pub struct Row {
     pub status: String,
     /// Shown as a problem (sign in again, a failure).
     pub trouble: bool,
+    pub renew_microsoft: bool,
     pub screener: bool,
     /// Imported messages whose upload gave up (§6.5), and why.
     pub stuck: Option<(usize, String)>,
@@ -45,6 +46,7 @@ pub struct Shown {
     pub use_anyway: bool,
     pub note: Option<String>,
     pub cfg: AccountConfig,
+    pub existing: Option<AccountId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -204,6 +206,7 @@ pub struct Settings {
     pub cred_state: Mutable<CredentialState>,
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
+    renewed: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
     kept: Rc<RefCell<Option<mpsc::Receiver<Result<(AccountConfig, Option<(mail_store::Server, [u8; 16])>), String>>>>>,
     microsoft: Rc<RefCell<Option<mpsc::Receiver<Result<[u8; 16], String>>>>>,
     pub microsoft_sheet_open: Rc<std::cell::Cell<bool>>,
@@ -256,6 +259,7 @@ impl Settings {
             ui,
             found: Rc::default(),
             kept: Rc::default(),
+            renewed: Rc::default(),
             microsoft: Rc::default(),
             microsoft_sheet_open: Rc::default(),
             added: Rc::default(),
@@ -280,12 +284,13 @@ impl Settings {
             .configured()
             .into_iter()
             .map(|(id, c)| {
-                let (status, trouble) = status(&c.reached);
+                let renew_microsoft = matches!(c.reached, Reached::SignInAgain { .. }) && c.oauth.as_deref() == Some("microsoft");
+                let (status, trouble) = if renew_microsoft { ("Microsoft sign-in expired".into(), true) } else { status(&c.reached) };
                 let stuck = match e.imports_stuck(id) {
                     Ok((n, why)) if n > 0 => Some((n, why.unwrap_or_default())),
                     _ => None,
                 };
-                Row { id, address: c.address, status, trouble, screener: e.screener(id).unwrap_or(false), stuck }
+                Row { id, address: c.address, status, trouble, renew_microsoft, screener: e.screener(id).unwrap_or(false), stuck }
             })
             .collect();
         let prefs = e.prefs();
@@ -423,7 +428,16 @@ impl Settings {
         } else {
             f.note.map(str::to_string)
         };
-        Shown { lines: server_lines(&cfg), guess: matches!(f.via, mail_sync::setup::Via::Guess), handled_by: f.handled_by.clone(), use_anyway: false, note, cfg }
+        Shown { lines: server_lines(&cfg), guess: matches!(f.via, mail_sync::setup::Via::Guess), handled_by: f.handled_by.clone(), use_anyway: false, note, cfg, existing: None }
+    }
+
+    pub fn renew_microsoft(&self, id: AccountId) {
+        if self.ui.get_cloned().adding != Adding::Closed || self.microsoft_sheet_open.get() { return; }
+        let Ok(Some(cfg)) = self.engine.store.account_config(id) else { return };
+        if cfg.oauth.as_deref() != Some("microsoft") || !matches!(cfg.reached, Reached::SignInAgain { .. }) { return; }
+        let shown = Shown { lines: server_lines(&cfg), cfg, existing: Some(id), guess: false, handled_by: None, use_anyway: false, note: None };
+        self.update(|u| u.adding = Adding::Found(shown));
+        self.add();
     }
 
     pub fn use_anyway(&self) {
@@ -450,7 +464,15 @@ impl Settings {
             if !self.can_add() { return; }
             let path = (*self.arca).clone();
             let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || { let _ = tx.send(crate::accounts::microsoft_sign_in(&path, &s.cfg.address)); });
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let renewal = if s.existing.is_some() {
+                        Some(s.cfg.incoming_item.zip(s.cfg.outgoing_item).ok_or("Missing Microsoft sign-in references")?)
+                    } else { None };
+                    crate::accounts::microsoft_sign_in(&path, &s.cfg.address, renewal)
+                })();
+                let _ = tx.send(result);
+            });
             *self.microsoft.borrow_mut() = Some(rx);
             self.update(|u| u.note = Some("Requesting Microsoft sign-in…".into()));
             return;
@@ -479,6 +501,19 @@ impl Settings {
         if s.cfg.oauth.as_deref() != Some("microsoft") { return; }
         let (arca, mut cfg) = ((*self.arca).clone(), s.cfg.clone());
         let (tx, rx) = mpsc::channel();
+        if s.existing.is_some() {
+            let (done, result) = mpsc::channel();
+            std::thread::spawn(move || {
+                let refs = (cfg.incoming_item, cfg.outgoing_item);
+                let outcome = crate::accounts::microsoft_result(&arca, &ticket, &mut cfg).and_then(|()| {
+                    if (cfg.incoming_item, cfg.outgoing_item) == refs { Ok(()) } else { Err("Arca returned different account references.".into()) }
+                });
+                let _ = done.send(outcome);
+            });
+            *self.renewed.borrow_mut() = Some(result);
+            self.update(|u| u.adding = Adding::Keeping(s));
+            return;
+        }
         std::thread::spawn(move || {
             let _ = tx.send(crate::accounts::microsoft_result(&arca, &ticket, &mut cfg).map(|_| (cfg, None)));
         });
@@ -933,6 +968,12 @@ impl Settings {
                 })
             });
         }
+        let renewed = self.renewed.borrow().as_ref().and_then(|r| r.try_recv().ok());
+        if let Some(result) = renewed {
+            self.renewed.borrow_mut().take();
+            if result.is_ok() { self.added.set(true); }
+            self.update(|u| { u.adding = Adding::Closed; u.note = Some(result.err().unwrap_or_else(|| "Signed in again. Checking for new mail.".into())); });
+        }
         let kept = self.kept.borrow().as_ref().and_then(|r| r.try_recv().ok());
         if let Some(r) = kept {
             *self.kept.borrow_mut() = None;
@@ -1153,6 +1194,11 @@ impl SettingsView {
             let s = self.s.clone();
             button(ctx, bx, y + rh / 2.0, scr, false, true, move || s.toggle_screener(id));
             y += rh;
+            if r.renew_microsoft && ui.adding == Adding::Closed {
+                let s = self.s.clone();
+                button(ctx, x, y + em(16.0), "Sign in again", true, !s.microsoft_sheet_open.get(), move || s.renew_microsoft(id));
+                y += em(40.0);
+            }
             if let Some((n, why)) = &r.stuck {
                 let line = format!("{} imported {} couldn't upload: {why}", n, if *n == 1 { "message" } else { "messages" });
                 let cw = measure("Clear", type_size::SM, Weight::Medium) + em(24.0);

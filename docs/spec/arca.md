@@ -43,6 +43,12 @@ refresh token before issuing a one-use login handle bound to the user,
 persona and mail endpoint. A mail courier can redeem it for the access
 token after TLS. Vault lock discards outstanding exchanges and handles.
 
+For a revoked Microsoft grant, signed Mail submits both existing references and the
+stored address with `MAIL_REAUTH`. Arca checks the persona, endpoint binding, linked
+grant owner and address, and records the owner version in the PKCE session. At redemption
+it repeats the checks, rejects a changed version, updates the owner in place, discards
+outstanding refresh leases for it and returns the original references.
+
 ## 1. The three promises
 
 1. **Use without read.** Wherever the protocol allows, a secret is *used* for the app
