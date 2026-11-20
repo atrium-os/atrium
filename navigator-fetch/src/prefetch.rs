@@ -317,9 +317,18 @@ impl<'a> Prefetcher<'a> {
             return Err("widget requires an HTTPS address".into());
         }
         let r = self.conv.get_once(&u, None).map_err(|e| e.to_string())?;
-        if r.status != 200 || !r.header("content-type").is_some_and(|s| s.split(';').next()
-            .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/html"))) || r.body.len() > 65536 {
-            return Err("widget requires a bounded HTML response".into());
+        if (300..400).contains(&r.status) {
+            return Err(format!("widget redirect refused (HTTP {})", r.status));
+        }
+        if r.status != 200 {
+            return Err(format!("widget document returned HTTP {}", r.status));
+        }
+        let mime = r.header("content-type").and_then(|value| value.split(';').next());
+        if !mime.is_some_and(|t| t.trim().eq_ignore_ascii_case("text/html")) {
+            return Err("widget document requires text/html".into());
+        }
+        if r.body.len() > 65536 {
+            return Err("widget document exceeds 64 KiB".into());
         }
         Ok(r.body)
     }

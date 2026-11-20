@@ -893,9 +893,24 @@ service logs are in `~/atrium-vm/evidence/navigator-i1-installed-start-20261120/
 The guest fixture fetcher served local bytes. On the Mac the production fetch service
 loop accepted a 200 HTML document from a local TLS server and refused a 302.
 The server saw neither cookies nor authorization headers and received no
-request for the redirect target. All 80 host fetch tests passed. The remaining integration gate is
-to run the installed fetch daemon against a local TLS origin, verify
-redirect refusal, and repeat the guarded Start from the installed window.
+request for the redirect target. All 80 host fetch tests passed.
+
+The installed TLS gate then ran on a fresh arm64 HVF Tessera overlay.
+The fetcher bundle contained the fixture CA and host entries. An isolated
+QEMU guest forward carried HTTPS to a loopback server on the Mac. The
+server observed the parent GET first. Opening the Start prompt made no
+widget request. Accepting it fetched 460 bytes from the widget origin and
+Increment changed Count 0 to Count 1. On a 302 to the parent origin the
+fetcher refused the response, the counter exited, and the server received
+no request for the redirect target. Both origins saw no Cookie or
+Authorization header. Restoring the 200 response and pressing Start
+again in the same window produced a working counter without reloading
+the parent. The guest hashes of the content-signed fetcher and interpreter
+matched staging. Ladybird ran as uid 50007 in Capsicum mode with both IP
+families disabled. The current refusal is logged by the broker. A later
+placement can still address the exited worker before the next Start.
+Screenshots, server requests, hashes and service logs are in
+`~/atrium-vm/evidence/navigator-i1-installed-tls-20261120/`.
 
 Evidence for the two gates is in
 `~/atrium-vm/evidence/navigator-i1-geometry-20261120/` and
