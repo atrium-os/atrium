@@ -166,3 +166,11 @@ After the chooser showed `Untitled` beneath the startup notice for `Proof.csv`, 
 Releasing the hold opened the first workbook once in its original jail slot with its original ID. An independent reader checked `zebra` after Save As and `zebra,2` after Save. Once the first workbook closed, a fresh Recover started the protected sibling. Its running Sheets process received the replacement ID, `41`. The saved sibling copy contained `fox,2`. Both recovery devices detached and both markers cleared. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `stale-id`.
 
 The stale-selection gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM.
+
+## Refreshing the chooser after a stale sibling selection
+
+The fixture kept the first runtime launch on hold after Sheets rejected the stale sibling row. Pressing Recover again restored the startup notice for `Proof.csv` and the selectable `Untitled` row. Refreshing left the launch count unchanged. Clicking the row opened the protected sibling in a separate jail, and its process arguments confirmed that it received the replacement recovery ID, `41`.
+
+Before releasing the first launch, the gate unlocked the sibling, saved it under a new name, added a cell edit, saved again, and closed it. The first workbook then opened once with its original ID. An independent reader verified `fox` followed by `fox,2` in the sibling copy and `zebra` followed by `zebra,2` in the first copy. Both pending markers cleared and both recovery devices detached. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-start-sibling`, the private fixture broker path, and `stale-refresh`.
+
+The refreshed-row gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM.

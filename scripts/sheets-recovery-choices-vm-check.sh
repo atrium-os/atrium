@@ -13,7 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
-# --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, or stale-id after the broker path.
+# --delayed-start-sibling keeps the protected workbook selectable; pass direct, refresh, unavailable, stale-id, or stale-refresh after the broker path.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -550,11 +550,11 @@ SH
             cp selectscreen.png "$results/repeated.png"
             cmp "$results/starting.png" "$results/repeated.png"
             ;;
-        direct|unavailable|stale-id) test "$1" = --delayed-start-sibling ;;
+        direct|unavailable|stale-id|stale-refresh) test "$1" = --delayed-start-sibling ;;
         *) exit 2 ;;
     esac
     count 0; test "$(wc -l < "$bin/attempts")" -eq 1
-    if test "${3:-}" = stale-id; then
+    if test "${3:-}" = stale-id || test "${3:-}" = stale-refresh; then
         sibling_marker="$(dirname "$marker")/1.pending"
         cp "$sibling_marker" "$results/listed.marker"
         # Change only the opaque ID; the old row still has the same name and slot.
@@ -572,6 +572,19 @@ SH
         cmp "$sibling_marker" "$results/replacement.marker"
         test -f "$bin/hold"; count 0; pending 2
         cmp "$bin/starts" "$bin/target"
+        if test "$3" = stale-refresh; then
+            click 213 24; input "MOVE 120 96"
+            # The pointer can reach the row before or after the chooser redraw.
+            refreshed() {
+                case "$(sha256 -q selectscreen.png)" in
+                    "$frame"|a5d0fe78e1729016f0d59f33c8b84dc325de128ed5934f8dcb9d37c7c3c27420) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            wait_for refreshed
+            cp selectscreen.png "$results/refreshed.png"
+            count 0; pending 2; cmp "$bin/starts" "$bin/target"
+        fi
     elif test "${3:-}" = unavailable; then
         store=$(dirname "$marker")
         sibling_image="$store/1.img"
@@ -592,14 +605,21 @@ SH
         cp selectscreen.png "$results/unavailable.png"
         test -f "$bin/hold"; count 0; pending 2
         cmp "$store/1.pending" "$results/sibling.marker"
-    elif test "$1" = --delayed-start-sibling; then
+    fi
+    case "$1/${3:-refresh}" in
+    --delayed-start-sibling/direct|--delayed-start-sibling/refresh|--delayed-start-sibling/stale-refresh)
         click 120 96; wait_for count 1
         sibling=$(docs)
         test "$(root "$sibling")" != "$plain_root"
         wait_for opened "$sibling" Untitled
+        if test "${3:-}" = stale-refresh; then
+            wait_for pgrep -f -j "$sibling" -- 'atrium-sheets --recover-document 41$'
+        fi
         sleep .6; save_copy protected
         wait_for pending 1; count 0; test -f "$bin/hold"
-    fi
+        test "$(wc -l < "$bin/starts")" -eq 2
+        ;;
+    esac
     unlink "$bin/hold"
     wait_for count 1; jid=$(docs)
     wait_for pgrep -x -j "$jid" atrium-sheets
