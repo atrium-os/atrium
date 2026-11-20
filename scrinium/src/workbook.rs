@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::fs::{File, Metadata};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -18,17 +18,68 @@ struct Grant {
     folder: File,
     name: CString,
     file: File,
-    version: (u64, i64, i64, i64, i64),
+    revision: Revision,
 }
 
-fn version(m: &Metadata) -> (u64, i64, i64, i64, i64) {
-    (
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec(),
-        m.ctime(),
-        m.ctime_nsec(),
-    )
+struct Revision {
+    metadata: Metadata,
+    digest: Option<blake3::Hash>,
+}
+
+fn changed() -> io::Error {
+    io::Error::other("The workbook changed since it was opened. Reopen it or use Save As.")
+}
+
+fn ctime(m: &Metadata) -> (i64, i64) {
+    (m.ctime(), m.ctime_nsec())
+}
+
+fn fingerprint(source: &File, output: &mut impl Write) -> io::Result<blake3::Hash> {
+    let mut digest = blake3::Hasher::new();
+    crate::fs::read_snapshot(source, |chunk| {
+        output.write_all(chunk)?;
+        digest.update(chunk);
+        Ok(())
+    })?;
+    Ok(digest.finalize())
+}
+
+impl Revision {
+    fn capture(file: &File) -> io::Result<Self> {
+        for _ in 0..3 {
+            let metadata = file.metadata()?;
+            // Existing grants can also target workbooks larger than a save snapshot.
+            let digest = (metadata.len() <= crate::fs::MAX_WORKBOOK_SIZE)
+                .then(|| fingerprint(file, &mut io::sink()))
+                .transpose()?;
+            if ctime(&metadata) == ctime(&file.metadata()?) {
+                return Ok(Self { metadata, digest });
+            }
+        }
+        Err(changed())
+    }
+
+    fn check(&self, file: &File, now: &Metadata) -> io::Result<()> {
+        let old = &self.metadata;
+        if old.len() != now.len()
+            || old.modified()? != now.modified()?
+            || old.mode() != now.mode()
+            || old.uid() != now.uid()
+            || old.gid() != now.gid()
+        {
+            return Err(changed());
+        }
+        // UFS soft updates can advance ctime after publication. Compare the
+        // pinned contents even if an outside writer restored the original mtime.
+        match self.digest {
+            Some(expected) if fingerprint(file, &mut io::sink())? != expected => {
+                return Err(changed());
+            }
+            None if ctime(old) != ctime(now) => return Err(changed()),
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn check_name(folder: &File, name: &CStr, file: &File) -> io::Result<()> {
@@ -77,7 +128,7 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
         folder,
         name,
         file: file.try_clone()?,
-        version: version(&file.metadata()?),
+        revision: Revision::capture(file)?,
     };
     let token = crate::fs::random_token()?;
     let mut grants = GRANTS.get_or_init(Default::default).lock().unwrap();
@@ -89,10 +140,13 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
 }
 
 pub fn commit(token: Token, source: &File) -> io::Result<()> {
-    commit_with(token, |out| crate::fs::copy_snapshot(source, out))
+    commit_with(token, |out| fingerprint(source, out))
 }
 
-fn commit_with(token: Token, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+fn commit_with(
+    token: Token,
+    write: impl FnOnce(&mut File) -> io::Result<blake3::Hash>,
+) -> io::Result<()> {
     let grant = GRANTS
         .get_or_init(Default::default)
         .lock()
@@ -106,55 +160,70 @@ fn commit_with(token: Token, write: impl FnOnce(&mut File) -> io::Result<()>) ->
     let mut grant = grant
         .try_lock()
         .map_err(|_| io::Error::other("Another save is in progress"))?;
-    let old = grant.file.metadata()?;
+    let (file, revision) = crate::fs::stage_in(
+        &grant.folder,
+        |out| {
+            let digest = write(out)?;
+            let old = grant.file.metadata()?;
+            prepare_replacement(&grant.file, &old, out)?;
+            Ok((digest, old))
+        },
+        |stage, tmp, staged, (digest, mut prepared)| {
+            for _ in 0..3 {
+                let now = grant.file.metadata()?;
+                grant.revision.check(&grant.file, &now)?;
+                if ctime(&prepared) != ctime(&now) {
+                    prepare_replacement(&grant.file, &now, staged)?;
+                    staged.sync_all()?;
+                    prepared = now.clone();
+                }
+                let revision = Revision {
+                    metadata: staged.metadata()?,
+                    digest: Some(digest),
+                };
+                let _serial = PUBLISH.lock().unwrap();
+                check_name(&grant.folder, &grant.name, &grant.file)?;
+                if ctime(&now) != ctime(&grant.file.metadata()?) {
+                    continue;
+                }
+                if unsafe {
+                    libc::renameat(
+                        stage,
+                        tmp.as_ptr(),
+                        grant.folder.as_raw_fd(),
+                        grant.name.as_ptr(),
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(revision);
+            }
+            Err(changed())
+        },
+    )?;
+    grant.file = file;
+    grant.revision = revision;
+    grant.file.sync_all()?;
+    grant.folder.sync_all()
+}
+
+fn prepare_replacement(file: &File, old: &Metadata, out: &File) -> io::Result<()> {
     if old.nlink() != 1 || old.mode() & 0o7000 != 0 {
         return Err(io::Error::other(
             "Use Save As for a linked workbook or one with special permissions",
         ));
     }
-    let (file, ()) = crate::fs::stage_in(
-        &grant.folder,
-        |out| {
-            write(out)?;
-            let new = out.metadata()?;
-            if (old.uid(), old.gid()) != (new.uid(), new.gid())
-                && unsafe { libc::fchown(out.as_raw_fd(), old.uid(), old.gid()) } != 0
-            {
-                return Err(io::Error::other(
-                    "Cannot preserve workbook ownership. Use Save As.",
-                ));
-            }
-            out.set_permissions(std::fs::Permissions::from_mode(old.mode() & 0o777))?;
-            preserve_metadata(&grant.file, out)
-        },
-        |stage, tmp| {
-            let _serial = PUBLISH.lock().unwrap();
-            check_name(&grant.folder, &grant.name, &grant.file)?;
-            if grant.version != version(&grant.file.metadata()?) {
-                return Err(io::Error::other(
-                    "The workbook changed since it was opened. Reopen it or use Save As.",
-                ));
-            }
-            if unsafe {
-                libc::renameat(
-                    stage,
-                    tmp.as_ptr(),
-                    grant.folder.as_raw_fd(),
-                    grant.name.as_ptr(),
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        },
-    )?;
-    grant.file = file;
-    // Settle deferred inode timestamps from the rename before recording the revision.
-    grant.file.sync_all()?;
-    grant.folder.sync_all()?;
-    grant.version = version(&grant.file.metadata()?);
-    Ok(())
+    let new = out.metadata()?;
+    if (old.uid(), old.gid()) != (new.uid(), new.gid())
+        && unsafe { libc::fchown(out.as_raw_fd(), old.uid(), old.gid()) } != 0
+    {
+        return Err(io::Error::other(
+            "Cannot preserve workbook ownership. Use Save As.",
+        ));
+    }
+    out.set_permissions(std::fs::Permissions::from_mode(old.mode() & 0o777))?;
+    preserve_metadata(file, out)
 }
 
 #[cfg(target_os = "freebsd")]
@@ -219,7 +288,52 @@ fn preserve_metadata(_: &File, _: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+
+    fn save_bytes(token: Token, bytes: &[u8]) -> io::Result<()> {
+        commit_with(token, |out| {
+            out.write_all(bytes)?;
+            Ok(blake3::hash(bytes))
+        })
+    }
+
+    #[test]
+    fn consecutive_saves_accept_ctime_drift_and_reject_external_bytes() -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let dir = std::env::temp_dir().join(format!("grant-revision-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("Budget.csv");
+        std::fs::write(&path, b"0,0\n")?;
+        File::open(&path)?.sync_all()?;
+        let handle = grant(&path, &File::options().read(true).write(true).open(&path)?)?;
+        let source = dir.join("staged.csv");
+        for n in 1..=4 {
+            let bytes = format!("{n},0\n");
+            std::fs::write(&source, &bytes)?;
+            commit(handle, &File::open(&source)?)?;
+            assert_eq!(std::fs::read(&path)?, bytes.as_bytes());
+            // A temporary second link changes ctime while leaving the final
+            // link count, mode, mtime and workbook contents intact.
+            let link = dir.join("temporary-link");
+            std::fs::hard_link(&path, &link)?;
+            std::fs::remove_file(link)?;
+        }
+        let external = File::options().write(true).open(&path)?;
+        let old = external.metadata()?;
+        external.write_all_at(b"9", 2)?;
+        external.sync_all()?;
+        external.set_modified(old.modified()?)?;
+        assert_eq!(external.metadata()?.modified()?, old.modified()?);
+        assert_eq!(external.metadata()?.ino(), old.ino());
+        assert_eq!(external.metadata()?.len(), old.len());
+        assert_eq!(
+            commit(handle, &File::open(source)?)
+                .unwrap_err()
+                .to_string(),
+            changed().to_string()
+        );
+        assert_eq!(std::fs::read(&path)?, b"4,9\n");
+        std::fs::remove_dir_all(dir)
+    }
 
     #[test]
     fn interrupted_overwrite_keeps_original_and_reopened_grant_saves_twice() {
@@ -251,16 +365,16 @@ mod tests {
         assert!(grant(&path, &File::open(&path).unwrap()).is_err());
         let handle = grant(&path, &file).unwrap();
         let other_window = grant(&path, &file).unwrap();
-        commit_with(handle, |out| out.write_all(b"revision one")).unwrap();
-        assert!(commit_with(other_window, |out| out.write_all(b"stale")).is_err());
+        save_bytes(handle, b"revision one").unwrap();
+        assert!(save_bytes(other_window, b"stale").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"revision one");
-        commit_with(handle, |out| out.write_all(b"revision two")).unwrap();
+        save_bytes(handle, b"revision two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"revision two");
         std::fs::rename(&path, dir.join("Moved.csv")).unwrap();
         std::fs::write(&path, b"different file").unwrap();
-        assert!(commit_with(handle, |out| out.write_all(b"wrong target")).is_err());
+        assert!(save_bytes(handle, b"wrong target").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"different file");
-        assert!(commit_with([0; 16], |_| Ok(())).is_err());
+        assert!(save_bytes([0; 16], b"").is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

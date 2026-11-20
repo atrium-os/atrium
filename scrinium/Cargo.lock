@@ -1322,6 +1322,7 @@ version = "0.1.0"
 dependencies = [
  "atrium-media",
  "atrium-types",
+ "blake3",
  "fresco-client",
  "fresco-protocol",
  "libc",

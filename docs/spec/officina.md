@@ -176,7 +176,9 @@ acknowledged revision saved. Later edits stay pending. Closing the window or
 pressing Ctrl+W during Save waits for the active request. Sheets closes only
 after confirmation if the workbook is clean. A later edit or missing
 confirmation keeps the document open. A stale or expired grant requires
-reopening the workbook or Save As.
+reopening the workbook or Save As. Consecutive saves on UFS tolerate deferred
+inode timestamp changes. Scrinium checks workbook contents before replacement,
+including when an outside edit preserves the file’s size and modification time.
 
 If Limen restarts, each open Sheets window drops its old picker or print
 session and reconnects to the broker. The workbook remains editable during

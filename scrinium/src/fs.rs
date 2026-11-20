@@ -246,20 +246,22 @@ fn publish_name<T>(name: &str, mut create: impl FnMut(&str) -> io::Result<T>) ->
 
 /// Finish a staged Save As before publishing a name in the chosen folder.
 pub fn publish_workbook(dir: &Path, name: &str, source: &std::fs::File) -> io::Result<(std::fs::File, String)> {
-    stage_workbook(dir, name, |file| copy_snapshot(source, file))
+    use std::io::Write;
+    stage_workbook(dir, name, |file| read_snapshot(source, |chunk| file.write_all(chunk)))
 }
 
-pub(crate) fn copy_snapshot(source: &std::fs::File, file: &mut std::fs::File) -> io::Result<()> {
+pub(crate) const MAX_WORKBOOK_SIZE: u64 = 2 << 30;
+
+pub(crate) fn read_snapshot(source: &std::fs::File, mut consume: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     let len = source.metadata()?.len();
-    if len > 2 << 30 { return Err(io::Error::other("invalid workbook size")); }
-    use std::io::Write;
+    if len > MAX_WORKBOOK_SIZE { return Err(io::Error::other("invalid workbook size")); }
     let mut buf = [0u8; 65536];
     let mut offset = 0;
     while offset < len {
         let n = buf.len().min((len - offset) as usize);
         source.read_exact_at(&mut buf[..n], offset)?;
-        file.write_all(&buf[..n])?;
+        consume(&buf[..n])?;
         offset += n as u64;
     }
     Ok(())
@@ -268,7 +270,7 @@ pub(crate) fn copy_snapshot(source: &std::fs::File, file: &mut std::fs::File) ->
 fn stage_workbook(dir: &Path, name: &str, write: impl FnOnce(&mut std::fs::File) -> io::Result<()>) -> io::Result<(std::fs::File, String)> {
     use std::os::fd::AsRawFd;
     let folder = std::fs::File::open(dir)?;
-    let result = stage_in(&folder, write, |stage, tmp| publish_name(name, |candidate| {
+    let result = stage_in(&folder, write, |stage, tmp, _, ()| publish_name(name, |candidate| {
         publish_new(stage, tmp, folder.as_raw_fd(), &std::ffi::CString::new(candidate)?)
     }).map(|(_, name)| name))?;
     result.0.sync_all()?;
@@ -284,8 +286,8 @@ pub(crate) fn random_token() -> io::Result<[u8; 16]> {
     Ok(bytes)
 }
 
-pub(crate) fn stage_in<T>(folder: &std::fs::File, write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
-    publish: impl FnOnce(std::os::fd::RawFd, &std::ffi::CStr) -> io::Result<T>) -> io::Result<(std::fs::File, T)> {
+pub(crate) fn stage_in<W, T>(folder: &std::fs::File, write: impl FnOnce(&mut std::fs::File) -> io::Result<W>,
+    publish: impl FnOnce(std::os::fd::RawFd, &std::ffi::CStr, &std::fs::File, W) -> io::Result<T>) -> io::Result<(std::fs::File, T)> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     let fd = folder.as_raw_fd();
@@ -311,12 +313,12 @@ pub(crate) fn stage_in<T>(folder: &std::fs::File, write: impl FnOnce(&mut std::f
         if raw < 0 { return Err(io::Error::last_os_error()); }
         let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
         let saved = (|| {
-            write(&mut file)?;
+            let written = write(&mut file)?;
             // On Tessera this fsync commits a mount generation while the live
             // workbook name still points to its old bytes. Keep it before
             // publication, including when a nullfs grant wraps the mount.
             file.sync_all()?;
-            publish(stage.as_raw_fd(), leaf)
+            publish(stage.as_raw_fd(), leaf, &file, written)
         })();
         unsafe { libc::unlinkat(stage.as_raw_fd(), leaf.as_ptr(), 0); }
         let published = saved?;
