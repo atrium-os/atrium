@@ -559,7 +559,14 @@ What Mail shows comes from what was checked, never from what the message says ab
   `header.from` domain matching the message’s sole From mailbox. A local
   verified signature takes precedence. A provider pass can cover a missing
   key or an unsigned message, but cannot override a failed aligned signature.
-  Mail currently leaves provider trust disabled for configured accounts.
+  Mail leaves provider trust disabled for configured accounts and rejects
+  provider verdicts returned by the parser. Mail preserves original headers
+  when importing messages into folders, including Inbox. An authenticated
+  IMAP or JMAP fetch can therefore return archive bytes with a provider-shaped
+  header. Before enabling trust for an account, verify that the provider
+  protects its authentication claims across SMTP ingress and mailbox writes
+  such as IMAP APPEND and JMAP import, or supplies authenticated delivery
+  metadata separately from the message bytes.
   [RFC 8601 §§4.1 and 5](https://www.rfc-editor.org/rfc/rfc8601.html#section-4.1)
 - Successful DKIM and DMARC TXT answers are cached in the persona’s Mail
   index across restarts. Positive answers are valid for six hours and empty

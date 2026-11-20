@@ -108,3 +108,33 @@ fn senders_are_checked_with_lookups_and_answers_kept() {
     engine.open(id4).unwrap();
     assert_eq!(engine.dns_lookups(), n);
 }
+
+#[test]
+fn inbox_import_round_trip_does_not_establish_provider_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("reader@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder {
+        name: "INBOX".into(),
+        role: mail_sync::Role::Inbox,
+        selectable: true,
+    }]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let mbox = b"From sender@example.com Thu Jan  1 00:00:00 1970\r\n\
+        Authentication-Results: edge.example; dmarc=pass header.from=example.com\r\n\
+        From: sender@example.com\r\nSubject: Archive import\r\n\r\nHello\r\n";
+    assert_eq!(engine.import_mbox(inbox, mbox.as_slice()).unwrap().queued, 1);
+    let mut uploaded = Vec::new();
+    assert_eq!(engine.upload_imports(account, &mut |folder, raw| {
+        assert_eq!(folder, "INBOX");
+        uploaded.extend_from_slice(raw);
+        Ok(())
+    }).unwrap(), 1);
+    assert!(uploaded.starts_with(b"Authentication-Results: edge.example;"));
+    sink.messages("INBOX", vec![fetched(1, uploaded)]).unwrap();
+
+    let id = engine.store.at(inbox, 1).unwrap().unwrap().0;
+    assert_eq!(engine.store.message(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
+    assert_eq!(engine.open(id).unwrap().summary.sender_check, SenderCheck::NotVerified);
+}

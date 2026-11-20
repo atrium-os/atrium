@@ -122,6 +122,15 @@ impl Drop for Jail {
 /// The worker's name in Mail's `[[workers]]`.
 pub const PARSE_WORKER: &str = "parse";
 
+// Provider trust belongs to the parent. Mail gives none of its current
+// parse requests an authserv-id, so a worker cannot grant it in a reply.
+fn check_local_sender_verdict(verdict: &wire::SenderCheck) -> Result<(), Error> {
+    if matches!(verdict, wire::SenderCheck::Verified { by_provider: true, .. }) {
+        return Err(Error::Jail("provider verdict without delivery trust".into()));
+    }
+    Ok(())
+}
+
 impl Parser {
     /// Installed, Mail declares the parser as its `parse` worker: a jail of
     /// its own, as a uid of its own, with no capability (app-composition.md
@@ -147,8 +156,7 @@ impl Parser {
         Ok(Jail { proc: Proc::Child(child), r: BufReader::new(r), w: BufWriter::new(w) })
     }
 
-    /// Frames until `Done`, answering lookups (none yet: DKIM keys come from
-    /// mail-sync's resolver in a later step, so signed mail stays Pending).
+    /// Frames until `Done`, answering DKIM and DMARC lookups.
     fn exchange(j: &mut Jail, lens: &dyn Fn(u64) -> Option<u64>, dns: &dyn Fn(&str) -> Option<String>) -> Result<Vec<FromJail>, Error> {
         let caps = Caps::default();
         let mut out = Vec::new();
@@ -159,6 +167,11 @@ impl Parser {
                 _ => 0,
             };
             f.check(&caps, raw_len).map_err(|e| Error::Jail(e.to_string()))?;
+            match &f {
+                FromJail::Summary { result: Ok(s), .. } => check_local_sender_verdict(&s.sender_check)?,
+                FromJail::Opened { result: Ok(o), .. } => check_local_sender_verdict(&o.summary.sender_check)?,
+                _ => {}
+            }
             match f {
                 FromJail::Query { query, name } => {
                     // mail-schema's check held the name to DKIM and DMARC records.
@@ -814,5 +827,19 @@ impl Engine {
             }
             Ok(n)
         })?)
+    }
+}
+
+#[cfg(test)]
+mod provider_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_cannot_grant_provider_trust() {
+        let domain = "example.com".to_owned();
+        let local = wire::SenderCheck::Verified { domain: domain.clone(), by_provider: false };
+        let provider = wire::SenderCheck::Verified { domain, by_provider: true };
+        assert!(check_local_sender_verdict(&local).is_ok());
+        assert!(matches!(check_local_sender_verdict(&provider), Err(Error::Jail(_))));
     }
 }
