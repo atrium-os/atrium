@@ -40,7 +40,8 @@ pub const MAX_BATCH_BYTES: usize = 32 << 20;
 /// TXT lookups one message may ask for: a few DKIM keys and the DMARC record
 /// (and its organizational domain's). More is a message trying to make the
 /// mailbox send DNS queries for it.
-pub const MAX_QUERIES_PER_MESSAGE: u32 = 6;
+pub const MAX_DKIM_QUERIES_PER_MESSAGE: u32 = 6;
+pub const MAX_DMARC_QUERIES_PER_MESSAGE: u32 = 2;
 
 // ---- engine → jail ----
 

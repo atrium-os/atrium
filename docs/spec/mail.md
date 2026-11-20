@@ -575,6 +575,9 @@ What Mail shows comes from what was checked, never from what the message says ab
   For the sender badge, Mail looks up only DKIM keys whose signing domain
   could align with the From domain. Repeated queries for the same key reuse
   the first answer within the message.
+  Each message can use up to six distinct DKIM key lookups. The parse
+  worker reserves up to two separate DMARC lookups for the From domain
+  and its organizational domain.
   [RFC 6376 §3.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.1)
   [RFC 6376 §§3.2, 3.5 and 3.6.1](https://www.rfc-editor.org/rfc/rfc6376.html#section-3.5)
   If a valid DKIM signature needs relaxed alignment, a failed policy lookup

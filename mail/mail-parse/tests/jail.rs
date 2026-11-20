@@ -141,6 +141,55 @@ fn sender_verification_only_looks_up_relevant_distinct_keys() {
 }
 
 #[test]
+fn dkim_key_requests_cannot_exhaust_the_dmarc_budget() {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let key = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let headers = HEADERS.replace("priya@example.com", "priya@mail.example.com");
+    let mut raw = Vec::new();
+    for index in 1..=8 {
+        let signed = signed_by(&kp, &format!("outbound{index}.example.com"), &headers, BODY);
+        if index == 8 {
+            raw.extend_from_slice(&signed);
+        } else {
+            let header_end = signed.iter().position(|&byte| byte == b'\n').unwrap();
+            raw.extend_from_slice(&signed[..=header_end]);
+        }
+    }
+    let key_queries: Vec<_> = (1..=6).map(|index| format!("sel._domainkey.outbound{index}.example.com")).collect();
+    let expected_queries: Vec<_> = key_queries.iter().map(String::as_str)
+        .chain(["_dmarc.mail.example.com", "_dmarc.example.com"]).collect();
+
+    let mut engine = Engine::start();
+    for (mode, verdict) in [
+        ("r", wire::SenderCheck::Verified { domain: "mail.example.com".into(), by_provider: false }),
+        ("s", wire::SenderCheck::NotVerified),
+    ] {
+        engine.queries.clear();
+        engine.send(&ToJail::Summarize {
+            authserv_id: None,
+            me: vec![],
+            now: 0,
+            headers_only: false,
+            roots: vec![],
+            batch: vec![wire::Raw { id: 1, bytes: raw.clone() }],
+        });
+        let output = engine.run(raw.len() as u64, &|name| match name {
+            "_dmarc.mail.example.com" => Some(String::new()),
+            "_dmarc.example.com" => Some(format!("v=DMARC1; p=reject; adkim={mode}")),
+            _ if key_queries.iter().any(|expected| expected == name) => Some(key.clone()),
+            _ => panic!("unexpected DNS lookup: {name}"),
+        });
+        let [FromJail::Summary { id: 1, result: Ok(summary) }] = output.as_slice() else {
+            panic!("unexpected frames: {output:?}");
+        };
+        assert_eq!(summary.sender_check, verdict);
+        assert_eq!(engine.queries, expected_queries);
+    }
+    engine.finish();
+}
+
+#[test]
 fn local_sender_verification_requires_one_from_mailbox() {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
