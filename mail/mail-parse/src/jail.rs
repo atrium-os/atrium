@@ -225,31 +225,34 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     // engine sees the broken stream and retires the jail either way.
     let lookup = |name: String| port.borrow_mut().query(name).ok().flatten();
 
-    let sigs = if s.dkim_signatures > 0 && !ctx.headers_only {
+    let from_domain = match s.from.as_slice() {
+        [from] if (s.dkim_signatures > 0 || ctx.authserv_id.is_some()) && dkim::has_single_from(raw) => from.domain(),
+        _ => "",
+    };
+    let sigs = if !from_domain.is_empty() && s.dkim_signatures > 0 && !ctx.headers_only {
         dkim::verify(raw, &|sel, dom| lookup(format!("{sel}._domainkey.{dom}")), ctx.now)
     } else { Vec::new() };
-    let from_domain = s.from.first().and_then(|a| a.addr.rsplit_once('@')).map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
     // DMARC only decides strict alignment, so it is looked up only when a
     // signature passed and could count.
     let dmarc = if sigs.iter().any(|g| g.outcome == dkim::Outcome::Pass) && !from_domain.is_empty() {
         let rec = |d: &str| lookup(format!("_dmarc.{d}"));
-        match rec(&from_domain) {
+        match rec(from_domain) {
             // A successful empty response permits fallback. An error leaves the
             // policy unknown because the From domain may publish an override.
             Some(record) if record.is_empty() => {
-                let org = dkim::org_domain(&from_domain);
+                let org = dkim::org_domain(from_domain);
                 if org != from_domain { rec(&org) } else { Some(record) }
             }
             record => record,
         }
     } else { None };
     let provider = ctx.authserv_id
-        .filter(|_| s.from.len() == 1)
+        .filter(|_| !from_domain.is_empty())
         .and_then(|id| dkim::provider_result(raw, id));
-    let sender_check = match dkim::verdict(&from_domain, &sigs, dmarc.as_deref(), provider.as_ref()) {
+    let sender_check = match dkim::verdict(from_domain, &sigs, dmarc.as_deref(), provider.as_ref()) {
         dkim::Verdict::Verified { domain, by_provider } => wire::SenderCheck::Verified { domain, by_provider },
         // Signed, but the body isn't here yet: checked when it is.
-        dkim::Verdict::NotVerified if ctx.headers_only && s.dkim_signatures > 0 => wire::SenderCheck::Pending,
+        dkim::Verdict::NotVerified if ctx.headers_only && s.dkim_signatures > 0 && !from_domain.is_empty() => wire::SenderCheck::Pending,
         dkim::Verdict::NotVerified => wire::SenderCheck::NotVerified,
         dkim::Verdict::Pending => wire::SenderCheck::Pending,
     };

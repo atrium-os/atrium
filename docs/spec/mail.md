@@ -561,6 +561,10 @@ What Mail shows comes from what was checked, never from what the message says ab
   again. Mail checks the organizational domain after a successful lookup
   finds no policy at the From domain. A valid signature from the exact From
   domain aligns under either mode.
+  Mail requires a single From field with one parsed mailbox before showing
+  a verified-sender badge. Multiple authors or duplicate From fields leave
+  the sender unverified while the message stays readable.
+  [RFC 5322 §3.6.2](https://www.rfc-editor.org/rfc/rfc5322.html#section-3.6.2)
 - **Provider results** require explicit trust in the account’s delivery
   boundary. The receiving MTA must remove outside claims to its own
   `authserv-id` before delivery, and Mail must obtain that ID independently

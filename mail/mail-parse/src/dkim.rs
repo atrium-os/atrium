@@ -35,6 +35,8 @@ pub struct Signature {
     pub partial_body: bool,
 }
 
+const MAX_RAW_FIELDS: usize = 2000;
+
 /// One header field as it was written, folds and line end included.
 struct RawField<'a> {
     name: &'a [u8],
@@ -61,7 +63,7 @@ fn raw_fields(raw: &[u8]) -> (Vec<RawField<'_>>, usize) {
             out.push(RawField { name: &bare[..c], bytes: &raw[i..end] });
         }
         i = end;
-        if out.len() > 2000 {
+        if out.len() > MAX_RAW_FIELDS {
             break;
         }
     }
@@ -444,11 +446,30 @@ pub struct ProviderResult {
     pub header_from: String,
 }
 
+/// A single From field with the spelling the message parser recognizes.
+pub(crate) fn has_single_from(raw: &[u8]) -> bool {
+    let (fields, _) = raw_fields(raw);
+    single_from(&fields)
+}
+
+fn single_from(fields: &[RawField<'_>]) -> bool {
+    // A truncated header block cannot establish uniqueness.
+    if fields.len() > MAX_RAW_FIELDS {
+        return false;
+    }
+    // Also count obsolete From fields with whitespace before the colon. The
+    // message parser skips those, but the DKIM field selector can match them.
+    let mut from = fields.iter().filter(|f| {
+        std::str::from_utf8(f.name).is_ok_and(|name| name.trim().eq_ignore_ascii_case("From"))
+    });
+    from.next().is_some_and(|f| f.name.eq_ignore_ascii_case(b"From")) && from.next().is_none()
+}
+
 /// The first Authentication-Results header. The caller must supply a trusted
 /// authserv-id from outside the message. Never search past an untrusted field.
 pub fn provider_result(raw: &[u8], authserv_id: &str) -> Option<ProviderResult> {
     let (fields, _) = raw_fields(raw);
-    if fields.iter().filter(|f| f.name.eq_ignore_ascii_case(b"From")).count() != 1 {
+    if !single_from(&fields) {
         return None;
     }
     let field = fields.iter().find(|f| f.name.eq_ignore_ascii_case(b"Authentication-Results"))?;

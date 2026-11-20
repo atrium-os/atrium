@@ -95,6 +95,63 @@ fn a_batch_is_summarized_with_keys_from_the_engine() {
 }
 
 #[test]
+fn local_sender_verification_requires_one_from_mailbox() {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let key = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let normal = signed(&kp, HEADERS, BODY);
+    let with_extra_from = |extra: &[u8]| {
+        let mut message = extra.to_vec();
+        message.extend_from_slice(&normal);
+        message
+    };
+    let duplicate = with_extra_from(b"fRoM: second@example.com\r\n");
+    let obsolete_duplicate = with_extra_from(b"From : second@example.com\r\n");
+    let multiple = signed(
+        &kp,
+        &HEADERS.replace("priya@example.com>", "priya@example.com>, second@example.com"),
+        BODY,
+    );
+    let mut engine = Engine::start();
+    for headers_only in [false, true] {
+        let batch: Vec<_> = [&normal, &duplicate, &obsolete_duplicate, &multiple]
+            .into_iter()
+            .enumerate()
+            .map(|(id, bytes)| wire::Raw { id: id as u64, bytes: bytes.clone() })
+            .collect();
+        let max_len = batch.iter().map(|m| m.bytes.len()).max().unwrap() as u64;
+        engine.queries.clear();
+        engine.send(&ToJail::Summarize {
+            authserv_id: None,
+            me: vec![],
+            now: 0,
+            headers_only,
+            roots: vec![],
+            batch,
+        });
+        let output = engine.run(max_len, &|name| match name {
+            "sel._domainkey.example.com" => Some(key.clone()),
+            "_dmarc.example.com" => Some(String::new()),
+            _ => panic!("unexpected query: {name}"),
+        });
+        let normal_check = if headers_only {
+            assert!(engine.queries.is_empty());
+            wire::SenderCheck::Pending
+        } else {
+            assert_eq!(engine.queries, ["sel._domainkey.example.com", "_dmarc.example.com"]);
+            wire::SenderCheck::Verified { domain: "example.com".into(), by_provider: false }
+        };
+        let mut checks = output.into_iter().enumerate().map(|(expected_id, frame)| match frame {
+            FromJail::Summary { id, result: Ok(summary) } if id == expected_id as u64 => summary.sender_check,
+            other => panic!("unexpected frame: {other:?}"),
+        });
+        assert_eq!(checks.next(), Some(normal_check));
+        assert_eq!(checks.collect::<Vec<_>>(), vec![wire::SenderCheck::NotVerified; 3]);
+    }
+    engine.finish();
+}
+
+#[test]
 fn opening_converts_the_html_and_drops_the_pixel() {
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
