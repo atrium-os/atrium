@@ -522,6 +522,7 @@ SH
     wait_for repeat_received
     input "MOVE 120 96"; sleep 2.5
     cp selectscreen.png "$results/repeated.png"
+    cmp "$results/starting.png" "$results/repeated.png"
     count 0; test "$(wc -l < "$bin/attempts")" -eq 1
     unlink "$bin/hold"
     wait_for count 1; jid=$(docs)

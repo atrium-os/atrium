@@ -136,3 +136,9 @@ The private fixture held the selected document’s runtime jail command after th
 Releasing the command started exactly one document jail. Its path and recovery ID matched the original workbook. An independent reader verified A1 was `zebra` after Save As and A1/B1 were `zebra,2` after Save. The protected sibling had already recovered and saved `fox,2`. Both documents closed with no pending markers or recovery devices. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--delayed-runtime-start` and the private fixture broker path.
 
 The gate passed with native Tessera and bounded UFS recovery volumes in the isolated Tessera-root VM. Both produced the same initial and repeated-press messages.
+
+## A second Recover press retains the named startup notice
+
+The broker now remembers a delayed recovery in its reserved slot and checks for the Sheets process when Recover is pressed again. The desktop gate waits for the second press to reach the broker and compares the resulting launcher screenshot byte for byte with the first. Both frames displayed “Sheets is still starting recovery for ‘Proof.csv’.”
+
+Native Tessera and bounded UFS recovery volumes each recorded one runtime jail start across the two presses. Releasing the hold opened the original recovery ID in its previous jail slot. An independent reader verified `zebra` after Save As and `zebra,2` after Save. The execution-failure desktop regression and five focused FreeBSD broker tests also passed.

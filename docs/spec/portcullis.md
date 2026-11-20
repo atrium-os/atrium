@@ -1275,7 +1275,10 @@ message. A worker that misses the deadline releases its mounts and slot
 before retry and cannot proceed to run the jail. Once prepared, an early
 runtime exit produces a named startup error. If the launch is still in
 progress at the deadline, the launcher reports that it is still starting.
-The worker continues supervising the jail until exit. Other workbooks can
+The reserved slot records the delayed launch and its recovery path. On a
+repeat request for that recovery the broker checks for the Sheets process
+in its assigned jail and UID. Until it starts, the launcher receives the
+same named notice. The worker continues supervising the jail until exit. Other workbooks can
 still be selected.
 
 Older empty markers receive a numbered label and an identifier on first use.

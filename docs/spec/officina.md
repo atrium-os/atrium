@@ -156,7 +156,9 @@ If the image mounts but preparing the document jail fails, the launcher
 names the workbook and prompts the user to try Recover again. If the jail
 starts but cannot execute Sheets, the launcher identifies the workbook whose
 recovery failed to start. The user can retry once the executable is available.
-Other pending workbooks can be recovered independently. Once the
+If startup takes longer than the acknowledgement deadline, the launcher names
+the workbook that is starting. Pressing Recover again keeps that notice visible
+while the original launch continues. Other pending workbooks can be recovered independently. Once the
 image is available, Recover can reopen it with its original identity.
 Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel
 closes that recovery window and leaves the generation available to try again.

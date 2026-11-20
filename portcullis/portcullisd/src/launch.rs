@@ -306,7 +306,17 @@ fn workbook_marker_dir(user: &str, persona: Option<&str>, publisher: Option<[u8;
 }
 
 const DOCUMENT_LIMIT: usize = 8;
-static ACTIVE_WORKBOOKS: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
+enum SlotState {
+    Free,
+    Active,
+    Delayed { pending: PathBuf, uid: u32, jail: String },
+}
+
+static ACTIVE_WORKBOOKS: Mutex<[SlotState; DOCUMENT_LIMIT]> = Mutex::new([const { SlotState::Free }; DOCUMENT_LIMIT]);
+
+fn starting_notice(name: &str) -> String {
+    format!("Sheets is still starting recovery for “{name}”.")
+}
 
 pub fn name_workbook_recovery(uid: u32, registry: &portcullis_peer::AppRegistry, id: [u8; 16], name: String) -> std::io::Result<()> {
     let Some((user, app)) = registry.resolve(uid) else {
@@ -347,7 +357,7 @@ static SLOT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
 struct WorkbookSlot(usize);
 impl Drop for WorkbookSlot {
     fn drop(&mut self) {
-        ACTIVE_WORKBOOKS.lock().unwrap()[self.0] = false;
+        ACTIVE_WORKBOOKS.lock().unwrap()[self.0] = SlotState::Free;
         SLOT_RELEASED.notify_all();
     }
 }
@@ -384,7 +394,19 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                 let pending = dir.join(format!("{index}.pending"));
                 let occupied = pending.try_exists()?;
                 if recover && !occupied { continue; }
-                if *used {
+                if let SlotState::Delayed { pending: owner_path, uid, jail } = used {
+                    if recover && *owner_path == pending {
+                        if recovery_process_running(jail, *uid) {
+                            *used = SlotState::Active;
+                        } else {
+                            let book = pending_workbook(&pending, index)?;
+                            if !matches!(action, WorkbookAction::Select(id) if id != book.id) {
+                                return Err(std::io::Error::other(starting_notice(&book.name)));
+                            }
+                        }
+                    }
+                }
+                if !matches!(used, SlotState::Free) {
                     finishing |= recover;
                     continue;
                 }
@@ -420,14 +442,14 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
                     if let WorkbookAction::Select(id) = action {
                         if book.id != id { continue; }
                         inspection?;
-                        *used = true;
+                        *used = SlotState::Active;
                         break 'reserve (WorkbookSlot(index), pending, book.name);
                     } else {
                         choices.push((index, book, inspection));
                         continue;
                     }
                 }
-                *used = true;
+                *used = SlotState::Active;
                 break 'reserve (WorkbookSlot(index), pending, name.to_owned());
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -440,7 +462,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
             }
             if let Some((index, book, inspection)) = choices.pop() {
                 inspection?;
-                active[index] = true;
+                active[index] = SlotState::Active;
                 break 'reserve (WorkbookSlot(index), dir.join(format!("{index}.pending")), book.name);
             }
             // The window can vanish before jail teardown and disk detach finish.
@@ -485,7 +507,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
             format!("Could not prepare a recovery window for “{name}”. Try Recover again.")))?;
         started.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|why| std::io::Error::other(match why {
             mpsc::RecvTimeoutError::Disconnected => format!("Could not start Sheets for “{name}”. Try Recover again."),
-            mpsc::RecvTimeoutError::Timeout => format!("Sheets is still starting recovery for “{name}”."),
+            mpsc::RecvTimeoutError::Timeout => starting_notice(&name),
         }))?;
     }
     Ok(Vec::new())
@@ -902,10 +924,10 @@ fn launch_inner(
         full_teardown(&jail_path, None);
         return Err(e);
     }
-    let recovery_start = if let Some(ready) = document.as_mut().and_then(|doc| doc.setup_ready.take()) {
+    let recovery_start = if let Some((doc, ready)) = document.as_mut().and_then(|doc| doc.setup_ready.take().map(|ready| (doc, ready))) {
         let (started, result) = mpsc::channel();
         ready.send(result).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
-        Some((app_uid, started))
+        Some(RecoveryStart { uid: app_uid, started, slot: doc.slot.0, pending: doc.pending.clone() })
     } else { None };
     let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid), recovery_start);
 
@@ -1209,7 +1231,7 @@ fn run_one_jail(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
     refresh_uid: Option<u32>,
-    recovery_start: Option<(u32, mpsc::Sender<()>)>,
+    recovery_start: Option<RecoveryStart>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★ A `full` network comes from jaild, the one allocator (network.md §0):
      * a point-to-point epair with the app's derived MAC — never the host's
@@ -1353,7 +1375,7 @@ fn run_one_jail_inner(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
     refresh_uid: Option<u32>,
-    recovery_start: Option<(u32, mpsc::Sender<()>)>,
+    recovery_start: Option<RecoveryStart>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
     portcullis_mounts::ensure_devfs_isolation(jc)
@@ -1380,7 +1402,7 @@ fn run_one_jail_inner(
         cmd.stderr(Stdio::from(serr));
     }
     let status = match (recovery_start, refresh_uid) {
-        (Some((uid, started)), _) => wait_for_recovery(&mut cmd, &jc.name, uid, started),
+        (Some(start), _) => wait_for_recovery(&mut cmd, &jc.name, start),
         (_, Some(uid)) => wait_for_files(&mut cmd, &jc.name, uid),
         _ => cmd.status(),
     };
@@ -1413,22 +1435,40 @@ fn run_one_jail_inner(
     Ok(code)
 }
 
+struct RecoveryStart {
+    uid: u32,
+    started: mpsc::Sender<()>,
+    slot: usize,
+    pending: PathBuf,
+}
+
+fn recovery_process_running(jail: &str, uid: u32) -> bool {
+    Command::new("pgrep").args(["-j", jail, "-U", &uid.to_string(), "-x", "atrium-sheets"])
+        .output().is_ok_and(|out| out.status.success())
+}
+
 // jail(8) stays alive while exec.start runs. Confirm Sheets in this specific
 // document jail before replying, then let the launch thread supervise its exit.
-fn wait_for_recovery(cmd: &mut Command, jail: &str, uid: u32, started: mpsc::Sender<()>) -> std::io::Result<ExitStatus> {
+fn wait_for_recovery(cmd: &mut Command, jail: &str, start: RecoveryStart) -> std::io::Result<ExitStatus> {
     let mut child = cmd.spawn()?;
-    let uid = uid.to_string();
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? { return Ok(status); }
-        if Command::new("pgrep").args(["-j", jail, "-U", &uid, "-x", "atrium-sheets"])
-            .output().is_ok_and(|out| out.status.success()) {
-            let _ = started.send(());
-            break;
+        if recovery_process_running(jail, start.uid) {
+            let _ = start.started.send(());
+            return child.wait();
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    child.wait()
+    // Wake a repeated Recover already waiting on this reservation. After the
+    // deadline, probe again only on demand while the original launch continues.
+    ACTIVE_WORKBOOKS.lock().unwrap()[start.slot] = SlotState::Delayed {
+        pending: start.pending, uid: start.uid, jail: jail.to_owned(),
+    };
+    SLOT_RELEASED.notify_all();
+    let status = child.wait();
+    ACTIVE_WORKBOOKS.lock().unwrap()[start.slot] = SlotState::Active;
+    status
 }
 
 fn files_should_stop() -> bool {
