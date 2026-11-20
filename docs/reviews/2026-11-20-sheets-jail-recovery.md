@@ -120,3 +120,11 @@ Both native Tessera and bounded UFS recovery volumes passed in the isolated Tess
 The broker now waits for the document worker to prepare the jail root and mountpoints before acknowledging recovery. With the same blocked upper layer, the launcher displayed “Could not prepare a recovery window for ‘Proof.csv’. Try Recover again.” The desktop gate checks the rendered frame both when the user selects that workbook from two choices and when Recover selects the only remaining workbook.
 
 The gate passed on native Tessera and bounded UFS recovery volumes. The protected sibling saved while the fault was present. After the fixture cleared the fault, retry recovered the original ID in the same jail slot, and the saved copy contained the original edit and a subsequent edit. The source CSV retained its original contents. Both recovery devices detached and both markers cleared. Five focused broker tests passed on FreeBSD.
+
+## Sheets cannot execute after the recovery jail is prepared
+
+The fixture cached both pending workbook names, then temporarily removed execute permission from its Sheets executable. FreeBSD logged a denied exec of `/bin/atrium-sheets` inside the selected document jail. The launcher displayed “Could not start Sheets for ‘Proof.csv’. Try Recover again.” The desktop gate checks the rendered message both for an explicit selection and for the only remaining recovery.
+
+With execute permission restored, the protected sibling recovered and saved. After the second failure, retry reopened the original workbook in its prior jail slot under the same broker, with its recovery ID intact. An independent reader verified the recovered A1 values and subsequent B1 edits in both saved copies. Both markers and devices cleared on close. Run the [desktop gate](../../scripts/sheets-recovery-choices-vm-check.sh) with `--retry-runtime-start`.
+
+Both native Tessera and bounded UFS recovery volumes passed in the isolated Tessera-root VM. The earlier jail preparation failure case and all five focused FreeBSD broker tests also passed. The launcher cleared the error after successful recovery.

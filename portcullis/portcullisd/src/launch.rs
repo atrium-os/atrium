@@ -22,7 +22,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use portcullis_jail::{build, jail_name_from_app_id, BuildOpts, JailConfig};
@@ -254,7 +254,7 @@ struct WorkbookLaunch {
     prepared: Option<RecoveryMount>,
     // Drop any prepared mount before making the slot available again.
     slot: WorkbookSlot,
-    setup_ready: Option<std::sync::mpsc::SyncSender<()>>,
+    setup_ready: Option<mpsc::SyncSender<mpsc::Receiver<()>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -466,7 +466,7 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
         Some(RecoveryMount { store, pending: pending.clone(), clean: false, id: [0; 16] })
     } else { None };
     let (setup_ready, setup_result) = recover.then(|| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+        let (sender, receiver) = mpsc::sync_channel(0);
         (sender, (receiver, name.clone()))
     }).unzip();
     let document = WorkbookLaunch { blank, recover, pending, publisher, name, prepared, slot, setup_ready };
@@ -480,8 +480,13 @@ fn launch_workbook(user: &str, persona: Option<&str>, name: &str, startup: Optio
     })?;
     if let Some((result, name)) = setup_result {
         // Dropping the receiver on timeout also cancels a worker still in setup.
-        result.recv_timeout(Duration::from_secs(2)).map_err(|_| std::io::Error::other(
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let started = result.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|_| std::io::Error::other(
             format!("Could not prepare a recovery window for “{name}”. Try Recover again.")))?;
+        started.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|why| std::io::Error::other(match why {
+            mpsc::RecvTimeoutError::Disconnected => format!("Could not start Sheets for “{name}”. Try Recover again."),
+            mpsc::RecvTimeoutError::Timeout => format!("Sheets is still starting recovery for “{name}”."),
+        }))?;
     }
     Ok(Vec::new())
 }
@@ -752,7 +757,7 @@ fn launch_inner(
                          inherits daemon intentionally — Phase 4.5
                          step-1 simplification. Step-2 will pipe setup
                          output through the same tty as the runtime
-                         app. */ None, None)
+                         app. */ None, None, None)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             if setup_exit != Some(0) {
                 full_teardown(&jail_path, None);
@@ -897,10 +902,12 @@ fn launch_inner(
         full_teardown(&jail_path, None);
         return Err(e);
     }
-    if let Some(ready) = document.as_mut().and_then(|doc| doc.setup_ready.take()) {
-        ready.send(()).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
-    }
-    let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid));
+    let recovery_start = if let Some(ready) = document.as_mut().and_then(|doc| doc.setup_ready.take()) {
+        let (started, result) = mpsc::channel();
+        ready.send(result).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
+        Some((app_uid, started))
+    } else { None };
+    let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid), recovery_start);
 
     let clean = full_teardown(&jail_path, Some(&jc.name));
     if refresh_groups && !clean {
@@ -1202,6 +1209,7 @@ fn run_one_jail(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
     refresh_uid: Option<u32>,
+    recovery_start: Option<(u32, mpsc::Sender<()>)>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★ A `full` network comes from jaild, the one allocator (network.md §0):
      * a point-to-point epair with the app's derived MAC — never the host's
@@ -1225,7 +1233,7 @@ fn run_one_jail(
         let _ = fs::create_dir_all(&etc);
         let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
-    let outcome = run_one_jail_inner(&jc, jail_path, stdio, refresh_uid);
+    let outcome = run_one_jail_inner(&jc, jail_path, stdio, refresh_uid, recovery_start);
     if networked.is_some() {
         jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
     }
@@ -1345,6 +1353,7 @@ fn run_one_jail_inner(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
     refresh_uid: Option<u32>,
+    recovery_start: Option<(u32, mpsc::Sender<()>)>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
     portcullis_mounts::ensure_devfs_isolation(jc)
@@ -1370,9 +1379,10 @@ fn run_one_jail_inner(
         cmd.stdout(Stdio::from(sout));
         cmd.stderr(Stdio::from(serr));
     }
-    let status = match refresh_uid {
-        Some(uid) => wait_for_files(&mut cmd, &jc.name, uid),
-        None => cmd.status(),
+    let status = match (recovery_start, refresh_uid) {
+        (Some((uid, started)), _) => wait_for_recovery(&mut cmd, &jc.name, uid, started),
+        (_, Some(uid)) => wait_for_files(&mut cmd, &jc.name, uid),
+        _ => cmd.status(),
     };
     let _ = fs::remove_file(&conf_path);
     /* Per-jail teardown: jail -r releases the jail's specific mounts
@@ -1401,6 +1411,24 @@ fn run_one_jail_inner(
      * Today setup failures are detected at the call site by
      * checking `code != Some(0)` after this returns. */
     Ok(code)
+}
+
+// jail(8) stays alive while exec.start runs. Confirm Sheets in this specific
+// document jail before replying, then let the launch thread supervise its exit.
+fn wait_for_recovery(cmd: &mut Command, jail: &str, uid: u32, started: mpsc::Sender<()>) -> std::io::Result<ExitStatus> {
+    let mut child = cmd.spawn()?;
+    let uid = uid.to_string();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? { return Ok(status); }
+        if Command::new("pgrep").args(["-j", jail, "-U", &uid, "-x", "atrium-sheets"])
+            .output().is_ok_and(|out| out.status.success()) {
+            let _ = started.send(());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    child.wait()
 }
 
 fn files_should_stop() -> bool {

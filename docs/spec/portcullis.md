@@ -1268,10 +1268,15 @@ The launch thread takes ownership of that mount for the document jail. A
 failed mount releases the reservation and reports an unavailable image
 for the requested workbook, including when it is the only pending recovery.
 Once the image has mounted, the recovery request waits up to two seconds for
-the worker to prepare the jail root and mountpoints. If preparation fails
+the worker to prepare the jail root and mountpoints and confirm the Sheets
+process in the reserved document jail under its assigned UID. If preparation fails
 or expires, the launcher receives the selected workbook’s name and a retry
 message. A worker that misses the deadline releases its mounts and slot
-before retry and cannot proceed to run the jail. Other workbooks can still be selected.
+before retry and cannot proceed to run the jail. Once prepared, an early
+runtime exit produces a named startup error. If the launch is still in
+progress at the deadline, the launcher reports that it is still starting.
+The worker continues supervising the jail until exit. Other workbooks can
+still be selected.
 
 Older empty markers receive a numbered label and an identifier on first use.
 The launcher receives only this metadata. The selected document jail reads

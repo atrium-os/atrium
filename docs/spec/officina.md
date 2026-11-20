@@ -153,7 +153,9 @@ post-reboot chooser reads the published name from the detached autosave.
 If a recovery image is missing or fails to mount, the launcher shows the
 workbook name in the error, including when the chooser already listed it.
 If the image mounts but preparing the document jail fails, the launcher
-names the workbook and prompts the user to try Recover again.
+names the workbook and prompts the user to try Recover again. If the jail
+starts but cannot execute Sheets, the launcher identifies the workbook whose
+recovery failed to start. The user can retry once the executable is available.
 Other pending workbooks can be recovered independently. Once the
 image is available, Recover can reopen it with its original identity.
 Canceling the picker keeps the previous name. A protected workbook asks for its password there. Cancel

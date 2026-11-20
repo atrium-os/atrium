@@ -13,6 +13,7 @@
 # --retry-recovery-label takes the fixture broker path. Its optional third argument
 # selects a missing name (missing, the default) or unreadable text (invalid-utf8).
 # --retry-missing-image [after-list|before-list] takes one image offline until its sibling is saved.
+# --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
 # --retry-unmountable-image leaves an unformatted fixture file at the image path.
 set -eu
@@ -468,7 +469,7 @@ if test "${1:-}" = --interrupted-labels || test "${1:-}" = --live-broker-restart
     fi
     exit 0
 fi
-if test "${1:-}" = --retry-jail-setup; then
+if test "${1:-}" = --retry-jail-setup || test "${1:-}" = --retry-runtime-start; then
     first=setup-retry
     broker_pid=$(sockstat -ulw | awk '$6=="/atrium/sockets/portcullis/portcullis.sock" {print $3}')
     test -n "$broker_pid"
@@ -483,34 +484,49 @@ if test "${1:-}" = --retry-jail-setup; then
     cp "$marker" "$results/selected.marker"
     cp "$store/1.pending" "$results/sibling.marker"
     upper="$plain_root-upper"
-    # A regular file at the tmpfs mountpoint makes create_dir_all fail with EEXIST.
-    # Link without replacement so teardown only unlinks the exact fixture inode.
-    touch "$results/blocked-upper"
-    unblock() { if test "$upper" -ef "$results/blocked-upper"; then unlink "$upper"; fi; }
+    if test "$1" = --retry-runtime-start; then
+        entry=/var/lib/atrium/apps/org.atrium.sheets/bin/atrium-sheets
+        test -x "$entry"; mode=$(stat -f %Lp "$entry")
+        block() { chmod a-x "$entry"; }
+        unblock() { chmod "$mode" "$entry"; }
+        diagnostic='exec /bin/atrium-sheets: Permission denied'
+        frame=93af748613319b84914805330182932743335f53ed60aca971da1b815c5633db
+        # Entering jail setup invalidates the detached-volume check.
+        selected_intact() {
+            sed 's/"checked_detached":true/"checked_detached":false/' "$results/selected.marker" | cmp -s - "$marker"
+        }
+    else
+        # Only remove the exact fixture inode used to block the upper mount.
+        touch "$results/blocked-upper"
+        block() { test ! -e "$upper" && ln "$results/blocked-upper" "$upper"; }
+        unblock() { if test "$upper" -ef "$results/blocked-upper"; then unlink "$upper"; fi; }
+        diagnostic='Sheets workbook launch: Failed("document", "File exists'
+        frame=b484989308608aba88ef7e66cc5c2d8ee83dabdd93f4f578cabf77416b0e2249
+        selected_intact() { cmp "$marker" "$results/selected.marker"; }
+    fi
     trap unblock EXIT
-    test ! -e "$upper"
-    ln "$results/blocked-upper" "$upper"
+    block
     start=$(wc -l < select-port.log)
     click 120 96
-    failed() { tail -n "+$((start+1))" select-port.log | grep -Fq 'Sheets workbook launch: Failed("document", "File exists'; }
+    failed() { tail -n "+$((start+1))" select-port.log | grep -Fq "$diagnostic"; }
     wait_for failed
-    # Verified against the rendered launcher text in this fixed headless fixture:
-    # Could not prepare a recovery window for “Proof.csv”. Try Recover again.
-    named_error() { test "$(sha256 -q selectscreen.png)" = b484989308608aba88ef7e66cc5c2d8ee83dabdd93f4f578cabf77416b0e2249; }
+    named_error() { test "$(sha256 -q selectscreen.png)" = "$frame"; }
     wait_for named_error
     cp selectscreen.png "$results/setup-failed.png"
     wait_for detached; count 0; pending 2
     mount -p | awk -v root="$plain_root" -v upper="$upper" '$2==root || index($2,root "/")==1 || $2==upper {found=1} END {exit found}'
-    cmp "$marker" "$results/selected.marker"
+    selected_intact
     cmp "$store/1.pending" "$results/sibling.marker"
+    if test "$1" = --retry-runtime-start; then unblock; fi
     choose protected; save_copy protected; wait_for pending 1
-    cmp "$marker" "$results/selected.marker"
+    # Listing the sibling can refresh the detached marker.
+    if test "$1" = --retry-runtime-start; then block; else selected_intact; fi
     start=$(wc -l < select-port.log)
     click 213 24; wait_for failed
     input "MOVE 120 96" # Clear the Recover button hover before comparing frames.
     wait_for named_error
     wait_for detached; count 0; pending 1
-    cmp "$marker" "$results/selected.marker"
+    selected_intact
     unblock; trap - EXIT
     click 213 24; wait_for count 1; wait_for opened "$(docs)" Proof.csv
     test "$(root "$(docs)")" = "$plain_root"
@@ -519,7 +535,7 @@ if test "${1:-}" = --retry-jail-setup; then
     sed 's/,"name":.*//' "$marker" > "$results/retried.id"
     sed 's/,"name":.*//' "$results/selected.marker" | cmp -s - "$results/retried.id"
     save_copy plain; wait_for pending 0; wait_for detached
-    echo "Retried the same workbook after jail setup failed. Copies: $results"
+    echo "Retried the same workbook after $1. Copies: $results"
     exit 0
 fi
 if test "${1:-}" = --retry-missing-image || test "${1:-}" = --retry-unmountable-image; then
