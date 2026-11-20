@@ -1182,6 +1182,14 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                 ok "the reconnected ESP report refreshed silently"
                                                 probe "IPv4 echo after silent HIP refresh on reconnected ESP"
                                                 rebind_restored_forwarding 15 "$initial_report" timer-rebind
+                                                before_refresh=$(awk 'END { print NR }' "$receipts")
+                                                wait_receipts "$((before_refresh + 1))"
+                                                [ "$(field signin)" = in ] &&
+                                                    [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$initial_report" ] &&
+                                                    [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$reviews" ] ||
+                                                    fail "unchanged HIP did not refresh silently on the rebound ESP tunnel"
+                                                ok "unchanged HIP refreshed silently on the rebound ESP tunnel"
+                                                probe "IPv4 echo after timer refresh on the same rebound ESP tunnel"
                                             fi
                                         fi
                                     fi

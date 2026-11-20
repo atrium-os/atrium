@@ -811,7 +811,8 @@ def main():
                                 expected_spis.extend([esp.configs[16][0][0]] * 3 + [esp.configs[17][0][0]])
                             if active_recovered_reconnect:
                                 reconnect_spi = esp.configs[18][0][0]
-                                expected_spis.extend([reconnect_spi, reconnect_spi, esp.configs[19][0][0]])
+                                rebound_spi = esp.configs[19][0][0]
+                                expected_spis.extend([reconnect_spi, reconnect_spi, rebound_spi, rebound_spi])
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -825,7 +826,7 @@ def main():
                 allowed_echoes = [expected_spis]
                 if rebind_retry and not rebind_decline:
                     if final_recover:
-                        recovery_echoes = 17 if active_recovered_reconnect else 14 if active_rebind_recover else 12 if active_refresh_reconnect and (not active_rebind_tls or active_rebind_recover) else 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
+                        recovery_echoes = 18 if active_recovered_reconnect else 14 if active_rebind_recover else 12 if active_refresh_reconnect and (not active_rebind_tls or active_rebind_recover) else 10 if active_refresh_retry and not active_refresh_decline else 8 if recovered_reconnect else 4
                         allowed_echoes.append([
                             *expected_spis[:-recovery_echoes], expected_spis[-recovery_echoes - 1],
                             *expected_spis[-recovery_echoes:],
@@ -835,12 +836,12 @@ def main():
                     else:
                         allowed_echoes.append([*expected_spis, expected_spis[-1]])
                 if active_rebind_recover:
-                    tail_echoes = 7 if active_recovered_reconnect else 4
+                    tail_echoes = 8 if active_recovered_reconnect else 4
                     allowed_echoes.extend([
                         *echoes[:-tail_echoes], retry_spi, *echoes[-tail_echoes:]
                     ] for echoes in allowed_echoes[:])
                     if active_recovered_reconnect:
-                        allowed_echoes.extend([*echoes[:-1], reconnect_spi, echoes[-1]] for echoes in allowed_echoes[:])
+                        allowed_echoes.extend([*echoes[:-2], reconnect_spi, *echoes[-2:]] for echoes in allowed_echoes[:])
                         allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 elif active_refresh_reconnect and not active_rebind_tls:
                     allowed_echoes.extend([*echoes[:-2], retry_spi, *echoes[-2:]] for echoes in allowed_echoes[:])
@@ -995,8 +996,9 @@ def main():
                                                                 assert set(reports[reconnect_report:]) == {original}, reports
                                                                 rebound_report = calls[:configs[19]].count("hipreport.esp")
                                                                 assert rebound_report >= reconnect_report + 2, reports
+                                                                assert len(reports[rebound_report:]) >= 2, reports
                                                                 assert set(reports[rebound_report:]) == {original}, reports
-                                                                print("Final rebind acknowledged unchanged HIP before traffic on the new ESP association")
+                                                                print("Unchanged HIP refreshed silently and IPv4 continued on the same rebound ESP association")
                                                             if active_recovered_decline:
                                                                 assert calls[configs[17]:].count("hipreportcheck.esp") >= 2, calls
                                                                 print("Declining the final rebound review withheld changed HIP and stopped IPv4 traffic")
