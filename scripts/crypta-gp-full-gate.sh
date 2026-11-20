@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-recovered-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=20 ;;
     esp-loss-hip-active-refresh-rebind-recover) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=19 ;;
     esp-loss-hip-active-refresh-rebind-tls) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=18 ;;
     esp-loss-hip-active-refresh-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=17 ;;
@@ -1087,7 +1088,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                             fail "HIP refreshed differently or prompted after rebind of the retry tunnel"
                                         ok "the approved retry report refreshed silently after rebind"
                                         probe "IPv4 echo after silent refresh on the rebound retry tunnel"
-                                        if [ "$retry_hip_submit" = 19 ]; then
+                                        if [ "$retry_hip_submit" -ge 19 ]; then
                                             rebind_restored_forwarding 12 "$retry_report"
                                             before_refresh=$(awk 'END { print NR }' "$receipts")
                                             wait_receipts "$((before_refresh + 1))"
@@ -1124,6 +1125,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                 fail "newly approved timer-retry HIP did not refresh silently"
                                             ok "newly approved timer-retry HIP refreshed silently"
                                             rebind_restored_forwarding 13 "$rebound_report"
+                                            if [ "$retry_hip_submit" = 20 ]; then
+                                                rebound_iface=$(field iface)
+                                                [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
+                                                before_decline=$(awk 'END { print NR }' "$receipts")
+                                                "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+                                                wait_prompt gp_hip_approval
+                                                printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                                    grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" ||
+                                                    fail "the rebound review omitted the forwarding change"
+                                                [ "$(hip_choice)" != "$approval_choice" ] ||
+                                                    fail "the rebound review reused the previous approval choice"
+                                                decline_esp_loss_review 13 "$rebound_iface"
+                                                if tail -n "+$((before_decline + 1))" "$receipts" | grep -Fxq "$initial_report"; then
+                                                    fail "the rebound ESP tunnel submitted declined HIP"
+                                                fi
+                                                ok "declining the rebound review withheld changed HIP and stopped IPv4 traffic"
+                                                echo "$pass checks passed"
+                                                exit 0
+                                            fi
                                         fi
                                     fi
                                 fi
