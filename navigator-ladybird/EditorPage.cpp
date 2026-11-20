@@ -4,6 +4,9 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#ifdef ATRIUM_I1_COUNTER
+#include <LibWeb/HTML/HistoryExecutor.h>
+#endif
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Parser/ParserScriptingMode.h>
 #include <LibWeb/Selection/Selection.h>
@@ -34,6 +37,23 @@ EditorPage::EditorPage(Gfx::Palette palette)
     , m_page(Web::Page::create(*this))
 {
 }
+
+#ifdef ATRIUM_I1_COUNTER
+void EditorPage::page_did_request_unload_check(Web::HTML::CrossProcessId id, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>> done)
+{
+    // The counter hosts one local document. LibWeb checks its unload handlers.
+    page().history_executor().run_ui_beforeunload_check({ id }, {}, {}, Web::HTML::UnloadPromptShown::No,
+        GC::create_function(heap(), GC::captures(done), [](auto& callback, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown) {
+            callback->function()(result);
+        }));
+}
+
+void EditorPage::page_did_request_history_operation(Web::HTML::CrossProcessId, Web::HistoryOperationParameters operation)
+{
+    if (operation.has<Web::CloseTopLevelTraversableHistoryOperationParameters>())
+        as<Web::HTML::LocalTraversableNavigable>(*page().local_traversable()).run_ui_traversable_close_unload_task();
+}
+#endif
 
 ErrorOr<void> EditorPage::load_fixture(StringView html, bool embedded)
 {

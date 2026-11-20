@@ -140,6 +140,33 @@ Limen, navigatord and counter builds, enable `NAVIGATOR_UI_AX=1`, and run
 `scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR --reports`.
 Evidence is in `~/atrium-vm/evidence/navigator-i2-channel-20261120/`.
 
+### I2 worker resize and voluntary close
+
+The embedded counter reports changes to its laid-out document’s scroll width
+and height. Navigatord retains the placement supplied by the parent. In the
+installed gate, Increment widened the body to 884 CSS pixels plus 32 pixels
+of padding. Ladybird reported 916 × 360. The two captured frames had the
+same compositor borders around the 640 × 360 slot, and the counter PID
+stayed the same. This gate exercises layout-driven resize requests. In the
+pinned LibWeb revision the JavaScript `window.resizeTo()` method returns
+immediately.
+
+Finish calls `window.close()`. The single-document host runs LibWeb’s
+before-unload check and close traversal. Once the page closes, the worker
+reports `Ended(Closed)`. The broker retired the worker, the chip returned
+to Static and the UI showed no crash prompt. A guarded Start reached Count 0
+with a different PID on the same parent and viewer.
+
+To repeat on the arm64 Tessera fixture, serve `counter-lifecycle.html` as
+`/counter.html` and copy it as `counter.html` into the counter build’s
+`--embed-dir`. Compile both `editor-check.cpp` and `EditorPage.cpp` with
+`ATRIUM_I1_COUNTER`. Launch the installed parent with UI AX tracing and run
+`scripts/navigator-i2-stop-check.py SSH_WRAPPER GUEST_STAGE NAVIGATOR_LOG EVIDENCE_DIR --lifecycle`.
+This check reads compositor frames with Pillow. The Limen unit tests also
+check all 7,776 length-five sequences over six representative reports and
+title lengths 0–513, including truncated frames. Evidence is in
+`~/atrium-vm/evidence/navigator-i2-worker-lifecycle-20261120/`.
+
 ## 6. Media
 
 The engine's `HTMLMediaElement` and `MediaSource` bind to `navigator_media::mse::Media`

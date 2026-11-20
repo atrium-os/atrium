@@ -77,6 +77,7 @@ impl Widget {
             let granted_origin = crate::origin(COUNTER);
             let mut reports = Lifecycle::default();
             let mut first_title = true;
+            let mut first_resize = true;
             let mut attached = Some(attached);
             let failure = loop {
                 let mut slot = watched.lock().unwrap();
@@ -94,8 +95,15 @@ impl Widget {
                                 eprintln!("navigatord: initial widget title received ({} bytes)", title.len());
                                 first_title = false;
                             }
+                            Some(Report::Resize { width, height }) if first_resize => {
+                                eprintln!("navigatord: widget requested {width}x{height}; parent controls placement");
+                                first_resize = false;
+                            }
                             Some(Report::Title(_) | Report::Resize { .. }) => {}
-                            Some(Report::Ended(EndReason::Closed)) => break None,
+                            Some(Report::Ended(EndReason::Closed)) => {
+                                eprintln!("navigatord: widget reported voluntary close");
+                                break None;
+                            }
                             _ => break Some(WidgetFailure::Exit),
                         }
                     }

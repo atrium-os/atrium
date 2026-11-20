@@ -71,4 +71,39 @@ mod tests {
         assert!(Report::Title(&"x".repeat(256)).encode().is_some());
         assert!(Report::Resize { width: 16384, height: 1 }.encode().is_some());
     }
+
+    #[test]
+    fn generated_report_sequences_preserve_session_order() {
+        use Report::*;
+        let reports = [Started { origin: "https://widget.example" }, Title(""), Title("文"),
+                       Resize { width: 1, height: 16384 }, Ended(EndReason::Closed), Ended(EndReason::Failed)];
+        // Every five-report sequence, including every prefix and repeated terminal reports.
+        for mut sequence in 0..reports.len().pow(5) {
+            let mut state = Lifecycle::default();
+            let (mut started, mut ended) = (false, false);
+            for _ in 0..5 {
+                let report = reports[sequence % reports.len()];
+                sequence /= reports.len();
+                let allowed = !ended && (matches!(report, Started { .. }) != started);
+                let wire = report.encode().unwrap();
+                assert_eq!(state.receive(&wire), allowed.then_some(report));
+                if allowed {
+                    started = true;
+                    ended = matches!(report, Ended(_));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_field_boundaries_are_checked_by_the_decoder() {
+        for n in 0..=MAX_FRAME + 1 {
+            let text = "x".repeat(n);
+            let report = Report::Title(&text);
+            let bytes = postcard::to_stdvec(&report).unwrap();
+            assert_eq!(Lifecycle::Running.receive(&bytes), (n <= 256).then_some(report));
+            assert!(Lifecycle::Running.receive(&bytes[..bytes.len()-1]).is_none());
+        }
+    }
+
 }

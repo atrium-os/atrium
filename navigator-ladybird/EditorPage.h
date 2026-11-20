@@ -31,6 +31,12 @@ public:
         pending_navigation = url;
     }
 #endif
+#ifdef ATRIUM_I1_COUNTER
+    void page_did_request_unload_check(Web::HTML::CrossProcessId, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;
+    void page_did_request_history_operation(Web::HTML::CrossProcessId, Web::HistoryOperationParameters) override;
+    void page_did_close() override { closed = true; }
+    bool closed { false };
+#endif
     Web::PageId id() const override { return Web::PageId { 1 }; }
     Web::Page& page() override { return *m_page; }
     Web::Page const& page() const override { return *m_page; }

@@ -56,13 +56,23 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
 #if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I1_COUNTER)
 extern "C" int navigator_page_pointer(NavigatorScene*, float*, float*);
 
+#ifdef ATRIUM_I1_COUNTER
+extern "C" bool navigator_counter_resize(NavigatorScene*, u16, u16);
+#endif
+
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
 {
     auto doc = client.page().local_traversable()->active_document();
     auto tree = doc->dom_tree_version();
     auto text = doc->character_data_version();
+#ifdef ATRIUM_I1_COUNTER
+    Gfx::IntSize last_extent { 640, 360 };
+#endif
     for (unsigned tick = 0; tick < 15000; ++tick) {
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+#ifdef ATRIUM_I1_COUNTER
+        if (client.closed) break;
+#endif
         float x = 0, y = 0;
         auto action = navigator_page_pointer(scene, &x, &y);
         if (action < 0) break;
@@ -76,6 +86,16 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         text = doc->character_data_version();
         Web::Layout::ForcedReadScope read { *doc };
         doc->update_layout(Web::DOM::UpdateLayoutReason::DumpDisplayList);
+#ifdef ATRIUM_I1_COUNTER
+        if (auto root = doc->document_element()) {
+            Gfx::IntSize extent { root->scroll_width(), root->scroll_height() };
+            if (extent != last_extent && extent.width() > 0 && extent.height() > 0
+                && extent.width() <= 16384 && extent.height() <= 16384) {
+                if (!navigator_counter_resize(scene, extent.width(), extent.height())) return 6;
+                last_extent = extent;
+            }
+        }
+#endif
         if (!doc->record_display_list(read, Web::HTML::PaintConfig {}, Web::Painting::PaintCommandCacheMode::ReadWrite)
             || !navigator_scene_sample(scene, doc->layout_node_arena().host(), true, false))
             return 6;

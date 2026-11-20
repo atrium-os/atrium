@@ -14,8 +14,9 @@ parser.add_argument("evidence", type=Path)
 parser.add_argument("--tier", action="store_true", help="check live-part transitions with NAVIGATOR_UI_AX=1")
 parser.add_argument("--recycle", action="store_true", help="use counter-recycle.html, a 10-second idle timeout and UI AX")
 parser.add_argument("--reports", action="store_true", help="verify the counter's typed origin and title on both launches")
+parser.add_argument("--lifecycle", action="store_true", help="use the pinned counter-lifecycle fixture with UI AX")
 args = parser.parse_args()
-if args.reports:
+if args.reports or args.lifecycle:
     args.tier = True
 args.evidence = args.evidence.resolve()
 args.evidence.mkdir(parents=True, exist_ok=True)
@@ -147,6 +148,54 @@ def recycle():
         raise RuntimeError("parent changed on retirement")
     print(f"Idle retired PID {int(first)} after two increments. Restarted PID {int(second)} in jail {jail}.")
     print(rules.decode().strip())
+
+
+def lifecycle():
+    from PIL import Image
+    import re
+
+    def edges(path):
+        with Image.open(path) as png:
+            image = png.convert("RGB")
+            amber = (250, 206, 97)
+            xs = [x for x in range(250, image.width) if image.getpixel((x, 200)) == amber]
+            ys = [y for y in range(75, image.height) if image.getpixel((600, y)) == amber]
+            return xs, ys
+
+    parents = parent()
+    start(0)
+    count("before-resize", 0)
+    tier(True)
+    worker = guest("pgrep -x counter")
+    bounds = edges(args.evidence / "before-resize.png")
+    if bounds != ([288, 929], [80, 441]):
+        raise RuntimeError(f"unexpected initial compositor frame: {bounds}")
+    press(350, 118)
+    count("after-resize", 1)
+    match = re.search(rb"widget requested (\d+)x(\d+)", log())
+    if not match or int(match[1]) < 884:
+        raise RuntimeError("missing wider document extent from the worker")
+    if edges(args.evidence / "after-resize.png") != bounds or guest("pgrep -x counter") != worker:
+        raise RuntimeError("resize changed the slot or replaced the worker")
+    press(434, 118)
+    wait_for("missing voluntary close", lambda: b"widget reported voluntary close" in log()
+             and not guest("pgrep -x counter || true"))
+    tier(False)
+    frame("closed")
+    if b"prompt=widget-failed" in log():
+        raise RuntimeError("voluntary close was presented as a crash")
+    start(1)
+    count("restarted", 0)
+    tier(True)
+    if guest("pgrep -x counter") == worker or parent() != parents:
+        raise RuntimeError("unexpected worker or parent identity after restart")
+    print(f"Requested {int(match[1])}x{int(match[2])}. The compositor kept the 640x360 slot.")
+    print("Finish retired the worker. Guarded Start reopened Count 0 on the same parent.")
+
+
+if args.lifecycle:
+    lifecycle()
+    raise SystemExit(0)
 
 
 if args.recycle:

@@ -855,6 +855,13 @@ pub mod host {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_counter_resize(state: &SceneState, width: u16, height: u16) -> bool {
+        let Some((child, embed, _)) = &state.embed else { return false };
+        let Some(bytes) = (limen::web_island::Report::Resize { width, height }).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn navigator_counter_ended(state: &SceneState, failed: bool) {
         use limen::web_island::{Report, EndReason};
         if let Some((child, embed, _)) = &state.embed {
