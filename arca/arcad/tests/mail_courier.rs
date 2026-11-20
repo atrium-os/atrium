@@ -268,3 +268,59 @@ fn reauthorization_requires_the_linked_pair_and_its_stored_address() {
     assert_eq!(s.handle(&other, op::MAIL_REAUTH, &good).status, status::DENIED);
     assert_eq!(s.handle(&app(), op::MAIL_REAUTH, &good).status, status::OK);
 }
+
+/// Drive the signed app, Navigator broker and partition-bound courier up to
+/// the point where the provider's reply is still in flight.
+fn start_exchange(s: &mut State, refs: Option<&[u8]>) -> ([u8; 16], Label) {
+    use arcad::oauth::{mail_partition, MICROSOFT};
+    let mut request = refs.unwrap_or_default().to_vec();
+    request.extend_from_slice(b"priya@example.org");
+    let begin = s.handle(&app(), if refs.is_some() { op::MAIL_REAUTH } else { op::MAIL_SIGN_IN }, &request);
+    assert_eq!(begin.status, status::OK);
+    let ticket: [u8; 16] = begin.body.bytes().try_into().unwrap();
+    let navigator = Label::WebBroker { user: "alice".into(), publisher: [7; 32], app_id: "org.atrium.navigator".into() };
+    let claim = s.handle(&navigator, arcad::proto::broker_op::W_MAIL_SIGN_IN, &ticket);
+    assert_eq!(claim.status, status::OK);
+    let url = std::str::from_utf8(claim.body.bytes()).unwrap();
+    let state = url.split_once('?').unwrap().1.split('&').find_map(|p| p.strip_prefix("state=")).unwrap();
+    let redirect = format!("{}?state={state}&code=fixture", MICROSOFT.redirect);
+    let label = Label::Courier(CourierLabel { user: "alice".into(), persona: "web".into(),
+        endpoint: Recipient::endpoint(Scheme::Https, MICROSOFT.token_host, 443, Some(&mail_partition(&ticket))).unwrap() });
+    assert_eq!(s.handle(&label, cop::MAIL_CODE, &body(|w| { w.raw(&ticket); w.str(&redirect); })).status, status::OK);
+    (ticket, label)
+}
+
+#[test]
+fn cancelling_an_in_flight_renewal_preserves_the_retry_and_its_committed_grant() {
+    let (_dir, mut s) = setup();
+    s.mail_sign_ins.mail_publisher = Some([7; 32]);
+    s.mail_sign_ins.registration = Some("fixture".into());
+    let grant = |ticket: &[u8; 16], value: &[u8]| body(|w| { w.raw(ticket); w.bytes(value); });
+    let result = |ticket: &[u8; 16]| body(|w| { w.raw(ticket); w.str("priya@example.org"); });
+
+    let (first, provider) = start_exchange(&mut s, None);
+    assert_eq!(s.handle(&provider, cop::MAIL_GRANT, &grant(&first, b"original")).status, status::OK);
+    let stored = s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&first));
+    assert_eq!(stored.status, status::OK);
+    let refs: [u8; 32] = stored.body.bytes().try_into().unwrap();
+
+    let (cancelled, old_provider) = start_exchange(&mut s, Some(&refs));
+    assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_CANCEL, &cancelled).status, status::OK);
+    let (retry, new_provider) = start_exchange(&mut s, Some(&refs));
+    assert_ne!(cancelled, retry);
+    let stale = grant(&cancelled, b"stale");
+    assert_eq!(s.handle(&old_provider, cop::MAIL_GRANT, &stale).status, status::DENIED);
+    assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&cancelled)).status, status::DENIED);
+    assert_eq!(s.handle(&new_provider, cop::MAIL_GRANT, &grant(&retry, b"renewed")).status, status::OK);
+    assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_CANCEL, &retry).status, status::DENIED);
+    assert_eq!(s.handle(&old_provider, cop::MAIL_GRANT, &stale).status, status::DENIED);
+    let saved = s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&retry));
+    assert_eq!(saved.status, status::OK);
+    assert_eq!(saved.body.bytes(), refs);
+    assert_eq!(s.handle(&app(), op::MAIL_SIGN_IN_RESULT, &result(&retry)).status, status::DENIED);
+
+    let endpoint = courier(Scheme::Https, "login.microsoftonline.com", 443);
+    let refresh = s.handle(&endpoint, cop::MAIL_REFRESH_BEGIN, &body(|w| { w.raw(&refs); w.u8(1); }));
+    assert_eq!(refresh.status, status::OK);
+    assert_eq!(&refresh.body.bytes()[16..], b"oauth1 microsoft fixture renewed");
+}
