@@ -6041,6 +6041,9 @@ a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
 log, build hashes and verdicts under the printed artifact directory. Before
 power-down it also collects available guest service logs, screenshots and
 job-list snapshots into `guest-artifacts.tar.gz`, including after a failed check.
+Successful runs remove the disposable disk overlay and EFI variables after
+QEMU exits cleanly. Set `PRELUM_R7_KEEP_VM=1` to keep them. Failed runs keep
+the overlay and EFI variables for diagnosis.
 Prelum must reach Done for each desktop job with an observed jailed IPP
 worker. Poppler checks the original Quick Look HTML and plain text after pathname replacement,
 and both PDF Quick Look print paths after pathname replacement, the Quick Look image's colors and aspect ratio, the Sheets print area with chart and pictures, Slides

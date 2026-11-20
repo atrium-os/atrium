@@ -14,6 +14,11 @@ key=$4
 qemu=${QEMU:-qemu-system-aarch64}
 ssh_port=${PRELUM_R7_SSH_PORT:-6329}
 ipps_port=${PRELUM_R7_IPPS_PORT:-19329}
+keep_vm=${PRELUM_R7_KEEP_VM:-0}
+case "$keep_vm" in
+    0|1) ;;
+    *) echo "PRELUM_R7_KEEP_VM must be 0 or 1" >&2; exit 2 ;;
+esac
 guest=/tmp/prelum-r7-desktop-gate
 for path in "$base" "$code" "$vars" "$key"; do
     test -f "$path" || { echo "Missing gate input: $path" >&2; exit 2; }
@@ -81,6 +86,11 @@ cleanup() {
             status=1
         else
             wait "$qemu_pid" || status=1
+            # Preserve failed runs for diagnosis. Only remove files created in
+            # this invocation's private directory after a clean QEMU exit.
+            if [ "$status" -eq 0 ] && [ "$keep_vm" -eq 0 ]; then
+                rm -f "$D/vm.qcow2" "$D/vars.fd" || status=1
+            fi
         fi
     fi
     if [ -n "$sim_pid" ]; then
