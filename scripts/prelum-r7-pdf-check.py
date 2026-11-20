@@ -1,4 +1,5 @@
 """Check the PDFs received by the isolated IPPS simulator."""
+import hashlib
 import re
 import subprocess
 import sys
@@ -21,15 +22,21 @@ transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
 job_ids = list(range(1, len(expected) + 1))
 creates = re.findall(r"^fake printer: Create-Job job ", transcript, re.M)
 sends = numbered_lines(r"^fake printer: Send-Document job (\d+) ", transcript)
-receipts = re.findall(r"^fake printer: got job (\d+) \((\d+) bytes\) ", transcript, re.M)
+receipts = re.findall(
+    r"^fake printer: got job (\d+) \((\d+) bytes\) .* sha256=([a-f0-9]{64})$",
+    transcript,
+    re.M,
+)
 completions = numbered_lines(r"^fake printer: job (\d+) completed$", transcript)
 assert len(creates) == len(job_ids), len(creates)
 assert sends == job_ids, sends
-assert [(int(job), int(size)) for job, size in receipts] == [
-    (job, pdf.stat().st_size) for job, pdf in zip(job_ids, expected)
-], receipts
+assert [int(job) for job, _, _ in receipts] == job_ids, receipts
+for pdf, (job, size, digest) in zip(expected, receipts):
+    payload = pdf.read_bytes()
+    assert len(payload) == int(size), (job, size, len(payload))
+    assert hashlib.sha256(payload).hexdigest() == digest, (job, "upload SHA-256 mismatch")
 assert completions == job_ids, completions
-print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs")
+print(f"IPPS simulator: one creation, upload and completion for each of {len(job_ids)} jobs; all upload hashes match")
 
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected
 

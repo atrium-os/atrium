@@ -13,6 +13,7 @@ seconds later, but only while the state is idle; documents go to --spool.
 """
 
 import argparse
+import hashlib
 import http.server
 import os
 import ssl
@@ -194,7 +195,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 out = struct.pack(">HHI", 0x0200, 0x0406, rid) + out[8:]
             else:
                 open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
-                print("fake printer: got job %d (%d bytes) %s" % (jid, len(doc), j["name"]), flush=True)
+                digest = hashlib.sha256(doc).hexdigest()
+                print(f"fake printer: got job {jid} ({len(doc)} bytes) {j['name']} sha256={digest}", flush=True)
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", 5)
         elif op == 0x09:
             with LOCK:
