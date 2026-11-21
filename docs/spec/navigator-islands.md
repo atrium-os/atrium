@@ -474,10 +474,26 @@ the sampled exposed bottom edge and zero in the sheet interior. The title,
 relying-party hostname and Cancel label were readable. A fresh sign-in
 on the corrected layout produced a third verified signature and redemption.
 
-The read-only Demo account field still appeared empty despite the value
-in the fixture HTML. Its text painting needs a separate trace. Before and
-after screenshots, guest unit tests, provider markers and shutdown evidence
-are in `~/atrium-vm/evidence/navigator-i3-cancel-layout-20261121/`.
+Before and after screenshots, guest unit tests, provider markers and shutdown evidence
+for cancellation and sheet geometry are in `~/atrium-vm/evidence/navigator-i3-cancel-layout-20261121/`.
+
+### I3 read-only input and Mail sidebar
+
+On arm64 Tessera, Ladybird's input value, default value and shadow text all
+matched the fixture address. The styled input painted 16 glyphs with a
+baseline at (128.203, 101.875) inside a clip beginning at (128, 88).
+The native painter subtracted the clip origin before handing the run to
+Pergola, whose placement encoder subtracted it again. The run landed
+outside its clip. The painter now passes document coordinates for both
+glyphs and rectangles and leaves the single conversion to Pergola.
+
+On reopening the sheet from Mail with the corrected JIT-off worker in
+Capsicum, OCR of the 172 × 18 field interior at (432, 244) read
+`ada@example.test`. The worker's jail had IPv4 and IPv6 disabled.
+The empty Mail sidebar also advances past its account label and action
+before drawing Views. The four rows below Search had disjoint ink bounds.
+Screens, field crops, sidebar bounds, worker identity and build evidence
+are in `~/atrium-vm/evidence/navigator-i3-readonly-sidebar-20261121/`.
 
 ### I3 installed WebAuthn get probe
 

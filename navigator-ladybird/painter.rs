@@ -416,7 +416,7 @@ fn assemble_scene(
     let mut seen = HashSet::new();
     let mut keys = HashSet::new();
     let mut leaf_slots = HashMap::new();
-    for (leaf_index, mut leaf) in leaves.into_iter().enumerate() {
+    for (leaf_index, leaf) in leaves.into_iter().enumerate() {
         if !leaf.context.effect.is_none() && !tree.effect_nodes.get(leaf.context.effect.0 as usize).is_some_and(|e|
             Some(leaf.context.effect)==tree.root_isolation_effect && e.parent.is_none() && e.local_clip.is_none()
             && matches!(&e.data,libcompositing_rust::visual_context::EffectNodeData::Effects(f)
@@ -488,7 +488,7 @@ fn assemble_scene(
             clip = c.parent;
         }
         // A form control clips text in the stationary document coordinate space.
-        // Intersect its ancestor clips there before translating the run to group-local coordinates.
+        // Intersect its ancestor clips in that same space.
         let mut bounds: Option<[f32; 4]> = None;
         let mut depth = 0;
         while !clip.is_none() {
@@ -591,16 +591,10 @@ fn assemble_scene(
             if right <= x || bottom <= y {
                 continue;
             }
-            match &mut leaf.node {
-                Node::Glyphs { origin, .. } => {
-                    origin.x -= x;
-                    origin.y -= y;
-                }
-                Node::Rect { rect, .. } => {
-                    rect.origin.x -= x;
-                    rect.origin.y -= y;
-                }
-                _ => return Err("unsupported clipped form primitive".into()),
+            // Pergola converts document coordinates to group-local coordinates
+            // when it emits placements, including children of this clip layer.
+            if !matches!(leaf.node, Node::Glyphs { .. } | Node::Rect { .. }) {
+                return Err("unsupported clipped form primitive".into());
             }
             let mut hash = DefaultHasher::new();
             (2u8, key).hash(&mut hash);

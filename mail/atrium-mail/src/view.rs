@@ -3557,6 +3557,7 @@ impl MailView {
             area(ctx, Rect::new(8.0, y + em(32.0), aw, place_h() - 2.0), Color::TRANSPARENT, move || m.ask_settings());
             text(ctx, 16.0, y + em(32.0) + place_h() / 2.0, "Add an account…", type_size::SM, Weight::Medium, t.accent_fg());
             ctx.pop();
+            y += em(32.0) + place_h();
         }
         // Views (§15.2): the newsletter lane, the screener's.
         if !ui.views.is_empty() && y < h {
