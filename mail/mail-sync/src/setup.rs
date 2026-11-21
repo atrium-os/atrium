@@ -277,8 +277,7 @@ fn autoconfig(b: &[u8], address: &str, domain: &str) -> Option<(Server, Server, 
     }
     let local = address.rsplit_once('@').map(|(l, _)| l).unwrap_or("");
     let fill = |h: &str| h.replace("%EMAILDOMAIN%", domain).replace("%EMAILLOCALPART%", local).replace("%EMAILADDRESS%", address).to_ascii_lowercase();
-    let mut oauth = None;
-    let mut pick = |kind: &str, tls: &'static str, starttls: &'static str| -> Option<Server> {
+    let pick = |kind: &str, tls: &'static str, starttls: &'static str| -> Option<(Server, bool)> {
         let tag = if kind == "imap" { "incomingServer" } else { "outgoingServer" };
         for (attrs, body) in elements(s, tag) {
             if attr(attrs, "type") != Some(kind) {
@@ -299,15 +298,26 @@ fn autoconfig(b: &[u8], address: &str, domain: &str) -> Option<(Server, Server, 
             if !host_ok(&host) || port == 0 {
                 continue;
             }
-            if elements(body, "authentication").iter().any(|(_, t)| t.trim() == "OAuth2") && host.ends_with("office365.com") {
-                oauth = Some("microsoft");
-            }
-            return Some(Server { scheme, host, port });
+            let microsoft_oauth = under(&host, "office365.com")
+                && elements(body, "authentication").iter().any(|(_, t)| t.trim() == "OAuth2");
+            return Some((Server { scheme, host, port }, microsoft_oauth));
         }
         None
     };
-    let imap = pick("imap", "imaps", "imap")?;
-    let smtp = pick("smtp", "submissions", "submission")?;
+    let (imap, imap_oauth) = pick("imap", "imaps", "imap")?;
+    let (smtp, smtp_oauth) = pick("smtp", "submissions", "submission")?;
+    let oauth = if imap_oauth || smtp_oauth {
+        // Arca creates both sign-in items for the preset endpoints.
+        let provider = PROVIDERS.iter().find(|p| p.oauth == Some("microsoft"))?;
+        if (imap.scheme, imap.host.as_str(), imap.port) != ("imaps", provider.imap.0, provider.imap.1)
+            || (smtp.scheme, smtp.host.as_str(), smtp.port) != provider.smtp
+        {
+            return None;
+        }
+        provider.oauth
+    } else {
+        None
+    };
     Some((imap, smtp, oauth))
 }
 
@@ -417,6 +427,36 @@ mod tests {
         });
         assert!(n.asked.iter().any(|query| query == "_submission._tcp.example.test"));
         assert!(!n.asked.iter().any(|query| query.starts_with("MX ")));
+    }
+
+    #[test]
+    fn microsoft_autoconfig_requires_the_supported_endpoint_pair() {
+        let discover = |imap: &str, imap_port: u16, smtp: &str, smtp_port: u16| {
+            let mut net = Net::default();
+            net.pages.insert(
+                "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=ada%40example.test".into(),
+                format!(r#"<clientConfig>
+<incomingServer type="imap"><hostname>{imap}</hostname><port>{imap_port}</port><socketType>SSL</socketType><authentication>OAuth2</authentication></incomingServer>
+<outgoingServer type="smtp"><hostname>{smtp}</hostname><port>{smtp_port}</port><socketType>STARTTLS</socketType></outgoingServer>
+</clientConfig>"#).into_bytes(),
+            );
+            net.mx.insert("example.test".into(), vec!["tenant.mail.protection.outlook.com.".into()]);
+            super::discover("ada@example.test", &mut net).unwrap()
+        };
+
+        let found = discover("outlook.office365.com", 993, "smtp.office365.com", 587);
+        assert_eq!(found.via, Via::Autoconfig);
+        assert_eq!(found.oauth, Some("microsoft"));
+
+        for found in [
+            discover("outlook.office365.com", 1993, "smtp.office365.com", 587),
+            discover("outlook.office365.com", 993, "smtp.example.test", 587),
+        ] {
+            assert_eq!(found.via, Via::Provider("Microsoft"));
+            assert_eq!(found.oauth, Some("microsoft"));
+            assert!(matches!(found.settings, Settings::Imap { imap, smtp }
+                if imap.port == 993 && smtp.host == "smtp.office365.com"));
+        }
     }
 
     #[test]
