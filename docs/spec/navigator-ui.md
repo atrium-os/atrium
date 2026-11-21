@@ -1171,7 +1171,7 @@ argued further on paper.
 | Limen (L6) | `doc-viewer` with the Navigator's worker as the child, opened by navigatord and bound into the UI's window; `LinkHover { url }` from child to parent (advisory, for showing a link's destination) | §2.1 |
 | navigatord | `Hover { session, href }` answered with the link decision (`Navigate`/`InDocument`/`Handoff`/`Blocked`), the predicted light and the last-seen certificate; rate-limited and cached | §5.7 |
 | UI | the status bar; refuse an `Activate` that resolves somewhere other than the destination shown | §5.7 |
-| Limen + frescod | slot kind `island`: frescod draws a 1 px frame and the "live code" tag, dashed while obscured | §6.3 |
+| Limen + frescod | slot kind `island`: frescod draws a 1 px frame and the "live code" tag, dashed while obscured; the frame is clipped against higher windows and the tag is suppressed if covered | §6.3 |
 | frescod | origin strip follows a window's `page` slot when the window has no origin of its own; a tier label after the origin and the marker in the light's colour, set with `SET_ORIGIN` | §6.1, §6.3, §6.5 |
 | Nuntius, Arca courier | report TLS facts per connection (protocol, chain subjects and issuers, root id, shipped or added) as structured fields | §6.5 |
 | navigatord | the light's verdict per page; lookalike check against Arca's skeleton list; jail monitor reports to red | §6.5 |

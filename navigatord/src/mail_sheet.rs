@@ -70,7 +70,7 @@ fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     frame.rect(fresco_protocol::RectParams {
         x: CANCEL_X, y: CANCEL_Y, w: CANCEL_W, h: CANCEL_H, r: 0.92, g: 0.94, b: 0.95, a: 1., radius: 5.,
     }).map_err(|_| ())?;
-    frame.text_run(font, 16., CANCEL_X + 15., CANCEL_Y + 24., [0.08, 0.12, 0.15, 1.], "Cancel sign-in").map_err(|_| ())?;
+    frame.text_run(font, 16., CANCEL_X + 15., CANCEL_Y + 9., [0.08, 0.12, 0.15, 1.], "Cancel sign-in").map_err(|_| ())?;
     frame.finish().map_err(|_| ())?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {

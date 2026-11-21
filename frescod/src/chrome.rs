@@ -291,6 +291,8 @@ const LABEL_H: i32 = 20;
 pub struct Island {
     pub rect: [i32; 4],
     pub covered: bool,
+    /// Higher windows in compositor coordinates, including those covering only the tag.
+    pub covers: Vec<[i32; 4]>,
     pub can_stop: bool,
     pub origin: Option<String>,
 }
@@ -327,15 +329,23 @@ fn island_frame(out: &mut Vec<SceneNode>, px: Px, i: &Island, top: i32) -> i32 {
     let (fx0, fy0, fx1, fy1) = (x0 - t, y0 - t, x1 + t, y1 + t);
     let (dash, gap, label_h) = (px.p(DASH), px.p(GAP), px.p(LABEL_H));
     let mut edge = |a: i32, b: i32, horizontal: bool, at: i32| {
-        if !i.covered {
-            out.push(if horizontal { rect(a, at, b - a, t, ISLAND_COLOR) } else { rect(at, a, t, b - a, ISLAND_COLOR) });
-            return;
-        }
-        let mut p = a;
-        while p < b {
-            let e = (p + dash).min(b);
-            out.push(if horizontal { rect(p, at, e - p, t, ISLAND_COLOR) } else { rect(at, p, t, e - p, ISLAND_COLOR) });
-            p = e + gap;
+        let side = if horizontal { [a, at, b, at + t] } else { [at, a, at + t, b] };
+        for [x, y, r, bottom] in uncovered(side, &i.covers) {
+            if !i.covered {
+                out.push(rect(x, y, r - x, bottom - y, ISLAND_COLOR));
+                continue;
+            }
+            let (start, end) = if horizontal { (x, r) } else { (y, bottom) };
+            // Anchor the pattern to the original edge across occluded spans.
+            let mut p = start - (start - a) % (dash + gap);
+            while p < end {
+                let (lo, hi) = (p.max(start), (p + dash).min(end));
+                if lo < hi {
+                    out.push(if horizontal { rect(lo, y, hi - lo, bottom - y, ISLAND_COLOR) }
+                        else { rect(x, lo, r - x, hi - lo, ISLAND_COLOR) });
+                }
+                p += dash + gap;
+            }
         }
     };
     edge(fx0, fx1, true, fy0);
@@ -352,6 +362,9 @@ fn island_frame(out: &mut Vec<SceneNode>, px: Px, i: &Island, top: i32) -> i32 {
     let w = text_width(px, &tag) + px.p(2 * PAD + 6);
     let above = fy0 - label_h;
     let y = if above >= top { above } else { fy1 };
+    if i.covers.iter().any(|&[l, t, r, b]| fx0 < r && l < fx0 + w && y < b && t < y + label_h) {
+        return fy1;
+    }
     let mut pill = rect(fx0, y, w, label_h, ISLAND_COLOR);
     pill.radius = px.p(3) as f32;
     out.push(pill);
@@ -692,7 +705,7 @@ mod tests {
     #[test]
     fn an_island_is_framed_and_tagged_and_dashed_while_covered() {
         let at = [200, 300, 600, 500];
-        let clear = Island { rect: at, covered: false, can_stop: false, origin: Some("media.example".into()) };
+        let clear = Island { rect: at, covered: false, covers: vec![], can_stop: false, origin: Some("media.example".into()) };
         assert_eq!(clear.tag(), "live code: media.example");
         assert_eq!(Island { origin: None, ..clear.clone() }.tag(), "live code");
         let sides = |f: &WindowFrame| f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).count();
@@ -707,6 +720,18 @@ mod tests {
         assert_eq!(pill.position[1] as i32, at[1] - 1 - LABEL_H, "above the island");
         let covered = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[Island { covered: true, ..clear.clone() }]);
         assert!(sides(&covered) > 20, "dashed");
+        // A foreground sheet crosses the bottom edge. The exposed portion
+        // stays dashed and none of those dashes may paint on the sheet.
+        let front = [at[0] + 50, at[3] - 20, at[2] + 5, at[3] + 20];
+        let partial = Island { covered: true, covers: vec![front], ..clear.clone() };
+        let frame = super::slot_frames(Px::ONE, &[], &[partial]).unwrap();
+        assert!(frame.rects.iter().any(|n| n.color == ISLAND_COLOR && n.position[1] == at[3] as f32));
+        for n in &frame.rects {
+            let [x, y] = n.position;
+            let [w, h] = n.size;
+            assert!(x + w <= front[0] as f32 || y + h <= front[1] as f32
+                || x >= front[2] as f32 || y >= front[3] as f32);
+        }
         // No room above, under the strip: the tag goes below.
         let high = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[Island { rect: [10, 30, 200, 100], ..clear.clone() }]);
         let pill = high.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).unwrap();

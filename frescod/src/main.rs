@@ -1658,10 +1658,12 @@ fn render_one_frame(
         rects.iter().map(|&(id, _)| id).filter(|&id| u16::try_from(id).is_ok_and(|w| c.is_island(w))).collect()
     };
     let island_at = |id: u32, origin: Option<String>| -> Option<chrome::Island> {
-        let r = rects.iter().find(|(l, _)| *l == id)?.1;
+        let at = rects.iter().position(|(l, _)| *l == id)?;
+        let r = rects[at].1;
+        let covers = rects[at + 1..].iter().map(|(_, rect)| *rect).collect();
         let covered = fresco_scene_server::window::island_covered(rects.iter().map(|&(l, r)| (l as u16, r)), id as u16);
         let can_stop = comp.lock().unwrap().windows.get(&(id as u16)).is_some_and(|w| w.island_stop.is_some());
-        Some(chrome::Island { rect: r, covered, can_stop, origin })
+        Some(chrome::Island { rect: r, covered, covers, can_stop, origin })
     };
     /* Trusted chrome (F4d), split mode: frescod's own layer, on top. */
     if let Some(b) = split {

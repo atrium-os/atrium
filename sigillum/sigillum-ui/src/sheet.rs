@@ -116,7 +116,13 @@ impl State {
                 "Create a passkey".into(),
                 vec![format!("{requester} wants to create a passkey for {rp_id}"), format!("Account: \u{201c}{user_name}\u{201d}")],
             ),
-            Sheet::Assert { requester, rp_id, .. } => ("Sign in with a passkey".into(), vec![format!("{requester} wants to sign you in to {rp_id}")]),
+            Sheet::Assert { requester, rp_id, .. } => ("Sign in with a passkey".into(), {
+                let mut lines = vec![format!("{requester} wants to sign you in to")];
+                // DNS names are ASCII. Keep every character visible, including the suffix.
+                let chars: Vec<_> = rp_id.chars().collect();
+                lines.extend(chars.chunks(30).map(|line| line.iter().collect::<String>()));
+                lines
+            }),
             Sheet::Verify { requester, user, purpose, .. } => {
                 let why = match purpose {
                     Purpose::ArcaItem { description } => format!("to use \u{201c}{description}\u{201d}"),
@@ -309,7 +315,7 @@ mod tests {
     fn a_device_choice_is_spent_before_sigillumd_hears_of_it() {
         let mut s = assert_sheet();
         assert_eq!(s.rows[0].label, "Use YubiKey 5");
-        assert_eq!(s.text().1[0], "Navigator wants to sign you in to example.com");
+        assert_eq!(s.text().1, ["Navigator wants to sign you in to", "example.com"]);
         assert_eq!(s.click(0, T), vec![Do::Spend { choice: Choice::Device(9), token: T }]);
         assert_eq!(s.spent(Choice::Device(9), false), vec![Do::Redraw]);
         assert!(s.notice.is_some(), "a refused press says so and sends nothing");

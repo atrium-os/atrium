@@ -6,21 +6,47 @@ use std::{io, time::Duration};
 fn main() -> io::Result<()> {
     let mut wm = Connection::connect("wm.sock")?;
     wm.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let windows = wm.wm_enumerate()?;
-    let mut sheets = windows.iter().filter(|w| w.owner_uid == 65030);
-    let sheet = sheets
-        .next()
-        .ok_or_else(|| io::Error::other("no Sigillum sheet"))?;
-    if sheets.next().is_some() {
-        return Err(io::Error::other("multiple Sigillum sheets"));
+    let layout = wm.wm_enumerate_all()?;
+    for surface in &layout.surfaces {
+        println!(
+            "surface {} uid={} role={:?} rect={:?}",
+            surface.surface_id, surface.owner_uid, surface.role, surface.rect
+        );
     }
-    let slots = windows
+    println!("embeds {:?}", layout.embeds);
+    let settings = std::env::args().nth(1).as_deref() == Some("--settings");
+    let mut targets = layout.surfaces.iter().filter(|w| {
+        if settings {
+            w.owner_uid == 50005 && w.rect.w == 1040 && w.rect.h == 720
+        } else {
+            w.owner_uid == 65030
+        }
+    });
+    let target = targets
+        .next()
+        .ok_or_else(|| io::Error::other("fixture window unavailable"))?;
+    if targets.next().is_some() {
+        return Err(io::Error::other("ambiguous fixture window"));
+    }
+    let slots = layout
+        .surfaces
         .iter()
+        .filter(|w| !layout.embeds.iter().any(|pair| pair[0] == w.surface_id))
         .map(|w| {
             let mut rect = w.rect;
-            let layer = if w.surface_id == sheet.surface_id {
-                rect.x = 360;
-                rect.y = 240;
+            // The 1280x840 gate has no Forum process to reserve the top strip.
+            if w.owner_uid == 50005 { rect.y = rect.y.max(24); }
+            let layer = if w.surface_id == target.surface_id {
+                if settings {
+                    // Centre Settings horizontally, leaving Mail's header above it.
+                    rect.x = (1280 - rect.w) / 2;
+                    rect.y = 72;
+                } else {
+                    rect.x = 360;
+                    // Cross the live page's bottom edge so the occlusion gate
+                    // sees both exposed dashes and the part behind this sheet.
+                    rect.y = 320;
+                }
                 0
             } else {
                 1
@@ -34,7 +60,7 @@ fn main() -> io::Result<()> {
         .collect();
     wm.wm_declare_layout(&WmDeclareLayoutPayload {
         slots,
-        focus: sheet.surface_id,
+        focus: target.surface_id,
         focus_cause: focus_cause::PROGRAM,
     })?;
     wm.wm_enumerate()?;

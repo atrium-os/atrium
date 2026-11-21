@@ -1240,7 +1240,7 @@ impl SettingsView {
                 for (i, (label, f)) in [("Address", &self.s.address), ("Your name", &self.s.name)].into_iter().enumerate() {
                     text(ctx, x, y + em(20.0), label, type_size::SM, Weight::Regular, t.text_secondary());
                     let fy = y + (em(40.0) - pergola::theme::size::input_height()) / 2.0;
-                    ctx.place(TextField::new(f.clone()).at(x + lw, fy).width(fw).autofocus(i == 0));
+                    TextField::new(f.clone()).at(x + lw, fy).width(fw).autofocus(i == 0).render(ctx);
                     y += em(40.0);
                 }
                 let finding = ui.adding == Adding::Finding;
@@ -1357,7 +1357,7 @@ impl SettingsView {
             let n = ui.people_count;
             y += para(ctx, x, y, inner, &format!("{n} {} you've written to, completed as you type.", if n == 1 { "person" } else { "people" }), type_size::XS, t.text_tertiary()) + em(8.0);
             let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-            ctx.place(TextField::new(self.s.person.clone()).at(x, fy).width(inner).placeholder("Find someone"));
+            TextField::new(self.s.person.clone()).at(x, fy).width(inner).placeholder("Find someone").render(ctx);
             y += em(40.0);
             if ui.people.is_empty() {
                 text(ctx, x, y + em(12.0), "No one by that", type_size::SM, Weight::Regular, t.text_secondary());
@@ -1394,7 +1394,7 @@ impl SettingsView {
             let fw = (inner - lw - bw - em(8.0)).max(em(120.0));
             text(ctx, x, y + em(18.0), "Domain", type_size::SM, Weight::Regular, t.text_secondary());
             let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-            ctx.place(TextField::new(self.s.domain.clone()).at(x + lw, fy).width(fw).placeholder("me.example"));
+            TextField::new(self.s.domain.clone()).at(x + lw, fy).width(fw).placeholder("me.example").render(ctx);
             let s = self.s.clone();
             button(ctx, x + lw + fw + em(8.0), y + em(18.0), "Save", false, true, move || s.save_domain());
             y += em(40.0);
@@ -1403,7 +1403,7 @@ impl SettingsView {
                 let fw = (inner - lw - mw - em(8.0)).max(em(120.0));
                 text(ctx, x, y + em(18.0), "New, for", type_size::SM, Weight::Regular, t.text_secondary());
                 let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-                ctx.place(TextField::new(self.s.made_for.clone()).at(x + lw, fy).width(fw).placeholder("shop.example"));
+                TextField::new(self.s.made_for.clone()).at(x + lw, fy).width(fw).placeholder("shop.example").render(ctx);
                 let s = self.s.clone();
                 button(ctx, x + lw + fw + em(8.0), y + em(18.0), "Make", true, true, move || s.make_private(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
                 y += em(44.0);
@@ -1435,7 +1435,7 @@ impl SettingsView {
             for (label, field, hint) in [("First day", &self.s.away_from, "2026-11-23, or empty"), ("Last day", &self.s.away_until, "2026-11-30, or empty"), ("Subject", &self.s.away_subject, "Away until Monday")] {
                 text(ctx, x, y + em(18.0), label, type_size::SM, Weight::Regular, t.text_secondary());
                 let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-                ctx.place(TextField::new(field.clone()).at(x + lw, fy).width(fw).placeholder(hint));
+                TextField::new(field.clone()).at(x + lw, fy).width(fw).placeholder(hint).render(ctx);
                 y += em(40.0);
             }
             // The reply: lines of its own, in a box like a field's.
@@ -1471,9 +1471,9 @@ impl SettingsView {
             let fw = em(72.0);
             let fy = y + (em(28.0) - pergola::theme::size::input_height()) / 2.0;
             text(ctx, fx - em(44.0), y + em(14.0), "from", type_size::SM, Weight::Regular, t.text_secondary());
-            ctx.place(TextField::new(self.s.quiet_from.clone()).at(fx, fy).width(fw));
+            TextField::new(self.s.quiet_from.clone()).at(fx, fy).width(fw).render(ctx);
             text(ctx, fx + fw + em(10.0), y + em(14.0), "to", type_size::SM, Weight::Regular, t.text_secondary());
-            ctx.place(TextField::new(self.s.quiet_to.clone()).at(fx + fw + em(32.0), fy).width(fw));
+            TextField::new(self.s.quiet_to.clone()).at(fx + fw + em(32.0), fy).width(fw).render(ctx);
         }
         y += em(32.0);
         let s = self.s.clone();
@@ -1492,12 +1492,12 @@ impl SettingsView {
         // The digest of other mail and the Later review: typed times.
         let fy = |y: f32| y + (em(28.0) - pergola::theme::size::input_height()) / 2.0;
         text(ctx, x, y + em(14.0), "Other mail, summed up at", type_size::SM, Weight::Regular, t.text_primary());
-        ctx.place(TextField::new(self.s.digest_at.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(80.0))));
+        TextField::new(self.s.digest_at.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(80.0))).render(ctx);
         y += em(32.0);
         text(ctx, x, y + em(8.0), "Times like 09:00, 17:00; leave it empty to only count it.", type_size::XS, Weight::Regular, t.text_tertiary());
         y += em(22.0);
         text(ctx, x, y + em(14.0), "Later: the morning review at", type_size::SM, Weight::Regular, t.text_primary());
-        ctx.place(TextField::new(self.s.review_at.clone()).at(x + em(190.0), fy(y)).width(em(72.0)));
+        TextField::new(self.s.review_at.clone()).at(x + em(190.0), fy(y)).width(em(72.0)).render(ctx);
         y += em(32.0);
         let s = self.s.clone();
         switch(ctx, x, y + em(14.0), "Later: a weekly look on Friday afternoon", ui.prefs.weekly, move || s.toggle_weekly());
@@ -1522,7 +1522,7 @@ impl SettingsView {
         y += para(ctx, x, y, inner, "A link through Safe Links, URL Defense or Mimecast opens through it, so your company's scanner still checks it. Mail shows where it goes either way.", type_size::XS, t.text_tertiary()) + em(8.0);
         if named || !ui.prefs.scanners.is_empty() {
             text(ctx, x, y + em(14.0), "Your company's own scanner", type_size::SM, Weight::Regular, t.text_primary());
-            ctx.place(TextField::new(self.s.scanners.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("scan.acme.example"));
+            TextField::new(self.s.scanners.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("scan.acme.example").render(ctx);
             y += em(32.0);
             y += para(ctx, x, y, inner, "Its host (and those under it). Links through it open through it too, and Mail shows the link it carries when it can.", type_size::XS, t.text_tertiary()) + em(8.0);
         }
@@ -1533,11 +1533,11 @@ impl SettingsView {
             y += em(8.0);
             section(ctx, x, &mut y, "COMPANY");
             text(ctx, x, y + em(14.0), "Its other mail domains", type_size::SM, Weight::Regular, t.text_primary());
-            ctx.place(TextField::new(self.s.company.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("acme.example, acme-corp.example"));
+            TextField::new(self.s.company.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("acme.example, acme-corp.example").render(ctx);
             y += em(32.0);
             y += para(ctx, x, y, inner, "Besides your address's own domain. Recipients anywhere else are pointed out as you write.", type_size::XS, t.text_tertiary()) + em(8.0);
             text(ctx, x, y + em(14.0), "Also send reports to", type_size::SM, Weight::Regular, t.text_primary());
-            ctx.place(TextField::new(self.s.report_to.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("phishing@company.example"));
+            TextField::new(self.s.report_to.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("phishing@company.example").render(ctx);
             y += em(32.0);
             y += para(ctx, x, y, inner, "Report phishing moves the message to Junk, and sends it here as it arrived, headers and all, so your security team can look. Empty: Junk only.", type_size::XS, t.text_tertiary()) + em(8.0);
         }
@@ -1584,7 +1584,7 @@ impl SettingsView {
         }
         let fw = (inner - em(80.0)).max(em(160.0));
         let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-        ctx.place(TextField::new(self.s.mail_rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com move GitHub"));
+        TextField::new(self.s.mail_rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com move GitHub").render(ctx);
         let s = self.s.clone();
         button(ctx, x + fw + em(8.0), y + em(18.0), "Add", false, true, move || s.add_mail_rule());
         y += em(40.0);
@@ -1602,7 +1602,7 @@ impl SettingsView {
         }
         let fw = (inner - em(80.0)).max(em(160.0));
         let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-        ctx.place(TextField::new(self.s.rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com updates"));
+        TextField::new(self.s.rule.clone()).at(x, fy).width(fw).placeholder("from:@github.com updates").render(ctx);
         let s = self.s.clone();
         button(ctx, x + fw + em(8.0), y + em(18.0), "Add", false, true, move || s.add_rule());
         y += em(40.0);
@@ -1614,7 +1614,7 @@ impl SettingsView {
         y += em(24.0);
         let fw = (inner - em(80.0)).max(em(160.0));
         let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
-        ctx.place(TextField::new(self.s.vip.clone()).at(x, fy).width(fw));
+        TextField::new(self.s.vip.clone()).at(x, fy).width(fw).render(ctx);
         let s = self.s.clone();
         button(ctx, x + fw + em(8.0), y + em(18.0), "Add", false, true, move || s.add_vip());
         y += em(40.0);

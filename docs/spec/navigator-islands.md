@@ -439,11 +439,45 @@ running display service. In a headless gate, run the Forum example
 `place_sigillum_fixture` from the directory containing the WM socket to
 place the sheet below the trusted strip before choosing the device.
 
-The gate covers local WebAuthn get with a pre-enrolled key. Registration,
-live Microsoft, page-driven abort and teardown during an active ceremony
-have separate verification requirements. Screenshots, stage markers,
+This gate covers local WebAuthn get with a pre-enrolled key. Registration
+and live Microsoft remain separate. The subsequent cancellation gate is below. Screenshots, stage markers,
 binary hash, confinement and shutdown logs are in
 `~/atrium-vm/evidence/navigator-i3-webauthn-bridge-20261121/`.
+
+### I3 cancellation and sign-in sheet geometry
+
+On 2026-11-21 the installed JIT-off Ladybird worker ran in Capsicum in an
+arm64 Tessera jail with IPv4 and IPv6 disabled. **Test page abort** called
+the native get with an AbortSignal and aborted it after five seconds.
+Sigillum saw the pending assertion end with `client gone`. The page
+displayed `AbortError`. A fresh get in that same page reached the PIN
+sheet, the fixture provider verified the signature and Arca redeemed the
+code. Reopening the Mail store found one account with distinct references.
+
+In a separate session, pressing Navigator's **Cancel sign-in** while
+Sigillum was open retired its ceremony and the old page worker. The
+provider log stayed byte-for-byte unchanged. Mail returned to its empty
+account form. Adding the account again launched a new page (JID 46,
+previously 41), and sign-in and the persisted-account check passed again.
+Use a Mail build containing the sheet-cancellation handler (`403b5b3a`
+or later). The original callback backing image predates that handler.
+
+The headless gate places the 1040 × 720 Settings window at (120, 72)
+on a 1280 × 840 desktop below the trusted strip. Run the Forum
+`place_sigillum_fixture --settings` example while Settings is open,
+then run it without arguments with the trusted sheet open to cross the
+page's bottom edge. The 640 × 360 live page began at (304, 156) and the
+440 × 270 trusted sheet began at (360, 320). The old chrome painted 263
+amber pixels across the foreground sheet in the earlier overlapping layout.
+The corrected device-choice and PIN screens each had 101 amber pixels on
+the sampled exposed bottom edge and zero in the sheet interior. The title,
+relying-party hostname and Cancel label were readable. A fresh sign-in
+on the corrected layout produced a third verified signature and redemption.
+
+The read-only Demo account field still appeared empty despite the value
+in the fixture HTML. Its text painting needs a separate trace. Before and
+after screenshots, guest unit tests, provider markers and shutdown evidence
+are in `~/atrium-vm/evidence/navigator-i3-cancel-layout-20261121/`.
 
 ### I3 installed WebAuthn get probe
 
