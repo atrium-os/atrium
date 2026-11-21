@@ -1911,16 +1911,26 @@ impl View for Sheets {
             ctx.add(Node::Text { rect: Rect::new(12.0, 54.0, w - 24.0, 22.0),
                 content: self.doc.borrow().status.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
             let books = self.pending_books.get_cloned();
+            let mut row_y = 80.0;
             for (index, book) in books.iter().enumerate() {
                 let id = book.id;
                 let cmds = self.cmds.clone();
                 let label = if books.iter().filter(|b| b.name == book.name).count() > 1 {
                     format!("{} ({})", book.name, index + 1)
                 } else { book.name.clone() };
-                Button::secondary(&label).at(12.0, 80.0 + index as f32 * 40.0)
-                    .width((w - 24.0).min(440.0)).on_click(move || {
-                        cmds.lock().unwrap().push(Cmd::RecoverWorkbook(Some(id), pergola::clipboard::current_activation()));
-                    }).render(ctx);
+                let button = Button::secondary(label).at(12.0, row_y).on_click(move || {
+                    cmds.lock().unwrap().push(Cmd::RecoverWorkbook(Some(id), pergola::clipboard::current_activation()));
+                });
+                let natural = button.natural_width().ceil();
+                let width = natural.max(440.0).min((w - 24.0).max(1.0));
+                let height = if natural > width {
+                    button.render_wrapped(ctx, width)
+                } else {
+                    let height = button.rect.h();
+                    button.width(width).render(ctx);
+                    height
+                };
+                row_y += height + 8.0;
             }
             self.picker_slot(ctx, w, h);
             ctx.pop();

@@ -115,11 +115,25 @@ impl Button {
 
 impl View for Button {
     fn render(&self, ctx: &mut Ctx) {
-        let theme = ctx.theme;
-
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::button_height() };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.natural_width(), h);
 
+        self.render_at(ctx, rect, None);
+    }
+}
+
+impl Button {
+    /// Draw a text button at the given width, wrapping its label and returning the row height.
+    pub fn render_wrapped(&self, ctx: &mut Ctx, width: f32) -> f32 {
+        let style = TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Medium, color: ctx.theme.text_primary() };
+        let lines = crate::text::lines(&self.label, &style, (width - 16.0).max(1.0));
+        let height = self.rect.h().max(lines.len() as f32 * crate::text::line_height(&style) + 12.0);
+        self.render_at(ctx, Rect::new(self.rect.x(), self.rect.y(), width, height), Some(&lines));
+        height
+    }
+
+    fn render_at(&self, ctx: &mut Ctx, rect: Rect, wrapped_lines: Option<&[String]>) {
+        let theme = ctx.theme;
         // Node structure is IDENTICAL in every state — state changes
         // colors, never node count — so ids stay stable across renders
         // and last frame's hover/press/focus (keyed by id) selects
@@ -209,28 +223,27 @@ impl View for Button {
             Some(ch) => (ch.to_string(), font::ICONS, Weight::Regular),
             None => (self.label.clone(), font::SANS, Weight::Medium),
         };
-        let label_size = Node::measure_text(&content, &TextStyle {
-            family: family.into(),
-            size: type_size::MD,
-            weight,
-            color: label_color,
-        });
-        let label_rect = Rect::new(
-            rect.x() + (rect.w() - label_size.w) / 2.0,
-            rect.y() + (rect.h() - label_size.h) / 2.0,
-            label_size.w,
-            label_size.h,
-        );
-        ctx.tree.insert(Some(bg_id), Node::Text {
-            rect: label_rect,
-            content,
-            style: TextStyle {
-                family: family.into(),
-                size: type_size::MD,
-                weight,
-                color: label_color,
-            },
-        });
+        let style = TextStyle { family: family.into(), size: type_size::MD, weight, color: label_color };
+        if let Some(lines) = wrapped_lines {
+            let line_height = crate::text::line_height(&style);
+            let top = rect.y() + (rect.h() - lines.len() as f32 * line_height) / 2.0;
+            for (i, line) in lines.iter().enumerate() {
+                ctx.tree.insert(Some(bg_id), Node::Text {
+                    rect: Rect::new(rect.x() + 8.0, top + i as f32 * line_height, (rect.w() - 16.0).max(1.0), line_height),
+                    content: line.clone(),
+                    style: style.clone(),
+                });
+            }
+        } else {
+            let label_size = Node::measure_text(&content, &style);
+            let label_rect = Rect::new(
+                rect.x() + (rect.w() - label_size.w) / 2.0,
+                rect.y() + (rect.h() - label_size.h) / 2.0,
+                label_size.w,
+                label_size.h,
+            );
+            ctx.tree.insert(Some(bg_id), Node::Text { rect: label_rect, content, style });
+        }
 
         // Wire the click handler; clickable buttons take Tab focus.
         if let Some(cb) = &self.on_click {

@@ -139,7 +139,8 @@ temporary layer is discarded at teardown. Each workbook journals into its
 own size-limited recovery volume at `/atrium/recovery`. After a crash,
 **Recover…** opens a single pending workbook directly. When several are
 pending, the launcher lists their current names and opens the chosen one
-in a fresh jail. A confirmed Save As updates the chooser label and the
+in a fresh jail. Chooser rows expand to show the full filename, wrapping it
+when it exceeds the launcher width. A confirmed Save As updates the chooser label and the
 autosave name to the filename Scrinium published, including any collision
 suffix. If Portcullis misses the update, it reconciles the chooser label from
 the durable autosave name after the document jail is torn down. A workbook

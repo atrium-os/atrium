@@ -255,3 +255,11 @@ The original single-line retry prompt ran behind the password field and buttons 
 The retry frame shows the name through `Review.osheet` and ends with “Try again” on the second line. The test compares both the initial and retry frames, then types the correct password without clicking the field after tiling. The loaded protected workbook must contain `fox,3`. The password field has a stable focus ID across changes to the number of prompt lines.
 
 The final desktop gate passed on native Tessera and bounded UFS recovery volumes, including the existing 1100 px prompt checks and the two new 640 px frames.
+
+## Choosing the long-named protected workbook after a crash
+
+The desktop gate enters C1=8 in the unlocked audit workbook and D1=9 in its plain sibling, waits for the edits to reach the journals, and kills both Sheets processes without saving. Two pending workbooks force the launcher to show the chooser. The original 440 px button centered the long label partly outside the window, hiding its beginning.
+
+The chooser now measures the button label, expands the row when space permits, and wraps the label within a taller button when necessary. The gate captures the 1100 px and 640 px chooser layouts and selects the protected workbook from the second line of its tiled row. After unlocking in a fresh jail it uses Save As, then reads the resulting protected workbook independently. It also recovers the plain sibling and compares the original published files with their pre-crash revisions.
+
+Both runs passed on native Tessera and bounded UFS recovery volumes. The protected copy contained `fox,3,8` and the plain copy contained `zebra,4,7,9`. The original revisions matched their pre-crash contents.

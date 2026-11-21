@@ -931,7 +931,8 @@ SH
         wait_for count 2; reopened=$(docs | grep -vx "$left_jail")
         protected_visible() { different_window 48 24 "$left_window" && test "$win" != "$picker_window"; }
         wait_for protected_visible
-        /tmp/tile-recovery-windows "$left_window" "$win" "$win"
+        right_window=$win
+        /tmp/tile-recovery-windows "$left_window" "$right_window" "$right_window"
         input 'MOVE 688 24'
         wait_for frame_is f8a508c84809a8200efd35035e5559b40b10bb1eb0c1823ac36e625c39e7a725
         cp selectscreen.png "$results/tiled-password.png"
@@ -940,10 +941,42 @@ SH
         cp selectscreen.png "$results/tiled-retry.png"
         type_keys 0x17 0x08 0x16 0x17 0x28 # test
         loaded_cells "$long_name" fox,3 protected
-        key 0x1a 1; wait_for count 1
+        # Leave two journaled workbooks so Recover offers an actual choice.
+        edit 831 0x25 # protected C1=8
+        protected_jail=$reopened
+        /tmp/tile-recovery-windows "$left_window" "$right_window" "$left_window"
+        edit 255 0x26 # plain D1=9
+        sleep 2.2
+        test -s "$directory/journal.$generation"
+        cmp "$books/Untitled.osheet" "$books/$long_name"
+        kill_doc "$protected_jail"; kill_doc "$left_jail"
+        wait_for count 0; wait_for pending 2
         /tmp/tile-recovery-windows --clear-focus
-        test "$(docs)" = "$left_jail"
+        click 213 24; input 'MOVE 8 240'
+        wait_for frame_is 2c2c469f30037c925bd2cfcced2e60d4991adf2208434f4e7a8a54f067dd2749
+        cp selectscreen.png "$results/long-chooser.png"
+        launcher=$(win_at 48 24)
+        /tmp/tile-recovery-windows --launcher-width "$launcher" 640
+        input 'MOVE 8 240'
+        wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
+        cp selectscreen.png "$results/tiled-long-chooser.png"
+        click 120 155; wait_for count 1
+        /tmp/tile-recovery-windows --clear-focus
+        reopened=$(docs)
+        test "$reopened" != "$protected_jail"
+        wait_for frame_is a9adaf60ea16d330ad49e809c57faf7e8fffc0aaf38e2cc46375e1a97270793f
+        type_keys 0x17 0x08 0x16 0x17 0x28
+        sleep .6
+        restored="${long_name%.osheet} (2).osheet"
+        publish "$restored" fox,3,8 protected
+        key 0x1a 1; wait_for count 0; wait_for pending 1
+        /tmp/tile-recovery-windows --launcher-width "$launcher" 1100
+        /tmp/tile-recovery-windows --clear-focus
+        click 213 24; wait_for count 1; sleep .6
+        plain_restored='Proof (2) (2).osheet'
+        publish "$plain_restored" zebra,4,7,9
         close_reopened
+        mv "$books/$restored" "$books/$plain_restored" "$results/"
         cmp "$books/Untitled.osheet" "$books/$long_name"
         mv "$books/$long_name" "$results/"
         cmp "$books/Proof.osheet" "$results/external.osheet"
