@@ -397,6 +397,36 @@ engine rather than in the document lane:
   allows it. A site whose sign-in needs script opens a sign-in window for it on the
   person's press, rather than turning the persona's whole trail live.
 
+### I3 installed WebAuthn get probe
+
+On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS
+provider through Arca on arm64 Tessera. The provider logged authorization,
+the cookie-authenticated first screen, stylesheet and WebAuthn script.
+Pressing **Use passkey** called `navigator.credentials.get({ publicKey })`.
+The page displayed **Passkey failed: InternalError**. The engine logged
+`FIXME: Unimplemented CredentialsContainer::get()`. The worker ran in jail
+15 with Capsicum active and IPv4 and IPv6 disabled. Its SHA-256 matched the
+JIT-off Ladybird binary from the earlier callback gate.
+
+At the pinned Ladybird revision, `CredentialRequestOptions` lacks a
+`publicKey` member. The Rust implementation of `CredentialsContainer::get`
+ignores the options and rejects the promise. The request stopped there.
+Navigatord's sign-in sheet currently accepts resource requests on its
+page channel. It has no WebAuthn request handler. No trusted Sigillum sheet
+opened, the provider issued no callback, and Arca redeemed no code.
+
+To reproduce this first hop, use the callback gate's local provider and
+choose `webauthn-probe` as the final argument to `courier-test-server`.
+The fixture explicitly refuses the earlier GET-only callback shortcut.
+The separate `sigillum-webauthn --test e2e` suite passed all six tests in
+the same VM, including RP signature verification with the software key,
+an Arca passkey, and cancellation. Those tests use a scripted sheet peer.
+The installed gate still needs a native public-key request and response
+binding, a cancellable request tied to the sheet and its courier-verified
+document origin, and a provider-issued challenge and verified assertion
+before OAuth completion. Screenshots and logs are in
+`~/atrium-vm/evidence/navigator-i3-webauthn-20261121/`.
+
 ## 7. Build steps
 
 Each step runs in the VM with a gate before the next, as the Navigator's other steps did.

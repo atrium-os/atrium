@@ -10,6 +10,8 @@
 //! A fifth argument is the listen address for the Mail sign-in fixture
 //! (use 127.0.0.1:0 on the host). In this mode the log contains stage
 //! markers only. The fixture checks PKCE request fields and a redirect cookie.
+//! With the final argument `webauthn-probe`, the page calls credentials.get
+//! and displays its outcome. That diagnostic flow cannot issue an OAuth code.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -19,6 +21,7 @@ use std::sync::Arc;
 // authorization and the code is removed on the first redemption attempt.
 #[derive(Default)]
 struct Provider {
+    webauthn_probe: bool,
     sessions: std::collections::HashMap<String, (String, String)>,
     codes: std::collections::HashMap<String, String>,
 }
@@ -61,13 +64,14 @@ impl Provider {
                 let resource = match path {
                     "/first" => Some(("first-screen-cookie-ok", "text/html", include_str!("../../../test-assets/navigator-i0/mail/first.html"))),
                     "/atrium-fixture/account.css" => Some(("stylesheet", "text/css", include_str!("../../../test-assets/navigator-i0/mail/account.css"))),
+                    "/atrium-fixture/account.js" if self.webauthn_probe => Some(("webauthn-script", "text/javascript", include_str!("../../../test-assets/navigator-i3/get.js"))),
                     "/atrium-fixture/account.js" => Some(("script", "text/javascript", include_str!("../../../test-assets/navigator-i0/mail/account.js"))),
                     _ => None,
                 };
                 if let Some((marker, mime, body)) = resource {
                     return (marker, response("200 OK", &format!("Content-Type: {mime}\r\n"), body));
                 }
-                if path == "/atrium-fixture/continue" && self.codes.len() < 64 {
+                if !self.webauthn_probe && path == "/atrium-fixture/continue" && self.codes.len() < 64 {
                     let (state, challenge) = self.sessions.remove(flow).unwrap();
                     let code = nonce();
                     self.codes.insert(code.clone(), challenge);
@@ -117,8 +121,9 @@ fn main() {
     // authority in that courier jail is this throwaway fixture CA.
     let mail_address = a.get(5);
     let mail = mail_address.is_some();
-    let callback = a.get(6).is_some_and(|mode| mode == "mail-callback");
-    let provider = Arc::new(std::sync::Mutex::new(Provider::default()));
+    let webauthn_probe = a.get(6).is_some_and(|mode| mode == "webauthn-probe");
+    let callback = webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
+    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, ..Provider::default() }));
     let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
@@ -225,6 +230,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webauthn_probe_requires_its_cookie_and_cannot_issue_a_callback() {
+        let mut provider = Provider { webauthn_probe: true, ..Provider::default() };
+        provider.sessions.insert("fixture".into(), ("state".into(), "challenge".into()));
+        let js = "GET /atrium-fixture/account.js HTTP/1.1";
+        assert_eq!(provider.callback(js, "", "").0, "refused");
+        assert_eq!(provider.callback(js, "flow=fixture", "").0, "webauthn-script");
+        assert_eq!(provider.callback("GET /atrium-fixture/continue HTTP/1.1", "flow=fixture", "").0, "refused");
+        assert!(provider.codes.is_empty());
+    }
 
     #[test]
     fn provider_requires_the_matching_verifier_and_consumes_each_code_once() {
