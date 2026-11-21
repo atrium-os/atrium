@@ -1027,6 +1027,7 @@ pub mod host {
             }
             Some(CredentialMessage::Error { name: "SecurityError", .. }) => -2,
             Some(CredentialMessage::Error { name: "TypeError", .. }) => -3,
+            Some(CredentialMessage::Error { name: "InvalidStateError", .. }) => -4,
             _ => -1
         }
     }

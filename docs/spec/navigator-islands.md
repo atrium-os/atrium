@@ -525,6 +525,14 @@ whose lookup returned status 5 in this fixture. The local provider,
 ephemeral key and fixture account cover a single run. Evidence is in
 `~/atrium-vm/evidence/navigator-i3-registration-20261121/`.
 
+The registration fixture also offers **Try duplicate** after enrollment. It
+uses an independent challenge and supplies the original raw credential ID in
+`excludeCredentials`. Cancellation in Sigillum should reject creation with
+`NotAllowedError` and leave **Create passkey** available. Exclusion should
+reject with `InvalidStateError`; the page retains the original ID for the
+subsequent sign-in. Verify that the provider receives just one registration
+and that its enrolled public key verifies the final assertion.
+
 ### I3 installed WebAuthn get probe
 
 On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS

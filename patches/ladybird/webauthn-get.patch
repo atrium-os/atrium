@@ -205,7 +205,7 @@
 +    let result = if n > 0 && n as usize <= bytes.len() {
 +        decode(&cx, &bytes[..n as usize])
 +    } else {
-+        let name = match n { -2 => "SecurityError", -3 => "TypeError", _ => "NotAllowedError" };
++        let name = match n { -2 => "SecurityError", -3 => "TypeError", -4 => "InvalidStateError", _ => "NotAllowedError" };
 +        Err(if name == "TypeError" { Exception::type_error("Invalid credential options") } else { Exception::Dom(name, Utf16String::from_ascii(b"Credential unavailable")) })
 +    };
 +    match result {

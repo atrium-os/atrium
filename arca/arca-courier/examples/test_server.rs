@@ -131,7 +131,8 @@ impl Provider {
             if self.sessions.contains_key(flow) {
                 if self.registration && path == "/atrium-fixture/account.js" {
                     let challenge = self.registration_challenges.entry(flow.into()).or_insert_with(nonce);
-                    let script = include_str!("../../../test-assets/navigator-i3/register.js").replace("__CREATE__", challenge);
+                    let script = include_str!("../../../test-assets/navigator-i3/register.js").replace("__CREATE__", challenge)
+                        .replace("__EXCLUDE__", &nonce());
                     let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
                     return ("registration-challenges-issued", response("200 OK", "Content-Type: text/javascript\r\n", &script.replace("__GET__", challenge)));
                 }
