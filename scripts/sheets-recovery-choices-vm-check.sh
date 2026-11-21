@@ -702,38 +702,43 @@ SH
                 kill -KILL "$old_limen"
                 trap - EXIT
             )
+            interrupt_published_save() (
+                # Stop the provider at the atomic rename. Freeze the broker
+                # before releasing the provider so confirmation cannot pass.
+                release="$results/$1-release-rename"
+                trap 'touch "$release"; kill -CONT "$old_limen" 2>/dev/null || :' EXIT
+                timeout 30 lldb -b -p "$files_pid" \
+                    -o 'breakpoint set -n renameat' \
+                    -o "platform shell touch $results/$1-debugger-ready" -o continue \
+                    -o "platform shell touch $results/$1-at-rename" \
+                    -o "platform shell timeout 15 sh -c 'until test -f $release; do sleep .1; done'" \
+                    -o 'process detach' </dev/null > "$results/$1-rename.log" 2>&1 &
+                debugger=$!
+                wait_for test -f "$results/$1-debugger-ready"
+                click 125 24
+                wait_for test -f "$results/$1-at-rename"
+                grep -q 'stop reason = breakpoint 1' "$results/$1-rename.log"
+                kill -STOP "$old_limen"
+                wait_for stopped_limen
+                "$2"
+                touch "$release"; wait "$debugger"
+                wait_for "$3"
+                if test "$#" -eq 4; then "$4"; fi
+                kill -KILL "$old_limen"
+                trap - EXIT
+            )
             if test "$5" = published-save || test "$5" = external-edit; then
                 if test "$5" = external-edit; then cp "$books/Proof.osheet" "$results/external.osheet"; fi
                 /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
                 wait_for tiled
                 edit 129 0x1f # First snapshot contains B1=2.
-                (
-                    # Stop the provider at the atomic rename. Freeze the broker
-                    # before releasing the provider so confirmation cannot pass.
-                    release="$results/release-rename"
-                    trap 'touch "$release"; kill -CONT "$old_limen" 2>/dev/null || :' EXIT
-                    timeout 30 lldb -b -p "$files_pid" \
-                        -o 'breakpoint set -n renameat' \
-                        -o "platform shell touch $results/debugger-ready" -o continue \
-                        -o "platform shell touch $results/at-rename" \
-                        -o "platform shell timeout 15 sh -c 'until test -f $release; do sleep .1; done'" \
-                        -o 'process detach' </dev/null > "$results/rename.log" 2>&1 &
-                    debugger=$!
-                    wait_for test -f "$results/debugger-ready"
-                    click 125 24
-                    wait_for test -f "$results/at-rename"
-                    grep -q 'stop reason = breakpoint 1' "$results/rename.log"
-                    kill -STOP "$old_limen"
-                    wait_for stopped_limen
-                    /tmp/check-recovered-copy "$books/Proof.osheet" zebra plain
-                    touch "$release"; wait "$debugger"
-                    published() { /tmp/check-recovered-copy "$books/Proof.osheet" zebra,2 plain; }
-                    wait_for published
+                before_publish() { /tmp/check-recovered-copy "$books/Proof.osheet" zebra plain; }
+                after_publish() { /tmp/check-recovered-copy "$books/Proof.osheet" zebra,2 plain; }
+                later_edit() {
                     test "$(sha256 -q "$books/Untitled.osheet")" = "$sibling_hash"
                     edit 129 0x21 # B1=4 stays in Sheets until the retry.
-                    kill -KILL "$old_limen"
-                    trap - EXIT
-                )
+                }
+                interrupt_published_save unlocked before_publish after_publish later_edit
                 plain_hash=$(sha256 -q "$books/Proof.osheet")
             elif test "$5" = pending-save; then
                 /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
@@ -1058,15 +1063,56 @@ SH
         journal_unchanged
         test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
 
-        trace_offset=$(wc -l < select-files.log)
-        click 125 24
-        plain_recovery_saved() { test "$(sha256 -q "$books/$plain_restored")" != "$plain_hash"; }
-        wait_for plain_recovery_saved
         plain_recovery_root=$(root "$plain_recovery")
-        tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid ${plain_recovery_root##*-})"
-        /tmp/check-recovered-copy "$books/$plain_restored" zebra,4,7,9,6 plain
-        plain_hash=$(sha256 -q "$books/$plain_restored")
+        save_plain_recovery() {
+            trace_offset=$(wc -l < select-files.log)
+            click 125 24
+            plain_recovery_saved() { test "$(sha256 -q "$books/$plain_restored")" != "$plain_hash"; }
+            wait_for plain_recovery_saved
+            tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid ${plain_recovery_root##*-})"
+            /tmp/check-recovered-copy "$books/$plain_restored" "$1" plain
+            plain_hash=$(sha256 -q "$books/$plain_restored")
+            journal_unchanged
+        }
+        save_plain_recovery zebra,4,7,9,6
+
+        # Cover both outcomes after publication without confirmation while
+        # retaining the same locked workbook and plain Save As grant.
+        restart_after_plain_publication() {
+            before_cells=$2; published_cells=$3
+            before_publish() { /tmp/check-recovered-copy "$books/$plain_restored" "$before_cells" plain; }
+            after_publish() { /tmp/check-recovered-copy "$books/$plain_restored" "$published_cells" plain; }
+            old_limen=$new_limen
+            interrupt_published_save "$1" before_publish after_publish
+            start_replacement_limen
+            for peer in "$plain_recovery_pid" "$locked_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
+            count 2; pending 2
+            journal_unchanged
+            after_publish
+            plain_hash=$(sha256 -q "$books/$plain_restored")
+        }
+        edit 382 0x24 # F1=7 publishes before confirmation.
+        restart_after_plain_publication locked-published zebra,4,7,9,6 zebra,4,7,9,6,7
+        edit 446 0x25 # G1=8 saves after reconnect using the existing grant.
+        save_plain_recovery zebra,4,7,9,6,7,8
+
+        cp "$books/$plain_restored" "$results/locked-external.osheet"
+        edit 510 0x26 # H1=9 publishes before the next interruption.
+        restart_after_plain_publication locked-conflict zebra,4,7,9,6,7,8 zebra,4,7,9,6,7,8,9
+        cat "$results/locked-external.osheet" > "$books/$plain_restored"
+        edit 574 0x1e # I1=1 remains pending when ordinary Save refuses the conflict.
+        click 125 24
+        input 'MOVE 8 240'
+        wait_for frame_is 09df1cdde2ef56cdf60ae8ec292a76a40379f3d569c8193118c411b2451c835b
+        cp selectscreen.png "$results/locked-conflict.png"
+        cmp "$books/$plain_restored" "$results/locked-external.osheet"
         journal_unchanged
+        conflict_copy='Proof (2) (2) (2).osheet'
+        publish "$conflict_copy" zebra,4,7,9,6,7,8,9,1
+        conflict_hash=$(sha256 -q "$books/$conflict_copy")
+        cmp "$books/$plain_restored" "$results/locked-external.osheet"
+        journal_unchanged
+        /tmp/tile-recovery-windows --window-width "$plain_window" 1100
         key 0x1a 1; wait_for count 1; wait_for pending 1
 
         /tmp/tile-recovery-windows --window-width "$locked_window" 1100
@@ -1086,8 +1132,9 @@ SH
         /tmp/tile-recovery-windows --window-width "$launcher" 1100
         /tmp/tile-recovery-windows --clear-focus
         wait_for launcher_visible
-        test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
-        mv "$books/$restored" "$books/$plain_restored" "$results/"
+        cmp "$books/$plain_restored" "$results/locked-external.osheet"
+        test "$(sha256 -q "$books/$conflict_copy")" = "$conflict_hash"
+        mv "$books/$restored" "$books/$plain_restored" "$books/$conflict_copy" "$results/"
         cmp "$books/Untitled.osheet" "$books/$long_name"
         mv "$books/$long_name" "$results/"
         cmp "$books/Proof.osheet" "$results/external.osheet"

@@ -301,3 +301,15 @@ The gate commits `E1=6` in the plain sibling and pauses Limen. It presses Save o
 The retry presses only Save. An independent read must find `zebra,4,7,9,6` in the same plain file. The protected prompt must still identify the long-named workbook. Unlocking and publishing its protected copy must recover `fox,3,8` and leave the retried plain revision intact.
 
 The complete desktop gate passed on native Tessera and bounded UFS recovery volumes. Both original workbooks matched their pre-crash contents.
+
+## Protected recovery closeout
+
+The desktop gate runs the protected recovery cases together. It cancels both password prompts, reopens the same recovery ID and journal, then saves the plain sibling while the protected workbook waits at Restore. It checks three points in the plain save flow while that same protected window remains open.
+
+- Before delivery, the gate verifies Save has reached Limen's receive queue, restarts Limen, and retries without retyping the edit. The existing copy must contain `E1=6`.
+- After publication, the gate pauses Scrinium at the rename, freezes Limen before releasing it, and reads `F1=7` from disk before terminating Limen. A later `G1=8` edit must save to the same destination after reconnect.
+- With an external revision, the gate repeats the unconfirmed publication with `H1=9`, writes a valid earlier revision to the same file, and checks the conflict message. Ordinary Save must preserve that external revision. Save As must preserve the local `H1=9` and `I1=1` in a separate copy.
+
+The protected journal must match through the Limen restarts and sibling saves. The protected copy must contain `C1=8` after unlocking, and its Save As must preserve both plain outputs byte for byte.
+
+The revised gate passed end to end on bounded UFS recovery volumes. On native Tessera, the run reached the expected conflict and captured the reference frame. A continuation verified Save As, protected unlock, and the final file contents in the same live jails.
