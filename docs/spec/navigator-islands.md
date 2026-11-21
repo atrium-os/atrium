@@ -525,13 +525,28 @@ whose lookup returned status 5 in this fixture. The local provider,
 ephemeral key and fixture account cover a single run. Evidence is in
 `~/atrium-vm/evidence/navigator-i3-registration-20261121/`.
 
-The registration fixture also offers **Try duplicate** after enrollment. It
-uses an independent challenge and supplies the original raw credential ID in
-`excludeCredentials`. Cancellation in Sigillum should reject creation with
-`NotAllowedError` and leave **Create passkey** available. Exclusion should
-reject with `InvalidStateError`; the page retains the original ID for the
-subsequent sign-in. Verify that the provider receives just one registration
-and that its enrolled public key verifies the final assertion.
+### I3 registration cancellation and credential exclusion
+
+On 2026-11-22 the installed JIT-off Ladybird worker ran in Capsicum on
+arm64 Tessera with IPv4 and IPv6 disabled. Starting with an empty software
+key, Cancel on Sigillum’s registration sheet returned `NotAllowedError`
+to the page. The provider received no registration. Retrying from the same
+page completed registration. **Try duplicate** sent an independent
+challenge and the enrolled raw ID in `excludeCredentials`. Sigillum logged
+`excluded` and Ladybird displayed `InvalidStateError`.
+
+**Use new passkey** then put the original ID in `allowCredentials`.
+The provider verified the assertion under the public key retained from
+the sole registration, and Arca redeemed the PKCE code. The four Sigillum
+ceremonies ended in order with cancellation, registration, exclusion and
+assertion. The flow’s provider log contains one `registration-verified`,
+one `assertion-verified`, and one `pkce-redeemed`.
+
+An initial UI driver press landed on the adjacent sign-in button because
+OCR grouped both button labels. The complete run above used a fresh soft
+key and flow, and targeted the individual button bounds. Screenshots,
+per-flow markers, ceremony log, worker hash, jail credentials and shutdown
+evidence are in `~/atrium-vm/evidence/navigator-i3-exclusion-20261122/`.
 
 ### I3 installed WebAuthn get probe
 
