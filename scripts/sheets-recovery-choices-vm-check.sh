@@ -18,7 +18,7 @@
 # Append restart-limen after interleave to restart the private Limen between Save As and Save.
 # Use pending-save instead of restart-limen to interrupt an ordinary Save before delivery.
 # Use published-save to interrupt confirmation after publication (requires guest LLDB).
-# Use external-edit to exercise the conflict, save another cell on the new grant, and reopen all three files.
+# Use external-edit to exercise the conflict, reopen all three files, and cancel and retry protected crash recovery.
 # --delayed-runtime-start takes the private broker path and delays one document jail start.
 # --retry-runtime-start temporarily removes execute permission from the fixture Sheets binary.
 # --retry-jail-setup blocks creation of the selected jail’s upper layer after mount.
@@ -948,6 +948,8 @@ SH
         edit 255 0x26 # plain D1=9
         sleep 2.2
         test -s "$directory/journal.$generation"
+        journal_rel="${directory##*/}/journal.$generation"
+        journal_hash=$(sha256 -q "$directory/journal.$generation")
         cmp "$books/Untitled.osheet" "$books/$long_name"
         kill_doc "$protected_jail"; kill_doc "$left_jail"
         wait_for count 0; wait_for pending 2
@@ -960,11 +962,39 @@ SH
         input 'MOVE 8 240'
         wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
         cp selectscreen.png "$results/tiled-long-chooser.png"
-        click 120 155; wait_for count 1
-        /tmp/tile-recovery-windows --clear-focus
-        reopened=$(docs)
+        open_protected_recovery() {
+            click 120 155; wait_for count 1
+            /tmp/tile-recovery-windows --clear-focus
+            reopened=$(docs)
+            wait_for frame_is a9adaf60ea16d330ad49e809c57faf7e8fffc0aaf38e2cc46375e1a97270793f
+        }
+        store=$(dirname "$marker")
+        # Opening the slot invalidates its detached-volume check. Compare the
+        # workbook names and identities without that cached flag.
+        pending_identity() { sed 's/,"checked_detached":[a-z]*//' "$store/$1.pending"; }
+        for slot in 0 1; do
+            pending_identity "$slot" > "$results/before-cancel-$slot.pending"
+        done
+        open_protected_recovery
         test "$reopened" != "$protected_jail"
-        wait_for frame_is a9adaf60ea16d330ad49e809c57faf7e8fffc0aaf38e2cc46375e1a97270793f
+        canceled_jail=$reopened
+        cp selectscreen.png "$results/before-cancel.png"
+        click 1058 94
+        wait_for count 0; wait_for detached; wait_for pending 2
+        for slot in 0 1; do
+            pending_identity "$slot" > "$results/after-cancel-$slot.pending"
+            cmp "$results/before-cancel-$slot.pending" "$results/after-cancel-$slot.pending"
+        done
+        cmp "$books/Untitled.osheet" "$books/$long_name"
+        files_intact
+
+        /tmp/tile-recovery-windows --clear-focus
+        click 213 24; input 'MOVE 8 240'
+        wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
+        cp selectscreen.png "$results/retry-chooser.png"
+        open_protected_recovery
+        test "$reopened" != "$canceled_jail"
+        test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
         type_keys 0x17 0x08 0x16 0x17 0x28
         sleep .6
         restored="${long_name%.osheet} (2).osheet"

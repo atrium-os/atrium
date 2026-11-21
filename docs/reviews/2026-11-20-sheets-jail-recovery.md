@@ -263,3 +263,9 @@ The desktop gate enters C1=8 in the unlocked audit workbook and D1=9 in its plai
 The chooser now measures the button label, expands the row when space permits, and wraps the label within a taller button when necessary. The gate captures the 1100 px and 640 px chooser layouts and selects the protected workbook from the second line of its tiled row. After unlocking in a fresh jail it uses Save As, then reads the resulting protected workbook independently. It also recovers the plain sibling and compares the original published files with their pre-crash revisions.
 
 Both runs passed on native Tessera and bounded UFS recovery volumes. The protected copy contained `fox,3,8` and the plain copy contained `zebra,4,7,9`. The original revisions matched their pre-crash contents.
+
+## Canceling and retrying the protected recovery
+
+The gate cancels the Restore password prompt before entering a password. It checks that the document jail exits, the recovery volume detaches, both pending workbook names and IDs survive, and the published files stay intact. It then chooses the same filename from the 640 px launcher and checks that a fresh jail mounts the original journal byte for byte. After unlocking, the protected copy must contain `fox,3,8`. The sibling must still recover `zebra,4,7,9`.
+
+The final desktop gate passed with both native Tessera and bounded UFS recovery volumes.
