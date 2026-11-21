@@ -232,6 +232,19 @@ pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str
 
 // ── autoconfig (Mozilla clientConfig v1.1) ───────────────────────────
 
+fn opening_tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, ch) in tag.char_indices() {
+        match ch {
+            delimiter if quote == Some(delimiter) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            '>' if quote.is_none() => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The text of each `<tag …>…</tag>` inside `within` (no nesting of the
 /// same tag), with the opening tag's attributes.
 fn elements<'a>(within: &'a str, tag: &str) -> Vec<(&'a str, &'a str)> {
@@ -245,7 +258,7 @@ fn elements<'a>(within: &'a str, tag: &str) -> Vec<(&'a str, &'a str)> {
             rest = after;
             continue;
         }
-        let Some(gt) = after.find('>') else { break };
+        let Some(gt) = opening_tag_end(after) else { break };
         let attrs = &after[..gt];
         let body = &after[gt + 1..];
         let Some(end) = body.find(&close) else { break };
@@ -497,6 +510,25 @@ mod tests {
         assert_eq!(found.settings, Settings::Imap {
             imap: Server { scheme: "imaps", host: "imap.example.test".into(), port: 993 },
             smtp: Server { scheme: "submission", host: "smtp.example.test".into(), port: 587 },
+        });
+        assert_eq!(net.asked, ["https://example.test/.well-known/jmap", url]);
+    }
+
+    #[test]
+    fn autoconfig_allows_a_greater_than_sign_inside_quoted_attributes() {
+        let mut net = Net::default();
+        let url = "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=ada%40example.test";
+        net.pages.insert(url.into(), br#"<clientConfig>
+<incomingServer label="Team's > shared" type="imap"><hostname>imap.west.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer label='Team "west" > shared' type="smtp"><hostname>smtp.west.example.test</hostname><port>587</port><socketType>STARTTLS</socketType></outgoingServer>
+</clientConfig>"#.to_vec());
+
+        let found = discover("ada@example.test", &mut net).unwrap();
+
+        assert_eq!(found.via, Via::Autoconfig);
+        assert_eq!(found.settings, Settings::Imap {
+            imap: Server { scheme: "imaps", host: "imap.west.example.test".into(), port: 993 },
+            smtp: Server { scheme: "submission", host: "smtp.west.example.test".into(), port: 587 },
         });
         assert_eq!(net.asked, ["https://example.test/.well-known/jmap", url]);
     }
