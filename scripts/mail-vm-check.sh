@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VMDIR="${VMDIR:-$HOME/atrium-vm}"
 VSSH="$ROOT/scripts/vssh"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
-SCP="scp -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222"
+SCP="scp -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P ${VM_SSH_PORT:-2222}"
 W=/root/mailcheck
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }

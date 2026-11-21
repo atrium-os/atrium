@@ -5164,6 +5164,19 @@ sh scripts/cloud-vm.sh e2e     # navigator-jail-e2e.sh --quick on a synthetic pa
 . scripts/cloud-vm.sh env      # exports CROSS_RUSTFLAGS + TARGET for cross-builds
 ```
 
+Run a gate with its own disposable guest using
+`sh scripts/cloud-vm.sh test sheets`, `test navigator-ui`, `test navigator-live`,
+or `test mail`. Start from a prepared, powered-off ZFS base in `VMDIR`.
+The runner uses a QCOW2 overlay and a private copy of the EFI variables.
+It uses SSH port 6222 by default. Set `ATRIUM_TEST_SSH_PORT` to a different
+unused port for concurrent runs. The printed evidence directory contains
+the gate transcript, QEMU and shutdown logs, and default screenshot outputs.
+Once QEMU exits cleanly, cleanup checks for dependent images and removes
+the disposable disk if unused. Add nonstandard image locations to
+`ATRIUM_VM_IMAGE_ROOTS` before the run. Custom Tessera harnesses can pass
+both their disposable `.qcow2` and `.raw` disk filenames to the cleanup
+helper after shutdown and evidence collection.
+
 | knob | meaning |
 |---|---|
 | `ARCH=amd64` | x86_64 guest (q35 + OVMF), state in `~/atrium-vm-amd64`; default arm64 in `~/atrium-vm` |

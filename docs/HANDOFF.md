@@ -32,7 +32,7 @@ Last updated: 2026-11-19.
 
 ## Recently finished
 
-- **Disposable VM cleanup** ([RUNBOOK.md](../RUNBOOK.md)). Prelum R7 and the M9 fresh-VM runner prune their run disks after QEMU exits and preserve evidence. The shared helper checks QCOW2 backing references before unlinking a runner-owned disk. Use it when adding disposable VM runners.
+- **Disposable VM cleanup** ([RUNBOOK.md](../RUNBOOK.md)). Prelum R7, the M9 fresh-VM runner, and `cloud-vm.sh test` (Sheets, Navigator UI/live, Mail) prune runner-owned overlays after QEMU exits and preserve evidence. The helper checks QCOW2 backing references before unlinking. Use it in custom runners after collecting evidence and reaping QEMU.
 
 Tessera encryption E0–E6, fonts, boot time, the share sheet.
 

@@ -20,9 +20,9 @@ set -- env
 set --
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-g() { ssh $SSHOPT -o ConnectTimeout=30 -p 2222 root@localhost "$@"; }
-put() { scp $SSHOPT -P 2222 -q "$1" "root@localhost:$2"; }
-get() { scp $SSHOPT -P 2222 -q "root@localhost:$1" "$2"; }
+g() { ssh $SSHOPT -o ConnectTimeout=30 -p "${VM_SSH_PORT:-2222}" root@localhost "$@"; }
+put() { scp $SSHOPT -P "${VM_SSH_PORT:-2222}" -q "$1" "root@localhost:$2"; }
+get() { scp $SSHOPT -P "${VM_SSH_PORT:-2222}" -q "root@localhost:$1" "$2"; }
 
 echo "=== cross-build"
 xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2); }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove explicitly owned QCOW2 disks after the runner has reaped QEMU."""
+"""Remove explicitly owned QCOW2 or raw disks after the runner reaps QEMU."""
 import argparse
 import json
 import os
@@ -9,8 +9,8 @@ import subprocess
 import tempfile
 
 
-def disk_info(path, shared=False):
-    command = ['qemu-img', 'info', '-f', 'qcow2', '--output=json']
+def disk_info(path, shared=False, image_format='qcow2'):
+    command = ['qemu-img', 'info', '-f', image_format, '--output=json']
     if shared:
         command.append('--force-share')
     return json.loads(subprocess.check_output([*command, str(path)], text=True, timeout=15))
@@ -63,18 +63,20 @@ def qcow_disks(roots):
 def remove_disks(run_dir, names, extra_roots=()):
     disks = {}
     for name in names:
-        if Path(name).name != name or Path(name).suffix != '.qcow2':
-            raise ValueError(f'Expected a QCOW2 filename within {run_dir}: {name}')
+        if Path(name).name != name or Path(name).suffix not in {'.qcow2', '.raw'}:
+            raise ValueError(f'Expected a .qcow2 or .raw filename in {run_dir}: {name}')
         path = run_dir / name
         if path.is_symlink():
             raise ValueError(f'Refusing to remove a symbolic link: {path}')
         if path.exists():
+            if not path.is_file():
+                raise ValueError(f'Expected a regular disk file: {path}')
             disks[path] = disk_identity(path)
     if not disks:
         return
 
     roots = {root.resolve() for root in
-             (run_dir, Path(tempfile.gettempdir()), Path('/tmp'),
+             (run_dir, Path(tempfile.gettempdir()), Path('/tmp'), Path('/var/tmp'),
               Path.home() / 'atrium-vm', Path.home() / 'atrium-vm-amd64',
               *extra_roots)}
     dependencies = {}
@@ -94,7 +96,7 @@ def remove_disks(run_dir, names, extra_roots=()):
         if identity in dependencies:
             print(f'Kept {path} because {dependencies[identity]} depends on it.')
             continue
-        disk_info(path)
+        disk_info(path, image_format='raw' if path.suffix == '.raw' else 'qcow2')
         if disk_identity(path) != identity:
             raise ValueError(f'Disk changed during cleanup: {path}')
         path.unlink()

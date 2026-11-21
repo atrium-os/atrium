@@ -14,6 +14,8 @@
 #   sh scripts/cloud-vm.sh up        # boot an existing image, wait for ssh
 #   TESSERA_ROOT=1 sh scripts/cloud-vm.sh up   # boot from $VMDIR/devroot.img
 #   sh scripts/cloud-vm.sh down      # clean poweroff
+#   sh scripts/cloud-vm.sh test sheets|navigator-ui|navigator-live|mail
+#                                    # run a gate on a disposable ZFS overlay
 #   sh scripts/cloud-vm.sh e2e       # navigator-jail-e2e.sh --quick on a synthetic page
 #   sh scripts/cloud-vm.sh lyra      # lyra-vm-check.sh (boot with its qemu-args for sound)
 #   . scripts/cloud-vm.sh env        # (sourced) export CROSS_RUSTFLAGS for cross-builds
@@ -47,6 +49,7 @@ SNAPS="https://download.freebsd.org/snapshots/VM-IMAGES/16.0-CURRENT/$ARCH"
 SMP="${SMP:-$(nproc)}"
 MEM="${MEM:-8G}"
 SYSROOT="$VMDIR/sysroot"
+VM_SSH_PORT="${VM_SSH_PORT:-2222}"
 
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
@@ -161,12 +164,13 @@ boot() {
         -drive if=pflash,format=raw,unit=0,file="$VMDIR/code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
         $DISKS \
-        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} -device virtio-net-pci,netdev=net0 \
+        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} -device virtio-net-pci,netdev=net0 \
         $GPUSIM_ARGS ${QEMU_EXTRA:-} \
         -display none \
         -serial unix:"$VMDIR/serial.sock",server,nowait \
         -monitor unix:"$VMDIR/mon.sock",server,nowait \
         > "$VMDIR/qemu.log" 2>&1 &
+    qemu_pid=$!
     sleep 3
     pgrep -f "file=$VMDIR/vm.qcow2" >/dev/null || die "qemu did not start: $(cat "$VMDIR/qemu.log")"
 }
@@ -285,6 +289,81 @@ EOF
     sh "$ROOT/scripts/navigator-jail-e2e.sh" --quick --recordings "$VMDIR/rec"
 }
 
+disposable_test() {
+    case "${1:-}" in
+        sheets) gate=sheets-vm.sh ;;
+        navigator-ui) gate=navigator-ui-vm.sh ;;
+        navigator-live) gate=navigator-live-vm.sh ;;
+        mail) gate=mail-vm-check.sh ;;
+        *) die "usage: $0 test sheets|navigator-ui|navigator-live|mail [gate arguments]" ;;
+    esac
+    shift
+    VM_SSH_PORT="${ATRIUM_TEST_SSH_PORT:-6222}"
+    python3 - "$VM_SSH_PORT" <<'PY' || die "disposable VM needs a free port other than 2222"
+import socket
+import sys
+port = int(sys.argv[1])
+if not 1024 <= port <= 65535 or port == 2222:
+    sys.exit(1)
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", port))
+PY
+    base=$(cd "$VMDIR" && pwd -P) || die "cannot find the prepared VM directory"
+    for input in vm.qcow2 code.fd vars.fd sysroot; do
+        [ -e "$base/$input" ] || die "missing prepared VM input $base/$input"
+    done
+    [ "${TESSERA_ROOT:-0}" = 0 ] || die "disposable cloud test requires a ZFS boot image"
+    command -v timeout >/dev/null || die "missing host tool: timeout"
+    qemu-img info -f qcow2 "$base/vm.qcow2" >/dev/null || die "base image is unavailable"
+    VMDIR=$(mktemp -d "${TMPDIR:-/tmp}/atrium-gate.XXXXXX") || die "mktemp"
+    export VMDIR VM_SSH_PORT
+    SYSROOT="$VMDIR/sysroot"
+    printf 'Gate evidence: %s\n' "$VMDIR"
+    qemu_pid=
+    trap disposable_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    qemu-img create -q -f qcow2 -F qcow2 -b "$base/vm.qcow2" "$VMDIR/vm.qcow2" || die "create overlay"
+    ln -s "$base/code.fd" "$base/sysroot" "$VMDIR/" || die "link read-only inputs"
+    cp "$base/vars.fd" "$VMDIR/vars.fd" || die "copy EFI variables"
+    boot
+    wait_ssh
+    if [ "$#" -eq 0 ]; then
+        case "$gate" in
+            sheets-vm.sh) set -- "$VMDIR/sheets.png" ;;
+            navigator-*) set -- "$VMDIR/screenshots" ;;
+        esac
+    fi
+    sh "$ROOT/scripts/$gate" "$@" >"$VMDIR/gate.log" 2>&1
+}
+
+disposable_cleanup() {
+    result=$?
+    trap - EXIT
+    if [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; then
+        timeout 20 "$ROOT/scripts/vssh" 'shutdown -p now' >"$VMDIR/shutdown.log" 2>&1 || :
+        elapsed=0
+        while kill -0 "$qemu_pid" 2>/dev/null && [ "$elapsed" -lt 120 ]; do
+            sleep 2
+            elapsed=$((elapsed + 2))
+        done
+        if kill -0 "$qemu_pid" 2>/dev/null; then
+            echo "QEMU is still running (PID $qemu_pid); VM state kept in $VMDIR" >&2
+            exit 1
+        fi
+    fi
+    if [ -n "$qemu_pid" ] && ! wait "$qemu_pid"; then
+        echo "QEMU exited abnormally; VM state kept in $VMDIR" >&2
+        exit 1
+    fi
+    if python3 "$ROOT/scripts/disposable-vm-cleanup.py" "$VMDIR" vm.qcow2; then
+        if [ ! -e "$VMDIR/vm.qcow2" ]; then rm -f "$VMDIR/vars.fd" || result=1; fi
+    else
+        result=1
+    fi
+    exit "$result"
+}
+
 case "${1:-}" in
     setup) setup ;;
     up)    mkdir -p "$VMDIR"; boot; wait_ssh ;;
@@ -295,6 +374,7 @@ case "${1:-}" in
                sleep 3
            done; echo "  down" ;;
     e2e)   e2e ;;
+    test)  shift; disposable_test "$@" ;;
     lyra)  cross_env; shift; sh "$ROOT/scripts/lyra-vm-check.sh" "$@" ;;
     env)   cross_env ;;
     *)     sed -n '2,20p' "$0"; exit 2 ;;

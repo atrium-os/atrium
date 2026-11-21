@@ -16,4 +16,4 @@ exec ssh -i "$HOME/.ssh/fresco_bsd_ed25519" \
     -o ConnectTimeout=${VSSH_CONNECT_TIMEOUT:-3} \
     -o ServerAliveInterval=3 \
     -o ServerAliveCountMax=2 \
-    -p 2222 root@localhost "$@"
+    -p "${VM_SSH_PORT:-2222}" root@localhost "$@"
