@@ -674,6 +674,14 @@ SH
                 sockstat -ucw | awk -v server="$1" -v peer="$2" \
                     '$3==server && index($0, "-> [" peer " ") {found=1} END {exit !found}'
             }
+            start_replacement_limen() {
+                offline() { ! kill -0 "$old_limen" 2>/dev/null && test -z "$(listener)"; }
+                wait_for offline
+                env LIMEN_SOCKET="$limen_socket" LIMEN_FRESCOD_ACTIVATION="$PWD/activation.sock" \
+                    daemon -f -u _limen -o "$PWD/bench-limen.log" "$PWD/limend"
+                listening() { new_limen=$(listener); test -n "$new_limen" && test "$new_limen" != "$old_limen"; }
+                wait_for listening
+            }
             old_limen=$(listener)
             test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
@@ -736,12 +744,7 @@ SH
             else
                 kill -TERM "$old_limen"
             fi
-            offline() { ! kill -0 "$old_limen" 2>/dev/null && test -z "$(listener)"; }
-            wait_for offline
-            env LIMEN_SOCKET="$limen_socket" LIMEN_FRESCOD_ACTIVATION="$PWD/activation.sock" \
-                daemon -f -u _limen -o "$PWD/bench-limen.log" "$PWD/limend"
-            listening() { new_limen=$(listener); test -n "$new_limen" && test "$new_limen" != "$old_limen"; }
-            wait_for listening
+            start_replacement_limen
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
             ;;
         esac
@@ -1042,6 +1045,27 @@ SH
         cmp "$books/Untitled.osheet" "$books/$long_name"
         files_intact
         /tmp/tile-recovery-windows --window-width "$plain_window" 1100
+        plain_recovery_pid=$(pgrep -x -j "$plain_recovery" atrium-sheets)
+        edit 318 0x23 # E1=6 waits in the plain document until after reconnect.
+        test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
+        old_limen=$(listener)
+        test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
+        for peer in "$plain_recovery_pid" "$locked_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
+        kill -TERM "$old_limen"
+        start_replacement_limen
+        for peer in "$plain_recovery_pid" "$locked_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
+        count 2; pending 2
+        journal_unchanged
+
+        trace_offset=$(wc -l < select-files.log)
+        click 125 24
+        plain_recovery_saved() { test "$(sha256 -q "$books/$plain_restored")" != "$plain_hash"; }
+        wait_for plain_recovery_saved
+        plain_recovery_root=$(root "$plain_recovery")
+        tail -n "+$((trace_offset+1))" select-files.log | grep -Fq "for org.atrium.sheets (uid ${plain_recovery_root##*-})"
+        /tmp/check-recovered-copy "$books/$plain_restored" zebra,4,7,9,6 plain
+        plain_hash=$(sha256 -q "$books/$plain_restored")
+        journal_unchanged
         key 0x1a 1; wait_for count 1; wait_for pending 1
 
         /tmp/tile-recovery-windows --window-width "$locked_window" 1100

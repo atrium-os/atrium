@@ -287,3 +287,9 @@ The desktop gate passed end to end on native Tessera and bounded UFS recovery vo
 The gate tiles the launcher beside the long-named protected workbook while it waits at its Restore password prompt. It recovers the plain sibling and saves a copy with `D1=9` while both document jails are open. The protected jail keeps the same process and journal through the plain save. After the plain window closes, the gate checks that Restore still names the protected workbook, unlocks it, and saves a protected copy with `C1=8`. A final digest check verifies the plain copy still holds the revision published before unlock.
 
 The complete desktop gate passed on bounded UFS recovery volumes. On native Tessera, the same sequence passed in stages while the fixture window placement and focus controls were adjusted. Independent reads verified both published copies on both filesystems.
+
+## Restarting Limen while protected recovery waits
+
+The desktop gate publishes the plain sibling, then leaves a new edit in its live window with the protected workbook still waiting at Restore. It restarts Limen and checks that the original Sheets and Scrinium processes connect to the replacement listener. Ordinary Save in the plain window must update its existing copy to `zebra,4,7,9,6`. The protected recovery journal must retain its digest through the restart and the sibling save. The same protected window must still show Restore, accept the password, and publish a protected copy with `fox,3,8`. That save must leave the plain copy byte-for-byte intact.
+
+The complete gate passed on native Tessera and bounded UFS recovery volumes. Both original workbooks matched their pre-crash contents.
