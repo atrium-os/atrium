@@ -80,7 +80,8 @@ ACTIVE_HIP_RECOVERED_DECLINE = "esp-loss-hip-active-refresh-recovered-decline"
 ACTIVE_HIP_REBOUND_DECLINE = "esp-loss-hip-active-refresh-rebound-decline"
 ACTIVE_HIP_POST_DECLINE_REFUSE = "esp-loss-hip-active-refresh-post-decline-refuse"
 ACTIVE_HIP_FINAL_REBOUND_DECLINE = "esp-loss-hip-active-refresh-final-rebound-decline"
-ACTIVE_HIP_POST_DECLINE_RECONNECT = ("esp-loss-hip-active-refresh-post-decline-reconnect", ACTIVE_HIP_FINAL_REBOUND_DECLINE)
+ACTIVE_HIP_FINAL_REBOUND_RECONNECT = "esp-loss-hip-active-refresh-final-rebound-reconnect"
+ACTIVE_HIP_POST_DECLINE_RECONNECT = ("esp-loss-hip-active-refresh-post-decline-reconnect", ACTIVE_HIP_FINAL_REBOUND_DECLINE, ACTIVE_HIP_FINAL_REBOUND_RECONNECT)
 ACTIVE_HIP_REBOUND_RECONNECT = ("esp-loss-hip-active-refresh-rebound-reconnect", ACTIVE_HIP_POST_DECLINE_REFUSE, *ACTIVE_HIP_POST_DECLINE_RECONNECT)
 ACTIVE_HIP_RECOVERED_RECONNECT = ("esp-loss-hip-active-refresh-recovered-reconnect", ACTIVE_HIP_REBOUND_DECLINE, *ACTIVE_HIP_REBOUND_RECONNECT)
 ACTIVE_HIP_REBIND_RECOVER = ("esp-loss-hip-active-refresh-rebind-recover", ACTIVE_HIP_RECOVERED_DECLINE, *ACTIVE_HIP_RECOVERED_RECONNECT)
@@ -375,6 +376,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
                             if forwarding != initial_forwarding:
                                 assert receipts.with_suffix(".final-forwarding-approved").exists(), "final rebound uploaded changed forwarding before approval"
+                        if hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT and calls.count("getconfig.esp") == 25:
+                            assert receipts.with_suffix(".final-reconnect-approved").exists(), "final reconnect uploaded HIP before approval"
                         if receipts:
                             with receipts.open("a") as receipt:
                                 fact = forwarding
@@ -454,6 +457,11 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             while not receipts.with_suffix(".final-rebind-ack").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".final-rebind-ack").exists(), "final rebind acknowledgement was never released"
+                        if hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT and calls.count("getconfig.esp") == 25:
+                            deadline = time.monotonic() + 25
+                            while not receipts.with_suffix(".final-reconnect-ack").exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            assert receipts.with_suffix(".final-reconnect-ack").exists(), "final reconnect acknowledgement was never released"
                         if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
@@ -829,6 +837,7 @@ def main():
                 active_post_decline_refuse = args.hip == ACTIVE_HIP_POST_DECLINE_REFUSE
                 active_post_decline_reconnect = args.hip in ACTIVE_HIP_POST_DECLINE_RECONNECT
                 active_final_rebound_decline = args.hip == ACTIVE_HIP_FINAL_REBOUND_DECLINE
+                active_final_rebound_reconnect = args.hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT
                 active_recovered_decline = args.hip == ACTIVE_HIP_RECOVERED_DECLINE
                 active_refresh_decline = args.hip == ACTIVE_HIP_REFRESH_DECLINE
                 final_rebind_retry = final_fallback or args.hip == "esp-loss-hip-submit-final-rebind"
@@ -836,7 +845,7 @@ def main():
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (24 if active_post_decline_reconnect else 22 if active_rebound_reconnect else 20 if active_recovered_reconnect else 18 if active_rebind_recover else 16 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (25 if active_final_rebound_reconnect else 24 if active_post_decline_reconnect else 22 if active_rebound_reconnect else 20 if active_recovered_reconnect else 18 if active_rebind_recover else 16 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -870,8 +879,11 @@ def main():
                                     final_echoes = 2 if active_post_decline_refuse or active_post_decline_reconnect else 3
                                     expected_spis.extend([last_spi] * 2 + [esp.configs[21][0][0]] * final_echoes)
                                     if active_post_decline_reconnect:
-                                        final_rebound_echoes = 2 if active_final_rebound_decline else 3
+                                        final_rebound_echoes = 2 if active_final_rebound_decline or active_final_rebound_reconnect else 3
                                         expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]] * final_rebound_echoes)
+                                        if active_final_rebound_reconnect:
+                                            expected_spis.extend([esp.configs[24][0][0]] * 2)
+                                            final_rebound_echoes += 2
                                         final_echoes += 2 + final_rebound_echoes
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
@@ -915,6 +927,10 @@ def main():
                                 allowed_echoes.extend([
                                     *echoes[:-final_rebound_echoes], esp.configs[22][0][0], *echoes[-final_rebound_echoes:]
                                 ] for echoes in allowed_echoes[:])
+                                if active_final_rebound_reconnect:
+                                    allowed_echoes.extend([
+                                        *echoes[:-2], esp.configs[23][0][0], *echoes[-2:]
+                                    ] for echoes in allowed_echoes[:])
                         allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 elif active_refresh_reconnect and not active_rebind_tls:
                     allowed_echoes.extend([*echoes[:-2], retry_spi, *echoes[-2:]] for echoes in allowed_echoes[:])
@@ -1090,6 +1106,16 @@ def main():
                                                                         if active_final_rebound_decline:
                                                                             assert set(final_reports) == {original}, reports
                                                                             print("Declining the final rebound review withheld changed HIP and stopped IPv4")
+                                                                            return
+                                                                        if active_final_rebound_reconnect:
+                                                                            final_config = configs[24]
+                                                                            final_receipt = calls[:final_config].count("hipreport.esp")
+                                                                            assert calls[final_config - 1] == "hipreportcheck.esp", calls
+                                                                            assert final_receipt >= rebound_receipt + 2, reports
+                                                                            assert set(reports[rebound_receipt:final_receipt]) == {original}, reports
+                                                                            assert len(reports[final_receipt:]) >= 2, reports
+                                                                            assert set(reports[final_receipt:]) == {changed}, reports
+                                                                            print("Final reconnect rejected stale approval, waited for HIP acknowledgement, and refreshed silently on new ESP")
                                                                             return
                                                                         changed_at = final_reports.index(changed)
                                                                         assert set(final_reports[:changed_at]) == {original}, reports
