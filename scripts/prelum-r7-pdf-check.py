@@ -73,10 +73,11 @@ completed_jobs = re.findall(
 )
 desktop_job_ids = job_ids
 if len(sys.argv) > 6:
-    # A rejected desktop job consumes a local ID without creating an IPP job.
-    skipped = int(sys.argv[6])
-    desktop_job_ids = [job if job < skipped else job + 1 for job in job_ids]
-    assert re.search(rf"^ +{skipped} +printer [0-9]+ +Failed +0/2 ", jobs, re.M), jobs
+    # Rejected desktop jobs consume local IDs without creating IPP jobs.
+    skipped = {int(job) for job in sys.argv[6].split(",")}
+    desktop_job_ids = [job for job in range(1, job_count + len(skipped) + 1) if job not in skipped]
+    for job in skipped:
+        assert re.search(rf"^ +{job} +printer [0-9]+ +Failed +0/2 ", jobs, re.M), jobs
 assert [int(job) for job, _, _, _ in completed_jobs] == desktop_job_ids, completed_jobs
 assert [title for _, _, _, title in completed_jobs] == [
     title for _, _, title, _, _, _ in receipts

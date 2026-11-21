@@ -35,6 +35,7 @@ A.add_argument("--tls-alt-cert")
 A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
 A.add_argument("--test-pin-job", action="append", default=[], help="title of a job that must supply the fixture PIN")
+A.add_argument("--test-no-send-document-flag", help="omit Send-Document support while this file exists")
 A.add_argument("--test-ignore-pin-job", help="title of a fixture PIN job to create with ignored attributes")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
@@ -126,6 +127,10 @@ def printer_attrs(host):
                 printer_uuid = "urn:uuid:" + str(uuid.UUID(override.read().strip()))
         except FileNotFoundError:
             pass
+    operations = [0x0002, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009, 0x000B, 0x003C]
+    if ARGS.test_no_send_document_flag and os.path.exists(ARGS.test_no_send_document_flag):
+        operations.remove(0x0006)
+        print("fake printer: advertising PIN capability without Send-Document", flush=True)
     return bytes([PRG]) + b"".join([
         attr(URI, "printer-uri-supported", uri),
         attr(INT, "job-password-supported", 8) if ARGS.test_pin_job else b"",
@@ -141,7 +146,7 @@ def printer_attrs(host):
         attr(KEYWORD, "media-default", "iso_a4_210x297mm"),
         attr(KEYWORD, "sides-supported", ["one-sided"]),
         attr(KEYWORD, "print-color-mode-supported", ["color", "monochrome"]),
-        attr(ENUM, "operations-supported", [0x0002, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009, 0x000B, 0x003C]),
+        attr(ENUM, "operations-supported", operations),
         attr(KEYWORD, "identify-actions-supported", ["display", "sound"]),
         attr(BOOL, "printer-is-accepting-jobs", True),
     ])
