@@ -269,3 +269,9 @@ Both runs passed on native Tessera and bounded UFS recovery volumes. The protect
 The gate cancels the Restore password prompt before entering a password. It checks that the document jail exits, the recovery volume detaches, both pending workbook names and IDs survive, and the published files stay intact. It then chooses the same filename from the 640 px launcher and checks that a fresh jail mounts the original journal byte for byte. After unlocking, the protected copy must contain `fox,3,8`. The sibling must still recover `zebra,4,7,9`.
 
 The final desktop gate passed with both native Tessera and bounded UFS recovery volumes.
+
+## Wrong password during protected recovery
+
+After reopening the long-named recovery from the chooser, the gate submits a wrong password. It checks the rendered workbook name and retry guidance, the same open jail, both pending recoveries, and the journal digest. It then types the correct password without refocusing the field. Save As must produce a protected copy with `fox,3,8`. The plain sibling must still recover `zebra,4,7,9`.
+
+The final gate passed end to end on UFS. The native Tessera trial captured the same retry frame, verified the original journal digest, and published the protected copy. Its first attempt to save the sibling reached Save As before the workbook window appeared. After the window appeared, the continuation saved and independently read the plain copy. The gate now waits for the workbook windows before interacting with them.

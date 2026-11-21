@@ -62,16 +62,20 @@ make_pair() {
     launcher=$(win_at 48 24)
     click 48 24
     wait_for different_window 488 183 "$launcher"
+    picker_window=$win
     click 488 183; sleep .5; key 0x28
     wait_for count 1; plain=$(docs)
     plain_root=$(root "$plain")
     wait_for opened "$plain" Proof.csv
-    sleep .6
+    plain_window_visible() { different_window 515 24 "$launcher" && test "$win" != "$picker_window"; }
+    wait_for plain_window_visible
+    plain_window=$win
     edit 62 0x1d 0x08 0x05 0x15 0x04 # zebra
     click 515 24; wait_for count 2
     protected=$(docs | grep -vx "$plain")
     wait_for opened "$protected" Untitled
-    sleep .6
+    protected_window_visible() { different_window 677 24 "$plain_window" && test "$win" != "$launcher"; }
+    wait_for protected_window_visible
     click 677 24; sleep .4
     type_keys 0x17 0x08 0x16 0x17 0x28 # fixture password: test
     private="$(root "$protected")/atrium/recovery"
@@ -995,6 +999,15 @@ SH
         open_protected_recovery
         test "$reopened" != "$canceled_jail"
         test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
+        type_keys 0x05 0x04 0x07 0x28 # bad
+        # The protected workbook stays locked and the full name and retry guidance are visible.
+        wait_for frame_is 300f65803a34296db04f3f55300f244489aa4479d1f8360314dc9cc94f949143
+        cp selectscreen.png "$results/protected-recovery-retry.png"
+        test "$(docs)" = "$reopened"
+        pending 2
+        test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
+        cmp "$books/Untitled.osheet" "$books/$long_name"
+        files_intact
         type_keys 0x17 0x08 0x16 0x17 0x28
         sleep .6
         restored="${long_name%.osheet} (2).osheet"
@@ -1002,7 +1015,8 @@ SH
         key 0x1a 1; wait_for count 0; wait_for pending 1
         /tmp/tile-recovery-windows --launcher-width "$launcher" 1100
         /tmp/tile-recovery-windows --clear-focus
-        click 213 24; wait_for count 1; sleep .6
+        click 213 24; wait_for count 1
+        wait_for different_window 205 24 "$launcher"
         plain_restored='Proof (2) (2).osheet'
         publish "$plain_restored" zebra,4,7,9
         close_reopened
