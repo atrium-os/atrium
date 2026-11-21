@@ -35,6 +35,7 @@ A.add_argument("--tls-alt-cert")
 A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
 A.add_argument("--test-pin-job", action="append", default=[], help="title of a job that must supply the fixture PIN")
+A.add_argument("--test-no-job-password-flag", help="omit job-password-supported while this file exists")
 A.add_argument("--test-no-send-document-flag", help="omit Send-Document support while this file exists")
 A.add_argument("--test-ignore-pin-job", help="title of a fixture PIN job to create with ignored attributes")
 ARGS = A.parse_args()
@@ -127,13 +128,17 @@ def printer_attrs(host):
                 printer_uuid = "urn:uuid:" + str(uuid.UUID(override.read().strip()))
         except FileNotFoundError:
             pass
+    pin_supported = bool(ARGS.test_pin_job or ARGS.test_ignore_pin_job)
+    if ARGS.test_no_job_password_flag and os.path.exists(ARGS.test_no_job_password_flag):
+        pin_supported = False
+        print("fake printer: withholding job-password capability", flush=True)
     operations = [0x0002, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009, 0x000B, 0x003C]
     if ARGS.test_no_send_document_flag and os.path.exists(ARGS.test_no_send_document_flag):
         operations.remove(0x0006)
-        print("fake printer: advertising PIN capability without Send-Document", flush=True)
+        print("fake printer: withholding send-document capability", flush=True)
     return bytes([PRG]) + b"".join([
         attr(URI, "printer-uri-supported", uri),
-        attr(INT, "job-password-supported", 8) if ARGS.test_pin_job else b"",
+        attr(INT, "job-password-supported", 8) if pin_supported else b"",
         attr(KEYWORD, "uri-security-supported", "tls" if ARGS.tls_cert else "none"),
         attr(URI, "printer-uuid", printer_uuid),
         attr(TEXT, "printer-info", ARGS.name),

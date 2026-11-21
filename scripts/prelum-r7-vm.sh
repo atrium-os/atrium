@@ -130,7 +130,7 @@ python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
     --test-pin-job "Fresh PIN after replay refusal" --test-ignore-pin-job "Printer ignored PIN" \
-    --test-no-send-document-flag "$D/no-send-document" \
+    --test-no-send-document-flag "$D/no-send-document" --test-no-job-password-flag "$D/no-job-password" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -315,25 +315,33 @@ python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/p
 cat "$D/pin-replay-pdf-checks.log"
 
 
-# A PIN-capable printer must still support sending the document separately.
+# Both PIN support and separate document submission are required.
 remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
     <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-fresh-stage.log" 2>&1
-remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-no-send-document-before-audit.log"
-touch "$D/no-send-document"
-remote "sh -s -- '$guest' '$marker' no-send-document pin-no-send-document" <"$scripts/prelum-r7-identity.sh" >"$D/pin-no-send-document.log" 2>&1 || { cat "$D/pin-no-send-document.log" >&2; exit 1; }
-cat "$D/pin-no-send-document.log"
-grep -F 'fake printer: advertising PIN capability without Send-Document' "$D/simulator.log"
-remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-no-send-document-after-audit.log"
-grep 'op=0x0011' "$D/pin-no-send-document-before-audit.log" >"$D/pin-no-send-document-before-redemptions.log"
-grep 'op=0x0011' "$D/pin-no-send-document-after-audit.log" >"$D/pin-no-send-document-after-redemptions.log"
-cmp "$D/pin-no-send-document-before-redemptions.log" "$D/pin-no-send-document-after-redemptions.log"
-remote "cat '$guest/pin-no-send-document-jobs.log'" >"$D/pin-no-send-document-jobs.txt"
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
-    "$D/pin-no-send-document-jobs.txt" "$D/fixtures/quicklook.pdf" 15 16,17 >"$D/pin-no-send-document-pdf-checks.log"
-cat "$D/pin-no-send-document-pdf-checks.log"
-rm "$D/no-send-document"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-capability-before-audit.log"
+grep 'op=0x0011' "$D/pin-capability-before-audit.log" >"$D/pin-capability-before-redemptions.log"
+check_missing_pin_capability() {
+    capability=$1
+    skipped_jobs=$2
+    proof="$D/pin-no-$capability"
+    touch "$D/no-$capability"
+    remote "sh -s -- '$guest' '$marker' missing-capability 'pin-no-$capability'" \
+        <"$scripts/prelum-r7-identity.sh" >"$proof.log" 2>&1 || { cat "$proof.log" >&2; exit 1; }
+    cat "$proof.log"
+    grep -F "fake printer: withholding $capability capability" "$D/simulator.log"
+    remote "cat '$guest/fixture-arca/audit.log'" >"$proof-after-audit.log"
+    grep 'op=0x0011' "$proof-after-audit.log" >"$proof-after-redemptions.log"
+    cmp "$D/pin-capability-before-redemptions.log" "$proof-after-redemptions.log"
+    remote "cat '$guest/pin-no-$capability-jobs.log'" >"$proof-jobs.txt"
+    python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
+        "$proof-jobs.txt" "$D/fixtures/quicklook.pdf" 15 "$skipped_jobs" >"$proof-pdf-checks.log"
+    cat "$proof-pdf-checks.log"
+    rm "$D/no-$capability"
+}
+check_missing_pin_capability send-document 16,17
+check_missing_pin_capability job-password 16,17,18
 
-# The same handle must redeem once and print after Send-Document returns.
+# The same handle must redeem once and print when both capabilities return.
 remote "sh -s -- '$guest' '$marker' fresh pin-fresh" <"$scripts/prelum-r7-identity.sh" >"$D/pin-fresh.log" 2>&1 || { cat "$D/pin-fresh.log" >&2; exit 1; }
 cat "$D/pin-fresh.log"
 remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-fresh-audit.log"
@@ -342,7 +350,7 @@ test "$(grep -c 'op=0x0011' "$D/pin-fresh-audit.log")" -eq 4
 test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-fresh-audit.log")" -eq 3
 grep -E 'op=0x0011' "$D/pin-fresh-audit.log" | tail -1 | grep -E 'prelum-ipp op=0x0011 .*status=0$'
 remote "cat '$guest/pin-fresh-jobs.log'" >"$D/pin-fresh-jobs.txt"
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17 >"$D/pin-fresh-pdf-checks.log"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18 >"$D/pin-fresh-pdf-checks.log"
 cat "$D/pin-fresh-pdf-checks.log"
 
 # A printer can allocate a job while reporting that it ignored the PIN.
@@ -356,5 +364,5 @@ test "$(grep -c 'op=0x0011' "$D/pin-ignored-audit.log")" -eq 5
 test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
 remote "cat '$guest/pin-ignored-jobs.log'" >"$D/pin-ignored-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
-    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17 17 >"$D/pin-ignored-pdf-checks.log"
+    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18 17 >"$D/pin-ignored-pdf-checks.log"
 cat "$D/pin-ignored-pdf-checks.log"
