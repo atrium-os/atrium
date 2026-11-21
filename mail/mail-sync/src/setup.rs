@@ -262,10 +262,31 @@ fn text<'a>(within: &'a str, tag: &str) -> Option<&'a str> {
     elements(within, tag).first().map(|(_, t)| t.trim())
 }
 
-fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
-    let i = attrs.find(&format!("{name}=\""))? + name.len() + 2;
-    let end = attrs[i..].find('"')?;
-    Some(&attrs[i..i + end])
+fn attr<'a>(mut attrs: &'a str, name: &str) -> Option<&'a str> {
+    const SPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+    let mut found = None;
+    while !attrs.is_empty() {
+        let trimmed = attrs.trim_start_matches(SPACE);
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.len() == attrs.len() {
+            return None;
+        }
+        let name_end = trimmed.find(['=', ' ', '\t', '\r', '\n'])?;
+        let (key, after_name) = trimmed.split_at(name_end);
+        if key.is_empty() {
+            return None;
+        }
+        let value = after_name.trim_start_matches(SPACE).strip_prefix('=')?.trim_start_matches(SPACE);
+        let quote = value.chars().next().filter(|ch| matches!(ch, '\'' | '"'))?;
+        let (value, remaining) = value[1..].split_once(quote)?;
+        if key == name && found.replace(value).is_some() {
+            return None;
+        }
+        attrs = remaining;
+    }
+    found
 }
 
 /// The first usable IMAP and SMTP servers of an autoconfig document:
@@ -457,6 +478,27 @@ mod tests {
             assert!(matches!(found.settings, Settings::Imap { imap, smtp }
                 if imap.port == 993 && smtp.host == "smtp.office365.com"));
         }
+    }
+
+    #[test]
+    fn autoconfig_reads_exact_type_attributes_with_either_quote_style() {
+        let mut net = Net::default();
+        let url = "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=ada%40example.test";
+        net.pages.insert(url.into(), br#"<clientConfig>
+<incomingServer subtype="imap"><hostname>unused.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<incomingServer type = 'imap' label="A"><hostname>imap.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer label='type="smtp"' type="other"><hostname>unused.example.test</hostname><port>465</port><socketType>SSL</socketType></outgoingServer>
+<outgoingServer label='A' type = "smtp"><hostname>smtp.example.test</hostname><port>587</port><socketType>STARTTLS</socketType></outgoingServer>
+</clientConfig>"#.to_vec());
+
+        let found = discover("ada@example.test", &mut net).unwrap();
+
+        assert_eq!(found.via, Via::Autoconfig);
+        assert_eq!(found.settings, Settings::Imap {
+            imap: Server { scheme: "imaps", host: "imap.example.test".into(), port: 993 },
+            smtp: Server { scheme: "submission", host: "smtp.example.test".into(), port: 587 },
+        });
+        assert_eq!(net.asked, ["https://example.test/.well-known/jmap", url]);
     }
 
     #[test]
