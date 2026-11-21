@@ -1081,7 +1081,10 @@ another origin. An active portal-profile session stays in engine memory.
   and withholds IPv4 before fresh approval and while the acknowledgement
   is pending. After acknowledgement traffic resumes on a new ESP
   association and the identical HIP report refreshes without prompting.
-  The FreeBSD arm64 gate passed 98/98 using the shared Cargo cache.
+  The final rebind resubmits the identical report without prompting.
+  The fixture withholds acknowledgement to verify IPv4 stays blocked,
+  then acknowledges the report and verifies IPv4 on a new ESP association.
+  The extended FreeBSD arm64 gate passed 101/101 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
