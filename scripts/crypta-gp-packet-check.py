@@ -607,6 +607,9 @@ def main():
             drop_config_indices = (8,)
             if args.hip in ACTIVE_HIP_REBIND_TLS:
                 drop_config_indices = (8, 15)
+        # The full reconnect sequence includes host builds, several retry
+        # intervals, timer refreshes, and guest teardown.
+        full_vm_timeout = 420 if args.hip == ACTIVE_HIP_POST_DECLINE_RECONNECT else 300
         with ExitStack() as stack:
             esp = None
             if args.esp or args.drop_esp or drop_config_indices or args.hip in ESP_LOSS_HIP:
@@ -618,7 +621,7 @@ def main():
                               loss_reconnect_approval=receipts.with_suffix(".approved") if args.hip in ESP_LOSS_RECONNECT_HIP else None)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
-            listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
+            listener.settimeout(full_vm_timeout + 5 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
             if receipts:
@@ -652,7 +655,7 @@ def main():
             elif args.full_vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin, "",
                                 ("TLS" if args.drop_esp else "ESP") if esp else "", args.hip or "", str(receipts or "")],
-                               check=True, timeout=300)
+                               check=True, timeout=full_vm_timeout)
             elif args.vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
                                check=True, timeout=110)
@@ -861,8 +864,8 @@ def main():
                                     final_echoes = 2 if active_post_decline_refuse or active_post_decline_reconnect else 3
                                     expected_spis.extend([last_spi] * 2 + [esp.configs[21][0][0]] * final_echoes)
                                     if active_post_decline_reconnect:
-                                        expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]])
-                                        final_echoes += 3
+                                        expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]] * 2)
+                                        final_echoes += 4
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -900,10 +903,10 @@ def main():
                             allowed_echoes.extend([*echoes[:-final_echoes], last_spi, *echoes[-final_echoes:]] for echoes in allowed_echoes[:])
                             if active_post_decline_reconnect:
                                 allowed_echoes.extend([
-                                    *echoes[:-3], esp.configs[21][0][0], *echoes[-3:]
+                                    *echoes[:-4], esp.configs[21][0][0], *echoes[-4:]
                                 ] for echoes in allowed_echoes[:])
                                 allowed_echoes.extend([
-                                    *echoes[:-1], esp.configs[22][0][0], echoes[-1]
+                                    *echoes[:-2], esp.configs[22][0][0], *echoes[-2:]
                                 ] for echoes in allowed_echoes[:])
                         allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 elif active_refresh_reconnect and not active_rebind_tls:
@@ -1076,8 +1079,9 @@ def main():
                                                                         assert set(reports[reconnect_receipt:]) == {original}, reports
                                                                         rebound_receipt = calls[:configs[23]].count("hipreport.esp")
                                                                         assert rebound_receipt >= reconnect_receipt + 2, reports
+                                                                        assert len(reports[rebound_receipt:]) >= 2, reports
                                                                         assert set(reports[rebound_receipt:]) == {original}, reports
-                                                                        print("Final rebind acknowledged unchanged HIP before IPv4 resumed on new ESP")
+                                                                        print("Unchanged HIP refreshed silently and IPv4 continued on the final rebound ESP association")
                                                                         return
                                                                     final_reports = reports[final_rebind_report:]
                                                                     assert final_reports[:2] == [changed, changed], reports
