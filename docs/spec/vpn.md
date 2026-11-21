@@ -1085,8 +1085,10 @@ another origin. An active portal-profile session stays in engine memory.
   The fixture withholds acknowledgement to verify IPv4 stays blocked,
   then acknowledges the report and verifies IPv4 on a new ESP association.
   The next timer refresh submits the same report without prompting,
-  and IPv4 echo continues on that same ESP association. The extended
-  FreeBSD arm64 gate passed 103/103 using the shared Cargo cache.
+  and IPv4 echo continues on that same ESP association. Changing IPv6
+  forwarding again requires fresh approval before upload. IPv4 echo
+  then passes on the same rebound association. The extended FreeBSD
+  arm64 gate passed 105/105 using the shared Cargo cache.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

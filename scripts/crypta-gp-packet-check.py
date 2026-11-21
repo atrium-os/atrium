@@ -370,6 +370,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 assert receipts.with_suffix(".post-decline-forwarding-approved").exists(), "post-decline rebound uploaded restored forwarding before approval"
                         if hip == ACTIVE_HIP_POST_DECLINE_RECONNECT and calls.count("getconfig.esp") == 23:
                             assert receipts.with_suffix(".post-decline-reconnect-approved").exists(), "post-decline reconnect uploaded before approval"
+                        if hip == ACTIVE_HIP_POST_DECLINE_RECONNECT and calls.count("getconfig.esp") == 24:
+                            initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
+                            if forwarding != initial_forwarding:
+                                assert receipts.with_suffix(".final-forwarding-approved").exists(), "final rebound uploaded changed forwarding before approval"
                         if receipts:
                             with receipts.open("a") as receipt:
                                 fact = forwarding
@@ -864,8 +868,8 @@ def main():
                                     final_echoes = 2 if active_post_decline_refuse or active_post_decline_reconnect else 3
                                     expected_spis.extend([last_spi] * 2 + [esp.configs[21][0][0]] * final_echoes)
                                     if active_post_decline_reconnect:
-                                        expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]] * 2)
-                                        final_echoes += 4
+                                        expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]] * 3)
+                                        final_echoes += 5
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
                     if retry_recheck:
@@ -903,10 +907,10 @@ def main():
                             allowed_echoes.extend([*echoes[:-final_echoes], last_spi, *echoes[-final_echoes:]] for echoes in allowed_echoes[:])
                             if active_post_decline_reconnect:
                                 allowed_echoes.extend([
-                                    *echoes[:-4], esp.configs[21][0][0], *echoes[-4:]
+                                    *echoes[:-5], esp.configs[21][0][0], *echoes[-5:]
                                 ] for echoes in allowed_echoes[:])
                                 allowed_echoes.extend([
-                                    *echoes[:-2], esp.configs[22][0][0], *echoes[-2:]
+                                    *echoes[:-3], esp.configs[22][0][0], *echoes[-3:]
                                 ] for echoes in allowed_echoes[:])
                         allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 elif active_refresh_reconnect and not active_rebind_tls:
@@ -1075,13 +1079,15 @@ def main():
                                                                         assert calls[reconnect_start - 1] == "hipreportcheck.esp", calls
                                                                         assert reconnect_receipt >= final_rebind_report + 2, reports
                                                                         assert set(reports[final_rebind_report:reconnect_receipt]) == {changed}, reports
-                                                                        assert len(reports[reconnect_receipt:]) >= 2, reports
-                                                                        assert set(reports[reconnect_receipt:]) == {original}, reports
                                                                         rebound_receipt = calls[:configs[23]].count("hipreport.esp")
                                                                         assert rebound_receipt >= reconnect_receipt + 2, reports
-                                                                        assert len(reports[rebound_receipt:]) >= 2, reports
-                                                                        assert set(reports[rebound_receipt:]) == {original}, reports
-                                                                        print("Unchanged HIP refreshed silently and IPv4 continued on the final rebound ESP association")
+                                                                        assert set(reports[reconnect_receipt:rebound_receipt]) == {original}, reports
+                                                                        final_reports = reports[rebound_receipt:]
+                                                                        assert final_reports[:2] == [original, original], reports
+                                                                        changed_at = final_reports.index(changed)
+                                                                        assert set(final_reports[:changed_at]) == {original}, reports
+                                                                        assert set(final_reports[changed_at:]) == {changed}, reports
+                                                                        print("Final rebound ESP withheld changed forwarding until fresh approval and kept IPv4 on the same association")
                                                                         return
                                                                     final_reports = reports[final_rebind_report:]
                                                                     assert final_reports[:2] == [changed, changed], reports

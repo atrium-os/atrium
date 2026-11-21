@@ -1261,6 +1261,25 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                                     fail "unchanged HIP did not refresh silently after final rebind"
                                                                 ok "unchanged HIP refreshed silently after final rebind"
                                                                 probe "IPv4 echo after HIP refresh on the same final rebound ESP"
+                                                                before_change=$(awk 'END { print NR }' "$receipts")
+                                                                "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+                                                                wait_prompt gp_hip_approval
+                                                                printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+                                                                    grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+                                                                    fail "final rebound review omitted changed forwarding"
+                                                                [ "$(hip_choice)" != "$approval_choice" ] ||
+                                                                    fail "final rebound reused the prior HIP choice"
+                                                                if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
+                                                                    fail "final rebound submitted changed HIP before approval"
+                                                                fi
+                                                                before_approval=$(awk 'END { print NR }' "$receipts")
+                                                                touch "$receipts.final-forwarding-approved"
+                                                                approve_hip
+                                                                wait_receipts "$((before_approval + 1))"
+                                                                [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$rebound_report" ] ||
+                                                                    fail "gateway did not receive the freshly approved final forwarding report"
+                                                                ok "changed forwarding on final rebound ESP required fresh approval"
+                                                                probe "IPv4 echo after fresh approval on the same final rebound ESP"
                                                                 "$V" "$CTL down name=gp-gate" >/dev/null
                                                             fi
                                                             echo "$pass checks passed"
