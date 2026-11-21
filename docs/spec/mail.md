@@ -176,7 +176,8 @@ person reads was never decoded next to another message.
    - Mozilla-style autoconfig at `autoconfig.<domain>` and `<domain>/.well-known/autoconfig`,
      with the full address percent-encoded as one query value on the autoconfig host.
      Use the first usable TLS entry for each protocol, skipping incomplete entries;
-   - SRV records `_imaps._tcp`, `_submissions._tcp`, `_jmap._tcp` (RFC 6186, RFC 8314);
+   - SRV records `_imaps._tcp`, `_submissions._tcp`, and `_submission._tcp` (RFC 6186, RFC 8314).
+     Ignore malformed targets and port zero before ranking endpoints;
    - the MX host's provider, matched against a small built-in table (Gmail, Microsoft 365,
      iCloud, Fastmail, Proton Bridge, Yahoo) for OAuth endpoints and quirks.
    Results not under the address's own domain or its MX's provider are shown ("Mail for

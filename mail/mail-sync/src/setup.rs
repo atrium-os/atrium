@@ -124,7 +124,15 @@ const PROVIDERS: &[Provider] = &[
 const MAX_ANSWER: usize = 256 << 10;
 
 fn host_ok(h: &str) -> bool {
-    !h.is_empty() && h.len() <= 253 && h.contains('.') && h.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && !l.starts_with('-'))
+    h.len() <= 253
+        && h.contains('.')
+        && h.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 fn under(host: &str, domain: &str) -> bool {
@@ -187,9 +195,17 @@ pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str
         }
     }
     let best = |l: &mut dyn Lookup, name: &str| -> Option<(String, u16)> {
-        let mut v: Vec<(u16, u16, u16, String)> = l.srv(name).into_iter().take(32).filter(|r| r.3 != "." && host_ok(r.3.trim_end_matches('.'))).collect();
-        v.sort_by_key(|r| (r.0, u16::MAX - r.1));
-        v.first().map(|r| (r.3.trim_end_matches('.').to_ascii_lowercase(), r.2))
+        l.srv(name)
+            .into_iter()
+            .take(32)
+            .filter_map(|(priority, weight, port, mut host)| {
+                if host.ends_with('.') {
+                    host.pop();
+                }
+                (port != 0 && host_ok(&host)).then_some((priority, weight, port, host))
+            })
+            .min_by_key(|&(priority, weight, _, _)| (priority, u16::MAX - weight))
+            .map(|(_, _, port, host)| (host.to_ascii_lowercase(), port))
     };
     if let Some((ih, ip)) = best(l, &format!("_imaps._tcp.{domain}")) {
         let smtp = best(l, &format!("_submissions._tcp.{domain}")).map(|(h, p)| Server { scheme: "submissions", host: h, port: p }).or_else(|| best(l, &format!("_submission._tcp.{domain}")).map(|(h, p)| Server { scheme: "submission", host: h, port: p }));
@@ -374,6 +390,33 @@ mod tests {
             smtp: Server { scheme: "submission", host: "smtp.good.example.test".into(), port: 587 },
         });
         assert_eq!(n.asked, ["https://example.test/.well-known/jmap", url]);
+    }
+
+    #[test]
+    fn srv_discovery_ranks_only_usable_mail_endpoints() {
+        let mut n = Net::default();
+        n.srv.insert("_imaps._tcp.example.test".into(), vec![
+            (0, 10, 0, "disabled.example.test.".into()),
+            (0, 9, 993, "imap-.example.test.".into()),
+            (0, 8, 993, "imap.example.test..".into()),
+            (10, 0, 993, "IMAP.EXAMPLE.TEST.".into()),
+        ]);
+        n.srv.insert("_submissions._tcp.example.test".into(), vec![
+            (0, 0, 0, "broken.example.test.".into()),
+        ]);
+        n.srv.insert("_submission._tcp.example.test".into(), vec![
+            (0, 0, 587, "smtp.example.test.".into()),
+        ]);
+
+        let found = discover("ada@example.test", &mut n).unwrap();
+
+        assert_eq!(found.via, Via::Srv);
+        assert_eq!(found.settings, Settings::Imap {
+            imap: Server { scheme: "imaps", host: "imap.example.test".into(), port: 993 },
+            smtp: Server { scheme: "submission", host: "smtp.example.test".into(), port: 587 },
+        });
+        assert!(n.asked.iter().any(|query| query == "_submission._tcp.example.test"));
+        assert!(!n.asked.iter().any(|query| query.starts_with("MX ")));
     }
 
     #[test]
