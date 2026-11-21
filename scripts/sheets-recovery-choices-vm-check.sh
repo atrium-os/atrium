@@ -686,6 +686,22 @@ SH
             test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
             for peer in "$plain_pid" "$sibling_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
             stopped_limen() { ps -p "$old_limen" -o state= | grep -q '^T'; }
+            interrupt_queued_save() (
+                # Prove this document sent Save and Limen has not delivered it.
+                pcb=$(sockstat -Aucw | awk -v server="$old_limen" -v peer="$1" \
+                    '$3==server && index($0, "-> [" peer " ") {sub(/^0x/,"",$NF); print $NF; exit}')
+                test -n "$pcb"
+                recv_bytes() { netstat -an -f unix | awk -v pcb="$pcb" '$1==pcb {print $3}'; }
+                trap 'kill -CONT "$old_limen" 2>/dev/null || :' EXIT
+                kill -STOP "$old_limen"
+                wait_for stopped_limen
+                test "$(recv_bytes)" = 0
+                click 125 24
+                queued() { test "$(recv_bytes)" -gt 0; }
+                wait_for queued
+                kill -KILL "$old_limen"
+                trap - EXIT
+            )
             if test "$5" = published-save || test "$5" = external-edit; then
                 if test "$5" = external-edit; then cp "$books/Proof.osheet" "$results/external.osheet"; fi
                 /tmp/tile-recovery-windows "$plain_win" "$sibling_win" "$plain_win"
@@ -724,23 +740,7 @@ SH
                 wait_for tiled
                 edit 129 0x21 # Commit B1=4 once. The retry presses only Save.
                 plain_hash=$(sha256 -q "$books/Proof.osheet")
-                # The server-side receive queue proves this document sent its
-                # request before the broker died, while Scrinium could not see it.
-                pcb=$(sockstat -Aucw | awk -v server="$old_limen" -v peer="$plain_pid" \
-                    '$3==server && index($0, "-> [" peer " ") {sub(/^0x/,"",$NF); print $NF; exit}')
-                test -n "$pcb"
-                recv_bytes() { netstat -an -f unix | awk -v pcb="$pcb" '$1==pcb {print $3}'; }
-                (
-                    trap 'kill -CONT "$old_limen" 2>/dev/null || :' EXIT
-                    kill -STOP "$old_limen"
-                    wait_for stopped_limen
-                    test "$(recv_bytes)" = 0
-                    click 125 24
-                    queued() { test "$(recv_bytes)" -gt 0; }
-                    wait_for queued
-                    kill -KILL "$old_limen"
-                    trap - EXIT
-                )
+                interrupt_queued_save "$plain_pid"
             else
                 kill -TERM "$old_limen"
             fi
@@ -1046,16 +1046,17 @@ SH
         files_intact
         /tmp/tile-recovery-windows --window-width "$plain_window" 1100
         plain_recovery_pid=$(pgrep -x -j "$plain_recovery" atrium-sheets)
-        edit 318 0x23 # E1=6 waits in the plain document until after reconnect.
+        edit 318 0x23 # Commit E1=6 once. The retry presses only Save.
         test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
         old_limen=$(listener)
         test "$(procstat -b "$old_limen" | awk 'NR==2 {print $NF}')" = "$PWD/limend"
         for peer in "$plain_recovery_pid" "$locked_pid" "$files_pid"; do connected "$old_limen" "$peer"; done
-        kill -TERM "$old_limen"
+        interrupt_queued_save "$plain_recovery_pid"
         start_replacement_limen
         for peer in "$plain_recovery_pid" "$locked_pid" "$files_pid"; do wait_for connected "$new_limen" "$peer"; done
         count 2; pending 2
         journal_unchanged
+        test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
 
         trace_offset=$(wc -l < select-files.log)
         click 125 24

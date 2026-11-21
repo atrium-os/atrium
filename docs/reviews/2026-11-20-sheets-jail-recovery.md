@@ -293,3 +293,11 @@ The complete desktop gate passed on bounded UFS recovery volumes. On native Tess
 The desktop gate publishes the plain sibling, then leaves a new edit in its live window with the protected workbook still waiting at Restore. It restarts Limen and checks that the original Sheets and Scrinium processes connect to the replacement listener. Ordinary Save in the plain window must update its existing copy to `zebra,4,7,9,6`. The protected recovery journal must retain its digest through the restart and the sibling save. The same protected window must still show Restore, accept the password, and publish a protected copy with `fox,3,8`. That save must leave the plain copy byte-for-byte intact.
 
 The complete gate passed on native Tessera and bounded UFS recovery volumes. Both original workbooks matched their pre-crash contents.
+
+## Interrupting the plain Save while protected recovery waits
+
+The gate commits `E1=6` in the plain sibling and pauses Limen. It presses Save once and checks that the receive queue for that Sheets process grows from zero before terminating Limen. That shows the request reached the broker socket while delivery to Scrinium was blocked. Both Sheets processes and Scrinium must connect to the replacement listener. The original plain copy must still match its pre-request digest, and the locked workbook's recovery journal must still match its pre-crash digest.
+
+The retry presses only Save. An independent read must find `zebra,4,7,9,6` in the same plain file. The protected prompt must still identify the long-named workbook. Unlocking and publishing its protected copy must recover `fox,3,8` and leave the retried plain revision intact.
+
+The complete desktop gate passed on native Tessera and bounded UFS recovery volumes. Both original workbooks matched their pre-crash contents.
