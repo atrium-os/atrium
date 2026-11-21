@@ -603,6 +603,7 @@ retry_hip_submit=0
 case "$hip" in
     esp-loss-decline) hip=esp-loss; decline_after_esp_loss=1 ;;
     esp-loss-reconnect) hip=esp-loss; decline_after_esp_loss=2 ;;
+    esp-loss-hip-active-refresh-final-rebound-decline) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=26 ;;
     esp-loss-hip-active-refresh-post-decline-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=25 ;;
     esp-loss-hip-active-refresh-post-decline-refuse) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=24 ;;
     esp-loss-hip-active-refresh-rebound-reconnect) hip=esp-loss; decline_after_esp_loss=2; retry_hip_submit=23 ;;
@@ -1249,7 +1250,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                                 fail "post-decline rebound submitted the declined forwarding report"
                                                             fi
                                                             ok "declining restored forwarding on post-decline rebound ESP withheld HIP and stopped IPv4"
-                                                            if [ "$retry_hip_submit" = 25 ]; then
+                                                            if [ "$retry_hip_submit" -ge 25 ]; then
                                                                 reconnect_after_esp_loss_decline "$before_change" post-decline-reconnect-approved "${initial_report%% *}"
                                                                 finish_hip_reconnect "$initial_report" post-decline-reconnect-ack
                                                                 rebind_restored_forwarding 19 "$initial_report" final-rebind
@@ -1271,6 +1272,17 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                                     fail "final rebound reused the prior HIP choice"
                                                                 if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
                                                                     fail "final rebound submitted changed HIP before approval"
+                                                                fi
+                                                                if [ "$retry_hip_submit" = 26 ]; then
+                                                                    rebound_iface=$(field iface)
+                                                                    [ -n "$rebound_iface" ] || fail "final rebound ESP has no interface"
+                                                                    decline_esp_loss_review 19 "$rebound_iface"
+                                                                    if tail -n "+$((before_change + 1))" "$receipts" | grep -q "^$changed_word "; then
+                                                                        fail "final rebound submitted the declined forwarding report"
+                                                                    fi
+                                                                    ok "declining the final rebound review withheld changed HIP and stopped IPv4"
+                                                                    echo "$pass checks passed"
+                                                                    exit 0
                                                                 fi
                                                                 before_approval=$(awk 'END { print NR }' "$receipts")
                                                                 touch "$receipts.final-forwarding-approved"
