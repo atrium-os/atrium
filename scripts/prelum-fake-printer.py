@@ -36,6 +36,7 @@ A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
 A.add_argument("--test-pin-job", action="append", default=[], help="title of a job that must supply the fixture PIN")
 A.add_argument("--test-no-job-password-flag", help="omit job-password-supported while this file exists")
+A.add_argument("--test-no-create-job-flag", help="omit Create-Job support while this file exists")
 A.add_argument("--test-no-send-document-flag", help="omit Send-Document support while this file exists")
 A.add_argument("--test-ignore-pin-job", help="title of a fixture PIN job to create with ignored attributes")
 ARGS = A.parse_args()
@@ -133,6 +134,9 @@ def printer_attrs(host):
         pin_supported = False
         print("fake printer: withholding job-password capability", flush=True)
     operations = [0x0002, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009, 0x000B, 0x003C]
+    if ARGS.test_no_create_job_flag and os.path.exists(ARGS.test_no_create_job_flag):
+        operations.remove(0x0005)
+        print("fake printer: withholding create-job capability", flush=True)
     if ARGS.test_no_send_document_flag and os.path.exists(ARGS.test_no_send_document_flag):
         operations.remove(0x0006)
         print("fake printer: withholding send-document capability", flush=True)

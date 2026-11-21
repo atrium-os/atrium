@@ -131,6 +131,7 @@ python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
     --test-pin-job "Fresh PIN after replay refusal" --test-ignore-pin-job "Printer ignored PIN" \
     --test-no-send-document-flag "$D/no-send-document" --test-no-job-password-flag "$D/no-job-password" \
+    --test-no-create-job-flag "$D/no-create-job" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -340,8 +341,9 @@ check_missing_pin_capability() {
 }
 check_missing_pin_capability send-document 16,17
 check_missing_pin_capability job-password 16,17,18
+check_missing_pin_capability create-job 16,17,18,19
 
-# The same handle must redeem once and print when both capabilities return.
+# With all capabilities restored, the same handle must redeem once and print.
 remote "sh -s -- '$guest' '$marker' fresh pin-fresh" <"$scripts/prelum-r7-identity.sh" >"$D/pin-fresh.log" 2>&1 || { cat "$D/pin-fresh.log" >&2; exit 1; }
 cat "$D/pin-fresh.log"
 remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-fresh-audit.log"
@@ -350,7 +352,7 @@ test "$(grep -c 'op=0x0011' "$D/pin-fresh-audit.log")" -eq 4
 test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-fresh-audit.log")" -eq 3
 grep -E 'op=0x0011' "$D/pin-fresh-audit.log" | tail -1 | grep -E 'prelum-ipp op=0x0011 .*status=0$'
 remote "cat '$guest/pin-fresh-jobs.log'" >"$D/pin-fresh-jobs.txt"
-python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18 >"$D/pin-fresh-pdf-checks.log"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 >"$D/pin-fresh-pdf-checks.log"
 cat "$D/pin-fresh-pdf-checks.log"
 
 # A printer can allocate a job while reporting that it ignored the PIN.
@@ -364,5 +366,5 @@ test "$(grep -c 'op=0x0011' "$D/pin-ignored-audit.log")" -eq 5
 test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
 remote "cat '$guest/pin-ignored-jobs.log'" >"$D/pin-ignored-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
-    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18 17 >"$D/pin-ignored-pdf-checks.log"
+    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 17 >"$D/pin-ignored-pdf-checks.log"
 cat "$D/pin-ignored-pdf-checks.log"

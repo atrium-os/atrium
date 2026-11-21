@@ -16,8 +16,9 @@ case "$kind" in
   pin-uuid) job=15; title="PIN after UUID restoration"; prefix=pin-uuid-identity ;;
   pin-no-send-document) job=17; title="PIN without Send-Document"; prefix=pin-no-send-document ;;
   pin-no-job-password) job=18; title="PIN without job-password support"; prefix=pin-no-job-password ;;
-  pin-fresh) job=19; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
-  pin-ignored) job=20; title="Printer ignored PIN"; prefix=pin-ignored ;;
+  pin-no-create-job) job=19; title="PIN without Create-Job"; prefix=pin-no-create-job ;;
+  pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
+  pin-ignored) job=21; title="Printer ignored PIN"; prefix=pin-ignored ;;
   *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
@@ -62,7 +63,7 @@ case "$phase" in
     ;;
   missing-capability)
     case "$kind" in
-      pin-no-send-document|pin-no-job-password) ;;
+      pin-no-send-document|pin-no-job-password|pin-no-create-job) ;;
       *) exit 2 ;;
     esac
     # Keep the root-only handle for the positive control after capability restoration.
