@@ -27,6 +27,14 @@ receipts = []
 for line in transcript.splitlines():
     if line.startswith("fake printer: Create-Job job "):
         events.append(("create", None))
+    elif line.startswith("fake printer: Print-Job job "):
+        events.append(("print-job", None))
+    elif ignored := re.fullmatch(r"fake printer: ignored fixture PIN for job (\d+)", line):
+        events.append(("ignore-pin", int(ignored[1])))
+    elif cancel := re.match(r"^fake printer: Cancel-Job job (\d+) ", line):
+        events.append(("cancel", int(cancel[1])))
+    elif canceled := re.fullmatch(r"fake printer: job (\d+) canceled", line):
+        events.append(("canceled", int(canceled[1])))
     elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
         events.append(("send", int(send[1])))
     elif receipt := re.fullmatch(
@@ -47,7 +55,15 @@ expected_events = [
     for job in job_ids
     for event in (("create", None), ("send", job), ("receipt", job), ("complete", job))
 ]
+if len(sys.argv) > 7:
+    ignored_job = int(sys.argv[7])
+    expected_events += [
+        ("create", None), ("ignore-pin", ignored_job),
+        ("cancel", ignored_job), ("canceled", ignored_job),
+    ]
 assert events == expected_events, events
+if len(sys.argv) > 7:
+    print(f"IPPS simulator: canceled job {ignored_job} after ignoring its PIN, with no document request or PDF")
 
 jobs = Path(sys.argv[3]).read_text(encoding="utf-8")
 completed_jobs = re.findall(

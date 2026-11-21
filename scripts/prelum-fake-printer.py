@@ -35,6 +35,7 @@ A.add_argument("--tls-alt-cert")
 A.add_argument("--tls-alt-key")
 A.add_argument("--tls-alt-flag", help="serve the alternative key while this file exists")
 A.add_argument("--test-pin-job", action="append", default=[], help="title of a job that must supply the fixture PIN")
+A.add_argument("--test-ignore-pin-job", help="title of a fixture PIN job to create with ignored attributes")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
@@ -194,7 +195,9 @@ class H(http.server.BaseHTTPRequestHandler):
         if op == 0x0B:
             out += printer_attrs(host)
         elif op in (0x05, 0x02):
-            pin_job = (a.get("job-name") or [""])[0] in ARGS.test_pin_job
+            title = (a.get("job-name") or ["?"])[0]
+            ignore_pin = title == ARGS.test_ignore_pin_job
+            pin_job = ignore_pin or title in ARGS.test_pin_job
             if pin_job and (op != 0x05 or a.get("job-password") != ["0427"]
                             or a.get("ipp-attribute-fidelity") != ["\x01"] or doc):
                 self.send_error(400, "Invalid fixture PIN submission")
@@ -203,8 +206,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 jid = NEXT[0]
                 NEXT[0] += 1
                 JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
-                             "name": (a.get("job-name") or ["?"])[0]}
-            if pin_job:
+                             "name": title}
+            if ignore_pin:
+                # successful-ok-ignored-or-substituted-attributes, with a real job ID.
+                out = head(0x0001, rid)
+                print(f"fake printer: ignored fixture PIN for job {jid}", flush=True)
+            elif pin_job:
                 print(f"fake printer: accepted fixture PIN for job {jid} before document", flush=True)
             if op == 0x02:
                 open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
@@ -246,6 +253,7 @@ class H(http.server.BaseHTTPRequestHandler):
             with LOCK:
                 if jid in JOBS:
                     JOBS[jid]["state"] = 7
+                    print(f"fake printer: job {jid} canceled", flush=True)
         out += bytes([ENDG])
         self.send_response(200)
         self.send_header("Content-Type", "application/ipp")

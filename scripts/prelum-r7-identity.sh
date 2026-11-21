@@ -15,7 +15,8 @@ case "$kind" in
   pin) job=14; title="PIN after TLS key restoration"; prefix=pin-identity ;;
   pin-uuid) job=15; title="PIN after UUID restoration"; prefix=pin-uuid-identity ;;
   pin-fresh) job=17; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
-  *) echo "Expected uuid, tls, pin, pin-uuid, or pin-fresh" >&2; exit 2 ;;
+  pin-ignored) job=18; title="Printer ignored PIN"; prefix=pin-ignored ;;
+  *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
 previous_hold=
@@ -58,13 +59,16 @@ case "$phase" in
     expected="^ +16 +printer +1 +Failed +0/2 +$title +Arca did not supply a usable PIN for this job *$"
     ;;
   fresh)
-    test "$kind" = pin-fresh
+    case "$kind" in
+      pin-fresh) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
+      pin-ignored) expected="^ +$job +printer +1 +Failed +0/2 +$title +the printer did not accept the PIN job *$" ;;
+      *) exit 2 ;;
+    esac
     exec 3<pin-handle
     rm -f pin-handle
     "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
     exec 3<&-
     snapshot=$prefix-jobs.log
-    expected="^ +$job +printer +1 +Done +2/2 +$title *$"
     ;;
   *) echo "Expected hold, retry, release, replay, or fresh" >&2; exit 2 ;;
 esac

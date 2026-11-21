@@ -119,7 +119,7 @@ check_served_key() {
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
-    --test-pin-job "Fresh PIN after replay refusal" \
+    --test-pin-job "Fresh PIN after replay refusal" --test-ignore-pin-job "Printer ignored PIN" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
     >"$D/simulator.log" 2>&1 &
 sim_pid=$!
@@ -317,3 +317,17 @@ grep -E 'op=0x0011' "$D/pin-fresh-audit.log" | tail -1 | grep -E 'prelum-ipp op=
 remote "cat '$guest/pin-fresh-jobs.log'" >"$D/pin-fresh-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16 >"$D/pin-fresh-pdf-checks.log"
 cat "$D/pin-fresh-pdf-checks.log"
+
+# A printer can allocate a job while reporting that it ignored the PIN.
+remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
+    <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-ignored-stage.log" 2>&1
+remote "sh -s -- '$guest' '$marker' fresh pin-ignored" <"$scripts/prelum-r7-identity.sh" >"$D/pin-ignored.log" 2>&1 || { cat "$D/pin-ignored.log" >&2; exit 1; }
+cat "$D/pin-ignored.log"
+remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-ignored-audit.log"
+test "$(grep -cE 'ui op=0x0068 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
+test "$(grep -c 'op=0x0011' "$D/pin-ignored-audit.log")" -eq 5
+test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
+remote "cat '$guest/pin-ignored-jobs.log'" >"$D/pin-ignored-jobs.txt"
+python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
+    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16 17 >"$D/pin-ignored-pdf-checks.log"
+cat "$D/pin-ignored-pdf-checks.log"
