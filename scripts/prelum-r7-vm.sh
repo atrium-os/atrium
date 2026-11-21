@@ -68,9 +68,13 @@ GUEST
 cleanup() {
     status=$?
     trap - EXIT
+    evidence_collected=1
+    if [ -n "$guest_connected" ]; then evidence_collected=0; fi
     if [ -n "$qemu_pid" ] && kill -0 "$qemu_pid" 2>/dev/null; then
         if [ -n "$guest_connected" ]; then
-            if ! collect_guest_artifacts >"$D/guest-artifacts.tar.gz" 2>"$D/guest-artifacts.log"; then
+            if collect_guest_artifacts >"$D/guest-artifacts.tar.gz" 2>"$D/guest-artifacts.log"; then
+                evidence_collected=1
+            else
                 echo "Could not collect guest artifacts; see $D/guest-artifacts.log" >&2
                 status=1
             fi
@@ -84,13 +88,19 @@ cleanup() {
         if kill -0 "$qemu_pid" 2>/dev/null; then
             echo "Isolated QEMU still running (pid $qemu_pid, logs in $D)" >&2
             status=1
-        else
-            wait "$qemu_pid" || status=1
-            # Preserve failed runs for diagnosis. Only remove files created in
-            # this invocation's private directory after a clean QEMU exit.
-            if [ "$status" -eq 0 ] && [ "$keep_vm" -eq 0 ]; then
-                rm -f "$D/vm.qcow2" "$D/vars.fd" || status=1
+        fi
+    fi
+    if [ -n "$qemu_pid" ] && ! kill -0 "$qemu_pid" 2>/dev/null; then
+        if wait "$qemu_pid"; then
+            if [ "$keep_vm" -eq 0 ] && [ "$evidence_collected" -eq 1 ]; then
+                if python3 "$scripts/disposable-vm-cleanup.py" "$D" vm.qcow2; then
+                    if [ ! -e "$D/vm.qcow2" ]; then rm -f "$D/vars.fd" || status=1; fi
+                else
+                    status=1
+                fi
             fi
+        else
+            status=1
         fi
     fi
     if [ -n "$sim_pid" ]; then

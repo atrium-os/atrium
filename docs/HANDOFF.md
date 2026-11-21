@@ -32,6 +32,8 @@ Last updated: 2026-11-19.
 
 ## Recently finished
 
+- **Disposable VM cleanup** ([RUNBOOK.md](../RUNBOOK.md)). Prelum R7 and the M9 fresh-VM runner prune their run disks after QEMU exits and preserve evidence. The shared helper checks QCOW2 backing references before unlinking a runner-owned disk. Use it when adding disposable VM runners.
+
 Tessera encryption E0–E6, fonts, boot time, the share sheet.
 
 - **Cargo build storage** ([AGENTS.md](../AGENTS.md)). The main checkout and scratch worktrees now share `$CARGO_HOME/atrium-build` for intermediate artifacts. The Mac's registered worktrees were migrated and their old build caches cleared. Use `scripts/scratch-worktree.sh` for historical revisions so they also resolve the shared directory. Final binaries stay in each crate's `target/` for deployment.

@@ -6041,9 +6041,17 @@ a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
 log, build hashes and verdicts under the printed artifact directory. Before
 power-down it also collects available guest service logs, screenshots and
 job-list snapshots into `guest-artifacts.tar.gz`, including after a failed check.
-Successful runs remove the disposable disk overlay and EFI variables after
-QEMU exits cleanly. Set `PRELUM_R7_KEEP_VM=1` to keep them. Failed runs keep
-the overlay and EFI variables for diagnosis.
+After the gate collects evidence and reaps QEMU, it removes the disposable
+overlay and EFI variables if the disk is unused, including when the checks
+fail. Set `PRELUM_R7_KEEP_VM=1` to retain VM state
+for debugging. The M9 fresh-VM runner uses the same disk cleanup helper.
+New runners can call `python3 scripts/disposable-vm-cleanup.py RUN_DIR DISK.qcow2`
+after collecting evidence and reaping QEMU. The helper checks the run
+directory, the system and user temporary directories, and the usual Atrium
+VM directories for QCOW2 backing references. Set `ATRIUM_VM_IMAGE_ROOTS` to
+a colon-separated list of additional image directories before the run if
+you keep dependent images elsewhere. Publish reusable base images separately
+from disposable run disks.
 Prelum must reach Done and report the expected completed and total sheet
 counts for each desktop job. The gate also requires a
 newly observed jailed IPP worker between submission and Done for each job.

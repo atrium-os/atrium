@@ -100,7 +100,9 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 
 - Create disposable test VMs when a check needs them. After the run, shut
   them down and remove their temporary disks once no remaining VM depends on
-  them. Keep logs, screenshots, and test results as evidence.
+  them. Keep logs, screenshots, and test results as evidence. For QCOW2
+  runs, call `scripts/disposable-vm-cleanup.py` with the run directory and
+  the disk filenames after QEMU exits (see RUNBOOK).
 - `scripts/run-vm.sh` boots it, `scripts/vssh` runs commands in it,
   `scripts/vshutdown` stops it. Always stop it with `vshutdown`.
 - **The Mac VM is shared by several agents working in parallel.** Don't boot,

@@ -277,7 +277,11 @@ def boot_and_run(cache, image, digest, out):
         if vm.returncode != 0:
             raise RuntimeError(f"QEMU exited with status {vm.returncode}; see {out}/qemu.log")
         print("Dedicated guest powered off.", flush=True)
-        for name in ("guest-key", "guest-key.pub", "vm.qcow2", "vars.fd"):
+        subprocess.run(["python3", ROOT / "scripts/disposable-vm-cleanup.py", out, "vm.qcow2"],
+                       check=True)
+        for name in ("guest-key", "guest-key.pub", "vars.fd"):
+            if name == "vars.fd" and (out / "vm.qcow2").exists():
+                continue
             (out / name).unlink()
 
 
