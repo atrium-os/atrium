@@ -9,17 +9,23 @@ fn main() -> io::Result<()> {
     wm.set_read_timeout(Some(Duration::from_secs(5)))?;
     let (slots, focus) = match args.as_slice() {
         [option] if option == "--clear-focus" => (Vec::new(), 0),
-        [option, id, width] if option == "--launcher-width" => {
-            let id = id.parse().expect("launcher window ID");
-            let width = width.parse().expect("launcher width");
+        [option, id, width] if option == "--window-width" => {
+            let id = id.parse().expect("window ID");
+            let width = width.parse().expect("window width");
             let windows = wm.wm_enumerate()?;
-            let launcher = windows.iter().find(|s| s.surface_id == id).expect("launcher is open");
-            let slot = WmSlot {
-                surface_id: id,
-                rect: WmRect { w: width, ..launcher.rect },
-                layer: 0,
-            };
-            (vec![slot], id)
+            assert!(windows.iter().any(|window| window.surface_id == id), "window is open");
+            let slots = windows
+                .into_iter()
+                .map(|window| {
+                    let selected = window.surface_id == id;
+                    WmSlot {
+                        surface_id: window.surface_id,
+                        rect: if selected { WmRect { x: 0, w: width, ..window.rect } } else { window.rect },
+                        layer: if selected { 0 } else { 1 },
+                    }
+                })
+                .collect();
+            (slots, id)
         }
         [left, right, focus] => {
             let left: u32 = left.parse().expect("plain window ID");
@@ -54,7 +60,7 @@ fn main() -> io::Result<()> {
             assert_eq!(placed, 2, "both documents must be open");
             (slots, focus)
         }
-        _ => panic!("expected plain, protected and focused IDs, --launcher-width ID WIDTH, or --clear-focus"),
+        _ => panic!("expected plain, protected and focused IDs, --window-width ID WIDTH, or --clear-focus"),
     };
     wm.wm_declare_layout(&WmDeclareLayoutPayload {
         slots,

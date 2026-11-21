@@ -962,7 +962,7 @@ SH
         wait_for frame_is 2c2c469f30037c925bd2cfcced2e60d4991adf2208434f4e7a8a54f067dd2749
         cp selectscreen.png "$results/long-chooser.png"
         launcher=$(win_at 48 24)
-        /tmp/tile-recovery-windows --launcher-width "$launcher" 640
+        /tmp/tile-recovery-windows --window-width "$launcher" 640
         input 'MOVE 8 240'
         wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
         cp selectscreen.png "$results/tiled-long-chooser.png"
@@ -991,9 +991,9 @@ SH
         wrong_recovery_password() {
             type_keys 0x05 0x04 0x07 0x28 # bad
             # The workbook stays locked and the full name and retry guidance are visible.
-            wait_for frame_is 300f65803a34296db04f3f55300f244489aa4479d1f8360314dc9cc94f949143
+            wait_for frame_is "${2:-300f65803a34296db04f3f55300f244489aa4479d1f8360314dc9cc94f949143}"
             test "$(docs)" = "$reopened"
-            pending 2
+            pending "${1:-2}"
             journal_unchanged
         }
         open_protected_recovery
@@ -1017,20 +1017,51 @@ SH
             recovery_unchanged "after-reopen-$prompt"
             journal_unchanged
         done
-        wrong_recovery_password
+        locked_jail=$reopened
+        locked_window=$(win_at 48 24)
+        test "$locked_window" -gt 0 && test "$locked_window" != "$launcher"
+        locked_pid=$(pgrep -x -j "$locked_jail" atrium-sheets)
+        # Put the launcher beside the protected recovery so both can receive input.
+        /tmp/tile-recovery-windows "$launcher" "$locked_window" "$launcher"
+        launcher_visible() { test "$(win_at 213 24)" = "$launcher"; }
+        wait_for launcher_visible
+        click 213 24; wait_for count 2
+        plain_recovery=$(docs | grep -vx "$locked_jail")
+        wait_for opened "$plain_recovery" 'Proof (2).osheet'
+        plain_recovery_visible() {
+            different_window 205 24 "$launcher" && test "$win" != "$locked_window"
+        }
+        wait_for plain_recovery_visible
+        plain_window=$win
+        plain_restored='Proof (2) (2).osheet'
+        publish "$plain_restored" zebra,4,7,9
+        plain_hash=$(sha256 -q "$books/$plain_restored")
+        count 2
+        test "$(pgrep -x -j "$locked_jail" atrium-sheets)" = "$locked_pid"
+        journal_unchanged
+        cmp "$books/Untitled.osheet" "$books/$long_name"
+        files_intact
+        /tmp/tile-recovery-windows --window-width "$plain_window" 1100
+        key 0x1a 1; wait_for count 1; wait_for pending 1
+
+        /tmp/tile-recovery-windows --window-width "$locked_window" 1100
+        wait_for frame_is f8f99323b7bc731b57445368c1f84102207abd7fe7db07e5acd372eae37daef5
+        cp selectscreen.png "$results/protected-after-plain-save.png"
+        test "$(docs)" = "$locked_jail"
+        wrong_recovery_password 1 fb70f11373a913e201d724b082cc62e84195646dfc24161fc8625455f548cc9b
         cp selectscreen.png "$results/protected-recovery-retry.png"
         type_keys 0x17 0x08 0x16 0x17 0x28
         sleep .6
         restored="${long_name%.osheet} (2).osheet"
         publish "$restored" fox,3,8 protected
-        key 0x1a 1; wait_for count 0; wait_for pending 1
-        /tmp/tile-recovery-windows --launcher-width "$launcher" 1100
-        /tmp/tile-recovery-windows --clear-focus
-        click 213 24; wait_for count 1
-        wait_for different_window 205 24 "$launcher"
-        plain_restored='Proof (2) (2).osheet'
-        publish "$plain_restored" zebra,4,7,9
+        /tmp/tile-recovery-windows --window-width "$locked_window" 1100
         close_reopened
+        /tmp/tile-recovery-windows --clear-focus
+        wait_for launcher_visible
+        /tmp/tile-recovery-windows --window-width "$launcher" 1100
+        /tmp/tile-recovery-windows --clear-focus
+        wait_for launcher_visible
+        test "$(sha256 -q "$books/$plain_restored")" = "$plain_hash"
         mv "$books/$restored" "$books/$plain_restored" "$results/"
         cmp "$books/Untitled.osheet" "$books/$long_name"
         mv "$books/$long_name" "$results/"

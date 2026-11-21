@@ -281,3 +281,9 @@ The final gate passed end to end on UFS. The native Tessera trial captured the s
 The gate cancels the protected recovery twice, first from Restore and then from the retry prompt after a wrong password. After each cancellation it checks that the jail exits and the recovery volume detaches. It compares both pending workbook names and IDs after cancellation and again after reopening from the chooser. The reopened jail must see the original journal digest. The final unlock and Save As must produce a protected copy with `C1=8`, and the plain sibling must still recover `D1=9`.
 
 The desktop gate passed end to end on native Tessera and bounded UFS recovery volumes. The original published workbooks matched their pre-crash contents.
+
+## Saving the plain sibling while protected recovery waits
+
+The gate tiles the launcher beside the long-named protected workbook while it waits at its Restore password prompt. It recovers the plain sibling and saves a copy with `D1=9` while both document jails are open. The protected jail keeps the same process and journal through the plain save. After the plain window closes, the gate checks that Restore still names the protected workbook, unlocks it, and saves a protected copy with `C1=8`. A final digest check verifies the plain copy still holds the revision published before unlock.
+
+The complete desktop gate passed on bounded UFS recovery volumes. On native Tessera, the same sequence passed in stages while the fixture window placement and focus controls were adjusted. Independent reads verified both published copies on both filesystems.
