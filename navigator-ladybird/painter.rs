@@ -964,12 +964,19 @@ pub mod host {
         emit_credential(CredentialMessage::SubmitFixture { body }).is_some()
     }
 
+    // Older get-only engine builds use the original symbol.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn navigator_get_begin(realm: *const std::ffi::c_void, bytes: *const u8, len: usize) -> u32 {
-        if realm.is_null() || realm != SIGN_IN_REALM.get() || ACTIVE_GET.get().is_some() || len > 32 * 1024 { return 0; }
+        unsafe { navigator_credential_begin(realm, false, bytes, len) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_credential_begin(realm: *const std::ffi::c_void, registering: bool, bytes: *const u8, len: usize) -> u32 {
+        if bytes.is_null() || realm.is_null() || realm != SIGN_IN_REALM.get() || ACTIVE_GET.get().is_some() || len > 32 * 1024 { return 0; }
         let Ok(options) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes, len) }) else { return 0 };
         let Some(id) = LAST_GET.get().checked_add(1) else { return 0 };
-        if emit_credential(CredentialMessage::Get { id, options }).is_none() { return 0; }
+        let message = if registering { CredentialMessage::Create { id, options } } else { CredentialMessage::Get { id, options } };
+        if emit_credential(message).is_none() { return 0; }
         LAST_GET.set(id);
         ACTIVE_GET.set(Some((id, std::time::Instant::now())));
         id
@@ -986,7 +993,7 @@ pub mod host {
 
     fn take_credential_reply(bytes: &[u8]) -> bool {
         match limen::sign_in::decode(bytes) {
-            Some(CredentialMessage::Assertion { id, .. } | CredentialMessage::Error { id, .. }) => {
+            Some(CredentialMessage::Registration { id, .. } | CredentialMessage::Assertion { id, .. } | CredentialMessage::Error { id, .. }) => {
                 if ACTIVE_GET.get().is_some_and(|(active, _)| active == id) { GET_REPLY.replace(Some(bytes.to_vec())); }
                 true
             }
@@ -1014,7 +1021,7 @@ pub mod host {
         let Some(bytes) = GET_REPLY.take() else { return 0 };
         ACTIVE_GET.set(None);
         match limen::sign_in::decode(&bytes) {
-            Some(CredentialMessage::Assertion { json, .. }) if json.len() <= cap => {
+            Some(CredentialMessage::Registration { json, .. } | CredentialMessage::Assertion { json, .. }) if json.len() <= cap => {
                 unsafe { std::ptr::copy_nonoverlapping(json.as_ptr(), out, json.len()); }
                 json.len() as i32
             }

@@ -24,6 +24,8 @@ libc            = "0.2"
 ring            = "0.17"
 
 [dev-dependencies]
+sigillum-cbor = { path = "../../sigillum/sigillum-cbor" }
+sigillum-ctap = { path = "../../sigillum/sigillum-ctap" }
 base64 = "0.22"
 serde_json = "1"
 url = "2"

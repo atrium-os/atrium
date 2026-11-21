@@ -495,6 +495,36 @@ before drawing Views. The four rows below Search had disjoint ink bounds.
 Screens, field crops, sidebar bounds, worker identity and build evidence
 are in `~/atrium-vm/evidence/navigator-i3-readonly-sidebar-20261121/`.
 
+### I3 passkey registration and sign-in
+
+The local fixture ran on arm64 HVF with Tessera mounted at root. The
+installed Ladybird worker used the JIT-off engine, ran in Capsicum as UID
+50006, and had IPv4 and IPv6 disabled. The software authenticator started
+with an empty credential store. Pressing **Create passkey** in the page
+called `navigator.credentials.create`. Navigator derived the origin from
+the attached document and Sigillum presented its trusted device and PIN
+sheet. The native Promise resolved with an `AuthenticatorAttestationResponse`.
+
+The provider checked the creation challenge, origin, RP hash, user
+presence and verification flags, credential ID, and ES256 key in the
+attestation object. It kept the registered public key under the flow
+cookie. **Use new passkey** supplied that ID in the allow list for an
+independent challenge. The provider checked the returned ID, user handle,
+counter and signature under the enrolled key. Only the assertion produced
+the OAuth callback. Arca redeemed it and Mail displayed the fixture account.
+
+For this gate apply `patches/ladybird/webauthn-create.patch` after
+`webauthn-get.patch`, regenerate the bindings and also link the generated
+AuthenticatorAttestationResponse object. Start `navigator-softkey --empty`
+and select `webauthn-register` in the local courier test server. Keep the
+fixture connection open after the registration POST returns 204 so the
+same courier can submit the assertion. The provider markers in order are
+`registration-verified`, `assertion-verified` and `pkce-redeemed`.
+The soft-key ceremony ran independently of the Arca platform-passkey list,
+whose lookup returned status 5 in this fixture. The local provider,
+ephemeral key and fixture account cover a single run. Evidence is in
+`~/atrium-vm/evidence/navigator-i3-registration-20261121/`.
+
 ### I3 installed WebAuthn get probe
 
 On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS

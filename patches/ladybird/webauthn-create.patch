@@ -1,0 +1,286 @@
+--- /dev/null
++++ b/Libraries/LibWeb/CredentialManagement/AuthenticatorAttestationResponse.idl
+@@ -0,0 +1,4 @@
++[Exposed=Window, SecureContext, ImplementedIn=Rust]
++interface AuthenticatorAttestationResponse : AuthenticatorResponse {
++    [SameObject] readonly attribute ArrayBuffer attestationObject;
++};
+--- a/Libraries/LibWeb/idl_files.cmake
++++ b/Libraries/LibWeb/idl_files.cmake
+@@ -759,3 +759,5 @@
+ libweb_js_bindings(CredentialManagement/AuthenticatorResponse)
+
+ libweb_js_bindings(CredentialManagement/AuthenticatorAssertionResponse)
++
++libweb_js_bindings(CredentialManagement/AuthenticatorAttestationResponse)
+--- a/Libraries/LibWeb/CredentialManagement/PublicKeyCredential.idl
++++ b/Libraries/LibWeb/CredentialManagement/PublicKeyCredential.idl
+@@ -1,7 +1,7 @@
+ [Exposed=Window, SecureContext, ImplementedIn=Rust]
+ interface PublicKeyCredential : Credential {
+     [SameObject] readonly attribute ArrayBuffer rawId;
+-    [SameObject] readonly attribute AuthenticatorAssertionResponse response;
++    [SameObject] readonly attribute AuthenticatorResponse response;
+     readonly attribute DOMString? authenticatorAttachment;
+ };
+ partial dictionary CredentialRequestOptions {
+@@ -18,3 +18,26 @@
+     required DOMString type;
+     required BufferSource id;
+ };
++
++partial dictionary CredentialCreationOptions {
++    PublicKeyCredentialCreationOptions publicKey;
++};
++dictionary PublicKeyCredentialCreationOptions {
++    required PublicKeyCredentialRpEntity rp;
++    required PublicKeyCredentialUserEntity user;
++    required BufferSource challenge;
++    required sequence<PublicKeyCredentialParameters> pubKeyCredParams;
++    unsigned long timeout;
++    any excludeCredentials;
++    AuthenticatorSelectionCriteria authenticatorSelection;
++    DOMString attestation = "none";
++};
++dictionary PublicKeyCredentialRpEntity { DOMString id; required DOMString name; };
++dictionary PublicKeyCredentialUserEntity { required BufferSource id; required DOMString name; required DOMString displayName; };
++dictionary PublicKeyCredentialParameters { required DOMString type; required long alg; };
++dictionary AuthenticatorSelectionCriteria {
++    DOMString authenticatorAttachment;
++    DOMString residentKey;
++    boolean requireResidentKey = false;
++    DOMString userVerification = "preferred";
++};
+--- a/Libraries/LibWeb/Bindings/Rust/src/credential_management/mod.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/credential_management/mod.rs
+@@ -16,3 +16,4 @@
+ pub(crate) mod public_key_credential;
+ pub(crate) mod authenticator_response;
+ pub(crate) mod authenticator_assertion_response;
++pub(crate) mod authenticator_attestation_response;
+--- /dev/null
++++ b/Libraries/LibWeb/Bindings/Rust/src/credential_management/authenticator_attestation_response.rs
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: BSD-2-Clause
++use super::authenticator_response::AuthenticatorResponse;
++use libjs_rust::api::{ArrayBuffer, Gc, Trace};
++use crate::bindings::{CallContext, WebIdlResult};
++use crate::bindings::interface::{Inherits, Wrappable};
++
++#[derive(Trace)]
++#[gc(crate = libjs_rust)]
++pub(crate) struct AuthenticatorAttestationResponse {
++    pub(crate) response: AuthenticatorResponse,
++    pub(crate) object: Gc<ArrayBuffer>,
++}
++impl Wrappable for AuthenticatorAttestationResponse {}
++impl Inherits<AuthenticatorResponse> for AuthenticatorAttestationResponse {
++    fn parent(&self) -> &AuthenticatorResponse { &self.response }
++}
++impl AuthenticatorAttestationResponse {
++    pub(crate) fn attestation_object(&self, _: &mut CallContext) -> WebIdlResult<Gc<ArrayBuffer>> { Ok(self.object) }
++}
+--- a/Libraries/LibWeb/Bindings/Rust/src/credential_management/credentials_container.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/credential_management/credentials_container.rs
+@@ -32,6 +32,7 @@
+ /// https://w3c.github.io/webappsec-credential-management/#dictdef-credentialcreationoptions
+ #[expect(dead_code, reason = "create() does not read the options yet")]
+ pub(crate) struct CredentialCreationOptions {
++    pub(crate) public_key: Option<super::public_key_credential::PublicKeyCredentialCreationOptions>,
+     pub(crate) federated: Option<FederatedCredentialInit>,
+     pub(crate) mediation: CredentialMediationRequirement,
+     pub(crate) password: Option<PasswordCredentialInit>,
+@@ -79,8 +80,11 @@
+         &self,
+         cx: &mut CallContext,
+         promise: WebIdlPromise,
+-        _: CredentialCreationOptions,
++        options: CredentialCreationOptions,
+     ) -> WebIdlResult<()> {
++        if let Some(options_key) = options.public_key {
++            return super::public_key_credential::create(cx, promise, options_key, options.signal);
++        }
+         eprintln!("FIXME: Unimplemented CredentialsContainer::create()");
+         reject_not_implemented_promise(cx.vm(), promise, "create");
+         Ok(())
+--- a/Libraries/LibWeb/Bindings/Rust/src/credential_management/public_key_credential.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/credential_management/public_key_credential.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-2-Clause
+ //! Navigator owns the sign-in connection. A single native Promise follows
+ //! its request ID until the broker replies or the page aborts.
++use super::authenticator_attestation_response::AuthenticatorAttestationResponse;
+ use super::{authenticator_assertion_response::AuthenticatorAssertionResponse, authenticator_response::AuthenticatorResponse, credential::Credential};
+ use crate::bindings::{CallContext, Exception, WebIdlResult};
+ use crate::bindings::interface::{Inherits, Ref, Wrappable, allocate, wrap};
+@@ -12,7 +13,7 @@
+ use serde_json::{json, Value as Json};
+
+ unsafe extern "C" {
+-    fn navigator_get_begin(realm: *const core::ffi::c_void, bytes: *const u8, len: usize) -> u32;
++    fn navigator_credential_begin(realm: *const core::ffi::c_void, registering: bool, bytes: *const u8, len: usize) -> u32;
+     fn navigator_get_poll(id: u32, buf: *mut u8, len: usize) -> i32;
+     fn navigator_get_abort(id: u32);
+ }
+@@ -25,12 +26,32 @@
+     pub(crate) user_verification: Utf16String,
+ }
+
++pub(crate) struct PublicKeyCredentialCreationOptions {
++    pub(crate) rp: PublicKeyCredentialRpEntity,
++    pub(crate) user: PublicKeyCredentialUserEntity,
++    pub(crate) challenge: BufferSource,
++    pub(crate) pub_key_cred_params: Vec<PublicKeyCredentialParameters>,
++    pub(crate) timeout: Option<u32>,
++    pub(crate) exclude_credentials: Option<Value>,
++    pub(crate) authenticator_selection: Option<AuthenticatorSelectionCriteria>,
++    pub(crate) attestation: Utf16String,
++}
++pub(crate) struct PublicKeyCredentialRpEntity { pub(crate) id: Option<Utf16String>, pub(crate) name: Utf16String }
++pub(crate) struct PublicKeyCredentialUserEntity { pub(crate) id: BufferSource, pub(crate) name: Utf16String, pub(crate) display_name: Utf16String }
++pub(crate) struct PublicKeyCredentialParameters { pub(crate) r#type: Utf16String, pub(crate) alg: i32 }
++pub(crate) struct AuthenticatorSelectionCriteria {
++    pub(crate) authenticator_attachment: Option<Utf16String>,
++    pub(crate) resident_key: Option<Utf16String>,
++    pub(crate) require_resident_key: bool,
++    pub(crate) user_verification: Utf16String,
++}
++
+ #[derive(Trace)]
+ #[gc(crate = libjs_rust)]
+ pub(crate) struct PublicKeyCredential {
+     credential: Credential,
+     raw: Gc<ArrayBuffer>,
+-    assertion: Ref<AuthenticatorAssertionResponse>,
++    response: Value,
+     attachment: Utf16String,
+ }
+ impl Wrappable for PublicKeyCredential {}
+@@ -39,7 +60,7 @@
+ }
+ impl PublicKeyCredential {
+     pub(crate) fn raw_id(&self, _: &mut CallContext) -> WebIdlResult<Gc<ArrayBuffer>> { Ok(self.raw) }
+-    pub(crate) fn response(&self, _: &mut CallContext) -> WebIdlResult<Ref<AuthenticatorAssertionResponse>> { Ok(self.assertion) }
++    pub(crate) fn response(&self, _: &mut CallContext) -> WebIdlResult<Value> { Ok(self.response) }
+     pub(crate) fn authenticator_attachment(&self, _: &mut CallContext) -> WebIdlResult<Option<Utf16String>> { Ok(Some(self.attachment.clone())) }
+ }
+
+@@ -56,6 +77,34 @@
+     unsafe { b.with_bytes(|bytes| string(&ak::encode_base64(bytes, ak::Base64Alphabet::Base64Url, true))) }
+ }
+
++fn descriptors(vm: &Vm, list: Value) -> WebIdlResult<Vec<Json>> {
++    Ok(sequence_from_js(vm, list, Vec::new(), |v| {
++            let obj = dictionary_object(vm, v, "PublicKeyCredentialDescriptor")?;
++            let field = |name| dictionary_member(vm, obj, &PropertyKey::from_utf8(name));
++            let id = to_buffer_source(vm, field("id")?.unwrap_or(Value::UNDEFINED), &BufferSourceRules { allow_shared: false, allow_resizable: false })?;
++            let ty = to_dom_string(vm, field("type")?.unwrap_or(Value::UNDEFINED))?;
++            Ok(json!({"type":string(&ty),"id":encoded(&id)}))
++        })?)
++}
++
++pub(crate) fn create(cx: &mut CallContext, promise: WebIdlPromise, o: PublicKeyCredentialCreationOptions, signal: Option<Ref<AbortSignal>>) -> WebIdlResult<()> {
++    let mut request = json!({
++        "rp": {"id":o.rp.id.as_ref().map(string), "name":string(&o.rp.name)},
++        "user": {"id":encoded(&o.user.id), "name":string(&o.user.name), "displayName":string(&o.user.display_name)},
++        "challenge":encoded(&o.challenge), "timeout":o.timeout, "attestation":string(&o.attestation),
++        "pubKeyCredParams":o.pub_key_cred_params.iter().map(|p| json!({"type":string(&p.r#type),"alg":p.alg})).collect::<Vec<_>>(),
++    });
++    if let Some(selection) = o.authenticator_selection {
++        request["authenticatorSelection"] = json!({
++            "authenticatorAttachment":selection.authenticator_attachment.as_ref().map(string),
++            "residentKey":selection.resident_key.as_ref().map(string),
++            "requireResidentKey":selection.require_resident_key, "userVerification":string(&selection.user_verification)
++        });
++    }
++    if let Some(list) = o.exclude_credentials { request["excludeCredentials"] = descriptors(cx.vm(), list)?.into(); }
++    begin(cx, promise, signal, request, true)
++}
++
+ pub(crate) fn get(cx: &mut CallContext, promise: WebIdlPromise, options: PublicKeyCredentialRequestOptions, signal: Option<Ref<AbortSignal>>) -> WebIdlResult<()> {
+     if let Some(s) = signal.filter(|s| s.aborted()) {
+         reject_promise(cx.vm(), promise, s.reason());
+@@ -66,21 +115,24 @@
+     if let Some(ms) = options.timeout { request["timeout"] = ms.into(); }
+     let vm = cx.vm();
+     if let Some(list) = options.allow_credentials {
+-        let descriptors = sequence_from_js(vm, list, Vec::new(), |v| {
+-            let obj = dictionary_object(vm, v, "PublicKeyCredentialDescriptor")?;
+-            let field = |name| dictionary_member(vm, obj, &PropertyKey::from_utf8(name));
+-            let id = to_buffer_source(vm, field("id")?.unwrap_or(Value::UNDEFINED), &BufferSourceRules { allow_shared: false, allow_resizable: false })?;
+-            let ty = to_dom_string(vm, field("type")?.unwrap_or(Value::UNDEFINED))?;
+-            Ok(json!({"type":string(&ty),"id":encoded(&id)}))
+-        })?;
++        let descriptors = descriptors(vm, list)?;
+         request["allowCredentials"] = descriptors.into();
+     }
++    begin(cx, promise, signal, request, false)
++}
++
++fn begin(cx: &mut CallContext, promise: WebIdlPromise, signal: Option<Ref<AbortSignal>>, request: Json, registering: bool) -> WebIdlResult<()> {
++    if let Some(s) = signal.filter(|s| s.aborted()) {
++        reject_promise(cx.vm(), promise, s.reason());
++        return Ok(());
++    }
++    let vm = cx.vm();
+     let bytes = request.to_string();
+     // SAFETY: begin copies the buffer before returning. Only the host's
+     // current sign-in document realm has a credential channel.
+-    let id = unsafe { navigator_get_begin(cx.realm().as_ptr().cast(), bytes.as_ptr(), bytes.len()) };
++    let id = unsafe { navigator_credential_begin(cx.realm().as_ptr().cast(), registering, bytes.as_ptr(), bytes.len()) };
+     if id == 0 { return Err(denied()); }
+-    let pending = Pending { realm: cx.realm(), promise, signal, id };
++    let pending = Pending { realm: cx.realm(), promise, signal, id, registering };
+     queue_a_task(vm, cx.realm(), TaskSource::UserInteraction, pending, poll);
+     Ok(())
+ }
+@@ -93,6 +145,8 @@
+     signal: Option<Ref<AbortSignal>>,
+     #[gc(untraced)]
+     id: u32,
++    #[gc(untraced)]
++    registering: bool,
+ }
+
+ fn poll(vm: &Vm, p: Pending) {
+@@ -109,7 +163,7 @@
+     }
+     let cx = CallContext::new(vm, p.realm);
+     let result = if n > 0 && n as usize <= bytes.len() {
+-        decode(&cx, &bytes[..n as usize])
++        decode(&cx, &bytes[..n as usize], p.registering)
+     } else {
+         let name = match n { -2 => "SecurityError", -3 => "TypeError", _ => "NotAllowedError" };
+         Err(if name == "TypeError" { Exception::type_error("Invalid credential options") } else { Exception::Dom(name, Utf16String::from_ascii(b"Credential unavailable")) })
+@@ -120,7 +174,7 @@
+     }
+ }
+
+-fn decode(cx: &CallContext, bytes: &[u8]) -> WebIdlResult<Ref<PublicKeyCredential>> {
++fn decode(cx: &CallContext, bytes: &[u8], registering: bool) -> WebIdlResult<Ref<PublicKeyCredential>> {
+     let v: Json = serde_json::from_slice(bytes).map_err(|_| denied())?;
+     let buffer = |s: &Json| {
+         let text = Utf16String::from_utf8(s.as_str().ok_or_else(denied)?);
+@@ -133,9 +187,16 @@
+     let attachment = Utf16String::from_utf8(v["authenticatorAttachment"].as_str().ok_or_else(denied)?);
+     let r = &v["response"];
+     let client_data = buffer(&r["clientDataJSON"])?;
+-    let auth = buffer(&r["authenticatorData"])?;
+-    let sig = buffer(&r["signature"])?;
+-    let user = r.get("userHandle").filter(|v| !v.is_null()).map(buffer).transpose()?;
+-    let assertion = allocate(cx.vm(), |_| AuthenticatorAssertionResponse { response: AuthenticatorResponse { client_data }, auth, sig, user });
+-    Ok(allocate(cx.vm(), |_| PublicKeyCredential { raw, assertion, attachment, credential: Credential::new(UsvString::from_ascii(id.as_bytes()), "public-key") }))
+-}
++    let response = if registering {
++        let object = buffer(&r["attestationObject"])?;
++        let attestation = allocate(cx.vm(), |_| AuthenticatorAttestationResponse { response: AuthenticatorResponse { client_data }, object });
++        Value::from_object(wrap(cx, attestation))
++    } else {
++        let auth = buffer(&r["authenticatorData"])?;
++        let sig = buffer(&r["signature"])?;
++        let user = r.get("userHandle").filter(|v| !v.is_null()).map(buffer).transpose()?;
++        let assertion = allocate(cx.vm(), |_| AuthenticatorAssertionResponse { response: AuthenticatorResponse { client_data }, auth, sig, user });
++        Value::from_object(wrap(cx, assertion))
++    };
++    Ok(allocate(cx.vm(), |_| PublicKeyCredential { raw, response, attachment, credential: Credential::new(UsvString::from_ascii(id.as_bytes()), "public-key") }))
++}

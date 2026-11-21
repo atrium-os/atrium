@@ -19,6 +19,7 @@ struct Sheet {
     credential: Option<crate::credential_get::Pending>,
     last_request: u32,
     assertion_issued: bool,
+    registration_issued: bool,
     window: Connection,
     token: [u8; 16],
     page: Option<(Parent, u64)>,
@@ -75,7 +76,7 @@ fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
         if let Some(Event::EmbedToken { window_id, token }) = window.wait_event(Some(Duration::from_millis(100))).map_err(|_| ())? {
-            if window_id == id { return Ok(Sheet { origin: None, credential: None, last_request: 0, assertion_issued: false, window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
+            if window_id == id { return Ok(Sheet { origin: None, credential: None, last_request: 0, assertion_issued: false, registration_issued: false, window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
         }
     }
     Err(())
@@ -174,12 +175,15 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
                 match parent.poll(Duration::ZERO) {
                     Ok(Some(ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed })) if embed == *worker => closed.push(id),
                     Ok(Some(ParentEvent::Message { embed, bytes })) if embed == *worker && limen::sign_in::decode(&bytes).is_some() => {
-                        match limen::sign_in::decode(&bytes) {
-                            Some(CredentialMessage::Get { id: request, options }) if request > sheet.last_request && sheet.credential.is_none() => {
+                        let message = limen::sign_in::decode(&bytes);
+                        let registering = matches!(message, Some(CredentialMessage::Create { .. }));
+                        match message {
+                            Some(CredentialMessage::Get { id: request, options } | CredentialMessage::Create { id: request, options }) if request > sheet.last_request && sheet.credential.is_none() => {
                                 sheet.last_request = request;
                                 sheet.assertion_issued = false;
+                                sheet.registration_issued = false;
                                 let pending = sheet.origin.as_ref().ok_or(DomError::Security)
-                                    .and_then(|origin| crate::credential_get::Pending::start(request, origin, options));
+                                    .and_then(|origin| crate::credential_get::Pending::start(request, origin, options, registering));
                                 match pending {
                                     Ok(pending) => sheet.credential = Some(pending),
                                     Err(error) => {
@@ -193,6 +197,13 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
                             }
                             Some(CredentialMessage::Abort { id: request }) if request == sheet.last_request => {
                                 sheet.assertion_issued = false;
+                                sheet.registration_issued = false;
+                            }
+                            Some(CredentialMessage::SubmitFixture { body }) if sheet.fixture_requests.is_some() && std::mem::take(&mut sheet.registration_issued) => {
+                                let enrolled = body.starts_with("registration=") && cookies.lock().ok()
+                                    .and_then(|mut broker| broker.mail_assertion(sheet.view, body).ok())
+                                    .is_some_and(|response| response.status == 204);
+                                if !enrolled { closed.push(id); }
                             }
                             Some(CredentialMessage::SubmitFixture { body }) if sheet.fixture_requests.is_some() && std::mem::take(&mut sheet.assertion_issued) => {
                                 let redeemed = sheet.ticket.as_ref().is_some_and(|ticket| {
@@ -222,12 +233,14 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
                     _ => {}
                 }
             }
-            if let Some((request, result)) = sheet.credential.as_ref().and_then(|c| Some((c.id, c.poll()?))) {
+            if let Some((request, registering, result)) = sheet.credential.as_ref().and_then(|c| Some((c.id, c.registering, c.poll()?))) {
                 sheet.credential.take();
                 if closed.contains(&id) { continue; }
                 if let Some((parent, worker)) = &mut sheet.page {
-                    sheet.assertion_issued = result.is_ok();
+                    sheet.registration_issued = registering && result.is_ok();
+                    sheet.assertion_issued = !registering && result.is_ok();
                     let reply = match &result {
+                        Ok(json) if registering => CredentialMessage::Registration { id: request, json },
                         Ok(json) => CredentialMessage::Assertion { id: request, json },
                         Err(error) => CredentialMessage::Error { id: request, name: error.name() },
                     };

@@ -22,6 +22,9 @@ use std::sync::Arc;
 #[derive(Default)]
 struct Provider {
     webauthn_probe: bool,
+    registration: bool,
+    registration_challenges: std::collections::HashMap<String, String>,
+    registered: std::collections::HashMap<String, Enrollment>,
     enrollment: Option<Enrollment>,
     challenges: std::collections::HashMap<String, String>,
     sessions: std::collections::HashMap<String, (String, String)>,
@@ -57,6 +60,29 @@ impl Enrollment {
             (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
         }
         Self { id: hex(fields[0]), key: hex(fields[1]), counter: fields[2].parse().unwrap() }
+    }
+
+    fn register(body: &str, challenge: &str) -> Option<Self> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use sigillum_ctap::{authdata::AuthData, cose::{alg, CoseKey}};
+        let mut fields = url::form_urlencoded::parse(body.as_bytes());
+        let (name, data) = fields.next()?;
+        if name != "registration" || fields.next().is_some() { return None; }
+        let credential: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let bytes = |k: &str| URL_SAFE_NO_PAD.decode(credential[k].as_str()?).ok();
+        let client: serde_json::Value = serde_json::from_slice(&bytes("clientDataJSON")?).ok()?;
+        if credential["type"] != "public-key" || client["type"] != "webauthn.create"
+            || client["origin"] != "https://login.microsoftonline.com" || client["crossOrigin"] != false
+            || client["challenge"] != challenge { return None; }
+        let object = sigillum_cbor::decode(&bytes("attestationObject")?).ok()?;
+        if object.get_text("fmt")?.as_text()? != "none" || !object.get_text("attStmt")?.as_map()?.is_empty() { return None; }
+        let auth = AuthData::parse(object.get_text("authData")?.as_bytes()?).ok()?;
+        let attested = auth.attested?;
+        if auth.rp_id_hash.as_slice() != ring::digest::digest(&ring::digest::SHA256, b"login.microsoftonline.com").as_ref()
+            || auth.flags & 5 != 5 || attested.cred_id != bytes("rawId")? { return None; }
+        let CoseKey::P256 { alg: alg::ES256, x, y } = attested.public_key else { return None };
+        let key = [&[4u8][..], &x, &y].concat();
+        Some(Self { id: attested.cred_id, key, counter: auth.sign_count })
     }
 
     fn verify(&mut self, body: &str, challenge: &str) -> Option<()> {
@@ -103,6 +129,12 @@ impl Provider {
                 }
             }
             if self.sessions.contains_key(flow) {
+                if self.registration && path == "/atrium-fixture/account.js" {
+                    let challenge = self.registration_challenges.entry(flow.into()).or_insert_with(nonce);
+                    let script = include_str!("../../../test-assets/navigator-i3/register.js").replace("__CREATE__", challenge);
+                    let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
+                    return ("registration-challenges-issued", response("200 OK", "Content-Type: text/javascript\r\n", &script.replace("__GET__", challenge)));
+                }
                 if self.enrollment.is_some() && path == "/atrium-fixture/account.js" {
                     let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
                     let js = include_str!("../../../test-assets/navigator-i3/sign-in.js").replace("__CHALLENGE__", challenge);
@@ -118,7 +150,7 @@ impl Provider {
                 if let Some((marker, mime, body)) = resource {
                     return (marker, response("200 OK", &format!("Content-Type: {mime}\r\n"), body));
                 }
-                if !self.webauthn_probe && self.enrollment.is_none() && path == "/atrium-fixture/continue" && self.codes.len() < 64 {
+                if !self.registration && !self.webauthn_probe && self.enrollment.is_none() && path == "/atrium-fixture/continue" && self.codes.len() < 64 {
                     let (state, challenge) = self.sessions.remove(flow).unwrap();
                     let code = nonce();
                     self.codes.insert(code.clone(), challenge);
@@ -126,7 +158,16 @@ impl Provider {
                 }
             }
         } else if method == "POST" && path == "/atrium-fixture/continue" {
-            if let (Some(enrollment), Some(challenge)) = (self.enrollment.as_mut(), self.challenges.remove(flow)) {
+            if self.registration && self.sessions.contains_key(flow) && body.starts_with("registration=") {
+                if let Some(key) = self.registration_challenges.remove(flow)
+                    .and_then(|challenge| Enrollment::register(body, &challenge)) {
+                    self.registered.insert(flow.to_owned(), key);
+                    return ("registration-verified", response("204 No Content", "", ""));
+                }
+                return ("registration-refused", response("403 Forbidden", "", ""));
+            }
+            let enrollment = if self.registration { self.registered.get_mut(flow) } else { self.enrollment.as_mut() };
+            if let (Some(enrollment), Some(challenge)) = (enrollment, self.challenges.remove(flow)) {
                 if self.codes.len() < 64 && enrollment.verify(body, &challenge).is_some() {
                     let (state, verifier_hash) = self.sessions.remove(flow).unwrap();
                     let code = nonce();
@@ -179,8 +220,9 @@ fn main() {
     let mail = mail_address.is_some();
     let webauthn_probe = a.get(6).is_some_and(|mode| mode == "webauthn-probe");
     let enrollment = a.get(6).filter(|mode| *mode == "webauthn-sign-in").map(|_| Enrollment::read(&a[7]));
-    let callback = enrollment.is_some() || webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
-    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, enrollment, ..Provider::default() }));
+    let registration = a.get(6).is_some_and(|mode| mode == "webauthn-register");
+    let callback = registration || enrollment.is_some() || webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
+    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, registration, enrollment, ..Provider::default() }));
     let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
@@ -215,7 +257,7 @@ fn main() {
                     let (marker, reply) = provider.lock().unwrap().callback(&first, &cookie, std::str::from_utf8(&body).unwrap_or(""));
                     let mut file = std::fs::OpenOptions::new().append(true).create(true).open(&log).unwrap();
                     writeln!(file, "{marker}").unwrap();
-                    if t.write_all(reply.as_bytes()).and_then(|_| t.flush()).is_err() || first.starts_with("POST ") { break; }
+                    if t.write_all(reply.as_bytes()).and_then(|_| t.flush()).is_err() || (first.starts_with("POST ") && marker != "registration-verified") { break; }
                     continue;
                 }
                 if inbox {
@@ -312,6 +354,23 @@ mod tests {
         assert_eq!(provider.callback(post, cookie, "assertion=bad").0, "refused");
         assert!(!provider.challenges.contains_key("fixture"));
         assert!(provider.codes.is_empty());
+    }
+
+    #[test]
+    fn registration_requires_its_own_flow_and_never_issues_a_code() {
+        let mut provider = Provider { registration: true, ..Provider::default() };
+        provider.sessions.insert("fixture".into(), ("state".into(), "pkce".into()));
+        let cookie = "flow=fixture";
+        assert_eq!(provider.callback("GET /atrium-fixture/account.js HTTP/1.1", cookie, "").0, "registration-challenges-issued");
+        assert_ne!(provider.registration_challenges["fixture"], provider.challenges["fixture"]);
+        let post = "POST /atrium-fixture/continue HTTP/1.1";
+        assert_eq!(provider.callback(post, "flow=other", "registration=bad").0, "refused");
+        assert!(provider.registration_challenges.contains_key("fixture"));
+        assert_eq!(provider.callback(post, cookie, "registration=bad").0, "registration-refused");
+        assert!(!provider.registration_challenges.contains_key("fixture"));
+        assert!(provider.registered.is_empty());
+        assert!(provider.codes.is_empty());
+        assert_eq!(provider.callback("GET /atrium-fixture/continue HTTP/1.1", cookie, "").0, "refused");
     }
 
     #[test]

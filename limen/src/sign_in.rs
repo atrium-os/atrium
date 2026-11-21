@@ -11,6 +11,8 @@ pub enum CredentialMessage<'a> {
     Assertion { id: u32, json: &'a str },
     SubmitFixture { body: &'a str },
     Error { id: u32, name: &'a str },
+    Create { id: u32, options: &'a str },
+    Registration { id: u32, json: &'a str },
 }
 
 impl CredentialMessage<'_> {
