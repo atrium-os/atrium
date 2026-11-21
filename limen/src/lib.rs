@@ -29,3 +29,4 @@ pub mod proto;
 pub mod share;
 pub mod share_target;
 pub mod web_island;
+pub mod sign_in;

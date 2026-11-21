@@ -26,13 +26,16 @@ version = "0.1.0"
 dependencies = [
  "arca-store",
  "arcad",
+ "base64",
  "libc",
  "navigator-fetch",
  "rcgen",
  "ring",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "tempfile",
+ "url",
 ]
 
 [[package]]

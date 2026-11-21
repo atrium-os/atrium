@@ -1111,3 +1111,13 @@ a `SecurityKey` / `KeyUv` reply for that ceremony only.
   [ostiarius-privsep.md](ostiarius-privsep.md), [atrium-input.md](atrium-input.md),
   [bluetooth.md](bluetooth.md), [atrium-navigator-threat-model.md](atrium-navigator-threat-model.md)
   §6.4, [jail-sysfil.md](jail-sysfil.md), [limen.md](limen.md), [portcullis.md](portcullis.md).
+
+
+#### Window identity in split Fresco
+
+Sigillum UI retains the window token delivered for its current sheet.
+It sends the token and the input activation to Fresco in
+`CONSUME_IDENTITY` (0x0905). Fresco resolves the token to its compositor
+window, checks the press belongs to that window, then applies the IDENTITY
+consumer, presenter UID, visibility, stillness and focus checks. A sheet
+without its token cannot authorize a device choice.

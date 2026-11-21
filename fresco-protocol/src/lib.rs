@@ -2676,6 +2676,8 @@ pub mod activation {
         pub const NOTE: u16 = 0x0903;
         /// Spend a PROMPT press only in the window identified by its embed token.
         pub const CONSUME_PROMPT: u16 = 0x0904;
+        /// Spend an IDENTITY press only in the sheet named by its window token.
+        pub const CONSUME_IDENTITY: u16 = 0x0905;
     }
 
     /// What a strip note says; frescod words it.
@@ -2742,11 +2744,13 @@ pub mod activation {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ConsumePrompt {
+    pub struct ConsumeWindow {
         pub press: Token,
         pub presenter_uid: u32,
         pub window: Token,
     }
+
+    pub type ConsumePrompt = ConsumeWindow;
 
     /// Refusal reasons, for the broker's audit log.
     pub mod refusal {

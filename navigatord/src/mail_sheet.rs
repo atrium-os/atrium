@@ -11,7 +11,14 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use limen::sign_in::CredentialMessage;
+use sigillum_webauthn::{DomError, Origin};
+
 struct Sheet {
+    origin: Option<Origin>,
+    credential: Option<crate::credential_get::Pending>,
+    last_request: u32,
+    assertion_issued: bool,
     window: Connection,
     token: [u8; 16],
     page: Option<(Parent, u64)>,
@@ -24,6 +31,7 @@ struct Sheet {
 
 impl Drop for Sheet {
     fn drop(&mut self) {
+        self.credential.take();
         if let Ok(mut broker) = self.cookies.lock() {
             broker.close_mail_sheet(self.view);
         }
@@ -67,7 +75,7 @@ fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
         if let Some(Event::EmbedToken { window_id, token }) = window.wait_event(Some(Duration::from_millis(100))).map_err(|_| ())? {
-            if window_id == id { return Ok(Sheet { window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
+            if window_id == id { return Ok(Sheet { origin: None, credential: None, last_request: 0, assertion_issued: false, window, token, page: None, ticket: None, fixture_requests: None, started, view, cookies }); }
         }
     }
     Err(())
@@ -92,6 +100,7 @@ fn page(sheet: &mut Sheet, view: u64, ticket: [u8; 16], cookies: &Cookies, socke
         && crate::settings::get("NAVIGATORD_MAIL_CONTINUATION_FIXTURE").as_deref() == Some("1") {
         sheet.fixture_requests = Some(0);
     }
+    sheet.origin = url::Url::parse(&result.url).ok().and_then(|url| Origin::parse(&url.origin().ascii_serialization())).filter(|o| o.is_secure());
     parent.send_fd(worker, result.url.into_bytes(), body.as_fd()).map_err(|_| ())?;
     sheet.ticket = Some(ticket);
     sheet.page = Some((parent, worker));
@@ -164,6 +173,39 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
             if let Some((parent, worker)) = &mut sheet.page {
                 match parent.poll(Duration::ZERO) {
                     Ok(Some(ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed })) if embed == *worker => closed.push(id),
+                    Ok(Some(ParentEvent::Message { embed, bytes })) if embed == *worker && limen::sign_in::decode(&bytes).is_some() => {
+                        match limen::sign_in::decode(&bytes) {
+                            Some(CredentialMessage::Get { id: request, options }) if request > sheet.last_request && sheet.credential.is_none() => {
+                                sheet.last_request = request;
+                                sheet.assertion_issued = false;
+                                let pending = sheet.origin.as_ref().ok_or(DomError::Security)
+                                    .and_then(|origin| crate::credential_get::Pending::start(request, origin, options));
+                                match pending {
+                                    Ok(pending) => sheet.credential = Some(pending),
+                                    Err(error) => {
+                                        let reply = CredentialMessage::Error { id: request, name: error.name() };
+                                        if !reply.encode().is_some_and(|wire| parent.send(embed, wire).is_ok()) { closed.push(id); }
+                                    }
+                                }
+                            }
+                            Some(CredentialMessage::Abort { id: request }) if sheet.credential.as_ref().is_some_and(|c| c.id == request) => {
+                                sheet.credential.take();
+                            }
+                            Some(CredentialMessage::Abort { id: request }) if request == sheet.last_request => {
+                                sheet.assertion_issued = false;
+                            }
+                            Some(CredentialMessage::SubmitFixture { body }) if sheet.fixture_requests.is_some() && std::mem::take(&mut sheet.assertion_issued) => {
+                                let redeemed = sheet.ticket.as_ref().is_some_and(|ticket| {
+                                    let Ok(mut broker) = cookies.lock() else { return false };
+                                    let Ok(result) = broker.mail_assertion(sheet.view, body) else { return false };
+                                    let mut locations = result.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("location"));
+                                    result.status == 302 && locations.next().is_some_and(|(_, url)| locations.next().is_none() && broker.couriers.redeem_mail(ticket, url).is_ok())
+                                });
+                                if redeemed { completed.push(id); } else { closed.push(id); }
+                            }
+                            _ => closed.push(id),
+                        }
+                    }
                     Ok(Some(ParentEvent::Message { embed, bytes })) if embed == *worker && bytes != b"frame" => {
                         let sent = sheet.fixture_requests.as_mut().filter(|count| **count < 16)
                             .is_some_and(|count| {
@@ -178,6 +220,18 @@ fn serve(socket: &Path, cookies: &Cookies) -> Result<(), ()> {
                     }
                     Err(_) => closed.push(id),
                     _ => {}
+                }
+            }
+            if let Some((request, result)) = sheet.credential.as_ref().and_then(|c| Some((c.id, c.poll()?))) {
+                sheet.credential.take();
+                if closed.contains(&id) { continue; }
+                if let Some((parent, worker)) = &mut sheet.page {
+                    sheet.assertion_issued = result.is_ok();
+                    let reply = match &result {
+                        Ok(json) => CredentialMessage::Assertion { id: request, json },
+                        Err(error) => CredentialMessage::Error { id: request, name: error.name() },
+                    };
+                    if !reply.encode().is_some_and(|wire| parent.send(*worker, wire).is_ok()) { closed.push(id); }
                 }
             }
         }

@@ -283,7 +283,7 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
 /// open-an-app prompt's publisher and capabilities, §6.4). No network:
 /// pages come through the fetcher jails.
 pub fn apply_navigator_broker(jc: &mut JailConfig, opts: &BuildOpts) {
-    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator", "opifex"] {
+    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "sigillum", "monstrator", "opifex"] {
         apply_socket(s, jc, opts);
     }
 }

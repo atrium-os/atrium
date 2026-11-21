@@ -22,6 +22,10 @@ extern "C" NavigatorScene* navigator_scene_create(bool);
 extern "C" void navigator_scene_destroy(NavigatorScene*);
 extern "C" bool navigator_scene_sample(NavigatorScene*, Web::Layout::RustFFI::DocumentHost*, bool, bool);
 
+#if defined(ATRIUM_MAIL_PAGE) && !defined(ATRIUM_INBOX_PAGE)
+extern "C" void navigator_get_realm(void const*);
+#endif
+
 namespace Navigator {
 
 // The development provider sets this field from an inline script after a
@@ -37,6 +41,9 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     auto& url = *parsed;
     doc->set_url(url);
     doc->set_origin(url.origin());
+#if defined(ATRIUM_MAIL_PAGE) && !defined(ATRIUM_INBOX_PAGE)
+    navigator_get_realm(&Web::HTML::relevant_realm(*doc));
+#endif
     doc->remove_all_children();
     Web::HTML::HTMLParser::create_from_byte_string(*doc, html, Web::HTML::ParserScriptingMode::Normal, "utf-8"sv)->run();
     auto field = doc->get_element_by_id(u"account"sv);

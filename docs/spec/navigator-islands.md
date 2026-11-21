@@ -397,6 +397,54 @@ engine rather than in the document lane:
   allows it. A site whose sign-in needs script opens a sign-in window for it on the
   person's press, rather than turning the persona's whole trail live.
 
+### I3 installed passkey sign-in
+
+On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
+HVF overlay with Tessera at root. The local TLS provider issued a fresh
+challenge to the cookie-bound page. Ladybird's native Rust binding returned
+a `PublicKeyCredential` with an `AuthenticatorAssertionResponse`. The
+fixture checks both prototypes and submits their binary fields. The provider
+checked the enrolled key and user handle, client-data origin, challenge,
+RP hash, user presence and verification flags, counter and P-256 signature.
+Only then did it return the OAuth redirect. The provider recorded
+`assertion-verified` followed by `pkce-redeemed`. Reopening the new Mail
+store found one account with separate nonzero IMAP and SMTP references.
+
+The interpreter-only page ran under Capsicum as UID 50006, with IPv4
+and IPv6 disabled and no Sigillum socket. Its sign-in embed carries a
+bounded get request with a sheet-local ID. Navigatord derives the origin
+from the courier's final document URL, checks the RP ID, and opens the
+Sigillum client socket under its signed app identity. The page can request
+cancellation, and dropping the sheet closes the ceremony connection. In
+this gate the guest ran the real Sigillum daemon, trusted UI and ephemeral
+software-key driver under their dedicated service UIDs. Fresco consumed
+the device-selection press for the sheet's window token after checking
+focus and visibility. Cancelling in a second trusted sheet returned
+`NotAllowedError` to the page and produced no callback or code exchange.
+
+For this build, apply `patches/ladybird/webauthn-get.patch` to the pinned
+Ladybird source before regenerating the IDL bindings. Apply
+`webauthn-submit.patch` after `fixture-fetch.patch`. Link the generated
+public-key and authenticator response interfaces, window exposures and
+intrinsics with the editor painter. The credential bridge is enabled for
+the sign-in document's realm. Only the local sign-in fixture accepts the
+assertion POST to its fixed continuation endpoint.
+
+Cross-build the `navigator-softkey` example from the `sigillum-fido` crate.
+Run the resulting guest binary as the Sigillum device UID.
+Supply its public enrollment line to `courier-test-server` after the
+`webauthn-sign-in` mode argument. Set the signed Navigator publisher for
+both Limen and Sigillum. Point the trusted UI's `FRESCO_ACTIVATION` at the
+running display service. In a headless gate, run the Forum example
+`place_sigillum_fixture` from the directory containing the WM socket to
+place the sheet below the trusted strip before choosing the device.
+
+The gate covers local WebAuthn get with a pre-enrolled key. Registration,
+live Microsoft, page-driven abort and teardown during an active ceremony
+have separate verification requirements. Screenshots, stage markers,
+binary hash, confinement and shutdown logs are in
+`~/atrium-vm/evidence/navigator-i3-webauthn-bridge-20261121/`.
+
 ### I3 installed WebAuthn get probe
 
 On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS
@@ -411,8 +459,8 @@ JIT-off Ladybird binary from the earlier callback gate.
 At the pinned Ladybird revision, `CredentialRequestOptions` lacks a
 `publicKey` member. The Rust implementation of `CredentialsContainer::get`
 ignores the options and rejects the promise. The request stopped there.
-Navigatord's sign-in sheet currently accepts resource requests on its
-page channel. It has no WebAuthn request handler. No trusted Sigillum sheet
+In the diagnostic build, navigatord's sign-in sheet accepted resource
+requests on its page channel and lacked a WebAuthn request handler. No trusted Sigillum sheet
 opened, the provider issued no callback, and Arca redeemed no code.
 
 To reproduce this first hop, use the callback gate's local provider and
@@ -421,7 +469,7 @@ The fixture explicitly refuses the earlier GET-only callback shortcut.
 The separate `sigillum-webauthn --test e2e` suite passed all six tests in
 the same VM, including RP signature verification with the software key,
 an Arca passkey, and cancellation. Those tests use a scripted sheet peer.
-The installed gate still needs a native public-key request and response
+At that point the installed gate still needed a native public-key request and response
 binding, a cancellable request tied to the sheet and its courier-verified
 document origin, and a provider-issued challenge and verified assertion
 before OAuth completion. Screenshots and logs are in

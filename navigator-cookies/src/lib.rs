@@ -369,10 +369,18 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         self.fetch_with_redirects(view, &f, None)
     }
 
+    pub fn mail_assertion(&mut self, view: ViewId, body: &str) -> Result<Fetched, Refused> {
+        if !self.views.get(&view).is_some_and(|v| v.microsoft) { return Err(Refused::NotCookied); }
+        if body.is_empty() || body.len() > 8192 { return Err(Refused::Malformed("invalid assertion length".into())); }
+        let f = Fetch::form("https://login.microsoftonline.com/atrium-fixture/continue", "login.microsoftonline.com", body.as_bytes().to_vec());
+        self.fetch_with_redirects(view, &f, None)
+    }
+
     fn fetch_with_redirects(&mut self, view: ViewId, f: &Fetch, limit: Option<usize>) -> Result<Fetched, Refused> {
         let Some(View { partition, cookied: Some(_), sign_in, microsoft }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
         // A form only from a sign-in window, and only as a form.
-        let form = sign_in.is_some() && f.method == Method::Post && f.reason == Reason::Form;
+        let assertion = microsoft && limit.is_none() && f.secret.is_none() && f.url == "https://login.microsoftonline.com/atrium-fixture/continue";
+        let form = (sign_in.is_some() || assertion) && f.method == Method::Post && f.reason == Reason::Form;
         if !matches!(f.method, Method::Get | Method::Head) && !form { return Err(Refused::Method) }
         if f.reason == Reason::Form && !form { return Err(Refused::Method) }
         if f.body.len() > arca_courier::schema::BODY_MAX { return Err(Refused::Malformed("the form is too big".into())) }

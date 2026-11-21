@@ -47,6 +47,7 @@ fn harden() -> std::io::Result<()> {
 struct Open {
     win: Connection,
     window_id: u32,
+    window_token: Option<[u8; 16]>,
     font: view::Font,
     state: State,
     /// The window's size in points.
@@ -78,7 +79,7 @@ impl Ctx {
                     }
                 }
                 Do::Spend { choice, token } => {
-                    let ok = self.gate.identity(token, self.me, o.window_id);
+                    let ok = o.window_token.is_some_and(|window| self.gate.identity(token, self.me, window));
                     queue.extend(o.state.spent(choice, ok));
                 }
             }
@@ -99,7 +100,7 @@ fn open(fresco: &str, msg: ToUi) -> std::io::Result<Open> {
     win.set_default_window(window_id as u16);
     let font = view::Font::open(&mut win);
     let scale = view::Scale { k: win.window_scale(window_id), text };
-    Ok(Open { win, window_id, font, state, size: (w, h), scale, dirty: true })
+    Ok(Open { win, window_id, window_token: None, font, state, size: (w, h), scale, dirty: true })
 }
 
 fn pt(w: f32, h: f32) -> (u32, u32) {
@@ -203,6 +204,10 @@ fn main() -> ExitCode {
                 }
             };
             let dos = match ev {
+                Event::EmbedToken { window_id, token } if window_id == o.window_id => {
+                    o.window_token = Some(token);
+                    Vec::new()
+                }
                 Event::Resized { width, height, scale, .. } => {
                     o.size = (width, height);
                     if scale > 0.0 {

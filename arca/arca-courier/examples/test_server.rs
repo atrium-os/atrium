@@ -22,6 +22,8 @@ use std::sync::Arc;
 #[derive(Default)]
 struct Provider {
     webauthn_probe: bool,
+    enrollment: Option<Enrollment>,
+    challenges: std::collections::HashMap<String, String>,
     sessions: std::collections::HashMap<String, (String, String)>,
     codes: std::collections::HashMap<String, String>,
 }
@@ -42,6 +44,46 @@ fn field<'a>(form: &'a str, key: &str) -> Option<&'a str> {
 const CLIENT: &str = "11111111-1111-4111-8111-111111111111";
 const REDIRECT: &str = "https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient";
 
+// The software authenticator hands only these public enrollment values to the fixture.
+struct Enrollment { id: Vec<u8>, key: Vec<u8>, counter: u32 }
+
+impl Enrollment {
+    fn read(path: &str) -> Self {
+        let input = std::fs::read_to_string(path).unwrap();
+        let fields: Vec<_> = input.split_whitespace().collect();
+        assert_eq!(fields.len(), 3);
+        fn hex(s: &str) -> Vec<u8> {
+            assert!(s.is_ascii() && s.len() % 2 == 0);
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).unwrap()).collect()
+        }
+        Self { id: hex(fields[0]), key: hex(fields[1]), counter: fields[2].parse().unwrap() }
+    }
+
+    fn verify(&mut self, body: &str, challenge: &str) -> Option<()> {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let mut fields = url::form_urlencoded::parse(body.as_bytes());
+        let (name, data) = fields.next()?;
+        if name != "assertion" || fields.next().is_some() { return None; }
+        let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+        let bytes = |k: &str| URL_SAFE_NO_PAD.decode(v[k].as_str()?).ok();
+        if v["type"] != "public-key" || bytes("rawId")? != self.id || bytes("userHandle")? != b"fixture-user" { return None; }
+        let client = bytes("clientDataJSON")?;
+        let cd: serde_json::Value = serde_json::from_slice(&client).ok()?;
+        if cd["type"] != "webauthn.get" || cd["origin"] != "https://login.microsoftonline.com"
+            || cd["crossOrigin"] != false || cd["challenge"] != challenge { return None; }
+        let mut signed = bytes("authenticatorData")?;
+        let sha = |b| ring::digest::digest(&ring::digest::SHA256, b);
+        if signed.len() != 37 || &signed[..32] != sha(b"login.microsoftonline.com").as_ref() || signed[32] & 5 != 5 { return None; }
+        let counter = u32::from_be_bytes(signed[33..37].try_into().ok()?);
+        if counter <= self.counter { return None; }
+        signed.extend_from_slice(sha(&client).as_ref());
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &self.key)
+            .verify(&signed, &bytes("signature")?).ok()?;
+        self.counter = counter;
+        Some(())
+    }
+}
+
 impl Provider {
     fn callback(&mut self, first: &str, cookie: &str, body: &str) -> (&'static str, String) {
         let mut parts = first.split_whitespace();
@@ -61,6 +103,11 @@ impl Provider {
                 }
             }
             if self.sessions.contains_key(flow) {
+                if self.enrollment.is_some() && path == "/atrium-fixture/account.js" {
+                    let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
+                    let js = include_str!("../../../test-assets/navigator-i3/sign-in.js").replace("__CHALLENGE__", challenge);
+                    return ("challenge-issued", response("200 OK", "Content-Type: text/javascript\r\n", &js));
+                }
                 let resource = match path {
                     "/first" => Some(("first-screen-cookie-ok", "text/html", include_str!("../../../test-assets/navigator-i0/mail/first.html"))),
                     "/atrium-fixture/account.css" => Some(("stylesheet", "text/css", include_str!("../../../test-assets/navigator-i0/mail/account.css"))),
@@ -71,11 +118,20 @@ impl Provider {
                 if let Some((marker, mime, body)) = resource {
                     return (marker, response("200 OK", &format!("Content-Type: {mime}\r\n"), body));
                 }
-                if !self.webauthn_probe && path == "/atrium-fixture/continue" && self.codes.len() < 64 {
+                if !self.webauthn_probe && self.enrollment.is_none() && path == "/atrium-fixture/continue" && self.codes.len() < 64 {
                     let (state, challenge) = self.sessions.remove(flow).unwrap();
                     let code = nonce();
                     self.codes.insert(code.clone(), challenge);
                     return ("callback-issued", response("302 Found", &format!("Location: {}?code={code}&state={state}\r\n", arcad::oauth::MICROSOFT.redirect), ""));
+                }
+            }
+        } else if method == "POST" && path == "/atrium-fixture/continue" {
+            if let (Some(enrollment), Some(challenge)) = (self.enrollment.as_mut(), self.challenges.remove(flow)) {
+                if self.codes.len() < 64 && enrollment.verify(body, &challenge).is_some() {
+                    let (state, verifier_hash) = self.sessions.remove(flow).unwrap();
+                    let code = nonce();
+                    self.codes.insert(code.clone(), verifier_hash);
+                    return ("assertion-verified", response("302 Found", &format!("Location: {}?code={code}&state={state}\r\n", arcad::oauth::MICROSOFT.redirect), ""));
                 }
             }
         } else if method == "POST" && path == arcad::oauth::MICROSOFT.token_path {
@@ -122,8 +178,9 @@ fn main() {
     let mail_address = a.get(5);
     let mail = mail_address.is_some();
     let webauthn_probe = a.get(6).is_some_and(|mode| mode == "webauthn-probe");
-    let callback = webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
-    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, ..Provider::default() }));
+    let enrollment = a.get(6).filter(|mode| *mode == "webauthn-sign-in").map(|_| Enrollment::read(&a[7]));
+    let callback = enrollment.is_some() || webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
+    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, enrollment, ..Provider::default() }));
     let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
@@ -239,6 +296,21 @@ mod tests {
         assert_eq!(provider.callback(js, "", "").0, "refused");
         assert_eq!(provider.callback(js, "flow=fixture", "").0, "webauthn-script");
         assert_eq!(provider.callback("GET /atrium-fixture/continue HTTP/1.1", "flow=fixture", "").0, "refused");
+        assert!(provider.codes.is_empty());
+    }
+
+    #[test]
+    fn passkey_continuation_requires_the_flow_and_a_verified_assertion() {
+        let mut provider = Provider { enrollment: Some(Enrollment { id: vec![1], key: vec![2], counter: 0 }), ..Provider::default() };
+        provider.sessions.insert("fixture".into(), ("state".into(), "pkce".into()));
+        let cookie = "flow=fixture";
+        assert_eq!(provider.callback("GET /atrium-fixture/account.js HTTP/1.1", cookie, "").0, "challenge-issued");
+        let post = "POST /atrium-fixture/continue HTTP/1.1";
+        assert_eq!(provider.callback(post, "flow=other", "assertion=bad").0, "refused");
+        assert!(provider.challenges.contains_key("fixture"));
+        assert_eq!(provider.callback("GET /atrium-fixture/continue HTTP/1.1", cookie, "").0, "refused");
+        assert_eq!(provider.callback(post, cookie, "assertion=bad").0, "refused");
+        assert!(!provider.challenges.contains_key("fixture"));
         assert!(provider.codes.is_empty());
     }
 

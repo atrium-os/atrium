@@ -1,0 +1,25 @@
+--- a/Libraries/LibWeb/Loader/ResourceLoader.cpp
++++ b/Libraries/LibWeb/Loader/ResourceLoader.cpp
+@@ -32,6 +32,7 @@
+ #include <LibWebCommon/Loader/UserAgent.h>
+
+ #ifdef ATRIUM_I0_EDITOR
++extern "C" bool navigator_page_assertion_post(u8 const*, size_t);
+ extern "C" size_t navigator_page_get(u8 const*, size_t, u8*, size_t);
+ extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
+ #endif
+@@ -513,6 +514,14 @@
+     }
+
+ #ifdef ATRIUM_I0_EDITOR
++    if (url.serialize() == "https://login.microsoftonline.com/atrium-fixture/continue"sv
++        && request.method() == "POST"sv && request.include_credentials() == HTTP::Cookie::IncludeCredentials::Yes
++        && navigator_page_assertion_post(request.body().data(), request.body().size())) {
++        auto headers = HTTP::HeaderList::create();
++        on_headers_received->function()(nullptr, *headers, 202, {}, Requests::CacheState::NotCached);
++        on_complete->function()(true, {}, {}, {});
++        return nullptr;
++    }
+     // The broker supplies only the resources granted to this fixture.
+     // All other schemes, request methods, and resources fail closed.
+     if (url.scheme() == "https"sv && request.method() == "GET"sv && request.body().is_empty()) {

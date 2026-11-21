@@ -52,6 +52,7 @@ mod files;
 mod portal;
 mod vpn;
 mod mail_sheet;
+mod credential_get;
 mod inbox_fixture;
 mod press;
 mod settings;

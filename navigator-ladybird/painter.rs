@@ -943,6 +943,93 @@ pub mod host {
     type ResourceChannel = (std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64);
     thread_local! { static RESOURCE_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
 
+    use limen::sign_in::CredentialMessage;
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static SIGN_IN_REALM: Cell<*const std::ffi::c_void> = const { Cell::new(std::ptr::null()) };
+        static LAST_GET: Cell<u32> = const { Cell::new(0) };
+        static ACTIVE_GET: Cell<Option<(u32,std::time::Instant)>> = const { Cell::new(None) };
+        static GET_REPLY: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_get_realm(realm: *const std::ffi::c_void) { SIGN_IN_REALM.set(realm); }
+
+    fn emit_credential(message: CredentialMessage<'_>) -> Option<()> {
+        let wire = message.encode()?;
+        RESOURCE_CHANNEL.with_borrow(|channel| {
+            let (child, embed) = channel.as_ref()?;
+            child.borrow_mut().emit(*embed, wire).ok()
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_page_assertion_post(bytes: *const u8, len: usize) -> bool {
+        if SIGN_IN_REALM.get().is_null() || bytes.is_null() || !(1..=8192).contains(&len) { return false; }
+        let Ok(body) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes, len) }) else { return false };
+        emit_credential(CredentialMessage::SubmitFixture { body }).is_some()
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_get_begin(realm: *const std::ffi::c_void, bytes: *const u8, len: usize) -> u32 {
+        if realm.is_null() || realm != SIGN_IN_REALM.get() || ACTIVE_GET.get().is_some() || len > 32 * 1024 { return 0; }
+        let Ok(options) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes, len) }) else { return 0 };
+        let Some(id) = LAST_GET.get().checked_add(1) else { return 0 };
+        if emit_credential(CredentialMessage::Get { id, options }).is_none() { return 0; }
+        LAST_GET.set(id);
+        ACTIVE_GET.set(Some((id, std::time::Instant::now())));
+        id
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_get_abort(id: u32) {
+        if ACTIVE_GET.get().is_some_and(|(active, _)| active == id) {
+            let _ = emit_credential(CredentialMessage::Abort { id });
+            ACTIVE_GET.set(None);
+            GET_REPLY.take();
+        }
+    }
+
+    fn take_credential_reply(bytes: &[u8]) -> bool {
+        match limen::sign_in::decode(bytes) {
+            Some(CredentialMessage::Assertion { id, .. } | CredentialMessage::Error { id, .. }) => {
+                if ACTIVE_GET.get().is_some_and(|(active, _)| active == id) { GET_REPLY.replace(Some(bytes.to_vec())); }
+                true
+            }
+            _ => false
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_get_poll(id: u32, out: *mut u8, cap: usize) -> i32 {
+        let Some((active, start)) = ACTIVE_GET.get() else { return -1 };
+        if active != id { return -1; }
+        if start.elapsed() > std::time::Duration::from_secs(130) { navigator_get_abort(id); return -1; }
+        let waiting = GET_REPLY.with_borrow(|reply| reply.is_none());
+        if waiting {
+            let valid = RESOURCE_CHANNEL.with_borrow(|channel| {
+                let (child, embed) = channel.as_ref()?;
+                match child.borrow_mut().poll(std::time::Duration::from_millis(16)).ok()? {
+                    Some(limen::proto::ChildEvent::Message { embed: from, bytes }) if from == *embed => take_credential_reply(&bytes).then_some(()),
+                    Some(limen::proto::ChildEvent::Resumed { .. } | limen::proto::ChildEvent::Suspended { .. }) | None => Some(()),
+                    _ => None,
+                }
+            });
+            if valid.is_none() { navigator_get_abort(id); return -1; }
+        }
+        let Some(bytes) = GET_REPLY.take() else { return 0 };
+        ACTIVE_GET.set(None);
+        match limen::sign_in::decode(&bytes) {
+            Some(CredentialMessage::Assertion { json, .. }) if json.len() <= cap => {
+                unsafe { std::ptr::copy_nonoverlapping(json.as_ptr(), out, json.len()); }
+                json.len() as i32
+            }
+            Some(CredentialMessage::Error { name: "SecurityError", .. }) => -2,
+            Some(CredentialMessage::Error { name: "TypeError", .. }) => -3,
+            _ => -1
+        }
+    }
+
     /// Returns the body length only after receiving the reply for this exact URL.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn navigator_page_get(url: *const u8, len: usize, out: *mut u8, cap: usize) -> usize {
@@ -959,6 +1046,7 @@ pub mod host {
                 let wait = until.saturating_duration_since(std::time::Instant::now());
                 if wait.is_zero() { return None; }
                 match channel.poll(wait).ok()?? {
+                    limen::proto::ChildEvent::Message {embed, bytes: reply} if embed == *id && take_credential_reply(&reply) => continue,
                     limen::proto::ChildEvent::MessageFd {embed, bytes: reply} if embed == *id && reply == bytes => break,
                     limen::proto::ChildEvent::Resumed {..} => continue,
                     _ => return None,

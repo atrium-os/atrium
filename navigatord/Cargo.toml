@@ -11,6 +11,8 @@ name = "navigatord"
 path = "src/main.rs"
 
 [dependencies]
+sigillum-webauthn = { path = "../sigillum/sigillum-webauthn" }
+sigillum-proto = { path = "../sigillum/sigillum-proto" }
 limen = { path = "../limen" }
 fresco-client = { path = "../fresco-client" }
 navigator-control = { path = "../navigator-control" }
