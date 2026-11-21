@@ -979,35 +979,46 @@ SH
         for slot in 0 1; do
             pending_identity "$slot" > "$results/before-cancel-$slot.pending"
         done
+        recovery_unchanged() {
+            for slot in 0 1; do
+                pending_identity "$slot" > "$results/$1-$slot.pending"
+                cmp "$results/before-cancel-$slot.pending" "$results/$1-$slot.pending" || return 1
+            done
+        }
+        journal_unchanged() {
+            test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
+        }
+        wrong_recovery_password() {
+            type_keys 0x05 0x04 0x07 0x28 # bad
+            # The workbook stays locked and the full name and retry guidance are visible.
+            wait_for frame_is 300f65803a34296db04f3f55300f244489aa4479d1f8360314dc9cc94f949143
+            test "$(docs)" = "$reopened"
+            pending 2
+            journal_unchanged
+        }
         open_protected_recovery
         test "$reopened" != "$protected_jail"
-        canceled_jail=$reopened
-        cp selectscreen.png "$results/before-cancel.png"
-        click 1058 94
-        wait_for count 0; wait_for detached; wait_for pending 2
-        for slot in 0 1; do
-            pending_identity "$slot" > "$results/after-cancel-$slot.pending"
-            cmp "$results/before-cancel-$slot.pending" "$results/after-cancel-$slot.pending"
-        done
-        cmp "$books/Untitled.osheet" "$books/$long_name"
-        files_intact
+        for prompt in initial wrong-password; do
+            if test "$prompt" = wrong-password; then wrong_recovery_password; fi
+            canceled_jail=$reopened
+            cp selectscreen.png "$results/before-cancel-$prompt.png"
+            click 1058 94
+            wait_for count 0; wait_for detached; wait_for pending 2
+            recovery_unchanged "after-cancel-$prompt"
+            cmp "$books/Untitled.osheet" "$books/$long_name"
+            files_intact
 
-        /tmp/tile-recovery-windows --clear-focus
-        click 213 24; input 'MOVE 8 240'
-        wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
-        cp selectscreen.png "$results/retry-chooser.png"
-        open_protected_recovery
-        test "$reopened" != "$canceled_jail"
-        test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
-        type_keys 0x05 0x04 0x07 0x28 # bad
-        # The protected workbook stays locked and the full name and retry guidance are visible.
-        wait_for frame_is 300f65803a34296db04f3f55300f244489aa4479d1f8360314dc9cc94f949143
+            /tmp/tile-recovery-windows --clear-focus
+            click 213 24; input 'MOVE 8 240'
+            wait_for frame_is fcc1c405c3f135937337aa6950a42493c2f0d63151419391e50ff9d4337b37e7
+            cp selectscreen.png "$results/retry-chooser-$prompt.png"
+            open_protected_recovery
+            test "$reopened" != "$canceled_jail"
+            recovery_unchanged "after-reopen-$prompt"
+            journal_unchanged
+        done
+        wrong_recovery_password
         cp selectscreen.png "$results/protected-recovery-retry.png"
-        test "$(docs)" = "$reopened"
-        pending 2
-        test "$(sha256 -q "$(root "$reopened")/atrium/recovery/$journal_rel")" = "$journal_hash"
-        cmp "$books/Untitled.osheet" "$books/$long_name"
-        files_intact
         type_keys 0x17 0x08 0x16 0x17 0x28
         sleep .6
         restored="${long_name%.osheet} (2).osheet"
