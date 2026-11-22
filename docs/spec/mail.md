@@ -506,13 +506,18 @@ as **making the account usable first, then filling in what's worth having, polit
   readback, it keeps the original location alias. A missing APPENDUID keeps the
   Message-ID fallback. One stable object per sync is checked with `UID SEARCH`
   across the account's listed selectable mailboxes, including labels skipped by
-  the ordinary Gmail sync. The probe allows at most 16 selectable mailboxes and
-  requires an explicit empty result from each. Read-only mailbox checks before
-  and after each sweep compare UIDVALIDITY, UIDNEXT and EXISTS, and a second
-  LIST must agree with the first. A positive result, changed mailbox, incomplete
-  search, or exceeded budget retains the alias. Confirmed absence from that
-  verified mailbox set releases just that object's aliases. The cursor persists
-  per account. A mailbox hidden by the server is outside this check.
+  the ordinary Gmail sync. The fallback searches at most 16 selectable mailboxes
+  and brackets each sweep with read-only UIDVALIDITY, UIDNEXT and EXISTS checks.
+  With LIST-STATUS, the limit is 32 selectable mailboxes. Matching inventories
+  with complete UIDVALIDITY, UIDNEXT and MESSAGES counters bracket the sweep.
+  Empty mailboxes need only those counters. Each nonempty mailbox requires an
+  exact search and a matching read-only checkpoint. An unreadable listed mailbox
+  or a missing previously known mailbox prevents release. An explicit
+  `NonExistent` hierarchy name can be included without searching it. A positive
+  result, changed counter, incomplete response or exceeded budget retains the
+  alias. Only verified absence in the visible scope releases the object's
+  aliases. The cursor persists per account. Mail cannot discover a mailbox the
+  server has never exposed to that account.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

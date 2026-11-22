@@ -486,11 +486,16 @@ impl Parser<'_> {
                 name: name(&vals[2]),
             },
             "STATUS" if vals.len() >= 2 => {
-                let l = vals[1].as_list();
-                let items = l
-                    .chunks(2)
-                    .filter_map(|c| Some((c.first()?.as_str()?.to_ascii_uppercase(), c.get(1)?.as_num()?)))
-                    .collect();
+                let Value::List(l) = &vals[1] else { return Err(Error::Syntax("STATUS data")) };
+                let mut pairs = l.chunks_exact(2);
+                let items = pairs.by_ref().map(|pair| {
+                    let key = pair[0].as_str().ok_or(Error::Syntax("STATUS key"))?.to_ascii_uppercase();
+                    let value = pair[1].as_num().ok_or(Error::Syntax("STATUS counter"))?;
+                    Ok((key, value))
+                }).collect::<Result<Vec<_>, Error>>()?;
+                if !pairs.remainder().is_empty() {
+                    return Err(Error::Syntax("STATUS pair"));
+                }
                 Response::Status { mailbox: name(&vals[0]), items }
             }
             "SEARCH" => {
@@ -801,6 +806,11 @@ impl Encoder {
         } else {
             self.simple("LIST \"\" \"*\"")
         }
+    }
+
+    /// Unrestricted mailbox inventory with the counters used for import probes.
+    pub fn list_import_status(&mut self) -> Cmd {
+        self.simple("LIST \"\" \"*\" RETURN (STATUS (UIDVALIDITY UIDNEXT MESSAGES))")
     }
 
     pub fn status(&mut self, mailbox: &str, items: &str) -> Cmd {

@@ -199,6 +199,10 @@ pub trait Sink {
     fn imap_import_probe(&mut self) -> std::result::Result<Option<String>, String> {
         Ok(None)
     }
+    /// Whether the server inventory covers mailboxes previously known to the account.
+    fn imap_import_scope_complete(&mut self, _mailboxes: &[String]) -> std::result::Result<bool, String> {
+        Ok(false)
+    }
     /// Save the probe position, releasing aliases only for confirmed absence.
     fn imap_import_probed(&mut self, _object: &str, _absent: bool) -> std::result::Result<(), String> {
         Ok(())
@@ -366,6 +370,17 @@ pub struct Report {
     pub texts: usize,
     pub flag_changes: usize,
     pub vanished: usize,
+}
+
+type ImapCheckpoint = (u32, u32, u32);
+const IMPORT_MAILBOX_LIMIT: usize = 16;
+const IMPORT_LIST_STATUS_LIMIT: usize = 32;
+
+#[derive(PartialEq, Eq)]
+struct ImportMailbox {
+    name: String,
+    selectable: bool,
+    checkpoint: Option<ImapCheckpoint>,
 }
 
 /// The IMAP session over the courier's socket.
@@ -621,17 +636,22 @@ impl<S: Read + Write> Session<S> {
             self.texts(&f.name, sink, &mut report)?;
         }
         if has(&self.caps, "OBJECTID") || has(&self.caps, "X-GM-EXT-1") {
-            self.reconcile_imap_import(sink)?;
+            self.reconcile_imap_import(sink, &all)?;
         }
         Ok(report)
     }
 
-    fn reconcile_imap_import(&mut self, sink: &mut dyn Sink) -> Result<()> {
+    fn reconcile_imap_import(&mut self, sink: &mut dyn Sink, listed: &[RemoteFolder]) -> Result<()> {
         let Some(id) = sink.imap_import_probe().map_err(Error::Sink)? else { return Ok(()) };
         let supported = (id.starts_with("emailid:") && has(&self.caps, "OBJECTID"))
             || (id.starts_with("gm:") && has(&self.caps, "X-GM-EXT-1"));
-        let absent = if supported && is_imap_object_id(&id) {
-            match self.imap_object_absent(&id) {
+        let batched = has(&self.caps, "LIST-STATUS");
+        let limit = if batched { IMPORT_LIST_STATUS_LIMIT } else { IMPORT_MAILBOX_LIMIT };
+        // The ordinary LIST already tells us when a proof would exceed the
+        // budget. Avoid a second, potentially oversized response in that case.
+        let within_budget = listed.iter().filter(|folder| folder.selectable).take(limit + 1).count() <= limit;
+        let absent = if supported && within_budget && is_imap_object_id(&id) {
+            match self.imap_object_absent(&id, sink, batched, limit) {
                 Ok(absent) => absent,
                 Err(err @ (Error::No(_) | Error::Throttled)) => {
                     eprintln!("mail-sync: IMAP import presence check refused: {err}");
@@ -647,11 +667,21 @@ impl<S: Read + Write> Session<S> {
         sink.imap_import_probed(&id, absent).map_err(Error::Sink)
     }
 
-    fn imap_object_absent(&mut self, id: &str) -> Result<bool> {
-        let Some(inventory) = self.import_inventory()? else { return Ok(false) };
+    fn imap_object_absent(&mut self, id: &str, sink: &mut dyn Sink, batched: bool, limit: usize) -> Result<bool> {
+        let Some(inventory) = self.import_inventory(batched, limit)? else { return Ok(false) };
+        let names: Vec<_> = inventory.iter().map(|mailbox| mailbox.name.clone()).collect();
+        if !sink.imap_import_scope_complete(&names).map_err(Error::Sink)? {
+            return Ok(false);
+        }
         let mut checkpoints = Vec::new();
-        for (name, _) in inventory.iter().filter(|(_, selectable)| *selectable) {
-            let Some(before) = self.import_checkpoint(name)? else { return Ok(false) };
+        for mailbox in inventory.iter().filter(|mailbox| mailbox.selectable) {
+            if mailbox.checkpoint.is_some_and(|(_, _, exists)| exists == 0) {
+                continue;
+            }
+            let Some(before) = self.import_checkpoint(&mailbox.name)? else { return Ok(false) };
+            if mailbox.checkpoint.is_some_and(|expected| expected != before) {
+                return Ok(false);
+            }
             let search = self.enc.uid_search_object(id).ok_or_else(|| Error::Protocol("bad IMAP object ID".into()))?;
             let (replies, _) = self.run_bounded(search, 64)?;
             let mut results = replies.iter().filter_map(|reply| match reply {
@@ -661,7 +691,9 @@ impl<S: Read + Write> Session<S> {
             if !matches!((results.next(), results.next()), (Some(ids), None) if ids.is_empty()) {
                 return Ok(false);
             }
-            checkpoints.push((name, before));
+            if !batched {
+                checkpoints.push((&mailbox.name, before));
+            }
         }
         // Bracket the searches. An append or move into a scanned mailbox
         // advances UIDNEXT even if the new UID is already gone on recheck.
@@ -670,36 +702,70 @@ impl<S: Read + Write> Session<S> {
                 return Ok(false);
             }
         }
-        Ok(self.import_inventory()?.as_ref() == Some(&inventory))
+        Ok(self.import_inventory(batched, limit)?.as_ref() == Some(&inventory))
     }
 
-    fn import_inventory(&mut self) -> Result<Option<Vec<(String, bool)>>> {
-        const MAILBOX_LIMIT: usize = 16;
-        let cmd = self.enc.list(false);
-        let (replies, _) = self.run_bounded(cmd, 64)?;
+    fn import_inventory(&mut self, batched: bool, limit: usize) -> Result<Option<Vec<ImportMailbox>>> {
+        let cmd = if batched { self.enc.list_import_status() } else { self.enc.list(false) };
+        let (replies, _) = self.run_bounded(cmd, if batched { 128 } else { 64 })?;
         let mut inventory = Vec::new();
+        let mut statuses = std::collections::BTreeMap::new();
+        let canonical = |name: String| if name.eq_ignore_ascii_case("INBOX") { "INBOX".into() } else { name };
         for reply in replies {
             match reply {
                 Response::List { name, flags, .. } if !name.is_empty() && name.len() <= 1024 => {
-                    let name = if name.eq_ignore_ascii_case("INBOX") { "INBOX".into() } else { name };
-                    let selectable = !(has(&flags, "\\Noselect") || has(&flags, "\\NonExistent"));
-                    inventory.push((name, selectable));
+                    let selectable = !has(&flags, "\\NonExistent");
+                    if selectable && has(&flags, "\\Noselect") {
+                        return Ok(None);
+                    }
+                    inventory.push(ImportMailbox { name: canonical(name), selectable, checkpoint: None });
+                }
+                Response::Status { mailbox, items } if batched => {
+                    let Some(checkpoint) = Self::import_status_checkpoint(&items) else { return Ok(None) };
+                    if statuses.insert(canonical(mailbox), checkpoint).is_some() {
+                        return Ok(None);
+                    }
                 }
                 Response::List { .. } => return Ok(None),
-                Response::Other(tag, _) if tag == "LIST" => return Ok(None),
+                Response::Other(tag, _) if tag == "LIST" || tag == "STATUS" => return Ok(None),
                 _ => {}
             }
         }
-        inventory.sort_unstable();
-        let selectable = inventory.iter().filter(|(_, selectable)| *selectable).count();
-        let complete = selectable <= MAILBOX_LIMIT
-            && inventory.binary_search(&("INBOX".into(), true)).is_ok()
-            && inventory.windows(2).all(|pair| pair[0].0 != pair[1].0);
-        Ok(complete.then_some(inventory))
+        inventory.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let selectable = inventory.iter().filter(|mailbox| mailbox.selectable).count();
+        if selectable > limit || !inventory.iter().any(|mailbox| mailbox.name == "INBOX" && mailbox.selectable)
+            || !inventory.windows(2).all(|pair| pair[0].name != pair[1].name)
+        {
+            return Ok(None);
+        }
+        if batched {
+            for mailbox in inventory.iter_mut().filter(|mailbox| mailbox.selectable) {
+                let Some(checkpoint) = statuses.remove(&mailbox.name) else { return Ok(None) };
+                mailbox.checkpoint = Some(checkpoint);
+            }
+            if !statuses.is_empty() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(inventory))
+    }
+
+    fn import_status_checkpoint(items: &[(String, u64)]) -> Option<ImapCheckpoint> {
+        let (mut validity, mut next, mut exists) = (None, None, None);
+        for (key, number) in items {
+            let value = u32::try_from(*number).ok()?;
+            match key.as_str() {
+                "UIDVALIDITY" if value != 0 && validity.is_none() => validity = Some(value),
+                "UIDNEXT" if value != 0 && next.is_none() => next = Some(value),
+                "MESSAGES" if exists.is_none() => exists = Some(value),
+                _ => return None,
+            }
+        }
+        Some((validity?, next?, exists?))
     }
 
     /// UID generation, next UID and EXISTS from one read-only selection.
-    fn import_checkpoint(&mut self, mailbox: &str) -> Result<Option<(u32, u32, u32)>> {
+    fn import_checkpoint(&mut self, mailbox: &str) -> Result<Option<ImapCheckpoint>> {
         let cmd = self.enc.select(mailbox, true, None, false);
         let (replies, _) = self.run_bounded(cmd, 64)?;
         let (mut validity, mut next, mut exists) = (None, None, None);

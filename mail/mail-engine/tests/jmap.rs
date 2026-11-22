@@ -1151,6 +1151,11 @@ enum ImapPresence {
     Changed,
     InventoryChanged,
     OverBudget,
+    LargeStable,
+    LargeChangedEmpty,
+    LargeMissingStatus,
+    LargeUnreadable,
+    LargeOverBudget,
 }
 
 // The regular sync sees empty folders. Exact object probes can see a
@@ -1164,9 +1169,11 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
     peer.set_read_timeout(timeout).unwrap();
     client.set_read_timeout(timeout).unwrap();
     let gmail = mode == ImapPresence::PresentInTrash;
+    let batched = matches!(mode, ImapPresence::LargeStable | ImapPresence::LargeChangedEmpty
+        | ImapPresence::LargeMissingStatus | ImapPresence::LargeUnreadable | ImapPresence::LargeOverBudget);
     let thread = std::thread::spawn(move || {
         let mut peer = BufReader::new(peer);
-        let capability = if gmail { "X-GM-EXT-1" } else { "OBJECTID" };
+        let capability = if batched { "OBJECTID LIST-STATUS" } else if gmail { "X-GM-EXT-1" } else { "OBJECTID" };
         write!(peer.get_mut(), "* PREAUTH [CAPABILITY IMAP4rev1 {capability}] ready\r\n").unwrap();
         let mut commands = Vec::new();
         let mut lists = 0;
@@ -1185,7 +1192,27 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
                 peer.get_mut().write_all(
                     b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\All) \"/\" AllMail\r\n* LIST (\\Trash) \"/\" Trash\r\n"
                 ).unwrap();
-                if mode == ImapPresence::OverBudget {
+                if batched {
+                    let extra = if mode == ImapPresence::LargeOverBudget { 30 } else { 18 };
+                    for n in 0..extra {
+                        let flags = if mode == ImapPresence::LargeUnreadable && n == 17 { "\\Noselect" } else { "" };
+                        write!(peer.get_mut(), "* LIST ({flags}) \"/\" Box{n}\r\n").unwrap();
+                    }
+                    if command.contains("RETURN (STATUS") {
+                        let mailboxes = ["INBOX".to_string(), "AllMail".into(), "Trash".into()]
+                            .into_iter().chain((0..extra).map(|n| format!("Box{n}")));
+                        for name in mailboxes {
+                            if matches!(mode, ImapPresence::LargeMissingStatus | ImapPresence::LargeUnreadable)
+                                && name == "Box17"
+                            {
+                                continue;
+                            }
+                            let count = u8::from(matches!(name.as_str(), "INBOX" | "Trash"));
+                            let next = 1 + u8::from(mode == ImapPresence::LargeChangedEmpty && lists == 3 && name == "Box17");
+                            write!(peer.get_mut(), "* STATUS {name} (UIDVALIDITY 7 UIDNEXT {next} MESSAGES {count})\r\n").unwrap();
+                        }
+                    }
+                } else if mode == ImapPresence::OverBudget {
                     for n in 0..14 {
                         write!(peer.get_mut(), "* LIST () \"/\" Box{n}\r\n").unwrap();
                     }
@@ -1195,7 +1222,8 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
             } else if command.starts_with("SELECT ") || command.starts_with("EXAMINE ") {
                 trash = command.contains("Trash");
                 let next = 1 + u32::from(mode == ImapPresence::Changed && probes >= 3);
-                write!(peer.get_mut(), "* 0 EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n* OK [UIDNEXT {next}] current\r\n").unwrap();
+                let exists = u8::from(batched && lists >= 2 && (trash || command.contains("INBOX")));
+                write!(peer.get_mut(), "* {exists} EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n* OK [UIDNEXT {next}] current\r\n").unwrap();
             } else if command.starts_with("UID SEARCH EMAILID ") || command.starts_with("UID SEARCH X-GM-MSGID ") {
                 probes += 1;
                 assert_eq!(command.contains("X-GM-MSGID"), gmail);
@@ -1262,11 +1290,8 @@ fn imap_import_probe_only_releases_confirmed_account_wide_absence() {
     assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH EMAILID B").count(), 3);
     assert_eq!(engine.import_mbox(inbox, &second[..]).unwrap().queued, 1);
     assert_eq!(engine.import_mbox(other_inbox, &parallel[..]).unwrap().already, 1);
-    for mode in [ImapPresence::Unreported, ImapPresence::Refused, ImapPresence::InventoryChanged, ImapPresence::OverBudget] {
-        let commands = sync_imap_presence(&engine, account, mode);
-        if mode == ImapPresence::OverBudget {
-            assert!(!commands.iter().any(|cmd| cmd.starts_with("UID SEARCH EMAILID ")));
-        }
+    for mode in [ImapPresence::Unreported, ImapPresence::Refused, ImapPresence::InventoryChanged] {
+        sync_imap_presence(&engine, account, mode);
         assert_eq!(engine.import_mbox(inbox, &first[..]).unwrap().already, 1);
     }
     sync_imap_presence(&engine, account, ImapPresence::Missing);
@@ -1278,6 +1303,54 @@ fn imap_import_probe_only_releases_confirmed_account_wide_absence() {
     let commands = sync_imap_presence(&engine, other, ImapPresence::PresentInTrash);
     assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH X-GM-MSGID 812").count(), 3);
     assert_eq!(engine.import_mbox(other_inbox, &gmail[..]).unwrap().already, 1);
+
+    let commands = sync_imap_presence(&engine, other, ImapPresence::OverBudget);
+    assert!(!commands.iter().any(|cmd| cmd.starts_with("UID SEARCH EMAILID ")));
+    assert_eq!(engine.import_mbox(other_inbox, &parallel[..]).unwrap().already, 1);
+}
+
+#[test]
+fn imap_list_status_checks_large_accounts_and_preserves_partial_scope() {
+    let parser = jail();
+    for (mode, hidden, expected_searches, released) in [
+        (ImapPresence::LargeStable, false, 2, true),
+        (ImapPresence::LargeChangedEmpty, false, 2, false),
+        (ImapPresence::LargeMissingStatus, false, 0, false),
+        (ImapPresence::LargeUnreadable, false, 0, false),
+        (ImapPresence::LargeStable, true, 0, false),
+        (ImapPresence::LargeOverBudget, false, 0, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+        let account = engine.store.add_account("ada@example.org").unwrap();
+        let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+        if hidden {
+            engine.store.folder_id(account, "PreviouslyVisible", Role::Other).unwrap();
+        }
+        let raw = message(10, "Imported", "body");
+        let blob = engine.store.put_blob(&raw).unwrap();
+        engine.store.write(|w| {
+            let id = w.queue_import(inbox, blob)?;
+            w.index_import(id, Some("m10@example.net"))?;
+            w.import_accepted(id, Some(mail_store::imports::ImportIdentity::Imap { validity: 7, uid: 1 }))?;
+            w.confirm_imap_import(account, (inbox, 7, 1), Some("rewritten@example.net"), Some("emailid:A"))
+        }).unwrap();
+        let commands = sync_imap_presence(&engine, account, mode);
+        let start = commands.iter().position(|cmd| cmd.contains("RETURN (STATUS"));
+        let probe = if mode == ImapPresence::LargeOverBudget {
+            assert!(start.is_none());
+            &commands[commands.len()..]
+        } else {
+            &commands[start.unwrap()..]
+        };
+        assert_eq!(probe.iter().filter(|cmd| cmd.starts_with("UID SEARCH EMAILID ")).count(), expected_searches);
+        assert_eq!(probe.iter().filter(|cmd| cmd.starts_with("EXAMINE ")).count(), expected_searches);
+        assert_eq!(probe.iter().filter(|cmd| cmd.contains("RETURN (STATUS")).count(), if mode == ImapPresence::LargeOverBudget { 0 } else if expected_searches == 0 { 1 } else { 2 });
+        let mut mbox = Vec::new();
+        mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+        let result = engine.import_mbox(inbox, &mbox[..]).unwrap();
+        assert_eq!((result.queued, result.already), if released { (1, 0) } else { (0, 1) });
+    }
 }
 
 #[test]

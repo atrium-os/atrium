@@ -738,6 +738,13 @@ impl Sink for AccountSink<'_> {
         self.e.store.imap_import_probe(self.account).map_err(|err| err.to_string())
     }
 
+    fn imap_import_scope_complete(&mut self, mailboxes: &[String]) -> Result<bool, String> {
+        let names: std::collections::BTreeSet<&str> = mailboxes.iter().map(String::as_str).collect();
+        let known = self.e.store.folders(self.account).map_err(|err| err.to_string())?;
+        Ok(known.iter().all(|(_, folder)| names.contains(folder.name.as_str())
+            || (folder.name.eq_ignore_ascii_case("INBOX") && names.contains("INBOX"))))
+    }
+
     fn imap_import_probed(&mut self, object: &str, absent: bool) -> Result<(), String> {
         if !mail_sync::is_imap_object_id(object) {
             return Err("invalid IMAP import object".into());

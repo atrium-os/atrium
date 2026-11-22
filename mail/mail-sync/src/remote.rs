@@ -148,6 +148,7 @@ pub enum SinkCall {
     ImapMessages(String, u32, Vec<Fetched>),
     ImapImportProbe,
     ImapImportProbed(String, bool),
+    ImapImportScope(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +167,7 @@ pub enum SinkAnswer {
     WantsSnoozed(std::result::Result<bool, String>),
     SnoozeMoves(std::result::Result<Vec<crate::SnoozeMove>, String>),
     JmapImportIds(std::result::Result<Vec<String>, String>),
+    ImapImportScope(std::result::Result<bool, String>),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -414,6 +416,12 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
             SinkAnswer::Text(id) => Ok(id),
             SinkAnswer::Done(Err(err)) => Err(err),
             _ => Err("bad IMAP import probe reply".into()),
+        }
+    }
+    fn imap_import_scope_complete(&mut self, mailboxes: &[String]) -> std::result::Result<bool, String> {
+        match self.ask(SinkCall::ImapImportScope(mailboxes.to_vec())).map_err(|err| err.to_string())? {
+            SinkAnswer::ImapImportScope(coverage) => coverage,
+            _ => Err("bad IMAP import scope reply".into()),
         }
     }
     fn imap_import_probed(&mut self, id: &str, absent: bool) -> std::result::Result<(), String> {
@@ -883,6 +891,7 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
             Ok(id) => SinkAnswer::Text(id),
             Err(err) => SinkAnswer::Done(Err(err)),
         },
+        SinkCall::ImapImportScope(mailboxes) => SinkAnswer::ImapImportScope(s.imap_import_scope_complete(&mailboxes)),
         SinkCall::ImapImportProbed(id, absent) => SinkAnswer::Done(s.imap_import_probed(&id, absent)),
         SinkCall::JmapImportIds(after, limit) => SinkAnswer::JmapImportIds(s.jmap_import_ids(&after, (limit as usize).min(32))),
         SinkCall::JmapDestroyed(ids) => SinkAnswer::Done(s.jmap_destroyed(&ids)),
