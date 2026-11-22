@@ -111,13 +111,46 @@ fn saved_status(d: &Doc, format: Format) -> String {
         (Some(officina_grid::macros::MacroFamily::Ooxml), Format::Xlsm) | (Some(officina_grid::macros::MacroFamily::Odf), Format::Ods) | (Some(_), Format::Native) => false,
         _ => true,
     };
-    if lost {
+    let mut status = if lost {
         format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name)
     } else if macros_lost {
         format!("Saved “{}”. Its macros aren't in this file: this format can't hold them.", d.name)
     } else {
         format!("Saved “{}”.", d.name)
+    };
+    if format == Format::Ods {
+        let mut changes = Vec::new();
+        let tables = d.wb.tables();
+        if !tables.is_empty() && d.wb.groups().any(|(_, group)| {
+            use officina_grid::formula::ast::Expr;
+            let mut referenced = false;
+            group.expr.walk(&mut |expr| {
+                referenced |= match expr {
+                    Expr::Table(_) => true,
+                    Expr::Name(name) => d.wb.names().get(group.sheet, name).is_none() && d.wb.table(name).is_some(),
+                    _ => false,
+                };
+            });
+            referenced
+        }) {
+            changes.push("converted table references to cell ranges");
+        }
+        if tables.iter().any(|table| table.style.is_some() || table.stripes) {
+            changes.push("omitted table styles");
+        }
+        if tables.iter().any(|table| table.totals) {
+            changes.push("kept table totals in plain cells");
+        }
+        if d.wb.charts().iter().flat_map(|chart| &chart.series).any(|series| {
+            matches!(&series.name, Some(officina_grid::charts::ChartText::Lit(name)) if !name.is_empty())
+        }) {
+            changes.push("omitted typed chart series names");
+        }
+        if !changes.is_empty() {
+            status.push_str(&format!(" ODS {}.", changes.join(", ")));
+        }
     }
+    status
 }
 
 /// Where Save writes a document opened from `target`: nowhere for an `.xls`,
@@ -1193,6 +1226,39 @@ mod document_tests {
     use super::*;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn ods_save_reports_table_and_chart_downgrades() {
+        use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Series};
+        use officina_grid::tables::Table;
+        use officina_grid::{CellAddr, Rect};
+
+        let mut doc = Doc::new("Sales.ods");
+        let rect = Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 0 };
+        doc.wb.set_input(CellAddr::new(0, 0, 0), "Units").unwrap();
+        doc.wb.add_table(Table {
+            name: "Sales".into(), rect, header: true, totals: true,
+            columns: vec!["Units".into()], style: Some("TableStyleMedium2".into()), stripes: true,
+        }).unwrap();
+        doc.wb.define_name("Rate", None, "=3").unwrap();
+        doc.wb.set_input(CellAddr::new(0, 0, 1), "=Rate").unwrap();
+        doc.wb.add_chart(Chart {
+            kind: ChartKind::Column, grouping: Grouping::Standard, title: None,
+            series: vec![Series {
+                name: Some(ChartText::Lit("Units shipped".into())), cats: None, vals: rect, kind: None,
+            }],
+            legend: None, x_title: None, y_title: None,
+            anchor: Anchor { sheet: 0, from: (4, 2, 0.0, 0.0), to: (12, 8, 0.0, 0.0) },
+        }).unwrap();
+
+        assert!(!saved_status(&doc, Format::Ods).contains("converted table references"));
+        doc.wb.set_input(CellAddr::new(0, 0, 1), "=SUM(Sales[Units])").unwrap();
+        assert_eq!(
+            saved_status(&doc, Format::Ods),
+            "Saved “Sales.ods”. ODS converted table references to cell ranges, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
+        );
+        assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Sales.ods”.");
+    }
 
     // Run under jail(8) with a workbook descriptor queued on stdin.
     #[test]

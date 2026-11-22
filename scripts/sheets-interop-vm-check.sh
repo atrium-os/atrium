@@ -2,9 +2,13 @@
 # Run in the private 1280x720 Sheets desktop fixture. Stage the two books
 # from the sheets_interop_fixture example in the only Scrinium place, and
 # stage the arm64 FreeBSD build of that example at /tmp/sheets-interop-fixture.
+# Set SHEETS_INTEROP_CASE=tables for the sheets_table_chart_fixture inputs
+# and stage its binary at /tmp/sheets-table-chart-fixture instead.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
+profile=${SHEETS_INTEROP_CASE:-pivots}
+case "$profile" in pivots|tables) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
@@ -25,12 +29,18 @@ other_window() { window=$(win_at "$1" "$2"); test "$window" -gt 0 && test "$wind
 same_window() { test "$(win_at "$1" "$2")" = "$3"; }
 docs() { jls -n jid name | awk '/org_atrium_sheets__document_/ {sub(/^jid=/,"",$1);print $1}'; }
 closed() { test -z "$(docs)"; }
-checkpoint() { /tmp/sheets-interop-fixture check "$1" "$2" 2>"$results/checkpoint.log"; }
+checkpoint() {
+    if test "$profile" = tables; then
+        /tmp/sheets-table-chart-fixture check "$1" "$2" "$format"
+    else
+        /tmp/sheets-interop-fixture check "$1" "$2"
+    fi
+} 2>"$results/checkpoint.log"
 loaded() {
     jail=$(docs)
     test -n "$jail" || return 1
     root=$(jls -j "$jail" path)/atrium/recovery
-    directory=$(dirname "$(find "$root" -name name -exec grep -lx "$1" {} +)")
+    directory=$(dirname "$(find "$root" -name name -type f -exec grep -slx "$1" {} +)")
     test "$directory" != . && test -s "$directory/current" || return 1
     checkpoint "$directory/base.$(cat "$directory/current").osheet" "$2"
 }
@@ -72,15 +82,7 @@ refresh_all() {
     wait_for same_window 645 18 "$document"
 }
 
-launcher=$(win_at 48 24)
-test "$launcher" -gt 0
-for format in ods xlsx; do
-    case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac
-    book=sales.$format
-    /tmp/sheets-interop-fixture check "$books/$book" initial
-    open_book "$row" "$book" initial
-    cp selectscreen.png "$results/$format-initial.png"
-
+pivots() {
     click 126 133 # B2 feeds the spill, LET, LAMBDA, and the pivot.
     key 0x25 # 8
     key 0x28 # Enter
@@ -95,10 +97,47 @@ for format in ods xlsx; do
     save "$book" edited
     click 445 24 # Redo it.
     save "$book" refreshed
+    final=refreshed
+}
+
+tables() {
+    click 383 133 # F2 feeds both named formulas, the table sum, and the chart.
+    key 0x25 # 8
+    key 0x28
+    save "$book" edited
+    cp selectscreen.png "$results/$format-edited.png"
+
+    click 83 112 # Open the Region filter and add South to the included values.
+    sleep .45
+    click 820 240
+    sleep .2
+    click 1054 663
+    save "$book" filtered
+    cp selectscreen.png "$results/$format-filtered.png"
+
+    click 370 24
+    save "$book" restored
+    click 445 24
+    save "$book" filtered
+    final=filtered
+}
+
+launcher=$(win_at 48 24)
+test "$launcher" -gt 0
+for format in ods xlsx; do
+    case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac
+    book=sales.$format
+    checkpoint "$books/$book" initial
+    open_book "$row" "$book" initial
+    sleep .4
+    cp selectscreen.png "$results/$format-initial.png"
+
+    "$profile"
     close_book
 
-    open_book "$row" "$book" refreshed
+    open_book "$row" "$book" "$final"
+    sleep .4
     cp selectscreen.png "$results/$format-reopened.png"
     close_book
-    echo "PASS $format spill, LET, LAMBDA, conditional formatting, pivot refresh, undo, redo, and converter reopen"
+    echo "PASS $format $profile edit, undo, redo, and converter reopen"
 done

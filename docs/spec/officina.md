@@ -1140,6 +1140,15 @@ Gates, on the 4-core cloud machine:
 | live | Sheets on the cloud VM shows a combo, a pie and an area chart over the grid (screenshot checked) |
 | hostile input | the `.xlsx` and package fuzzers now run on a book with a table, a filter and charts; clean |
 
+The `tables` profile of `scripts/sheets-interop-vm-check.sh` runs O4d
+and O4e together in the installed desktop. An edit to the chart source
+updates the workbook and sheet-scoped formulas, table total, and chart.
+Changing the filter updates the chart’s visible categories. The test saves
+each state, including undo and redo, and reopens both XLSX and ODS through
+the converter. Sheets reports ODS save approximations for structured cell
+references, table styles and totals, and typed chart series names when
+those features are present.
+
 ### 16.8 O4f as built (2026-11-14): macros kept inert
 
 - **Model** (`officina-grid::macros`): a workbook may carry one set of macro parts, each
