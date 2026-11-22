@@ -5,8 +5,8 @@
 //! like any other mail, so the server and every other client have them.
 //!
 //! Reads the file as it goes (an mbox can be gigabytes), checking a bounded
-//! batch of headers at a time. Messages the account already has (by Message-ID) are skipped,
-//! so importing the same file twice adds nothing.
+//! batch of headers at a time. Mail skips a Message-ID already indexed or
+//! queued for this account.
 
 use std::collections::HashSet;
 use std::io::{BufRead, Read};
@@ -143,10 +143,10 @@ pub const PROGRESS_EVERY: usize = 500;
 /// [`import`], calling `progress` with the counts so far after every
 /// [`PROGRESS_EVERY`] messages read (a big file takes minutes).
 pub fn import_with(store: &Store, parser: &Parser, account: AccountId, folder: FolderId, r: impl BufRead, progress: &mut dyn FnMut(&Imported)) -> Result<Imported, Error> {
+    index_legacy_imports(store, parser, account)?;
     let mut batch = ImportBatch {
         store,
         parser,
-        account,
         folder,
         progress,
         out: Imported::default(),
@@ -161,10 +161,47 @@ pub fn import_with(store: &Store, parser: &Parser, account: AccountId, folder: F
     Ok(batch.out)
 }
 
+fn headers(raw: &[u8]) -> &[u8] {
+    let len = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(raw.len(), |p| p + 4);
+    &raw[..len]
+}
+
+// Read and validate old blobs one at a time, retaining only bounded header batches.
+fn index_legacy_imports(store: &Store, parser: &Parser, account: AccountId) -> Result<(), Error> {
+    let mut pending = Vec::new();
+    let mut bytes = 0;
+    for (id, blob) in store.unindexed_imports(account)? {
+        let raw = store.blob(&blob)?;
+        let header = headers(&raw);
+        if pending.len() == MAX_BATCH || bytes + header.len() > MAX_BATCH_BYTES {
+            index_legacy_headers(store, parser, &pending)?;
+            pending.clear();
+            bytes = 0;
+        }
+        pending.push((id, header.to_vec()));
+        bytes += header.len();
+    }
+    index_legacy_headers(store, parser, &pending)
+}
+
+fn index_legacy_headers(store: &Store, parser: &Parser, pending: &[(u64, Vec<u8>)]) -> Result<(), Error> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let batch: Vec<_> = pending.iter().map(|(id, header)| (*id, header.as_slice())).collect();
+    let summaries = parser.summarize(&batch, true, &[])?;
+    store.write(|w| {
+        for ((id, _), summary) in pending.iter().zip(summaries) {
+            w.index_import(*id, summary.as_ref().and_then(|summary| summary.message_id.as_deref()))?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 struct ImportBatch<'a> {
     store: &'a Store,
     parser: &'a Parser,
-    account: AccountId,
     folder: FolderId,
     progress: &'a mut dyn FnMut(&Imported),
     out: Imported,
@@ -197,25 +234,22 @@ impl ImportBatch<'_> {
         }
         let pending = std::mem::take(&mut self.pending);
         self.bytes = 0;
-        let headers: Vec<_> = pending.iter().enumerate().map(|(i, raw)| {
-            let len = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(raw.len(), |p| p + 4);
-            (i as u64, &raw[..len])
-        }).collect();
+        let headers: Vec<_> = pending.iter().enumerate().map(|(i, raw)| (i as u64, headers(raw))).collect();
         // If one header is larger than the worker's wire limit, keep the
         // existing single-message handling rather than dropping its neighbors.
         let summaries = self.parser.summarize(&headers, true, &[])?;
         for (raw, summary) in pending.into_iter().zip(summaries) {
             if let Some(summary) = summary {
-                let duplicate = match summary.message_id {
-                    Some(mid) => !self.seen.insert(mid.clone()) || self.store.has_message_id(self.account, &mid)?,
-                    None => false,
-                };
-                if duplicate {
-                    self.out.already += 1;
-                } else {
-                    let blob = self.store.put_blob(&raw)?;
-                    self.store.write(|w| w.queue_import(self.folder, blob))?;
+                // Sync can drain the queue while the file is still being read.
+                let mid = summary.message_id.as_deref();
+                let seen = mid.is_some_and(|mid| !self.seen.insert(mid.to_owned()));
+                let queued = !seen && self.store.write(|w| {
+                    w.queue_import_if_new(self.folder, mid, || self.store.put_blob(&raw))
+                })?;
+                if queued {
                     self.out.queued += 1;
+                } else {
+                    self.out.already += 1;
                 }
             } else {
                 self.out.refused += 1;

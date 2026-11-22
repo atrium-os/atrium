@@ -481,7 +481,11 @@ as **making the account usable first, then filling in what's worth having, polit
   It drains oversized lines through their newline, counts the oversized message
   once, and resumes at the next envelope separator. It queues in file order, reports
   progress every 500 processed messages including refusals, and preserves complete
-  messages read before an I/O error.
+  messages read before an I/O error. For an account, each new queue entry is checked
+  against both synced mail and queued imports by Message-ID. Mail persists queued
+  Message-IDs across restarts, including for imports waiting for a retry. On the
+  next import, the parse jail supplies Message-IDs for any older queue entries.
+  Cancelling or discarding a queue entry releases its Message-ID from the queue.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 
@@ -2129,9 +2133,9 @@ Stalwart in the cloud VM, and later a real account):
    Mail streams it on a background thread with the line and batch bounds in §6.5.
    It accepts mboxrd or mboxo with CRLF or LF, skips text before the first `From ` line,
    and unquotes `>From `. The parse jail checks each message’s headers (refused
-   ones, and any over 64 MiB, are counted as "weren't mail"), and one the account already
-   has by Message-ID, or that came earlier in the file, is skipped, so importing the same
-   file twice adds nothing. The rest are kept as blobs in a new `imports` table and go up
+   ones, and any over 64 MiB, are counted as "weren't mail"). Messages with a Message-ID
+   already in the account or its upload queue are skipped. The rest are kept as blobs
+   with queue records in the `imports` table and go up
    to that folder on the server in the next sync pass, seen (IMAP `APPEND`; JMAP upload +
    `Email/import`, new `Jmap::import` and worker call `JmapImport`), at most 200 a pass;
    a pass that uploaded any syncs again so they list at once. A failed upload is kept

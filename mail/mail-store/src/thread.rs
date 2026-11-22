@@ -293,24 +293,50 @@ impl Writer<'_> {
     }
 }
 
-impl Store {
-    /// Whether `account` has a message with Message-ID `mid` (an import
-    /// skips mail that is already there, §6.5).
-    pub fn has_message_id(&self, account: AccountId, mid: &str) -> Result<bool> {
-        let tx = self.db.begin_read()?;
-        let Some(t) = tx.open_table(MSGID_THREADS)?.get((account, mid))?.map(|v| v.value()) else { return Ok(false) };
-        let Some(th) = tx.open_table(THREADS)?.get(t)? else { return Ok(false) };
-        let th: Thread = dec(th.value())?;
-        let msgs = tx.open_table(MESSAGES)?;
-        for id in th.msgs {
-            if let Some(v) = msgs.get(id)? {
-                let m: Message = dec(v.value())?;
-                if m.summary.message_id.as_deref() == Some(mid) {
-                    return Ok(true);
-                }
+fn contains_message_id(
+    ids: &impl ReadableTable<(AccountId, &'static str), u64>,
+    threads: &impl ReadableTable<u64, &'static [u8]>,
+    messages: &impl ReadableTable<u64, &'static [u8]>,
+    account: AccountId,
+    mid: &str,
+) -> Result<bool> {
+    let Some(t) = ids.get((account, mid))?.map(|v| v.value()) else { return Ok(false) };
+    let Some(th) = threads.get(t)? else { return Ok(false) };
+    let th: Thread = dec(th.value())?;
+    for id in th.msgs {
+        if let Some(v) = messages.get(id)? {
+            let m: Message = dec(v.value())?;
+            if m.summary.message_id.as_deref() == Some(mid) {
+                return Ok(true);
             }
         }
-        Ok(false)
+    }
+    Ok(false)
+}
+
+impl Writer<'_> {
+    pub(crate) fn has_message_id(&self, account: AccountId, mid: &str) -> Result<bool> {
+        contains_message_id(
+            &self.tx.open_table(MSGID_THREADS)?,
+            &self.tx.open_table(THREADS)?,
+            &self.tx.open_table(MESSAGES)?,
+            account,
+            mid,
+        )
+    }
+}
+
+impl Store {
+    /// Whether `account` has a message with Message-ID `mid`.
+    pub fn has_message_id(&self, account: AccountId, mid: &str) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        contains_message_id(
+            &tx.open_table(MSGID_THREADS)?,
+            &tx.open_table(THREADS)?,
+            &tx.open_table(MESSAGES)?,
+            account,
+            mid,
+        )
     }
 
     /// Rows `offset..offset+limit` of a folder's conversation list, by

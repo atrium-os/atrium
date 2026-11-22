@@ -303,7 +303,7 @@ impl Store {
             tx.open_table(later::PARKED)?;
             tx.open_table(people::PEOPLE)?;
             tx.open_table(people::PEOPLE_COUNTED)?;
-            tx.open_table(imports::IMPORTS)?;
+            imports::open(&tx)?;
             tx.open_table(away::AWAY)?;
             tx.open_table(sieve::SIEVE)?;
             let mut meta = tx.open_table(META)?;

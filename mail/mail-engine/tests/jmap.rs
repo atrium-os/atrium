@@ -676,6 +676,90 @@ fn mbox_import_keeps_complete_messages_before_a_read_error() {
 }
 
 #[test]
+fn mbox_repeat_import_skips_queued_messages_after_reopen() {
+    use mail_engine::import::Imported;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let folder = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let other_folder = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let other_account = engine.store.add_account("bea@example.org").unwrap();
+    let other_archive = engine.store.folder_id(other_account, "Archive", Role::Archive).unwrap();
+
+    let mut original = Vec::new();
+    mail_engine::export::write_one(&mut original, &message(77, "First copy", "original"), 0).unwrap();
+    let mut alternate = Vec::new();
+    mail_engine::export::write_one(&mut alternate, &message(77, "Same ID", "different bytes"), 0).unwrap();
+    let queued = Imported { queued: 1, already: 0, refused: 0 };
+    let skipped = Imported { queued: 0, already: 1, refused: 0 };
+    assert_eq!(engine.import_mbox(folder, &original[..]).unwrap(), queued);
+    assert_eq!(engine.import_mbox(folder, &original[..]).unwrap(), skipped);
+    assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.import_mbox(folder, &alternate[..]).unwrap(), skipped);
+    assert_eq!(engine.import_mbox(other_archive, &alternate[..]).unwrap(), queued);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 1);
+    assert_eq!(engine.imports_waiting(other_account).unwrap(), 1);
+
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server)), SESSION).unwrap();
+    let uploaded = engine.upload_imports(account, &mut |folder, bytes| {
+        client.import(folder, bytes).map(|_| ()).map_err(|e| e.0)
+    }).unwrap();
+    assert_eq!(uploaded, 1);
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
+    let rows = engine.store.list(folder, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    let stored = engine.store.message(rows[0].msg).unwrap().full.unwrap();
+    assert_eq!(engine.store.blob(&stored).unwrap(), message(77, "First copy", "original"));
+}
+
+#[test]
+fn mbox_legacy_queue_keeps_message_id_through_retry_and_releases_it_on_cancel() {
+    use mail_engine::import::Imported;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let account = store.add_account("ada@example.org").unwrap();
+    let archive = store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let inbox = store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let raw = message(89, "Waiting", "old queue");
+    let blob = store.put_blob(&raw).unwrap();
+    // Old builds could queue this Message-ID in more than one folder.
+    let (first, second) = store.write(|w| {
+        let first = w.queue_import(archive, blob)?;
+        let second = w.queue_import(inbox, blob)?;
+        for _ in 0..mail_store::imports::TRIES_MAX {
+            w.import_failed(second, "test temporary failure")?;
+        }
+        Ok((first, second))
+    }).unwrap();
+    drop(store);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let before = engine.store.imports().unwrap();
+    assert_eq!(before.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [first, second]);
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+    let skipped = Imported { queued: 0, already: 1, refused: 0 };
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+    assert_eq!(engine.store.imports().unwrap(), before);
+    assert!(engine.store.unindexed_imports(account).unwrap().is_empty());
+
+    assert_eq!(engine.store.write(|w| w.cancel_imports(archive)).unwrap(), 1);
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+    assert_eq!(engine.retry_imports(account).unwrap(), 1);
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+    assert_eq!(engine.store.write(|w| w.cancel_imports(inbox)).unwrap(), 1);
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), Imported { queued: 1, already: 0, refused: 0 });
+}
+
+#[test]
 fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     use mail_engine::import::{import_with, UPLOADS_PER_PASS};
 
