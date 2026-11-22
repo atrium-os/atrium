@@ -491,6 +491,16 @@ signed assertion. Crypta redeemed one token and fetched `crypta-ac-ok`
 over `tun0` on the same engine start. The focused FreeBSD unit test also
 passed. Both dedicated guests shut down cleanly.
 
+A second gate pressed Ctrl-R twice in the same sign-in window, each time
+with a new script-generated proposal pending. Each reload removed the
+proposal and fetched a fresh script. The gateway received zero POSTs for
+either discarded proposal, and the guest had no handshake or sentinel
+response during either reload. The third proposal stayed unsent until
+trusted confirmation. The gateway then recorded exactly one script POST,
+one accepted SAML assertion, and one token redemption. Crypta fetched
+`crypta-ac-ok` through `tun0` without another engine start. This run reused
+the verified binaries from the shared-cache build.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
