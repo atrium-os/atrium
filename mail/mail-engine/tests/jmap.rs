@@ -67,6 +67,8 @@ struct Server {
     wrong_presence_account: bool,
     repeat_presence_reply: bool,
     reply_override: Option<(&'static str, &'static str, Value)>,
+    override_mailbox: Option<&'static str>,
+    missing_from_query_get: Option<&'static str>,
 }
 
 impl Server {
@@ -107,7 +109,10 @@ impl Server {
 
     fn api(&mut self, req: &Value) -> Value {
         let mut out: Vec<Value> = Vec::new();
-        for call in req["methodCalls"].as_array().unwrap() {
+        let calls = req["methodCalls"].as_array().unwrap();
+        let query_mailbox = calls.iter().find(|call| call[0] == "Email/query")
+            .and_then(|call| call[1]["filter"]["inMailbox"].as_str());
+        for call in calls {
             let (name, args, cid) = (call[0].as_str().unwrap(), &call[1], call[2].as_str().unwrap());
             let mut args = args.clone();
             if let Some(r) = args.get("#ids").cloned() {
@@ -126,7 +131,7 @@ impl Server {
                     if let Some(name) = &self.snoozed {
                         list.push(mb("snooze", name, Value::Null, Value::Null));
                     }
-                    json!({ "state": "m1", "list": list, "notFound": [] })
+                    json!({ "accountId": ACCOUNT, "state": "m1", "list": list, "notFound": [] })
                 }
                 "Mailbox/set" => {
                     assert!(self.snoozed.is_none());
@@ -148,7 +153,7 @@ impl Server {
                     ids.sort_by(|a, b| b.cmp(a));
                     let (pos, limit) = (args["position"].as_u64().unwrap() as usize, args["limit"].as_u64().unwrap() as usize);
                     let page: Vec<&String> = ids.iter().skip(pos).take(limit).map(|(_, id)| *id).collect();
-                    json!({ "ids": page, "total": ids.len(), "position": pos, "queryState": "q" })
+                    json!({ "accountId": ACCOUNT, "ids": page, "total": ids.len(), "position": pos, "queryState": "q" })
                 }
                 "Email/get" => {
                     let ids: Vec<String> = args["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
@@ -158,9 +163,14 @@ impl Server {
                         self.presence_queries.push(ids.clone());
                     }
                     let account = if presence && self.wrong_presence_account { "wrong" } else { ACCOUNT };
-                    let list: Vec<Value> = ids.iter().filter(|id| self.mails.contains_key(*id))
+                    let exists = |id: &str| {
+                        self.mails.contains_key(id)
+                            && !(cid == "g" && query_mailbox.is_some()
+                                && self.missing_from_query_get == Some(id))
+                    };
+                    let list: Vec<Value> = ids.iter().filter(|id| exists(id))
                         .map(|id| if presence { json!({ "id": id }) } else { self.email(id) }).collect();
-                    let missing: Vec<_> = ids.iter().filter(|id| !self.mails.contains_key(*id)).collect();
+                    let missing: Vec<_> = ids.iter().filter(|id| !exists(id)).collect();
                     json!({ "accountId": account, "state": self.state.to_string(), "list": list, "notFound": missing })
                 }
                 "Email/changes" => {
@@ -274,7 +284,7 @@ impl Server {
                 other => panic!("unexpected {other}"),
             };
             if let Some((tag, key, value)) = &self.reply_override {
-                if *tag == cid {
+                if *tag == cid && self.override_mailbox.is_none_or(|name| query_mailbox == Some(name)) {
                     answer[*key] = value.clone();
                 }
             }
@@ -916,6 +926,89 @@ fn jmap_rewritten_import_id_survives_restart_and_move_until_object_destruction()
     }).unwrap(), 1);
     client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+}
+
+#[test]
+fn jmap_first_sync_validates_accounts_and_the_entire_query_page() {
+    let server = Rc::new(RefCell::new(Server { presence_limit: Some(1), ..Default::default() }));
+    {
+        let mut s = server.borrow_mut();
+        s.add(message(26, "Older retained result", "body"), &["in"], &[], 1_795_000_000);
+        s.add(message(27, "Newer disappeared result", "body"), &["in"], &[], 1_795_000_001);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+
+    for (tag, field, value, expected) in [
+        ("m", "accountId", json!("other"), "wrong account"),
+        ("s", "accountId", json!("other"), "wrong account"),
+        ("s", "notFound", json!(["M1"]), "unexpected"),
+        ("q", "accountId", json!("other"), "wrong account"),
+        ("q", "position", json!(7), "wrong position"),
+        ("q", "ids", json!(["M1", "M1"]), "repeated ID"),
+        ("q", "ids", json!([]), "inconsistent Email/query page size"),
+        ("g", "accountId", json!("other"), "wrong account"),
+        ("g", "list", json!([]), "incomplete Email/get"),
+        ("g", "notFound", json!(["foreign"]), "unexpected"),
+    ] {
+        server.borrow_mut().reply_override = Some((tag, field, value));
+        let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+        assert!(error.contains(expected), "{tag}.{field}: {error}");
+        assert!(engine.store.sync_state(account, "jmap:email").unwrap().is_none());
+        for id in ["M1", "M2"] {
+            assert!(engine.store.by_server_id(account, id).unwrap().is_none());
+        }
+    }
+
+    server.borrow_mut().reply_override = None;
+    // The first queried ID vanished before Email/get, but still occupies the
+    // first query slot. The next request must retrieve the older message.
+    server.borrow_mut().missing_from_query_get = Some("M2");
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert!(engine.store.by_server_id(account, "M2").unwrap().is_none());
+    assert!(engine.store.by_server_id(account, "M1").unwrap().is_some());
+    assert_eq!(engine.store.sync_state(account, "jmap:email").unwrap().as_deref(), Some("2"));
+}
+
+#[test]
+fn jmap_failed_refresh_keeps_previous_state_and_mailbox_locations() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    server.borrow_mut().add(message(28, "Moved while offline", "body"), &["arch"], &[], 1_795_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let old = engine.store.by_server_id(account, "M1").unwrap().unwrap();
+    let prior = engine.store.sync_state(account, "jmap:email").unwrap();
+    assert_eq!(engine.store.count(archive).unwrap(), 1);
+    {
+        let mut s = server.borrow_mut();
+        s.mails.get_mut("M1").unwrap().boxes = ["in".into()].into();
+        s.touch("M1", false);
+        s.oldest = s.state;
+        // The valid Inbox page comes first and sees the move. Archive fails
+        // later, so the previous Archive location and cursor must survive.
+        s.override_mailbox = Some("arch");
+        s.reply_override = Some(("g", "accountId", json!("other")));
+    }
+    let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+    assert!(error.contains("wrong account"), "{error}");
+    assert_eq!(engine.store.sync_state(account, "jmap:email").unwrap(), prior);
+    assert_eq!(engine.store.count(archive).unwrap(), 1);
+    assert_eq!(engine.store.list(inbox, 0, 1).unwrap()[0].msg, old);
+    assert_eq!(engine.store.list(archive, 0, 1).unwrap()[0].msg, old);
+
+    server.borrow_mut().reply_override = None;
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.count(archive).unwrap(), 0);
+    assert_eq!(engine.store.count(inbox).unwrap(), 1);
+    assert_eq!(engine.store.list(inbox, 0, 1).unwrap()[0].msg, old);
+    assert_eq!(engine.store.sync_state(account, "jmap:email").unwrap().as_deref(), Some("2"));
 }
 
 #[test]

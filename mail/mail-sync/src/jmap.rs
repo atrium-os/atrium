@@ -8,6 +8,8 @@
 //! each mailbox it is in, allocated from the folder's `uidnext`; the JMAP
 //! email id is its server id, which the sink uses to find it again.
 
+use std::collections::BTreeMap;
+
 use mail_proto::jmap::{self, Answers, Email, Mailbox, Update};
 
 use crate::{Change, FolderState, Report, Role, RemoteFolder, Sink, What};
@@ -168,6 +170,8 @@ pub const MESSAGE_MAX: usize = 64 << 20;
 const EMAIL_STATE: &str = "jmap:email";
 const CHANGE_PAGES_PER_SYNC: usize = 64;
 
+type RefreshRemovals = BTreeMap<String, Vec<(String, u32)>>;
+
 pub struct Client<H: Http> {
     h: H,
     pub session: jmap::Session,
@@ -279,7 +283,7 @@ impl<H: Http> Client<H> {
     /// The folders, refreshed.
     pub fn folders(&mut self, sink: &mut dyn Sink) -> Result<Vec<RemoteFolder>> {
         let a = self.call(jmap::get_mailboxes(&self.session.account))?;
-        let (list, _) = jmap::mailboxes(&a)?;
+        let (list, _) = jmap::mailboxes(&a, &self.session.account)?;
         self.mailboxes = list;
         let folders: Vec<RemoteFolder> = self.mailboxes.iter().filter_map(|m| Some(RemoteFolder { name: self.path(&m.id)?, role: role(m.role.as_deref()), selectable: true })).collect();
         sink.folders(&folders).map_err(Error)?;
@@ -327,7 +331,7 @@ impl<H: Http> Client<H> {
                         return Err(Error("JMAP Email/changes repeated a state".into()));
                     }
                     for e in &c.changed {
-                        self.place(sink, e, true, &mut report)?;
+                        self.place(sink, e, true, None, &mut report)?;
                     }
                     Self::remove_destroyed(sink, &c.destroyed, &mut report)?;
                     state = c.new_state;
@@ -391,12 +395,12 @@ impl<H: Http> Client<H> {
             self.folders(sink)?;
         }
         let a = self.call(jmap::query(&self.session.account, query.jmap(), limit as u64))?;
-        let (emails, _, _) = jmap::mailbox_page(&a)?;
+        let page = jmap::mailbox_page(&a, &self.session.account, 0, limit as u64)?;
         let mut report = Report::default();
-        for e in emails.iter().take(limit) {
+        for e in &page.emails {
             let listed = sink.listed(&e.id);
             if listed.is_empty() {
-                self.place(sink, e, true, &mut report)?;
+                self.place(sink, e, true, None, &mut report)?;
                 continue;
             }
             let lacking: Vec<(String, u32)> = listed.into_iter().filter(|(f, u)| !sink.has_text(f, *u)).collect();
@@ -409,7 +413,7 @@ impl<H: Http> Client<H> {
                 sink.messages(&folder, vec![crate::Fetched { uid, flags: flags(&e.keywords), size: e.size.max(bytes.len() as u64), internal_date: e.received, server_id: Some(e.id.clone()), bytes: bytes.clone(), full: true }]).map_err(Error)?;
             }
         }
-        Ok(emails.len().min(limit))
+        Ok(page.emails.len())
     }
 
     /// Stage 3 (§6.4): whole messages for the text window, newest first,
@@ -444,22 +448,33 @@ impl<H: Http> Client<H> {
     /// The first sync: the state now, then each mailbox's newest messages.
     fn first(&mut self, sink: &mut dyn Sink, report: &mut Report) -> Result<()> {
         let a = self.call(jmap::email_state(&self.session.account))?;
-        let state = jmap::current_state(&a)?;
+        let state = jmap::current_state(&a, &self.session.account)?;
         let boxes: Vec<String> = self.mailboxes.iter().map(|m| m.id.clone()).collect();
+        let page_max = self.session.max_objects_in_get.unwrap_or(PAGE).clamp(1, PAGE);
+        let mut removals = RefreshRemovals::new();
         for mb in boxes {
             let mut position = 0;
             while position < FIRST_SYNC_MAX {
-                let a = self.call(jmap::query_mailbox(&self.session.account, &mb, position, PAGE))?;
-                let (emails, total, _) = jmap::mailbox_page(&a)?;
-                if emails.is_empty() {
+                let limit = page_max.min(FIRST_SYNC_MAX - position);
+                let a = self.call(jmap::query_mailbox(&self.session.account, &mb, position, limit))?;
+                let page = jmap::mailbox_page(&a, &self.session.account, position, limit)?;
+                for e in &page.emails {
+                    self.place(sink, e, false, Some(&mut removals), report)?;
+                }
+                position = page.next_position;
+                if position >= page.total {
                     break;
                 }
-                position += emails.len() as u64;
-                for e in &emails {
-                    self.place(sink, e, false, report)?;
-                }
-                if position >= total {
-                    break;
+            }
+        }
+        // A refresh can add verified headers incrementally. Wait for every
+        // page to succeed before removing any previously known locations.
+        for (id, places) in removals {
+            let current = sink.listed(&id);
+            for (folder, uid) in places {
+                if current.iter().any(|(name, at)| name == &folder && *at == uid) {
+                    sink.vanished(&folder, &[uid]).map_err(Error)?;
+                    report.vanished += 1;
                 }
             }
         }
@@ -470,11 +485,29 @@ impl<H: Http> Client<H> {
     /// where it stayed, listed in folders it is new to. `whole`: download
     /// it whole (new mail) when it is small enough; else its header block
     /// lists it, and the text comes with [`Client::texts`] or on opening.
-    fn place(&mut self, sink: &mut dyn Sink, e: &Email, whole: bool, report: &mut Report) -> Result<()> {
+    fn place(
+        &mut self,
+        sink: &mut dyn Sink,
+        e: &Email,
+        whole: bool,
+        refresh: Option<&mut RefreshRemovals>,
+        report: &mut Report,
+    ) -> Result<()> {
         let now: Vec<String> = e.mailboxes.iter().filter_map(|m| self.path(m)).collect();
         let was = sink.listed(&e.id);
-        for (folder, uid) in &was {
-            if !now.contains(folder) {
+        let leaving = was.iter().filter(|(folder, _)| !now.contains(folder));
+        if let Some(removals) = refresh {
+            if now.len() != e.mailboxes.len() {
+                return Err(Error("JMAP refresh Email refers to an unlisted mailbox".into()));
+            }
+            let places: Vec<_> = leaving.cloned().collect();
+            if places.is_empty() {
+                removals.remove(&e.id);
+            } else {
+                removals.insert(e.id.clone(), places);
+            }
+        } else {
+            for (folder, uid) in leaving {
                 sink.vanished(folder, &[*uid]).map_err(Error)?;
                 report.vanished += 1;
             }
@@ -542,7 +575,7 @@ impl<H: Http> Client<H> {
             if !ids.is_empty() {
                 let a = self.call(jmap::get_emails(&self.session.account, &ids))?;
                 for e in jmap::emails(&a)? {
-                    self.place(sink, &e, true, report)?;
+                    self.place(sink, &e, true, None, report)?;
                 }
             }
         }
@@ -600,7 +633,7 @@ impl<H: Http> Client<H> {
         }
         if self.mailboxes.is_empty() {
             let a = self.call(jmap::get_mailboxes(&self.session.account))?;
-            self.mailboxes = jmap::mailboxes(&a)?.0;
+            self.mailboxes = jmap::mailboxes(&a, &self.session.account)?.0;
         }
         let sent = self.mailboxes.iter().find(|m| m.role.as_deref() == Some("sent")).map(|m| m.id.clone()).ok_or(Error("the account has no Sent mailbox".into()))?;
         let a = self.call(jmap::get_identities(&self.session.account))?;
@@ -675,7 +708,7 @@ impl<H: Http> Client<H> {
         }
         if self.mailboxes.is_empty() {
             let a = self.call(jmap::get_mailboxes(&self.session.account))?;
-            self.mailboxes = jmap::mailboxes(&a)?.0;
+            self.mailboxes = jmap::mailboxes(&a, &self.session.account)?.0;
         }
         let mailbox = self.id_of(folder).ok_or_else(|| Error(format!("the server has no folder {folder}")))?;
         let url = self.session.upload();

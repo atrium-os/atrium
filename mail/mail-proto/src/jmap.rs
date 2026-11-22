@@ -82,6 +82,17 @@ fn ids(v: Option<&Value>, what: &str) -> Result<Vec<String>> {
     a.iter().map(|x| x.as_str().filter(|s| id_ok(s)).map(str::to_string).ok_or_else(|| Error(format!("bad id in {what}")))).collect()
 }
 
+fn distinct_ids(values: Option<&Value>, what: &str) -> Result<Vec<String>> {
+    let list = values.filter(|v| v.is_array())
+        .ok_or_else(|| Error(format!("missing {what} list")))?;
+    let ids = ids(Some(list), what)?;
+    let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+    if distinct.len() != ids.len() {
+        return err(format!("repeated ID in {what}"));
+    }
+    Ok(ids)
+}
+
 /// A URL from the server: https only (or http for a test on loopback), no
 /// spaces or controls.
 fn url_ok(u: &str) -> bool {
@@ -531,8 +542,11 @@ pub struct Mailbox {
     pub role: Option<String>,
 }
 
-pub fn mailboxes(a: &Answers) -> Result<(Vec<Mailbox>, String)> {
-    let o = a.of("m", "Mailbox/get")?;
+pub fn mailboxes(a: &Answers, account: &str) -> Result<(Vec<Mailbox>, String)> {
+    let o = a.account_reply("m", "Mailbox/get", account)?;
+    if !distinct_ids(o.get("notFound"), "Mailbox/get notFound")?.is_empty() {
+        return err("Mailbox/get reported unrequested IDs");
+    }
     let list = o.get("list").and_then(Value::as_array).ok_or(Error("no list".into()))?;
     if list.len() > MAX_MAILBOXES {
         return err("too many mailboxes");
@@ -547,6 +561,10 @@ pub fn mailboxes(a: &Answers) -> Result<(Vec<Mailbox>, String)> {
             parent: get_str(m, "parentId").filter(|p| id_ok(p)).map(str::to_string),
             role: get_str(m, "role").filter(|r| r.len() <= 32 && r.bytes().all(|b| b.is_ascii_alphabetic())).map(|r| r.to_ascii_lowercase()),
         });
+    }
+    let distinct: std::collections::BTreeSet<_> = out.iter().map(|m| &m.id).collect();
+    if distinct.len() != out.len() {
+        return err("repeated mailbox ID");
     }
     Ok((out, need_state(o, "state")?))
 }
@@ -610,10 +628,13 @@ fn emails_in(o: &Map<String, Value>) -> Result<Vec<Email>> {
             }
             Ok(m.iter().filter(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.to_ascii_lowercase()).filter(|k| k.len() <= MAX_ID && !k.bytes().any(|b| b <= b' ')).collect())
         };
-        let mailboxes = keys("mailboxIds", 1000)?;
-        if mailboxes.iter().any(|m| !id_ok(m)) {
-            return err("bad mailbox id");
+        let mailboxes = e.get("mailboxIds").and_then(Value::as_object)
+            .filter(|m| !m.is_empty() && m.len() <= 1000)
+            .ok_or(Error("bad Email mailboxIds".into()))?;
+        if mailboxes.iter().any(|(id, present)| !id_ok(id) || present.as_bool() != Some(true)) {
+            return err("bad Email mailboxIds entry");
         }
+        let mailboxes = mailboxes.keys().cloned().collect();
         out.push(Email {
             id: need_id(e, "id")?,
             blob: need_id(e, "blobId")?,
@@ -627,16 +648,42 @@ fn emails_in(o: &Map<String, Value>) -> Result<Vec<Email>> {
     Ok(out)
 }
 
-/// One page of a mailbox: the messages, how many it has, and the Email state.
-pub fn mailbox_page(a: &Answers) -> Result<(Vec<Email>, u64, String)> {
-    let q = a.of("q", "Email/query")?;
-    let total = q.get("total").and_then(Value::as_u64).unwrap_or(0);
-    let g = a.of("g", "Email/get")?;
-    Ok((emails_in(g)?, total, need_state(g, "state")?))
+/// One verified query page. The next offset counts all queried IDs, including
+/// emails that disappeared before the chained read.
+pub struct QueryPage {
+    pub emails: Vec<Email>,
+    pub next_position: u64,
+    pub total: u64,
 }
 
-pub fn current_state(a: &Answers) -> Result<String> {
-    need_state(a.of("s", "Email/get")?, "state")
+pub fn mailbox_page(a: &Answers, account: &str, position: u64, limit: u64) -> Result<QueryPage> {
+    let q = a.account_reply("q", "Email/query", account)?;
+    if q.get("position").and_then(Value::as_u64) != Some(position) {
+        return err("wrong position in Email/query reply");
+    }
+    need_state(q, "queryState")?;
+    let total = q.get("total").and_then(Value::as_u64).ok_or(Error("bad Email/query total".into()))?;
+    let limit = match q.get("limit") {
+        Some(value) => value.as_u64().filter(|&n| n > 0 && n <= limit)
+            .ok_or(Error("bad Email/query limit".into()))?,
+        None => limit,
+    };
+    let ids = distinct_ids(q.get("ids"), "Email/query IDs")?;
+    let count = ids.len() as u64;
+    if count != limit.min(total.saturating_sub(position)) {
+        return err("inconsistent Email/query page size");
+    }
+
+    let g = a.account_reply("g", "Email/get", account)?;
+    check_get_coverage(g, &ids)?;
+    need_state(g, "state")?;
+    Ok(QueryPage { emails: emails_in(g)?, next_position: position + count, total })
+}
+
+pub fn current_state(a: &Answers, account: &str) -> Result<String> {
+    let answer = a.account_reply("s", "Email/get", account)?;
+    check_get_coverage(answer, &[])?;
+    need_state(answer, "state")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -658,16 +705,7 @@ pub fn changes(a: &Answers, account: &str, since: &str, max: u64) -> Result<Chan
     let new_state = need_state(c, "newState")?;
     let more = c.get("hasMoreChanges").and_then(Value::as_bool)
         .ok_or(Error("bad hasMoreChanges in Email/changes reply".into()))?;
-    let change_ids = |key| {
-        let list = c.get(key).filter(|v| v.is_array())
-            .ok_or_else(|| Error(format!("missing {key} list in Email/changes reply")))?;
-        let ids = ids(Some(list), key)?;
-        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
-        if distinct.len() != ids.len() {
-            return err(format!("repeated ID in {key}"));
-        }
-        Ok(ids)
-    };
+    let change_ids = |key| distinct_ids(c.get(key), key);
     let created = change_ids("created")?;
     let updated = change_ids("updated")?;
     let destroyed = change_ids("destroyed")?;
@@ -905,13 +943,31 @@ mod tests {
         assert_eq!(s.download("B 1"), "https://jmap.example/d/A1/B%201/message.eml?type=message%2Frfc822");
         assert!(session(br#"{"apiUrl":"javascript:x"}"#).is_err());
 
-        let a = answers(br#"{"methodResponses":[["Mailbox/get",{"state":"m1","list":[{"id":"i1","name":"Inbox","role":"inbox"},{"id":"k2","name":"Kids","parentId":"i1"}]},"m"]]}"#).unwrap();
-        let (m, st) = mailboxes(&a).unwrap();
+        let a = answers(br#"{"methodResponses":[["Mailbox/get",{"accountId":"A1","state":"m1","notFound":[],"list":[{"id":"i1","name":"Inbox","role":"inbox"},{"id":"k2","name":"Kids","parentId":"i1"}]},"m"]]}"#).unwrap();
+        let (m, st) = mailboxes(&a, "A1").unwrap();
         assert_eq!(st, "m1");
         assert_eq!(m[1].parent.as_deref(), Some("i1"));
         assert_eq!(m[0].role.as_deref(), Some("inbox"));
         let a = answers(br#"{"methodResponses":[["error",{"type":"cannotCalculateChanges"},"c"]]}"#).unwrap();
         assert_eq!(changes(&a, "A1", "1", 256).unwrap_err().0, "Email/changes: cannotCalculateChanges");
+    }
+
+    #[test]
+    fn query_page_honors_a_server_limit_and_preserves_mailbox_id_case() {
+        let a = answers(br#"{"methodResponses":[
+            ["Email/query",{"accountId":"A1","queryState":"q1","position":1,"total":5,
+                "limit":1,"ids":["M2"]},"q"],
+            ["Email/get",{"accountId":"A1","state":"s1","list":[{"id":"M2","blobId":"B2",
+                "mailboxIds":{"InboxABC":true},"keywords":{"$SEEN":true}}],"notFound":[]},"g"]
+        ]}"#).unwrap();
+        let page = mailbox_page(&a, "A1", 1, 3).unwrap();
+        assert_eq!((page.next_position, page.total), (2, 5));
+        assert_eq!(page.emails[0].mailboxes, ["InboxABC"]);
+        assert_eq!(page.emails[0].keywords, ["$seen"]);
+
+        let mut repeated = a;
+        repeated.0.push(repeated.0[1].clone());
+        assert_eq!(mailbox_page(&repeated, "A1", 1, 3).err().unwrap().0, "repeated Email/get reply");
     }
 
     #[test]

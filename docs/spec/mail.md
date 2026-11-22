@@ -1695,7 +1695,13 @@ Stalwart in the cloud VM, and later a real account):
    (up to 5,000, pages of 256) listed from the `headers` property with no download,
    then a text pass downloads whole messages under 2 MiB for the text window, inbox and
    Sent first, 200 a pass. Resync is `Email/changes` (moves, flags, new, destroyed);
-   `cannotCalculateChanges` reads everything again without doubling. The person's
+   `cannotCalculateChanges` reruns the bounded header scan. First sync and refresh
+   validate the account on the mailbox inventory, initial Email state, and each
+   chained query and read. Each query page accounts for every returned ID and
+   advances by query IDs, including any reported missing by the read. Validated
+   pages can add headers immediately. A failed refresh preserves the previous
+   Email state and mailbox locations. Mail removes superseded locations only
+   after all pages validate. The person's
    changes go as one `Email/set` (several changes to one message are one patch); delete
    from the last mailbox destroys. Send: upload, `Email/import` into Sent (seen),
    `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
