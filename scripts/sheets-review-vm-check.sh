@@ -1,12 +1,15 @@
 #!/bin/sh
 # Run on the private 1280x720 Sheets desktop fixture with its Scrinium place.
-# Stage check_recovered_copy at /tmp/check-recovered-copy.
+# Stage check_recovered_copy at /tmp/check-recovered-copy for the native flow.
+# For SHEETS_REVIEW_FORMAT=ods or xlsx, stage one directory from the
+# sheets_review_fixture example in the Scrinium place and the FreeBSD
+# build of the example at /tmp/sheets-review-fixture.
 set -eu
 cd /var/tmp/sheets-desktop
-books=/var/tmp/sheets-select-input
+books=${1:-/var/tmp/sheets-select-input}
+format=${SHEETS_REVIEW_FORMAT:-native}
 results=$(mktemp -d /var/tmp/sheets-review-results.XXXXXX)
 echo "Sheets review evidence: $results"
-test "$(ls -A "$books")" = Proof.csv
 
 input() { printf '%s\n' "$@" | nc -N -U inject.sock >/dev/null; }
 click() { input "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'; }
@@ -64,13 +67,101 @@ save_as() {
     wait_for same_window 824 458 "$document"
     /tmp/check-recovered-copy "$books/$1" "$2" plain
 }
-closed() { test -z "$(docs)" && test -z "$(mdconfig -lv | grep sheets-recovery)"; }
+closed() {
+    test -z "$(docs)" || return 1
+    if test "$format" = native; then
+        test -z "$(mdconfig -lv | grep sheets-recovery)"
+    fi
+}
 close_document() {
     # A click on the grid returns focus after the picker is closed.
     click 518 240
     key 0x1a 1
     wait_for closed
 }
+
+capture() {
+    input 'MOVE 8 240'
+    sleep .45
+    cp selectscreen.png "$results/$1.png"
+}
+checkpoint() { /tmp/sheets-review-fixture check "$1" "$2"; } 2>"$results/checkpoint.log"
+save_in_place() {
+    click 125 24
+    wait_for checkpoint "$books/01-local.$format" "$1"
+}
+conversion_count() { grep -Fc 'officina: converted ' select-port.log || :; }
+converted_after() { test "$(conversion_count)" -gt "$1"; }
+picked_copy() {
+    before=$(conversion_count)
+    pick "$1"
+    wait_for converted_after "$before"
+    wait_for same_window 594 24 "$document"
+}
+reopened_state() {
+    loaded "01-local.$format" &&
+        checkpoint "$directory/base.$(cat "$directory/current").osheet" "$1"
+}
+
+foreign_review() {
+    test "$(ls -A "$books")" = "$(printf '01-local.%s\n02-review.%s\n03-base.%s\n04-incoming.%s' "$format" "$format" "$format" "$format")"
+    (cd "$books" && sha256 0[234]-*) >"$results/sources.sha256"
+    checkpoint "$books/01-local.$format" local
+
+    open_document 183 "01-local.$format"
+    wait_for reopened_state local
+    data_command 18 # Compare with…
+    wait_for picker_open
+    picked_copy 213
+    capture compare-collapsed
+    click 890 154
+    sleep .25 # The list lays out the newly expanded group before the row click.
+    click 890 183
+    capture compare-detail
+    click 890 154
+    capture compare-collapsed-again
+    click 1055 72 # Close Compare.
+
+    data_command 102 # Merge Copies…
+    wait_for picker_open
+    base_picker=$window
+    pick 243
+    incoming_picker() {
+        other_window 520 183 "$document" && test "$window" != "$base_picker"
+    }
+    wait_for incoming_picker
+    picked_copy 273
+    capture merge-collapsed
+
+    # Prove the independent changes applied before either conflict is resolved.
+    save_in_place independent
+    click 890 154
+    sleep .25 # The list lays out the newly expanded group before the row click.
+    click 890 183
+    capture merge-take-detail
+    click 802 666 # Take Incoming for B1.
+    sleep .25
+    click 890 183
+    capture merge-keep-detail
+    click 908 666 # Keep Mine for C1.
+    capture merge-resolved
+    save_in_place resolved
+    cp "$books/01-local.$format" "$results/saved.$format"
+    close_document
+
+    open_document 183 "01-local.$format"
+    wait_for reopened_state resolved
+    capture merge-reopened
+    close_document
+    (cd "$books" && sha256 0[234]-*) | cmp - "$results/sources.sha256"
+    echo "PASS $format grouped review, independent edits, and resolved conflicts after Save and reopen"
+}
+
+case "$format" in
+    ods|xlsx) foreign_review; exit ;;
+    native) test "$(ls -A "$books")" = Proof.csv ;;
+    *) exit 2 ;;
+esac
 
 jot 1200 | sed 's/$/,10,stable/' >"$books/01-review-local.csv"
 jot 1200 | sed 's/$/,20,stable/' >"$books/02-review-incoming.csv"

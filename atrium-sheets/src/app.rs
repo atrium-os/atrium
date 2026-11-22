@@ -4067,9 +4067,9 @@ mod tests {
         assert!(pane.picked.is_none());
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         let contains = |text| tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == text));
-        assert!(contains("▸ Budget · Cell edits (5000)"));
-        assert!(contains("▸ Forecast · Cell edits (5000)"));
-        assert!(contains("▸ Budget · Sheet settings (1)"));
+        assert!(contains("+ Budget · Cell edits (5000)"));
+        assert!(contains("+ Forecast · Cell edits (5000)"));
+        assert!(contains("+ Budget · Sheet settings (1)"));
         assert!(!contains("Take"));
         let budget = Group(Some(0), "Cell edits");
         sheets.review_cmd(ReviewCmd::Toggle(budget));
