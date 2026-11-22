@@ -18,7 +18,7 @@ case "$kind" in
   pin-no-job-password) job=18; title="PIN without job-password support"; prefix=pin-no-job-password ;;
   pin-no-create-job) job=19; title="PIN without Create-Job"; prefix=pin-no-create-job ;;
   pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
-  pin-rejection) job=$5; title="PIN response $6 $7"; prefix="pin-$6-$7" ;;
+  pin-rejection) job=$5; title="PIN response $6 $7 $8"; prefix="pin-$6-$7-$8" ;;
   *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "

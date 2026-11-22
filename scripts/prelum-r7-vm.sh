@@ -365,19 +365,20 @@ expected_responses="$D/pin-rejection-expected.txt"
 check_pin_rejection() {
     response=$1
     id_mode=$2
+    cancel_result=$3
     desktop_job=$((desktop_job + 1))
     redemption_count=$((redemption_count + 1))
     successful_redemptions=$((successful_redemptions + 1))
-    proof="$D/pin-$response-$id_mode"
+    proof="$D/pin-$response-$id_mode-$cancel_result"
     if [ "$id_mode" = with-id ]; then
         printer_job=$((printer_job + 1))
-        printf '%s %s\n' "$response" "$printer_job" >>"$expected_responses"
+        printf '%s %s %s\n' "$response" "$printer_job" "$cancel_result" >>"$expected_responses"
     else
-        printf '%s -\n' "$response" >>"$expected_responses"
+        printf '%s - %s\n' "$response" "$cancel_result" >>"$expected_responses"
     fi
     remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
         <"$scripts/prelum-r7-pin-stage.sh" >"$proof-stage.log" 2>&1
-    remote "sh -s -- '$guest' '$marker' fresh pin-rejection '$desktop_job' '$response' '$id_mode'" \
+    remote "sh -s -- '$guest' '$marker' fresh pin-rejection '$desktop_job' '$response' '$id_mode' '$cancel_result'" \
         <"$scripts/prelum-r7-identity.sh" >"$proof.log" 2>&1 || { cat "$proof.log" >&2; exit 1; }
     cat "$proof.log"
     remote "cat '$guest/fixture-arca/audit.log'" >"$proof-audit.log"
@@ -386,11 +387,16 @@ check_pin_rejection() {
     test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
 }
 for response in ignored conflicting unsupported-group unsupported-status server-busy; do
-    check_pin_rejection "$response" with-id
-    check_pin_rejection "$response" without-id
+    check_pin_rejection "$response" with-id canceled
+    check_pin_rejection "$response" without-id none
 done
-check_pin_rejection success without-id
-remote "cat '$guest/pin-success-without-id-jobs.log'" >"$D/pin-rejection-jobs.txt"
+check_pin_rejection success without-id none
+
+# The rejected PIN must also block upload when cancellation fails.
+for cancel_result in ipp-refused http-refused dropped truncated; do
+    check_pin_rejection ignored with-id "$cancel_result"
+done
+remote "cat '$guest/pin-ignored-with-id-truncated-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
     "$D/pin-rejection-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 "$expected_responses" >"$D/pin-rejection-pdf-checks.log"
 cat "$D/pin-rejection-pdf-checks.log"

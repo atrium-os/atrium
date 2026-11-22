@@ -33,8 +33,8 @@ for line in transcript.splitlines():
         events.append((response[1], response[2]))
     elif cancel := re.match(r"^fake printer: Cancel-Job job (\d+) ", line):
         events.append(("cancel", int(cancel[1])))
-    elif canceled := re.fullmatch(r"fake printer: job (\d+) canceled", line):
-        events.append(("canceled", int(canceled[1])))
+    elif result := re.fullmatch(r"fake printer: Cancel-Job result ([a-z-]+) (\d+)", line):
+        events.append((result[1], int(result[2])))
     elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
         events.append(("send", int(send[1])))
     elif receipt := re.fullmatch(
@@ -57,15 +57,15 @@ expected_events = [
 ]
 if len(sys.argv) > 7:
     responses = [line.split() for line in Path(sys.argv[7]).read_text(encoding="utf-8").splitlines()]
-    for response, printer_job in responses:
+    for response, printer_job, cancel_result in responses:
         expected_events.extend([("create", None), (response, printer_job)])
         if printer_job != "-":
             job = int(printer_job)
-            expected_events.extend([("cancel", job), ("canceled", job)])
+            expected_events.extend([("cancel", job), (cancel_result, job)])
 assert events == expected_events, events
 if len(sys.argv) > 7:
-    for response, printer_job in responses:
-        result = "no job ID" if printer_job == "-" else f"canceled job {printer_job}"
+    for response, printer_job, cancel_result in responses:
+        result = "no job ID" if printer_job == "-" else f"job {printer_job} cancellation {cancel_result}"
         print(f"IPPS simulator: PIN response {response}, {result}, no document request or PDF")
 
 jobs = Path(sys.argv[3]).read_text(encoding="utf-8")

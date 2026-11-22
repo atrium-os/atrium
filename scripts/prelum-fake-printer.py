@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import http.server
 import os
+import socket
 import ssl
 import struct
 import threading
@@ -63,6 +64,7 @@ PIN_RESPONSE_STATUS = {
     "server-busy": 0x0507,
     "success": 0x0000,
 }
+PIN_CANCEL_RESULTS = ("canceled", "ipp-refused", "http-refused", "dropped", "truncated")
 
 LOCK = threading.Lock()
 JOBS = {}  # id -> dict(state, name, done_at, impressions)
@@ -214,6 +216,7 @@ class H(http.server.BaseHTTPRequestHandler):
         st, reasons = state()
         jid = (a.get("job-id") or [0])[0]
         out = head(0, rid)
+        cancel_result = None
         name = {0x0B: "Get-Printer-Attributes", 0x05: "Create-Job", 0x06: "Send-Document", 0x09: "Get-Job-Attributes",
                 0x08: "Cancel-Job", 0x3C: "Identify-Printer", 0x04: "Validate-Job", 0x02: "Print-Job"}.get(op, hex(op))
         print("fake printer: %s job %s (state %s %s)" % (name, jid, st, " ".join(reasons)), flush=True)
@@ -228,13 +231,18 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.send_error(400, "Invalid fixture PIN submission")
                 return
             include_job_id = True
+            cancel_mode = "canceled"
             if rejection:
-                scenario = title.removeprefix(PIN_RESPONSE_PREFIX)
-                response, _, id_mode = scenario.partition(" ")
-                if response not in PIN_RESPONSE_STATUS or id_mode not in ("with-id", "without-id"):
+                fields = title.removeprefix(PIN_RESPONSE_PREFIX).split()
+                if len(fields) != 3:
+                    self.send_error(400, "Invalid fixture PIN response title")
+                    return
+                response, id_mode, cancel_mode = fields
+                include_job_id = id_mode == "with-id"
+                valid_cancel_modes = PIN_CANCEL_RESULTS if include_job_id else ("none",)
+                if response not in PIN_RESPONSE_STATUS or id_mode not in ("with-id", "without-id") or cancel_mode not in valid_cancel_modes:
                     self.send_error(400, "Unknown fixture PIN response")
                     return
-                include_job_id = id_mode == "with-id"
                 out = head(PIN_RESPONSE_STATUS[response], rid)
                 out += attr(TEXT, "status-message", "Fixture printer diagnostic")
                 if response == "unsupported-group":
@@ -244,7 +252,7 @@ class H(http.server.BaseHTTPRequestHandler):
                     jid = NEXT[0]
                     NEXT[0] += 1
                     JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
-                                 "name": title}
+                                 "name": title, "cancel_mode": cancel_mode}
                 if op == 0x02:
                     open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(URI, "job-uri", "ipp://%s/ipp/print/%d" % (host, jid)) + attr(ENUM, "job-state", 3)
@@ -286,14 +294,35 @@ class H(http.server.BaseHTTPRequestHandler):
                     jr = {9: ["job-completed-successfully"], 7: ["job-canceled-by-user"]}.get(js, ["job-printing"])
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", js) + attr(KEYWORD, "job-state-reasons", jr) + attr(INT, "job-impressions-completed", j["impressions"])
         elif op == 0x08:
+            if doc:
+                self.send_error(400, "Document in Cancel-Job request")
+                return
             with LOCK:
-                if jid in JOBS:
-                    JOBS[jid]["state"] = 7
-                    print(f"fake printer: job {jid} canceled", flush=True)
+                j = JOBS.get(jid)
+                if j:
+                    cancel_result = j["cancel_mode"]
+                    if cancel_result == "canceled":
+                        j["state"] = 7
+            if cancel_result:
+                print(f"fake printer: Cancel-Job result {cancel_result} {jid}", flush=True)
+            if cancel_result == "ipp-refused":
+                out = head(0x0404, rid)  # client-error-not-possible
+            elif cancel_result == "http-refused":
+                self.send_error(403, "Fixture cancellation refused")
+                return
+            elif cancel_result == "dropped":
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+                return
         out += bytes([ENDG])
         self.send_response(200)
         self.send_header("Content-Type", "application/ipp")
         self.send_header("Content-Length", str(len(out)))
+        if cancel_result == "truncated":
+            # Advertise the full length, then close before delivering the end marker.
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            out = out[:-1]
         self.end_headers()
         self.wfile.write(out)
 
