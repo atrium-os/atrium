@@ -597,6 +597,15 @@ proposal and IPv4 traffic waited for fresh confirmation. That press
 produced one POST, one accepted assertion, and one redemption, and the
 guest fetched `crypta-ac-ok` through ocserv on `tun5`.
 
+The next gate disconnected again before the queued request could launch.
+Portcullis discarded it while the old jail was still open. After that
+jail closed, no new window opened and gateway page, script and POST
+counters stayed unchanged. A separate reconnect used a distinct Crypta
+attempt. Its new proposal and IPv4 traffic waited for fresh
+confirmation. One confirmed POST produced one accepted assertion and
+one redemption. The guest fetched `crypta-ac-ok` through ocserv on
+`tun6`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
