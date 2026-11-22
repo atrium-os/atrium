@@ -489,12 +489,16 @@ as **making the account usable first, then filling in what's worth having, polit
   indexes it for that account. Cancelling or discarding a queued upload releases
   its queue identity. For JMAP, Mail uses the Email ID from `Email/import` to retain
   the original Message-ID as an account-scoped import alias. Readback uses the
-  message's actual headers, and a mailbox move preserves the alias. An explicit
-  JMAP destruction report releases it. To recover omitted deletions, each sync
-  checks a rotating page of at most 32 tracked Email IDs, subject to the server's
-  advertised limit. The presence check requests IDs only. A complete response for
-  the right account can release aliases for the requested IDs in `notFound`. A
-  failed presence check keeps those aliases and lets ordinary sync continue.
+  message's actual headers, and a mailbox move preserves the alias. Mail
+  releases it on a destruction report only after validating the changes page
+  and its chained reads for the requested account and starting state. A fetched
+  Email reported as destroyed invalidates the page. Each sync processes at most
+  64 change pages and saves the last applied state for the next sync. To
+  recover omitted deletions, each sync checks a rotating page of at most 32
+  tracked Email IDs, subject to the server's advertised limit. The presence
+  check requests IDs only. A complete, unambiguous response for the right
+  account can release aliases for the requested IDs in `notFound`. A failed
+  presence check keeps those aliases and lets ordinary sync continue.
   IMAP preserves both fields of a valid single-message APPENDUID and matches
   readback by destination mailbox, UIDVALIDITY and UID. If readback preserves the
   original Message-ID, the ordinary index takes over. When exact readback shows

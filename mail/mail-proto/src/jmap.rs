@@ -268,29 +268,32 @@ pub fn import_presence(account: &str, ids: &[String]) -> Vec<u8> {
 
 /// Only a complete, account-matched response can release import identities.
 pub fn missing_imports(a: &Answers, account: &str, ids: &[String]) -> Result<Vec<String>> {
-    let answer = a.of("importPresence", "Email/get")?;
-    if get_str(answer, "accountId") != Some(account) {
-        return err("wrong account in import presence reply");
-    }
+    let answer = a.account_reply("importPresence", "Email/get", account)?;
+    check_get_coverage(answer, ids)
+}
+
+// A complete partition of requested IDs is needed before applying a change
+// page or using notFound as evidence to retire an import identity.
+fn check_get_coverage(answer: &Map<String, Value>, ids: &[String]) -> Result<Vec<String>> {
     let mut remaining: std::collections::BTreeSet<_> = ids.iter().map(String::as_str).collect();
-    let found = answer.get("list").and_then(Value::as_array).ok_or(Error("no import presence list".into()))?;
-    let missing = answer.get("notFound").and_then(Value::as_array).ok_or(Error("no import presence notFound".into()))?;
+    let found = answer.get("list").and_then(Value::as_array).ok_or(Error("no Email/get list".into()))?;
+    let missing = answer.get("notFound").and_then(Value::as_array).ok_or(Error("no Email/get notFound".into()))?;
     for item in found {
-        let id = item.get("id").and_then(Value::as_str).ok_or(Error("bad import presence ID".into()))?;
+        let id = item.get("id").and_then(Value::as_str).ok_or(Error("bad Email/get ID".into()))?;
         if !remaining.remove(id) {
-            return err("unexpected or repeated import presence ID");
+            return err("unexpected or repeated Email/get ID");
         }
     }
     let mut out = Vec::new();
     for item in missing {
-        let id = item.as_str().ok_or(Error("bad missing import ID".into()))?;
+        let id = item.as_str().ok_or(Error("bad Email/get notFound ID".into()))?;
         if !remaining.remove(id) {
-            return err("unexpected or repeated missing import ID");
+            return err("unexpected or repeated Email/get notFound ID");
         }
         out.push(id.to_string());
     }
     if !remaining.is_empty() {
-        return err("incomplete import presence reply");
+        return err("incomplete Email/get reply");
     }
     Ok(out)
 }
@@ -475,7 +478,10 @@ pub fn answers(body: &[u8]) -> Result<Answers> {
     let v: Value = serde_json::from_slice(body).map_err(|e| Error(format!("answer: {e}")))?;
     let list = v.get("methodResponses").and_then(Value::as_array).ok_or(Error("no methodResponses".into()))?;
     let mut out = Vec::new();
-    for r in list.iter().take(16) {
+    if list.len() > 16 {
+        return err("too many method responses");
+    }
+    for r in list {
         let a = r.as_array().filter(|a| a.len() == 3).ok_or(Error("bad method response".into()))?;
         let name = a[0].as_str().ok_or(Error("bad method name".into()))?.to_string();
         let args = a[1].as_object().cloned().ok_or(Error("bad arguments".into()))?;
@@ -486,6 +492,21 @@ pub fn answers(body: &[u8]) -> Result<Answers> {
 }
 
 impl Answers {
+    fn unique_reply(&self, call: &str, name: &str) -> Result<&Map<String, Value>> {
+        if self.0.iter().filter(|(_, _, tag)| tag == call).count() > 1 {
+            return err(format!("repeated {name} reply"));
+        }
+        self.of(call, name)
+    }
+
+    fn account_reply(&self, call: &str, name: &str, account: &str) -> Result<&Map<String, Value>> {
+        let answer = self.unique_reply(call, name)?;
+        if get_str(answer, "accountId") != Some(account) {
+            return err(format!("wrong account in {name} reply"));
+        }
+        Ok(answer)
+    }
+
     /// The arguments of call `call`, which must be `name` (a server error
     /// is said as one).
     fn of(&self, call: &str, name: &str) -> Result<&Map<String, Value>> {
@@ -629,11 +650,48 @@ pub struct Changes {
 
 /// The answer to [`email_changes`]. `Err` with "cannotCalculateChanges":
 /// the state is too old, start again.
-pub fn changes(a: &Answers) -> Result<Changes> {
-    let c = a.of("c", "Email/changes")?;
-    let mut changed = emails_in(a.of("gc", "Email/get")?)?;
-    changed.extend(emails_in(a.of("gu", "Email/get")?)?);
-    Ok(Changes { new_state: need_state(c, "newState")?, more: c.get("hasMoreChanges").and_then(Value::as_bool).unwrap_or(false), changed, destroyed: ids(c.get("destroyed"), "destroyed")? })
+pub fn changes(a: &Answers, account: &str, since: &str, max: u64) -> Result<Changes> {
+    let c = a.account_reply("c", "Email/changes", account)?;
+    if get_str(c, "oldState") != Some(since) {
+        return err("wrong oldState in Email/changes reply");
+    }
+    let new_state = need_state(c, "newState")?;
+    let more = c.get("hasMoreChanges").and_then(Value::as_bool)
+        .ok_or(Error("bad hasMoreChanges in Email/changes reply".into()))?;
+    let change_ids = |key| {
+        let list = c.get(key).filter(|v| v.is_array())
+            .ok_or_else(|| Error(format!("missing {key} list in Email/changes reply")))?;
+        let ids = ids(Some(list), key)?;
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        if distinct.len() != ids.len() {
+            return err(format!("repeated ID in {key}"));
+        }
+        Ok(ids)
+    };
+    let created = change_ids("created")?;
+    let updated = change_ids("updated")?;
+    let destroyed = change_ids("destroyed")?;
+    let count = created.len() + updated.len() + destroyed.len();
+    if count as u64 > max {
+        return err("too many IDs in Email/changes reply");
+    }
+    if new_state == since && (more || count != 0) {
+        return err("Email/changes reply did not advance state");
+    }
+
+    let created_get = a.account_reply("gc", "Email/get", account)?;
+    let updated_get = a.account_reply("gu", "Email/get", account)?;
+    check_get_coverage(created_get, &created)?;
+    check_get_coverage(updated_get, &updated)?;
+    let mut changed = emails_in(created_get)?;
+    changed.extend(emails_in(updated_get)?);
+    // RFC 8620 permits overlap between the requested ID lists. A
+    // fetched Email in the destroyed list is contradictory.
+    let gone: std::collections::BTreeSet<_> = destroyed.iter().map(String::as_str).collect();
+    if changed.iter().any(|email| gone.contains(email.id.as_str())) {
+        return err("Email/changes reported a fetched Email as destroyed");
+    }
+    Ok(Changes { new_state, more, changed, destroyed })
 }
 
 /// The ids the server did not change, with its reason (the rest went).
@@ -853,12 +911,22 @@ mod tests {
         assert_eq!(m[1].parent.as_deref(), Some("i1"));
         assert_eq!(m[0].role.as_deref(), Some("inbox"));
         let a = answers(br#"{"methodResponses":[["error",{"type":"cannotCalculateChanges"},"c"]]}"#).unwrap();
-        assert_eq!(changes(&a).unwrap_err().0, "Email/changes: cannotCalculateChanges");
-        // An id with a path in it is refused.
-        let a = answers(br#"{"methodResponses":[["Email/changes",{"newState":"2","created":["../x"]},"c"],["Email/get",{"list":[],"state":"2"},"gc"],["Email/get",{"list":[],"state":"2"},"gu"]]}"#).unwrap();
-        assert!(changes(&a).is_ok(), "created ids come from the gets");
-        let a = answers(br#"{"methodResponses":[["Email/changes",{"newState":"2","destroyed":["../x"]},"c"],["Email/get",{"list":[],"state":"2"},"gc"],["Email/get",{"list":[],"state":"2"},"gu"]]}"#).unwrap();
-        assert!(changes(&a).is_err());
+        assert_eq!(changes(&a, "A1", "1", 256).unwrap_err().0, "Email/changes: cannotCalculateChanges");
+    }
+
+    #[test]
+    fn change_reply_respects_the_requested_page_budget() {
+        let a = answers(br#"{"methodResponses":[
+            ["Email/changes",{"accountId":"A1","oldState":"1","newState":"2","hasMoreChanges":true,
+                "created":[],"updated":["M1"],"destroyed":["M2"]},"c"],
+            ["Email/get",{"accountId":"A1","list":[],"notFound":[]},"gc"],
+            ["Email/get",{"accountId":"A1","list":[],"notFound":["M1"]},"gu"]
+        ]}"#).unwrap();
+        assert_eq!(changes(&a, "A1", "1", 1).unwrap_err().0, "too many IDs in Email/changes reply");
+        let page = changes(&a, "A1", "1", 2).unwrap();
+        assert!(page.more);
+        assert_eq!(page.new_state, "2");
+        assert_eq!(page.destroyed, ["M2"]);
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub const MESSAGE_MAX: usize = 64 << 20;
 
 /// The sink key holding the Email state.
 const EMAIL_STATE: &str = "jmap:email";
+const CHANGE_PAGES_PER_SYNC: usize = 64;
 
 pub struct Client<H: Http> {
     h: H,
@@ -310,17 +311,21 @@ impl<H: Http> Client<H> {
             None => self.first(sink, &mut report)?,
             Some(state) => {
                 let mut state = state;
-                loop {
+                let mut seen = std::collections::BTreeSet::from([state.clone()]);
+                for _ in 0..CHANGE_PAGES_PER_SYNC {
                     let a = self.call(jmap::email_changes(&self.session.account, &state, PAGE))?;
-                    let c = match jmap::changes(&a) {
+                    let c = match jmap::changes(&a, &self.session.account, &state, PAGE) {
                         Ok(c) => c,
-                        Err(e) if e.0.ends_with("cannotCalculateChanges") => {
+                        Err(e) if e.0 == "Email/changes: cannotCalculateChanges" => {
                             // Too old: read everything again.
                             self.first(sink, &mut report)?;
                             break;
                         }
                         Err(e) => return Err(e.into()),
                     };
+                    if c.new_state != state && !seen.insert(c.new_state.clone()) {
+                        return Err(Error("JMAP Email/changes repeated a state".into()));
+                    }
                     for e in &c.changed {
                         self.place(sink, e, true, &mut report)?;
                     }

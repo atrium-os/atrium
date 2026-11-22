@@ -65,6 +65,8 @@ struct Server {
     presence_limit: Option<usize>,
     presence_queries: Vec<Vec<String>>,
     wrong_presence_account: bool,
+    repeat_presence_reply: bool,
+    reply_override: Option<(&'static str, &'static str, Value)>,
 }
 
 impl Server {
@@ -117,7 +119,7 @@ impl Server {
                 }
                 args["ids"] = prior[1][path].clone();
             }
-            let answer = match name {
+            let mut answer = match name {
                 "Mailbox/get" => {
                     let mb = |id: &str, name: &str, role: Value, parent: Value| json!({ "id": id, "name": name, "role": role, "parentId": parent });
                     let mut list = vec![mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj")), mb("spam", "Junk", json!("junk"), Value::Null)];
@@ -174,7 +176,7 @@ impl Server {
                             if *gone { destroyed.push(id.clone()) } else if !created.contains(id) && self.mails.contains_key(id) { created.push(id.clone()) }
                         }
                     }
-                    json!({ "oldState": since.to_string(), "newState": self.state.to_string(), "hasMoreChanges": false, "created": [], "updated": created, "destroyed": destroyed })
+                    json!({ "accountId": ACCOUNT, "oldState": since.to_string(), "newState": self.state.to_string(), "hasMoreChanges": false, "created": [], "updated": created, "destroyed": destroyed })
                 }
                 "Email/set" => {
                     let mut updated = Map::new();
@@ -271,6 +273,18 @@ impl Server {
                 }
                 other => panic!("unexpected {other}"),
             };
+            if let Some((tag, key, value)) = &self.reply_override {
+                if *tag == cid {
+                    answer[*key] = value.clone();
+                }
+            }
+            if self.repeat_presence_reply && cid == "importPresence" {
+                let found = &args["ids"];
+                let alternative: Vec<_> = found.as_array().unwrap().iter().map(|id| json!({ "id": id })).collect();
+                out.push(json!([name, &answer, cid]));
+                answer["list"] = json!(alternative);
+                answer["notFound"] = json!([]);
+            }
             out.push(json!([name, answer, cid]));
         }
         json!({ "methodResponses": out, "sessionState": "s" })
@@ -905,6 +919,65 @@ fn jmap_rewritten_import_id_survives_restart_and_move_until_object_destruction()
 }
 
 #[test]
+fn jmap_invalid_change_pages_preserve_mail_aliases_and_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server { rewrite_import_message_ids: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(25, "Original", "body"), 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    client.sync(&mut engine.sink(account)).unwrap();
+    let prior = engine.store.sync_state(account, "jmap:email").unwrap().unwrap();
+    assert_eq!(engine.store.count(archive).unwrap(), 1);
+    let still_here = engine.store.by_server_id(account, "M1").unwrap().unwrap();
+    let deleted = {
+        let mut s = server.borrow_mut();
+        let deleted = s.mails.remove("M1").unwrap();
+        s.touch("M1", true);
+        deleted
+    };
+
+    for (tag, field, value, expected) in [
+        ("c", "accountId", json!("other"), "wrong account"),
+        ("c", "oldState", json!("stale"), "wrong oldState"),
+        ("c", "newState", json!(prior), "did not advance state"),
+        ("c", "destroyed", json!(["M1", "M1"]), "repeated ID"),
+        ("c", "destroyed", json!(["invalid/id"]), "bad id"),
+        ("gu", "accountId", json!("other"), "wrong account"),
+        ("gu", "notFound", json!(["unrequested"]), "unexpected"),
+    ] {
+        server.borrow_mut().reply_override = Some((tag, field, value));
+        let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+        assert!(error.contains(expected), "{tag}.{field}: {error}");
+        assert_eq!(engine.store.sync_state(account, "jmap:email").unwrap().as_deref(), Some(prior.as_str()));
+        assert_eq!(engine.store.by_server_id(account, "M1").unwrap(), Some(still_here));
+        assert_eq!(engine.store.count(archive).unwrap(), 1);
+        assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().already, 1);
+    }
+
+    // RFC 8620 permits the same requested ID in updated and destroyed.
+    // A found object contradicts destruction. A matching notFound confirms it.
+    server.borrow_mut().reply_override = Some(("c", "updated", json!(["M1"])));
+    server.borrow_mut().mails.insert("M1".into(), deleted);
+    let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+    assert!(error.contains("fetched Email as destroyed"), "{error}");
+    assert_eq!(engine.store.by_server_id(account, "M1").unwrap(), Some(still_here));
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().already, 1);
+    assert_eq!(engine.store.sync_state(account, "jmap:email").unwrap().as_deref(), Some(prior.as_str()));
+
+    server.borrow_mut().mails.remove("M1").unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.count(archive).unwrap(), 0);
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_ne!(engine.store.sync_state(account, "jmap:email").unwrap(), Some(prior));
+}
+
+#[test]
 fn jmap_missing_deletion_is_confirmed_in_bounded_pages() {
     let dir = tempfile::tempdir().unwrap();
     let parser = jail();
@@ -944,8 +1017,12 @@ fn jmap_missing_deletion_is_confirmed_in_bounded_pages() {
     client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().already, 1);
     server.borrow_mut().wrong_presence_account = false;
+    server.borrow_mut().repeat_presence_reply = true;
     client.sync(&mut engine.sink(account)).unwrap();
-    assert_eq!(server.borrow().presence_queries, [vec!["M1"], vec!["M2"], vec!["M3"], vec!["M3"]]);
+    assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().already, 1);
+    server.borrow_mut().repeat_presence_reply = false;
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(server.borrow().presence_queries, [vec!["M1"], vec!["M2"], vec!["M3"], vec!["M3"], vec!["M3"]]);
     assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().queued, 1);
     for file in &files[..2] {
         assert_eq!(engine.import_mbox(archive, file.as_slice()).unwrap().already, 1);
