@@ -1034,8 +1034,8 @@ pub enum Response {
     /// router), and whether it is online now (the window closes then).
     PortalStatus { network: String, start_url: Option<String>, online: bool },
     /// VpnSignInStatus → the profile the window signs in to, where its
-    /// sign-in starts, and the address that ends it.
-    VpnSignInStatus { profile: String, start_url: String, final_url: String },
+    /// sign-in starts, the address that ends it, and its live Crypta attempt.
+    VpnSignInStatus { profile: String, start_url: String, final_url: String, attempt: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.

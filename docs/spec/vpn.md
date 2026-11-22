@@ -435,7 +435,9 @@ PIN entry and "use this certificate for this gateway" binding are Sigillum's, un
    session cookies are kept for the next VPN sign-in but never mixed with personal browsing.
    The trail shows "Sign in to <gateway>" in the strip, and the user signs in with whatever
    the IdP asks: password into Arca's field, push approval, a passkey or security key
-   through Sigillum's WebAuthn.
+   through Sigillum's WebAuthn. Portcullis binds the window to the live Crypta sign-in
+   attempt. Disconnecting ends that attempt, so Navigator closes the window and rejects
+   any pending form. A reconnect gets a fresh attempt and requires a new confirmation.
 3. The last step of SAML posts to the gateway's own address (the assertion consumer
    service). That fetch goes, like every cookied Navigator fetch, through Arca's courier for
    the gateway endpoint. The courier is told, for this endpoint and jar, which response

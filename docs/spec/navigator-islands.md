@@ -511,6 +511,15 @@ recorded one script POST, one accepted SAML assertion, and one token
 redemption, and the FreeBSD guest fetched `crypta-ac-ok` over `tun1`.
 The gate reused the verified shared-cache binaries.
 
+The automatic-dismissal gate repeated the two reloads and disconnected
+with a proposal pending. Navigator detected that its Crypta attempt had
+ended and exited on its own. The gate waited for its jail to disappear,
+saw zero POSTs, and then reconnected. Portcullis bound the reopened
+window to a distinct Crypta attempt. The new proposal and IPv4 traffic
+waited for trusted confirmation. The gateway recorded one POST,
+one accepted assertion, and one token redemption. The guest fetched
+`crypta-ac-ok` through `tun1`. Both dedicated guests shut down cleanly.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

@@ -2178,7 +2178,23 @@ struct VpnSignIn {
 }
 
 /// Each person's latest VPN sign-in, by owner.
-static VPN_SIGN_INS: Mutex<Vec<(String, VpnSignIn)>> = Mutex::new(Vec::new());
+static VPN_SIGN_INS: Mutex<Vec<(String, VpnSignIn, String)>> = Mutex::new(Vec::new());
+
+/// Query Crypta without granting its root control socket to the sign-in jail.
+fn vpn_sign_in_attempt(profile: &str) -> Option<String> {
+    use std::io::{BufRead, Read, Write};
+    use std::time::Duration;
+
+    let path = std::env::var("PORTCULLISD_CRYPTA_SOCK").unwrap_or_else(|_| "/var/run/atrium/crypta.sock".into());
+    let mut stream = UnixStream::connect(path).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+    writeln!(stream, "sso-attempt name={profile}").ok()?;
+    let mut line = String::new();
+    BufReader::new(stream.take(128)).read_line(&mut line).ok()?;
+    let attempt = line.strip_prefix("sso-attempt id=")?.strip_suffix('\n')?;
+    (attempt.len() == 32 && attempt.bytes().all(|b| b.is_ascii_hexdigit())).then(|| attempt.to_string())
+}
 
 /// Whether `uid` is an instance in the reserved VPN sign-in persona.
 fn is_vpn_instance(uid: u32) -> bool {
@@ -2225,13 +2241,20 @@ fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: 
         return refuse("no installed app holds network-portal (the Navigator)".into());
     };
     let profile = ask.profile.clone();
+    let Some(attempt) = vpn_sign_in_attempt(&profile) else {
+        return refuse("Crypta has no live sign-in attempt for this profile".into());
+    };
+    let p = Some(portcullis_peer::VPN_PERSONA);
+    let running = launch::running_jid_instance(&app, p).is_some();
     {
         let mut v = VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner());
-        v.retain(|(o, _)| o != owner);
-        v.push((owner.to_string(), ask));
+        if running && !v.iter().any(|(o, sign_in, id)| o == owner && sign_in == &ask && id == &attempt) {
+            return refuse("the previous VPN sign-in window is still open".into());
+        }
+        v.retain(|(o, _, _)| o != owner);
+        v.push((owner.to_string(), ask, attempt));
     }
-    let p = Some(portcullis_peer::VPN_PERSONA);
-    if launch::running_jid_instance(&app, p).is_some() {
+    if running {
         let Some(press) = activation else {
             eprintln!("portcullisd: VPN sign-in window for {owner}: already open");
             return Response::Ok;
@@ -2261,10 +2284,14 @@ fn handle_vpn_sign_in_status(uid: u32) -> Response {
     let Some(owner) = reg.resolve(uid).map(|(u, _)| u.to_string()) else {
         return Response::Error { message: "not a launched app".into() };
     };
-    match VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(o, _)| *o == owner) {
-        Some((_, s)) => Response::VpnSignInStatus { profile: s.profile.clone(), start_url: s.start_url.clone(), final_url: s.final_url.clone() },
-        None => Response::Error { message: "no VPN sign-in was asked for".into() },
+    let requested = VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(o, _, _)| *o == owner).cloned();
+    let Some((_, sign_in, attempt)) = requested else {
+        return Response::Error { message: "no VPN sign-in was asked for".into() };
+    };
+    if vpn_sign_in_attempt(&sign_in.profile).as_deref() != Some(attempt.as_str()) {
+        return Response::Error { message: "the VPN sign-in attempt ended".into() };
     }
+    Response::VpnSignInStatus { profile: sign_in.profile, start_url: sign_in.start_url, final_url: sign_in.final_url, attempt }
 }
 
 /// PortalStatus: the sign-in window's network, for that window only.

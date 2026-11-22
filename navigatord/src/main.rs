@@ -1525,6 +1525,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     refuse("only a sign-in window sends a page's form".into());
                     continue;
                 }
+                if cfg.vpn.as_ref().is_some_and(|v| !v.is_current()) {
+                    refuse("the VPN sign-in attempt ended".into());
+                    continue;
+                }
                 if !ctl::form_ok(&action, &fields) {
                     refuse("the form is out of shape".into());
                     continue;
@@ -2109,9 +2113,16 @@ fn main() {
     if cfg.portal.is_some() {
         std::thread::spawn(watch_portal);
     }
-    if cfg.vpn.is_some() {
-        std::thread::spawn(|| {
-            std::thread::sleep(vpn::LIFETIME);
+    if let Some(sign_in) = cfg.vpn.clone() {
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + vpn::LIFETIME;
+            while Instant::now() < deadline {
+                std::thread::sleep(vpn::POLL);
+                if !sign_in.is_current() {
+                    eprintln!("navigatord: the VPN sign-in attempt ended; the window closes");
+                    std::process::exit(0);
+                }
+            }
             eprintln!("navigatord: the VPN sign-in window closes after {} minutes", vpn::LIFETIME.as_secs() / 60);
             std::process::exit(0);
         });

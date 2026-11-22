@@ -33,6 +33,7 @@
 //!   label=HEX`), or `sso login=HEX final=HEX cookie=HEX`
 //! - `answer name=N tI=HEX | hI=HANDLE [keep=1] ... | cancel=1`: field I's
 //!   text, or the handle of what was typed into Arca's field
+//! - `sso-attempt name=N`: the live sign-in attempt ID (for Portcullis)
 //! - `sso-done name=N ok=0|1`, `rebind name=N`, `banner name=N` (`text` lines)
 //! - `csr name=N [cn=HEX]`: a P-256 key in Arca and a request for it
 //! - `certificate name=N` with the PEM chain as a descriptor
@@ -139,6 +140,8 @@ struct AcRun {
     prompt: Option<engine::Prompt>,
     /// `(login, final_url, token_cookie)`.
     sso: Option<(String, String, String)>,
+    /// Window identity, kept through SAML completion until this engine ends.
+    sso_attempt: Option<arca_store::ItemId>,
     pushed: Option<engine::Pushed>,
     /// What the person answered the username and group fields with, kept
     /// in the profile once the sign-in succeeds.
@@ -462,6 +465,7 @@ impl D {
         r.handshake = false;
         r.ac.prompt = None;
         r.ac.sso = None;
+        r.ac.sso_attempt = None;
         Ok(())
     }
 
@@ -826,6 +830,10 @@ impl D {
                 v
             }),
             ("answer", Some(n)) => self.answer(&n, l).map(|_| vec![]),
+            ("sso-attempt", Some(n)) => self.ac_run(&n).and_then(|k| {
+                let id = self.runs[k].ac.sso_attempt.ok_or("no-sso-attempt")?;
+                Ok(vec![Line::new("sso-attempt").with("id", id.hex())])
+            }),
             ("sso-done", Some(n)) => {
                 let ok = l.get("ok") == Some("1");
                 self.ac_run(&n).and_then(|k| {
@@ -936,6 +944,7 @@ impl D {
                     self.log(&format!("{}: single sign-on at {}", self.runs[k].p.name, login.chars().take(120).collect::<String>()));
                     self.runs[k].ac.prompt = None;
                     self.runs[k].ac.sso = Some((login, final_url, token_cookie));
+                    self.runs[k].ac.sso_attempt = Some(arca_store::ItemId::random());
                 }
                 FromEngine::Pushed(p) => {
                     if self.runs[k].p.ac.as_ref().is_some_and(|a| a.gp_portal)
@@ -984,6 +993,7 @@ impl D {
     fn engine_gone(&mut self, k: usize, why: &str) {
         let r = &mut self.runs[k];
         let Some(e) = r.engine.take() else { return };
+        r.ac.sso_attempt = None;
         // An engine that ran a while starts again at once; one that keeps
         // dying waits longer each time.
         if e.started.elapsed() > Duration::from_secs(60) {

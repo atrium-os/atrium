@@ -14,12 +14,13 @@
 //!   POST in that jar. The gateway's sign-on token, set at the end, is
 //!   Arca's for Crypta (arcad's `jar::VPN_SSO_COOKIE`): the page never has
 //!   it, and cryptad notices it there;
-//! - ends when a page at the final address opens, or after ten minutes.
+//! - ends when Crypta ends the attempt, the final address opens, or ten minutes pass.
 
 use std::time::Duration;
 
 /// The window ends after this long, signed in or not.
 pub const LIFETIME: Duration = Duration::from_secs(10 * 60);
+pub const POLL: Duration = Duration::from_millis(500);
 /// How long the final page shows before the window closes.
 pub const LINGER: Duration = Duration::from_secs(3);
 /// The broker's one view: the whole sign-in is one jar.
@@ -31,6 +32,8 @@ pub struct SignIn {
     pub profile: String,
     pub start_url: String,
     pub final_url: String,
+    /// Absent only for the unconfined fixture.
+    pub attempt: Option<String>,
 }
 
 impl SignIn {
@@ -46,11 +49,15 @@ impl SignIn {
         a.scheme() == b.scheme() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default() && a.path() == b.path()
     }
 
+    pub fn is_current(&self) -> bool {
+        self.attempt.is_none() || status().is_ok_and(|current| current == *self)
+    }
+
     /// `NAVIGATORD_VPN_SIGN_IN="<profile> <start> <final>"`, for a test run
     /// (`--unconfined-for-testing` only).
     pub fn parse(v: &str) -> Option<SignIn> {
         let mut f = v.split_ascii_whitespace();
-        let s = SignIn { profile: f.next()?.into(), start_url: f.next()?.into(), final_url: f.next()?.into() };
+        let s = SignIn { profile: f.next()?.into(), start_url: f.next()?.into(), final_url: f.next()?.into(), attempt: None };
         (f.next().is_none() && s.start_url.starts_with("https://") && s.final_url.starts_with("https://")).then_some(s)
     }
 }
@@ -65,7 +72,7 @@ pub fn status() -> Result<SignIn, String> {
         other => return Err(format!("portcullisd hello: {other:?}")),
     }
     match round_trip(&mut s, &Request::VpnSignInStatus) {
-        Ok(Response::VpnSignInStatus { profile, start_url, final_url }) => Ok(SignIn { profile, start_url, final_url }),
+        Ok(Response::VpnSignInStatus { profile, start_url, final_url, attempt }) => Ok(SignIn { profile, start_url, final_url, attempt: Some(attempt) }),
         Ok(Response::Error { message }) => Err(message),
         other => Err(format!("portcullisd: {other:?}")),
     }
