@@ -2359,6 +2359,13 @@ value fields; counts without the grand total column): `.ods`→`.ods` and our
 cells; LibreOffice's own `.xlsx` export keeps 2/3 (it doesn't write
 `rowGrandTotals="0"`).
 
+The installed Sheets desktop runs O5f and O5g together in
+`scripts/sheets-interop-vm-check.sh`. The paired XLSX and ODS fixtures open
+through the jailed converter. Editing a source cell recalculates the spill,
+`LET`, and `LAMBDA` and changes the matching conditional fills. The test
+saves the stale pivot, refreshes it from Data, saves undo and redo results,
+and checks the formulas, rule, and pivot after a fresh picker reopen.
+
 ### 16.33 O6 plan (2026-11-15): `atrium-slides`
 
 O6 builds the slides app (§9.1, §9.3) in steps, each ending with a gate:
