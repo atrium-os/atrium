@@ -220,8 +220,16 @@ fresh picker for the current revision, including edits made while offline.
 
 Save As sends a sealed native workbook to Scrinium’s Save picker. Scrinium
 publishes the completed file under an unused name and returns a new save grant.
-An interruption before publication leaves the previous workbook intact and can
-leave a hidden staging file. Neither operation exposes the directory to Sheets.
+Once Sheets acknowledges the copy, ordinary Save uses that grant and writes the
+native file. The original XLSX or ODS keeps its existing contents. An interruption
+before publication leaves the previous workbook intact and can leave a hidden
+staging file. Neither operation exposes the directory to Sheets.
+
+The installed desktop gate `scripts/sheets-interop-vm-check.sh` with
+`SHEETS_INTEROP_CASE=native_copy` exercises Save As with unsaved edits in XLSX
+and ODS. It edits and saves each native copy, reopens both through the picker,
+checks the saved formulas and workbook features, and compares the originals
+byte for byte.
 
 On Tessera, the same save boundaries preserve the prior and published file
 in native filesystem generations under the volume’s retention policy

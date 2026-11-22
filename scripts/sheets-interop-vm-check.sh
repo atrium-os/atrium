@@ -17,14 +17,16 @@
 # Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
+# Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
+    native_copy) test "$(ls "$books")" = "$(printf 'orders.ods\nsales.xlsx')" ;;
     legacy) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')" ;;
     delimited) test "$(ls "$books")" = "$(printf '01-utf8.csv\n02-utf8.tsv\n03-ansi.csv\n04-ansi.tsv')" ;;
     *) test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')" ;;
@@ -57,16 +59,22 @@ checkpoint() {
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
+        native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
-loaded() {
+recovery_dir() {
     jail=$(docs)
     test -n "$jail" || return 1
     root=$(jls -j "$jail" path)/atrium/recovery
-    directory=$(dirname "$(find "$root" -name name -type f -exec grep -slx "$1" {} +)")
-    test "$directory" != . && test -s "$directory/current" || return 1
+    name_file=$(find "$root" -name name -type f -exec grep -slx "$1" {} +)
+    test -n "$name_file" || return 1
+    dirname "$name_file"
+}
+loaded() {
+    directory=$(recovery_dir "$1") || return 1
+    test -s "$directory/current" || return 1
     checkpoint "$directory/base.$(cat "$directory/current").osheet" "$2"
 }
 worker_count() { grep -Fc 'worker org.atrium.sheets/convert for alice runs as ' select-port.log || :; }
@@ -468,6 +476,62 @@ delimited() {
     done
 }
 
+copy_edit_units() {
+    click 126 133 # B2 feeds the formula and the conditional format.
+    key "$1"
+    key 0x28
+}
+copy_originals_intact() {
+    cmp "$books/orders.ods" "$results/original.ods"
+    cmp "$books/sales.xlsx" "$results/original.xlsx"
+}
+native_copy() {
+    cp "$books/orders.ods" "$results/original.ods"
+    cp "$books/sales.xlsx" "$results/original.xlsx"
+    for format in ods xlsx; do
+        case "$format" in
+            ods) stem=orders; row=183; first_key=0x23; edit_key=0x25 ;; # 6, 8
+            xlsx) stem=sales; row=243; first_key=0x24; edit_key=0x22 ;; # 7, 5
+        esac
+        source=$stem.$format
+        copy=$stem.osheet
+        checkpoint "$books/$source" initial
+        open_book "$row" "$source" initial
+        copy_edit_units "$first_key"
+
+        click 205 24
+        wait_for other_window 824 458 "$document"
+        sleep .4
+        cp selectscreen.png "$results/$format-save-as.png"
+        click 824 458
+        wait_for checkpoint "$books/$copy" copy
+        wait_for same_window 824 458 "$document"
+        # The published name confirms Sheets has received the new save grant.
+        wait_for recovery_dir "$copy" >/dev/null
+        cp "$books/$copy" "$results/$format-published.osheet"
+        copy_originals_intact
+
+        copy_edit_units "$edit_key"
+        save "$copy" edited
+        cp "$books/$copy" "$results/$format-saved.osheet"
+        copy_originals_intact
+        close_book
+    done
+
+    # With both copies present, reopen each by its own name and its own edited value.
+    for format in ods xlsx; do
+        case "$format" in ods) copy=orders.osheet; row=213 ;; xlsx) copy=sales.osheet; row=243 ;; esac
+        open_book "$row" "$copy" edited native
+        sleep .4
+        cp selectscreen.png "$results/$format-native-reopened.png"
+        cmp "$books/$copy" "$results/$format-saved.osheet"
+        close_book
+        echo "PASS $format native Save As, ordinary Save and picker reopen"
+    done
+    copy_originals_intact
+    echo "PASS both foreign originals are byte-identical"
+}
+
 legacy() {
     checksum=$(sha256 -q "$books/legacy.xls")
     checkpoint "$books/macro.xlsm" macro-initial
@@ -524,6 +588,7 @@ test "$launcher" -gt 0
 case "$profile" in
     legacy) legacy; exit ;;
     delimited) delimited; exit ;;
+    native_copy) native_copy; exit ;;
 esac
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac
