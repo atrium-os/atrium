@@ -727,7 +727,7 @@ pub fn work(w: Want, tx: Sender<Got>) {
                 say(connect().and_then(|mut c| c.sso_done(&s).map_err(fail(n.clone()))).map(|_| format!("{n}: single sign-on ended")))
             }
             Want::SsoWindow { name, login, final_url, activation } => {
-                say(sso_window(&name, &login, &final_url, activation).map(|_| format!("{name}: the sign-in window is open")))
+                say(sso_window(&name, &login, &final_url, activation).map(|_| format!("{name}: sign-in requested")))
             }
             Want::CertRequest(n) => {
                 let r = connect().and_then(|mut c| c.cert_request(&CertRequest { name: n.clone(), cn: None }).map_err(|e| e.1));

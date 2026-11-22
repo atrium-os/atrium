@@ -438,6 +438,9 @@ PIN entry and "use this certificate for this gateway" binding are Sigillum's, un
    through Sigillum's WebAuthn. Portcullis binds the window to the live Crypta sign-in
    attempt. Disconnecting ends that attempt, so Navigator closes the window and rejects
    any pending form. A reconnect gets a fresh attempt and requires a new confirmation.
+   If Sign In is pressed during reconnect while the old window is closing, Portcullis
+   holds one request for the fresh attempt. It opens the new window if teardown
+   finishes within ten seconds and Crypta still has that attempt.
 3. The last step of SAML posts to the gateway's own address (the assertion consumer
    service). That fetch goes, like every cookied Navigator fetch, through Arca's courier for
    the gateway endpoint. The courier is told, for this endpoint and jar, which response

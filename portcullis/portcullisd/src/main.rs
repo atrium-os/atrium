@@ -2178,7 +2178,39 @@ struct VpnSignIn {
 }
 
 /// Each person's latest VPN sign-in, by owner.
-static VPN_SIGN_INS: Mutex<Vec<(String, VpnSignIn, String)>> = Mutex::new(Vec::new());
+type VpnSignInEntry = (String, VpnSignIn, String);
+static VPN_SIGN_INS: Mutex<Vec<VpnSignInEntry>> = Mutex::new(Vec::new());
+static QUEUED_VPN_SIGN_IN: Mutex<Option<VpnSignInEntry>> = Mutex::new(None);
+
+/// The reserved instance remains busy until the previous launch has torn down.
+fn vpn_window_busy(app: &str) -> bool {
+    let persona = Some(portcullis_peer::VPN_PERSONA);
+    let key = portcullisd::opens::channel_key(app, persona);
+    STARTED_FOR_OPEN.lock().unwrap().contains(&key) || launch::running_jid_instance(app, persona).is_some()
+}
+
+/// Wait for the stale window without changing the attempt it sees.
+fn open_queued_vpn_sign_in(app: String, profile: String, attempt: String) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && vpn_sign_in_attempt(&profile).as_deref() == Some(attempt.as_str()) {
+        if !vpn_window_busy(&app) {
+            let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
+            let Some(entry) = queue.take() else { return };
+            let owner = entry.0.clone();
+            {
+                let mut entries = VPN_SIGN_INS.lock().unwrap();
+                entries.retain(|(o, _, _)| *o != owner);
+                entries.push(entry);
+            }
+            start_for_instance(&app, Some(portcullis_peer::VPN_PERSONA), &owner, "a queued VPN sign-in window");
+            return;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    QUEUED_VPN_SIGN_IN.lock().unwrap().take();
+    eprintln!("portcullisd: discarded queued VPN sign-in for {profile}");
+}
 
 /// Query Crypta without granting its root control socket to the sign-in jail.
 fn vpn_sign_in_attempt(profile: &str) -> Option<String> {
@@ -2220,8 +2252,8 @@ impl VpnSignIn {
 
 /// VpnSignInWindow (vpn.md §9.3): the person `owner`'s Navigator in the
 /// reserved `vpn` persona, at the gateway's sign-on address. Started if it
-/// isn't running; brought forward on a press if it is (it signs in to the
-/// latest profile asked for when it starts).
+/// isn't running, brought forward on a press for the same attempt, or
+/// queued for a reconnect while the old window closes.
 fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: Option<[u8; 16]>, shared: &Mutex<Tenants>) -> Response {
     use portcullisd::opens;
     let refuse = |why: String| {
@@ -2245,16 +2277,29 @@ fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: 
         return refuse("Crypta has no live sign-in attempt for this profile".into());
     };
     let p = Some(portcullis_peer::VPN_PERSONA);
-    let running = launch::running_jid_instance(&app, p).is_some();
+    let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
+    let entry = (owner.to_string(), ask, attempt);
+    if let Some(queued) = queue.as_ref() {
+        return if queued == &entry { Response::Ok } else { refuse("another VPN sign-in window is queued".into()) };
+    }
+    let running = vpn_window_busy(&app);
     {
         let mut v = VPN_SIGN_INS.lock().unwrap_or_else(|e| e.into_inner());
-        if running && !v.iter().any(|(o, sign_in, id)| o == owner && sign_in == &ask && id == &attempt) {
-            return refuse("the previous VPN sign-in window is still open".into());
+        if running && !v.contains(&entry) {
+            if !v.iter().any(|(o, sign_in, id)| o == owner && sign_in.profile == profile && id != &entry.2) {
+                return refuse("the previous VPN sign-in window is still open".into());
+            }
+            let attempt = entry.2.clone();
+            *queue = Some(entry);
+            eprintln!("portcullisd: queued VPN sign-in window for {owner} ({profile})");
+            thread::spawn(move || open_queued_vpn_sign_in(app, profile, attempt));
+            return Response::Ok;
         }
         v.retain(|(o, _, _)| o != owner);
-        v.push((owner.to_string(), ask, attempt));
+        v.push(entry);
     }
     if running {
+        drop(queue);
         let Some(press) = activation else {
             eprintln!("portcullisd: VPN sign-in window for {owner}: already open");
             return Response::Ok;

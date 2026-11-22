@@ -529,6 +529,14 @@ with no tunnel handshake or sentinel response. Confirmation produced
 one script POST, one accepted assertion, and one redemption. The guest
 then fetched `crypta-ac-ok` over `tun1`.
 
+The queued Sign In gate made one request during that overlap. Portcullis
+held it against the fresh Crypta attempt until the old jail finished
+teardown, then launched a distinct jail without another request. A press
+on the stale confirmation produced zero POSTs. The new proposal and
+tunnel waited for trusted confirmation. The gateway recorded one POST,
+one accepted assertion, and one redemption, and `tun1` returned
+`crypta-ac-ok` through ocserv. Both dedicated guests shut down cleanly.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
