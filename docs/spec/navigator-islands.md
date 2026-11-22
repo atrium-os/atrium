@@ -470,6 +470,17 @@ and Crypta redeemed the token. The arm64 Tessera guest recorded
 returned exactly `crypta-ac-ok`. Both VMs shut down cleanly. Redacted logs
 and binary hashes are in `~/atrium-vm/evidence/navigator-i3-vpn-external-js-20261122/`.
 
+The follow-up batched an abandoned proposal with a fresh sign-in. The
+gateway's loopback stats count external script responses, attempted POSTs,
+and accepted POSTs separately. Pressing the page's Continue button displayed
+a proposal in trusted chrome with zero POSTs at the gateway. The guest had
+no VPN handshake and could not fetch the sentinel. Disconnecting the profile
+and closing its test window left the proposal unsent. Reopening fetched a
+new gateway flow and again sent nothing until the trusted confirmation.
+The retry recorded one script POST, one accepted assertion, and one token
+redemption. The guest fetched `crypta-ac-ok` through `tun3`. Both dedicated
+guests shut down cleanly.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

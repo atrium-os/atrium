@@ -60,7 +60,10 @@ ACCOUNTS = {"alice": ("alice", "alice-pw", "Staff")}
 lock = threading.Lock()
 tokens = {}   # token -> (subject, minted at)
 pending = {}  # AuthnRequest id -> time
-stats = {"init": 0, "sso_login": 0, "acs_ok": 0, "acs_refused": 0, "token_ok": 0, "token_refused": 0, "proxied": 0}
+stats = dict.fromkeys((
+    "init", "sso_login", "script_delivered", "script_posts", "script_accepted",
+    "acs_ok", "acs_refused", "token_ok", "token_refused", "proxied",
+), 0)
 
 
 def log(*a):
@@ -136,6 +139,8 @@ def js_login(f):
 
 
 def js_continue(f, method, path, headers, body):
+    if method == "POST" and path == POST_PATH:
+        bump("script_posts")
     cookies = SimpleCookie()
     try:
         cookies.load(headers.get("cookie", ""))
@@ -157,9 +162,11 @@ def js_continue(f, method, path, headers, body):
         script = ("document.getElementById('proceed').addEventListener('click', () => {"
                   "const form = document.forms[0]; form.elements.proof.value = "
                   + json.dumps(flow[0]) + "; form.requestSubmit(); });")
+        bump("script_delivered")
         respond(f, "200 OK", [("Cache-Control", "no-store")], script.encode(), "text/javascript")
         log("external sign-in script delivered")
     elif method == "POST" and path == POST_PATH:
+        bump("script_accepted")
         respond(f, "303 See Other", [("Location", authn_request())])
         log("external sign-in form accepted")
     else:
