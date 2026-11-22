@@ -520,6 +520,15 @@ waited for trusted confirmation. The gateway recorded one POST,
 one accepted assertion, and one token redemption. The guest fetched
 `crypta-ac-ok` through `tun1`. Both dedicated guests shut down cleanly.
 
+The immediate-reconnect variant briefly paused the old broker to ensure
+Crypta could disconnect and begin a distinct attempt while the old window
+still existed. Portcullis refused to reuse that window, and a press on its
+old confirmation produced zero POSTs. The old window closed on its own
+when the broker resumed. The fresh window waited for trusted confirmation
+with no tunnel handshake or sentinel response. Confirmation produced
+one script POST, one accepted assertion, and one redemption. The guest
+then fetched `crypta-ac-ok` over `tun1`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
