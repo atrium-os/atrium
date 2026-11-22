@@ -121,13 +121,21 @@ pub fn session(body: &[u8]) -> Result<Session> {
     let primary = o.get("primaryAccounts").and_then(Value::as_object).ok_or(Error("no primaryAccounts".into()))?;
     let account = get_str(primary, MAIL).filter(|a| id_ok(a)).ok_or(Error("no mail account".into()))?.to_string();
     let caps = o.get("capabilities").and_then(Value::as_object).ok_or(Error("no capabilities".into()))?;
-    if !caps.contains_key(MAIL) {
+    if caps.get(CORE).and_then(Value::as_object).is_none() {
+        return err("the server has no JMAP core capability");
+    }
+    if caps.get(MAIL).and_then(Value::as_object).is_none() {
         return err("the server has no JMAP mail");
     }
     let max_size_upload = caps.get(CORE).and_then(|c| c.get("maxSizeUpload")).and_then(Value::as_u64).unwrap_or(0);
-    let acct = o.get("accounts").and_then(|a| a.get(&account)).and_then(|a| a.get("accountCapabilities")).and_then(Value::as_object);
-    let can_submit = acct.is_some_and(|c| c.contains_key(SUBMISSION));
-    let max_delayed_send = acct.and_then(|c| c.get(SUBMISSION)).and_then(|s| s.get("maxDelayedSend")).and_then(Value::as_u64).unwrap_or(0);
+    let acct = o.get("accounts")
+        .and_then(|a| a.get(&account))
+        .and_then(|a| a.get("accountCapabilities"))
+        .and_then(Value::as_object)
+        .filter(|caps| caps.get(MAIL).and_then(Value::as_object).is_some())
+        .ok_or(Error("the primary account has no JMAP mail capability".into()))?;
+    let can_submit = acct.contains_key(SUBMISSION);
+    let max_delayed_send = acct.get(SUBMISSION).and_then(|s| s.get("maxDelayedSend")).and_then(Value::as_u64).unwrap_or(0);
     Ok(Session {
         api_url: url("apiUrl")?,
         download_url: url("downloadUrl")?,
@@ -137,8 +145,8 @@ pub fn session(body: &[u8]) -> Result<Session> {
         can_submit,
         max_size_upload,
         max_delayed_send,
-        can_vacation: acct.is_some_and(|c| c.contains_key(VACATION)),
-        sieve: acct.and_then(|c| c.get(SIEVE)).map(|s| s.get("sieveExtensions").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|e| e.len() <= 64).take(100).map(str::to_string).collect()).unwrap_or_default()),
+        can_vacation: acct.contains_key(VACATION),
+        sieve: acct.get(SIEVE).map(|s| s.get("sieveExtensions").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|e| e.len() <= 64).take(100).map(str::to_string).collect()).unwrap_or_default()),
         state: get_str(o, "state").filter(|s| state_ok(s)).unwrap_or("0").to_string(),
     })
 }

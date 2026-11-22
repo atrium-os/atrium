@@ -172,7 +172,10 @@ person reads was never decoded next to another message.
 
 1. The person types their address (and nothing else, usually).
 2. The engine looks up settings, in this order, through Nuntius and the system resolver:
-   - JMAP session resource at `https://<domain>/.well-known/jmap` (RFC 8620 §2.2);
+   - JMAP session resource at `https://<domain>/.well-known/jmap` (RFC 8620 §2.2).
+     Require Core and Mail capabilities and a primary account that advertises Mail.
+     The API, upload and download URLs must use the discovery HTTPS origin because
+     Arca binds the sign-in to that origin. If these checks fail, continue discovery;
    - Mozilla-style autoconfig at `autoconfig.<domain>` and `<domain>/.well-known/autoconfig`,
      with the full address percent-encoded as one query value on the autoconfig host.
      Parse the bounded response as XML with DTD processing disabled. Ignore comments and

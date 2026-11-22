@@ -173,6 +173,17 @@ fn encode_query_value(value: &str) -> String {
     encoded
 }
 
+// Discovery has a fixed HTTPS origin. Arca binds the sign-in to it.
+fn jmap_uses_discovery_origin(session: &mail_proto::jmap::Session, domain: &str) -> bool {
+    [&session.api_url, &session.download_url, &session.upload_url].into_iter().all(|url| {
+        let Some(authority) = url.strip_prefix("https://").and_then(|rest| rest.split('/').next()) else {
+            return false;
+        };
+        let (host, port) = authority.split_once(':').unwrap_or((authority, "443"));
+        host.eq_ignore_ascii_case(domain) && port.parse::<u16>() == Ok(443) && !url.contains('#')
+    })
+}
+
 /// Find the servers for `address`.
 pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str> {
     let address = address.trim();
@@ -182,7 +193,11 @@ pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str
     }
     // JMAP: the session resource must parse and offer mail.
     let url = format!("https://{domain}/.well-known/jmap");
-    if l.get(&url).filter(|b| b.len() <= MAX_ANSWER).is_some_and(|b| mail_proto::jmap::session(&b).is_ok()) {
+    if l.get(&url)
+        .filter(|body| body.len() <= MAX_ANSWER)
+        .and_then(|body| mail_proto::jmap::session(&body).ok())
+        .is_some_and(|session| jmap_uses_discovery_origin(&session, &domain))
+    {
         return Ok(Found { settings: Settings::Jmap { session: url }, via: Via::Jmap, oauth: None, handled_by: None, note: None });
     }
     let query_address = encode_query_value(address);
@@ -533,10 +548,64 @@ mod tests {
         }
     }
 
+    fn jmap_discovery_session() -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:core": {},
+                "urn:ietf:params:jmap:mail": {},
+            },
+            "accounts": { "a1": { "accountCapabilities": { "urn:ietf:params:jmap:mail": {} } } },
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": "a1" },
+            "apiUrl": "https://jmap.example/api/",
+            "downloadUrl": "https://JMAP.EXAMPLE:443/d/{blobId}",
+            "uploadUrl": "https://jmap.example/u/{accountId}",
+            "state": "1",
+        })
+    }
+
+    fn discover_with_jmap(session: serde_json::Value) -> Found {
+        let mut net = Net::default();
+        net.pages.insert("https://jmap.example/.well-known/jmap".into(), session.to_string().into_bytes());
+        net.pages.insert("https://jmap.example/.well-known/autoconfig/mail/config-v1.1.xml".into(), br#"<clientConfig>
+<incomingServer type="imap"><hostname>imap.jmap.example</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer type="smtp"><hostname>smtp.jmap.example</hostname><port>587</port><socketType>STARTTLS</socketType></outgoingServer>
+</clientConfig>"#.to_vec());
+        discover("ada@jmap.example", &mut net).unwrap()
+    }
+
+    #[test]
+    fn jmap_discovery_requires_a_primary_mail_account() {
+        for (key, invalid) in [
+            ("accounts", serde_json::json!({})),
+            ("accounts", serde_json::json!({"a1": {"accountCapabilities": {}}})),
+            ("capabilities", serde_json::json!({"urn:ietf:params:jmap:mail": {}})),
+        ] {
+            let mut session = jmap_discovery_session();
+            session[key] = invalid;
+            assert_eq!(discover_with_jmap(session).via, Via::Autoconfig);
+        }
+    }
+
+    #[test]
+    fn jmap_discovery_requires_usable_endpoints_on_its_https_origin() {
+        assert_eq!(discover_with_jmap(jmap_discovery_session()).via, Via::Jmap);
+        for (key, url) in [
+            ("apiUrl", "https://other.example/api/"),
+            ("downloadUrl", "https://jmap.example:444/d/{blobId}"),
+            ("uploadUrl", "http://localhost/u/{accountId}"),
+        ] {
+            let mut session = jmap_discovery_session();
+            session[key] = serde_json::json!(url);
+            let settings = discover_with_jmap(session).settings;
+            assert!(matches!(settings, Settings::Imap { imap, smtp }
+                if imap.host == "imap.jmap.example" && smtp.host == "smtp.jmap.example"), "{key}");
+        }
+    }
+
     #[test]
     fn jmap_autoconfig_srv_mx_then_a_guess() {
         let mut n = Net::default();
-        n.pages.insert("https://jmap.example/.well-known/jmap".into(), br#"{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:mail":{}},"accounts":{},"primaryAccounts":{"urn:ietf:params:jmap:mail":"a1"},"apiUrl":"https://jmap.example/api/","downloadUrl":"https://jmap.example/d/{blobId}","uploadUrl":"https://jmap.example/u/","state":"1"}"#.to_vec());
+        n.pages.insert("https://jmap.example/.well-known/jmap".into(), jmap_discovery_session().to_string().into_bytes());
         assert_eq!(discover("a@jmap.example", &mut n).unwrap().settings, Settings::Jmap { session: "https://jmap.example/.well-known/jmap".into() });
 
         n.pages.insert("https://auto.example/.well-known/autoconfig/mail/config-v1.1.xml".into(), br#"<?xml version="1.0"?>
