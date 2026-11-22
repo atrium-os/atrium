@@ -149,6 +149,7 @@ pub enum SinkCall {
     ImapImportProbe,
     ImapImportProbed(String, bool),
     ImapImportScope(Vec<String>),
+    ImapImportProof(String, Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,8 +425,12 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
             _ => Err("bad IMAP import scope reply".into()),
         }
     }
-    fn imap_import_probed(&mut self, id: &str, absent: bool) -> std::result::Result<(), String> {
-        self.done(SinkCall::ImapImportProbed(id.into(), absent))
+    fn imap_import_probed(&mut self, id: &str, proof: Option<&[String]>) -> std::result::Result<(), String> {
+        let call = match proof {
+            Some(names) => SinkCall::ImapImportProof(id.into(), names.to_vec()),
+            None => SinkCall::ImapImportProbed(id.into(), false),
+        };
+        self.done(call)
     }
     fn jmap_import_ids(&mut self, after: &str, limit: usize) -> std::result::Result<Vec<String>, String> {
         match self.ask(SinkCall::JmapImportIds(after.into(), limit as u32)).map_err(|err| err.to_string())? {
@@ -892,7 +897,9 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
             Err(err) => SinkAnswer::Done(Err(err)),
         },
         SinkCall::ImapImportScope(mailboxes) => SinkAnswer::ImapImportScope(s.imap_import_scope_complete(&mailboxes)),
-        SinkCall::ImapImportProbed(id, absent) => SinkAnswer::Done(s.imap_import_probed(&id, absent)),
+        SinkCall::ImapImportProbed(id, false) => SinkAnswer::Done(s.imap_import_probed(&id, None)),
+        SinkCall::ImapImportProbed(_, true) => SinkAnswer::Done(Err("IMAP absence needs a mailbox list".into())),
+        SinkCall::ImapImportProof(id, names) => SinkAnswer::Done(s.imap_import_probed(&id, Some(&names))),
         SinkCall::JmapImportIds(after, limit) => SinkAnswer::JmapImportIds(s.jmap_import_ids(&after, (limit as usize).min(32))),
         SinkCall::JmapDestroyed(ids) => SinkAnswer::Done(s.jmap_destroyed(&ids)),
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),

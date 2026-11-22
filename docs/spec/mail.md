@@ -515,10 +515,12 @@ as **making the account usable first, then filling in what's worth having, polit
   read-only checkpoint. Exceeding either budget retains the alias. An unreadable listed mailbox
   or a missing previously known mailbox prevents release. An explicit
   `NonExistent` hierarchy name can be included without searching it. A positive
-  result, changed counter, incomplete response or exceeded budget retains the
-  alias. Only verified absence in the visible scope releases the object's
-  aliases. The cursor persists per account. Mail cannot discover a mailbox the
-  server has never exposed to that account.
+  result, changed counter, incomplete or contradictory search response, or an
+  exceeded budget retains the alias. The sync worker supplies the verified list
+  of mailboxes, and the store rechecks it against known folders in the same
+  transaction that releases the alias. A folder learned during the sweep keeps
+  the alias if it falls outside the proof. The cursor persists per account.
+  Mail cannot discover a mailbox the server has never exposed to that account.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

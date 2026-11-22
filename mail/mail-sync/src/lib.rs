@@ -203,8 +203,8 @@ pub trait Sink {
     fn imap_import_scope_complete(&mut self, _mailboxes: &[String]) -> std::result::Result<bool, String> {
         Ok(false)
     }
-    /// Save the probe position, releasing aliases only for confirmed absence.
-    fn imap_import_probed(&mut self, _object: &str, _absent: bool) -> std::result::Result<(), String> {
+    /// Save the probe position. A completed absence proof carries its mailbox list.
+    fn imap_import_probed(&mut self, _object: &str, _proof: Option<&[String]>) -> std::result::Result<(), String> {
         Ok(())
     }
     /// A bounded page of JMAP import aliases, ordered by Email ID.
@@ -652,52 +652,61 @@ impl<S: Read + Write> Session<S> {
         // The ordinary LIST already tells us when a proof would exceed the
         // budget. Avoid a second, potentially oversized response in that case.
         let within_budget = listed.iter().filter(|folder| folder.selectable).take(limit + 1).count() <= limit;
-        let absent = if supported && within_budget && is_imap_object_id(&id) {
+        let proof = if supported && within_budget && is_imap_object_id(&id) {
             match self.imap_object_absent(&id, sink, batched, limit) {
-                Ok(absent) => absent,
+                Ok(proof) => proof,
                 Err(err @ (Error::No(_) | Error::Throttled)) => {
                     eprintln!("mail-sync: IMAP import presence check refused: {err}");
-                    false
+                    None
                 }
                 // A truncated or malformed exchange can leave the stream out
                 // of sync. Preserve the alias and let the next pass reconnect.
                 Err(err) => return Err(err),
             }
         } else {
-            false
+            None
         };
-        sink.imap_import_probed(&id, absent).map_err(Error::Sink)
+        sink.imap_import_probed(&id, proof.as_deref()).map_err(Error::Sink)
     }
 
-    fn imap_object_absent(&mut self, id: &str, sink: &mut dyn Sink, batched: bool, limit: usize) -> Result<bool> {
-        let Some(inventory) = self.import_inventory(batched, limit)? else { return Ok(false) };
+    fn imap_object_absent(&mut self, id: &str, sink: &mut dyn Sink, batched: bool, limit: usize) -> Result<Option<Vec<String>>> {
+        let Some(inventory) = self.import_inventory(batched, limit)? else { return Ok(None) };
         let searchable = inventory.iter()
             .filter(|mailbox| mailbox.checkpoint.is_some_and(|(_, _, count)| count != 0))
             .count();
         if batched && searchable > IMPORT_STATUS_SEARCH_LIMIT {
-            return Ok(false);
+            return Ok(None);
         }
         let names: Vec<_> = inventory.iter().map(|mailbox| mailbox.name.clone()).collect();
         if !sink.imap_import_scope_complete(&names).map_err(Error::Sink)? {
-            return Ok(false);
+            return Ok(None);
         }
         let mut checkpoints = Vec::new();
         for mailbox in inventory.iter().filter(|mailbox| mailbox.selectable) {
             if mailbox.checkpoint.is_some_and(|(_, _, exists)| exists == 0) {
                 continue;
             }
-            let Some(before) = self.import_checkpoint(&mailbox.name)? else { return Ok(false) };
+            let Some(before) = self.import_checkpoint(&mailbox.name)? else { return Ok(None) };
             if mailbox.checkpoint.is_some_and(|expected| expected != before) {
-                return Ok(false);
+                return Ok(None);
             }
             let search = self.enc.uid_search_object(id).ok_or_else(|| Error::Protocol("bad IMAP object ID".into()))?;
             let (replies, _) = self.run_bounded(search, 64)?;
+            // A reply in another search format is not evidence of absence,
+            // even if the same command also included an empty SEARCH reply.
+            if replies.iter().any(|reply| match reply {
+                Response::Other(kind, _) => kind == "ESEARCH",
+                Response::Expunge(_) | Response::Vanished { .. } => true,
+                _ => false,
+            }) {
+                return Ok(None);
+            }
             let mut results = replies.iter().filter_map(|reply| match reply {
                 Response::Search { ids, .. } => Some(ids),
                 _ => None,
             });
             if !matches!((results.next(), results.next()), (Some(ids), None) if ids.is_empty()) {
-                return Ok(false);
+                return Ok(None);
             }
             if !batched {
                 checkpoints.push((&mailbox.name, before));
@@ -707,10 +716,10 @@ impl<S: Read + Write> Session<S> {
         // advances UIDNEXT even if the new UID is already gone on recheck.
         for (name, before) in checkpoints {
             if self.import_checkpoint(name)? != Some(before) {
-                return Ok(false);
+                return Ok(None);
             }
         }
-        Ok(self.import_inventory(batched, limit)?.as_ref() == Some(&inventory))
+        Ok((self.import_inventory(batched, limit)?.as_ref() == Some(&inventory)).then_some(names))
     }
 
     fn import_inventory(&mut self, batched: bool, limit: usize) -> Result<Option<Vec<ImportMailbox>>> {

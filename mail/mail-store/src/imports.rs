@@ -6,7 +6,7 @@
 use redb::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
-use crate::{dec, enc, AccountId, Folder, FolderId, Hash, Result, Store, Writer, FOLDERS, META};
+use crate::{dec, enc, AccountId, Folder, FolderId, Hash, Result, Store, Writer, FOLDERS, FOLDER_NAMES, META};
 
 /// id → postcard [`Import`].
 pub(crate) const IMPORTS: TableDefinition<u64, &[u8]> = TableDefinition::new("imports");
@@ -39,6 +39,36 @@ const IMAP_IMPORT_OBJECTS: MultimapTableDefinition<(AccountId, &str), &str> =
 const IMAP_IMPORTS_BY_OBJECT: MultimapTableDefinition<(AccountId, &str), &str> =
     MultimapTableDefinition::new("imap_imports_by_object");
 const IMAP_IMPORT_CURSOR: &str = "imap-import-presence";
+
+// Validate the worker's scope in both the preflight read and the transaction
+// which retires the alias. FOLDER_NAMES includes folders hidden by later LISTs.
+fn imap_scope_complete(
+    names: &impl ReadableTable<(AccountId, &'static str), FolderId>,
+    account: AccountId,
+    mailboxes: &[String],
+) -> Result<bool> {
+    if mailboxes.len() > 192 || mailboxes.iter().any(|name| {
+        name.is_empty() || name.len() > 1024 || (name.eq_ignore_ascii_case("INBOX") && name != "INBOX")
+    }) {
+        return Ok(false);
+    }
+    let scope: std::collections::BTreeSet<_> = mailboxes.iter().map(String::as_str).collect();
+    if !scope.contains("INBOX") || scope.len() != mailboxes.len() {
+        return Ok(false);
+    }
+    for row in names.range((account, "")..)? {
+        let (key, _) = row?;
+        let (owner, name) = key.value();
+        if owner != account {
+            break;
+        }
+        let canonical = if name.eq_ignore_ascii_case("INBOX") { "INBOX" } else { name };
+        if !scope.contains(canonical) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 /// A protocol-issued identity for a successful upload.
 pub enum ImportIdentity {
@@ -236,9 +266,16 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Finish a bounded probe and remove only the confirmed absent object.
-    pub fn finish_imap_import_probe(&mut self, account: AccountId, object: &str, absent: bool) -> Result<()> {
-        if absent {
+    /// Retire an alias only if the proof covers the scope at commit time.
+    pub fn finish_imap_import_probe(&mut self, account: AccountId, object: &str, proof: Option<&[String]>) -> Result<()> {
+        if self.tx.open_table(crate::ACCOUNTS)?.get(account)?.is_none() {
+            return Ok(());
+        }
+        let complete = match proof {
+            Some(mailboxes) => imap_scope_complete(&self.tx.open_table(FOLDER_NAMES)?, account, mailboxes)?,
+            None => false,
+        };
+        if complete {
             let mut originals = self.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
             let mut by_object = self.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?;
             for original in by_object.remove_all((account, object))? {
@@ -376,6 +413,12 @@ impl Store {
             out.push((k.value(), dec(v.value())?));
         }
         Ok(out)
+    }
+
+    /// Whether the probe's visible scope covers the account's known folders.
+    pub fn imap_import_scope_complete(&self, account: AccountId, mailboxes: &[String]) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        imap_scope_complete(&tx.open_table(FOLDER_NAMES)?, account, mailboxes)
     }
 
     /// Rotate through stable IMAP objects using a persisted, account-scoped cursor.
@@ -517,5 +560,39 @@ mod tests {
         store.write(|w| w.remove_account(account)).unwrap();
         let tx = store.db.begin_read().unwrap();
         assert!(tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap().get((account, mid)).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn imap_absence_requires_a_complete_account_scope_at_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let account = store.add_account("ada@example.org").unwrap();
+        let other = store.add_account("bea@example.org").unwrap();
+        let inbox = store.folder_id(account, "inbox", crate::Role::Inbox).unwrap();
+        store.folder_id(other, "OtherAccount", crate::Role::Other).unwrap();
+        let mid = "original@example.org";
+        let object = "emailid:A";
+        store.write(|w| {
+            w.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?.insert((account, mid), object)?;
+            w.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?.insert((account, object), mid)?;
+            Ok(())
+        }).unwrap();
+
+        let proof = vec!["INBOX".to_owned()];
+        assert!(store.imap_import_scope_complete(account, &proof).unwrap());
+        store.folder_id(account, "NewMailbox", crate::Role::Other).unwrap();
+        let complete = vec!["INBOX".to_owned(), "NewMailbox".to_owned()];
+        let duplicate = vec!["INBOX".to_owned(), "NewMailbox".to_owned(), "NewMailbox".to_owned()];
+        for incomplete in [&proof, &duplicate] {
+            store.write(|w| w.finish_imap_import_probe(account, object, Some(incomplete))).unwrap();
+            assert_eq!(store.imap_import_probe(account).unwrap().as_deref(), Some(object));
+        }
+        store.write(|w| w.finish_imap_import_probe(account, object, Some(&complete))).unwrap();
+        assert!(store.imap_import_probe(account).unwrap().is_none());
+        let blob = store.put_blob(b"Subject: reimport").unwrap();
+        assert!(store.write(|w| w.queue_import_if_new(inbox, Some(mid), || Ok(blob))).unwrap());
+        store.write(|w| w.remove_account(account)).unwrap();
+        store.write(|w| w.finish_imap_import_probe(account, object, Some(&complete))).unwrap();
+        assert!(store.sync_state(account, IMAP_IMPORT_CURSOR).unwrap().is_none());
     }
 }

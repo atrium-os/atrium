@@ -1150,6 +1150,8 @@ enum ImapPresence {
     Refused,
     Changed,
     InventoryChanged,
+    ContradictorySearch,
+    LearnedAfterSearch,
     OverBudget,
     LargeStable,
     LargeSparseAtLimit,
@@ -1177,8 +1179,9 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
     let batched = matches!(mode, ImapPresence::LargeStable | ImapPresence::LargeChangedEmpty
         | ImapPresence::LargeMissingStatus | ImapPresence::LargeUnreadable | ImapPresence::LargeOverBudget
         | ImapPresence::LargeSparseAtLimit | ImapPresence::LargeBusyAtLimit | ImapPresence::LargeBusy
-        | ImapPresence::LargeDuplicateStatus | ImapPresence::LargeForeignStatus);
+        | ImapPresence::LargeDuplicateStatus | ImapPresence::LargeForeignStatus | ImapPresence::LearnedAfterSearch);
     let busy = matches!(mode, ImapPresence::LargeBusyAtLimit | ImapPresence::LargeBusy);
+    let store = engine.store.clone();
     let thread = std::thread::spawn(move || {
         let mut peer = BufReader::new(peer);
         let capability = if batched { "OBJECTID LIST-STATUS" } else if gmail { "X-GM-EXT-1" } else { "OBJECTID" };
@@ -1197,6 +1200,9 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
             commands.push(command.to_owned());
             if command.starts_with("LIST ") {
                 lists += 1;
+                if mode == ImapPresence::LearnedAfterSearch && lists == 3 {
+                    store.folder_id(account, "LearnedDuringProbe", Role::Other).unwrap();
+                }
                 peer.get_mut().write_all(
                     b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\All) \"/\" AllMail\r\n* LIST (\\Trash) \"/\" Trash\r\n"
                 ).unwrap();
@@ -1255,9 +1261,13 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
                 if mode != ImapPresence::Unreported {
                     let uids = if gmail && trash { " 11" } else { "" };
                     write!(peer.get_mut(), "* SEARCH{uids}\r\n").unwrap();
+                    if mode == ImapPresence::ContradictorySearch {
+                        write!(peer.get_mut(), "* ESEARCH (TAG \"{tag}\") UID ALL 11\r\n").unwrap();
+                    }
                 }
             } else if command == "LOGOUT" {
-                write!(peer.get_mut(), "* BYE done\r\n{tag} OK done\r\n").unwrap();
+                // The client may close as soon as it reads BYE.
+                let _ = write!(peer.get_mut(), "* BYE done\r\n{tag} OK done\r\n");
                 break;
             } else {
                 assert!(command.starts_with("UID FETCH "), "{command}");
@@ -1311,7 +1321,7 @@ fn imap_import_probe_only_releases_confirmed_account_wide_absence() {
     assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH EMAILID B").count(), 3);
     assert_eq!(engine.import_mbox(inbox, &second[..]).unwrap().queued, 1);
     assert_eq!(engine.import_mbox(other_inbox, &parallel[..]).unwrap().already, 1);
-    for mode in [ImapPresence::Unreported, ImapPresence::Refused, ImapPresence::InventoryChanged] {
+    for mode in [ImapPresence::Unreported, ImapPresence::Refused, ImapPresence::InventoryChanged, ImapPresence::ContradictorySearch] {
         sync_imap_presence(&engine, account, mode);
         assert_eq!(engine.import_mbox(inbox, &first[..]).unwrap().already, 1);
     }
@@ -1320,7 +1330,7 @@ fn imap_import_probe_only_releases_confirmed_account_wide_absence() {
 
     // The ordinary Gmail walk skips Trash as a label view. The explicit
     // account sweep must still see the tracked object there.
-    engine.store.write(|w| w.finish_imap_import_probe(other, "emailid:B", false)).unwrap();
+    engine.store.write(|w| w.finish_imap_import_probe(other, "emailid:B", None)).unwrap();
     let commands = sync_imap_presence(&engine, other, ImapPresence::PresentInTrash);
     assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH X-GM-MSGID 812").count(), 3);
     assert_eq!(engine.import_mbox(other_inbox, &gmail[..]).unwrap().already, 1);
@@ -1345,6 +1355,7 @@ fn imap_list_status_checks_large_accounts_and_preserves_partial_scope() {
         (ImapPresence::LargeDuplicateStatus, false, 0, false),
         (ImapPresence::LargeForeignStatus, false, 0, false),
         (ImapPresence::LargeOverBudget, false, 0, false),
+        (ImapPresence::LearnedAfterSearch, false, 2, false),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
@@ -1376,6 +1387,9 @@ fn imap_list_status_checks_large_accounts_and_preserves_partial_scope() {
         mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
         let result = engine.import_mbox(inbox, &mbox[..]).unwrap();
         assert_eq!((result.queued, result.already), if released { (1, 0) } else { (0, 1) });
+        if mode == ImapPresence::LearnedAfterSearch {
+            assert!(engine.store.folders(account).unwrap().iter().any(|(_, folder)| folder.name == "LearnedDuringProbe"));
+        }
     }
 }
 
