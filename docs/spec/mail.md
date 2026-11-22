@@ -508,10 +508,11 @@ as **making the account usable first, then filling in what's worth having, polit
   across the account's listed selectable mailboxes, including labels skipped by
   the ordinary Gmail sync. The fallback searches at most 16 selectable mailboxes
   and brackets each sweep with read-only UIDVALIDITY, UIDNEXT and EXISTS checks.
-  With LIST-STATUS, the limit is 32 selectable mailboxes. Matching inventories
-  with complete UIDVALIDITY, UIDNEXT and MESSAGES counters bracket the sweep.
-  Empty mailboxes need only those counters. Each nonempty mailbox requires an
-  exact search and a matching read-only checkpoint. An unreadable listed mailbox
+  With LIST-STATUS, Mail inventories at most 64 selectable mailboxes and searches
+  at most 32 nonempty mailboxes. Matching inventories with complete UIDVALIDITY,
+  UIDNEXT and MESSAGES counters bracket the sweep. Empty mailboxes need only
+  those counters. Each nonempty mailbox requires an exact search and a matching
+  read-only checkpoint. Exceeding either budget retains the alias. An unreadable listed mailbox
   or a missing previously known mailbox prevents release. An explicit
   `NonExistent` hierarchy name can be included without searching it. A positive
   result, changed counter, incomplete response or exceeded budget retains the

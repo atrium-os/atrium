@@ -1152,6 +1152,11 @@ enum ImapPresence {
     InventoryChanged,
     OverBudget,
     LargeStable,
+    LargeSparseAtLimit,
+    LargeBusyAtLimit,
+    LargeBusy,
+    LargeDuplicateStatus,
+    LargeForeignStatus,
     LargeChangedEmpty,
     LargeMissingStatus,
     LargeUnreadable,
@@ -1170,7 +1175,10 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
     client.set_read_timeout(timeout).unwrap();
     let gmail = mode == ImapPresence::PresentInTrash;
     let batched = matches!(mode, ImapPresence::LargeStable | ImapPresence::LargeChangedEmpty
-        | ImapPresence::LargeMissingStatus | ImapPresence::LargeUnreadable | ImapPresence::LargeOverBudget);
+        | ImapPresence::LargeMissingStatus | ImapPresence::LargeUnreadable | ImapPresence::LargeOverBudget
+        | ImapPresence::LargeSparseAtLimit | ImapPresence::LargeBusyAtLimit | ImapPresence::LargeBusy
+        | ImapPresence::LargeDuplicateStatus | ImapPresence::LargeForeignStatus);
+    let busy = matches!(mode, ImapPresence::LargeBusyAtLimit | ImapPresence::LargeBusy);
     let thread = std::thread::spawn(move || {
         let mut peer = BufReader::new(peer);
         let capability = if batched { "OBJECTID LIST-STATUS" } else if gmail { "X-GM-EXT-1" } else { "OBJECTID" };
@@ -1193,7 +1201,13 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
                     b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\All) \"/\" AllMail\r\n* LIST (\\Trash) \"/\" Trash\r\n"
                 ).unwrap();
                 if batched {
-                    let extra = if mode == ImapPresence::LargeOverBudget { 30 } else { 18 };
+                    let extra = match mode {
+                        ImapPresence::LargeSparseAtLimit => 61,
+                        ImapPresence::LargeOverBudget => 62,
+                        ImapPresence::LargeBusyAtLimit => 29,
+                        ImapPresence::LargeBusy => 30,
+                        _ => 18,
+                    };
                     for n in 0..extra {
                         let flags = if mode == ImapPresence::LargeUnreadable && n == 17 { "\\Noselect" } else { "" };
                         write!(peer.get_mut(), "* LIST ({flags}) \"/\" Box{n}\r\n").unwrap();
@@ -1207,9 +1221,16 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
                             {
                                 continue;
                             }
-                            let count = u8::from(matches!(name.as_str(), "INBOX" | "Trash"));
-                            let next = 1 + u8::from(mode == ImapPresence::LargeChangedEmpty && lists == 3 && name == "Box17");
-                            write!(peer.get_mut(), "* STATUS {name} (UIDVALIDITY 7 UIDNEXT {next} MESSAGES {count})\r\n").unwrap();
+                            let count = u8::from(busy || matches!(name.as_str(), "INBOX" | "Trash"));
+                            let next = 2 + u8::from(mode == ImapPresence::LargeChangedEmpty && lists == 3 && name == "Box17");
+                            let reply = format!("* STATUS {name} (UIDVALIDITY 7 UIDNEXT {next} MESSAGES {count})\r\n");
+                            peer.get_mut().write_all(reply.as_bytes()).unwrap();
+                            if mode == ImapPresence::LargeDuplicateStatus && name == "Box17" {
+                                peer.get_mut().write_all(reply.as_bytes()).unwrap();
+                            }
+                        }
+                        if mode == ImapPresence::LargeForeignStatus {
+                            peer.get_mut().write_all(b"* STATUS Unlisted (UIDVALIDITY 7 UIDNEXT 1 MESSAGES 0)\r\n").unwrap();
                         }
                     }
                 } else if mode == ImapPresence::OverBudget {
@@ -1221,8 +1242,8 @@ fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: Ima
                 }
             } else if command.starts_with("SELECT ") || command.starts_with("EXAMINE ") {
                 trash = command.contains("Trash");
-                let next = 1 + u32::from(mode == ImapPresence::Changed && probes >= 3);
-                let exists = u8::from(batched && lists >= 2 && (trash || command.contains("INBOX")));
+                let next = 2 + u32::from(mode == ImapPresence::Changed && probes >= 3);
+                let exists = u8::from(batched && lists >= 2 && (busy || trash || command.contains("INBOX")));
                 write!(peer.get_mut(), "* {exists} EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n* OK [UIDNEXT {next}] current\r\n").unwrap();
             } else if command.starts_with("UID SEARCH EMAILID ") || command.starts_with("UID SEARCH X-GM-MSGID ") {
                 probes += 1;
@@ -1318,6 +1339,11 @@ fn imap_list_status_checks_large_accounts_and_preserves_partial_scope() {
         (ImapPresence::LargeMissingStatus, false, 0, false),
         (ImapPresence::LargeUnreadable, false, 0, false),
         (ImapPresence::LargeStable, true, 0, false),
+        (ImapPresence::LargeSparseAtLimit, false, 2, true),
+        (ImapPresence::LargeBusyAtLimit, false, 32, true),
+        (ImapPresence::LargeBusy, false, 0, false),
+        (ImapPresence::LargeDuplicateStatus, false, 0, false),
+        (ImapPresence::LargeForeignStatus, false, 0, false),
         (ImapPresence::LargeOverBudget, false, 0, false),
     ] {
         let dir = tempfile::tempdir().unwrap();

@@ -374,7 +374,9 @@ pub struct Report {
 
 type ImapCheckpoint = (u32, u32, u32);
 const IMPORT_MAILBOX_LIMIT: usize = 16;
-const IMPORT_LIST_STATUS_LIMIT: usize = 32;
+const IMPORT_STATUS_MAILBOX_LIMIT: usize = 64;
+const IMPORT_STATUS_SEARCH_LIMIT: usize = 32;
+const IMPORT_STATUS_REPLY_LIMIT: usize = 192;
 
 #[derive(PartialEq, Eq)]
 struct ImportMailbox {
@@ -646,7 +648,7 @@ impl<S: Read + Write> Session<S> {
         let supported = (id.starts_with("emailid:") && has(&self.caps, "OBJECTID"))
             || (id.starts_with("gm:") && has(&self.caps, "X-GM-EXT-1"));
         let batched = has(&self.caps, "LIST-STATUS");
-        let limit = if batched { IMPORT_LIST_STATUS_LIMIT } else { IMPORT_MAILBOX_LIMIT };
+        let limit = if batched { IMPORT_STATUS_MAILBOX_LIMIT } else { IMPORT_MAILBOX_LIMIT };
         // The ordinary LIST already tells us when a proof would exceed the
         // budget. Avoid a second, potentially oversized response in that case.
         let within_budget = listed.iter().filter(|folder| folder.selectable).take(limit + 1).count() <= limit;
@@ -669,6 +671,12 @@ impl<S: Read + Write> Session<S> {
 
     fn imap_object_absent(&mut self, id: &str, sink: &mut dyn Sink, batched: bool, limit: usize) -> Result<bool> {
         let Some(inventory) = self.import_inventory(batched, limit)? else { return Ok(false) };
+        let searchable = inventory.iter()
+            .filter(|mailbox| mailbox.checkpoint.is_some_and(|(_, _, count)| count != 0))
+            .count();
+        if batched && searchable > IMPORT_STATUS_SEARCH_LIMIT {
+            return Ok(false);
+        }
         let names: Vec<_> = inventory.iter().map(|mailbox| mailbox.name.clone()).collect();
         if !sink.imap_import_scope_complete(&names).map_err(Error::Sink)? {
             return Ok(false);
@@ -707,7 +715,7 @@ impl<S: Read + Write> Session<S> {
 
     fn import_inventory(&mut self, batched: bool, limit: usize) -> Result<Option<Vec<ImportMailbox>>> {
         let cmd = if batched { self.enc.list_import_status() } else { self.enc.list(false) };
-        let (replies, _) = self.run_bounded(cmd, if batched { 128 } else { 64 })?;
+        let (replies, _) = self.run_bounded(cmd, if batched { IMPORT_STATUS_REPLY_LIMIT } else { 64 })?;
         let mut inventory = Vec::new();
         let mut statuses = std::collections::BTreeMap::new();
         let canonical = |name: String| if name.eq_ignore_ascii_case("INBOX") { "INBOX".into() } else { name };
