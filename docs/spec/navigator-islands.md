@@ -572,6 +572,15 @@ confirmation. The confirmed proposal produced one POST, one accepted
 assertion and one redemption. The guest fetched `crypta-ac-ok` through
 ocserv on `tun8`.
 
+The next gate held the original jail open across two replacements,
+cancelled the newest attempt, then reconnected and requeued Sign In
+while that jail still existed. Portcullis replaced the cancelled queue
+entry in place. After teardown only the latest window launched, with no
+additional Sign In press. The gateway saw zero POSTs and IPv4 stayed
+blocked before fresh confirmation. The confirmed proposal produced one
+POST, one accepted assertion, one redemption and `crypta-ac-ok` through
+ocserv on `tun4`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
