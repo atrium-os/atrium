@@ -640,23 +640,90 @@ fn jmap_sync_changes_and_send() {
     }
     assert_eq!(engine.clear_stuck_imports(account).unwrap(), 1);
     assert!(engine.store.imports().unwrap().is_empty());
-    // A big file says how far it has got.
-    let mut big = Vec::new();
-    for i in 0..1200u32 {
-        mail_engine::export::write_one(&mut big, format!("Message-ID: <big{i}@example.com>\r\nSubject: {i}\r\n\r\nx\r\n").as_bytes(), t0).unwrap();
+}
+
+#[test]
+fn jmap_bulk_import_uploads_and_syncs_all_messages() {
+    use mail_engine::import::{import_with, UPLOADS_PER_PASS};
+
+    const COUNT: usize = 1200;
+    let raw_message = |i| format!("Message-ID: <big{i}@example.com>\r\nSubject: {i}\r\n\r\nx\r\n");
+    let server = Rc::new(RefCell::new(Server::default()));
+    let parser = jail();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = Engine::new(Store::open(source_dir.path()).unwrap(), Parser { program: parser.clone() });
+    let source_account = source.store.add_account("ada@example.org").unwrap();
+    let destination = source.store.folder_id(source_account, "Archive", Role::Archive).unwrap();
+    let mut writer = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+
+    // A separate client and empty Mail index observe changes from before the uploads.
+    let reader_dir = tempfile::tempdir().unwrap();
+    let reader = Engine::new(Store::open(reader_dir.path()).unwrap(), Parser { program: parser });
+    let reader_account = reader.store.add_account("ada@example.org").unwrap();
+    let mut read_client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let baseline = read_client.sync(&mut reader.sink(reader_account)).unwrap();
+    assert_eq!((baseline.headers, baseline.texts), (0, 0));
+    let archive = reader.store.folder_id(reader_account, "Archive", Role::Archive).unwrap();
+    assert_eq!(reader.store.count(archive).unwrap(), 0);
+
+    let mut mbox = Vec::new();
+    for i in 0..COUNT {
+        mail_engine::export::write_one(&mut mbox, raw_message(i).as_bytes(), 1_795_000_000).unwrap();
     }
-    let mut seen = Vec::new();
-    let r = mail_engine::import::import_with(&engine.store, &engine.parser, account, gone, &big[..], &mut |p| seen.push(p.progress_line("old.mbox"))).unwrap();
-    assert_eq!(r.queued, 1200);
-    let queued = engine.store.imports().unwrap();
-    assert_eq!(queued.len(), 1200);
-    assert!(queued.iter().all(|(_, import)| import.folder == gone && import.tries == 0));
-    for (i, (_, import)) in queued.iter().enumerate() {
-        let raw = engine.store.blob(&import.blob).unwrap();
-        let expected = format!("Message-ID: <big{i}@example.com>\r\nSubject: {i}\r\n\r\nx\r\n");
-        assert_eq!(raw, expected.as_bytes(), "queued message {i}");
+    let mut progress = Vec::new();
+    let imported = import_with(&source.store, &source.parser, source_account, destination, &mbox[..], &mut |p| {
+        progress.push(p.progress_line("old.mbox"));
+    }).unwrap();
+    assert_eq!(imported, mail_engine::import::Imported { queued: COUNT, already: 0, refused: 0 });
+    assert_eq!(progress, ["Reading old.mbox: 500 messages so far, 500 new", "Reading old.mbox: 1000 messages so far, 1000 new"]);
+    let queued = source.store.imports().unwrap();
+    assert_eq!(queued.len(), COUNT);
+    for (i, (_, entry)) in queued.iter().enumerate() {
+        assert_eq!((entry.folder, entry.tries), (destination, 0));
+        assert_eq!(source.store.blob(&entry.blob).unwrap(), raw_message(i).as_bytes(), "queued message {i}");
     }
-    assert_eq!(seen, ["Reading old.mbox: 500 messages so far, 500 new", "Reading old.mbox: 1000 messages so far, 1000 new"]);
+
+    let mut server_ids = Vec::with_capacity(COUNT);
+    for offset in (0..COUNT).step_by(UPLOADS_PER_PASS) {
+        let expected = (COUNT - offset).min(UPLOADS_PER_PASS);
+        let uploaded = source.upload_imports(source_account, &mut |folder, bytes| {
+            let id = writer.import(folder, bytes).map_err(|e| e.0)?;
+            server_ids.push(id);
+            Ok(())
+        }).unwrap();
+        assert_eq!(uploaded, expected, "upload pass at {offset}");
+        let completed = offset + expected;
+        assert_eq!(source.imports_waiting(source_account).unwrap(), COUNT - completed);
+        let report = read_client.sync(&mut reader.sink(reader_account)).unwrap();
+        assert_eq!((report.headers, report.texts), (expected, expected), "readback pass at {offset}");
+        assert_eq!(reader.store.count(archive).unwrap(), completed);
+        eprintln!("JMAP bulk import: {completed}/{COUNT} uploaded and synced");
+    }
+
+    assert!(source.store.imports().unwrap().is_empty());
+    assert_eq!(server_ids.iter().collect::<BTreeSet<_>>().len(), COUNT);
+    let rows = reader.store.list(archive, 0, COUNT).unwrap();
+    let archive_ids: BTreeSet<_> = rows.iter().map(|row| row.msg).collect();
+    assert_eq!(archive_ids.len(), COUNT);
+    {
+        let server = server.borrow();
+        assert_eq!((server.uploads.len(), server.mails.len(), server.downloads), (COUNT, COUNT, COUNT));
+        for (i, id) in server_ids.iter().enumerate() {
+            let expected = raw_message(i);
+            let uploaded = &server.mails[id];
+            assert_eq!(uploaded.bytes, expected.as_bytes(), "server message {i}");
+            assert_eq!(uploaded.boxes, BTreeSet::from(["arch".to_string()]));
+            let msg = reader.store.by_server_id(reader_account, id).unwrap().expect("synced JMAP message");
+            assert!(archive_ids.contains(&msg), "message {i} is in Archive");
+            let stored = reader.store.message(msg).unwrap();
+            assert_eq!(reader.store.blob(&stored.full.expect("full JMAP message")).unwrap(), expected.as_bytes(), "synced message {i}");
+            assert_eq!(stored.summary.sender_check, SenderCheck::NotVerified);
+        }
+    }
+    let again = read_client.sync(&mut reader.sink(reader_account)).unwrap();
+    assert_eq!((again.headers, again.texts), (0, 0));
+    assert_eq!(reader.store.count(archive).unwrap(), COUNT);
+    assert_eq!(server.borrow().downloads, COUNT);
 }
 
 /// A session with an event source, and a scripted stream.
