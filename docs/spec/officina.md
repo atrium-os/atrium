@@ -3929,6 +3929,14 @@ Sheets can print a saved XLSX print area when it names one absolute cell or rect
 - **Not yet:** wrapped text in printing (the printing thread's part).
 - **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller` (with `line_top`), `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter, the second line); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it` (with alignment), `rows_nobody_sized_grow_for_typed_lines`, `records_round_trip`.
 
+The `layout` profile of `scripts/sheets-interop-vm-check.sh` verifies
+these features together with frozen panes (§16.82), merged cells (§16.79),
+and hidden axes and manual sizes (§16.89–16.90) in XLSX and ODS. It edits
+a cell, drags a row and column edge, saves the undo and redo states, and
+reopens through the installed picker and converter. Checkpoints assert the
+visible and hidden dimensions and the wrapped and merged cells. The
+scrolled screenshots show the pinned top row and left column after reopen.
+
 ### 16.94 Entry keys and typed dates (2026-11-19)
 
 - **Typed dates and times:** typing `2026-11-19`, `14:30`, `14:30:05` or `2026-11-19 14:30` enters a date or time serial, and a cell still in General format gets `yyyy-mm-dd`, `hh:mm` (and so on) in the same undo step (`doc::typed_date`). Before, these stayed text. Impossible days (`2026-02-31`) stay text.

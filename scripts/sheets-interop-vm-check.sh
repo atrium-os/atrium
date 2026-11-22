@@ -4,11 +4,12 @@
 # stage the arm64 FreeBSD build of that example at /tmp/sheets-interop-fixture.
 # Set SHEETS_INTEROP_CASE=tables for the sheets_table_chart_fixture inputs
 # and stage its binary at /tmp/sheets-table-chart-fixture instead.
+# Use SHEETS_INTEROP_CASE=layout and /tmp/sheets-layout-fixture for layout.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
@@ -30,11 +31,11 @@ same_window() { test "$(win_at "$1" "$2")" = "$3"; }
 docs() { jls -n jid name | awk '/org_atrium_sheets__document_/ {sub(/^jid=/,"",$1);print $1}'; }
 closed() { test -z "$(docs)"; }
 checkpoint() {
-    if test "$profile" = tables; then
-        /tmp/sheets-table-chart-fixture check "$1" "$2" "$format"
-    else
-        /tmp/sheets-interop-fixture check "$1" "$2"
-    fi
+    case "$profile" in
+        tables) /tmp/sheets-table-chart-fixture check "$1" "$2" "$format" ;;
+        layout) /tmp/sheets-layout-fixture check "$1" "$2" ;;
+        pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
+    esac
 } 2>"$results/checkpoint.log"
 loaded() {
     jail=$(docs)
@@ -122,6 +123,46 @@ tables() {
     final=filtered
 }
 
+drag() {
+    input "MOVE $1 $2" 'BTN 1 1'
+    sleep .25
+    input "MOVE $3 $4"
+    sleep .25
+    input 'BTN 1 0'
+}
+
+layout() {
+    click 322 205 # D4, beside the hidden row and column.
+    key 0x25 # 8
+    key 0x28
+    save "$book" edited
+
+    drag 277 89 309 89 # Widen column B by 32 pixels.
+    save "$book" wider
+    drag 20 216 20 240 # Increase row 4 by 24 pixels.
+    save "$book" resized
+
+    click 370 24
+    save "$book" wider
+    click 370 24
+    save "$book" edited
+    click 445 24
+    save "$book" wider
+    click 445 24
+    save "$book" resized
+    cp selectscreen.png "$results/$format-resized.png"
+    final=resized
+}
+
+scroll_layout() {
+    click 350 205
+    # Move to the right of the first viewport, then scroll the body down.
+    for i in $(jot 25); do key 0x4f; sleep .04; done
+    input 'MOVE 605 400' 'SCROLL 440'
+    sleep .6
+    cp selectscreen.png "$results/$format-scrolled.png"
+}
+
 launcher=$(win_at 48 24)
 test "$launcher" -gt 0
 for format in ods xlsx; do
@@ -138,6 +179,7 @@ for format in ods xlsx; do
     open_book "$row" "$book" "$final"
     sleep .4
     cp selectscreen.png "$results/$format-reopened.png"
+    if test "$profile" = layout; then scroll_layout; fi
     close_book
     echo "PASS $format $profile edit, undo, redo, and converter reopen"
 done
