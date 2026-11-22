@@ -581,6 +581,14 @@ blocked before fresh confirmation. The confirmed proposal produced one
 POST, one accepted assertion, one redemption and `crypta-ac-ok` through
 ocserv on `tun4`.
 
+The follow-up disconnected while the latest requeued window still had
+an unconfirmed proposal. The jail closed, the gateway saw zero POSTs,
+and the IPv4 sentinel was unreachable. Reconnect used a distinct
+Crypta attempt and required a fresh proposal and confirmation. Before
+confirmation there was no handshake or IPv4 sentinel response. One
+confirmed POST led to one assertion and one redemption, and the guest
+fetched `crypta-ac-ok` through ocserv on `tun5`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
