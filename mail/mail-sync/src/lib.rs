@@ -330,6 +330,17 @@ fn imap_day(t: i64) -> String {
     format!("{d}-{}-{y}", MONTHS[m.clamp(1, 12) - 1])
 }
 
+/// The stable, namespaced server IDs recognized for IMAP imports.
+pub fn is_imap_object_id(id: &str) -> bool {
+    if let Some(value) = id.strip_prefix("emailid:") {
+        return !value.is_empty() && value.len() <= 255 && !value.eq_ignore_ascii_case("NIL")
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    }
+    id.strip_prefix("gm:").is_some_and(|value| {
+        !value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit()) && value.parse::<u64>().is_ok()
+    })
+}
+
 /// A change the person made, to make on the server (mail.md §6.3).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Change {
@@ -515,6 +526,8 @@ impl<S: Read + Write> Session<S> {
     fn fetched(&self, rs: Vec<Response>, full: bool) -> (Vec<Fetched>, Vec<(u32, Vec<String>)>) {
         let mut msgs = Vec::new();
         let mut flags_only = Vec::new();
+        let gmail = has(&self.caps, "X-GM-EXT-1");
+        let objectid = !gmail && has(&self.caps, "OBJECTID");
         for r in rs {
             let Response::Fetch { items, .. } = r else { continue };
             let mut f = Fetched { uid: 0, flags: Vec::new(), size: 0, internal_date: None, server_id: None, bytes: Vec::new(), full };
@@ -526,8 +539,13 @@ impl<S: Read + Write> Session<S> {
                     FetchItem::Flags(fl) => { f.flags = fl; got_flags = true }
                     FetchItem::Size(n) => f.size = n,
                     FetchItem::InternalDate(d) => f.internal_date = internal_date(&d),
-                    FetchItem::EmailId(e) if !e.is_empty() => f.server_id = Some(format!("emailid:{e}")),
-                    FetchItem::GmMsgId(g) if g != 0 => f.server_id = Some(format!("gm:{g}")),
+                    FetchItem::EmailId(e) if objectid => {
+                        let id = format!("emailid:{e}");
+                        if is_imap_object_id(&id) {
+                            f.server_id = Some(id);
+                        }
+                    }
+                    FetchItem::GmMsgId(g) if gmail && g != 0 => f.server_id = Some(format!("gm:{g}")),
                     FetchItem::Body { data: Some(d), .. } => { f.bytes = d; got_body = true }
                     _ => {}
                 }
@@ -906,7 +924,15 @@ impl<S: Read + Write> Session<S> {
             return Ok(());
         }
         let cmd = self.enc.select(name, true, None, false);
-        self.run(cmd)?;
+        let (responses, _) = self.run(cmd)?;
+        let validity = responses.iter().find_map(|reply| match reply {
+            Response::State { code: Some(Code::UidValidity(value)), .. } => Some(*value),
+            _ => None,
+        }).unwrap_or(0);
+        if validity != 0 && sink.state(name).uidvalidity != validity {
+            // The wanted UIDs came from an older generation.
+            return Ok(());
+        }
         let mut items = vec![FetchWant::Uid, FetchWant::Flags, FetchWant::Size, FetchWant::InternalDate, FetchWant::BodyPeek { section: String::new(), partial: None }];
         if has(&self.caps, "X-GM-EXT-1") {
             items.push(FetchWant::GmMsgId);
@@ -918,7 +944,7 @@ impl<S: Read + Write> Session<S> {
             let (rs, _) = self.run(cmd)?;
             let (msgs, _) = self.fetched(rs, true);
             report.texts += msgs.len();
-            sink.messages(name, msgs).map_err(Error::Sink)?;
+            sink.imap_messages(name, validity, msgs).map_err(Error::Sink)?;
         }
         Ok(())
     }

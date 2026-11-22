@@ -596,9 +596,11 @@ impl Sink for AccountSink<'_> {
             for ((uid, link, m), fresh) in stored.into_iter().zip(fresh) {
                 let selection = self.selected_imap;
                 let observed = selection.and_then(|_| m.summary.message_id.clone());
+                let object = selection.and_then(|_| m.server_id.as_deref())
+                    .filter(|id| mail_sync::is_imap_object_id(id)).map(str::to_owned);
                 let msg = w.put_linked(id, account, uid, m, link)?;
                 if let Some(validity) = selection {
-                    w.confirm_imap_import(account, (id, validity, uid), observed.as_deref())?;
+                    w.confirm_imap_import(account, (id, validity, uid), observed.as_deref(), object.as_deref())?;
                 }
                 all.push(msg);
                 if fresh {

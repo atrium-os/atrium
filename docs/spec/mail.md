@@ -497,10 +497,15 @@ as **making the account usable first, then filling in what's worth having, polit
   failed presence check keeps those aliases and lets ordinary sync continue.
   IMAP preserves both fields of a valid single-message APPENDUID and matches
   readback by destination mailbox, UIDVALIDITY and UID. If readback preserves the
-  original Message-ID, the ordinary index takes over. A rewritten header keeps
-  the original alias, since disappearance from one IMAP mailbox can also mean a
-  move. Without a usable APPENDUID, the original Message-ID remains the fallback.
-  Removing the account clears its accepted uploads and aliases.
+  original Message-ID, the ordinary index takes over. When exact readback shows
+  a rewritten header and a valid OBJECTID `EMAILID` or Gmail `X-GM-MSGID`, Mail
+  binds the original Message-ID to that account-scoped object. The alias survives
+  a restart and follows the object across mailbox moves and UID changes. Readback
+  preserves the server's actual headers. Earlier location aliases can bind after
+  an exact fetch of their recorded UID. If Mail sees the move before any exact
+  readback, it keeps the original location alias. A missing APPENDUID keeps the
+  Message-ID fallback. Disappearance from a mailbox is ambiguous, so Mail retains
+  protected aliases until account removal.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

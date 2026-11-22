@@ -31,6 +31,11 @@ const IMAP_IMPORTS_BY_ORIGINAL: MultimapTableDefinition<(AccountId, &str), ImapL
 const IMAP_IMPORTS_PENDING: MultimapTableDefinition<ImapLocation, &str> =
     MultimapTableDefinition::new("imap_imports_pending");
 
+// Once an exact APPENDUID readback supplies a stable object ID, the
+// alias is independent of the mailbox and UID it was first seen in.
+const IMAP_IMPORT_OBJECTS: MultimapTableDefinition<(AccountId, &str), &str> =
+    MultimapTableDefinition::new("imap_import_objects");
+
 /// A protocol-issued identity for a successful upload.
 pub enum ImportIdentity {
     Jmap(String),
@@ -46,7 +51,8 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?;
     tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?;
     tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
-    tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
+    let mut pending_imap = tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
+    tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
     let mut meta = tx.open_table(META)?;
     if meta.get("import_identity_index")?.is_none() {
         for row in imports.iter()? {
@@ -54,6 +60,19 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
             unindexed.insert(id.value(), ())?;
         }
         meta.insert("import_identity_index", 1)?;
+    }
+    if meta.get("imap_import_object_index")?.is_none() {
+        // Earlier builds kept the location alias after rewritten readback
+        // but discarded its pending entry. Allow a later exact fetch to bind it.
+        let originals = tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
+        for row in originals.iter()? {
+            let (key, locations) = row?;
+            let (_, mid) = key.value();
+            for location in locations {
+                pending_imap.insert(location?.value(), mid)?;
+            }
+        }
+        meta.insert("imap_import_object_index", 1)?;
     }
     Ok(())
 }
@@ -94,6 +113,7 @@ impl Writer<'_> {
                 || self.tx.open_table(ACCEPTED_IMPORTS)?.get((account, mid))?.is_some()
                 || self.tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?.get((account, mid))?.next().transpose()?.is_some()
                 || self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?.get((account, mid))?.next().transpose()?.is_some()
+                || self.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?.get((account, mid))?.next().transpose()?.is_some()
                 || self.has_message_id(account, mid)?
             {
                 return Ok(false);
@@ -177,21 +197,25 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Complete readback only for the precise APPENDUID mailbox identity.
-    pub fn confirm_imap_import(&mut self, account: AccountId, location: (FolderId, u32, u32), observed: Option<&str>) -> Result<()> {
+    /// Bind a rewritten import to the object returned for its exact APPENDUID.
+    pub fn confirm_imap_import(
+        &mut self, account: AccountId, location: ImapLocation, observed: Option<&str>, object: Option<&str>,
+    ) -> Result<()> {
         let mut pending = self.tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
-        if pending.get(location)?.next().transpose()?.is_none() {
+        let rows = pending.get(location)?.map(|mid| Ok(mid?.value().to_owned())).collect::<Result<Vec<_>>>()?;
+        if rows.is_empty() {
             return Ok(());
         }
         let mut originals = self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
-        for mid in pending.remove_all(location)? {
-            let mid = mid?;
-            let original = mid.value();
-            // A rewritten header leaves a durable alias. A later disappearance
-            // from one IMAP mailbox could be a move, so retain that protection.
-            if observed == Some(original) && self.has_message_id(account, original)? {
-                originals.remove((account, original), location)?;
+        let mut objects = self.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
+        for original in rows {
+            let mid = original.as_str();
+            if observed != Some(mid) || !self.has_message_id(account, mid)? {
+                let Some(object) = object else { continue };
+                objects.insert((account, mid), object)?;
             }
+            originals.remove((account, mid), location)?;
+            pending.remove(location, mid)?;
         }
         Ok(())
     }
@@ -247,6 +271,19 @@ impl Writer<'_> {
             for location in originals.remove_all((account, mid.as_str()))? {
                 pending.remove(location?.value(), mid.as_str())?;
             }
+        }
+        let mut objects = self.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
+        let mut mids = Vec::new();
+        for row in objects.range((account, "")..)? {
+            let (key, _) = row?;
+            let (owner, mid) = key.value();
+            if owner != account {
+                break;
+            }
+            mids.push(mid.to_owned());
+        }
+        for mid in mids {
+            objects.remove_all((account, mid.as_str()))?;
         }
         Ok(())
     }
@@ -379,5 +416,49 @@ mod tests {
         assert!(!store.write(|w| w.queue_import_if_new(folder, Some("old@example.org"), || {
             panic!("a duplicate must not save another blob")
         })).unwrap());
+    }
+
+    #[test]
+    fn imap_legacy_location_promotes_only_from_exact_readback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let account = store.add_account("old@example.org").unwrap();
+        let folder = store.folder_id(account, "INBOX", crate::Role::Inbox).unwrap();
+        let location = (folder, 7, 9);
+        let mid = "original@example.org";
+        let object = "emailid:Mstable";
+        store.write(|w| {
+            w.tx.open_table(META)?.remove("imap_import_object_index")?;
+            w.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?.insert((account, mid), location)?;
+            Ok(())
+        }).unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+        store.write(|w| {
+            w.confirm_imap_import(account, (folder, 8, 9), Some("replacement@example.org"), Some("emailid:Mwrong"))?;
+            w.confirm_imap_import(account, location, Some("replacement@example.org"), None)
+        }).unwrap();
+        {
+            let tx = store.db.begin_read().unwrap();
+            assert!(tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap().get((account, mid)).unwrap().next().is_none());
+            assert!(tx.open_multimap_table(IMAP_IMPORTS_PENDING).unwrap().get(location).unwrap().next().is_some());
+        }
+        store.write(|w| w.confirm_imap_import(account, location, Some("replacement@example.org"), Some(object))).unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+        {
+            let tx = store.db.begin_read().unwrap();
+            let aliases = tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap();
+            let actual: Vec<_> = aliases.get((account, mid)).unwrap().map(|value| value.unwrap().value().to_owned()).collect();
+            assert_eq!(actual, [object]);
+            assert!(tx.open_multimap_table(IMAP_IMPORTS_PENDING).unwrap().get(location).unwrap().next().is_none());
+            assert!(tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL).unwrap().get((account, mid)).unwrap().next().is_none());
+        }
+        assert!(!store.write(|w| w.queue_import_if_new(folder, Some(mid), || panic!("object alias must guard the import"))).unwrap());
+        store.write(|w| w.remove_account(account)).unwrap();
+        let tx = store.db.begin_read().unwrap();
+        assert!(tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap().get((account, mid)).unwrap().next().is_none());
     }
 }

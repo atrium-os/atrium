@@ -1020,6 +1020,128 @@ fn imap_appenduid_matches_only_the_selected_mailbox_and_generation() {
     assert_eq!(engine.import_mbox(inbox, &file[..]).unwrap().already, 1);
 }
 
+// An authenticated synthetic IMAP peer. The stable ID is identical on
+// both sides of the move, while mailbox generation and UID both change.
+fn imap_move_peer(
+    capability: &'static str, attribute: &'static str, moved: bool, rewritten: Vec<u8>, original: Vec<u8>,
+) -> (std::os::unix::net::UnixStream, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let (client, peer) = UnixStream::pair().unwrap();
+    let timeout = Some(std::time::Duration::from_secs(15));
+    peer.set_read_timeout(timeout).unwrap();
+    client.set_read_timeout(timeout).unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut peer = BufReader::new(peer);
+        write!(peer.get_mut(), "* PREAUTH [CAPABILITY IMAP4rev1 UIDPLUS {capability}] ready\r\n").unwrap();
+        let mut appended = moved;
+        let mut selected = "";
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if peer.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            if command.starts_with("APPEND ") {
+                let size = command.rsplit_once('{').unwrap().1.trim_end_matches('}').parse::<usize>().unwrap();
+                peer.get_mut().write_all(b"+ go\r\n").unwrap();
+                let mut bytes = vec![0; size + 2];
+                peer.read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes[..size], original.as_slice());
+                appended = true;
+                write!(peer.get_mut(), "{tag} OK [APPENDUID 7 5] appended\r\n").unwrap();
+                continue;
+            }
+            if command.starts_with("LIST ") {
+                peer.get_mut().write_all(b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\HasNoChildren) \"/\" Archive\r\n").unwrap();
+            } else if command.starts_with("SELECT ") || command.starts_with("EXAMINE ") {
+                selected = if command.contains("Archive") { "Archive" } else { "INBOX" };
+                let exists = u8::from(appended && (selected == "Archive") == moved);
+                let (validity, next) = if selected == "Archive" { (91, if moved { 44 } else { 43 }) } else { (7, 6) };
+                write!(peer.get_mut(), "* {exists} EXISTS\r\n* OK [UIDVALIDITY {validity}] selected\r\n* OK [UIDNEXT {next}] selected\r\n").unwrap();
+            } else if command.starts_with("UID SEARCH ") {
+                let uid = if !appended || (selected == "Archive") != moved { "" } else if moved { " 43" } else { " 5" };
+                write!(peer.get_mut(), "* SEARCH{uid}\r\n").unwrap();
+            } else if command.starts_with("UID FETCH ") {
+                if appended && (selected == "Archive") == moved {
+                    let uid = if moved { 43 } else { 5 };
+                    if command.contains("BODY.PEEK") {
+                        assert!(command.contains(attribute.split_whitespace().next().unwrap()), "{command}");
+                        let section = if command.contains("[HEADER]") { "HEADER" } else { "" };
+                        let raw = if section == "HEADER" {
+                            let end = rewritten.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+                            &rewritten[..end]
+                        } else {
+                            rewritten.as_slice()
+                        };
+                        write!(peer.get_mut(), "* 1 FETCH (UID {uid} FLAGS (\\Seen) RFC822.SIZE {} {attribute} BODY[{section}] {{{}}}\r\n", rewritten.len(), raw.len()).unwrap();
+                        peer.get_mut().write_all(raw).unwrap();
+                        peer.get_mut().write_all(b")\r\n").unwrap();
+                    } else {
+                        write!(peer.get_mut(), "* 1 FETCH (UID {uid} FLAGS (\\Seen))\r\n").unwrap();
+                    }
+                }
+            } else if command == "LOGOUT" {
+                write!(peer.get_mut(), "* BYE done\r\n{tag} OK done\r\n").unwrap();
+                break;
+            } else {
+                panic!("unexpected command: {command}");
+            }
+            write!(peer.get_mut(), "{tag} OK done\r\n").unwrap();
+        }
+    });
+    (client, thread)
+}
+
+#[test]
+fn imap_rewritten_import_follows_stable_ids_across_mailbox_moves() {
+    for (capability, attribute, object) in [
+        ("OBJECTID", "EMAILID (Mstable_1)", "emailid:Mstable_1"),
+        ("X-GM-EXT-1", "X-GM-MSGID 1278455344230334865", "gm:1278455344230334865"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let parser = jail();
+        let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+        let account = engine.store.add_account("ada@example.org").unwrap();
+        let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+        let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+        let original = message(23, "Original", "body");
+        let rewritten = message(24, "Rewritten", "body");
+        let mut mbox = Vec::new();
+        mail_engine::export::write_one(&mut mbox, &original, 0).unwrap();
+        let (socket, peer) = imap_move_peer(capability, attribute, false, rewritten.clone(), original.clone());
+        let mut first = mail_engine::accounts::open_imap(socket).unwrap();
+        assert_eq!(engine.import_mbox(inbox, &mbox[..]).unwrap().queued, 1);
+        assert_eq!(engine.upload_imap_imports(account, first.as_mut()).unwrap(), 1);
+        first.sync(&mut engine.sink(account)).unwrap();
+        let id = engine.store.at(inbox, 5).unwrap().unwrap().0;
+        let row = engine.store.message(id).unwrap();
+        assert_eq!(row.server_id.as_deref(), Some(object));
+        assert_eq!(row.summary.message_id.as_deref(), Some("m24@example.net"));
+        assert_eq!(engine.import_mbox(inbox, &mbox[..]).unwrap().already, 1);
+        first.logout().unwrap();
+        peer.join().unwrap();
+        drop(engine);
+
+        let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+        let (socket, peer) = imap_move_peer(capability, attribute, true, rewritten.clone(), original);
+        let mut second = mail_engine::accounts::open_imap(socket).unwrap();
+        second.sync(&mut engine.sink(account)).unwrap();
+        assert!(engine.store.at(inbox, 5).unwrap().is_none());
+        let (id, _) = engine.store.at(archive, 43).unwrap().unwrap();
+        assert_eq!(engine.store.by_server_id(account, object).unwrap(), Some(id));
+        let row = engine.store.message(id).unwrap();
+        assert_eq!(row.summary.message_id.as_deref(), Some("m24@example.net"));
+        assert_eq!(engine.store.blob(&row.full.unwrap()).unwrap(), rewritten);
+        assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().already, 1);
+        assert_eq!(engine.upload_imap_imports(account, second.as_mut()).unwrap(), 0);
+        second.logout().unwrap();
+        peer.join().unwrap();
+    }
+}
+
 #[test]
 fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     use mail_engine::import::{import_with, UPLOADS_PER_PASS};
