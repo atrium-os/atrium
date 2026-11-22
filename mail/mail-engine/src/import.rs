@@ -327,6 +327,19 @@ impl Engine {
     /// [`UPLOADS_PER_PASS`]; `put` stores one message in a folder (by its
     /// name). How many went up.
     pub fn upload_imports(&self, account: AccountId, put: &mut dyn FnMut(&str, &[u8]) -> Result<(), String>) -> Result<usize, Error> {
+        self.upload_imports_with_identity(account, |folder, bytes| put(folder, bytes).map(|()| None))
+    }
+
+    /// Upload JMAP imports and retain the returned Email IDs for deduplication.
+    pub fn upload_jmap_imports(&self, account: AccountId, client: &mut dyn mail_sync::jmap::Jmap) -> Result<usize, Error> {
+        self.upload_imports_with_identity(account, |folder, bytes| client.import(folder, bytes).map(Some).map_err(|err| err.0))
+    }
+
+    fn upload_imports_with_identity(
+        &self,
+        account: AccountId,
+        mut put: impl FnMut(&str, &[u8]) -> Result<Option<String>, String>,
+    ) -> Result<usize, Error> {
         index_legacy_imports(&self.store, &self.parser, account)?;
         let mut done = 0;
         for (id, i) in self.store.imports()? {
@@ -345,8 +358,8 @@ impl Engine {
             }
             let bytes = self.store.blob(&i.blob)?;
             match put(&f.name, &bytes) {
-                Ok(()) => {
-                    self.store.write(|w| w.import_accepted(id))?;
+                Ok(jmap_id) => {
+                    self.store.write(|w| w.import_accepted(id, jmap_id.as_deref()))?;
                     done += 1;
                 }
                 Err(why) => {

@@ -141,6 +141,7 @@ pub enum SinkCall {
     HasText(String, u32),
     WantsSnoozed,
     SnoozeMoves,
+    JmapDestroyed(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +398,9 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
     }
     fn set_server_state(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
         self.done(SinkCall::SetServerState(key.into(), value.into()))
+    }
+    fn jmap_destroyed(&mut self, ids: &[String]) -> std::result::Result<(), String> {
+        self.done(SinkCall::JmapDestroyed(ids.to_vec()))
     }
     fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
         match self.ask(SinkCall::Listed(id.into())) {
@@ -838,6 +842,7 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::ChangeDone(id, ok) => SinkAnswer::Done(s.change_done(id, ok)),
         SinkCall::ServerState(k) => SinkAnswer::Text(s.server_state(&k)),
         SinkCall::SetServerState(k, v) => SinkAnswer::Done(s.set_server_state(&k, &v)),
+        SinkCall::JmapDestroyed(ids) => SinkAnswer::Done(s.jmap_destroyed(&ids)),
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),
         SinkCall::ServerIdAt(f, u) => SinkAnswer::Text(s.server_id_at(&f, u)),
         SinkCall::Get { .. } | SinkCall::Post { .. } => SinkAnswer::Body(Err("no HTTP here".into())),

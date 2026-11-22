@@ -184,6 +184,10 @@ pub trait Sink {
         let _ = (key, value);
         Err("this store can't keep a server state".into())
     }
+    /// JMAP reported these Email IDs destroyed, even if they never synced down.
+    fn jmap_destroyed(&mut self, _ids: &[String]) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// Where the message with server id `id` is listed: (folder, UID).
     fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
         let _ = id;

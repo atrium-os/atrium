@@ -487,7 +487,13 @@ as **making the account usable first, then filling in what's worth having, polit
   the next import or upload. After upload acceptance, Mail atomically removes the
   retryable queue row and retains its Message-ID across restarts until mailbox sync
   indexes it for that account. Cancelling or discarding a queued upload releases
-  its queue identity. Removing the account clears its accepted uploads.
+  its queue identity. For JMAP, Mail uses the Email ID from `Email/import` to retain
+  the original Message-ID as an account-scoped import alias. Readback uses the
+  message's actual headers, and a mailbox move preserves the alias. An explicit
+  JMAP destruction report releases it. If the server omits the destruction,
+  the alias remains. The IMAP upload path currently returns the UID alone. Mail
+  keeps that acceptance record until sync indexes the original Message-ID.
+  Removing the account clears its accepted uploads and aliases.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

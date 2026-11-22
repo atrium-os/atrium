@@ -719,6 +719,10 @@ impl Sink for AccountSink<'_> {
         self.e.store.write(|w| w.set_sync_state(account, key, Some(value))).map_err(|e| e.to_string())
     }
 
+    fn jmap_destroyed(&mut self, ids: &[String]) -> Result<(), String> {
+        self.e.store.write(|w| w.forget_jmap_imports(self.account, ids)).map_err(|err| err.to_string())
+    }
+
     fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
         let Ok(Some(msg)) = self.e.store.by_server_id(self.account, id) else { return Vec::new() };
         let Ok(m) = self.e.store.message(msg) else { return Vec::new() };

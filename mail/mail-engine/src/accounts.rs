@@ -348,7 +348,7 @@ impl Engine {
         let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
         let mut client = open_jmap(net.jmap(session, &item)?, session)?;
         let mut pass = Pass { report: client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?, ..Default::default() };
-        if self.upload_imports(account, &mut |folder, m| client.import(folder, m).map(|_| ()).map_err(|e| e.0)).map_err(|e| e.to_string())? > 0 {
+        if self.upload_jmap_imports(account, client.as_mut()).map_err(|e| e.to_string())? > 0 {
             client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         }
         // The automatic reply (§11.6): set what waits, read the server's.

@@ -330,6 +330,9 @@ impl<H: Http> Client<H> {
                             report.vanished += 1;
                         }
                     }
+                    if !c.destroyed.is_empty() {
+                        sink.jmap_destroyed(&c.destroyed).map_err(Error)?;
+                    }
                     state = c.new_state;
                     sink.set_server_state(EMAIL_STATE, &state).map_err(Error)?;
                     if !c.more {

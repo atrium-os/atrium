@@ -61,6 +61,7 @@ struct Server {
     /// The session has no VacationResponse.
     no_vacation: bool,
     fail_mailbox_sync: bool,
+    rewrite_import_message_ids: bool,
 }
 
 impl Server {
@@ -237,6 +238,15 @@ impl Server {
                 "Email/import" => {
                     let e = &args["emails"]["m"];
                     let bytes = self.uploads[e["blobId"].as_str().unwrap()].clone();
+                    let bytes = if self.rewrite_import_message_ids {
+                        let text = String::from_utf8(bytes).unwrap();
+                        let start = text.find("Message-ID: ").unwrap();
+                        let end = start + text[start..].find("\r\n").unwrap();
+                        let rewritten = format!("Message-ID: <rewritten-{}@jmap.test>", self.next + 1);
+                        [text[..start].as_bytes(), rewritten.as_bytes(), text[end..].as_bytes()].concat()
+                    } else {
+                        bytes
+                    };
                     let boxes: Vec<String> = e["mailboxIds"].as_object().unwrap().keys().cloned().collect();
                     let b: Vec<&str> = boxes.iter().map(String::as_str).collect();
                     let id = self.add(bytes, &b, &["$seen"], 1_800_000_000);
@@ -807,6 +817,79 @@ fn mbox_legacy_upload_is_protected_before_its_first_readback() {
 }
 
 #[test]
+fn jmap_rewritten_import_id_survives_restart_and_move_until_object_destruction() {
+    use mail_engine::import::Imported;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let other = engine.store.add_account("other@example.org").unwrap();
+    let other_archive = engine.store.folder_id(other, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server { rewrite_import_message_ids: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(23, "Original", "body"), 0).unwrap();
+    let queued = Imported { queued: 1, already: 0, refused: 0 };
+    let skipped = Imported { queued: 0, already: 1, refused: 0 };
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), queued);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    assert_eq!(engine.store.count(archive).unwrap(), 0);
+    assert_eq!(engine.import_mbox(inbox, &mbox[..]).unwrap(), skipped);
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.import_mbox(inbox, &mbox[..]).unwrap(), skipped);
+    assert_eq!(engine.import_mbox(other_archive, &mbox[..]).unwrap(), queued);
+    client.sync(&mut engine.sink(account)).unwrap();
+    let first = engine.store.by_server_id(account, "M1").unwrap().unwrap();
+    let first = engine.store.message(first).unwrap();
+    assert_eq!(first.summary.message_id.as_deref(), Some("rewritten-1@jmap.test"));
+    assert!(!engine.store.has_message_id(account, "m23@example.net").unwrap());
+    assert_eq!(engine.import_mbox(inbox, &mbox[..]).unwrap(), skipped);
+
+    // Replacing every label locally must not release an object still on the server.
+    {
+        let mut s = server.borrow_mut();
+        s.mails.get_mut("M1").unwrap().boxes = ["in".into()].into();
+        s.touch("M1", false);
+    }
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.count(archive).unwrap(), 0);
+    assert_eq!(engine.store.count(inbox).unwrap(), 1);
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert_eq!(server.borrow().uploads.len(), 1);
+
+    // A destroyed object releases its original identity, even without readback.
+    for object in ["M1", "M2"] {
+        {
+            let mut s = server.borrow_mut();
+            assert!(s.mails.remove(object).is_some());
+            s.touch(object, true);
+        }
+        client.sync(&mut engine.sink(account)).unwrap();
+        assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), queued);
+        if object == "M1" {
+            assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+            assert!(engine.store.by_server_id(account, "M2").unwrap().is_none());
+        }
+    }
+    assert_eq!(engine.imports_waiting(other).unwrap(), 1);
+
+    // Exercise the same acceptance API used when the transport supplies no
+    // stable identity. A rewritten header cannot release that receipt.
+    assert_eq!(engine.upload_imports(account, &mut |folder, raw| {
+        client.import(folder, raw).map(|_| ()).map_err(|err| err.0)
+    }).unwrap(), 1);
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+}
+
+#[test]
 fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     use mail_engine::import::{import_with, UPLOADS_PER_PASS};
 
@@ -849,14 +932,10 @@ fn jmap_bulk_import_uploads_and_syncs_all_messages() {
         assert_eq!(source.store.blob(&entry.blob).unwrap(), raw_message(i).as_bytes(), "queued message {i}");
     }
 
-    let mut server_ids = Vec::with_capacity(COUNT);
+    let server_ids: Vec<_> = (1..=COUNT).map(|number| format!("M{number}")).collect();
     for offset in (0..COUNT).step_by(UPLOADS_PER_PASS) {
         let expected = (COUNT - offset).min(UPLOADS_PER_PASS);
-        let uploaded = source.upload_imports(source_account, &mut |folder, bytes| {
-            let id = writer.import(folder, bytes).map_err(|e| e.0)?;
-            server_ids.push(id);
-            Ok(())
-        }).unwrap();
+        let uploaded = source.upload_jmap_imports(source_account, writer.as_mut()).unwrap();
         assert_eq!(uploaded, expected, "upload pass at {offset}");
         let completed = offset + expected;
         assert_eq!(source.imports_waiting(source_account).unwrap(), COUNT - completed);
@@ -867,7 +946,6 @@ fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     }
 
     assert!(source.store.imports().unwrap().is_empty());
-    assert_eq!(server_ids.iter().collect::<BTreeSet<_>>().len(), COUNT);
     let rows = reader.store.list(archive, 0, COUNT).unwrap();
     let archive_ids: BTreeSet<_> = rows.iter().map(|row| row.msg).collect();
     assert_eq!(archive_ids.len(), COUNT);
