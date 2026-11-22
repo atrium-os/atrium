@@ -545,6 +545,15 @@ A later reconnect opened sign-in for a distinct attempt. The gateway
 received one POST after trusted confirmation, and the guest fetched
 `crypta-ac-ok` through `tun2`.
 
+The requeue gate made the next reconnect and Sign In request while
+the original window still existed. Portcullis discarded the canceled
+request and launched only the latest window after teardown. The gateway
+served just one new sign-in page and recorded zero POSTs until trusted
+confirmation. The first run exposed an Arca handle-revocation race.
+Navigator now keeps the field attached until the broker replies to the
+form. The rerun recorded one script POST, one accepted assertion, one
+token redemption, and `crypta-ac-ok` through `tun5`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

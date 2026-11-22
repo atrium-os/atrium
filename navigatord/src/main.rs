@@ -1545,8 +1545,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 };
                 if let Err(why) = spend(press) {
-                    eprintln!("navigatord: form {id} refused: {why}");
-                    send(&w, &Event::PressRefused { why });
+                    refuse(why);
                     continue;
                 }
                 // A password typed into Arca's field: only a VPN sign-in

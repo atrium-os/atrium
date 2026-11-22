@@ -144,6 +144,8 @@ pub struct Live {
     /// Arca's password field in a VPN sign-in form: its embed, for which
     /// form (page, forms sent), and when to ask again after a refusal.
     arca: Option<(EmbedId, ArcaFor)>,
+    /// The field owns its handle until this submission has a reply.
+    arca_post: Option<u32>,
     arca_next: Instant,
 }
 
@@ -292,6 +294,7 @@ impl Live {
                 printing: None,
                 print_ask: None,
                 arca: None,
+                arca_post: None,
                 arca_next: Instant::now(),
             },
             Hello { frescod: fd, limen, measure, trails: kept },
@@ -435,7 +438,9 @@ impl Live {
     /// asked for while the form shows one, anew for each form sent, gone
     /// with the form. A press waiting for its handle goes at the deadline.
     fn arca_field(&mut self, s: &mut Shell) -> bool {
-        s.arca_tick(Instant::now());
+        if self.arca_post.is_some() {
+            return false;
+        }
         let want: Option<ArcaFor> = s.form.as_ref().and_then(|f| f.arca_field().map(|_| (f.key, f.sent)));
         let Some(e) = self.embeds.clone() else { return false };
         let mut changed = false;
@@ -640,6 +645,9 @@ impl Live {
                     self.shown = shown;
                 }
                 Event::Link { id, action } => {
+                    if self.arca_post == Some(id) {
+                        self.arca_post = None;
+                    }
                     let beside = self.activations.remove(&id).unwrap_or(false);
                     match action {
                         LinkAction::Navigate { url, .. } => s.follow_link(&url, beside),
@@ -778,7 +786,7 @@ impl Live {
                 Event::TrailsNotSaved { why } => eprintln!("navigator-ui: trail store not kept: {why}"),
             }
         }
-        changed |= self.arca_field(s);
+        s.arca_tick(Instant::now());
         // The page children.
         loop {
             let ev = match &self.embeds {
@@ -1037,7 +1045,13 @@ impl Live {
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
+                    if self.arca_post.is_some() {
+                        continue;
+                    }
                     let id = self.id();
+                    if fields.iter().any(|field| field.arca.is_some()) {
+                        self.arca_post = Some(id);
+                    }
                     self.activations.insert(id, false);
                     send(&mut self.w, &Request::SubmitForm { id, page, jar, action, post, fields, press });
                 }
@@ -1090,6 +1104,7 @@ impl Live {
                 changed = true;
             }
         }
+        changed |= self.arca_field(s);
         // The page shown's sections, for the find bar.
         let secs = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k)).map(|c| c.sections.clone()).unwrap_or_default();
         if s.sections != secs {

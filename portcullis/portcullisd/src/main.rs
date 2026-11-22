@@ -2180,7 +2180,7 @@ struct VpnSignIn {
 /// Each person's latest VPN sign-in, by owner.
 type VpnSignInEntry = (String, VpnSignIn, String);
 static VPN_SIGN_INS: Mutex<Vec<VpnSignInEntry>> = Mutex::new(Vec::new());
-static QUEUED_VPN_SIGN_IN: Mutex<Option<VpnSignInEntry>> = Mutex::new(None);
+static QUEUED_VPN_SIGN_IN: Mutex<Option<(VpnSignInEntry, std::time::Instant)>> = Mutex::new(None);
 
 /// The reserved instance remains busy until the previous launch has torn down.
 fn vpn_window_busy(app: &str) -> bool {
@@ -2190,13 +2190,20 @@ fn vpn_window_busy(app: &str) -> bool {
 }
 
 /// Wait for the stale window without changing the attempt it sees.
-fn open_queued_vpn_sign_in(app: String, profile: String, attempt: String) {
+fn open_queued_vpn_sign_in(app: String) {
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && vpn_sign_in_attempt(&profile).as_deref() == Some(attempt.as_str()) {
+    loop {
+        let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
+        let Some(((_, sign_in, attempt), queued_at)) = queue.as_ref() else { return };
+        if Instant::now().duration_since(*queued_at) >= Duration::from_secs(10)
+            || vpn_sign_in_attempt(&sign_in.profile).as_deref() != Some(attempt.as_str())
+        {
+            eprintln!("portcullisd: discarded queued VPN sign-in for {}", sign_in.profile);
+            queue.take();
+            return;
+        }
         if !vpn_window_busy(&app) {
-            let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
-            let Some(entry) = queue.take() else { return };
+            let (entry, _) = queue.take().unwrap();
             let owner = entry.0.clone();
             {
                 let mut entries = VPN_SIGN_INS.lock().unwrap();
@@ -2206,10 +2213,9 @@ fn open_queued_vpn_sign_in(app: String, profile: String, attempt: String) {
             start_for_instance(&app, Some(portcullis_peer::VPN_PERSONA), &owner, "a queued VPN sign-in window");
             return;
         }
+        drop(queue);
         thread::sleep(Duration::from_millis(250));
     }
-    QUEUED_VPN_SIGN_IN.lock().unwrap().take();
-    eprintln!("portcullisd: discarded queued VPN sign-in for {profile}");
 }
 
 /// Query Crypta without granting its root control socket to the sign-in jail.
@@ -2273,14 +2279,22 @@ fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: 
         return refuse("no installed app holds network-portal (the Navigator)".into());
     };
     let profile = ask.profile.clone();
+    let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
     let Some(attempt) = vpn_sign_in_attempt(&profile) else {
         return refuse("Crypta has no live sign-in attempt for this profile".into());
     };
     let p = Some(portcullis_peer::VPN_PERSONA);
-    let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
     let entry = (owner.to_string(), ask, attempt);
-    if let Some(queued) = queue.as_ref() {
-        return if queued == &entry { Response::Ok } else { refuse("another VPN sign-in window is queued".into()) };
+    if let Some((queued, _)) = queue.as_ref() {
+        if queued == &entry {
+            return Response::Ok;
+        }
+        if queued.0 != owner || queued.1.profile != profile || queued.2 == entry.2 {
+            return refuse("another VPN sign-in window is queued".into());
+        }
+        *queue = Some((entry, std::time::Instant::now()));
+        eprintln!("portcullisd: replaced queued VPN sign-in window for {owner} ({profile})");
+        return Response::Ok;
     }
     let running = vpn_window_busy(&app);
     {
@@ -2289,10 +2303,9 @@ fn handle_vpn_sign_in_window(uid: u32, owner: &str, ask: VpnSignIn, activation: 
             if !v.iter().any(|(o, sign_in, id)| o == owner && sign_in.profile == profile && id != &entry.2) {
                 return refuse("the previous VPN sign-in window is still open".into());
             }
-            let attempt = entry.2.clone();
-            *queue = Some(entry);
+            *queue = Some((entry, std::time::Instant::now()));
             eprintln!("portcullisd: queued VPN sign-in window for {owner} ({profile})");
-            thread::spawn(move || open_queued_vpn_sign_in(app, profile, attempt));
+            thread::spawn(move || open_queued_vpn_sign_in(app));
             return Response::Ok;
         }
         v.retain(|(o, _, _)| o != owner);
