@@ -68,14 +68,14 @@ fn xlsx_round_trip_of_every_rule_kind() {
 }
 
 /// Rules as Excel 2016 saves them (Home › Conditional Formatting), over A1:A6 =
-/// 5, 12, 7, 12, 30, 1: what Excel shows is in the comments.
+/// 5, 12, 7, 12, 30, 5: the minimum cells also satisfy the duplicate rule.
 const EXCEL_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
 <row r="1"><c r="A1"><v>5</v></c></row><row r="2"><c r="A2"><v>12</v></c></row><row r="3"><c r="A3"><v>7</v></c></row>
-<row r="4"><c r="A4"><v>12</v></c></row><row r="5"><c r="A5"><v>30</v></c></row><row r="6"><c r="A6"><v>1</v></c></row>
+<row r="4"><c r="A4"><v>12</v></c></row><row r="5"><c r="A5"><v>30</v></c></row><row r="6"><c r="A6"><v>5</v></c></row>
 </sheetData>
 <conditionalFormatting sqref="A1:A6"><cfRule type="duplicateValues" dxfId="0" priority="3"/><cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan"><formula>20</formula></cfRule></conditionalFormatting>
-<conditionalFormatting sqref="A1:A6"><cfRule type="top10" dxfId="0" priority="2" bottom="1" rank="1"/></conditionalFormatting>
+<conditionalFormatting sqref="A1:A6"><cfRule type="top10" dxfId="1" priority="2" stopIfTrue="1" bottom="1" rank="1"/></conditionalFormatting>
 <conditionalFormatting sqref="A1:A6"><cfRule type="dataBar" priority="4"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{B025F937-C7B1-47D3-B67F-A62EFF666E3E}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:id>{1}</x14:id></ext></extLst></cfRule></conditionalFormatting>
 <pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>
 <extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormattings><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="dataBar" id="{1}"><x14:dataBar minLength="0" maxLength="100"><x14:cfvo type="autoMin"/><x14:cfvo type="autoMax"/></x14:dataBar></x14:cfRule><xm:sqref>A1:A6</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>
@@ -83,10 +83,15 @@ const EXCEL_SHEET: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="ye
 
 #[test]
 fn rules_as_excel_saves_them_pick_what_excel_shows() {
-    // Our file for the rest of the package (its styles have one red dxf).
+    // Use the converter to build the rest of the package with two distinct styles.
     let mut wb = Workbook::new();
     wb.add_sheet("S").unwrap();
-    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![Rect { sheet: 0, r0: 0, c0: 0, r1: 0, c1: 0 }], rules: vec![Rule { kind: RuleKind::Blanks(true), dxf: Dxf { fill: Some(0xFFC7CE), ..Dxf::default() }, stop: false }] }).unwrap();
+    let rules = [0xFFC7CE, 0xBDD7EE].into_iter().map(|fill| Rule {
+        kind: RuleKind::Blanks(true),
+        dxf: Dxf { fill: Some(fill), ..Dxf::default() },
+        stop: false,
+    }).collect();
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![Rect::cell(CellAddr::new(0, 0, 0))], rules }).unwrap();
     let ours = xlsx::write(&wb, Vec::new()).unwrap();
     let z = Archive::open(&ours).unwrap();
     let mut w = ZipWriter::new(Vec::new());
@@ -98,8 +103,15 @@ fn rules_as_excel_saves_them_pick_what_excel_shows() {
     // The 2010 extension repeats the data bar: noted, not doubled.
     assert_eq!(loaded.report.human().len(), 1, "{:?}", loaded.report.human());
     let red: Vec<u32> = (0..6).filter(|&r| back.look(CellAddr::new(0, r, 0)).dxf.fill == Some(0xFFC7CE)).map(|r| r + 1).collect();
-    // Duplicates (12, 12), over 20 (30), the bottom one (1).
-    assert_eq!(red, [2, 4, 5, 6]);
+    // The minimum cells get blue even though the duplicate rule is in the first block.
+    assert_eq!(red, [2, 4, 5]);
+    let blue: Vec<u32> = (0..6).filter(|&r| back.look(CellAddr::new(0, r, 0)).dxf.fill == Some(0xBDD7EE)).map(|r| r + 1).collect();
+    assert_eq!(blue, [1, 6]);
+    let (saved, _) = xlsx::read(&xlsx::write(&back, Vec::new()).unwrap()).unwrap();
+    for row in 0..6 {
+        let cell = CellAddr::new(0, row, 0);
+        assert_eq!(saved.look(cell), back.look(cell));
+    }
     // Priority order across formats: greater-than first, top-10 second, duplicates third.
     let kinds: Vec<&str> = back.cond_formats().iter().flat_map(|f| f.rules.iter()).map(|r| match r.kind {
         RuleKind::CellIs { .. } => "cellIs",
@@ -108,7 +120,7 @@ fn rules_as_excel_saves_them_pick_what_excel_shows() {
         RuleKind::DataBar { .. } => "bar",
         _ => "?",
     }).collect();
-    assert_eq!(kinds, ["cellIs", "dup", "top", "bar"]);
+    assert_eq!(kinds, ["cellIs", "top", "dup", "bar"]);
     assert_eq!(back.look(CellAddr::new(0, 4, 0)).bar.map(|b| b.0), Some(1.0));
 }
 

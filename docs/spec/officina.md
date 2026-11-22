@@ -2304,9 +2304,11 @@ unchanged.
   and number format, and the data bar under the text (a tenth of the cell at
   the low end, as Excel 2007 draws it).
 - **Files.** `.xlsx`: `<conditionalFormatting>` with every `cfRule` type
-  above and its `dxf`s in the styles part, read in Excel's priority order
-  across formats; Excel 2010's `x14` extension (repeating data bars with
-  their newer options) is noted and the 2007 rule kept. `.ods`:
+  above and its `dxf`s in the styles part. Rule priorities apply across
+  the whole sheet. The importer splits a range block when rules from
+  another block interleave, keeping each rule's original ranges and
+  formula origin. Excel 2010's `x14` extension is reported and the 2007
+  data bar rule is kept. `.ods`:
   LibreOffice's `calcext:conditional-formats` (conditions naming generated
   `CF` cell styles in `office:styles`, colour scales, data bars) both ways.
   LibreOffice applies only the first condition of a format that matches, so
@@ -3586,6 +3588,10 @@ Conditional formats gain Excel's icon sets: all 20 (3 to 5 icons: arrows, grey a
 Data ▸ Conditional Formatting… opens a panel at the window's right on the rules whose ranges meet the selection, first applied first (with nothing there it opens straight on a new rule). A rule is picked by a click; New Rule, Edit, Delete, Up and Down work on it. The rule form has Apply To (cells, ranges, whole columns or rows, several split by commas), the kind (cell value, text, formula, top or bottom, average, duplicates, blanks, errors, colour scale, data bar, icon set), its comparison or choice (Excel's twelve colour scales, six bar colours, all twenty icon sets with reverse and icon only), one or two values, Excel's six ready-made looks with a sample, and Stop If True. A value typed for a comparison is a formula when it starts with `=`, a number when it reads as one, else text. What the form doesn't show is kept when a rule is changed: custom looks and colour scales show as "As it is", icon thresholds stay while the set does, an average rule keeps its standard-deviation line. New rules go first, as in Excel; a changed rule keeps its place and its format takes the new ranges. Errors are said in the panel and nothing changes.
 
 Each change is one undo step: `GridOp::CondFormats` swaps in the whole list, held as the native file's bytes so the journal can replay it (a list naming a sheet no longer there changes nothing). Tests: every kind and choice saves, loads back into the form and saves to the same rule; a panel test makes, changes, picks by click, reorders and deletes rules and undoes each.
+
+When recalculation finishes in the first deferred slice after an edit, the desktop schedules a fresh frame for the updated values and formats.
+
+The installed desktop gate `scripts/sheets-interop-vm-check.sh` with `SHEETS_INTEROP_CASE=condfmt` checks fill colors in XLSX and ODS before and after editing a shared threshold and a calculated score. It verifies rule priority when both rules match, then checks the saved rule order, formula references and visual result on reopen. A further edit verifies that the reopened rules still respond.
 
 ### 16.61 The pivot field list in Sheets (2026-11-17)
 

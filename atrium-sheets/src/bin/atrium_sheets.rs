@@ -671,7 +671,9 @@ fn main() {
         {
             let mut d = run.sheets.doc.borrow_mut();
             d.recalc_budget = Some(atrium_sheets::doc::RECALC_SLICE);
-            let was = recalculating;
+            // A grid edit can leave work that finishes in this first slice.
+            // Its final values and conditional formats still need a new frame.
+            let was = recalculating || d.wb.recalc_pending();
             recalculating = d.settle();
             drop(d);
             if was || recalculating {

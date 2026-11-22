@@ -16,11 +16,12 @@
 # Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
 # Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
+# Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -55,6 +56,7 @@ checkpoint() {
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
+        condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
@@ -319,6 +321,40 @@ formulas_reopened() {
     cp selectscreen.png "$results/$format-formulas-reopened.png"
 }
 
+condfmt_screen() {
+    /tmp/sheets-condfmt-fixture screen selectscreen.png "$1" 2>"$results/screen.log"
+}
+condfmt_capture() {
+    wait_for condfmt_screen "$1"
+    cp selectscreen.png "$results/$format-$1.png"
+    /tmp/sheets-condfmt-fixture screen "$results/$format-$1.png" "$1"
+}
+condfmt() {
+    condfmt_capture initial
+
+    click 318 133 # E2 is the shared threshold. D3 now satisfies both rules.
+    key 0x23 # 6
+    key 0x28
+    condfmt_capture threshold
+
+    click 62 133 # A2 drives the formula in B2. D2 falls back to the second rule.
+    key 0x1f # 2
+    key 0x28
+    condfmt_capture edited
+    save "$book" edited
+    cp "$books/$book" "$results/saved.$format"
+    final=edited
+}
+condfmt_reopened() {
+    /tmp/sheets-condfmt-fixture screen "$results/$format-reopened.png" edited
+
+    click 318 133 # D3 must fall back again as soon as the restored rule sees 8.
+    key 0x25 # 8
+    key 0x28
+    condfmt_capture reopened-edit
+    save "$book" reopened-edit
+}
+
 validation() {
     click 126 133
     key 0x26 # 9 is outside the rule.
@@ -509,6 +545,7 @@ for format in ods xlsx; do
         print) print_pdf ;;
         formulas) formulas_reopened ;;
         validation) validation_reopened ;;
+        condfmt) condfmt_reopened ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"

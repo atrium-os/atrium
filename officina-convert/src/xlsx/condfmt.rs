@@ -304,13 +304,17 @@ pub struct Raw {
 #[cfg(feature = "read")]
 /// Turns a sheet's `<conditionalFormatting>`s into the workbook's formats.
 pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: &[u32], rep: &mut Report) {
-    // Excel orders rules by priority across the sheet; keep that order per format.
+    use officina_grid::condfmt::{MAX_RANGES, MAX_RULES};
+
+    let mut sheet_rules = Vec::new();
+    let mut sheet_ranges = Vec::new();
     for raw in raws {
         let ranges: Vec<Rect> = raw
             .sqref
             .split_whitespace()
             .filter_map(super::read::parse_ref)
             .map(|(r0, c0, r1, c1)| Rect { sheet: s, r0, c0, r1, c1 })
+            .take(MAX_RANGES)
             .collect();
         if ranges.is_empty() {
             continue;
@@ -386,12 +390,25 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
                 _ => {}
             }
         }
-        rules.sort_by_key(|(p, _)| *p);
-        let rules: Vec<Rule> = rules.into_iter().map(|(_, r)| r).take(officina_grid::condfmt::MAX_RULES).collect();
         if rules.is_empty() {
             continue;
         }
-        let ranges: Vec<Rect> = ranges.into_iter().take(officina_grid::condfmt::MAX_RANGES).collect();
+        rules.sort_by_key(|(priority, _)| *priority);
+        let group = sheet_ranges.len();
+        sheet_ranges.push(ranges);
+        sheet_rules.extend(rules.into_iter().take(MAX_RULES).map(|(priority, rule)| (priority, group, rule)));
+    }
+
+    // The priority applies to the whole sheet. Keep consecutive rules with the
+    // same source together, splitting blocks where another block interleaves.
+    sheet_rules.sort_by_key(|(priority, _, _)| *priority);
+    let mut ordered = sheet_rules.into_iter().peekable();
+    while let Some((_, group, first)) = ordered.next() {
+        let mut rules = vec![first];
+        while let Some((_, _, rule)) = ordered.next_if(|(_, next, _)| *next == group) {
+            rules.push(rule);
+        }
+        let ranges = sheet_ranges[group].clone();
         if wb.add_cond_format(CondFormat { sheet: s, ranges, rules }).is_err() {
             rep.note(Kind::Dropped, "conditional formats past the limits");
         }
