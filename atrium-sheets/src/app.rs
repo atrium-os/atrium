@@ -1971,13 +1971,12 @@ impl View for Sheets {
             (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some())
         };
         if macros {
-            // The file has macros: say they don't run, and offer to drop them (§5.3).
+            // The workbook holds inert macros that the user can remove (§5.3).
             let cmds = self.cmds.clone();
             Button::secondary("Remove Macros").at(x, 8.0).width(132.0).on_click(move || cmds.lock().unwrap().push(Cmd::RemoveMacros)).render(ctx);
             x += 140.0;
         }
         let title = if dirty { format!("{name} (edited)") } else { name };
-        let title = if macros { format!("{title} · has macros; Atrium doesn't run them") } else { title };
         ctx.add(Node::Text { rect: Rect::new(x + 12.0, 14.0, (w - x - 24.0).max(0.0), 22.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
 
         // Formula bar: where the cursor is and what the cell holds.
@@ -2103,7 +2102,15 @@ impl View for Sheets {
             pergola::widgets::EditMode::Enter => "Enter",
             pergola::widgets::EditMode::Edit => "Edit",
         });
-        let room = if mode.is_some() { 72.0 } else { 0.0 };
+        let mut room = if mode.is_some() { 72.0 } else { 0.0 };
+        if macros {
+            let notice = "Macros are inactive";
+            let style = st(type_size::XS, Weight::Semibold, t.text_primary());
+            let width = Node::measure_text(notice, &style).w.ceil() + 2.0;
+            let x = (w - 12.0 - room - width).max(12.0);
+            ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: notice.into(), style });
+            room += width + 12.0;
+        }
         ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0 - room).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
         if let Some(m) = mode {
             ctx.add(Node::Text { rect: Rect::new((w - 12.0 - 60.0).max(0.0), sy + 4.0, 60.0, 18.0), content: m.into(), style: st(type_size::XS, Weight::Semibold, t.text_primary()) });
@@ -3096,6 +3103,36 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn macro_notice_fits_beside_save_status_in_a_narrow_window() {
+        use officina_grid::macros::{MacroFamily, MacroPart, Macros};
+
+        let mut doc = Doc::new("A long workbook name that fills the whole Sheets toolbar.xlsm");
+        doc.wb.set_macros(Macros {
+            family: MacroFamily::Ooxml,
+            parts: vec![MacroPart {
+                path: "xl/vbaProject.bin".into(),
+                media_type: "application/vnd.ms-office.vbaProject".into(),
+                data: vec![1].into(),
+            }],
+            workbook_code: None,
+            sheet_codes: Vec::new(),
+        }).unwrap();
+        doc.status = "Saved workbook.".into();
+        let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (640.0, 440.0));
+        let mut app = App::new(sheets);
+        app.tick();
+        let (notice, style) = app.tree().iter().find_map(|(_, node)| match node {
+            Node::Text { content, rect, style } if content == "Macros are inactive" => Some((*rect, style)),
+            _ => None,
+        }).expect("visible macro notice");
+        assert!(notice.x() >= 0.0 && notice.x() + notice.w() <= 640.0 && notice.y() >= 440.0 - STATUS_H);
+        assert!(notice.w() >= Node::measure_text("Macros are inactive", style).w);
+        assert!(app.tree().iter().any(|(_, node)| matches!(node, Node::Text { content, rect, .. }
+            if content == "Saved workbook." && rect.x() + rect.w() < notice.x())));
+    }
 
     #[test]
     fn reopened_axis_ids_merge_multiple_blank_shifts_and_flag_conflicts() {

@@ -419,7 +419,11 @@ impl Run {
         match r {
             Ok(mut d) => {
                 if read_only {
-                    d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
+                    if !d.status.is_empty() {
+                        if !d.status.ends_with(['.', '!', '?']) { d.status.push('.'); }
+                        d.status.push(' ');
+                    }
+                    d.status.push_str("Opened read-only. Save asks where to put a copy.");
                 }
                 self.show(d, target);
             }

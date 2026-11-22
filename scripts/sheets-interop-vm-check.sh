@@ -6,14 +6,20 @@
 # and stage its binary at /tmp/sheets-table-chart-fixture instead.
 # Use SHEETS_INTEROP_CASE=layout and /tmp/sheets-layout-fixture for layout.
 # Use SHEETS_INTEROP_CASE=annotations and /tmp/sheets-annotations-fixture for annotations.
+# Use SHEETS_INTEROP_CASE=legacy and /tmp/sheets-legacy-fixture for legacy.xls
+# and macro.xlsm. Stage the same SimpleMacro.xlsm source at /tmp/sheets-vba-source.xlsm.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
-test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
+if test "$profile" = legacy; then
+    test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')"
+else
+    test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
+fi
 
 input() { printf '%s\n' "$@" | nc -N -U inject.sock >/dev/null; }
 click() { input "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'; }
@@ -37,6 +43,7 @@ checkpoint() {
         layout) /tmp/sheets-layout-fixture check "$1" "$2" ;;
         annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
+        legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
 loaded() {
@@ -56,7 +63,11 @@ open_book() {
     click 520 "$1"
     click 824 458
     wait_for loaded "$2" "$3"
-    wait_for worker_started "$before"
+    if test "${4:-foreign}" = native; then
+        test "$(worker_count)" -eq "$before"
+    else
+        wait_for worker_started "$before"
+    fi
     wait_for other_window 594 24 "$launcher"
     document=$window
 }
@@ -230,8 +241,60 @@ check_reopened_validation() {
     save "$book" accepted
 }
 
+legacy() {
+    checksum=$(sha256 -q "$books/legacy.xls")
+    checkpoint "$books/macro.xlsm" macro-initial
+    open_book 213 macro.xlsm macro-initial
+    sleep .45
+    cp selectscreen.png "$results/xlsm-initial.png"
+    click 63 132
+    key 0x25 # 8
+    key 0x28
+    save macro.xlsm macro-edited
+    cp selectscreen.png "$results/xlsm-saved.png"
+    close_book
+    open_book 213 macro.xlsm macro-edited
+    sleep .45
+    cp selectscreen.png "$results/xlsm-reopened.png"
+    close_book
+
+    checkpoint "$books/legacy.xls" xls-initial
+    open_book 183 legacy.xls xls-initial
+    sleep .45
+    cp selectscreen.png "$results/xls-initial.png"
+    click 63 112
+    key 0x25
+    key 0x28
+    sleep .4
+
+    # Ordinary Save offers a copy for this read-only format.
+    click 125 24
+    wait_for other_window 824 458 "$document"
+    sleep .4
+    cp selectscreen.png "$results/xls-save-offers-copy.png"
+    click 752 458 # Cancel, then exercise the explicit Save As button.
+    wait_for same_window 824 458 "$document"
+    click 205 24
+    wait_for other_window 824 458 "$document"
+    click 824 458
+    wait_for test -s "$books/legacy.osheet"
+    wait_for checkpoint "$books/legacy.osheet" native-copy
+    wait_for same_window 824 458 "$document"
+    sleep .4
+    test "$(sha256 -q "$books/legacy.xls")" = "$checksum"
+    close_book
+
+    open_book 183 legacy.osheet native-copy native
+    sleep .45
+    cp selectscreen.png "$results/xls-native-reopened.png"
+    close_book
+    echo "PASS XLSM VBA bytes and code names, inert notice, ordinary Save and reopen"
+    echo "PASS XLS import and fidelity notice, Save As and native reopen, original bytes unchanged"
+}
+
 launcher=$(win_at 48 24)
 test "$launcher" -gt 0
+if test "$profile" = legacy; then legacy; exit; fi
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac
     book=sales.$format

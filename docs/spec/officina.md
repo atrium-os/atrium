@@ -1173,9 +1173,10 @@ those features are present.
 - **Across formats**: macros go back only into their own family: `.xlsm` macros are not
   written to `.ods` or `.xlsx`, Basic is not written to `.xlsm`; Sheets says so when it
   saves.
-- **Sheets**: a file with macros shows "has macros; Atrium doesn't run them" by its name
-  and a Remove Macros button; removing them is journaled (a crash after it doesn't bring
-  them back) and takes effect at the next save. `.xlsm` files save as `.xlsm`.
+- **Sheets** shows "Macros are inactive" in the status bar independently of the
+  workbook name and Save feedback. The Remove Macros button journals the removal
+  immediately and applies it to the file at the next Save. `.xlsm` files save as
+  `.xlsm`.
 
 Gates, on the 4-core cloud machine:
 
@@ -1185,6 +1186,14 @@ Gates, on the 4-core cloud machine:
 | round trips | `tests/roundtrip.rs`: `.xlsm` parts and code names equal through write and read and through a native file; `.xlsx` gets none; parts outside `xl/` and the other family's parts are not written; `.ods` Basic and Scripts parts equal |
 | hostile input | the `.xlsx` and `.ods` fuzzers now run on packages with macros, with code-name, relationship-target and manifest-path mutations; clean |
 | app | `atrium-sheets` test: removing macros survives a crash |
+
+
+The [desktop interoperability gate](../../scripts/sheets-interop-vm-check.sh)
+with `SHEETS_INTEROP_CASE=legacy` opens a workbook based on Apache POI's
+[SimpleMacro.xlsm](https://github.com/apache/poi/blob/trunk/test-data/spreadsheet/SimpleMacro.xlsm)
+fixture, edits a value, saves and reopens it. It checks the exact VBA parts
+and code names, the expected cell values and recalculation, and the inactive
+macro notice.
 
 ### 16.9 Sheets: the Data menu (2026-11-14)
 
@@ -2852,7 +2861,14 @@ binary formats' RC4 encryption comes with O7b–O7d.
 - **Sheets** opens `.xls` through the converter (`officina-convert xls`,
   `--password` as for the others). It doesn't write `.xls` (§16.40, D8): a
   document opened from one has no save target, so Save asks where to keep a
-  copy and says why.
+  copy. The workbook status shows the import fidelity notice and explains
+  that the source opened read-only.
+
+The [desktop interoperability gate](../../scripts/sheets-interop-vm-check.sh)
+with `SHEETS_INTEROP_CASE=legacy` checks this flow using a BIFF8 workbook with
+an unsupported merged range. Ordinary Save opens the copy picker. Save As
+writes a native `.osheet` that reopens with the edited value and recalculated
+formula. The source workbook's bytes remain unchanged.
 
 **Gates.** `officina-convert/examples/xls_lo.rs`: the conformance workbook
 (152 formulas) and a sheet of formats, saved as `.xls` by LibreOffice 24.2,
