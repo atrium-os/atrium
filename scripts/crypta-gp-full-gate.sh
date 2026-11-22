@@ -724,6 +724,27 @@ check_final_reconnect_rebind() {
     ok "restored forwarding on final ESP required fresh approval"
     probe "IPv4 echo after fresh approval on the same final ESP association"
     check_rebound_hip_refresh "$initial_report" "$((reviews + 1))" "IPv4 echo after restored forwarding refreshed silently on final ESP"
+
+    reviews=$((reviews + 1))
+    rebound_iface=$(field iface)
+    [ -n "$rebound_iface" ] || fail "the rebound ESP tunnel has no interface"
+    before_decline=$(awk 'END { print NR }' "$receipts")
+    "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+        grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+        fail "the final decline review omitted changed forwarding"
+    declined_choice=$(hip_choice)
+    [ -n "$declined_choice" ] && [ "$declined_choice" != "$approval_choice" ] ||
+        fail "the final decline did not have a fresh approval choice"
+    decline_esp_loss_review 21 "$rebound_iface"
+    if tail -n "+$((before_decline + 1))" "$receipts" | grep -q "^$changed_word "; then
+        fail "final rebound submitted the declined forwarding report"
+    fi
+    ok "declining changed forwarding tore down final ESP without sending the report"
+
+    reconnect_after_esp_loss_decline "$before_decline" batch-reconnect-approved
+    finish_hip_reconnect "$rebound_report" batch-reconnect-ack
 }
 restore_forwarding_and_rebind() {
     before_restore=$(awk 'END { print NR }' "$receipts")

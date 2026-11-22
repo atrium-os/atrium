@@ -1104,6 +1104,12 @@ another origin. An active portal-profile session stays in engine memory.
   upload. The newly approved report refreshes silently and IPv4 echo
   passes on the same ESP association. The batched FreeBSD arm64 gate
   passed 118/118 using the shared Cargo cache.
+  The extended decline and reconnect batch passed 124/124 with the
+  same cache. Declining a subsequent forwarding change leaves the
+  changed report unsent and tears down rebound ESP. Reconnect rejects
+  the old approval choice and keeps IPv4 blocked until fresh approval
+  and gateway acknowledgement. The unchanged report then refreshes
+  without prompting while IPv4 continues on the new ESP association.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
