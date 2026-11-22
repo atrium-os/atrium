@@ -101,6 +101,7 @@ pub struct Session {
     /// The account can send (urn:ietf:params:jmap:submission).
     pub can_submit: bool,
     pub max_size_upload: u64,
+    pub max_objects_in_get: Option<u64>,
     /// The submission capability's `maxDelayedSend` (seconds; 0: none).
     pub max_delayed_send: u64,
     /// The account has a vacation reply (urn:ietf:params:jmap:vacationresponse).
@@ -144,6 +145,7 @@ pub fn session(body: &[u8]) -> Result<Session> {
         account,
         can_submit,
         max_size_upload,
+        max_objects_in_get: caps.get(CORE).and_then(|c| c.get("maxObjectsInGet")).and_then(Value::as_u64),
         max_delayed_send,
         can_vacation: acct.contains_key(VACATION),
         sieve: acct.get(SIEVE).map(|s| s.get("sieveExtensions").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).filter(|e| e.len() <= 64).take(100).map(str::to_string).collect()).unwrap_or_default()),
@@ -257,6 +259,40 @@ pub fn get_emails(account: &str, ids: &[String]) -> Vec<u8> {
 /// The answer to [`get_emails`].
 pub fn emails(a: &Answers) -> Result<Vec<Email>> {
     emails_in(a.of("g", "Email/get")?)
+}
+
+/// Check whether imported Email IDs still exist, without fetching headers.
+pub fn import_presence(account: &str, ids: &[String]) -> Vec<u8> {
+    request(vec![json!(["Email/get", { "accountId": account, "ids": ids, "properties": ["id"] }, "importPresence"])], false)
+}
+
+/// Only a complete, account-matched response can release import identities.
+pub fn missing_imports(a: &Answers, account: &str, ids: &[String]) -> Result<Vec<String>> {
+    let answer = a.of("importPresence", "Email/get")?;
+    if get_str(answer, "accountId") != Some(account) {
+        return err("wrong account in import presence reply");
+    }
+    let mut remaining: std::collections::BTreeSet<_> = ids.iter().map(String::as_str).collect();
+    let found = answer.get("list").and_then(Value::as_array).ok_or(Error("no import presence list".into()))?;
+    let missing = answer.get("notFound").and_then(Value::as_array).ok_or(Error("no import presence notFound".into()))?;
+    for item in found {
+        let id = item.get("id").and_then(Value::as_str).ok_or(Error("bad import presence ID".into()))?;
+        if !remaining.remove(id) {
+            return err("unexpected or repeated import presence ID");
+        }
+    }
+    let mut out = Vec::new();
+    for item in missing {
+        let id = item.as_str().ok_or(Error("bad missing import ID".into()))?;
+        if !remaining.remove(id) {
+            return err("unexpected or repeated missing import ID");
+        }
+        out.push(id.to_string());
+    }
+    if !remaining.is_empty() {
+        return err("incomplete import presence reply");
+    }
+    Ok(out)
 }
 
 /// The current Email state (no messages).

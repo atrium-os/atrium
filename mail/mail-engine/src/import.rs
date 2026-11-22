@@ -332,13 +332,22 @@ impl Engine {
 
     /// Upload JMAP imports and retain the returned Email IDs for deduplication.
     pub fn upload_jmap_imports(&self, account: AccountId, client: &mut dyn mail_sync::jmap::Jmap) -> Result<usize, Error> {
-        self.upload_imports_with_identity(account, |folder, bytes| client.import(folder, bytes).map(Some).map_err(|err| err.0))
+        self.upload_imports_with_identity(account, |folder, bytes| client.import(folder, bytes).map(|id| Some(mail_store::imports::ImportIdentity::Jmap(id))).map_err(|err| err.0))
+    }
+
+    /// Upload IMAP imports using the complete APPENDUID when available.
+    pub fn upload_imap_imports(&self, account: AccountId, client: &mut dyn mail_sync::remote::Imap) -> Result<usize, Error> {
+        self.upload_imports_with_identity(account, |folder, bytes| {
+            client.append_identity(folder, &["\\Seen"], bytes)
+                .map(|identity| identity.map(|id| mail_store::imports::ImportIdentity::Imap { validity: id.validity, uid: id.uid }))
+                .map_err(|err| err.to_string())
+        })
     }
 
     fn upload_imports_with_identity(
         &self,
         account: AccountId,
-        mut put: impl FnMut(&str, &[u8]) -> Result<Option<String>, String>,
+        mut put: impl FnMut(&str, &[u8]) -> Result<Option<mail_store::imports::ImportIdentity>, String>,
     ) -> Result<usize, Error> {
         index_legacy_imports(&self.store, &self.parser, account)?;
         let mut done = 0;
@@ -358,8 +367,8 @@ impl Engine {
             }
             let bytes = self.store.blob(&i.blob)?;
             match put(&f.name, &bytes) {
-                Ok(jmap_id) => {
-                    self.store.write(|w| w.import_accepted(id, jmap_id.as_deref()))?;
+                Ok(identity) => {
+                    self.store.write(|w| w.import_accepted(id, identity))?;
                     done += 1;
                 }
                 Err(why) => {

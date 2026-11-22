@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Change, Error, Fetched, FolderState, RemoteFolder, Report, Result, Session, Sink};
+use crate::{AppendUid, Change, Error, Fetched, FolderState, RemoteFolder, Report, Result, Session, Sink};
 
 pub const WIRE: u8 = 0;
 pub const EOF: u8 = 1;
@@ -76,6 +76,7 @@ pub enum Call {
     /// Put Mail's filters on a ManageSieve session (instead of `Start`;
     /// the worker ends after it). Answers [`Reply::Sieved`].
     Sieve(crate::sieve::Plan),
+    AppendIdentity { folder: String, flags: Vec<String>, message: Vec<u8> },
 }
 
 /// What [`Error`] was, across the wire.
@@ -108,6 +109,7 @@ pub enum Reply {
     /// How many messages a server search found.
     Found(u32),
     Failed(Kind, String),
+    AppendedIdentity(Option<AppendUid>),
 }
 
 /// A [`Sink`] call, from the worker.
@@ -142,6 +144,8 @@ pub enum SinkCall {
     WantsSnoozed,
     SnoozeMoves,
     JmapDestroyed(Vec<String>),
+    JmapImportIds(String, u32),
+    ImapMessages(String, u32, Vec<Fetched>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +163,7 @@ pub enum SinkAnswer {
     Go(bool),
     WantsSnoozed(std::result::Result<bool, String>),
     SnoozeMoves(std::result::Result<Vec<crate::SnoozeMove>, String>),
+    JmapImportIds(std::result::Result<Vec<String>, String>),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -399,6 +404,15 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
     fn set_server_state(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
         self.done(SinkCall::SetServerState(key.into(), value.into()))
     }
+    fn imap_messages(&mut self, folder: &str, validity: u32, page: Vec<Fetched>) -> std::result::Result<(), String> {
+        self.done(SinkCall::ImapMessages(folder.into(), validity, page))
+    }
+    fn jmap_import_ids(&mut self, after: &str, limit: usize) -> std::result::Result<Vec<String>, String> {
+        match self.ask(SinkCall::JmapImportIds(after.into(), limit as u32)).map_err(|err| err.to_string())? {
+            SinkAnswer::JmapImportIds(ids) => ids,
+            _ => Err("bad JMAP import IDs reply".into()),
+        }
+    }
     fn jmap_destroyed(&mut self, ids: &[String]) -> std::result::Result<(), String> {
         self.done(SinkCall::JmapDestroyed(ids.to_vec()))
     }
@@ -544,6 +558,10 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 let f: Vec<&str> = flags.iter().map(String::as_str).collect();
                 s.append(&folder, &f, &message).map(Reply::Appended).unwrap_or_else(|e| fail(&e))
             }
+            (Call::AppendIdentity { folder, flags, message }, Some(s)) => {
+                let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+                s.append_identity(&folder, &flags, &message).map(Reply::AppendedIdentity).unwrap_or_else(|e| fail(&e))
+            }
             (Call::Idle { folder }, Some(s)) => s.idle(&folder).map(Reply::Idled).unwrap_or_else(|e| fail(&e)),
             (Call::Search { query, limit }, Some(s)) => s.search_server(&query, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| fail(&e)),
             (Call::Logout, Some(_)) => {
@@ -572,6 +590,9 @@ pub trait Imap {
     fn capabilities(&self) -> &[String];
     fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report>;
     fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>>;
+    fn append_identity(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<AppendUid>> {
+        self.append(folder, flags, message).map(|_| None)
+    }
     /// `IDLE` on `folder` until a change or `wait` passes.
     fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool>;
     fn logout(&mut self) -> Result<()>;
@@ -605,6 +626,9 @@ impl Imap for Local {
     }
     fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
         self.s()?.append(folder, flags, message)
+    }
+    fn append_identity(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<AppendUid>> {
+        self.s()?.append_identity(folder, flags, message)
     }
     fn search(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
         self.s()?.search_server(query, sink, limit)
@@ -842,6 +866,8 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::ChangeDone(id, ok) => SinkAnswer::Done(s.change_done(id, ok)),
         SinkCall::ServerState(k) => SinkAnswer::Text(s.server_state(&k)),
         SinkCall::SetServerState(k, v) => SinkAnswer::Done(s.set_server_state(&k, &v)),
+        SinkCall::ImapMessages(folder, validity, page) => SinkAnswer::Done(s.imap_messages(&folder, validity, page)),
+        SinkCall::JmapImportIds(after, limit) => SinkAnswer::JmapImportIds(s.jmap_import_ids(&after, (limit as usize).min(32))),
         SinkCall::JmapDestroyed(ids) => SinkAnswer::Done(s.jmap_destroyed(&ids)),
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),
         SinkCall::ServerIdAt(f, u) => SinkAnswer::Text(s.server_id_at(&f, u)),
@@ -868,6 +894,13 @@ impl<I: Write + AsFd, O: Read + AsFd> Imap for Remote<I, O> {
         let c = Call::Append { folder: folder.into(), flags: flags.iter().map(|f| f.to_string()).collect(), message: message.to_vec() };
         self.reply(&c, None, QUIET, |r| match r {
             Reply::Appended(x) => Some(x),
+            _ => None,
+        })
+    }
+    fn append_identity(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<AppendUid>> {
+        let call = Call::AppendIdentity { folder: folder.into(), flags: flags.iter().map(|flag| (*flag).into()).collect(), message: message.to_vec() };
+        self.reply(&call, None, QUIET, |reply| match reply {
+            Reply::AppendedIdentity(identity) => Some(identity),
             _ => None,
         })
     }

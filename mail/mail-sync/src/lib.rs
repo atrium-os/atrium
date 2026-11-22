@@ -104,6 +104,13 @@ pub struct FolderState {
 }
 
 /// One message as fetched.
+/// The destination mailbox generation and UID from a single APPENDUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppendUid {
+    pub validity: u32,
+    pub uid: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fetched {
     pub uid: u32,
@@ -183,6 +190,14 @@ pub trait Sink {
     fn set_server_state(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
         let _ = (key, value);
         Err("this store can't keep a server state".into())
+    }
+    /// A fetched page and the UIDVALIDITY of its selected IMAP mailbox.
+    fn imap_messages(&mut self, folder: &str, _validity: u32, page: Vec<Fetched>) -> std::result::Result<(), String> {
+        self.messages(folder, page)
+    }
+    /// A bounded page of JMAP import aliases, ordered by Email ID.
+    fn jmap_import_ids(&mut self, _after: &str, _limit: usize) -> std::result::Result<Vec<String>, String> {
+        Ok(Vec::new())
     }
     /// JMAP reported these Email IDs destroyed, even if they never synced down.
     fn jmap_destroyed(&mut self, _ids: &[String]) -> std::result::Result<(), String> {
@@ -638,12 +653,15 @@ impl<S: Read + Write> Session<S> {
     /// Put a message in `folder` (a sent copy, a draft); its new UID when
     /// the server says (UIDPLUS).
     pub fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
+        Ok(self.append_identity(folder, flags, message)?.map(|receipt| receipt.uid))
+    }
+
+    pub fn append_identity(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<AppendUid>> {
         let cmd = self.enc.append(folder, flags, message);
         let (_, code) = self.run(cmd)?;
-        Ok(match code {
-            Some(Code::AppendUid { uids, .. }) => uids.parse().ok(),
-            _ => None,
-        })
+        let Some(Code::AppendUid { validity, uids }) = code else { return Ok(None) };
+        let uid = uids.bytes().all(|byte| byte.is_ascii_digit()).then(|| uids.parse::<u32>().ok()).flatten();
+        Ok(uid.filter(|&uid| uid != 0 && validity != 0).map(|uid| AppendUid { validity, uid }))
     }
 
     /// Make the person's due changes on the server, folder by folder. A
@@ -858,7 +876,7 @@ impl<S: Read + Write> Session<S> {
             let (msgs, _) = self.fetched(rs, false);
             done += page.len();
             report.headers += msgs.len();
-            sink.messages(name, msgs).map_err(Error::Sink)?;
+            sink.imap_messages(name, validity, msgs).map_err(Error::Sink)?;
             let lowest = *page.iter().min().unwrap();
             // Checkpoint: everything from `lowest` up is here (new UIDs were
             // fetched first, and pages go down).

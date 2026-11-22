@@ -324,15 +324,7 @@ impl<H: Http> Client<H> {
                     for e in &c.changed {
                         self.place(sink, e, true, &mut report)?;
                     }
-                    for id in &c.destroyed {
-                        for (folder, uid) in sink.listed(id) {
-                            sink.vanished(&folder, &[uid]).map_err(Error)?;
-                            report.vanished += 1;
-                        }
-                    }
-                    if !c.destroyed.is_empty() {
-                        sink.jmap_destroyed(&c.destroyed).map_err(Error)?;
-                    }
+                    Self::remove_destroyed(sink, &c.destroyed, &mut report)?;
                     state = c.new_state;
                     sink.set_server_state(EMAIL_STATE, &state).map_err(Error)?;
                     if !c.more {
@@ -341,9 +333,45 @@ impl<H: Http> Client<H> {
                 }
             }
         }
+        if let Err(err) = self.reconcile_imports(sink, &mut report) {
+            eprintln!("mail-sync: couldn't reconcile imported Email IDs: {err}");
+        }
         self.snooze(sink, &mut report)?;
         self.texts(sink, &mut report)?;
         Ok(report)
+    }
+
+    fn reconcile_imports(&mut self, sink: &mut dyn Sink, report: &mut Report) -> Result<()> {
+        const CURSOR: &str = "jmap-import-presence";
+        const PROBE_MAX: u64 = 32;
+
+        let limit = self.session.max_objects_in_get.unwrap_or(PROBE_MAX).clamp(1, PROBE_MAX) as usize;
+        let after = sink.server_state(CURSOR).unwrap_or_default();
+        let mut ids = sink.jmap_import_ids(&after, limit).map_err(Error)?;
+        if ids.is_empty() && !after.is_empty() {
+            ids = sink.jmap_import_ids("", limit).map_err(Error)?;
+        }
+        let Some(last) = ids.last() else { return Ok(()) };
+        if ids.len() > limit {
+            return Err(Error("too many JMAP import IDs to reconcile".into()));
+        }
+        let answer = self.call(jmap::import_presence(&self.session.account, &ids))?;
+        let missing = jmap::missing_imports(&answer, &self.session.account, &ids)?;
+        Self::remove_destroyed(sink, &missing, report)?;
+        sink.set_server_state(CURSOR, last).map_err(Error)
+    }
+
+    fn remove_destroyed(sink: &mut dyn Sink, ids: &[String], report: &mut Report) -> Result<()> {
+        for id in ids {
+            for (folder, uid) in sink.listed(id) {
+                sink.vanished(&folder, &[uid]).map_err(Error)?;
+                report.vanished += 1;
+            }
+        }
+        if !ids.is_empty() {
+            sink.jmap_destroyed(ids).map_err(Error)?;
+        }
+        Ok(())
     }
 
     /// Search the server for `query` (JMAP `Email/query`, §11.2), newest

@@ -372,7 +372,7 @@ impl Engine {
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {
-        AccountSink { e: self, account, refused: 0, snoozed: None }
+        AccountSink { e: self, account, refused: 0, snoozed: None, selected_imap: None }
     }
 
     /// A message for reading. Its whole bytes when here, parsed alone; else
@@ -451,6 +451,7 @@ pub struct AccountSink<'a> {
     /// Messages the parse jail refused (kept out of the list).
     pub refused: usize,
     snoozed: Option<(FolderId, String)>,
+    selected_imap: Option<u32>,
 }
 
 fn role(r: mail_sync::Role) -> Role {
@@ -521,6 +522,13 @@ impl Sink for AccountSink<'_> {
         self.e.store.write(|w| { w.clear_folder(id)?; w.set_folder(id, &f) }).map_err(|e| e.to_string())
     }
 
+    fn imap_messages(&mut self, folder: &str, validity: u32, page: Vec<mail_sync::Fetched>) -> Result<(), String> {
+        self.selected_imap = (validity != 0).then_some(validity);
+        let result = self.messages(folder, page);
+        self.selected_imap = None;
+        result
+    }
+
     fn known_uids(&mut self, folder: &str) -> Vec<u32> {
         self.fid(folder).ok().and_then(|id| self.e.store.uids(id).ok()).unwrap_or_default()
     }
@@ -586,7 +594,12 @@ impl Sink for AccountSink<'_> {
         let mut all = Vec::new();
         self.e.store.write(|w| {
             for ((uid, link, m), fresh) in stored.into_iter().zip(fresh) {
+                let selection = self.selected_imap;
+                let observed = selection.and_then(|_| m.summary.message_id.clone());
                 let msg = w.put_linked(id, account, uid, m, link)?;
+                if let Some(validity) = selection {
+                    w.confirm_imap_import(account, (id, validity, uid), observed.as_deref())?;
+                }
                 all.push(msg);
                 if fresh {
                     new.push((uid, msg));
@@ -717,6 +730,10 @@ impl Sink for AccountSink<'_> {
     fn set_server_state(&mut self, key: &str, value: &str) -> Result<(), String> {
         let account = self.account;
         self.e.store.write(|w| w.set_sync_state(account, key, Some(value))).map_err(|e| e.to_string())
+    }
+
+    fn jmap_import_ids(&mut self, after: &str, limit: usize) -> Result<Vec<String>, String> {
+        self.e.store.jmap_import_ids(self.account, after, limit).map_err(|err| err.to_string())
     }
 
     fn jmap_destroyed(&mut self, ids: &[String]) -> Result<(), String> {

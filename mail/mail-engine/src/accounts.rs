@@ -87,6 +87,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> mail_sync::Result<Option<u32>> {
         self.remote.append(folder, flags, message)
     }
+    fn append_identity(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> mail_sync::Result<Option<mail_sync::AppendUid>> {
+        self.remote.append_identity(folder, flags, message)
+    }
     fn idle(&mut self, folder: &str, wait: std::time::Duration) -> mail_sync::Result<bool> {
         self.remote.idle(folder, wait)
     }
@@ -316,7 +319,7 @@ impl Engine {
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         self.copy_drafts(account, s.as_mut(), DRAFT_REST).map_err(|e| e.to_string())?;
         // Imported mail (§6.5) goes up; the next sync brings it in.
-        if self.upload_imports(account, &mut |folder, m| s.append(folder, &["\\Seen"], m).map(|_| ()).map_err(|e| e.to_string())).map_err(|e| e.to_string())? > 0 {
+        if self.upload_imap_imports(account, s.as_mut()).map_err(|e| e.to_string())? > 0 {
             s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         }
         let mut copies = Vec::new();

@@ -490,9 +490,16 @@ as **making the account usable first, then filling in what's worth having, polit
   its queue identity. For JMAP, Mail uses the Email ID from `Email/import` to retain
   the original Message-ID as an account-scoped import alias. Readback uses the
   message's actual headers, and a mailbox move preserves the alias. An explicit
-  JMAP destruction report releases it. If the server omits the destruction,
-  the alias remains. The IMAP upload path currently returns the UID alone. Mail
-  keeps that acceptance record until sync indexes the original Message-ID.
+  JMAP destruction report releases it. To recover omitted deletions, each sync
+  checks a rotating page of at most 32 tracked Email IDs, subject to the server's
+  advertised limit. The presence check requests IDs only. A complete response for
+  the right account can release aliases for the requested IDs in `notFound`. A
+  failed presence check keeps those aliases and lets ordinary sync continue.
+  IMAP preserves both fields of a valid single-message APPENDUID and matches
+  readback by destination mailbox, UIDVALIDITY and UID. If readback preserves the
+  original Message-ID, the ordinary index takes over. A rewritten header keeps
+  the original alias, since disappearance from one IMAP mailbox can also mean a
+  move. Without a usable APPENDUID, the original Message-ID remains the fallback.
   Removing the account clears its accepted uploads and aliases.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.

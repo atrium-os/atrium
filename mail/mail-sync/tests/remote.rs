@@ -129,6 +129,8 @@ fn the_worker_runs_the_same_session_as_here() {
 
     // APPEND, with UIDPLUS's new UID.
     assert_eq!(r.append("INBOX", &["\\Seen"], b"Subject: x\r\n\r\nhi\r\n").unwrap(), Some(5));
+    assert_eq!(r.append_identity("INBOX", &["\\Seen"], b"Subject: y\r\n\r\nhello\r\n").unwrap(),
+        Some(mail_sync::AppendUid { validity: 7, uid: 5 }));
     r.logout().unwrap();
 }
 

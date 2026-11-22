@@ -62,6 +62,9 @@ struct Server {
     no_vacation: bool,
     fail_mailbox_sync: bool,
     rewrite_import_message_ids: bool,
+    presence_limit: Option<usize>,
+    presence_queries: Vec<Vec<String>>,
+    wrong_presence_account: bool,
 }
 
 impl Server {
@@ -147,8 +150,16 @@ impl Server {
                 }
                 "Email/get" => {
                     let ids: Vec<String> = args["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-                    let list: Vec<Value> = ids.iter().filter(|id| self.mails.contains_key(*id)).map(|id| self.email(id)).collect();
-                    json!({ "state": self.state.to_string(), "list": list, "notFound": [] })
+                    let presence = cid == "importPresence";
+                    if presence {
+                        assert!(ids.len() <= self.presence_limit.unwrap_or(32));
+                        self.presence_queries.push(ids.clone());
+                    }
+                    let account = if presence && self.wrong_presence_account { "wrong" } else { ACCOUNT };
+                    let list: Vec<Value> = ids.iter().filter(|id| self.mails.contains_key(*id))
+                        .map(|id| if presence { json!({ "id": id }) } else { self.email(id) }).collect();
+                    let missing: Vec<_> = ids.iter().filter(|id| !self.mails.contains_key(*id)).collect();
+                    json!({ "accountId": account, "state": self.state.to_string(), "list": list, "notFound": missing })
                 }
                 "Email/changes" => {
                     let since: u64 = args["sinceState"].as_str().unwrap().parse().unwrap();
@@ -274,6 +285,10 @@ impl Http for Fake {
         let mut s = self.0.borrow_mut();
         let body = if url == SESSION {
             let mut caps = json!({ "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold }, "urn:ietf:params:jmap:vacationresponse": {} });
+            let mut core = json!({ "maxSizeUpload": 50_000_000 });
+            if let Some(limit) = s.presence_limit {
+                core["maxObjectsInGet"] = json!(limit);
+            }
             if s.no_vacation {
                 caps.as_object_mut().unwrap().remove("urn:ietf:params:jmap:vacationresponse");
             }
@@ -281,7 +296,7 @@ impl Http for Fake {
                 caps["urn:ietf:params:jmap:sieve"] = json!({ "sieveExtensions": ["fileinto", "imap4flags", "vacation"], "maxSizeScript": 65536 });
             }
             serde_json::to_vec(&json!({
-                "capabilities": { "urn:ietf:params:jmap:core": { "maxSizeUpload": 50_000_000 }, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} },
+                "capabilities": { "urn:ietf:params:jmap:core": core, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} },
                 "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": caps } },
                 "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT },
                 "apiUrl": "https://jmap.test/api/",
@@ -887,6 +902,122 @@ fn jmap_rewritten_import_id_survives_restart_and_move_until_object_destruction()
     }).unwrap(), 1);
     client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
+}
+
+#[test]
+fn jmap_missing_deletion_is_confirmed_in_bounded_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server {
+        rewrite_import_message_ids: true,
+        presence_limit: Some(1),
+        ..Default::default()
+    }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let files: Vec<_> = (11..=13).map(|n| {
+        let mut file = Vec::new();
+        mail_engine::export::write_one(&mut file, &message(n, "Imported", "body"), 0).unwrap();
+        file
+    }).collect();
+    for file in &files {
+        assert_eq!(engine.import_mbox(archive, file.as_slice()).unwrap().queued, 1);
+    }
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 3);
+    // A create followed by deletion can be absent from changes entirely.
+    {
+        let mut s = server.borrow_mut();
+        s.mails.remove("M3").unwrap();
+        s.state += 1;
+    }
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(server.borrow().presence_queries, [vec!["M1"]]);
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().already, 1);
+    server.borrow_mut().wrong_presence_account = true;
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().already, 1);
+    server.borrow_mut().wrong_presence_account = false;
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(server.borrow().presence_queries, [vec!["M1"], vec!["M2"], vec!["M3"], vec!["M3"]]);
+    assert_eq!(engine.import_mbox(archive, files[2].as_slice()).unwrap().queued, 1);
+    for file in &files[..2] {
+        assert_eq!(engine.import_mbox(archive, file.as_slice()).unwrap().already, 1);
+    }
+    assert_eq!(engine.store.count(archive).unwrap(), 2);
+}
+
+#[test]
+fn imap_appenduid_matches_only_the_selected_mailbox_and_generation() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+    use mail_sync::Sink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let original = message(21, "Original", "body");
+    let replaced = message(22, "Rewritten", "body");
+    let mut file = Vec::new();
+    mail_engine::export::write_one(&mut file, &original, 0).unwrap();
+
+    let (client, peer) = UnixStream::pair().unwrap();
+    let timeout = Some(std::time::Duration::from_secs(10));
+    peer.set_read_timeout(timeout).unwrap();
+    client.set_read_timeout(timeout).unwrap();
+    let expected = original.clone();
+    let server = std::thread::spawn(move || {
+        let mut reader = BufReader::new(peer);
+        reader.get_mut().write_all(b"* PREAUTH [CAPABILITY IMAP4rev1 UIDPLUS] ready\r\n").unwrap();
+        for receipt in ["7 5", "8 6"] {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            assert!(command.starts_with("APPEND "));
+            let size = command.rsplit_once('{').unwrap().1.trim_end_matches('}').parse::<usize>().unwrap();
+            reader.get_mut().write_all(b"+ go\r\n").unwrap();
+            let mut body = vec![0; size + 2];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body[..size], expected.as_slice());
+            write!(reader.get_mut(), "{tag} OK [APPENDUID {receipt}] stored\r\n").unwrap();
+        }
+    });
+    let mut client = mail_engine::accounts::open_imap(client).unwrap();
+    assert_eq!(engine.import_mbox(inbox, &file[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_imap_imports(account, client.as_mut()).unwrap(), 1);
+    drop(engine);
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    let mut sink = engine.sink(account);
+    let fetched = |uid, raw: &[u8]| mail_sync::Fetched {
+        uid, flags: Vec::new(), size: raw.len() as u64, internal_date: None,
+        server_id: None, bytes: raw.to_vec(), full: true,
+    };
+
+    for (folder, validity, id, uid) in [("Archive", 7, archive, 5), ("INBOX", 8, inbox, 5), ("INBOX", 7, inbox, 6)] {
+        sink.imap_messages(folder, validity, vec![fetched(uid, &original)]).unwrap();
+        engine.store.write(|w| w.remove(id, uid)).unwrap();
+        assert_eq!(engine.import_mbox(inbox, &file[..]).unwrap().already, 1);
+    }
+    sink.imap_messages("INBOX", 7, vec![fetched(5, &original)]).unwrap();
+    engine.store.write(|w| w.remove(inbox, 5)).unwrap();
+    assert_eq!(engine.import_mbox(inbox, &file[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_imap_imports(account, client.as_mut()).unwrap(), 1);
+    server.join().unwrap();
+
+    sink.imap_messages("INBOX", 8, vec![fetched(6, &replaced)]).unwrap();
+    let row = engine.store.at(inbox, 6).unwrap().unwrap().0;
+    assert_eq!(engine.store.message(row).unwrap().summary.message_id.as_deref(), Some("m22@example.net"));
+    engine.store.write(|w| w.remove(inbox, 6)).unwrap();
+    assert_eq!(engine.import_mbox(inbox, &file[..]).unwrap().already, 1);
 }
 
 #[test]

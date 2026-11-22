@@ -25,6 +25,18 @@ const JMAP_IMPORTS_BY_ORIGINAL: MultimapTableDefinition<(AccountId, &str), &str>
 const JMAP_IMPORTS_BY_OBJECT: MultimapTableDefinition<(AccountId, &str), &str> =
     MultimapTableDefinition::new("jmap_imports_by_object");
 
+type ImapLocation = (FolderId, u32, u32);
+const IMAP_IMPORTS_BY_ORIGINAL: MultimapTableDefinition<(AccountId, &str), ImapLocation> =
+    MultimapTableDefinition::new("imap_imports_by_original");
+const IMAP_IMPORTS_PENDING: MultimapTableDefinition<ImapLocation, &str> =
+    MultimapTableDefinition::new("imap_imports_pending");
+
+/// A protocol-issued identity for a successful upload.
+pub enum ImportIdentity {
+    Jmap(String),
+    Imap { validity: u32, uid: u32 },
+}
+
 pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     let imports = tx.open_table(IMPORTS)?;
     let mut unindexed = tx.open_table(UNINDEXED_IMPORTS)?;
@@ -33,6 +45,8 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     tx.open_table(ACCEPTED_IMPORTS)?;
     tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?;
     tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?;
+    tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
+    tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
     let mut meta = tx.open_table(META)?;
     if meta.get("import_identity_index")?.is_none() {
         for row in imports.iter()? {
@@ -79,6 +93,7 @@ impl Writer<'_> {
             if queue.range((account, mid, 0)..=(account, mid, u64::MAX))?.next().transpose()?.is_some()
                 || self.tx.open_table(ACCEPTED_IMPORTS)?.get((account, mid))?.is_some()
                 || self.tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?.get((account, mid))?.next().transpose()?.is_some()
+                || self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?.get((account, mid))?.next().transpose()?.is_some()
                 || self.has_message_id(account, mid)?
             {
                 return Ok(false);
@@ -121,19 +136,30 @@ impl Writer<'_> {
     /// Drop the upload from the queue and keep its Message-ID protected
     /// until the account indexes it, or until JMAP reports its object deleted
     /// when the upload returned an Email ID.
-    pub fn import_accepted(&mut self, id: u64, jmap_id: Option<&str>) -> Result<()> {
+    pub fn import_accepted(&mut self, id: u64, identity: Option<ImportIdentity>) -> Result<()> {
         {
             let identities = self.tx.open_table(IMPORT_IDENTITIES)?;
-            let identity = identities.get(id)?;
-            if let Some(row) = identity {
+            let pending = identities.get(id)?;
+            if let Some(row) = pending {
                 let (account, mid) = row.value();
                 let account_exists = self.tx.open_table(crate::ACCOUNTS)?.get(account)?.is_some();
                 if account_exists {
-                    if let Some(object) = jmap_id {
-                        self.tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?.insert((account, mid), object)?;
-                        self.tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?.insert((account, object), mid)?;
-                    } else if !self.has_message_id(account, mid)? {
-                        self.tx.open_table(ACCEPTED_IMPORTS)?.insert((account, mid), ())?;
+                    match identity {
+                        Some(ImportIdentity::Jmap(object)) => {
+                            self.tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?.insert((account, mid), object.as_str())?;
+                            self.tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?.insert((account, object.as_str()), mid)?;
+                        }
+                        Some(ImportIdentity::Imap { validity, uid }) if validity != 0 && uid != 0 => {
+                            let imports = self.tx.open_table(IMPORTS)?;
+                            let upload: Import = dec(imports.get(id)?.ok_or(crate::Error::NotFound)?.value())?;
+                            let location = (upload.folder, validity, uid);
+                            self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?.insert((account, mid), location)?;
+                            self.tx.open_multimap_table(IMAP_IMPORTS_PENDING)?.insert(location, mid)?;
+                        }
+                        _ if !self.has_message_id(account, mid)? => {
+                            self.tx.open_table(ACCEPTED_IMPORTS)?.insert((account, mid), ())?;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -147,6 +173,25 @@ impl Writer<'_> {
         // repeat import on its own.
         if accepted.get((account, mid))?.is_some() && self.has_message_id(account, mid)? {
             accepted.remove((account, mid))?;
+        }
+        Ok(())
+    }
+
+    /// Complete readback only for the precise APPENDUID mailbox identity.
+    pub fn confirm_imap_import(&mut self, account: AccountId, location: (FolderId, u32, u32), observed: Option<&str>) -> Result<()> {
+        let mut pending = self.tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
+        if pending.get(location)?.next().transpose()?.is_none() {
+            return Ok(());
+        }
+        let mut originals = self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
+        for mid in pending.remove_all(location)? {
+            let mid = mid?;
+            let original = mid.value();
+            // A rewritten header leaves a durable alias. A later disappearance
+            // from one IMAP mailbox could be a move, so retain that protection.
+            if observed == Some(original) && self.has_message_id(account, original)? {
+                originals.remove((account, original), location)?;
+            }
         }
         Ok(())
     }
@@ -186,7 +231,24 @@ impl Writer<'_> {
             }
             objects.push(object.to_owned());
         }
-        self.forget_jmap_imports(account, &objects)
+        self.forget_jmap_imports(account, &objects)?;
+        let mut originals = self.tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
+        let mut pending = self.tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
+        let mut mids = Vec::new();
+        for entry in originals.range((account, "")..)? {
+            let (key, _) = entry?;
+            let (owner, mid) = key.value();
+            if owner != account {
+                break;
+            }
+            mids.push(mid.to_owned());
+        }
+        for mid in mids {
+            for location in originals.remove_all((account, mid.as_str()))? {
+                pending.remove(location?.value(), mid.as_str())?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove a queued row and release its Message-ID.
@@ -246,6 +308,24 @@ impl Store {
             out.push((k.value(), dec(v.value())?));
         }
         Ok(out)
+    }
+
+    /// A bounded page of tracked JMAP objects for one account, in ID order.
+    pub fn jmap_import_ids(&self, account: AccountId, after: &str, limit: usize) -> Result<Vec<String>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let tx = self.db.begin_read()?;
+        let table = tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?;
+        let mut ids = Vec::new();
+        for entry in table.range((Excluded((account, after)), Unbounded))?.take(limit) {
+            let (key, _) = entry?;
+            let (owner, id) = key.value();
+            if owner != account {
+                break;
+            }
+            ids.push(id.to_owned());
+        }
+        Ok(ids)
     }
 
     /// Queued rows that still need their headers parsed.

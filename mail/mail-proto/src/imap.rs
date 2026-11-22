@@ -523,7 +523,7 @@ fn parse_code(b: &[u8], limits: &Limits) -> Code {
     let s = |i: usize| vals.get(i).and_then(Value::as_str).unwrap_or_default();
     match name.as_str() {
         "CAPABILITY" => Code::Capability(vals.iter().filter_map(Value::as_str).map(|s| s.to_ascii_uppercase()).collect()),
-        "UIDVALIDITY" => num(0).map(|n| Code::UidValidity(n as u32)).unwrap_or(Code::Other(name)),
+        "UIDVALIDITY" => num(0).and_then(|n| u32::try_from(n).ok()).filter(|&n| n != 0).map(Code::UidValidity).unwrap_or(Code::Other(name)),
         "UIDNEXT" => num(0).map(|n| Code::UidNext(n as u32)).unwrap_or(Code::Other(name)),
         "HIGHESTMODSEQ" => num(0).map(Code::HighestModSeq).unwrap_or(Code::Other(name)),
         "NOMODSEQ" => Code::NoModSeq,
@@ -534,7 +534,8 @@ fn parse_code(b: &[u8], limits: &Limits) -> Code {
         "TRYCREATE" => Code::TryCreate,
         "THROTTLED" | "LIMIT" | "OVERQUOTA" | "INUSE" | "UNAVAILABLE" => Code::Throttled,
         "ALERT" => Code::Alert,
-        "APPENDUID" => Code::AppendUid { validity: num(0).unwrap_or(0) as u32, uids: s(1) },
+        "APPENDUID" if vals.len() == 2 => num(0).and_then(|n| u32::try_from(n).ok()).filter(|&n| n != 0)
+            .map(|validity| Code::AppendUid { validity, uids: s(1) }).unwrap_or(Code::Other(name)),
         "COPYUID" => Code::CopyUid { validity: num(0).unwrap_or(0) as u32, from: s(1), to: s(2) },
         "MODIFIED" => Code::Modified(s(0)),
         _ => Code::Other(name),
