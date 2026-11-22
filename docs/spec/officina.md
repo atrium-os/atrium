@@ -3710,6 +3710,22 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 
 Sheets can print a saved XLSX print area when it names one absolute cell or rectangle. Frozen rows and columns repeat within the printed bounds. Anchored charts print as PDF paths and text. Embedded XLSX PNG and JPEG pictures print at their anchor bounds and are retained through native saves and XLSX export. One-cell, two-cell and absolute anchors are accepted. Picture source crops and center rotations survive native saves and XLSX round trips and are applied when printing. The PDF omits source pixels entirely outside a crop. XLSX picture links survive native and XLSX saves. Printing uses the workbook cache or a PNG or JPEG the user selects in the system picker. Sheets leaves the external target inert. Other drawing objects remain open for Sheets. Slides prints full slides, speaker notes with slide thumbnails and continuation pages, or handouts with two, three, four, six, or nine slides per page. Include Hidden Slides in the Print menu opts all print layouts into hidden slides, including their speaker notes in the notes layout.
 
+
+The [desktop print gate](../../scripts/sheets-interop-vm-check.sh) with
+`SHEETS_INTEROP_CASE=print` edits and saves an XLSX and an ODS workbook, reopens
+them, and exports each through Prelum and Scrinium. The
+[PDF checker](../../scripts/sheets-interop-pdf-check.py) checks the edit and
+recalculated formula, page order, picture count and print bounds.
+
+- XLSX keeps the tested sheet-local single-row `_xlnm.Print_Titles` definition
+  across Save. PDF pagination currently repeats the frozen bands. The explicit
+  title cell prints on its own page only. The saved print area excludes cells
+  outside it and the picture anchored wholly beyond it.
+- ODS drops the test PNG and reports the discarded drawing at import. The
+  ODS print area and explicit repeated rows and columns are also lost on Save.
+  The PDF uses the sheet's used range and its frozen bands.
+  [ODF 1.3 table schema](https://docs.oasis-open.org/office/OpenDocument/v1.3/OpenDocument-v1.3-part3-schema.html)
+
 ### 16.79 Merged cells (2026-11-18)
 
 - **Engine** (`officina-grid::merges`). A sheet keeps merged areas: disjoint, at least two cells each, sorted. `Workbook::merges`, `merge_at`, `merges_in` and `grow_to_merges` read them. `GridOp::Merges { sheet, list }` (journal tag 16) swaps them in whole as one undo step, and the native file keeps them in chunk `MERGES` (16). Cells under a merge keep what they hold, as Excel's and LibreOffice's files do. Inserted and deleted rows and columns move, grow or shrink a merge. One left as a single cell is no longer merged. A merge counts toward a sheet not being "bare", and Delete Sheet clears its merges first.

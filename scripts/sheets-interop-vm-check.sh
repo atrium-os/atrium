@@ -8,11 +8,14 @@
 # Use SHEETS_INTEROP_CASE=annotations and /tmp/sheets-annotations-fixture for annotations.
 # Use SHEETS_INTEROP_CASE=legacy and /tmp/sheets-legacy-fixture for legacy.xls
 # and macro.xlsm. Stage the same SimpleMacro.xlsm source at /tmp/sheets-vba-source.xlsm.
+# Use SHEETS_INTEROP_CASE=print and /tmp/sheets-print-fixture for print layout.
+# The print profile also needs Prelum and the print sheet with no printers
+# configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 if test "$profile" = legacy; then
@@ -43,6 +46,7 @@ checkpoint() {
         layout) /tmp/sheets-layout-fixture check "$1" "$2" ;;
         annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
+        print) /tmp/sheets-print-fixture check "$1" "$2" "$format" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
@@ -241,6 +245,38 @@ check_reopened_validation() {
     save "$book" accepted
 }
 
+print() {
+    click 255 151 # C3, whose edit changes the printed formula in D3.
+    key 0x25
+    key 0x28
+    save "$book" edited
+    final=edited
+}
+
+pdf_finished() {
+    test -s "$1" && tail -c 16 "$1" | grep -q '^%%EOF'
+}
+
+pdf_picker_open() {
+    other_window 824 458 "$print_window" && test "$window" != "$document"
+}
+
+print_pdf() {
+    pdf="$books/sales – Report.pdf"
+    test ! -e "$pdf"
+    click 280 24
+    wait_for other_window 829 578 "$document"
+    print_window=$window
+    sleep 1
+    cp selectscreen.png "$results/$format-print.png"
+    click 850 551 # Save as PDF is the only destination.
+    wait_for pdf_picker_open
+    click 824 458 # Confirm the suggested name in the system picker.
+    wait_for pdf_finished "$pdf"
+    wait_for same_window 824 458 "$document"
+    mv "$pdf" "$results/$format.pdf"
+}
+
 legacy() {
     checksum=$(sha256 -q "$books/legacy.xls")
     checkpoint "$books/macro.xlsm" macro-initial
@@ -312,6 +348,7 @@ for format in ods xlsx; do
     case "$profile" in
         layout) scroll_layout ;;
         annotations) check_reopened_validation ;;
+        print) print_pdf ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"
