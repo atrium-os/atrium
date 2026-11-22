@@ -560,11 +560,28 @@ Portcullis broker for platform user verification.
 
 Select `webauthn-platform` on the local provider. The page requests platform
 attachment and checks the returned attachment before it submits either
-registration or assertion. On the host, the Sigillum–Arca socket integration
-test cancelled registration, retried, excluded the enrolled ID, and verified
-the final assertion with the original public key. Its scripted UI and
-Ostiarius passcode stand-in leave the installed Ladybird sheet and PAM path
-to verify together on Tessera. The VM was off for this batch.
+registration or assertion. The installed JIT-off Ladybird worker on arm64
+Tessera ran in Capsicum as UID 50006 with both IP stacks disabled.
+Jaild launched Ostiarius as UID 50093 in its service jail. Its verify socket
+forwarded Sigillum's passcode checks to Portcullis, which loaded libpam and
+used the atrium-login PAM stack. The fixture ran without a roaming key.
+
+Cancel returned `NotAllowedError`. On retry the wrong passcode produced a
+visible rejection and no enrollment. The correct passcode registered one
+platform credential. Trying to register its ID again returned
+`InvalidStateError` and Sigillum logged `excluded (arca)`. A separate
+assertion required the passcode again. The provider verified the signature
+against the original registered key and fresh challenge; Arca redeemed the
+PKCE code and Mail displayed the fixture account.
+
+The first provider rejected the valid assertion because its counter check
+required an increase even when both counters were zero. Arca reports zero
+for its platform passkeys. The fixture now accepts zero followed by zero;
+a nonzero counter must advance. All five provider tests passed. A fresh
+authorization flow on the same overlay produced exactly one each of
+`registration-verified`, `assertion-verified` and `pkce-redeemed`.
+The screenshots, logs, worker hashes and shutdown evidence are in
+`~/atrium-vm/evidence/navigator-i3-platform-20261122/`.
 
 ### I3 installed WebAuthn get probe
 

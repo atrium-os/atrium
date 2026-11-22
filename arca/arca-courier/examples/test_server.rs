@@ -52,6 +52,12 @@ const REDIRECT: &str = "https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth
 struct Enrollment { id: Vec<u8>, key: Vec<u8>, counter: u32 }
 
 impl Enrollment {
+    // Arca passkeys report zero on every use. A key that reports a counter
+    // must advance it on each verified assertion.
+    fn accepts_counter(&self, next: u32) -> bool {
+        (self.counter == 0 && next == 0) || next > self.counter
+    }
+
     fn read(path: &str) -> Self {
         let input = std::fs::read_to_string(path).unwrap();
         let fields: Vec<_> = input.split_whitespace().collect();
@@ -102,7 +108,7 @@ impl Enrollment {
         let sha = |b| ring::digest::digest(&ring::digest::SHA256, b);
         if signed.len() != 37 || &signed[..32] != sha(b"login.microsoftonline.com").as_ref() || signed[32] & 5 != 5 { return None; }
         let counter = u32::from_be_bytes(signed[33..37].try_into().ok()?);
-        if counter <= self.counter { return None; }
+        if !self.accepts_counter(counter) { return None; }
         signed.extend_from_slice(sha(&client).as_ref());
         ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &self.key)
             .verify(&signed, &bytes("signature")?).ok()?;
@@ -358,6 +364,18 @@ mod tests {
         assert_eq!(provider.callback(post, cookie, "assertion=bad").0, "refused");
         assert!(!provider.challenges.contains_key("fixture"));
         assert!(provider.codes.is_empty());
+    }
+
+    #[test]
+    fn counterless_passkeys_and_monotonic_counters() {
+        let mut key = Enrollment { id: vec![], key: vec![], counter: 0 };
+        assert!(key.accepts_counter(0));
+        assert!(key.accepts_counter(1));
+        key.counter = 2;
+        assert!(!key.accepts_counter(0));
+        assert!(!key.accepts_counter(1));
+        assert!(!key.accepts_counter(2));
+        assert!(key.accepts_counter(3));
     }
 
     #[test]
