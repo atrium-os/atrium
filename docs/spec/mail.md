@@ -175,10 +175,11 @@ person reads was never decoded next to another message.
    - JMAP session resource at `https://<domain>/.well-known/jmap` (RFC 8620 §2.2);
    - Mozilla-style autoconfig at `autoconfig.<domain>` and `<domain>/.well-known/autoconfig`,
      with the full address percent-encoded as one query value on the autoconfig host.
-     Read the exact XML `type` attribute, accepting single or double quotes and whitespace around
-     the equals sign. A greater-than sign inside a quoted value stays part of the value. Use the first
-     usable TLS entry for each protocol, skipping incomplete entries. For Microsoft OAuth2, the
-     selected IMAPS and submission endpoints must match the pair Arca binds.
+     Parse the bounded response as XML with DTD processing disabled. Ignore comments and
+     decode character references in attributes and text. Select the first provider block with
+     usable TLS entries for both protocols. A response can also list both entries directly under
+     `clientConfig`. Skip incomplete entries and keep both endpoints in the same block.
+     For Microsoft OAuth2, the selected IMAPS and submission endpoints must match the pair Arca binds.
      If they differ, continue discovery through the remaining sources;
    - SRV records `_imaps._tcp`, `_submissions._tcp`, and `_submission._tcp` (RFC 6186, RFC 8314).
      Ignore malformed targets and port zero before ranking endpoints;

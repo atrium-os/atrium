@@ -2091,6 +2091,7 @@ dependencies = [
  "libc",
  "mail-proto",
  "postcard",
+ "roxmltree",
  "serde",
  "serde_json",
 ]

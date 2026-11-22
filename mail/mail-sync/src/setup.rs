@@ -232,99 +232,55 @@ pub fn discover(address: &str, l: &mut dyn Lookup) -> Result<Found, &'static str
 
 // ── autoconfig (Mozilla clientConfig v1.1) ───────────────────────────
 
-fn opening_tag_end(tag: &str) -> Option<usize> {
-    let mut quote = None;
-    for (index, ch) in tag.char_indices() {
-        match ch {
-            delimiter if quote == Some(delimiter) => quote = None,
-            '\'' | '"' if quote.is_none() => quote = Some(ch),
-            '>' if quote.is_none() => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The text of each `<tag …>…</tag>` inside `within` (no nesting of the
-/// same tag), with the opening tag's attributes.
-fn elements<'a>(within: &'a str, tag: &str) -> Vec<(&'a str, &'a str)> {
-    let mut out = Vec::new();
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut rest = within;
-    while let Some(i) = rest.find(&open) {
-        let after = &rest[i + open.len()..];
-        if !after.starts_with(['>', ' ', '\t', '\r', '\n']) {
-            rest = after;
-            continue;
-        }
-        let Some(gt) = opening_tag_end(after) else { break };
-        let attrs = &after[..gt];
-        let body = &after[gt + 1..];
-        let Some(end) = body.find(&close) else { break };
-        out.push((attrs, &body[..end]));
-        rest = &body[end + close.len()..];
-        if out.len() >= 16 {
-            break;
-        }
-    }
-    out
-}
-
-fn text<'a>(within: &'a str, tag: &str) -> Option<&'a str> {
-    elements(within, tag).first().map(|(_, t)| t.trim())
-}
-
-fn attr<'a>(mut attrs: &'a str, name: &str) -> Option<&'a str> {
-    const SPACE: [char; 4] = [' ', '\t', '\r', '\n'];
-    let mut found = None;
-    while !attrs.is_empty() {
-        let trimmed = attrs.trim_start_matches(SPACE);
-        if trimmed.is_empty() {
-            break;
-        }
-        if trimmed.len() == attrs.len() {
+fn xml_text(field: roxmltree::Node<'_, '_>) -> Option<String> {
+    let mut text = String::new();
+    for child in field.children() {
+        if child.is_element() {
             return None;
         }
-        let name_end = trimmed.find(['=', ' ', '\t', '\r', '\n'])?;
-        let (key, after_name) = trimmed.split_at(name_end);
-        if key.is_empty() {
-            return None;
+        if child.is_text() {
+            text.push_str(child.text()?);
         }
-        let value = after_name.trim_start_matches(SPACE).strip_prefix('=')?.trim_start_matches(SPACE);
-        let quote = value.chars().next().filter(|ch| matches!(ch, '\'' | '"'))?;
-        let (value, remaining) = value[1..].split_once(quote)?;
-        if key == name && found.replace(value).is_some() {
-            return None;
-        }
-        attrs = remaining;
     }
-    found
+    Some(text)
 }
 
 /// The first usable IMAP and SMTP servers of an autoconfig document:
 /// TLS only (no plain), with `%EMAILADDRESS%`-style placeholders filled.
 fn autoconfig(b: &[u8], address: &str, domain: &str) -> Option<(Server, Server, Option<&'static str>)> {
-    let s = std::str::from_utf8(b).ok()?;
-    if !s.contains("<clientConfig") {
+    // The caller bounds the response size. DTDs are disabled by default.
+    let doc = roxmltree::Document::parse(std::str::from_utf8(b).ok()?).ok()?;
+    let root = doc.root_element();
+    if !root.has_tag_name("clientConfig") {
         return None;
     }
+    std::iter::once(root)
+        .chain(root.children().filter(|child| child.has_tag_name("emailProvider")))
+        .find_map(|provider| autoconfig_provider(provider, address, domain))
+}
+
+fn autoconfig_provider(
+    settings: roxmltree::Node<'_, '_>,
+    address: &str,
+    domain: &str,
+) -> Option<(Server, Server, Option<&'static str>)> {
     let local = address.rsplit_once('@').map(|(l, _)| l).unwrap_or("");
     let fill = |h: &str| h.replace("%EMAILDOMAIN%", domain).replace("%EMAILLOCALPART%", local).replace("%EMAILADDRESS%", address).to_ascii_lowercase();
     let pick = |kind: &str, tls: &'static str, starttls: &'static str| -> Option<(Server, bool)> {
         let tag = if kind == "imap" { "incomingServer" } else { "outgoingServer" };
-        for (attrs, body) in elements(s, tag) {
-            if attr(attrs, "type") != Some(kind) {
+        for server in settings.children().filter(|child| child.has_tag_name(tag)).take(16) {
+            if server.attribute("type") != Some(kind) {
                 continue;
             }
-            let (Some(hostname), Some(port_text)) = (text(body, "hostname"), text(body, "port")) else {
+            let field = |name| server.children().find(|child| child.has_tag_name(name)).and_then(xml_text);
+            let (Some(hostname), Some(port_text)) = (field("hostname"), field("port")) else {
                 continue;
             };
-            let host = fill(hostname);
-            let Ok(port) = port_text.parse::<u16>() else {
+            let host = fill(hostname.trim());
+            let Ok(port) = port_text.trim().parse::<u16>() else {
                 continue;
             };
-            let scheme = match text(body, "socketType") {
+            let scheme = match field("socketType").as_deref().map(str::trim) {
                 Some("SSL") => tls,
                 Some("STARTTLS") => starttls,
                 _ => continue,
@@ -333,7 +289,10 @@ fn autoconfig(b: &[u8], address: &str, domain: &str) -> Option<(Server, Server, 
                 continue;
             }
             let microsoft_oauth = under(&host, "office365.com")
-                && elements(body, "authentication").iter().any(|(_, t)| t.trim() == "OAuth2");
+                && server.children().any(|child| {
+                    child.has_tag_name("authentication")
+                        && xml_text(child).is_some_and(|value| value.trim() == "OAuth2")
+                });
             return Some((Server { scheme, host, port }, microsoft_oauth));
         }
         None
@@ -531,6 +490,47 @@ mod tests {
             smtp: Server { scheme: "submission", host: "smtp.west.example.test".into(), port: 587 },
         });
         assert_eq!(net.asked, ["https://example.test/.well-known/jmap", url]);
+    }
+
+    #[test]
+    fn autoconfig_ignores_comments_and_decodes_character_references() {
+        let xml = br#"<clientConfig><emailProvider id="example.test">
+<!-- <incomingServer type="imap"><hostname>unused.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer> -->
+<incomingServer type="&#105;map"><hostname>imap&#46;example<!-- comment -->.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer type="smtp"><hostname>smtp.example.test</hostname><port>587</port><socketType>STARTTLS</socketType></outgoingServer>
+</emailProvider></clientConfig>"#;
+        let (imap, smtp, oauth) = autoconfig(xml, "ada@example.test", "example.test").unwrap();
+        assert_eq!(imap.host, "imap.example.test");
+        assert_eq!(smtp.host, "smtp.example.test");
+        assert_eq!(oauth, None);
+    }
+
+    #[test]
+    fn autoconfig_does_not_mix_provider_blocks() {
+        let xml = br#"<clientConfig>
+<emailProvider id="incomplete"><incomingServer type="imap"><hostname>unused.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer></emailProvider>
+<emailProvider id="complete">
+<incomingServer type="imap"><hostname>imap.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer>
+<outgoingServer type="smtp"><hostname>smtp.example.test</hostname><port>465</port><socketType>SSL</socketType></outgoingServer>
+</emailProvider></clientConfig>"#;
+        let (imap, smtp, _) = autoconfig(xml, "ada@example.test", "example.test").unwrap();
+        assert_eq!(imap.host, "imap.example.test");
+        assert_eq!(smtp.host, "smtp.example.test");
+    }
+
+    #[test]
+    fn autoconfig_rejects_malformed_documents_and_dtds() {
+        let valid = "<clientConfig><incomingServer type='imap'><hostname>imap.example.test</hostname><port>993</port><socketType>SSL</socketType></incomingServer><outgoingServer type='smtp'><hostname>smtp.example.test</hostname><port>465</port><socketType>SSL</socketType></outgoingServer></clientConfig>";
+        for invalid in [
+            valid.replace("</clientConfig>", ""),
+            format!("<!DOCTYPE clientConfig [<!ELEMENT clientConfig ANY>]>{valid}"),
+        ] {
+            let mut net = Net::default();
+            let url = "https://autoconfig.example.test/mail/config-v1.1.xml?emailaddress=ada%40example.test";
+            net.pages.insert(url.into(), invalid.into_bytes());
+            let found = discover("ada@example.test", &mut net).unwrap();
+            assert_eq!(found.via, Via::Guess);
+        }
     }
 
     #[test]
