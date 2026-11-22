@@ -146,6 +146,11 @@ fn saved_status(d: &Doc, format: Format) -> String {
         }) {
             changes.push("omitted typed chart series names");
         }
+        if (0..d.wb.sheet_count() as u16).any(|sheet| {
+            d.wb.comments(sheet).values().any(|comment| !comment.thread().is_empty())
+        }) {
+            changes.push("saved comment threads as plain notes");
+        }
         if !changes.is_empty() {
             status.push_str(&format!(" ODS {}.", changes.join(", ")));
         }
@@ -1258,6 +1263,22 @@ mod document_tests {
             "Saved “Sales.ods”. ODS converted table references to cell ranges, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
         );
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Sales.ods”.");
+    }
+
+    #[test]
+    fn ods_save_reports_flattening_comment_threads() {
+        use officina_grid::comments::{Comment, ThreadMessage, ThreadPerson};
+        let mut doc = Doc::new("Notes.ods");
+        doc.wb.set_comments(0, vec![(0, 0, Some(Comment::new("Ana", "Plain note")))]);
+        assert_eq!(saved_status(&doc, Format::Ods), "Saved “Notes.ods”.");
+        let thread = Comment::threaded(vec![ThreadMessage {
+            id: 1, parent: None,
+            author: Arc::new(ThreadPerson { id: 2, name: "Ana".into(), user_id: "".into(), provider_id: "".into() }),
+            timestamp: "".into(), done: false, text: "Thread".into(), mentions: Arc::default(),
+        }]).unwrap();
+        doc.wb.set_comments(0, vec![(0, 0, Some(thread))]);
+        assert_eq!(saved_status(&doc, Format::Ods), "Saved “Notes.ods”. ODS saved comment threads as plain notes.");
+        assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Notes.ods”.");
     }
 
     // Run under jail(8) with a workbook descriptor queued on stdin.

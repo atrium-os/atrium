@@ -653,7 +653,8 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                     seg.valid = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
                 }
             }
-            b"dataValidations" | b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules from Excel 2010's extensions"),
+            // The extension list is a container. Count only its rules.
+            b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules from Excel 2010's extensions"),
             b"hyperlink" => {
                 if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
                     if seg.links.len() < officina_grid::links::MAX_LINKS {

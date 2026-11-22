@@ -5,11 +5,12 @@
 # Set SHEETS_INTEROP_CASE=tables for the sheets_table_chart_fixture inputs
 # and stage its binary at /tmp/sheets-table-chart-fixture instead.
 # Use SHEETS_INTEROP_CASE=layout and /tmp/sheets-layout-fixture for layout.
+# Use SHEETS_INTEROP_CASE=annotations and /tmp/sheets-annotations-fixture for annotations.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
@@ -34,6 +35,7 @@ checkpoint() {
     case "$profile" in
         tables) /tmp/sheets-table-chart-fixture check "$1" "$2" "$format" ;;
         layout) /tmp/sheets-layout-fixture check "$1" "$2" ;;
+        annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
     esac
 } 2>"$results/checkpoint.log"
@@ -69,15 +71,13 @@ close_book() {
     key 0x1a 1
     wait_for closed
 }
-refresh_all() {
+data_from_bottom() {
     click 594 24
     wait_for other_window 645 18 "$document"
     input 'MOVE 646 18'
     sleep .4
-    # Start on Compare with… and wrap up from the bottom of the menu.
-    # In this single-sheet fixture, Refresh All is sixth from the last
-    # enabled item. The following checkpoint verifies the command.
-    for i in $(jot 6); do key 0x52; sleep .1; done
+    # Start on Compare with… and wrap up through enabled items.
+    for i in $(jot "$1"); do key 0x52; sleep .1; done
     sleep .3
     key 0x28
     wait_for same_window 645 18 "$document"
@@ -90,7 +90,7 @@ pivots() {
     save "$book" edited
     cp selectscreen.png "$results/$format-before-refresh.png"
 
-    refresh_all
+    data_from_bottom 6 # Refresh All Pivot Tables in the pivot fixture.
     save "$book" refreshed
     cp selectscreen.png "$results/$format-refreshed.png"
 
@@ -163,6 +163,73 @@ scroll_layout() {
     cp selectscreen.png "$results/$format-scrolled.png"
 }
 
+append_x() {
+    click 302 681
+    key 0x4d # End
+    key 0x1b # x
+    key 0x28
+}
+
+annotations() {
+    click 63 112
+    data_from_bottom 22 # Edit Comment…
+    append_x
+    save "$book" note
+
+    click 126 112
+    data_from_bottom 22 # Edit Link…
+    click 302 681
+    key 0x04 1 # Select all
+    key 0x09 # f
+    key 0x1e # 1
+    key 0x28
+    save "$book" link
+
+    click 191 112
+    data_from_bottom 6 # Data Validation…
+    sleep .35
+    click 1014 295 # Highest
+    key 0x04 1
+    key 0x25 # 8
+    click 1054 663
+    save "$book" rule
+
+    click 254 112
+    if test "$format" = xlsx; then
+        data_from_bottom 23 # Open Comment Thread…
+        append_x
+    else
+        data_from_bottom 22 # New Comment Thread…
+        click 302 681
+        key 0x14 # q
+        key 0x28
+        sleep .45
+        click 254 112
+        data_from_bottom 23 # Open Comment Thread…
+        sleep .35
+        click 945 681 # Reply
+        click 302 681
+        key 0x15 # r
+        key 0x28
+    fi
+    save "$book" thread
+    sleep .4
+    cp selectscreen.png "$results/$format-annotations-saved.png"
+    final=thread
+}
+
+check_reopened_validation() {
+    click 191 112
+    key 0x26 # 9 is refused by the reopened rule.
+    key 0x28
+    sleep .5
+    cp selectscreen.png "$results/$format-validation-refused.png"
+    click 191 112
+    key 0x25 # 8 is accepted.
+    key 0x28
+    save "$book" accepted
+}
+
 launcher=$(win_at 48 24)
 test "$launcher" -gt 0
 for format in ods xlsx; do
@@ -179,7 +246,10 @@ for format in ods xlsx; do
     open_book "$row" "$book" "$final"
     sleep .4
     cp selectscreen.png "$results/$format-reopened.png"
-    if test "$profile" = layout; then scroll_layout; fi
+    case "$profile" in
+        layout) scroll_layout ;;
+        annotations) check_reopened_validation ;;
+    esac
     close_book
-    echo "PASS $format $profile edit, undo, redo, and converter reopen"
+    echo "PASS $format $profile desktop save and converter reopen"
 done
