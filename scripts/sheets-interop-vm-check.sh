@@ -11,11 +11,12 @@
 # Use SHEETS_INTEROP_CASE=print and /tmp/sheets-print-fixture for print layout.
 # The print profile also needs Prelum and the print sheet with no printers
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
+# Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 if test "$profile" = legacy; then
@@ -47,6 +48,7 @@ checkpoint() {
         annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
+        formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
@@ -277,6 +279,39 @@ print_pdf() {
     mv "$pdf" "$results/$format.pdf"
 }
 
+formulas() {
+    click 320 133 # E2. Enter =SUM(D2#), including in the ODS workbook.
+    key 0x2e # =
+    key 0x16 # s
+    key 0x18 # u
+    key 0x10 # m
+    key 0x26 2 # (
+    key 0x07 # d
+    key 0x1f # 2
+    key 0x20 2 # #
+    key 0x27 2 # )
+    key 0x28
+    click 126 133 # B2. Expand the spill to three rows and produce #DIV/0!.
+    key 0x20
+    key 0x28
+    save "$book" edited
+    sleep .8 # The on-disk checkpoint can precede the Save acknowledgment.
+    cp selectscreen.png "$results/$format-formulas-saved.png"
+    final=edited
+}
+
+formulas_reopened() {
+    click 126 133 # Resize again to distinguish dynamic and fixed spill references.
+    key 0x21 # 4
+    key 0x28
+    save "$book" resized
+    cp selectscreen.png "$results/$format-formulas-resized.png"
+    close_book
+    open_book "$row" "$book" resized
+    sleep .4
+    cp selectscreen.png "$results/$format-formulas-reopened.png"
+}
+
 legacy() {
     checksum=$(sha256 -q "$books/legacy.xls")
     checkpoint "$books/macro.xlsm" macro-initial
@@ -349,6 +384,7 @@ for format in ods xlsx; do
         layout) scroll_layout ;;
         annotations) check_reopened_validation ;;
         print) print_pdf ;;
+        formulas) formulas_reopened ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"

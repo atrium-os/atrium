@@ -2258,7 +2258,17 @@ unchanged.
   `_xlfn.SINGLE` for an `@` Excel would keep, `_xlfn._xlws.` on `FILTER` and
   `SORT`, `_xlpm.` on `LET` and `LAMBDA` names. In `.ods` it is a matrix
   formula over its current spill, spill references become the range they
-  cover, and Excel's newer functions get `COM.MICROSOFT.` names.
+  cover, and Excel's newer functions get `COM.MICROSOFT.` names. An ODS Save
+  reports the conversion when a cell formula uses a spill reference. A saved
+  fixed-range formula keeps the range it received even if the spill grows
+  after reopen.
+- **Desktop gate.** The [interoperability check](../../scripts/sheets-interop-vm-check.sh)
+  with `SHEETS_INTEROP_CASE=formulas` exercises XLSX and ODS dates, times,
+  named and cross-sheet references, spill anchors and errors. Each source
+  contains a stale formula cache that triggers the import notice. The gate
+  edits the input, saves, reopens and grows the spill again to verify the
+  XLSX dynamic reference and the ODS fixed range. It checks the repaired
+  cache on both saved files.
 - **Functions.** `SEQUENCE`, `RANDARRAY`, `TRANSPOSE`, `FILTER`, `SORT`,
   `SORTBY`, `UNIQUE`, `VSTACK`, `HSTACK`, `TAKE`, `DROP`, `CHOOSEROWS`,
   `CHOOSECOLS`, `TOCOL`, `TOROW`, `WRAPROWS`, `WRAPCOLS`, `EXPAND`; `ROW` and

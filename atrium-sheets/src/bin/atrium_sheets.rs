@@ -119,10 +119,18 @@ fn saved_status(d: &Doc, format: Format) -> String {
         format!("Saved “{}”.", d.name)
     };
     if format == Format::Ods {
+        use officina_grid::formula::ast::Expr;
+
         let mut changes = Vec::new();
+        if d.wb.groups().any(|(_, group)| {
+            let mut referenced = false;
+            group.expr.walk(&mut |expr| referenced |= matches!(expr, Expr::Spill(_)));
+            referenced
+        }) {
+            changes.push("replaced spill references with fixed ranges or reference errors");
+        }
         let tables = d.wb.tables();
         if !tables.is_empty() && d.wb.groups().any(|(_, group)| {
-            use officina_grid::formula::ast::Expr;
             let mut referenced = false;
             group.expr.walk(&mut |expr| {
                 referenced |= match expr {
@@ -1267,6 +1275,19 @@ mod document_tests {
             "Saved “Sales.ods”. ODS converted table references to cell ranges, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
         );
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Sales.ods”.");
+    }
+
+    #[test]
+    fn ods_save_reports_fixed_spill_references() {
+        let mut doc = Doc::new("Arrays.ods");
+        doc.type_into(0, 0, "=SEQUENCE(2)");
+        assert_eq!(saved_status(&doc, Format::Ods), "Saved “Arrays.ods”.");
+        doc.type_into(0, 1, "=SUM(A1#)");
+        assert_eq!(
+            saved_status(&doc, Format::Ods),
+            "Saved “Arrays.ods”. ODS replaced spill references with fixed ranges or reference errors."
+        );
+        assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Arrays.ods”.");
     }
 
     #[test]
