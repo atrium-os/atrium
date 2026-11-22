@@ -104,6 +104,7 @@ impl Writer<'_> {
             self.tx.open_table(crate::FOLDERS)?.remove(*id)?;
             self.tx.open_table(crate::FOLDER_NAMES)?.remove((account, f.name.as_str()))?;
         }
+        self.clear_accepted_imports(account)?;
         self.tx.open_table(crate::ACCOUNTS)?.remove(account)?;
         self.tx.open_table(crate::IDENTITIES)?.remove(account)?;
         self.tx.open_table(CONFIG)?.remove(account)?;

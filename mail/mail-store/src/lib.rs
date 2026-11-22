@@ -659,6 +659,9 @@ impl Writer<'_> {
         } else {
             self.thread_refresh(cur.thread)?;
         }
+        if let Some(mid) = cur.summary.message_id.as_deref() {
+            self.confirm_import_readback(account, mid)?;
+        }
         Ok(id)
     }
 

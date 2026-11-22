@@ -6,7 +6,7 @@
 //!
 //! Reads the file as it goes (an mbox can be gigabytes), checking a bounded
 //! batch of headers at a time. Mail skips a Message-ID already indexed or
-//! queued for this account.
+//! queued for this account, including accepted uploads awaiting readback.
 
 use std::collections::HashSet;
 use std::io::{BufRead, Read};
@@ -327,6 +327,7 @@ impl Engine {
     /// [`UPLOADS_PER_PASS`]; `put` stores one message in a folder (by its
     /// name). How many went up.
     pub fn upload_imports(&self, account: AccountId, put: &mut dyn FnMut(&str, &[u8]) -> Result<(), String>) -> Result<usize, Error> {
+        index_legacy_imports(&self.store, &self.parser, account)?;
         let mut done = 0;
         for (id, i) in self.store.imports()? {
             if done >= UPLOADS_PER_PASS {
@@ -345,7 +346,7 @@ impl Engine {
             let bytes = self.store.blob(&i.blob)?;
             match put(&f.name, &bytes) {
                 Ok(()) => {
-                    self.store.write(|w| w.import_done(id))?;
+                    self.store.write(|w| w.import_accepted(id))?;
                     done += 1;
                 }
                 Err(why) => {

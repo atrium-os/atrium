@@ -482,10 +482,12 @@ as **making the account usable first, then filling in what's worth having, polit
   once, and resumes at the next envelope separator. It queues in file order, reports
   progress every 500 processed messages including refusals, and preserves complete
   messages read before an I/O error. For an account, each new queue entry is checked
-  against both synced mail and queued imports by Message-ID. Mail persists queued
-  Message-IDs across restarts, including for imports waiting for a retry. On the
-  next import, the parse jail supplies Message-IDs for any older queue entries.
-  Cancelling or discarding a queue entry releases its Message-ID from the queue.
+  by Message-ID against synced mail, queued imports and accepted uploads awaiting
+  mailbox sync. The parse jail supplies Message-IDs for older queue entries before
+  the next import or upload. After upload acceptance, Mail atomically removes the
+  retryable queue row and retains its Message-ID across restarts until mailbox sync
+  indexes it for that account. Cancelling or discarding a queued upload releases
+  its queue identity. Removing the account clears its accepted uploads.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

@@ -16,11 +16,15 @@ const IMPORT_IDENTITIES: TableDefinition<u64, (AccountId, &str)> = TableDefiniti
 const IMPORTS_BY_MESSAGE_ID: TableDefinition<(AccountId, &str, u64), ()> =
     TableDefinition::new("imports_by_message_id");
 
+// An accepted upload protects its Message-ID until mailbox sync indexes it.
+const ACCEPTED_IMPORTS: TableDefinition<(AccountId, &str), ()> = TableDefinition::new("accepted_imports");
+
 pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     let imports = tx.open_table(IMPORTS)?;
     let mut unindexed = tx.open_table(UNINDEXED_IMPORTS)?;
     tx.open_table(IMPORT_IDENTITIES)?;
     tx.open_table(IMPORTS_BY_MESSAGE_ID)?;
+    tx.open_table(ACCEPTED_IMPORTS)?;
     let mut meta = tx.open_table(META)?;
     if meta.get("import_identity_index")?.is_none() {
         for row in imports.iter()? {
@@ -53,8 +57,8 @@ impl Writer<'_> {
         Ok(id)
     }
 
-    /// Check for the same Message-ID in the account's index and queue,
-    /// and insert a new row in that same transaction.
+    /// Check the account's index, queue and accepted uploads for the same
+    /// Message-ID. Insert a new row in that same transaction.
     pub fn queue_import_if_new(
         &mut self,
         folder: FolderId,
@@ -65,6 +69,7 @@ impl Writer<'_> {
         if let Some(mid) = message_id {
             let queue = self.tx.open_table(IMPORTS_BY_MESSAGE_ID)?;
             if queue.range((account, mid, 0)..=(account, mid, u64::MAX))?.next().transpose()?.is_some()
+                || self.tx.open_table(ACCEPTED_IMPORTS)?.get((account, mid))?.is_some()
                 || self.has_message_id(account, mid)?
             {
                 return Ok(false);
@@ -100,6 +105,50 @@ impl Writer<'_> {
             let import: Import = dec(row.value())?;
             let account = self.store_folder(import.folder)?.account;
             self.index_message_id(id, account, mid)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the upload from the queue and keep its Message-ID protected
+    /// until the account indexes it.
+    pub fn import_accepted(&mut self, id: u64) -> Result<()> {
+        {
+            let identities = self.tx.open_table(IMPORT_IDENTITIES)?;
+            let identity = identities.get(id)?;
+            if let Some(row) = identity {
+                let (account, mid) = row.value();
+                let account_exists = self.tx.open_table(crate::ACCOUNTS)?.get(account)?.is_some();
+                if account_exists && !self.has_message_id(account, mid)? {
+                    self.tx.open_table(ACCEPTED_IMPORTS)?.insert((account, mid), ())?;
+                }
+            }
+        }
+        self.import_done(id)
+    }
+
+    pub(crate) fn confirm_import_readback(&mut self, account: AccountId, mid: &str) -> Result<()> {
+        let mut accepted = self.tx.open_table(ACCEPTED_IMPORTS)?;
+        // Only retire the acceptance when the regular index can suppress a
+        // repeat import on its own.
+        if accepted.get((account, mid))?.is_some() && self.has_message_id(account, mid)? {
+            accepted.remove((account, mid))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_accepted_imports(&mut self, account: AccountId) -> Result<()> {
+        let mut accepted = self.tx.open_table(ACCEPTED_IMPORTS)?;
+        let mut ids = Vec::new();
+        for entry in accepted.range((account, "")..)? {
+            let (key, _) = entry?;
+            let (owner, mid) = key.value();
+            if owner != account {
+                break;
+            }
+            ids.push(mid.to_owned());
+        }
+        for mid in ids {
+            accepted.remove((account, mid.as_str()))?;
         }
         Ok(())
     }

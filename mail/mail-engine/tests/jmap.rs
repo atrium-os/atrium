@@ -60,6 +60,7 @@ struct Server {
     sieve_refuse: Option<&'static str>,
     /// The session has no VacationResponse.
     no_vacation: bool,
+    fail_mailbox_sync: bool,
 }
 
 impl Server {
@@ -300,6 +301,9 @@ impl Http for Fake {
             "https://jmap.test/api/" => {
                 assert_eq!(content_type, "application/json");
                 let req: Value = serde_json::from_slice(body).unwrap();
+                if s.fail_mailbox_sync && req["methodCalls"].as_array().unwrap().iter().any(|call| call[0] == "Mailbox/get") {
+                    return Err("test mailbox sync outage".into());
+                }
                 Ok(serde_json::to_vec(&s.api(&req)).unwrap())
             }
             "https://jmap.test/upload/u1/" => {
@@ -699,24 +703,42 @@ fn mbox_repeat_import_skips_queued_messages_after_reopen() {
     assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
     drop(engine);
 
-    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
     assert_eq!(engine.import_mbox(folder, &alternate[..]).unwrap(), skipped);
-    assert_eq!(engine.import_mbox(other_archive, &alternate[..]).unwrap(), queued);
     assert_eq!(engine.imports_waiting(account).unwrap(), 1);
-    assert_eq!(engine.imports_waiting(other_account).unwrap(), 1);
 
     let server = Rc::new(RefCell::new(Server::default()));
-    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server)), SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
     let uploaded = engine.upload_imports(account, &mut |folder, bytes| {
         client.import(folder, bytes).map(|_| ()).map_err(|e| e.0)
     }).unwrap();
     assert_eq!(uploaded, 1);
+    assert_eq!(engine.store.count(folder).unwrap(), 0);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 0);
+    server.borrow_mut().fail_mailbox_sync = true;
+    let err = client.sync(&mut engine.sink(account)).unwrap_err();
+    assert!(err.to_string().contains("test mailbox sync outage"), "{err}");
+    assert_eq!(engine.import_mbox(other_archive, &alternate[..]).unwrap(), queued);
+    assert_eq!(engine.imports_waiting(other_account).unwrap(), 1);
+    assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.store.count(folder).unwrap(), 0);
+    assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
+    assert_eq!(engine.upload_imports(account, &mut |_, _| panic!("accepted mail must not upload again")).unwrap(), 0);
+    server.borrow_mut().fail_mailbox_sync = false;
     client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(server.borrow().mails.len(), 1);
     assert_eq!(engine.import_mbox(other_folder, &alternate[..]).unwrap(), skipped);
     let rows = engine.store.list(folder, 0, 10).unwrap();
     assert_eq!(rows.len(), 1);
     let stored = engine.store.message(rows[0].msg).unwrap().full.unwrap();
     assert_eq!(engine.store.blob(&stored).unwrap(), message(77, "First copy", "original"));
+    // Once readback supersedes the acceptance record, removing the synced
+    // message allows it to be imported again, even with another account queued.
+    engine.store.write(|w| w.remove(folder, rows[0].uid)).unwrap();
+    assert_eq!(engine.import_mbox(folder, &original[..]).unwrap(), queued);
 }
 
 #[test]
@@ -757,6 +779,31 @@ fn mbox_legacy_queue_keeps_message_id_through_retry_and_releases_it_on_cancel() 
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), skipped);
     assert_eq!(engine.store.write(|w| w.cancel_imports(inbox)).unwrap(), 1);
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), Imported { queued: 1, already: 0, refused: 0 });
+}
+
+#[test]
+fn mbox_legacy_upload_is_protected_before_its_first_readback() {
+    use mail_engine::import::Imported;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let raw = message(44, "Older import", "accepted body");
+    let blob = engine.store.put_blob(&raw).unwrap();
+    engine.store.write(|w| w.queue_import(archive, blob)).unwrap();
+
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server)), SESSION).unwrap();
+    assert_eq!(engine.upload_imports(account, &mut |folder, bytes| {
+        assert_eq!(bytes, raw);
+        client.import(folder, bytes).map(|_| ()).map_err(|e| e.0)
+    }).unwrap(), 1);
+    assert!(engine.store.imports().unwrap().is_empty());
+    assert_eq!(engine.store.count(archive).unwrap(), 0);
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), Imported { queued: 0, already: 1, refused: 0 });
 }
 
 #[test]
