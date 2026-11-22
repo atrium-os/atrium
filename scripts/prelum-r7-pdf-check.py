@@ -94,7 +94,12 @@ if outcomes:
             assert (str(desktop_job), "2", "2", f"PIN recovery after {cancel_result}") in completed_jobs, jobs
             print(f"IPPS simulator: fresh PIN after {cancel_result}, job {printer_job} uploaded once")
         elif response == "replay":
-            title = re.escape(f"PIN response ignored with-id {cancel_result}")
+            title = (
+                f"PIN response {cancel_result} without-id none"
+                if cancel_result.startswith("create-")
+                else f"PIN response ignored with-id {cancel_result}"
+            )
+            title = re.escape(title)
             assert re.search(
                 rf"^ +{desktop_job} +printer [0-9]+ +Failed +0/2 +{title} +Arca did not supply a usable PIN for this job *$",
                 jobs,

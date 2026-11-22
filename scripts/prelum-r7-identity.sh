@@ -18,6 +18,7 @@ case "$kind" in
   pin-no-job-password) job=18; title="PIN without job-password support"; prefix=pin-no-job-password ;;
   pin-no-create-job) job=19; title="PIN without Create-Job"; prefix=pin-no-create-job ;;
   pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
+  pin-create-replay) job=$5; title="PIN response $6 without-id none"; prefix="pin-replay-$6" ;;
   pin-replay) job=$5; title="PIN response ignored with-id $6"; prefix="pin-replay-$6" ;;
   pin-recovery) job=$5; title="PIN recovery after $6"; prefix="pin-recovery-$6" ;;
   pin-rejection) job=$5; title="PIN response $6 $7 $8"; prefix="pin-$6-$7-$8" ;;
@@ -56,7 +57,7 @@ case "$phase" in
   replay)
     case "$kind" in
       pin-uuid) job=16; prefix=pin-replay ;;
-      pin-replay) ;;
+      pin-replay|pin-create-replay) ;;
       *) exit 2 ;;
     esac
     # Replay the retained handle, then leave no handle file for the next job.
@@ -82,8 +83,13 @@ case "$phase" in
     case "$kind" in
       pin-fresh|pin-recovery) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
       pin-rejection)
-        reason="the printer did not accept the PIN job"
-        if [ "$6" = success ]; then reason="the printer gave no job id"; fi
+        case "$6" in
+          success) reason="the printer gave no job id" ;;
+          create-http-refused) reason="the printer answered HTTP 403" ;;
+          create-invalid-ipp) reason="the printer's answer is not valid IPP: .+" ;;
+          create-dropped|create-truncated) reason=".+" ;;
+          *) reason="the printer did not accept the PIN job" ;;
+        esac
         expected="^ +$job +printer +1 +Failed +0/2 +$title +$reason *$"
         ;;
       *) exit 2 ;;

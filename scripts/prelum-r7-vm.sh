@@ -132,6 +132,8 @@ python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port
     --test-pin-job "Fresh PIN after replay refusal" --test-pin-rejections \
     --test-pin-job "PIN recovery after ipp-refused" --test-pin-job "PIN recovery after http-refused" \
     --test-pin-job "PIN recovery after dropped" --test-pin-job "PIN recovery after truncated" \
+    --test-pin-job "PIN recovery after create-http-refused" --test-pin-job "PIN recovery after create-dropped" \
+    --test-pin-job "PIN recovery after create-truncated" --test-pin-job "PIN recovery after create-invalid-ipp" \
     --test-no-send-document-flag "$D/no-send-document" --test-no-job-password-flag "$D/no-job-password" \
     --test-no-create-job-flag "$D/no-create-job" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
@@ -402,20 +404,27 @@ check_pin_rejection success without-id none
 
 # Replay the consumed handle before testing recovery with a newly staged one.
 job_operations='^fake printer: (Create-Job|Print-Job|Send-Document|Cancel-Job) job '
-for cancel_result in ipp-refused http-refused dropped truncated; do
-    check_pin_rejection ignored with-id "$cancel_result" retain
-    printf 'replay - %s\n' "$cancel_result" >>"$expected_responses"
-    replay_proof="$D/pin-replay-$cancel_result"
+replay_and_recover() {
+    replay_proof="$D/pin-replay-$2"
+    printf 'replay - %s\n' "$2" >>"$expected_responses"
     grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-before-operations.log"
-    submit_pin_fixture replay "pin-replay-$cancel_result" pin-replay "$cancel_result"
+    submit_pin_fixture replay "pin-replay-$2" "$1" "$2"
     grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-after-operations.log"
     cmp "$replay_proof-before-operations.log" "$replay_proof-after-operations.log"
 
     printer_job=$((printer_job + 1))
-    printf 'recovery %s %s\n' "$printer_job" "$cancel_result" >>"$expected_responses"
-    submit_pin_fixture fresh "pin-recovery-$cancel_result" pin-recovery "$cancel_result"
+    printf 'recovery %s %s\n' "$printer_job" "$2" >>"$expected_responses"
+    submit_pin_fixture fresh "pin-recovery-$2" pin-recovery "$2"
+}
+for cancel_result in ipp-refused http-refused dropped truncated; do
+    check_pin_rejection ignored with-id "$cancel_result" retain
+    replay_and_recover pin-replay "$cancel_result"
 done
-remote "cat '$guest/pin-recovery-truncated-jobs.log'" >"$D/pin-rejection-jobs.txt"
+for create_failure in create-http-refused create-dropped create-truncated create-invalid-ipp; do
+    check_pin_rejection "$create_failure" without-id none retain
+    replay_and_recover pin-create-replay "$create_failure"
+done
+remote "cat '$guest/pin-recovery-create-invalid-ipp-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
     "$D/pin-rejection-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 "$expected_responses" >"$D/pin-rejection-pdf-checks.log"
 cat "$D/pin-rejection-pdf-checks.log"

@@ -64,6 +64,7 @@ PIN_RESPONSE_STATUS = {
     "server-busy": 0x0507,
     "success": 0x0000,
 }
+PIN_CREATE_FAILURES = ("create-http-refused", "create-dropped", "create-truncated", "create-invalid-ipp")
 PIN_CANCEL_RESULTS = ("canceled", "ipp-refused", "http-refused", "dropped", "truncated")
 
 LOCK = threading.Lock()
@@ -216,7 +217,7 @@ class H(http.server.BaseHTTPRequestHandler):
         st, reasons = state()
         jid = (a.get("job-id") or [0])[0]
         out = head(0, rid)
-        cancel_result = None
+        truncate_reply = False
         name = {0x0B: "Get-Printer-Attributes", 0x05: "Create-Job", 0x06: "Send-Document", 0x09: "Get-Job-Attributes",
                 0x08: "Cancel-Job", 0x3C: "Identify-Printer", 0x04: "Validate-Job", 0x02: "Print-Job"}.get(op, hex(op))
         print("fake printer: %s job %s (state %s %s)" % (name, jid, st, " ".join(reasons)), flush=True)
@@ -240,13 +241,30 @@ class H(http.server.BaseHTTPRequestHandler):
                 response, id_mode, cancel_mode = fields
                 include_job_id = id_mode == "with-id"
                 valid_cancel_modes = PIN_CANCEL_RESULTS if include_job_id else ("none",)
-                if response not in PIN_RESPONSE_STATUS or id_mode not in ("with-id", "without-id") or cancel_mode not in valid_cancel_modes:
+                if id_mode not in ("with-id", "without-id") or cancel_mode not in valid_cancel_modes:
+                    self.send_error(400, "Invalid fixture PIN response mode")
+                    return
+                if response in PIN_CREATE_FAILURES and not include_job_id:
+                    if response == "create-http-refused":
+                        print(f"fake printer: PIN response {response} -", flush=True)
+                        self.send_error(403, "Fixture creation refused")
+                        return
+                    if response == "create-dropped":
+                        print(f"fake printer: PIN response {response} -", flush=True)
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                    truncate_reply = response == "create-truncated"
+                    if response == "create-invalid-ipp":
+                        out = b"invalid"
+                elif response in PIN_RESPONSE_STATUS:
+                    out = head(PIN_RESPONSE_STATUS[response], rid)
+                    out += attr(TEXT, "status-message", "Fixture printer diagnostic")
+                    if response == "unsupported-group":
+                        out += bytes([UNSUPG]) + attr(UNSUPPORTED, "job-password", "")
+                else:
                     self.send_error(400, "Unknown fixture PIN response")
                     return
-                out = head(PIN_RESPONSE_STATUS[response], rid)
-                out += attr(TEXT, "status-message", "Fixture printer diagnostic")
-                if response == "unsupported-group":
-                    out += bytes([UNSUPG]) + attr(UNSUPPORTED, "job-password", "")
             if include_job_id:
                 with LOCK:
                     jid = NEXT[0]
@@ -297,6 +315,7 @@ class H(http.server.BaseHTTPRequestHandler):
             if doc:
                 self.send_error(400, "Document in Cancel-Job request")
                 return
+            cancel_result = None
             with LOCK:
                 j = JOBS.get(jid)
                 if j:
@@ -314,11 +333,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 self.close_connection = True
                 self.connection.shutdown(socket.SHUT_RDWR)
                 return
+            truncate_reply = cancel_result == "truncated"
         out += bytes([ENDG])
         self.send_response(200)
         self.send_header("Content-Type", "application/ipp")
         self.send_header("Content-Length", str(len(out)))
-        if cancel_result == "truncated":
+        if truncate_reply:
             # Advertise the full length, then close before delivering the end marker.
             self.send_header("Connection", "close")
             self.close_connection = True
