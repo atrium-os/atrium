@@ -305,6 +305,23 @@ converted approximately (an unsupported chart type drawn as a picture, a font su
 what was kept inert, and what was dropped. Saving back to a foreign format lists what the
 format can't carry. No silent loss.
 
+#### Sheets fidelity triage
+
+Prioritize changes that let invalid input through or alter saved values, then
+changes that turn editable workbook features into static content. Cosmetic
+differences come after those. The following groups cover the current notices
+and their associated import or Save behavior.
+
+| Priority | Formats | Group and user impact |
+|---|---|---|
+| 1 | XLSX, XLSM | **Input validation.** Formula-backed Excel extension rules previously disappeared on open and ordinary Save. Sheets now reads them and writes direct cross-sheet rules in the extension. Extension-only list encodings and rules with missing or unparseable formulas still receive loss notices. |
+| 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells can display or behave differently. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. Test saved values, date arithmetic and ordinary Save together. |
+| 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Excel cell protection settings and ODS sheet protection can be lost. XLS still drops validation rules when importing to a native copy. Group enforcement checks with the corresponding import notices. |
+| 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Specialized filters may retain hidden rows without live predicates. Unsupported or calculated pivot fields, table features and some formulas may become static values or plain cells. ODS Save can turn spill and table references into fixed ranges. |
+| 5 | XLSX, XLSM, ODS, XLS | **Review and output.** ODS can flatten comment threads. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can lose content or change output. Legacy XLS also drops comments and hyperlinks. |
+| 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Rotation, shrink-to-fit, patterned or gradient fills, diagonal borders and styles on empty rows can change how a sheet looks. |
+| Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
+
 ### 5.3 What never runs, and what is kept inert
 
 | in the file | on open | on save to the same format |
@@ -3865,7 +3882,7 @@ bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
   - `GridOp::Validations` (journal tag 20) sets the rules as one undo step, and the native file keeps them in chunk `VALIDATIONS` (20). Deleting a sheet takes its rules with it, and undo brings them back.
   - Limits: 65,536 rules, 1,024 ranges a rule, 1 KiB a message, 4,096 list items.
 - **Files.**
-  - **.xlsx:** `<dataValidations>`. Excel's `showDropDown="1"` means the drop-down is hidden. Excel 2010's `x14` rules (lists on other sheets in old files) are counted and reported as dropped.
+  - **.xlsx and .xlsm.** Read ordinary `<dataValidations>` and formula-backed rules in the [Excel worksheet validation extension](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/07d607af-5618-4ca2-b683-6a78dc0d9627). Both use the same rule limits and preserve ranges, formulas, prompts and alerts. A rule with a direct reference to another sheet is saved in the extension. Other supported rules can be saved in the standard container. Missing required formulas and invalid ranges are reported. Excel's `showDropDown="1"` hides the list button.
   - **.ods:** `table:content-validations` before the tables, and each covered cell names its rule (`table:content-validation-name`). Conditions use OpenDocument's text, such as `cell-content-is-whole-number() and cell-content-is-between(1,100)`, `cell-content-is-in-list("Yes";"No")` or `is-true-formula(…)`. Their formulas are relative to the base cell.
   - Writing names at most 10,000 rows past a sheet's last used row (a whole-column rule would otherwise name a million cells), and 500,000 cells per file.
   - **LibreOffice:** it reads our .xlsx and writes .ods, and reads our .ods and writes .xlsx, with every rule coming back the same (`officina-convert/tests/validation.rs`). LibreOffice writes a second formula of `0` for one-formula rules, and we drop it.
@@ -3901,10 +3918,12 @@ bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
 The `annotations` profile of `scripts/sheets-interop-vm-check.sh` edits
 a rich note, an internal hyperlink, a validation rule, and a comment thread
 in the installed desktop. XLSX keeps the thread and its mention metadata.
-ODS keeps the conversation as a plain note. The fixture checks the original
-XLSX import notice for one extension validation rule and verifies that the
-edited ordinary rule still rejects and accepts the expected values after
-reopening either format.
+ODS keeps the conversation as a plain note. The edited ordinary rule rejects
+and accepts the expected values after reopening either format. The XLSX fixture
+also verifies that a cross-sheet extension list survives Save and reopen and
+still rejects values outside the list. The converter tests cover multiple
+target ranges, two formula bounds, specific loss notices for missing bounds,
+and the XLSM round trip with inert VBA.
 
 ### 16.85 Long text runs over empty cells (2026-11-19)
 

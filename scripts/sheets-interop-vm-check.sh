@@ -205,13 +205,17 @@ append_x() {
 }
 
 annotations() {
+    sheet_options=0
+    if test "$format" = xlsx; then
+        sheet_options=2 # Move Sheet Right and Delete Sheet are enabled with the Rates tab.
+    fi
     click 63 112
-    data_from_bottom 22 # Edit Comment…
+    data_from_bottom "$((22 + sheet_options))" # Edit Comment…
     append_x
     save "$book" note
 
     click 126 112
-    data_from_bottom 22 # Edit Link…
+    data_from_bottom "$((22 + sheet_options))" # Edit Link…
     click 302 681
     key 0x04 1 # Select all
     key 0x09 # f
@@ -220,7 +224,7 @@ annotations() {
     save "$book" link
 
     click 191 112
-    data_from_bottom 6 # Data Validation…
+    data_from_bottom "$((6 + sheet_options))" # Data Validation…
     sleep .35
     click 1014 295 # Highest
     key 0x04 1
@@ -230,7 +234,7 @@ annotations() {
 
     click 254 112
     if test "$format" = xlsx; then
-        data_from_bottom 23 # Open Comment Thread…
+        data_from_bottom "$((23 + sheet_options))" # Open Comment Thread…
         append_x
     else
         data_from_bottom 22 # New Comment Thread…
@@ -239,7 +243,7 @@ annotations() {
         key 0x28
         sleep .45
         click 254 112
-        data_from_bottom 23 # Open Comment Thread…
+        data_from_bottom "$((23 + sheet_options))" # Open Comment Thread…
         sleep .35
         click 945 681 # Reply
         click 302 681
@@ -262,6 +266,18 @@ check_reopened_validation() {
     key 0x25 # 8 is accepted.
     key 0x28
     save "$book" accepted
+    if test "$format" = xlsx; then
+        click 510 112 # H1 has an Excel extension list sourced from Rates.
+        key 0x26
+        key 0x28
+        sleep .5
+        cp selectscreen.png "$results/xlsx-extended-list-refused.png"
+        click 510 112
+        key 0x25
+        key 0x28
+        save "$book" extended
+        cp "$books/$book" "$results/saved.xlsx"
+    fi
 }
 
 print() {

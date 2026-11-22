@@ -11,7 +11,7 @@ use officina_grid::links::Link;
 use officina_grid::validation::{Allow, ErrorStyle, Message, Validation};
 use officina_grid::{CellAddr, Rect, Value, Workbook};
 
-const EXTENSION_NOTE: &str = "data validation rules from Excel 2010's extensions";
+const EXTENSION_PROMPT: &str = "Use a value from the Rates sheet.";
 
 fn at(col: u32) -> CellAddr {
     CellAddr::new(0, 0, col)
@@ -135,8 +135,9 @@ fn xlsx_with_extension(book: &Workbook) -> Vec<u8> {
                 r#"<extLst><ext uri="{CCE6A557-97BC-4B89-ADB6-D9C93CAAB3DF}""#,
                 r#" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main""#,
                 r#" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">"#,
-                r#"<x14:dataValidations count="1"><x14:dataValidation type="whole" operator="greaterThan">"#,
-                r#"<x14:formula1><xm:f>0</xm:f></x14:formula1><xm:sqref>H1</xm:sqref>"#,
+                r#"<x14:dataValidations count="1"><x14:dataValidation type="list" showErrorMessage="1""#,
+                r#" errorTitle="Select a rate" error="Use a value from the Rates sheet.">"#,
+                r#"<x14:formula1><xm:f>Rates!$A$1:$A$2</xm:f></x14:formula1><xm:sqref>H1 H3</xm:sqref>"#,
                 "</x14:dataValidation></x14:dataValidations></ext></extLst></worksheet>"
             )).into_bytes();
         }
@@ -152,7 +153,7 @@ fn check(book: &mut Workbook, format: &str, state: &str) {
         "link" => (true, true, false, false, false),
         "rule" => (true, true, true, false, false),
         "thread" => (true, true, true, true, false),
-        "accepted" => (true, true, true, true, true),
+        "accepted" | "extended" => (true, true, true, true, true),
         _ => panic!("Unknown checkpoint {state}"),
     };
     let note = book.comment(0, 0, 0).unwrap();
@@ -176,7 +177,29 @@ fn check(book: &mut Workbook, format: &str, state: &str) {
         "https://example.invalid/guide"
     );
 
-    assert_eq!(book.validations().len(), 1);
+    assert_eq!(
+        book.validations().len(),
+        if format == "xlsx" { 2 } else { 1 }
+    );
+    if format == "xlsx" {
+        let extended = book.validation_at(at(7)).unwrap();
+        assert_eq!(extended.allow, Allow::List);
+        assert!(extended.dropdown && extended.show_error && !extended.allow_blank);
+        assert_eq!(
+            extended.error,
+            Message::new("Select a rate", EXTENSION_PROMPT)
+        );
+        assert_eq!(
+            extended.ranges,
+            [Rect::cell(at(7)), Rect::cell(CellAddr::new(0, 2, 7))]
+        );
+        assert_eq!(book.list_items(at(7)), [Value::Num(6.0), Value::Num(8.0)]);
+        assert_eq!(
+            book.get(at(7)),
+            Value::Num(if state == "extended" { 8.0 } else { 6.0 })
+        );
+        assert!(book.check_cell(at(7)).is_ok());
+    }
     let rule = book.validation_at(at(2)).unwrap();
     assert_eq!(rule.allow, Allow::Whole);
     assert_eq!(rule.op, CmpOp::Between);
@@ -250,6 +273,10 @@ fn main() {
             )
             .unwrap();
             book.set_comments(0, vec![(0, 3, Some(thread()))]);
+            let rates = book.add_sheet("Rates").unwrap();
+            book.set_value(CellAddr::new(rates, 0, 0), Value::Num(6.0));
+            book.set_value(CellAddr::new(rates, 1, 0), Value::Num(8.0));
+            book.set_value(at(7), Value::Num(6.0));
             fs::write(dir.join("sales.xlsx"), xlsx_with_extension(&book)).unwrap();
         }
         [action, file, state, format] if action == "check" => {
@@ -260,12 +287,7 @@ fn main() {
                 book
             } else if file.ends_with(".xlsx") {
                 let (book, loaded) = xlsx::read(&bytes).unwrap();
-                let notices = loaded.report.lines();
-                if state == "initial" {
-                    assert_eq!(notices, [format!("dropped\t1\t{EXTENSION_NOTE}\t")]);
-                } else {
-                    assert!(notices.is_empty(), "{notices:?}");
-                }
+                assert!(loaded.report.is_empty(), "{:?}", loaded.report.lines());
                 book
             } else {
                 officina_grid::native::load(&bytes).unwrap()

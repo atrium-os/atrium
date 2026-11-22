@@ -503,6 +503,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         }
         o.extend_from_slice(b"</tableParts>");
     }
+    super::validation::extension_xml(wb, s, &mut o);
     o.extend_from_slice(b"</worksheet>");
     Ok(o)
 }

@@ -400,8 +400,8 @@ struct Seg {
     filter: Option<(String, Vec<(u32, Cond)>)>,
     /// `<conditionalFormatting>`s, read once the workbook's formulas can be.
     cond: Vec<super::condfmt::Raw>,
-    /// `<dataValidations>`' inner XML, read once formulas can be.
-    valid: Vec<u8>,
+    /// Validation XML, read once formulas can be.
+    valid: super::validation::Raw,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
     /// A frozen `<pane>`: the first unfrozen row and column, and the first
@@ -649,12 +649,18 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
             b"dataValidations" if !empty && e.name().as_ref() == b"dataValidations" => {
                 let end = e.name().as_ref().to_vec();
                 let span = r.read_to_end(quick_xml::name::QName(&end))?;
-                if seg.valid.is_empty() {
-                    seg.valid = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
+                if seg.valid.base.is_empty() {
+                    seg.valid.base = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
                 }
             }
-            // The extension list is a container. Count only its rules.
-            b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules from Excel 2010's extensions"),
+            b"ext" if !empty && attr(&e, b"uri")?.is_some_and(|uri| uri.eq_ignore_ascii_case(super::validation::EXT_URI)) => {
+                let end = e.name().as_ref().to_vec();
+                let span = r.read_to_end(quick_xml::name::QName(&end))?;
+                if seg.valid.extension.is_none() {
+                    seg.valid.extension = Some(data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec());
+                }
+            }
+            b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules outside a recognized worksheet container"),
             b"hyperlink" => {
                 if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
                     if seg.links.len() < officina_grid::links::MAX_LINKS {
@@ -737,7 +743,7 @@ const PIECE: usize = 8 << 20;
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>, valid: &mut Vec<u8>) -> Result<(), XlsxError> {
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>, valid: &mut super::validation::Raw) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -857,8 +863,11 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     wb.sheet_mut(s).freeze_from = from;
                 }
                 cond.extend(seg.cond);
-                if valid.is_empty() {
-                    *valid = seg.valid;
+                if valid.base.is_empty() {
+                    valid.base = seg.valid.base;
+                }
+                if valid.extension.is_none() {
+                    valid.extension = seg.valid.extension;
                 }
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
@@ -1148,13 +1157,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     }
     let mut all_f: Vec<(u16, Vec<FCell>, HashMap<u32, (u32, u32, String)>)> = Vec::new();
     let mut conds: Vec<(u16, Vec<super::condfmt::Raw>)> = Vec::new();
-    let mut valids: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut valids = Vec::new();
     for (i, (_, part)) in sheets.iter().enumerate() {
         let e = z.find(part).ok_or_else(|| bad(format!("missing {part}")))?.clone();
         let mut fcells = Vec::new();
         let mut shared = HashMap::new();
         let mut cond = Vec::new();
-        let mut valid = Vec::new();
+        let mut valid = super::validation::Raw::default();
         sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond, &mut valid)?;
         all_f.push((i as u16, fcells, shared));
         conds.push((i as u16, cond));
@@ -1193,10 +1202,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     for (s, raws) in &conds {
         super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);
     }
-    for (s, inner) in &valids {
-        if !inner.is_empty() {
-            super::validation::read_sheet(&mut wb, *s, inner, &mut rep);
-        }
+    for (s, raw) in &valids {
+        super::validation::read_sheet(&mut wb, *s, raw, &mut rep);
     }
     wb.recalc();
     // The differential: our results against the file's.
