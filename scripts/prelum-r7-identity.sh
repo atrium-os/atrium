@@ -141,9 +141,11 @@ grep -E "$expected" "$snapshot"
 # after outstanding sockets release their references.
 for attempt in $(seq 90); do
   jls -d -n name >jails-after-print.log
-  remaining=$(find /var/lib/atrium/jails -mindepth 1 -maxdepth 1 -name 'system-prelum-*' -print)
-  printf '%s\n' "$remaining" >worker-roots-after-print.log
-  if ! grep -q '^name=system-prelum-' jails-after-print.log && [ -z "$remaining" ]; then
+  # A worker root can vanish while the janitor is running.
+  for root in /var/lib/atrium/jails/system-prelum-*; do
+    if [ -e "$root" ] || [ -L "$root" ]; then printf '%s\n' "$root"; fi
+  done >worker-roots-after-print.log
+  if ! grep -q '^name=system-prelum-' jails-after-print.log && [ ! -s worker-roots-after-print.log ]; then
     echo "Prelum: all worker jails and roots removed after printing"
     exit 0
   fi
