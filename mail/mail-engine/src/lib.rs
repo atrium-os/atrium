@@ -734,6 +734,18 @@ impl Sink for AccountSink<'_> {
         self.e.store.write(|w| w.set_sync_state(account, key, Some(value))).map_err(|e| e.to_string())
     }
 
+    fn imap_import_probe(&mut self) -> Result<Option<String>, String> {
+        self.e.store.imap_import_probe(self.account).map_err(|err| err.to_string())
+    }
+
+    fn imap_import_probed(&mut self, object: &str, absent: bool) -> Result<(), String> {
+        if !mail_sync::is_imap_object_id(object) {
+            return Err("invalid IMAP import object".into());
+        }
+        self.e.store.write(|w| w.finish_imap_import_probe(self.account, object, absent))
+            .map_err(|err| err.to_string())
+    }
+
     fn jmap_import_ids(&mut self, after: &str, limit: usize) -> Result<Vec<String>, String> {
         self.e.store.jmap_import_ids(self.account, after, limit).map_err(|err| err.to_string())
     }

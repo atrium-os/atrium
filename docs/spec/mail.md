@@ -504,8 +504,15 @@ as **making the account usable first, then filling in what's worth having, polit
   preserves the server's actual headers. Earlier location aliases can bind after
   an exact fetch of their recorded UID. If Mail sees the move before any exact
   readback, it keeps the original location alias. A missing APPENDUID keeps the
-  Message-ID fallback. Disappearance from a mailbox is ambiguous, so Mail retains
-  protected aliases until account removal.
+  Message-ID fallback. One stable object per sync is checked with `UID SEARCH`
+  across the account's listed selectable mailboxes, including labels skipped by
+  the ordinary Gmail sync. The probe allows at most 16 selectable mailboxes and
+  requires an explicit empty result from each. Read-only mailbox checks before
+  and after each sweep compare UIDVALIDITY, UIDNEXT and EXISTS, and a second
+  LIST must agree with the first. A positive result, changed mailbox, incomplete
+  search, or exceeded budget retains the alias. Confirmed absence from that
+  verified mailbox set releases just that object's aliases. The cursor persists
+  per account. A mailbox hidden by the server is outside this check.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 

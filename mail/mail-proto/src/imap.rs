@@ -498,9 +498,12 @@ impl Parser<'_> {
                 let mut modseq = None;
                 for v in &vals {
                     match v {
-                        Value::Number(n) => ids.push(*n as u32),
-                        Value::List(l) if l.len() == 2 => modseq = l[1].as_num(),
-                        _ => {}
+                        Value::Number(n) => ids.push(u32::try_from(*n).ok().filter(|&id| id != 0).ok_or(Error::Syntax("SEARCH UID"))?),
+                        Value::List(l) if l.len() == 2 && modseq.is_none()
+                            && l[0].as_str().is_some_and(|tag| tag.eq_ignore_ascii_case("MODSEQ")) => {
+                            modseq = Some(l[1].as_num().ok_or(Error::Syntax("SEARCH MODSEQ"))?);
+                        }
+                        _ => return Err(Error::Syntax("SEARCH data")),
                     }
                 }
                 Response::Search { ids, modseq }
@@ -524,7 +527,7 @@ fn parse_code(b: &[u8], limits: &Limits) -> Code {
     match name.as_str() {
         "CAPABILITY" => Code::Capability(vals.iter().filter_map(Value::as_str).map(|s| s.to_ascii_uppercase()).collect()),
         "UIDVALIDITY" => num(0).and_then(|n| u32::try_from(n).ok()).filter(|&n| n != 0).map(Code::UidValidity).unwrap_or(Code::Other(name)),
-        "UIDNEXT" => num(0).map(|n| Code::UidNext(n as u32)).unwrap_or(Code::Other(name)),
+        "UIDNEXT" => num(0).and_then(|n| u32::try_from(n).ok()).filter(|&n| n != 0).map(Code::UidNext).unwrap_or(Code::Other(name)),
         "HIGHESTMODSEQ" => num(0).map(Code::HighestModSeq).unwrap_or(Code::Other(name)),
         "NOMODSEQ" => Code::NoModSeq,
         "PERMANENTFLAGS" => Code::PermanentFlags(vals.first().map(|v| v.as_list().iter().filter_map(Value::as_str).collect()).unwrap_or_default()),
@@ -645,6 +648,22 @@ pub enum StoreOp {
     Add,
     Remove,
     Replace,
+}
+
+fn object_search_key(id: &str) -> Option<(&'static str, &str)> {
+    if let Some(value) = id.strip_prefix("emailid:") {
+        return (!value.is_empty() && value.len() <= 255 && !value.eq_ignore_ascii_case("NIL")
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+            .then_some(("EMAILID", value));
+    }
+    let value = id.strip_prefix("gm:")?;
+    (!value.starts_with('0') && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u64>().is_ok()).then_some(("X-GM-MSGID", value))
+}
+
+/// Whether the object can be issued as a single validated IMAP search key.
+pub fn is_imap_object_id(id: &str) -> bool {
+    object_search_key(id).is_some()
 }
 
 /// Search keys mail-sync uses; built only from typed values, so nothing a
@@ -899,6 +918,12 @@ impl Encoder {
         line.extend_from_slice(if self.utf8 { b"UID SEARCH " } else { b"UID SEARCH CHARSET UTF-8 " });
         self.search(&mut chunks, &mut line, q);
         Self::finish(tag, chunks, line)
+    }
+
+    /// Exact stable identifier search. Accepts only the protocol's atom syntax.
+    pub fn uid_search_object(&mut self, id: &str) -> Option<Cmd> {
+        let (key, value) = object_search_key(id)?;
+        Some(self.simple(&format!("UID SEARCH {key} {value}")))
     }
 
     fn search(&self, chunks: &mut Vec<Chunk>, line: &mut Vec<u8>, q: &Search) {

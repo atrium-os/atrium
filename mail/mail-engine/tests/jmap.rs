@@ -1142,6 +1142,144 @@ fn imap_rewritten_import_follows_stable_ids_across_mailbox_moves() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImapPresence {
+    PresentInTrash,
+    Missing,
+    Unreported,
+    Refused,
+    Changed,
+    InventoryChanged,
+    OverBudget,
+}
+
+// The regular sync sees empty folders. Exact object probes can see a
+// copy in Trash or observe a counter change during the bounded sweep.
+fn sync_imap_presence(engine: &Engine, account: mail_store::AccountId, mode: ImapPresence) -> Vec<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let (client, peer) = UnixStream::pair().unwrap();
+    let timeout = Some(std::time::Duration::from_secs(15));
+    peer.set_read_timeout(timeout).unwrap();
+    client.set_read_timeout(timeout).unwrap();
+    let gmail = mode == ImapPresence::PresentInTrash;
+    let thread = std::thread::spawn(move || {
+        let mut peer = BufReader::new(peer);
+        let capability = if gmail { "X-GM-EXT-1" } else { "OBJECTID" };
+        write!(peer.get_mut(), "* PREAUTH [CAPABILITY IMAP4rev1 {capability}] ready\r\n").unwrap();
+        let mut commands = Vec::new();
+        let mut lists = 0;
+        let mut probes = 0;
+        let mut trash = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if peer.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            commands.push(command.to_owned());
+            if command.starts_with("LIST ") {
+                lists += 1;
+                peer.get_mut().write_all(
+                    b"* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\All) \"/\" AllMail\r\n* LIST (\\Trash) \"/\" Trash\r\n"
+                ).unwrap();
+                if mode == ImapPresence::OverBudget {
+                    for n in 0..14 {
+                        write!(peer.get_mut(), "* LIST () \"/\" Box{n}\r\n").unwrap();
+                    }
+                } else if mode == ImapPresence::InventoryChanged && lists == 3 {
+                    peer.get_mut().write_all(b"* LIST () \"/\" NewFolder\r\n").unwrap();
+                }
+            } else if command.starts_with("SELECT ") || command.starts_with("EXAMINE ") {
+                trash = command.contains("Trash");
+                let next = 1 + u32::from(mode == ImapPresence::Changed && probes >= 3);
+                write!(peer.get_mut(), "* 0 EXISTS\r\n* OK [UIDVALIDITY 7] stable\r\n* OK [UIDNEXT {next}] current\r\n").unwrap();
+            } else if command.starts_with("UID SEARCH EMAILID ") || command.starts_with("UID SEARCH X-GM-MSGID ") {
+                probes += 1;
+                assert_eq!(command.contains("X-GM-MSGID"), gmail);
+                if mode == ImapPresence::Refused {
+                    write!(peer.get_mut(), "{tag} NO probe refused\r\n").unwrap();
+                    continue;
+                }
+                if mode != ImapPresence::Unreported {
+                    let uids = if gmail && trash { " 11" } else { "" };
+                    write!(peer.get_mut(), "* SEARCH{uids}\r\n").unwrap();
+                }
+            } else if command == "LOGOUT" {
+                write!(peer.get_mut(), "* BYE done\r\n{tag} OK done\r\n").unwrap();
+                break;
+            } else {
+                assert!(command.starts_with("UID FETCH "), "{command}");
+            }
+            write!(peer.get_mut(), "{tag} OK done\r\n").unwrap();
+        }
+        commands
+    });
+    let mut session = mail_engine::accounts::open_imap(client).unwrap();
+    session.sync(&mut engine.sink(account)).unwrap();
+    session.logout().unwrap();
+    thread.join().unwrap()
+}
+
+#[test]
+fn imap_import_probe_only_releases_confirmed_account_wide_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let other = engine.store.add_account("bea@example.org").unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let other_inbox = engine.store.folder_id(other, "INBOX", Role::Inbox).unwrap();
+    let seed = |account, folder, n, uid, object| {
+        let raw = message(n, "Import", "body");
+        let blob = engine.store.put_blob(&raw).unwrap();
+        let mid = format!("m{n}@example.net");
+        engine.store.write(|w| {
+            let id = w.queue_import(folder, blob)?;
+            w.index_import(id, Some(&mid))?;
+            w.import_accepted(id, Some(mail_store::imports::ImportIdentity::Imap { validity: 7, uid }))?;
+            w.confirm_imap_import(account, (folder, 7, uid), Some("rewritten@example.net"), Some(object))
+        }).unwrap();
+        let mut mbox = Vec::new();
+        mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+        mbox
+    };
+    let first = seed(account, inbox, 12, 1, "emailid:A");
+    let second = seed(account, inbox, 13, 2, "emailid:B");
+    let parallel = seed(other, other_inbox, 13, 3, "emailid:B");
+    let gmail = seed(other, other_inbox, 14, 4, "gm:812");
+    assert_eq!(engine.store.imap_import_probe(account).unwrap().as_deref(), Some("emailid:A"));
+    let commands = sync_imap_presence(&engine, account, ImapPresence::Changed);
+    assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH EMAILID A").count(), 3);
+    assert_eq!(engine.import_mbox(inbox, &first[..]).unwrap().already, 1);
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.store.imap_import_probe(account).unwrap().as_deref(), Some("emailid:B"));
+    let commands = sync_imap_presence(&engine, account, ImapPresence::Missing);
+    assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH EMAILID B").count(), 3);
+    assert_eq!(engine.import_mbox(inbox, &second[..]).unwrap().queued, 1);
+    assert_eq!(engine.import_mbox(other_inbox, &parallel[..]).unwrap().already, 1);
+    for mode in [ImapPresence::Unreported, ImapPresence::Refused, ImapPresence::InventoryChanged, ImapPresence::OverBudget] {
+        let commands = sync_imap_presence(&engine, account, mode);
+        if mode == ImapPresence::OverBudget {
+            assert!(!commands.iter().any(|cmd| cmd.starts_with("UID SEARCH EMAILID ")));
+        }
+        assert_eq!(engine.import_mbox(inbox, &first[..]).unwrap().already, 1);
+    }
+    sync_imap_presence(&engine, account, ImapPresence::Missing);
+    assert_eq!(engine.import_mbox(inbox, &first[..]).unwrap().queued, 1);
+
+    // The ordinary Gmail walk skips Trash as a label view. The explicit
+    // account sweep must still see the tracked object there.
+    engine.store.write(|w| w.finish_imap_import_probe(other, "emailid:B", false)).unwrap();
+    let commands = sync_imap_presence(&engine, other, ImapPresence::PresentInTrash);
+    assert_eq!(commands.iter().filter(|cmd| cmd.as_str() == "UID SEARCH X-GM-MSGID 812").count(), 3);
+    assert_eq!(engine.import_mbox(other_inbox, &gmail[..]).unwrap().already, 1);
+}
+
 #[test]
 fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     use mail_engine::import::{import_with, UPLOADS_PER_PASS};

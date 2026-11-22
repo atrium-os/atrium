@@ -195,6 +195,14 @@ pub trait Sink {
     fn imap_messages(&mut self, folder: &str, _validity: u32, page: Vec<Fetched>) -> std::result::Result<(), String> {
         self.messages(folder, page)
     }
+    /// The next tracked stable IMAP object for this account.
+    fn imap_import_probe(&mut self) -> std::result::Result<Option<String>, String> {
+        Ok(None)
+    }
+    /// Save the probe position, releasing aliases only for confirmed absence.
+    fn imap_import_probed(&mut self, _object: &str, _absent: bool) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// A bounded page of JMAP import aliases, ordered by Email ID.
     fn jmap_import_ids(&mut self, _after: &str, _limit: usize) -> std::result::Result<Vec<String>, String> {
         Ok(Vec::new())
@@ -330,16 +338,7 @@ fn imap_day(t: i64) -> String {
     format!("{d}-{}-{y}", MONTHS[m.clamp(1, 12) - 1])
 }
 
-/// The stable, namespaced server IDs recognized for IMAP imports.
-pub fn is_imap_object_id(id: &str) -> bool {
-    if let Some(value) = id.strip_prefix("emailid:") {
-        return !value.is_empty() && value.len() <= 255 && !value.eq_ignore_ascii_case("NIL")
-            && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
-    }
-    id.strip_prefix("gm:").is_some_and(|value| {
-        !value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit()) && value.parse::<u64>().is_ok()
-    })
-}
+pub use mail_proto::imap::is_imap_object_id;
 
 /// A change the person made, to make on the server (mail.md §6.3).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -431,13 +430,23 @@ impl<S: Read + Write> Session<S> {
 
     /// Send a command; collect untagged responses until its tagged one.
     fn run(&mut self, cmd: Cmd) -> Result<(Vec<Response>, Option<Code>)> {
+        self.run_bounded(cmd, usize::MAX)
+    }
+
+    fn run_bounded(&mut self, cmd: Cmd, limit: usize) -> Result<(Vec<Response>, Option<Code>)> {
         let mut out = std::mem::take(&mut self.pending);
+        let mut remaining = limit.saturating_sub(out.len());
+        let charge = |remaining: &mut usize| -> Result<()> {
+            *remaining = remaining.checked_sub(1).ok_or_else(|| Error::Protocol("too many IMAP responses".into()))?;
+            Ok(())
+        };
         for c in cmd.chunks {
             match c {
                 Chunk::Send(b) => self.s.write_all(&b)?,
                 Chunk::AwaitContinue => {
                     self.s.flush()?;
                     loop {
+                        charge(&mut remaining)?;
                         match self.read()? {
                             Response::Continue(_) => break,
                             Response::Tagged { tag, status, code, text } if tag == cmd.tag => return Self::done(status, code, text, out),
@@ -449,6 +458,7 @@ impl<S: Read + Write> Session<S> {
         }
         self.s.flush()?;
         loop {
+            charge(&mut remaining)?;
             match self.read()? {
                 Response::Tagged { tag, status, code, text } if tag == cmd.tag => return Self::done(status, code, text, out),
                 Response::State { status: Status::Bye, text, .. } => return Err(Error::Bye(text)),
@@ -610,7 +620,102 @@ impl<S: Read + Write> Session<S> {
         for f in &walk {
             self.texts(&f.name, sink, &mut report)?;
         }
+        if has(&self.caps, "OBJECTID") || has(&self.caps, "X-GM-EXT-1") {
+            self.reconcile_imap_import(sink)?;
+        }
         Ok(report)
+    }
+
+    fn reconcile_imap_import(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        let Some(id) = sink.imap_import_probe().map_err(Error::Sink)? else { return Ok(()) };
+        let supported = (id.starts_with("emailid:") && has(&self.caps, "OBJECTID"))
+            || (id.starts_with("gm:") && has(&self.caps, "X-GM-EXT-1"));
+        let absent = if supported && is_imap_object_id(&id) {
+            match self.imap_object_absent(&id) {
+                Ok(absent) => absent,
+                Err(err @ (Error::No(_) | Error::Throttled)) => {
+                    eprintln!("mail-sync: IMAP import presence check refused: {err}");
+                    false
+                }
+                // A truncated or malformed exchange can leave the stream out
+                // of sync. Preserve the alias and let the next pass reconnect.
+                Err(err) => return Err(err),
+            }
+        } else {
+            false
+        };
+        sink.imap_import_probed(&id, absent).map_err(Error::Sink)
+    }
+
+    fn imap_object_absent(&mut self, id: &str) -> Result<bool> {
+        let Some(inventory) = self.import_inventory()? else { return Ok(false) };
+        let mut checkpoints = Vec::new();
+        for (name, _) in inventory.iter().filter(|(_, selectable)| *selectable) {
+            let Some(before) = self.import_checkpoint(name)? else { return Ok(false) };
+            let search = self.enc.uid_search_object(id).ok_or_else(|| Error::Protocol("bad IMAP object ID".into()))?;
+            let (replies, _) = self.run_bounded(search, 64)?;
+            let mut results = replies.iter().filter_map(|reply| match reply {
+                Response::Search { ids, .. } => Some(ids),
+                _ => None,
+            });
+            if !matches!((results.next(), results.next()), (Some(ids), None) if ids.is_empty()) {
+                return Ok(false);
+            }
+            checkpoints.push((name, before));
+        }
+        // Bracket the searches. An append or move into a scanned mailbox
+        // advances UIDNEXT even if the new UID is already gone on recheck.
+        for (name, before) in checkpoints {
+            if self.import_checkpoint(name)? != Some(before) {
+                return Ok(false);
+            }
+        }
+        Ok(self.import_inventory()?.as_ref() == Some(&inventory))
+    }
+
+    fn import_inventory(&mut self) -> Result<Option<Vec<(String, bool)>>> {
+        const MAILBOX_LIMIT: usize = 16;
+        let cmd = self.enc.list(false);
+        let (replies, _) = self.run_bounded(cmd, 64)?;
+        let mut inventory = Vec::new();
+        for reply in replies {
+            match reply {
+                Response::List { name, flags, .. } if !name.is_empty() && name.len() <= 1024 => {
+                    let name = if name.eq_ignore_ascii_case("INBOX") { "INBOX".into() } else { name };
+                    let selectable = !(has(&flags, "\\Noselect") || has(&flags, "\\NonExistent"));
+                    inventory.push((name, selectable));
+                }
+                Response::List { .. } => return Ok(None),
+                Response::Other(tag, _) if tag == "LIST" => return Ok(None),
+                _ => {}
+            }
+        }
+        inventory.sort_unstable();
+        let selectable = inventory.iter().filter(|(_, selectable)| *selectable).count();
+        let complete = selectable <= MAILBOX_LIMIT
+            && inventory.binary_search(&("INBOX".into(), true)).is_ok()
+            && inventory.windows(2).all(|pair| pair[0].0 != pair[1].0);
+        Ok(complete.then_some(inventory))
+    }
+
+    /// UID generation, next UID and EXISTS from one read-only selection.
+    fn import_checkpoint(&mut self, mailbox: &str) -> Result<Option<(u32, u32, u32)>> {
+        let cmd = self.enc.select(mailbox, true, None, false);
+        let (replies, _) = self.run_bounded(cmd, 64)?;
+        let (mut validity, mut next, mut exists) = (None, None, None);
+        for reply in replies {
+            let unique = match reply {
+                Response::State { status: Status::Ok, code: Some(Code::UidValidity(value)), .. } => validity.replace(value).is_none(),
+                Response::State { status: Status::Ok, code: Some(Code::UidNext(value)), .. } => next.replace(value).is_none(),
+                Response::Exists(value) => exists.replace(value).is_none(),
+                Response::Expunge(_) | Response::Vanished { .. } => false,
+                _ => true,
+            };
+            if !unique {
+                return Ok(None);
+            }
+        }
+        Ok(validity.zip(next).zip(exists).map(|((validity, next), exists)| (validity, next, exists)))
     }
 
     /// Search the server for messages that fit `query` (IMAP `UID

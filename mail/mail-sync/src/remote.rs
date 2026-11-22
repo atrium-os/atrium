@@ -146,6 +146,8 @@ pub enum SinkCall {
     JmapDestroyed(Vec<String>),
     JmapImportIds(String, u32),
     ImapMessages(String, u32, Vec<Fetched>),
+    ImapImportProbe,
+    ImapImportProbed(String, bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +408,16 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
     }
     fn imap_messages(&mut self, folder: &str, validity: u32, page: Vec<Fetched>) -> std::result::Result<(), String> {
         self.done(SinkCall::ImapMessages(folder.into(), validity, page))
+    }
+    fn imap_import_probe(&mut self) -> std::result::Result<Option<String>, String> {
+        match self.ask(SinkCall::ImapImportProbe).map_err(|err| err.to_string())? {
+            SinkAnswer::Text(id) => Ok(id),
+            SinkAnswer::Done(Err(err)) => Err(err),
+            _ => Err("bad IMAP import probe reply".into()),
+        }
+    }
+    fn imap_import_probed(&mut self, id: &str, absent: bool) -> std::result::Result<(), String> {
+        self.done(SinkCall::ImapImportProbed(id.into(), absent))
     }
     fn jmap_import_ids(&mut self, after: &str, limit: usize) -> std::result::Result<Vec<String>, String> {
         match self.ask(SinkCall::JmapImportIds(after.into(), limit as u32)).map_err(|err| err.to_string())? {
@@ -867,6 +879,11 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::ServerState(k) => SinkAnswer::Text(s.server_state(&k)),
         SinkCall::SetServerState(k, v) => SinkAnswer::Done(s.set_server_state(&k, &v)),
         SinkCall::ImapMessages(folder, validity, page) => SinkAnswer::Done(s.imap_messages(&folder, validity, page)),
+        SinkCall::ImapImportProbe => match s.imap_import_probe() {
+            Ok(id) => SinkAnswer::Text(id),
+            Err(err) => SinkAnswer::Done(Err(err)),
+        },
+        SinkCall::ImapImportProbed(id, absent) => SinkAnswer::Done(s.imap_import_probed(&id, absent)),
         SinkCall::JmapImportIds(after, limit) => SinkAnswer::JmapImportIds(s.jmap_import_ids(&after, (limit as usize).min(32))),
         SinkCall::JmapDestroyed(ids) => SinkAnswer::Done(s.jmap_destroyed(&ids)),
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),

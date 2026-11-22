@@ -36,6 +36,10 @@ const IMAP_IMPORTS_PENDING: MultimapTableDefinition<ImapLocation, &str> =
 const IMAP_IMPORT_OBJECTS: MultimapTableDefinition<(AccountId, &str), &str> =
     MultimapTableDefinition::new("imap_import_objects");
 
+const IMAP_IMPORTS_BY_OBJECT: MultimapTableDefinition<(AccountId, &str), &str> =
+    MultimapTableDefinition::new("imap_imports_by_object");
+const IMAP_IMPORT_CURSOR: &str = "imap-import-presence";
+
 /// A protocol-issued identity for a successful upload.
 pub enum ImportIdentity {
     Jmap(String),
@@ -52,7 +56,8 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     tx.open_multimap_table(JMAP_IMPORTS_BY_OBJECT)?;
     tx.open_multimap_table(IMAP_IMPORTS_BY_ORIGINAL)?;
     let mut pending_imap = tx.open_multimap_table(IMAP_IMPORTS_PENDING)?;
-    tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
+    let imap_objects = tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
+    let mut by_object = tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?;
     let mut meta = tx.open_table(META)?;
     if meta.get("import_identity_index")?.is_none() {
         for row in imports.iter()? {
@@ -73,6 +78,16 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
             }
         }
         meta.insert("imap_import_object_index", 1)?;
+    }
+    if meta.get("imap_import_reverse_index")?.is_none() {
+        for row in imap_objects.iter()? {
+            let (key, objects) = row?;
+            let (account, mid) = key.value();
+            for object in objects {
+                by_object.insert((account, object?.value()), mid)?;
+            }
+        }
+        meta.insert("imap_import_reverse_index", 1)?;
     }
     Ok(())
 }
@@ -213,11 +228,24 @@ impl Writer<'_> {
             if observed != Some(mid) || !self.has_message_id(account, mid)? {
                 let Some(object) = object else { continue };
                 objects.insert((account, mid), object)?;
+                self.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?.insert((account, object), mid)?;
             }
             originals.remove((account, mid), location)?;
             pending.remove(location, mid)?;
         }
         Ok(())
+    }
+
+    /// Finish a bounded probe and remove only the confirmed absent object.
+    pub fn finish_imap_import_probe(&mut self, account: AccountId, object: &str, absent: bool) -> Result<()> {
+        if absent {
+            let mut originals = self.tx.open_multimap_table(IMAP_IMPORT_OBJECTS)?;
+            let mut by_object = self.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?;
+            for original in by_object.remove_all((account, object))? {
+                originals.remove((account, original?.value()), object)?;
+            }
+        }
+        self.set_sync_state(account, IMAP_IMPORT_CURSOR, Some(object))
     }
 
     /// Release aliases only for objects the JMAP server reported destroyed.
@@ -282,8 +310,11 @@ impl Writer<'_> {
             }
             mids.push(mid.to_owned());
         }
+        let mut by_object = self.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?;
         for mid in mids {
-            objects.remove_all((account, mid.as_str()))?;
+            for object in objects.remove_all((account, mid.as_str()))? {
+                by_object.remove((account, object?.value()), mid.as_str())?;
+            }
         }
         Ok(())
     }
@@ -345,6 +376,25 @@ impl Store {
             out.push((k.value(), dec(v.value())?));
         }
         Ok(out)
+    }
+
+    /// Rotate through stable IMAP objects using a persisted, account-scoped cursor.
+    pub fn imap_import_probe(&self, account: AccountId) -> Result<Option<String>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let cursor = self.sync_state(account, IMAP_IMPORT_CURSOR)?.unwrap_or_default();
+        let tx = self.db.begin_read()?;
+        let table = tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?;
+        for after in [cursor.as_str(), ""] {
+            if let Some(row) = table.range((Excluded((account, after)), Unbounded))?.next() {
+                let (key, _) = row?;
+                let (owner, object) = key.value();
+                if owner == account {
+                    return Ok(Some(object.to_owned()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// A bounded page of tracked JMAP objects for one account, in ID order.
@@ -444,10 +494,17 @@ mod tests {
             assert!(tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap().get((account, mid)).unwrap().next().is_none());
             assert!(tx.open_multimap_table(IMAP_IMPORTS_PENDING).unwrap().get(location).unwrap().next().is_some());
         }
-        store.write(|w| w.confirm_imap_import(account, location, Some("replacement@example.org"), Some(object))).unwrap();
+        store.write(|w| {
+            w.confirm_imap_import(account, location, Some("replacement@example.org"), Some(object))?;
+            // Simulate the first stable-object schema, without its reverse index.
+            w.tx.open_multimap_table(IMAP_IMPORTS_BY_OBJECT)?.remove_all((account, object))?;
+            w.tx.open_table(META)?.remove("imap_import_reverse_index")?;
+            Ok(())
+        }).unwrap();
         drop(store);
 
         let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.imap_import_probe(account).unwrap().as_deref(), Some(object));
         {
             let tx = store.db.begin_read().unwrap();
             let aliases = tx.open_multimap_table(IMAP_IMPORT_OBJECTS).unwrap();
