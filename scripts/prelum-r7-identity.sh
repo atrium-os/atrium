@@ -20,6 +20,7 @@ case "$kind" in
   pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
   pin-create-replay) job=$5; title="PIN response $6 without-id none"; prefix="pin-replay-$6" ;;
   pin-replay) job=$5; title="PIN response ignored with-id $6"; prefix="pin-replay-$6" ;;
+  pin-send-failure) job=$5; title="PIN upload failure $6"; prefix="pin-send-$6" ;;
   pin-recovery) job=$5; title="PIN recovery after $6"; prefix="pin-recovery-$6" ;;
   pin-rejection) job=$5; title="PIN response $6 $7 $8"; prefix="pin-$6-$7-$8" ;;
   *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
@@ -82,6 +83,17 @@ case "$phase" in
     if [ "$phase" = retain ]; then test "$kind" = pin-rejection; fi
     case "$kind" in
       pin-fresh|pin-recovery) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
+      pin-send-failure)
+        case "$6" in
+          ipp-refused) reason="the printer refused [(]0x040b[)]:.*" ;;
+          ipp-busy) reason="the printer refused [(]0x0507[)]:.*" ;;
+          http-refused) reason="the printer answered HTTP 403" ;;
+          dropped|truncated) reason=".+" ;;
+          invalid-ipp) reason="the printer's answer is not valid IPP: .+" ;;
+          *) exit 2 ;;
+        esac
+        expected="^ +$job +printer +1 +Failed +0/2 +$title +$reason *$"
+        ;;
       pin-rejection)
         case "$6" in
           success) reason="the printer gave no job id" ;;

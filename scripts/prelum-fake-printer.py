@@ -56,6 +56,8 @@ OPG, JOBG, ENDG, PRG, UNSUPG = 0x01, 0x02, 0x03, 0x04, 0x05
 UNSUPPORTED = 0x10
 
 PIN_RESPONSE_PREFIX = "PIN response "
+PIN_UPLOAD_FAILURE_PREFIX = "PIN upload failure "
+PIN_UPLOAD_FAILURES = ("ipp-refused", "ipp-busy", "http-refused", "dropped", "truncated", "invalid-ipp")
 PIN_RESPONSE_STATUS = {
     "ignored": 0x0001,
     "conflicting": 0x0002,
@@ -226,7 +228,13 @@ class H(http.server.BaseHTTPRequestHandler):
         elif op in (0x05, 0x02):
             title = (a.get("job-name") or ["?"])[0]
             rejection = ARGS.test_pin_rejections and title.startswith(PIN_RESPONSE_PREFIX)
-            pin_job = rejection or title in ARGS.test_pin_job
+            send_failure = None
+            if ARGS.test_pin_rejections and title.startswith(PIN_UPLOAD_FAILURE_PREFIX):
+                send_failure = title.removeprefix(PIN_UPLOAD_FAILURE_PREFIX)
+                if send_failure not in PIN_UPLOAD_FAILURES:
+                    self.send_error(400, "Unknown fixture PIN upload failure")
+                    return
+            pin_job = rejection or send_failure or title in ARGS.test_pin_job
             if pin_job and (op != 0x05 or a.get("job-password") != ["0427"]
                             or a.get("ipp-attribute-fidelity") != ["\x01"] or doc):
                 self.send_error(400, "Invalid fixture PIN submission")
@@ -270,7 +278,7 @@ class H(http.server.BaseHTTPRequestHandler):
                     jid = NEXT[0]
                     NEXT[0] += 1
                     JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
-                                 "name": title, "cancel_mode": cancel_mode}
+                                 "name": title, "cancel_mode": cancel_mode, "send_failure": send_failure}
                 if op == 0x02:
                     open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
                 out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(URI, "job-uri", "ipp://%s/ipp/print/%d" % (host, jid)) + attr(ENUM, "job-state", 3)
@@ -284,7 +292,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 return
             with LOCK:
                 j = JOBS.get(jid)
-                if j:
+                if j and not j["send_failure"]:
                     j["data"] = True
             if j is None:
                 out = struct.pack(">HHI", 0x0200, 0x0406, rid) + out[8:]
@@ -298,7 +306,26 @@ class H(http.server.BaseHTTPRequestHandler):
                     f"sha256={digest} format={document_format} tls={tls}",
                     flush=True,
                 )
-                out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", 5)
+                failure = j["send_failure"]
+                if failure:
+                    print(f"fake printer: Send-Document result {failure} {jid}", flush=True)
+                    if failure == "ipp-refused":
+                        out = head(0x040B, rid)
+                    elif failure == "ipp-busy":
+                        out = head(0x0507, rid)
+                    elif failure == "http-refused":
+                        self.send_error(403, "Fixture upload refused")
+                        return
+                    elif failure == "dropped":
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        return
+                    elif failure == "truncated":
+                        truncate_reply = True
+                    elif failure == "invalid-ipp":
+                        out = b"invalid"
+                else:
+                    out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(ENUM, "job-state", 5)
         elif op == 0x09:
             with LOCK:
                 j = JOBS.get(jid)

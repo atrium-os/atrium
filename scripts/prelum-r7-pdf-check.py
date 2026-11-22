@@ -30,7 +30,8 @@ responses = Path(sys.argv[7]).read_text(encoding="utf-8").splitlines() if len(sy
 outcomes = [line.split() for line in responses]
 job_ids = list(range(1, job_count + 1))
 job_ids.extend(int(job) for response, job, _ in outcomes if response == "recovery")
-expected = [spool / f"job-{job}.pdf" for job in job_ids]
+failed_uploads = {int(job): mode for response, job, mode in outcomes if response == "send-failure"}
+expected = [spool / f"job-{job}.pdf" for job in sorted([*job_ids, *failed_uploads])]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
 transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
 events = []
@@ -46,6 +47,10 @@ for line in transcript.splitlines():
         events.append(("cancel", int(cancel[1])))
     elif result := re.fullmatch(r"fake printer: Cancel-Job result ([a-z-]+) (\d+)", line):
         events.append((result[1], int(result[2])))
+    elif send_result := re.fullmatch(r"fake printer: Send-Document result ([a-z-]+) (\d+)", line):
+        events.append((f"send-{send_result[1]}", int(send_result[2])))
+    elif poll := re.match(r"^fake printer: Get-Job-Attributes job (\d+) ", line):
+        assert int(poll[1]) not in failed_uploads, line
     elif accepted := re.fullmatch(r"fake printer: accepted fixture PIN for job (\d+) before document", line):
         events.append(("pin-accepted", int(accepted[1])))
     elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
@@ -65,6 +70,10 @@ expected_events = [
 for response, printer_job, cancel_result in outcomes:
     if response == "recovery":
         expected_events.extend(printed_events(int(printer_job)))
+    elif response == "send-failure":
+        job = int(printer_job)
+        expected_events.extend(printed_events(job)[:-1])
+        expected_events.append((f"send-{cancel_result}", job))
     elif response != "replay":
         expected_events.extend([("create", None), (response, printer_job)])
         if printer_job != "-":
@@ -106,6 +115,10 @@ if outcomes:
                 re.M,
             ), jobs
             print(f"IPPS simulator: replay after {cancel_result}, no printer job or PDF")
+        elif response == "send-failure":
+            title = re.escape(f"PIN upload failure {cancel_result}")
+            assert re.search(rf"^ +{desktop_job} +printer [0-9]+ +Failed +0/2 +{title} ", jobs, re.M), jobs
+            print(f"IPPS simulator: Send-Document {cancel_result}, job {printer_job} uploaded once and failed at 0/2")
         else:
             id_mode = "without-id" if printer_job == "-" else "with-id"
             title = re.escape(f"PIN response {response} {id_mode} {cancel_result}")
@@ -113,11 +126,17 @@ if outcomes:
             result = "no job ID" if printer_job == "-" else f"job {printer_job} cancellation {cancel_result}"
             print(f"IPPS simulator: PIN response {response}, {result}, no document request or PDF")
 assert [int(job) for job, _, _, _ in completed_jobs] == desktop_job_ids, completed_jobs
-assert [title for _, _, _, title in completed_jobs] == [
-    title for _, _, title, _, _, _ in receipts
-], (completed_jobs, receipts)
-for pdf, receipt, (_, completed, total, _) in zip(expected, receipts, completed_jobs):
-    job, size, _title, digest, document_format, tls = receipt
+completed_by_printer = dict(zip(job_ids, completed_jobs))
+for pdf, receipt in zip(expected, receipts):
+    job, size, title, digest, document_format, tls = receipt
+    printer_job = int(job)
+    if printer_job in failed_uploads:
+        completed = total = "2"
+        assert title == f"PIN upload failure {failed_uploads[printer_job]}", receipt
+    else:
+        _, completed, total, expected_title = completed_by_printer[printer_job]
+        assert title == expected_title, (receipt, expected_title)
+    assert pdf.name == f"job-{job}.pdf", (pdf, receipt)
     assert document_format == "application/pdf", (job, document_format)
     assert tls in ("TLSv1.2", "TLSv1.3"), (job, tls)
     payload = pdf.read_bytes()
@@ -126,7 +145,7 @@ for pdf, receipt, (_, completed, total, _) in zip(expected, receipts, completed_
     info = subprocess.check_output(["pdfinfo", str(pdf)], text=True)
     page_count = re.search(r"^Pages: +([0-9]+)$", info, re.M)
     assert page_count and completed == total == page_count[1], (job, completed, total, info)
-print(f"IPPS simulator: {len(job_ids)} ordered job lifecycles; PDF format and TLS verified; desktop titles, sheet counts and upload hashes match")
+print(f"IPPS simulator: {len(job_ids)} completed jobs and {len(failed_uploads)} failed uploads; PDF format, TLS, titles, page counts and upload hashes verified")
 
 html, sheets, slides_hidden_off, slides_hidden_on, notes_hidden_on, notes_hidden_off, mail, plain_text, picture, pdf_button, pdf_shortcut = expected[:11]
 
@@ -240,6 +259,11 @@ for path, action in ((pdf_button, "Print button"), (pdf_shortcut, "viewer Ctrl+P
 
 
 if original:
-    for job, pdf in zip(desktop_job_ids[11:], expected[11:]):
-        assert pages_of(pdf) == pages_of(original), (job, "Released job PDF differs from its input")
+    original_pages = pages_of(original)
+    for job, printer_job in zip(desktop_job_ids[11:], job_ids[11:]):
+        pdf = spool / f"job-{printer_job}.pdf"
+        assert pages_of(pdf) == original_pages, (job, "Printed PDF differs from its input")
         print(f"Diagnostic job {job}: both original pages printed")
+    for printer_job in failed_uploads:
+        pdf = spool / f"job-{printer_job}.pdf"
+        assert pages_of(pdf) == original_pages, (printer_job, "Failed upload PDF differs from its input")
