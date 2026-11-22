@@ -548,6 +548,24 @@ key and flow, and targeted the individual button bounds. Screenshots,
 per-flow markers, ceremony log, worker hash, jail credentials and shutdown
 evidence are in `~/atrium-vm/evidence/navigator-i3-exclusion-20261122/`.
 
+### I3 Arca platform-passkey batch
+
+The soft-key fixture started arcad directly without its production
+`ARCA_SERVICES` mapping. Sigillum's `P_LIST` request then received
+status 5 (`UNKNOWN_PEER`). The shipped arcad manifest already identifies
+`sigillumd=65028`. In the private fixture, set
+`ARCA_SERVICES="sigillumd=$(id -u _sigillum)"` on arcad and unlock the
+fixture user's store. Run Ostiarius's verify socket with the PAM-enabled
+Portcullis broker for platform user verification.
+
+Select `webauthn-platform` on the local provider. The page requests platform
+attachment and checks the returned attachment before it submits either
+registration or assertion. On the host, the Sigillum–Arca socket integration
+test cancelled registration, retried, excluded the enrolled ID, and verified
+the final assertion with the original public key. Its scripted UI and
+Ostiarius passcode stand-in leave the installed Ladybird sheet and PAM path
+to verify together on Tessera. The VM was off for this batch.
+
 ### I3 installed WebAuthn get probe
 
 On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS

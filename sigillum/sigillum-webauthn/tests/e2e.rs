@@ -56,6 +56,7 @@ enum Press {
     Key,
     /// Arca: "save on this device", or the first passkey listed.
     Arca,
+    CancelThenArca,
 }
 
 /// arcad on a real socket, serving sigillumd's uid (this test's) as the
@@ -126,8 +127,13 @@ fn rig_typing(press: Press, typed: &'static [u8]) -> Rig {
     let mut s = UnixStream::connect(&settings.ui_socket).unwrap();
     let mut w = s.try_clone().unwrap();
     std::thread::spawn(move || {
+        let mut press = press;
         while let Ok(Some(m)) = read_msg::<ToUi>(&mut s, ui::MAX_MESSAGE) {
             let answer = match &m {
+                ToUi::Show { key, sheet: Sheet::Register { platform: true, .. }, .. } if press == Press::CancelThenArca => {
+                    press = Press::Arca;
+                    Some(FromUi::Press { key: *key, choice: Choice::Cancel, activation_ok: true })
+                }
                 ToUi::Show { key, devices, .. } if press == Press::Key => devices.first().map(|d| FromUi::Press { key: *key, choice: Choice::Device(d.id), activation_ok: true }),
                 ToUi::Show { key, sheet: Sheet::Register { platform: true, .. }, .. } if press == Press::Arca => Some(FromUi::Press { key: *key, choice: Choice::Platform, activation_ok: true }),
                 ToUi::Show { key, sheet: Sheet::Assert { passkeys, .. }, .. } if press == Press::Arca => passkeys.first().map(|p| FromUi::Press { key: *key, choice: Choice::Passkey(p.id), activation_ok: true }),
@@ -370,6 +376,26 @@ fn an_arca_passkey_through_both_daemons_verified_by_the_relying_party() {
     let o = RequestOptions::from_json(r#"{"challenge":"dXYtcmVxdWlyZWQ","rpId":"example.com","userVerification":"required"}"#).unwrap();
     let a = get(&mut t, &origin, None, &o).unwrap();
     RP.authenticate(&a.to_json(), &o.challenge, &cred_id, &key, true);
+}
+
+#[test]
+fn cancelled_platform_registration_retries_and_exclusion_preserves_the_original_key() {
+    let rig = rig(Press::CancelThenArca);
+    let mut client = broker(&rig);
+    let origin = Origin::parse(RP.origin).unwrap();
+    let options = creation("");
+    assert_eq!(create(&mut client, &origin, None, &options).unwrap_err(), DomError::NotAllowed);
+    let registration = create(&mut client, &origin, None, &options).unwrap();
+    let (id, public_key) = RP.register(&registration.to_json(), &options.challenge, true);
+    let mut duplicate = options;
+    duplicate.challenge = b"duplicate challenge".to_vec();
+    duplicate.exclude = vec![id.clone()];
+    assert_eq!(create(&mut client, &origin, None, &duplicate).unwrap_err(), DomError::InvalidState);
+    let mut request = RequestOptions::from_json(r#"{"challenge":"YXJjYS1zaWduLWlu","rpId":"example.com","userVerification":"required"}"#).unwrap();
+    request.allow = vec![id.clone()];
+    let assertion = get(&mut client, &origin, None, &request).unwrap();
+    assert_eq!(assertion.authenticator_attachment, "platform");
+    RP.authenticate(&assertion.to_json(), &request.challenge, &id, &public_key, true);
 }
 
 #[test]

@@ -7,17 +7,19 @@ function encode(buffer) {
     return btoa(String.fromCharCode(...new Uint8Array(buffer))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 async function submit(name, credential, fields) {
+    if (attachment && credential.authenticatorAttachment !== attachment) throw new Error("Unexpected authenticator");
     const data = {type: credential.type, rawId: encode(credential.rawId)};
     for (const field of fields) data[field] = encode(credential.response[field]);
     await fetch("/atrium-fixture/continue", {method: "POST", credentials: "same-origin",
         body: new URLSearchParams({[name]: JSON.stringify(data)})});
 }
+const attachment = "__ATTACHMENT__";
 function create(challenge, excludeCredentials) {
     return navigator.credentials.create({publicKey: {
         rp: {name: "Local I3 provider", id: location.hostname},
         user: {id: new TextEncoder().encode("fixture-user"), name: "ada@example.test", displayName: "Ada"},
         challenge: decode(challenge), pubKeyCredParams: [{type: "public-key", alg: -7}], excludeCredentials,
-        authenticatorSelection: {residentKey: "required", userVerification: "required"}, timeout: 60000
+        authenticatorSelection: {authenticatorAttachment: attachment || undefined, residentKey: "required", userVerification: "required"}, timeout: 60000
     }});
 }
 const duplicate = document.createElement("button");

@@ -23,6 +23,7 @@ use std::sync::Arc;
 struct Provider {
     webauthn_probe: bool,
     registration: bool,
+    platform_only: bool,
     registration_challenges: std::collections::HashMap<String, String>,
     registered: std::collections::HashMap<String, Enrollment>,
     enrollment: Option<Enrollment>,
@@ -132,7 +133,8 @@ impl Provider {
                 if self.registration && path == "/atrium-fixture/account.js" {
                     let challenge = self.registration_challenges.entry(flow.into()).or_insert_with(nonce);
                     let script = include_str!("../../../test-assets/navigator-i3/register.js").replace("__CREATE__", challenge)
-                        .replace("__EXCLUDE__", &nonce());
+                        .replace("__EXCLUDE__", &nonce())
+                        .replace("__ATTACHMENT__", if self.platform_only { "platform" } else { "" });
                     let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
                     return ("registration-challenges-issued", response("200 OK", "Content-Type: text/javascript\r\n", &script.replace("__GET__", challenge)));
                 }
@@ -221,9 +223,10 @@ fn main() {
     let mail = mail_address.is_some();
     let webauthn_probe = a.get(6).is_some_and(|mode| mode == "webauthn-probe");
     let enrollment = a.get(6).filter(|mode| *mode == "webauthn-sign-in").map(|_| Enrollment::read(&a[7]));
-    let registration = a.get(6).is_some_and(|mode| mode == "webauthn-register");
+    let platform_only = a.get(6).is_some_and(|mode| mode == "webauthn-platform");
+    let registration = platform_only || a.get(6).is_some_and(|mode| mode == "webauthn-register");
     let callback = registration || enrollment.is_some() || webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
-    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, registration, enrollment, ..Provider::default() }));
+    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, registration, platform_only, enrollment, ..Provider::default() }));
     let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
