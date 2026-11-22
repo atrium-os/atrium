@@ -18,6 +18,7 @@ case "$kind" in
   pin-no-job-password) job=18; title="PIN without job-password support"; prefix=pin-no-job-password ;;
   pin-no-create-job) job=19; title="PIN without Create-Job"; prefix=pin-no-create-job ;;
   pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
+  pin-replay) job=$5; title="PIN response ignored with-id $6"; prefix="pin-replay-$6" ;;
   pin-recovery) job=$5; title="PIN recovery after $6"; prefix="pin-recovery-$6" ;;
   pin-rejection) job=$5; title="PIN response $6 $7 $8"; prefix="pin-$6-$7-$8" ;;
   *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
@@ -53,14 +54,18 @@ case "$phase" in
     expected="^ +$job +printer +1 +Done +2/2 +$title *$"
     ;;
   replay)
-    test "$kind" = pin-uuid
-    # Open the exact handle staged for job 15, then unlink it before submitting.
+    case "$kind" in
+      pin-uuid) job=16; prefix=pin-replay ;;
+      pin-replay) ;;
+      *) exit 2 ;;
+    esac
+    # Replay the retained handle, then leave no handle file for the next job.
     exec 3<pin-handle
     rm -f pin-handle
     "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
     exec 3<&-
-    snapshot=pin-replay-jobs.log
-    expected="^ +16 +printer +1 +Failed +0/2 +$title +Arca did not supply a usable PIN for this job *$"
+    snapshot=$prefix-jobs.log
+    expected="^ +$job +printer +1 +Failed +0/2 +$title +Arca did not supply a usable PIN for this job *$"
     ;;
   missing-capability)
     case "$kind" in
@@ -72,7 +77,8 @@ case "$phase" in
     snapshot=$prefix-jobs.log
     expected="^ +$job +printer +1 +Failed +0/2 +$title +this printer cannot accept a PIN before the document is sent *$"
     ;;
-  fresh)
+  fresh|retain)
+    if [ "$phase" = retain ]; then test "$kind" = pin-rejection; fi
     case "$kind" in
       pin-fresh|pin-recovery) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
       pin-rejection)
@@ -83,12 +89,13 @@ case "$phase" in
       *) exit 2 ;;
     esac
     exec 3<pin-handle
-    rm -f pin-handle
+    # Keep the exact root-only handle until the cancellation failure is replayed.
+    if [ "$phase" = fresh ]; then rm -f pin-handle; fi
     "$P/r7-pin-fixture" submit "$P/print.sock" "$P/identity-proof.pdf" "$title" <&3
     exec 3<&-
     snapshot=$prefix-jobs.log
     ;;
-  *) echo "Expected hold, retry, release, replay, missing-capability, or fresh" >&2; exit 2 ;;
+  *) echo "Expected hold, retry, release, replay, missing-capability, fresh, or retain" >&2; exit 2 ;;
 esac
 matches_snapshot() {
   if [ -n "$previous_hold" ]; then

@@ -65,7 +65,7 @@ expected_events = [
 for response, printer_job, cancel_result in outcomes:
     if response == "recovery":
         expected_events.extend(printed_events(int(printer_job)))
-    else:
+    elif response != "replay":
         expected_events.extend([("create", None), (response, printer_job)])
         if printer_job != "-":
             job = int(printer_job)
@@ -93,6 +93,14 @@ if outcomes:
             desktop_job_ids.append(desktop_job)
             assert (str(desktop_job), "2", "2", f"PIN recovery after {cancel_result}") in completed_jobs, jobs
             print(f"IPPS simulator: fresh PIN after {cancel_result}, job {printer_job} uploaded once")
+        elif response == "replay":
+            title = re.escape(f"PIN response ignored with-id {cancel_result}")
+            assert re.search(
+                rf"^ +{desktop_job} +printer [0-9]+ +Failed +0/2 +{title} +Arca did not supply a usable PIN for this job *$",
+                jobs,
+                re.M,
+            ), jobs
+            print(f"IPPS simulator: replay after {cancel_result}, no printer job or PDF")
         else:
             id_mode = "without-id" if printer_job == "-" else "with-id"
             title = re.escape(f"PIN response {response} {id_mode} {cancel_result}")

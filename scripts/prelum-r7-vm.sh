@@ -365,19 +365,25 @@ successful_redemptions=3
 expected_responses="$D/pin-rejection-expected.txt"
 : >"$expected_responses"
 submit_pin_fixture() {
-    proof="$D/$1"
+    phase=$1
+    proof="$D/$2"
     desktop_job=$((desktop_job + 1))
     redemption_count=$((redemption_count + 1))
-    successful_redemptions=$((successful_redemptions + 1))
-    remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
-        <"$scripts/prelum-r7-pin-stage.sh" >"$proof-stage.log" 2>&1
-    remote "sh -s -- '$guest' '$marker' fresh '$2' '$desktop_job' '$3' '${4:-}' '${5:-}'" \
+    expected_status=1
+    if [ "$phase" != replay ]; then
+        expected_status=0
+        successful_redemptions=$((successful_redemptions + 1))
+        remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
+            <"$scripts/prelum-r7-pin-stage.sh" >"$proof-stage.log" 2>&1
+    fi
+    remote "sh -s -- '$guest' '$marker' '$phase' '$3' '$desktop_job' '$4' '${5:-}' '${6:-}'" \
         <"$scripts/prelum-r7-identity.sh" >"$proof.log" 2>&1 || { cat "$proof.log" >&2; exit 1; }
     cat "$proof.log"
     remote "cat '$guest/fixture-arca/audit.log'" >"$proof-audit.log"
     test "$(grep -cE 'ui op=0x0068 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
     test "$(grep -c 'op=0x0011' "$proof-audit.log")" -eq "$redemption_count"
     test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
+    grep 'op=0x0011' "$proof-audit.log" | tail -1 | grep -Eq "prelum-ipp op=0x0011 .*status=$expected_status$"
 }
 check_pin_rejection() {
     if [ "$2" = with-id ]; then
@@ -386,7 +392,7 @@ check_pin_rejection() {
     else
         printf '%s - %s\n' "$1" "$3" >>"$expected_responses"
     fi
-    submit_pin_fixture "pin-$1-$2-$3" pin-rejection "$1" "$2" "$3"
+    submit_pin_fixture "${4:-fresh}" "pin-$1-$2-$3" pin-rejection "$1" "$2" "$3"
 }
 for response in ignored conflicting unsupported-group unsupported-status server-busy; do
     check_pin_rejection "$response" with-id canceled
@@ -394,12 +400,20 @@ for response in ignored conflicting unsupported-group unsupported-status server-
 done
 check_pin_rejection success without-id none
 
-# Pair each failed cancellation with a separate job and a freshly staged handle.
+# Replay the consumed handle before testing recovery with a newly staged one.
+job_operations='^fake printer: (Create-Job|Print-Job|Send-Document|Cancel-Job) job '
 for cancel_result in ipp-refused http-refused dropped truncated; do
-    check_pin_rejection ignored with-id "$cancel_result"
+    check_pin_rejection ignored with-id "$cancel_result" retain
+    printf 'replay - %s\n' "$cancel_result" >>"$expected_responses"
+    replay_proof="$D/pin-replay-$cancel_result"
+    grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-before-operations.log"
+    submit_pin_fixture replay "pin-replay-$cancel_result" pin-replay "$cancel_result"
+    grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-after-operations.log"
+    cmp "$replay_proof-before-operations.log" "$replay_proof-after-operations.log"
+
     printer_job=$((printer_job + 1))
     printf 'recovery %s %s\n' "$printer_job" "$cancel_result" >>"$expected_responses"
-    submit_pin_fixture "pin-recovery-$cancel_result" pin-recovery "$cancel_result"
+    submit_pin_fixture fresh "pin-recovery-$cancel_result" pin-recovery "$cancel_result"
 done
 remote "cat '$guest/pin-recovery-truncated-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
