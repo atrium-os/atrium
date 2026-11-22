@@ -378,6 +378,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 assert receipts.with_suffix(".final-forwarding-approved").exists(), "final rebound uploaded changed forwarding before approval"
                         if hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT and calls.count("getconfig.esp") == 25:
                             assert receipts.with_suffix(".final-reconnect-approved").exists(), "final reconnect uploaded HIP before approval"
+                        if hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT and calls.count("getconfig.esp") == 26:
+                            initial_forwarding = receipts.read_text().splitlines()[0].split()[0]
+                            if forwarding == initial_forwarding:
+                                assert receipts.with_suffix(".final-reconnect-forwarding-approved").exists(), "restored forwarding arrived before fresh approval"
                         if receipts:
                             with receipts.open("a") as receipt:
                                 fact = forwarding
@@ -462,6 +466,12 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             while not receipts.with_suffix(".final-reconnect-ack").exists() and time.monotonic() < deadline:
                                 time.sleep(0.05)
                             assert receipts.with_suffix(".final-reconnect-ack").exists(), "final reconnect acknowledgement was never released"
+                        if hip == ACTIVE_HIP_FINAL_REBOUND_RECONNECT and calls.count("getconfig.esp") == 26:
+                            receipts.with_suffix(".final-reconnect-rebind-pending").touch()
+                            deadline = time.monotonic() + 25
+                            while not receipts.with_suffix(".final-reconnect-rebind-ack").exists() and time.monotonic() < deadline:
+                                time.sleep(0.05)
+                            assert receipts.with_suffix(".final-reconnect-rebind-ack").exists(), "final rebind acknowledgement was never released"
                         if esp and (hip in RECONNECT_HIP or hip in ESP_LOSS_RECONNECT_HIP):
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
@@ -845,7 +855,7 @@ def main():
                 submit_retry = retry_reconnect or retry_decline or retry_recheck or args.hip == "esp-loss-hip-submit-retry"
                 assert not esp.errors, esp.errors
                 configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
-                assert len(esp.configs) == len(configs) == (25 if active_final_rebound_reconnect else 24 if active_post_decline_reconnect else 22 if active_rebound_reconnect else 20 if active_recovered_reconnect else 18 if active_rebind_recover else 16 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
+                assert len(esp.configs) == len(configs) == (26 if active_final_rebound_reconnect else 24 if active_post_decline_reconnect else 22 if active_rebound_reconnect else 20 if active_recovered_reconnect else 18 if active_rebind_recover else 16 if active_refresh_reconnect else 14 if active_refresh_retry else 13 if recovered_reconnect else 11 if final_recover else 9 if final_rebind_retry else 8 if rebind_reconnect else 7 if rebind_retry else 6 if reconnected_after_rebind or retry_reconnect else 5 if retry_recheck else 4 if reconnected else 2), calls
                 original_spi = esp.configs[0][0][0]
                 expected_spis = [original_spi]
                 if submit_retry:
@@ -882,8 +892,8 @@ def main():
                                         final_rebound_echoes = 2 if active_final_rebound_decline or active_final_rebound_reconnect else 3
                                         expected_spis.extend([esp.configs[22][0][0]] * 2 + [esp.configs[23][0][0]] * final_rebound_echoes)
                                         if active_final_rebound_reconnect:
-                                            expected_spis.extend([esp.configs[24][0][0]] * 2)
-                                            final_rebound_echoes += 2
+                                            expected_spis.extend([esp.configs[24][0][0]] * 2 + [esp.configs[25][0][0]] * 4)
+                                            final_rebound_echoes += 6
                                         final_echoes += 2 + final_rebound_echoes
                     elif not retry_decline:
                         expected_spis.extend([esp.configs[3][0][0]] * 2)
@@ -929,7 +939,10 @@ def main():
                                 ] for echoes in allowed_echoes[:])
                                 if active_final_rebound_reconnect:
                                     allowed_echoes.extend([
-                                        *echoes[:-2], esp.configs[23][0][0], *echoes[-2:]
+                                        *echoes[:-6], esp.configs[23][0][0], *echoes[-6:]
+                                    ] for echoes in allowed_echoes[:])
+                                    allowed_echoes.extend([
+                                        *echoes[:-4], esp.configs[24][0][0], *echoes[-4:]
                                     ] for echoes in allowed_echoes[:])
                         allowed_echoes.extend([*echoes, expected_spis[-1]] for echoes in allowed_echoes[:])
                 elif active_refresh_reconnect and not active_rebind_tls:
@@ -1113,9 +1126,16 @@ def main():
                                                                             assert calls[final_config - 1] == "hipreportcheck.esp", calls
                                                                             assert final_receipt >= rebound_receipt + 2, reports
                                                                             assert set(reports[rebound_receipt:final_receipt]) == {original}, reports
-                                                                            assert len(reports[final_receipt:]) >= 2, reports
-                                                                            assert set(reports[final_receipt:]) == {changed}, reports
-                                                                            print("Final reconnect rejected stale approval, waited for HIP acknowledgement, and refreshed silently on new ESP")
+                                                                            final_rebind = calls[:configs[25]].count("hipreport.esp")
+                                                                            assert final_rebind >= final_receipt + 2, reports
+                                                                            assert set(reports[final_receipt:final_rebind]) == {changed}, reports
+                                                                            final_reports = reports[final_rebind:]
+                                                                            assert final_reports[:2] == [changed, changed], reports
+                                                                            restored_at = final_reports.index(original)
+                                                                            assert set(final_reports[:restored_at]) == {changed}, reports
+                                                                            assert len(final_reports[restored_at:]) >= 2, reports
+                                                                            assert set(final_reports[restored_at:]) == {original}, reports
+                                                                            print("Final ESP rebind gated IPv4 on acknowledgement, refreshed silently, and required fresh approval for restored forwarding")
                                                                             return
                                                                         changed_at = final_reports.index(changed)
                                                                         assert set(final_reports[:changed_at]) == {original}, reports

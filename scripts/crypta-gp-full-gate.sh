@@ -691,6 +691,40 @@ finish_hip_reconnect() {
     ok "the reconnected ESP report refreshed silently"
     probe "IPv4 echo after silent HIP refresh on reconnected ESP"
 }
+check_rebound_hip_refresh() {
+    before_refresh=$(awk 'END { print NR }' "$receipts")
+    wait_receipts "$((before_refresh + 1))"
+    [ "$(field signin)" = in ] &&
+        [ "$(sed -n "$((before_refresh + 1))p" "$receipts")" = "$1" ] &&
+        [ "$("$V" "grep -o 'gp-gate: the gateway asks' $G/cryptad.log | wc -l | tr -d ' '")" = "$2" ] ||
+        fail "rebound HIP timer refresh changed the report or opened a review"
+    ok "rebound ESP refreshed the approved report without prompting"
+    probe "$3"
+}
+check_final_reconnect_rebind() {
+    rebind_restored_forwarding 21 "$rebound_report" final-reconnect-rebind
+    check_rebound_hip_refresh "$rebound_report" "$reviews" "IPv4 echo after unchanged HIP refresh on final ESP"
+
+    before_restore=$(awk 'END { print NR }' "$receipts")
+    "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+        grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" ||
+        fail "final rebound review omitted restored forwarding"
+    [ "$(hip_choice)" != "$approval_choice" ] || fail "final rebound reused the prior approval choice"
+    if tail -n "+$((before_restore + 1))" "$receipts" | grep -q "^${initial_report%% *} "; then
+        fail "final rebound uploaded restored forwarding before approval"
+    fi
+    before_approval=$(awk 'END { print NR }' "$receipts")
+    touch "$receipts.final-reconnect-forwarding-approved"
+    approve_hip
+    wait_receipts "$((before_approval + 1))"
+    [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$initial_report" ] ||
+        fail "gateway did not receive freshly approved restored forwarding"
+    ok "restored forwarding on final ESP required fresh approval"
+    probe "IPv4 echo after fresh approval on the same final ESP association"
+    check_rebound_hip_refresh "$initial_report" "$((reviews + 1))" "IPv4 echo after restored forwarding refreshed silently on final ESP"
+}
 restore_forwarding_and_rebind() {
     before_restore=$(awk 'END { print NR }' "$receipts")
     "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
@@ -1286,6 +1320,7 @@ if [ "$hip" = refresh ] || [ "$hip" = esp-loss ]; then
                                                                     if [ "$retry_hip_submit" = 27 ]; then
                                                                         reconnect_after_esp_loss_decline "$before_change" final-reconnect-approved
                                                                         finish_hip_reconnect "$rebound_report" final-reconnect-ack
+                                                                        check_final_reconnect_rebind
                                                                         "$V" "$CTL down name=gp-gate" >/dev/null
                                                                     fi
                                                                     echo "$pass checks passed"
