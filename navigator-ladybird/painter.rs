@@ -1146,6 +1146,16 @@ pub mod host {
             Ok(Some(fresco_client::Event::PointerButton {x: px, y: py, button: 1, pressed, ..})) => {
                 *x = px; *y = py; if pressed { 1 } else { 2 }
             }
+            Ok(Some(event @ fresco_client::Event::Key { pressed: true, repeat: false, .. })) if state.vpn_page => {
+                use limen::doc_viewer::{ChromeKey, ToParent};
+                if let Some(pergola::Event::Key { modifiers, chars, .. }) = pergola::input::translate(&event) {
+                    if modifiers.ctrl && !modifiers.alt && !modifiers.meta && !modifiers.shift && chars == "r" {
+                        let key = ToParent::Key { key: ChromeKey::Char, chars, ctrl: true, shift: false, alt: false };
+                        let _ = child.borrow_mut().emit(*embed, key.encode());
+                    }
+                }
+                0
+            }
             Err(_) | Ok(Some(fresco_client::Event::CloseRequested {..})) => -1,
             _ => 0,
         }

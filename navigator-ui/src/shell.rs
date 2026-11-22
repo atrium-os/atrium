@@ -1650,6 +1650,7 @@ impl Shell {
     pub fn reload(&mut self) {
         let Some(key) = self.shown_key() else { return };
         let Some(p) = self.store.trail_mut().page_mut() else { return };
+        self.form = None;
         p.saved = None;
         p.asked = None;
         p.prompts = Default::default();
@@ -1904,6 +1905,39 @@ mod tests {
         let Some(Out::SubmitForm { fields, .. }) = s.outbox.pop() else { panic!("{:?}", s.outbox) };
         assert_eq!(fields[1].arca, None);
         assert_eq!(fields[1].value, "");
+    }
+
+    #[test]
+    fn reloading_a_sign_in_page_discards_the_unconfirmed_form() {
+        use limen::doc_viewer::{Field, FieldKind, Form};
+
+        let proposal = |proof: &str| Form {
+            action: "/+CSCOE+/saml/sp/continue".into(),
+            post: true,
+            fields: vec![
+                Field { kind: FieldKind::Text, name: "proof".into(), label: "Sign-in code".into(), value: proof.into(), checked: false },
+                Field { kind: FieldKind::Submit, name: String::new(), label: "Continue to sign-in".into(), value: String::new(), checked: false },
+            ],
+        };
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(true);
+        s.enter("https://sso.example/+CSCOE+/saml/sp/login");
+        s.portal = Some("the corp VPN".into());
+        s.set_forms(vec![proposal("old")]);
+
+        s.reload();
+        s.submit_form(1, None);
+        assert!(s.form.is_none());
+        assert_eq!(s.outbox, vec![Out::Reload { key: s.shown_key().unwrap() }]);
+        s.outbox.clear();
+
+        s.set_forms(vec![proposal("fresh")]);
+        assert!(s.outbox.is_empty());
+        s.submit_form(1, None);
+        let [Out::SubmitForm { fields, .. }] = s.outbox.as_slice() else { panic!("expected a single confirmed POST") };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "fresh");
     }
 
     #[test]

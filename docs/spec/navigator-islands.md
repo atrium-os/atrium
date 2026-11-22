@@ -481,6 +481,16 @@ The retry recorded one script POST, one accepted assertion, and one token
 redemption. The guest fetched `crypta-ac-ok` through `tun3`. Both dedicated
 guests shut down cleanly.
 
+Ctrl-R in the focused VPN page now goes to trusted chrome, which clears
+the pending form immediately and fetches the current page in the same
+sign-in window. The arm64 Tessera gate verified that the old proposal
+disappeared, the gateway served a fresh script, and no POST, assertion,
+or token redemption occurred before confirmation of the new proposal.
+After confirmation the gateway accepted exactly one script POST and one
+signed assertion. Crypta redeemed one token and fetched `crypta-ac-ok`
+over `tun0` on the same engine start. The focused FreeBSD unit test also
+passed. Both dedicated guests shut down cleanly.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
