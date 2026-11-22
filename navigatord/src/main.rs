@@ -486,7 +486,7 @@ enum Upstream {
     /// couriers with the broker's tickets; the rest the plain way.
     /// In a sign-in window, the first ask may be a form's POST of these
     /// bytes, from a page on this host.
-    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, form: Option<FormSend>, plain: Box<Upstream> },
+    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, form: Option<FormSend>, plain: Option<Box<Upstream>> },
     /// The sign-in window's fetcher; the first navigation is a form's POST
     /// of these bytes when there are any.
     Portal(Arc<portal::Portal>, Option<Vec<u8>>),
@@ -513,7 +513,10 @@ impl Upstream {
                     };
                     Reply::Ok { status: r.status, rest: format!("0 {} {}", body.len(), r.url), body }
                 }
-                Err(e) if e.plain_instead() => plain.reply(ask),
+                Err(e) if e.plain_instead() => match plain {
+                    Some(fetcher) => fetcher.reply(ask),
+                    None => Reply::Err(format!("through Arca: {e:?}")),
+                },
                 Err(e) => Reply::Err(format!("through Arca: {e:?}")),
             };
         }
@@ -666,22 +669,27 @@ type FormSend = (Vec<u8>, String, Option<(usize, [u8; 16])>);
 
 fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<FormSend>) -> Result<Got, String> {
     let inst = instance();
-    let mut up = upstream(cfg, &inst)?;
-    let mut form = form;
-    if let Upstream::Portal(_, f) = &mut up {
-        if form.as_ref().is_some_and(|f| f.2.is_some()) {
-            return Err("a password from Arca's field goes only through Arca's couriers".into());
-        }
-        *f = form.take().map(|(b, _, _)| b);
-    }
-    let jar = cookies.as_ref().map(|(c, v)| (c.clone(), *v));
-    if let Some((cookies, view)) = cookies {
+    let jar = cookies.clone();
+    let mut up = if let Some((cookies, view)) = cookies {
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
-        up = Upstream::Cookied { cookies, view, host, navigated: false, form: form.take(), plain: Box::new(up) };
-    }
-    if form.is_some() {
-        return Err("a form is sent only from a sign-in window".into());
-    }
+        // A VPN sign-in has exactly one network path, through its profile's couriers.
+        let plain = if cfg.vpn.is_some() { None } else { Some(Box::new(upstream(cfg, &inst)?)) };
+        Upstream::Cookied { cookies, view, host, navigated: false, form, plain }
+    } else {
+        if cfg.vpn.is_some() {
+            return Err("the VPN sign-in needs its courier jar".into());
+        }
+        let mut up = upstream(cfg, &inst)?;
+        if let Upstream::Portal(_, body) = &mut up {
+            if form.as_ref().is_some_and(|f| f.2.is_some()) {
+                return Err("a password from Arca's field goes only through Arca's couriers".into());
+            }
+            *body = form.map(|(bytes, _, _)| bytes);
+        } else if form.is_some() {
+            return Err("a form is sent only from a sign-in window".into());
+        }
+        up
+    };
     let mut budget = FetchBudget::new(FetchBudget::DEFAULT);
     let mut hops = vec![];
     let (base, doc) = match budget.admit(url, |u| {

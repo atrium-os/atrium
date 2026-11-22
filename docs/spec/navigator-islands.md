@@ -397,6 +397,34 @@ engine rather than in the document lane:
   allows it. A site whose sign-in needs script opens a sign-in window for it on the
   person's press, rather than turning the persona's whole trail live.
 
+### I3 VPN gateway on Tessera
+
+On 2026-11-22 Portcullis accepted `VpnSignInWindow` for profile `win`
+and launched the signed Navigator broker in the reserved `vpn` persona.
+The installed UI opened **Sign in to corp** through separate Arca couriers
+to the gateway and Keycloak 26.0.7. The broker now uses only the profile's
+couriers for VPN sign-in. This run had no plain fetcher bundle installed.
+All 22 broker unit tests passed on arm64 FreeBSD.
+
+The installed window requested the Limen document viewer. A separate
+JIT-off Ladybird rendering probe read the guest-fetched Keycloak login HTML,
+found the username, password and submit controls, and built a native Fresco
+scene with 13 node changes. The non-root worker verified its jail, Capsicum
+mode and denial of a filesystem lookup. This exercised the initial document
+only. The installed window still needs a live page role, brokered resource
+and form navigation, and the trusted Arca password field.
+
+The host gateway control verified Keycloak's signed response and minted a
+token, rejected a repeated signed response with HTTP 403, reused the IdP
+session without a password, and asked for a password after clearing its
+browser jar. The fixture now resolves Keycloak's key name to the configured
+IdP certificate with xmlsec 1.3. These controls used the fixture browser.
+Arca profile deletion, Crypta token consumption and replay refusal, and
+traffic through ocserv remain open in the installed Ladybird flow. The VPN
+team's separate ocserv backend was offline during this run.
+
+Evidence on the Mac is in `~/atrium-vm/evidence/navigator-i3-vpn-sso-20261122/`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

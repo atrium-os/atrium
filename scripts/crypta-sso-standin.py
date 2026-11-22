@@ -133,15 +133,27 @@ NS = {"p": "urn:oasis:names:tc:SAML:2.0:protocol", "a": "urn:oasis:names:tc:SAML
 def check_response(b64):
     """The subject of a SAMLResponse we asked for, or why not."""
     raw = base64.b64decode(b64)
+    x = ET.fromstring(raw)
     if IDP_CERT:
+        # Keycloak names its signing key. Give xmlsec that lookup name for
+        # the pinned fixture key; never load a key from the response.
+        ds = "{http://www.w3.org/2000/09/xmldsig#}"
+        signature = x.find(ds + "Signature")
+        if x.tag != "{" + NS["p"] + "}Response" or signature is None:
+            return None, "missing signed response"
+        kid = signature.findtext(ds + "KeyInfo/" + ds + "KeyName") or ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", kid):
+            return None, "missing signing key name"
+        refs = signature.findall(ds + "SignedInfo/" + ds + "Reference")
+        if not x.get("ID") or len(refs) != 1 or refs[0].get("URI") != "#" + x.get("ID"):
+            return None, "signature does not cover the response"
         with tempfile.NamedTemporaryFile(suffix=".xml") as t:
             t.write(raw)
             t.flush()
-            r = subprocess.run(["xmlsec1", "--verify", "--pubkey-cert-pem", IDP_CERT, "--id-attr:ID", "urn:oasis:names:tc:SAML:2.0:assertion:Assertion",
+            r = subprocess.run(["xmlsec1", "--verify", "--enabled-key-data", "key-name", "--pubkey-cert-pem:" + kid, IDP_CERT, "--id-attr:ID", "urn:oasis:names:tc:SAML:2.0:assertion:Assertion",
                                 "--id-attr:ID", "urn:oasis:names:tc:SAML:2.0:protocol:Response", t.name], capture_output=True, text=True)
             if r.returncode != 0:
                 return None, "signature: " + r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "signature"
-    x = ET.fromstring(raw)
     st = x.find("p:Status/p:StatusCode", NS)
     if st is None or not st.get("Value", "").endswith(":Success"):
         return None, "status " + (st.get("Value") if st is not None else "?")
