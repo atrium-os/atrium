@@ -1059,8 +1059,9 @@ Gates, on the 4-core cloud machine:
 
 ### 16.6 O4d as built (2026-11-14): names, sort, filter, tables
 
-Engine and files; the Sheets UI for them (sort and filter menus, table creation, the
-filter buttons) is the next step.
+Sheets offers stable single-column sorts in Data and value filters by column.
+To sort by several keys through the desktop, sort the least significant
+column first and finish with the primary column.
 
 - **Defined names** (`officina-grid::names`): workbook and sheet scope (a sheet name
   hides a workbook one), stored parsed as if in A1 so their relative parts follow the
@@ -1101,6 +1102,7 @@ Gates, on the 4-core cloud machine:
 | LibreOffice both ways (`examples/ods_lo.rs`) | 4 names, a two-column auto-filter with hand-hidden rows and a table with a calculated column, used from another sheet: all kept in and out, values equal |
 | round trips | `tests/roundtrip.rs` and `tests/ods.rs`: names, filter state and hidden rows, tables and their formulas equal after write and read; native round trip in the grid tests |
 | hostile input | structured-reference parser: unbalanced brackets, bad keywords, three-part ranges refused; print/parse round trip; existing formula and package fuzzers clean |
+| Sheets desktop | [Interoperability gate](../../scripts/sheets-interop-vm-check.sh) with `SHEETS_INTEROP_CASE=sort_filter` saves both sort passes and both filters in XLSX and ODS. It reopens the original format and checks stable ties, both filter predicates, visible rows, the manually hidden row outside the filter, and recalculated row and cross-sheet formulas. |
 
 ### 16.7 O4e as built (2026-11-14): charts
 

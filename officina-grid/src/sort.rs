@@ -269,6 +269,19 @@ mod tests {
     }
 
     #[test]
+    fn two_keys_preserve_the_order_of_exact_ties() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        for (row, (region, rank)) in [("South", 2.0), ("North", 1.0), ("North", 2.0), ("North", 2.0), ("South", 3.0)].into_iter().enumerate() {
+            wb.set_value(CellAddr::new(0, row as u32, 0), Value::str(region));
+            wb.set_value(CellAddr::new(0, row as u32, 1), Value::Num(rank));
+        }
+        let rect = Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 1 };
+        let keys = [SortKey { col: 0, descending: false }, SortKey { col: 1, descending: true }];
+        assert_eq!(order(&wb, &rect, &keys), [2, 3, 1, 4, 0]);
+    }
+
+    #[test]
     fn a_sorted_fill_stays_one_fill() {
         let mut wb = Workbook::new();
         wb.add_sheet("S").unwrap();

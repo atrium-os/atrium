@@ -13,11 +13,12 @@
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
 # Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
+# Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -50,6 +51,7 @@ checkpoint() {
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
+        sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
@@ -312,6 +314,29 @@ formulas_reopened() {
     open_book "$row" "$book" resized
     sleep .4
     cp selectscreen.png "$results/$format-formulas-reopened.png"
+}
+
+sort_filter() {
+    click 191 133 # Sort the secondary key, Rank, first. Sort is stable.
+    data_from_bottom 17 # Sort Z to A
+    save "$book" secondary
+
+    click 62 133 # Region becomes the primary key.
+    data_from_bottom 18 # Sort A to Z
+    save "$book" sorted
+    cp selectscreen.png "$results/$format-sorted.png"
+
+    click 62 133 # A2 contains North in the sorted list.
+    data_from_bottom 15 # Show Only North
+    save "$book" region
+
+    click 126 133 # B2 contains Open. Show All is now enabled in the menu.
+    data_from_bottom 16 # Show Only Open
+    save "$book" filtered
+    sleep .8
+    cp selectscreen.png "$results/$format-filtered.png"
+    cp "$books/$book" "$results/saved.$format"
+    final=filtered
 }
 
 delimited() {
