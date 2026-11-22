@@ -1120,6 +1120,28 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
             Some(_) => continue,
             None => None,
         };
+        if name.eq_ignore_ascii_case(officina_grid::print::TITLES) {
+            if let Some(sheet) = scope {
+                let refs = crate::ods::formula::split_outside_quotes(text, ',');
+                let mut axes = Vec::new();
+                let valid = refs.len() <= 2 && refs.iter().all(|part| {
+                    let src = formula_in(part.trim());
+                    let Some((axis, _)) = wb.parse(&src, sheet, 0, 0).ok()
+                        .and_then(|expr| officina_grid::print::title(&expr, sheet)) else { return false };
+                    if axes.iter().any(|(seen, _)| *seen == axis) { return false; }
+                    axes.push((axis, src));
+                    true
+                });
+                if valid && axes.len() + wb.names().len() <= officina_grid::names::MAX_NAMES {
+                    for (axis, src) in axes {
+                        wb.define_name(axis, scope, &src).map_err(|e| bad(e.to_string()))?;
+                    }
+                    continue;
+                }
+            }
+            rep.note(Kind::Dropped, "unsupported print titles");
+            continue;
+        }
         if wb.define_name(name, scope, &formula_in(text)).is_err() {
             rep.note_at(Kind::Dropped, "defined names this engine can't use", || format!("{name}: {}", text.chars().take(60).collect::<String>()));
         }

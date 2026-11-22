@@ -38,6 +38,7 @@ pub mod native;
 pub mod numfmt;
 pub mod ops;
 pub mod pivot;
+pub mod print;
 pub mod recalc;
 pub mod axis_ids;
 pub mod shift;

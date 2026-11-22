@@ -37,6 +37,8 @@ pub(crate) struct FrameIn {
     pub end_x: f64,
     pub end_y: f64,
     pub href: Option<String>,
+    pub image: Option<String>,
+    pub transformed: bool,
 }
 
 const PT_PX: f64 = 72.0 / 96.0;
@@ -85,18 +87,9 @@ fn cell_at(wb: &Workbook, sheet: u16, x: f64, y: f64) -> (u32, u32, f32, f32) {
 }
 
 #[cfg(feature = "read")]
-/// Turns the frames read into charts.
+/// Turns sheet frames into charts and bounded embedded pictures.
 pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, rep: &mut Report) {
     for f in frames {
-        let Some(href) = f.href.as_deref() else {
-            rep.note(Kind::Dropped, "images and drawings");
-            continue;
-        };
-        let dir = href.trim_start_matches("./").trim_end_matches('/');
-        let Ok(Some(data)) = z.read_name(&format!("{dir}/content.xml")) else {
-            rep.note(Kind::Dropped, "embedded objects other than charts");
-            continue;
-        };
         if (f.sheet as usize) >= wb.sheet_count() {
             continue;
         }
@@ -115,6 +108,32 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
             None => cell_at(wb, f.sheet, x0 + f.w, y0 + f.h),
         };
         let anchor = Anchor { sheet: f.sheet, from, to };
+        // Chart frames can also carry a cached preview. Prefer the chart.
+        let Some(href) = f.href.as_deref() else {
+            let added = f.image.as_deref().is_some_and(|href| {
+                let path = href.strip_prefix("./").unwrap_or(href);
+                if path.contains([':', '\\']) || path.split('/').any(|c| matches!(c, "" | "." | "..")) {
+                    return false;
+                }
+                let Some(part) = z.find(path) else { return false };
+                if !wb.can_add_picture(part.size as usize) { return false; }
+                let Ok(data) = z.read(part) else { return false };
+                wb.add_picture(officina_grid::charts::Picture {
+                    anchor, bytes: data.into(), link: None, crop: [0; 4], rotation: 0,
+                }).is_ok()
+            });
+            if !added {
+                rep.note(Kind::Dropped, "unsupported images and drawings");
+            } else if f.transformed {
+                rep.note(Kind::Approximate, "picture transforms");
+            }
+            continue;
+        };
+        let dir = href.trim_start_matches("./").trim_end_matches('/');
+        let Ok(Some(data)) = z.read_name(&format!("{dir}/content.xml")) else {
+            rep.note(Kind::Dropped, "embedded objects other than charts");
+            continue;
+        };
         match chart_doc(wb, &data, anchor, rep) {
             Some(c) => {
                 if wb.add_chart(c).is_err() {
@@ -385,21 +404,36 @@ pub(crate) fn object_xml(wb: &Workbook, c: &Chart) -> String {
     o
 }
 
-/// The `draw:frame` for chart `i` (shown as `Object {i+1}`), anchored to its sheet.
-pub(crate) fn frame_xml(wb: &Workbook, c: &Chart, i: usize) -> String {
-    let a = c.anchor;
+/// Package part for an embedded picture.
+pub(crate) fn picture_path(p: &officina_grid::charts::Picture, i: usize) -> Option<String> {
+    let ext = officina_grid::charts::Picture::extension(&p.bytes)?;
+    Some(format!("Pictures/image{}.{ext}", i + 1))
+}
+
+pub(crate) fn picture_xml(wb: &Workbook, p: &officina_grid::charts::Picture, i: usize) -> Option<String> {
+    let path = picture_path(p, i)?;
+    let [x, y, w, h] = frame_inches(wb, p.anchor);
+    Some(format!(
+        r#"<draw:frame draw:name="Picture {}" svg:x="{x}" svg:y="{y}" svg:width="{w}" svg:height="{h}"><draw:image xlink:href="{path}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#,
+        i + 1,
+    ))
+}
+
+fn frame_inches(wb: &Workbook, a: Anchor) -> [String; 4] {
     let sh = wb.sheet(a.sheet);
     let pos = |(r, col, dx, dy): (u32, u32, f32, f32)| (sh.col_sizes.offset(col) + dx as f64 / PT_PX, sh.row_sizes.offset(r) + dy as f64 / PT_PX);
     let (x0, y0) = pos(a.from);
     let (x1, y1) = pos(a.to);
-    let inch = |px: f64| format!("{:.4}in", px / 96.0);
+    [x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)].map(|px| format!("{:.6}in", px / 96.0))
+}
+
+/// The `draw:frame` for chart `i` (shown as `Object {i+1}`), anchored to its sheet.
+pub(crate) fn frame_xml(wb: &Workbook, c: &Chart, i: usize) -> String {
+    let [x, y, w, h] = frame_inches(wb, c.anchor);
     format!(
         r#"<draw:frame draw:z-index="{i}" draw:name="Chart {}" svg:x="{}" svg:y="{}" svg:width="{}" svg:height="{}"><draw:object xlink:href="./Object {}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/></draw:frame>"#,
         i + 1,
-        inch(x0),
-        inch(y0),
-        inch((x1 - x0).max(1.0)),
-        inch((y1 - y0).max(1.0)),
+        x, y, w, h,
         i + 1
     )
 }

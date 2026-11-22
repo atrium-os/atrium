@@ -944,6 +944,17 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
     out.push_str("</table:table-cell>");
 }
 
+// Split compressed row/column runs at the header wrapper's boundaries.
+fn header_boundary(out: &mut String, at: u32, band: Option<(u32, u32)>, tag: &str) -> u32 {
+    if let Some((start, end)) = band {
+        if at < start { return start; }
+        if at == start { let _ = write!(out, "<{tag}>"); }
+        if at < end { return end; }
+        if at == end { let _ = write!(out, "</{tag}>"); }
+    }
+    u32::MAX
+}
+
 fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u64, usize>, col_style: &mut BTreeMap<u64, usize>, bools: &mut BTreeSet<StyleId>, budget: &mut usize) -> io::Result<()> {
     let (rows, cols) = wb.extent(s);
     let name = wb.sheet_name(s);
@@ -1009,17 +1020,32 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         // Its tab colour (tableooo:tab-color) is on table style "taS{s}".
         let _ = write!(out, "\" table:style-name=\"taS{s}");
     }
+    if let Some([r0, c0, r1, c1]) = wb.names().get(s, officina_grid::print::AREA)
+        .and_then(|d| officina_grid::print::area(&d.expr, s))
+    {
+        let sheet = super::formula::sheet_a1(&name);
+        let c0 = officina_grid::addr::col_name(c0);
+        let c1 = officina_grid::addr::col_name(c1 - 1);
+        out.push_str(r#"" table:print-ranges=""#);
+        esc(out, &format!("${sheet}.${c0}${}:${sheet}.${c1}${r1}", r0 + 1));
+    }
     out.push_str("\">");
-    // Charts on this sheet, as frames anchored to it.
+    let (print_rows, print_cols) = officina_grid::print::titles(wb, s);
+    // Drawings on this sheet, as frames anchored to it.
     let mut shapes = String::new();
     for (i, ch) in wb.charts().iter().enumerate().filter(|(_, c)| c.anchor.sheet == s) {
         shapes.push_str(&super::chart::frame_xml(wb, ch, i));
+    }
+    for (i, p) in wb.pictures().iter().enumerate().filter(|(_, p)| p.anchor.sheet == s) {
+        if let Some(xml) = super::chart::picture_xml(wb, p, i) {
+            shapes.push_str(&xml);
+        }
     }
     if !shapes.is_empty() {
         let _ = write!(out, "<table:shapes>{shapes}</table:shapes>");
     }
     // Columns: (width, default style) grouped.
-    let ncols = cols.max(tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1)).max(sh.col_sizes.overrides().last().map_or(0, |o| o.0 + 1)).min(ODS_COLS);
+    let ncols = cols.max(print_cols.map_or(0, |b| b.1)).max(tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1)).max(sh.col_sizes.overrides().last().map_or(0, |o| o.0 + 1)).min(ODS_COLS);
     let width = |c: u32| sh.col_sizes.overrides().binary_search_by_key(&c, |o| o.0).map(|i| sh.col_sizes.overrides()[i].1).unwrap_or(sh.col_sizes.default);
     // A hidden column's style keeps the width it will show again at.
     let kept = |c: u32| sh.hidden_widths.binary_search_by_key(&c, |h| h.0).map_or(sh.col_sizes.default, |i| sh.hidden_widths[i].1);
@@ -1029,11 +1055,14 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         *col_style.entry(key).or_insert(n)
     };
     let mut c = 0;
+    const COLUMN_HEADER: &str = "table:table-header-columns";
+    const ROW_HEADER: &str = "table:table-header-rows";
     while c < ncols.max(1) {
+        let limit = ncols.max(1).min(header_boundary(out, c, print_cols, COLUMN_HEADER));
         let (w, t) = (width(c), tail(c));
         let k = if w <= 0.0 { kept(c) } else { w };
         let mut n = 1;
-        while c + n < ncols && width(c + n) == w && tail(c + n) == t && (w > 0.0 || kept(c + n) == k) {
+        while c + n < limit && width(c + n) == w && tail(c + n) == t && (w > 0.0 || kept(c + n) == k) {
             n += 1;
         }
         let _ = write!(out, r#"<table:table-column table:style-name="co{}""#, style_of_width(k));
@@ -1046,6 +1075,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         let _ = write!(out, r#" table:default-cell-style-name="{}"/>"#, if t == 0 { "Default".to_string() } else { format!("ce{t}") });
         c += n;
     }
+    header_boundary(out, c, print_cols, COLUMN_HEADER);
     // Rows.
     let heights = sh.row_sizes.overrides();
     let mut row_of_height = |px: f64| {
@@ -1083,7 +1113,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
                 Some(&(a, _)) => a as u64,
                 None => end,
             }
-            .min(end);
+            .min(end)
+            .min(u64::from(header_boundary(out, r as u32, print_rows, ROW_HEADER)));
             let m = next - r;
             let _ = write!(out, r#"<table:table-row table:style-name="ro{def_row}"{v}"#);
             if m > 1 {
@@ -1116,6 +1147,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             }
             hi += 1;
         }
+        header_boundary(out, r, print_rows, ROW_HEADER);
         let _ = write!(out, r#"<table:table-row table:style-name="ro{rs}"{}>"#, vis(r));
         let mut col = 0u32;
         let mut any = false;
@@ -1155,15 +1187,14 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         row = r + 1;
     }
     let hid_end = sh.hidden.last().map_or(0, |h| h.1 + 1).min(ODS_ROWS);
-    if tails.iter().any(|&t| t != 0) {
-        // LibreOffice applies a column's default style only to rows the table has:
-        // run the table to its last row.
-        gap(out, row, ODS_ROWS - row);
-    } else if hid_end > row {
-        gap(out, row, hid_end - row);
-    } else if row == 0 {
-        gap(out, 0, 1);
-    }
+    let end = if tails.iter().any(|&t| t != 0) {
+        // LibreOffice applies a column's default style only to rows the table has.
+        ODS_ROWS
+    } else {
+        hid_end.max(row).max(print_rows.map_or(0, |b| b.1)).max(1)
+    };
+    gap(out, row, end - row);
+    header_boundary(out, end, print_rows, ROW_HEADER);
     out.push_str(&super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb)));
     out.push_str(&names_xml(wb, Some(s)));
     out.push_str("</table:table>");
@@ -1257,7 +1288,9 @@ fn names_xml(wb: &Workbook, scope: Option<u16>) -> String {
     let mut out = String::new();
     let base_sheet = super::formula::sheet_a1(&wb.sheet_name(scope.unwrap_or(0)));
     let base = format!("${}.$A$1", base_sheet.trim_start_matches('$'));
-    for d in wb.names().iter().filter(|d| d.scope == scope) {
+    for d in wb.names().iter().filter(|d| d.scope == scope
+        && !officina_grid::print::is_title_name(&d.name)
+        && !d.name.eq_ignore_ascii_case(officina_grid::print::AREA)) {
         let of = super::formula::to_of(&wb.name_text(d));
         let range = matches!(*d.expr, Expr::Ref(_) | Expr::Range(_)).then(|| of.strip_prefix("of:=[").and_then(|r| r.strip_suffix(']'))).flatten().filter(|r| !r.contains('['));
         out.push_str(if range.is_some() { r#"<table:named-range table:name=""# } else { r#"<table:named-expression table:name=""# });
@@ -1384,6 +1417,12 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         let _ = write!(objects, r#"<manifest:file-entry manifest:full-path="Object {n}/" manifest:version="1.3" manifest:media-type="application/vnd.oasis.opendocument.chart"/><manifest:file-entry manifest:full-path="Object {n}/content.xml" manifest:media-type="text/xml"/>"#);
     }
     let settings = super::settings::settings_xml(wb);
+    for (i, p) in wb.pictures().iter().enumerate() {
+        if let Some(path) = super::chart::picture_path(p, i) {
+            let mime = if path.ends_with(".png") { "image/png" } else { "image/jpeg" };
+            let _ = write!(objects, r#"<manifest:file-entry manifest:full-path="{path}" manifest:media-type="{mime}"/>"#);
+        }
+    }
     let settings_entry = if settings.is_some() { r#"<manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/>"# } else { "" };
     let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>{settings_entry}{objects}</manifest:manifest>"#);
     let meta = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" office:version="1.3"><office:meta><meta:generator>Officina</meta:generator></office:meta></office:document-meta>"#);
@@ -1399,6 +1438,11 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     for (i, ch) in wb.charts().iter().enumerate() {
         z.add(&format!("Object {}/content.xml", i + 1), super::chart::object_xml(wb, ch).as_bytes())?;
+    }
+    for (i, picture) in wb.pictures().iter().enumerate() {
+        if let Some(path) = super::chart::picture_path(picture, i) {
+            z.add_stored(&path, &picture.bytes)?;
+        }
     }
     for p in &macros {
         z.add(&p.path, &p.data)?;

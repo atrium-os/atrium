@@ -139,6 +139,66 @@ fn bands_after(sizes: &[f64], room: f64, from: usize, title: f64) -> Vec<(usize,
     out
 }
 
+/// Body bounds inside the snapshot and which title bands came from print
+/// settings. The snapshot may also contain explicit titles outside the body.
+#[derive(Clone, Copy)]
+pub struct PrintRegion {
+    pub body: [u32; 4],
+    pub explicit_rows: bool,
+    pub explicit_cols: bool,
+}
+
+#[derive(Clone, Copy)]
+struct AxisTile {
+    start: usize,
+    end: usize,
+    length: f64,
+    draw_objects: bool,
+}
+
+fn axis_pages(sizes: &[f64], room: f64, (lo, hi): (usize, usize), title: (u32, u32), explicit: bool) -> Vec<Vec<AxisTile>> {
+    let (a, b) = if explicit {
+        ((title.0 as usize).min(sizes.len()), (title.1 as usize).min(sizes.len()))
+    } else {
+        ((title.0 as usize).clamp(lo, hi), (title.1 as usize).clamp(lo, hi))
+    };
+    let measure = |start, end| sizes[start..end].iter().sum::<f64>();
+    let tile = |start, end, draw_objects| AxisTile { start, end, length: measure(start, end), draw_objects };
+    let size = measure(a, b.max(a));
+    let title = (a < b && size > 0.0 && size <= room / 2.0).then_some(tile(a, b.max(a), explicit));
+    if let Some(title) = title.filter(|_| explicit) {
+        // The title is a prefix on every page. Exclude its original cells from
+        // the body so a title inside the print area appears exactly once.
+        let indices: Vec<_> = (lo..hi).filter(|i| !(a..b).contains(i)).collect();
+        let lengths: Vec<_> = indices.iter().map(|&i| sizes[i]).collect();
+        let runs = bands(&lengths, room - size);
+        if runs.is_empty() { return vec![vec![title]]; }
+        return runs.into_iter().map(|(start, end)| {
+            let mut tiles = vec![title];
+            let mut run = indices[start];
+            let mut previous = run;
+            for &i in &indices[start + 1..end] {
+                if i != previous + 1 {
+                    tiles.push(tile(run, previous + 1, true));
+                    run = i;
+                }
+                previous = i;
+            }
+            tiles.push(tile(run, previous + 1, true));
+            tiles
+        }).collect();
+    }
+    let split = title.map_or(0, |t| t.end - lo);
+    bands_after(&sizes[lo..hi], room, split, title.map_or(0.0, |t| t.length))
+        .into_iter().map(|(start, end)| {
+            let start = start + lo;
+            let mut tiles = Vec::with_capacity(2);
+            if let Some(t) = title.filter(|t| start >= t.end) { tiles.push(t); }
+            tiles.push(tile(start, end + lo, true));
+            tiles
+        }).collect()
+}
+
 /// An object in sheet pixel coordinates, relative to the print area's origin.
 pub struct Drawing {
     pub bounds: [f64; 4],
@@ -274,30 +334,30 @@ fn fit(s: &Shaper, c: &Cell, room: i64) -> Option<(Para, ParaLayout, i64)> {
 /// Writes `sheet` as PDF on `setup`'s paper to `out`, calling
 /// `progress(done, total)` after each page.
 pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
-    export_drawings(sheet, &[], setup, fonts, files, title, out, progress)
+    export_drawings(sheet, &[], None, setup, fonts, files, title, out, progress)
 }
 
-fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
+fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
     let (pw, ph) = (setup.w, setup.h);
     let m = setup.margin.clamp(0.0, pw.min(ph) / 3.0);
     let (room_w, room_h) = (pw - 2.0 * m, ph - 2.0 * m);
     if sheet.rows.len() as u64 * sheet.cols.len() as u64 > MAX_CELLS {
         return Err(io::Error::other(format!("more than {MAX_CELLS} cells to print")));
     }
-    let total_w: f64 = sheet.cols.iter().sum::<f64>() * PT_PER_PX;
+    let PrintRegion { body, explicit_rows, explicit_cols } = region.unwrap_or(PrintRegion {
+        body: [0, 0, sheet.rows.len() as u32, sheet.cols.len() as u32],
+        explicit_rows: false, explicit_cols: false,
+    });
+    let [top, left, bottom, right] = body.map(|i| i as usize);
+    if top > bottom || bottom > sheet.rows.len() || left > right || right > sheet.cols.len() {
+        return Err(io::Error::other("print area is outside the snapshot"));
+    }
+    let total_w: f64 = sheet.cols[left..right].iter().sum::<f64>() * PT_PER_PX;
     let k = if setup.fit_width && total_w > room_w { (room_w / total_w).max(1.0 / 3.0) } else { 1.0 } * PT_PER_PX;
     let cols: Vec<f64> = sheet.cols.iter().map(|w| w.max(0.0) * k).collect();
     let rows: Vec<f64> = sheet.rows.iter().map(|h| h.max(0.0) * k).collect();
-    // Print titles, unless they would take more than half the page.
-    let titles = |(a, b): (u32, u32), sizes: &[f64], room: f64| {
-        let (a, b) = ((a as usize).min(sizes.len()), (b as usize).min(sizes.len()));
-        let size: f64 = sizes[a..b.max(a)].iter().sum();
-        if b > a && size > 0.0 && size <= room / 2.0 { ((a, b), size) } else { ((0, 0), 0.0) }
-    };
-    let (tr_, tr_h) = titles(sheet.title_rows, &rows, room_h);
-    let (tc_, tc_w) = titles(sheet.title_cols, &cols, room_w);
-    let across = bands_after(&cols, room_w, tc_.1, tc_w);
-    let down = bands_after(&rows, room_h, tr_.1, tr_h);
+    let across = axis_pages(&cols, room_w, (left, right), sheet.title_cols, explicit_cols);
+    let down = axis_pages(&rows, room_h, (top, bottom), sheet.title_rows, explicit_rows);
     let shaper = Shaper::new(fonts, TEXT_PX * k);
     let lu = |v: f64| (v * LU as f64).round() as i64;
     let total = (across.len() * down.len()).max(1);
@@ -435,26 +495,38 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], setup: &Setup,
         })).collect::<Vec<_>>()
     };
     let (xs, ys) = (offsets(&cols), offsets(&rows));
-    // Down, then across; the print titles (frozen rows and columns) on
-    // every page that doesn't already start with them.
-    for &(c0, c1) in &across {
-        for &(r0, r1) in &down {
+    // Down, then across, placing the Cartesian product of each page's
+    // title and body bands.
+    for columns in &across {
+        for rows in &down {
             let mut page = Page::default();
             let mut items = Vec::new();
             let mut lines = Vec::new();
-            let tr = if r0 >= tr_.1 && tr_.1 > tr_.0 { Some(tr_) } else { None };
-            let tc = if c0 >= tc_.1 && tc_.1 > tc_.0 { Some(tc_) } else { None };
-            let (dx, dy) = (tc.map_or(0.0, |_| tc_w), tr.map_or(0.0, |_| tr_h));
-            if let (Some(tr), Some(tc)) = (tr, tc) {
-                block(&mut items, &mut lines, tr, tc, m, m);
+            let mut drawing_tiles = Vec::new();
+            let mut y = m;
+            for r in rows {
+                let mut x = m;
+                for c in columns {
+                    block(&mut items, &mut lines, (r.start, r.end), (c.start, c.end), x, y);
+                    if c.draw_objects && r.draw_objects {
+                        // Include objects that intersect the print area. On a
+                        // title tile, paint only the part inside the area.
+                        let x0 = c.start.max(left).min(c.end);
+                        let x1 = c.end.min(right).max(x0);
+                        let y0 = r.start.max(top).min(r.end);
+                        let y1 = r.end.min(bottom).max(y0);
+                        let origin = [x - xs[c.start], y - ys[r.start]];
+                        let (clip_x, clip_y) = (origin[0] + xs[x0], origin[1] + ys[y0]);
+                        let w = (xs[x1] - xs[x0]).min(m + room_w - clip_x);
+                        let h = (ys[y1] - ys[y0]).min(m + room_h - clip_y);
+                        if w > 0.0 && h > 0.0 {
+                            drawing_tiles.push(drawing::Tile { origin, clip: [clip_x, clip_y, w, h], scale: k, height: ph });
+                        }
+                    }
+                    x += c.length;
+                }
+                y += r.length;
             }
-            if let Some(tr) = tr {
-                block(&mut items, &mut lines, tr, (c0, c1), m + dx, m);
-            }
-            if let Some(tc) = tc {
-                block(&mut items, &mut lines, (r0, r1), tc, m, m + dy);
-            }
-            block(&mut items, &mut lines, (r0, r1), (c0, c1), m + dx, m + dy);
             // Gridlines first, so fills and borders cover them.
             if !lines.is_empty() {
                 use folium_content::ops::Op;
@@ -465,12 +537,9 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], setup: &Setup,
                 page.c.extend([Op::Stroke, Op::Restore]);
             }
             pdf.items(&mut page, items, ph, files, &none)?;
-            drawing::paint(&mut pdf, &mut page, drawings, drawing::Tile {
-                origin: [m + dx - xs[c0], m + dy - ys[r0]],
-                clip: [m + dx, m + dy, (xs[c1] - xs[c0]).min(room_w - dx), (ys[r1] - ys[r0]).min(room_h - dy)],
-                scale: k,
-                height: ph,
-            }, fonts, files)?;
+            for tile in drawing_tiles {
+                drawing::paint(&mut pdf, &mut page, drawings, tile, fonts, files)?;
+            }
             pdf.end_page(page, pw, ph)?;
             done += 1;
             progress(done, total);
@@ -492,13 +561,29 @@ pub fn print(sheet: &Sheet, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
 
 /// Print with the sheet's anchored charts and pictures over the cells.
 pub fn print_drawings(sheet: &Sheet, drawings: &[Drawing], setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
+    print_region(sheet, drawings, None, setup, title)
+}
+
+pub fn print_region(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
     let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
-    export_drawings(sheet, drawings, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
+    export_drawings(sheet, drawings, region, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_titles_can_precede_or_overlap_the_print_area() {
+        let sizes = [10.0; 9];
+        let parts = |body, title| {
+            axis_pages(&sizes, 35.0, body, title, true).into_iter().map(|page| {
+                page.into_iter().map(|tile| (tile.start, tile.end)).collect::<Vec<_>>()
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(parts((3, 8), (0, 1)), [vec![(0, 1), (3, 5)], vec![(0, 1), (5, 7)], vec![(0, 1), (7, 8)]]);
+        assert_eq!(parts((0, 5), (1, 2)), [vec![(1, 2), (0, 1), (2, 3)], vec![(1, 2), (3, 5)]]);
+    }
 
     #[test]
     fn bands_fit_the_room_and_wide_ones_stand_alone() {

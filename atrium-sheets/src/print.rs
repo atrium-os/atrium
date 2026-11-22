@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use officina_pdf::sheet::{Align, Cell, Drawing, DrawingContent, Setup, Sheet, MAX_CELLS};
+use officina_pdf::sheet::{Align, Cell, Drawing, DrawingContent, PrintRegion, Setup, Sheet, MAX_CELLS};
 use pergola::widgets::{CellAlign, CellView, GridSource};
 use pergola::Color;
 
@@ -27,9 +27,10 @@ pub struct Snapshot {
     pub merges: Vec<[u32; 4]>,
     /// Center Across Selection runs, `[row, c0, c1]` inclusive.
     pub across: Vec<[u32; 3]>,
-    /// The frozen rows and columns (`a..b`), repeated on every page.
+    /// Title bands, explicit print settings or frozen panes.
     pub title_rows: (u32, u32),
     pub title_cols: (u32, u32),
+    region: PrintRegion,
 }
 
 fn srgb(c: Color) -> u32 {
@@ -60,34 +61,28 @@ pub fn cell_of(v: CellView) -> Cell {
     }
 }
 
-/// The imported Excel print area, when the current sheet has one.
+/// The imported print area, when the current sheet has one.
 fn print_area(d: &Doc) -> Result<Option<[u32; 4]>, String> {
-    use officina_grid::formula::ast::{Coord::Abs, Expr, RangeKind};
-    let Some(name) = d.wb.names().get(d.sheet, "_xlnm.Print_Area") else { return Ok(None) };
-    let (sheet, bounds) = match name.expr.as_ref() {
-        Expr::Ref(r) => (r.sheet, match (r.row, r.col) {
-            (Abs(row), Abs(col)) => Some([row, col, row + 1, col + 1]),
-            _ => None,
-        }),
-        Expr::Range(r) => (r.sheet, match (r.kind, r.r0, r.c0, r.r1, r.c1) {
-            (RangeKind::Cells, Abs(r0), Abs(c0), Abs(r1), Abs(c1)) =>
-                Some([r0.min(r1), c0.min(c1), r0.max(r1) + 1, c0.max(c1) + 1]),
-            _ => None,
-        }),
-        _ => (None, None),
+    use officina_grid::{formula::ast::Expr, print};
+    let Some(name) = d.wb.names().get(d.sheet, print::AREA) else { return Ok(None) };
+    let sheet = match name.expr.as_ref() {
+        Expr::Ref(r) => r.sheet,
+        Expr::Range(r) => r.sheet,
+        _ => None,
     };
     if name.scope.is_none() && sheet.is_some_and(|sheet| sheet != d.sheet) {
         return Ok(None);
     }
-    bounds.filter(|_| sheet.is_none_or(|sheet| sheet == d.sheet)).map(Some)
+    print::area(&name.expr, d.sheet).map(Some)
         .ok_or_else(|| "The print area must be one absolute cell or rectangular range on this sheet".into())
 }
 
 /// The current sheet's print area or its used range, captured at print time.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
-    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges, drawings, links, object_rows, object_cols) = {
+    let (top, left, rows, cols, name, col_px, row_px, title_rows, title_cols, explicit_rows, explicit_cols, body, merges, drawings, links, object_rows, object_cols) = {
         let d = doc.borrow();
         let area = print_area(&d)?;
+        let (repeat_rows, repeat_cols) = officina_grid::print::titles(&d.wb, d.sheet);
         let (r, c) = d.wb.extent(d.sheet);
         let (mut bottom, mut right) = (r, c);
         let all_merges = d.wb.merges(d.sheet);
@@ -100,7 +95,9 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let sh = d.wb.sheet(d.sheet);
         let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
         let cs = &sh.col_sizes;
-        let [top, left, _, _] = area.unwrap_or([0; 4]);
+        let [area_top, area_left, _, _] = area.unwrap_or([0; 4]);
+        let top = repeat_rows.map_or(area_top, |b| area_top.min(b.0));
+        let left = repeat_cols.map_or(area_left, |b| area_left.min(b.0));
         let (ox, oy) = (cs.offset(left), rs.offset(top));
         let bounds = |a: officina_grid::charts::Anchor| {
             let point = |(r, c, x, y): (u32, u32, f32, f32)| {
@@ -122,8 +119,9 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             if w < 4.0 || h < 4.0 || x + w <= 0.0 || y + h <= 0.0 {
                 return false;
             }
-            if let Some([_, _, r, c]) = area {
-                return x < cs.offset(c) - ox && y < rs.offset(r) - oy;
+            if let Some([r0, c0, r1, c1]) = area {
+                return x + w > cs.offset(c0) - ox && y + h > rs.offset(r0) - oy
+                    && x < cs.offset(c1) - ox && y < rs.offset(r1) - oy;
             }
             object_rows = object_rows.max(past(&rs, y + h, officina_grid::addr::MAX_ROWS));
             object_cols = object_cols.max(past(cs, x + w, officina_grid::addr::MAX_COLS));
@@ -158,7 +156,10 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
                 drawings.push(Drawing { bounds, content: DrawingContent::Chart(prims) });
             }
         }
-        let [top, left, bottom, right] = area.unwrap_or([0, 0, bottom.max(object_rows), right.max(object_cols)]);
+        let body = area.map(|[r0, c0, r1, c1]| [r0 - top, c0 - left, r1 - top, c1 - left]);
+        let [_, _, bottom, right] = area.unwrap_or([0, 0, bottom.max(object_rows), right.max(object_cols)]);
+        let bottom = repeat_rows.map_or(bottom, |b| bottom.max(b.1));
+        let right = repeat_cols.map_or(right, |b| right.max(b.1));
         let (rows, cols) = (bottom - top, right - left);
         if u64::from(rows) * u64::from(cols) > MAX_CELLS {
             return Err(format!("the print area has more than {MAX_CELLS} cells"));
@@ -169,9 +170,14 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             .filter(|m| (top..bottom).contains(&m.r0) && (left..right).contains(&m.c0))
             .map(|m| [m.r0 - top, m.c0 - left, m.r1.min(bottom - 1) - top, m.c1.min(right - 1) - left])
             .collect::<Vec<_>>();
-        let from = (sh.freeze_from.0.saturating_sub(top), sh.freeze_from.1.saturating_sub(left));
-        let to = (sh.freeze.0.saturating_sub(top), sh.freeze.1.saturating_sub(left));
-        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges, drawings, links, object_rows, object_cols)
+        let titles = |band: Option<(u32, u32)>, start: u32, end: u32, offset: u32| {
+            let (a, b) = band.unwrap_or((start, end));
+            (a.saturating_sub(offset), b.saturating_sub(offset))
+        };
+        let title_rows = titles(repeat_rows, sh.freeze_from.0, sh.freeze.0, top);
+        let title_cols = titles(repeat_cols, sh.freeze_from.1, sh.freeze.1, left);
+        (top, left, rows, cols, sh.name.clone(), col_px, row_px, title_rows, title_cols,
+            repeat_rows.is_some(), repeat_cols.is_some(), body, merges, drawings, links, object_rows, object_cols)
     };
     let src = SheetSource::new(doc.clone());
     let mut cells = Vec::with_capacity((rows * cols) as usize);
@@ -207,8 +213,16 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             last_c = last_c.max(c1 + 1);
         }
     }
-    if fixed {
+    let region = PrintRegion {
+        body: body.unwrap_or([0, 0, last_r, last_c]),
+        explicit_rows,
+        explicit_cols,
+    };
+    if body.is_some() {
         (last_r, last_c) = (rows, cols);
+    } else {
+        if explicit_rows { last_r = last_r.max(title_rows.1); }
+        if explicit_cols { last_c = last_c.max(title_cols.1); }
     }
     let merges = merges.into_iter()
         .filter(|m| m[0] < last_r && m[1] < last_c)
@@ -221,7 +235,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, drawings, links, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
+    Ok(Snapshot { name, drawings, links, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (title_rows.0, title_rows.1.min(last_r)), title_cols: (title_cols.0, title_cols.1.min(last_c)), region })
 }
 
 impl Snapshot {
@@ -267,7 +281,7 @@ pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String>
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
     let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone(), title_rows: s.title_rows, title_cols: s.title_cols };
-    officina_pdf::sheet::print_drawings(&sheet, &s.drawings, &Setup::paper(w, h), title).map_err(|e| e.to_string())
+    officina_pdf::sheet::print_region(&sheet, &s.drawings, Some(s.region), &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

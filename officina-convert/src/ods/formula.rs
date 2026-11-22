@@ -127,7 +127,7 @@ fn ref_from_of(s: &str) -> Option<String> {
     Some(out)
 }
 
-fn split_outside_quotes(s: &str, sep: char) -> Vec<String> {
+pub(crate) fn split_outside_quotes(s: &str, sep: char) -> Vec<String> {
     let mut v = vec![String::new()];
     let mut q = false;
     for c in s.chars() {
@@ -144,7 +144,7 @@ fn split_outside_quotes(s: &str, sep: char) -> Vec<String> {
 }
 
 /// `Sheet1.$A$1` → (Some("Sheet1"), "$A$1"); `.A1` → (None, "A1").
-fn split_sheet(p: &str) -> Option<(Option<String>, String)> {
+pub(crate) fn split_sheet(p: &str) -> Option<(Option<String>, String)> {
     let p = p.trim();
     // The cell is after the last '.' outside quotes.
     let mut q = false;

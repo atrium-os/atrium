@@ -6,7 +6,7 @@
 //! number formats from ODF data styles (turned into Excel format codes), bold, italic,
 //! underline, strike, font colour, background, borders, alignment, wrap.
 //!
-//! Reported, not carried: charts and images, conditional
+//! Reported, not carried: some drawings, conditional
 //! formats, validation, named ranges, hidden rows and columns (shown), other formula
 //! namespaces (kept as values).
 
@@ -838,6 +838,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut frames: Vec<super::chart::FrameIn> = Vec::new();
     let mut frame: Option<super::chart::FrameIn> = None;
     let mut frame_depth = 0u32;
+    let mut print_areas = Vec::new();
+    let (mut header_row, mut header_col) = (None, None);
     // Data validation rules, the ranges whose cells name each, and the range
     // still growing down for (name, sheet, first column, last column).
     let mut val_rules: Vec<super::validation::RuleIn> = Vec::new();
@@ -887,9 +889,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                 let name = e.name();
                 let name = name.as_ref();
                 if frame_depth > 0 {
-                    if frame_depth == 1 && name == b"draw:object" {
+                    if frame_depth == 1 {
                         if let Some(f) = frame.as_mut() {
-                            f.href = attrs(e).get("xlink:href").cloned();
+                            match name {
+                                b"draw:object" => f.href = attrs(e).remove("xlink:href"),
+                                b"draw:image" if f.image.is_none() => f.image = attrs(e).remove("xlink:href"),
+                                _ => {}
+                            }
                         }
                     }
                     if !empty {
@@ -939,6 +945,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         let id = wb.add_sheet(&n).map_err(bad)?;
                         wb.sheet_mut(id).tab_color = a.get("table:style-name").and_then(|t| styles.tab_color.get(t)).copied();
                         sheet = Some(id);
+                        if let Some(area) = a.get("table:print-ranges").filter(|a| !a.is_empty()) {
+                            print_areas.push((id, area.clone()));
+                        }
+                        (header_row, header_col) = (None, None);
                         row = 0;
                         col_x = 0;
                         col_defaults.clear();
@@ -946,6 +956,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             rep.note(Kind::Dropped, "sheet protection");
                         }
                     }
+                    b"table:table-header-rows" if !empty => header_row = Some(row),
+                    b"table:table-header-columns" if !empty => header_col = Some(col_x),
                     b"table:table-column" => {
                         let a = attrs(e);
                         let n = a.get("table:number-columns-repeated").and_then(|v| v.parse::<u64>().ok()).unwrap_or(1).clamp(1, MAX_COLS as u64);
@@ -1059,7 +1071,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             ann = Some(Annotation::default());
                         }
                     }
-                    b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS => {
+                    b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS + officina_grid::charts::MAX_PICTURES => {
                         let a = attrs(e);
                         let len = |k: &str| a.get(k).and_then(|v| length_px(v)).unwrap_or(0.0);
                         let f = super::chart::FrameIn {
@@ -1073,6 +1085,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             end_x: len("table:end-x"),
                             end_y: len("table:end-y"),
                             href: None,
+                            image: None,
+                            transformed: a.contains_key("draw:transform"),
                         };
                         if empty {
                             frames.push(f);
@@ -1461,6 +1475,25 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         row += row_repeat as u64;
                         row_cells.clear();
                     }
+                    b"table:table-header-rows" => {
+                        if let Some((sheet, start)) = sheet.zip(header_row.take()) {
+                            let end = row.min(u64::from(MAX_ROWS));
+                            if start < end && wb.define_name(officina_grid::print::ROWS, Some(sheet), &format!("=${}:${end}", start + 1)).is_err() {
+                                rep.note(Kind::Dropped, "unsupported print titles");
+                            }
+                        }
+                    }
+                    b"table:table-header-columns" => {
+                        if let Some((sheet, start)) = sheet.zip(header_col.take()) {
+                            let end = col_x.min(u64::from(MAX_COLS));
+                            if start < end {
+                                use officina_grid::addr::col_name;
+                                if wb.define_name(officina_grid::print::COLS, Some(sheet), &format!("=${}:${}", col_name(start as u32), col_name(end as u32 - 1))).is_err() {
+                                    rep.note(Kind::Dropped, "unsupported print titles");
+                                }
+                            }
+                        }
+                    }
                     b"table:table" => {
                         if let Some(s) = sheet.take() {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
@@ -1480,6 +1513,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
     if wb.sheet_count() == 0 {
         return Err(bad("no tables"));
+    }
+
+    for (sheet, target) in print_areas {
+        let valid = print_area_formula(&wb.sheet_name(sheet), &target).is_some_and(|src| {
+            wb.define_name(officina_grid::print::AREA, Some(sheet), &src).is_ok()
+        });
+        if !valid {
+            rep.note(Kind::Dropped, "unsupported print areas");
+        }
     }
 
     // Auto-filters: their range names the sheet.
@@ -1674,6 +1716,26 @@ mod tests {
         assert_eq!(time_value("PT36H"), Some(1.5));
         assert_eq!(time_value("P1DT6H"), Some(1.25));
         assert_eq!(time_value("nope"), None);
+    }
+}
+
+/// ODF print addresses describe positions even when the '$' markers are
+/// omitted. Read both endpoints so a cross-sheet range cannot be misapplied.
+fn print_area_formula(sheet: &str, address: &str) -> Option<String> {
+    use officina_grid::addr::{col_name, parse_a1};
+    if address.len() > 8192 { return None; }
+    let parts = super::formula::split_outside_quotes(address, ':');
+    if parts.len() > 2 { return None; }
+    let mut cells = parts.iter().map(|part| {
+        let (owner, cell) = super::formula::split_sheet(part)?;
+        if owner.is_some_and(|owner| owner != sheet) { return None; }
+        let (r, c) = parse_a1(&cell.replace('$', ""))?;
+        Some(format!("${}${}", col_name(c), r + 1))
+    });
+    let start = cells.next()??;
+    match cells.next() {
+        Some(end) => Some(format!("={start}:{}", end?)),
+        None => Some(format!("={start}")),
     }
 }
 

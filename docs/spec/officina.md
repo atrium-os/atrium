@@ -3708,23 +3708,41 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 - **Apps.** Print… on the toolbar and Ctrl+P in both, through `pergola::print` (printing.md §5.1); the print sheet's Relayout gets a new layout for the paper and orientation chosen.
 - **Gates:** `officina-pdf/tests/print.rs` (pages, look and text read back and drawn by Folium); `atrium_sheets::print` tests; `scripts/prelum-r4-vm.sh` stages `sheets` and `slides`.
 
-Sheets can print a saved XLSX print area when it names one absolute cell or rectangle. Frozen rows and columns repeat within the printed bounds. Anchored charts print as PDF paths and text. Embedded XLSX PNG and JPEG pictures print at their anchor bounds and are retained through native saves and XLSX export. One-cell, two-cell and absolute anchors are accepted. Picture source crops and center rotations survive native saves and XLSX round trips and are applied when printing. The PDF omits source pixels entirely outside a crop. XLSX picture links survive native and XLSX saves. Printing uses the workbook cache or a PNG or JPEG the user selects in the system picker. Sheets leaves the external target inert. Other drawing objects remain open for Sheets. Slides prints full slides, speaker notes with slide thumbnails and continuation pages, or handouts with two, three, four, six, or nine slides per page. Include Hidden Slides in the Print menu opts all print layouts into hidden slides, including their speaker notes in the notes layout.
+Sheets prints a saved XLSX or ODS print area when it specifies one cell or
+rectangle. Explicit rows and columns repeat on their respective page axes,
+including when the title lies outside the body. An explicit band takes
+precedence over the frozen pane on its axis. An axis without explicit titles
+can repeat its frozen band inside the print area. Title bands use the page's
+existing space limit, and overlapping title cells appear once per page.
+
+The workbook stores these settings as sheet-local names so edits to the sheet
+structure and native saves carry them with other references. XLSX serializes
+both repeat bands as one `_xlnm.Print_Titles` union. ODS writes the print area
+as `table:print-ranges` and splits row and column runs at the header wrapper
+boundaries. Disjoint ODS print areas receive a fidelity notice.
+[ODF 1.3 table schema](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
+
+Anchored charts print as PDF paths and text. XLSX and ODS can store and print
+embedded package PNG and JPEG pictures. ODS writes sheet-anchored frames with
+the picture bytes in package parts. ODS external and inline image data and
+frame transforms remain outside this path. XLSX accepts one-cell, two-cell
+and absolute anchors. XLSX source crops and center rotations survive native
+and XLSX saves and are applied when printing. The PDF omits source pixels
+entirely outside a crop. XLSX picture links survive native and XLSX saves.
+Printing uses the workbook cache or a PNG or JPEG the user selects in the
+system picker. Sheets leaves the external target inert.
+
+Slides prints full slides, speaker notes with slide thumbnails and continuation pages, or handouts with two, three, four, six, or nine slides per page. Include Hidden Slides in the Print menu opts all print layouts into hidden slides, including their speaker notes in the notes layout.
 
 
 The [desktop print gate](../../scripts/sheets-interop-vm-check.sh) with
-`SHEETS_INTEROP_CASE=print` edits and saves an XLSX and an ODS workbook, reopens
-them, and exports each through Prelum and Scrinium. The
-[PDF checker](../../scripts/sheets-interop-pdf-check.py) checks the edit and
-recalculated formula, page order, picture count and print bounds.
-
-- XLSX keeps the tested sheet-local single-row `_xlnm.Print_Titles` definition
-  across Save. PDF pagination currently repeats the frozen bands. The explicit
-  title cell prints on its own page only. The saved print area excludes cells
-  outside it and the picture anchored wholly beyond it.
-- ODS drops the test PNG and reports the discarded drawing at import. The
-  ODS print area and explicit repeated rows and columns are also lost on Save.
-  The PDF uses the sheet's used range and its frozen bands.
-  [ODF 1.3 table schema](https://docs.oasis-open.org/office/OpenDocument/v1.3/OpenDocument-v1.3-part3-schema.html)
+`SHEETS_INTEROP_CASE=print` edits, saves and reopens XLSX and ODS workbooks and
+exports through Prelum and Scrinium. The
+[PDF checker](../../scripts/sheets-interop-pdf-check.py) checks both repeat
+bands, their intersection exactly once per page, the recalculated formula and
+the picture inside the print area. The workbooks also retain a second picture
+outside the print area, which the PDFs omit. The converter tests cover JPEG
+bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
 
 ### 16.79 Merged cells (2026-11-18)
 

@@ -46,7 +46,7 @@ checkpoint() {
         layout) /tmp/sheets-layout-fixture check "$1" "$2" ;;
         annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
-        print) /tmp/sheets-print-fixture check "$1" "$2" "$format" ;;
+        print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
@@ -246,7 +246,7 @@ check_reopened_validation() {
 }
 
 print() {
-    click 255 151 # C3, whose edit changes the printed formula in D3.
+    click 400 172 # E4, whose edit changes the printed formula in F4.
     key 0x25
     key 0x28
     save "$book" edited

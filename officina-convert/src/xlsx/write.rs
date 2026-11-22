@@ -665,7 +665,23 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
             esc(&mut w, &format!("{sheet}!${}${}:${}${}", officina_grid::addr::col_name(f.rect.c0), f.rect.r0 + 1, officina_grid::addr::col_name(f.rect.c1), f.rect.r1 + 1));
             w.extend_from_slice(b"</definedName>");
         }
-        for d in wb.names().iter().filter(|d| !d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase")) {
+        for s in 0..n as u16 {
+            use officina_grid::{addr::col_name, print::titles};
+            let (rows, cols) = titles(wb, s);
+            if rows.is_none() && cols.is_none() { continue; }
+            let sheet = crate::ods::formula::sheet_a1(&wb.sheet_name(s));
+            let mut refs = Vec::new();
+            if let Some((a, b)) = rows {
+                refs.push(format!("{sheet}!${}:${b}", a + 1));
+            }
+            if let Some((a, b)) = cols {
+                refs.push(format!("{sheet}!${}:${}", col_name(a), col_name(b - 1)));
+            }
+            let _ = write!(w, r#"<definedName name="_xlnm.Print_Titles" localSheetId="{s}">"#);
+            esc(&mut w, &refs.join(","));
+            w.extend_from_slice(b"</definedName>");
+        }
+        for d in wb.names().iter().filter(|d| !d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase") && !officina_grid::print::is_title_name(&d.name)) {
             w.extend_from_slice(b"<definedName name=\"");
             esc(&mut w, &d.name);
             w.push(b'"');
