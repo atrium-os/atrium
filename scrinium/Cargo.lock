@@ -1331,6 +1331,7 @@ dependencies = [
  "officina-pdf",
  "pergola",
  "portcullis-ipc",
+ "serde",
  "serde_json",
 ]
 

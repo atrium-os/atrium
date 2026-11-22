@@ -23,6 +23,7 @@ struct Grant {
     revision: Revision,
     history: VecDeque<Arc<File>>,
     history_anchor: Option<(i64, i64)>,
+    bookmark_scope: Option<crate::bookmarks::Scope>,
 }
 
 struct Revision {
@@ -115,15 +116,6 @@ fn check_name(folder: &File, name: &CStr, file: &File) -> io::Result<()> {
 }
 
 pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if flags & libc::O_ACCMODE != libc::O_RDWR {
-        return Err(io::Error::other(
-            "A workbook save grant requires a writable file",
-        ));
-    }
     let folder = File::open(
         path.parent()
             .ok_or_else(|| io::Error::other("missing parent folder"))?,
@@ -133,6 +125,23 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
             .ok_or_else(|| io::Error::other("missing workbook name"))?
             .as_encoded_bytes(),
     )?;
+    let scope = crate::bookmarks::scope(path, file).unwrap_or_else(|err| {
+        eprintln!("scrinium: could not scope workbook bookmark: {err}");
+        None
+    });
+    grant_at(folder, name, file, scope.map(|(scope, _)| scope))
+}
+
+pub(crate) fn grant_at(folder: File, name: CString, file: &File, bookmark_scope: Option<crate::bookmarks::Scope>) -> io::Result<Token> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDWR {
+        return Err(io::Error::other(
+            "A workbook save grant requires a writable file",
+        ));
+    }
     check_name(&folder, &name, file)?;
     let value = Grant {
         folder,
@@ -141,6 +150,7 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
         revision: Revision::capture(file)?,
         history: VecDeque::new(),
         history_anchor: None,
+        bookmark_scope,
     };
     let token = crate::fs::random_token()?;
     let mut grants = GRANTS.get_or_init(Default::default).lock().unwrap();
@@ -308,6 +318,13 @@ fn commit_with(
     grant.revision = revision;
     grant.file.sync_all()?;
     grant.folder.sync_all()?;
+    if let Some(scope) = &grant.bookmark_scope {
+        let result = previous.metadata().and_then(|metadata| crate::bookmarks::Identity::of(&metadata))
+            .and_then(|previous| crate::bookmarks::saved(scope, previous, &grant.file, &grant.folder, &grant.name));
+        if let Err(err) = result {
+            eprintln!("scrinium: could not advance workbook bookmark after save: {err}");
+        }
+    }
     if retain {
         grant.history_anchor = grant.file.metadata().ok().map(|metadata| ctime(&metadata));
         if grant.history.len() == MAX_HISTORY {

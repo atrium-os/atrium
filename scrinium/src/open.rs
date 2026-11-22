@@ -45,9 +45,39 @@ pub fn open_workbook(parent: u32, mime: &str, name: &str, write: bool, token: [u
     open_file("org.atrium.sheets", mime, name, write, false, token, file, Some(parent), Some(path))
 }
 
+pub fn reopen_workbook(parent: u32, name: &str, activation: [u8; 16], pick: &crate::bookmarks::Pick) -> Result<String, String> {
+    let mime = workbook_mime(name, &pick.file)?;
+    let write = pick.write && mime != "application/vnd.ms-excel";
+    let commit = if write {
+        Some(crate::workbook::grant_at(pick.folder.try_clone().map_err(|err| err.to_string())?, pick.name.clone(), &pick.file, Some(pick.scope.clone())).map_err(|err| err.to_string())?)
+    } else { None };
+    launch_file("org.atrium.sheets", mime, name, write, false, activation, &pick.file, Some(parent), commit)
+}
+
+pub fn workbook_mime(name: &str, file: &std::fs::File) -> Result<&'static str, String> {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0; atrium_types::HEAD];
+    let n = file.read_at(&mut head, 0).map_err(|err| err.to_string())?;
+    let detected = atrium_types::detect(name, &head[..n]);
+    let ty = detected.known().ok_or_else(|| detected.question().unwrap_or_else(|| "Unknown workbook format".into()))?;
+    Ok(if ty.mime == "text/plain" { "text/csv" } else { ty.mime })
+}
+
 fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, path: Option<&std::path::Path>) -> Result<String, String> {
-    let mut s = connect()?;
     let workbook_commit = if write && app == "org.atrium.sheets" { Some(crate::workbook::grant(path.ok_or("Missing workbook path")?, file).map_err(|e| e.to_string())?) } else { None };
+    let result = launch_file(app, mime, name, write, always, token, file, workbook_picker, workbook_commit)?;
+    if app == "org.atrium.sheets" {
+        if let Some(path) = path {
+            if let Err(err) = crate::bookmarks::remember_path(path, file, name) {
+                eprintln!("scrinium: could not remember workbook: {err}");
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn launch_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, workbook_commit: Option<[u8; 16]>) -> Result<String, String> {
+    let mut s = connect()?;
     let req = Request::OpenFile { app: app.into(), mime: mime.into(), name: name.into(), write, activation: token, always, workbook_picker, workbook_commit };
     match round_trip(&mut s, &req).map_err(|e| e.to_string())? {
         Response::ReadyForFds => {}
@@ -59,6 +89,24 @@ fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token
         Response::Opened { app, .. } => Ok(app),
         Response::Error { message } => Err(message),
         r => Err(format!("an odd answer: {r:?}")),
+    }
+}
+
+pub fn workbook_bookmark(
+    file: &std::fs::File,
+    expected: Option<portcullis_ipc::WorkbookBookmark>,
+) -> Result<Option<portcullis_ipc::WorkbookBookmark>, String> {
+    let mut socket = connect()?;
+    match round_trip(&mut socket, &Request::WorkbookBookmark { expected }).map_err(|e| e.to_string())? {
+        Response::ReadyForFds => {}
+        Response::Error { message } => return Err(message),
+        _ => return Err("Unexpected workbook bookmark reply".into()),
+    }
+    send_fds(&socket, &[file.as_raw_fd()]).map_err(|e| e.to_string())?;
+    match portcullis_ipc::read_response(&mut socket).map_err(|e| e.to_string())? {
+        Response::WorkbookBookmark { bookmark } => Ok(bookmark),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected workbook bookmark reply".into()),
     }
 }
 

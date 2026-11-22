@@ -84,6 +84,20 @@ pub const VPN_PERSONA: &str = "vpn";
 /// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
 pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 
+/// A live file handle plus its persistent backing filesystem identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkbookBookmark {
+    pub volume: BookmarkVolume,
+    pub length: u16,
+    pub fid: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BookmarkVolume {
+    Tessera([u8; 16]),
+    Ufs([u8; 8]),
+}
+
 /// A broker-owned pending generation and its current display name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingWorkbook {
@@ -416,6 +430,9 @@ pub enum Request {
     /// Scrinium supplies the current workbook and an already-held predecessor.
     /// With a generation, the reply carries one read-only historical file.
     WorkbookVersion { generation: Option<u64> },
+
+    /// Issue or check a native bookmark against one held workbook descriptor.
+    WorkbookBookmark { expected: Option<WorkbookBookmark> },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with
@@ -1007,6 +1024,7 @@ pub enum Response {
     Opened { app: String, name: String },
     /// Retained generation for the supplied workbook revision, if available.
     WorkbookVersion { generation: Option<u64> },
+    WorkbookBookmark { bookmark: Option<WorkbookBookmark> },
     PendingWorkbooks { books: Vec<PendingWorkbook> },
     /// A download saved: the name it has, and its folder in words
     /// ("Downloads", "Work's Downloads").

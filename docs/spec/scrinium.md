@@ -323,37 +323,38 @@ or pick files"), because a folder mount would need the app to hold the
 group for as long as it runs. Folder picks from home get their own
 decision later.
 
-**Bookmarks (for O5h and "open recent").** A bookmark is an Arca-sealed
-token naming (person, app id, file handle). The file handle is FreeBSD's
-`fhandle_t` (the file system id and the file's inode and generation), which
-is the file identity officina.md §4.3 asked for: a moved file is the same
-file, a copy is a different one, and a deleted and reused inode doesn't
-match. Only root can open by handle and only root can see the generation,
-so:
+**Bookmarks (O5h).** Scrinium keeps up to eight Sheets bookmarks in its
+private per-person app state. The picker lists the display names and uses
+opaque row IDs internally. Each record holds the filesystem identity,
+native file handle, and a relative name hint. Personal home exports are
+eligible. Persona folders, removable and network media, and files with
+multiple hard links are outside this first implementation.
 
-1. Scrinium, when it hands over a file, asks dispensatord for a bookmark;
-   dispensatord takes the handle (`getfh(2)` on the path in
-   Scrinium's grant), seals {uid, app id, handle, time} with Arca and
-   returns it. The app keeps it (Officina keeps them in its recent list).
-2. To open it, the app gives the token to Scrinium's picker channel with
-   no sheet shown; Scrinium passes it to dispensatord, which unseals it,
-   checks the app id and person match the caller, `fhopen`s it, checks the
-   file is still a regular file under one of the person's home folders
-   (owner and group as above), narrows the descriptor and sends it back
-   through `EMIT_FD`. Missing, moved out of the home folders, or not the
-   person's: "The file is no longer there."
-3. Bookmarks for files on sticks are not issued in v1 (msdosfs handles
-   are not stable across remounts).
+1. Scrinium opens the workbook within its existing home-folder grant.
+   Portcullis accepts the descriptor from Scrinium, verifies the backing
+   vnode through any nullfs layers, and issues a native file handle with
+   `getfh(2)`. It checks the handle through `fhopen(2)` against the selected
+   descriptor. UFS supplies its persistent filesystem ID. Tessera supplies
+   its volume UUID alongside the native vnode identifier.
+2. On selection, Scrinium walks the relative name hint with no symlink
+   traversal. When the hint is stale it looks for the inode within its
+   current home exports, bounded to 16,384 entries and 32 directory
+   levels. Portcullis checks the candidate’s native handle and opens it by
+   handle. The file sent to Sheets is the descriptor Scrinium opened
+   within its existing scope. A matching name, timestamp, or content
+   alone cannot redeem a bookmark.
+3. A successful Scrinium Save advances an existing bookmark to the
+   verified published inode. Save As records a separate workbook. A
+   missing or replaced workbook is reported by name in the picker.
 
-**Build steps.** H1 the group, folders and `home-files` (portcullisd,
-atrium-session, Scrinium's places list); H2 the picker over home (files
-only); H3 bookmarks (dispensatord `BOOKMARK` and `REDEEM`, Arca sealing,
-`limen::picker` messages); gate: `vm-scrinium-check.sh` grows home checks,
-and a bookmark survives a rename and is refused after a copy-and-delete.
+H1 and H2 provide the home exports and descriptor picker. H3 now uses
+Scrinium’s application sandbox for bookmark storage and Portcullis for
+native identity checks. The Sheets restart gate covers a move, a
+byte-identical replacement, and Save through the refreshed grant.
 
 | | decision | recommendation |
 |---|---|---|
 | H1 | how Scrinium may touch the person's files | A, a per-person files group given by the restricted capability `home-files` |
 | H2 | folder picks from home | not in v1; files only |
-| H3 | bookmark identity | `fhandle_t` through dispensatord, sealed by Arca; home folders only |
+| H3 | bookmark identity | FreeBSD file handles through Portcullis, stored privately by Scrinium for personal home folders |
 

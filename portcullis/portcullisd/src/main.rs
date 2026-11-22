@@ -742,7 +742,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * Catalog is: only the session's file manager, by its installed
          * manifest. OpenFile also takes a descriptor, so it needs the
          * connection itself. */
-        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. }) {
+        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. }) {
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
             continue;
         }
@@ -1552,6 +1552,26 @@ fn handle_open(
     }
     let declarable = |mime: &str| atrium_types::by_mime(mime).filter(|t| t.family.declarable());
     match req {
+        Request::WorkbookBookmark { expected } => {
+            if caller.as_deref() != Some("org.atrium.scrinium") {
+                return refuse(writer, "Workbook bookmarks are served by Scrinium.".into());
+            }
+            if !reader.buffer().is_empty() {
+                return refuse(writer, "protocol violation: data buffered before the descriptor".into());
+            }
+            write_response(writer, &Response::ReadyForFds)?;
+            let fds = portcullis_ipc::recv_fds(reader.get_ref(), 1)?;
+            let Ok([file]): Result<[OwnedFd; 1], _> = fds.try_into() else {
+                return refuse(writer, "expected one workbook descriptor".into());
+            };
+            if let Err(why) = opens::check(&file, false) {
+                return refuse(writer, why);
+            }
+            match portcullisd::workbook_versions::bookmark(&std::fs::File::from(file), expected.as_ref()) {
+                Ok(bookmark) => write_response(writer, &Response::WorkbookBookmark { bookmark }),
+                Err(err) => refuse(writer, format!("Workbook bookmark: {err}")),
+            }
+        }
         Request::WorkbookVersion { generation } => {
             if caller.as_deref() != Some("org.atrium.scrinium") {
                 return refuse(writer, "Workbook versions are served by Scrinium.".into());
@@ -3874,7 +3894,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

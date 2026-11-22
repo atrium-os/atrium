@@ -96,39 +96,107 @@ mod native {
             && candidate.created().ok() == before.created().ok()
     }
 
-    fn backing_path(current: &File) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    /// Follow the kernel's nullfs mount sources, checking the held
+    /// descriptor against the current name at every layer.
+    fn backing_file(current: &File) -> io::Result<Option<(libc::statfs, PathBuf, File)>> {
         let mut fs = mount(current)?;
-        let mut path = if path_field(&fs.f_fstypename)? == "tessera"
-            || path_field(&fs.f_fstypename)? == "nullfs"
-        {
-            kernel_path(current)?
-        } else {
+        if !matches!(path_field(&fs.f_fstypename)?.to_str(), Some("tessera" | "ufs" | "nullfs")) {
             return Ok(None);
-        };
+        }
+        let mut path = kernel_path(current)?;
         let expected = current.metadata()?;
-        let mut check = open_absolute(&path, false)?.metadata()?;
+        let mut file = open_absolute(&path, false)?;
+        let check = file.metadata()?;
         if !info_matches(&expected, &check) || expected.dev() != check.dev() {
             return Err(io::Error::other("workbook has moved"));
         }
         for _ in 0..MAX_MOUNT_LAYERS {
-            let kind = path_field(&fs.f_fstypename)?;
-            let root = Path::new(path_field(&fs.f_mntonname)?);
-            let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-            match kind.to_str() {
-                Some("tessera") => return Ok(Some((root.to_path_buf(), relative.to_path_buf()))),
+            match path_field(&fs.f_fstypename)?.to_str() {
+                Some("tessera" | "ufs") => return Ok(Some((fs, path, file))),
                 Some("nullfs") => {
+                    let root = Path::new(path_field(&fs.f_mntonname)?);
+                    let relative = path.strip_prefix(root).map_err(io::Error::other)?;
                     path = Path::new(path_field(&fs.f_mntfromname)?).join(relative);
-                    let lower = open_absolute(&path, false)?;
-                    check = lower.metadata()?;
-                    if !info_matches(&expected, &check) {
+                    file = open_absolute(&path, false)?;
+                    if !info_matches(&expected, &file.metadata()?) {
                         return Err(io::Error::other("workbook mount has changed"));
                     }
-                    fs = mount(&lower)?;
+                    fs = mount(&file)?;
                 }
                 _ => return Ok(None),
             }
         }
         Err(io::Error::other("too many workbook mount layers"))
+    }
+
+    fn backing_path(current: &File) -> io::Result<Option<(PathBuf, PathBuf)>> {
+        let Some((fs, path, _)) = backing_file(current)? else { return Ok(None) };
+        if path_field(&fs.f_fstypename)? != "tessera" { return Ok(None); }
+        let root = PathBuf::from(path_field(&fs.f_mntonname)?);
+        let relative = path.strip_prefix(&root).map_err(io::Error::other)?.to_owned();
+        Ok(Some((root, relative)))
+    }
+
+    pub fn bookmark(
+        current: &File,
+        expected: Option<&portcullis_ipc::WorkbookBookmark>,
+    ) -> io::Result<Option<portcullis_ipc::WorkbookBookmark>> {
+        use portcullis_ipc::{BookmarkVolume, WorkbookBookmark};
+
+        let Some((fs, path, lower)) = backing_file(current)? else { return Ok(None) };
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let mut handle: libc::fhandle_t = unsafe { std::mem::zeroed() };
+        // SAFETY: this writes the FreeBSD fhandle_t record for the named file.
+        if unsafe { libc::lgetfh(path.as_ptr(), &mut handle) } != 0 {
+            let err = io::Error::last_os_error();
+            return if err.raw_os_error() == Some(libc::EOPNOTSUPP) { Ok(None) } else { Err(err) };
+        }
+        let fsid_bytes = |id: libc::fsid_t| {
+            // fsid_t consists of two initialized 32-bit ints.
+            unsafe { std::mem::transmute::<libc::fsid_t, [u8; 8]>(id) }
+        };
+        if fsid_bytes(handle.fh_fsid) != fsid_bytes(fs.f_fsid) {
+            return Ok(None);
+        }
+        let actual = lower.metadata()?;
+        if actual.nlink() != 1 {
+            return Ok(None);
+        }
+        // SAFETY: lgetfh filled the native handle. Reopen the live vnode and
+        // compare it with the descriptor from the no-symlink traversal.
+        let raw = unsafe { libc::fhopen(&handle, libc::O_PATH | libc::O_CLOEXEC) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        let reopened = unsafe { File::from_raw_fd(raw) };
+        let check = reopened.metadata()?;
+        if !info_matches(&actual, &check) || actual.dev() != check.dev() || check.nlink() != 1 {
+            return Ok(None);
+        }
+        let volume = if path_field(&fs.f_fstypename)? == "tessera" {
+            // FreeBSD _IOR('T', 12, uint8_t[16]).
+            const VOLUME_UUID: libc::c_ulong = 0x4010_540c;
+            let mut uuid = [0u8; 16];
+            // Reopen the verified vnode so ioctl has a real file descriptor.
+            let raw = unsafe {
+                libc::openat(reopened.as_raw_fd(), c"".as_ptr(),
+                    libc::O_EMPTY_PATH | libc::O_RDONLY | libc::O_CLOEXEC)
+            };
+            if raw < 0 { return Err(io::Error::last_os_error()); }
+            let file = unsafe { File::from_raw_fd(raw) };
+            if unsafe { libc::ioctl(file.as_raw_fd(), VOLUME_UUID, uuid.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            BookmarkVolume::Tessera(uuid)
+        } else {
+            // FreeBSD UFS mount IDs are the persistent fs_id from the
+            // superblock.
+            BookmarkVolume::Ufs(fsid_bytes(fs.f_fsid))
+        };
+        let bookmark = WorkbookBookmark {
+            volume,
+            length: handle.fh_fid.fid_len,
+            fid: handle.fh_fid.fid_data.map(|byte| byte as u8),
+        };
+        Ok(expected.is_none_or(|expected| expected == &bookmark).then_some(bookmark))
     }
 
     fn same_bytes(
@@ -287,7 +355,7 @@ mod native {
 }
 
 #[cfg(target_os = "freebsd")]
-pub use native::retained;
+pub use native::{bookmark, retained};
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn retained(
@@ -295,5 +363,13 @@ pub fn retained(
     _previous: &std::fs::File,
     _generation: Option<u64>,
 ) -> std::io::Result<Option<(u64, std::fs::File)>> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn bookmark(
+    _current: &std::fs::File,
+    _expected: Option<&portcullis_ipc::WorkbookBookmark>,
+) -> std::io::Result<Option<portcullis_ipc::WorkbookBookmark>> {
     Ok(None)
 }

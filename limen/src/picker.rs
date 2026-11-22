@@ -125,6 +125,8 @@ pub enum ToChild {
     Commit([u8; 16]),
     /// Show retained versions of a workbook already granted to Sheets.
     BrowseVersions([u8; 16]),
+    /// Show the Sheets launcher’s saved workbook bookmarks.
+    RecentWorkbooks,
 }
 
 impl ToChild {

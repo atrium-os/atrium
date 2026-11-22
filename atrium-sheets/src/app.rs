@@ -46,6 +46,7 @@ pub enum Cmd {
     Open,
     RecoverWorkbook(Option<[u8; 16]>, Option<fresco_protocol::activation::Token>),
     NewWorkbook(Option<fresco_protocol::activation::Token>),
+    RecentWorkbooks,
     Save,
     SaveAs,
     /// Print the sheet through the print sheet (Ctrl+P too).
@@ -1907,6 +1908,10 @@ impl View for Sheets {
             let cmds = self.cmds.clone();
             Button::secondary("Recover…").at(x, 8.0).width(96.0).on_click(move || {
                 cmds.lock().unwrap().push(Cmd::RecoverWorkbook(None, pergola::clipboard::current_activation()));
+            }).render(ctx);
+            let cmds = self.cmds.clone();
+            Button::secondary("Recent Workbooks…").at(x + 104.0, 8.0).on_click(move || {
+                cmds.lock().unwrap().push(Cmd::RecentWorkbooks);
             }).render(ctx);
             ctx.add(Node::Text { rect: Rect::new(12.0, 54.0, w - 24.0, 22.0),
                 content: self.doc.borrow().status.clone(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });

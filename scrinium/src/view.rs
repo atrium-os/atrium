@@ -438,6 +438,33 @@ impl View for ScriniumView {
         let (w, h) = self.size.get();
         let t = ctx.theme;
         rect(ctx, 0.0, 0.0, w, h, t.bg_canvas(), 0.0);
+        if let Some(rows) = &b.recent_workbooks {
+            use pergola::widgets::Button;
+            let title = TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Semibold, color: t.text_primary() };
+            let body = TextStyle { weight: Weight::Regular, ..title.clone() };
+            ctx.add(Node::Text { rect: Rect::new(16.0, 14.0, w - 32.0, 24.0),
+                content: "Recent Workbooks".into(), style: title });
+            for (index, (id, name)) in rows.iter().enumerate() {
+                let id = *id;
+                let state = self.state.clone();
+                Button::secondary(name.clone()).at(16.0, 48.0 + 35.0 * index as f32)
+                    .width(w - 32.0).on_click(move || {
+                        with(&state, |b| b.outcome = Some(Outcome::RecentWorkbook {
+                            id, activation: pergola::clipboard::current_activation().unwrap_or_default(),
+                        }));
+                    }).render(ctx);
+            }
+            let message = b.notice.as_ref().map(|notice| notice.text.as_str())
+                .or_else(|| rows.is_empty().then_some("No recent workbooks."));
+            if let Some(message) = message {
+                ctx.add(Node::Text { rect: Rect::new(16.0, h - 80.0, w - 32.0, 24.0),
+                    content: message.into(), style: body });
+            }
+            let state = self.state.clone();
+            Button::secondary("Close").at(w - 92.0, h - 46.0).width(76.0)
+                .on_click(move || with(&state, |b| b.outcome = Some(Outcome::Cancelled))).render(ctx);
+            return;
+        }
         if let Some((name, versions)) = &b.versions {
             use pergola::widgets::Button;
             let title = TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Semibold, color: t.text_primary() };
@@ -1486,7 +1513,7 @@ impl ScriniumView {
                 (format!("“{name}” {into}"), t.text_primary())
             }
             (_, Err(e), _) => (e.clone(), t.text_tertiary()),
-            (_, Ok(Outcome::Cancelled | Outcome::WorkbookVersion { .. }), _) => (String::new(), t.text_tertiary()),
+            (_, Ok(Outcome::Cancelled | Outcome::WorkbookVersion { .. } | Outcome::RecentWorkbook { .. }), _) => (String::new(), t.text_tertiary()),
         };
         text(ctx, 16.0, foot + pick_foot_h() / 2.0, &fit(&msg, type_size::SM, Weight::Regular, w - 56.0 - gw - cw), type_size::SM, Weight::Regular, color);
     }

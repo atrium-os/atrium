@@ -69,6 +69,22 @@ Forced unmount (`umount -f`) may write `last_unmount_clean = 0` and skip step 3,
 
 `sync` and `vfs_sync` flush dirty buffers and any pending transaction batches. Tessera batches multiple inode writes into one journal transaction with a soft cap (default 32 inodes or 100 ms of dirty residence, whichever first).
 
+### 2.4 Persistent file identity through FreeBSD handles
+
+Tessera implements `VOP_VPTOFH` and `VFS_FHTOVP` for live regular files. A
+versioned 16-byte fid encodes the 32-bit inode number and the inode’s
+immutable birth time in nanoseconds. Tessera’s mutable inode revision
+counter remains available through attributes. A rename or in-place edit
+preserves the handle. An unlink, different inode incarnation, or malformed
+fid returns `ESTALE`. Historical and synthetic views do not issue these
+live handles, and key-group checks still apply.
+
+FreeBSD’s `fhandle_t` includes the current mount’s fsid. A host broker that
+persists a handle can pair the fid with the 16-byte volume UUID read using
+`TESSERA_IOC_VOLUME_UUID` on a live descriptor. The broker validates the UUID
+before using the current mount’s fsid. The ioctl requires the host’s
+`PRIV_VFS_GETFH` privilege.
+
 ## 3. Directories
 
 A directory is an inode with `mode & S_IFMT == S_IFDIR` whose `manifest_hash` points at a `DIRECTORY` manifest (tessera-fs.md §6.2).

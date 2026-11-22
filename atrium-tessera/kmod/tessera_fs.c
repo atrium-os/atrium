@@ -27,6 +27,7 @@
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/dirent.h>
+#include <sys/endian.h>
 #include <sys/extattr.h>
 #include <sys/stat.h>
 #include <sys/lockmgr.h>
@@ -10470,10 +10471,97 @@ tessera_uninit_impl(struct vfsconf *vfsp)
 	return (0);
 }
 
+/*
+ * FreeBSD file handles use the mount's fsid and this 16-byte fid. The
+ * inode's mutation counter changes on writes. The birth timestamp instead
+ * identifies the inode's incarnation and is unchanged by edits or rename.
+ * Scope these handles to live regular files. Snapshot vnodes can have
+ * the same inode number but refer to a different view.
+ */
+#define TESSERA_FID_VERSION 1
+#define TESSERA_FID_SIZE 16
+_Static_assert(TESSERA_FID_SIZE <= MAXFIDSZ, "Tessera fid fits FreeBSD");
+
+static int
+tessera_handle_inode(struct vnode *vp, tessera_inode_record_t *ino)
+{
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	uint8_t key[4];
+	int error;
+
+	if (tmp_->readonly_snapshot || tn == NULL ||
+	    tn->kind != TESSERA_NODE_REGULAR || tn->snapshot_gen != 0 ||
+	    vp->v_type != VREG)
+		return (EOPNOTSUPP);
+	error = tessera_fs_vp_keycheck(vp);
+	if (error != 0)
+		return (error);
+	encode_inode_key((uint32_t)tn->inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, ino) != TESSERA_OK ||
+	    ino->nlink == 0 || ino->inode_no != tn->inode_no)
+		return (ESTALE);
+	return (0);
+}
+
+static int
+tessera_vop_vptofh(struct vop_vptofh_args *ap)
+{
+	tessera_inode_record_t ino;
+	struct fid *fid = ap->a_fhp;
+	int error;
+
+	error = tessera_handle_inode(ap->a_vp, &ino);
+	if (error != 0)
+		return (error);
+	bzero(fid, sizeof(*fid));
+	fid->fid_len = TESSERA_FID_SIZE;
+	le32enc(fid->fid_data, TESSERA_FID_VERSION);
+	le32enc(fid->fid_data + 4, ino.inode_no);
+	le64enc(fid->fid_data + 8, ino.btime_ns);
+	return (0);
+}
+
+static int
+tessera_fhtovp(struct mount *mp, struct fid *fid, int flags,
+    struct vnode **vpp)
+{
+	tessera_inode_record_t ino;
+	struct vnode *vp;
+	uint32_t inode_no;
+	uint64_t birth;
+	int error;
+
+	*vpp = NULL;
+	if (VFSTOTESSERA(mp)->readonly_snapshot ||
+	    fid->fid_len != TESSERA_FID_SIZE || fid->fid_data0 != 0 ||
+	    le32dec(fid->fid_data) != TESSERA_FID_VERSION)
+		return (ESTALE);
+	inode_no = le32dec(fid->fid_data + 4);
+	birth = le64dec(fid->fid_data + 8);
+	if (inode_no < TESSERA_INODE_FIRST_USER)
+		return (ESTALE);
+	error = tessera_vget(mp, inode_no, 0, &vp);
+	if (error != 0)
+		return (error == ENOENT ? ESTALE : error);
+	error = tessera_handle_inode(vp, &ino);
+	if (error == EOPNOTSUPP || (error == 0 && ino.btime_ns != birth))
+		error = ESTALE;
+	if (error != 0) {
+		vput(vp);
+		return (error);
+	}
+	if ((flags & LK_TYPE_MASK) == LK_SHARED)
+		VOP_LOCK(vp, LK_DOWNGRADE);
+	*vpp = vp;
+	return (0);
+}
+
 static struct vfsops tessera_vfsops = {
 	.vfs_mount   = tessera_mount_impl,
 	.vfs_unmount = tessera_unmount_impl,
 	.vfs_root    = tessera_root_impl,
+	.vfs_fhtovp  = tessera_fhtovp,
 	.vfs_statfs  = tessera_statfs_impl,
 	.vfs_init    = tessera_init_impl,
 	.vfs_uninit  = tessera_uninit_impl,
@@ -34582,6 +34670,10 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * EROFS on a read-only mount. */
 #define TESSERA_IOC_CLEAR_RECOVERY _IO('T', 6)
 
+/* The durable volume identifier for rebinding live file handles after a
+ * remount. f_fsid remains a unique identifier of the current mount. */
+#define TESSERA_IOC_VOLUME_UUID _IOR('T', 12, uint8_t[16])
+
 /* Key groups (tessera-encryption.md §5.4, E4.2). Unjailed root only.
  *
  * TESSERA_IOC_GROUP_CREATE, on any vnode of the mount: make a key group
@@ -35119,6 +35211,17 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	 * oracle (DEDUP_POLICY), and spend the mount's time in GC or in
 	 * console output (GC, QUOTA_DUMP). Kmod audit 2026-11-07, T1.
 	 */
+	if (ap->a_command == TESSERA_IOC_VOLUME_UUID) {
+		if (jailed(ap->a_cred))
+			return (EPERM);
+		int error = priv_check_cred(ap->a_cred, PRIV_VFS_GETFH);
+		if (error != 0)
+			return (error);
+		if (tmp_->readonly_snapshot || tessera_node_is_readonly(VTOTNODE(ap->a_vp)))
+			return (EOPNOTSUPP);
+		memcpy(ap->a_data, tmp_->sb.volume_uuid, sizeof(tmp_->sb.volume_uuid));
+		return (0);
+	}
 	switch (ap->a_command) {
 	case TESSERA_IOC_QUOTA_SET:
 	case TESSERA_IOC_GC:
@@ -36055,6 +36158,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_pathconf = tessera_vop_pathconf,
 	.vop_access   = tessera_vop_access,
 	.vop_getattr  = tessera_vop_getattr,
+	.vop_vptofh  = tessera_vop_vptofh,
 	.vop_setattr  = tessera_vop_setattr,
 	.vop_lookup   = vfs_cache_lookup,
 	.vop_cachedlookup = tessera_vop_lookup,

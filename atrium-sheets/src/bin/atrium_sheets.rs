@@ -59,6 +59,7 @@ enum Asking {
     MergeBase,
     MergeIncoming,
     Versions,
+    Recent,
 }
 
 fn state_root() -> PathBuf {
@@ -664,6 +665,10 @@ fn main() {
                     run.sheets.pending_books.set(Vec::new());
                     want_picker = Some(Asking::Open);
                 }
+                Cmd::RecentWorkbooks => {
+                    run.sheets.pending_books.set(Vec::new());
+                    want_picker = Some(Asking::Recent);
+                }
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
                 Cmd::Data(atrium_sheets::data::DataCmd::BrowseVersions) => {
                     if matches!(run.target, Some(Target::Picked { .. })) {
@@ -786,6 +791,7 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
+                        Asking::Recent => Filter::file(),
                         Asking::Open => Filter { kind: Kind::Workbook, extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into(), name: String::new(), origin: String::new() },
                         Asking::Compare | Asking::MergeBase | Asking::MergeIncoming => Filter {
                             kind: Kind::File,
@@ -831,6 +837,7 @@ fn main() {
                         use std::os::fd::AsFd;
                         let message = match (&run.target, what, commit_target) {
                             (Some(Target::Picked { commit, .. }), Asking::Versions, _) => ToChild::BrowseVersions(*commit),
+                            (_, Asking::Recent, _) => ToChild::RecentWorkbooks,
                             (_, _, Some((token, _))) => ToChild::Commit(token),
                             _ => ToChild::Open(filter),
                         }.encode();

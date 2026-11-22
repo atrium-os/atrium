@@ -34,4 +34,5 @@ portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 libc = "0.2"
 # Asking the install sheet for a double-clicked .insula (opifex.md §7.4).
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 log = "0.4"

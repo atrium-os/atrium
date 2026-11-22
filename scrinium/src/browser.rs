@@ -173,6 +173,7 @@ pub enum Outcome {
     /// A workbook for a new Sheets jail, with the picker's own press.
     Workbook { name: String, path: PathBuf, write: bool, activation: [u8; 16] },
     WorkbookVersion { generation: u64, activation: [u8; 16] },
+    RecentWorkbook { id: crate::bookmarks::Id, activation: [u8; 16] },
     /// A folder of a stick to put into the app's jail: the stick's
     /// partition and the folder's path on it (`/` for all of it).
     Folder { part: String, path: String, name: String },
@@ -196,6 +197,7 @@ pub const DOUBLE_MS: f64 = 450.0;
 pub struct Browser {
     pub mode: Mode,
     pub versions: Option<(String, Vec<u64>)>,
+    pub recent_workbooks: Option<Vec<(crate::bookmarks::Id, String)>>,
     pub places: Vec<Place>,
     /// Index into `places`.
     pub at: Option<usize>,
@@ -420,6 +422,7 @@ impl Browser {
         Self {
             mode,
             versions: None,
+            recent_workbooks: None,
             places: Vec::new(),
             at: None,
             path: Vec::new(),

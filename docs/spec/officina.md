@@ -34,9 +34,9 @@ decoding), [fresco-scene-groups.md](fresco-scene-groups.md), [insula.md](insula.
   no files, capped memory and time, which emits Officina's own model as bounded, validated
   messages (the Navigator converter's pattern). Macros, OLE objects, DDE and external links
   never run; they are reported, and kept inert only where round-tripping needs them.
-- **Files come from Scrinium.** Open is the picker's descriptor; Save As needs a new picker
-  mode that creates a file and replaces it atomically (§4). Home folders and "recent files"
-  depend on Scrinium work not yet built.
+- **Files come from Scrinium.** Open gives the app a descriptor, and Save As
+  publishes an atomic copy. The Sheets launcher reopens files in personal
+  home folders through Scrinium bookmarks (§4).
 - **Drawing is Pergola and Fresco, no private toolkit.** Text is shaped in-app into glyph
   runs; pages, slides and sheet tiles are scene groups; scrolling is `ScrollView`'s
   shift-and-strip; charts and shapes are `Canvas` fills. New Pergola widgets come out of
@@ -229,15 +229,18 @@ in native filesystem generations under the volume’s retention policy
 
 ### 4.3 Recent files and reopening
 
-Reopening a file after a restart needs a grant that outlives the process, which Atrium has
-no notion of yet (scrinium.md §8 "always allow"). Scrinium issues a **bookmark**, an
-Arca-sealed token naming (user, app id, file identity) that only Scrinium can redeem,
-re-checking that the file still exists and the user still owns it. File identity is
-(volume id, file id, generation), so a copied file is a different file: the bookmark says
-the original is gone rather than opening the copy. The launcher keeps bookmarks, never paths
-or descriptors. Agreed with the Scrinium thread 2026-11-14; needs Scrinium to hold the
-user's home folders first (scrinium.md §8). Until then, recent files work only within a
-session.
+The Sheets launcher’s **Recent Workbooks** button opens a Scrinium picker
+with up to eight personal workbooks. Opening a workbook or publishing it
+with Save As records a bookmark when the file is in a supported home
+folder. Ordinary Save advances that bookmark to the file Scrinium just
+published. Scrinium keeps the bookmarks in its private per-person app
+state across restarts (scrinium.md §9).
+
+Selecting a row rechecks the file’s native handle and opens a fresh
+document jail with a new grant. A rename within the accessible home
+folders preserves the bookmark on the same filesystem. Deleting the file
+and putting a copy at the same name leaves the bookmark unavailable.
+Sheets receives the chosen file’s displayed name and descriptor.
 
 ### 4.4 Autosave, recovery and versions
 
@@ -826,7 +829,7 @@ use as test data, and a set Shankar provides of real files he cares about.
 | **O2** | `GridView` + 2D ScrollView + frescod two-axis shift; `atrium-sheets` with CSV open/save, picker open and Save As (§4.2), autosave journal | scroll gates on a 1 M-row sheet on frescod; crash-recovery test |
 | **O3** | `RichTextEditor` (flowing mode first, then paged), `officina-text` paged layout, `atrium-write` with `.odt`/`.docx` converters, PDF export | round-trip gate for text; keystroke-latency gate on a 500-page document; the large-document gates of §15 on a generated 1,500-page document and ECMA-376 Part 1 |
 | **O4** | `.xlsx`/`.ods` converters, styles, number formats, charts, sort/filter, structured tables, macros kept inert | round-trip gate for sheets; 1,048,576-row `.xlsx` open target |
-| **O5** | tracked changes, comments, footnotes, TOC; pivot tables, conditional formats, dynamic arrays, `LAMBDA`; recent files via bookmarks (needs Scrinium home folders) | the corresponding corpus files |
+| **O5** | tracked changes, comments, footnotes, TOC; pivot tables, conditional formats, dynamic arrays, `LAMBDA`; recent files via Scrinium bookmarks | the corresponding corpus files |
 | **O6** | `atrium-slides`: masters, layouts, presenter view, transitions, `.pptx`/`.odp` | round-trip gate for slides; presenter view on two monitors; the large-deck gates of §9.3 |
 | **O7** | signing via Sigillum, encrypted documents, external data via Nuntius, IME-dependent scripts, legacy binary import if D8 says yes | per feature |
 
@@ -1597,7 +1600,7 @@ hundreds of each) and LibreOffice both ways:
 | O5e | floating pictures with wrap (square, top and bottom, behind, in front) | LibreOffice both ways; layout tests |
 | O5f | sheets: conditional formats, dynamic arrays and spill, `LET`, `LAMBDA` | Excel-result differential cases, as O1's |
 | O5g | sheets: pivot tables (model, refresh, `.xlsx`/`.ods`) | LibreOffice both ways |
-| O5h | recent files via bookmarks, once Scrinium has home folders | — |
+| O5h | recent files via Scrinium bookmarks | Tessera and UFS desktop restart gates |
 
 **O5a design.** A note's anchor is U+FFFC with a `note` attribute naming an entry of
 the document's note store, so the anchor is one character to the caret, find and the
