@@ -461,8 +461,14 @@ and a second submission. For this fixture the broker fetches the named script
 through the profile courier, checks MIME, status, final URL and size, and
 seals it with the HTML. Ladybird's proposed URL-encoded POST goes to the
 trusted window for confirmation. Host fixture controls and framing tests
-passed. Installed script execution, SSO and tunnel traffic for this variant
-await the Tessera run.
+passed. On 2026-11-22 the installed JIT-off Ladybird page initially offered
+zero plain forms. Clicking Continue on the page produced the trusted form.
+Confirming it sent a 38-byte POST that the gateway accepted. Arca held the
+typed Keycloak password, the gateway accepted the signed SAML response,
+and Crypta redeemed the token. The arm64 Tessera guest recorded
+`handshake=1` and routed `10.98.0.1` through `tun0`. Its HTTP GET
+returned exactly `crypta-ac-ok`. Both VMs shut down cleanly. Redacted logs
+and binary hashes are in `~/atrium-vm/evidence/navigator-i3-vpn-external-js-20261122/`.
 
 ### I3 installed passkey sign-in
 
