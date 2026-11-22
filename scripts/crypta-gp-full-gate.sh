@@ -701,28 +701,31 @@ check_rebound_hip_refresh() {
     ok "rebound ESP refreshed the approved report without prompting"
     probe "$3"
 }
-check_final_reconnect_rebind() {
-    rebind_restored_forwarding 21 "$rebound_report" final-reconnect-rebind
-    check_rebound_hip_refresh "$rebound_report" "$reviews" "IPv4 echo after unchanged HIP refresh on final ESP"
-
+approve_restored_forwarding_on_rebound() {
     before_restore=$(awk 'END { print NR }' "$receipts")
     "$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null
     wait_prompt gp_hip_approval
     printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
         grep -q "$(hex "IPv6 forwarding  ${initial_report%% *}")" ||
-        fail "final rebound review omitted restored forwarding"
-    [ "$(hip_choice)" != "$approval_choice" ] || fail "final rebound reused the prior approval choice"
+        fail "rebound review omitted restored forwarding"
+    [ "$(hip_choice)" != "$approval_choice" ] || fail "rebound reused the prior approval choice"
     if tail -n "+$((before_restore + 1))" "$receipts" | grep -q "^${initial_report%% *} "; then
-        fail "final rebound uploaded restored forwarding before approval"
+        fail "rebound uploaded restored forwarding before approval"
     fi
     before_approval=$(awk 'END { print NR }' "$receipts")
-    touch "$receipts.final-reconnect-forwarding-approved"
+    touch "$receipts.$1"
     approve_hip
     wait_receipts "$((before_approval + 1))"
     [ "$(sed -n "$((before_approval + 1))p" "$receipts")" = "$initial_report" ] ||
         fail "gateway did not receive freshly approved restored forwarding"
-    ok "restored forwarding on final ESP required fresh approval"
-    probe "IPv4 echo after fresh approval on the same final ESP association"
+    ok "restored forwarding on rebound ESP required fresh approval"
+    probe "IPv4 echo after fresh approval on the same rebound ESP association"
+}
+check_final_reconnect_rebind() {
+    rebind_restored_forwarding 21 "$rebound_report" final-reconnect-rebind
+    check_rebound_hip_refresh "$rebound_report" "$reviews" "IPv4 echo after unchanged HIP refresh on final ESP"
+
+    approve_restored_forwarding_on_rebound final-reconnect-forwarding-approved
     check_rebound_hip_refresh "$initial_report" "$((reviews + 1))" "IPv4 echo after restored forwarding refreshed silently on final ESP"
 
     reviews=$((reviews + 1))
@@ -745,6 +748,9 @@ check_final_reconnect_rebind() {
 
     reconnect_after_esp_loss_decline "$before_decline" batch-reconnect-approved
     finish_hip_reconnect "$rebound_report" batch-reconnect-ack
+    rebind_restored_forwarding 23 "$rebound_report" batch-reconnect-rebind
+    check_rebound_hip_refresh "$rebound_report" "$reviews" "IPv4 echo after silent refresh on the rebound reconnect association"
+    approve_restored_forwarding_on_rebound batch-rebound-forwarding-approved
 }
 restore_forwarding_and_rebind() {
     before_restore=$(awk 'END { print NR }' "$receipts")
