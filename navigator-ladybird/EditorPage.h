@@ -7,6 +7,9 @@
 #endif
 
 struct NavigatorScene;
+#ifdef ATRIUM_MAIL_PAGE
+extern "C" bool navigator_vpn_script_submit(u8 const*, size_t);
+#endif
 
 namespace Navigator {
 
@@ -24,6 +27,16 @@ public:
     bool navigation_refused { false };
     void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget target, URL::URL const& url, Utf16String, Optional<Web::HTML::NavigationStartRequest> request) override
     {
+#ifdef ATRIUM_MAIL_PAGE
+        if (target == Web::NavigationTarget::TopLevel && request.has_value() && request->url == url
+            && url.serialize() == "https://sso.crypta.test:447/+CSCOE+/saml/sp/continue"sv
+            && request->initiator_origin == url.origin() && request->document_resource.has<Web::HTML::POSTResource>()) {
+            auto const& post = request->document_resource.get<Web::HTML::POSTResource>();
+            if (post.request_content_type == Web::HTML::POSTResource::RequestContentType::ApplicationXWWWFormUrlencoded
+                && post.request_body.has_value() && navigator_vpn_script_submit(post.request_body->data(), post.request_body->size()))
+                return;
+        }
+#endif
         if (target != Web::NavigationTarget::TopLevel || pending_navigation.has_value()
             || !request.has_value() || request->url != url || !request->document_resource.has<Empty>()
             || request->history_handling != Web::Bindings::NavigationHistoryBehavior::Replace) {

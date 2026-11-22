@@ -914,9 +914,18 @@ pub mod host {
         let Some(fd) = child.take_fd() else { return std::ptr::null_mut() };
         let file = std::fs::File::from(fd);
         let mut bytes = Vec::new();
-        if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
-            || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 { return std::ptr::null_mut(); }
+        let bound = if vpn { (2 << 20) + 65536 + 16 } else { 2 << 20 };
+        if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(bound as u64 + 1).read_to_end(&mut bytes).is_err()
+            || bytes.is_empty() || bytes.len() > bound { return std::ptr::null_mut(); }
+        if vpn {
+            let Some(doc) = limen::sign_in::VpnDocument::decode(&bytes) else { return std::ptr::null_mut() };
+            VPN_SCRIPT.with(|s| s.replace(doc.script.to_vec()));
+            bytes = doc.html.to_vec();
+        }
         let child = std::rc::Rc::new(std::cell::RefCell::new(child));
+        if vpn && VPN_SCRIPT.with_borrow(|s| !s.is_empty()) {
+            VPN_FORM_CHANNEL.with(|s| s.replace(Some((child.clone(), embed))));
+        }
         if !vpn { RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed)))); }
         let state = Box::new(SceneState { embed: Some((child, embed, surface)), vpn_page: vpn, mail_document: Some((location, bytes)), ..Default::default() });
         let (location, bytes) = state.mail_document.as_ref().unwrap();
@@ -961,6 +970,31 @@ pub mod host {
                 _ => break,
             }
         }
+    }
+
+    thread_local! { static VPN_SCRIPT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+    thread_local! { static VPN_FORM_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
+
+    /// A script-initiated fixture POST still needs a press on the trusted
+    /// window. Only the expected, non-secret form field goes to that window.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_vpn_script_submit(body: *const u8, len: usize) -> bool {
+        use limen::doc_viewer::{Field, FieldKind, Form, ToParent};
+        if body.is_null() || len != b"proof=".len() + 32 { return false; }
+        let Some(value) = (unsafe { std::slice::from_raw_parts(body, len) }).strip_prefix(b"proof=") else { return false };
+        if !value.iter().all(u8::is_ascii_hexdigit) { return false; }
+        let form = Form {
+            action: "/+CSCOE+/saml/sp/continue".into(),
+            post: true,
+            fields: vec![
+                Field { kind: FieldKind::Text, name: "proof".into(), label: "Sign-in code".into(), value: String::from_utf8_lossy(value).into_owned(), checked: false },
+                Field { kind: FieldKind::Submit, name: String::new(), label: "Continue to sign-in".into(), value: String::new(), checked: false },
+            ],
+        };
+        VPN_FORM_CHANNEL.with_borrow(|binding| binding.as_ref().is_some_and(|(child, embed)| {
+            child.borrow_mut().emit(*embed, ToParent::Forms { forms: vec![form] }.encode()).is_ok()
+        }))
     }
 
     type ResourceChannel = (std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64);
@@ -1067,6 +1101,13 @@ pub mod host {
         use std::io::Read;
         let bytes = unsafe { std::slice::from_raw_parts(url, len) };
         if len > 512 || cap > 65536 { return 0; }
+        if bytes == limen::sign_in::VPN_JS_URL.as_bytes() {
+            return VPN_SCRIPT.with_borrow(|script| {
+                if script.len() > cap { return 0; }
+                unsafe { std::ptr::copy_nonoverlapping(script.as_ptr(), out, script.len()) };
+                script.len()
+            });
+        }
         RESOURCE_CHANNEL.with(|slot| {
             let binding = slot.borrow();
             let (child, id) = binding.as_ref()?;

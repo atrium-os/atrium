@@ -453,6 +453,17 @@ assertion and redemption opened `tun3` and returned the same sentinel.
 The local gateway exercised the replay in memory. Evidence is in
 `~/atrium-vm/evidence/navigator-i3-vpn-installed-20261122/`.
 
+The optional external-script gateway fixture (`CRYPTA_SSO_EXTERNAL_JS=1`)
+adds a page before the Keycloak redirect. Its Continue button runs an
+external same-origin script that fills a per-session value and calls
+`requestSubmit()`. The gateway refuses an empty POST, a different session
+and a second submission. For this fixture the broker fetches the named script
+through the profile courier, checks MIME, status, final URL and size, and
+seals it with the HTML. Ladybird's proposed URL-encoded POST goes to the
+trusted window for confirmation. Host fixture controls and framing tests
+passed. Installed script execution, SSO and tunnel traffic for this variant
+await the Tessera run.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

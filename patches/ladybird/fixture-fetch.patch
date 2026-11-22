@@ -26,7 +26,7 @@
 +            auto body = buffer.release_value();
 +            StringView mime = "text/html"sv;
 +            size_t length = 0;
-+            bool script = name == "https://inbox.example/inbox.js"sv || name == "https://login.microsoftonline.com/atrium-fixture/account.js"sv;
++            bool script = name == "https://sso.crypta.test:447/+CSCOE+/saml/sp/continue.js"sv || name == "https://inbox.example/inbox.js"sv || name == "https://login.microsoftonline.com/atrium-fixture/account.js"sv;
 +            bool stylesheet = name == "https://inbox.example/inbox.css"sv || name == "https://login.microsoftonline.com/atrium-fixture/account.css"sv;
 +            bool json = name == "https://inbox.example/api/inbox"sv || name == "https://login.microsoftonline.com/atrium-fixture/continue"sv;
 +            if (script || stylesheet || (json && request.include_credentials() == HTTP::Cookie::IncludeCredentials::Yes)) {

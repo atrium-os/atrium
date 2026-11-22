@@ -36,6 +36,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vpn_document_bounds_both_bodies_and_consumes_the_frame() {
+        let doc = VpnDocument { html: b"<title>Sign in</title>", script: b"document.forms[0].requestSubmit()" };
+        let mut wire = doc.encode().unwrap();
+        assert_eq!(VpnDocument::decode(&wire).unwrap().script, doc.script);
+        assert!(VpnDocument::decode(&wire[..wire.len() - 1]).is_none());
+        wire.push(0);
+        assert!(VpnDocument::decode(&wire).is_none());
+        let too_large = vec![0; 65537];
+        let oversized = VpnDocument { script: &too_large, ..doc };
+        assert!(VpnDocument::decode(&oversized.encode().unwrap()).is_none());
+    }
+
+    #[test]
     fn rejects_incomplete_extended_and_oversized_frames() {
         let request = CredentialMessage::Get {
             id: 4,
@@ -49,5 +62,26 @@ mod tests {
         wire.resize(crate::catalogue::MAX_MESSAGE + 1, 0);
         assert!(decode(&wire).is_none());
         assert!(decode(b"https://login.microsoftonline.com/first").is_none());
+    }
+}
+
+/// The VPN fixture's script is fetched through the current profile's courier.
+/// The sealed file contains both responses, with no URL authority for the worker.
+pub const VPN_JS_LOGIN: &str = "https://sso.crypta.test:447/+CSCOE+/saml/sp/login";
+pub const VPN_JS_PATH: &str = "/+CSCOE+/saml/sp/continue.js";
+pub const VPN_JS_URL: &str = "https://sso.crypta.test:447/+CSCOE+/saml/sp/continue.js";
+
+#[derive(Serialize, Deserialize)]
+pub struct VpnDocument<'a> {
+    pub html: &'a [u8],
+    pub script: &'a [u8],
+}
+
+impl VpnDocument<'_> {
+    pub fn encode(&self) -> Result<Vec<u8>, postcard::Error> { postcard::to_stdvec(self) }
+
+    pub fn decode(bytes: &[u8]) -> Option<VpnDocument<'_>> {
+        let (doc, rest) = postcard::take_from_bytes::<VpnDocument>(bytes).ok()?;
+        (rest.is_empty() && !doc.html.is_empty() && doc.html.len() <= 2 << 20 && doc.script.len() <= 65536).then_some(doc)
     }
 }

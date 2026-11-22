@@ -709,19 +709,17 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
         Reply::Err(e) if navigator_cookies::site_needs_cookies(&hops) => return Ok(Got::NeedsCookies(e)),
         Reply::Err(e) => return Err(e),
     };
-    let vpn_document = if cfg.vpn.is_some() && !cfg.unconfined {
-        if doc.is_empty() || doc.len() > 2 * 1024 * 1024 {
-            return Err("VPN sign-in document outside the worker size bound".into());
-        }
-        Some(Arc::new(doc.clone()))
-    } else { None };
+    let vpn_worker = cfg.vpn.is_some() && !cfg.unconfined;
+    if vpn_worker && (doc.is_empty() || doc.len() > 2 * 1024 * 1024) {
+        return Err("VPN sign-in document outside the worker size bound".into());
+    }
     if let Some((what, ext)) = files::kind(&doc) {
         return Ok(Got::File { url: base, what, ext, body: doc });
     }
     // ★ A cookied view's scripts start with its script-readable cookies
     // (legacy-web §5.4.1e step 6); what they write stays in the converter.
-    let script_cookies = match jar {
-        Some((c, view)) => match c.lock().unwrap().script_cookies(view, &base) {
+    let script_cookies = match &jar {
+        Some((c, view)) => match c.lock().unwrap().script_cookies(*view, &base) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("navigatord: no document.cookie for {base}: {e:?}");
@@ -815,6 +813,24 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
     if recording.len() as u64 > ctl::RECORDING_MAX {
         return Err("the recording is over its bound".into());
     }
+    let vpn_document = if vpn_worker {
+        use limen::sign_in::{VpnDocument, VPN_JS_LOGIN, VPN_JS_PATH, VPN_JS_URL};
+        let mut script = Vec::new();
+        let declared = navigator_backend::links::attr_spelling("src", VPN_JS_PATH);
+        if base.split('?').next() == Some(VPN_JS_LOGIN) && recording.windows(declared.len()).any(|w| w == declared) {
+            let (broker, view) = jar.as_ref().ok_or("missing VPN profile jar")?;
+            let ask = Fetch::subresource(VPN_JS_URL, "sso.crypta.test");
+            let r = broker.lock().unwrap().fetch_once(*view, &ask).map_err(|e| format!("VPN script: {e:?}"))?;
+            let mut types = r.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+            let javascript = types.next().is_some_and(|(_, v)| v.split(';').next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/javascript"))) && types.next().is_none();
+            if r.status != 200 || r.url != VPN_JS_URL || r.redirects != 0 || !javascript || r.body.is_empty() || r.body.len() > 65536 {
+                return Err("unexpected VPN script response".into());
+            }
+            script = r.body;
+        }
+        Some(Arc::new(VpnDocument { html: &doc, script: &script }.encode().map_err(|e| e.to_string())?))
+    } else { None };
     let insecure = base.starts_with("http:");
     let consents = consents_of(&o.report);
     Ok(Got::Page(Page { vpn_document, title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images), consents: Arc::new(consents) }))

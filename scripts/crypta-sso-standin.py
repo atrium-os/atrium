@@ -31,6 +31,7 @@ counts as JSON (from 127.0.0.1 only).
 import base64
 import datetime
 import json
+from http.cookies import CookieError, SimpleCookie
 import os
 import re
 import secrets
@@ -103,6 +104,66 @@ def respond(f, status, headers=(), body=b"", ctype="text/html; charset=utf-8"):
 def config_auth(inner, typ="auth-request"):
     return (f'<?xml version="1.0" encoding="UTF-8"?>\n<config-auth client="vpn" type="{typ}" aggregate-auth-version="2">'
             f"{inner}</config-auth>").encode()
+
+
+# Optional installed Navigator gate. Each login gets a distinct proof solely
+# through a same-origin script. Static HTML submission cannot reach the IdP.
+JS_GATE = os.environ.get("CRYPTA_SSO_EXTERNAL_JS") == "1"
+JS_PATH = "/+CSCOE+/saml/sp/continue.js"
+POST_PATH = "/+CSCOE+/saml/sp/continue"
+JS_COOKIE = "atriumScriptFlow"
+js_flows = {}
+
+
+def js_login(f):
+    sid, proof = secrets.token_hex(16), secrets.token_hex(16)
+    now = time.monotonic()
+    with lock:
+        expired = [k for k, (_, deadline) in js_flows.items() if deadline <= now]
+        for k in expired:
+            del js_flows[k]
+        full = len(js_flows) >= 128
+        if not full:
+            js_flows[sid] = (proof, now + 120)
+    if full:
+        respond(f, "503 Service Unavailable")
+        return
+    html = (f'<!doctype html><title>VPN sign-in</title><form method="post" action="{POST_PATH}">'
+            '<input type="hidden" name="proof"><button type="button" id="proceed">Continue to sign-in</button>'
+            f'</form><script src="{JS_PATH}"></script>')
+    respond(f, "200 OK", [("Cache-Control", "no-store"),
+            ("Set-Cookie", f"{JS_COOKIE}={sid}; HttpOnly; Secure; Path=/; SameSite=Strict")], html.encode())
+
+
+def js_continue(f, method, path, headers, body):
+    cookies = SimpleCookie()
+    try:
+        cookies.load(headers.get("cookie", ""))
+    except CookieError:
+        respond(f, "403 Forbidden")
+        return
+    cookie = cookies.get(JS_COOKIE)
+    sid = cookie.value if cookie else ""
+    with lock:
+        flow = js_flows.get(sid)
+        active = flow is not None and flow[1] > time.monotonic()
+        if active and method == "POST" and path == POST_PATH:
+            active = body == urllib.parse.urlencode({"proof": flow[0]}).encode()
+            if active:
+                del js_flows[sid]
+    if not active:
+        respond(f, "403 Forbidden")
+    elif method == "GET" and path == JS_PATH:
+        script = ("document.getElementById('proceed').addEventListener('click', () => {"
+                  "const form = document.forms[0]; form.elements.proof.value = "
+                  + json.dumps(flow[0]) + "; form.requestSubmit(); });")
+        respond(f, "200 OK", [("Cache-Control", "no-store")], script.encode(), "text/javascript")
+        log("external sign-in script delivered")
+    elif method == "POST" and path == POST_PATH:
+        respond(f, "303 See Other", [("Location", authn_request())])
+        log("external sign-in form accepted")
+    else:
+        respond(f, "405 Method Not Allowed")
 
 
 def sso_request():
@@ -302,7 +363,13 @@ def serve(sock, peer):
                     continue
             if method == "GET" and path == "/+CSCOE+/saml/sp/login":
                 bump("sso_login")
-                respond(f, "302 Found", [("Location", authn_request())])
+                if JS_GATE:
+                    js_login(f)
+                else:
+                    respond(f, "302 Found", [("Location", authn_request())])
+                continue
+            if JS_GATE and path in (JS_PATH, POST_PATH):
+                js_continue(f, method, path, headers, body)
                 continue
             if method == "POST" and path == "/+CSCOE+/saml/sp/acs":
                 form = urllib.parse.parse_qs(body.decode())
