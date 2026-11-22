@@ -129,7 +129,7 @@ check_served_key() {
 python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port" \
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
-    --test-pin-job "Fresh PIN after replay refusal" --test-ignore-pin-job "Printer ignored PIN" \
+    --test-pin-job "Fresh PIN after replay refusal" --test-pin-rejections \
     --test-no-send-document-flag "$D/no-send-document" --test-no-job-password-flag "$D/no-job-password" \
     --test-no-create-job-flag "$D/no-create-job" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
@@ -355,16 +355,42 @@ remote "cat '$guest/pin-fresh-jobs.log'" >"$D/pin-fresh-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" "$D/pin-fresh-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 >"$D/pin-fresh-pdf-checks.log"
 cat "$D/pin-fresh-pdf-checks.log"
 
-# A printer can allocate a job while reporting that it ignored the PIN.
-remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
-    <"$scripts/prelum-r7-pin-stage.sh" >"$D/pin-ignored-stage.log" 2>&1
-remote "sh -s -- '$guest' '$marker' fresh pin-ignored" <"$scripts/prelum-r7-identity.sh" >"$D/pin-ignored.log" 2>&1 || { cat "$D/pin-ignored.log" >&2; exit 1; }
-cat "$D/pin-ignored.log"
-remote "cat '$guest/fixture-arca/audit.log'" >"$D/pin-ignored-audit.log"
-test "$(grep -cE 'ui op=0x0068 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
-test "$(grep -c 'op=0x0011' "$D/pin-ignored-audit.log")" -eq 5
-test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$D/pin-ignored-audit.log")" -eq 4
-remote "cat '$guest/pin-ignored-jobs.log'" >"$D/pin-ignored-jobs.txt"
+# Check each response with and without a job ID, plus plain success without an ID.
+desktop_job=20
+printer_job=16
+redemption_count=4
+successful_redemptions=3
+expected_responses="$D/pin-rejection-expected.txt"
+: >"$expected_responses"
+check_pin_rejection() {
+    response=$1
+    id_mode=$2
+    desktop_job=$((desktop_job + 1))
+    redemption_count=$((redemption_count + 1))
+    successful_redemptions=$((successful_redemptions + 1))
+    proof="$D/pin-$response-$id_mode"
+    if [ "$id_mode" = with-id ]; then
+        printer_job=$((printer_job + 1))
+        printf '%s %s\n' "$response" "$printer_job" >>"$expected_responses"
+    else
+        printf '%s -\n' "$response" >>"$expected_responses"
+    fi
+    remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
+        <"$scripts/prelum-r7-pin-stage.sh" >"$proof-stage.log" 2>&1
+    remote "sh -s -- '$guest' '$marker' fresh pin-rejection '$desktop_job' '$response' '$id_mode'" \
+        <"$scripts/prelum-r7-identity.sh" >"$proof.log" 2>&1 || { cat "$proof.log" >&2; exit 1; }
+    cat "$proof.log"
+    remote "cat '$guest/fixture-arca/audit.log'" >"$proof-audit.log"
+    test "$(grep -cE 'ui op=0x0068 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
+    test "$(grep -c 'op=0x0011' "$proof-audit.log")" -eq "$redemption_count"
+    test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
+}
+for response in ignored conflicting unsupported-group unsupported-status server-busy; do
+    check_pin_rejection "$response" with-id
+    check_pin_rejection "$response" without-id
+done
+check_pin_rejection success without-id
+remote "cat '$guest/pin-success-without-id-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
-    "$D/pin-ignored-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 17 >"$D/pin-ignored-pdf-checks.log"
-cat "$D/pin-ignored-pdf-checks.log"
+    "$D/pin-rejection-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 "$expected_responses" >"$D/pin-rejection-pdf-checks.log"
+cat "$D/pin-rejection-pdf-checks.log"

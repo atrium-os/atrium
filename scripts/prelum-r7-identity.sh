@@ -18,7 +18,7 @@ case "$kind" in
   pin-no-job-password) job=18; title="PIN without job-password support"; prefix=pin-no-job-password ;;
   pin-no-create-job) job=19; title="PIN without Create-Job"; prefix=pin-no-create-job ;;
   pin-fresh) job=20; title="Fresh PIN after replay refusal"; prefix=pin-fresh ;;
-  pin-ignored) job=21; title="Printer ignored PIN"; prefix=pin-ignored ;;
+  pin-rejection) job=$5; title="PIN response $6 $7"; prefix="pin-$6-$7" ;;
   *) echo "Unknown print fixture: $kind" >&2; exit 2 ;;
 esac
 held="^ +$job +printer +1 +Held +0/0 +$title +.*alert IdentityChanged since "
@@ -74,7 +74,11 @@ case "$phase" in
   fresh)
     case "$kind" in
       pin-fresh) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
-      pin-ignored) expected="^ +$job +printer +1 +Failed +0/2 +$title +the printer did not accept the PIN job *$" ;;
+      pin-rejection)
+        reason="the printer did not accept the PIN job"
+        if [ "$6" = success ]; then reason="the printer gave no job id"; fi
+        expected="^ +$job +printer +1 +Failed +0/2 +$title +$reason *$"
+        ;;
       *) exit 2 ;;
     esac
     exec 3<pin-handle

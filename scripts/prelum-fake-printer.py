@@ -38,7 +38,7 @@ A.add_argument("--test-pin-job", action="append", default=[], help="title of a j
 A.add_argument("--test-no-job-password-flag", help="omit job-password-supported while this file exists")
 A.add_argument("--test-no-create-job-flag", help="omit Create-Job support while this file exists")
 A.add_argument("--test-no-send-document-flag", help="omit Send-Document support while this file exists")
-A.add_argument("--test-ignore-pin-job", help="title of a fixture PIN job to create with ignored attributes")
+A.add_argument("--test-pin-rejections", action="store_true", help="serve fixture PIN responses selected by job title")
 ARGS = A.parse_args()
 if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
     A.error("--tls-cert and --tls-key must be used together")
@@ -52,6 +52,17 @@ INT, BOOL, ENUM = 0x21, 0x22, 0x23
 TEXT, NAME, KEYWORD, URI, CHARSET, LANG, MIME = 0x41, 0x42, 0x44, 0x45, 0x47, 0x48, 0x49
 # Group tags.
 OPG, JOBG, ENDG, PRG, UNSUPG = 0x01, 0x02, 0x03, 0x04, 0x05
+UNSUPPORTED = 0x10
+
+PIN_RESPONSE_PREFIX = "PIN response "
+PIN_RESPONSE_STATUS = {
+    "ignored": 0x0001,
+    "conflicting": 0x0002,
+    "unsupported-group": 0x0000,
+    "unsupported-status": 0x040B,
+    "server-busy": 0x0507,
+    "success": 0x0000,
+}
 
 LOCK = threading.Lock()
 JOBS = {}  # id -> dict(state, name, done_at, impressions)
@@ -129,7 +140,7 @@ def printer_attrs(host):
                 printer_uuid = "urn:uuid:" + str(uuid.UUID(override.read().strip()))
         except FileNotFoundError:
             pass
-    pin_supported = bool(ARGS.test_pin_job or ARGS.test_ignore_pin_job)
+    pin_supported = bool(ARGS.test_pin_job or ARGS.test_pin_rejections)
     if ARGS.test_no_job_password_flag and os.path.exists(ARGS.test_no_job_password_flag):
         pin_supported = False
         print("fake printer: withholding job-password capability", flush=True)
@@ -210,26 +221,37 @@ class H(http.server.BaseHTTPRequestHandler):
             out += printer_attrs(host)
         elif op in (0x05, 0x02):
             title = (a.get("job-name") or ["?"])[0]
-            ignore_pin = title == ARGS.test_ignore_pin_job
-            pin_job = ignore_pin or title in ARGS.test_pin_job
+            rejection = ARGS.test_pin_rejections and title.startswith(PIN_RESPONSE_PREFIX)
+            pin_job = rejection or title in ARGS.test_pin_job
             if pin_job and (op != 0x05 or a.get("job-password") != ["0427"]
                             or a.get("ipp-attribute-fidelity") != ["\x01"] or doc):
                 self.send_error(400, "Invalid fixture PIN submission")
                 return
-            with LOCK:
-                jid = NEXT[0]
-                NEXT[0] += 1
-                JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
-                             "name": title}
-            if ignore_pin:
-                # successful-ok-ignored-or-substituted-attributes, with a real job ID.
-                out = head(0x0001, rid)
-                print(f"fake printer: ignored fixture PIN for job {jid}", flush=True)
+            include_job_id = True
+            if rejection:
+                scenario = title.removeprefix(PIN_RESPONSE_PREFIX)
+                response, _, id_mode = scenario.partition(" ")
+                if response not in PIN_RESPONSE_STATUS or id_mode not in ("with-id", "without-id"):
+                    self.send_error(400, "Unknown fixture PIN response")
+                    return
+                include_job_id = id_mode == "with-id"
+                out = head(PIN_RESPONSE_STATUS[response], rid)
+                out += attr(TEXT, "status-message", "Fixture printer diagnostic")
+                if response == "unsupported-group":
+                    out += bytes([UNSUPG]) + attr(UNSUPPORTED, "job-password", "")
+            if include_job_id:
+                with LOCK:
+                    jid = NEXT[0]
+                    NEXT[0] += 1
+                    JOBS[jid] = {"state": 5, "done_at": None, "impressions": 0, "data": op == 0x02 and bool(doc),
+                                 "name": title}
+                if op == 0x02:
+                    open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
+                out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(URI, "job-uri", "ipp://%s/ipp/print/%d" % (host, jid)) + attr(ENUM, "job-state", 3)
+            if rejection:
+                print(f"fake printer: PIN response {response} {jid if include_job_id else '-'}", flush=True)
             elif pin_job:
                 print(f"fake printer: accepted fixture PIN for job {jid} before document", flush=True)
-            if op == 0x02:
-                open(os.path.join(ARGS.spool, "job-%d.pdf" % jid), "wb").write(doc)
-            out += bytes([JOBG]) + attr(INT, "job-id", jid) + attr(URI, "job-uri", "ipp://%s/ipp/print/%d" % (host, jid)) + attr(ENUM, "job-state", 3)
         elif op == 0x06:
             if "job-password" in a:
                 self.send_error(400, "PIN in document request")

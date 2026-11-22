@@ -29,8 +29,8 @@ for line in transcript.splitlines():
         events.append(("create", None))
     elif line.startswith("fake printer: Print-Job job "):
         events.append(("print-job", None))
-    elif ignored := re.fullmatch(r"fake printer: ignored fixture PIN for job (\d+)", line):
-        events.append(("ignore-pin", int(ignored[1])))
+    elif response := re.fullmatch(r"fake printer: PIN response ([a-z-]+) (\d+|-)", line):
+        events.append((response[1], response[2]))
     elif cancel := re.match(r"^fake printer: Cancel-Job job (\d+) ", line):
         events.append(("cancel", int(cancel[1])))
     elif canceled := re.fullmatch(r"fake printer: job (\d+) canceled", line):
@@ -56,14 +56,17 @@ expected_events = [
     for event in (("create", None), ("send", job), ("receipt", job), ("complete", job))
 ]
 if len(sys.argv) > 7:
-    ignored_job = int(sys.argv[7])
-    expected_events += [
-        ("create", None), ("ignore-pin", ignored_job),
-        ("cancel", ignored_job), ("canceled", ignored_job),
-    ]
+    responses = [line.split() for line in Path(sys.argv[7]).read_text(encoding="utf-8").splitlines()]
+    for response, printer_job in responses:
+        expected_events.extend([("create", None), (response, printer_job)])
+        if printer_job != "-":
+            job = int(printer_job)
+            expected_events.extend([("cancel", job), ("canceled", job)])
 assert events == expected_events, events
 if len(sys.argv) > 7:
-    print(f"IPPS simulator: canceled job {ignored_job} after ignoring its PIN, with no document request or PDF")
+    for response, printer_job in responses:
+        result = "no job ID" if printer_job == "-" else f"canceled job {printer_job}"
+        print(f"IPPS simulator: PIN response {response}, {result}, no document request or PDF")
 
 jobs = Path(sys.argv[3]).read_text(encoding="utf-8")
 completed_jobs = re.findall(
@@ -78,6 +81,9 @@ if len(sys.argv) > 6:
     desktop_job_ids = [job for job in range(1, job_count + len(skipped) + 1) if job not in skipped]
     for job in skipped:
         assert re.search(rf"^ +{job} +printer [0-9]+ +Failed +0/2 ", jobs, re.M), jobs
+if len(sys.argv) > 7:
+    failed_pin_jobs = re.findall(r"^ +([0-9]+) +printer [0-9]+ +Failed +0/2 +PIN response ", jobs, re.M)
+    assert len(failed_pin_jobs) == len(responses), failed_pin_jobs
 assert [int(job) for job, _, _, _ in completed_jobs] == desktop_job_ids, completed_jobs
 assert [title for _, _, _, title in completed_jobs] == [
     title for _, _, title, _, _, _ in receipts
