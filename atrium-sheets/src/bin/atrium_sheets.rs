@@ -58,6 +58,7 @@ enum Asking {
     Compare,
     MergeBase,
     MergeIncoming,
+    Versions,
 }
 
 fn state_root() -> PathBuf {
@@ -664,6 +665,13 @@ fn main() {
                     want_picker = Some(Asking::Open);
                 }
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
+                Cmd::Data(atrium_sheets::data::DataCmd::BrowseVersions) => {
+                    if matches!(run.target, Some(Target::Picked { .. })) {
+                        want_picker = Some(Asking::Versions);
+                    } else {
+                        run.set_status("Open or save a workbook through Scrinium to browse its versions.");
+                    }
+                }
                 Cmd::Data(atrium_sheets::data::DataCmd::MergeCopies) => {
                     run.merge_base = None;
                     want_picker = Some(Asking::MergeBase);
@@ -790,6 +798,7 @@ fn main() {
                             },
                             name: String::new(), origin: String::new(),
                         },
+                        Asking::Versions => Filter::file(),
                         Asking::SaveAs | Asking::Commit => Filter::save(&save_name(&name), ""),
                         Asking::LinkedPicture => {
                             let Some(link) = print_snap.as_ref().and_then(|snap| snap.next_link()) else { continue };
@@ -820,7 +829,11 @@ fn main() {
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| {
                         use std::os::fd::AsFd;
-                        let message = match commit_target { Some((token, _)) => ToChild::Commit(token), None => ToChild::Open(filter) }.encode();
+                        let message = match (&run.target, what, commit_target) {
+                            (Some(Target::Picked { commit, .. }), Asking::Versions, _) => ToChild::BrowseVersions(*commit),
+                            (_, _, Some((token, _))) => ToChild::Commit(token),
+                            _ => ToChild::Open(filter),
+                        }.encode();
                         let result = match source {
                             Some(file) => e.borrow_mut().send_fd(id, message, file.as_fd()),
                             None => e.borrow_mut().send(id, message),

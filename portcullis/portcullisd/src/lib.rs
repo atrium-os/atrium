@@ -38,3 +38,5 @@ pub mod route_domain;
 pub mod supervisor;
 pub mod system_services;
 pub mod volumes_client;
+
+pub mod workbook_versions;

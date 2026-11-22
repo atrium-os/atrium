@@ -163,6 +163,19 @@ Tessera retains the generation. Scrinium leaves retention to the filesystem;
 the document jail needs only its existing workbook grant. Other filesystems
 continue to use their own sync and rename guarantees.
 
+**Browse Versions.** Scrinium keeps up to eight predecessor descriptors per live
+workbook save grant on Tessera or a nullfs grant mount. A newly opened grant for the
+same live inode can reuse that cache. The host Portcullis service resolves the live
+descriptor to its backing Tessera mount and searches recent retained generations for
+the same relative path. It refuses symlink traversal and verifies the historical file
+against the predecessor descriptor's identity and bytes. UFS has no native history.
+On selection the host seals the matched bytes before spawning a new Sheets jail.
+This keeps the selected bytes available if Tessera retires the generation during
+document startup. Scrinium opens the copy under a name that includes its generation,
+with no save grant. Neither application receives a directory from the snapshot namespace.
+The cache covers successful Scrinium saves during its session and is cleared when
+Scrinium exits.
+
 Hard links, special permissions, filesystem flags and user extended attributes
 require Save As. Replacement preserves ownership, mode and supported access ACLs.
 A directory sync error after rename means publication could have succeeded.

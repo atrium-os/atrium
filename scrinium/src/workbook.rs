@@ -12,6 +12,7 @@ type Token = [u8; 16];
 type Grants = VecDeque<(Token, Arc<Mutex<Grant>>)>;
 const VERIFY_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_GRANTS: usize = 128;
+const MAX_HISTORY: usize = 8;
 static GRANTS: OnceLock<Mutex<Grants>> = OnceLock::new();
 static PUBLISH: Mutex<()> = Mutex::new(());
 
@@ -20,6 +21,8 @@ struct Grant {
     name: CString,
     file: File,
     revision: Revision,
+    history: VecDeque<Arc<File>>,
+    history_anchor: Option<(i64, i64)>,
 }
 
 struct Revision {
@@ -136,9 +139,24 @@ pub fn grant(path: &Path, file: &File) -> io::Result<Token> {
         name,
         file: file.try_clone()?,
         revision: Revision::capture(file)?,
+        history: VecDeque::new(),
+        history_anchor: None,
     };
     let token = crate::fs::random_token()?;
     let mut grants = GRANTS.get_or_init(Default::default).lock().unwrap();
+    let mut value = value;
+    let current = file.metadata()?;
+    for (_, prior) in grants.iter().rev() {
+        let Ok(prior) = prior.try_lock() else { continue };
+        let old = &prior.revision.metadata;
+        if prior.name == value.name && old.ino() == current.ino() && old.dev() == current.dev()
+            && prior.history_anchor == Some(ctime(&current))
+        {
+            value.history = prior.history.clone();
+            value.history_anchor = prior.history_anchor;
+            break;
+        }
+    }
     if grants.len() >= MAX_GRANTS {
         grants.pop_front();
     }
@@ -152,11 +170,8 @@ pub fn commit(token: Token, source: &File) -> io::Result<()> {
     })
 }
 
-fn commit_with(
-    token: Token,
-    write: impl FnOnce(&mut File) -> io::Result<blake3::Hash>,
-) -> io::Result<()> {
-    let grant = GRANTS
+fn find_grant(token: Token) -> io::Result<Arc<Mutex<Grant>>> {
+    GRANTS
         .get_or_init(Default::default)
         .lock()
         .unwrap()
@@ -165,7 +180,84 @@ fn commit_with(
         .map(|(_, g)| g.clone())
         .ok_or_else(|| {
             io::Error::other("The save grant expired. Reopen the workbook or use Save As.")
-        })?;
+        })
+}
+
+#[cfg(target_os = "freebsd")]
+fn may_retain(file: &File) -> bool {
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs initializes the output before reporting success.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), buf.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let buf = unsafe { buf.assume_init() };
+    // SAFETY: f_fstypename is NUL-terminated by fstatfs.
+    matches!(unsafe { CStr::from_ptr(buf.f_fstypename.as_ptr()) }.to_bytes(), b"tessera" | b"nullfs")
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn may_retain(_: &File) -> bool { false }
+
+pub struct Versions {
+    name: String,
+    current: File,
+    entries: Vec<(u64, Arc<File>)>,
+}
+
+impl Versions {
+    pub fn name(&self) -> &str { &self.name }
+
+    pub fn display_name(&self, number: u64) -> String {
+        let (stem, extension) = self.name.rsplit_once('.').unwrap_or((&self.name, "osheet"));
+        let suffix = format!(" (version {number}).{extension}");
+        let limit = limen::picker::MAX_NAME.saturating_sub(suffix.len());
+        let mut end = stem.len().min(limit);
+        while !stem.is_char_boundary(end) { end -= 1; }
+        format!("{}{suffix}", &stem[..end])
+    }
+    pub fn generations(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.iter().map(|(number, _)| *number)
+    }
+
+    pub fn open(&self, generation: u64) -> Result<File, String> {
+        let (_, prior) = self.entries.iter().find(|(number, _)| *number == generation)
+            .ok_or("Unknown workbook version")?;
+        crate::open::workbook_version(&self.current, prior, Some(generation))?.1
+            .ok_or_else(|| "Tessera no longer retains this version.".into())
+    }
+}
+
+pub fn versions(token: Token) -> Result<Versions, String> {
+    let grant = find_grant(token).map_err(|err| err.to_string())?;
+    let (name, current, history) = {
+        let grant = grant.try_lock().map_err(|_| "Another save is in progress")?;
+        let current = grant.file.try_clone().map_err(|err| err.to_string())?;
+        let stamp = current.metadata().map_err(|err| err.to_string())?;
+        // A fresh grant can reuse history only if the published file has
+        // not had its ownership, access metadata, or contents changed.
+        let history = if grant.history_anchor == Some(ctime(&stamp)) {
+            grant.history.clone()
+        } else {
+            VecDeque::new()
+        };
+        (grant.name.to_string_lossy().into_owned(), current, history)
+    };
+    let mut entries = Vec::new();
+    for previous in history {
+        if let (Some(number), _) = crate::open::workbook_version(&current, &previous, None)? {
+            entries.push((number, previous));
+        }
+    }
+    entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    entries.dedup_by_key(|entry| entry.0);
+    Ok(Versions { name, current, entries })
+}
+
+fn commit_with(
+    token: Token,
+    write: impl FnOnce(&mut File) -> io::Result<blake3::Hash>,
+) -> io::Result<()> {
+    let grant = find_grant(token)?;
     let mut grant = grant
         .try_lock()
         .map_err(|_| io::Error::other("Another save is in progress"))?;
@@ -211,10 +303,19 @@ fn commit_with(
             Err(changed())
         },
     )?;
-    grant.file = file;
+    let retain = may_retain(&grant.file);
+    let previous = std::mem::replace(&mut grant.file, file);
     grant.revision = revision;
     grant.file.sync_all()?;
-    grant.folder.sync_all()
+    grant.folder.sync_all()?;
+    if retain {
+        grant.history_anchor = grant.file.metadata().ok().map(|metadata| ctime(&metadata));
+        if grant.history.len() == MAX_HISTORY {
+            grant.history.pop_back();
+        }
+        grant.history.push_front(Arc::new(previous));
+    }
+    Ok(())
 }
 
 fn prepare_replacement(file: &File, old: &Metadata, out: &File) -> io::Result<()> {

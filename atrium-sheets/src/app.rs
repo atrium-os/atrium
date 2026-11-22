@@ -2750,7 +2750,7 @@ impl Sheets {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
                     false
                 }
-                Cmd::Data(crate::data::DataCmd::CompareWith | crate::data::DataCmd::MergeCopies) => true,
+                Cmd::Data(crate::data::DataCmd::CompareWith | crate::data::DataCmd::MergeCopies | crate::data::DataCmd::BrowseVersions) => true,
                 Cmd::Data(crate::data::DataCmd::TrackChanges) => {
                     self.start_tracking();
                     false

@@ -254,6 +254,7 @@ fn connect_trace(b: &scrinium::browser::Browser) -> String {
 /// From the limend thread to a picker's thread.
 enum ToPane {
     Open(Filter),
+    Versions(String, Vec<u64>),
     /// The asking app's persona (limen `ParentPersona`; `None`: Personal).
     Persona(Option<String>),
     Failed(String),
@@ -267,6 +268,7 @@ enum FromPane {
     Gone(EmbedId),
     Published(EmbedId, std::io::Result<(std::fs::File, String, [u8; 16])>),
     Committed(EmbedId, std::io::Result<()>),
+    Versions(EmbedId, Result<scrinium::workbook::Versions, String>),
 }
 
 /// A picker's window, on its own thread: frescod keeps it hidden until
@@ -311,6 +313,10 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
                     b.set_places(list);
                 });
             }
+            Ok(ToPane::Versions(name, versions)) => {
+                opened = true;
+                with(&pane.state, |b| b.versions = Some((name, versions)));
+            }
             Ok(ToPane::Persona(p)) => {
                 let list = places.lock().unwrap().list.clone();
                 with(&pane.state, |b| {
@@ -341,6 +347,7 @@ struct Embed {
     sheets: bool,
     write: bool,
     staged: Option<std::fs::File>,
+    versions: Option<scrinium::workbook::Versions>,
     requested: bool,
 }
 
@@ -401,6 +408,14 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
             let mime = if ty.mime == "text/plain" { "text/csv" } else { ty.mime };
             let write = write && mime != "application/vnd.ms-excel";
             scrinium::open::open_workbook(e.parent_uid, mime, &name, write, activation, &file, &path)?;
+            child.emit(embed, ToParent::Done { files: 0 }.encode()).map_err(|err| format!("{err:?}"))?;
+            Ok(())
+        }
+        Outcome::WorkbookVersion { generation, activation } => {
+            let versions = e.versions.as_ref().ok_or("No workbook versions are available")?;
+            let file = versions.open(generation)?;
+            let name = versions.display_name(generation);
+            scrinium::open::open_workbook_version(e.parent_uid, &name, activation, &file)?;
             child.emit(embed, ToParent::Done { files: 0 }.encode()).map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
@@ -467,7 +482,7 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                 Some(ChildEvent::Attach { embed, role, parent_app, parent_uid }) if role == "picker" => {
                     eprintln!("scrinium: picker {embed} for {parent_app} (uid {parent_uid})");
                     let (ptx, prx) = mpsc::channel();
-                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", write: false, staged: None, requested: false });
+                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", write: false, staged: None, versions: None, requested: false });
                     let (f, pl, t) = (fresco.clone(), places.clone(), tx.clone());
                     std::thread::spawn(move || picker_pane(embed, parent_app, f, pl, prx, t));
                 }
@@ -505,7 +520,20 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                     }
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
-                    if let (Some(e), Some(ToChild::Open(f))) = (embeds.get_mut(&embed), ToChild::decode(&bytes)) {
+                    let message = ToChild::decode(&bytes);
+                    if let (Some(e), Some(ToChild::BrowseVersions(token))) = (embeds.get_mut(&embed), &message) {
+                        if !e.sheets || e.requested {
+                            let _ = child.emit(embed, workbook_failure("Invalid workbook history request".into()).encode());
+                            continue;
+                        }
+                        e.requested = true;
+                        let tx = tx.clone();
+                        let token = *token;
+                        std::thread::spawn(move || {
+                            let _ = tx.send(FromPane::Versions(embed, scrinium::workbook::versions(token)));
+                        });
+                    }
+                    if let (Some(e), Some(ToChild::Open(f))) = (embeds.get_mut(&embed), message) {
                         if e.requested { continue; }
                         e.requested = true;
                         if f.kind == limen::picker::Kind::Workbook && !e.sheets {
@@ -546,6 +574,16 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                         if let Err(why) = hand_over(&mut child, embed, e, o, &media_sock) {
                             eprintln!("scrinium: picker {embed}: {why}");
                             let _ = e.to_pane.send(ToPane::Failed(why));
+                        }
+                    }
+                    FromPane::Versions(embed, result) => {
+                        let Some(e) = embeds.get_mut(&embed) else { continue };
+                        match result {
+                            Ok(versions) => {
+                                let _ = e.to_pane.send(ToPane::Versions(versions.name().into(), versions.generations().collect()));
+                                e.versions = Some(versions);
+                            }
+                            Err(why) => { let _ = child.emit(embed, workbook_failure(why).encode()); }
                         }
                     }
                     FromPane::Committed(embed, result) => {

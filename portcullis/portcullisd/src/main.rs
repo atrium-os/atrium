@@ -742,7 +742,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * Catalog is: only the session's file manager, by its installed
          * manifest. OpenFile also takes a descriptor, so it needs the
          * connection itself. */
-        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. }) {
+        if matches!(req, Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. }) {
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
             continue;
         }
@@ -1552,6 +1552,39 @@ fn handle_open(
     }
     let declarable = |mime: &str| atrium_types::by_mime(mime).filter(|t| t.family.declarable());
     match req {
+        Request::WorkbookVersion { generation } => {
+            if caller.as_deref() != Some("org.atrium.scrinium") {
+                return refuse(writer, "Workbook versions are served by Scrinium.".into());
+            }
+            if !reader.buffer().is_empty() {
+                return refuse(writer, "protocol violation: data buffered before the descriptors".into());
+            }
+            write_response(writer, &Response::ReadyForFds)?;
+            let fds = portcullis_ipc::recv_fds(reader.get_ref(), 2)?;
+            let Ok([current, previous]): Result<[OwnedFd; 2], _> = fds.try_into() else {
+                return refuse(writer, "expected current and previous workbook descriptors".into());
+            };
+            if let Err(why) = opens::check(&current, false).and_then(|()| opens::check(&previous, false)) {
+                return refuse(writer, why);
+            }
+            let retained = match portcullisd::workbook_versions::retained(
+                &std::fs::File::from(current), &std::fs::File::from(previous), generation,
+            ) {
+                Ok(retained) => retained,
+                Err(err) => return refuse(writer, format!("Workbook version lookup: {err}")),
+            };
+            let Some((number, file)) = retained else {
+                return write_response(writer, &Response::WorkbookVersion { generation: None });
+            };
+            if generation.is_some() {
+                let fd = OwnedFd::from(file);
+                write_response(writer, &Response::WorkbookVersion { generation: Some(number) })?;
+                portcullis_ipc::send_fds(writer, &[fd.as_raw_fd()])?;
+                Ok(())
+            } else {
+                write_response(writer, &Response::WorkbookVersion { generation: Some(number) })
+            }
+        }
         Request::OpenApps { mime } => {
             if declarable(&mime).is_none() {
                 return refuse(writer, format!("{mime}: not a type Atrium opens in apps"));
@@ -3841,7 +3874,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

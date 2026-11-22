@@ -692,7 +692,7 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
             let save = match ToChild::decode(&s.bytes) {
                 Some(ToChild::Open(filter)) => filter.kind == Kind::Save,
                 Some(ToChild::Commit(_)) => true,
-                None => false,
+                _ => false,
             };
             if !save { return Err(Reply::Refused { reason: refusal::MALFORMED }); }
             if !crate::fdpass::sealed(f) {

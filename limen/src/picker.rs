@@ -123,6 +123,8 @@ pub enum ToChild {
     Open(Filter),
     /// Replace one previously granted workbook with the attached sealed snapshot.
     Commit([u8; 16]),
+    /// Show retained versions of a workbook already granted to Sheets.
+    BrowseVersions([u8; 16]),
 }
 
 impl ToChild {

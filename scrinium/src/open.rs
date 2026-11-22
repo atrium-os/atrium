@@ -38,16 +38,16 @@ pub fn apps(mime: &str) -> Result<Vec<Choice>, String> {
 
 /// Hand `file` to `app`; the app's name on success.
 pub fn open(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, path: &std::path::Path) -> Result<String, String> {
-    open_file(app, mime, name, write, always, token, file, None, path)
+    open_file(app, mime, name, write, always, token, file, None, Some(path))
 }
 
 pub fn open_workbook(parent: u32, mime: &str, name: &str, write: bool, token: [u8; 16], file: &std::fs::File, path: &std::path::Path) -> Result<String, String> {
-    open_file("org.atrium.sheets", mime, name, write, false, token, file, Some(parent), path)
+    open_file("org.atrium.sheets", mime, name, write, false, token, file, Some(parent), Some(path))
 }
 
-fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, path: &std::path::Path) -> Result<String, String> {
+fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, path: Option<&std::path::Path>) -> Result<String, String> {
     let mut s = connect()?;
-    let workbook_commit = if write && app == "org.atrium.sheets" { Some(crate::workbook::grant(path, file).map_err(|e| e.to_string())?) } else { None };
+    let workbook_commit = if write && app == "org.atrium.sheets" { Some(crate::workbook::grant(path.ok_or("Missing workbook path")?, file).map_err(|e| e.to_string())?) } else { None };
     let req = Request::OpenFile { app: app.into(), mime: mime.into(), name: name.into(), write, activation: token, always, workbook_picker, workbook_commit };
     match round_trip(&mut s, &req).map_err(|e| e.to_string())? {
         Response::ReadyForFds => {}
@@ -60,4 +60,42 @@ fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token
         Response::Error { message } => Err(message),
         r => Err(format!("an odd answer: {r:?}")),
     }
+}
+
+/// Ask the host to prove retention or return one read-only historical descriptor.
+pub fn workbook_version(
+    current: &std::fs::File,
+    previous: &std::fs::File,
+    generation: Option<u64>,
+) -> Result<(Option<u64>, Option<std::fs::File>), String> {
+    let mut socket = connect()?;
+    match round_trip(&mut socket, &Request::WorkbookVersion { generation }).map_err(|e| e.to_string())? {
+        Response::ReadyForFds => {}
+        Response::Error { message } => return Err(message),
+        _ => return Err("Unexpected workbook version reply".into()),
+    }
+    send_fds(&socket, &[current.as_raw_fd(), previous.as_raw_fd()]).map_err(|e| e.to_string())?;
+    match portcullis_ipc::read_response(&mut socket).map_err(|e| e.to_string())? {
+        Response::WorkbookVersion { generation: retained } => {
+            let file = if generation.is_some() && retained == generation {
+                let mut fds = portcullis_ipc::recv_fds(&socket, 1).map_err(|e| e.to_string())?;
+                Some(std::fs::File::from(fds.pop().ok_or("Missing workbook version descriptor")?))
+            } else {
+                None
+            };
+            Ok((retained, file))
+        }
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected workbook version reply".into()),
+    }
+}
+
+pub fn open_workbook_version(parent: u32, name: &str, activation: [u8; 16], file: &std::fs::File) -> Result<String, String> {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0; atrium_types::HEAD];
+    let n = file.read_at(&mut head, 0).map_err(|e| e.to_string())?;
+    let detected = atrium_types::detect(name, &head[..n]);
+    let ty = detected.known().ok_or_else(|| "Unknown workbook format".to_string())?;
+    let mime = if ty.mime == "text/plain" { "text/csv" } else { ty.mime };
+    open_file("org.atrium.sheets", mime, name, false, false, activation, file, Some(parent), None)
 }

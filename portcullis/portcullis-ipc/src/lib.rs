@@ -413,6 +413,9 @@ pub enum Request {
     RecoverSelectedWorkbook { activation: [u8; 16], id: [u8; 16] },
     /// Update only this document's display name after a confirmed Save As.
     NameWorkbookRecovery { id: [u8; 16], name: String },
+    /// Scrinium supplies the current workbook and an already-held predecessor.
+    /// With a generation, the reply carries one read-only historical file.
+    WorkbookVersion { generation: Option<u64> },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with
@@ -1002,6 +1005,8 @@ pub enum Response {
     Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
+    /// Retained generation for the supplied workbook revision, if available.
+    WorkbookVersion { generation: Option<u64> },
     PendingWorkbooks { books: Vec<PendingWorkbook> },
     /// A download saved: the name it has, and its folder in words
     /// ("Downloads", "Work's Downloads").

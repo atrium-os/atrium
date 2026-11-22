@@ -245,10 +245,13 @@ session.
   appended to the document's private autosave folder every few seconds and on blur; a crash
   replays it over the last saved file. Nothing is written to the user's file without Save
   (§17 D9 asks whether to change that).
-- **Versions.** On Tessera, the native format is chunked so that saves of a big workbook
-  share unchanged chunks (content-addressed, Tessera dedups them), and "browse versions"
-  lists earlier saves. On other file systems (FAT sticks, network shares) only the current
-  file exists.
+- **Versions.** Data ▸ Browse Versions… opens Scrinium for a workbook with a current
+  save grant. Scrinium lists recent predecessors from its live grant cache whose bytes
+  Tessera still retains. Selecting one opens a separate Sheets jail from a sealed,
+  read-only historical copy. Editing or saving that view cannot replace either the
+  historical generation or the current file. Save opens a picker for a new copy.
+  The list follows Tessera retention and the lifetime of Scrinium's grant cache.
+  UFS and other filesystems keep their current-file save flow and show an empty list.
 
 ## 5. Formats
 
