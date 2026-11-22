@@ -9,7 +9,7 @@
 //! so importing the same file twice adds nothing.
 
 use std::collections::HashSet;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use mail_schema::{MAX_BATCH, MAX_BATCH_BYTES};
 
@@ -85,32 +85,46 @@ fn split_messages(r: impl BufRead, mut each: impl FnMut(Option<Vec<u8>>) -> Resu
         }
         each(Some(m))
     };
+    let separator = b"From ";
+    let read_error = |e| Error::Sync(format!("reading the file: {e}"));
     loop {
+        // Allow for CRLF and an mboxrd quote even when the message is
+        // nearly full. Outside a usable message, only the separator matters.
+        let limit = match &cur {
+            Some(message) if !big => (MESSAGE_MAX - message.len() + 3).max(separator.len()),
+            _ => separator.len(),
+        };
         line.clear();
-        let n = r.read_until(b'\n', &mut line).map_err(|e| Error::Sync(format!("reading the file: {e}")))?;
+        let n = (&mut r).take(limit as u64).read_until(b'\n', &mut line).map_err(read_error)?;
         if n == 0 {
             break;
         }
-        let mut l: &[u8] = &line;
-        l = l.strip_suffix(b"\n").unwrap_or(l);
-        l = l.strip_suffix(b"\r").unwrap_or(l);
-        if l.starts_with(b"From ") {
+        let clipped = n == limit && line.last() != Some(&b'\n');
+        let starts_message = line.starts_with(separator);
+        if starts_message {
             end(cur.take(), big)?;
             cur = Some(Vec::new());
             big = false;
+        }
+        // Drain the rest of this physical line before looking for another
+        // separator. A prefix inside the drained bytes can't start a message.
+        if clipped {
+            r.skip_until(b'\n').map_err(read_error)?;
+        }
+        if starts_message || big {
             continue;
         }
         let Some(c) = cur.as_mut() else { continue };
-        if big {
-            continue;
-        }
+        let l = line.strip_suffix(b"\n").unwrap_or(&line);
+        let l = l.strip_suffix(b"\r").unwrap_or(l);
         let gt = l.iter().take_while(|&&b| b == b'>').count();
-        let l = if gt > 0 && l[gt..].starts_with(b"From ") { &l[1..] } else { l };
-        c.extend_from_slice(l);
-        c.extend_from_slice(b"\r\n");
-        if c.len() > MESSAGE_MAX {
+        let l = if gt > 0 && l[gt..].starts_with(separator) { &l[1..] } else { l };
+        if clipped || c.len() + l.len() + 2 > MESSAGE_MAX {
             big = true;
             *c = Vec::new();
+        } else {
+            c.extend_from_slice(l);
+            c.extend_from_slice(b"\r\n");
         }
     }
     end(cur, big)
@@ -313,7 +327,7 @@ impl Engine {
 mod tests {
     use super::*;
 
-    fn all(s: &[u8]) -> (Vec<Vec<u8>>, usize) {
+    fn all(s: impl BufRead) -> (Vec<Vec<u8>>, usize) {
         let mut v = Vec::new();
         let mut big = 0;
         split_stream(s, |m| {
@@ -330,9 +344,9 @@ mod tests {
         let b = b"Subject: b\r\n\r\nbye\r\n".to_vec();
         crate::export::write_one(&mut out, &a, 0).unwrap();
         crate::export::write_one(&mut out, &b, 0).unwrap();
-        assert_eq!(all(&out), (vec![a, b], 0));
+        assert_eq!(all(out.as_slice()), (vec![a, b], 0));
         // CRLF files, text before the first From line, blank messages.
-        let (v, _) = all(b"junk\r\nFrom x Thu Jan  1 00:00:00 1970\r\nSubject: c\r\n\r\nhi\r\n\r\nFrom y\r\n\r\n");
+        let (v, _) = all(&b"junk\r\nFrom x Thu Jan  1 00:00:00 1970\r\nSubject: c\r\n\r\nhi\r\n\r\nFrom y\r\n\r\n"[..]);
         assert_eq!(v, vec![b"Subject: c\r\n\r\nhi\r\n".to_vec()]);
     }
 
@@ -345,8 +359,33 @@ mod tests {
             f.push(b'\n');
         }
         f.extend_from_slice(b"From y\nSubject: small\n\nok\n");
-        let (v, big) = all(&f);
+        let (v, big) = all(f.as_slice());
         assert_eq!(big, 1);
         assert_eq!(v, vec![b"Subject: small\r\n\r\nok\r\n".to_vec()]);
+    }
+
+    #[test]
+    fn oversized_physical_line_recovers_at_the_next_separator() {
+        use std::io::{repeat, BufReader};
+
+        let first = b"Subject: first\r\n\r\nkeep\r\n";
+        let large_headers = b"Subject: oversized\r\n\r\n";
+        let input = (&b"preamble From fake\nFrom first\r\n"[..])
+            .chain(&first[..])
+            .chain(&b"From oversized\r\n"[..])
+            .chain(&large_headers[..])
+            .chain(repeat(b'x').take((MESSAGE_MAX - large_headers.len() + 3) as u64))
+            .chain(&b"From inside line\r\nSubject: discard\r\n\r\nFrom final\r\nSubject: final\r\n\r\nkeep too"[..]);
+        let (messages, refused) = all(BufReader::new(input));
+        assert_eq!(refused, 1);
+        assert_eq!(messages, vec![first.to_vec(), b"Subject: final\r\n\r\nkeep too\r\n".to_vec()]);
+    }
+
+    #[test]
+    fn oversized_physical_line_at_eof_counts_once() {
+        use std::io::{repeat, BufReader};
+
+        let input = (&b"From oversized\n"[..]).chain(repeat(b'x').take((MESSAGE_MAX + 4) as u64));
+        assert_eq!(all(BufReader::new(input)), (Vec::new(), 1));
     }
 }

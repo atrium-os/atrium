@@ -476,9 +476,12 @@ as **making the account usable first, then filling in what's worth having, polit
   descriptor), parsed in parse jails, written into a local folder or uploaded to an
   account with IMAP `APPEND` or JMAP `Email/import`. The mbox reader checks headers
   in batches of at most 64 messages. It buffers up to 32 MiB of complete messages per
-  batch or handles one larger message alone. It queues in file order, reports each
-  500 processed messages including refusals, and preserves complete messages read
-  before an I/O error.
+  batch or handles one larger message alone. The reader bounds each physical line
+  by the remaining 64 MiB message budget plus room for mbox quoting and line ends.
+  It drains oversized lines through their newline, counts the oversized message
+  once, and resumes at the next envelope separator. It queues in file order, reports
+  progress every 500 processed messages including refusals, and preserves complete
+  messages read before an I/O error.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 
@@ -2123,9 +2126,9 @@ Stalwart in the cloud VM, and later a real account):
 
    **Import from mbox (2026-11-19, §6.5).** The palette's "Import an mbox file into Inbox"
    (the folder shown; not from search results) opens the picker for one file, read-only.
-   Mail reads it on a thread as it goes (one message held at a time, so a file of
-   gigabytes is fine), mboxrd or mboxo, CRLF or LF, text before the first `From ` line
-   ignored, `>From ` unquoted; each message's headers are checked in a parse jail (refused
+   Mail streams it on a background thread with the line and batch bounds in §6.5.
+   It accepts mboxrd or mboxo with CRLF or LF, skips text before the first `From ` line,
+   and unquotes `>From `. The parse jail checks each message’s headers (refused
    ones, and any over 64 MiB, are counted as "weren't mail"), and one the account already
    has by Message-ID, or that came earlier in the file, is skipped, so importing the same
    file twice adds nothing. The rest are kept as blobs in a new `imports` table and go up
@@ -2135,10 +2138,11 @@ Stalwart in the cloud VM, and later a real account):
    with its reason and tried on later passes up to 5 times. The window says "Adding 120
    messages to Inbox; they upload as mail syncs; 3 messages already there" and asks for a
    pass. Mail never shows imported mail before the server has it: it comes back through
-   sync like any other mail. Tests: engine lib 2 (splitting what export writes, CRLF and
-   leading junk, a message over the limit), JMAP 1 (Lunch already there and a duplicate
+   sync like any other mail. Splitter tests cover export round trips, CRLF, leading
+   junk, cumulative size, oversized physical lines at EOF, and recovery at the next
+   envelope separator. JMAP tests cover Lunch already there and a duplicate
    skipped, upload, synced back seen and byte for byte, a second import adds nothing, a
-   folder the server lacks gives up after 5 with its reason), Dovecot 1 (an import into
+   folder the server lacks gives up after 5 with its reason. Dovecot 1 (an import into
    Sent goes up by `APPEND` in a real pass and is listed seen), window 1 (palette entry,
    not from search, not while the picker is up). **Not yet**: Maildir (the picker's folder
    kind could carry it), local-only folders (every import goes to a server); progress
