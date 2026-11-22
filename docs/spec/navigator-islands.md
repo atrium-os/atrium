@@ -562,6 +562,16 @@ and the new tunnel had no handshake or IPv4 sentinel response before
 trusted confirmation. Confirmation produced one script POST, one accepted
 assertion, one redemption and `crypta-ac-ok` through ocserv on `tun2`.
 
+The follow-up used one VM session for two in-place replacements and
+cancellation of the newest request. Portcullis discarded the request
+while the original jail was still open. After teardown no queued window
+launched, and gateway page, script and POST counters stayed unchanged.
+A separate reconnect used a distinct Crypta attempt and a fresh
+proposal. There was no handshake or IPv4 sentinel response before
+confirmation. The confirmed proposal produced one POST, one accepted
+assertion and one redemption. The guest fetched `crypta-ac-ok` through
+ocserv on `tun8`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
