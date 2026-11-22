@@ -339,7 +339,7 @@ fn run(mut conn: Connection, uid: u32, id: ConnId, rx: Receiver<Out>, shared: Ar
 fn navigator_ui_operation(opc: u16, payload: &[u8]) -> bool {
     match opc {
         op::REQUEST => postcard::from_bytes::<proto::Request>(payload)
-            .is_ok_and(|req| matches!(req.role.as_str(), "doc-viewer" | "credential" | "print")),
+            .is_ok_and(|req| matches!(req.role.as_str(), "doc-viewer" | "vpn-sign-in-page" | "credential" | "print")),
         op::PLACE | op::SEND | op::SEND_FD | op::DETACH | op::SET_VISIBLE => true,
         _ => false,
     }
@@ -443,6 +443,13 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
     if (role.name == "navigator-inbox-page" || with_fetch) && (app != "org.atrium.navigator" ||
         !shared.mail_sheet_provider.lock().unwrap().as_ref().is_some_and(|check| check(uid))) {
         return refuse(refusal::NOT_PROVIDER);
+    }
+    if role.name == "vpn-sign-in-page" {
+        let signed = shared.mail_sheet_provider.lock().unwrap().as_ref().is_some_and(|check| check(uid));
+        let persona = shared.persona.lock().unwrap().as_ref().and_then(|lookup| lookup(uid));
+        if app != "org.atrium.navigator" || !signed || persona.as_deref() != Some("vpn") {
+            return refuse(refusal::NOT_PROVIDER);
+        }
     }
     if role.slot == SlotKind::SignInPage && !st.embeds.values().any(|sheet|
         sheet.role.name == "mail-sign-in" && sheet.child_uid == uid && sheet.child_window == Some(req.window)

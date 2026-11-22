@@ -425,6 +425,16 @@ team's separate ocserv backend was offline during this run.
 
 Evidence on the Mac is in `~/atrium-vm/evidence/navigator-i3-vpn-sso-20261122/`.
 
+The installed VPN window requests the fixed `vpn-sign-in-page` worker through
+its delegated Limen connection. Limen verifies the Navigator broker's app
+identity, publisher and reserved persona. Navigatord passes the bounded HTML
+response and its final HTTPS address to the window. The window forwards the
+sealed descriptor to the matching embed. Ladybird paints the page and reports
+forms from the parsed DOM. The trusted window embeds Arca's credential field,
+and navigatord permits its handle only on an HTTPS POST to the page's origin.
+The converter recording still supplies the broker's form checks. Installed
+gateway and tunnel verification is pending.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64

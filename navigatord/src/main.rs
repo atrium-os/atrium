@@ -225,6 +225,7 @@ impl Ctx {
 
 /// A converted page.
 struct Page {
+    vpn_document: Option<Arc<Vec<u8>>>,
     url: String,
     recording: Vec<u8>,
     title: String,
@@ -281,6 +282,7 @@ impl State {
     /// Put a converted page in the store; returns it with its record's
     /// address (or as it was, if the store refused: it still shows).
     fn stored(&mut self, mut p: Page) -> Page {
+        if p.vpn_document.is_some() { return p; }
         let written = p.ctx.written();
         let store: &mut dyn Store = if written { &mut *self.store } else { self.memory.entry(p.ctx.jar).or_default() };
         let put = store.put(&p.recording).and_then(|rec| {
@@ -336,7 +338,7 @@ impl State {
         if !consents_ok(&r.consents) {
             return Err("the record's consents are out of bounds".into());
         }
-        Ok(Page { title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images), consents: Arc::new(r.consents) })
+        Ok(Page { vpn_document: None, title: title(&recording), insecure: url.starts_with("http:"), url: r.url, recording, saved: saved.into(), ctx, images: Arc::new(images), consents: Arc::new(r.consents) })
     }
 
     /// The page at `url` this UI may act on: the cache, else the store.
@@ -362,9 +364,9 @@ impl State {
     fn keep(&mut self, p: Arc<Page>, asked: &str) {
         self.cache.retain(|q| !(q.url == p.url && q.ctx == p.ctx));
         self.cache.push(p.clone());
-        if asked != p.url {
+        if asked != p.url && p.vpn_document.is_none() {
             // A redirect: the asked address finds it too.
-            self.cache.push(Arc::new(Page { url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx, images: p.images.clone(), consents: p.consents.clone() }));
+            self.cache.push(Arc::new(Page { vpn_document: p.vpn_document.clone(), url: asked.into(), recording: p.recording.clone(), title: p.title.clone(), insecure: p.insecure, saved: p.saved.clone(), ctx: p.ctx, images: p.images.clone(), consents: p.consents.clone() }));
         }
         while self.cache.len() > CACHE {
             self.cache.remove(0);
@@ -707,6 +709,12 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
         Reply::Err(e) if navigator_cookies::site_needs_cookies(&hops) => return Ok(Got::NeedsCookies(e)),
         Reply::Err(e) => return Err(e),
     };
+    let vpn_document = if cfg.vpn.is_some() && !cfg.unconfined {
+        if doc.is_empty() || doc.len() > 2 * 1024 * 1024 {
+            return Err("VPN sign-in document outside the worker size bound".into());
+        }
+        Some(Arc::new(doc.clone()))
+    } else { None };
     if let Some((what, ext)) = files::kind(&doc) {
         return Ok(Got::File { url: base, what, ext, body: doc });
     }
@@ -809,7 +817,7 @@ fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64
     }
     let insecure = base.starts_with("http:");
     let consents = consents_of(&o.report);
-    Ok(Got::Page(Page { title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images), consents: Arc::new(consents) }))
+    Ok(Got::Page(Page { vpn_document, title: title(&recording), url: base, recording, insecure, saved: String::new(), ctx, images: Arc::new(images), consents: Arc::new(consents) }))
 }
 
 /// The converter's `CW <n> <line>` report lines: what each consent control
@@ -1441,6 +1449,17 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                 }
                                 if !sources.is_empty() { send(&w, &Event::IslandSources { id, sources }); }
                             }
+                            if let Some(html) = &p.vpn_document {
+                                let result = limen::fdpass::sealed_file("vpn-sign-in-document", html).and_then(|fd| {
+                                    let socket = w.lock().unwrap();
+                                    ctl::write_frame(&mut &*socket, &Event::VpnDocument { id, url: p.url.clone() })?;
+                                    ctl::send_fd(&socket, std::os::fd::AsRawFd::as_raw_fd(&fd))
+                                });
+                                if let Err(error) = result {
+                                    send(&w, &Event::Failed { id, url: p.url.clone(), why: error.to_string() });
+                                    return;
+                                }
+                            }
                             send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
                             // The gateway's final page: the sign-in is over
                             // (its token, if it set one, is Arca's now).
@@ -1515,6 +1534,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 let arca = fields.iter().position(|f| f.arca.is_some());
                 if arca.is_some() && (cfg.vpn.is_none() || !post) {
                     refuse("a password from Arca's field goes only with a sign-in window's POST".into());
+                    continue;
+                }
+                if arca.is_some() && !url::Url::parse(&p.url).ok().zip(url::Url::parse(&target).ok())
+                    .is_some_and(|(page, target)| page.scheme() == "https" && page.origin() == target.origin()) {
+                    refuse("a trusted password goes only to the HTTPS origin displaying its field".into());
                     continue;
                 }
                 let secret_of = arca.and_then(|i| fields[i].arca);
@@ -1987,6 +2011,10 @@ fn main() {
         }
     }
     if cfg.vpn.is_some() {
+        if !unconfined && !matches!(cfg.ui, Some(worker::Spec::Jail(_))) {
+            eprintln!("navigatord: a VPN sign-in requires its jailed UI");
+            std::process::exit(1);
+        }
         // Nothing of the window is kept but the sign-in jar (vpn.rs).
         cfg.trails = None;
         cfg.store = None;
@@ -2217,7 +2245,7 @@ mod tests {
 
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
-        Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default(), consents: Default::default() }
+        Page { vpn_document: None, url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default(), consents: Default::default() }
     }
 
     #[test]

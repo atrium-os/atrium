@@ -68,7 +68,7 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes", catalogue::NAVIGATOR_ENGINE].contains(&app), "{app}");
+        assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes", "org.atrium.navigator.mail-page", catalogue::NAVIGATOR_ENGINE].contains(&app), "{app}");
         self.0.send((embed, ch)).unwrap();
         Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
@@ -824,6 +824,18 @@ fn the_print_sheet_takes_a_sealed_pdf_hands_back_save_as_pdf_and_opens_once_per_
     app.detach(e3).unwrap();
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(refused(app.request("print", W_APP)), refusal::RATE, "the fourth in a minute, at once");
+}
+
+#[test]
+fn vpn_page_requires_the_signed_navigator_in_the_vpn_persona() {
+    let w = World::new();
+    w.shared.set_persona_lookup(Box::new(|uid| (uid != 4101).then(|| "vpn".into())));
+    w.shared.set_mail_sheet_provider(Box::new(|uid| matches!(uid, 4101 | 4112)));
+    for uid in [4101, 4102, 4112] {
+        assert_eq!(refused(w.parent(uid).request("vpn-sign-in-page", W_APP)), refusal::NOT_PROVIDER);
+    }
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4102));
+    assert!(w.parent(4102).request("vpn-sign-in-page", W_APP).is_ok());
 }
 
 #[test]

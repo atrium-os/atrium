@@ -1193,6 +1193,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-forms"
+version = "0.1.0"
+dependencies = [
+ "limen",
+ "navigator-dom",
+]
+
+[[package]]
 name = "navigator-image"
 version = "0.1.0"
 dependencies = [
@@ -1230,6 +1238,7 @@ dependencies = [
  "limen",
  "navigator-control",
  "navigator-dom",
+ "navigator-forms",
  "navigator-image",
  "navigator-normalize",
  "navigator-render",

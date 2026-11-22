@@ -760,20 +760,22 @@ pub mod host {
         previous: NodeTree,
         pointer: Option<(f32, f32)>,
         interactive_island: bool,
+        vpn_page: bool,
         unload_query: u32,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
 
-    fn attach(expected_role: &str) -> Result<(limen::client::Child, u64, FrescoSurface), String> {
+    fn attach(expected_role: &str) -> Result<(limen::client::Child, u64, FrescoSurface, bool), String> {
         use limen::proto::ChildEvent;
         use std::time::{Duration, Instant};
         let (mut child, stream) = limen::client::Child::embedded().map_err(|e| format!("{e:?}"))?;
-        let embed = match child
+        let (embed, vpn) = match child
             .poll(Duration::from_secs(10))
             .map_err(|e| format!("{e:?}"))?
         {
-            Some(ChildEvent::Attach { embed, role, .. }) if role == expected_role => embed,
+            Some(ChildEvent::Attach { embed, role, .. }) if role == expected_role => (embed, false),
+            Some(ChildEvent::Attach { embed, role, .. }) if expected_role == "mail-sign-in-page" && role == "vpn-sign-in-page" => (embed, true),
             _ => return Err("unexpected Limen role".into()),
         };
         let mut conn = fresco_client::Connection::wrap(stream).map_err(|e| e.to_string())?;
@@ -799,7 +801,7 @@ pub mod host {
             {
                 if window_id == window {
                     child.ready(embed, token).map_err(|e| format!("{e:?}"))?;
-                    return Ok((child, embed, FrescoSurface::new(conn, window)));
+                    return Ok((child, embed, FrescoSurface::new(conn, window), vpn));
                 }
             }
         }
@@ -811,7 +813,7 @@ pub mod host {
         let mut state = SceneState::default();
         if embedded {
             match attach("web-island") {
-                Ok((child, id, surface)) => state.embed = Some((std::rc::Rc::new(std::cell::RefCell::new(child)), id, surface)),
+                Ok((child, id, surface, _)) => state.embed = Some((std::rc::Rc::new(std::cell::RefCell::new(child)), id, surface)),
                 Err(reason) => {
                     eprintln!("editor attach: {reason}");
                     return std::ptr::null_mut();
@@ -823,7 +825,7 @@ pub mod host {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_counter_scene_create() -> *mut SceneState {
-        let Ok((child, id, surface)) = attach("web-island") else { return std::ptr::null_mut() };
+        let Ok((child, id, surface, _)) = attach("web-island") else { return std::ptr::null_mut() };
         let embed = Some((std::rc::Rc::new(std::cell::RefCell::new(child)), id, surface));
         Box::into_raw(Box::new(SceneState { embed, interactive_island: true, ..Default::default() }))
     }
@@ -897,7 +899,7 @@ pub mod host {
     pub unsafe extern "C" fn navigator_mail_scene_open(inbox: bool, out_url: *mut *const u8, url_len: *mut usize,
         html: *mut *const u8, html_len: *mut usize) -> *mut SceneState {
         use std::io::Read;
-        let Ok((mut child, embed, surface)) = attach(if inbox { "navigator-inbox-page" } else { "mail-sign-in-page" }) else { return std::ptr::null_mut() };
+        let Ok((mut child, embed, surface, vpn)) = attach(if inbox { "navigator-inbox-page" } else { "mail-sign-in-page" }) else { return std::ptr::null_mut() };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let url = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -915,11 +917,25 @@ pub mod host {
         if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
             || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 { return std::ptr::null_mut(); }
         let child = std::rc::Rc::new(std::cell::RefCell::new(child));
-        RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed))));
-        let state = Box::new(SceneState { embed: Some((child, embed, surface)), mail_document: Some((location, bytes)), ..Default::default() });
+        if !vpn { RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed)))); }
+        let state = Box::new(SceneState { embed: Some((child, embed, surface)), vpn_page: vpn, mail_document: Some((location, bytes)), ..Default::default() });
         let (location, bytes) = state.mail_document.as_ref().unwrap();
         unsafe { *out_url = location.as_ptr(); *url_len = location.len(); *html = bytes.as_ptr(); *html_len = bytes.len(); }
         Box::into_raw(state)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_is_vpn_page(state: &SceneState) -> bool { state.vpn_page }
+
+    /// Forms go to the trusted window after LibWeb has parsed and painted the document.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_vpn_forms(state: &SceneState, html: *const u8, len: usize) -> bool {
+        if !state.vpn_page || html.is_null() || len > 2 * 1024 * 1024 { return false; }
+        let Some((child, embed, _)) = &state.embed else { return false };
+        let Ok(doc) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(html, len) }) else { return false };
+        let forms = navigator_forms::forms(doc);
+        if forms.is_empty() { return true; }
+        child.borrow_mut().emit(*embed, limen::doc_viewer::ToParent::Forms { forms }.encode()).is_ok()
     }
 
     #[unsafe(no_mangle)]
@@ -1181,7 +1197,7 @@ pub mod host {
                         "editor outbound wire bytes={}",
                         surface.connection().encoded_bytes() - before
                     );
-                    if state.interactive_island {
+                    if state.interactive_island || state.vpn_page {
                         state.previous = next;
                         return true;
                     }

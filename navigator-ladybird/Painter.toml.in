@@ -5,13 +5,14 @@ edition = "2024"
 publish = false
 
 [features]
-editor = ["dep:nuntius", "dep:libxml_rust", "dep:libweb_bindings_rust", "dep:libweb_rust", "dep:limen", "dep:fresco-client", "dep:fresco-protocol"]
+editor = ["dep:navigator-forms", "dep:nuntius", "dep:libxml_rust", "dep:libweb_bindings_rust", "dep:libweb_rust", "dep:limen", "dep:fresco-client", "dep:fresco-protocol"]
 
 [lib]
 crate-type = ["rlib", "staticlib"]
 path = "@CMAKE_CURRENT_SOURCE_DIR@/painter.rs"
 
 [dependencies]
+navigator-forms = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../navigator-page/forms", optional = true }
 pergola = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../pergola" }
 libcompositing_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibCompositing/Rust", default-features = false }
 libgfx_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibGfx/Rust", default-features = false }

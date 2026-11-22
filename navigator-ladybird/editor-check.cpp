@@ -34,6 +34,8 @@ extern "C" bool navigator_counter_started(NavigatorScene*, u8 const*, size_t, u8
 extern "C" void navigator_counter_ended(NavigatorScene*, bool);
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" NavigatorScene* navigator_mail_scene_open(bool, u8 const**, size_t*, u8 const**, size_t*);
+extern "C" bool navigator_is_vpn_page(NavigatorScene*);
+extern "C" bool navigator_vpn_forms(NavigatorScene*, u8 const*, size_t);
 extern "C" void navigator_mail_scene_wait(NavigatorScene*);
 #endif
 
@@ -135,6 +137,15 @@ int main(int argc, char** argv)
         Web::ResourceLoader::initialize(GC::Heap::the());
     auto painted = Navigator::paint_document(*client, scene, { url, url_len }, { body, body_len }, false);
     if (painted.is_error()) return 4;
+    if (navigator_is_vpn_page(scene)) {
+        auto doc = client->page().local_traversable()->active_document();
+        auto root = doc->document_element();
+        if (!root) return 4;
+        auto html = root->inner_html();
+        if (html.is_exception()) return 4;
+        auto utf8 = html.release_value().to_well_formed_utf8();
+        if (!navigator_vpn_forms(scene, utf8.bytes().data(), utf8.byte_count())) return 4;
+    }
     return Navigator::drive_page(*client, scene, loop);
 #endif
     if (mail_probe) {

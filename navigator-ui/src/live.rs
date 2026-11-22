@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -60,6 +60,7 @@ struct Child {
     asked: Option<u32>,
     /// A ticket waiting for the child to attach.
     pending: Option<Ticket>,
+    vpn_document: Option<(String, OwnedFd)>,
     /// Where to scroll the page when it opens.
     scroll: f32,
     /// When it was asked for, until the page is laid out (timing).
@@ -108,7 +109,7 @@ fn retire_widget(active: &mut Option<ActiveWidget>, document: Ticket, press: ctl
 
 pub struct Live {
     w: UnixStream,
-    rx: mpsc::Receiver<Event>,
+    rx: mpsc::Receiver<(Event, Option<OwnedFd>)>,
     embeds: Option<Rc<RefCell<Embeds>>>,
     window: Option<WindowToken>,
     widget: Option<ActiveWidget>,
@@ -250,7 +251,10 @@ impl Live {
         std::thread::spawn(move || loop {
             match ctl::read_frame::<Event>(&mut r) {
                 Ok(Some(e)) => {
-                    if tx.send(e).is_err() {
+                    let document = if matches!(e, Event::VpnDocument { .. }) {
+                        match ctl::recv_fd(&r) { Ok(fd) => Some(fd), Err(_) => return }
+                    } else { None };
+                    if tx.send((e, document)).is_err() {
                         return;
                     }
                 }
@@ -412,6 +416,14 @@ impl Live {
     fn give(&mut self, i: usize, ticket: Ticket) {
         let c = &mut self.children[i];
         if c.attached {
+            if crate::shell::window_vpn() {
+                if let (Some((url, fd)), Some(embeds)) = (c.vpn_document.take(), &self.embeds) {
+                    if let Err(err) = embeds.borrow_mut().send_fd(c.embed, url.into_bytes(), fd.as_fd()) {
+                        eprintln!("navigator-ui: VPN document delivery failed: {err:?}");
+                    }
+                }
+                return;
+            }
             let (embed, scroll, reading) = (c.embed, c.scroll, c.reading);
             self.to_child(embed, &ToChild::Open { ticket, reading, scroll });
         } else {
@@ -473,7 +485,8 @@ impl Live {
             if let Err(err) = e.hide(PAGE_SLOT) {
                 eprintln!("navigator-ui: limend: {err:?}");
             }
-            match e.request("doc-viewer", w, PAGE_SLOT) {
+            let role = if crate::shell::window_vpn() { "vpn-sign-in-page" } else { "doc-viewer" };
+            match e.request(role, w, PAGE_SLOT) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("navigator-ui: limend: {err:?}");
@@ -492,6 +505,7 @@ impl Live {
             attached: false,
             asked: Some(id),
             pending: None,
+            vpn_document: None,
             scroll,
             since: Some((Instant::now(), None)),
             seen: Instant::now(),
@@ -557,9 +571,16 @@ impl Live {
             }
         }
         // navigatord's answers.
-        while let Ok(ev) = self.rx.try_recv() {
+        while let Ok((ev, document)) = self.rx.try_recv() {
             changed = true;
             match ev {
+                Event::VpnDocument { id, url } => {
+                    if crate::shell::window_vpn() {
+                        if let Some(child) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
+                            child.vpn_document = document.map(|fd| (url, fd));
+                        }
+                    }
+                }
                 Event::ReplayedRecording { id } => {
                     if let Some(c) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
                         c.replayed = true;

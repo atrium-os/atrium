@@ -362,6 +362,8 @@ pub enum Event {
     WidgetAttached { document: Ticket, press: Press, origin: String },
     WidgetUnload { document: Ticket, start: Press, query: u32, pending: bool },
     ReplayedRecording { id: u32 },
+    /// A sealed VPN document descriptor follows on the installed UI channel.
+    VpnDocument { id: u32, url: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
