@@ -432,7 +432,7 @@ impl<H: Http> Client<H> {
             }
             let ids: Vec<String> = wanted.iter().map(|(_, id)| id.clone()).collect();
             let a = self.call(jmap::get_emails(&self.session.account, &ids))?;
-            let found = jmap::emails(&a)?;
+            let found = jmap::emails(&a, &self.session.account, &ids)?;
             for (uid, id) in wanted {
                 let Some(e) = found.iter().find(|e| e.id == id) else { continue };
                 let url = self.session.download(&e.blob);
@@ -574,7 +574,7 @@ impl<H: Http> Client<H> {
             }
             if !ids.is_empty() {
                 let a = self.call(jmap::get_emails(&self.session.account, &ids))?;
-                for e in jmap::emails(&a)? {
+                for e in jmap::emails(&a, &self.session.account, &ids)? {
                     self.place(sink, &e, true, None, report)?;
                 }
             }

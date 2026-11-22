@@ -69,6 +69,7 @@ struct Server {
     reply_override: Option<(&'static str, &'static str, Value)>,
     override_mailbox: Option<&'static str>,
     missing_from_query_get: Option<&'static str>,
+    direct_get_overrides: Map<String, Value>,
 }
 
 impl Server {
@@ -288,6 +289,11 @@ impl Server {
                     answer[*key] = value.clone();
                 }
             }
+            if cid == "g" && name == "Email/get" && call[1].get("#ids").is_none() {
+                for (key, value) in &self.direct_get_overrides {
+                    answer[key] = value.clone();
+                }
+            }
             if self.repeat_presence_reply && cid == "importPresence" {
                 let found = &args["ids"];
                 let alternative: Vec<_> = found.as_array().unwrap().iter().map(|id| json!({ "id": id })).collect();
@@ -402,6 +408,105 @@ fn jmap_snoozes_until_due_and_preserves_existing_labels() {
     assert_eq!(server.borrow().mails[&id].boxes.iter().map(String::as_str).collect::<Vec<_>>(), ["in", "q4"]);
     assert!(!server.borrow().mails[&id].keywords.contains("$snoozed"));
     assert_eq!(engine.store.list(inbox, 0, 10).unwrap()[0].msg, msg);
+    assert!(engine.store.parked(account).unwrap().is_empty());
+}
+
+#[test]
+fn jmap_text_window_checks_direct_reads_before_downloading() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let first = message(29, "First text", "first body");
+    let second = message(30, "Second text", "second body");
+    {
+        let mut s = server.borrow_mut();
+        assert_eq!(s.add(first.clone(), &["in"], &[], at), "M1");
+        assert_eq!(s.add(second.clone(), &["in"], &[], at + 1), "M2");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let expected = server.borrow().email("M1");
+    let other = server.borrow().email("M2");
+    let mut foreign = other.clone();
+    foreign["id"] = json!("foreign");
+
+    for (overrides, detail) in [
+        (json!({"accountId": "other"}), "wrong account"),
+        (json!({"state": null}), "bad state"),
+        (json!({"list": [&expected]}), "incomplete Email/get"),
+        (json!({"list": [&expected, &foreign]}), "unexpected or repeated Email/get ID"),
+        (json!({"list": [&expected, &expected]}), "unexpected or repeated Email/get ID"),
+        (json!({"notFound": ["M1"]}), "unexpected or repeated Email/get notFound ID"),
+    ] {
+        server.borrow_mut().direct_get_overrides = overrides.as_object().unwrap().clone();
+        let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+        assert!(error.contains(detail), "{error}");
+        assert_eq!(server.borrow().downloads, 0);
+        for id in ["M1", "M2"] {
+            let row = engine.store.by_server_id(account, id).unwrap().unwrap();
+            assert!(engine.store.message(row).unwrap().full.is_none());
+        }
+        assert!(engine.store.by_server_id(account, "foreign").unwrap().is_none());
+    }
+
+    // An explicit notFound is valid coverage. Download the other result
+    // without treating the missing text as a deletion of its local header.
+    server.borrow_mut().direct_get_overrides =
+        json!({"list": [expected], "notFound": ["M2"]}).as_object().unwrap().clone();
+    assert_eq!(client.sync(&mut engine.sink(account)).unwrap().texts, 1);
+    assert_eq!(server.borrow().downloads, 1);
+    let m1 = engine.store.by_server_id(account, "M1").unwrap().unwrap();
+    let m2 = engine.store.by_server_id(account, "M2").unwrap().unwrap();
+    assert_eq!(engine.store.blob(&engine.store.message(m1).unwrap().full.unwrap()).unwrap(), first);
+    assert!(engine.store.message(m2).unwrap().full.is_none());
+
+    server.borrow_mut().direct_get_overrides.clear();
+    assert_eq!(client.sync(&mut engine.sink(account)).unwrap().texts, 1);
+    assert_eq!(server.borrow().downloads, 2);
+    assert_eq!(engine.store.blob(&engine.store.message(m2).unwrap().full.unwrap()).unwrap(), second);
+}
+
+#[test]
+fn jmap_post_snooze_reads_reject_wrong_accounts_and_unrequested_ids() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let id = server.borrow_mut().add(message(31, "Later", "body"), &["in", "q4"], &[], at);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let msg = engine.store.by_server_id(account, &id).unwrap().unwrap();
+    let due = at + 3600;
+    engine.set_later(msg, mail_store::later::kind::READ, due, "").unwrap();
+
+    server.borrow_mut().direct_get_overrides = json!({"accountId": "other"}).as_object().unwrap().clone();
+    let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+    assert!(error.contains("wrong account"), "{error}");
+    assert!(server.borrow().mails[&id].boxes.contains("snooze"));
+    let snoozed = engine.store.folder_id(account, "Snoozed", Role::Other).unwrap();
+    assert!(engine.store.message(msg).unwrap().locations.iter().all(|(folder, _)| *folder != snoozed));
+
+    server.borrow_mut().direct_get_overrides.clear();
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert!(engine.store.message(msg).unwrap().locations.iter().any(|(folder, _)| *folder == snoozed));
+    assert_eq!(engine.later_due(due).unwrap(), 1);
+    let mut foreign = server.borrow().email(&id);
+    foreign["id"] = json!("foreign");
+    foreign["mailboxIds"] = json!({"in": true});
+    server.borrow_mut().direct_get_overrides = json!({"list": [foreign]}).as_object().unwrap().clone();
+    let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+    assert!(error.contains("unexpected or repeated Email/get ID"), "{error}");
+    assert!(!server.borrow().mails[&id].boxes.contains("snooze"));
+    assert!(engine.store.by_server_id(account, "foreign").unwrap().is_none());
+    assert_eq!(engine.store.count(inbox).unwrap(), 0);
+
+    server.borrow_mut().direct_get_overrides.clear();
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.list(inbox, 0, 10).unwrap()[0].msg, msg);
+    assert_eq!(engine.store.count(inbox).unwrap(), 1);
     assert!(engine.store.parked(account).unwrap().is_empty());
 }
 

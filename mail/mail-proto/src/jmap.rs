@@ -267,9 +267,12 @@ pub fn get_emails(account: &str, ids: &[String]) -> Vec<u8> {
     request(vec![json!(["Email/get", { "accountId": account, "ids": ids, "properties": EMAIL_PROPS }, "g"])], false)
 }
 
-/// The answer to [`get_emails`].
-pub fn emails(a: &Answers) -> Result<Vec<Email>> {
-    emails_in(a.of("g", "Email/get")?)
+/// The answer to [`get_emails`], bound to the requested account and IDs.
+pub fn emails(a: &Answers, account: &str, requested: &[String]) -> Result<Vec<Email>> {
+    let answer = a.account_reply("g", "Email/get", account)?;
+    check_get_coverage(answer, requested)?;
+    need_state(answer, "state")?;
+    emails_in(answer)
 }
 
 /// Check whether imported Email IDs still exist, without fetching headers.

@@ -1701,7 +1701,11 @@ Stalwart in the cloud VM, and later a real account):
    advances by query IDs, including any reported missing by the read. Validated
    pages can add headers immediately. A failed refresh preserves the previous
    Email state and mailbox locations. Mail removes superseded locations only
-   after all pages validate. The person's
+   after all pages validate. The text window and post-snooze readback also
+   validate the account and exact requested ID coverage before any download
+   or local write from that reply. A requested ID reported in `notFound`
+   is skipped. A rejected post-snooze read leaves the server-side move in
+   place so the next incremental sync can reconcile it. The person's
    changes go as one `Email/set` (several changes to one message are one patch); delete
    from the last mailbox destroys. Send: upload, `Email/import` into Sent (seen),
    `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
