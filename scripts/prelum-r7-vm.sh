@@ -130,6 +130,8 @@ python3 -u "$scripts/prelum-fake-printer.py" --bind 127.0.0.1 --port "$ipps_port
     --state "$D/state" --spool "$D/spool" --uuid-override-file "$D/printer-uuid" --tls-cert "$D/ipps.pem" --tls-key "$D/ipps.key" \
     --test-pin-job "PIN after TLS key restoration" --test-pin-job "PIN after UUID restoration" \
     --test-pin-job "Fresh PIN after replay refusal" --test-pin-rejections \
+    --test-pin-job "PIN recovery after ipp-refused" --test-pin-job "PIN recovery after http-refused" \
+    --test-pin-job "PIN recovery after dropped" --test-pin-job "PIN recovery after truncated" \
     --test-no-send-document-flag "$D/no-send-document" --test-no-job-password-flag "$D/no-job-password" \
     --test-no-create-job-flag "$D/no-create-job" \
     --tls-alt-cert "$D/ipps-alt.pem" --tls-alt-key "$D/ipps-alt.key" --tls-alt-flag "$D/use-alt-key" \
@@ -362,23 +364,14 @@ redemption_count=4
 successful_redemptions=3
 expected_responses="$D/pin-rejection-expected.txt"
 : >"$expected_responses"
-check_pin_rejection() {
-    response=$1
-    id_mode=$2
-    cancel_result=$3
+submit_pin_fixture() {
+    proof="$D/$1"
     desktop_job=$((desktop_job + 1))
     redemption_count=$((redemption_count + 1))
     successful_redemptions=$((successful_redemptions + 1))
-    proof="$D/pin-$response-$id_mode-$cancel_result"
-    if [ "$id_mode" = with-id ]; then
-        printer_job=$((printer_job + 1))
-        printf '%s %s %s\n' "$response" "$printer_job" "$cancel_result" >>"$expected_responses"
-    else
-        printf '%s - %s\n' "$response" "$cancel_result" >>"$expected_responses"
-    fi
     remote "sh -s -- '$guest' '$marker' '$pin_spki' '$printer_uuid' reuse" \
         <"$scripts/prelum-r7-pin-stage.sh" >"$proof-stage.log" 2>&1
-    remote "sh -s -- '$guest' '$marker' fresh pin-rejection '$desktop_job' '$response' '$id_mode' '$cancel_result'" \
+    remote "sh -s -- '$guest' '$marker' fresh '$2' '$desktop_job' '$3' '${4:-}' '${5:-}'" \
         <"$scripts/prelum-r7-identity.sh" >"$proof.log" 2>&1 || { cat "$proof.log" >&2; exit 1; }
     cat "$proof.log"
     remote "cat '$guest/fixture-arca/audit.log'" >"$proof-audit.log"
@@ -386,17 +379,29 @@ check_pin_rejection() {
     test "$(grep -c 'op=0x0011' "$proof-audit.log")" -eq "$redemption_count"
     test "$(grep -cE 'prelum-ipp op=0x0011 .*status=0$' "$proof-audit.log")" -eq "$successful_redemptions"
 }
+check_pin_rejection() {
+    if [ "$2" = with-id ]; then
+        printer_job=$((printer_job + 1))
+        printf '%s %s %s\n' "$1" "$printer_job" "$3" >>"$expected_responses"
+    else
+        printf '%s - %s\n' "$1" "$3" >>"$expected_responses"
+    fi
+    submit_pin_fixture "pin-$1-$2-$3" pin-rejection "$1" "$2" "$3"
+}
 for response in ignored conflicting unsupported-group unsupported-status server-busy; do
     check_pin_rejection "$response" with-id canceled
     check_pin_rejection "$response" without-id none
 done
 check_pin_rejection success without-id none
 
-# The rejected PIN must also block upload when cancellation fails.
+# Pair each failed cancellation with a separate job and a freshly staged handle.
 for cancel_result in ipp-refused http-refused dropped truncated; do
     check_pin_rejection ignored with-id "$cancel_result"
+    printer_job=$((printer_job + 1))
+    printf 'recovery %s %s\n' "$printer_job" "$cancel_result" >>"$expected_responses"
+    submit_pin_fixture "pin-recovery-$cancel_result" pin-recovery "$cancel_result"
 done
-remote "cat '$guest/pin-ignored-with-id-truncated-jobs.log'" >"$D/pin-rejection-jobs.txt"
+remote "cat '$guest/pin-recovery-truncated-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \
     "$D/pin-rejection-jobs.txt" "$D/fixtures/quicklook.pdf" 16 16,17,18,19 "$expected_responses" >"$D/pin-rejection-pdf-checks.log"
 cat "$D/pin-rejection-pdf-checks.log"

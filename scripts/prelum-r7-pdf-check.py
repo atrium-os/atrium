@@ -15,13 +15,24 @@ def numbered_lines(pattern, body):
     return [int(number) for number in re.findall(pattern, body, re.M)]
 
 
+def printed_events(job):
+    lifecycle = [("create", None)]
+    if job >= 14:
+        lifecycle.append(("pin-accepted", job))
+    lifecycle.extend([("send", job), ("receipt", job), ("complete", job)])
+    return lifecycle
+
+
 spool = Path(sys.argv[1])
 original = Path(sys.argv[4]) if len(sys.argv) > 4 else None
 job_count = int(sys.argv[5]) if original else 11
-expected = [spool / f"job-{job}.pdf" for job in range(1, job_count + 1)]
+responses = Path(sys.argv[7]).read_text(encoding="utf-8").splitlines() if len(sys.argv) > 7 else []
+outcomes = [line.split() for line in responses]
+job_ids = list(range(1, job_count + 1))
+job_ids.extend(int(job) for response, job, _ in outcomes if response == "recovery")
+expected = [spool / f"job-{job}.pdf" for job in job_ids]
 assert set(spool.glob("*.pdf")) == set(expected), list(spool.iterdir())
 transcript = Path(sys.argv[2]).read_text(encoding="utf-8")
-job_ids = list(range(1, len(expected) + 1))
 events = []
 receipts = []
 for line in transcript.splitlines():
@@ -35,6 +46,8 @@ for line in transcript.splitlines():
         events.append(("cancel", int(cancel[1])))
     elif result := re.fullmatch(r"fake printer: Cancel-Job result ([a-z-]+) (\d+)", line):
         events.append((result[1], int(result[2])))
+    elif accepted := re.fullmatch(r"fake printer: accepted fixture PIN for job (\d+) before document", line):
+        events.append(("pin-accepted", int(accepted[1])))
     elif send := re.match(r"^fake printer: Send-Document job (\d+) ", line):
         events.append(("send", int(send[1])))
     elif receipt := re.fullmatch(
@@ -45,28 +58,19 @@ for line in transcript.splitlines():
         receipts.append(receipt.groups())
     elif completed := re.fullmatch(r"fake printer: job (\d+) completed", line):
         events.append(("complete", int(completed[1])))
-for job in range(14, job_count + 1):
-    pin_accept = f"fake printer: accepted fixture PIN for job {job} before document"
-    assert transcript.count(pin_accept) == 1
-    assert transcript.index(pin_accept) < transcript.index(f"fake printer: Send-Document job {job} ")
 
 expected_events = [
-    event
-    for job in job_ids
-    for event in (("create", None), ("send", job), ("receipt", job), ("complete", job))
+    event for job in range(1, job_count + 1) for event in printed_events(job)
 ]
-if len(sys.argv) > 7:
-    responses = [line.split() for line in Path(sys.argv[7]).read_text(encoding="utf-8").splitlines()]
-    for response, printer_job, cancel_result in responses:
+for response, printer_job, cancel_result in outcomes:
+    if response == "recovery":
+        expected_events.extend(printed_events(int(printer_job)))
+    else:
         expected_events.extend([("create", None), (response, printer_job)])
         if printer_job != "-":
             job = int(printer_job)
             expected_events.extend([("cancel", job), (cancel_result, job)])
 assert events == expected_events, events
-if len(sys.argv) > 7:
-    for response, printer_job, cancel_result in responses:
-        result = "no job ID" if printer_job == "-" else f"job {printer_job} cancellation {cancel_result}"
-        print(f"IPPS simulator: PIN response {response}, {result}, no document request or PDF")
 
 jobs = Path(sys.argv[3]).read_text(encoding="utf-8")
 completed_jobs = re.findall(
@@ -74,16 +78,27 @@ completed_jobs = re.findall(
     jobs,
     re.M,
 )
-desktop_job_ids = job_ids
+desktop_job_ids = list(range(1, job_count + 1))
+skipped = set()
 if len(sys.argv) > 6:
-    # Rejected desktop jobs consume local IDs without creating IPP jobs.
+    # Earlier rejections consume local IDs without creating IPP jobs.
     skipped = {int(job) for job in sys.argv[6].split(",")}
     desktop_job_ids = [job for job in range(1, job_count + len(skipped) + 1) if job not in skipped]
     for job in skipped:
         assert re.search(rf"^ +{job} +printer [0-9]+ +Failed +0/2 ", jobs, re.M), jobs
-if len(sys.argv) > 7:
-    failed_pin_jobs = re.findall(r"^ +([0-9]+) +printer [0-9]+ +Failed +0/2 +PIN response ", jobs, re.M)
-    assert len(failed_pin_jobs) == len(responses), failed_pin_jobs
+if outcomes:
+    first_followup = job_count + len(skipped) + 1
+    for desktop_job, (response, printer_job, cancel_result) in enumerate(outcomes, first_followup):
+        if response == "recovery":
+            desktop_job_ids.append(desktop_job)
+            assert (str(desktop_job), "2", "2", f"PIN recovery after {cancel_result}") in completed_jobs, jobs
+            print(f"IPPS simulator: fresh PIN after {cancel_result}, job {printer_job} uploaded once")
+        else:
+            id_mode = "without-id" if printer_job == "-" else "with-id"
+            title = re.escape(f"PIN response {response} {id_mode} {cancel_result}")
+            assert re.search(rf"^ +{desktop_job} +printer [0-9]+ +Failed +0/2 +{title} ", jobs, re.M), jobs
+            result = "no job ID" if printer_job == "-" else f"job {printer_job} cancellation {cancel_result}"
+            print(f"IPPS simulator: PIN response {response}, {result}, no document request or PDF")
 assert [int(job) for job, _, _, _ in completed_jobs] == desktop_job_ids, completed_jobs
 assert [title for _, _, _, title in completed_jobs] == [
     title for _, _, title, _, _, _ in receipts
