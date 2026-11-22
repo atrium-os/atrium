@@ -271,7 +271,14 @@ fn main() -> std::io::Result<()> {
             // The sign-in window's form, when no prompt shows, is guarded
             // the same way: its button's press is spent only if seen clear.
             let g = s.geo();
-            let row = g.prompt.or(g.form).map(|r| [r.x().ceil() as i32, r.y().ceil() as i32, r.w().floor() as i32 - 1, r.h().floor() as i32 - 1]);
+            let row = g.prompt.or_else(|| g.form.map(|mut form| {
+                if let Some(i) = s.form.as_ref().and_then(|p| p.arca_field()) {
+                    if let Some((_, field)) = s.form_layout().0.into_iter().find(|(index, _)| *index == i) {
+                        form = pergola::Rect::new(form.x(), form.y(), form.w(), field.y() - form.y());
+                    }
+                }
+                form
+            })).map(|r| [r.x().ceil() as i32, r.y().ceil() as i32, r.w().floor() as i32 - 1, r.h().floor() as i32 - 1]);
             if changed || to_page {
                 state.set(s);
             }

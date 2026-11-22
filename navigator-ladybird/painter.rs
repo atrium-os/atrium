@@ -933,7 +933,20 @@ pub mod host {
         if !state.vpn_page || html.is_null() || len > 2 * 1024 * 1024 { return false; }
         let Some((child, embed, _)) = &state.embed else { return false };
         let Ok(doc) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(html, len) }) else { return false };
-        let forms = navigator_forms::forms(doc);
+        let mut forms = navigator_forms::forms(doc);
+        // A scripting-enabled DOM can omit the noscript submit control on a
+        // SAML POST binding. Recover only fixed-value POSTs from the sealed
+        // response. The trusted window still requires a guarded press.
+        if forms.is_empty() {
+            use limen::doc_viewer::FieldKind;
+            if let Some(source) = state.mail_document.as_ref().and_then(|(_, bytes)| std::str::from_utf8(bytes).ok()) {
+                forms = navigator_forms::forms(source).into_iter().filter(|form| {
+                    form.post && form.fields.iter().all(|f| matches!(f.kind, FieldKind::Fixed | FieldKind::Submit))
+                        && form.fields.iter().any(|f| f.kind == FieldKind::Fixed && f.name == "SAMLResponse")
+                }).collect();
+            }
+        }
+        eprintln!("VPN page offered {} forms", forms.len());
         if forms.is_empty() { return true; }
         child.borrow_mut().emit(*embed, limen::doc_viewer::ToParent::Forms { forms }.encode()).is_ok()
     }

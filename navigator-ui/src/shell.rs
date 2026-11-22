@@ -1413,12 +1413,19 @@ impl Shell {
         let cx = x + label_w + em(16.0);
         let mut y = r.y() + em(FORM_HEAD);
         let mut rows = Vec::new();
-        for i in p.rows().into_iter().take(FORM_ROWS_SHOWN) {
+        let visible: Vec<_> = p.rows().into_iter().take(FORM_ROWS_SHOWN).collect();
+        let credential = p.arca_field().filter(|i| visible.contains(i));
+        for i in visible.into_iter().filter(|i| Some(*i) != credential) {
             rows.push((i, Rect::new(x, y, r.w() - em(32.0), em(FORM_ROW))));
             y += em(FORM_ROW);
         }
         let buttons = p.buttons().into_iter().enumerate()
             .map(|(k, i)| (i, Rect::new(cx + k as f32 * em(FORM_BUTTON_W + 12.0), y + em(4.0), em(FORM_BUTTON_W), em(28.0)))).collect();
+        // The credential surface is another window. Keep it immediately
+        // below the guarded chrome so it cannot cover the submit action.
+        if let Some(i) = credential {
+            rows.push((i, Rect::new(x, y + em(FORM_ROW), r.w() - em(32.0), em(FORM_ROW))));
+        }
         (rows, buttons, cx)
     }
 
@@ -1873,6 +1880,9 @@ mod tests {
         s.form.as_mut().unwrap().vpn = true;
         let p = s.form.as_ref().unwrap();
         assert_eq!((p.arca_field(), p.texts()), (Some(1), vec![0]), "the password is Arca's field, not the panel's");
+        let (rows, buttons, _) = s.form_layout();
+        let credential = rows.iter().find(|(i, _)| *i == 1).unwrap().1;
+        assert!(buttons.iter().all(|(_, b)| b.y() + b.h() <= credential.y()));
         s.form_field(1);
         assert_eq!(s.form.as_ref().unwrap().focus, Some(0), "the panel never takes its keys");
         for c in "alice".chars() {

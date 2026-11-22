@@ -406,12 +406,12 @@ to the gateway and Keycloak 26.0.7. The broker now uses only the profile's
 couriers for VPN sign-in. This run had no plain fetcher bundle installed.
 All 22 broker unit tests passed on arm64 FreeBSD.
 
-The installed window requested the Limen document viewer. A separate
+The initial run requested the Limen document viewer. A separate
 JIT-off Ladybird rendering probe read the guest-fetched Keycloak login HTML,
 found the username, password and submit controls, and built a native Fresco
 scene with 13 node changes. The non-root worker verified its jail, Capsicum
 mode and denial of a filesystem lookup. This exercised the initial document
-only. The installed window still needs a live page role, brokered resource
+only. At that point the installed window still needed a live page role, brokered resource
 and form navigation, and the trusted Arca password field.
 
 The host gateway control verified Keycloak's signed response and minted a
@@ -420,7 +420,7 @@ session without a password, and asked for a password after clearing its
 browser jar. The fixture now resolves Keycloak's key name to the configured
 IdP certificate with xmlsec 1.3. These controls used the fixture browser.
 Arca profile deletion, Crypta token consumption and replay refusal, and
-traffic through ocserv remain open in the installed Ladybird flow. The VPN
+traffic through ocserv were pending at that point. The VPN
 team's separate ocserv backend was offline during this run.
 
 Evidence on the Mac is in `~/atrium-vm/evidence/navigator-i3-vpn-sso-20261122/`.
@@ -432,8 +432,26 @@ response and its final HTTPS address to the window. The window forwards the
 sealed descriptor to the matching embed. Ladybird paints the page and reports
 forms from the parsed DOM. The trusted window embeds Arca's credential field,
 and navigatord permits its handle only on an HTTPS POST to the page's origin.
-The converter recording still supplies the broker's form checks. Installed
-gateway and tunnel verification is pending.
+The converter recording still supplies the broker's form checks.
+
+The installed gate subsequently passed on a private arm64 HVF Tessera root.
+Fresco initially refused the submit press because Arca's embedded surface
+overlapped the guarded form. The heading, ordinary fields and submit buttons
+now occupy the guarded area, with Arca's surface immediately below it.
+The broker reads the 16-byte Arca handle through the bounded application
+reply reader. The worker can recover a fixed-value SAML POST and its
+noscript Continue button from the sealed response when the parsed DOM has
+no actionable form. Sending it still takes a separate guarded press.
+
+The installed Keycloak window reused its session on reopening. The gateway
+verified the signed assertion, accepted Crypta's token and refused the same
+auth-reply when repeated over a new TLS connection. Fetching
+`http://10.98.0.1/` through ocserv on `tun2` returned `crypta-ac-ok`.
+Deleting `win` removed it from Crypta's list. Recreating the same name
+brought back the username and Arca password fields. A fresh sign-in,
+assertion and redemption opened `tun3` and returned the same sentinel.
+The local gateway exercised the replay in memory. Evidence is in
+`~/atrium-vm/evidence/navigator-i3-vpn-installed-20261122/`.
 
 ### I3 installed passkey sign-in
 

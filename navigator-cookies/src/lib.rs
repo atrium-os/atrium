@@ -605,6 +605,8 @@ impl ArcadSocket {
         arcad::proto::write_request(&mut s, op, body).map_err(|e| format!("arcad: {e}"))?;
         let (st, b) = if op == arcad::proto::broker_op::W_MAIL_SIGN_IN {
             arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::AuthorizationUrl)
+        } else if op == arcad::proto::broker_op::W_HANDLE_FOR {
+            arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::Ticket)
         } else {
             arcad::proto::read_reply(&mut s).map(|(st, b)| (st, b.as_ref().to_vec()))
         }.map_err(|e| format!("arcad: {e}"))?;
