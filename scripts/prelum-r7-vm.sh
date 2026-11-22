@@ -411,7 +411,7 @@ replay_and_recover() {
     replay_proof="$D/pin-replay-$2"
     printf 'replay - %s\n' "$2" >>"$expected_responses"
     grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-before-operations.log"
-    submit_pin_fixture replay "pin-replay-$2" "$1" "$2"
+    submit_pin_fixture replay "pin-replay-$2" "$1" "${3:-$2}"
     grep -E "$job_operations" "$D/simulator.log" >"$replay_proof-after-operations.log"
     cmp "$replay_proof-before-operations.log" "$replay_proof-after-operations.log"
 
@@ -434,8 +434,8 @@ done
 for send_failure in ipp-refused ipp-busy http-refused dropped truncated invalid-ipp; do
     printer_job=$((printer_job + 1))
     printf 'send-failure %s %s\n' "$printer_job" "$send_failure" >>"$expected_responses"
-    submit_pin_fixture fresh "pin-send-$send_failure" pin-send-failure "$send_failure"
-    recover_with_fresh_pin "send-$send_failure"
+    submit_pin_fixture retain "pin-send-$send_failure" pin-send-failure "$send_failure"
+    replay_and_recover pin-send-failure "send-$send_failure" "$send_failure"
 done
 remote "cat '$guest/pin-recovery-send-invalid-ipp-jobs.log'" >"$D/pin-rejection-jobs.txt"
 python3 -I "$scripts/prelum-r7-pdf-check.py" "$D/spool" "$D/simulator.log" \

@@ -59,6 +59,7 @@ case "$phase" in
     case "$kind" in
       pin-uuid) job=16; prefix=pin-replay ;;
       pin-replay|pin-create-replay) ;;
+      pin-send-failure) prefix=pin-replay-send-$6 ;;
       *) exit 2 ;;
     esac
     # Replay the retained handle, then leave no handle file for the next job.
@@ -80,7 +81,12 @@ case "$phase" in
     expected="^ +$job +printer +1 +Failed +0/2 +$title +this printer cannot accept a PIN before the document is sent *$"
     ;;
   fresh|retain)
-    if [ "$phase" = retain ]; then test "$kind" = pin-rejection; fi
+    if [ "$phase" = retain ]; then
+      case "$kind" in
+        pin-rejection|pin-send-failure) ;;
+        *) exit 2 ;;
+      esac
+    fi
     case "$kind" in
       pin-fresh|pin-recovery) expected="^ +$job +printer +1 +Done +2/2 +$title *$" ;;
       pin-send-failure)
