@@ -112,7 +112,8 @@ fn saved_status(d: &Doc, format: Format) -> String {
         _ => true,
     };
     let mut status = if lost {
-        format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name)
+        let label = if d.csv_sep == b'\t' { "TSV" } else { "CSV" };
+        format!("Saved “{}”. {label} keeps formula results as values.", d.name)
     } else if macros_lost {
         format!("Saved “{}”. Its macros aren't in this file: this format can't hold them.", d.name)
     } else {
@@ -1275,6 +1276,26 @@ mod document_tests {
             "Saved “Sales.ods”. ODS converted table references to cell ranges, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
         );
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Sales.ods”.");
+    }
+
+    #[test]
+    fn delimited_save_reports_formula_results_in_the_written_format() {
+        for (name, input, label) in [
+            ("Data.csv", b"a,b\n7,0\n".as_slice(), "CSV"),
+            ("Data.TSV", b"a,b,c,d\tCalc\n7\t0\nsolo\n".as_slice(), "TSV"),
+        ] {
+            let (mut doc, _) = Doc::from_csv(name, input).unwrap();
+            doc.type_into(1, 1, "=A2*3");
+            let bytes = encode(&doc, Format::Csv).unwrap();
+            let (back, _) = Doc::from_csv(name, &bytes).unwrap();
+            let result = officina_grid::CellAddr::new(0, 1, 1);
+            assert_eq!(back.wb.get(result), officina_grid::Value::Num(21.0));
+            assert!(back.wb.formula_text(result).is_none());
+            assert_eq!(
+                saved_status(&doc, Format::Csv),
+                format!("Saved “{name}”. {label} keeps formula results as values.")
+            );
+        }
     }
 
     #[test]

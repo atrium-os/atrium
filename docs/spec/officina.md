@@ -898,17 +898,24 @@ bytes a cell in a mixed chunk plus the pool) and get their own measurement in O4
   `fresco_compute::damage`); O2 adds tests that diagonal and sideways scrolls shift and
   equal full redraws (`pack.rs`), and the RDNA4 oracle cases `fresco_shift_diagonal` and
   `fresco_shift_across` (CPU reference passes; the gpusim run is on the Mac).
-- **CSV** (`officina-grid/src/csv.rs`): separator detection (`,` `;` tab `|`), UTF-8 with
-  or without BOM, Windows-1252 fallback, RFC 4180 quoting; values typed as a user would
-  type them, formulas kept as text unless asked; writes General format at 15 digits with
-  CRLF and the separator it was read with.
+- **CSV and TSV** (`officina-grid/src/csv.rs`). Detection compares the first
+  records using commas, semicolons and tabs, counting line breaks inside
+  quotes as part of the field. Sheets uses tabs for a `.tsv` name.
+  Import accepts UTF-8 with or without a BOM and reports Windows-1252
+  fallback. Formula-like input stays text. Ordinary Save uses UTF-8, CRLF
+  record endings, the source delimiter and General number formatting.
+  Formulas save as calculated values, and Sheets names the delimited format
+  in the Save notice. The [desktop gate](../../scripts/sheets-interop-vm-check.sh)
+  with `SHEETS_INTEROP_CASE=delimited` checks both encodings in both formats,
+  including quoted delimiters, doubled quotes, embedded CRLF and the original
+  formula-like text beside a saved formula result.
 - **`atrium-sheets`**: the app. Toolbar (Open, Save, Save As, Undo, Redo), a formula bar
   (address and the active cell's formula), the grid, a status line. Files come from the
   system picker (scrinium.md §4.1): Open asks for one file read-write and Save writes
   back to that descriptor. **Save As is interim:** until Scrinium's Save As sheet (§4.2)
   exists it asks the picker for a folder with write access and writes `NAME.osheet`
   there (temp file, hard link, so nothing is ever replaced; `NAME 2.osheet` and so on
-  when taken). Saving to CSV keeps values only and says so.
+  when taken). Saving to CSV or TSV keeps formula results as values.
 - **Autosave and crash recovery** (`atrium-sheets/src/doc.rs`). Each document journals
   every action (`officina-core` records: a run of ops, undo, redo, a column width, a
   "saved" mark) to a private folder under `~/.local/state/atrium-sheets/autosave/`,

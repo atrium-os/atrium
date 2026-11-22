@@ -66,6 +66,8 @@ pub enum Check {
     Bytes(&'static [(usize, &'static [u8])]),
     /// Text (§4.2: UTF-8, no NUL).
     Text,
+    /// Text or Windows-1252 for a named CSV or TSV. Used only to confirm a name.
+    DelimitedText,
     /// Text whose first non-blank characters, lowercased, start with one of these.
     TextStarts(&'static [&'static str]),
     /// Text that has this (lowercase) in its head.
@@ -93,7 +95,7 @@ macro_rules! t {
     };
 }
 
-use Check::{Bytes, Text, TextHas, TextStarts};
+use Check::{Bytes, DelimitedText, Text, TextHas, TextStarts};
 
 /// The table. Order matters for naming by bytes: the first type whose
 /// marks match wins, so programs come first and plain text last.
@@ -160,7 +162,7 @@ pub static TYPES: &[Type] = &[
     // Text and markup: specific before plain.
     t!("text/html", "Web page", WebPage, ["html", "htm", "xhtml"], [TextStarts(&["<!doctype html", "<html"])], [Text]),
     t!("text/markdown", "Markdown text", Text, ["md", "markdown"], [], [Text]),
-    t!("text/csv", "CSV table", Spreadsheet, ["csv", "tsv"], [], [Text]),
+    t!("text/csv", "CSV table", Spreadsheet, ["csv", "tsv"], [], [DelimitedText]),
     t!("application/json", "JSON data", Text, ["json"], [], [Text]),
     t!("application/xml", "XML data", Text, ["xml"], [TextStarts(&["<?xml"])], [Text]),
     t!("text/plain", "Plain text", Text, ["txt", "text", "log", "ini", "cfg", "conf", "toml", "yaml", "yml", "rs", "c", "h", "cpp", "go", "java", "css"], [Text], []),
@@ -211,6 +213,10 @@ fn check(c: &Check, head: &[u8]) -> bool {
     match c {
         Bytes(pairs) => pairs.iter().all(|(o, b)| head.get(*o..o + b.len()) == Some(*b)),
         Text => is_text(head),
+        DelimitedText => is_text(head) || (head.iter().copied().all(|b| {
+            matches!(b, b'\t' | b'\r' | b'\n' | 0x20..=0x7e | 0x80..=0xff)
+                && !matches!(b, 0x81 | 0x8d | 0x8f | 0x90 | 0x9d)
+        }) && by_bytes(head).is_none()),
         TextStarts(p) => is_text(head) && {
             let l = lead(head);
             p.iter().any(|p| l.starts_with(p))
@@ -363,6 +369,18 @@ mod tests {
         assert_eq!(mime(detect("song.m4a", b"\0\0\0\x18ftypM4A ")), "audio/mp4");
         assert_eq!(mime(detect("p.svg", b"<?xml version=\"1.0\"?>\n<svg xmlns=")), "image/svg+xml");
         assert_eq!(mime(detect("empty.txt", b"")), "text/plain");
+    }
+
+    #[test]
+    fn named_tables_accept_windows_1252_text() {
+        let legacy = b"Product,Price\r\ncaf\xe9,\x80 7\r\n";
+        for name in ["list.csv", "list.tsv"] {
+            assert_eq!(mime(detect(name, legacy)), "text/csv");
+            assert!(detect(name, b"a,\0x").known().is_none());
+            assert!(detect(name, b"\xff\xd8\xff\xe0").known().is_none());
+        }
+        assert!(detect("list.txt", legacy).known().is_none());
+        assert!(detect("list", legacy).known().is_none());
     }
 
     #[test]

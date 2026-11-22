@@ -7,8 +7,8 @@
 //! (`=WEBSERVICE(...)`, or a formula a later export turns into a command for another
 //! program) is a known attack.
 //!
-//! - Separator: comma, semicolon or tab, detected from the first lines when not given
-//!   (the one that splits them most evenly, outside quotes).
+//! - Separator: comma, semicolon or tab. Auto-detection compares the first
+//!   logical records, including quoted fields with embedded line breaks.
 //! - Encoding: UTF-8 (a BOM is skipped); bytes that are not UTF-8 are read as
 //!   Windows-1252, as Excel does for "ANSI" CSV.
 //! - Line ends: CRLF, LF or CR; newlines inside quotes are kept in the cell.
@@ -69,30 +69,45 @@ impl std::fmt::Display for CsvError {
 
 impl std::error::Error for CsvError {}
 
-/// The separator that splits the first lines of `text` most evenly.
+/// The separator that splits the first records of `text` most evenly.
 pub fn detect_separator(text: &str) -> u8 {
-    let lines: Vec<&str> = text.lines().take(20).collect();
-    let mut best = (b',', 0usize, false);
-    for sep in [b',', b';', b'\t'] {
-        let counts: Vec<usize> = lines
-            .iter()
-            .map(|l| {
-                let mut quoted = false;
-                l.bytes()
-                    .filter(|&b| {
-                        if b == b'"' {
-                            quoted = !quoted;
-                        }
-                        b == sep && !quoted
-                    })
-                    .count()
-            })
-            .collect();
-        let first = counts.first().copied().unwrap_or(0);
-        let even = !counts.is_empty() && counts.iter().all(|&c| c == first);
-        // Prefer a separator present on every line the same number of times.
+    const SEPARATORS: [u8; 3] = [b',', b';', b'\t'];
+    let mut records = Vec::with_capacity(20);
+    let mut counts = [0; SEPARATORS.len()];
+    let (mut quoted, mut nonempty) = (false, false);
+    for byte in text.bytes() {
+        match byte {
+            b'"' => {
+                // Doubled quotes toggle twice inside a quoted field.
+                quoted = !quoted;
+                nonempty = true;
+            }
+            b'\r' | b'\n' if !quoted => {
+                if nonempty {
+                    records.push(std::mem::take(&mut counts));
+                    if records.len() == 20 { break; }
+                }
+                nonempty = false; // Skip blanks and the LF in CRLF.
+            }
+            _ => {
+                nonempty = true;
+                if !quoted {
+                    if let Some(index) = SEPARATORS.iter().position(|&sep| byte == sep) {
+                        counts[index] += 1;
+                    }
+                }
+            }
+        }
+    }
+    if nonempty && records.len() < 20 {
+        records.push(counts);
+    }
+    let mut best = (b',', 0, false);
+    for (index, separator) in SEPARATORS.into_iter().enumerate() {
+        let first = records.first().map_or(0, |counts| counts[index]);
+        let even = records.iter().all(|counts| counts[index] == first);
         if first > 0 && ((even && !best.2) || (even == best.2 && first > best.1)) {
-            best = (sep, first, even);
+            best = (separator, first, even);
         }
     }
     best.0
@@ -341,6 +356,17 @@ mod tests {
         assert!(st.latin);
         assert_eq!(get(&wb, 1, 0), Value::str("€ 5"));
         assert_eq!(get(&wb, 1, 1), Value::str("café"));
+    }
+
+    #[test]
+    fn separator_detection_counts_quoted_lines_as_one_record() {
+        let multiline = "Label; owner; project; month; status,Qty,Calc,Literal\r\n\"a, \"\"quote\"\"\r\nsecond line, end\",7,0,=1+2\r\n\" padded \",1,TRUE,#N/A";
+        let mut wb = book();
+        let stats = read(&mut wb, 0, multiline.as_bytes(), CsvOptions::default()).unwrap();
+        assert_eq!((stats.separator, stats.rows, stats.cols), (b',', 3, 4));
+        assert_eq!(get(&wb, 1, 0), Value::str("a, \"quote\"\r\nsecond line, end"));
+        assert_eq!(get(&wb, 2, 0), Value::str(" padded "));
+        assert_eq!(detect_separator("label,group,code;total\rtext;1\rmore;2"), b';');
     }
 
     #[test]

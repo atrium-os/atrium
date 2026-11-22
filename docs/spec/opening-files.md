@@ -97,6 +97,10 @@ holds the stick or share) and compares:
 - no extension, or one the table doesn't know: the bytes decide if they
   match; otherwise **unknown** (§4.3).
 
+A named `.csv` or `.tsv` can also be confirmed by a Windows-1252 text prefix.
+This confirmation rejects binary signatures, control bytes other than tab
+and line endings, and undefined Windows-1252 bytes.
+
 The check is Scrinium's (it runs in its own jail, reads bytes, parses
 nothing). The app then parses the file in its own jail as it would any
 file the user picked.

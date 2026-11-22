@@ -12,18 +12,19 @@
 # The print profile also needs Prelum and the print sheet with no printers
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
+# Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
-if test "$profile" = legacy; then
-    test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')"
-else
-    test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')"
-fi
+case "$profile" in
+    legacy) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')" ;;
+    delimited) test "$(ls "$books")" = "$(printf '01-utf8.csv\n02-utf8.tsv\n03-ansi.csv\n04-ansi.tsv')" ;;
+    *) test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')" ;;
+esac
 
 input() { printf '%s\n' "$@" | nc -N -U inject.sock >/dev/null; }
 click() { input "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'; }
@@ -49,6 +50,7 @@ checkpoint() {
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
+        delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
 } 2>"$results/checkpoint.log"
@@ -69,7 +71,7 @@ open_book() {
     click 520 "$1"
     click 824 458
     wait_for loaded "$2" "$3"
-    if test "${4:-foreign}" = native; then
+    if test "$profile" = delimited || test "${4:-foreign}" = native; then
         test "$(worker_count)" -eq "$before"
     else
         wait_for worker_started "$before"
@@ -312,6 +314,38 @@ formulas_reopened() {
     cp selectscreen.png "$results/$format-formulas-reopened.png"
 }
 
+delimited() {
+    row=183
+    for book in 01-utf8.csv 02-utf8.tsv 03-ansi.csv 04-ansi.tsv; do
+        format=${book##*.}
+        case "$book" in *-utf8.*) encoding=utf8 ;; *) encoding=ansi ;; esac
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        sleep .45
+        cp selectscreen.png "$results/$book-initial.png"
+
+        click 191 133 # C2. Enter =B2*3.
+        key 0x2e
+        key 0x05
+        key 0x1f
+        key 0x25 2
+        key 0x20
+        key 0x28
+        save "$book" saved
+        sleep .8 # Wait for the Save acknowledgment after checking the bytes.
+        cp selectscreen.png "$results/$book-saved.png"
+        cp "$books/$book" "$results/$book"
+        close_book
+
+        open_book "$row" "$book" saved
+        sleep .45
+        cp selectscreen.png "$results/$book-reopened.png"
+        close_book
+        echo "PASS $format $encoding quoted records, values-only Save and reopen"
+        row=$((row + 30))
+    done
+}
+
 legacy() {
     checksum=$(sha256 -q "$books/legacy.xls")
     checkpoint "$books/macro.xlsm" macro-initial
@@ -365,7 +399,10 @@ legacy() {
 
 launcher=$(win_at 48 24)
 test "$launcher" -gt 0
-if test "$profile" = legacy; then legacy; exit; fi
+case "$profile" in
+    legacy) legacy; exit ;;
+    delimited) delimited; exit ;;
+esac
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac
     book=sales.$format

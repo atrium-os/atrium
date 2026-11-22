@@ -618,7 +618,9 @@ impl Doc {
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
     pub fn from_csv(name: &str, data: &[u8]) -> Result<(Self, CsvStats), csv::CsvError> {
         let mut doc = Self::new(name);
-        let st = csv::read(&mut doc.wb, 0, data, CsvOptions::default())?;
+        let is_tsv = name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tsv"));
+        let opts = CsvOptions { separator: is_tsv.then_some(b'\t'), ..CsvOptions::default() };
+        let st = csv::read(&mut doc.wb, 0, data, opts)?;
         doc.csv_sep = st.separator;
         doc.wb.recalc();
         Ok((doc, st))
