@@ -537,6 +537,14 @@ tunnel waited for trusted confirmation. The gateway recorded one POST,
 one accepted assertion, and one redemption, and `tun1` returned
 `crypta-ac-ok` through ocserv. Both dedicated guests shut down cleanly.
 
+The cancellation gate disconnected again while the new Sign In request
+was queued. Portcullis discarded it before the old broker resumed. The
+old jail then exited without a queued launch, and the gateway counts
+showed zero POSTs, zero accepted assertions, and zero redemptions.
+A later reconnect opened sign-in for a distinct attempt. The gateway
+received one POST after trusted confirmation, and the guest fetched
+`crypta-ac-ok` through `tun2`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
