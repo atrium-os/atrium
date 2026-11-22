@@ -19,6 +19,9 @@ use mail_sync::jmap::{Client, Http};
 use serde_json::{json, Map, Value};
 
 fn jail() -> PathBuf {
+    if let Some(program) = std::env::var_os("MAIL_PARSE_JAIL") {
+        return program.into();
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());
@@ -645,6 +648,14 @@ fn jmap_sync_changes_and_send() {
     let mut seen = Vec::new();
     let r = mail_engine::import::import_with(&engine.store, &engine.parser, account, gone, &big[..], &mut |p| seen.push(p.progress_line("old.mbox"))).unwrap();
     assert_eq!(r.queued, 1200);
+    let queued = engine.store.imports().unwrap();
+    assert_eq!(queued.len(), 1200);
+    assert!(queued.iter().all(|(_, import)| import.folder == gone && import.tries == 0));
+    for (i, (_, import)) in queued.iter().enumerate() {
+        let raw = engine.store.blob(&import.blob).unwrap();
+        let expected = format!("Message-ID: <big{i}@example.com>\r\nSubject: {i}\r\n\r\nx\r\n");
+        assert_eq!(raw, expected.as_bytes(), "queued message {i}");
+    }
     assert_eq!(seen, ["Reading old.mbox: 500 messages so far, 500 new", "Reading old.mbox: 1000 messages so far, 1000 new"]);
 }
 
