@@ -554,6 +554,14 @@ Navigator now keeps the field attached until the broker replies to the
 form. The rerun recorded one script POST, one accepted assertion, one
 token redemption, and `crypta-ac-ok` through `tun5`.
 
+The in-place replacement gate held the queue worker outside the lock in
+a fixture-only build. Portcullis logged one enqueue and one replacement
+while the original jail was still open. After teardown it launched one
+window for the newest attempt. The gateway received zero stale POSTs,
+and the new tunnel had no handshake or IPv4 sentinel response before
+trusted confirmation. Confirmation produced one script POST, one accepted
+assertion, one redemption and `crypta-ac-ok` through ocserv on `tun2`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
