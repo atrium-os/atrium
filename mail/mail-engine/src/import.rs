@@ -4,11 +4,14 @@
 //! server (IMAP `APPEND`, JMAP `Email/import`). Sync brings them back in
 //! like any other mail, so the server and every other client have them.
 //!
-//! Reads the file as it goes (an mbox can be gigabytes); keeps one message
-//! at a time. Messages the account already has (by Message-ID) are skipped,
+//! Reads the file as it goes (an mbox can be gigabytes), checking a bounded
+//! batch of headers at a time. Messages the account already has (by Message-ID) are skipped,
 //! so importing the same file twice adds nothing.
 
+use std::collections::HashSet;
 use std::io::BufRead;
+
+use mail_schema::{MAX_BATCH, MAX_BATCH_BYTES};
 
 use mail_store::{AccountId, FolderId, Store};
 
@@ -55,15 +58,24 @@ impl Imported {
 /// (CRLF line ends, `>From ` unquoted). `too_big` is called instead for a
 /// message over [`MESSAGE_MAX`].
 pub fn split_stream(r: impl BufRead, mut each: impl FnMut(Vec<u8>) -> Result<(), Error>, mut too_big: impl FnMut()) -> Result<(), Error> {
+    split_messages(r, |message| match message {
+        Some(raw) => each(raw),
+        None => {
+            too_big();
+            Ok(())
+        }
+    })
+}
+
+fn split_messages(r: impl BufRead, mut each: impl FnMut(Option<Vec<u8>>) -> Result<(), Error>) -> Result<(), Error> {
     let mut cur: Option<Vec<u8>> = None;
     let mut big = false;
     let mut r = r;
     let mut line = Vec::new();
-    let mut end = |m: Option<Vec<u8>>, big: bool, each: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>| -> Result<(), Error> {
+    let mut end = |m: Option<Vec<u8>>, big: bool| -> Result<(), Error> {
         let Some(mut m) = m else { return Ok(()) };
         if big {
-            too_big();
-            return Ok(());
+            return each(None);
         }
         while m.ends_with(b"\r\n\r\n") {
             m.truncate(m.len() - 2);
@@ -71,7 +83,7 @@ pub fn split_stream(r: impl BufRead, mut each: impl FnMut(Vec<u8>) -> Result<(),
         if m.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(());
         }
-        each(m)
+        each(Some(m))
     };
     loop {
         line.clear();
@@ -83,7 +95,7 @@ pub fn split_stream(r: impl BufRead, mut each: impl FnMut(Vec<u8>) -> Result<(),
         l = l.strip_suffix(b"\n").unwrap_or(l);
         l = l.strip_suffix(b"\r").unwrap_or(l);
         if l.starts_with(b"From ") {
-            end(cur.take(), big, &mut each)?;
+            end(cur.take(), big)?;
             cur = Some(Vec::new());
             big = false;
             continue;
@@ -101,7 +113,7 @@ pub fn split_stream(r: impl BufRead, mut each: impl FnMut(Vec<u8>) -> Result<(),
             *c = Vec::new();
         }
     }
-    end(cur, big, &mut each)
+    end(cur, big)
 }
 
 /// Import the mbox `r` into `folder` (of `account`): each message checked
@@ -117,37 +129,94 @@ pub const PROGRESS_EVERY: usize = 500;
 /// [`import`], calling `progress` with the counts so far after every
 /// [`PROGRESS_EVERY`] messages read (a big file takes minutes).
 pub fn import_with(store: &Store, parser: &Parser, account: AccountId, folder: FolderId, r: impl BufRead, progress: &mut dyn FnMut(&Imported)) -> Result<Imported, Error> {
-    let mut out = Imported::default();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut big = 0;
-    split_stream(
-        r,
-        |m| {
-            let read = out.queued + out.already + out.refused;
-            if read > 0 && read % PROGRESS_EVERY == 0 {
-                progress(&out);
-            }
-            let head_len = m.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(m.len());
-            let s = parser.summarize(&[(0, &m[..head_len])], true, &[])?;
-            let Some(Some(s)) = s.into_iter().next() else {
-                out.refused += 1;
-                return Ok(());
-            };
-            if let Some(mid) = &s.message_id {
-                if !seen.insert(mid.clone()) || store.has_message_id(account, mid)? {
-                    out.already += 1;
-                    return Ok(());
+    let mut batch = ImportBatch {
+        store,
+        parser,
+        account,
+        folder,
+        progress,
+        out: Imported::default(),
+        seen: HashSet::new(),
+        pending: Vec::new(),
+        bytes: 0,
+    };
+    let read = split_messages(r, |message| batch.push(message));
+    // Keep complete messages read before an I/O error, as with single-message imports.
+    batch.flush()?;
+    read?;
+    Ok(batch.out)
+}
+
+struct ImportBatch<'a> {
+    store: &'a Store,
+    parser: &'a Parser,
+    account: AccountId,
+    folder: FolderId,
+    progress: &'a mut dyn FnMut(&Imported),
+    out: Imported,
+    seen: HashSet<String>,
+    pending: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl ImportBatch<'_> {
+    fn push(&mut self, message: Option<Vec<u8>>) -> Result<(), Error> {
+        let Some(raw) = message else {
+            self.flush()?;
+            self.out.refused += 1;
+            self.report_progress();
+            return Ok(());
+        };
+        // Keep memory bounded by whole messages, not just the headers sent to
+        // the worker. A single large message can still be checked by itself.
+        if self.pending.len() == MAX_BATCH || self.bytes + raw.len() > MAX_BATCH_BYTES {
+            self.flush()?;
+        }
+        self.bytes += raw.len();
+        self.pending.push(raw);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.bytes = 0;
+        let headers: Vec<_> = pending.iter().enumerate().map(|(i, raw)| {
+            let len = raw.windows(4).position(|w| w == b"\r\n\r\n").map_or(raw.len(), |p| p + 4);
+            (i as u64, &raw[..len])
+        }).collect();
+        // If one header is larger than the worker's wire limit, keep the
+        // existing single-message handling rather than dropping its neighbors.
+        let summaries = self.parser.summarize(&headers, true, &[])?;
+        for (raw, summary) in pending.into_iter().zip(summaries) {
+            if let Some(summary) = summary {
+                let duplicate = match summary.message_id {
+                    Some(mid) => !self.seen.insert(mid.clone()) || self.store.has_message_id(self.account, &mid)?,
+                    None => false,
+                };
+                if duplicate {
+                    self.out.already += 1;
+                } else {
+                    let blob = self.store.put_blob(&raw)?;
+                    self.store.write(|w| w.queue_import(self.folder, blob))?;
+                    self.out.queued += 1;
                 }
+            } else {
+                self.out.refused += 1;
             }
-            let h = store.put_blob(&m)?;
-            store.write(|w| w.queue_import(folder, h))?;
-            out.queued += 1;
-            Ok(())
-        },
-        || big += 1,
-    )?;
-    out.refused += big;
-    Ok(out)
+            self.report_progress();
+        }
+        Ok(())
+    }
+
+    fn report_progress(&mut self) {
+        let read = self.out.queued + self.out.already + self.out.refused;
+        if read % PROGRESS_EVERY == 0 {
+            (self.progress)(&self.out);
+        }
+    }
 }
 
 impl Engine {

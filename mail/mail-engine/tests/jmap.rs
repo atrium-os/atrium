@@ -643,6 +643,39 @@ fn jmap_sync_changes_and_send() {
 }
 
 #[test]
+fn mbox_import_keeps_complete_messages_before_a_read_error() {
+    use std::io::{self, BufReader, Cursor, Read};
+
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("test mbox read error"))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let a = message(1, "First", "body one");
+    let b = message(2, "Second", "body two");
+    let mut mbox = Vec::new();
+    for raw in [&a, &b] {
+        mail_engine::export::write_one(&mut mbox, raw, 0).unwrap();
+    }
+    mbox.extend_from_slice(b"From sender\nSubject: Interrupted");
+    let input = BufReader::new(Cursor::new(mbox).chain(Broken));
+    let error = engine.import_mbox(archive, input).unwrap_err();
+    assert!(error.to_string().contains("test mbox read error"), "{error}");
+    let queued = engine.store.imports().unwrap();
+    assert_eq!(queued.len(), 2);
+    for ((_, entry), raw) in queued.iter().zip([a, b]) {
+        assert_eq!(entry.folder, archive);
+        assert_eq!(engine.store.blob(&entry.blob).unwrap(), raw);
+    }
+}
+
+#[test]
 fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     use mail_engine::import::{import_with, UPLOADS_PER_PASS};
 
@@ -670,11 +703,13 @@ fn jmap_bulk_import_uploads_and_syncs_all_messages() {
     for i in 0..COUNT {
         mail_engine::export::write_one(&mut mbox, raw_message(i).as_bytes(), 1_795_000_000).unwrap();
     }
+    // Repeat the first Message-ID after crossing several parser batch boundaries.
+    mail_engine::export::write_one(&mut mbox, raw_message(0).as_bytes(), 1_795_000_000).unwrap();
     let mut progress = Vec::new();
     let imported = import_with(&source.store, &source.parser, source_account, destination, &mbox[..], &mut |p| {
         progress.push(p.progress_line("old.mbox"));
     }).unwrap();
-    assert_eq!(imported, mail_engine::import::Imported { queued: COUNT, already: 0, refused: 0 });
+    assert_eq!(imported, mail_engine::import::Imported { queued: COUNT, already: 1, refused: 0 });
     assert_eq!(progress, ["Reading old.mbox: 500 messages so far, 500 new", "Reading old.mbox: 1000 messages so far, 1000 new"]);
     let queued = source.store.imports().unwrap();
     assert_eq!(queued.len(), COUNT);

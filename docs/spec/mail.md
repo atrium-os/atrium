@@ -474,7 +474,11 @@ as **making the account usable first, then filling in what's worth having, polit
 
 - **Import** mbox and Maildir from a file the person picks (Scrinium picker, read-only
   descriptor), parsed in parse jails, written into a local folder or uploaded to an
-  account with `APPEND`.
+  account with IMAP `APPEND` or JMAP `Email/import`. The mbox reader checks headers
+  in batches of at most 64 messages. It buffers up to 32 MiB of complete messages per
+  batch or handles one larger message alone. It queues in file order, reports each
+  500 processed messages including refusals, and preserves complete messages read
+  before an I/O error.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 
