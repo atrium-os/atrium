@@ -3856,13 +3856,12 @@ bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
   - Writing names at most 10,000 rows past a sheet's last used row (a whole-column rule would otherwise name a million cells), and 500,000 cells per file.
   - **LibreOffice:** it reads our .xlsx and writes .ods, and reads our .ods and writes .xlsx, with every rule coming back the same (`officina-convert/tests/validation.rs`). LibreOffice writes a second formula of `0` for one-formula rules, and we drop it.
 - **Sheets.**
-  - A value a Stop rule refuses is taken back, and the status line gives the rule's own message, or what the cell takes ("This cell takes one of: Yes, No.").
-  - A Warning rule keeps the value and asks in a bar under the grid: Keep, or Undo.
-  - An Information rule keeps the value and says why in the status line.
-  - The cursor cell's input prompt shows beside it, as a comment does. A list cell adds the hint "Data ▸ Choose from List…", which opens the list at the right of the grid, with a search. A press types the item in, and the rule checks it as it checks typing.
-- **Not yet:**
-  - Checking pasted values (Excel doesn't either).
-- **Gates:** officina-grid `rules_allow_and_refuse_values` and `rules_are_undone_saved_and_move_with_rows`; officina-convert `tests/validation.rs`; atrium-sheets `validation_refuses_warns_and_offers_its_list`.
+  - Typing, paste, and fill check the affected cells after the edit has been applied and recalculated. Custom formulas see every change in the batch. An edit can cover up to 100,000 cells with enabled validation.
+  - A Stop rule rejects the entire edit before it reaches undo history or autosave. The status line gives the rule's message and identifies the offending cell for a batch.
+  - A Warning rule keeps the edit and offers Keep or Undo in a bar under the grid. Undo takes back the entire edit.
+  - An Information rule keeps the edit and gives the rule's message in the status line.
+  - The cursor cell's input prompt shows beside it, as a comment does. A list cell adds the hint "Data ▸ Choose from List…", which opens the list at the right of the grid, with a search. Choosing an item uses the same validation as typing.
+- **Gates.** The grid and converter validation tests cover rule evaluation and format persistence. The Sheets tests cover tentative edits and undo. The installed desktop gate `scripts/sheets-interop-vm-check.sh` with `SHEETS_INTEROP_CASE=validation` covers typing, system clipboard paste through Tabula, fill, undo and redo, and Save and reopen in XLSX and ODS.
 
 ### 16.84 Data validation panel (2026-11-19)
 

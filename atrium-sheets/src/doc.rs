@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use officina_convert::crypt::CryptError;
 use officina_convert::sealed::{self, Protection, Sealer};
-use officina_core::history::History;
+use officina_core::history::{History, Op};
 use officina_core::journal::{self, JournalWriter};
 use officina_core::wire::{Reader, WireError, Writer};
 use officina_grid::addr::{CellAddr, Rect};
@@ -755,9 +755,14 @@ impl Doc {
 
     /// Runs `ops` as one undo step: applied, journaled, recalculated.
     pub fn run(&mut self, label: &str, ops: Vec<GridOp>) {
+        self.run_action(label, ops);
+    }
+
+    fn run_action(&mut self, label: &str, ops: Vec<GridOp>) -> bool {
         if ops.is_empty() {
-            return;
+            return true;
         }
+        self.warned = None;
         let before = self.wb.memory_bytes();
         let r = Record::Run { label: label.into(), ops };
         self.journal(&r);
@@ -766,15 +771,94 @@ impl Doc {
             self.journal(&Record::Undo);
             self.history.undo(&mut self.wb);
             self.keep_sheet();
-            return;
+            return false;
         }
         self.keep_sheet();
         self.recalc();
         self.dirty = true;
+        true
     }
 
-    /// The user typed `text` into a cell. A formula that doesn't parse is refused
-    /// (the cell keeps what it had) and the reason goes to `status`.
+    /// Checks the cells written by an edit against the completed batch.
+    /// A Stop refusal rolls back before either history or autosave records it.
+    pub(crate) fn run_validated(&mut self, label: &str, ops: Vec<GridOp>) -> bool {
+        fn find_writes(ops: &[GridOp], writes: &mut Vec<Rect>) {
+            for op in ops {
+                match op {
+                    GridOp::Replace(region) => writes.push(region.rect),
+                    GridOp::Batch(ops) => find_writes(ops, writes),
+                    _ => {}
+                }
+            }
+        }
+
+        self.status.clear();
+        let mut writes = Vec::new();
+        find_writes(&ops, &mut writes);
+        let mut cells = std::collections::BTreeSet::new();
+        for rule in self.wb.validations().iter().filter(|rule| rule.show_error && rule.allow != officina_grid::validation::Allow::Any) {
+            for range in &rule.ranges {
+                for &write in writes.iter().filter(|write| write.intersects(range)) {
+                    for row in range.r0.max(write.r0)..=range.r1.min(write.r1) {
+                        for col in range.c0.max(write.c0)..=range.c1.min(write.c1) {
+                            cells.insert((write.sheet, row, col));
+                            if cells.len() > 100_000 {
+                                self.status = "This edit covers more than 100,000 cells with validation. Select a smaller range.".into();
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if cells.is_empty() {
+            return self.run_action(label, ops);
+        }
+        let before = self.wb.memory_bytes();
+        let inverses: Vec<_> = ops.iter().cloned().map(|op| op.apply(&mut self.wb)).collect();
+        let mut stop = self.over_budget(before);
+        let (mut warning, mut info) = (None, None);
+        if !stop {
+            self.wb.recalc();
+            stop = self.over_budget(before);
+        }
+        if !stop {
+            for (sheet, row, col) in cells {
+                let cell = CellAddr::new(sheet, row, col);
+                if let Err(refusal) = self.wb.check_cell(cell) {
+                    let message = refusal_text(&refusal);
+                    match refusal.style {
+                        ErrorStyle::Stop => {
+                            self.status = if label == "Typing" {
+                                message
+                            } else {
+                                format!("{} · {message}", officina_grid::addr::a1(row, col))
+                            };
+                            stop = true;
+                            break;
+                        }
+                        ErrorStyle::Warning if warning.is_none() => warning = Some((cell, message)),
+                        ErrorStyle::Information if info.is_none() => info = Some(message),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if stop {
+            for inverse in inverses.into_iter().rev() { inverse.apply(&mut self.wb); }
+            self.wb.recalc();
+            return false;
+        }
+        self.journal(&Record::Run { label: label.into(), ops });
+        self.history.record_applied(label, inverses);
+        self.dirty = true;
+        self.warned = warning;
+        if self.status.is_empty() {
+            self.status = self.warned.as_ref().map(|(_, message)| message.clone()).or(info).unwrap_or_default();
+        }
+        true
+    }
+
     /// `ops` as part of the last action, undone with it.
     pub fn extend(&mut self, ops: Vec<GridOp>) {
         if ops.is_empty() {
@@ -821,68 +905,45 @@ impl Doc {
             self.status = format!("Ctrl+Enter fills at most {MAX_TYPE_ALL} cells.");
             return false;
         }
-        if !self.type_into(area.r0, area.c0, text) {
+        if area.cells() > 1 && self.wb.merges_in(&area).next().is_some() {
+            self.status = "Unmerge the selected cells before filling them.".into();
             return false;
         }
-        if area.cells() == 1 {
-            return true;
-        }
-        let one = officina_grid::Rect { r1: area.r0, c1: area.c0, ..area };
-        let clip = officina_grid::clip::Clip::take(&self.wb, one, false);
-        match clip.paste_into_as(&self.wb, area, officina_grid::clip::What::Formulas) {
-            Ok((ops, _)) => {
-                self.extend(ops);
-                self.recalc();
-                true
-            }
-            Err(e) => {
-                self.status = e;
-                false
-            }
-        }
-    }
-
-    pub fn type_into(&mut self, row: u32, col: u32, text: &str) -> bool {
         let (input, date_fmt) = match typed_date(text) {
             Some((serial, fmt)) => (Input::Value(officina_grid::Value::Num(serial)), Some(fmt)),
             None => (Input::typed(text), None),
         };
-        if let Input::Formula(f) = &input {
-            if let Err(e) = self.wb.parse(f, self.sheet, row, col) {
-                self.status = format!("That formula has a problem at character {}: {}", e.at + 1, e.msg);
-                return false;
-            }
-        }
-        if self.wb.input(CellAddr::new(self.sheet, row, col)) == input {
-            return true;
-        }
-        self.status.clear();
-        self.warned = None;
-        let a = CellAddr::new(self.sheet, row, col);
-        let mut ops = vec![GridOp::set(a, input)];
-        // A date or time typed: shown as one, unless the cell has a format.
-        if let Some(fmt) = date_fmt.filter(|_| &*self.wb.style(a).num_fmt == "General") {
-            let r = officina_grid::Rect { sheet: a.sheet, r0: row, c0: col, r1: row, c1: col };
-            ops.push(GridOp::restyle(&self.wb, r, |st| officina_grid::style::Style { num_fmt: fmt.as_str().into(), ..st.clone() }));
-        }
-        self.run("Typing", ops);
-        // A validation rule over the cell: refuse, warn, or tell (§16.83).
-        if let Err(r) = self.wb.check_cell(a) {
-            let msg = refusal_text(&r);
-            match r.style {
-                ErrorStyle::Stop => {
-                    self.undo();
-                    self.status = msg;
+        let (row, col) = (area.r0, area.c0);
+        let a = CellAddr::new(area.sheet, row, col);
+        let formula = if let Input::Formula(f) = &input {
+            match self.wb.parse(f, area.sheet, row, col) {
+                Ok(expr) => Some(expr),
+                Err(e) => {
+                    self.status = format!("That formula has a problem at character {}: {}", e.at + 1, e.msg);
                     return false;
                 }
-                ErrorStyle::Warning => {
-                    self.status = msg.clone();
-                    self.warned = Some((a, msg));
-                }
-                ErrorStyle::Information => self.status = msg,
             }
+        } else {
+            None
+        };
+        if area.cells() == 1 && self.wb.input(a) == input {
+            return true;
         }
-        true
+        let rows = (row..=area.r1).map(|r| (col..=area.c1).map(|c| {
+            match &formula {
+                Some(expr) if (r, c) != (row, col) => Input::Formula(officina_grid::formula::to_a1(expr, r, c, &|sheet| self.wb.sheet_name(sheet))),
+                _ => input.clone(),
+            }
+        }).collect()).collect();
+        let mut ops = vec![GridOp::block(area.sheet, row, col, rows)];
+        if let Some(fmt) = date_fmt.filter(|_| &*self.wb.style(a).num_fmt == "General") {
+            ops.push(GridOp::restyle(&self.wb, Rect::cell(a), |st| officina_grid::style::Style { num_fmt: fmt.as_str().into(), ..st.clone() }));
+        }
+        self.run_validated(if area.cells() == 1 { "Typing" } else { "Fill Selection" }, ops)
+    }
+
+    pub fn type_into(&mut self, row: u32, col: u32, text: &str) -> bool {
+        self.type_all(Rect::cell(CellAddr::new(self.sheet, row, col)), text)
     }
 
     /// Keeps the value a rule warned about.
@@ -893,7 +954,7 @@ impl Doc {
 
     /// Takes back the value a rule warned about (if it is still the last change).
     pub fn undo_warned(&mut self) {
-        if self.warned.take().is_some() && self.history.undo_label() == Some("Typing") {
+        if self.warned.take().is_some() {
             self.undo();
             self.status = "Taken back.".into();
         }
@@ -916,23 +977,19 @@ impl Doc {
         use officina_grid::autofill::{fill, Mode};
         let from = Rect { sheet: self.sheet, ..from };
         let to = Rect { sheet: self.sheet, ..to };
-        match fill(&self.wb, from, to, mode) {
-            Ok(GridOp::Batch(ops)) => {
-                self.status.clear();
-                self.run(if mode == Mode::Series { "Fill Series" } else { "Fill" }, ops);
-                self.last_fill = Some((from, to, mode, self.edits));
-                true
-            }
-            Ok(op) => {
-                self.run("Fill", vec![op]);
-                self.last_fill = Some((from, to, mode, self.edits));
-                true
-            }
+        let ops = match fill(&self.wb, from, to, mode) {
+            Ok(GridOp::Batch(ops)) => ops,
+            Ok(op) => vec![op],
             Err(e) => {
                 self.status = e;
-                false
+                return false;
             }
+        };
+        if !self.run_validated(if mode == Mode::Series { "Fill Series" } else { "Fill" }, ops) {
+            return false;
         }
+        self.last_fill = Some((from, to, mode, self.edits));
+        true
     }
 
     /// Whether the last change is a fill that [`refill`](Self::refill) can
@@ -945,20 +1002,22 @@ impl Doc {
     /// undo step in its place.
     pub fn refill(&mut self, how: FillHow) -> bool {
         use officina_grid::autofill::{fill, Mode};
-        let Some((from, to, mode, _)) = self.last_fill.filter(|_| self.can_refill()) else {
+        let Some((from, to, previous_mode, _)) = self.last_fill.filter(|_| self.can_refill()) else {
             self.status = "Fill first; then choose how it fills.".into();
             return false;
         };
         let mode = match how {
             FillHow::Copy => Mode::Copy,
             FillHow::Series => Mode::Count,
-            FillHow::FormatsOnly | FillHow::NoFormats => mode,
+            FillHow::FormatsOnly | FillHow::NoFormats => previous_mode,
         };
         self.undo();
         let ops = match fill(&self.wb, from, to, mode) {
             Ok(GridOp::Batch(ops)) => ops,
             Ok(op) => vec![op],
             Err(e) => {
+                self.redo();
+                self.last_fill = Some((from, to, previous_mode, self.edits));
                 self.status = e;
                 return false;
             }
@@ -978,7 +1037,13 @@ impl Doc {
             FillHow::FormatsOnly => "Fill Formats",
             FillHow::NoFormats => "Fill Without Formats",
         };
-        self.run(label, ops);
+        if !self.run_validated(label, ops) {
+            let reason = std::mem::take(&mut self.status);
+            self.redo();
+            self.last_fill = Some((from, to, previous_mode, self.edits));
+            self.status = reason;
+            return false;
+        }
         self.last_fill = Some((from, to, mode, self.edits));
         true
     }
@@ -1056,8 +1121,9 @@ impl Doc {
     fn finish_clip_paste(&mut self, result: Result<(Vec<GridOp>, Rect), String>, cut: bool) -> Option<Rect> {
         match result {
             Ok((ops, to)) => {
-                self.status.clear();
-                self.run(if cut { "Move" } else { "Paste" }, ops);
+                if !self.run_validated(if cut { "Move" } else { "Paste" }, ops) {
+                    return None;
+                }
                 if cut {
                     // A cut pastes once, as Excel's does.
                     self.clip = None;
@@ -1096,8 +1162,7 @@ impl Doc {
                     .collect()
             })
             .collect();
-        self.run("Paste", vec![GridOp::block(self.sheet, row, col, rows)]);
-        true
+        self.run_validated("Paste", vec![GridOp::block(self.sheet, row, col, rows)])
     }
 
     /// The range as tab-separated values, as other spreadsheets paste it.
@@ -1129,6 +1194,7 @@ impl Doc {
         if !self.history.can_undo() {
             return false;
         }
+        self.warned = None;
         self.journal(&Record::Undo);
         self.history.undo(&mut self.wb);
         self.keep_sheet();
@@ -1141,6 +1207,7 @@ impl Doc {
         if !self.history.can_redo() {
             return false;
         }
+        self.warned = None;
         let before = self.wb.memory_bytes();
         self.journal(&Record::Redo);
         self.history.redo(&mut self.wb);
@@ -1261,6 +1328,53 @@ mod tests {
         let d = std::env::temp_dir().join(format!("atrium-sheets-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn bulk_validation_checks_final_values_and_preserves_history_on_refusal() {
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, Validation};
+        use officina_grid::Value;
+
+        let mut d = Doc::new("Inputs");
+        let target = Rect { sheet: 0, r0: 0, c0: 0, r1: 1, c1: 0 };
+        let formula = |d: &Doc, text: &str| Some(d.wb.validation_formula(text, 0, (0, 0)).unwrap());
+        let rule = Validation::new(0, vec![target], Allow::Custom, CmpOp::Equal,
+            formula(&d, "=A1<=B1"), None);
+        d.wb.add_validation(rule).unwrap();
+        // The checked cells see the limits written by the same paste.
+        assert!(d.paste_tsv(0, 0, "=3+4\t7\n8\t8"));
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 0)), Value::Num(7.0));
+        assert!(!d.paste_tsv(0, 0, "6\t7\n9\t8"));
+        assert!(d.status.starts_with("A2"), "{}", d.status);
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 0)), Value::Num(7.0));
+        assert_eq!(d.wb.get(CellAddr::new(0, 1, 0)), Value::Num(8.0));
+
+        assert!(d.undo());
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 0)), Value::Empty);
+        assert!(!d.paste_tsv(0, 0, "9\t8"));
+        assert!(d.redo());
+        assert_eq!(d.wb.get(CellAddr::new(0, 1, 0)), Value::Num(8.0));
+        assert!(!d.redo());
+    }
+
+    #[test]
+    fn a_bulk_warning_can_undo_the_entire_paste() {
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, Validation};
+        use officina_grid::Value;
+
+        let mut d = Doc::new("Inputs");
+        let range = Rect { sheet: 0, r0: 0, c0: 0, r1: 1, c1: 0 };
+        let mut rule = Validation::new(0, vec![range], Allow::Whole, CmpOp::LessOrEqual,
+            Some(d.wb.validation_formula("8", 0, (0, 0)).unwrap()), None);
+        rule.style = ErrorStyle::Warning;
+        d.wb.add_validation(rule).unwrap();
+        assert!(d.paste_tsv(0, 0, "8\n9"));
+        assert_eq!(d.warned.as_ref().unwrap().0, CellAddr::new(0, 1, 0));
+        d.undo_warned();
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 0)), Value::Empty);
+        assert_eq!(d.wb.get(CellAddr::new(0, 1, 0)), Value::Empty);
     }
 
     #[test]

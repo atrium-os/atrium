@@ -42,6 +42,12 @@ impl<O> History<O> {
         O: Op<D>,
     {
         let inv: Vec<O> = ops.into_iter().map(|o| o.apply(doc)).collect();
+        self.record_applied(label, inv);
+    }
+
+    /// Records a successful edit already applied by the caller. Its inverses
+    /// are in the original application order.
+    pub fn record_applied(&mut self, label: &str, inv: Vec<O>) {
         self.redo.clear();
         self.undo.push(Transaction { label: label.to_string(), ops: inv });
         if self.undo.len() > self.limit {

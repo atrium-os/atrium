@@ -12,6 +12,7 @@ icon        = "table"
 
 [capabilities]
 graphics = "fresco"
+clipboard = true
 network  = "none"
 # Limen roles it embeds (app-composition.md §3): the picker for Open and Save, the print sheet.
 embeds   = ["picker", "print"]

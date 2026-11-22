@@ -470,8 +470,10 @@ pub fn paste_with(d: &mut Doc, sel: CellRange, sp: officina_grid::clip::Special,
         return Err("Copy some cells first.".into());
     };
     let (ops, _) = copy.clip.paste_special(&d.wb, d.sheet, sel.r0, sel.c0, sp)?;
-    d.run(label, ops);
-    Ok(format!("{label}: done."))
+    if !d.run_validated(label, ops) {
+        return Err(d.status.clone());
+    }
+    Ok(if d.status.is_empty() { format!("{label}: done.") } else { d.status.clone() })
 }
 
 pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
@@ -706,7 +708,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::FlashFill => {
             let (ops, n) = officina_grid::flashfill::flash_fill(&d.wb, s, cursor.0, cursor.1)?;
-            d.run("Flash Fill", ops);
+            if !d.run_validated("Flash Fill", ops) {
+                return Err(d.status.clone());
+            }
+            if !d.status.is_empty() {
+                return Ok(d.status.clone());
+            }
             Ok(if n == 1 { "Flash Fill filled 1 cell.".into() } else { format!("Flash Fill filled {n} cells.") })
         }
         DataCmd::CenterAcross => {
@@ -727,7 +734,11 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 DataCmd::FillFormats => FillHow::FormatsOnly,
                 _ => FillHow::NoFormats,
             };
-            if d.refill(how) { Ok("Filled again.".into()) } else { Err(std::mem::take(&mut d.status)) }
+            if d.refill(how) && d.status.is_empty() {
+                Ok("Filled again.".into())
+            } else {
+                Ok(std::mem::take(&mut d.status))
+            }
         }
         DataCmd::AlignTop | DataCmd::AlignMiddle | DataCmd::AlignBottom => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };

@@ -14,11 +14,13 @@
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
 # Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
 # Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
+# Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
+# Approve the Sheets manifest that requests clipboard access for the fixture user.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -52,6 +54,7 @@ checkpoint() {
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
+        validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
@@ -316,6 +319,64 @@ formulas_reopened() {
     cp selectscreen.png "$results/$format-formulas-reopened.png"
 }
 
+validation() {
+    click 126 133
+    key 0x26 # 9 is outside the rule.
+    key 0x28
+    sleep .45
+    cp selectscreen.png "$results/$format-typing-rejected.png"
+    click 126 133
+    key 0x25 # 8
+    key 0x28
+    save "$book" typed
+
+    drag 318 133 318 153 # E2:E3 is 7, 9.
+    key 0x06 1 # Copy
+    click 126 133
+    key 0x19 1 # Paste
+    sleep .6
+    cp selectscreen.png "$results/$format-paste-rejected.png"
+    click 370 24 # Undo the accepted typing, skipping the rejected paste.
+    save "$book" initial
+
+    drag 382 133 382 153 # F2:F3 is 6, 8.
+    key 0x06 1
+    click 126 133
+    key 0x19 1
+    save "$book" pasted
+    click 370 24 # Undo both pasted cells together.
+    save "$book" initial
+    click 445 24
+    save "$book" pasted
+
+    drag 191 133 254 153 # Ctrl+D copies C2:D2 (6, 9) into C3:D3.
+    key 0x07 1
+    sleep .6
+    cp selectscreen.png "$results/$format-fill-rejected.png"
+    click 254 133
+    key 0x25 # Change the unvalidated source D2 to 8.
+    key 0x28
+    save "$book" ready
+
+    drag 191 133 254 153
+    key 0x07 1
+    save "$book" filled
+    click 370 24 # Undo the whole fill.
+    save "$book" ready
+    click 445 24
+    save "$book" filled
+    cp "$books/$book" "$results/saved.$format"
+    final=filled
+}
+
+validation_reopened() {
+    click 126 133
+    key 0x26
+    key 0x28
+    sleep .45
+    cp selectscreen.png "$results/$format-reopened-rejection.png"
+}
+
 sort_filter() {
     click 191 133 # Sort the secondary key, Rank, first. Sort is stable.
     data_from_bottom 17 # Sort Z to A
@@ -447,6 +508,7 @@ for format in ods xlsx; do
         annotations) check_reopened_validation ;;
         print) print_pdf ;;
         formulas) formulas_reopened ;;
+        validation) validation_reopened ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"
