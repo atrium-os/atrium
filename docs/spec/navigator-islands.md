@@ -501,6 +501,16 @@ one accepted SAML assertion, and one token redemption. Crypta fetched
 `crypta-ac-ok` through `tun0` without another engine start. This run reused
 the verified binaries from the shared-cache build.
 
+The next installed gate disconnected after the two reloads while the
+third proposal was pending. The profile went down and the gateway still
+recorded zero POSTs, signed assertions, and token redemptions. The gate
+closed the old test window and opened sign-in again after reconnecting.
+The second engine and fresh gateway flow had no handshake or sentinel
+response before trusted confirmation. After confirmation the gateway
+recorded one script POST, one accepted SAML assertion, and one token
+redemption, and the FreeBSD guest fetched `crypta-ac-ok` over `tun1`.
+The gate reused the verified shared-cache binaries.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
