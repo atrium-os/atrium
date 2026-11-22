@@ -589,6 +589,14 @@ confirmation there was no handshake or IPv4 sentinel response. One
 confirmed POST led to one assertion and one redemption, and the guest
 fetched `crypta-ac-ok` through ocserv on `tun5`.
 
+The overlap gate kept that requeued window open across disconnect and
+queued the next Sign In against a distinct live Crypta attempt. A press
+on the stale confirmation sent zero POSTs. After teardown Portcullis
+launched the queued window without a second Sign In request. The new
+proposal and IPv4 traffic waited for fresh confirmation. That press
+produced one POST, one accepted assertion, and one redemption, and the
+guest fetched `crypta-ac-ok` through ocserv on `tun5`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
