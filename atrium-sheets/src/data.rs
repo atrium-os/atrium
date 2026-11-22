@@ -317,7 +317,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let circling = d.circling;
     let special = d.clip.as_ref().is_some_and(|c| !c.clip.cut);
     let mut v = vec![
-        (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()), Some(DataCmd::FillCopy)),
+        (MenuItem::new("Compare with…"), Some(DataCmd::CompareWith)),
+        (MenuItem::new("Start Tracking Cell Changes"), Some(DataCmd::TrackChanges)),
+        (MenuItem::new("Review Tracked Changes"), Some(DataCmd::ReviewTracked)),
+        (MenuItem::new("Merge Copies…"), Some(DataCmd::MergeCopies)),
+        (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()).separated(), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
@@ -417,10 +421,6 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
-    v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
-    v.push((MenuItem::new("Start Tracking Cell Changes"), Some(DataCmd::TrackChanges)));
-    v.push((MenuItem::new("Review Tracked Changes"), Some(DataCmd::ReviewTracked)));
-    v.push((MenuItem::new("Merge Copies…"), Some(DataCmd::MergeCopies)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
     v.push((MenuItem::new("Tab Colour…"), Some(DataCmd::TabColor)));

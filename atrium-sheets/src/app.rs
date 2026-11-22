@@ -2581,8 +2581,8 @@ impl View for Sheets {
                     let d = doc.borrow();
                     let (label, action, selected) = if offset == 0 {
                         let sheet = group.group.0.map(|id| d.wb.sheet_name(id)).unwrap_or_else(|| "Workbook".into());
-                        let arrow = if group.expanded { "▾" } else { "▸" };
-                        (format!("{arrow} {sheet} · {} ({})", group.group.1, group.count), ReviewCmd::Toggle(group.group), false)
+                        let marker = if group.expanded { "-" } else { "+" };
+                        (format!("{marker} {sheet} · {} ({})", group.group.1, group.count), ReviewCmd::Toggle(group.group), false)
                     } else {
                         let i = rv.group_items(group.group)[offset - 1];
                         let other = other.borrow();
