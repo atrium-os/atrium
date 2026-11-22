@@ -774,16 +774,15 @@ fn read_with(data: &[u8], password: Option<&str>, formulas: bool) -> Result<(Wor
     let g = globals(&grecs, &mut rep)?;
     drop(grecs);
     out.date1904 = g.date1904;
-    if g.date1904 {
-        out.report.note(Kind::Approximate, "1904 date system: dates are serial numbers counted from 1904");
-    }
     if let Ok(c) = Cfb::open(data) {
         if c.entries.iter().any(|e| e.path.to_ascii_lowercase().starts_with("_vba_project_cur")) {
             rep.note(Kind::Dropped, "macros");
         }
     }
     // Sheets: worksheets become sheets; formulas still name the others.
-    let mut wb = Workbook::new();
+    use officina_grid::eval::dates::DateSystem;
+    let system = if g.date1904 { DateSystem::Excel1904 } else { DateSystem::Excel1900 };
+    let mut wb = Workbook::with_date_system(system);
     let mut ctx = Ctx { xti: g.xti.clone(), books: g.books.clone(), ..Default::default() };
     let mut ids: Vec<Option<u16>> = Vec::new();
     for sh in &g.sheets {

@@ -4,7 +4,6 @@
 
 use super::criteria::{Criterion, Key};
 use super::ifcache;
-use super::dates;
 use super::arrays::*;
 use super::{to_bool, to_num, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
@@ -1278,7 +1277,7 @@ fn text_fn(c: &Ctx, a: &[Expr]) -> Ev {
         v => v,
     };
     let code = tri!(text(c, &a[1]));
-    let f = crate::numfmt::NumFmt::parse(&code).format(&x);
+    let f = crate::numfmt::NumFmt::parse(&code).format_in(&x, c.wb.date_system());
     if f.hashes {
         return e(ErrorKind::Value);
     }
@@ -1573,14 +1572,14 @@ fn date(c: &Ctx, a: &[Expr]) -> Ev {
     let y = tri!(num(c, &a[0]));
     let m = tri!(num(c, &a[1]));
     let d = tri!(num(c, &a[2]));
-    match dates::date_serial(y, m, d) {
+    match c.wb.date_system().date(y, m, d) {
         Some(s) => n(s),
         None => e(ErrorKind::Num),
     }
 }
 fn ymd_part(c: &Ctx, a: &[Expr], part: usize) -> Ev {
     let x = tri!(num(c, &a[0]));
-    match dates::ymd(x) {
+    match c.wb.date_system().ymd(x) {
         Some((y, m, d)) => n([y, m, d][part] as f64),
         None => e(ErrorKind::Num),
     }
@@ -1597,12 +1596,11 @@ fn day(c: &Ctx, a: &[Expr]) -> Ev {
 fn weekday(c: &Ctx, a: &[Expr]) -> Ev {
     let x = tri!(num(c, &a[0]));
     let t = tri!(opt_num(c, a, 1, 1.0)) as i64;
-    if !(0.0..2958466.0).contains(&x) {
+    let system = c.wb.date_system();
+    if !system.contains(x) {
         return e(ErrorKind::Num);
     }
-    // Serial 1 (1900-01-01, by Excel's count) is a Sunday in Excel's numbering.
-    let s = x.floor() as i64;
-    let sun0 = (s - 1).rem_euclid(7); // 0 = Sunday
+    let sun0 = system.weekday(x.floor() as i64);
     let r = match t {
         1 => sun0 + 1,
         2 => (sun0 + 6) % 7 + 1,
@@ -1611,11 +1609,11 @@ fn weekday(c: &Ctx, a: &[Expr]) -> Ev {
     };
     n(r as f64)
 }
-fn today(_: &Ctx, _: &[Expr]) -> Ev {
-    n(dates::now_serial().floor())
+fn today(c: &Ctx, _: &[Expr]) -> Ev {
+    n(c.wb.date_system().now().floor())
 }
-fn now(_: &Ctx, _: &[Expr]) -> Ev {
-    n(dates::now_serial())
+fn now(c: &Ctx, _: &[Expr]) -> Ev {
+    n(c.wb.date_system().now())
 }
 
 /// Text compare helper re-exported for the lookup index.

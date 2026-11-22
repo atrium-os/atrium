@@ -402,6 +402,8 @@ struct Seg {
     cond: Vec<super::condfmt::Raw>,
     /// Validation XML, read once formulas can be.
     valid: super::validation::Raw,
+    /// Default formats for successful ISO date cells.
+    iso_dates: Vec<(u32, u32, &'static str)>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
     /// A frozen `<pane>`: the first unfrozen row and column, and the first
@@ -416,7 +418,7 @@ struct Seg {
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
-fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<Seg, XlsxError> {
+fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: officina_grid::eval::dates::DateSystem) -> Result<Seg, XlsxError> {
     let mut seg = Seg::default();
     let mut r = xml(data);
     r.config_mut().check_end_names = false;
@@ -607,10 +609,19 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                     "inlineStr" => Value::str(inline.as_deref().unwrap_or("")),
                     "b" => Value::Bool(v.map(str::trim) == Some("1")),
                     "e" => Value::Err(v.and_then(|x| ErrorKind::from_text(x.trim())).unwrap_or(ErrorKind::Value)),
-                    "d" => {
-                        seg.rep.note_at(Kind::Approximate, "ISO date cells kept as text", || a1(rr, cc));
-                        Value::str(v.unwrap_or(""))
-                    }
+                    "d" => match v.filter(|s| !s.trim().is_empty()) {
+                        Some(text) => match system.iso(text) {
+                            Some((serial, format)) => {
+                                seg.iso_dates.push((rr, cc, format));
+                                Value::Num(serial)
+                            }
+                            None => {
+                                seg.rep.note_at(Kind::Approximate, "invalid or out-of-range ISO date cells kept as text", || a1(rr, cc));
+                                Value::str(text)
+                            }
+                        },
+                        None => Value::Empty,
+                    },
                     _ => return Err(bad("unknown cell type")),
                 };
                 seg.cells += 1;
@@ -749,6 +760,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
     use std::sync::Mutex;
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 16);
     let mut reader = z.reader(part)?;
+    let system = wb.date_system();
     let (piece_tx, piece_rx) = sync_channel::<(usize, Vec<u8>)>(workers * 2);
     let piece_rx = Mutex::new(piece_rx);
     let (seg_tx, seg_rx) = channel::<(usize, Result<Seg, XlsxError>)>();
@@ -799,7 +811,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             sc.spawn(move || loop {
                 let next = piece_rx.lock().unwrap().recv();
                 let Ok((i, data)) = next else { return };
-                if seg_tx.send((i, segment(&data, sst, theme, i == 0))).is_err() {
+                if seg_tx.send((i, segment(&data, sst, theme, i == 0, system))).is_err() {
                     return;
                 }
             });
@@ -816,6 +828,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut links = Vec::new();
         let mut filter = None;
         let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
+        let mut iso_dates = Vec::new();
         let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
         let (mut dw, mut dh) = (None, None);
         let mut failed = None;
@@ -848,6 +861,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     wb.set_value(CellAddr::new(s, r, c), v);
                 }
                 fcells.extend(seg.fcells);
+                iso_dates.extend(seg.iso_dates);
                 shared.extend(seg.shared);
                 widths.extend(seg.widths);
                 heights.extend(seg.heights);
@@ -957,6 +971,13 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         }
         // Styles: a column's own style under its cells' runs.
         apply_styles(wb, s, col_styles, &sruns, xf_ids, rep);
+        for (row, col, format) in iso_dates {
+            let address = CellAddr::new(s, row, col);
+            if wb.styles.format(wb.style_id(address)).is_general() {
+                let style = wb.style(address).clone().with_num_fmt(format);
+                wb.set_style(&officina_grid::addr::Rect::cell(address), style);
+            }
+        }
         Ok(())
     })
 }
@@ -1089,13 +1110,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     if sheets.is_empty() {
         return Err(bad("no worksheets"));
     }
-    if out.date1904 {
-        out.report.note(Kind::Approximate, "1904 date system: dates are serial numbers counted from 1904");
-    }
     let sst_path = wb_rels.values().find(|(t, _)| t.ends_with("/sharedStrings")).map(|(_, p)| p.as_str());
     let sst = shared_strings(&z, sst_path, &mut out.report)?;
 
-    let mut wb = Workbook::new();
+    use officina_grid::eval::dates::DateSystem;
+    let system = if out.date1904 { DateSystem::Excel1904 } else { DateSystem::Excel1900 };
+    let mut wb = Workbook::with_date_system(system);
     for (name, _) in &sheets {
         // Names Excel allows and we don't get a safe stand-in.
         let mut n: String = name.chars().filter(|c| !"[]:*?/\\".contains(*c)).collect();

@@ -135,6 +135,10 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             }
         }
     }
+    // Older files end after the sheet settings and use the 1900 calendar.
+    if wb.date_system() == crate::eval::dates::DateSystem::Excel1904 {
+        w.u8(1);
+    }
     c.add(WORKBOOK, &w.into_bytes())?;
     if let Some(set) = wb.tracked_cells() {
         let mut w = Writer::new();
@@ -498,6 +502,12 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
                 wb.sheets[s as usize].col_sizes = sz;
             }
         }
+    }
+    if r.remaining() != 0 {
+        if r.u8()? != 1 {
+            return Err(LoadError::Bad("unknown workbook date system"));
+        }
+        wb.date_system = crate::eval::dates::DateSystem::Excel1904;
     }
     done(&r)?;
 

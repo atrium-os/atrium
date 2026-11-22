@@ -239,6 +239,11 @@ impl NumFmt {
 
     /// How `v` shows in a cell with this format. Booleans and errors are not formatted.
     pub fn format(&self, v: &Value) -> Formatted {
+        self.format_in(v, dates::DateSystem::default())
+    }
+
+    /// Formats a number using its workbook's date system.
+    pub fn format_in(&self, v: &Value, system: dates::DateSystem) -> Formatted {
         let plain = |text: String| Formatted { text, color: None, hashes: false };
         match v {
             Value::Empty => plain(String::new()),
@@ -254,11 +259,11 @@ impl NumFmt {
                     None => plain(s.to_string()),
                 }
             }
-            Value::Num(x) => self.format_num(*x),
+            Value::Num(x) => self.format_num(*x, system),
         }
     }
 
-    fn format_num(&self, x: f64) -> Formatted {
+    fn format_num(&self, x: f64, system: dates::DateSystem) -> Formatted {
         let (sec, neg_sign) = self.pick(x);
         let Some(sec) = sec else {
             return Formatted { text: format_general(x), color: None, hashes: false };
@@ -266,7 +271,7 @@ impl NumFmt {
         // A section for negatives shows the magnitude; its own literals say "negative".
         let v = if neg_sign { x } else { x.abs() };
         let (text, hashes) = if sec.is_date() {
-            match format_date(sec, v) {
+            match format_date(sec, v, system) {
                 Some(t) => (t, false),
                 None => ("#".repeat(11), true),
             }
@@ -959,7 +964,7 @@ fn best_fraction(x: f64, max_d: u64) -> (u64, u64) {
     (p1, q1)
 }
 
-fn format_date(sec: &Section, v: f64) -> Option<String> {
+fn format_date(sec: &Section, v: f64, system: dates::DateSystem) -> Option<String> {
     if !(0.0..2958466.0).contains(&v) {
         return None;
     }
@@ -975,7 +980,11 @@ fn format_date(sec: &Section, v: f64) -> Option<String> {
     let secs = in_day / scale;
     let frac = in_day % scale;
     let (h, mi, s) = (secs / 3600, secs / 60 % 60, secs % 60);
-    let (y, mo, d) = dates::ymd(day as f64)?;
+    let (y, mo, d) = if sec.toks.iter().any(|tok| matches!(tok, Tok::Year(_) | Tok::Month(_) | Tok::Day(_))) {
+        system.ymd(day as f64)?
+    } else {
+        (0, 1, 0)
+    };
     let ampm = sec.toks.iter().any(|t| matches!(t, Tok::AmPm { .. }));
     let total_secs = ticks / scale;
     let mut out = String::new();
@@ -993,9 +1002,7 @@ fn format_date(sec: &Section, v: f64) -> Option<String> {
             Tok::Day(1) => out.push_str(&d.to_string()),
             Tok::Day(2) => out.push_str(&format!("{d:02}")),
             Tok::Day(n) => {
-                // Serial 0 is Saturday 1900-01-00 in Excel; its weekdays follow on
-                // (including its 29 February 1900).
-                let wd = ((day + 6) % 7) as usize;
+                let wd = system.weekday(day) as usize;
                 let name = DAYS[wd];
                 out.push_str(if *n == 3 { &name[..3] } else { name });
             }

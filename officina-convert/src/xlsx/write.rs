@@ -645,8 +645,17 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     z.add("_rels/.rels", br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#)?;
     let mut w: Vec<u8> = Vec::new();
     let _ = write!(w, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook {NS}>"#);
-    if let Some(c) = macros.and_then(|m| m.workbook_code.as_deref()) {
-        let _ = write!(w, r#"<workbookPr codeName="{c}"/>"#);
+    let code_name = macros.and_then(|m| m.workbook_code.as_deref());
+    let date1904 = wb.date_system() == officina_grid::eval::dates::DateSystem::Excel1904;
+    if date1904 || code_name.is_some() {
+        w.extend_from_slice(b"<workbookPr");
+        if date1904 {
+            w.extend_from_slice(br#" date1904="1""#);
+        }
+        if let Some(name) = code_name {
+            let _ = write!(w, r#" codeName="{name}""#);
+        }
+        w.extend_from_slice(b"/>");
     }
     w.extend_from_slice(b"<sheets>");
     for s in 0..n {

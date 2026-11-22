@@ -110,12 +110,19 @@ const MONTH_NAMES: [&str; 12] = ["january", "february", "march", "april", "may",
 
 /// As [`typed_date`], with the order and this year given.
 pub fn typed_date_with(s: &str, day_first: bool, this_year: Option<i32>) -> Option<(f64, String)> {
+    typed_date_in(s, day_first, this_year, Default::default())
+}
+
+fn typed_date_in(s: &str, day_first: bool, this_year: Option<i32>, system: officina_grid::eval::dates::DateSystem) -> Option<(f64, String)> {
     let s = s.trim();
+    if let Some((serial, fmt)) = system.iso(s) {
+        return Some((serial, fmt.into()));
+    }
     let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().ok().filter(|n| (lo..=hi).contains(n) && !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit()));
     let serial = |y: u32, m: u32, d: u32| -> Option<f64> {
-        let serial = officina_grid::eval::dates::date_serial(y as f64, m as f64, d as f64)?;
+        let serial = system.date(y.into(), m.into(), d.into())?;
         // 2026-02-31 is not a day.
-        (officina_grid::eval::dates::ymd(serial) == Some((y as i64, m as i64, d as i64))).then_some(serial)
+        (system.ymd(serial) == Some((y as i64, m as i64, d as i64))).then_some(serial)
     };
     // A year as typed: four digits, or two (30-99 the 1900s, else the 2000s).
     let year = |t: &str| -> Option<u32> {
@@ -909,7 +916,7 @@ impl Doc {
             self.status = "Unmerge the selected cells before filling them.".into();
             return false;
         }
-        let (input, date_fmt) = match typed_date(text) {
+        let (input, date_fmt) = match typed_date_in(text, day_first(), crate::source::local_now().map(|n| n.0), self.wb.date_system()) {
             Some((serial, fmt)) => (Input::Value(officina_grid::Value::Num(serial)), Some(fmt)),
             None => (Input::typed(text), None),
         };

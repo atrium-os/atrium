@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::addr::{CellAddr, Rect};
 use crate::book::Workbook;
-use crate::eval::dates::{date_serial, ymd};
+use crate::eval::dates::DateSystem;
 use crate::formula::ast::Expr;
 use crate::numfmt::NumFmt;
 use crate::ops::{GridOp, Region, StyleRegion};
@@ -161,11 +161,11 @@ pub fn fill(wb: &Workbook, src: Rect, to: Rect, mode: Mode) -> Result<GridOp, St
             .collect();
         let back = matches!(dir, Dir::Up | Dir::Left);
         let series = match mode {
-            Mode::Series => series_of(&read, back),
+            Mode::Series => series_of(&read, back, wb.date_system()),
             Mode::Copy => Series::Repeat,
             Mode::Count => match &read[..] {
                 [(Src::Value(Value::Num(n)), _)] => Series::Days { first: *n, step: if back { -1.0 } else { 1.0 } },
-                _ => series_of(&read, back),
+                _ => series_of(&read, back, wb.date_system()),
             },
             Mode::Flip => match &read[..] {
                 [(Src::Value(Value::Num(n)), _)] => Series::Days { first: *n, step: if back { -1.0 } else { 1.0 } },
@@ -190,7 +190,7 @@ pub fn fill(wb: &Workbook, src: Rect, to: Rect, mode: Mode) -> Result<GridOp, St
                     continue;
                 }
                 (Series::Repeat, Src::Value(v)) => v.clone(),
-                (s, _) => at_step(s, x as f64),
+                (s, _) => at_step(s, x as f64, wb.date_system()),
             };
             if !v.is_empty() {
                 values.push((r, c, v));
@@ -270,19 +270,19 @@ fn run_end(wb: &Workbook, sheet: u16, c: u32, from: u32, filled: bool) -> u32 {
 }
 
 /// A value of a series at step `x`.
-fn at_step(s: &Series, x: f64) -> Value {
+fn at_step(s: &Series, x: f64, system: DateSystem) -> Value {
     match s {
         Series::Repeat => Value::Empty,
         Series::Linear { mean_x, mean_y, slope } => Value::Num(round15(mean_y + slope * (x - mean_x))),
         Series::Days { first, step } => Value::Num(round15(first + step * x)),
         Series::Months { first: (y, m, d), step, time } => {
             let months = (step * x).round();
-            match date_serial(*y as f64, *m as f64 + months, 1.0) {
+            match system.date(*y as f64, *m as f64 + months, 1.0) {
                 // The day kept where the month has it, else the month's last.
                 Some(start) => {
-                    let (yy, mm, _) = ymd(start).unwrap_or((*y, *m, 1));
-                    let last = date_serial(yy as f64, mm as f64 + 1.0, 0.0).and_then(ymd).map_or(28, |t| t.2);
-                    date_serial(yy as f64, mm as f64, (*d).min(last) as f64).map_or(Value::Err(crate::value::ErrorKind::Num), |v| Value::Num(v + time))
+                    let (yy, mm, _) = system.ymd(start).unwrap_or((*y, *m, 1));
+                    let last = system.date(yy as f64, mm as f64 + 1.0, 0.0).and_then(|serial| system.ymd(serial)).map_or(28, |t| t.2);
+                    system.date(yy as f64, mm as f64, (*d).min(last) as f64).map_or(Value::Err(crate::value::ErrorKind::Num), |v| Value::Num(v + time))
                 }
                 None => Value::Err(crate::value::ErrorKind::Num),
             }
@@ -320,7 +320,7 @@ fn round15(v: f64) -> f64 {
 /// The series a line's source cells make, or [`Series::Repeat`]. The cells
 /// come in the fill's direction, so a series of two or more carries on as it
 /// goes; one cell counts up, or down when filling up or left (`back`).
-fn series_of(read: &[(Src, Style)], back: bool) -> Series {
+fn series_of(read: &[(Src, Style)], back: bool, system: DateSystem) -> Series {
     let one = if back { -1 } else { 1 };
     let vals: Option<Vec<&Value>> = read.iter().map(|(s, _)| if let Src::Value(v) = s { Some(v) } else { None }).collect();
     let Some(vals) = vals else { return Series::Repeat };
@@ -333,7 +333,7 @@ fn series_of(read: &[(Src, Style)], back: bool) -> Series {
             if n == 1 {
                 return Series::Days { first: ys[0], step: one as f64 };
             }
-            if let Some(s) = months_of(&ys) {
+            if let Some(s) = months_of(&ys, system) {
                 return s;
             }
         }
@@ -359,8 +359,8 @@ fn series_of(read: &[(Src, Style)], back: bool) -> Series {
 }
 
 /// Dates on the same day of the month, a whole number of months apart.
-fn months_of(ys: &[f64]) -> Option<Series> {
-    let parts: Option<Vec<(i64, i64, i64)>> = ys.iter().map(|&y| ymd(y)).collect();
+fn months_of(ys: &[f64], system: DateSystem) -> Option<Series> {
+    let parts: Option<Vec<(i64, i64, i64)>> = ys.iter().map(|&y| system.ymd(y)).collect();
     let parts = parts?;
     let first = parts[0];
     let time = ys[0] - ys[0].floor();
@@ -425,6 +425,9 @@ fn numbered_of(texts: &[&str], one: i64) -> Option<Series> {
     }
     Some(Series::Numbered { head: head.to_string(), tail: tail.to_string(), width, first: nums[0], step })
 }
+
+#[cfg(test)]
+use crate::eval::dates::{date_serial, ymd};
 
 #[cfg(test)]
 mod tests {

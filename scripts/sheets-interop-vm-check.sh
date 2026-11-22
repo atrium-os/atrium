@@ -18,14 +18,16 @@
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
+# Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy|dates) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
+    dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
     native_copy) test "$(ls "$books")" = "$(printf 'orders.ods\nsales.xlsx')" ;;
     legacy) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')" ;;
     delimited) test "$(ls "$books")" = "$(printf '01-utf8.csv\n02-utf8.tsv\n03-ansi.csv\n04-ansi.tsv')" ;;
@@ -60,6 +62,7 @@ checkpoint() {
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
+        dates) /tmp/sheets-date-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
     esac
@@ -492,6 +495,54 @@ delimited() {
     done
 }
 
+
+type_epoch_date() {
+    click 62 "$1"
+    for digit in 0x1e 0x26 0x27 0x21 0x2d 0x27 0x1e 0x2d 0x27 0x26; do key "$digit"; done # 1904-01-09
+    key 0x28
+}
+dates() {
+    for format in xlsx xlsm; do
+        case "$format" in xlsx) book=dates.xlsx; row=183 ;; xlsm) book=macro.xlsm; row=243 ;; esac
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        sleep .4
+        cp selectscreen.png "$results/$format-initial.png"
+        type_epoch_date 133
+        save "$book" edited
+        cp "$books/$book" "$results/saved.$format"
+        close_book
+        open_book "$row" "$book" edited
+        sleep .4
+        cp selectscreen.png "$results/$format-reopened.png"
+        close_book
+        echo "PASS $format date arithmetic, ordinary Save and picker reopen"
+    done
+
+    format=xls
+    checksum=$(sha256 -q "$books/legacy.xls")
+    checkpoint "$books/legacy.xls" initial
+    open_book 213 legacy.xls initial
+    sleep .4
+    cp selectscreen.png "$results/xls-initial.png"
+    type_epoch_date 112
+    click 205 24
+    wait_for other_window 824 458 "$document"
+    click 824 458
+    wait_for checkpoint "$books/legacy.osheet" edited
+    wait_for same_window 824 458 "$document"
+    wait_for recovery_dir legacy.osheet >/dev/null
+    close_book
+
+    open_book 213 legacy.osheet edited native
+    sleep .4
+    cp selectscreen.png "$results/xls-native-reopened.png"
+    cp "$books/legacy.osheet" "$results/saved.osheet"
+    close_book
+    test "$(sha256 -q "$books/legacy.xls")" = "$checksum"
+    echo "PASS XLS 1904 date arithmetic and native Save As, original bytes unchanged"
+}
+
 copy_edit_units() {
     click 126 133 # B2 feeds the formula and the conditional format.
     key "$1"
@@ -605,6 +656,7 @@ case "$profile" in
     legacy) legacy; exit ;;
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;
+    dates) dates; exit ;;
 esac
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac

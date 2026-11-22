@@ -305,6 +305,14 @@ converted approximately (an unsupported chart type drawn as a picture, a font su
 what was kept inert, and what was dropped. Saving back to a foreign format lists what the
 format can't carry. No silent loss.
 
+XLSX and XLSM import ISO calendar-date and timestamp cells as numeric dates
+in the workbook's epoch. Explicit number formats are preserved. Cells in
+General get a date or timestamp display format. Timestamps with offsets
+are normalized to UTC. Invalid or out-of-range date strings remain text with
+a fidelity notice. Ordinary Save writes the numeric value and its number
+format. The installed `SHEETS_INTEROP_CASE=dates` gate checks XLSX, XLSM and
+native Save As from XLS. [Excel date-cell format notes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/b9d01770-b85b-4fb2-a387-f5811719a1af)
+
 #### Sheets fidelity triage
 
 Prioritize changes that let invalid input through or alter saved values, then
@@ -315,7 +323,7 @@ and their associated import or Save behavior.
 | Priority | Formats | Group and user impact |
 |---|---|---|
 | 1 | XLSX, XLSM | **Input validation.** Formula-backed Excel extension rules previously disappeared on open and ordinary Save. Sheets now reads them and writes direct cross-sheet rules in the extension. Extension-only list encodings and rules with missing or unparseable formulas still receive loss notices. |
-| 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells can display or behave differently. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. Test saved values, date arithmetic and ordinary Save together. |
+| 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells are handled within the supported date range. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. |
 | 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Excel cell protection settings and ODS sheet protection can be lost. XLS still drops validation rules when importing to a native copy. Group enforcement checks with the corresponding import notices. |
 | 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Specialized filters may retain hidden rows without live predicates. Unsupported or calculated pivot fields, table features and some formulas may become static values or plain cells. ODS Save can turn spill and table references into fixed ranges. |
 | 5 | XLSX, XLSM, ODS, XLS | **Review and output.** ODS can flatten comment threads. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can lose content or change output. Legacy XLS also drops comments and hyperlinks. |
@@ -531,7 +539,12 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   (`FILTER`, `SORT`, `UNIQUE`, `SEQUENCE`, spill ranges) first; financial, engineering and
   the long tail later. `LAMBDA`/`LET` in O5.
 - **Numbers:** IEEE `f64`, displayed to 15 significant digits as Excel does; Excel's 1900
-  date system (including the 1900 leap-year quirk) and 1904 for Mac-origin files.
+  date system (including the 1900 leap-year quirk) and the workbook's 1904 system.
+  The workbook epoch drives date formulas, number formats and typed dates.
+  Time-only values and elapsed durations use the unshifted numeric value.
+  XLSX and XLSM preserve `workbookPr date1904`. XLS imports the BIFF setting and
+  native Save As stores it as an optional trailing byte in the WORKBOOK chunk.
+  A native workbook without that byte uses the 1900 system. [Excel date systems](https://support.microsoft.com/en-us/excel/date-systems-in-excel)
 - **Volatile** functions (`NOW`, `RAND`, `INDIRECT`, `OFFSET`) recompute on every recalc and
   are flagged in the dependency graph.
 - **External** functions (`WEBSERVICE`, stock and currency data, links to other workbooks)
@@ -2896,8 +2909,9 @@ binary formats' RC4 encryption comes with O7b–O7d.
   fonts (font 4 skipped as BIFF8 numbers them), number formats (`FORMAT` and
   built-ins), the palette (the file's `PALETTE` over the default 56),
   fills, the four borders with colours, alignment, wrap, indent, column
-  widths and hidden columns, row heights and hidden rows, default sizes, the
-  1904 date system, hidden sheets shown.
+  widths and hidden columns, row heights and hidden rows, and default sizes.
+  Hidden sheets are shown. The 1904 date system is retained for calculation,
+  display and native Save As.
 - **Reported, not carried:** merged cells, comments, hyperlinks, charts,
   pictures, shapes and form controls, conditional formats, data validation,
   frozen panes, pivot tables (their values kept), macros, chart and macro

@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use officina_grid::eval::dates::DateSystem;
 use officina_grid::addr::{CellAddr, MAX_COLS, MAX_ROWS};
 use officina_grid::style::{HAlign, Line, StyleId, StyleTable, VAlign};
 use officina_grid::Value;
@@ -85,7 +86,7 @@ pub fn rgb(c: u32) -> Color {
 
 /// How a value shows in a cell with a style: through its number format, in its
 /// font's colour and weight, its fill and borders, aligned as it says.
-pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
+fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Option<CellView> {
     let st = t.get(id);
     // An empty cell centring across shows, so the run can reach over it.
     let has_look = st.fill.is_some() || st.borders.iter().any(|b| b.line != Line::None) || st.h_align == HAlign::CenterAcross;
@@ -93,7 +94,7 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
         Value::Empty if !has_look => return None,
         Value::Empty => CellView::text(""),
         Value::Num(_) | Value::Str(_) => {
-            let f = t.format(id).format(v);
+            let f = t.format(id).format_in(v, system);
             let text = if f.hashes { "#".repeat(8) } else { f.text };
             let mut cv = if matches!(v, Value::Num(_)) { CellView::number(text) } else { CellView::text(text) };
             if let Some(c) = f.color {
@@ -154,14 +155,14 @@ pub fn pivot_view(cv: Option<CellView>, role: officina_grid::pivot::Role) -> Opt
 
 /// A cell's view under its conditional formats: their fill, colour scale, font
 /// colour, weight and number format, and the data bar under the text.
-pub fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value) -> Option<CellView> {
+fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value, system: DateSystem) -> Option<CellView> {
     let d = &look.dxf;
     if look.scale.is_none() && look.bar.is_none() && look.icon.is_none() && *d == officina_grid::condfmt::Dxf::default() {
         return cv;
     }
     let mut cv = cv.unwrap_or_else(|| CellView::text(""));
     if let (Some(code), Value::Num(_)) = (&d.num_fmt, v) {
-        let f = officina_grid::numfmt::NumFmt::parse(code).format(v);
+        let f = officina_grid::numfmt::NumFmt::parse(code).format_in(v, system);
         cv.text = if f.hashes { "#".repeat(8) } else { f.text };
         if let Some(c) = f.color {
             cv.color = Some(rgb(c.rgb()));
@@ -805,7 +806,7 @@ impl GridSource for SheetSource {
         let v = d.wb.value(d.sheet, r, c);
         let sh = d.wb.sheet(d.sheet);
         let id = sh.style_id(r, c);
-        let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v) };
+        let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v, d.wb.date_system()) };
         if !d.wb.pivots().is_empty() {
             let a = CellAddr::new(d.sheet, r, c);
             if let Some((i, role)) = d.wb.pivot_at(a) {
@@ -818,7 +819,7 @@ impl GridSource for SheetSource {
                 }
             }
         }
-        let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v) };
+        let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v, d.wb.date_system()) };
         // A link reads as one: blue, unless the cell has a colour of its own.
         if let Some(v) = cv.as_mut().filter(|v| v.color.is_none() && !v.text.is_empty()) {
             if d.wb.link_at(CellAddr::new(d.sheet, r, c)).is_some() {
@@ -901,14 +902,14 @@ mod tests {
         use officina_grid::condfmt::{Dxf, Look};
         let look = Look { dxf: Dxf { fill: Some(0xFFC7CE), color: Some(0x9C0006), bold: Some(true), num_fmt: Some("0.0%".into()), ..Dxf::default() }, scale: None, bar: Some((0.5, 0x638EC6)), ..Look::default() };
         let v = Value::Num(0.25);
-        let cv = cond_view(view_of(&v), &look, &v).unwrap();
+        let cv = cond_view(view_of(&v), &look, &v, DateSystem::Excel1900).unwrap();
         assert_eq!(cv.text, "25.0%");
         assert_eq!((cv.fill, cv.color, cv.bold), (Some(rgb(0xFFC7CE)), Some(rgb(0x9C0006)), true));
         assert_eq!(cv.bar, Some((0.5, rgb(0x638EC6))));
         // A blank cell a rule fills; a colour scale over the fill.
         let look = Look { dxf: Dxf { fill: Some(1), ..Dxf::default() }, scale: Some(0x63BE7B), ..Look::default() };
-        assert_eq!(cond_view(None, &look, &Value::Empty).unwrap().fill, Some(rgb(0x63BE7B)));
-        assert!(cond_view(None, &Look::default(), &Value::Empty).is_none());
+        assert_eq!(cond_view(None, &look, &Value::Empty, DateSystem::Excel1900).unwrap().fill, Some(rgb(0x63BE7B)));
+        assert!(cond_view(None, &Look::default(), &Value::Empty, DateSystem::Excel1900).is_none());
     }
 
     #[test]
@@ -920,18 +921,18 @@ mod tests {
         st.fill = Some(0xFFFF00);
         st.borders[3] = Edge { line: Line::Thick, color: None };
         let id = t.intern(st);
-        let cv = styled_view(&t, id, &Value::Num(-1234.5)).unwrap();
+        let cv = styled_view(&t, id, &Value::Num(-1234.5), DateSystem::Excel1900).unwrap();
         assert_eq!(cv.text, "-1,234.50");
         assert!(cv.bold && cv.numeric && cv.align == CellAlign::Right);
         assert_eq!(cv.color, Some(rgb(0xFF0000)));
         assert_eq!(cv.fill, Some(rgb(0xFFFF00)));
         assert_eq!(cv.borders[3].map(|b| b.0), Some(3.0));
         // An empty cell with a fill still draws; an empty plain one does not.
-        assert!(styled_view(&t, id, &Value::Empty).is_some_and(|c| c.text.is_empty()));
+        assert!(styled_view(&t, id, &Value::Empty, DateSystem::Excel1900).is_some_and(|c| c.text.is_empty()));
         let d = t.intern(Style::default().with_num_fmt("yyyy-mm-dd"));
-        assert!(styled_view(&t, d, &Value::Empty).is_none());
-        assert_eq!(styled_view(&t, d, &Value::Num(46340.0)).unwrap().text, "2026-11-14");
-        assert_eq!(styled_view(&t, d, &Value::Num(-1.0)).unwrap().text, "########");
+        assert!(styled_view(&t, d, &Value::Empty, DateSystem::Excel1900).is_none());
+        assert_eq!(styled_view(&t, d, &Value::Num(46340.0), DateSystem::Excel1900).unwrap().text, "2026-11-14");
+        assert_eq!(styled_view(&t, d, &Value::Num(-1.0), DateSystem::Excel1900).unwrap().text, "########");
     }
 
     #[test]
@@ -1015,9 +1016,9 @@ mod tests {
         assert_eq!(icon_of(0, 2).unwrap().0, CellIcon::Arrow(2));
         let v = officina_grid::Value::Num(5.0);
         let look = Look { icon: Some((0, 1)), ..Look::default() };
-        let cv = cond_view(Some(CellView::number("5")), &look, &v).unwrap();
+        let cv = cond_view(Some(CellView::number("5")), &look, &v, DateSystem::Excel1900).unwrap();
         assert_eq!((cv.text.as_str(), cv.icon.map(|i| i.0)), ("5", Some(CellIcon::Arrow(0))));
-        let cv = cond_view(Some(CellView::number("5")), &Look { hide_value: true, ..look }, &v).unwrap();
+        let cv = cond_view(Some(CellView::number("5")), &Look { hide_value: true, ..look }, &v, DateSystem::Excel1900).unwrap();
         assert_eq!(cv.text, "");
     }
 }

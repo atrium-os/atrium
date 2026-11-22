@@ -149,6 +149,7 @@ impl LookupIndex {
 type LookupKey = (u16, u32, u32, u32);
 
 pub struct Workbook {
+    pub(crate) date_system: crate::eval::dates::DateSystem,
     pub(crate) sheets: Vec<Sheet>,
     pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
@@ -199,7 +200,13 @@ impl Default for Workbook {
 
 impl Workbook {
     pub fn new() -> Self {
+        Self::with_date_system(crate::eval::dates::DateSystem::default())
+    }
+
+    /// Constructs an empty workbook with the epoch its numeric dates use.
+    pub fn with_date_system(date_system: crate::eval::dates::DateSystem) -> Self {
         Workbook {
+            date_system,
             sheets: Vec::new(),
             tracked_cells: None,
             strings: StringPool::new(),
@@ -878,10 +885,14 @@ impl Workbook {
         self.set_style_id(r, id);
     }
 
+    pub fn date_system(&self) -> crate::eval::dates::DateSystem {
+        self.date_system
+    }
+
     /// How a cell shows: its value through its number format.
     pub fn formatted(&self, a: CellAddr) -> Formatted {
         let v = self.get(a);
-        self.styles.format(self.style_id(a)).format(&v)
+        self.styles.format(self.style_id(a)).format_in(&v, self.date_system)
     }
 }
 
