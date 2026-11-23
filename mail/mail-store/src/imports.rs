@@ -137,6 +137,19 @@ pub struct Import {
     pub why: Option<String>,
 }
 
+const LEGACY_JMAP_HOLD: &str = "Older JMAP import has no saved server state. Check the server before clearing it.";
+
+impl Import {
+    pub fn needs_jmap_review(&self, has_attempt: bool) -> bool {
+        !has_attempt && (self.tries > 0 || self.why.is_some())
+    }
+
+    fn hold_for_jmap_review(&mut self) {
+        self.tries = TRIES_MAX;
+        self.why = Some(LEGACY_JMAP_HOLD.into());
+    }
+}
+
 /// After this many failed uploads a message waits for the person.
 pub const TRIES_MAX: u32 = 5;
 
@@ -400,8 +413,7 @@ impl Writer<'_> {
     pub fn hold_legacy_jmap_import(&mut self, id: u64) -> Result<()> {
         let mut t = self.tx.open_table(IMPORTS)?;
         let Some(mut row) = t.get(id)?.map(|v| dec::<Import>(v.value())).transpose()? else { return Ok(()) };
-        row.tries = TRIES_MAX;
-        row.why = Some("Older JMAP import has no saved server state. Check the server before clearing it.".into());
+        row.hold_for_jmap_review();
         t.insert(id, enc(&row).as_slice())?;
         Ok(())
     }
@@ -416,13 +428,21 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Try a given-up upload again from the start.
-    pub fn import_retry(&mut self, id: u64) -> Result<()> {
+    /// Queue a stopped upload for another pass when its history permits it.
+    pub fn import_retry(&mut self, id: u64, jmap: bool) -> Result<bool> {
         let mut t = self.tx.open_table(IMPORTS)?;
-        let Some(mut i) = t.get(id)?.map(|v| dec::<Import>(v.value())).transpose()? else { return Ok(()) };
-        i.tries = 0;
-        t.insert(id, enc(&i).as_slice())?;
-        Ok(())
+        let Some(mut row) = t.get(id)?.map(|v| dec::<Import>(v.value())).transpose()? else { return Ok(false) };
+        if row.tries < TRIES_MAX {
+            return Ok(false);
+        }
+        if jmap && row.needs_jmap_review(self.tx.open_table(JMAP_ATTEMPTS)?.get(id)?.is_some()) {
+            row.hold_for_jmap_review();
+            t.insert(id, enc(&row).as_slice())?;
+            return Ok(false);
+        }
+        row.tries = 0;
+        t.insert(id, enc(&row).as_slice())?;
+        Ok(true)
     }
 
     /// Forget every waiting upload to `folder` (the person cancelled).

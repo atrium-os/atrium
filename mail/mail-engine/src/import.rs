@@ -311,8 +311,15 @@ impl Engine {
     /// Try the given-up uploads of `account` again at the next sync; how many.
     pub fn retry_imports(&self, account: AccountId) -> Result<usize, Error> {
         let ids: Vec<u64> = self.stuck(account)?.into_iter().map(|(id, _)| id).collect();
-        self.store.write(|w| ids.iter().try_for_each(|&id| w.import_retry(id)))?;
-        Ok(ids.len())
+        let jmap = self.store.account_config(account)?
+            .is_some_and(|config| matches!(config.protocol, mail_store::Protocol::Jmap { .. }));
+        Ok(self.store.write(|w| {
+            let mut queued = 0;
+            for id in ids {
+                queued += usize::from(w.import_retry(id, jmap)?);
+            }
+            Ok(queued)
+        })?)
     }
 
     /// Drop the given-up uploads of `account` (their messages stay only in
@@ -352,7 +359,7 @@ impl Engine {
                 continue;
             }
             let saved = self.store.jmap_import_attempt(id)?;
-            if saved.is_none() && row.why.is_some() {
+            if row.needs_jmap_review(saved.is_some()) {
                 self.store.write(|w| w.hold_legacy_jmap_import(id))?;
                 continue;
             }

@@ -1668,6 +1668,74 @@ fn jmap_holds_an_ambiguous_import_when_the_server_copy_cannot_be_proven() {
 }
 
 #[test]
+fn jmap_legacy_failed_imports_stay_held_across_retry_and_reopen() {
+    use mail_store::imports::TRIES_MAX;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let open = || Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let engine = open();
+    let account = engine.store.add_configured(&mail_store::AccountConfig {
+        address: "ada@example.org".into(),
+        name: "Ada".into(),
+        protocol: mail_store::Protocol::Jmap { session: SESSION.into() },
+        incoming_item: None,
+        outgoing_item: None,
+        oauth: None,
+        reached: Default::default(),
+    }).unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let raw = message(50, "A possible prior import", "Already on the server");
+    let legacy_blob = engine.store.put_blob(&raw).unwrap();
+    let partial_blob = engine.store.put_blob(&message(51, "Another ambiguous import", "Missing reply")).unwrap();
+    let safe_blob = engine.store.put_blob(&message(52, "Safe retry", "Explicitly refused")).unwrap();
+    let (legacy, partial, safe) = engine.store.write(|w| {
+        let legacy = w.queue_import(archive, legacy_blob)?;
+        let partial = w.queue_import(archive, partial_blob)?;
+        let safe = w.queue_import(archive, safe_blob)?;
+        for _ in 0..TRIES_MAX {
+            w.import_failed(legacy, "Old connection failure with no receipt")?;
+            w.jmap_import_refused(safe, "Server explicitly refused")?;
+        }
+        w.import_failed(partial, "Old connection failure below the retry limit")?;
+        Ok((legacy, partial, safe))
+    }).unwrap();
+    drop(engine);
+
+    let engine = open();
+    assert_eq!(engine.store.jmap_import_attempt(legacy).unwrap(), None);
+    assert_eq!(engine.store.jmap_import_attempt(partial).unwrap(), None);
+    assert_eq!(engine.store.jmap_import_attempt(safe).unwrap(), Some(Vec::new()));
+    assert_eq!(engine.retry_imports(account).unwrap(), 1);
+    let server = Rc::new(RefCell::new(Server::default()));
+    let existing = server.borrow_mut().add(raw.clone(), &["arch"], &[], 1_800_000_000);
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    {
+        let s = server.borrow();
+        assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (1, 1, 2));
+        assert_eq!(s.mails[&existing].bytes, raw);
+        assert_eq!(s.mails.values().filter(|m| m.bytes == raw).count(), 1);
+    }
+    drop((client, engine));
+
+    let engine = open();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    assert_eq!(engine.retry_imports(account).unwrap(), 0);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 0);
+    let rows = engine.store.imports().unwrap();
+    assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [legacy, partial]);
+    for (id, row) in rows {
+        assert_eq!(row.tries, TRIES_MAX);
+        assert!(row.why.unwrap().contains("no saved server state"));
+        assert_eq!(engine.store.jmap_import_attempt(id).unwrap(), None);
+    }
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    let s = server.borrow();
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (1, 1, 2));
+}
+
+#[test]
 fn jmap_explicit_refusal_allows_a_fresh_import_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });

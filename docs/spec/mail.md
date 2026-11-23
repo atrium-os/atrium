@@ -504,7 +504,8 @@ as **making the account usable first, then filling in what's worth having, polit
   across candidate downloads). If proof is unavailable, Mail keeps the row
   and never retries with a fresh state. A first-attempt explicit refusal lets
   Mail prepare a fresh attempt. Older failed rows without a saved state are
-  held for review. Readback uses the
+  held for review. Try again leaves those rows on hold and counts only
+  rows queued for another pass. Readback uses the
   message's actual headers, and a mailbox move preserves the alias. Mail
   releases it on a destruction report only after validating the changes page
   and its chained reads for the requested account and starting state. A fetched

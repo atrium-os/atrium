@@ -741,6 +741,7 @@ impl Settings {
     pub fn stuck_imports(&self, account: AccountId, retry: bool) {
         let r = if retry { self.engine.retry_imports(account) } else { self.engine.clear_stuck_imports(account) };
         let note = match r {
+            Ok(0) if retry => "No imports queued to try again".to_string(),
             Ok(n) if retry => format!("Trying {} again at the next sync", if n == 1 { "1 message".to_string() } else { format!("{n} messages") }),
             Ok(_) => "Dropped; they're still in the file they came from".to_string(),
             Err(e) => format!("Couldn't: {e:?}"),
