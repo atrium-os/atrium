@@ -606,6 +606,14 @@ confirmation. One confirmed POST produced one accepted assertion and
 one redemption. The guest fetched `crypta-ac-ok` through ocserv on
 `tun6`.
 
+The next gate waited for the second disconnect to discard queued
+Sign In, then reconnected and queued a new request while the old jail
+was still open. After teardown only the newest request launched, with
+no additional Sign In press. The stale confirmation sent zero POSTs.
+The new attempt had no handshake or IPv4 sentinel response until fresh
+confirmation. One confirmed POST led to one accepted assertion, one
+redemption, and `crypta-ac-ok` through ocserv on `tun6`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
