@@ -441,8 +441,36 @@ moved to x=471, 371 and 471 on the two-second timeline, matching 1.5,
 0.5 and 1.5 seconds. The installed gate observed the compositor output;
 the earlier probe recorded the decoder acknowledgements separately.
 See `~/atrium-vm/evidence/navigator-i4-installed-chapters-worker-20261123/`.
-The real YouTube embed remains the next playback test. Fingerprint
-verification is deferred.
+### YouTube provider playback control
+
+On 2026-11-23 a fresh signed-out Chrome profile loaded the project watch
+document for each referrer policy. The same Play action produced:
+
+| Identity visible to the player | Player result after 15 s | Decoded frames |
+| --- | --- | ---: |
+| No referrer | Error 153, time 0 | 0 |
+| Loopback watch origin only | Playing, time 13.97 s | 423 |
+| Navigator package ID, separate desktop WebView-style navigation control | Playing, time 13.77 s | 417 |
+
+The last control supplied `https://org.atrium.navigator/` on navigation
+to the embed. The ID comes from Navigator's installed broker bundle.
+YouTube documents the installed app ID as a desktop client identity.
+See [YouTube's embedded-player requirements](https://developers.google.com/youtube/terms/required-minimum-functionality#api-client-identity-and-credentials).
+The signed-out control received separate VP9/WebM and Opus/WebM format
+offers and fetched media from a Google Video CDN. A player script measured
+1,957,976 decoded bytes. These observations establish compatibility with
+the provider in Chrome. They do not confer a network grant on Ladybird.
+
+Installed Navigator still has a three-resource, 64 KiB-per-resource grant,
+a fixed fixture entry URL and one VP9 SourceBuffer. Its ordinary fetcher
+omits Referer. The proposed provider path would send only the broker-owned
+package identity on the initial user-started embed GET. This needs an
+explicit exception to the documented header policy. After that decision,
+test bounded provider resource loading before adding the separate audio
+track and running the installed playback and chapter gate on Tessera.
+Host control scripts and observations are at
+`~/atrium-vm/evidence/navigator-i4-youtube-provider-20261123/`.
+Fingerprint verification is deferred.
 
 ## 6a. Sign-in: SSO and WebAuthn
 
