@@ -880,6 +880,14 @@ identity or erasing its persona invalidates its pending opens.
    local cross sysroot has OpenSSL 3.5.9 and the implicit-rejection
    parameter. The jailed runtime is still unverified.
 
+The non-default `legacy-smime-prototype` Cargo feature builds a test
+adapter for the bounded reader and the native default-provider operation.
+It is compiled only into the test binary. The adapter uses in-memory
+enrollments and a synthetic approval witness bound to the request. The
+approver and worker run in-process during the prototype and do not stand
+in for verification of the real trusted sheet, process boundary or
+persistent key-store rules.
+
 The synthetic Tessera gate must cover a successful Work open, no key
 use without the trusted confirmation, rejection of stale or reused
 authorization and a changed message, Personal isolation, lock and

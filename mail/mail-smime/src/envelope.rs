@@ -125,7 +125,7 @@ fn oaep_sha256(alg: &AlgorithmIdentifierOwned) -> Option<()> {
         && p.p_source.oid == oid::PSPECIFIED && empty).then_some(())
 }
 
-fn oaep_public_key(c: &x509_cert::Certificate) -> Option<rsa::RsaPublicKey> {
+fn rsa_public_key(c: &x509_cert::Certificate) -> Option<rsa::RsaPublicKey> {
     use rsa::{pkcs1::DecodeRsaPublicKey, traits::PublicKeyParts};
 
     let spki = &c.tbs_certificate.subject_public_key_info;
@@ -141,9 +141,13 @@ fn oaep_public_key(c: &x509_cert::Certificate) -> Option<rsa::RsaPublicKey> {
 /// The fingerprint Arca uses and the exact wrapped-key length for this
 /// known certificate. Derive this from Mail’s certificate, not a worker reply.
 pub fn oaep_recipient(my_cert: &[u8]) -> Option<([u8; 32], usize)> {
+    rsa_recipient(my_cert)
+}
+
+fn rsa_recipient(my_cert: &[u8]) -> Option<([u8; 32], usize)> {
     use rsa::{pkcs8::EncodePublicKey, traits::PublicKeyParts};
 
-    let key = oaep_public_key(&cert::parse(my_cert).ok()?)?;
+    let key = rsa_public_key(&cert::parse(my_cert).ok()?)?;
     let spki = key.to_public_key_der().ok()?;
     Some((cert::sha256(spki.as_bytes()), key.size()))
 }
@@ -164,7 +168,7 @@ pub fn oaep_wrapped_key(env: &EnvelopedData, my_cert: &[u8]) -> Option<(u8, Vec<
         return None;
     }
     let c = cert::parse(my_cert).ok()?;
-    let size = oaep_public_key(&c)?.size();
+    let size = rsa_public_key(&c)?.size();
     let mut matches = recipients_for(env, &c).filter(|k| k.key_enc_alg.oid == oid::RSA_OAEP);
     let recipient = matches.next()?;
     if matches.next().is_some() || recipient.enc_key.as_bytes().len() != size {
@@ -172,6 +176,40 @@ pub fn oaep_wrapped_key(env: &EnvelopedData, my_cert: &[u8]) -> Option<(u8, Vec<
     }
     oaep_sha256(&recipient.key_enc_alg)?;
     Some((key_bytes, recipient.enc_key.as_bytes().to_vec()))
+}
+
+/// A bounded, unambiguous legacy match for the selected certificate.
+#[cfg(feature = "legacy-receive-prototype")]
+pub fn legacy_recipient(
+    env: &EnvelopedData,
+    certificate: &[u8],
+) -> Option<([u8; 32], usize, Vec<u8>)> {
+    let (fingerprint, modulus) = rsa_recipient(certificate)?;
+    let certificate = cert::parse(certificate).ok()?;
+    let mut matching = recipients_for(env, &certificate);
+    let recipient = matching.next()?;
+    if matching.next().is_some()
+        || recipient.key_enc_alg.oid != oid::RSA
+        || recipient.key_enc_alg.parameters.as_ref()?.decode_as::<der::asn1::Null>().is_err()
+        || recipient.enc_key.as_bytes().len() != modulus
+        || env.recip_infos.0.len() > MAX_RECIPIENTS
+    {
+        return None;
+    }
+    let content = &env.encrypted_content;
+    let key_bytes = match content.content_enc_alg.oid {
+        oid::AES128_CBC => 16,
+        oid::AES256_CBC => 32,
+        _ => return None,
+    };
+    let iv = content.content_enc_alg.parameters.as_ref()?.decode_as::<der::asn1::OctetStringRef<'_>>().ok()?;
+    let encrypted = content.encrypted_content.as_ref()?.as_bytes();
+    if content.content_type != oid::DATA || iv.as_bytes().len() != 16
+        || encrypted.is_empty() || encrypted.len() % 16 != 0
+    {
+        return None;
+    }
+    Some((fingerprint, key_bytes, recipient.enc_key.as_bytes().to_vec()))
 }
 
 /// Decrypt the content with the unwrapped content key.
@@ -191,6 +229,34 @@ pub fn decrypt(env: &EnvelopedData, key: &[u8]) -> Result<Vec<u8>, String> {
             cbc::Decryptor::<aes::Aes128>::new(&k.into(), &iv.into()).decrypt_padded_vec_mut::<Pkcs7>(ct).map_err(bad)
         }
         _ => Err("encrypted with a cipher mail can't read".into()),
+    }
+}
+
+#[cfg(all(test, feature = "legacy-receive-prototype"))]
+mod legacy_tests {
+    use super::*;
+
+    const CERT: &[u8] = include_bytes!("../tests/data/leaf.der");
+    const ENVELOPE: &[u8] = include_bytes!("../tests/data/env.der");
+
+    #[test]
+    fn legacy_routes_only_an_unambiguous_legacy_recipient() {
+        let mut envelope = enveloped_data(ENVELOPE).unwrap();
+        assert!(legacy_recipient(&envelope, CERT).is_some());
+        assert!(oaep_wrapped_key(&envelope, CERT).is_none());
+
+        let RecipientInfo::Ktri(mut oaep) = envelope.recip_infos.0.iter().next().unwrap().clone() else {
+            panic!("expected RSA key transport in the fixture");
+        };
+        oaep.key_enc_alg.oid = oid::RSA_OAEP;
+        let mut mixed = envelope.recip_infos.0.clone();
+        mixed.insert(RecipientInfo::Ktri(oaep.clone())).unwrap();
+        envelope.recip_infos = RecipientInfos(mixed);
+        assert!(legacy_recipient(&envelope, CERT).is_none());
+
+        envelope.recip_infos = RecipientInfos(SetOfVec::try_from(vec![RecipientInfo::Ktri(oaep)]).unwrap());
+        assert!(oaep_wrapped_key(&envelope, CERT).is_none(), "unsupported OAEP parameters");
+        assert!(legacy_recipient(&envelope, CERT).is_none(), "OAEP failure cannot select legacy");
     }
 }
 

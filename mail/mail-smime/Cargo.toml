@@ -6,6 +6,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "S/MIME for Mail (docs/spec/mail.md §10.1): verify a detached signature and its chain (in the parse jail), build a signature around a signature someone else makes (Sigillum's token, Arca's key), and encrypt to and decrypt from CMS EnvelopedData with a content key someone else unwraps. Holds no private key. RustCrypto CMS/X.509 types and ring; no OpenSSL."
 
+[features]
+# Synthetic prototype only. Mail's reader does not opt in.
+legacy-receive-prototype = []
+
 [dependencies]
 cms = { version = "0.2.3", default-features = false, features = ["std"] }
 x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }

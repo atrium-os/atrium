@@ -17,6 +17,8 @@ path = "src/bin/arcad.rs"
 [features]
 # Run the native S/MIME test with host OpenSSL 3. FreeBSD uses base libcrypto.
 host-openssl-tests = []
+# Compiles the synthetic gate only. No socket or UI dispatch is enabled.
+legacy-smime-prototype = ["dep:mail-smime", "dep:subtle"]
 
 [dependencies]
 arca-store      = { path = "../arca-store" }
@@ -31,6 +33,9 @@ getrandom       = { version = "0.2", features = ["std"] }
 sha2            = "0.10"
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 psl = "2"
+
+mail-smime      = { path = "../../mail/mail-smime", optional = true, features = ["legacy-receive-prototype"] }
+subtle         = { version = "2.6", optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"

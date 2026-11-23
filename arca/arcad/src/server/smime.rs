@@ -251,6 +251,9 @@ fn certificate(item: &arca_store::ItemMeta) -> Option<&[u8]> {
     (item.kind == Kind::SmimeRsaKey && (1..=SMIME_CERT_MAX).contains(&der.len())).then_some(der)
 }
 
+#[cfg(all(test, feature = "legacy-smime-prototype", any(target_os = "freebsd", feature = "host-openssl-tests")))]
+mod legacy;
+
 #[cfg(any(target_os = "freebsd", all(test, feature = "host-openssl-tests")))]
 mod native {
     use std::ffi::{c_char, c_int, c_long, c_void};
@@ -398,6 +401,25 @@ mod native {
             input: *const u8,
             len: usize,
         ) -> c_int;
+    }
+
+    #[cfg(all(test, feature = "legacy-smime-prototype"))]
+    #[repr(C)]
+    struct OsslParam {
+        key: *const c_char,
+        data_type: std::ffi::c_uint,
+        data: *mut c_void,
+        data_size: usize,
+        return_size: usize,
+    }
+
+    #[cfg(all(test, feature = "legacy-smime-prototype"))]
+    #[link(name = "crypto")]
+    unsafe extern "C" {
+        fn OSSL_PARAM_construct_uint(key: *const c_char, value: *mut std::ffi::c_uint) -> OsslParam;
+        fn OSSL_PARAM_construct_end() -> OsslParam;
+        fn EVP_PKEY_CTX_set_params(ctx: *mut c_void, params: *const OsslParam) -> c_int;
+        fn EVP_PKEY_CTX_get_params(ctx: *mut c_void, params: *mut OsslParam) -> c_int;
     }
 
     pub(super) const AVAILABLE: bool = true;
@@ -570,6 +592,36 @@ mod native {
             LockedBuf::from_slice(&out.as_ref()[..n]).map_err(Error::Io)
         }
 
+        /// Prototype only. The worker receives exactly the cipher's public
+        /// key size. The result and recovered length never leave Arca.
+        #[cfg(all(test, feature = "legacy-smime-prototype"))]
+        pub(super) fn legacy_candidate(&self, ciphertext: &[u8], key_bytes: usize) -> Result<LockedBuf, Error> {
+            use subtle::{ConditionallySelectable, ConstantTimeEq};
+
+            if !matches!(key_bytes, 16 | 32) || ciphertext.len() != self.size() {
+                return Err(INVALID_CIPHERTEXT);
+            }
+            let _errors = ClearErrors;
+            let ctx = self.context()?;
+            ctx.set_legacy_with_implicit_rejection()?;
+            let mut n = self.size();
+            let mut candidate = LockedBuf::zeroed(n).map_err(Error::Io)?;
+            let mut output = LockedBuf::zeroed(key_bytes).map_err(Error::Io)?;
+            getrandom::getrandom(output.as_mut())
+                .map_err(|_| Error::Io(std::io::Error::other("legacy S/MIME randomness unavailable")))?;
+            // SAFETY: the initialized default-provider context and both
+            // buffers live through the call. n starts at the output capacity.
+            let status = unsafe {
+                EVP_PKEY_decrypt(ctx.0.as_ptr(), candidate.as_mut().as_mut_ptr(),
+                    &mut n, ciphertext.as_ptr(), ciphertext.len())
+            };
+            let usable = status.ct_eq(&1) & n.ct_eq(&key_bytes);
+            for (fallback, byte) in output.as_mut().iter_mut().zip(candidate.as_ref()) {
+                *fallback = u8::conditional_select(fallback, byte, usable);
+            }
+            Ok(output)
+        }
+
         #[cfg(test)]
         pub(super) fn wrap_for_test(&self, key: &[u8]) -> Vec<u8> {
             let _errors = ClearErrors;
@@ -596,6 +648,35 @@ mod native {
     }
 
     impl Context {
+        #[cfg(all(test, feature = "legacy-smime-prototype"))]
+        fn set_legacy_with_implicit_rejection(&self) -> Result<(), Error> {
+            const RSA_PKCS1_PADDING: c_int = 1;
+            let ctx = self.0.as_ptr();
+            let mut enabled = 1;
+            let mut actual = 0;
+            // SAFETY: the parameter arrays are terminated and point to
+            // live unsigned values for the duration of the EVP calls.
+            let checked = unsafe {
+                let setting = [
+                    OSSL_PARAM_construct_uint(c"implicit-rejection".as_ptr(), &mut enabled),
+                    OSSL_PARAM_construct_end(),
+                ];
+                let mut reading = [
+                    OSSL_PARAM_construct_uint(c"implicit-rejection".as_ptr(), &mut actual),
+                    OSSL_PARAM_construct_end(),
+                ];
+                EVP_PKEY_decrypt_init(ctx) == 1
+                    && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) == 1
+                    && EVP_PKEY_CTX_set_params(ctx, setting.as_ptr()) == 1
+                    && EVP_PKEY_CTX_get_params(ctx, reading.as_mut_ptr()) == 1
+            };
+            if checked && actual == 1 {
+                Ok(())
+            } else {
+                Err(Error::Io(std::io::Error::other("legacy S/MIME provider protection unavailable")))
+            }
+        }
+
         fn set_oaep(&self) -> Result<(), Error> {
             let p = self.0.as_ptr();
             if unsafe {
