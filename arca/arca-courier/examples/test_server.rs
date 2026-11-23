@@ -24,6 +24,7 @@ struct Provider {
     webauthn_probe: bool,
     registration: bool,
     platform_only: bool,
+    physical_key: bool,
     registration_challenges: std::collections::HashMap<String, String>,
     registered: std::collections::HashMap<String, Enrollment>,
     enrollment: Option<Enrollment>,
@@ -92,14 +93,16 @@ impl Enrollment {
         Some(Self { id: attested.cred_id, key, counter: auth.sign_count })
     }
 
-    fn verify(&mut self, body: &str, challenge: &str) -> Option<()> {
+    fn verify(&mut self, body: &str, challenge: &str, physical_key: bool) -> Option<()> {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let mut fields = url::form_urlencoded::parse(body.as_bytes());
         let (name, data) = fields.next()?;
         if name != "assertion" || fields.next().is_some() { return None; }
         let v: serde_json::Value = serde_json::from_str(&data).ok()?;
         let bytes = |k: &str| URL_SAFE_NO_PAD.decode(v[k].as_str()?).ok();
-        if v["type"] != "public-key" || bytes("rawId")? != self.id || bytes("userHandle")? != b"fixture-user" { return None; }
+        let user = bytes("userHandle")?;
+        if v["type"] != "public-key" || bytes("rawId")? != self.id { return None; }
+        if user != b"fixture-user" && !(physical_key && user.is_empty()) { return None; }
         let client = bytes("clientDataJSON")?;
         let cd: serde_json::Value = serde_json::from_slice(&client).ok()?;
         if cd["type"] != "webauthn.get" || cd["origin"] != "https://login.microsoftonline.com"
@@ -140,7 +143,8 @@ impl Provider {
                     let challenge = self.registration_challenges.entry(flow.into()).or_insert_with(nonce);
                     let script = include_str!("../../../test-assets/navigator-i3/register.js").replace("__CREATE__", challenge)
                         .replace("__EXCLUDE__", &nonce())
-                        .replace("__ATTACHMENT__", if self.platform_only { "platform" } else { "" });
+                        .replace("__ATTACHMENT__", if self.platform_only { "platform" } else if self.physical_key { "cross-platform" } else { "" })
+                        .replace("__RESIDENCY__", if self.physical_key { "discouraged" } else { "required" });
                     let challenge = self.challenges.entry(flow.into()).or_insert_with(nonce);
                     return ("registration-challenges-issued", response("200 OK", "Content-Type: text/javascript\r\n", &script.replace("__GET__", challenge)));
                 }
@@ -177,7 +181,7 @@ impl Provider {
             }
             let enrollment = if self.registration { self.registered.get_mut(flow) } else { self.enrollment.as_mut() };
             if let (Some(enrollment), Some(challenge)) = (enrollment, self.challenges.remove(flow)) {
-                if self.codes.len() < 64 && enrollment.verify(body, &challenge).is_some() {
+                if self.codes.len() < 64 && enrollment.verify(body, &challenge, self.physical_key).is_some() {
                     let (state, verifier_hash) = self.sessions.remove(flow).unwrap();
                     let code = nonce();
                     self.codes.insert(code.clone(), verifier_hash);
@@ -230,9 +234,10 @@ fn main() {
     let webauthn_probe = a.get(6).is_some_and(|mode| mode == "webauthn-probe");
     let enrollment = a.get(6).filter(|mode| *mode == "webauthn-sign-in").map(|_| Enrollment::read(&a[7]));
     let platform_only = a.get(6).is_some_and(|mode| mode == "webauthn-platform");
-    let registration = platform_only || a.get(6).is_some_and(|mode| mode == "webauthn-register");
+    let physical_key = a.get(6).is_some_and(|mode| mode == "webauthn-physical");
+    let registration = physical_key || platform_only || a.get(6).is_some_and(|mode| mode == "webauthn-register");
     let callback = registration || enrollment.is_some() || webauthn_probe || a.get(6).is_some_and(|mode| mode == "mail-callback");
-    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, registration, platform_only, enrollment, ..Provider::default() }));
+    let provider = Arc::new(std::sync::Mutex::new(Provider { webauthn_probe, registration, platform_only, physical_key, enrollment, ..Provider::default() }));
     let continuation = a.get(6).is_some_and(|mode| mode == "mail-continue");
     let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();

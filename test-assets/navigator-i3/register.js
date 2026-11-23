@@ -19,7 +19,7 @@ function create(challenge, excludeCredentials) {
         rp: {name: "Local I3 provider", id: location.hostname},
         user: {id: new TextEncoder().encode("fixture-user"), name: "ada@example.test", displayName: "Ada"},
         challenge: decode(challenge), pubKeyCredParams: [{type: "public-key", alg: -7}], excludeCredentials,
-        authenticatorSelection: {authenticatorAttachment: attachment || undefined, residentKey: "required", userVerification: "required"}, timeout: 60000
+        authenticatorSelection: {authenticatorAttachment: attachment || undefined, residentKey: "__RESIDENCY__", userVerification: "required"}, timeout: 60000
     }});
 }
 const duplicate = document.createElement("button");
