@@ -542,6 +542,26 @@ as **making the account usable first, then filling in what's worth having, polit
   transaction that releases the alias. A folder learned during the sweep keeps
   the alias if it falls outside the proof. The cursor persists per account.
   Mail cannot discover a mailbox the server has never exposed to that account.
+  A negative sweep establishes absence within its verified scope.
+  Account-wide deletion requires evidence for any possible move destination
+  outside that scope. To qualify a deployment, the operator identifies
+  every namespace that can receive the object through a move and supplies either
+  a complete, consistent server-side lookup by stable object ID across that
+  scope or an authoritative destruction record for the same account and
+  object. A server inventory is evidence only for the namespaces and
+  permissions it actually covers. [RFC 7377 §2.2](https://www.rfc-editor.org/rfc/rfc7377.html#section-2.2)
+  permits search to omit inaccessible mailboxes, and [RFC 6154 §2](https://www.rfc-editor.org/rfc/rfc6154.html#section-2)
+  permits a special-use `\All` mailbox to omit messages.
+
+  Qualify the coverage on a dedicated test account with two controls. First
+  move a tracked object to an operator-verified mailbox hidden from the
+  client and confirm that the client reports no match while the server
+  evidence still finds that same object. Then destroy a separate tracked
+  object from the full covered scope and verify the server evidence records
+  its absence or destruction. Capture the stable ID, the account and
+  namespace scope, and the client and server results for both controls.
+  Keep the account-wide result unresolved when any possible destination
+  or lookup is unaccounted for.
 - **Export** a folder, a search, or everything as mbox or Maildir through the picker's Save.
   Mail never makes it hard to leave.
 
