@@ -56,8 +56,10 @@ ensure_user _arca-ui 65021
 ensure_user _limen 65022
 ensure_user _ostiarius 50093
 ensure_user mailcertpicker 51973
-test ! -e "/home/$person"
-pw useradd "$person" -m -d "/home/$person" -s /bin/sh
+if ! id "$person" >/dev/null 2>&1; then
+    test ! -e "/home/$person"
+    pw useradd "$person" -m -d "/home/$person" -s /bin/sh
+fi
 install -d -o "$person" -m 755 "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 chown "$person" "/var/db/atrium/$person/policy.toml"
@@ -77,7 +79,8 @@ install -d /var/run/atrium "$s/arca" "$s/sigillum" "$s/portcullis" "$s/fresco" "
 touch "$registry" /var/run/atrium/courier-registry
 # Only Scrinium's trusted provider is injected into the registry. Portcullis
 # writes the Work and Personal Mail entries when it launches the signed app.
-printf '51973 %s org.atrium.scrinium\n' "$person" >>"$registry"
+picker_registry="51973 $person org.atrium.scrinium"
+grep -qxF "$picker_registry" "$registry" || printf '%s\n' "$picker_registry" >>"$registry"
 chown _arca:_arca "$s/arca"
 chown _limen:_limen "$s/limen"
 install -d -o _arca -g _arca -m 700 /var/db/arca
@@ -88,8 +91,7 @@ done
 touch "$root/var/run/atrium/app-registry" "$root/var/run/atrium/courier-registry"
 install -m 0555 "$d/arcad" /usr/local/bin/atrium-arcad
 install -m 0644 "$d/devfs.rules" /usr/local/etc/atrium/devfs.rules
-sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null
-sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets'
+sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules"; devfs_init_rulesets'
 test -n "$(devfs rule -s 32 show)"
 sh "$d/jaild-policy-merge.sh" "$d/jaild.policy.toml" /etc/atrium/jaild.policy.toml >"$d/policy.toml"
 install -m 0644 "$d/policy.toml" /etc/atrium/jaild.policy.toml
@@ -153,7 +155,11 @@ start scrinium -u mailcertpicker env SCRINIUM_PERSONAS="$d/personas" FRESCO_SOCK
 su -m "$person" -c "$d/portcullis policy grant $app"
 
 launch() {
-    start "$1" su -m "$person" -c "$d/portcullis launch $app --persona $1"
+    case "$1" in
+        work) start work su -m "$person" -c "$d/portcullis launch $app --persona work" ;;
+        personal) start personal su -m "$person" -c "$d/portcullis launch $app" ;;
+        *) return 1 ;;
+    esac
 }
 wait_mail() {
     for _ in $(jot 40); do
@@ -190,6 +196,8 @@ workpid=$(wait_mail "$work")
 workuid=$(verify_identity "$workpid" work)
 printf 'MAIL_SIGNED_WORK_UID=%s\n' "$workuid"
 verify_certs "$work" "$workuid" empty | grep -x MAIL_SMIME_PUBLIC_CERTS=0
+# Enumerated surfaces can precede the first composed Settings frame.
+sleep 3
 timeout 115 "$d/smime_installed_probe" drive "$d/wm.sock" "$d/input.sock" "$workuid"
 verify_certs "$work" "$workuid" /bin/smime-fixture.der | grep -x MAIL_SMIME_PUBLIC_CERTS=1
 grep -Eq 'picker [0-9]+ is for work' "$d/scrinium.log"
