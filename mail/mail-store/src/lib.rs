@@ -276,6 +276,7 @@ impl Store {
             tx.open_table(IDENTITIES)?;
             tx.open_table(ops::OPS)?;
             tx.open_table(outbox::OUTBOX)?;
+            tx.open_table(outbox::JMAP_SUBMISSIONS)?;
             tx.open_table(drafts::DRAFTS)?;
             tx.open_table(thread::THREADS)?;
             tx.open_table(thread::MSGID_THREADS)?;

@@ -79,6 +79,9 @@ pub enum Call {
     AppendIdentity { folder: String, flags: Vec<String>, message: Vec<u8> },
     JmapPrepareImport { folder: String, message: Vec<u8> },
     JmapFinishImport { attempt: crate::jmap::PreparedImport, retry: Option<Vec<u8>> },
+    JmapPrepareSend { message: Vec<u8>, from: String, rcpts: Vec<String>, send_at: Option<i64> },
+    JmapDispatchSend(crate::jmap::PreparedSend),
+    JmapReconcileSend(crate::jmap::PreparedSend),
 }
 
 /// What [`Error`] was, across the wire.
@@ -115,6 +118,8 @@ pub enum Reply {
     JmapPreparedImport(std::result::Result<crate::jmap::PreparedImport, String>),
     JmapFinishedImport(std::result::Result<crate::jmap::ImportResult, String>),
     JmapSubmitted(crate::jmap::SendResult),
+    JmapPreparedSend(crate::jmap::PrepareSendResult),
+    JmapSendStatus(std::result::Result<Option<crate::jmap::SendStatus>, String>),
 }
 
 /// A [`Sink`] call, from the worker.
@@ -539,7 +544,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_) => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapPrepareSend { .. } | Call::JmapDispatchSend(_) | Call::JmapReconcileSend(_) | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_) => {
                 let reply = match (next, jmap.as_mut()) {
                     (Call::JmapWatch, Some(c)) => {
                         let mut a = RemoteSink(chan.clone());
@@ -548,7 +553,15 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     }
                     (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
-                    (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSubmitted(c.send(&message, &from, &rcpts, send_at)),
+                    (Call::JmapSend { .. }, Some(_)) => Reply::JmapSubmitted(Err(crate::jmap::SendError::BeforeSubmission {
+                        why: "the Mail engine must save the Email ID before dispatch".into(),
+                        transient: false,
+                    })),
+                    (Call::JmapPrepareSend { message, from, rcpts, send_at }, Some(c)) => {
+                        Reply::JmapPreparedSend(c.prepare_send(&message, &from, &rcpts, send_at))
+                    }
+                    (Call::JmapDispatchSend(prepared), Some(c)) => Reply::JmapSubmitted(c.dispatch_send(&prepared)),
+                    (Call::JmapReconcileSend(prepared), Some(c)) => Reply::JmapSendStatus(c.reconcile_send(&prepared).map_err(|e| e.0)),
                     (Call::JmapImport { folder, message }, Some(c)) => Reply::JmapSent(c.import(&folder, &message).map_err(|e| e.0)),
                     (Call::JmapPrepareImport { folder, message }, Some(c)) => {
                         Reply::JmapPreparedImport(c.prepare_import(&folder, &message).map_err(|e| e.0))
@@ -587,7 +600,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
             }
             (Call::Sieve(plan), None) => Reply::Sieved(crate::sieve::apply(Tunnel(chan.clone()), &plan)),
             (Call::Start, Some(_)) | (Call::Submit { .. } | Call::Sieve(_), Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_), _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapPrepareSend { .. } | Call::JmapDispatchSend(_) | Call::JmapReconcileSend(_) | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_), _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -975,13 +988,29 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
             Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
         }
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> crate::jmap::SendResult {
-        let c = Call::JmapSend { message: message.to_vec(), from: from.into(), rcpts: rcpts.to_vec(), send_at };
+    fn prepare_send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> crate::jmap::PrepareSendResult {
+        let c = Call::JmapPrepareSend { message: message.to_vec(), from: from.into(), rcpts: rcpts.to_vec(), send_at };
         match self.call(&c, None, QUIET) {
+            Ok(Reply::JmapPreparedSend(result)) => result,
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::SendError::Uncertain(t)),
+            Ok(other) => Err(crate::jmap::SendError::Uncertain(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::SendError::Uncertain(format!("the sync worker: {e}"))),
+        }
+    }
+    fn dispatch_send(&mut self, prepared: &crate::jmap::PreparedSend) -> crate::jmap::SendResult {
+        match self.call(&Call::JmapDispatchSend(prepared.clone()), None, QUIET) {
             Ok(Reply::JmapSubmitted(result)) => result,
             Ok(Reply::Failed(_, t)) => Err(crate::jmap::SendError::Uncertain(t)),
             Ok(other) => Err(crate::jmap::SendError::Uncertain(format!("the worker answered {other:?}"))),
             Err(e) => Err(crate::jmap::SendError::Uncertain(format!("the sync worker: {e}"))),
+        }
+    }
+    fn reconcile_send(&mut self, prepared: &crate::jmap::PreparedSend) -> crate::jmap::Result<Option<crate::jmap::SendStatus>> {
+        match self.call(&Call::JmapReconcileSend(prepared.clone()), None, QUIET) {
+            Ok(Reply::JmapSendStatus(result)) => result.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
         }
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> crate::jmap::Result<crate::jmap::Pushed> {

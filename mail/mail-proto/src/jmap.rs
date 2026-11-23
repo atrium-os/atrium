@@ -458,21 +458,102 @@ fn import_call(account: &str, blob: &str, mailbox: &str) -> Value {
     }, IMPORT_TAG])
 }
 
-/// Send uploaded message `blob`: import it into `sent` (seen), then submit
-/// it as `identity` to `rcpts`, at `send_at` if the server holds sends.
-pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str, rcpts: &[String], send_at: Option<&str>) -> Vec<u8> {
+/// Import a copy of an outgoing message before dispatch.
+pub fn import_for_send(account: &str, blob: &str, sent: &str) -> Vec<u8> {
+    request(vec![import_call(account, blob, sent)], true)
+}
+
+/// Submit a previously acknowledged Email.
+pub fn submit(account: &str, email: &str, identity: &str, from: &str, rcpts: &[String], send_at: Option<&str>) -> Vec<u8> {
     let mut mail_from = json!({ "email": from });
     if let Some(t) = send_at {
         mail_from["parameters"] = json!({ "HOLDUNTIL": t });
     }
     let rcpt: Vec<Value> = rcpts.iter().map(|r| json!({ "email": r })).collect();
-    request(
-        vec![
-            import_call(account, blob, sent),
-            json!(["EmailSubmission/set", { "accountId": account, "create": { (SUBMISSION_CREATION_ID): { "identityId": identity, "emailId": format!("#{IMPORT_CREATION_ID}"), "envelope": { "mailFrom": mail_from, "rcptTo": rcpt } } } }, SUBMISSION_TAG]),
-        ],
-        true,
-    )
+    request(vec![json!([
+        "EmailSubmission/set",
+        { "accountId": account, "create": { (SUBMISSION_CREATION_ID): {
+            "identityId": identity, "emailId": email,
+            "envelope": { "mailFrom": mail_from, "rcptTo": rcpt }
+        } } },
+        SUBMISSION_TAG
+    ])], true)
+}
+
+/// The correlation saved before dispatch. Times bound the expected release.
+pub struct SubmissionMatch<'a> {
+    pub account: &'a str,
+    pub email: &'a str,
+    pub identity: &'a str,
+    pub from: &'a str,
+    pub recipients: &'a [String],
+    pub earliest: i64,
+    pub latest: i64,
+}
+
+pub fn query_submission(expected: &SubmissionMatch<'_>) -> Vec<u8> {
+    request(vec![json!(["EmailSubmission/query", {
+        "accountId": expected.account,
+        "filter": {
+            "emailIds": [expected.email], "identityIds": [expected.identity],
+            "after": utc_string(expected.earliest), "before": utc_string(expected.latest)
+        },
+        "position": 0, "limit": 2, "calculateTotal": true
+    }, "subq"])], true)
+}
+
+pub fn submission_id(a: &Answers, account: &str) -> Result<Option<String>> {
+    let query = a.account_reply("subq", "EmailSubmission/query", account)?;
+    need_state(query, "queryState")?;
+    if query.get("position").and_then(Value::as_u64) != Some(0) {
+        return err("bad EmailSubmission/query position");
+    }
+    let ids = distinct_ids(query.get("ids"), "EmailSubmission/query IDs")?;
+    if ids.len() == 1 && query.get("total").and_then(Value::as_u64) == Some(1) {
+        return Ok(ids.into_iter().next());
+    }
+    Ok(None)
+}
+
+pub fn get_submission(account: &str, id: &str) -> Vec<u8> {
+    request(vec![json!(["EmailSubmission/get", {
+        "accountId": account, "ids": [id],
+        "properties": ["id", "emailId", "identityId", "envelope", "sendAt", "undoStatus"]
+    }, "subg"])], true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionStatus {
+    Pending,
+    Final,
+    Canceled,
+}
+
+pub fn submission_status(a: &Answers, id: &str, expected: &SubmissionMatch<'_>) -> Result<Option<SubmissionStatus>> {
+    let reply = a.account_reply("subg", "EmailSubmission/get", expected.account)?;
+    need_state(reply, "state")?;
+    if !check_get_coverage(reply, &[id.to_string()])?.is_empty() {
+        return Ok(None);
+    }
+    let row = &reply["list"][0];
+    let Some(at) = row["sendAt"].as_str().and_then(utc_date) else { return Ok(None) };
+    if row["emailId"] != expected.email || row["identityId"] != expected.identity
+        || row["envelope"]["mailFrom"]["email"] != expected.from
+        || !(expected.earliest..expected.latest).contains(&at)
+    {
+        return Ok(None);
+    }
+    let Some(recipients) = row["envelope"]["rcptTo"].as_array() else { return Ok(None) };
+    let Some(addresses) = recipients.iter().map(|r| r.get("email").and_then(Value::as_str)).collect::<Option<BTreeSet<_>>>() else { return Ok(None) };
+    if addresses != expected.recipients.iter().map(String::as_str).collect() {
+        return Ok(None);
+    }
+    Ok(match row["undoStatus"].as_str() {
+        Some("pending") => Some(SubmissionStatus::Pending),
+        Some("final") => Some(SubmissionStatus::Final),
+        Some("canceled") => Some(SubmissionStatus::Canceled),
+        _ => None,
+    })
 }
 
 /// Store uploaded message `blob` in `mailbox` (an import, mail.md §6.5),
@@ -832,8 +913,8 @@ pub struct Identity {
     pub email: String,
 }
 
-pub fn identities(a: &Answers) -> Result<Vec<Identity>> {
-    let o = a.of("i", "Identity/get")?;
+pub fn identities(a: &Answers, account: &str) -> Result<Vec<Identity>> {
+    let o = a.account_reply("i", "Identity/get", account)?;
     let list = o.get("list").and_then(Value::as_array).ok_or(Error("no list".into()))?;
     Ok(list.iter().take(256).filter_map(|i| i.as_object()).filter_map(|i| Some(Identity { id: need_id(i, "id").ok()?, email: get_str(i, "email")?.to_ascii_lowercase() })).collect())
 }
@@ -843,9 +924,8 @@ pub enum SubmissionAck {
     Refused(String),
 }
 
-/// An explicit refusal is conclusive. A success must match both parts of
-/// the request, including the Email referenced by the submission.
-pub fn submitted(a: &Answers, account: &str) -> Result<SubmissionAck> {
+/// Check a create acknowledgment against the account and saved Email.
+pub fn submitted(a: &Answers, account: &str, email: &str) -> Result<SubmissionAck> {
     const METHOD: &str = "EmailSubmission/set";
     let reply = a.account_reply(SUBMISSION_TAG, METHOD, account)?;
     need_state(reply, "newState")?;
@@ -866,11 +946,10 @@ pub fn submitted(a: &Answers, account: &str) -> Result<SubmissionAck> {
         (Some(submission), None) => {
             let submission = submission.as_object().ok_or(Error("bad EmailSubmission/set creation result".into()))?;
             need_id(submission, "id")?;
-            let email = imported(a, account)?;
-            if submission.get("emailId").is_some_and(|id| id.as_str() != Some(email.as_str())) {
+            if submission.get("emailId").is_some_and(|id| id.as_str() != Some(email)) {
                 return err("wrong EmailSubmission/set emailId");
             }
-            Ok(SubmissionAck::Accepted(email))
+            Ok(SubmissionAck::Accepted(email.into()))
         }
         (None, Some(error)) => {
             let error = error.as_object().ok_or(Error("bad EmailSubmission/set refusal".into()))?;
@@ -880,14 +959,6 @@ pub fn submitted(a: &Answers, account: &str) -> Result<SubmissionAck> {
             Ok(SubmissionAck::Refused(format!("not sent: {} {}", kind.chars().filter(|c| c.is_ascii_graphic()).take(64).collect::<String>(), detail.chars().filter(|c| !c.is_control()).take(200).collect::<String>())))
         }
         _ => err("missing or conflicting EmailSubmission/set creation outcome"),
-    }
-}
-
-/// The answer to [`import`]: the stored message's id, or why not.
-pub fn imported(a: &Answers, account: &str) -> Result<String> {
-    match import_acknowledgment(a, account, None)? {
-        ImportAck::Created(id) => Ok(id),
-        ImportAck::Refused(why) => err(why),
     }
 }
 

@@ -176,8 +176,14 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn sync(&mut self, sink: &mut dyn mail_sync::Sink) -> mail_sync::jmap::Result<mail_sync::Report> {
         mail_sync::jmap::Jmap::sync(&mut self.remote, sink)
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> mail_sync::jmap::SendResult {
-        mail_sync::jmap::Jmap::send(&mut self.remote, message, from, rcpts, send_at)
+    fn prepare_send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> mail_sync::jmap::PrepareSendResult {
+        mail_sync::jmap::Jmap::prepare_send(&mut self.remote, message, from, rcpts, send_at)
+    }
+    fn dispatch_send(&mut self, prepared: &mail_sync::jmap::PreparedSend) -> mail_sync::jmap::SendResult {
+        mail_sync::jmap::Jmap::dispatch_send(&mut self.remote, prepared)
+    }
+    fn reconcile_send(&mut self, prepared: &mail_sync::jmap::PreparedSend) -> mail_sync::jmap::Result<Option<mail_sync::jmap::SendStatus>> {
+        mail_sync::jmap::Jmap::reconcile_send(&mut self.remote, prepared)
     }
     fn can_hold(&self, secs: i64) -> bool {
         self.remote.can_hold(secs)
@@ -357,6 +363,7 @@ impl Engine {
         let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
         let mut client = open_jmap(net.jmap(session, &item)?, session)?;
         let mut pass = Pass { report: client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?, ..Default::default() };
+        pass.sent += self.reconcile_jmap_sends(account, client.as_mut()).map_err(|err| err.to_string())?;
         if self.upload_jmap_imports(account, client.as_mut()).map_err(|e| e.to_string())? > 0 {
             client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         }

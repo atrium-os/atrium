@@ -295,7 +295,7 @@ fn jmap_runs_in_the_worker_with_the_http_here() {
     let (le, re) = (mail_sync::jmap::Jmap::sync(&mut l, &mut Log::default()).unwrap_err(), mail_sync::jmap::Jmap::sync(&mut r, &mut Log::default()).unwrap_err());
     assert_eq!(le.0, re.0, "the same error as here");
     let rcpts = ["b@x.example".to_string()];
-    let (le, re) = (l.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err(), r.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err());
+    let (le, re) = (l.prepare_send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err(), r.prepare_send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err());
     assert_eq!(le, re);
     // A server search (§11.2) too.
     let q = mail_sync::ServerQuery { text: vec!["zanzibar".into()], ..Default::default() };

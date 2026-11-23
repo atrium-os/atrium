@@ -1730,25 +1730,25 @@ Stalwart in the cloud VM, and later a real account):
    back only acknowledged snooze updates. Send: upload, `Email/import` into Sent (seen),
    `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
    `maxDelayedSend` covers a send-later time, else the engine holds it
-   (`Engine::deliver_jmap`). Mail validates both acknowledgments against the
-   account and their requested creation IDs. If the submission echoes an
-   Email ID, it must match the verified import. An explicit submission refusal
-   stops the send. A lost or invalid reply after submission dispatch, a lost
-   worker reply, or a restart during an in-flight JMAP send leaves an
-   uncertain outbox item for review. Automatic retries and Send again leave
-   it held. A copy in Sent alone is insufficient to establish delivery, since
-   the import can succeed before submission is refused. A read-only
-   `EmailSubmission/query` by verified server Email ID and identity, followed
-   by `EmailSubmission/get`, can confirm a uniquely correlated retained
-   record. Correlate the account, Email ID, identity, envelope and expected
-   release window. The record can show pending, final or canceled. Final
-   describes recallability. Per-recipient delivery uses a separate, optional
-   status. Servers may retire submission
-   records, so absence or an ambiguous match leaves the outcome unresolved.
-   The current outbox saves the RFC 5322 Message-ID. The test-only probe
-   gets the verified server Email ID independently from the fixture and
-   reports its findings without changing outbox state. Failures known to
-   precede submission retain the normal retry policy. The store keeps the
+   (`Engine::deliver_jmap`). Mail verifies the account and import creation ID,
+   then saves the server Email ID, JMAP account and endpoint, identity, envelope,
+   and expected release window in the outbox before dispatching submission.
+   The submission acknowledgment must match the account and creation ID.
+   A returned Email ID must match the saved import. Explicit refusals stop
+   the send. Failures known to occur before the mutating import can retry
+   under the normal policy. A lost or invalid mutating reply, a lost worker
+   reply, or a restart during an in-flight send leaves the outbox item held.
+
+   On sync, Mail checks up to 16 held sends with saved evidence per account
+   using only `EmailSubmission/query` and `EmailSubmission/get`. It rotates
+   through held rows between passes. A unique record must match the saved
+   account and endpoint, Email ID, identity, envelope (including Bcc), and
+   expected release window. Pending and final records acknowledge server
+   acceptance and clear the outbox item. Canceled records stop it with a
+   cancellation reason. Per-recipient delivery uses separate optional
+   status. Missing, pruned, ambiguous or mismatched records, and older rows
+   without a verified Email ID, stay held. Reconciliation never uploads,
+   imports or resubmits. The store keeps the
    Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in
    two mailboxes, a large one by headers only, archive + read made on the server, changes

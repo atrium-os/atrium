@@ -249,7 +249,18 @@ impl Engine {
             Ok(b) => b,
             Err(e) => return failed(format!("the written message is missing: {e}"), false),
         };
-        match client.send(&bytes, &o.from, &o.rcpts, send_at) {
+        let result = match client.prepare_send(&bytes, &o.from, &o.rcpts, send_at) {
+            Ok(prepared) => {
+                let evidence = postcard::to_stdvec(&prepared).map_err(|err| Error::Sync(err.to_string()))?;
+                if !self.store.write(|w| w.save_jmap_submission(id, &evidence))? {
+                    return Ok(Delivery::NotDue);
+                }
+                // This is the first call that can submit, after the durable save.
+                client.dispatch_send(&prepared)
+            }
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(_) => {
                 self.store.write(|w| {
                     w.send_done(id)?;
@@ -265,6 +276,55 @@ impl Engine {
                 Ok(Delivery::Failed { why, transient: false })
             }
         }
+    }
+
+    /// Resolve held sends from verified submission status. This path only reads
+    /// JMAP and never invokes preparation or dispatch.
+    pub fn reconcile_jmap_sends(&self, account: AccountId, client: &mut dyn mail_sync::jmap::Jmap) -> Result<usize, Error> {
+        use mail_sync::jmap::{PreparedSend, SendStatus};
+
+        const CURSOR: &str = "jmap:submission-reconcile";
+        const CHECKS_PER_PASS: usize = 16;
+        let after = self.store.sync_state(account, CURSOR)?.and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+        let rows = self.store.outbox()?;
+        let start = rows.partition_point(|(id, _)| *id <= after);
+        let mut checked = 0;
+        let mut accepted = 0;
+        let mut last = None;
+        for (id, row) in rows[start..].iter().chain(&rows[..start]) {
+            if row.account != account || !matches!(row.state, SendState::Uncertain { .. }) {
+                continue;
+            }
+            let Some(evidence) = self.store.jmap_submission(*id)? else { continue };
+            if checked == CHECKS_PER_PASS {
+                break;
+            }
+            checked += 1;
+            last = Some(*id);
+            let prepared: PreparedSend = postcard::from_bytes(&evidence)
+                .map_err(|err| Error::Sync(format!("invalid stored JMAP submission: {err}")))?;
+            let status = match client.reconcile_send(&prepared) {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(err) => {
+                    eprintln!("mail: JMAP submission remains uncertain: {err}");
+                    continue;
+                }
+            };
+            if self.store.write(|w| {
+                let Some(outgoing) = w.resolve_jmap_submission(*id, &evidence, status == SendStatus::Canceled)? else {
+                    return Ok(false);
+                };
+                self.note_wrote(w, &outgoing)?;
+                Ok(true)
+            })? {
+                accepted += 1;
+            }
+        }
+        if let Some(id) = last {
+            self.store.write(|w| w.set_sync_state(account, CURSOR, Some(&id.to_string())))?;
+        }
+        Ok(accepted)
     }
 
     /// The name of `account`'s Sent folder, if it has one.

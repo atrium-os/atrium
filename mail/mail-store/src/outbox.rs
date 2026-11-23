@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{dec, enc, AccountId, Error, Hash, Result, Store, Writer};
 
 pub(crate) const OUTBOX: TableDefinition<u64, &[u8]> = TableDefinition::new("outbox");
+/// The server identity and envelope saved before dispatch.
+pub(crate) const JMAP_SUBMISSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_submissions");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendState {
@@ -83,6 +85,7 @@ impl Writer<'_> {
             return Ok(None);
         }
         t.remove(id)?;
+        self.tx.open_table(JMAP_SUBMISSIONS)?.remove(id)?;
         Ok(Some(o))
     }
 
@@ -118,6 +121,7 @@ impl Writer<'_> {
 
     /// The server took send `id`: it leaves the outbox.
     pub fn send_done(&mut self, id: u64) -> Result<Option<Outgoing>> {
+        self.tx.open_table(JMAP_SUBMISSIONS)?.remove(id)?;
         Ok(self.tx.open_table(OUTBOX)?.remove(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()?)
     }
 
@@ -135,7 +139,43 @@ impl Writer<'_> {
             o.state = SendState::Stopped { why: why.to_string() };
         }
         t.insert(id, enc(&o).as_slice())?;
+        self.tx.open_table(JMAP_SUBMISSIONS)?.remove(id)?;
         Ok(())
+    }
+
+    pub fn save_jmap_submission(&mut self, id: u64, evidence: &[u8]) -> Result<bool> {
+        let outbox = self.tx.open_table(OUTBOX)?;
+        let row = outbox.get(id)?.map(|value| dec::<Outgoing>(value.value())).transpose()?;
+        if !row.is_some_and(|row| row.state == SendState::JmapSending) {
+            return Ok(false);
+        }
+        let mut saved = self.tx.open_table(JMAP_SUBMISSIONS)?;
+        if saved.get(id)?.is_some() {
+            return Ok(false);
+        }
+        saved.insert(id, evidence)?;
+        Ok(true)
+    }
+
+    /// Apply a read-only finding only while the original held row and its
+    /// evidence still exist. Return an accepted send for address bookkeeping.
+    pub fn resolve_jmap_submission(&mut self, id: u64, evidence: &[u8], canceled: bool) -> Result<Option<Outgoing>> {
+        {
+            let outbox = self.tx.open_table(OUTBOX)?;
+            let row = outbox.get(id)?.map(|value| dec::<Outgoing>(value.value())).transpose()?;
+            if !row.is_some_and(|row| matches!(row.state, SendState::Uncertain { .. })) {
+                return Ok(None);
+            }
+            let saved = self.tx.open_table(JMAP_SUBMISSIONS)?;
+            if !saved.get(id)?.is_some_and(|value| value.value() == evidence) {
+                return Ok(None);
+            }
+        }
+        if canceled {
+            self.send_failed(id, "The JMAP server canceled this submission.", false, 0)?;
+            return Ok(None);
+        }
+        self.send_done(id)
     }
 
     pub fn send_uncertain(&mut self, id: u64, why: &str) -> Result<()> {
@@ -225,6 +265,12 @@ fn uncertain(why: &str) -> SendState {
 }
 
 impl Store {
+    pub fn jmap_submission(&self, id: u64) -> Result<Option<Vec<u8>>> {
+        let tx = self.db.begin_read()?;
+        let saved = tx.open_table(JMAP_SUBMISSIONS)?;
+        Ok(saved.get(id)?.map(|value| value.value().to_vec()))
+    }
+
     /// Every send in the outbox, oldest first.
     pub fn outbox(&self) -> Result<Vec<(u64, Outgoing)>> {
         let tx = self.db.begin_read()?;

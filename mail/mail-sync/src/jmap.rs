@@ -43,7 +43,9 @@ impl<T: Http + ?Sized> Http for Box<T> {
 /// worker (remote.rs).
 pub trait Jmap {
     fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report>;
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult;
+    fn prepare_send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> PrepareSendResult;
+    fn dispatch_send(&mut self, prepared: &PreparedSend) -> SendResult;
+    fn reconcile_send(&mut self, prepared: &PreparedSend) -> Result<Option<SendStatus>>;
     fn can_hold(&self, secs: i64) -> bool;
     /// See [`Client::watch`].
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed>;
@@ -90,6 +92,29 @@ impl SendError {
 }
 
 pub type SendResult = std::result::Result<String, SendError>;
+pub type PrepareSendResult = std::result::Result<PreparedSend, SendError>;
+
+/// Verified before a submit request can be sent. This is persisted locally.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedSend {
+    api_url: String,
+    account: String,
+    pub email: String,
+    identity: String,
+    from: String,
+    recipients: Vec<String>,
+    send_at: Option<i64>,
+    earliest: i64,
+    latest: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SendStatus {
+    Pending,
+    Final,
+    Canceled,
+}
+
 
 /// A validated preflight, saved before a queued import can modify the server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,8 +166,14 @@ impl<H: Http> Jmap for Client<H> {
     fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
         Client::sync(self, sink)
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult {
-        Client::send(self, message, from, rcpts, send_at)
+    fn prepare_send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> PrepareSendResult {
+        Client::prepare_send(self, message, from, rcpts, send_at)
+    }
+    fn dispatch_send(&mut self, prepared: &PreparedSend) -> SendResult {
+        Client::dispatch_send(self, prepared)
+    }
+    fn reconcile_send(&mut self, prepared: &PreparedSend) -> Result<Option<SendStatus>> {
+        Client::reconcile_send(self, prepared)
     }
     fn can_hold(&self, secs: i64) -> bool {
         Client::can_hold(self, secs)
@@ -684,10 +715,8 @@ impl<H: Http> Client<H> {
         Ok(jmap::uploaded(&answer, &self.session.account, media_type, bytes.len())?)
     }
 
-    /// Send `message` (as written, with Bcc left out) from `from` to
-    /// `rcpts`; the server keeps the copy in Sent. `send_at`: hold it until
-    /// then, where the server holds sends. The new message's id.
-    pub fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult {
+    /// Import and validate the Email before handing its identity to the outbox.
+    pub fn prepare_send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> PrepareSendResult {
         if !self.session.can_submit {
             return Err(SendError::unavailable("this account can't send over JMAP"));
         }
@@ -701,15 +730,71 @@ impl<H: Http> Client<H> {
         let sent = self.mailboxes.iter().find(|m| m.role.as_deref() == Some("sent")).map(|m| m.id.clone()).ok_or_else(|| SendError::unavailable("the account has no Sent mailbox"))?;
         let a = self.call(jmap::get_identities(&self.session.account)).map_err(SendError::preflight)?;
         let from_l = from.to_ascii_lowercase();
-        let identity = jmap::identities(&a).map_err(SendError::preflight)?.into_iter().find(|i| i.email == from_l).ok_or_else(|| SendError::unavailable(&format!("the server doesn't let this account send as {from}")))?;
+        let identity = jmap::identities(&a, &self.session.account).map_err(SendError::preflight)?.into_iter().find(|i| i.email == from_l).ok_or_else(|| SendError::unavailable(&format!("the server doesn't let this account send as {from}")))?;
         let blob = self.upload("message/rfc822", message).map_err(SendError::preflight)?;
-        let hold = send_at.filter(|_| self.session.max_delayed_send > 0).map(jmap::utc_string);
-        let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))
+        let answer = self.call(jmap::import_for_send(&self.session.account, &blob, &sent))
             .map_err(|err| SendError::Uncertain(err.0))?;
-        match jmap::submitted(&a, &self.session.account).map_err(|err| SendError::Uncertain(err.to_string()))? {
+        let email = match jmap::import_acknowledgment(&answer, &self.session.account, None)
+            .map_err(|err| SendError::Uncertain(err.to_string()))?
+        {
+            jmap::ImportAck::Created(id) => id,
+            jmap::ImportAck::Refused(why) => return Err(SendError::Refused(why)),
+        };
+        let send_at = send_at.filter(|_| self.session.max_delayed_send > 0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| SendError::Uncertain(err.to_string()))?.as_secs() as i64;
+        let release = send_at.unwrap_or(now);
+        Ok(PreparedSend {
+            api_url: self.session.api_url.clone(),
+            account: self.session.account.clone(),
+            email,
+            identity: identity.id,
+            from: from.into(),
+            recipients: rcpts.to_vec(),
+            send_at,
+            earliest: release.saturating_sub(5 * 60),
+            latest: release.saturating_add(15 * 60),
+        })
+    }
+
+    pub fn dispatch_send(&mut self, prepared: &PreparedSend) -> SendResult {
+        if prepared.account != self.session.account || prepared.api_url != self.session.api_url {
+            return Err(SendError::Uncertain("saved submission belongs to a different JMAP account or endpoint".into()));
+        }
+        let hold = prepared.send_at.map(jmap::utc_string);
+        let a = self.call(jmap::submit(&prepared.account, &prepared.email, &prepared.identity,
+            &prepared.from, &prepared.recipients, hold.as_deref()))
+            .map_err(|err| SendError::Uncertain(err.0))?;
+        match jmap::submitted(&a, &prepared.account, &prepared.email)
+            .map_err(|err| SendError::Uncertain(err.to_string()))?
+        {
             jmap::SubmissionAck::Accepted(id) => Ok(id),
             jmap::SubmissionAck::Refused(why) => Err(SendError::Refused(why)),
         }
+    }
+
+    /// Read-only. A missing or inconclusive lookup never authorizes another send.
+    pub fn reconcile_send(&mut self, prepared: &PreparedSend) -> Result<Option<SendStatus>> {
+        if prepared.account != self.session.account || prepared.api_url != self.session.api_url {
+            return Ok(None);
+        }
+        let expected = jmap::SubmissionMatch {
+            account: &prepared.account,
+            email: &prepared.email,
+            identity: &prepared.identity,
+            from: &prepared.from,
+            recipients: &prepared.recipients,
+            earliest: prepared.earliest,
+            latest: prepared.latest,
+        };
+        let a = self.call(jmap::query_submission(&expected))?;
+        let Some(id) = jmap::submission_id(&a, &prepared.account)? else { return Ok(None) };
+        let a = self.call(jmap::get_submission(&prepared.account, &id))?;
+        Ok(jmap::submission_status(&a, &id, &expected)?.map(|status| match status {
+            jmap::SubmissionStatus::Pending => SendStatus::Pending,
+            jmap::SubmissionStatus::Final => SendStatus::Final,
+            jmap::SubmissionStatus::Canceled => SendStatus::Canceled,
+        }))
     }
 
     /// The vacation reply, set to `set` first if given; `None` when the
