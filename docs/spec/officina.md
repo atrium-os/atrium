@@ -336,14 +336,9 @@ and their associated import or Save behavior.
 |---|---|---|
 | Sheet rank filters | XLSX, XLSM, ODS | Sheets retains top and bottom numeric rules by count and percentage. **Data → Reapply Filter** recalculates the cutoff after edits. See §16.6 for rounding and ties. |
 | Static filter visibility | XLSX, XLSM, ODS | Text and wildcard tests, dynamic date and appearance filters, table-local filters, and complex ODS predicates can leave only the saved row visibility. A later filter change can expose rows that were excluded by a rule Sheets could not import. |
-| Static pivot results | XLSX, XLSM, ODS | Calculated Excel pivot fields, missing pivot caches, unavailable sources, and unsupported ODS pivot fields or functions can leave the saved cells as plain values. They cannot be refreshed from the source. |
-| Pivot results that change on refresh | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Display calculations such as percentages and differences and ODS grouping or field references can appear in the saved cells, then give way to plain items and aggregates on Refresh. |
-
-Ranked sheet filters were the first fix in this group because losing the
-predicate can change which source rows feed a report as soon as a user works
-with the filter. Pivot display calculations and grouping are the next
-related set to investigate. Cover the saved output and a refresh after a
-source edit together.
+| Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references and named, numeric and calendar groups based on a source field. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |
+| Static pivot results | XLSX, XLSM, ODS | Calculated fields and grouped Excel caches, missing caches, unavailable sources, and unsupported ODS fields, aggregate functions or group chains can leave the saved cells as plain values. These pivots cannot be refreshed from the source. |
+| Pivot layout and order | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Outline layout, values down the rows and custom item ordering can change on refresh. Previous, next and running total calculations use Sheets' displayed order. |
 
 #### Sheet and cell protection in Sheets
 
@@ -2453,19 +2448,40 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   rebuilds it on opening) and the pivot table definition in tabular form
   (`compact="0" outline="0"`), with hidden items, page fields, value fields'
   functions and captions, grand totals, subtotals; the workbook's
-  `pivotCaches`. Read: sources on a sheet or a table's name, whole columns
-  cut to the rows in use; compact-form pivots, values shown as percentages,
-  and values down the rows are noted (shown in tabular form, plain values,
-  across, once refreshed); calculated fields keep the pivot as values. The
-  cells a file holds stay as they are until a refresh. `.ods`: LibreOffice's
-  `table:data-pilot-tables` both ways (tabular layout, members shown or not,
-  selected page, data layout field, `tableooo:display-name`, grand totals);
-  groups and "show as" are noted, database and external sources keep the
-  cells only. Native file: its own block, with each output's place.
-- **Not yet:** a field-list pane (drag fields between axes, pick functions and
-  items); compact and outline layouts; grouping dates and numbers; values shown
-  as percentages; calculated fields; GETPIVOTDATA; pivots following inserted
-  rows and columns; pivot charts.
+  `pivotCaches`. The reader accepts sources on a sheet or a table's name.
+  Whole-column sources end at the last row in use. Outline layout and values
+  down the rows carry fidelity notices. Calculated fields and grouped Excel
+  cache fields keep the pivot's cells as values.
+- **Display calculations.** XLSX retains `showDataAs` and the Office 2010
+  `pivotShowAs` extension. Named base items resolve through the pivot field's
+  item list and cache, so Save can rebuild their indices. Differences,
+  percentages, index, running totals, parent totals and ranks use the
+  aggregates of the relevant value field. Cells keep their saved results
+  until Refresh. Percentage calculations give newly generated cells a
+  percentage format when they have the General format.
+- **ODS.** `table:data-pilot-tables` retains selected pages, members, value
+  captions and grand totals. `table:data-pilot-field-reference` keeps the
+  reference calculation and its base field or item. `table:data-pilot-groups`
+  keeps named item groups, numeric intervals and calendar groups, including
+  fixed or automatic bounds. The grouped field can have its own name and
+  appear beside the original source field. Group chains that reference
+  another derived group, external sources and database sources leave the
+  saved cells as values. When exporting to a different format, grouped ODS
+  pivots in XLSX and Excel-only display modes in ODS keep their visible
+  cells as values and receive Save notices.
+- **Native file and recovery.** Pivot definitions carry display modes,
+  group definitions and the last output area. The pivot operation journals
+  the definition, cell edits and percentage format changes together.
+- **Remaining gaps.** Custom item order and outline layouts, calculated
+  fields, GETPIVOTDATA and pivot charts.
+  [Excel display modes](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.showdataasvalues?view=openxml-3.0.1) · [Excel extended modes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/f5b294f2-a168-46c3-b9a9-8e4f0132b78d) · [OpenDocument data pilots](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
+
+The installed Sheets desktop gate `SHEETS_INTEROP_CASE=pivot_display`
+covers ordinary Save and picker reopen in XLSX and ODS, a source edit that
+leaves the cached output visible, and Refresh followed by another ordinary
+Save. Its XLSX fixture verifies that ranking changes and a difference still
+uses the named base after Save rebuilds the cache. The ODS fixture verifies
+the named groups, percentages and a reference to a grouped member.
 
 Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows
 for two row fields and a column field, several value fields with and without

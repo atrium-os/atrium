@@ -1042,7 +1042,7 @@ mod tests {
         ours.set_value(occupied, Value::str("Local note"));
         let mut pivot = Pivot::new("Summary", Rect { sheet: 0, r0: 0, r1: 1, c0: 0, c1: 1 }, occupied);
         pivot.rows.push(PivotField::new(0));
-        pivot.data.push(DataField { field: 1, agg: Agg::Sum, name: None });
+        pivot.data.push(DataField { field: 1, agg: Agg::Sum, name: None, show_as: Default::default() });
         theirs.add_pivot(pivot).unwrap();
 
         let (changes, _) = compare(&ours, &theirs);

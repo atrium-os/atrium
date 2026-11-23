@@ -67,6 +67,7 @@ fn fixture() -> Workbook {
         field: 1,
         agg: Agg::Sum,
         name: None,
+        show_as: Default::default(),
     });
     book.add_pivot(pivot).unwrap();
     book.recalc();

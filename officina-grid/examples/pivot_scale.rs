@@ -29,7 +29,7 @@ fn main() {
     let mut p = Pivot::new("Big", Rect { sheet: 0, r0: 0, c0: 0, r1: n, c1: 3 }, CellAddr::new(0, 0, 6));
     p.rows = vec![PivotField::new(0), PivotField::new(1)];
     p.cols = vec![PivotField::new(2)];
-    p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None }];
+    p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None, show_as: Default::default() }];
     let t = Instant::now();
     let i = wb.add_pivot(p).unwrap();
     let ms = t.elapsed().as_secs_f64() * 1e3;

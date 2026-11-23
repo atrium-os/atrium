@@ -44,9 +44,10 @@ pub struct PivotPane {
 
 /// The pivot's fields: each source column's name and where it is (values first
 /// found wins when a field is also summed).
-pub fn fields(wb: &Workbook, p: &Pivot) -> Vec<(String, Option<Area>)> {
+pub fn fields(wb: &Workbook, p: &Pivot) -> Vec<(u32, String, Option<Area>)> {
     let width = p.source.c1 - p.source.c0 + 1;
-    (0..width).map(|f| (wb.pivot_field_name(p, f), area_of(p, f))).collect()
+    (0..width).chain(p.groups.iter().map(|group| group.field).filter(|&field| field >= width))
+        .map(|field| (field, wb.pivot_field_name(p, field), area_of(p, field))).collect()
 }
 
 /// Where field `f` is.
@@ -111,6 +112,9 @@ fn change(d: &mut Doc, i: usize, f: impl FnOnce(&Workbook, &mut Pivot)) -> Resul
 
 /// Puts field `f` of pivot `i` in `to` (last there), or out of the pivot (`None`).
 pub fn place(d: &mut Doc, i: usize, f: u32, to: Option<Area>) -> Result<(), String> {
+    if f >= officina_grid::addr::MAX_COLS && to == Some(Area::Values) {
+        return Err("Use the source field to add values for this group.".into());
+    }
     change(d, i, |wb, p| {
         if area_of(p, f) == to {
             return;
@@ -119,7 +123,7 @@ pub fn place(d: &mut Doc, i: usize, f: u32, to: Option<Area>) -> Result<(), Stri
         match to {
             Some(Area::Values) => {
                 let agg = if numeric(wb, p, f) { Agg::Sum } else { Agg::Count };
-                p.data.push(DataField { field: f, agg, name: None });
+                p.data.push(DataField { field: f, agg, name: None, show_as: Default::default() });
             }
             Some(a) => axis_mut(p, a).unwrap().push(PivotField { field: f, hidden }),
             None => {}
@@ -229,8 +233,8 @@ mod tests {
         let p = d.wb.pivots()[0].clone();
         let (r0, c0) = (p.dest.row, p.dest.col);
         let f = fields(&d.wb, &p);
-        assert_eq!(f.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["Region", "Product", "Units", "Price"]);
-        assert_eq!(f.iter().map(|x| x.1).collect::<Vec<_>>(), [Some(Area::Rows), None, Some(Area::Values), Some(Area::Values)]);
+        assert_eq!(f.iter().map(|x| x.1.as_str()).collect::<Vec<_>>(), ["Region", "Product", "Units", "Price"]);
+        assert_eq!(f.iter().map(|x| x.2).collect::<Vec<_>>(), [Some(Area::Rows), None, Some(Area::Values), Some(Area::Values)]);
         assert_eq!(area_line(&d.wb, &p, Area::Values), "Values: Sum of Units, Sum of Price");
         // Product across the columns.
         place(&mut d, 0, 1, Some(Area::Columns)).unwrap();

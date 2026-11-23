@@ -838,6 +838,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Data pilots (pivot tables) and the one being read.
     let mut pilot: Option<super::pivot::TableIn> = None;
     let mut pilots: Vec<super::pivot::TableIn> = Vec::new();
+    let mut in_pilot_group = false;
     let mut filter_or_depth = 0usize;
     let mut unsupported_rank = false;
     let mut in_set = false;
@@ -1182,6 +1183,16 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             f.subtotals |= attrs(e).get("table:function").is_some_and(|v| v != "none");
                         }
                     }
+                    b"table:data-pilot-member" | b"table:data-pilot-group-member" if in_pilot_group => {
+                        if let Some(group) = pilot.as_mut().and_then(|t| t.fields.last_mut()).and_then(|f| f.group.as_mut()) {
+                            if group.size >= officina_grid::pivot::MAX_GROUP_MEMBERS {
+                                group.clipped = true;
+                            } else if let (Some(item), Some(name)) = (group.members.last_mut(), attrs(e).get("table:name")) {
+                                item.members.push(Arc::from(name.as_str()));
+                                group.size += 1;
+                            }
+                        }
+                    }
                     b"table:data-pilot-member" => {
                         let a = attrs(e);
                         if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
@@ -1190,8 +1201,45 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             }
                         }
                     }
-                    b"table:data-pilot-group" | b"table:data-pilot-groups" | b"table:data-pilot-field-reference" => {
-                        rep.note(Kind::Approximate, "pivot table groups and values shown as (refreshing shows plain items and values)");
+                    b"table:data-pilot-field-reference" => {
+                        if let Some(field) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            let a = attrs(e);
+                            field.reference = Some(super::pivot::ReferenceIn {
+                                kind: a.get("table:type").cloned().unwrap_or_default(),
+                                field: a.get("table:field-name").cloned().unwrap_or_default(),
+                                member_type: a.get("table:member-type").cloned().unwrap_or_default(),
+                                member: a.get("table:member-name").cloned().unwrap_or_default(),
+                            });
+                        }
+                    }
+                    b"table:data-pilot-groups" => {
+                        in_pilot_group = false;
+                        if let Some(field) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            let a = attrs(e);
+                            let dates = ["table:date-start", "table:date-end", "table:grouped-by"]
+                                .iter().any(|key| a.contains_key(*key));
+                            field.group = Some(super::pivot::GroupIn {
+                                source: a.get("table:source-field-name").cloned().unwrap_or_default(),
+                                dates,
+                                part: a.get("table:grouped-by").cloned(),
+                                start: a.get(if dates { "table:date-start" } else { "table:start" }).cloned(),
+                                end: a.get(if dates { "table:date-end" } else { "table:end" }).cloned(),
+                                step: a.get("table:step").cloned(),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    b"table:data-pilot-group" => {
+                        in_pilot_group = !empty;
+                        if let Some(group) = pilot.as_mut().and_then(|t| t.fields.last_mut()).and_then(|f| f.group.as_mut()) {
+                            if group.members.len() >= officina_grid::pivot::MAX_GROUP_MEMBERS {
+                                group.clipped = true;
+                            } else if let Some(name) = attrs(e).get("table:name") {
+                                group.members.push(officina_grid::pivot::ItemGroup { name: Arc::from(name.as_str()), members: Vec::new() });
+                            } else {
+                                group.clipped = true;
+                            }
+                        }
                     }
                     b"calcext:conditional-format" => {
                         let a = attrs(e);
@@ -1393,6 +1441,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     continue;
                 }
                 match name {
+                    b"table:data-pilot-group" | b"table:data-pilot-groups" | b"table:data-pilot-field" => {
+                        in_pilot_group = false;
+                    }
                     b"table:data-pilot-table" => {
                         if pilots.len() < officina_grid::pivot::MAX_PIVOTS {
                             pilots.extend(pilot.take());

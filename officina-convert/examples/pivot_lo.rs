@@ -36,20 +36,20 @@ fn book() -> Workbook {
     let mut p = Pivot::new("Units by region", src, CellAddr::new(1, 2, 1));
     p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo")] }];
     p.cols = vec![PivotField::new(2)];
-    p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None }];
+    p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None, show_as: Default::default() }];
     // COMPACT=1: this one in compact form.
     p.compact = std::env::var_os("COMPACT").is_some();
     wb.add_pivot(p).unwrap();
     let mut q = Pivot::new("Prices", src, CellAddr::new(0, 0, 7));
     q.rows = vec![PivotField::new(1)];
     q.pages = vec![PivotField { field: 0, hidden: vec![Value::str("South")] }];
-    q.data = vec![DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()) }, DataField { field: 3, agg: Agg::Max, name: None }];
+    q.data = vec![DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()), show_as: Default::default() }, DataField { field: 3, agg: Agg::Max, name: None, show_as: Default::default() }];
     q.subtotals = false;
     wb.add_pivot(q).unwrap();
     let mut r = Pivot::new("Count", src, CellAddr::new(1, 20, 1));
     r.cols = vec![PivotField::new(0)];
     r.rows = vec![PivotField::new(2)];
-    r.data = vec![DataField { field: 1, agg: Agg::Count, name: None }];
+    r.data = vec![DataField { field: 1, agg: Agg::Count, name: None, show_as: Default::default() }];
     r.grand_col = false;
     wb.add_pivot(r).unwrap();
     wb.recalc();

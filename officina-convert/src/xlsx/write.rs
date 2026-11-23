@@ -602,6 +602,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     let mut z = ZipWriter::new(out);
     let code_of = |s: usize| macros.and_then(|m| m.sheet_codes.iter().find(|(i, _)| *i as usize == s)).map(|(_, c)| &**c);
     let n = wb.sheet_count();
+    let pivots: Vec<_> = wb.pivots().iter().enumerate().filter(|(_, p)| p.groups.is_empty()).collect();
     let threads = super::threaded::Export::new(wb);
     let mut strings = Strings { ids: HashMap::new(), list: Vec::new(), uses: 0 };
     let mut parts = Vec::with_capacity(n);
@@ -646,7 +647,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     for i in 0..wb.tables().len() {
         ct.push_str(&format!(r#"<Override PartName="/xl/tables/table{}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>"#, i + 1));
     }
-    for i in 0..wb.pivots().len() {
+    for &(i, _) in &pivots {
         ct.push_str(&format!(r#"<Override PartName="/xl/pivotTables/pivotTable{0}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/><Override PartName="/xl/pivotCache/pivotCacheDefinition{0}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml"/>"#, i + 1));
     }
     let dynamic = wb.groups().any(|(_, g)| arrays::for_file(&g.expr).1);
@@ -717,9 +718,9 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
         w.extend_from_slice(b"</definedNames>");
     }
-    if !wb.pivots().is_empty() {
+    if !pivots.is_empty() {
         w.extend_from_slice(b"<pivotCaches>");
-        for i in 0..wb.pivots().len() {
+        for &(i, _) in &pivots {
             let _ = write!(w, r#"<pivotCache cacheId="{}" r:id="rIdPc{}"/>"#, i + 1, i + 1);
         }
         w.extend_from_slice(b"</pivotCaches>");
@@ -736,7 +737,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         let vba = m.parts.iter().find(|p| &*p.media_type == super::macros::VBA).expect("writable checked");
         r.push_str(&format!(r#"<Relationship Id="rId{}" Type="{}" Target="{}"/>"#, n + 3, super::macros::VBA_REL, &vba.path[3..]));
     }
-    for i in 0..wb.pivots().len() {
+    for &(i, _) in &pivots {
         r.push_str(&format!(r#"<Relationship Id="rIdPc{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition{0}.xml"/>"#, i + 1));
     }
     if dynamic {
@@ -770,10 +771,10 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         let charts: Vec<usize> = (1..=wb.charts().len()).filter(|&i| wb.charts()[i - 1].anchor.sheet as usize == s).collect();
         let pictures: Vec<usize> = wb.pictures().iter().enumerate()
             .filter(|(_, p)| p.anchor.sheet as usize == s).map(|(i, _)| i).collect();
-        let pivots: Vec<usize> = (0..wb.pivots().len()).filter(|&i| wb.pivots()[i].dest.sheet as usize == s).collect();
+        let pivots_here: Vec<_> = pivots.iter().filter(|(_, p)| p.dest.sheet as usize == s).map(|&(i, _)| i).collect();
         let noted = !wb.comments(s as u16).is_empty();
         let external: Vec<&str> = wb.links(s as u16).values().filter(|l| l.is_external()).map(|l| &*l.target).collect();
-        if !mine.is_empty() || !charts.is_empty() || !pictures.is_empty() || !pivots.is_empty() || noted || !external.is_empty() {
+        if !mine.is_empty() || !charts.is_empty() || !pictures.is_empty() || !pivots_here.is_empty() || noted || !external.is_empty() {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
@@ -814,7 +815,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
                 r.push_str(&format!(r#"<Relationship Id="rIdTc" Type="{}" Target="../threadedComments/threadedComment{}.xml"/>"#, super::threaded::THREAD_REL, s + 1));
                 z.add(&format!("xl/threadedComments/threadedComment{}.xml", s + 1), threads.sheet_xml(wb, s as u16).as_bytes())?;
             }
-            for i in &pivots {
+            for i in &pivots_here {
                 r.push_str(&format!(r#"<Relationship Id="rIdPt{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable{0}.xml"/>"#, i + 1));
             }
             r.push_str("</Relationships>");
@@ -827,7 +828,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     for (i, c) in wb.charts().iter().enumerate() {
         z.add(&format!("xl/charts/chart{}.xml", i + 1), super::chart::chart_xml(wb, c).as_bytes())?;
     }
-    for (i, p) in wb.pivots().iter().enumerate() {
+    for (i, p) in pivots {
         let n = i + 1;
         z.add(&format!("xl/pivotTables/pivotTable{n}.xml"), super::pivot::table_xml(wb, p, i, n).as_bytes())?;
         z.add(&format!("xl/pivotTables/_rels/pivotTable{n}.xml.rels"), format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition{n}.xml"/></Relationships>"#).as_bytes())?;

@@ -31,7 +31,7 @@ fn src() -> Rect {
 }
 
 fn sum(field: u32) -> DataField {
-    DataField { field, agg: Agg::Sum, name: None }
+    DataField { field, agg: Agg::Sum, name: None, show_as: Default::default() }
 }
 
 /// The output as text rows ("" for empty), trailing empties cut.
@@ -90,7 +90,7 @@ fn several_values_counts_averages_and_no_subtotals() {
     let mut wb = book();
     let mut p = Pivot::new("P", src(), CellAddr::new(0, 0, 7));
     p.rows = vec![PivotField::new(0)];
-    p.data = vec![sum(3), DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()) }, DataField { field: 1, agg: Agg::Count, name: None }];
+    p.data = vec![sum(3), DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()), show_as: Default::default() }, DataField { field: 1, agg: Agg::Count, name: None, show_as: Default::default() }];
     let i = wb.add_pivot(p).unwrap();
     assert_eq!(
         grid(&wb, i),
@@ -169,7 +169,7 @@ fn native_files_keep_pivots() {
     let mut p = Pivot::new("Sales by rep", src(), CellAddr::new(0, 0, 7));
     p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo"), Value::Num(3.0)] }];
     p.cols = vec![PivotField::new(2)];
-    p.data = vec![sum(3), DataField { field: 4, agg: Agg::Max, name: Some("Top".into()) }];
+    p.data = vec![sum(3), DataField { field: 4, agg: Agg::Max, name: Some("Top".into()), show_as: Default::default() }];
     p.grand_col = false;
     let i = wb.add_pivot(p).unwrap();
     let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();

@@ -6,8 +6,11 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use officina_grid::addr::{col_name, Rect};
-use officina_grid::pivot::{same_item, Agg, DataField, Pivot, PivotField};
+use officina_grid::addr::{col_name, Rect, MAX_COLS};
+use officina_grid::pivot::{
+    same_item, Agg, BaseItem, DataField, DatePart, GroupField, GroupKind, ItemGroup,
+    Pivot, PivotField, ReferenceCalc, ShowAs, MAX_GROUPS,
+};
 use officina_grid::{CellAddr, Value, Workbook};
 
 use super::formula::sheet_a1;
@@ -53,13 +56,95 @@ fn member(v: &Value) -> String {
     }
 }
 
+const DATE_PARTS: [&str; 7] = ["seconds", "minutes", "hours", "days", "months", "quarters", "years"];
+
+fn reference_xml(out: &mut String, wb: &Workbook, p: &Pivot, mode: &ShowAs) {
+    let kind = match mode {
+        ShowAs::Normal => return,
+        ShowAs::PercentOfRow => "row-percentage",
+        ShowAs::PercentOfColumn => "column-percentage",
+        ShowAs::PercentOfTotal => "total-percentage",
+        ShowAs::Index => "index",
+        ShowAs::RunningTotal(_) => "running-total",
+        ShowAs::Reference { calc, .. } => match calc {
+            ReferenceCalc::Difference => "member-difference",
+            ReferenceCalc::Percent => "member-percentage",
+            ReferenceCalc::PercentDifference => "member-percentage-difference",
+        },
+        _ => return, // Excel extensions have no ODS representation.
+    };
+    let _ = write!(out, r#"<table:data-pilot-field-reference table:type="{kind}""#);
+    if let Some(field) = mode.base_field() {
+        let _ = write!(out, r#" table:field-name="{}""#, esc(&wb.pivot_field_name(p, field)));
+    }
+    if let ShowAs::Reference { item, .. } = mode {
+        match item {
+            BaseItem::Named(value) => {
+                let _ = write!(out, r#" table:member-type="named" table:member-name="{}""#, esc(&member(value)));
+            }
+            BaseItem::Previous => out.push_str(r#" table:member-type="previous""#),
+            BaseItem::Next => out.push_str(r#" table:member-type="next""#),
+        }
+    }
+    out.push_str("/>");
+}
+
+fn group_xml(out: &mut String, wb: &Workbook, p: &Pivot, field: u32) {
+    let Some(group) = p.groups.iter().find(|group| group.field == field) else { return };
+    out.push_str("<table:data-pilot-groups");
+    if field != group.source {
+        let _ = write!(out, r#" table:source-field-name="{}""#, esc(&wb.pivot_field_name(p, group.source)));
+    }
+    let mut bounds = |start: Option<f64>, end: Option<f64>, date: bool| {
+        for (name, value) in [("start", start), ("end", end)] {
+            let value = value.and_then(|value| {
+                if date {
+                    let serial = match wb.date_system() {
+                        officina_grid::eval::dates::DateSystem::Excel1900 => value,
+                        officina_grid::eval::dates::DateSystem::Excel1904 => value + 1462.0,
+                    };
+                    super::write::date_text(serial)
+                } else {
+                    Some(value.to_string())
+                }
+            }).unwrap_or_else(|| "auto".into());
+            let prefix = if date { "date-" } else { "" };
+            let _ = write!(out, r#" table:{prefix}{name}="{value}""#);
+        }
+    };
+    match &group.kind {
+        GroupKind::Named(groups) => {
+            out.push('>');
+            for group in groups {
+                let _ = write!(out, r#"<table:data-pilot-group table:name="{}">"#, esc(&group.name));
+                for value in &group.members {
+                    let _ = write!(out, r#"<table:data-pilot-group-member table:name="{}"/>"#, esc(value));
+                }
+                out.push_str("</table:data-pilot-group>");
+            }
+            out.push_str("</table:data-pilot-groups>");
+        }
+        GroupKind::Intervals { start, end, step, dates } => {
+            bounds(*start, *end, *dates);
+            let _ = write!(out, r#" table:step="{step}"/>"#);
+        }
+        GroupKind::DateParts { start, end, part } => {
+            bounds(*start, *end, true);
+            let _ = write!(out, r#" table:grouped-by="{}" table:step="1"/>"#, DATE_PARTS[*part as usize]);
+        }
+    }
+}
+
 /// `table:data-pilot-tables`, or nothing.
 pub fn tables_xml(wb: &Workbook) -> String {
-    if wb.pivots().is_empty() {
+    let mut pivots = wb.pivots().iter().enumerate()
+        .filter(|(_, p)| p.data.iter().all(|d| !d.show_as.is_excel_extension()))
+        .peekable();
+    if pivots.peek().is_none() {
         return String::new();
     }
     let mut o = String::from("<table:data-pilot-tables>");
-    for (i, p) in wb.pivots().iter().enumerate() {
+    for (i, p) in pivots {
         let area = wb.pivot_shape(i).and_then(|s| s.area).unwrap_or(Rect { sheet: p.dest.sheet, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row, c1: p.dest.col });
         let grand = match (p.grand_row, p.grand_col) {
             (true, true) => "",
@@ -91,7 +176,9 @@ pub fn tables_xml(wb: &Workbook) -> String {
             }
             // LibreOffice keeps the compact form as its own extension.
             let compact = if p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
-            let _ = write!(o, r#"</table:data-pilot-members><table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level></table:data-pilot-field>"#);
+            let _ = write!(o, r#"</table:data-pilot-members><table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level>"#);
+            group_xml(o, wb, p, f.field);
+            o.push_str("</table:data-pilot-field>");
         };
         for f in &p.rows {
             field(&mut o, f, "row", p.subtotals);
@@ -105,8 +192,15 @@ pub fn tables_xml(wb: &Workbook) -> String {
         for f in &p.pages {
             field(&mut o, f, "page", false);
         }
+        for group in &p.groups {
+            if !p.rows.iter().chain(&p.cols).chain(&p.pages).any(|f| f.field == group.field) {
+                field(&mut o, &PivotField::new(group.field), "hidden", false);
+            }
+        }
         for d in &p.data {
-            let _ = write!(o, r#"<table:data-pilot-field table:source-field-name="{}" tableooo:display-name="{}" table:orientation="data" table:used-hierarchy="-1" table:function="{}"/>"#, esc(&wb.pivot_field_name(p, d.field)), esc(&wb.data_caption(p, d)), func(d.agg));
+            let _ = write!(o, r#"<table:data-pilot-field table:source-field-name="{}" tableooo:display-name="{}" table:orientation="data" table:used-hierarchy="-1" table:function="{}">"#, esc(&wb.pivot_field_name(p, d.field)), esc(&wb.data_caption(p, d)), func(d.agg));
+            reference_xml(&mut o, wb, p, &d.show_as);
+            o.push_str("</table:data-pilot-field>");
         }
         o.push_str("</table:data-pilot-table>");
     }
@@ -131,7 +225,62 @@ pub struct FieldIn {
     /// LibreOffice's compact form (`loext:layout-mode="compact-layout"`).
     pub compact: bool,
     pub hidden: Vec<String>,
+    pub reference: Option<ReferenceIn>,
+    pub group: Option<GroupIn>,
 }
+
+#[derive(Default, Debug)]
+pub struct ReferenceIn {
+    pub kind: String,
+    pub field: String,
+    pub member_type: String,
+    pub member: String,
+}
+
+#[derive(Default, Debug)]
+pub struct GroupIn {
+    pub source: String,
+    pub dates: bool,
+    pub part: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub step: Option<String>,
+    pub members: Vec<ItemGroup>,
+    pub size: usize,
+    pub clipped: bool,
+}
+
+#[cfg(feature = "read")]
+impl GroupIn {
+    fn kind(&self) -> Option<GroupKind> {
+        if self.clipped {
+            return None;
+        }
+        if self.part.is_none() && self.step.is_none() && !self.dates {
+            return Some(GroupKind::Named(self.members.clone()));
+        }
+        // LibreOffice writes a zero step for named groups.
+        if !self.members.is_empty() {
+            return Some(GroupKind::Named(self.members.clone()));
+        }
+        let bound = |value: Option<&str>| match value.unwrap_or("auto") {
+            "auto" => Some(None),
+            value => {
+                let n = if self.dates { super::read::date_value(value)? } else { value.parse::<f64>().ok()? };
+                n.is_finite().then_some(Some(n))
+            }
+        };
+        let (start, end) = (bound(self.start.as_deref())?, bound(self.end.as_deref())?);
+        if let Some(part) = &self.part {
+            let part = DatePart::ALL[DATE_PARTS.iter().position(|name| name == part)?];
+            Some(GroupKind::DateParts { start, end, part })
+        } else {
+            let step: f64 = self.step.as_ref()?.parse().ok()?;
+            (step.is_finite() && step > 0.0).then_some(GroupKind::Intervals { start, end, step, dates: self.dates })
+        }
+    }
+}
+
 
 #[derive(Default, Debug)]
 pub struct TableIn {
@@ -162,8 +311,28 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
         let mut p = Pivot::new(&t.name, source, CellAddr::new(area.sheet, area.r0, area.c0));
         let width = source.c1 - source.c0 + 1;
         let probe = p.clone();
-        let index = |name: &str| (0..width).find(|&f| wb.pivot_field_name(&probe, f) == name);
+        let source_index = |name: &str| (0..width).find(|&f| wb.pivot_field_name(&probe, f) == name);
         let mut bad = None;
+        for field in &t.fields {
+            let Some(group) = &field.group else { continue };
+            let source = if group.source.is_empty() { &field.name } else { &group.source };
+            let (Some(source), Some(kind)) = (source_index(source), group.kind()) else {
+                bad = Some(format!("unsupported grouping for {}", field.name));
+                break;
+            };
+            if p.groups.len() == MAX_GROUPS {
+                bad = Some("too many grouped fields".to_string());
+                break;
+            }
+            let index = source_index(&field.name).unwrap_or(MAX_COLS + p.groups.len() as u32);
+            p.groups.push(GroupField { field: index, source, name: Arc::from(field.name.as_str()), kind });
+        }
+        if let Some(w) = bad {
+            why(rep, &w);
+            continue;
+        }
+        let index = |name: &str, p: &Pivot| source_index(name)
+            .or_else(|| p.groups.iter().find(|group| group.name.as_ref() == name).map(|group| group.field));
         let mut subtotals = false;
         let mut multi_on_rows = false;
         let mut compact = None;
@@ -175,7 +344,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             if f.orient == "hidden" {
                 continue;
             }
-            let Some(x) = index(&f.name) else {
+            let Some(x) = index(&f.name, &p) else {
                 bad = Some(format!("no field {}", f.name));
                 break;
             };
@@ -184,7 +353,44 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                     bad = Some(format!("function {}", f.function));
                     break;
                 };
-                let d = DataField { field: x, agg, name: None };
+                let mut show_as = ShowAs::Normal;
+                if let Some(reference) = &f.reference {
+                    let field = || index(&reference.field, &p).filter(|&index| t.fields.iter().any(|f| {
+                        f.name == reference.field && matches!(f.orient.as_str(), "row" | "column")
+                            && !f.data_layout && wb.pivot_field_name(&p, index) == f.name
+                    }));
+                    let mode = match reference.kind.as_str() {
+                        "" | "none" => Some(ShowAs::Normal),
+                        "row-percentage" => Some(ShowAs::PercentOfRow),
+                        "column-percentage" => Some(ShowAs::PercentOfColumn),
+                        "total-percentage" => Some(ShowAs::PercentOfTotal),
+                        "index" => Some(ShowAs::Index),
+                        "running-total" => field().map(ShowAs::RunningTotal),
+                        name @ ("member-difference" | "member-percentage" | "member-percentage-difference") => field().and_then(|field| {
+                            let calc = match name {
+                                "member-difference" => ReferenceCalc::Difference,
+                                "member-percentage" => ReferenceCalc::Percent,
+                                _ => ReferenceCalc::PercentDifference,
+                            };
+                            let item = match reference.member_type.as_str() {
+                                "previous" => BaseItem::Previous,
+                                "next" => BaseItem::Next,
+                                "" | "named" => BaseItem::Named(wb.pivot_items(&p, field).into_iter()
+                                    .find(|value| member(value).eq_ignore_ascii_case(&reference.member))
+                                    .unwrap_or_else(|| Value::str(&reference.member))),
+                                _ => return None,
+                            };
+                            Some(ShowAs::Reference { calc, field, item })
+                        }),
+                        _ => None,
+                    };
+                    let Some(mode) = mode else {
+                        bad = Some(format!("unsupported field reference for {}", f.name));
+                        break;
+                    };
+                    show_as = mode;
+                }
+                let d = DataField { field: x, agg, name: None, show_as };
                 let default = wb.data_caption(&p, &d);
                 let name = f.display.clone().filter(|n| *n != default).map(|n| Arc::from(n.as_str()));
                 p.data.push(DataField { name, ..d });

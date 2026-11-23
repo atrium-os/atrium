@@ -457,8 +457,8 @@ pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid:
     };
     let cursor = (r.c0..=r.c1).contains(&t.col).then_some(t.col).filter(|&c| !numeric(c));
     let rows = cursor.or_else(|| (r.c0..=r.c1).find(|&c| !numeric(c)))?;
-    let data: Vec<DataField> = (r.c0..=r.c1).filter(|&c| c != rows && numeric(c)).take(3).map(|c| DataField { field: c - r.c0, agg: Agg::Sum, name: None }).collect();
-    let data = if data.is_empty() { vec![DataField { field: rows - r.c0, agg: Agg::Count, name: None }] } else { data };
+    let data: Vec<DataField> = (r.c0..=r.c1).filter(|&c| c != rows && numeric(c)).take(3).map(|c| DataField { field: c - r.c0, agg: Agg::Sum, name: None, show_as: Default::default() }).collect();
+    let data = if data.is_empty() { vec![DataField { field: rows - r.c0, agg: Agg::Count, name: None, show_as: Default::default() }] } else { data };
     let mut p = Pivot::new(name, r, CellAddr::new(s, r.r0, (r.c1 + 2).min(officina_grid::addr::MAX_COLS - 1)));
     p.rows = vec![PivotField::new(rows - r.c0)];
     p.data = data;

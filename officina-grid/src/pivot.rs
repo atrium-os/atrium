@@ -17,6 +17,17 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod display;
+mod group;
+
+pub use display::{BaseItem, ReferenceCalc, ShowAs};
+pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
+use display::{Display, Slot};
+use group::Grouping;
+
+pub const MAX_GROUPS: usize = 64;
+pub const MAX_GROUP_MEMBERS: usize = 65_536;
+
 pub const MAX_PIVOTS: usize = 256;
 /// Fields on one axis, and value fields.
 pub const MAX_FIELDS: usize = 16;
@@ -85,6 +96,7 @@ pub struct DataField {
     pub agg: Agg,
     /// Its caption; "Sum of <field>" when `None`.
     pub name: Option<Arc<str>>,
+    pub show_as: ShowAs,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +110,7 @@ pub struct Pivot {
     pub cols: Vec<PivotField>,
     pub pages: Vec<PivotField>,
     pub data: Vec<DataField>,
+    pub groups: Vec<GroupField>,
     /// The Grand Total row at the bottom.
     pub grand_row: bool,
     /// The Grand Total column at the right.
@@ -112,7 +125,7 @@ pub struct Pivot {
 
 impl Pivot {
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
-        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
+        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
     }
 }
 
@@ -358,7 +371,30 @@ pub struct Output {
     pub cells: Vec<(u32, u32, Value)>,
     pub rows: u32,
     pub cols: u32,
+    percent_cols: Vec<u32>,
     pub shape: Shape,
+}
+
+impl Output {
+    fn percent_styles<'a>(&'a self, wb: &'a Workbook) -> impl Iterator<Item = crate::ops::GridOp> + 'a {
+        let body = self.shape.area.and_then(|area| {
+            let r0 = area.r0 + self.shape.page_rows + self.shape.header_rows;
+            (r0 <= area.r1).then_some(Rect { r0, ..area })
+        });
+        let percent: Arc<str> = Arc::from("0.00%");
+        self.percent_cols.iter().filter_map(move |col| {
+            let area = body?;
+            let col = area.c0 + col;
+            let rect = Rect { c0: col, c1: col, ..area };
+            Some(crate::ops::GridOp::restyle(wb, rect, |style| {
+                let mut style = style.clone();
+                if style.num_fmt.eq_ignore_ascii_case("General") {
+                    style.num_fmt = percent.clone();
+                }
+                style
+            }))
+        })
+    }
 }
 
 impl Workbook {
@@ -376,8 +412,12 @@ impl Workbook {
         self.pivot_shapes.iter().enumerate().find_map(|(i, s)| (self.pivots[i].dest.sheet == a.sheet).then(|| s.role(a)).flatten().map(|r| (i, r)))
     }
 
-    /// A source column's name: its header cell's text.
+    /// A source column's name, or a grouped field's own name.
     pub fn pivot_field_name(&self, p: &Pivot, field: u32) -> String {
+        if field >= MAX_COLS {
+            return p.groups.iter().find(|group| group.field == field)
+                .map_or_else(String::new, |group| group.name.to_string());
+        }
         let v = self.get(CellAddr::new(p.source.sheet, p.source.r0, p.source.c0 + field));
         match v {
             Value::Str(s) => s.to_string(),
@@ -407,9 +447,19 @@ impl Workbook {
         if p.rows.len() > MAX_FIELDS || p.cols.len() > MAX_FIELDS || p.pages.len() > MAX_FIELDS || p.data.len() > MAX_FIELDS {
             return Err("too many fields");
         }
+        if p.groups.len() > MAX_GROUPS {
+            return Err("too many grouped fields");
+        }
+        let mut grouped = Vec::new();
+        for group in &p.groups {
+            if !group.valid(width) || grouped.contains(&group.field) {
+                return Err("an invalid grouped field");
+            }
+            grouped.push(group.field);
+        }
         let mut seen = Vec::new();
         for f in all {
-            if f.field >= width {
+            if f.field >= width && !grouped.contains(&f.field) {
                 return Err("a field outside the source");
             }
             if seen.contains(&f.field) {
@@ -419,6 +469,11 @@ impl Workbook {
         }
         if p.data.iter().any(|d| d.field >= width) {
             return Err("a field outside the source");
+        }
+        if p.data.iter().filter_map(|d| d.show_as.base_field()).any(|field| {
+            !p.rows.iter().chain(&p.cols).any(|f| f.field == field)
+        }) {
+            return Err("a display calculation needs its base field in Rows or Columns");
         }
         if p.name.is_empty() || p.name.len() > 255 {
             return Err("a pivot table needs a name");
@@ -541,6 +596,7 @@ impl Workbook {
                         }
                     }
                 }
+                ops.extend(out.percent_styles(self));
                 ops.push(GridOp::Replace(Region { rect: new, values: out.cells.into_iter().map(|(r, c, v)| (new.r0 + r, new.c0 + c, v)).collect(), fills: Vec::new() }));
                 match i {
                     Some(i) => state[i] = (p, Some(new)),
@@ -628,6 +684,11 @@ impl Workbook {
         if let Some(o) = old {
             self.clear_values(o);
         }
+        let styles: Vec<_> = out.percent_styles(self).collect();
+        for style in styles {
+            use officina_core::history::Op;
+            style.apply(self);
+        }
         if let Some(a) = out.shape.area {
             for (r, c, v) in out.cells {
                 self.set_value(CellAddr::new(a.sheet, a.r0 + r, a.c0 + c), v);
@@ -651,35 +712,53 @@ impl Workbook {
         bad
     }
 
-    /// The distinct items of a source column, in Excel's order.
+    /// The distinct items of a source or grouped column, in display order.
     pub fn pivot_items(&self, p: &Pivot, field: u32) -> Vec<Value> {
-        self.axis(p, field).map(|a| a.items).unwrap_or_default()
+        let grouping = p.groups.iter().find(|group| group.field == field)
+            .map(|group| Grouping::new(self, p, group));
+        self.axis(p, field, grouping.as_ref()).map(|a| a.items).unwrap_or_default()
     }
 
-    fn axis(&self, p: &Pivot, field: u32) -> Result<Axis, &'static str> {
+    fn pivot_item(&self, p: &Pivot, row: u32, field: u32, grouping: Option<&Grouping>) -> (Value, Option<f64>) {
+        grouping.map_or_else(
+            || (self.get(CellAddr::new(p.source.sheet, row, p.source.c0 + field)), None),
+            |group| group.item(self, p, row),
+        )
+    }
+
+    fn axis(&self, p: &Pivot, field: u32, grouping: Option<&Grouping>) -> Result<Axis, &'static str> {
         let s = &p.source;
         let mut seen: HashMap<Key, ()> = HashMap::new();
         let mut items = Vec::new();
         for r in s.r0 + 1..=s.r1 {
-            let v = self.get(CellAddr::new(s.sheet, r, s.c0 + field));
+            let (v, order) = self.pivot_item(p, r, field, grouping);
             if seen.insert(key(&v), ()).is_none() {
-                items.push(if matches!(&v, Value::Str(x) if x.is_empty()) { Value::Empty } else { v });
+                let item = if matches!(&v, Value::Str(x) if x.is_empty()) { Value::Empty } else { v };
+                items.push((item, order));
                 if items.len() > MAX_ITEMS {
                     return Err("a field with too many items");
                 }
             }
         }
-        items.sort_by(item_order);
-        Ok(Axis { items })
+        items.sort_by(|(a, ak), (b, bk)| match (ak, bk) {
+            (Some(a), Some(b)) => a.total_cmp(b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            _ => item_order(a, b),
+        });
+        Ok(Axis { items: items.into_iter().map(|(item, _)| item).collect() })
     }
 
     /// The pivot's output, computed, not written.
     pub fn pivot_output(&self, p: &Pivot) -> Result<Output, &'static str> {
         let s = &p.source;
         let fields: Vec<&PivotField> = p.rows.iter().chain(&p.cols).chain(&p.pages).collect();
+        let groups: HashMap<_, _> = p.groups.iter()
+            .filter(|group| fields.iter().any(|f| f.field == group.field))
+            .map(|group| (group.field, Grouping::new(self, p, group))).collect();
         let mut axes: HashMap<u32, (Axis, HashMap<Key, u32>)> = HashMap::new();
         for f in &fields {
-            let ax = self.axis(p, f.field)?;
+            let ax = self.axis(p, f.field, groups.get(&f.field))?;
             let hidden: Vec<Key> = f.hidden.iter().map(key).collect();
             let kept: Vec<Value> = ax.items.into_iter().filter(|v| !hidden.contains(&key(v))).collect();
             let idx = kept.iter().enumerate().map(|(i, v)| (key(v), i as u32)).collect();
@@ -697,7 +776,8 @@ impl Workbook {
             keybuf.clear();
             for f in &fields {
                 let (_, idx) = &axes[&f.field];
-                let Some(&i) = idx.get(&key(&at(f.field))) else { continue 'rows };
+                let (item, _) = self.pivot_item(p, r, f.field, groups.get(&f.field));
+                let Some(&i) = idx.get(&key(&item)) else { continue 'rows };
                 keybuf.push(i);
             }
             keybuf.truncate(k + m);
@@ -892,13 +972,22 @@ impl Workbook {
         let first = top + header_rows;
         let mut total_rows = Vec::new();
         let mut prev: Option<&Path> = None;
+        let displays: Vec<_> = p.data.iter().enumerate().map(|(i, data)| {
+            let field = data.show_as.base_field();
+            let slot = field.and_then(|field| {
+                p.rows.iter().position(|f| f.field == field).map(|level| Slot { column: false, level })
+                    .or_else(|| p.cols.iter().position(|f| f.field == field).map(|level| Slot { column: true, level }))
+            });
+            let items = field.and_then(|field| axes.get(&field)).map(|(_, items)| items);
+            Display::new(&data.show_as, slot, items, &acc, i, data.agg)
+        }).collect();
         let value = |rp: &[u32], h: &ColHead| -> Value {
-            match acc.get(&(rp.to_vec(), h.path.clone())) {
-                Some(a) => match p.data.get(h.data) {
-                    Some(d) => a[h.data].result(d.agg),
-                    None => a[0].result(Agg::Count),
-                },
-                None => Value::Empty,
+            let agg = p.data.get(h.data).map_or(Agg::Count, |d| d.agg);
+            let raw = |row: &[u32], col: &[u32]| acc.get(&(row.to_vec(), col.to_vec()))
+                .map_or(Value::Empty, |a| a[h.data].result(agg));
+            match displays.get(h.data) {
+                Some(display) => display.value(rp, &h.path, raw),
+                None => raw(rp, &h.path),
             }
         };
         let mut row = first;
@@ -957,7 +1046,10 @@ impl Workbook {
             total_cols,
             indents,
         };
-        Ok(Output { cells, rows: rows_total as u32, cols: cols_total as u32, shape })
+        let percent_cols = heads.iter().enumerate()
+            .filter(|(_, head)| p.data.get(head.data).is_some_and(|data| data.show_as.is_percent()))
+            .map(|(col, _)| label_cols + col as u32).collect();
+        Ok(Output { cells, rows: rows_total as u32, cols: cols_total as u32, shape, percent_cols })
     }
 }
 
@@ -1015,6 +1107,10 @@ fn get_rect(r: &mut Reader) -> Result<Rect, WireError> {
     Ok(Rect { sheet, r0: v[0], c0: v[1], r1: v[2], c1: v[3] })
 }
 
+fn get_field(r: &mut Reader) -> Result<u32, WireError> {
+    r.len("pivot field", u64::from(MAX_COLS) + MAX_GROUPS as u64 - 1).map(|field| field as u32)
+}
+
 impl Pivot {
     /// The definition and where its output is (`area`, the shape's).
     pub fn encode(&self, w: &mut Writer, area: Option<Rect>) {
@@ -1023,7 +1119,10 @@ impl Pivot {
         w.u16(self.dest.sheet);
         w.var(self.dest.row as u64);
         w.var(self.dest.col as u64);
-        w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2 | (self.compact as u8) << 3);
+        let display = self.data.iter().any(|d| d.show_as != ShowAs::Normal);
+        let grouped = !self.groups.is_empty();
+        w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2
+            | (self.compact as u8) << 3 | (display as u8) << 4 | (grouped as u8) << 5);
         for axis in [&self.rows, &self.cols, &self.pages] {
             w.var(axis.len() as u64);
             for f in axis {
@@ -1039,6 +1138,15 @@ impl Pivot {
             w.var(d.field as u64);
             w.u8(Agg::ALL.iter().position(|a| *a == d.agg).unwrap_or(0) as u8);
             w.str(d.name.as_deref().unwrap_or(""));
+            if display {
+                d.show_as.encode(w);
+            }
+        }
+        if grouped {
+            w.var(self.groups.len() as u64);
+            for group in &self.groups {
+                group.encode(w);
+            }
         }
         match area {
             Some(a) => {
@@ -1058,12 +1166,15 @@ impl Pivot {
             return Err(WireError::Invalid("pivot place"));
         }
         let flags = r.u8()?;
+        if flags & !63 != 0 {
+            return Err(WireError::Invalid("pivot flags"));
+        }
         let mut axes = Vec::new();
         for _ in 0..3 {
             let n = r.count("pivot fields", MAX_FIELDS as u64, 2)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                let field = r.var()?.min(MAX_COLS as u64) as u32;
+                let field = get_field(r)?;
                 let h = r.count("hidden items", MAX_ITEMS as u64, 1)?;
                 let mut hidden = Vec::with_capacity(h.min(1024));
                 for _ in 0..h {
@@ -1076,10 +1187,19 @@ impl Pivot {
         let n = r.count("value fields", MAX_FIELDS as u64, 3)?;
         let mut data = Vec::with_capacity(n);
         for _ in 0..n {
-            let field = r.var()?.min(MAX_COLS as u64) as u32;
+            let field = get_field(r)?;
             let agg = *Agg::ALL.get(r.u8()? as usize).ok_or(WireError::Invalid("pivot function"))?;
             let nm = r.str("value field name", 255)?;
-            data.push(DataField { field, agg, name: (!nm.is_empty()).then(|| Arc::from(nm)) });
+            let name = (!nm.is_empty()).then(|| Arc::from(nm));
+            let show_as = if flags & 16 == 0 { ShowAs::Normal } else { ShowAs::decode(r)? };
+            data.push(DataField { field, agg, name, show_as });
+        }
+        let mut groups = Vec::new();
+        if flags & 32 != 0 {
+            let n = r.count("pivot group fields", MAX_GROUPS as u64, 4)?;
+            for _ in 0..n {
+                groups.push(GroupField::decode(r)?);
+            }
         }
         let area = match r.u8()? {
             0 => None,
@@ -1088,6 +1208,6 @@ impl Pivot {
         let pages = axes.pop().unwrap();
         let cols = axes.pop().unwrap();
         let rows = axes.pop().unwrap();
-        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
+        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
     }
 }

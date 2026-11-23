@@ -119,10 +119,16 @@ fn saved_status(d: &Doc, format: Format) -> String {
     } else {
         format!("Saved “{}”.", d.name)
     };
+    if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !p.groups.is_empty()) {
+        status.push_str(" Excel export saved grouped ODS pivot tables as cell values.");
+    }
     if format == Format::Ods {
         use officina_grid::formula::ast::Expr;
 
         let mut changes = Vec::new();
+        if d.wb.pivots().iter().any(|p| p.data.iter().any(|f| f.show_as.is_excel_extension())) {
+            changes.push("saved pivot tables with Excel-only display calculations as cell values");
+        }
         if d.wb.groups().any(|(_, group)| {
             let mut referenced = false;
             group.expr.walk(&mut |expr| referenced |= matches!(expr, Expr::Spill(_)));

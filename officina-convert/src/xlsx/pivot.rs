@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
-use officina_grid::pivot::{Agg, DataField, Pivot, PivotField};
+use officina_grid::pivot::{same_item, Agg, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
 use officina_grid::{CellAddr, ErrorKind, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
@@ -53,6 +53,62 @@ fn axis_fields(p: &Pivot) -> Vec<&PivotField> {
     p.rows.iter().chain(&p.cols).chain(&p.pages).collect()
 }
 
+fn field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
+    let mut items = wb.pivot_items(p, field);
+    // Keep named bases addressable if the source edit removes their last row.
+    for data in &p.data {
+        if let ShowAs::Reference { field: base, item: BaseItem::Named(value), .. } = &data.show_as {
+            if *base == field && !items.iter().any(|item| same_item(item, value)) {
+                items.push(value.clone());
+            }
+        }
+    }
+    items
+}
+
+fn show_as_xml(out: &mut String, wb: &Workbook, p: &Pivot, mode: &ShowAs) {
+    let (name, field, item) = match mode {
+        ShowAs::Normal => ("normal", 0, 0),
+        ShowAs::PercentOfRow => ("percentOfRow", 0, 0),
+        ShowAs::PercentOfColumn => ("percentOfCol", 0, 0),
+        ShowAs::PercentOfTotal => ("percentOfTotal", 0, 0),
+        ShowAs::Index => ("index", 0, 0),
+        ShowAs::RunningTotal(field) => ("runTotal", *field, 0),
+        ShowAs::PercentOfParentRow => ("percentOfParentRow", 0, 0),
+        ShowAs::PercentOfParentColumn => ("percentOfParentCol", 0, 0),
+        ShowAs::PercentOfParent(field) => ("percentOfParent", *field, 0),
+        ShowAs::PercentOfRunningTotal(field) => ("percentOfRunningTotal", *field, 0),
+        ShowAs::Rank { field, descending } => (if *descending { "rankDescending" } else { "rankAscending" }, *field, 0),
+        ShowAs::Reference { calc, field, item } => {
+            let name = match calc {
+                ReferenceCalc::Difference => "difference",
+                ReferenceCalc::Percent => "percent",
+                ReferenceCalc::PercentDifference => "percentDiff",
+            };
+            let index = match item {
+                BaseItem::Previous => 1_048_828,
+                BaseItem::Next => 1_048_829,
+                BaseItem::Named(value) => field_items(wb, p, *field).iter()
+                    .position(|item| same_item(item, value)).unwrap_or(0),
+            };
+            (name, *field, index)
+        }
+    };
+    let extended = mode.is_excel_extension();
+    if !extended && !matches!(mode, ShowAs::Normal) {
+        let _ = write!(out, r#" showDataAs="{name}""#);
+    }
+    if mode.is_percent() {
+        out.push_str(r#" numFmtId="10""#);
+    }
+    let _ = write!(out, r#" baseField="{field}" baseItem="{item}""#);
+    if extended {
+        let _ = write!(out, r#"><extLst><ext uri="{{E15A36E0-9728-4E99-A89B-3F7291B0FE68}}"><x14:dataField xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" pivotShowAs="{name}"/></ext></extLst></dataField>"#);
+    } else {
+        out.push_str("/>");
+    }
+}
+
 /// `xl/pivotCache/pivotCacheDefinitionN.xml` for pivot `p`.
 pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
     let s = &p.source;
@@ -60,7 +116,8 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
     let mut o = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotCacheDefinition {NS} refreshOnLoad="1" saveData="0" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="{}"><cacheSource type="worksheet"><worksheetSource ref="{r}" sheet="{}"/></cacheSource>"#, s.r1 - s.r0, esc(&wb.sheet_name(s.sheet)));
     let width = s.c1 - s.c0 + 1;
     let _ = write!(o, r#"<cacheFields count="{width}">"#);
-    let on_axis: Vec<u32> = axis_fields(p).iter().map(|f| f.field).collect();
+    let on_axis: Vec<u32> = axis_fields(p).iter().map(|f| f.field)
+        .chain(p.data.iter().filter_map(|d| d.show_as.base_field())).collect();
     let mut names: Vec<String> = Vec::new();
     for f in 0..width {
         // Field names are unique in a cache: a repeat gets a number.
@@ -73,7 +130,7 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
         }
         names.push(name.clone());
         let _ = write!(o, r#"<cacheField name="{}" numFmtId="0">"#, esc(&name));
-        let items = wb.pivot_items(p, f);
+        let items = field_items(wb, p, f);
         let (mut str_, mut nums, mut blank, mut other, mut ints) = (false, false, false, false, true);
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for v in &items {
@@ -183,7 +240,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         }
         match pf {
             Some(pf) => {
-                let items = wb.pivot_items(p, f);
+                let items = field_items(wb, p, f);
                 let n = items.len() + p.subtotals as usize;
                 let _ = write!(o, r#"><items count="{n}">"#);
                 for (x, v) in items.iter().enumerate() {
@@ -230,7 +287,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
             if d.agg != Agg::Sum {
                 let _ = write!(o, r#" subtotal="{}""#, agg_name(d.agg));
             }
-            o.push_str(r#" baseField="0" baseItem="0"/>"#);
+            show_as_xml(&mut o, wb, p, &d.show_as);
         }
         o.push_str("</dataFields>");
     }
@@ -249,11 +306,12 @@ struct Cache {
     name: Option<String>,
     items: Vec<Vec<Value>>,
     calculated: bool,
+    grouped: bool,
 }
 
 #[cfg(feature = "read")]
-fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
-    let mut c = Cache { sheet: None, rf: None, name: None, items: Vec::new(), calculated: false };
+fn read_cache(data: &[u8], dates: officina_grid::eval::dates::DateSystem) -> Result<Cache, XlsxError> {
+    let mut c = Cache { sheet: None, rf: None, name: None, items: Vec::new(), calculated: false, grouped: false };
     let mut r = xml(data);
     let mut buf = Vec::new();
     let mut depth_items = false;
@@ -273,7 +331,10 @@ fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
                     c.items.push(Vec::new());
                 }
                 b"sharedItems" => depth_items = true,
-                b"fieldGroup" => depth_items = false,
+                b"fieldGroup" => {
+                    depth_items = false;
+                    c.grouped = true;
+                }
                 tag if depth_items => {
                     let v = attr(&e, b"v")?.unwrap_or_default();
                     let val = match tag {
@@ -282,7 +343,7 @@ fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
                         b"b" => Value::Bool(v == "1" || v == "true"),
                         b"e" => Value::Err(ErrorKind::from_text(&v).unwrap_or(ErrorKind::NA)),
                         b"m" => Value::Empty,
-                        b"d" => Value::str(&v),
+                        b"d" => dates.iso(&v).map_or_else(|| Value::str(&v), |(date, _)| Value::Num(date)),
                         _ => continue,
                     };
                     if let Some(l) = c.items.last_mut() {
@@ -305,6 +366,8 @@ fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
 #[derive(Default)]
 struct FieldIn {
     hidden: Vec<u32>,
+    /// Shared-item index addressed by each position in this pivot field's items.
+    items: Vec<Option<u32>>,
     /// Shown in compact form (`compact`, default on) and outline form (`outline`).
     compact: bool,
     outline: bool,
@@ -314,7 +377,7 @@ struct FieldIn {
 #[cfg(feature = "read")]
 /// One pivot table part (with its cache) into the workbook.
 pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep: &mut Report) -> Result<(), XlsxError> {
-    let c = read_cache(cache)?;
+    let c = read_cache(cache, wb.date_system())?;
     let mut r = xml(data);
     let mut buf = Vec::new();
     let mut name = String::from("PivotTable");
@@ -324,13 +387,15 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     let mut rows: Vec<i64> = Vec::new();
     let mut cols: Vec<i64> = Vec::new();
     let mut pages: Vec<(u32, Option<u32>)> = Vec::new();
-    let mut datas: Vec<(u32, Agg, String)> = Vec::new();
+    let mut datas: Vec<(u32, Agg, String, Option<String>, Option<u32>, Option<u32>)> = Vec::new();
     let mut list = 0u8; // 1 rows, 2 cols
     let mut compact = false;
-    let mut shown_as = false;
+    let mut active_data = None;
     loop {
         buf.clear();
-        match r.read_event_into(&mut buf)? {
+        let event = r.read_event_into(&mut buf)?;
+        let start = matches!(event, Event::Start(_));
+        match event {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"pivotTableDefinition" => {
                     name = attr(&e, b"name")?.unwrap_or(name);
@@ -346,12 +411,14 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                     let subtotal = attr(&e, b"defaultSubtotal")?.is_none_or(|v| v != "0" && v != "false");
                     let on = |v: Option<String>| v.is_none_or(|v| v != "0" && v != "false");
                     let (compact, outline) = (on(attr(&e, b"compact")?), on(attr(&e, b"outline")?));
-                    fields.push(FieldIn { hidden: Vec::new(), subtotal, compact, outline });
+                    fields.push(FieldIn { subtotal, compact, outline, ..Default::default() });
                 }
                 b"item" => {
-                    if let (Some(f), Some(x)) = (fields.last_mut(), attr(&e, b"x")?.and_then(|v| v.parse::<u32>().ok())) {
+                    if let Some(f) = fields.last_mut().filter(|f| f.items.len() < officina_grid::pivot::MAX_ITEMS) {
+                        let x = attr(&e, b"x")?.and_then(|v| v.parse::<u32>().ok());
+                        f.items.push(x);
                         if attr(&e, b"h")?.is_some_and(|v| v == "1" || v == "true") {
-                            f.hidden.push(x);
+                            f.hidden.extend(x);
                         }
                     }
                 }
@@ -373,18 +440,24 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                 b"dataField" if datas.len() < 64 => {
                     if let Some(f) = attr(&e, b"fld")?.and_then(|v| v.parse::<u32>().ok()) {
                         let agg = attr(&e, b"subtotal")?.map_or(Some(Agg::Sum), |v| agg_of(&v));
-                        if attr(&e, b"showDataAs")?.is_some_and(|v| v != "normal") {
-                            shown_as = true;
-                        }
+                        let mode = attr(&e, b"showDataAs")?;
+                        let field = attr(&e, b"baseField")?.and_then(|v| v.parse().ok());
+                        let item = attr(&e, b"baseItem")?.and_then(|v| v.parse().ok());
                         match agg {
-                            Some(a) => datas.push((f, a, attr(&e, b"name")?.unwrap_or_default())),
+                            Some(a) => {
+                                active_data = start.then(|| (datas.len(), e.name().as_ref().to_vec()));
+                                datas.push((f, a, attr(&e, b"name")?.unwrap_or_default(), mode, field, item));
+                            }
                             None => rep.note(Kind::Dropped, "pivot table value fields summed in ways this engine lacks"),
                         }
+                    } else if let (Some((index, _)), Some(mode)) = (&active_data, attr(&e, b"pivotShowAs")?) {
+                        datas[*index].3 = Some(mode);
                     }
                 }
                 _ => {}
             },
             Event::End(e) if matches!(e.local_name().as_ref(), b"rowFields" | b"colFields") => list = 0,
+            Event::End(e) if active_data.as_ref().is_some_and(|(_, name)| e.name().as_ref() == name) => active_data = None,
             Event::Eof => break,
             _ => {}
         }
@@ -392,6 +465,10 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     let why = |rep: &mut Report, w: &str| rep.note_at(Kind::Dropped, "pivot tables this engine can't use (their cells kept as values)", || format!("{name}: {w}"));
     if c.calculated {
         rep.note(Kind::Dropped, "calculated pivot fields (pivot tables kept as values)");
+        return Ok(());
+    }
+    if c.grouped {
+        why(rep, "it uses grouped Excel cache fields");
         return Ok(());
     }
     // The source: a range on a sheet, or a table's name.
@@ -433,14 +510,52 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         }
         p.pages.push(pf);
     }
-    p.data = datas
-        .into_iter()
-        .map(|(f, agg, n)| {
-            let d = DataField { field: f, agg, name: None };
-            let default = wb.data_caption(&p, &d);
-            DataField { name: (!n.is_empty() && n != default).then(|| Arc::from(n.as_str())), ..d }
-        })
-        .collect();
+    let active = |field: u32| p.rows.iter().chain(&p.cols).any(|x| x.field == field);
+    let mut data = Vec::new();
+    for (f, agg, n, mode, base_field, base_item) in datas {
+        let base_field = base_field.filter(|&field| active(field));
+        let item = |field: u32| match base_item.unwrap_or(0) {
+            1_048_828 => Some(BaseItem::Previous),
+            1_048_829 => Some(BaseItem::Next),
+            index => {
+                let indices = &fields.get(field as usize)?.items;
+                let shared = if indices.is_empty() { index } else { (*indices.get(index as usize)?)? };
+                c.items.get(field as usize)?.get(shared as usize).cloned().map(BaseItem::Named)
+            }
+        };
+        let show_as = match mode.as_deref().unwrap_or("normal") {
+            "normal" => Some(ShowAs::Normal),
+            "percentOfRow" => Some(ShowAs::PercentOfRow),
+            "percentOfCol" => Some(ShowAs::PercentOfColumn),
+            "percentOfTotal" => Some(ShowAs::PercentOfTotal),
+            "index" => Some(ShowAs::Index),
+            "runTotal" => base_field.map(ShowAs::RunningTotal),
+            "percentOfParentRow" => Some(ShowAs::PercentOfParentRow),
+            "percentOfParentCol" => Some(ShowAs::PercentOfParentColumn),
+            "percentOfParent" => base_field.map(ShowAs::PercentOfParent),
+            "percentOfRunningTotal" => base_field.map(ShowAs::PercentOfRunningTotal),
+            name @ ("rankAscending" | "rankDescending") => base_field.map(|field| ShowAs::Rank {
+                field, descending: name == "rankDescending",
+            }),
+            name @ ("difference" | "percent" | "percentDiff") => base_field.and_then(|field| {
+                let calc = match name {
+                    "difference" => ReferenceCalc::Difference,
+                    "percent" => ReferenceCalc::Percent,
+                    _ => ReferenceCalc::PercentDifference,
+                };
+                Some(ShowAs::Reference { calc, field, item: item(field)? })
+            }),
+            _ => None,
+        };
+        let Some(show_as) = show_as else {
+            why(rep, "its display calculation or base item could not be resolved");
+            return Ok(());
+        };
+        let d = DataField { field: f, agg, name: None, show_as };
+        let default = wb.data_caption(&p, &d);
+        data.push(DataField { name: (!n.is_empty() && n != default).then(|| Arc::from(n.as_str())), ..d });
+    }
+    p.data = data;
     let axis: Vec<u32> = p.rows.iter().chain(&p.cols).map(|f| f.field).collect();
     p.subtotals = axis.iter().any(|&f| fields.get(f as usize).is_some_and(|x| x.subtotal));
     p.grand_col = grand_col;
@@ -451,9 +566,6 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     p.compact = compact && row_fields.iter().all(|f| f.compact);
     if !p.compact && row_fields.len() > 1 && row_fields.iter().any(|f| f.outline) {
         rep.note(Kind::Approximate, "pivot tables in outline form (shown in tabular form once refreshed)");
-    }
-    if shown_as {
-        rep.note(Kind::Approximate, "pivot table values shown as percentages or differences (refreshing shows the plain values)");
     }
     let area = Rect { sheet, r0: page_top, c0, r1, c1: c1.max(c0 + if pages_n > 0 { 1 } else { 0 }) };
     if let Err(w) = wb.add_pivot_as_is(p, Some(area)) {

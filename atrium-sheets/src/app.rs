@@ -2657,12 +2657,12 @@ impl View for Sheets {
                 let t = ctx.theme;
                 let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, PIVOT_W - 1.0, PIVOT_ROW_H), 0.0));
                 ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
-                let (name, area) = &rows[k];
-                let on = picked == Some(k as u32);
+                let (field, name, area) = &rows[k];
+                let on = picked == Some(*field);
                 let hit = ctx.add(Node::Rect { rect: Rect::new(6.0, 1.0, PIVOT_W - 13.0, PIVOT_ROW_H - 2.0), fill: if on { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
                 let cmds = cmds.clone();
-                let f = k as u32;
-                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Pick(f))));
+                let field = *field;
+                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Pick(field))));
                 let tx = TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if area.is_some() { Weight::Semibold } else { Weight::Regular }, color: t.text_primary() };
                 ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 5.0, PIVOT_W - 110.0, 18.0), content: name.chars().take(40).collect(), style: tx });
                 if let Some(a) = area {
@@ -3870,7 +3870,7 @@ mod tests {
         let pivot = |name: &str, sales, summary, col, agg| {
             let mut p = Pivot::new(name, Cells { sheet: sales, r0: 0, r1: 2, c0: 0, c1: 1 }, CellAddr::new(summary, 0, col));
             p.rows.push(PivotField::new(0));
-            p.data.push(DataField { field: 1, agg, name: None });
+            p.data.push(DataField { field: 1, agg, name: None, show_as: Default::default() });
             p
         };
         for t in [table("KeepTable", 0, 1, false), table("OldTable", 0, 3, false)] {

@@ -776,7 +776,7 @@ fn num_kind(wb: &Workbook, id: StyleId) -> NumKind {
     NumKind::Float
 }
 
-fn date_text(x: f64) -> Option<String> {
+pub(super) fn date_text(x: f64) -> Option<String> {
     let (y, m, d) = dates::ymd(x)?;
     if d == 0 || (y == 1900 && m == 2 && d == 29) {
         return None;
