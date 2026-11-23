@@ -290,20 +290,23 @@ and what governments ask for. The alternative is to make ODF the native format (
 |---|---|---|---|
 | `.docx`, `.xlsx`, `.pptx` (OOXML, ECMA-376 transitional and strict) | converter | converter (writer in the doc process, our own model in) | O3 / O4 / O6 |
 | `.odt`, `.ods`, `.odp` (ODF 1.3) | converter | writer | O3 / O4 / O6 |
-| `.csv`, `.tsv` (encoding and delimiter detection) | converter (streaming, for huge files) | writer | O2 |
+| `.csv`, `.tsv` (encoding and delimiter detection) | Sheets delimited reader | UTF-8 values using the input separator | O2 |
 | `.rtf`, `.txt`, `.md` | converter | writer | O3 |
 | pasted / dropped HTML | `navigator-normalize` in a jail, then profile → rich text | Tabula offers HTML subset | O3 |
 | `.xlsm`, `.docm`, `.pptm` | as their base format; macros reported, kept inert (§5.3) | with the kept macro parts, byte for byte (D7; `.xlsm` built in O4f, §16.8) | O4 |
-| `.doc`, `.xls`, `.ppt` (binary, pre-2007) | later, converter only (§17 D8) | never | O7+ |
+| `.xls` (BIFF8) | converter (§17 D8) | native Save As | O7b |
+| `.doc`, `.ppt` (binary, pre-2007) | converter (§17 D8) | native Save As | O7+ |
 | `.pdf` | not edited; opens in `atrium-pdf` | `officina-pdf` export, PDF/A-2b | O3 |
 
 Writers run in the document process because their input is our own validated model; their
 output is checked by reading it back through the converter in CI.
 
-Every import ends with a **fidelity report** in the document's info panel: what was
-converted approximately (an unsupported chart type drawn as a picture, a font substituted),
-what was kept inert, and what was dropped. Saving back to a foreign format lists what the
-format can't carry. No silent loss.
+In Sheets, **Import Notes** opens the full report when a workbook has import
+notices. Previous and Next show each note in order, including approximations,
+inert content, dropped content, read-only opens and delimited encoding
+conversion. The button stays available while the workbook is open, including
+after editing or saving. Save notices appear in the status bar. A reopened
+file gets a new report from its current contents.
 
 XLSX and XLSM import ISO calendar-date and timestamp cells as numeric dates
 in the workbook's epoch. Explicit number formats are preserved. Cells in
@@ -339,6 +342,27 @@ and their associated import or Save behavior.
 | 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Sheets draws turned or stacked text, shrink-to-fit, diagonal borders, patterns and supported linear gradients. Native files and applicable foreign formats retain these settings. XLSX and ODS import bound the width of style defaults on empty rows. Unsupported gradients and conversion to formats with fewer fill or border options receive fidelity notices. |
 | Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
 
+#### Installed desktop closeout matrix
+
+On a private Tessera-root guest with current Sheets, its converter, and
+Scrinium from the same source revision, run the `appearance`, `legacy`, and
+`delimited` cases of the [desktop gate](../../scripts/sheets-interop-vm-check.sh)
+against fresh fixtures in the sole picker place. Set `SHEETS_INTEROP_NOTES=1`
+for the appearance and delimited runs.
+
+| Formats | Desktop evidence |
+|---|---|
+| XLSX and ODS | Ordinary Save, picker reopen, pixel-identical styled regions and the import notice for bounded row defaults |
+| XLSM | Ordinary Save, picker reopen, original VBA and code names, the persistent inactive-macro label, and both pages of a multi-note report |
+| XLS | Read-only and unsupported-merge notices, the copy picker from ordinary Save, native Save As and picker reopen, and an unchanged source |
+| CSV and TSV | Quoted fields and embedded line breaks in UTF-8 and Windows-1252 inputs, values-only Save, and picker reopen as UTF-8 |
+
+The [visual checker](../../scripts/sheets-appearance-png-check.py) checks the
+saved grid regions. The [notice checker](../../scripts/sheets-interop-notices-check.py)
+checks the status and Import Notes screenshots with Pillow and Tesseract.
+Use current Scrinium for the Windows-1252 cases so the named-delimited-text
+check runs at the picker.
+
 #### Advanced filters and pivot fidelity
 
 | Group | Formats | What the user sees |
@@ -347,7 +371,7 @@ and their associated import or Save behavior.
 | Sheet text filters | XLSX, XLSM, ODS | Excel custom filters keep text comparisons and `*`, `?`, and tilde escapes. ODS keeps text comparisons, begins/ends/contains, regex matches, their negations, and case sensitivity. Open restores the last saved row visibility and shows filter buttons for ODS standard filters. **Data → Reapply Filter** reruns the rules after editing the source. |
 | ODS compound filters | ODS | Worksheet filters and named database ranges retain cross-column OR and nested AND/OR. Reapply uses current values, while Save retains the last applied visibility. Single-column selections can narrow the compound rule. Show All clears the whole filter. Live compound rules are bounded to 16 levels and 1,024 nodes. |
 | Excel calendar filters | XLSX, XLSM | Sheets keeps Gregorian year through second selections, including ordinary values and blanks in the same checklist. It retains supported non-Gregorian calendar tags and evaluates the group fields as Gregorian, matching Excel. It preserves relative day, week, month, quarter and year rules, Year to Date, and named months and quarters across years. Save keeps the last applied bounds and visibility. **Data → Reapply Filter** uses the current UTC date, like Sheets' TODAY formula. Weeks start on Sunday. Both Excel date systems are supported. |
-| Excel appearance filters | XLSX, XLSM | Sheets keeps solid cell colors, cell-level font colors, No Fill, Automatic font color, and built-in icon selections, including Office 2010 icon sets and No Cell Icon. Pattern filters distinguish geometry and resolved foreground and background colors. Excel Save preserves the patterns, and the Sheets grid previews them with a solid color. Office 2010 custom icon rules retain their threshold slots, including mixed icon sets and empty slots. **Data → Reapply Filter** uses the current cell style and conditional formatting. Save keeps the last applied row visibility. |
+| Excel appearance filters | XLSX, XLSM | Sheets keeps solid cell colors, cell-level font colors, No Fill, Automatic font color, and built-in icon selections, including Office 2010 icon sets and No Cell Icon. Pattern filters distinguish geometry and resolved foreground and background colors. Excel Save preserves the patterns, and the Sheets grid draws them. Office 2010 custom icon rules retain their threshold slots, including mixed icon sets and empty slots. **Data → Reapply Filter** uses the current cell style and conditional formatting. Save keeps the last applied row visibility. |
 | Table-local filters | XLSX, XLSM, ODS | Each table owns its filter rules and last applied row visibility. The Data menu and header dropdown act on that table. Worksheet filters stay independent. A row is hidden while any applicable filter hides it. Excel table parts and ODS named database ranges keep supported rules across Save and reopen. |
 | Static filter visibility | XLSX, XLSM, ODS | Unknown calendar tags, gradient filter targets, malformed custom icons and unsupported ODS conditions can leave only the saved row visibility. ODS regex uses the bounded Rust regex syntax. Rules that need unsupported syntax, such as backreferences or look-around, receive a fidelity notice. Excel export reports when an ODS filter cannot be carried as a live rule. ODS export reports when it keeps only the saved row visibility of Excel calendar or appearance rules, or omits Excel custom conditional icons. |
 | Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references, derived group chains and automatic aggregation. Excel retains discrete groups, fixed numeric bins and arithmetic calculated fields over local worksheet sources. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |

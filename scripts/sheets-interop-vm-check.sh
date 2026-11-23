@@ -31,6 +31,7 @@
 # Use SHEETS_INTEROP_CASE=table_filters and /tmp/sheets-table-filter-fixture for table-local filters.
 # Use SHEETS_INTEROP_CASE=advanced_filters and /tmp/sheets-advanced-filter-fixture for nested ODS and advanced Excel filters.
 # Use SHEETS_INTEROP_CASE=appearance and /tmp/sheets-appearance-fixture with /tmp/sheets-vba-source.xlsm.
+# Set SHEETS_INTEROP_NOTES=1 in appearance and delimited to capture the Import Notes dialog for closeout.
 # Use SHEETS_INTEROP_CASE=appearance_filters and /tmp/sheets-appearance-filter-fixture for Excel color and icon filters.
 # Use SHEETS_INTEROP_CASE=date_filters and /tmp/sheets-date-filter-fixture for Excel date filters.
 # Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
@@ -458,6 +459,15 @@ appearance() {
         open_book "$row" "$book" initial
         sleep 1.6
         cp selectscreen.png "$results/$format-appearance-initial.png"
+        if test "$format" = xlsm && test "${SHEETS_INTEROP_NOTES:-0}" = 1; then
+            click 921 706 # Import Notes beside the persistent macro label.
+            sleep .4
+            cp selectscreen.png "$results/xlsm-import-note-1.png"
+            click 628 406 # Next in the centered two-line dialog.
+            sleep .4
+            cp selectscreen.png "$results/xlsm-import-note-2.png"
+            key 0x29 # Escape closes the dialog.
+        fi
         click 62 112
         key 0x25
         key 0x28
@@ -733,7 +743,7 @@ validation_legacy() {
         click 510 133
         key 0x1f # The exact list still rejects 2 after picker reopen.
         key 0x28
-        sleep .45
+        sleep 1.6
         cp selectscreen.png "$results/$format-list-reopened-rejection.png"
         click 126 133
         key 0x24 # 7 is a valid whole number. Save this fresh edit.
@@ -750,7 +760,7 @@ validation_reopened() {
     click 126 133
     key 0x26
     key 0x28
-    sleep .45
+    sleep 1.6
     cp selectscreen.png "$results/$format-reopened-rejection.png"
 }
 
@@ -828,8 +838,14 @@ delimited() {
         case "$book" in *-utf8.*) encoding=utf8 ;; *) encoding=ansi ;; esac
         checkpoint "$books/$book" initial
         open_book "$row" "$book" initial
-        sleep .45
+        sleep 1.6
         cp selectscreen.png "$results/$book-initial.png"
+        if test "$encoding" = ansi && test "${SHEETS_INTEROP_NOTES:-0}" = 1; then
+            click 1034 706
+            sleep .4
+            cp selectscreen.png "$results/$book-import-note.png"
+            key 0x29
+        fi
 
         click 191 133 # C2. Enter =B2*3.
         key 0x2e
@@ -845,7 +861,7 @@ delimited() {
         close_book
 
         open_book "$row" "$book" saved
-        sleep .45
+        sleep 1.6
         cp selectscreen.png "$results/$book-reopened.png"
         close_book
         echo "PASS $format $encoding quoted records, values-only Save and reopen"
@@ -1116,6 +1132,7 @@ dates() {
     open_book 213 legacy.osheet edited native
     sleep .4
     cp selectscreen.png "$results/xls-native-reopened.png"
+    cp "$books/legacy.osheet" "$results/reopened.osheet"
     cp "$books/legacy.osheet" "$results/saved.osheet"
     close_book
     test "$(sha256 -q "$books/legacy.xls")" = "$checksum"
@@ -1182,7 +1199,7 @@ legacy() {
     checksum=$(sha256 -q "$books/legacy.xls")
     checkpoint "$books/macro.xlsm" macro-initial
     open_book 213 macro.xlsm macro-initial
-    sleep .45
+    sleep 1.6
     cp selectscreen.png "$results/xlsm-initial.png"
     click 63 132
     key 0x25 # 8
@@ -1191,13 +1208,14 @@ legacy() {
     cp selectscreen.png "$results/xlsm-saved.png"
     close_book
     open_book 213 macro.xlsm macro-edited
-    sleep .45
+    sleep 1.6
     cp selectscreen.png "$results/xlsm-reopened.png"
+    cp "$books/macro.xlsm" "$results/reopened.xlsm"
     close_book
 
     checkpoint "$books/legacy.xls" xls-initial
     open_book 183 legacy.xls xls-initial
-    sleep .45
+    sleep 1.6
     cp selectscreen.png "$results/xls-initial.png"
     click 63 112
     key 0x25
@@ -1222,8 +1240,9 @@ legacy() {
     close_book
 
     open_book 183 legacy.osheet native-copy native
-    sleep .45
+    sleep 1.6
     cp selectscreen.png "$results/xls-native-reopened.png"
+    cp "$books/legacy.osheet" "$results/reopened.osheet"
     close_book
     echo "PASS XLSM VBA bytes and code names, inert notice, ordinary Save and reopen"
     echo "PASS XLS import and fidelity notice, Save As and native reopen, original bytes unchanged"

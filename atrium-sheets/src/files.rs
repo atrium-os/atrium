@@ -148,14 +148,17 @@ pub fn load_with(name: &str, data: &[u8], password: Option<&str>) -> Result<Doc,
         return Ok(d);
     }
     let (mut d, st) = Doc::from_csv(name, data).map_err(|e| failed(format!("“{name}” couldn't be read as CSV: {e:?}")))?;
-    let mut notes = vec![format!("Opened “{name}”: {} rows × {} columns", st.rows, st.cols)];
     if st.latin {
-        notes.push("read as Windows-1252 (not UTF-8)".into());
+        d.notes.push("Read as Windows-1252 (not UTF-8).".into());
     }
     if st.cut > 0 {
-        notes.push(format!("{} over-long cells cut", st.cut));
+        d.notes.push(format!("{} over-long cells cut.", st.cut));
     }
-    d.status = notes.join("; ") + ".";
+    d.status = format!("Opened “{name}”: {} rows × {} columns.", st.rows, st.cols);
+    for note in &d.notes {
+        d.status.push(' ');
+        d.status.push_str(note);
+    }
     Ok(d)
 }
 

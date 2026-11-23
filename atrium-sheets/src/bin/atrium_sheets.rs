@@ -450,7 +450,9 @@ impl Run {
                         if !d.status.ends_with(['.', '!', '?']) { d.status.push('.'); }
                         d.status.push(' ');
                     }
-                    d.status.push_str("Opened read-only. Save asks where to put a copy.");
+                    const READ_ONLY: &str = "Opened read-only. Save asks where to put a copy.";
+                    d.status.push_str(READ_ONLY);
+                    d.notes.push(READ_ONLY.into());
                 }
                 self.show(d, target);
             }

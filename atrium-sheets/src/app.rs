@@ -283,6 +283,8 @@ pub struct Sheets {
     pub filter_scroll: Mutable<ScrollState>,
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
+    import_notes_open: Mutable<bool>,
+    import_note: Mutable<usize>,
     pub cond: Mutable<crate::condfmt::CondPanel>,
     /// Compare with…: the pane, and the other copy it compares with.
     pub review: Mutable<crate::review::ReviewPane>,
@@ -337,7 +339,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -912,6 +914,8 @@ impl Sheets {
     pub fn replace(&self, doc: Doc) -> Doc {
         let old = std::mem::replace(&mut *self.doc.borrow_mut(), doc);
         self.close_comment_bar();
+        self.import_notes_open.set(false);
+        self.import_note.set(0);
         self.review.set(crate::review::ReviewPane::default());
         *self.theirs.borrow_mut() = None;
         self.home();
@@ -1971,9 +1975,9 @@ impl View for Sheets {
             Button::secondary("Password…").at(x, 8.0).width(100.0).on_click(move || cmds.lock().unwrap().push(Cmd::PasswordOpen)).render(ctx);
             x += 108.0;
         }
-        let (name, dirty, status, macros) = {
+        let (name, dirty, status, macros, import_notes) = {
             let d = self.doc.borrow();
-            (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some())
+            (d.name.clone(), d.dirty, d.status.clone(), d.wb.macros().is_some(), !d.notes.is_empty())
         };
         if macros {
             // The workbook holds inert macros that the user can remove (§5.3).
@@ -2115,6 +2119,20 @@ impl View for Sheets {
             let x = (w - 12.0 - room - width).max(12.0);
             ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: notice.into(), style });
             room += width + 12.0;
+        }
+        if import_notes {
+            const WIDTH: f32 = 108.0;
+            let (open, index) = (self.import_notes_open.clone(), self.import_note.clone());
+            let mut button = Button::secondary("Import Notes")
+                .at((w - 12.0 - room - WIDTH).max(12.0), sy + 2.0)
+                .width(WIDTH)
+                .on_click(move || {
+                    index.set(0);
+                    open.set(true);
+                });
+            button.rect.size.h = STATUS_H - 4.0;
+            button.render(ctx);
+            room += WIDTH + 12.0;
         }
         ctx.add(Node::Text { rect: Rect::new(12.0, sy + 4.0, (w - 24.0 - room).max(0.0), 18.0), content: line, style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
         if let Some(m) = mode {
@@ -2737,6 +2755,31 @@ impl View for Sheets {
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        if self.import_notes_open.get() {
+            use pergola::widgets::{Dialog, DialogButton};
+            let d = self.doc.borrow();
+            let idx = self.import_note.get();
+            if let Some(note) = d.notes.get(idx) {
+                let page = |offset| {
+                    let (open, page) = (self.import_notes_open.clone(), self.import_note.clone());
+                    move || {
+                        page.set(offset);
+                        open.set(true);
+                    }
+                };
+                let mut buttons = Vec::new();
+                if idx > 0 {
+                    buttons.push(DialogButton::new("Previous", page(idx - 1)));
+                }
+                if idx + 1 < d.notes.len() {
+                    buttons.push(DialogButton::new("Next", page(idx + 1)));
+                }
+                buttons.push(DialogButton::new("Close", || {}));
+                Dialog::new(self.import_notes_open.clone(), Rect::new(0.0, 0.0, w, h),
+                    format!("Import Notes ({} of {})", idx + 1, d.notes.len()), note, buttons).render(ctx);
+            }
+        }
+
         self.picker_slot(ctx, w, h);
         ctx.pop();
     }
@@ -3108,6 +3151,43 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn import_notes_can_be_read_in_order_and_reset_on_open() {
+        let mut doc = Doc::new("Report.xlsx");
+        doc.notes = vec!["First notice".into(), "Second notice".into()];
+        doc.status = "Opened with two notes.".into();
+        let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (640.0, 440.0));
+        let mut app = App::new(sheets.clone());
+        app.tick();
+        let hit = |app: &App<Sheets>, label: &str| {
+            app.tree().iter().find_map(|(_, node)| match node {
+                Node::Text { content, rect, .. } if content == label => Some(Point::new(rect.x() + rect.w() / 2.0, rect.y() + rect.h() / 2.0)),
+                _ => None,
+            })
+        };
+        let click = |app: &mut App<Sheets>, label| {
+            let at = hit(app, label).expect("visible control");
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            app.tick();
+        };
+        click(&mut app, "Import Notes");
+        assert!(hit(&app, "First notice").is_some());
+        assert!(hit(&app, "Second notice").is_none());
+        click(&mut app, "Next");
+        assert!(hit(&app, "Second notice").is_some());
+        click(&mut app, "Previous");
+        assert!(hit(&app, "First notice").is_some());
+        click(&mut app, "Close");
+        assert!(hit(&app, "First notice").is_none());
+        click(&mut app, "Import Notes");
+        sheets.replace(Doc::new("Clean.osheet"));
+        app.tick();
+        assert!(hit(&app, "Import Notes").is_none());
+        assert!(hit(&app, "First notice").is_none());
+    }
 
     #[test]
     fn macro_notice_fits_beside_save_status_in_a_narrow_window() {
