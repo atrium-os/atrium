@@ -26,7 +26,7 @@ fn setup() -> (tempfile::TempDir, State) {
 const MAIL: &str = "org.atrium.mail";
 
 fn app() -> Label {
-    Label::App { user: "alice".into(), publisher: [7; 32], app_id: MAIL.into() }
+    Label::App { user: "alice".into(), publisher: [7; 32], app_id: MAIL.into(), persona: None }
 }
 
 fn courier(scheme: Scheme, host: &str, port: u16) -> Label {
@@ -199,7 +199,7 @@ fn removing_an_account_deletes_its_kept_passwords() {
     // The item has to be named with its own endpoint.
     assert_eq!(delete_for(&mut s, &app(), smtp, ids[0]), status::DENIED);
     // Another app can't delete Mail's.
-    let other = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.other".into() };
+    let other = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.other".into(), persona: None };
     assert_eq!(delete_for(&mut s, &other, imap, ids[0]), status::DENIED);
     // Plain DELETE is for the app's own items, not endpoint-bound ones.
     assert_eq!(s.handle(&app(), op::DELETE, &ids[0]).status, status::DENIED);
@@ -264,7 +264,7 @@ fn reauthorization_requires_the_linked_pair_and_its_stored_address() {
     assert_eq!(s.handle(&app(), op::MAIL_REAUTH, &renew(&incoming, &outgoing, "other@example.org")).status, status::DENIED);
     assert_ne!(s.handle(&app(), op::MAIL_REAUTH, &renew(&outgoing, &incoming, "priya@example.org")).status, status::OK);
     let good = renew(&incoming, &outgoing, "priya@example.org");
-    let other = Label::App { user: "alice".into(), publisher: [8; 32], app_id: MAIL.into() };
+    let other = Label::App { user: "alice".into(), publisher: [8; 32], app_id: MAIL.into(), persona: None };
     assert_eq!(s.handle(&other, op::MAIL_REAUTH, &good).status, status::DENIED);
     assert_eq!(s.handle(&app(), op::MAIL_REAUTH, &good).status, status::OK);
 }

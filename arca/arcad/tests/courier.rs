@@ -23,7 +23,7 @@ fn setup() -> (tempfile::TempDir, State) {
 }
 
 fn app(p: u8, id: &str) -> Label {
-    Label::App { user: "alice".into(), publisher: [p; 32], app_id: id.into() }
+    Label::App { user: "alice".into(), publisher: [p; 32], app_id: id.into(), persona: None }
 }
 
 fn courier(p: u8, id: &str, host: &str) -> Label {

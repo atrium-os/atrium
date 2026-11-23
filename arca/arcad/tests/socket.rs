@@ -15,7 +15,7 @@ fn identity_is_the_peer_uid_not_the_message() {
     let d = tempfile::tempdir().unwrap();
     let me = unsafe { libc::getuid() };
     let reg = d.path().join("registry");
-    std::fs::write(&reg, format!("{me} alice org.example.mail {}\n", "07".repeat(32))).unwrap();
+    std::fs::write(&reg, format!("{me} alice org.example.mail {} persona=work\n", "07".repeat(32))).unwrap();
     let resolver = Resolver { registry: reg, vestibulum_uid: None, ui_uid: None, allow_unsigned: false, courier_registry: None, web_broker: None, share_registry: None, file_manager: None, services: vec![] };
     let state = Arc::new(Mutex::new(State::new(d.path().join("db")).unwrap()));
     // Vestibulum makes alice's store (directly; it would be another uid).
@@ -27,7 +27,7 @@ fn identity_is_the_peer_uid_not_the_message() {
     let (mut client, server) = UnixStream::pair().unwrap();
     let (uid, _) = portcullis_peer::uid_gid(server.as_raw_fd()).unwrap();
     let label = resolver.resolve(uid);
-    assert_eq!(label, Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into() });
+    assert_eq!(label, Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into(), persona: Some("work".into()) });
     let st = state.clone();
     let t = std::thread::spawn(move || arcad::serve_conn(server, &label, &st));
 

@@ -103,7 +103,7 @@ fn only_the_file_manager_saves_and_only_from_its_own_field() {
     let share = nas("/home/alice", KEY);
     // Another app has the user type a password, then tries to bind it to a
     // server of its choosing.
-    let evil = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.evil".into() };
+    let evil = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.evil".into(), persona: None };
     let h = typed(&mut s, 9, "org.example.evil", b"pw");
     assert_eq!(save(&mut s, &evil, h, &share, "alice").0, status::DENIED);
     // ... or hands its handle to the file manager.

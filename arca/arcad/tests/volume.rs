@@ -89,7 +89,7 @@ fn mint_loads_the_key_and_no_reply_carries_it() {
         dispensatord(),
         Label::Service("atrium-volumes".into()),
         Label::Service("vinculumd".into()),
-        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into() },
+        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into(), persona: None },
         Label::TrustedUi,
         Label::Vestibulum,
     ];
@@ -148,7 +148,7 @@ fn only_the_volume_services_may_use_the_ops() {
     for who in [
         Label::Service("vinculumd".into()),
         Label::Service("sigillumd".into()),
-        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into() },
+        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into(), persona: None },
         Label::Vestibulum,
         Label::TrustedUi,
         Label::Unknown,
@@ -258,7 +258,7 @@ fn a_plugged_in_stick_finds_its_persona() {
     assert_eq!(find(&mut s, &dispensatord(), "alice", &work, [0x5b; 16], 0).0, status::DENIED);
     assert_eq!(find(&mut s, &dispensatord(), "alice", &[9u8; 16], UUID, 0).0, status::DENIED);
     assert_eq!(find(&mut s, &dispensatord(), MACHINE_USER, &work, UUID, 0).0, status::DENIED);
-    let app = Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into() };
+    let app = Label::App { user: "alice".into(), publisher: [3; 32], app_id: "org.example.files".into(), persona: None };
     assert_ne!(find(&mut s, &app, "alice", &work, UUID, 0).0, status::OK);
     assert!(k.lock().unwrap().loaded.is_empty());
 

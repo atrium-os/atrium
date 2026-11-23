@@ -181,7 +181,7 @@ mod freebsd {
     fn ask(d: &Daemon, s: &mut UnixStream) -> Result<jail::Courier, u8> {
         let uid = peer_uid(s).ok_or(reply::NOT_AN_APP)?;
         let (user, publisher, app_id, broker) = match d.resolver.resolve(uid) {
-            Label::App { user, publisher, app_id } => (user, publisher, app_id, false),
+            Label::App { user, publisher, app_id, .. } => (user, publisher, app_id, false),
             Label::WebBroker { user, publisher, app_id } => (user, publisher, app_id, true),
             _ => return Err(reply::NOT_AN_APP),
         };

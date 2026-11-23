@@ -28,7 +28,7 @@ fn setup() -> (tempfile::TempDir, State) {
 }
 
 fn mail() -> Label {
-    Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into() }
+    Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into(), persona: None }
 }
 
 fn rcp(p: u8, app: &str) -> Recipient {
@@ -128,7 +128,7 @@ fn a_wifi_passphrase_goes_only_to_the_wifi_key_service_once() {
     assert!(s.redeem(&h, "alice", &rcp(7, "org.atrium.curia")).is_none());
     let h = hold(&mut s);
     assert_eq!(s.handle(&Label::Service("vinculumd".into()), op::TAKE_WIFI, &h).status, status::DENIED);
-    assert_eq!(s.handle(&Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.atrium.curia".into() }, op::TAKE_WIFI, &h).status, status::DENIED);
+    assert_eq!(s.handle(&Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.atrium.curia".into(), persona: None }, op::TAKE_WIFI, &h).status, status::DENIED);
     // The Wi-Fi key service, once.
     let h = hold(&mut s);
     let r = s.handle(&keys, op::TAKE_WIFI, &h);

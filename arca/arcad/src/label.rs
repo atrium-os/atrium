@@ -3,7 +3,7 @@
 //! The kernel's peer uid, resolved through the launch registry that
 //! portcullisd writes, never anything the peer says. The registry carries
 //! the manifest's verified publisher id, so an app's label is (owning user,
-//! publisher, app id).
+//! publisher, app id) with the launch persona recorded separately.
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Label {
     /// A launched app.
-    App { user: String, publisher: [u8; 32], app_id: String },
+    App { user: String, publisher: [u8; 32], app_id: String, persona: Option<String> },
     /// Vestibulum: unlocks and locks stores; never sees item values.
     Vestibulum,
     /// Arca's own trusted UI (grants, reveal); a separate process of Arca's.
@@ -158,6 +158,7 @@ impl Resolver {
         if self.file_manager.as_ref().is_some_and(|(p, a)| *p == publisher && a == app_id) {
             return Label::FileManager { user: user.into(), publisher, app_id: app_id.into() };
         }
-        Label::App { user: user.into(), publisher, app_id: app_id.into() }
+        let Some(persona) = reg.persona(uid) else { return Label::Unknown };
+        Label::App { user: user.into(), publisher, app_id: app_id.into(), persona: persona.map(str::to_owned) }
     }
 }

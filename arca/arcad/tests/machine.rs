@@ -102,7 +102,7 @@ fn nobody_else_reaches_a_services_items() {
     let (_, id) = store(&mut s, &vinculum(), BOND, AFTER_BOOT, "lk", b"secret");
     let others = [
         Label::Service("other".into()),
-        Label::App { user: "alice".into(), publisher: [7; 32], app_id: "vinculumd".into() },
+        Label::App { user: "alice".into(), publisher: [7; 32], app_id: "vinculumd".into(), persona: None },
         Label::TrustedUi,
         Label::Vestibulum,
         Label::Unknown,
@@ -146,7 +146,7 @@ fn apps_cannot_store_bond_keys() {
     w.str("alice");
     w.raw(&[1; 32]);
     assert_eq!(s.handle(&Label::Vestibulum, op::V_CREATE, &w.buf).status, status::OK);
-    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bt".into() };
+    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bt".into(), persona: None };
     assert_eq!(store(&mut s, &app, BOND, 2, "lk", b"k").0, status::UNSUPPORTED);
 }
 

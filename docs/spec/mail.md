@@ -1722,6 +1722,12 @@ Stalwart in the cloud VM, and later a real account):
    signed-data (`smime-type=signed-data`) and AuthEnvelopedData (AES-GCM); revocation
    (OCSP/CRL); a certificates page (seen certificates, forgetting one; built 2026-11-19, below); Bcc recipients
    show in the envelope's recipient list (as in other clients).
+   **Arca key transport:** Arca’s persona-bound RSA-OAEP operation
+   ([arca.md §9.2](arca.md#92-mail-smime-content-key-unwrap)) accepts
+   SHA-256 and MGF1-SHA-256 with an empty label. The Mail reader still
+   needs to recognize and validate those CMS parameters and invoke it.
+   Production provisioning and legacy PKCS#1 v1.5 compatibility remain
+   separate work.
    **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
    request builders, bounded readers of every answer, RFC 3339 dates) and
    `mail-sync::jmap::Client` over the caller's HTTP (the HTTP courier, which adds the

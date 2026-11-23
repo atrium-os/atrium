@@ -193,7 +193,7 @@ fn mail() -> Parent {
 #[test]
 fn the_client_against_arcad() {
     let (_d, st, path) = arcad();
-    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.mail".into(), persona: None };
     let r = st.lock().unwrap().handle(&app, op::STORE, &body(|w| { w.u16(1); w.u8(2); w.str("ana"); w.bytes(b"stored-pw"); }));
     assert_eq!(r.status, status::OK);
     let a = Arcad::new(&path);

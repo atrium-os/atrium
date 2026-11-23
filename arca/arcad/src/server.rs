@@ -19,8 +19,8 @@ use crate::label::Label;
 use crate::proto::{broker_op, courier_op, op, share_op, ssh_op, status, volume_op, MAX_SIGN_MSG};
 use crate::share::ShareLabel;
 
-/// Personas arrive with the label once insula.md §13.6 lands; until then
-/// every app item is in the user's main persona.
+/// Storage partition for existing generic app operations. S/MIME uses
+/// the attested launch persona carried by the app's label.
 pub const PERSONA: &str = "main";
 
 /// The machine store's user and persona (arca.md §6.4). It lives in
@@ -248,7 +248,7 @@ impl State {
             }
             return Some((user, format!("Forget the key of \u{201c}{}\u{201d}", m.account)));
         }
-        let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id } | Label::FileManager { user, publisher, app_id }) = who else { return None };
+        let (Label::App { user, publisher, app_id, .. } | Label::WebBroker { user, publisher, app_id } | Label::FileManager { user, publisher, app_id }) = who else { return None };
         if !matches!(op, op::PUBKEY | op::SIGN | op::RELEASE) || body.len() < 16 {
             return None;
         }
@@ -261,13 +261,22 @@ impl State {
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
-            Label::App { user, publisher, app_id } if matches!(op, op::MAIL_SIGN_IN | op::MAIL_REAUTH) => self.mail_begin(user, publisher, app_id, body, op == op::MAIL_REAUTH),
-            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_CANCEL => {
+            Label::App { user, publisher, app_id, persona } if op == op::MAIL_SMIME_UNWRAP => {
+                if app_id == smime::MAIL && *publisher != crate::label::UNSIGNED_PUBLISHER
+                    && self.mail_sign_ins.mail_publisher.as_ref() == Some(publisher)
+                {
+                    self.smime_unwrap(user, persona.as_deref(), body, &mut item)
+                } else {
+                    reply(status::DENIED)
+                }
+            }
+            Label::App { user, publisher, app_id, .. } if matches!(op, op::MAIL_SIGN_IN | op::MAIL_REAUTH) => self.mail_begin(user, publisher, app_id, body, op == op::MAIL_REAUTH),
+            Label::App { user, publisher, app_id, .. } if op == op::MAIL_SIGN_IN_CANCEL => {
                 if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
                 let Ok(ticket) = body.try_into() else { return malformed() };
                 if self.mail_sign_ins.cancel(user, ticket) { ok(vec![]) } else { reply(status::DENIED) }
             }
-            Label::App { user, publisher, app_id } if op == op::MAIL_SIGN_IN_RESULT => {
+            Label::App { user, publisher, app_id, .. } if op == op::MAIL_SIGN_IN_RESULT => {
                 if app_id != "org.atrium.mail" || Some(publisher) != self.mail_sign_ins.mail_publisher.as_ref() { return reply(status::DENIED); }
                 let mut r = Reader::new(body);
                 let (Ok(ticket), Ok(address)) = (r.array::<16>(), r.str(caps::ACCOUNT)) else { return malformed() };
@@ -275,7 +284,7 @@ impl State {
                 self.mail_sign_ins.result(user, &ticket, address).map_or_else(|| reply(status::DENIED), |ids| ok(ids.to_vec()))
             }
             Label::WebBroker { user, .. } if op == broker_op::W_MAIL_SIGN_IN => self.mail_claim(user, body),
-            Label::App { user, publisher, app_id } => match Recipient::app(*publisher, app_id) {
+            Label::App { user, publisher, app_id, .. } => match Recipient::app(*publisher, app_id) {
                 Ok(me) => self.app_op(user, &me, op, body, &mut item),
                 Err(_) => reply(status::UNKNOWN_PEER),
             },
@@ -324,7 +333,7 @@ impl State {
         let Some(f) = self.audit.as_mut() else { return };
         let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let who = match who {
-            Label::App { user, publisher, app_id } => {
+            Label::App { user, publisher, app_id, .. } => {
                 let p: String = publisher[..6].iter().map(|b| format!("{b:02x}")).collect();
                 format!("app:{app_id}/{p}@{user}")
             }
@@ -1536,6 +1545,8 @@ impl State {
             op::U_STORE_PRINT_LOGIN => self.store_print_login(body, item),
             op::U_SAVE_PRINT_PIN => self.saved_print_pin(body, true, item),
             op::U_USE_SAVED_PRINT_PIN => self.saved_print_pin(body, false, item),
+            op::U_SMIME_IMPORT => self.smime_import(body, item),
+            op::U_SMIME_FORGET => self.smime_forget(body, item),
             op::U_DROP => {
                 let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
                 self.handles.drop_handle(&h);
@@ -3131,3 +3142,5 @@ fn zeroize_array(b: &mut [u8; 32]) {
         unsafe { std::ptr::write_volatile(x, 0) };
     }
 }
+
+mod smime;

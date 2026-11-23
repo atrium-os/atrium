@@ -301,7 +301,7 @@ fn samesite_goes_by_the_tickets_context() {
 #[test]
 fn only_the_configured_broker_issues_tickets() {
     let (_d, mut s) = setup();
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: BROKER.into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: BROKER.into(), persona: None };
     assert_eq!(s.handle(&app, arcad::proto::broker_op::W_TICKET, &[]).status, status::DENIED);
     let c = courier(MAIL, "www.example.com", None);
     assert_eq!(s.handle(&c, arcad::proto::broker_op::W_TICKET, &[]).status, status::DENIED);
@@ -316,7 +316,7 @@ fn only_the_configured_broker_issues_tickets() {
 #[test]
 fn apps_and_other_peers_cant_ask_for_cookies() {
     let (_d, mut s) = setup();
-    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: MAIL.into() };
+    let app = Label::App { user: "alice".into(), publisher: [7; 32], app_id: MAIL.into(), persona: None };
     assert_eq!(s.handle(&app, cop::COOKIES, &body(|w| w.str("/"))).status, status::DENIED);
     assert_eq!(s.handle(&Label::TrustedUi, cop::COOKIES, &body(|w| w.str("/"))).status, status::DENIED);
 }
@@ -383,7 +383,7 @@ fn the_broker_forgets_a_jar_an_unrecorded_trails_or_all_of_them() {
     for (p, x) in [("e", 1), ("u-123.", 1), ("u-00000000000000A1.", 1), ("example.com", 2), ("", 0)] {
         assert_eq!(forget(&mut s, &broker(), p, x).0, status::MALFORMED, "{p:?} {x}");
     }
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into(), persona: None };
     assert_ne!(forget(&mut s, &app, "u-", 1).0, status::OK);
     assert_ne!(forget(&mut s, &web("www.example.com", "example.com"), "u-", 1).0, status::OK);
     assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
@@ -458,7 +458,7 @@ fn signing_out_ends_one_jars_session_cookies_only() {
     assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
     // Only the broker, and only a partition.
     assert_eq!(sign_out(&mut s, &broker(), "").0, status::MALFORMED);
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into(), persona: None };
     assert_ne!(sign_out(&mut s, &app, "news.example").0, status::OK);
     assert_eq!(jar_has(&mut s, "news.example", "news.example"), "news=v");
 }
@@ -493,7 +493,7 @@ fn the_broker_learns_the_accounts_arca_has_for_a_site_by_name_only() {
     assert_eq!(accounts(&mut s, &broker(), "example.com"), (status::OK, vec![(pk, "alice@example.com".into())]));
     assert_eq!(accounts(&mut s, &broker(), "news.example"), (status::OK, vec![]));
     assert_eq!(accounts(&mut s, &broker(), "").0, status::MALFORMED);
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into(), persona: None };
     assert_ne!(accounts(&mut s, &app, "example.com").0, status::OK);
 }
 
@@ -523,7 +523,7 @@ fn a_scripts_cookies_leave_out_httponly_ones() {
     }
     assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", "news.example", "/").1, "");
     assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", "example.com", "x").0, status::MALFORMED);
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into(), persona: None };
     assert_ne!(script_cookies(&mut s, &app, "www.example.com", "example.com", "/").0, status::OK);
     assert_ne!(script_cookies(&mut s, &web("www.example.com", "example.com"), "www.example.com", "example.com", "/").0, status::OK);
 }
@@ -565,7 +565,7 @@ fn a_taken_transitions_script_cookie_is_kept() {
         assert_eq!(script_set(&mut s, "www.example.com", p, "/news/a", "here=; Max-Age=0"), status::OK, "{p}");
         assert_eq!(script_cookies(&mut s, &broker(), "www.example.com", p, "/news/b").1, "consent=yes", "{p}");
     }
-    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into() };
+    let app = Label::App { user: "alice".into(), publisher: [9; 32], app_id: "org.example.mail".into(), persona: None };
     assert_ne!(s.handle(&app, arcad::proto::broker_op::W_SCRIPT_SET_COOKIE, &body(|w| {
         arcad::proto::write_endpoint(w, "www.example.com", 443);
         w.str("example.com");

@@ -96,6 +96,8 @@ pub enum Kind {
     /// through `SIGN` by the crypta service, never released. Value: the
     /// 32-byte scalar.
     TlsClientKey = 0x105,
+    /// RSA key for Mail's CMS content-key transport.
+    SmimeRsaKey = 0x106,
 }
 
 impl Kind {
@@ -118,6 +120,7 @@ impl Kind {
             0x103 => VolumeKey,
             0x104 => WireGuardKey,
             0x105 => TlsClientKey,
+            0x106 => SmimeRsaKey,
             _ => return Err(Error::Corrupt("unknown kind")),
         })
     }
@@ -254,6 +257,8 @@ pub enum Recipient {
     Share { proto: ShareProto, host: String, port: u16, path: String, key: [u8; 32] },
     /// A saved IPPS printer, identified by its TLS key and IPP UUID.
     Printer { key: [u8; 32], uuid: String },
+    /// The signed Mail publisher, through the persona-bound CMS operation.
+    Smime { publisher: [u8; 32] },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -431,6 +436,10 @@ impl Recipient {
                 w.raw(key);
                 w.str(uuid);
             }
+            Recipient::Smime { publisher } => {
+                w.u8(8);
+                w.raw(publisher);
+            }
         }
     }
 
@@ -482,6 +491,7 @@ impl Recipient {
                 Recipient::share(proto, &host, port, &path, key).map_err(|_| Error::Corrupt("recipient"))
             }
             7 => Recipient::printer(r.array::<32>()?, r.str(36)?).map_err(|_| Error::Corrupt("recipient")),
+            8 => Ok(Recipient::Smime { publisher: r.array::<32>()? }),
             _ => Err(Error::Corrupt("recipient tag")),
         }
     }

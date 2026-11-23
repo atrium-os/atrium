@@ -99,6 +99,9 @@ pub mod op {
     /// Reauthorize existing IMAP/submission items: two ids followed by the account address.
     pub const MAIL_REAUTH: u16 = 0x16;
     pub const MAIL_SIGN_IN_CANCEL: u16 = 0x17;
+    /// Signed Mail: `sha256(spki)[32] | bytes ciphertext` → a CMS content key.
+    /// Fixed RSA-OAEP with SHA-256, MGF1-SHA-256, and the empty label.
+    pub const MAIL_SMIME_UNWRAP: u16 = 0x18;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -164,6 +167,11 @@ pub mod op {
     pub const U_SAVE_PRINT_PIN: u16 = 0x6A;
     /// Trusted UI: printer binding → one-use handle for the stored PIN.
     pub const U_USE_SAVED_PRINT_PIN: u16 = 0x6B;
+    /// Trusted UI: `str user | str persona (empty for Personal) | str label |
+    /// bytes unencrypted PKCS#8 DER` → `sha256(spki)[32]`.
+    pub const U_SMIME_IMPORT: u16 = 0x6C;
+    /// Trusted UI: `str user | str persona (empty for Personal) | sha256(spki)[32]`.
+    pub const U_SMIME_FORGET: u16 = 0x6D;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).

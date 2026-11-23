@@ -790,6 +790,31 @@ For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
   verifier, or a passcode reply returns no signature.
 - Gate: `scripts/vm-ssh-agent-check.sh`.
 
+### 9.2 Mail S/MIME content-key unwrap
+
+The trusted UI can provision or forget an RSA S/MIME private key for an
+unlocked user and one launch persona. Import accepts unencrypted PKCS#8 DER
+with a 2048-, 3072-, or 4096-bit RSA key and returns the SHA-256 fingerprint
+of the canonical public SubjectPublicKeyInfo. Arca seals the key as a
+`WhileUnlocked` item with a dedicated recipient bound to the configured
+Mail publisher. The named persona’s ordinary destruction path removes its
+keys. Arca reserves the generic `main` store partition for existing
+operations.
+
+`MAIL_SMIME_UNWRAP` accepts the fingerprint and one wrapped content key
+from signed `org.atrium.mail` with the configured publisher. The user and
+persona come from Portcullis’s launch registry. The fixed profile is
+RSA-OAEP with SHA-256, MGF1-SHA-256 and an empty label. Success returns
+only a 16- or 32-byte content key. Input buffers, the return buffer and
+OpenSSL allocations use locked, zeroized memory. The operation fails
+closed when the locked allocator is unavailable. The daemon consumes
+only the bounded transport fields. Mail’s parse worker remains responsible
+for CMS and MIME.
+
+The trusted UI provisioning screens and Mail’s OAEP CMS recognize-and-open
+path are separate integration work. Mail’s current PKCS#1 v1.5 envelopes
+need a separately reviewed compatibility path.
+
 ## 10. Audit
 
 Every release and every operation is logged with the item id, client label, recipient,

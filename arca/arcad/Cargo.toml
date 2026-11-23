@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "arcad"
 path = "src/bin/arcad.rs"
 
+[features]
+# Run the native S/MIME test with host OpenSSL 3. FreeBSD uses base libcrypto.
+host-openssl-tests = []
+
 [dependencies]
 arca-store      = { path = "../arca-store" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }

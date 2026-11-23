@@ -93,7 +93,7 @@ fn sigillumd(typed: &'static [u8]) -> (std::path::PathBuf, Arc<Mutex<Vec<String>
 }
 
 fn app() -> arcad::label::Label {
-    arcad::label::Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bank".into() }
+    arcad::label::Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bank".into(), persona: None }
 }
 
 /// arcad's state with alice unlocked, serving one app connection that

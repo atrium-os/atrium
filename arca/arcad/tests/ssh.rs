@@ -83,7 +83,7 @@ fn a_workspace_signs_with_only_its_granted_keys() {
     assert_eq!(grant(&mut s, "main", id, "web", true), status::OK);
     let not_agent = Label::Service("vinculumd".into());
     assert_ne!(sign(&mut s, &not_agent, "main", "web", id, b"m").0, status::OK);
-    let app = Label::App { user: "alice".into(), publisher: [4; 32], app_id: "org.example.x".into() };
+    let app = Label::App { user: "alice".into(), publisher: [4; 32], app_id: "org.example.x".into(), persona: None };
     assert_ne!(sign(&mut s, &app, "main", "web", id, b"m").0, status::OK);
     // An app's own SIGN can't name the agent's item either.
     assert_ne!(s.handle(&app, op::SIGN, &body(|w| { w.raw(&id); w.bytes(b"m"); })).status, status::OK);

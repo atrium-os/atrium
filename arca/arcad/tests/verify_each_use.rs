@@ -14,7 +14,7 @@ const VERIFY_EACH_USE: u8 = 3;
 const ED25519: u16 = 0x100;
 
 fn app() -> Label {
-    Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bank".into() }
+    Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.bank".into(), persona: None }
 }
 
 fn state(d: &tempfile::TempDir) -> Arc<Mutex<State>> {
@@ -105,7 +105,7 @@ fn only_its_own_apps_items_are_asked_about() {
     let mut c = connect(&st, Some(sheet.clone()));
     let id = mint(&mut c);
     // Another app naming the id: DENIED, and no sheet.
-    let other = Label::App { user: "alice".into(), publisher: [8; 32], app_id: "org.example.evil".into() };
+    let other = Label::App { user: "alice".into(), publisher: [8; 32], app_id: "org.example.evil".into(), persona: None };
     let mut w = Writer::new();
     w.raw(&id);
     w.bytes(b"x");

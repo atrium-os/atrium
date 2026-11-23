@@ -122,7 +122,7 @@ fn only_sigillumd_may_ask() {
     let (_d, mut s) = setup();
     let others = [
         Label::Service("vinculumd".into()),
-        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "com.example.app".into() },
+        Label::App { user: "alice".into(), publisher: [3; 32], app_id: "com.example.app".into(), persona: None },
         Label::WebBroker { user: "alice".into(), publisher: [0xAB; 32], app_id: "org.atrium.navigator".into() },
         Label::TrustedUi,
         Label::Vestibulum,

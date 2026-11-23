@@ -8,7 +8,7 @@ use arcad::server::State;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 fn app(id: &str, publisher: u8) -> Label {
-    Label::App { user: "alice".into(), publisher: [publisher; 32], app_id: id.into() }
+    Label::App { user: "alice".into(), publisher: [publisher; 32], app_id: id.into(), persona: None }
 }
 
 fn body(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
@@ -50,7 +50,7 @@ fn another_apps_item_is_eacces() {
     for other in [
         app("org.example.evil", 7),   // same publisher, another app
         app("org.example.mail", 9),   // the same app id, another publisher
-        Label::App { user: "bob".into(), publisher: [7; 32], app_id: "org.example.mail".into() },
+        Label::App { user: "bob".into(), publisher: [7; 32], app_id: "org.example.mail".into(), persona: None },
     ] {
         for o in [op::RELEASE, op::DELETE, op::PUBKEY, op::SIGN] {
             let b = if o == op::SIGN { body(|w| { w.raw(&id); w.bytes(b"x"); }) } else { id.to_vec() };
