@@ -792,6 +792,7 @@ fn from_odf_href(h: &str) -> String {
 /// An `office:annotation` being read.
 #[derive(Default)]
 struct Annotation {
+    thread: Option<Comment>,
     author: String,
     text: String,
     in_creator: bool,
@@ -1125,7 +1126,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"office:annotation" => {
                         if !empty {
                             annotation_depth = 1;
-                            ann = Some(Annotation::default());
+                            let thread = match super::comments::read_thread(e) {
+                                Some(Some(thread)) => Some(thread),
+                                Some(None) => {
+                                    rep.note(Kind::Dropped, "malformed ODS comment thread metadata (kept the visible note)");
+                                    None
+                                }
+                                None => None,
+                            };
+                            ann = Some(Annotation { thread, ..Annotation::default() });
                         }
                     }
                     b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS + officina_grid::charts::MAX_PICTURES => {
@@ -1448,7 +1457,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     if annotation_depth == 0 {
                         if let (Some(a), Some(s)) = (ann.take(), sheet) {
                             if row < MAX_ROWS as u64 && col < MAX_COLS as u64 && comments.len() < officina_grid::comments::MAX_COMMENTS {
-                                comments.push((row as u32, col as u32, Some(Comment::with_runs(a.author.trim(), &a.text, a.runs))));
+                                let visible = Comment::with_runs(a.author.trim(), &a.text, a.runs);
+                                let comment = match a.thread {
+                                    Some(thread) if thread.author.trim() == visible.author.as_ref()
+                                        && thread.text == visible.text && visible.runs().is_empty() => thread,
+                                    Some(_) => {
+                                        rep.note(Kind::Dropped, "ODS comment threads whose visible notes changed (kept the edited note)");
+                                        visible
+                                    }
+                                    None => visible,
+                                };
+                                comments.push((row as u32, col as u32, Some(comment)));
                             }
                             let _ = s;
                         }

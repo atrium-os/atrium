@@ -15,6 +15,7 @@
 # Use SHEETS_INTEROP_CASE=legacy and /tmp/sheets-legacy-fixture for legacy.xls
 # and macro.xlsm. Stage the same SimpleMacro.xlsm source at /tmp/sheets-vba-source.xlsm.
 # Use SHEETS_INTEROP_CASE=print and /tmp/sheets-print-fixture for print layout.
+# Use comments_print with the same binary and its make-comments-print inputs.
 # The print profile also needs Prelum and the print sheet with no printers
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
@@ -37,12 +38,13 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
     pivot_cache) test "$(ls "$books")" = "$(printf 'missing.xlsx\nunusable.xlsx')" ;;
     pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
+    comments_print) test "$(ls "$books")" = "$(printf 'legacy.xls\nsales.ods')" ;;
     validation_legacy) test "$(ls "$books")" = "$(printf 'extension.xlsx\nvalidation.xls')" ;;
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     table_filters) test "$(ls "$books")" = "$(printf 'tables.ods\ntables.xlsm\ntables.xlsx')" ;;
@@ -85,6 +87,7 @@ checkpoint() {
         pivot_sources) /tmp/sheets-pivot-sources-fixture check "$1" "$2" "$format" ;;
         pivot_cache) /tmp/sheets-pivot-cache-fixture check "$1" "$2" "$format" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
+        comments_print) /tmp/sheets-print-fixture check "$1" "$2-$variant" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
         text_filter) /tmp/sheets-text-filter-fixture check "$1" "$2" "$format" ;;
@@ -425,7 +428,7 @@ pdf_picker_open() {
 }
 
 print_pdf() {
-    pdf="$books/sales – Report.pdf"
+    pdf="$books/${book%.*} – Report.pdf"
     test ! -e "$pdf"
     click 280 24
     wait_for other_window 829 578 "$document"
@@ -438,6 +441,52 @@ print_pdf() {
     wait_for pdf_finished "$pdf"
     wait_for same_window 824 458 "$document"
     mv "$pdf" "$results/$format.pdf"
+}
+
+comments_print() {
+    format=ods
+    variant=threads
+    book=sales.ods
+    checkpoint "$books/$book" initial
+    open_book 213 "$book" initial
+    print
+    close_book
+    open_book 213 "$book" edited
+    click 326 172 # Commented D4, with the restored conversation.
+    sleep .45
+    cp selectscreen.png "$results/ods-thread-reopened.png"
+    print_pdf
+    cp "$books/$book" "$results/thread-reopened.ods"
+    close_book
+
+    format=xls
+    variant=legacy
+    book=legacy.xls
+    checksum=$(sha256 -q "$books/$book")
+    checkpoint "$books/$book" initial
+    open_book 183 "$book" initial
+    click 400 172
+    key 0x25 # E4 -> 8, printed formula in F4 -> 168.
+    key 0x28
+    sleep .45
+    click 205 24
+    wait_for other_window 824 458 "$document"
+    click 824 458
+    book=legacy.osheet
+    wait_for checkpoint "$books/$book" edited
+    wait_for same_window 824 458 "$document"
+    close_book
+    open_book 183 "$book" edited native
+    click 326 172
+    sleep .45
+    cp selectscreen.png "$results/xls-note-reopened.png"
+    print_pdf
+    cp "$books/$book" "$results/legacy-reopened.osheet"
+    close_book
+    test "$(sha256 -q "$books/legacy.xls")" = "$checksum"
+    echo "PASS ODS thread retained after ordinary Save and picker reopen"
+    echo "PASS XLS rich note, two link forms and print settings retained through native Save As and picker reopen"
+    echo "PASS both workbooks exported PDF through installed Prelum and Scrinium"
 }
 
 formulas() {
@@ -1148,6 +1197,7 @@ case "$profile" in
     table_filters) table_filters; exit ;;
     pivot_scope) pivot_scope; exit ;;
     legacy) legacy; exit ;;
+    comments_print) comments_print; exit ;;
     validation_legacy) validation_legacy; exit ;;
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;

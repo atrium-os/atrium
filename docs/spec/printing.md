@@ -797,7 +797,7 @@ The Navigator prints too (2026-11-18, navigator-ui.md §7 "Printing"): the page'
 jailed child lays it out on the paper and writes the PDF, handed back to the window as a
 sealed memory file, and it answers Relayout the same way.
 
-Sheets honors a saved XLSX print area consisting of one absolute cell or rectangle.
+Sheets honors a saved print area consisting of one absolute cell or rectangle in XLSX, ODS, and imported BIFF8 workbooks. BIFF8 print titles and the print area persist through native Save As.
 Without a saved area it prints the used range, including anchored charts and embedded
 PNG and JPEG pictures imported from XLSX. Charts use the on-screen layout with paper
 colors and PDF text and vectors. Pictures use the XLSX source crop and rotate clockwise

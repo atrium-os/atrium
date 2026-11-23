@@ -165,9 +165,9 @@ fn saved_status(d: &Doc, format: Format) -> String {
             changes.push("omitted typed chart series names");
         }
         if (0..d.wb.sheet_count() as u16).any(|sheet| {
-            d.wb.comments(sheet).values().any(|comment| !comment.thread().is_empty())
+            d.wb.comments(sheet).values().any(|comment| !officina_convert::ods::supports_comment_thread(comment))
         }) {
-            changes.push("saved comment threads as plain notes");
+            changes.push("saved oversized comment threads as plain notes");
         }
         if !changes.is_empty() {
             status.push_str(&format!(" ODS {}.", changes.join(", ")));
@@ -1323,7 +1323,7 @@ mod document_tests {
     }
 
     #[test]
-    fn ods_save_reports_flattening_comment_threads() {
+    fn ods_save_retains_supported_comment_threads() {
         use officina_grid::comments::{Comment, ThreadMessage, ThreadPerson};
         let mut doc = Doc::new("Notes.ods");
         doc.wb.set_comments(0, vec![(0, 0, Some(Comment::new("Ana", "Plain note")))]);
@@ -1334,7 +1334,7 @@ mod document_tests {
             timestamp: "".into(), done: false, text: "Thread".into(), mentions: Arc::default(),
         }]).unwrap();
         doc.wb.set_comments(0, vec![(0, 0, Some(thread))]);
-        assert_eq!(saved_status(&doc, Format::Ods), "Saved “Notes.ods”. ODS saved comment threads as plain notes.");
+        assert_eq!(saved_status(&doc, Format::Ods), "Saved “Notes.ods”.");
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Notes.ods”.");
     }
 

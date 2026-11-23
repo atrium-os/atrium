@@ -10,10 +10,11 @@
 //! CryptoAPI) is decrypted here, inside the sandbox; one protected only
 //! against writing opens with Excel's default password.
 //!
-//! Reported, not carried: merged cells, comments, hyperlinks, drawings and
+//! Reported, not carried: merged cells, drawings and
 //! charts, conditional formats, and macros. Refused: Excel 95
 //! and older (BIFF5 and before) and XOR obfuscation.
 
+mod annotations;
 pub mod biff;
 pub mod formula;
 mod ftab;
@@ -253,12 +254,14 @@ fn color(g: &Globals, icv: u16) -> Option<u32> {
     g.palette.get(icv as usize).copied()
 }
 
+fn font_at(fonts: &[FontRec], index: u16) -> Option<&FontRec> {
+    let index = index as usize;
+    fonts.get(if index >= 4 { index - 1 } else { index })
+}
+
 /// The workbook's cell formats, in `XF` order.
 fn styles(g: &Globals, rep: &mut Report) -> Vec<Style> {
-    let font = |i: u16| -> Option<&FontRec> {
-        let i = i as usize;
-        g.fonts.get(if i >= 4 { i - 1 } else { i })
-    };
+    let font = |i| font_at(&g.fonts, i);
     let base = g.fonts.first();
     let mut out = Vec::with_capacity(g.xfs.len());
     for x in &g.xfs {
@@ -417,6 +420,10 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
     let mut depth = 0u32;
     let mut row_styled = 0u64;
     let mut nested_note = false;
+    let mut note_object = None;
+    let mut note_text = HashMap::new();
+    let mut notes = Vec::new();
+    let mut link_cells = 0u64;
     let cell_at = |r: u32, c: u32| -> bool { c < formula::COLS && r < formula::ROWS };
     for (i, r) in recs.iter().enumerate() {
         if i == 0 {
@@ -610,8 +617,38 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
                 }
             }
             0x00E5 => rep.note(Kind::Approximate, "merged cells shown unmerged"),
-            0x001C => rep.note(Kind::Dropped, "comments"),
-            0x01B8 => rep.note(Kind::Dropped, "hyperlinks"),
+            0x001C => match annotations::Note::read(r) {
+                Ok(note) if notes.len() < officina_grid::comments::MAX_COMMENTS => notes.push(note),
+                _ => rep.note(Kind::Dropped, "malformed or excessive BIFF8 notes"),
+            },
+            0x01B6 => {
+                if let Some(object) = note_object.take() {
+                    if let Ok((text, damaged)) = annotations::Text::read(r, &g.fonts) {
+                        if damaged {
+                            rep.note(Kind::Approximate, "BIFF8 notes with damaged formatting (kept the text)");
+                        }
+                        note_text.entry(object).or_insert(text);
+                    }
+                }
+            }
+            0x01B8 => match annotations::hyperlink(s, r) {
+                Ok((rect, link)) => {
+                    let cells = u64::from(rect.r1 - rect.r0 + 1) * u64::from(rect.c1 - rect.c0 + 1);
+                    if link_cells + cells <= officina_grid::links::MAX_LINKS as u64 {
+                        let mut links = Vec::with_capacity(cells as usize);
+                        for row in rect.r0..=rect.r1 {
+                            for col in rect.c0..=rect.c1 {
+                                links.push((row, col, Some(link.clone())));
+                            }
+                        }
+                        wb.set_links(s, links);
+                        link_cells += cells;
+                    } else {
+                        rep.note(Kind::Dropped, "BIFF8 hyperlink ranges past the sheet limit");
+                    }
+                }
+                Err(_) => rep.note(Kind::Dropped, "malformed or unsupported BIFF8 hyperlinks"),
+            },
             0x01BE => {
                 if wb.validations().len() >= officina_grid::validation::MAX_VALIDATIONS {
                     rep.note(Kind::Dropped, "BIFF8 data validation rules past the limits");
@@ -631,9 +668,10 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
             0x01B0 | 0x01B1 => rep.note(Kind::Dropped, "conditional formats"),
             0x005D => {
                 // OBJ: its common data names the kind of object.
+                note_object = None;
                 c.skip(4)?;
                 match c.u16()? {
-                    0x19 => {}
+                    0x19 => note_object = c.u16().ok(),
                     0x05 => rep.note(Kind::Dropped, "charts"),
                     0x08 => rep.note(Kind::Dropped, "pictures"),
                     0x07 | 0x0B | 0x0C | 0x0E | 0x10 | 0x11 | 0x12 | 0x14 => rep.note(Kind::Dropped, "form controls"),
@@ -651,6 +689,15 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
             _ => {}
         }
     }
+    let mut comments = Vec::with_capacity(notes.len());
+    for note in notes {
+        if let Some(text) = note_text.remove(&note.object) {
+            comments.push((note.row, note.col, Some(text.comment(&note.author))));
+        } else {
+            rep.note(Kind::Dropped, "BIFF8 notes without their comment text");
+        }
+    }
+    wb.set_comments(s, comments);
     if row_styled > 0 {
         out.report.note_n(Kind::Approximate, "row formats on empty cells not kept (cells keep their own)", row_styled);
     }
@@ -829,12 +876,6 @@ fn read_with(data: &[u8], password: Option<&str>, formulas: bool) -> Result<(Wor
         if n.func || n.rgce.is_empty() {
             continue;
         }
-        if n.builtin {
-            if n.name != "_xlnm._FilterDatabase" {
-                rep.note_at(Kind::Dropped, "print areas, print titles and other built-in names", || n.name.clone());
-            }
-            continue;
-        }
         let scope = match n.itab {
             0 => None,
             t => match ids.get(t as usize - 1) {
@@ -842,6 +883,26 @@ fn read_with(data: &[u8], password: Option<&str>, formulas: bool) -> Result<(Wor
                 _ => continue,
             },
         };
+        if n.builtin {
+            use officina_grid::print;
+            let parsed = || formula::decompile(&n.rgce, &n.rgcb, 0, 0, false, &ctx).ok();
+            let preserved = match n.name.as_str() {
+                print::AREA => scope.zip(parsed()).is_some_and(|(sheet, text)| {
+                    let src = crate::xlsx::read::formula_in(&text);
+                    let valid = wb.parse(&src, sheet, 0, 0).ok().is_some_and(|e| print::area(&e, sheet).is_some());
+                    valid && wb.define_name(print::AREA, scope, &src).is_ok()
+                }),
+                print::TITLES => scope.zip(parsed()).is_some_and(|(sheet, text)| {
+                    crate::xlsx::read::define_print_titles(&mut wb, sheet, &text)
+                }),
+                "_xlnm._FilterDatabase" => true,
+                _ => false,
+            };
+            if !preserved {
+                rep.note_at(Kind::Dropped, "unsupported BIFF8 print settings or built-in names", || n.name.clone());
+            }
+            continue;
+        }
         // Relative parts are offsets from the cell that uses the name: read
         // them from mid-grid, where BIFF8's wrapping offsets land on both sides.
         let (br, bc) = (formula::ROWS / 2, formula::COLS / 2);

@@ -1417,25 +1417,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
             None => None,
         };
         if name.eq_ignore_ascii_case(officina_grid::print::TITLES) {
-            if let Some(sheet) = scope {
-                let refs = crate::ods::formula::split_outside_quotes(text, ',');
-                let mut axes = Vec::new();
-                let valid = refs.len() <= 2 && refs.iter().all(|part| {
-                    let src = formula_in(part.trim());
-                    let Some((axis, _)) = wb.parse(&src, sheet, 0, 0).ok()
-                        .and_then(|expr| officina_grid::print::title(&expr, sheet)) else { return false };
-                    if axes.iter().any(|(seen, _)| *seen == axis) { return false; }
-                    axes.push((axis, src));
-                    true
-                });
-                if valid && axes.len() + wb.names().len() <= officina_grid::names::MAX_NAMES {
-                    for (axis, src) in axes {
-                        wb.define_name(axis, scope, &src).map_err(|e| bad(e.to_string()))?;
-                    }
-                    continue;
-                }
+            if !scope.is_some_and(|sheet| define_print_titles(&mut wb, sheet, text)) {
+                rep.note(Kind::Dropped, "unsupported print titles");
             }
-            rep.note(Kind::Dropped, "unsupported print titles");
             continue;
         }
         if wb.define_name(name, scope, &formula_in(text)).is_err() {
@@ -1635,6 +1619,24 @@ pub(crate) fn missing_top_level_function(wb: &Workbook, sheet: u16, mut expr: &E
         expr = inner;
     }
     matches!(expr, Expr::Call(Func::Unknown(name), _) if wb.names().get(sheet, name).is_none())
+}
+
+pub(crate) fn define_print_titles(wb: &mut Workbook, sheet: u16, text: &str) -> bool {
+    let refs = crate::ods::formula::split_outside_quotes(text, ',');
+    if refs.len() > 2 || refs.len() + wb.names().len() > officina_grid::names::MAX_NAMES {
+        return false;
+    }
+    let mut axes = Vec::new();
+    for part in refs {
+        let src = formula_in(part.trim());
+        let Some((axis, _)) = wb.parse(&src, sheet, 0, 0).ok()
+            .and_then(|expr| officina_grid::print::title(&expr, sheet)) else { return false };
+        if axes.iter().any(|(seen, _)| *seen == axis) {
+            return false;
+        }
+        axes.push((axis, src));
+    }
+    axes.into_iter().all(|(axis, src)| wb.define_name(axis, Some(sheet), &src).is_ok())
 }
 
 /// Places one sheet's formula cells: each parsed at its cell (a shared formula

@@ -169,3 +169,112 @@ pub fn validation_workbook() -> Vec<u8> {
     rec(&mut s, biff::EOF, &[]);
     crate::cfb::write(&[("Workbook", &s)])
 }
+
+/// BIFF8 notes, links and print ranges for the desktop print fixture.
+pub fn print_workbook(labels: &[(u16, u16, &str)]) -> Vec<u8> {
+    fn words(out: &mut Vec<u8>, values: &[u16]) {
+        for n in values {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+
+    fn area(bounds: [u16; 4]) -> Vec<u8> {
+        let mut token = vec![0x3B];
+        words(&mut token, &[0]); // First EXTERNSHEET entry, the local worksheet.
+        words(&mut token, &bounds);
+        token
+    }
+
+    fn name(out: &mut Vec<u8>, code: u8, tokens: &[u8]) {
+        let mut data = vec![0x20, 0, 0, 1]; // Built-in name, one character.
+        words(&mut data, &[tokens.len() as u16, 0, 1, 0, 0]);
+        data.extend_from_slice(&[0, code]);
+        data.extend_from_slice(tokens);
+        rec(out, 0x0018, &data);
+    }
+
+    fn link(out: &mut Vec<u8>, bounds: [u16; 4], external: bool, text: &str) {
+        let mut data = Vec::new();
+        words(&mut data, &bounds);
+        data.extend_from_slice(&[0xD0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0, 0xAA, 0, 0x4B, 0xA9, 0x0B]);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let units: Vec<_> = text.encode_utf16().chain([0]).collect();
+        if external {
+            data.extend_from_slice(&3u32.to_le_bytes()); // Absolute URL moniker.
+            data.extend_from_slice(&[0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0, 0xAA, 0, 0x4B, 0xA9, 0x0B]);
+            data.extend_from_slice(&(units.len() as u32 * 2).to_le_bytes());
+        } else {
+            data.extend_from_slice(&8u32.to_le_bytes()); // In-workbook location string.
+            data.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        }
+        words(&mut data, &units);
+        rec(out, 0x01B8, &data);
+    }
+
+    let mut stream = Vec::new();
+    rec(&mut stream, biff::BOF, &bof(0x0005));
+    let sheet_at = stream.len() + 4;
+    rec(&mut stream, biff::BOUNDSHEET, b"\0\0\0\0\0\0\x06\0Report");
+    rec(&mut stream, 0x01AE, &[1, 0, 1, 4]); // One sheet in the current workbook.
+    rec(&mut stream, 0x0017, &[1, 0, 0, 0, 0, 0, 0, 0]);
+    name(&mut stream, 6, &area([3, 89, 3, 14]));
+    let mut titles = area([1, 1, 0, 255]);
+    titles.extend(area([0, 65535, 1, 1]));
+    titles.push(0x10); // PtgUnion.
+    name(&mut stream, 7, &titles);
+    for (options, weight) in [(0, 400), (0, 700), (2, 400)] {
+        let mut font = Vec::new();
+        words(&mut font, &[220, options, 0x7FFF, weight, 0]);
+        font.extend_from_slice(b"\0\0\0\0\x05\0Arial");
+        rec(&mut stream, 0x0031, &font);
+    }
+    rec(&mut stream, biff::EOF, &[]);
+    let at = stream.len() as u32;
+    stream[sheet_at..sheet_at + 4].copy_from_slice(&at.to_le_bytes());
+    rec(&mut stream, biff::BOF, &bof(0x0010));
+
+    for &(row, col, label) in labels {
+        let mut cell = Vec::new();
+        words(&mut cell, &[row, col, 0, label.len() as u16]);
+        cell.push(0);
+        cell.extend_from_slice(label.as_bytes());
+        rec(&mut stream, 0x0204, &cell);
+    }
+    let mut num = vec![3, 0, 4, 0, 0, 0];
+    num.extend_from_slice(&3.0f64.to_le_bytes());
+    rec(&mut stream, 0x0203, &num);
+    let mut calc = vec![3, 0, 5, 0, 0, 0];
+    calc.extend_from_slice(&63.0f64.to_le_bytes());
+    calc.extend_from_slice(&[0; 6]);
+    let rgce = [0x44, 3, 0, 4, 0xC0, 0x1E, 21, 0, 0x05];
+    words(&mut calc, &[rgce.len() as u16]);
+    calc.extend_from_slice(&rgce);
+    rec(&mut stream, 0x0006, &calc);
+    for (col, width) in [(0, 3218), (1, 3365), (2, 3511)] {
+        let mut data = Vec::new();
+        words(&mut data, &[col, col, width, 0, 0, 0]);
+        rec(&mut stream, 0x007D, &data);
+    }
+
+    let mut object = Vec::new();
+    words(&mut object, &[0x0015, 18, 0x19, 11, 0x4011, 0, 0, 0, 0, 0, 0, 0, 0]);
+    rec(&mut stream, 0x005D, &object);
+    let mut txo = vec![0; 10];
+    words(&mut txo, &[5, 24, 0, 0]);
+    rec(&mut stream, 0x01B6, &txo);
+    rec(&mut stream, biff::CONTINUE, b"\0Hi ");
+    let mut tail = vec![1];
+    words(&mut tail, &"🧭".encode_utf16().collect::<Vec<_>>());
+    rec(&mut stream, biff::CONTINUE, &tail);
+    let mut runs = Vec::new();
+    words(&mut runs, &[0, 1, 0, 0, 3, 2, 0, 0, 5, 0, 0, 0]);
+    rec(&mut stream, biff::CONTINUE, &runs);
+    let mut note = Vec::new();
+    words(&mut note, &[3, 3, 0, 11, 3]);
+    note.extend_from_slice(b"\0Ana\0");
+    rec(&mut stream, 0x001C, &note);
+    link(&mut stream, [3, 3, 3, 3], false, "Report!$F$4");
+    link(&mut stream, [4, 4, 3, 4], true, "https://example.test/report");
+    rec(&mut stream, biff::EOF, &[]);
+    crate::cfb::write(&[("Workbook", &stream)])
+}

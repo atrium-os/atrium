@@ -2,9 +2,11 @@
 use std::{env, fs, path::Path};
 
 use officina_convert::zip::{crc32, Archive, ZipWriter};
-use officina_convert::{ods, xlsx};
+use officina_convert::{ods, xls, xlsx};
 use officina_grid::charts::{Anchor, Picture};
+use officina_grid::comments::{Comment, ThreadMention, ThreadMessage, ThreadPerson};
 use officina_grid::{print, CellAddr, Value, Workbook};
+use std::sync::Arc;
 
 const IMAGE_PATH: &str = "Pictures/proof.png";
 
@@ -51,22 +53,24 @@ fn picture(row: u32) -> Picture {
     }
 }
 
+const LABELS: &[(u16, u16, &str)] = &[
+    (0, 0, "Frozen"),
+    (1, 1, "Corner"),
+    (1, 3, "NearTitle"),
+    (1, 14, "FarTitle"),
+    (3, 1, "NearKey"),
+    (69, 1, "FarKey"),
+    (3, 2, "OutLeft"),
+    (3, 15, "OutRight"),
+    (90, 3, "OutBottom"),
+    (79, 14, "FarBody"),
+];
+
 fn workbook() -> Workbook {
     let mut book = Workbook::new();
     book.add_sheet("Report").unwrap();
-    for (row, col, text) in [
-        (0, 0, "Frozen"),
-        (1, 1, "Corner"),
-        (1, 3, "NearTitle"),
-        (1, 14, "FarTitle"),
-        (3, 1, "NearKey"),
-        (69, 1, "FarKey"),
-        (3, 2, "OutLeft"),
-        (3, 15, "OutRight"),
-        (90, 3, "OutBottom"),
-        (79, 14, "FarBody"),
-    ] {
-        book.set_value(at(row, col), Value::str(text));
+    for &(row, col, text) in LABELS {
+        book.set_value(at(row.into(), col.into()), Value::str(text));
     }
     book.set_value(at(3, 4), Value::Num(3.0));
     book.set_formula(at(3, 5), "=E4*21").unwrap();
@@ -155,9 +159,77 @@ fn make(dir: &Path) {
     .unwrap();
 }
 
+fn conversation() -> Comment {
+    let ana = Arc::new(ThreadPerson {
+        id: 10,
+        name: "Ana".into(),
+        user_id: "ana@example.test".into(),
+        provider_id: "local".into(),
+    });
+    let jo = Arc::new(ThreadPerson {
+        id: 20,
+        name: "Jo".into(),
+        user_id: "jo@example.test".into(),
+        provider_id: "local".into(),
+    });
+    Comment::threaded(vec![
+        ThreadMessage {
+            id: 11,
+            parent: None,
+            author: ana.clone(),
+            timestamp: "2026-11-23T12:00:00Z".into(),
+            done: true,
+            text: "Check  🧭\n@Jo".into(),
+            mentions: vec![ThreadMention {
+                id: 12,
+                person: jo.clone(),
+                start: 12,
+                end: 15,
+            }]
+            .into(),
+        },
+        ThreadMessage {
+            id: 21,
+            parent: Some(11),
+            author: jo,
+            timestamp: "2026-11-23T12:30:00Z".into(),
+            done: false,
+            text: "Checked @Ana".into(),
+            mentions: vec![ThreadMention {
+                id: 22,
+                person: ana,
+                start: 8,
+                end: 12,
+            }]
+            .into(),
+        },
+    ])
+    .unwrap()
+}
+
+fn make_comments_print(dir: &Path) {
+    let mut book = workbook();
+    book.set_comments(
+        0,
+        vec![
+            (3, 3, Some(conversation())),
+            (4, 3, Some(Comment::new("Ana", "Plain control"))),
+        ],
+    );
+    fs::write(dir.join("sales.ods"), ods_fixture(&book)).unwrap();
+    fs::write(dir.join("legacy.xls"), xls::sample::print_workbook(LABELS)).unwrap();
+}
+
 fn check(file: &Path, state: &str) {
     let bytes = fs::read(file).unwrap();
-    let book = match file.extension().unwrap().to_str().unwrap() {
+    let format = file.extension().unwrap().to_str().unwrap();
+    let (state, variant) = state.split_once('-').unwrap_or((state, ""));
+    let book = match format {
+        "xls" => {
+            let (book, loaded) = xls::read(&bytes, None).unwrap();
+            assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+            book
+        }
         "ods" => {
             let (book, loaded) = ods::read(&bytes).unwrap();
             assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
@@ -187,7 +259,10 @@ fn check(file: &Path, state: &str) {
         _ => panic!("Unexpected format"),
     };
     assert_eq!(book.sheet_name(0), "Report");
-    assert_eq!(book.sheet(0).freeze, (1, 1));
+    assert_eq!(
+        book.sheet(0).freeze,
+        if variant == "legacy" { (0, 0) } else { (1, 1) }
+    );
     let value = match state {
         "initial" => 3.0,
         "edited" => 8.0,
@@ -198,6 +273,31 @@ fn check(file: &Path, state: &str) {
     let area = book.names().get(0, print::AREA).unwrap();
     assert_eq!(print::area(&area.expr, 0), Some([3, 3, 90, 15]));
     assert_eq!(print::titles(&book, 0), (Some((1, 2)), Some((1, 2))));
+    if variant == "legacy" {
+        let note = book.comment(0, 3, 3).unwrap();
+        assert_eq!((&*note.author, &*note.text), ("Ana", "Hi 🧭"));
+        let runs: Vec<_> = note
+            .segments()
+            .map(|(text, style)| (text, style.bold, style.italic))
+            .collect();
+        assert_eq!(runs, [("Hi ", true, false), ("🧭", false, true)]);
+        assert_eq!(book.link(0, 3, 3).unwrap().place(&book, 0), Some(at(3, 5)));
+        for col in 3..=4 {
+            assert_eq!(
+                &*book.link(0, 4, col).unwrap().target,
+                "https://example.test/report"
+            );
+        }
+        assert!(book.pictures().is_empty());
+        return;
+    }
+    if variant == "threads" {
+        assert_eq!(book.comment(0, 3, 3).unwrap(), &conversation());
+        assert_eq!(
+            book.comment(0, 4, 3).unwrap(),
+            &Comment::new("Ana", "Plain control")
+        );
+    }
     assert_eq!(book.pictures().len(), 2);
     for (actual, expected) in book.pictures().iter().zip([picture(5), picture(92)]) {
         assert_eq!(actual.bytes, expected.bytes);
@@ -219,7 +319,77 @@ fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     match args.as_slice() {
         [action, dir] if action == "make" => make(Path::new(dir)),
+        [action, dir] if action == "make-comments-print" => make_comments_print(Path::new(dir)),
         [action, file, state] if action == "check" => check(Path::new(file), state),
-        _ => panic!("usage: sheets_print_fixture make DIR | check FILE STATE"),
+        _ => panic!(
+            "usage: sheets_print_fixture make DIR | make-comments-print DIR | check FILE STATE"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ods_threads_round_trip_and_visible_edits_take_precedence() {
+        let mut book = workbook();
+        let thread = conversation();
+        book.set_comments(0, vec![(0, 0, Some(thread.clone()))]);
+        let bytes = ods::write(&book, Vec::new()).unwrap();
+        let (reopened, loaded) = ods::read(&bytes).unwrap();
+        assert_eq!(reopened.comment(0, 0, 0), Some(&thread));
+        assert!(loaded.report.is_empty());
+
+        for malformed in [false, true] {
+            let archive = Archive::open(&bytes).unwrap();
+            let mut out = ZipWriter::new(Vec::new());
+            for part in &archive.entries {
+                let bytes = archive.read(part).unwrap();
+                if part.name == "content.xml" {
+                    let xml = String::from_utf8(bytes).unwrap();
+                    let edited = if malformed {
+                        xml.replace(
+                            "atrium:comment-thread-v1=\"",
+                            "atrium:comment-thread-v1=\"invalid",
+                        )
+                    } else {
+                        xml.replace("Checked @Ana", "Edited in another editor")
+                    };
+                    assert_ne!(edited, xml);
+                    out.add(&part.name, edited.as_bytes()).unwrap();
+                } else if part.name == "mimetype" {
+                    out.add_stored(&part.name, &bytes).unwrap();
+                } else {
+                    out.add(&part.name, &bytes).unwrap();
+                }
+            }
+            let (reopened, loaded) = ods::read(&out.finish().unwrap()).unwrap();
+            let comment = reopened.comment(0, 0, 0).unwrap();
+            assert!(comment.thread().is_empty());
+            assert!(comment.text.contains(if malformed {
+                "Checked @Ana"
+            } else {
+                "Edited in another editor"
+            }));
+            assert_eq!(loaded.report.human().len(), 1);
+            assert!(loaded.report.human()[0].contains("kept the"));
+        }
+    }
+
+    #[test]
+    fn legacy_notes_links_area_and_titles_survive_native_round_trip() {
+        let bytes = xls::sample::print_workbook(LABELS);
+        let (book, loaded) = xls::read(&bytes, None).unwrap();
+        assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+        let native = officina_grid::native::save_to_vec(&book);
+        let reopened = officina_grid::native::load(&native).unwrap();
+        assert_eq!(reopened.comments(0), book.comments(0));
+        assert_eq!(reopened.links(0), book.links(0));
+        let area = reopened.names().get(0, print::AREA).unwrap();
+        assert_eq!(print::area(&area.expr, 0), Some([3, 3, 90, 15]));
+        assert_eq!(print::titles(&reopened, 0), (Some((1, 2)), Some((1, 2))));
+        assert_eq!(reopened.get(at(1, 3)), Value::str("NearTitle"));
+        assert_eq!(reopened.get(at(3, 5)), Value::Num(63.0));
     }
 }

@@ -810,7 +810,9 @@ fn time_text(x: f64) -> String {
 /// The cell's comment as an `office:annotation`, if it has one.
 fn note(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32) {
     let Some(k) = wb.comment(s, r, c) else { return };
-    out.push_str("<office:annotation>");
+    out.push_str("<office:annotation");
+    super::comments::write_thread(out, k);
+    out.push('>');
     if !k.author.is_empty() {
         out.push_str("<dc:creator>");
         esc(out, &k.author);

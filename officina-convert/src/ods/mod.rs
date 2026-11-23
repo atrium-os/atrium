@@ -2,6 +2,7 @@
 //! for the document process.
 
 pub(crate) mod chart;
+mod comments;
 pub(crate) mod condfmt;
 #[cfg(feature = "read")]
 mod filter;
@@ -18,3 +19,4 @@ pub mod write;
 pub use read::{read, OdsError};
 pub use write::write;
 pub use pivot::supports as supports_pivot;
+pub use comments::supports_thread as supports_comment_thread;
