@@ -697,6 +697,14 @@ gateway saw zero POSTs. A separate reconnect used a distinct attempt
 and kept IPv4 blocked until fresh confirmation. Confirmation produced
 one POST, one redemption, and `crypta-ac-ok` through ocserv on `tun12`.
 
+The requeue variant reconnected after cancellation and queued a
+distinct Crypta attempt before the old jail closed. The latest queued
+request alone launched after teardown, with no additional Sign In
+press. The stale confirmation sent zero POSTs. The new proposal,
+tunnel handshake and IPv4 traffic waited for fresh confirmation.
+Exactly one POST led to one redemption and `crypta-ac-ok` through
+ocserv on `tun12`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
