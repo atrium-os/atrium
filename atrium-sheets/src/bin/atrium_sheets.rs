@@ -262,7 +262,7 @@ struct Run {
     /// A file being read (converted, loaded and recalculated) on its own
     /// thread, so the window keeps answering however big the file is.
     opening: Option<Opening>,
-    merge_base: Option<officina_grid::compare::CellSnapshot>,
+    merge_base: Option<officina_grid::Workbook>,
 }
 
 struct Opening {
@@ -421,12 +421,12 @@ impl Run {
             match (purpose, r) {
                 (Asking::Compare, Ok(d)) => self.sheets.compare_with(&name, d.wb),
                 (Asking::MergeBase, Ok(d)) => {
-                    self.merge_base = Some(officina_grid::compare::CellSnapshot::capture(&d.wb));
+                    self.merge_base = Some(d.wb);
                     *want_picker = Some(Asking::MergeIncoming);
                 }
                 (Asking::MergeIncoming, Ok(d)) => {
                     if let Some(base) = self.merge_base.take() {
-                        self.sheets.merge_copies(&name, &base, &d.wb);
+                        self.sheets.merge_copies(&name, &base, d.wb);
                     } else {
                         self.set_status("The common base is no longer available. Run Merge Copies again.");
                     }

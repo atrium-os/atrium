@@ -23,6 +23,11 @@ use crate::value::Value;
 
 mod annotations;
 mod layout;
+mod merge;
+pub use merge::merge_parts;
+mod sheets;
+pub use sheets::{named_for_review, plan_renames, take_added_sheets};
+pub(crate) use merge::parts_changed_in_band;
 mod parts;
 mod rules;
 mod settings;
@@ -71,6 +76,8 @@ pub enum Change {
     RowsRemoved { sheet: u16, row: u32, n: u32 },
     /// A sheet only theirs has.
     SheetAdded { name: String },
+    SheetRenamed { sheet: u16, before: String, after: String },
+    SheetConflict { name: String, sheet: Option<u16>, versions: Box<[String; 2]> },
     TabOrder { before: Vec<String>, after: Vec<String> },
     /// A sheet only ours has.
     SheetRemoved { sheet: u16 },
@@ -94,7 +101,7 @@ impl Change {
     pub fn reorder_local(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
         let sheet = |s| new.sheet_id(&old.sheet_name(s));
         match self {
-            Self::Cell { sheet: s, .. } | Self::SheetRemoved { sheet: s } |
+            Self::Cell { sheet: s, .. } | Self::SheetRemoved { sheet: s } | Self::SheetRenamed { sheet: s, .. } |
             Self::RowsAdded { sheet: s, .. } | Self::RowsRemoved { sheet: s, .. } |
             Self::StructuralConflict { sheet: s, .. } => *s = sheet(*s)?,
             Self::Style { rect, .. } => rect.sheet = sheet(rect.sheet)?,
@@ -110,6 +117,7 @@ impl Change {
             Self::Table(c) => c.reorder(old, new)?,
             Self::Validations(c) => c.reorder(old, new)?,
             Self::ConditionalFormats(c) => c.reorder(old, new)?,
+            Self::SheetConflict { sheet: s, .. } => { if let Some(id) = s { *id = sheet(*id)?; } }
             Self::TabOrder { .. } | Self::SheetAdded { .. } => {}
         }
         Some(())
@@ -118,8 +126,9 @@ impl Change {
     /// Our sheet it is on, if any.
     pub fn sheet(&self) -> Option<u16> {
         match *self {
-            Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::StructuralConflict { sheet, .. } => Some(sheet),
+            Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::SheetRenamed { sheet, .. } | Change::StructuralConflict { sheet, .. } => Some(sheet),
             Change::Style { rect, .. } => Some(rect.sheet),
+            Change::SheetConflict { sheet, .. } => sheet,
             Change::Comment(ref comment) => Some(comment.at.sheet),
             Change::Link(ref link) => Some(link.at.sheet),
             Change::Chart(ref chart) => chart.sheet,
@@ -142,7 +151,8 @@ impl Change {
             Change::Cell { sheet, row, col, .. } => Some((sheet, row, col)),
             Change::RowsAdded { sheet, at, .. } => Some((sheet, at, 0)),
             Change::RowsRemoved { sheet, row, .. } => Some((sheet, row, 0)),
-            Change::SheetRemoved { sheet } => Some((sheet, 0, 0)),
+            Change::SheetRemoved { sheet } | Change::SheetRenamed { sheet, .. } => Some((sheet, 0, 0)),
+            Change::SheetConflict { sheet, .. } => sheet.map(|sheet| (sheet, 0, 0)),
             Change::StructuralConflict { sheet, axis, at, .. } => Some(match axis {
                 crate::shift::Axis::Rows => (sheet, at, 0),
                 crate::shift::Axis::Cols => (sheet, 0, at),
@@ -222,12 +232,61 @@ impl Change {
                     let flags = [(font.bold, "bold"), (font.italic, "italic"), (font.underline, "underline"), (font.strike, "strikethrough")]
                         .into_iter().filter_map(|(on, label)| on.then_some(label)).collect::<Vec<_>>();
                     let size = font.size.map_or_else(|| "default".into(), |s| format!("{} pt", f64::from(s) / 20.0));
-                    format!("Number format: {}\nFont: {}, {size} {}\nText color: {}\nFill: {}\nAlignment: {:?}, {:?}\nWrap: {} · Indent: {} · Rotation: {}°",
+                    let mut text = format!("Number format: {}\nFont: {}, {size} {}\nText color: {}\nFill: {}\nAlignment: {:?}, {:?}\nWrap: {} · Shrink: {} · Indent: {} · Rotation: {}°",
                         style.num_fmt, font.name.as_deref().unwrap_or("default"), flags.join(", "),
-                        color(font.color), color(style.fill), style.h_align, style.v_align, style.wrap, style.indent, style.rotation)
+                        color(font.color), color(style.fill), style.h_align, style.v_align, style.wrap,
+                        style.shrink_to_fit, style.indent, style.rotation);
+                    if let Some(pattern) = &style.pattern { text.push_str(&format!("\nPattern: {pattern:?}")); }
+                    if let Some(gradient) = &style.gradient { text.push_str(&format!("\nGradient: {gradient:?}")); }
+                    for (side, edge) in ["Left", "Right", "Top", "Bottom", "Down diagonal", "Up diagonal"]
+                        .into_iter().zip(style.borders.iter().chain(&style.diagonals))
+                    {
+                        if *edge != crate::style::Edge::default() { text.push_str(&format!("\n{side} border: {edge:?}")); }
+                    }
+                    if style.unlocked || style.hide_formula || style.hide_value {
+                        text.push_str(&format!("\nProtection: unlocked {} · hide formula {} · hide value {}",
+                            style.unlocked, style.hide_formula, style.hide_value));
+                    }
+                    text
                 };
                 versions(self.describe(ours, theirs), props(before), props(after))
             }
+            Change::Setting(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::RowHeight(change) | Change::ColumnWidth(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Chart(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Picture(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Table(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Pivot(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::ConditionalFormats(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Validations(change) => {
+                let (before, after) = change.details();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::SheetRenamed { before, after, .. } => versions("Worksheet name".into(), before.clone(), after.clone()),
+            Change::SheetConflict { versions: sides, .. } => versions(self.describe(ours, theirs), sides[0].clone(), sides[1].clone()),
+            Change::SheetAdded { .. } => versions(self.describe(ours, theirs), "(absent)".into(), "Worksheet present".into()),
+            Change::SheetRemoved { .. } => versions(self.describe(ours, theirs), "Worksheet present".into(), "(absent)".into()),
             Change::StructuralConflict { versions: sides, .. } =>
                 versions(self.describe(ours, theirs), sides[0].clone(), sides[1].clone()),
             _ => self.describe(ours, theirs),
@@ -279,6 +338,8 @@ impl Change {
                 crate::shift::Axis::Cols => format!("Column {}: {reason}", crate::addr::col_name(*at)),
             },
             Change::TabOrder { .. } => "Worksheet tab order changed".into(),
+            Change::SheetRenamed { before, after, .. } => format!("Sheet “{before}” → “{after}”"),
+            Change::SheetConflict { name, .. } => format!("Sheet “{name}” conflict"),
             Change::SheetAdded { name } => format!("Sheet “{name}” added"),
             Change::SheetRemoved { sheet } => format!("Sheet “{}” removed", ours.sheet_name(*sheet)),
         }
@@ -297,6 +358,21 @@ fn theirs_row_text(theirs: &Workbook, ours: &Workbook, ch: &Change, row: u32) ->
 /// What turns `ours` into `theirs`, at most [`MAX_CHANGES`]; the flag says
 /// whether more were left out.
 pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
+    let Ok(named) = named_for_review(ours, theirs) else { return compare_named(ours, theirs); };
+    let Some(named) = named else { return compare_named(ours, theirs); };
+    let (mut changes, more) = compare_named(ours, &named);
+    for sheet in 0..ours.sheet_count() as u16 {
+        let Some(source) = sheets::matched_sheet(ours, sheet, theirs) else { continue };
+        let (before, after) = (ours.sheet_name(sheet), theirs.sheet_name(source));
+        if ours.sheet(sheet).identity != 0 && ours.sheet(sheet).identity == theirs.sheet(source).identity && before != after {
+            if changes.len() == MAX_CHANGES { return (changes, true); }
+            changes.push(Change::SheetRenamed { sheet, before, after });
+        }
+    }
+    (changes, more)
+}
+
+fn compare_named(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
     let mut out = Vec::new();
     let mut more = false;
     for s in 0..ours.sheet_count() as u16 {
@@ -316,21 +392,35 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
             out.push(Change::SheetAdded { name });
         }
     }
-    for change in parts::chart_matches(ours, theirs).chain(parts::picture_matches(ours, theirs)).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)).chain(tables::compare(ours, theirs)) {
+    for change in workbook_parts(ours, theirs) {
         if out.len() == MAX_CHANGES { return (out, true); }
         out.push(change);
     }
+    if let Some(change) = tab_order(ours, theirs) {
+        if out.len() == MAX_CHANGES { return (out, true); }
+        out.push(change);
+    }
+    (out, more)
+}
+
+fn review_value(value: &impl std::fmt::Debug) -> String {
+    format!("{value:#?}")
+}
+
+fn workbook_parts<'a>(ours: &'a Workbook, theirs: &'a Workbook) -> impl Iterator<Item = Change> + 'a {
+    parts::chart_matches(ours, theirs).chain(parts::picture_matches(ours, theirs))
+        .chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs))
+        .chain(tables::compare(ours, theirs))
+}
+
+pub fn tab_order(ours: &Workbook, theirs: &Workbook) -> Option<Change> {
     let before: Vec<_> = (0..ours.sheet_count() as u16).map(|s| ours.sheet_name(s)).collect();
     let mut shared = (0..theirs.sheet_count() as u16).filter_map(|t| ours.sheet_id(&theirs.sheet_name(t)));
     let after: Vec<_> = before.iter().map(|name| {
         if theirs.sheet_id(name).is_some() { ours.sheet_name(shared.next().expect("matched sheet")) }
         else { name.clone() }
     }).collect();
-    if before != after {
-        if out.len() == MAX_CHANGES { return (out, true); }
-        out.push(Change::TabOrder { before, after });
-    }
-    (out, more)
+    (before != after).then_some(Change::TabOrder { before, after })
 }
 
 /// Sparse, positional cell inputs for tracking edits and merging copies
@@ -351,18 +441,29 @@ pub enum MergeError {
     SheetLayout,
     TooManyChanges,
     StructuralAlignment,
+    CannotApply,
+}
+
+fn snapshot_name(wb: &Workbook, sheet: u16, merge: bool) -> String {
+    let name = wb.sheet_name(sheet);
+    if merge { name.to_ascii_lowercase() } else { name }
 }
 
 impl CellSnapshot {
-    pub fn capture(wb: &Workbook) -> Self {
+    pub fn capture(wb: &Workbook) -> Self { Self::capture_inputs(wb, false) }
+
+    pub(crate) fn for_merge(wb: &Workbook) -> Self { Self::capture_inputs(wb, true) }
+
+    fn capture_inputs(wb: &Workbook, skip_pivots: bool) -> Self {
         let sheets = (0..wb.sheet_count() as u16).map(|sheet| {
-            let inputs = Rows::of(wb, sheet).rows.into_iter().flat_map(|(row, cells)| {
+            let pivot_areas = if skip_pivots { tables::pivot_areas(wb, sheet) } else { Vec::new() };
+            let inputs = Rows::outside(wb, sheet, &pivot_areas).rows.into_iter().flat_map(|(row, cells)| {
                 cells.into_iter().map(move |(col, _)| ((row, col), wb.input(CellAddr::new(sheet, row, col))))
             }).collect();
-            (wb.sheet_name(sheet), inputs)
+            (snapshot_name(wb, sheet, skip_pivots), inputs)
         }).collect();
         let axes = (0..wb.sheet_count() as u16).map(|sheet| {
-            (wb.sheet_name(sheet), wb.sheet(sheet).axis_ids.clone())
+            (snapshot_name(wb, sheet, skip_pivots), wb.sheet(sheet).axis_ids.clone())
         }).collect();
         Self { sheets, axes }
     }
@@ -387,11 +488,14 @@ impl CellSnapshot {
         if self.sheets.keys().ne(current.sheets.keys()) || self.sheets.keys().ne(theirs.sheets.keys()) {
             return Err(MergeError::SheetLayout);
         }
+        self.plan_shared(wb, current, theirs)
+    }
+
+    pub(crate) fn plan_shared(&self, wb: &Workbook, current: &Self, theirs: &Self) -> Result<MergePlan, MergeError> {
         let mut plan = MergePlan { incoming: Vec::new(), conflicts: Vec::new() };
         for (name, base) in &self.sheets {
+            let (Some(local), Some(other)) = (current.sheets.get(name), theirs.sheets.get(name)) else { continue };
             let sheet = wb.sheet_id(name).expect("matching sheet");
-            let local = &current.sheets[name];
-            let other = &theirs.sheets[name];
             // Only incoming edits can require either an apply or a decision.
             for (&(row, col), value) in other.iter().chain(base.iter().filter(|(key, _)| !other.contains_key(key))) {
                 let key = (row, col);
@@ -425,10 +529,6 @@ struct Rows {
 }
 
 impl Rows {
-    fn of(wb: &Workbook, sheet: u16) -> Rows {
-        Self::outside(wb, sheet, &[])
-    }
-
     fn outside(wb: &Workbook, sheet: u16, excluded: &[Rect]) -> Rows {
         let (n, cols) = wb.extent(sheet);
         let mut rows: HashMap<u32, Vec<(u32, Key)>> = HashMap::new();
@@ -714,7 +814,7 @@ fn theirs_sheet(theirs: &Workbook, ours: &Workbook, s: u16) -> u16 {
 /// The edits that take `ch` from theirs, in order: a cell takes their
 /// cell; rows added are inserted (references to the rows below follow)
 /// and given their cells; rows removed are deleted. Sheets added or
-/// removed can't be taken (None).
+/// return None when the change cannot be applied to the current workbook.
 pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridOp>> {
     use crate::shift::{shift_op, Axis};
     match ch {
@@ -799,7 +899,13 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             Some(ops)
         }
         Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
-        Change::SheetAdded { .. } | Change::SheetRemoved { .. } | Change::StructuralConflict { .. } => None,
+        Change::SheetAdded { name } => take_added_sheets(ours, theirs, &[name]),
+        Change::SheetRemoved { sheet } => crate::sheetops::delete_sheet_op(ours, *sheet).map(|op| vec![op]),
+        Change::SheetRenamed { sheet, before, after } => {
+            if ours.sheet_name(*sheet) != *before || ours.sheet_name_ok(after, Some(*sheet)).is_err() { return None; }
+            crate::sheetops::rename_sheet_op(ours, *sheet, after).map(|op| vec![op])
+        }
+        Change::SheetConflict { .. } | Change::StructuralConflict { .. } => None,
     }
 }
 

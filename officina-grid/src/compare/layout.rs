@@ -21,6 +21,10 @@ pub struct MergeChange {
 }
 
 impl MergeChange {
+    pub(super) fn intersects(&self, intersects: impl Fn(Rect) -> bool) -> bool {
+        self.before.is_some_and(&intersects) || self.after.is_some_and(intersects)
+    }
+
     pub(super) fn reorder(&mut self, sheet: u16) {
         self.at.sheet = sheet;
         for r in self.before.iter_mut().chain(self.after.iter_mut()) { r.sheet = sheet; }
@@ -52,12 +56,25 @@ struct Size {
 pub struct SizeChange {
     pub(super) at: CellAddr,
     name: Arc<str>,
-    whole_axis: bool,
+    pub(super) whole_axis: bool,
     before: Size,
     after: Size,
 }
 
 impl SizeChange {
+    fn show(size: Size) -> String {
+        match (size.over, size.hidden) {
+            (Some(0.0), Some(width)) => format!("Hidden (restore to {width} px)"),
+            (Some(0.0), _) => "Hidden".into(),
+            (Some(width), _) => format!("{width} px"),
+            _ => "Default".into(),
+        }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        (Self::show(self.before), Self::show(self.after))
+    }
+
     pub(super) fn describe(&self, rows: bool) -> String {
         let label = match (self.whole_axis, rows) {
             (true, true) => "Default row height".into(),
@@ -65,12 +82,12 @@ impl SizeChange {
             (false, true) => format!("Row {} height", self.at.row + 1),
             (false, false) => format!("Column {} width", col_name(self.at.col)),
         };
-        let show = |size: Size| match (size.over, size.hidden) {
+        let compact = |size: Size| match (size.over, size.hidden) {
             (Some(0.0), Some(width)) => format!("hidden ({width})"),
             (Some(width), _) => width.to_string(),
             _ => "default".into(),
         };
-        format!("{label}: {} → {}", show(self.before), show(self.after))
+        format!("{label}: {} → {}", compact(self.before), compact(self.after))
     }
 }
 

@@ -20,6 +20,13 @@ pub struct RuleChange<T> {
     after: Vec<T>,
 }
 
+impl<T: std::fmt::Debug> RuleChange<T> {
+    pub(super) fn details(&self) -> (String, String) {
+        let show = |rules: &[T]| if rules.is_empty() { "(none)".into() } else { super::review_value(&rules) };
+        (show(&self.before), show(&self.after))
+    }
+}
+
 trait SheetRule: Clone + PartialEq {
     fn sheet(&self) -> u16;
     fn ranges(&self) -> &[Rect];
@@ -57,6 +64,12 @@ impl SheetRule for Validation {
 
 #[allow(private_bounds)]
 impl<T: SheetRule> RuleChange<T> {
+    pub(super) fn same_incoming(&self, other: &Self, source: &Workbook, other_source: &Workbook) -> bool {
+        let map = sheet_map(source, other_source);
+        self.after.len() == other.after.len() && self.after.iter().zip(&other.after)
+            .all(|(left, right)| remap(left, other.source_sheet, &map).as_ref() == Some(right))
+    }
+
     pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
         self.sheet = new.sheet_id(&old.sheet_name(self.sheet))?;
         let map = sheet_map(old, new);

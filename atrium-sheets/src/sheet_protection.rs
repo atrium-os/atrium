@@ -60,7 +60,7 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
                     .iter()
                     .filter(|rule| wb.sheet_protected(rule.sheet)))
         }),
-        GridOp::AddSheet(_) | GridOp::Freeze { .. } => true,
+        GridOp::AddSheet(_) | GridOp::AddIdentifiedSheet { .. } | GridOp::Freeze { .. } => true,
         GridOp::Pivots(_) | GridOp::Names(_) | GridOp::DropSheet | GridOp::MoveSheet { .. } => {
             false
         }

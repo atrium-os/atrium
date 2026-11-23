@@ -491,60 +491,29 @@ impl Sheets {
         }
     }
 
-    pub fn merge_copies(&self, name: &str, base: &officina_grid::compare::CellSnapshot, incoming: &officina_grid::Workbook) {
-        use crate::review::{merge_error, writable, ReviewMode};
-        use officina_grid::{compare::Change, ops::GridOp, CellAddr};
+    pub fn merge_copies(&self, name: &str, base: &officina_grid::Workbook, incoming: officina_grid::Workbook) {
+        use crate::review::{merge_error, ReviewMode};
 
         let mut d = self.doc.borrow_mut();
-        use officina_grid::structural_merge::{align, Alignment};
-        let alignment = align(base, &d.wb, incoming).and_then(|aligned| match aligned {
-            Alignment::Positional(plan) => Ok((Vec::new(), None, plan)),
-            Alignment::Aligned { ops, local, cells } => Ok((ops, Some(local), cells)),
-            Alignment::Blocked(changes) => Ok((Vec::new(), None, officina_grid::compare::MergePlan {
-                incoming: Vec::new(), conflicts: changes,
-            })),
-        });
-        let (mut ops, aligned, plan) = match alignment {
-            Ok(plan) => plan,
+        let result = crate::review::merge(&mut d, base, incoming);
+        let (other, conflicts, count, structural) = match result {
+            Ok(result) => result,
             Err(error) => {
                 drop(d);
                 self.set_status(merge_error(error));
                 return;
             }
         };
-        let structural = ops.len();
-        let working = aligned.as_deref().unwrap_or(&d.wb);
-        let mut conflicts = plan.conflicts;
-        let mut applied = Vec::new();
-        for change in plan.incoming {
-            let Change::Cell { sheet, row, col, ref theirs, .. } = change else { unreachable!("cell merge") };
-            let addr = CellAddr::new(sheet, row, col);
-            if writable(working, addr) {
-                ops.push(GridOp::set(addr, theirs.clone()));
-                applied.push((addr, change));
-            } else {
-                conflicts.push(change);
-            }
-        }
         let sheets = (0..d.wb.sheet_count() as u16).map(|s| d.wb.sheet_name(s)).collect();
-        d.run("Merge Independent Changes", ops);
-        let mut count = 0;
-        for (addr, change) in applied {
-            if let Change::Cell { ref theirs, .. } = change {
-                if d.wb.input(addr) == *theirs {
-                    count += 1;
-                } else {
-                    conflicts.push(change);
-                }
-            }
-        }
+        let revision = d.edits;
         drop(d);
-        self.open_cell_review(ReviewMode::Merge { sheets }, name.into(), conflicts);
+        self.open_cell_review(ReviewMode::Merge { sheets, revision }, name.into(), conflicts);
+        *self.theirs.borrow_mut() = Some(other);
         let summary = self.review.get_cloned().summary();
-        if structural == 0 {
-            self.set_status(format!("{count} independent cell changes applied. {summary}."));
+        if structural {
+            self.set_status(format!("Merged row and column changes with {count} independent changes. {summary}."));
         } else {
-            self.set_status(format!("Merged row and column changes with {count} cell edits. {summary}."));
+            self.set_status(format!("{count} independent changes applied. {summary}."));
         }
     }
 
@@ -619,31 +588,57 @@ impl Sheets {
         }
         if !matches!(p.mode, rv::ReviewMode::Compare) {
             match c {
-                ReviewCmd::Close => p = rv::ReviewPane::default(),
+                ReviewCmd::Close => {
+                    p = rv::ReviewPane::default();
+                    *self.theirs.borrow_mut() = None;
+                }
                 ReviewCmd::Pick(_) | ReviewCmd::Toggle(_) => unreachable!(),
                 ReviewCmd::Take | ReviewCmd::Keep => {
-                    if let (rv::ReviewMode::Merge { sheets }, Some(i)) = (&p.mode, p.picked) {
-                        if let Some(officina_grid::compare::Change::Cell { sheet, row, col, ours, theirs }) = p.changes.get(i) {
+                    if let (rv::ReviewMode::Merge { sheets, revision }, Some(i)) = (&mut p.mode, p.picked) {
+                        let change = &p.changes[i];
+                        if c == ReviewCmd::Take {
                             let mut d = self.doc.borrow_mut();
-                            let addr = officina_grid::CellAddr::new(*sheet, *row, *col);
-                            if c == ReviewCmd::Take {
-                                let same_sheet = (*sheet as usize) < d.wb.sheet_count()
-                                    && sheets.get(*sheet as usize) == Some(&d.wb.sheet_name(*sheet));
-                                if !same_sheet || !rv::writable(&d.wb, addr) || d.wb.input(addr) != *ours {
-                                    d.status = "This conflict changed or its cell is unavailable. Run Merge Copies again.".into();
-                                    drop(d);
-                                    self.changed();
-                                    return;
-                                }
-                                d.run("Resolve Merge Conflict", vec![officina_grid::ops::GridOp::set(addr, theirs.clone())]);
-                                if d.wb.input(addr) != *theirs {
-                                    drop(d);
-                                    self.changed();
-                                    return;
-                                }
+                            let theirs = self.theirs.borrow();
+                            let same_layout = (0..d.wb.sheet_count() as u16)
+                                .map(|s| d.wb.sheet_name(s)).eq(sheets.iter().cloned());
+                            let stale_deletion = matches!(change, officina_grid::compare::Change::SheetRemoved { .. })
+                                && d.edits != *revision;
+                            if !same_layout || stale_deletion
+                                || !theirs.as_ref().is_some_and(|other| rv::take_conflict(&mut d, other, change))
+                            {
+                                d.status = "This conflict changed or is unavailable. Run Merge Copies again.".into();
+                                drop(d);
+                                self.changed();
+                                return;
                             }
-                            p.resolve(i);
+                            *revision = d.edits;
+                            let mut old = officina_grid::Workbook::new();
+                            for name in sheets.iter() { old.add_sheet(name).expect("existing sheet name"); }
+                            let current: Vec<_> = (0..d.wb.sheet_count() as u16).map(|s| d.wb.sheet_name(s)).collect();
+                            if *sheets != current {
+                                let renamed = match change {
+                                    officina_grid::compare::Change::SheetRenamed { sheet, after, .. } => Some((*sheet, after)),
+                                    _ => None,
+                                };
+                                if let Some((sheet, name)) = renamed { let _ = old.rename_sheet(sheet, name); }
+                                let remaining = p.changes.iter().enumerate().filter_map(|(j, change)| {
+                                    if j == i { return None; }
+                                    let mut change = change.clone();
+                                    change.reorder_local(&old, &d.wb)?;
+                                    Some(change)
+                                }).collect();
+                                *sheets = current;
+                                p.expanded.clear();
+                                p.replace_changes(remaining);
+                                drop(d);
+                                drop(theirs);
+                                self.clamp_review_scroll(&p);
+                                self.review.set(p);
+                                self.changed();
+                                return;
+                            }
                         }
+                        p.resolve(i);
                     }
                 }
                 ReviewCmd::TakeAll => {}
@@ -656,13 +651,19 @@ impl Sheets {
         let theirs = self.theirs.clone();
         let theirs = theirs.borrow();
         let Some(other) = theirs.as_ref() else { return };
-        let order = match c {
-            ReviewCmd::Take => p.picked.and_then(|i| p.changes.get(i)),
-            ReviewCmd::TakeAll => p.changes.iter().find(|ch| matches!(ch, officina_grid::compare::Change::TabOrder { .. })),
-            _ => None,
-        }.and_then(|ch| match ch {
-            officina_grid::compare::Change::TabOrder { before, .. } => Some(before.clone()),
-            _ => None,
+        let changes_tabs = |change: &officina_grid::compare::Change| matches!(change,
+            officina_grid::compare::Change::TabOrder { .. } |
+            officina_grid::compare::Change::SheetAdded { .. } |
+            officina_grid::compare::Change::SheetRemoved { .. } |
+            officina_grid::compare::Change::SheetRenamed { .. });
+        let reorders = match c {
+            ReviewCmd::Take => p.picked.and_then(|i| p.changes.get(i)).is_some_and(changes_tabs),
+            ReviewCmd::TakeAll => p.changes.iter().any(changes_tabs),
+            _ => false,
+        };
+        let order = reorders.then(|| {
+            let d = self.doc.borrow();
+            (0..d.wb.sheet_count() as u16).map(|s| d.wb.sheet_name(s)).collect::<Vec<_>>()
         });
         let active = order.as_ref().map(|_| {
             let d = self.doc.borrow();
@@ -675,12 +676,7 @@ impl Sheets {
                     if c == ReviewCmd::Keep {
                         Arc::make_mut(&mut p.kept).push(ch);
                     } else if !rv::take(&mut self.doc.borrow_mut(), other, &ch) {
-                        if matches!(ch, officina_grid::compare::Change::SheetAdded { .. } | officina_grid::compare::Change::SheetRemoved { .. }) {
-                            self.doc.borrow_mut().status = "Sheets added or removed can't be taken here; add or delete the sheet itself.".into();
-                            Arc::make_mut(&mut p.kept).push(ch);
-                        } else {
-                            self.doc.borrow_mut().status = "This change could not be applied to the current workbook.".into();
-                        }
+                        self.doc.borrow_mut().status = "This change could not be applied to the current workbook.".into();
                     }
                     p.refresh_after(&self.doc.borrow().wb, other, order.as_deref());
                 }
@@ -1076,7 +1072,7 @@ impl Sheets {
                         None
                     } else {
                         let name = crate::tabs::new_name(&d.wb);
-                        d.run("Add Sheet", vec![officina_grid::ops::GridOp::AddSheet(name)]);
+                        d.run("Add Sheet", vec![officina_grid::ops::GridOp::add_sheet(name)]);
                         (d.wb.sheet_count() > n).then_some(n as u16)
                     }
                 };
@@ -1156,7 +1152,11 @@ impl Sheets {
                     drop(d);
                 } else {
                     match d.wb.sheet_name_ok(&name, Some(s)) {
-                        Ok(()) => d.run("Rename Sheet", vec![officina_grid::ops::GridOp::RenameSheet { sheet: s, name }]),
+                        Ok(()) => {
+                            if let Some(op) = officina_grid::sheetops::rename_sheet_op(&d.wb, s, &name) {
+                                d.run("Rename Sheet", vec![op]);
+                            }
+                        }
                         Err(why) => {
                             d.status = match why {
                                 "bad sheet name" => format!("A sheet name is 1 to {} characters, without [ ] : * ? / or \\.", officina_grid::book::MAX_SHEET_NAME),
@@ -2607,6 +2607,7 @@ impl View for Sheets {
             }
             let (doc, other, cmds) = (self.doc.clone(), self.theirs.clone(), self.cmds.clone());
             let actions = picked.is_some_and(|ch| !matches!(ch, officina_grid::compare::Change::StructuralConflict { .. }));
+            let takeable = !matches!(picked, Some(officina_grid::compare::Change::SheetConflict { .. }));
             let compare = matches!(rv.mode, ReviewMode::Compare);
             let tracked = matches!(rv.mode, ReviewMode::Tracked { .. });
             pergola::widgets::VirtualList::new(self.review_scroll.clone(), Rect::new(x0 + 1.0, ly, REVIEW_W - 1.0, lh),
@@ -2641,7 +2642,9 @@ impl View for Sheets {
             ctx.add(Node::Rect { rect: Rect::new(x0, by - 6.0, REVIEW_W, 1.0), fill: t.border_default(), radius: 0.0 });
             if actions && !tracked {
                 let label = if compare { "Take" } else { "Take Incoming" };
-                Button::primary(label).at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
+                if takeable {
+                    Button::primary(label).at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
+                }
                 Button::secondary("Keep Mine").at(x0 + 120.0, by).width(96.0).on_click(push(ReviewCmd::Keep)).render(ctx);
             }
             if compare {
@@ -3232,7 +3235,7 @@ mod tests {
         let saved = seed.stored_native().unwrap();
         let open = || Doc::from_native("base.osheet", &saved).unwrap();
         let reopen = |doc: &Doc| Doc::from_native("branch.osheet", &doc.stored_native().unwrap()).unwrap();
-        let base = CellSnapshot::capture(&open().wb);
+        let base = open().wb;
         let make_app = |doc| Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
 
@@ -3251,7 +3254,7 @@ mod tests {
         let incoming = reopen(&incoming);
 
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.osheet", &base, &incoming.wb);
+        sheets.merge_copies("incoming.osheet", &base, reopen(&incoming).wb);
         assert!(sheets.review.get_cloned().changes.is_empty());
         let merged = reopen(&sheets.doc.borrow());
         assert_eq!(merged.wb.value(0, 3, 5), Value::num(51.0));
@@ -3264,7 +3267,7 @@ mod tests {
         // The imported IDs match on a second merge, so no axis is inserted twice.
         let sheets = make_app(merged);
         let before = CellSnapshot::capture(&sheets.doc.borrow().wb);
-        sheets.merge_copies("incoming.osheet", &base, &incoming.wb);
+        sheets.merge_copies("incoming.osheet", &base, incoming.wb);
         assert!(sheets.review.get_cloned().changes.is_empty());
         assert_eq!(CellSnapshot::capture(&sheets.doc.borrow().wb), before);
 
@@ -3273,7 +3276,7 @@ mod tests {
         let mut incoming = open();
         shift(&mut incoming, Axis::Rows, 5, -1);
         let sheets = make_app(reopen(&ours));
-        sheets.merge_copies("incoming.osheet", &base, &reopen(&incoming).wb);
+        sheets.merge_copies("incoming.osheet", &base, reopen(&incoming).wb);
         assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
             [Change::StructuralConflict { axis: Axis::Rows, at: 5, .. }]));
         sheets.review_cmd(crate::review::ReviewCmd::Pick(0));
@@ -3288,17 +3291,17 @@ mod tests {
         shift(&mut ours, Axis::Cols, 3, 1);
         shift(&mut incoming, Axis::Cols, 3, 1);
         let sheets = make_app(reopen(&ours));
-        sheets.merge_copies("incoming.osheet", &base, &reopen(&incoming).wb);
+        sheets.merge_copies("incoming.osheet", &base, reopen(&incoming).wb);
         assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
             [Change::StructuralConflict { axis: Axis::Cols, at: 3, .. }]));
     }
 
     #[test]
     fn structural_merge_combines_both_axes_and_flags_overlapping_edits() {
-        use officina_grid::{compare::{CellSnapshot, Change}, ops::GridOp, shift::{shift_op, Axis}, CellAddr, Value};
+        use officina_grid::{compare::Change, ops::GridOp, shift::{shift_op, Axis}, CellAddr, Value};
 
         let source = || Doc::from_csv("base.csv", b"1,2,3,4\n5,6,7,8\n9,10,11,12\n13,14,15,16\n").unwrap().0;
-        let base = CellSnapshot::capture(&source().wb);
+        let base = source().wb;
         let make_app = |doc| Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         let shift = |doc: &mut Doc, axis, at, by| {
@@ -3313,7 +3316,7 @@ mod tests {
         shift(&mut theirs, Axis::Cols, 1, -1);
         assert!(theirs.type_into(2, 1, "110"));
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.csv", &base, &theirs.wb);
+        sheets.merge_copies("incoming.csv", &base, theirs.wb);
         assert!(sheets.review.get_cloned().changes.is_empty());
         {
             let doc = sheets.doc.borrow();
@@ -3331,7 +3334,7 @@ mod tests {
         shift(&mut theirs, Axis::Cols, 2, 1);
         assert!(theirs.type_into(2, 2, "70"));
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.csv", &base, &theirs.wb);
+        sheets.merge_copies("incoming.csv", &base, theirs.wb);
         assert!(sheets.review.get_cloned().changes.is_empty());
         assert_eq!(sheets.doc.borrow().wb.value(0, 1, 2), Value::num(70.0));
         assert_eq!(sheets.doc.borrow().wb.value(0, 1, 3), Value::num(11.0));
@@ -3344,7 +3347,7 @@ mod tests {
         let mut theirs = source();
         shift(&mut theirs, Axis::Rows, 2, -1);
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.csv", &base, &theirs.wb);
+        sheets.merge_copies("incoming.csv", &base, theirs.wb);
         assert!(sheets.review.get_cloned().changes.is_empty());
         assert_eq!(sheets.doc.borrow().wb.value(0, 1, 0), Value::num(50.0));
         assert_eq!(sheets.doc.borrow().wb.value(0, 2, 0), Value::num(5.0));
@@ -3356,7 +3359,7 @@ mod tests {
         ours.run("Edit deleted row", vec![GridOp::set(CellAddr::new(0, 1, 1),
             officina_grid::book::Input::Value(Value::num(60.0)))]);
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.csv", &base, &theirs.wb);
+        sheets.merge_copies("incoming.csv", &base, theirs.wb);
         assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
             [Change::StructuralConflict { axis: Axis::Rows, at: 1, .. }]));
         assert_eq!(sheets.doc.borrow().wb.value(0, 1, 1), Value::num(60.0));
@@ -3368,7 +3371,7 @@ mod tests {
         assert!(ours.type_into(0, 1, "41"));
         assert!(theirs.type_into(0, 1, "42"));
         let sheets = make_app(ours);
-        sheets.merge_copies("incoming.csv", &base, &theirs.wb);
+        sheets.merge_copies("incoming.csv", &base, theirs.wb);
         assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
             [Change::StructuralConflict { axis: Axis::Cols, at: 1, .. }]));
         assert_eq!(sheets.doc.borrow().wb.value(0, 0, 1), Value::num(41.0));
@@ -3415,10 +3418,10 @@ mod tests {
     #[test]
     fn tracked_cell_changes_and_three_way_merge_use_undo_and_flag_conflicts() {
         use crate::{data::DataCmd, review::ReviewCmd};
-        use officina_grid::{book::Input, compare::{CellSnapshot, Change}, ops::GridOp, CellAddr, Value};
+        use officina_grid::{book::Input, compare::Change, ops::GridOp, CellAddr, Value};
 
         let workbook = || Doc::from_csv("base.csv", b"1,2,3,4\n5,6,7,8\n").unwrap().0;
-        let base = CellSnapshot::capture(&workbook().wb);
+        let base = workbook().wb;
         let sheets = Sheets::new(workbook(), Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         let addr = |r, c| CellAddr::new(0, r, c);
@@ -3454,7 +3457,8 @@ mod tests {
             GridOp::set(addr(1, 3), number(88.0)),
         ]);
         assert_eq!(data(DataCmd::MergeCopies), vec![Cmd::Data(DataCmd::MergeCopies)]);
-        sheets.merge_copies("incoming.csv", &base, &other.wb);
+        let incoming_bytes = other.stored_native().unwrap();
+        sheets.merge_copies("incoming.csv", &base, other.wb);
         assert_eq!(input(0, 0), number(11.0));
         assert_eq!(input(0, 1), number(22.0));
         assert_eq!(input(0, 2), Input::Formula("=A1+B1".into()));
@@ -3484,7 +3488,7 @@ mod tests {
         assert_eq!(input(0, 1), number(33.0));
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(input(0, 1), number(22.0));
-        sheets.merge_copies("incoming.csv", &base, &other.wb);
+        sheets.merge_copies("incoming.csv", &base, Doc::from_native("incoming.csv", &incoming_bytes).unwrap().wb);
         sheets.review_cmd(ReviewCmd::Pick(0));
         sheets.doc.borrow_mut().run("Further edit", vec![GridOp::set(addr(0, 1), number(44.0))]);
         sheets.review_cmd(ReviewCmd::Take);
@@ -3493,6 +3497,143 @@ mod tests {
         sheets.review_cmd(ReviewCmd::Keep);
         assert!(sheets.review.get_cloned().changes.is_empty());
         assert_eq!(input(0, 1), number(44.0));
+    }
+
+    #[test]
+    fn workbook_merge_groups_large_conflicts_and_persists_metadata_resolutions() {
+        use crate::review::{Group, ReviewCmd};
+        use officina_grid::{book::Input, compare::Change, ops::GridOp, style::Style, CellAddr, Rect as Cells, Value};
+
+        const ROWS: usize = 1200;
+        let mut seed = Doc::new("base");
+        seed.wb.rename_sheet(0, "Budget").unwrap();
+        seed.wb.add_sheet("Forecast").unwrap();
+        let fill = |n| vec![vec![Input::Value(Value::num(n))]; ROWS];
+        seed.run("Inputs", vec![GridOp::block(0, 0, 0, fill(1.0))]);
+        let bytes = seed.stored_native().unwrap();
+        let open = || Doc::from_native("sheet.osheet", &bytes).unwrap();
+        let mut local = open();
+        local.run("Local edits", vec![
+            GridOp::block(0, 0, 0, fill(2.0)),
+            GridOp::style(Cells { sheet: 0, r0: 0, r1: 3, c0: 1, c1: 1 }, Style { fill: Some(0x112233), ..Style::default() }),
+            GridOp::TabColor { sheet: 1, color: Some(0xaabbcc) },
+        ]);
+        let mut incoming = open();
+        incoming.run("Incoming edits", vec![
+            GridOp::block(0, 0, 0, fill(3.0)),
+            GridOp::style(Cells { sheet: 0, r0: 2, r1: 5, c0: 1, c1: 1 }, Style { fill: Some(0x556677), ..Style::default() }),
+            GridOp::TabColor { sheet: 1, color: Some(0x334455) },
+            GridOp::Freeze { sheet: 1, rows: 2, cols: 0, from: (0, 0) },
+        ]);
+        let incoming_bytes = incoming.stored_native().unwrap();
+        let app = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let merge = || app.merge_copies("incoming.osheet", &seed.wb, Doc::from_native("incoming", &incoming_bytes).unwrap().wb);
+        merge();
+        let pane = app.review.get_cloned();
+        assert_eq!(pane.group_rows().1, 3);
+        assert_eq!(pane.group_items(Group(Some(0), "Cell conflicts")).len(), ROWS);
+        assert_eq!(pane.group_items(Group(Some(0), "Styles")).len(), 1);
+        assert_eq!(pane.group_items(Group(Some(1), "Sheet settings")).len(), 1);
+        let state = |doc: &Doc| {
+            let color = |row| doc.wb.styles.get(doc.wb.style_id(CellAddr::new(0, row, 1))).fill;
+            (color(1), color(2), color(5), doc.wb.sheet(1).tab_color, doc.wb.sheet(1).freeze)
+        };
+        assert_eq!(state(&app.doc.borrow()), (Some(0x112233), Some(0x112233), Some(0x556677), Some(0xaabbcc), (2, 0)));
+        assert!(app.doc.borrow_mut().undo());
+        assert_eq!(state(&app.doc.borrow()).2, None);
+        assert_eq!(state(&app.doc.borrow()).4, (0, 0));
+        merge();
+        let choose = |is: fn(&Change) -> bool, action| {
+            let pane = app.review.get_cloned();
+            let index = pane.changes.iter().position(is).unwrap();
+            app.review_cmd(ReviewCmd::Pick(index));
+            let local = app.doc.borrow();
+            let incoming = app.theirs.borrow();
+            let details = pane.changes[index].details(&local.wb, incoming.as_ref().unwrap(), false);
+            assert!(details.contains("Current") && details.contains("Incoming"), "{details}");
+            drop(local);
+            drop(incoming);
+            app.review_cmd(action);
+        };
+        choose(|c| matches!(c, Change::Style { .. }), ReviewCmd::Take);
+        choose(|c| matches!(c, Change::Setting(_)), ReviewCmd::Keep);
+        assert_eq!(app.review.get_cloned().changes.len(), ROWS);
+        let bytes = app.doc.borrow().stored_native().unwrap();
+        let reopened = Doc::from_native("merged.osheet", &bytes).unwrap();
+        assert_eq!(state(&reopened), (Some(0x112233), Some(0x556677), Some(0x556677), Some(0xaabbcc), (2, 0)));
+        assert_eq!(reopened.wb.value(0, 1199, 0), Value::num(2.0));
+        assert!(app.doc.borrow_mut().undo());
+        assert_eq!(state(&app.doc.borrow()).1, Some(0x112233));
+        assert_eq!(state(&app.doc.borrow()).2, Some(0x556677));
+    }
+
+    #[test]
+    fn workbook_review_takes_tabs_and_preserves_references_and_undo() {
+        use crate::review::ReviewCmd;
+        use officina_core::history::Op;
+        use officina_grid::{compare::Change, ops::GridOp, CellAddr, Value};
+
+        let mut seed = Doc::new("base");
+        seed.wb.rename_sheet(0, "Summary").unwrap();
+        seed.wb.add_sheet("Inputs").unwrap();
+        seed.wb.add_sheet("Retired").unwrap();
+        seed.wb.set_input(CellAddr::new(0, 0, 0), "=Inputs!A1").unwrap();
+        seed.wb.set_input(CellAddr::new(1, 0, 0), "8").unwrap();
+        seed.wb.set_input(CellAddr::new(2, 0, 0), "old").unwrap();
+        seed.wb.recalc();
+        let bytes = seed.stored_native().unwrap();
+        let open = || Doc::from_native("sheet.osheet", &bytes).unwrap();
+        let mut incoming = open();
+        incoming.wb.rename_sheet(1, "Source").unwrap();
+        let new = incoming.wb.add_sheet("Forecast").unwrap();
+        incoming.wb.set_input(CellAddr::new(new, 0, 0), "=Source!A1*2").unwrap();
+        incoming.wb.set_input(CellAddr::new(0, 1, 0), "=Forecast!A1").unwrap();
+        incoming.run("Color new sheet", vec![GridOp::TabColor { sheet: new, color: Some(0x123456) }]);
+        let remove = officina_grid::sheetops::delete_sheet_op(&incoming.wb, 2).unwrap();
+        remove.apply(&mut incoming.wb);
+        assert!(incoming.wb.move_sheet(1, 0));
+        incoming.wb.recalc();
+        let incoming_bytes = incoming.stored_native().unwrap();
+        let app_for = |doc| Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let assert_incoming = |doc: &Doc| {
+            assert_eq!(doc.wb.sheet_name(0), "Source");
+            let summary = doc.wb.sheet_id("Summary").unwrap();
+            let forecast = doc.wb.sheet_id("Forecast").unwrap();
+            assert_eq!(doc.wb.value(summary, 0, 0), Value::num(8.0));
+            assert_eq!(doc.wb.value(summary, 1, 0), Value::num(16.0));
+            assert_eq!(doc.wb.sheet(forecast).tab_color, Some(0x123456));
+        };
+
+        let app = app_for(open());
+        app.compare_with("incoming.osheet", Doc::from_native("in", &incoming_bytes).unwrap().wb);
+        assert!(app.review.get_cloned().changes.iter().any(|c| matches!(c, Change::SheetRenamed { .. })));
+        app.review_cmd(ReviewCmd::TakeAll);
+        assert_incoming(&app.doc.borrow());
+        assert!(app.doc.borrow().wb.sheet_id("Retired").is_none());
+        assert!(app.doc.borrow_mut().undo());
+        assert!(app.doc.borrow().wb.sheet_id("Inputs").is_some());
+        assert!(app.doc.borrow().wb.sheet_id("Retired").is_some());
+        assert!(app.doc.borrow().wb.sheet_id("Forecast").is_none());
+
+        let mut local = open();
+        local.wb.set_input(CellAddr::new(2, 0, 0), "locally retained").unwrap();
+        let app = app_for(local);
+        app.merge_copies("incoming.osheet", &seed.wb, Doc::from_native("in", &incoming_bytes).unwrap().wb);
+        assert_incoming(&app.doc.borrow());
+        let pane = app.review.get_cloned();
+        assert_eq!(pane.changes.len(), 1, "{:?}", pane.changes);
+        assert!(matches!(pane.changes[0], Change::SheetRemoved { .. }));
+        app.review_cmd(ReviewCmd::Pick(0));
+        app.review_cmd(ReviewCmd::Keep);
+        let reopened = Doc::from_native("merged.osheet", &app.doc.borrow().stored_native().unwrap()).unwrap();
+        assert_incoming(&reopened);
+        let retired = reopened.wb.sheet_id("Retired").unwrap();
+        assert_eq!(reopened.wb.value(retired, 0, 0).display(), "locally retained");
+        assert!(app.doc.borrow_mut().undo());
+        assert_eq!(app.doc.borrow().wb.sheet_name(1), "Inputs");
+        assert!(app.doc.borrow().wb.sheet_id("Forecast").is_none());
     }
 
     #[test]

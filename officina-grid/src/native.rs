@@ -60,6 +60,7 @@ pub const FREEZE_FROM: u16 = 22;
 pub const TRACKED_CELLS: u16 = 23;
 pub const AXIS_IDENTITIES: u16 = 24;
 pub const PICTURE: u16 = 25;
+pub const SHEET_IDENTITIES: u16 = 26;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -152,6 +153,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     c.add(WORKBOOK, &w.into_bytes())?;
+    if wb.sheets.iter().any(|sheet| sheet.identity != 0) {
+        let mut w = Writer::new();
+        for sheet in &wb.sheets {
+            w.u64((sheet.identity >> 64) as u64);
+            w.u64(sheet.identity as u64);
+        }
+        c.add(SHEET_IDENTITIES, &w.into_bytes())?;
+    }
     if let Some(set) = wb.tracked_cells() {
         let mut w = Writer::new();
         set.encode(&mut w);
@@ -495,7 +504,7 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     }
     for _ in 0..n {
         let name = r.str("sheet name", MAX_SHEET_NAME as u64)?;
-        let s = wb.add_sheet(name).map_err(LoadError::Bad)?;
+        let s = wb.add_identified_sheet(name, 0).map_err(LoadError::Bad)?;
         for (axis, max) in [(0, MAX_ROWS), (1, MAX_COLS)] {
             let def = size(&mut r, false)?;
             let k = r.count("size overrides", max as u64, 9)?;
@@ -536,6 +545,19 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
     }
     done(&r)?;
+
+    let mut sheet_ids = of(SHEET_IDENTITIES);
+    if let Some(index) = sheet_ids.next() {
+        if sheet_ids.next().is_some() { return Err(LoadError::Bad("two SHEET_IDENTITIES chunks")); }
+        let mut r = Reader::new(c.chunk(index)?);
+        let mut seen = std::collections::HashSet::new();
+        for sheet in &mut wb.sheets {
+            let id = (u128::from(r.u64()?) << 64) | u128::from(r.u64()?);
+            if id != 0 && !seen.insert(id) { return Err(LoadError::Bad("duplicate worksheet identity")); }
+            sheet.identity = id;
+        }
+        done(&r)?;
+    }
 
     let mut tracked = of(TRACKED_CELLS);
     if let Some(i) = tracked.next() {

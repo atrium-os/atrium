@@ -70,6 +70,35 @@ pub(super) fn compare(
 }
 
 impl SettingChange {
+    pub(super) fn kind(&self) -> u8 {
+        match self.before { Setting::Tab(_) => 0, Setting::Freeze { .. } => 1, Setting::Visibility(_) => 2 }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        let show = |setting: &Setting| match setting {
+            Setting::Tab(None) => "Default tab color".into(),
+            Setting::Tab(Some(rgb)) => format!("Tab color #{rgb:06X}"),
+            Setting::Freeze { end: (0, 0), .. } => "No frozen panes".into(),
+            Setting::Freeze { end: (rows, cols), from } =>
+                format!("From {}: {} rows, {} columns", crate::addr::a1(from.0, from.1), rows - from.0, cols - from.1),
+            Setting::Visibility(state) => {
+                let mut text = state.filter.as_ref().map_or_else(|| "Auto-filter off".into(), |filter| {
+                    let a = crate::addr::a1(filter.rect.r0, filter.rect.c0);
+                    let b = crate::addr::a1(filter.rect.r1, filter.rect.c1);
+                    format!("Auto-filter {a}:{b}\n{:#?}", filter.conds)
+                });
+                if !state.hidden.is_empty() {
+                    let rows = state.hidden.iter().map(|&(a, b)|
+                        if a == b { (a + 1).to_string() } else { format!("{}–{}", a + 1, b + 1) })
+                        .collect::<Vec<_>>().join(", ");
+                    text.push_str(&format!("\nHidden rows: {rows}"));
+                }
+                text
+            }
+        };
+        (show(&self.before), show(&self.after))
+    }
+
     pub(super) fn reorder(&mut self, sheet: u16) {
         self.sheet = sheet;
         for setting in [&mut self.before, &mut self.after] {

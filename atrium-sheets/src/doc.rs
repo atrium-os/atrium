@@ -773,7 +773,7 @@ impl Doc {
         false
     }
 
-    fn run_action(&mut self, label: &str, ops: Vec<GridOp>) -> bool {
+    pub(crate) fn run_action(&mut self, label: &str, ops: Vec<GridOp>) -> bool {
         if !self.check_protection(&ops) {
             return false;
         }

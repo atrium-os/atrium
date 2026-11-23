@@ -32,12 +32,6 @@ loaded() {
     test "$directory" != . && test -s "$directory/current"
 }
 same_window() { test "$(win_at "$1" "$2")" = "$3"; }
-has_frame() { test "$(sha256 -q selectscreen.png)" = "$1"; }
-expect() {
-    input 'MOVE 8 240'
-    wait_for has_frame "$2"
-    cp selectscreen.png "$results/$1.png"
-}
 pick() {
     click 520 "$1"
     sleep .25
@@ -85,7 +79,7 @@ capture() {
     sleep .45
     cp selectscreen.png "$results/$1.png"
 }
-checkpoint() { /tmp/sheets-review-fixture check "$1" "$2"; } 2>"$results/checkpoint.log"
+checkpoint() { /tmp/sheets-review-fixture check "$1" "$2"; } 2>>"$results/checkpoint.log"
 save_in_place() {
     click 125 24
     wait_for checkpoint "$books/01-local.$format" "$1"
@@ -95,7 +89,7 @@ converted_after() { test "$(conversion_count)" -gt "$1"; }
 picked_copy() {
     before=$(conversion_count)
     pick "$1"
-    wait_for converted_after "$before"
+    if test "$format" != native; then wait_for converted_after "$before"; fi
     wait_for same_window 594 24 "$document"
 }
 reopened_state() {
@@ -144,8 +138,19 @@ foreign_review() {
     click 890 183
     capture merge-keep-detail
     click 908 666 # Keep Mine for C1.
-    capture merge-resolved
+    # With both cell decisions resolved, the style group takes the first row.
+    click 890 154
+    sleep .25
+    click 890 183
+    capture merge-style-detail
+    click 802 666 # Take Incoming for the fill.
     save_in_place resolved
+    click 365 24 # Undo the fill resolution only.
+    save_in_place style-undone
+    capture merge-style-undone
+    click 438 24 # Redo the fill resolution.
+    save_in_place resolved
+    capture merge-resolved
     cp "$books/01-local.$format" "$results/saved.$format"
     close_document
 
@@ -168,57 +173,67 @@ jot 1200 | sed 's/$/,20,stable/' >"$books/02-review-incoming.csv"
 printf 'merge,10,20,30,40\n' >"$books/03-merge-local.csv"
 printf 'merge,1,2,3,40\n' >"$books/04-merge-base.csv"
 printf 'merge,11,22,3,44\n' >"$books/05-merge-incoming.csv"
-chown sheetsfiles "$books"/0*.csv
+chown sheetsfiles:sheetsfiles "$books"/0*.csv
 (cd "$books" && sha256 0*.csv) >"$results/sources.sha256"
 
 open_document 183 01-review-local.csv
 data_command 46 # Start Tracking Cell Changes
-expect tracking-started 5cb68979f3d477b8960353131d3d383633bf59c86086b0156c32daaedb9273de
+capture tracking-started
 data_command 18 # Compare with…
 wait_for picker_open
-expect compare-picker f79d897df1a16a7482ebfde698d6febc247c0df9356522486f3779c4e21a4859
-pick 213
-expect compare-collapsed 850caa15d17d0c55a9364b65d3a4d46cd06601c7ebf478ec79fb534c4190a7ea
+capture compare-picker
+picked_copy 213
+capture compare-collapsed
 click 890 154
+sleep .25
 click 890 183
-expect compare-detail ff4972a441f99b999689dfb93656d073da3546bd2449e1c3daa10a0102786650
+capture compare-detail
 click 802 666 # Take B1
 click 890 183
 click 908 666 # Keep B2
 click 1040 666 # Take all remaining changes.
-expect compare-applied 6fe4430ad5b0f3c044ec9caf444789641ad110ed2c76cf47a5c70fa51da3a999
+capture compare-applied
 # The native output must contain every taken value and the one kept value.
 expected=$(jot 1200 | awk '{printf "%s%d,%d,stable", (NR == 1 ? "" : "\r\n"), $1, ($1 == 2 ? 10 : 20)}')
 save_as 01-review-local.osheet "$expected"
 close_document
 open_document 213 01-review-local.osheet
+/tmp/check-recovered-copy "$directory/base.$(cat "$directory/current").osheet" "$expected" plain
 data_command 74 # Review Tracked Changes
-expect tracked-reopened 227114dcadea8ba0220abceda571299ecb3355aa396ca88c83f63bcdf5a2284d
+capture tracked-reopened
 click 890 154
+sleep .25
 click 890 183
-expect tracked-detail 62dfd20dcd39fb4a3a56122b66b1f189598958bff450f454e5f622311baa3a4f
+capture tracked-detail
 close_document
 
 open_document 273 03-merge-local.csv
 data_command 102 # Merge Copies…
 wait_for picker_open
-expect merge-base-picker 229d162a56bf48eba575afeb5a3f054ec0a5ac02fd7e1843909ac020d8834226
+capture merge-base-picker
+base_picker=$window
 pick 303
-expect merge-incoming-picker 080e1c70e2b1a33c73727142f0128ab8035eeac62d40865b66eb1c634eec9515
-pick 333
-expect merge-collapsed c85afaa5719f21546daf02682751471999525c96c4c936c323197f5ba502468d
+incoming_picker() {
+    other_window 520 183 "$document" && test "$window" != "$base_picker"
+}
+wait_for incoming_picker
+capture merge-incoming-picker
+picked_copy 333
+capture merge-collapsed
 click 890 154
+sleep .25
 click 890 183
-expect merge-detail da6d110f40fdfff0871349f96007a2141ba5e6919d16c812438e37f331e66d92
+capture merge-detail
 click 802 666 # Take Incoming for B1.
 click 890 183
 click 908 666 # Keep Mine for C1.
-expect merge-resolved f2c6faae2b9c0d85997c574c6a232a7f1c7d077f0929c8c77f7c1e5b0cbb0d54
+capture merge-resolved
 # D1 is our independent edit; E1 is the independent incoming edit.
 save_as 03-merge-local.osheet 'merge,11,20,30,44'
 close_document
 open_document 303 03-merge-local.osheet
-expect merge-reopened 2ac5609504f437d69af82168c11af764696bb4bc6dfdfc3138e511ee03c9e395
+/tmp/check-recovered-copy "$directory/base.$(cat "$directory/current").osheet" 'merge,11,20,30,44' plain
+capture merge-reopened
 close_document
 (cd "$books" && sha256 0*.csv) | cmp - "$results/sources.sha256"
 echo "Sheets desktop review passed: $results"

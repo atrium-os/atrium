@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use officina_core::history::Op;
 
-use crate::addr::CellAddr;
 use crate::axis_ids::Run;
 use crate::book::Input;
 use crate::compare::{CellSnapshot, Change, MergeError, MergePlan};
@@ -44,15 +43,13 @@ impl Patch {
 pub enum Alignment {
     Positional(MergePlan),
     Blocked(Vec<Change>),
-    Aligned { ops: Vec<GridOp>, local: Box<Workbook>, cells: MergePlan },
+    Aligned { ops: Vec<GridOp>, local: Box<Workbook>, base: Box<Workbook>, incoming: Box<Workbook>, cells: MergePlan },
 }
 
-pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Result<Alignment, MergeError> {
-    let local = CellSnapshot::capture(ours);
-    let remote = CellSnapshot::capture(incoming);
-    if base.sheets.keys().ne(local.sheets.keys()) || base.sheets.keys().ne(remote.sheets.keys()) {
-        return Err(MergeError::SheetLayout);
-    }
+pub fn align(base_book: &Workbook, ours: &Workbook, incoming: &Workbook) -> Result<Alignment, MergeError> {
+    let base = CellSnapshot::for_merge(base_book);
+    let local = CellSnapshot::for_merge(ours);
+    let remote = CellSnapshot::for_merge(incoming);
     if local == remote {
         return Ok(Alignment::Positional(MergePlan { incoming: Vec::new(), conflicts: Vec::new() }));
     }
@@ -60,6 +57,7 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
     let mut right = Vec::new();
     let mut conflicts = Vec::new();
     for (name, cells) in &base.sheets {
+        if !local.sheets.contains_key(name) || !remote.sheets.contains_key(name) { continue; }
         let sheet = ours.sheet_id(name).expect("matching sheet");
         for axis in [Axis::Rows, Axis::Cols] {
             let index = axis.index();
@@ -90,13 +88,13 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
     }
     if !conflicts.is_empty() { return Ok(Alignment::Blocked(conflicts)); }
     if left.is_empty() && right.is_empty() {
-        return base.plan_with(ours, &local, &remote).map(Alignment::Positional);
+        return base.plan_shared(ours, &local, &remote).map(Alignment::Positional);
     }
 
     drop(local);
     drop(remote);
-    let mut base_local = from_snapshot(base)?;
-    let mut base_remote = from_snapshot(base)?;
+    let mut base_local = copy(base_book)?;
+    let mut base_remote = copy(base_book)?;
     normalize(&mut base_local, &left, &[], false)?;
     normalize(&mut base_remote, &right, &[], false)?;
 
@@ -104,8 +102,8 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
         (true, &left, &right, incoming, &base_remote),
         (false, &right, &left, ours, &base_local),
     ] {
-        let branch = CellSnapshot::capture(branch);
-        let reference = CellSnapshot::capture(reference);
+        let branch_cells = CellSnapshot::for_merge(branch);
+        let reference_cells = CellSnapshot::for_merge(reference);
         for patch in patches {
             // Matching recorded inserts have the same identity. Two independent
             // inserts at the same gap have different identities and conflict.
@@ -120,10 +118,20 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
                 }
                 continue;
             }
-            if patch.remove != 0 && changed_in_band(&branch, &reference, &translated(patch, others.iter())?) {
-                let mut versions = [patch.describe(), "Edited cells in the deleted range".into()];
-                if !local_patch { versions.swap(0, 1); }
-                conflicts.push(flag(sheet, patch.axis, patch.at, "Deletion overlaps a cell edit", versions));
+            if patch.remove != 0 {
+                let at = translated(patch, others.iter())?;
+                let kind = if changed_in_band(&branch_cells, &reference_cells, &at) {
+                    Some(("Deletion overlaps a cell edit", "Edited cells in the deleted range"))
+                } else if crate::compare::parts_changed_in_band(reference, branch, &at.name, at.axis, at.at, at.remove)? {
+                    Some(("Deletion overlaps a workbook change", "Edited workbook parts in the deleted range"))
+                } else {
+                    None
+                };
+                if let Some((reason, detail)) = kind {
+                    let mut versions = [patch.describe(), detail.into()];
+                    if !local_patch { versions.swap(0, 1); }
+                    conflicts.push(flag(sheet, patch.axis, patch.at, reason, versions));
+                }
             }
         }
     }
@@ -136,9 +144,10 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
     let ops = normalize(&mut normalized_local, &right, &left, true)?;
     normalize(&mut normalized_base, &right, &left, false)?;
     normalize(&mut normalized_remote, &left, &right, false)?;
-    let cells = CellSnapshot::capture(&normalized_base)
-        .plan(&normalized_local, &CellSnapshot::capture(&normalized_remote))?;
-    Ok(Alignment::Aligned { ops, local: Box::new(normalized_local), cells })
+    let cells = CellSnapshot::for_merge(&normalized_base).plan_shared(&normalized_local,
+        &CellSnapshot::for_merge(&normalized_local), &CellSnapshot::for_merge(&normalized_remote))?;
+    Ok(Alignment::Aligned { ops, local: Box::new(normalized_local), base: Box::new(normalized_base),
+        incoming: Box::new(normalized_remote), cells })
 }
 
 fn flag(sheet: u16, axis: Axis, at: u32, reason: &'static str, versions: [String; 2]) -> Change {
@@ -235,21 +244,7 @@ fn infer(base: &Inputs, side: &Inputs, axis: Axis) -> Result<Option<(u32, i64)>,
     Ok(Some((at as u32, delta)))
 }
 
-fn from_snapshot(snapshot: &CellSnapshot) -> Result<Workbook, MergeError> {
-    let mut wb = Workbook::new();
-    for name in snapshot.sheets.keys() { wb.add_sheet(name).map_err(|_| MergeError::SheetLayout)?; }
-    for (name, cells) in &snapshot.sheets {
-        let sheet = wb.sheet_id(name).expect("matching sheet");
-        wb.sheet_mut(sheet).axis_ids = snapshot.axes[name].clone();
-        for (&(row, col), value) in cells {
-            wb.set(CellAddr::new(sheet, row, col), value).map_err(|_| MergeError::StructuralAlignment)?;
-        }
-    }
-    wb.recalc();
-    Ok(wb)
-}
-
-fn copy(wb: &Workbook) -> Result<Workbook, MergeError> {
+pub(crate) fn copy(wb: &Workbook) -> Result<Workbook, MergeError> {
     let bytes = crate::native::save(wb, Vec::new()).map_err(|_| MergeError::StructuralAlignment)?;
     crate::native::load(&bytes).map_err(|_| MergeError::StructuralAlignment)
 }

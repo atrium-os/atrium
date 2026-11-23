@@ -23,6 +23,7 @@ pub const MAX_SHEET_NAME: usize = 255;
 
 #[derive(Debug)]
 pub struct Sheet {
+    pub(crate) identity: u128,
     pub protection: Option<crate::protection::SheetProtection>,
     pub name: String,
     pub(crate) cols: Vec<Column>,
@@ -62,9 +63,13 @@ pub struct Sheet {
     pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
 }
 
+pub(crate) fn new_sheet_identity() -> u128 {
+    crate::axis_ids::Run::inserted(1).origin
+}
+
 impl Sheet {
-    fn new(name: &str) -> Self {
-        Sheet { protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
+    fn new(name: &str, identity: u128) -> Self {
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -278,11 +283,18 @@ impl Workbook {
     // ---------- sheets ----------
 
     pub fn add_sheet(&mut self, name: &str) -> Result<u16, &'static str> {
+        self.add_identified_sheet(name, new_sheet_identity())
+    }
+
+    pub(crate) fn add_identified_sheet(&mut self, name: &str, identity: u128) -> Result<u16, &'static str> {
+        if identity != 0 && self.sheets.iter().any(|s| s.identity == identity) {
+            return Err("duplicate worksheet identity");
+        }
         if self.sheets.len() >= MAX_SHEETS {
             return Err("too many sheets");
         }
         self.sheet_name_ok(name, None)?;
-        self.sheets.push(Sheet::new(name));
+        self.sheets.push(Sheet::new(name, identity));
         Ok((self.sheets.len() - 1) as u16)
     }
     /// Whether `name` can name a sheet (other than sheet `except`).

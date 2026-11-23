@@ -1,4 +1,4 @@
-//! Two-sheet review and three-way cell merge for foreign workbook formats.
+//! Two-sheet review and three-way workbook merge for foreign formats.
 use std::{env, fs, path::Path};
 
 use officina_convert::{ods, xlsx};
@@ -50,19 +50,19 @@ fn fixture(variant: &str) -> Workbook {
     }
     if variant == "review" {
         book.set_value(CellAddr::new(0, 0, 1), Value::str(INCOMING_TEXT));
-        book.set_style(
-            &Rect {
-                sheet: 0,
-                r0: 1,
-                c0: 3,
-                r1: 1,
-                c1: 3,
-            },
-            officina_grid::style::Style {
-                fill: Some(0xDDEBF7),
-                ..Default::default()
-            },
-        );
+    }
+    let color = match variant {
+        "local" => 0xBDE8C7,
+        "incoming" => 0xF7C8A7,
+        "review" => 0xDDEBF7,
+        _ => 0xE6E6E6,
+    };
+    book.set_style(
+        &Rect::cell(CellAddr::new(0, 1, 3)),
+        officina_grid::style::Style { fill: Some(color), ..Default::default() },
+    );
+    if variant == "incoming" {
+        book.sheet_mut(1).row_sizes.set(2, 42.0);
     }
     book.recalc();
     book
@@ -100,7 +100,7 @@ fn check(path: &Path, state: &str) {
     let (b1, e1, result, b1_formula, cross_formula) = match state {
         "local" => (10.0, 40.0, 0.0, None, None),
         "independent" => (10.0, 44.0, 20.0, None, Some("=Data!B1*2")),
-        "resolved" => (11.0, 44.0, 22.0, Some("=5+6"), Some("=Data!B1*2")),
+        "resolved" | "style-undone" => (11.0, 44.0, 22.0, Some("=5+6"), Some("=Data!B1*2")),
         _ => panic!("unknown checkpoint {state}"),
     };
     assert_eq!(book.sheet_count(), 2);
@@ -137,7 +137,11 @@ fn check(path: &Path, state: &str) {
         assert_eq!(book.get(CellAddr::new(0, row, 1)), Value::Num(10.0));
         assert_eq!(book.get(CellAddr::new(0, row, 2)), Value::str("stable"));
     }
-    assert_eq!(book.style(CellAddr::new(0, 1, 3)).fill, None);
+    let color = if state == "resolved" { 0xF7C8A7 } else { 0xBDE8C7 };
+    assert_eq!(book.style(CellAddr::new(0, 1, 3)).fill, Some(color));
+    if state != "local" {
+        assert!((book.sheet(1).row_sizes.size(2) - 42.0).abs() < 0.1);
+    }
 }
 
 fn main() {

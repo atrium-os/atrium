@@ -77,6 +77,7 @@ pub enum GridOp {
     /// A new empty sheet at the end, by this name (refused, changing nothing, if
     /// the name is taken or bad). Its inverse is [`GridOp::DropSheet`].
     AddSheet(String),
+    AddIdentifiedSheet { name: String, identity: u128 },
     /// Takes away the last sheet (the inverse of [`GridOp::AddSheet`], which
     /// undo order leaves empty again by then). The first sheet always stays.
     DropSheet,
@@ -122,6 +123,10 @@ pub(crate) fn decode_widths(r: &mut Reader) -> Result<Vec<(u32, f64)>, WireError
 
 impl GridOp {
     /// Sets one cell.
+    pub fn add_sheet(name: String) -> Self {
+        Self::AddIdentifiedSheet { name, identity: crate::book::new_sheet_identity() }
+    }
+
     pub fn set(a: CellAddr, input: Input) -> Self {
         Self::block(a.sheet, a.row, a.col, vec![vec![input]])
     }
@@ -257,6 +262,13 @@ impl GridOp {
             GridOp::AddSheet(name) => {
                 w.u8(11);
                 w.str(name);
+                return w.into_bytes();
+            }
+            GridOp::AddIdentifiedSheet { name, identity } => {
+                w.u8(25);
+                w.str(name);
+                w.u64((*identity >> 64) as u64);
+                w.u64(*identity as u64);
                 return w.into_bytes();
             }
             GridOp::DropSheet => {
@@ -460,6 +472,12 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
+        }
+        if kind == 25 {
+            let name = r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string();
+            let identity = (u128::from(r.u64()?) << 64) | u128::from(r.u64()?);
+            if !r.is_empty() { return Err(WireError::Invalid("trailing bytes")); }
+            return Ok(GridOp::AddIdentifiedSheet { name, identity });
         }
         if (11..=15).contains(&kind) {
             let op = match kind {
@@ -684,10 +702,17 @@ impl Op<Workbook> for GridOp {
                 Ok(_) => GridOp::DropSheet,
                 Err(_) => GridOp::Batch(Vec::new()),
             },
-            GridOp::DropSheet => match wb.drop_last_sheet() {
-                Some(name) => GridOp::AddSheet(name),
-                None => GridOp::Batch(Vec::new()),
+            GridOp::AddIdentifiedSheet { name, identity } => match wb.add_identified_sheet(&name, identity) {
+                Ok(_) => GridOp::DropSheet,
+                Err(_) => GridOp::Batch(Vec::new()),
             },
+            GridOp::DropSheet => {
+                let identity = wb.sheets.last().map_or(0, |sheet| sheet.identity);
+                match wb.drop_last_sheet() {
+                    Some(name) => GridOp::AddIdentifiedSheet { name, identity },
+                    None => GridOp::Batch(Vec::new()),
+                }
+            }
             GridOp::MoveSheet { from, to } => {
                 if wb.move_sheet(from, to) {
                     GridOp::MoveSheet { from: to, to: from }

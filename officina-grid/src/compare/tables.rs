@@ -25,6 +25,29 @@ pub struct PivotChange {
 }
 
 impl TableChange {
+    pub(super) fn is_addition(&self) -> bool { self.before.is_none() }
+
+    pub(super) fn on_new_sheet(&self, local: &Workbook, incoming: &Workbook) -> bool {
+        self.after.as_ref().is_some_and(|obj| local.sheet_id(&incoming.sheet_name(obj.rect.sheet)).is_none())
+    }
+
+    pub(super) fn key(&self) -> String {
+        self.before.as_ref().or(self.after.as_ref()).unwrap().name.to_uppercase()
+    }
+
+    pub(super) fn same_incoming(&self, other: &Self, source: &Workbook, other_source: &Workbook) -> bool {
+        match (&self.after, &other.after) {
+            (Some(a), Some(b)) => map_table(a, source, other_source).as_ref() == Some(b.as_ref()),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        (self.before.as_deref().map_or_else(|| "(none)".into(), super::review_value),
+         self.after.as_deref().map_or_else(|| "(none)".into(), super::review_value))
+    }
+
     pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
         if let Some(a) = &mut self.at { a.sheet = new.sheet_id(&old.sheet_name(a.sheet))?; }
         if let Some(obj) = &mut self.before { **obj = map_table(obj, old, new)?; }
@@ -40,6 +63,29 @@ impl TableChange {
 }
 
 impl PivotChange {
+    pub(super) fn is_addition(&self) -> bool { self.before.is_none() }
+
+    pub(super) fn on_new_sheet(&self, local: &Workbook, incoming: &Workbook) -> bool {
+        self.after.as_ref().is_some_and(|obj| local.sheet_id(&incoming.sheet_name(obj.dest.sheet)).is_none())
+    }
+
+    pub(super) fn key(&self) -> String {
+        self.before.as_ref().or(self.after.as_ref()).unwrap().name.to_uppercase()
+    }
+
+    pub(super) fn same_incoming(&self, other: &Self, source: &Workbook, other_source: &Workbook) -> bool {
+        match (&self.after, &other.after) {
+            (Some(a), Some(b)) => map_pivot(a, source, other_source).as_ref() == Some(b.as_ref()),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        (self.before.as_deref().map_or_else(|| "(none)".into(), super::review_value),
+         self.after.as_deref().map_or_else(|| "(none)".into(), super::review_value))
+    }
+
     pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
         if let Some(a) = &mut self.at { a.sheet = new.sheet_id(&old.sheet_name(a.sheet))?; }
         if let Some(obj) = &mut self.before { **obj = map_pivot(obj, old, new)?; }

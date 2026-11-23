@@ -31,6 +31,27 @@ fn break_refs(e: &Expr, own: u16, gone: u16) -> Expr {
     }
 }
 
+/// Rename a tab and keep the targets of cell hyperlinks. Text typed into
+/// formulas is left alone, including string arguments to HYPERLINK().
+pub fn rename_sheet_op(wb: &Workbook, sheet: u16, name: &str) -> Option<GridOp> {
+    if sheet as usize >= wb.sheet_count() || wb.sheet_name_ok(name, Some(sheet)).is_err() { return None; }
+    let mut ops = vec![GridOp::RenameSheet { sheet, name: name.into() }];
+    for own in 0..wb.sheet_count() as u16 {
+        let set: Vec<_> = wb.links(own).iter().filter_map(|(&(row, col), link)| {
+            let (prefix, range) = link.target.strip_prefix('#')?.rsplit_once('!')?;
+            if link.place(wb, own)?.sheet != sheet { return None; }
+            let new_prefix = if !prefix.starts_with('\'') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                name.to_owned()
+            } else {
+                format!("'{}'", name.replace('\'', "''"))
+            };
+            Some((row, col, crate::links::Link::new(&format!("#{new_prefix}!{range}"))))
+        }).collect();
+        if !set.is_empty() { ops.push(GridOp::Links { sheet: own, set }); }
+    }
+    Some(GridOp::Batch(ops))
+}
+
 /// The edit that deletes sheet `s`; None for the only sheet or one that isn't.
 pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     let n = wb.sheet_count();
@@ -71,7 +92,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if tables.len() != wb.tables().len() {
         ops.push(GridOp::Tables(tables));
     }
-    let charts: Vec<_> = wb.charts().iter().filter(|c| c.anchor.sheet != s && c.series.iter().all(|x| x.vals.sheet != s && x.cats.is_none_or(|r| r.sheet != s))).cloned().collect();
+    let reads_sheet = |text: &Option<crate::charts::ChartText>| matches!(text, Some(crate::charts::ChartText::Cell(a)) if a.sheet == s);
+    let charts: Vec<_> = wb.charts().iter().filter(|c| c.anchor.sheet != s && !reads_sheet(&c.title)
+        && c.series.iter().all(|x| x.vals.sheet != s && x.cats.is_none_or(|r| r.sheet != s) && !reads_sheet(&x.name))).cloned().collect();
     if charts.len() != wb.charts().len() {
         ops.push(GridOp::Charts(charts));
     }
@@ -84,12 +107,18 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if kept_p.len() != pivots.len() {
         ops.push(GridOp::Pivots(kept_p));
     }
-    let cfs: Vec<_> = wb.cond_formats().iter().filter(|f| f.sheet != s).cloned().collect();
-    if cfs.len() != wb.cond_formats().len() {
+    let cfs: Vec<_> = wb.cond_formats().iter().filter(|f| f.sheet != s).map(|f| {
+        let rules = f.rules.iter().map(|rule| crate::condfmt::Rule {
+            kind: rule.kind.map_exprs(&|expr| break_refs(expr, f.sheet, s)), ..rule.clone()
+        }).collect();
+        crate::condfmt::CondFormat { rules, ..f.clone() }
+    }).collect();
+    if cfs != wb.cond_formats() {
         ops.push(GridOp::cond_formats(wb, &cfs));
     }
-    let vs: Vec<_> = wb.validations().iter().filter(|v| v.sheet != s).cloned().collect();
-    if vs.len() != wb.validations().len() {
+    let vs: Vec<_> = wb.validations().iter().filter(|v| v.sheet != s)
+        .map(|v| v.map_exprs(&|expr| break_refs(expr, v.sheet, s))).collect();
+    if vs != wb.validations() {
         ops.push(GridOp::validations(wb, &vs));
     }
 

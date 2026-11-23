@@ -30,6 +30,29 @@ impl ChartChange {
         Some((self.sheet?, chart.anchor.from.0, chart.anchor.from.1))
     }
 
+    pub(super) fn key(&self, ours: &Workbook, source: &Workbook) -> (String, u32, u32) {
+        let (wb, anchor) = if let Some((_, before)) = &self.before {
+            (ours, before.anchor)
+        } else {
+            (source, self.after.as_ref().unwrap().anchor)
+        };
+        (wb.sheet_name(anchor.sheet).to_ascii_lowercase(), anchor.from.0, anchor.from.1)
+    }
+
+    pub(super) fn same_incoming(&self, other: &Self, source: &Workbook, other_source: &Workbook) -> bool {
+        match (&self.after, &other.after) {
+            (Some(a), Some(b)) => remap_chart(a, source, other_source).as_ref() == Some(b.as_ref()),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        let show = |obj: &Chart| super::review_value(obj);
+        (self.before.as_ref().map_or_else(|| "(none)".into(), |(_, obj)| show(obj)),
+         self.after.as_deref().map_or_else(|| "(none)".into(), show))
+    }
+
     pub(crate) fn same_review_item(&self, other: &Self) -> bool {
         self.sheet == other.sheet && self.after == other.after
             && self.before.as_ref().map(|(_, c)| c) == other.before.as_ref().map(|(_, c)| c)
@@ -65,6 +88,35 @@ impl PictureChange {
         Some((self.sheet?, picture.anchor.from.0, picture.anchor.from.1))
     }
 
+    pub(super) fn key(&self, ours: &Workbook, source: &Workbook) -> (String, u32, u32) {
+        let (wb, anchor) = if let Some((_, before)) = &self.before {
+            (ours, before.anchor)
+        } else {
+            (source, self.after.as_ref().unwrap().anchor)
+        };
+        (wb.sheet_name(anchor.sheet).to_ascii_lowercase(), anchor.from.0, anchor.from.1)
+    }
+
+    pub(super) fn same_incoming(&self, other: &Self, source: &Workbook, other_source: &Workbook) -> bool {
+        match (&self.after, &other.after) {
+            (Some(a), Some(b)) => remap_picture(a, source, other_source).as_ref() == Some(b.as_ref()),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    pub(super) fn details(&self) -> (String, String) {
+        let show = |obj: &Picture| format!("{} bytes\nAnchor: {:?}\nCrop: {:?}\nRotation: {}\nLink: {}\nContent fingerprint: {:016x}",
+                obj.bytes.len(), obj.anchor, obj.crop, obj.rotation, obj.link.as_deref().unwrap_or("(none)"), {
+                    use std::hash::{Hash, Hasher};
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    obj.bytes.hash(&mut hash);
+                    hash.finish()
+                });
+        (self.before.as_ref().map_or_else(|| "(none)".into(), |(_, obj)| show(obj)),
+         self.after.as_deref().map_or_else(|| "(none)".into(), show))
+    }
+
     pub(crate) fn same_review_item(&self, other: &Self) -> bool {
         self.sheet == other.sheet && self.after == other.after
             && self.before.as_ref().map(|(_, picture)| picture) == other.before.as_ref().map(|(_, picture)| picture)
@@ -81,8 +133,8 @@ impl PictureChange {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NameChange {
     pub(crate) sheet: Option<u16>,
-    scope: Option<String>,
-    key: String,
+    pub(super) scope: Option<String>,
+    pub(super) key: String,
     before: Option<(String, String)>,
     after: Option<(String, String)>,
 }
@@ -168,7 +220,7 @@ pub(super) fn styles(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, pairs: 
     false
 }
 
-fn segment(runs: &[StyleRun], index: &mut usize, at: u32) -> (u32, u32) {
+pub(super) fn segment(runs: &[StyleRun], index: &mut usize, at: u32) -> (u32, u32) {
     while runs.get(*index).is_some_and(|&(_, hi, _)| hi < at) { *index += 1; }
     match runs.get(*index) {
         Some(&(lo, hi, id)) if lo <= at => (id, hi + 1),
