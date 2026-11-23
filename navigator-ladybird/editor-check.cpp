@@ -35,7 +35,7 @@ static constexpr char fixture[] = {
 extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
 extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
-#ifdef ATRIUM_I4_VIDEO
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 extern "C" bool navigator_video_channel(int);
 #endif
 extern "C" bool navigator_counter_started(NavigatorScene*, u8 const*, size_t, u8 const*, size_t);
@@ -86,7 +86,7 @@ int main(int argc, char** argv)
     if (embedded) {
 #ifndef ATRIUM_MAIL_PAGE
         int channel = dup(STDOUT_FILENO);
-#ifdef ATRIUM_I4_VIDEO
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
         if (channel < 0 || !navigator_video_channel(channel)) return 1;
 #endif
         if (channel < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0 || !navigator_fixture_channel(channel))

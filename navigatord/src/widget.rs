@@ -83,7 +83,7 @@ impl Widget {
         parent
             .place(embed, Some(rect))
             .map_err(|e| format!("place: {e:?}"))?;
-        let video = if source == VIDEO {
+        let video = if matches!(source, VIDEO | YOUTUBE_ENTRY) {
             use std::os::fd::AsRawFd;
             let (video, worker) = crate::widget_video::Video::start(socket, window, rect)?;
             navigator_control::send_fd(&channel, worker.as_raw_fd()).map_err(|e| e.to_string())?;

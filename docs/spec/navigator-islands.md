@@ -538,6 +538,13 @@ first queued portion of the post-seek tone. Frames, PCM, hashes, resolved
 LibJS features and jail evidence are in
 `~/atrium-vm/evidence/navigator-i4-opus-20261123/`.
 
+For the restricted YouTube entry, navigatord now passes the same native
+player descriptor used by the two-track fixture. On trusted Start the
+worker receives the descriptor before entering capability mode. The
+provider continues to use its existing restricted fetch path. The broker
+and worker cross-link for FreeBSD arm64. Guest verification of codec
+readiness and the provider Play control with this descriptor is pending.
+
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
 now retains same-space intersecting rectangular clips and represents a
