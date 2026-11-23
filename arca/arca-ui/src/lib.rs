@@ -14,3 +14,6 @@ pub mod keymap;
 pub mod view;
 pub mod smime;
 pub mod smime_sheet;
+
+#[cfg(all(target_os = "freebsd", feature = "legacy-smime-integration"))]
+pub mod legacy_smime_fixture;

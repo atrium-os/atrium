@@ -9,6 +9,7 @@ description = "S/MIME for Mail (docs/spec/mail.md §10.1): verify a detached sig
 [features]
 # Synthetic prototype only. Mail's reader does not opt in.
 legacy-receive-prototype = []
+legacy-receive-worker = ["legacy-receive-prototype", "dep:libc", "dep:zeroize"]
 
 [dependencies]
 cms = { version = "0.2.3", default-features = false, features = ["std"] }
@@ -20,6 +21,14 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }
 rsa = "0.9"
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+libc = { version = "0.2", optional = true }
+zeroize = { version = "1", optional = true }
+
+[[bin]]
+name = "mail-legacy-smime-worker"
+path = "src/bin/legacy_worker.rs"
+required-features = ["legacy-receive-worker"]
 
 [dev-dependencies]
 rcgen = "0.13"

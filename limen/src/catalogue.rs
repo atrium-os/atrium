@@ -69,6 +69,8 @@ pub const CHOICE_MS: u64 = 30_000;
 pub const PRELUM: &str = "org.atrium.prelum";
 
 pub const ROLES: &[Role] = &[
+    #[cfg(feature = "legacy-smime-integration")]
+    Role { name: "smime-legacy-read", provider: Provider::System(ARCA), slot: SlotKind::Sheet { w: 620, h: 350 }, takes_fd: false, returns_fd: false },
     Role { name: "smime-provision", provider: Provider::System(ARCA), slot: SlotKind::Sheet { w: 680, h: 520 }, takes_fd: false, returns_fd: false },
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },

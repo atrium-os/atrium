@@ -678,6 +678,30 @@ impl Store {
         out
     }
 
+    /// Find an S/MIME fingerprint across this user's personas and old
+    /// publishers. The caller authorizes enrollment before using this.
+    pub fn has_smime_key(&self, kind: Kind, fingerprint: &[u8; 32]) -> Result<bool, Error> {
+        for (id, group) in &self.groups {
+            let same_purpose = matches!(
+                (kind, &group.recipient),
+                (Kind::SmimeRsaKey, Recipient::Smime { .. })
+                    | (Kind::SmimeLegacyRsaKey, Recipient::SmimeLegacy { .. })
+            );
+            if !same_purpose {
+                continue;
+            }
+            let class = self.class_key_for_meta(group.class)?;
+            let key = self.data_key(id, group, class.key())?;
+            for index in 0..group.items.len() {
+                let item = self.meta_of(id, index, &key)?;
+                if item.kind == kind && item.scope.starts_with(fingerprint) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Items for one recipient, metadata only.
     pub fn list(&self, who: &Access<'_>) -> Result<Vec<ItemMeta>, Error> {
         let mut out = Vec::new();

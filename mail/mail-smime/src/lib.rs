@@ -7,6 +7,8 @@
 pub mod ber;
 pub mod cert;
 pub mod envelope;
+#[cfg(feature = "legacy-receive-prototype")]
+pub mod legacy_wire;
 pub mod sign;
 pub mod verify;
 

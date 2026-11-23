@@ -3147,4 +3147,6 @@ fn zeroize_array(b: &mut [u8; 32]) {
     }
 }
 
+#[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+pub use smime::integration;
 mod smime;

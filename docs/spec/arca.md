@@ -888,6 +888,19 @@ approver and worker run in-process during the prototype and do not stand
 in for verification of the real trusted sheet, process boundary or
 persistent key-store rules.
 
+The separate, non-default `legacy-smime-integration` feature adds a
+synthetic fixture provider for a Limen sheet and uses real Fresco
+approval and a one-shot Portcullis worker. The worker checks it is
+jailed and enters Capsicum before accepting any input. The trusted
+fixture owns the private worker connection, and the parent receives
+only a typed outcome. The fixture uses a fixed test message, a
+synthetic launch registry and a private persistent Arca store. Normal
+Mail and arcad expose no legacy dispatch. The legacy store recipient
+and item kind are distinct from OAEP. Enrollment checks the opposite
+purpose across the same user's stored personas and publishers. The
+default OAEP operation keeps legacy items out of certificate discovery
+and refuses to provision a key that exists as a legacy enrollment.
+
 The synthetic Tessera gate must cover a successful Work open, no key
 use without the trusted confirmation, rejection of stale or reused
 authorization and a changed message, Personal isolation, lock and

@@ -19,6 +19,8 @@ path = "src/bin/arcad.rs"
 host-openssl-tests = []
 # Compiles the synthetic gate only. No socket or UI dispatch is enabled.
 legacy-smime-prototype = ["dep:mail-smime", "dep:subtle"]
+# Integration lab only. No ordinary Mail or daemon dispatch uses this.
+legacy-smime-integration = ["dep:subtle", "dep:mail-smime"]
 
 [dependencies]
 arca-store      = { path = "../arca-store" }

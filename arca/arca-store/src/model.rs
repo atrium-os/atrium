@@ -98,6 +98,8 @@ pub enum Kind {
     TlsClientKey = 0x105,
     /// RSA key for Mail's CMS content-key transport.
     SmimeRsaKey = 0x106,
+    /// Dedicated legacy receive-only RSA key.
+    SmimeLegacyRsaKey = 0x107,
 }
 
 impl Kind {
@@ -121,6 +123,7 @@ impl Kind {
             0x104 => WireGuardKey,
             0x105 => TlsClientKey,
             0x106 => SmimeRsaKey,
+            0x107 => SmimeLegacyRsaKey,
             _ => return Err(Error::Corrupt("unknown kind")),
         })
     }
@@ -259,6 +262,8 @@ pub enum Recipient {
     Printer { key: [u8; 32], uuid: String },
     /// The signed Mail publisher, through the persona-bound CMS operation.
     Smime { publisher: [u8; 32] },
+    /// A separate recipient for the legacy receive-only operation.
+    SmimeLegacy { publisher: [u8; 32] },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -440,6 +445,10 @@ impl Recipient {
                 w.u8(8);
                 w.raw(publisher);
             }
+            Recipient::SmimeLegacy { publisher } => {
+                w.u8(9);
+                w.raw(publisher);
+            }
         }
     }
 
@@ -492,6 +501,7 @@ impl Recipient {
             }
             7 => Recipient::printer(r.array::<32>()?, r.str(36)?).map_err(|_| Error::Corrupt("recipient")),
             8 => Ok(Recipient::Smime { publisher: r.array::<32>()? }),
+            9 => Ok(Recipient::SmimeLegacy { publisher: r.array::<32>()? }),
             _ => Err(Error::Corrupt("recipient tag")),
         }
     }

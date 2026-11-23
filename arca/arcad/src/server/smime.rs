@@ -69,6 +69,9 @@ impl State {
         let key = tri!(native::Key::parse(der));
         tri!(key.check_private());
         let fingerprint = tri!(key.fingerprint());
+        if tri!(store.has_smime_key(Kind::SmimeLegacyRsaKey, &fingerprint)) {
+            return reply(status::DENIED);
+        }
         let recipient = Recipient::Smime { publisher };
         let access = Access {
             persona,
@@ -254,6 +257,9 @@ fn certificate(item: &arca_store::ItemMeta) -> Option<&[u8]> {
 #[cfg(all(test, feature = "legacy-smime-prototype", any(target_os = "freebsd", feature = "host-openssl-tests")))]
 mod legacy;
 
+#[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+pub mod integration;
+
 #[cfg(any(target_os = "freebsd", all(test, feature = "host-openssl-tests")))]
 mod native {
     use std::ffi::{c_char, c_int, c_long, c_void};
@@ -403,7 +409,7 @@ mod native {
         ) -> c_int;
     }
 
-    #[cfg(all(test, feature = "legacy-smime-prototype"))]
+    #[cfg(any(all(test, feature = "legacy-smime-prototype"), feature = "legacy-smime-integration"))]
     #[repr(C)]
     struct OsslParam {
         key: *const c_char,
@@ -413,7 +419,7 @@ mod native {
         return_size: usize,
     }
 
-    #[cfg(all(test, feature = "legacy-smime-prototype"))]
+    #[cfg(any(all(test, feature = "legacy-smime-prototype"), feature = "legacy-smime-integration"))]
     #[link(name = "crypto")]
     unsafe extern "C" {
         fn OSSL_PARAM_construct_uint(key: *const c_char, value: *mut std::ffi::c_uint) -> OsslParam;
@@ -594,7 +600,7 @@ mod native {
 
         /// Prototype only. The worker receives exactly the cipher's public
         /// key size. The result and recovered length never leave Arca.
-        #[cfg(all(test, feature = "legacy-smime-prototype"))]
+        #[cfg(any(all(test, feature = "legacy-smime-prototype"), feature = "legacy-smime-integration"))]
         pub(super) fn legacy_candidate(&self, ciphertext: &[u8], key_bytes: usize) -> Result<LockedBuf, Error> {
             use subtle::{ConditionallySelectable, ConstantTimeEq};
 
@@ -648,7 +654,7 @@ mod native {
     }
 
     impl Context {
-        #[cfg(all(test, feature = "legacy-smime-prototype"))]
+        #[cfg(any(all(test, feature = "legacy-smime-prototype"), feature = "legacy-smime-integration"))]
         fn set_legacy_with_implicit_rejection(&self) -> Result<(), Error> {
             const RSA_PKCS1_PADDING: c_int = 1;
             let ctx = self.0.as_ptr();

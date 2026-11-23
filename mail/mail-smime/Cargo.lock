@@ -318,6 +318,7 @@ dependencies = [
  "cbc",
  "cms",
  "der",
+ "libc",
  "p256",
  "rand_core",
  "rcgen",
@@ -326,6 +327,7 @@ dependencies = [
  "sha2",
  "spki",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

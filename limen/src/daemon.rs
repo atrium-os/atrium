@@ -458,7 +458,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         identity
     };
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
-    let smime_scope = if role.name == "smime-provision" {
+    let smime_scope = if matches!(role.name, "smime-provision" | "smime-legacy-read") {
         let valid = shared.smime_mail.lock().unwrap().as_ref().and_then(|resolve| resolve(uid));
         if app != "org.atrium.mail" || valid.is_none() {
             return refuse(refusal::NOT_AN_APP);
@@ -620,7 +620,7 @@ fn request_smime_picker(shared: &Arc<Shared>, conn: ConnId, uid: u32, sheet: Emb
     }
     let mut st = shared.state.lock().unwrap();
     let Some(outer) = st.embeds.get(&sheet).filter(|outer| {
-        outer.bound && outer.visible && outer.child_uid == uid && outer.child_window == Some(window)
+        outer.role.name == "smime-provision" && outer.bound && outer.visible && outer.child_uid == uid && outer.child_window == Some(window)
     }) else {
         return refuse(refusal::NOT_ATTACHED);
     };
@@ -828,7 +828,11 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
     if m.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
-    if e.smime_scope.is_some() {
+    if e.role.name == "smime-legacy-read" {
+        if !e.bound || fd.is_some() || !matches!(&m.bytes[..], b"opened" | b"closed" | b"cancelled") {
+            return Err(Reply::Refused { reason: refusal::MALFORMED });
+        }
+    } else if e.smime_scope.is_some() {
         use crate::smime_provision::Outcome;
         match Outcome::decode(&m.bytes) {
             Some(Outcome::Failed) if !e.attached => {}
@@ -1047,7 +1051,7 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
     // configured, otherwise by its registry identity.
     let fixed = shared.system_uids.lock().unwrap().get(app).copied();
     let ok = match fixed {
-        None if role.name == "smime-provision" => false,
+        None if matches!(role.name, "smime-provision" | "smime-legacy-read") => false,
         Some(u) => u == uid,
         None => matches!((shared.resolve)(uid), Some((_, a)) if a == app),
     };
