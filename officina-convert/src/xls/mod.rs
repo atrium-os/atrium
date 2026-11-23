@@ -11,7 +11,7 @@
 //! against writing opens with Excel's default password.
 //!
 //! Reported, not carried: merged cells, comments, hyperlinks, drawings and
-//! charts, conditional formats, data validation, macros. Refused: Excel 95
+//! charts, conditional formats, and macros. Refused: Excel 95
 //! and older (BIFF5 and before) and XOR obfuscation.
 
 pub mod biff;
@@ -19,6 +19,7 @@ pub mod formula;
 mod ftab;
 #[doc(hidden)]
 pub mod sample;
+mod validation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -403,7 +404,7 @@ struct SheetOut {
 
 /// One worksheet substream into sheet `s`.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report) -> Result<SheetOut, XlsError> {
+fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report) -> Result<SheetOut, XlsError> {
     let mut so = SheetOut::default();
     let mut widths: Vec<(u32, f64)> = Vec::new();
     let mut heights: Vec<(u32, f64)> = Vec::new();
@@ -611,7 +612,22 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, xf_ids: &[Styl
             0x00E5 => rep.note(Kind::Approximate, "merged cells shown unmerged"),
             0x001C => rep.note(Kind::Dropped, "comments"),
             0x01B8 => rep.note(Kind::Dropped, "hyperlinks"),
-            0x01BE => rep.note(Kind::Dropped, "data validation rules"),
+            0x01BE => {
+                if wb.validations().len() >= officina_grid::validation::MAX_VALIDATIONS {
+                    rep.note(Kind::Dropped, "BIFF8 data validation rules past the limits");
+                } else {
+                    match validation::read(wb, s, r, ctx) {
+                        Ok((rule, ime)) => {
+                            if wb.add_validation(rule).is_err() {
+                                rep.note(Kind::Dropped, "BIFF8 data validation rules past the limits");
+                            } else if ime {
+                                rep.note(Kind::Approximate, "BIFF8 data validation input method settings");
+                            }
+                        }
+                        Err(reason) => rep.note(Kind::Dropped, reason),
+                    }
+                }
+            }
             0x01B0 | 0x01B1 => rep.note(Kind::Dropped, "conditional formats"),
             0x005D => {
                 // OBJ: its common data names the kind of object.
@@ -850,7 +866,7 @@ fn read_with(data: &[u8], password: Option<&str>, formulas: bool) -> Result<(Wor
             Some(r) if r.kind == biff::BOF && r.data.len() >= 4 && u16::from_le_bytes([r.data[2], r.data[3]]) == 0x0010 => {}
             _ => return Err(bad(format!("sheet {} isn't where the workbook says", sh.name))),
         }
-        let so = sheet(&mut wb, s, &recs, &g, &xf_ids, &mut out, &mut rep)?;
+        let so = sheet(&mut wb, s, &recs, &g, &ctx, &xf_ids, &mut out, &mut rep)?;
         all.push((s, so));
     }
     if !formulas {

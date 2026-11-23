@@ -23,6 +23,7 @@
 # Use SHEETS_INTEROP_CASE=rank_filter and /tmp/sheets-rank-filter-fixture for rank filters.
 # Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
 # Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
+# Use validation_legacy with the same binary and its make-legacy inputs.
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
@@ -36,12 +37,13 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
     pivot_cache) test "$(ls "$books")" = "$(printf 'missing.xlsx\nunusable.xlsx')" ;;
     pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
+    validation_legacy) test "$(ls "$books")" = "$(printf 'extension.xlsx\nvalidation.xls')" ;;
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     table_filters) test "$(ls "$books")" = "$(printf 'tables.ods\ntables.xlsm\ntables.xlsx')" ;;
     advanced_filters) test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')" ;;
@@ -88,6 +90,7 @@ checkpoint() {
         text_filter) /tmp/sheets-text-filter-fixture check "$1" "$2" "$format" ;;
         rank_filter) /tmp/sheets-rank-filter-fixture check "$1" "$2" "$format" ;;
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
+        validation_legacy) /tmp/sheets-validation-fixture check "$1" "$2${list_stage:-}-$variant" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
         protection) /tmp/sheets-protection-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
@@ -491,7 +494,7 @@ condfmt() {
     key 0x28
     condfmt_capture edited
     save "$book" edited
-    cp "$books/$book" "$results/saved.$format"
+    cp "$books/$book" "$results/saved.${book##*.}"
     final=edited
 }
 condfmt_reopened() {
@@ -550,8 +553,106 @@ validation() {
     save "$book" ready
     click 445 24
     save "$book" filled
-    cp "$books/$book" "$results/saved.$format"
+    cp "$books/$book" "$results/saved.${book##*.}"
     final=filled
+}
+
+validation_list_type() {
+    click 510 133 # H2 allows "2,0" as one item. The fallback's bare 2 must fail.
+    key 0x1f # 2
+    key 0x28
+    sleep .45
+    cp selectscreen.png "$results/$format-list-typing-rejected.png"
+    click 510 153
+    key 0x25 # 8
+    key 0x28
+    sleep .45
+}
+
+validation_list_bulk() {
+    drag 318 133 318 153 # 7, 9 are rejected as a list paste.
+    key 0x06 1
+    click 510 133
+    key 0x19 1
+    sleep .6
+    cp selectscreen.png "$results/$format-list-paste-rejected.png"
+    save "$book" filled
+
+    click 510 112 # Seed unvalidated H1 with 2.
+    key 0x1f
+    key 0x28
+    drag 510 112 510 133
+    key 0x07 1
+    sleep .6
+    cp selectscreen.png "$results/$format-list-fill-rejected.png"
+    save "$book" filled
+
+    drag 382 133 382 153 # F2:F3 is 6, 8. Both are allowed.
+    key 0x06 1
+    click 510 133
+    key 0x19 1
+    list_stage=+paste
+    save "$book" filled
+
+    drag 510 133 510 153
+    key 0x07 1
+    list_stage=+fill
+    save "$book" filled
+}
+
+validation_legacy() {
+    for format in xlsx xls; do
+        list_stage=
+        if test "$format" = xls; then
+            book=validation.xls
+            variant=legacy
+            row=213
+            checksum=$(sha256 -q "$books/$book")
+        else
+            book=extension.xlsx
+            variant=extended
+            row=183
+        fi
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        validation_list_type
+        list_stage=+list
+        if test "$format" = xls; then
+            click 205 24 # Save As the foreign workbook as a native copy.
+            wait_for other_window 824 458 "$document"
+            click 824 458
+            book=validation.osheet
+            wait_for test -s "$books/$book"
+            wait_for checkpoint "$books/$book" initial
+            wait_for same_window 824 458 "$document"
+        else
+            save "$book" initial
+        fi
+        validation
+        validation_list_bulk
+        close_book
+
+        if test "$format" = xls; then
+            test "$(sha256 -q "$books/validation.xls")" = "$checksum"
+            open_book 213 "$book" filled native
+        else
+            open_book "$row" "$book" filled
+        fi
+        validation_reopened
+        click 510 133
+        key 0x1f # The exact list still rejects 2 after picker reopen.
+        key 0x28
+        sleep .45
+        cp selectscreen.png "$results/$format-list-reopened-rejection.png"
+        click 126 133
+        key 0x24 # 7 is a valid whole number. Save this fresh edit.
+        key 0x28
+        save "$book" reopened
+        cp "$books/$book" "$results/reopened.${book##*.}"
+        close_book
+        echo "PASS $format numeric and exact-list typing, clipboard and fill, ordinary Save and picker reopen"
+    done
+    echo "PASS XLS native Save As retained its validation and the original XLS bytes"
 }
 
 validation_reopened() {
@@ -1047,6 +1148,7 @@ case "$profile" in
     table_filters) table_filters; exit ;;
     pivot_scope) pivot_scope; exit ;;
     legacy) legacy; exit ;;
+    validation_legacy) validation_legacy; exit ;;
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;
     dates) dates; exit ;;

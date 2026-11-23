@@ -434,6 +434,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
     let mut vbuf: Vec<u8> = Vec::new();
     loop {
         buf.clear();
+        let tag_start = r.buffer_position() as usize;
         let ev = r.read_event_into(&mut buf)?;
         let (e, empty) = match ev {
             Event::Start(e) => (e, false),
@@ -442,6 +443,16 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
             _ => continue,
         };
         match e.local_name().as_ref() {
+            b"worksheet" if first => {
+                for a in e.attributes().flatten().filter(|a| a.key.as_ref() == b"xmlns" || a.key.as_ref().starts_with(b"xmlns:")) {
+                    seg.valid.root_namespaces.push(b' ');
+                    seg.valid.root_namespaces.extend_from_slice(a.key.as_ref());
+                    seg.valid.root_namespaces.extend_from_slice(b"=\"");
+                    let value = a.unescape_value()?;
+                    seg.valid.root_namespaces.extend_from_slice(crate::xml::esc(&value).as_bytes());
+                    seg.valid.root_namespaces.push(b'"');
+                }
+            }
             b"tabColor" if first => seg.tab = super::styles::color_of(&e, theme),
             b"sheetFormatPr" => {
                 seg.default_h = attr(&e, b"defaultRowHeight")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v < 410.0);
@@ -678,16 +689,16 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
             b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
             b"dataValidations" if !empty && e.name().as_ref() == b"dataValidations" => {
                 let end = e.name().as_ref().to_vec();
-                let span = r.read_to_end(quick_xml::name::QName(&end))?;
+                r.read_to_end(quick_xml::name::QName(&end))?;
                 if seg.valid.base.is_empty() {
-                    seg.valid.base = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
+                    seg.valid.base = data[tag_start..r.buffer_position() as usize].to_vec();
                 }
             }
             b"ext" if !empty && attr(&e, b"uri")?.is_some_and(|uri| uri.eq_ignore_ascii_case(super::validation::EXT_URI)) => {
                 let end = e.name().as_ref().to_vec();
-                let span = r.read_to_end(quick_xml::name::QName(&end))?;
+                r.read_to_end(quick_xml::name::QName(&end))?;
                 if seg.valid.extension.is_none() {
-                    seg.valid.extension = Some(data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec());
+                    seg.valid.extension = Some(data[tag_start..r.buffer_position() as usize].to_vec());
                 }
             }
             b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules outside a recognized worksheet container"),
@@ -853,6 +864,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     wb.sheet_mut(s).freeze_from = from;
                 }
                 cond.extend(seg.cond);
+                valid.root_namespaces.extend(seg.valid.root_namespaces);
                 if valid.base.is_empty() {
                     valid.base = seg.valid.base;
                 }

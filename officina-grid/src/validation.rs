@@ -35,7 +35,7 @@ pub enum Allow {
     Any,
     Whole,
     Decimal,
-    /// A value from a list: `f1` is a range or a text of items split by commas.
+    /// A value from a range, an array of items, or a string split by commas.
     List,
     Date,
     Time,
@@ -130,6 +130,18 @@ impl Validation {
     pub fn new(sheet: u16, ranges: Vec<Rect>, allow: Allow, op: CmpOp, f1: Option<Arc<Expr>>, f2: Option<Arc<Expr>>) -> Validation {
         Validation { sheet, ranges, allow, op, f1, f2, allow_blank: true, dropdown: true, style: ErrorStyle::Stop, show_prompt: true, show_error: true, prompt: Message::default(), error: Message::default() }
     }
+    /// Exact literal lists retain each text item separately in a constant array.
+    pub fn literal_list_items(&self) -> Option<Vec<&str>> {
+        if self.allow != Allow::List {
+            return None;
+        }
+        let Expr::Array(rows) = self.f1.as_deref()? else { return None };
+        rows.iter().flatten().map(|item| match item {
+            Expr::Str(text) => Some(text.as_ref()),
+            _ => None,
+        }).collect()
+    }
+
     /// The cell formulas are written for: the first range's top-left.
     pub fn origin(&self) -> (u32, u32) {
         self.ranges.first().map_or((0, 0), |r| (r.r0, r.c0))

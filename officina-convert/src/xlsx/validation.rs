@@ -8,6 +8,9 @@ use officina_grid::Workbook;
 
 use crate::xml::esc;
 
+const LIST_NS: &str = "http://schemas.microsoft.com/office/spreadsheetml/2011/1/ac";
+const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
 pub const EXT_URI: &str = "{CCE6A557-97BC-4B89-ADB6-D9C93CAAB3DF}";
 
 fn cross_sheet(v: &Validation) -> bool {
@@ -90,7 +93,14 @@ fn write_rules(wb: &Workbook, s: u16, o: &mut Vec<u8>, extended: bool) {
         } else {
             let _ = write!(x, r#" sqref="{sqref}">"#);
         }
+        let list = v.literal_list_items();
+        if let Some(items) = &list {
+            write_literal_list(&mut x, items);
+        }
         for (tag, expr) in [("formula1", &v.f1), ("formula2", &v.f2)] {
+            if tag == "formula1" && list.is_some() {
+                continue;
+            }
             if let Some(t) = f(expr) {
                 let t = esc(t.strip_prefix('=').unwrap_or(&t));
                 if extended {
@@ -112,33 +122,90 @@ fn write_rules(wb: &Workbook, s: u16, o: &mut Vec<u8>, extended: bool) {
     o.extend_from_slice(x.as_bytes());
 }
 
+fn write_literal_list(out: &mut String, items: &[&str]) {
+    let _ = write!(out, r#"<mc:AlternateContent xmlns:mc="{MC_NS}" xmlns:x12ac="{LIST_NS}"><mc:Choice Requires="x12ac"><x12ac:list>"#);
+    let quote = |item: &str, encoded: &mut Vec<u8>| {
+        encoded.push(b'"');
+        let text = item.replace('"', "\"\"");
+        for (i, part) in text.split('\r').enumerate() {
+            if i != 0 {
+                encoded.extend_from_slice(b"_x000D_");
+            }
+            super::write::esc(encoded, part);
+        }
+        encoded.push(b'"');
+    };
+    let mut encoded = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        if idx != 0 {
+            encoded.push(b',');
+        }
+        quote(item, &mut encoded);
+    }
+    out.push_str(std::str::from_utf8(&encoded).expect("XML escape writes UTF-8"));
+    out.push_str("</x12ac:list></mc:Choice>");
+    // Only provide the compatibility formula if older readers can enforce
+    // exactly the same choices using ordinary comma splitting.
+    if items.iter().all(|item| !item.contains([',', '"', '\r', '\n']) && *item == item.trim()) {
+        let text = items.join(",");
+        if text.encode_utf16().count() <= 255 {
+            let _ = write!(out, "<mc:Fallback><formula1>\"{}\"</formula1></mc:Fallback>", esc(&text));
+        }
+    }
+    out.push_str("</mc:AlternateContent>");
+}
+
+#[cfg(feature = "read")]
+fn read_literal_list(mut text: &str) -> Result<std::sync::Arc<formula::Expr>, ()> {
+    use officina_grid::validation::MAX_ITEMS;
+    let mut items = Vec::new();
+    loop {
+        if items.len() == MAX_ITEMS {
+            return Err(());
+        }
+        text = text.trim_start().strip_prefix('"').ok_or(())?;
+        let mut item = String::new();
+        loop {
+            let (part, tail) = text.split_once('"').ok_or(())?;
+            item.push_str(part);
+            if let Some(rest) = tail.strip_prefix('"') {
+                item.push('"');
+                text = rest;
+            } else {
+                text = tail.trim_start();
+                break;
+            }
+        }
+        items.push(formula::Expr::Str(super::read::decode_escapes(&item).as_ref().into()));
+        if text.is_empty() {
+            return Ok(std::sync::Arc::new(formula::Expr::Array(vec![items])));
+        }
+        text = text.strip_prefix(',').ok_or(())?;
+    }
+}
+
 #[cfg(feature = "read")]
 #[derive(Default)]
 pub struct Raw {
+    pub root_namespaces: Vec<u8>,
     pub base: Vec<u8>,
     pub extension: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "read")]
 pub fn read_sheet(wb: &mut Workbook, s: u16, raw: &Raw, rep: &mut crate::report::Report) {
-    use quick_xml::events::Event;
-    read_rules(wb, s, &raw.base, false, rep);
-    if let Some(extension) = &raw.extension {
-        let mut reader = quick_xml::Reader::from_reader(extension.as_slice());
-        reader.config_mut().trim_text(true);
-        // The validation extension has one dataValidations child.
-        let section = match reader.read_event() {
-            Ok(Event::Start(tag)) if tag.local_name().as_ref() == b"dataValidations" => {
-                reader.read_to_end(tag.name()).ok().and_then(|span| extension.get(span.start as usize..span.end as usize))
-            }
-            Ok(Event::Empty(tag)) if tag.local_name().as_ref() == b"dataValidations" => Some(&[][..]),
-            _ => None,
-        };
-        if let Some(inner) = section {
-            read_rules(wb, s, inner, true, rep);
-        } else {
-            rep.note(crate::report::Kind::Dropped, "malformed Excel validation extension");
+    for (part, extended) in [(&raw.base[..], false), (raw.extension.as_deref().unwrap_or_default(), true)] {
+        if part.is_empty() {
+            continue;
         }
+        // The sheet parser saves these sections for when workbook names exist.
+        // Restore the worksheet namespace bindings for the detached XML.
+        let mut section = b"<worksheet".to_vec();
+        section.extend_from_slice(&raw.root_namespaces);
+        section.push(b'>');
+        section.extend_from_slice(part);
+        section.extend_from_slice(b"</worksheet>");
+        read_rules(wb, s, &section, extended, rep);
     }
 }
 
@@ -148,18 +215,22 @@ fn read_rules(wb: &mut Workbook, s: u16, inner: &[u8], extended: bool, rep: &mut
     use officina_grid::addr::Rect;
     use officina_grid::condfmt::CmpOp;
     use quick_xml::events::Event;
-    let mut r = quick_xml::Reader::from_reader(inner);
+    use quick_xml::name::{QName, ResolveResult};
+    let mut r = quick_xml::NsReader::from_reader(inner);
     let mut buf = Vec::new();
     // The rule being read: its attributes and formulas; which formula is open.
     type Attributes = std::collections::HashMap<Vec<u8>, String>;
-    type Fields = [String; 3];
+    type Fields = [String; 4];
     const MAX_SQREF: usize = officina_grid::validation::MAX_RANGES * 32;
     let mut cur: Option<(Attributes, Fields, bool)> = None;
     let mut open: Option<usize> = None;
+    let mut alternate = false;
+    let mut list_present = false;
+    let mut skip_depth = 0;
     let attrs = |e: &quick_xml::events::BytesStart| -> std::collections::HashMap<Vec<u8>, String> {
         e.attributes().with_checks(false).flatten().filter_map(|a| a.unescape_value().ok().map(|v| (a.key.local_name().as_ref().to_vec(), v.into_owned()))).collect()
     };
-    let mut done = |wb: &mut Workbook, a: Attributes, fs: Fields, oversized: bool| {
+    let mut done = |wb: &mut Workbook, a: Attributes, fs: Fields, oversized: bool, list_present: bool| {
         if oversized {
             rep.note(Kind::Dropped, "data validation rules with oversized formulas or ranges");
             return;
@@ -188,7 +259,14 @@ fn read_rules(wb: &mut Workbook, s: u16, inner: &[u8], extended: bool, rep: &mut
         let op = get(b"operator").and_then(CmpOp::from_name).unwrap_or(CmpOp::Between);
         // LibreOffice can write a second formula even for single-formula rules.
         let ranged = matches!(op, CmpOp::Between | CmpOp::NotBetween) && !matches!(allow, Allow::List | Allow::Custom | Allow::Any);
-        let (Ok(f1), Ok(f2)) = (fx(&fs[0]), fx(if ranged { &fs[1] } else { "" })) else {
+        let first = if allow == Allow::List && list_present {
+            read_literal_list(&fs[3]).map(Some)
+        } else if allow == Allow::Custom && list_present {
+            fx(&fs[3])
+        } else {
+            fx(&fs[0])
+        };
+        let (Ok(f1), Ok(f2)) = (first, fx(if ranged { &fs[1] } else { "" })) else {
             rep.note(Kind::Dropped, "data validation rules with formulas this engine can't read");
             return;
         };
@@ -210,12 +288,51 @@ fn read_rules(wb: &mut Workbook, s: u16, inner: &[u8], extended: bool, rep: &mut
     };
     loop {
         buf.clear();
-        let Ok(ev) = r.read_event_into(&mut buf) else { break };
+        let ev = match r.read_event_into(&mut buf) {
+            Ok(ev) => ev,
+            Err(_) => {
+                rep.note(Kind::Dropped, "malformed Excel validation XML");
+                break;
+            }
+        };
+        if skip_depth > 0 {
+            match ev {
+                Event::Start(_) => skip_depth += 1,
+                Event::End(_) => skip_depth -= 1,
+                Event::Eof => break,
+                _ => {}
+            }
+            continue;
+        }
         match ev {
             Event::Start(e) => match e.local_name().as_ref() {
                 b"dataValidation" => {
                     cur = Some((attrs(&e), Fields::default(), false));
                     open = None;
+                    alternate = false;
+                    list_present = false;
+                }
+                b"AlternateContent" if cur.is_some() && matches!(r.resolve_element(e.name()).0, ResolveResult::Bound(ns) if ns.as_ref() == MC_NS.as_bytes()) => {
+                    alternate = true;
+                }
+                b"Choice" if alternate && matches!(r.resolve_element(e.name()).0, ResolveResult::Bound(ns) if ns.as_ref() == MC_NS.as_bytes()) => {
+                    let supports_list = attrs(&e).get(b"Requires".as_slice()).is_some_and(|value| {
+                        let mut requires = value.split_whitespace();
+                        requires.next().is_some_and(|prefix| {
+                            let name = format!("{prefix}:list");
+                            matches!(r.resolve_element(QName(name.as_bytes())).0, ResolveResult::Bound(ns) if ns.as_ref() == LIST_NS.as_bytes())
+                        }) && requires.next().is_none()
+                    });
+                    if !supports_list || list_present {
+                        skip_depth = 1;
+                    }
+                }
+                b"Fallback" if alternate && list_present && matches!(r.resolve_element(e.name()).0, ResolveResult::Bound(ns) if ns.as_ref() == MC_NS.as_bytes()) => {
+                    skip_depth = 1;
+                }
+                b"list" if cur.is_some() && matches!(r.resolve_element(e.name()).0, ResolveResult::Bound(ns) if ns.as_ref() == LIST_NS.as_bytes()) => {
+                    list_present = true;
+                    open = Some(3);
                 }
                 b"formula1" => open = Some(0),
                 b"formula2" => open = Some(1),
@@ -223,11 +340,19 @@ fn read_rules(wb: &mut Workbook, s: u16, inner: &[u8], extended: bool, rep: &mut
                 _ => {}
             },
             Event::Empty(e) if e.local_name().as_ref() == b"dataValidation" => {
-                done(wb, attrs(&e), Fields::default(), false);
+                done(wb, attrs(&e), Fields::default(), false, false);
+            }
+            Event::Empty(e) if cur.is_some() && e.local_name().as_ref() == b"list"
+                && matches!(r.resolve_element(e.name()).0, ResolveResult::Bound(ns) if ns.as_ref() == LIST_NS.as_bytes()) => {
+                list_present = true;
             }
             Event::Text(t) => {
                 if let (Some(i), Some((_, fs, oversized))) = (open, cur.as_mut()) {
-                    let limit = if i == 2 { MAX_SQREF } else { formula::MAX_STORED_FORMULA_LEN };
+                    let limit = match i {
+                        2 => MAX_SQREF,
+                        3 => formula::MAX_STORED_FORMULA_LEN - 3, // native array braces and leading '='
+                        _ => formula::MAX_STORED_FORMULA_LEN,
+                    };
                     match t.unescape() {
                         Ok(text) if fs[i].len() + text.len() <= limit => fs[i].push_str(&text),
                         _ => *oversized = true,
@@ -235,10 +360,11 @@ fn read_rules(wb: &mut Workbook, s: u16, inner: &[u8], extended: bool, rep: &mut
                 }
             }
             Event::End(e) => match e.local_name().as_ref() {
-                b"formula1" | b"formula2" | b"sqref" => open = None,
+                b"AlternateContent" => alternate = false,
+                b"formula1" | b"formula2" | b"sqref" | b"list" => open = None,
                 b"dataValidation" => {
                     if let Some((a, fs, oversized)) = cur.take() {
-                        done(wb, a, fs, oversized);
+                        done(wb, a, fs, oversized, list_present);
                     }
                 }
                 _ => {}

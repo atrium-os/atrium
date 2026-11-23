@@ -56,10 +56,13 @@ pub fn condition(wb: &Workbook, v: &Validation) -> Option<String> {
     Some(match v.allow {
         Allow::Any => return None,
         Allow::List => {
-            let items = match v.f1.as_deref() {
-                // Items in a text split by commas, as Excel keeps them: one string each.
-                Some(Expr::Str(t)) => t.split(',').map(|i| format!("\"{}\"", i.replace('"', "\"\""))).collect::<Vec<_>>().join(";"),
-                _ => x,
+            let quote = |i: &str| format!("\"{}\"", i.replace('"', "\"\""));
+            let items = if let Some(items) = v.literal_list_items() {
+                items.into_iter().map(quote).collect::<Vec<_>>().join(";")
+            } else if let Some(Expr::Str(t)) = v.f1.as_deref() {
+                t.split(',').map(|i| quote(i.trim())).collect::<Vec<_>>().join(";")
+            } else {
+                x
             };
             format!("cell-content-is-in-list({items})")
         }
@@ -271,12 +274,15 @@ fn parse_condition(c: &str) -> Option<(Allow, CmpOp, Option<String>, Option<Stri
     }
     if let Some(x) = inside(c, "cell-content-is-in-list") {
         let items = split_top(x, ';');
-        // Strings: one text of the items split by commas, as Excel keeps them.
         let texts: Option<Vec<String>> = items.iter().map(|i| super::condfmt::unquote(i)).collect();
         let f = match texts {
-            Some(t) if items.len() > 1 || x.trim().starts_with('"') => format!("\"{}\"", t.join(",").replace('"', "\"\"")),
-            _ if items.len() == 1 => x.to_string(),
-            _ => return None,
+            Some(t) if t.iter().any(|item| item.contains(',') || item.trim() != item) => {
+                let items = t.iter().map(|item| format!("\"{}\"", item.replace('"', "\"\""))).collect::<Vec<_>>().join("|");
+                format!("{{{items}}}")
+            }
+            Some(t) => format!("\"{}\"", t.join(",").replace('"', "\"\"")),
+            None if items.len() == 1 => x.to_string(),
+            None => return None,
         };
         return Some((Allow::List, CmpOp::Between, Some(f), None));
     }

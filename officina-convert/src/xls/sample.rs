@@ -90,3 +90,82 @@ pub fn workbook(password: Option<&str>) -> Vec<u8> {
     }
     crate::cfb::write(&[("Workbook", &s)])
 }
+
+/// BIFF8 desktop validation fixture. The malformed record exercises local
+/// recovery without interrupting the valid rules that follow it.
+pub fn validation_workbook() -> Vec<u8> {
+    fn dv(out: &mut Vec<u8>, flags: u32, title: &str, message: &str, first: &[u8], second: &[u8], ranges: &[[u16; 4]]) {
+        let mut data = flags.to_le_bytes().to_vec();
+        for text in ["Choose", title, "Enter an allowed value.", message] {
+            let units: Vec<_> = text.encode_utf16().collect();
+            data.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            data.push(1);
+            for unit in units {
+                data.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        for tokens in [first, second] {
+            data.extend_from_slice(&(tokens.len() as u16).to_le_bytes());
+            data.extend_from_slice(&[0, 0]);
+            data.extend_from_slice(tokens);
+        }
+        data.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
+        for range in ranges {
+            for bound in range {
+                data.extend_from_slice(&bound.to_le_bytes());
+            }
+        }
+        rec(out, 0x01BE, &data);
+    }
+
+    let mut s = Vec::new();
+    rec(&mut s, biff::BOF, &bof(0x0005));
+    let sheet_at = s.len() + 4;
+    rec(&mut s, biff::BOUNDSHEET, &[0, 0, 0, 0, 0, 0, 6, 0, b'I', b'n', b'p', b'u', b't', b's']);
+    rec(&mut s, biff::EOF, &[]);
+    let at = s.len() as u32;
+    s[sheet_at..sheet_at + 4].copy_from_slice(&at.to_le_bytes());
+    rec(&mut s, biff::BOF, &bof(0x0010));
+    for (row, col, value) in [
+        (1u16, 1u16, 2.0f64), (2, 1, 3.0), (1, 2, 6.0), (1, 3, 9.0), (2, 2, 4.0),
+        (2, 3, 5.0), (1, 4, 7.0), (2, 4, 9.0), (1, 5, 6.0), (2, 5, 8.0),
+        (1, 8, 7.0), (2, 8, 7.0),
+    ] {
+        let mut data = Vec::new();
+        for value in [row, col, 0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&value.to_le_bytes());
+        rec(&mut s, 0x0203, &data);
+    }
+    let mut sum = vec![1, 0, 6, 0, 0, 0];
+    sum.extend_from_slice(&14.0f64.to_le_bytes());
+    sum.extend_from_slice(&[0; 6]);
+    let add = [
+        0x44, 1, 0, 1, 0xC0, 0x44, 2, 0, 1, 0xC0, 0x03,
+        0x44, 2, 0, 2, 0xC0, 0x03, 0x44, 2, 0, 3, 0xC0, 0x03,
+    ];
+    sum.extend_from_slice(&(add.len() as u16).to_le_bytes());
+    sum.extend_from_slice(&add);
+    rec(&mut s, 0x0006, &sum);
+
+    let mut header = [0; 18];
+    header[10..14].copy_from_slice(&u32::MAX.to_le_bytes());
+    header[14..18].copy_from_slice(&4u32.to_le_bytes());
+    rec(&mut s, 0x01B2, &header);
+    rec(&mut s, 0x01BE, &[0; 6]);
+
+    let flags = (1 << 8) | (1 << 18) | (1 << 19);
+    dv(&mut s, flags | 1, "Outside limit", "Use a whole number from 1 to 8.",
+        &[0x1E, 1, 0], &[0x1E, 8, 0], &[[1, 2, 1, 1], [2, 2, 2, 3]]);
+    let items = b"2,0\x006\x008\x00say \"yes\"\x00literal _x000D_";
+    let mut literal = vec![0x17, items.len() as u8, 0];
+    literal.extend_from_slice(items);
+    dv(&mut s, flags | 3 | (1 << 7), "Outside list", "Choose an item from the list.",
+        &literal, &[], &[[1, 2, 7, 7]]);
+    // I2 > F2, relative to each validated row. I3=7 fails against F3=8.
+    dv(&mut s, flags | 7, "Too low", "Enter more than the comparison cell.",
+        &[0x4C, 0, 0, 0, 0xC0, 0x4C, 0, 0, 0xFD, 0xC0, 0x0D], &[], &[[1, 2, 8, 8]]);
+    rec(&mut s, biff::EOF, &[]);
+    crate::cfb::write(&[("Workbook", &s)])
+}
