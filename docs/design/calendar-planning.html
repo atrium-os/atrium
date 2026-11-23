@@ -1,0 +1,162 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<div id="atrium-calendar-planning" aria-label="Atrium Calendar design preview">
+  <div class="identity"><b>Atrium</b><span class="persona">Work</span><span>Calendar</span></div>
+  <div class="toolbar">
+    <div class="views" aria-label="Calendar views"><button data-view="Today" aria-pressed="true">Today</button><button data-view="Week" aria-pressed="false">Week</button></div>
+    <button id="cal-find">Find 45 min</button><button id="cal-offer">Offer times…</button>
+  </div>
+  <div class="workspace">
+    <aside>
+      <h3>November 2026</h3><div class="month" aria-label="November 2026, Tuesday 24 selected"></div>
+      <h3>Calendars</h3><div class="key"><i></i> Work schedule</div><div class="key hold-key"><i></i> Private holds</div>
+    </aside>
+    <section class="canvas" aria-label="Schedule">
+      <div class="heading"><div><small id="cal-kicker">Today</small><h2 id="cal-date">Tuesday, 24 November</h2></div><small>Kolkata · UTC+05:30</small></div>
+      <div id="cal-agenda"></div>
+      <div class="sheet" hidden aria-label="Offer times">
+        <h3>Offer times</h3><p>Choose the openings to include.</p>
+        <div id="cal-options"></div><small>Message preview</small><blockquote id="cal-message"></blockquote>
+        <button id="cal-done">Close preview</button>
+      </div>
+    </section>
+  </div>
+  <footer aria-live="polite" id="cal-status">Work calendar · On this device</footer>
+</div>
+<style>
+#atrium-calendar-planning{color-scheme:light dark;--paper:light-dark(#fafbfc,#1e2328);--panel:light-dark(#fff,#282e34);--rail:light-dark(#f2f4f6,#242a2f);--ink:light-dark(#181c20,#ecedef);--soft:light-dark(#59636c,#b4bec7);--rule:light-dark(#d7dce0,#444c54);--amber:light-dark(#925c21,#edba7b);--wash:light-dark(#fbf1e5,#3c3024);--work:light-dark(#497ba9,#8bb6db);font:14px/1.45 "IBM Plex Sans","Helvetica Neue",sans-serif;color:var(--ink);background:var(--paper);border:1px solid var(--rule);border-radius:7px;overflow:hidden;container-type:inline-size;text-align:left}
+#atrium-calendar-planning *{box-sizing:border-box}
+#atrium-calendar-planning [hidden]{display:none}
+#atrium-calendar-planning h2,#atrium-calendar-planning h3,#atrium-calendar-planning p{margin:0}
+#atrium-calendar-planning h2{font-size:clamp(20px,3.1cqw,29px);font-weight:550;letter-spacing:-.025em}
+#atrium-calendar-planning h3{font-size:14px;font-weight:600}
+#atrium-calendar-planning small{font-size:12px;color:var(--soft)}
+#atrium-calendar-planning .identity{display:flex;align-items:center;gap:11px;color:#f1f3f4;background:#202529;padding:5px 14px;font-size:12px}
+#atrium-calendar-planning .persona{background:#456d91;color:#fff;padding:0 8px;border-radius:8px}
+#atrium-calendar-planning .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;background:var(--paper);border-bottom:1px solid var(--rule);padding:9px 14px}
+#atrium-calendar-planning button{background:var(--panel);color:var(--ink);font:inherit;font-size:13px;border:1px solid var(--rule);border-radius:5px;padding:5px 11px;cursor:pointer;line-height:1.4}
+#atrium-calendar-planning button:hover{border-color:var(--amber)}
+#atrium-calendar-planning button:focus-visible,#atrium-calendar-planning input:focus-visible{outline:2px solid var(--work);outline-offset:2px}
+#atrium-calendar-planning .views{display:flex;margin-right:6px}
+#atrium-calendar-planning .views button:first-child{border-radius:5px 0 0 5px}
+#atrium-calendar-planning .views button:last-child{border-radius:0 5px 5px 0;margin-left:-1px}
+#atrium-calendar-planning [aria-pressed=true]{background:var(--wash);color:var(--amber);border-color:var(--amber);z-index:1}
+#atrium-calendar-planning .workspace{display:grid;grid-template-columns:minmax(155px,21%) minmax(0,1fr)}
+#atrium-calendar-planning aside{background:var(--rail);border-right:1px solid var(--rule);padding:20px 12px}
+#atrium-calendar-planning aside h3{margin:0 0 10px}
+#atrium-calendar-planning .month{display:grid;grid-template-columns:repeat(7,1fr);text-align:center;gap:3px 0;margin-bottom:24px;font-size:12px;font-variant-numeric:tabular-nums}
+#atrium-calendar-planning .month span{padding:2px 0}
+#atrium-calendar-planning .dayname{color:var(--soft)}
+#atrium-calendar-planning .selected{background:var(--amber);color:var(--panel);border-radius:3px;font-weight:600}
+#atrium-calendar-planning .key{display:flex;gap:8px;align-items:center;margin:8px 0;font-size:13px}
+#atrium-calendar-planning .key i{width:9px;height:9px;border-radius:2px;background:var(--work)}
+#atrium-calendar-planning .hold-key i{background:var(--amber)}
+#atrium-calendar-planning .canvas{padding:18px clamp(12px,2.7cqw,28px) 20px;background:var(--panel);min-width:0}
+#atrium-calendar-planning .heading{display:flex;align-items:end;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+#atrium-calendar-planning .row{border-top:1px solid var(--rule);display:grid;grid-template-columns:105px minmax(95px,1fr) auto;align-items:center;min-height:48px;gap:10px;padding:6px 8px;font-size:14px}
+#atrium-calendar-planning .time{font:12px "IBM Plex Mono",ui-monospace,monospace;white-space:nowrap;color:var(--soft)}
+#atrium-calendar-planning .entry{border-left:3px solid var(--work);padding-left:10px}
+#atrium-calendar-planning .gap{color:var(--soft)}
+#atrium-calendar-planning .held .entry{border-color:var(--amber)}
+#atrium-calendar-planning .match,#atrium-calendar-planning .held{background:var(--wash)}
+#atrium-calendar-planning .weekline{display:grid;grid-template-columns:80px 1fr;gap:12px;padding:10px 0;border-top:1px solid var(--rule)}
+#atrium-calendar-planning .weekline b{font-weight:550}
+#atrium-calendar-planning .weekitems{display:grid;gap:4px}
+#atrium-calendar-planning .sheet{background:var(--rail);border:1px solid var(--rule);padding:14px;margin-top:14px;border-radius:6px}
+#atrium-calendar-planning .sheet p,#atrium-calendar-planning .sheet label{margin:6px 0;color:var(--soft)}
+#atrium-calendar-planning .sheet label{display:flex;align-items:center;gap:8px}
+#atrium-calendar-planning blockquote{margin:5px 0 12px;padding:8px 12px;border-left:3px solid var(--amber);background:var(--panel)}
+#atrium-calendar-planning footer{border-top:1px solid var(--rule);padding:6px 14px;background:var(--rail);color:var(--soft);font-size:12px}
+@container(max-width:690px){#atrium-calendar-planning .workspace{grid-template-columns:1fr}#atrium-calendar-planning aside{display:none}}
+@container(max-width:475px){#atrium-calendar-planning .row{grid-template-columns:94px 1fr}#atrium-calendar-planning .row button{grid-column:2;justify-self:start}#atrium-calendar-planning .canvas{padding:12px}}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('atrium-calendar-planning');
+  const get = id => root.querySelector('#cal-' + id);
+  const events = [
+    ['09:00–09:30','Team check-in'], ['09:30–10:30','1 hour open'],
+    ['10:30–12:00','Interviews'], ['12:00–13:00','Lunch'],
+    ['13:00–14:00','1 hour open'], ['14:00–15:00','Budget review']
+  ];
+  const choices = {1:['09:30–10:15','10:15–10:30'],4:['13:00–13:45','13:45–14:00']};
+  const month = root.querySelector('.month');
+  for (const day of ['M','T','W','T','F','S','S']) month.insertAdjacentHTML('beforeend','<span class="dayname">'+day+'</span>');
+  for (let d=-5; d<=30; d++) {
+    const cell = document.createElement('span');
+    cell.textContent = d>0 ? d : '';
+    if (d===24) cell.className='selected';
+    month.append(cell);
+  }
+  let view='Today', finding=false;
+  const holds = new Set();
+  const sheet = root.querySelector('.sheet');
+  function row(time,title,kind,action) {
+    const item=document.createElement('div');
+    item.className='row '+kind;
+    const clock=document.createElement('span'), name=document.createElement('span');
+    clock.className='time'; clock.textContent=time;
+    name.className=kind.includes('gap')?'':'entry'; name.textContent=title;
+    item.append(clock,name);
+    if (action) {
+      const button=document.createElement('button');
+      button.textContent=action.label;
+      button.setAttribute('aria-label',action.label+' · '+time);
+      button.onclick=()=>{action.run(); const next=get('agenda').querySelector('[data-slot="'+action.slot+'"]'); if(next) next.focus();};
+      button.dataset.slot=action.slot; item.append(button);
+    }
+    return item;
+  }
+  function paint() {
+    const agenda=get('agenda'); agenda.replaceChildren();
+    get('kicker').textContent=view; get('date').textContent=view==='Today'?'Tuesday, 24 November':'23–29 November';
+    root.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.view===view)));
+    get('find').setAttribute('aria-pressed',String(finding && view==='Today'));
+    if(view==='Week'){
+      const week=[['Mon 23',['14:00 · Project planning']],['Tue 24',events.flatMap(([time,title],i)=>choices[i]?(holds.has(i)?[choices[i][0]+' · Preparation (held)']:[]):[time+' · '+title])],['Wed 25',['10:30 · Interviews']],['Thu 26',['11:00 · Design review']],['Fri 27',['14:00 · Team retrospective']],['Sat 28',['Open']],['Sun 29',['Open']]];
+      week.forEach(([date,items])=>{
+        const line=document.createElement('div');line.className='weekline';
+        const day=document.createElement('b');day.textContent=date;
+        const list=document.createElement('div'); list.className='weekitems';
+        items.forEach(t=>{const item=document.createElement('span');item.textContent=t;list.append(item);});
+        line.append(day,list);agenda.append(line);
+      });
+      return;
+    }
+    events.forEach(([time,title],i)=>{
+      if(!choices[i]) {agenda.append(row(time,title,''));return;}
+      const held=holds.has(i);
+      if(held) {
+        agenda.append(row(choices[i][0],'Preparation · Private hold','held',{slot:i,label:'Release hold',run:()=>changeHold(i,false)}),row(choices[i][1],'15 min open','gap'));
+      } else {
+        const action=finding?{slot:i,label:'Hold 45 min',run:()=>changeHold(i,true)}:null;
+        agenda.append(row(time,title,finding?'gap match':'gap',action));
+      }
+    });
+  }
+  function changeHold(i,held){
+    if(held) holds.add(i); else holds.delete(i);
+    get('status').textContent=choices[i][0]+(held?' held · Only on this device':' released · Open again');
+    sheet.hidden=true; paint();
+  }
+  function preview(){
+    const selected=[...get('options').querySelectorAll('input:checked')].map(x=>choices[x.value][0]);
+    get('message').textContent=selected.length?'Would '+selected.join(' or ')+' on Tuesday 24 November 2026 work for you? Kolkata (UTC+05:30).':'Choose an open time.';
+  }
+  get('offer').onclick=()=>{
+    view='Today'; paint();const options=get('options');options.replaceChildren();
+    Object.keys(choices).filter(i=>!holds.has(Number(i))).forEach(i=>{
+      const label=document.createElement('label'),box=document.createElement('input');
+      box.type='checkbox';box.value=i;box.checked=true;box.onchange=preview;
+      label.append(box,choices[i][0]);options.append(label);
+    });
+    sheet.hidden=false;preview();
+    if(!options.children.length)get('message').textContent='Both openings are held.';
+    (options.querySelector('input')||get('done')).focus();
+  };
+  get('done').onclick=()=>{sheet.hidden=true;get('offer').focus();};
+  get('find').onclick=()=>{finding=view==='Week'||!finding; view='Today';sheet.hidden=true;paint();get('status').textContent=finding?(2-holds.size)+' openings of at least 45 minutes before Budget review':'Work calendar · On this device';};
+  root.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{view=b.dataset.view;sheet.hidden=true;get('status').textContent='Work calendar · On this device';paint();});
+  paint();
+})();
+</script>

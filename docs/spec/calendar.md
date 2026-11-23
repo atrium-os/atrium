@@ -102,6 +102,8 @@ For writable collections, create with a stable resource name and If-None-Match, 
 
 ## 7. Delivery and evidence
 
+The [interactive planning mockup](../design/calendar-planning.html) opens on Today with a sample Work schedule. Try **Find 45 min**, hold one opening, and switch to Week to see the same hold. **Offer times…** previews the later sharing flow locally.
+
 **Proposed first usable build (C0).** Start with a blank Work calendar offline. Add a weekly 14:00 review and an all-day item. Find a 45-minute gap before the review and explicitly hold it for preparation. Move this week’s review, see the gap change, then find next week’s review at its original time. Today, Week and Month, local search, event editing and deletion, and the separate opening preferences for Work and Personal are all part of this build. Closing and reopening Calendar restores the saved events and holds. Complete the same planning flow by keyboard.
 
 The scope decision is how people get their first events. In C0 they enter them by hand. Moving local ICS import forward from C1 would let someone start with their own week, at the cost of bringing the isolated parser, import preview and recurrence-fidelity checks into the first build. Mail invitations can still follow separately.
