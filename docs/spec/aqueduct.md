@@ -229,8 +229,10 @@ vendor / experimental. New core classes added by editing this
 document and `aqueduct/src/classes.rs` together.
 
 Class 21 is Calendar's Fasti store. Operation 1 accepts a version-one local
-day query, event creation, or hold release. The envelope carries at most
-4 KiB for a request and 1 MiB for a day reply. Only the registered Calendar
+day, week or month query, event creation, hold release or opening-view preference
+change. A browse request can ask for the stored opening view. Preference writes
+carry the current store revision. The envelope carries at most 4 KiB for a
+request and 1 MiB for a reply. Only the registered Calendar
 instance for that store can use it. [Calendar](calendar.md)
 
 ### 5.3 Per-class opcodes

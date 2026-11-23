@@ -1,4 +1,6 @@
 //! Manual local planning. Times are floating civil minutes within the selected date.
+mod period;
+pub use period::{CalendarPage, CalendarView};
 pub mod store;
 pub mod wire;
 

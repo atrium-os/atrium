@@ -1,6 +1,6 @@
 use atrium_calendar::{
-    wire::{call, Request},
-    Entry, Kind, Span,
+    wire::{call, page, Request},
+    CalendarView, Entry, Kind, Span,
 };
 use std::{
     fs,
@@ -64,6 +64,14 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     let (daemon, socket) = start(dir, &publisher);
     let date = "2026-11-24".parse().unwrap();
     let query = Request::Day { date };
+    let resume = Request::Browse { date, view: None };
+    let set_week = Request::SetOpeningView {
+        revision: 1,
+        opening_view: CalendarView::Week,
+        date,
+        view: CalendarView::Today,
+    };
+    assert_eq!(page(&socket, &resume).unwrap().view, CalendarView::Today);
     assert_eq!(call(&socket, &query).unwrap().revision, 0);
     let event = Entry {
         id: Uuid::new_v4(),
@@ -114,6 +122,8 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     ] {
         register(user, app, signer, suffix);
         assert!(call(&socket, &query).is_err());
+        assert!(page(&socket, &resume).is_err());
+        assert!(page(&socket, &set_week).is_err());
         assert!(call(
             &socket,
             &Request::Add {
@@ -152,4 +162,9 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     assert_eq!(reloaded.revision, 1);
     assert_eq!(reloaded.entries.len(), 1);
     assert_eq!(reloaded.entries[0].id, event.id);
+    let saved = page(&socket, &set_week).unwrap();
+    assert_eq!(saved.view, CalendarView::Today);
+    assert_eq!(saved.opening_view, CalendarView::Week);
+    assert_eq!(page(&socket, &resume).unwrap().view, CalendarView::Week);
+    assert!(page(&socket, &set_week).is_err());
 }

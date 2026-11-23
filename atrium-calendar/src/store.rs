@@ -1,5 +1,5 @@
 //! One Fasti process owns one private, supervisor-provisioned persona directory.
-use super::{Day, Entry, Kind};
+use super::{CalendarPage, CalendarView, Day, Entry, Kind};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +17,8 @@ const MAX_BYTES: u64 = 1024 * 1024;
 struct Snapshot {
     version: u8,
     revision: u64,
+    #[serde(default)]
+    opening_view: CalendarView,
     entries: Vec<Entry>,
 }
 
@@ -59,6 +61,7 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot {
                 version: 1,
                 revision: 0,
+                opening_view: CalendarView::Today,
                 entries: Vec::new(),
             },
             Err(e) => return Err(e),
@@ -71,18 +74,36 @@ impl Store {
     }
 
     pub fn day(&self, date: NaiveDate) -> Day {
+        self.page(date, Some(CalendarView::Today)).into_day()
+    }
+
+    pub fn page(&self, date: NaiveDate, view: Option<CalendarView>) -> CalendarPage {
+        let view = view.unwrap_or(self.state.opening_view);
+        let dates: Vec<_> = view.dates(date).collect();
         let mut entries: Vec<_> = self
             .state
             .entries
             .iter()
-            .filter(|e| e.appears(date))
+            .filter(|e| dates.iter().any(|&d| e.appears(d)))
             .cloned()
             .collect();
         entries.sort_by_key(|e| (e.span.start, e.span.end, e.id));
-        Day {
+        CalendarPage {
+            view,
+            opening_view: self.state.opening_view,
             revision: self.state.revision,
             entries,
         }
+    }
+
+    pub fn set_opening_view(&mut self, revision: u64, view: CalendarView) -> Result<(), String> {
+        if revision != self.state.revision {
+            return Err("Calendar changed. Refresh before saving.".into());
+        }
+        if view == self.state.opening_view {
+            return Ok(());
+        }
+        self.commit(revision, self.state.entries.clone(), view)
     }
 
     pub fn add(&mut self, revision: u64, event: Entry) -> Result<(), String> {
@@ -107,7 +128,7 @@ impl Store {
         }
         let mut entries = self.state.entries.clone();
         entries.push(event);
-        self.commit(revision, entries)
+        self.commit(revision, entries, self.state.opening_view)
     }
 
     pub fn release(
@@ -125,11 +146,17 @@ impl Store {
             .position(|e| e.id == id && e.date == date && e.kind == Kind::Hold)
             .ok_or("Hold no longer exists")?;
         entries.remove(index);
-        self.commit(revision, entries)
+        self.commit(revision, entries, self.state.opening_view)
     }
 
-    fn commit(&mut self, revision: u64, entries: Vec<Entry>) -> Result<(), String> {
+    fn commit(
+        &mut self,
+        revision: u64,
+        entries: Vec<Entry>,
+        opening_view: CalendarView,
+    ) -> Result<(), String> {
         let next = Snapshot {
+            opening_view,
             version: 1,
             revision: revision.checked_add(1).ok_or("Revision limit reached")?,
             entries,

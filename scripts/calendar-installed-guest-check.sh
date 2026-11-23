@@ -24,10 +24,10 @@ wait_ui() {
     return 1
 }
 enter() {
-    inj 'MOVE 220 97' 'BTN 1 1' 'BTN 1 0'
+    inj 'MOVE 220 143' 'BTN 1 1' 'BTN 1 0'
     sleep 1
     for code in "$@"; do inj "KEY $code 1 0" "KEY $code 0 0"; done
-    inj 'MOVE 205 138' 'BTN 1 1' 'BTN 1 0'
+    inj 'MOVE 205 184' 'BTN 1 1' 'BTN 1 0'
 }
 inj() { printf '%s\n' "$@" | nc -w 3 -N -U inject.sock; }
 saved() {
@@ -177,6 +177,69 @@ cp original.sig "$bundle/atrium.toml.sig"
 launch work
 wait_ui "$work_jail" work
 check_instance "$work_jail" work "$work_store" "design review"
+
+# Save independent opening views through the native controls. Use the
+# authorized test peer to populate both schedules without editing storage.
+click() {
+    inj "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'
+    sleep 1
+}
+close_ui() {
+    kill -TERM "$(pgrep -j "$1" -x atrium-calendar)"
+    for i in $(jot 25); do jls -j "$1" jid >/dev/null 2>&1 || return 0; sleep 1; done
+    return 1
+}
+today=$(date -u +%Y-%m-%d)
+cal_socket=/atrium/sockets/calendar/calendar.sock
+jexec -u "$(id -nu "$wu")" "$work_jail" /bin/installed-probe "$cal_socket" "$today" --work-schedule
+jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --personal-schedule
+
+set_default() {
+    click 606 60  # Opening view
+    click "$1" 193
+    grep -q "\"opening_view\":\"$2\"" "$3/calendar.json"
+    click "$4" 60 # browse this period
+    click 52 60   # temporarily return to Today
+    grep -q "\"opening_view\":\"$2\"" "$3/calendar.json"
+}
+# Refresh after seeding so the settings write uses the latest revision.
+click 80 184
+set_default 174 Week "$work_store" 150
+grep -q '"opening_view":"Today"' "$personal_store/calendar.json"
+close_ui "$work_jail"
+click 80 184
+set_default 277 Month "$personal_store" 234
+close_ui "$personal_jail"
+
+# Select a date different from today using a view-specific control. A
+# window that accidentally opened on Today cannot save on the expected date.
+launch work
+wait_ui "$work_jail" work
+sleep 2
+cp screen.png week-reopened.png
+weekday=$(date -u +%u)
+if [ "$weekday" -eq 1 ]; then row=1; else row=0; fi
+target=$(date -u -v-$((weekday - 1))d -v+${row}d +%Y-%m-%d)
+click 64 $((193 + row * 52))
+enter 25 12 22 12 23 # visit
+saved "$work_store" visit
+grep -q "\"date\":\"$target\",\"title\":\"visit\"" "$work_store/calendar.json"
+close_ui "$work_jail"
+launch personal
+wait_ui "$personal_jail" personal
+sleep 2
+cp screen.png month-reopened.png
+first_weekday=$(date -u -v1d +%u)
+if [ "$(date -u +%d)" = 01 ]; then number=2; else number=1; fi
+slot=$((first_weekday + number - 2))
+target=$(date -u -v${number}d +%Y-%m-%d)
+click $((62 + (slot % 7) * 95)) $((192 + (slot / 7) * 60))
+enter 21 12 7 8 # ride
+saved "$personal_store" ride
+grep -q "\"date\":\"$target\",\"title\":\"ride\"" "$personal_store/calendar.json"
+grep -q '"opening_view":"Week"' "$work_store/calendar.json"
+grep -q '"opening_view":"Month"' "$personal_store/calendar.json"
+echo "PASS: independent opening views, temporary browsing and date selection from both reopened windows"
 
 # Exercise the same authenticated SessionEnded message Ostiarius sends.
 printf '%s\n' '{"op":"hello","version":1}' '{"op":"session_ended","user":"calfixture"}' |

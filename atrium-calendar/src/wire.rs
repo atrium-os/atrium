@@ -1,5 +1,5 @@
 //! One bounded request and reply per connection. Version 1 uses inline JSON.
-use super::{store::Store, Day, Entry};
+use super::{store::Store, CalendarPage, CalendarView, Day, Entry};
 use aqueduct::{classes::CLASS_CALENDAR, envelope, flag, Header};
 use chrono::NaiveDate;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -18,6 +18,16 @@ const WAIT: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    Browse {
+        date: NaiveDate,
+        view: Option<CalendarView>,
+    },
+    SetOpeningView {
+        revision: u64,
+        opening_view: CalendarView,
+        date: NaiveDate,
+        view: CalendarView,
+    },
     Day {
         date: NaiveDate,
     },
@@ -129,6 +139,18 @@ fn receive<T: DeserializeOwned>(s: &mut UnixStream, flags: u16, limit: usize) ->
 }
 
 pub fn call(socket: &Path, request: &Request) -> Result<Day, String> {
+    exchange(socket, request)
+}
+
+pub fn page(socket: &Path, request: &Request) -> Result<CalendarPage, String> {
+    let page: CalendarPage = exchange(socket, request)?;
+    if page.entries.iter().any(|entry| entry.validate().is_err()) {
+        return Err("Invalid Calendar reply".into());
+    }
+    Ok(page)
+}
+
+fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, String> {
     let mut s =
         UnixStream::connect(socket).map_err(|e| format!("Calendar service unavailable: {e}"))?;
     s.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -139,15 +161,26 @@ pub fn call(socket: &Path, request: &Request) -> Result<Day, String> {
 
 pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
-    let reply: Result<Day, String> = match receive(s, flag::RESPONSE_EXPECTED, 4096) {
-        Ok(Request::Day { date }) => Ok(store.day(date)),
+    let reply: Result<CalendarPage, String> = match receive(s, flag::RESPONSE_EXPECTED, 4096) {
+        Ok(Request::Browse { date, view }) => Ok(store.page(date, view)),
+        Ok(Request::SetOpeningView {
+            revision,
+            opening_view,
+            date,
+            view,
+        }) => store
+            .set_opening_view(revision, opening_view)
+            .map(|()| store.page(date, Some(view))),
+        Ok(Request::Day { date }) => Ok(store.page(date, Some(CalendarView::Today))),
         Ok(Request::Add { revision, entry }) => {
             let date = entry.date;
-            store.add(revision, entry).map(|_| store.day(date))
+            store
+                .add(revision, entry)
+                .map(|_| store.page(date, Some(CalendarView::Today)))
         }
-        Ok(Request::Release { revision, date, id }) => {
-            store.release(revision, date, id).map(|()| store.day(date))
-        }
+        Ok(Request::Release { revision, date, id }) => store
+            .release(revision, date, id)
+            .map(|()| store.page(date, Some(CalendarView::Today))),
         Err(_) => Err("Invalid Calendar request".into()),
     };
     send(s, flag::IS_RESPONSE, &reply)

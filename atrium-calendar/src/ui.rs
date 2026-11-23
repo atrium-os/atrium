@@ -1,9 +1,9 @@
-//! Calendar's first native day view. Fasti is the only persistent writer.
+//! Calendar's native planner. Fasti is the only persistent writer.
 use atrium_calendar::{
-    wire::{call, Request},
-    Day, Entry, Kind, Span,
+    wire::{page, Request},
+    CalendarPage, CalendarView, Entry, Kind, Span,
 };
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use pergola::{
     text_edit::TextEdit, view::Ctx, window::StepResult, App, Button, Label, Mutable, SizeSpec,
     TextField, View, Window, WindowDesc,
@@ -16,6 +16,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod overview;
+use overview::rect;
+
 const PAGE: usize = 6;
 const WORKDAY: Span = Span {
     start: 540,
@@ -24,7 +27,11 @@ const WORKDAY: Span = Span {
 
 #[derive(Clone, Copy)]
 enum Action {
+    Resume,
     Load,
+    Browse(CalendarView, NaiveDate),
+    Settings(bool),
+    SetOpening(CalendarView),
     Save(Kind),
     Hold(Span),
     Release(Uuid),
@@ -39,7 +46,9 @@ struct Planner {
     start: Mutable<TextEdit>,
     end: Mutable<TextEdit>,
     shown: Mutable<NaiveDate>,
-    day: Mutable<Option<Day>>,
+    data: Mutable<Option<CalendarPage>>,
+    view: Mutable<Option<CalendarView>>,
+    settings: Mutable<bool>,
     status: Mutable<String>,
     finding: Mutable<bool>,
     page: Mutable<usize>,
@@ -68,8 +77,12 @@ fn time(field: &TextEdit) -> Result<u16, String> {
 
 impl Planner {
     fn button(&self, ctx: &mut Ctx, x: f32, y: f32, w: f32, label: &str, action: Action) {
+        self.control(ctx, Button::secondary(label), x, y, w, action);
+    }
+
+    fn control(&self, ctx: &mut Ctx, button: Button, x: f32, y: f32, w: f32, action: Action) {
         let tx = self.actions.clone();
-        Button::secondary(label)
+        button
             .at(x, y)
             .width(w)
             .on_click(move || {
@@ -79,6 +92,38 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<(NaiveDate, Request), String> {
+        if matches!(action, Action::Resume) {
+            let date = self.shown.get();
+            return Ok((
+                date,
+                Request::Browse {
+                    date,
+                    view: self.view.get(),
+                },
+            ));
+        }
+        if let Action::Browse(view, date) = action {
+            return Ok((
+                date,
+                Request::Browse {
+                    date,
+                    view: Some(view),
+                },
+            ));
+        }
+        if let Action::SetOpening(opening_view) = action {
+            let data = self.data.get_cloned().ok_or("Refresh Calendar first")?;
+            let date = self.shown.get();
+            return Ok((
+                date,
+                Request::SetOpeningView {
+                    revision: data.revision,
+                    opening_view,
+                    date,
+                    view: data.view,
+                },
+            ));
+        }
         let date = self
             .date
             .get_cloned()
@@ -87,13 +132,19 @@ impl Planner {
             .parse::<NaiveDate>()
             .map_err(|_| "Enter a date as YYYY-MM-DD")?;
         if matches!(action, Action::Load) {
-            return Ok((date, Request::Day { date }));
+            return Ok((
+                date,
+                Request::Browse {
+                    date,
+                    view: self.view.get(),
+                },
+            ));
         }
         if date != self.shown.get() {
             return Err("Open the selected day first".into());
         }
         let revision = self
-            .day
+            .data
             .get_cloned()
             .ok_or("Refresh the day first")?
             .revision;
@@ -135,71 +186,131 @@ impl Planner {
 
 impl View for Planner {
     fn render(&self, ctx: &mut Ctx) {
-        let theme = ctx.theme;
-        for (rect, fill) in [
-            (
-                pergola::geom::Rect::new(0., 0., 700., 540.),
-                theme.bg_canvas(),
-            ),
-            (
-                pergola::geom::Rect::new(0., 0., 700., 156.),
-                theme.bg_surface(),
-            ),
-            (
-                pergola::geom::Rect::new(0., 156., 700., 1.),
-                theme.border_default(),
-            ),
-        ] {
-            ctx.add(pergola::node::Node::Rect {
-                rect,
-                fill,
-                radius: 0.0,
-            });
-        }
         let shown = self.shown.get();
-        Label::new(format!(
-            "{} · {}",
-            if shown == Local::now().date_naive() {
-                "Today"
-            } else {
-                "Day"
-            },
-            shown
-        ))
-        .size(22.)
-        .at(18., 16.)
-        .render(ctx);
+        let heading = match self.view.get() {
+            None => "Calendar".to_owned(),
+            Some(CalendarView::Today) if shown == Local::now().date_naive() => {
+                format!("Today · {shown}")
+            }
+            Some(CalendarView::Today) => format!("Day · {shown}"),
+            Some(view @ CalendarView::Week) => format!(
+                "Week of {}",
+                view.dates(shown).next().unwrap().format("%d %b %Y")
+            ),
+            Some(CalendarView::Month) => shown.format("%B %Y").to_string(),
+        };
+        let theme = ctx.theme;
+        rect(ctx, 0., 0., 700., 600., theme.bg_canvas());
+        rect(ctx, 0., 0., 700., 84., theme.bg_surface());
+        rect(ctx, 0., 84., 700., 1., theme.border_default());
+        Label::new(heading).size(22.).at(18., 18.).render(ctx);
         Label::new(&self.calendar_name)
-            .at(320., 18.)
+            .at(350., 19.)
             .size(16.)
             .render(ctx);
+        let data = self.data.get_cloned();
+        if self.waiting.get() {
+            Label::new("Loading calendar…").at(18., 110.).render(ctx);
+            return;
+        }
+        let Some(data) = data else {
+            self.button(ctx, 18., 44., 130., "Refresh", Action::Resume);
+            Label::new(self.status.get_cloned())
+                .at(18., 110.)
+                .render(ctx);
+            return;
+        };
+        let view = data.view;
+        if self.settings.get() {
+            self.button(
+                ctx,
+                18.,
+                44.,
+                124.,
+                "Back to calendar",
+                Action::Settings(false),
+            );
+            Label::new("Opening view")
+                .at(18., 120.)
+                .size(20.)
+                .render(ctx);
+            Label::new(format!(
+                "{} opens in {}.",
+                self.calendar_name,
+                data.opening_view.label()
+            ))
+            .at(18., 154.)
+            .render(ctx);
+            for (i, choice) in CalendarView::ALL.into_iter().enumerate() {
+                let button = if choice == data.opening_view {
+                    Button::primary(choice.label())
+                } else {
+                    Button::secondary(choice.label())
+                };
+                self.control(
+                    ctx,
+                    button,
+                    18. + i as f32 * 112.,
+                    178.,
+                    104.,
+                    Action::SetOpening(choice),
+                );
+            }
+            return;
+        }
+        for (i, choice) in CalendarView::ALL.into_iter().enumerate() {
+            let button = if choice == view {
+                Button::primary(choice.label())
+            } else {
+                Button::ghost(choice.label())
+            };
+            let date = if choice == CalendarView::Today {
+                Local::now().date_naive()
+            } else {
+                shown
+            };
+            self.control(
+                ctx,
+                button,
+                18. + i as f32 * 88.,
+                44.,
+                82.,
+                Action::Browse(choice, date),
+            );
+        }
+        self.button(
+            ctx,
+            531.,
+            44.,
+            150.,
+            "Opening view…",
+            Action::Settings(true),
+        );
+        Label::new(self.status.get_cloned())
+            .at(18., 565.)
+            .render(ctx);
+        if view != CalendarView::Today {
+            self.overview(ctx, shown, &data);
+            return;
+        }
+        let day = data.into_day();
         for (label, field, x, w) in [
             ("Date", &self.date, 18., 140.),
             ("Title", &self.title, 174., 238.),
             ("Start", &self.start, 426., 82.),
             ("End", &self.end, 522., 82.),
         ] {
-            Label::new(label).at(x, 60.).render(ctx);
+            Label::new(label).at(x, 106.).render(ctx);
             TextField::new(field.clone())
-                .at(x, 82.)
+                .at(x, 128.)
                 .width(w)
                 .render(ctx);
         }
-        if self.waiting.get() {
-            Label::new("Loading calendar…").at(18., 130.).render(ctx);
-            return;
-        }
-        self.button(ctx, 18., 122., 124., "Open / Refresh", Action::Load);
-        let Some(day) = self.day.get_cloned() else {
-            Label::new(self.status.get_cloned())
-                .at(18., 176.)
-                .render(ctx);
-            return;
-        };
+        self.button(ctx, 18., 168., 124., "Open / Refresh", Action::Load);
         self.button(
             ctx,
             151.,
-            122.,
+            168.,
             114.,
             "Add event",
             Action::Save(Kind::Appointment),
@@ -207,7 +318,7 @@ impl View for Planner {
         self.button(
             ctx,
             273.,
-            122.,
+            168.,
             114.,
             "Add weekly",
             Action::Save(Kind::Weekly),
@@ -215,7 +326,7 @@ impl View for Planner {
         self.button(
             ctx,
             395.,
-            122.,
+            168.,
             114.,
             "Add all-day",
             Action::Save(Kind::AllDay),
@@ -223,7 +334,7 @@ impl View for Planner {
         self.button(
             ctx,
             518.,
-            122.,
+            168.,
             136.,
             if self.finding.get() {
                 "Show agenda"
@@ -236,7 +347,7 @@ impl View for Planner {
         let mut rows = Vec::new();
         if self.finding.get() {
             Label::new("45 minutes between 09:00 and 17:00")
-                .at(18., 176.)
+                .at(18., 222.)
                 .render(ctx);
             for gap in day.openings(WORKDAY, 45).expect("constant valid window") {
                 let span = Span {
@@ -254,7 +365,7 @@ impl View for Planner {
                 ));
             }
         } else {
-            Label::new("Agenda · local time").at(18., 176.).render(ctx);
+            Label::new("Agenda · local time").at(18., 222.).render(ctx);
             for e in day.entries {
                 let label = match e.kind {
                     Kind::Weekly => "Weekly · ",
@@ -280,11 +391,11 @@ impl View for Planner {
             } else {
                 "No events on this day"
             })
-            .at(18., 216.)
+            .at(18., 262.)
             .render(ctx);
         }
         for (i, (label, action)) in rows.iter().skip(page * PAGE).take(PAGE).enumerate() {
-            let y = 208. + i as f32 * 38.;
+            let y = 254. + i as f32 * 38.;
             ctx.add(pergola::node::Node::Rect {
                 rect: pergola::geom::Rect::new(18., y + 31., 636., 1.),
                 fill: theme.border_default(),
@@ -296,14 +407,11 @@ impl View for Planner {
             }
         }
         if page > 0 {
-            self.button(ctx, 18., 445., 105., "Previous", Action::Page(page - 1));
+            self.button(ctx, 18., 498., 105., "Previous", Action::Page(page - 1));
         }
         if (page + 1) * PAGE < rows.len() {
-            self.button(ctx, 132., 445., 105., "Next", Action::Page(page + 1));
+            self.button(ctx, 132., 498., 105., "Next", Action::Page(page + 1));
         }
-        Label::new(self.status.get_cloned())
-            .at(18., 492.)
-            .render(ctx);
     }
 }
 
@@ -322,7 +430,7 @@ pub fn run() -> io::Result<()> {
         }
         _ => return Err(io::Error::other("Invalid Calendar launch arguments")),
     };
-    let mut win = Window::open(&WindowDesc::new(&calendar_name, SizeSpec::Fixed(700, 540)))?;
+    let mut win = Window::open(&WindowDesc::new(&calendar_name, SizeSpec::Fixed(700, 600)))?;
     let dirty = Arc::new(AtomicBool::new(true));
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
@@ -333,7 +441,9 @@ pub fn run() -> io::Result<()> {
         start: field("09:00"),
         end: field("09:30"),
         shown: Mutable::with_dirty(today, dirty.clone()),
-        day: Mutable::with_dirty(None, dirty.clone()),
+        data: Mutable::with_dirty(None, dirty.clone()),
+        view: Mutable::with_dirty(None, dirty.clone()),
+        settings: Mutable::with_dirty(false, dirty.clone()),
         status: Mutable::with_dirty(String::new(), dirty.clone()),
         finding: Mutable::with_dirty(false, dirty.clone()),
         page: Mutable::with_dirty(0, dirty.clone()),
@@ -352,7 +462,7 @@ pub fn run() -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| "/atrium/sockets/calendar/calendar.sock".into());
     let (done, answers) = mpsc::channel();
-    tx.send(Action::Load).unwrap();
+    tx.send(Action::Resume).unwrap();
     loop {
         while let Ok(action) = rx.try_recv() {
             if planner.waiting.get() {
@@ -363,6 +473,7 @@ pub fn run() -> io::Result<()> {
                     planner.finding.set(!planner.finding.get());
                     planner.page.set(0);
                 }
+                Action::Settings(open) => planner.settings.set(open),
                 Action::Page(p) => planner.page.set(p),
                 action => match planner.request(action) {
                     Ok((date, req)) => {
@@ -370,7 +481,7 @@ pub fn run() -> io::Result<()> {
                         let tx = done.clone();
                         let path = socket.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send((date, action, call(&path, &req)));
+                            let _ = tx.send((date, action, page(&path, &req)));
                         });
                     }
                     Err(e) => planner.status.set(e),
@@ -380,15 +491,22 @@ pub fn run() -> io::Result<()> {
         while let Ok((date, action, reply)) = answers.try_recv() {
             planner.waiting.set(false);
             match reply {
-                Ok(day) => {
+                Ok(data) => {
+                    planner.view.set(Some(data.view));
+                    if matches!(action, Action::Resume | Action::Load | Action::Browse(..)) {
+                        planner.date.set(TextEdit::new(&date.to_string()));
+                        planner.finding.set(false);
+                    }
+                    planner.settings.set(false);
                     planner.shown.set(date);
-                    planner.day.set(Some(day));
+                    planner.data.set(Some(data));
                     planner.page.set(0);
                     if matches!(action, Action::Save(_)) {
                         planner.title.set(TextEdit::new(""));
                     }
                     planner.status.set(
                         match action {
+                            Action::SetOpening(_) => "Opening view saved",
                             Action::Hold(_) => "Held on this device",
                             Action::Release(_) => "Hold released",
                             Action::Save(_) => "Event saved",
@@ -398,7 +516,8 @@ pub fn run() -> io::Result<()> {
                     );
                 }
                 Err(e) => {
-                    planner.day.set(None);
+                    planner.data.set(None);
+                    planner.settings.set(false);
                     planner.status.set(e);
                 }
             }
