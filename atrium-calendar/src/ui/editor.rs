@@ -38,15 +38,7 @@ impl Editor {
             .ok_or("Missing source zone")?
             .get_cloned();
         let input = name.text().trim();
-        let tz = input
-            .parse::<Tz>()
-            .ok()
-            .or_else(|| {
-                chrono_tz::TZ_VARIANTS
-                    .iter()
-                    .copied()
-                    .find(|z| z.name().eq_ignore_ascii_case(input))
-            })
+        let tz = atrium_calendar::zone::parse_name(input)
             .ok_or("Enter an IANA zone, such as America/New_York")?;
         let date = self
             .date
@@ -90,12 +82,11 @@ impl Editor {
         }))
     }
 
-    pub(super) fn create(&self, kind: Kind) -> Result<(NaiveDate, Request), String> {
+    pub(super) fn create(&self, kind: Kind) -> Result<Request, String> {
         if !self.creating || !matches!(kind, Kind::Appointment | Kind::Weekly) {
             return Err("Open the zoned event form first".into());
         }
         let f = self.draft()?;
-        let date = f.agenda_date()?;
         let entry = Entry {
             id: self.id,
             date: f.date,
@@ -106,13 +97,10 @@ impl Editor {
             kind,
             excluded: Vec::new(),
         };
-        Ok((
-            date,
-            Request::Add {
-                revision: self.revision,
-                entry,
-            },
-        ))
+        Ok(Request::Add {
+            revision: self.revision,
+            entry,
+        })
     }
 
     fn draft(&self) -> Result<EventEdit, String> {
@@ -145,27 +133,20 @@ impl Editor {
         Ok(fields)
     }
 
-    pub(super) fn request(&self, delete: bool) -> Result<(NaiveDate, Request), String> {
+    pub(super) fn request(&self, delete: bool) -> Result<Request, String> {
         if delete && self.stage != Stage::ReviewDelete
             || !delete && self.scope == EditScope::WholeSeries && self.stage != Stage::ReviewChange
         {
             return Err("Review the change first".into());
         }
         let replacement = if delete { None } else { Some(self.draft()?) };
-        let date = replacement
-            .as_ref()
-            .filter(|_| self.scope == EditScope::ThisEvent)
-            .map_or(Ok(self.shown), EventEdit::agenda_date)?;
-        Ok((
-            date,
-            Request::Change {
-                revision: self.revision,
-                id: self.id,
-                shown: self.shown,
-                scope: self.scope,
-                operation: replacement.map_or(EventChange::Delete, EventChange::Update),
-            },
-        ))
+        Ok(Request::Change {
+            revision: self.revision,
+            id: self.id,
+            shown: self.shown,
+            scope: self.scope,
+            operation: replacement.map_or(EventChange::Delete, EventChange::Update),
+        })
     }
 
     fn subject(&self) -> &'static str {
@@ -229,7 +210,7 @@ impl Planner {
                 end: time(&self.end.get_cloned())?,
             },
             zone: Some(Zone {
-                name: chrono_tz::UTC,
+                name: self.viewing_zone(),
                 start_fold: None,
                 end_fold: None,
             }),
@@ -508,9 +489,12 @@ impl Planner {
             if let Some(z) = f.zone {
                 if let Ok((start, end)) = z.interval(f.date, f.span, false) {
                     Label::new(format!(
-                        "Agenda   {} – {} UTC",
-                        start.format("%b %d %H:%M"),
-                        end.format("%b %d %H:%M")
+                        "Agenda   {} – {}",
+                        start
+                            .with_timezone(&self.viewing_zone())
+                            .format("%b %d %H:%M %Z"),
+                        end.with_timezone(&self.viewing_zone())
+                            .format("%b %d %H:%M %Z")
                     ))
                     .at(18., 448.)
                     .render(ctx);

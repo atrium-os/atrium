@@ -36,6 +36,8 @@ enum Action {
     Browse(CalendarView, NaiveDate),
     Settings(bool),
     SetOpening(CalendarView),
+    SetZone(bool),
+    Today(Option<CalendarView>),
     Save(Kind),
     Hold(Span),
     Release(Uuid),
@@ -70,6 +72,7 @@ struct Planner {
     data: Mutable<Option<CalendarPage>>,
     view: Mutable<Option<CalendarView>>,
     settings: Mutable<bool>,
+    zone_field: Mutable<TextEdit>,
     editor: Mutable<Option<Editor>>,
     status: Mutable<String>,
     finding: Mutable<bool>,
@@ -98,6 +101,12 @@ fn time(field: &TextEdit) -> Result<u16, String> {
 }
 
 impl Planner {
+    fn viewing_zone(&self) -> chrono_tz::Tz {
+        self.data
+            .get_cloned()
+            .map_or(chrono_tz::UTC, |d| d.viewing_zone)
+    }
+
     fn button(&self, ctx: &mut Ctx, x: f32, y: f32, w: f32, label: &str, action: Action) {
         self.control(ctx, Button::secondary(label), x, y, w, action);
     }
@@ -113,45 +122,56 @@ impl Planner {
             .render(ctx);
     }
 
-    fn request(&self, action: Action) -> Result<(NaiveDate, Request), String> {
+    fn request(&self, action: Action) -> Result<Request, String> {
         if let Action::Search(offset) = action {
             let form = self.search.get_cloned().ok_or("Open Search first")?;
-            return Ok((self.shown.get(), form.request(offset)?));
+            return form.request(offset);
         }
         if let Action::OpenHit(id, date, revision) = action {
-            return Ok((date, Request::OpenSearchHit { revision, id, date }));
+            return Ok(Request::OpenSearchHit { revision, id, date });
         }
         if matches!(action, Action::Resume) {
             let date = self.shown.get();
-            return Ok((
+            return Ok(Request::Browse {
                 date,
-                Request::Browse {
-                    date,
-                    view: self.view.get(),
-                },
-            ));
+                view: self.view.get(),
+            });
         }
         if let Action::Browse(view, date) = action {
-            return Ok((
+            return Ok(Request::Browse {
                 date,
-                Request::Browse {
-                    date,
-                    view: Some(view),
-                },
-            ));
+                view: Some(view),
+            });
+        }
+        if let Action::Today(view) = action {
+            return Ok(Request::Today { view });
+        }
+        if let Action::SetZone(follow) = action {
+            let data = self.data.get_cloned().ok_or("Refresh Calendar first")?;
+            let pinned = if follow {
+                None
+            } else {
+                Some(
+                    atrium_calendar::zone::parse_name(self.zone_field.get_cloned().text())
+                        .ok_or("Enter a time zone such as Europe/London")?,
+                )
+            };
+            return Ok(Request::SetViewingZone {
+                revision: data.revision,
+                pinned,
+                date: data.date,
+                view: data.view,
+            });
         }
         if let Action::SetOpening(opening_view) = action {
             let data = self.data.get_cloned().ok_or("Refresh Calendar first")?;
             let date = self.shown.get();
-            return Ok((
+            return Ok(Request::SetOpeningView {
+                revision: data.revision,
+                opening_view,
                 date,
-                Request::SetOpeningView {
-                    revision: data.revision,
-                    opening_view,
-                    date,
-                    view: data.view,
-                },
-            ));
+                view: data.view,
+            });
         }
         if let Action::CreateZoned(kind) = action {
             return self
@@ -175,13 +195,10 @@ impl Planner {
             .parse::<NaiveDate>()
             .map_err(|_| "Enter a date as YYYY-MM-DD")?;
         if matches!(action, Action::Load) {
-            return Ok((
+            return Ok(Request::Browse {
                 date,
-                Request::Browse {
-                    date,
-                    view: self.view.get(),
-                },
-            ));
+                view: self.view.get(),
+            });
         }
         if date != self.shown.get() {
             return Err("Open the selected day first".into());
@@ -192,7 +209,7 @@ impl Planner {
             .ok_or("Refresh the day first")?
             .revision;
         if let Action::Release(id) = action {
-            return Ok((date, Request::Release { revision, date, id }));
+            return Ok(Request::Release { revision, date, id });
         }
         let (kind, span, title) = match action {
             Action::Hold(span) => (Kind::Hold, span, "Preparation".to_string()),
@@ -226,7 +243,7 @@ impl Planner {
             kind,
         };
         entry.validate()?;
-        Ok((date, Request::Add { revision, entry }))
+        Ok(Request::Add { revision, entry })
     }
 }
 
@@ -235,7 +252,12 @@ impl View for Planner {
         let shown = self.shown.get();
         let heading = match self.view.get() {
             None => "Calendar".to_owned(),
-            Some(CalendarView::Today) if shown == Local::now().date_naive() => {
+            Some(CalendarView::Today)
+                if shown
+                    == chrono::Utc::now()
+                        .with_timezone(&self.viewing_zone())
+                        .date_naive() =>
+            {
                 format!("Today · {shown}")
             }
             Some(CalendarView::Today) => format!("Day · {shown}"),
@@ -321,6 +343,33 @@ impl View for Planner {
                     Action::SetOpening(choice),
                 );
             }
+            Label::new("Viewing time zone")
+                .at(18., 259.)
+                .size(20.)
+                .render(ctx);
+            let current = if data.pinned_zone.is_none() {
+                format!("Follows this device · {}", data.viewing_zone)
+            } else {
+                format!("Fixed for this calendar · {}", data.viewing_zone)
+            };
+            Label::new(current).at(18., 292.).render(ctx);
+            self.button(ctx, 18., 315., 164., "Follow device", Action::SetZone(true));
+            TextField::new(self.zone_field.clone())
+                .key(118)
+                .at(18., 372.)
+                .width(300.)
+                .render(ctx);
+            self.button(
+                ctx,
+                330.,
+                372.,
+                160.,
+                "Use this zone",
+                Action::SetZone(false),
+            );
+            Label::new(self.status.get_cloned())
+                .at(18., 435.)
+                .render(ctx);
             return;
         }
         for (i, choice) in CalendarView::ALL.into_iter().enumerate() {
@@ -329,30 +378,16 @@ impl View for Planner {
             } else {
                 Button::ghost(choice.label())
             };
-            let date = if choice == CalendarView::Today {
-                Local::now().date_naive()
+            let action = if choice == CalendarView::Today {
+                Action::Today(Some(choice))
             } else {
-                shown
+                Action::Browse(choice, shown)
             };
-            self.control(
-                ctx,
-                button,
-                18. + i as f32 * 88.,
-                44.,
-                82.,
-                Action::Browse(choice, date),
-            );
+            self.control(ctx, button, 18. + i as f32 * 88., 44., 82., action);
         }
         self.button(ctx, 283., 44., 104., "Zoned event…", Action::NewZoned);
         self.button(ctx, 396., 44., 121., "Search…", Action::SearchPanel(true));
-        self.button(
-            ctx,
-            531.,
-            44.,
-            150.,
-            "Opening view…",
-            Action::Settings(true),
-        );
+        self.button(ctx, 531., 44., 150., "Settings…", Action::Settings(true));
         Label::new(self.status.get_cloned())
             .at(18., 565.)
             .render(ctx);
@@ -360,6 +395,7 @@ impl View for Planner {
             self.overview(ctx, shown, &data);
             return;
         }
+        let viewing_zone = data.viewing_zone;
         let day = data.into_day();
         for (label, field, x, w) in [
             ("Date", &self.date, 18., 140.),
@@ -414,9 +450,9 @@ impl View for Planner {
         let mut rows = Vec::new();
         if self.finding.get() {
             Label::new(if day.entries.iter().any(|e| e.zone.is_some()) {
-                "45 minutes between 09:00 and 17:00 · zoned events in UTC"
+                format!("45 minutes between 09:00 and 17:00 · {viewing_zone}")
             } else {
-                "45 minutes between 09:00 and 17:00"
+                "45 minutes between 09:00 and 17:00".to_owned()
             })
             .at(18., 222.)
             .render(ctx);
@@ -438,9 +474,9 @@ impl View for Planner {
             }
         } else {
             Label::new(if day.entries.iter().any(|e| e.zone.is_some()) {
-                "Agenda · zoned events in UTC"
+                format!("Agenda · {viewing_zone}")
             } else {
-                "Agenda · local time"
+                "Agenda · local time".to_owned()
             })
             .at(18., 222.)
             .render(ctx);
@@ -453,13 +489,10 @@ impl View for Planner {
                 };
                 let time = if e.kind == Kind::AllDay {
                     String::new()
+                } else if let Some(source) = e.source {
+                    format!("{}   ", source.clock_label())
                 } else {
-                    format!(
-                        "{}–{}{}   ",
-                        clock(e.span.start),
-                        clock(e.span.end),
-                        if e.zone.is_some() { " UTC" } else { "" }
-                    )
+                    format!("{}–{}   ", clock(e.span.start), clock(e.span.end))
                 };
                 let title: String = e
                     .title
@@ -540,6 +573,7 @@ pub fn run() -> io::Result<()> {
     let planner = Arc::new(Planner {
         search: Mutable::with_dirty(None, dirty.clone()),
         selected_row: Mutable::with_dirty(None, dirty.clone()),
+        zone_field: field(""),
         calendar_name,
         date: field(&today.to_string()),
         title: field(""),
@@ -568,8 +602,41 @@ pub fn run() -> io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| "/atrium/sockets/calendar/calendar.sock".into());
     let (done, answers) = mpsc::channel();
-    tx.send(Action::Resume).unwrap();
+    tx.send(Action::Today(None)).unwrap();
+    let clock_path = socket.with_file_name("device-zone");
+    let mut clock_name = std::fs::read_to_string(&clock_path).ok();
+    let mut checked = std::time::Instant::now();
+    let mut refresh_zone = false;
     loop {
+        if checked.elapsed() >= Duration::from_secs(2) {
+            let current = std::fs::read_to_string(&clock_path).ok();
+            refresh_zone |= current != clock_name;
+            clock_name = current;
+            checked = std::time::Instant::now();
+        }
+        if refresh_zone
+            && !planner.waiting.get()
+            && planner.editor.get_cloned().is_none()
+            && planner.search.get_cloned().is_none()
+            && !planner.settings.get()
+        {
+            refresh_zone = false;
+            if let Some(data) = planner.data.get_cloned() {
+                if data.pinned_zone.is_none() {
+                    let was_today = data.date
+                        == chrono::Utc::now()
+                            .with_timezone(&data.viewing_zone)
+                            .date_naive();
+                    let _ = tx.send(if was_today {
+                        Action::Today(Some(data.view))
+                    } else {
+                        Action::Resume
+                    });
+                }
+            } else {
+                let _ = tx.send(Action::Resume);
+            }
+        }
         while let Ok(action) = rx.try_recv() {
             if planner.waiting.get() {
                 continue;
@@ -609,10 +676,18 @@ pub fn run() -> io::Result<()> {
                     planner.finding.set(!planner.finding.get());
                     planner.page.set(0);
                 }
-                Action::Settings(open) => planner.settings.set(open),
+                Action::Settings(open) => {
+                    if open {
+                        planner
+                            .zone_field
+                            .set(TextEdit::new(planner.viewing_zone().name()));
+                    }
+                    planner.settings.set(open);
+                    planner.status.set(String::new());
+                }
                 Action::Page(p) => planner.page.set(p),
                 action => match planner.request(action) {
-                    Ok((date, req)) => {
+                    Ok(req) => {
                         planner.waiting.set(true);
                         let tx = done.clone();
                         let path = socket.clone();
@@ -637,14 +712,14 @@ pub fn run() -> io::Result<()> {
                                 }),
                                 req => page(&path, &req).map(Reply::Calendar),
                             };
-                            let _ = tx.send((date, action, reply));
+                            let _ = tx.send((action, reply));
                         });
                     }
                     Err(e) => planner.status.set(e),
                 },
             }
         }
-        while let Ok((date, action, reply)) = answers.try_recv() {
+        while let Ok((action, reply)) = answers.try_recv() {
             planner.waiting.set(false);
             match reply {
                 Ok(Reply::Results(results)) => {
@@ -655,6 +730,7 @@ pub fn run() -> io::Result<()> {
                     planner.status.set(String::new());
                 }
                 Ok(Reply::Calendar(data)) => {
+                    let date = data.date;
                     let selected = match action {
                         Action::OpenHit(id, ..) => data.entries.iter().position(|e| e.id == id),
                         _ => None,
@@ -664,7 +740,9 @@ pub fn run() -> io::Result<()> {
                     planner.view.set(Some(data.view));
                     if matches!(
                         action,
-                        Action::Resume
+                        Action::Today(_)
+                            | Action::SetZone(_)
+                            | Action::Resume
                             | Action::Load
                             | Action::Browse(..)
                             | Action::Change(_)
@@ -687,6 +765,7 @@ pub fn run() -> io::Result<()> {
                             Action::OpenHit(..) => "Selected search result",
                             Action::Change(true) => "Deleted on this device",
                             Action::Change(false) => "Changes saved on this device",
+                            Action::SetZone(_) => "Viewing time zone saved",
                             Action::SetOpening(_) => "Opening view saved",
                             Action::Hold(_) => "Held on this device",
                             Action::Release(_) => "Hold released",

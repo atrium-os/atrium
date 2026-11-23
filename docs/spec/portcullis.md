@@ -16,6 +16,8 @@ service atrium-portcullisd-bootstrap       # supervisor; reads /etc/atrium/servi
 
 Each ships an `rc.d` script in-tree (`portcullis/{jaild,atrium-volumes,portcullisd}/etc/`).
 
+The Calendar session supervisor publishes the public device time-zone name in a root-owned file beside each persona socket. It observes FreeBSD’s localtime link or the matching zone recorded by tzsetup and replaces the file atomically on change. Fasti reads it inside the existing endpoint mount. Calendar’s per-persona viewing preference stays inside its private store. [Calendar §7.7](calendar.md#77-follow-the-device-time-zone)
+
 **Live properties** (VM-verified):
 - Manifest schema: `enabled`, `name`, `path`, `[[mounts]]`, `[[volumes]]` (with `[volumes.init]` first-run sentinels), `[exec]`, `[supervision]`, `[capabilities]`.
 - `[capabilities] attach_mount = true` derives a ro_nullfs mount of `/var/run/atrium/caps/portcullisd/` → `/atrium/sockets/portcullisd/` at jail-create time. In-jail services connect to the daemon over aqueduct.

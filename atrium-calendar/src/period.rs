@@ -70,6 +70,10 @@ impl CalendarView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalendarPage {
+    pub date: NaiveDate,
+    pub pinned_zone: Option<chrono_tz::Tz>,
+    pub viewing_zone: chrono_tz::Tz,
+    pub clock_gap: Option<crate::Span>,
     pub revision: u64,
     pub entries: Vec<Entry>,
     pub view: CalendarView,
@@ -82,30 +86,66 @@ pub struct CalendarPage {
 impl CalendarPage {
     /// Sort after projection so each occurrence uses its offset on this date.
     pub fn on(&self, date: NaiveDate) -> std::vec::IntoIter<Entry> {
-        let mut rows: Vec<_> = self.entries.iter().filter_map(|e| e.on_day(date)).collect();
-        rows.sort_by_key(|e| (e.span.start, e.span.end, e.id));
+        let mut rows: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.on_day(date, self.viewing_zone))
+            .collect();
+        rows.sort_by_cached_key(|e| {
+            (
+                crate::zone::sort_time(e.source, e.span, date, self.viewing_zone),
+                e.span.end,
+                e.id,
+            )
+        });
         rows.into_iter()
     }
 
     /// Peak simultaneous commitments per half-hour. A pair of adjacent
     /// meetings within one bin is still a single busy interval.
     pub fn half_hours(&self, date: NaiveDate) -> [u8; 48] {
-        let mut changes = [0i32; 1441];
-        for entry in self.on(date) {
-            changes[usize::from(entry.span.start)] += 1;
-            changes[usize::from(entry.span.end)] -= 1;
-        }
         let mut levels = [0; 48];
-        let mut active = 0;
-        for (minute, delta) in changes[..1440].iter().enumerate() {
-            active += delta;
-            levels[minute / 30] = levels[minute / 30].max(active.min(2) as u8);
+        let rows: Vec<_> = self.on(date).collect();
+        // Count each physical pass through a repeated hour separately.
+        for clock in crate::zone::day_parts(date, self.viewing_zone)
+            .into_iter()
+            .flatten()
+        {
+            let mut changes = [0i32; 1441];
+            for entry in &rows {
+                let mut count = |span: crate::Span| {
+                    let start = span.start.max(clock.span.start);
+                    let end = span.end.min(clock.span.end);
+                    if start < end {
+                        changes[usize::from(start)] += 1;
+                        changes[usize::from(end)] -= 1;
+                    }
+                };
+                if let Some(source) = entry.source {
+                    for p in source
+                        .parts
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p.offset == clock.offset)
+                    {
+                        count(p.span);
+                    }
+                } else {
+                    count(entry.span);
+                }
+            }
+            let mut active = 0;
+            for (minute, delta) in changes[..1440].iter().enumerate() {
+                active += delta;
+                levels[minute / 30] = levels[minute / 30].max(active.min(2) as u8);
+            }
         }
         levels
     }
 
     pub fn into_day(self) -> Day {
         Day {
+            clock_gap: self.clock_gap,
             revision: self.revision,
             entries: self.entries,
         }

@@ -55,6 +55,7 @@ saved() {
 }
 
 test ! -e "$home"
+tzsetup -s UTC
 test ! -e "/var/lib/atrium/apps/$app"
 for bin in portcullisd atrium-jaild opifex portcullis; do
     install -m 0555 "$bin" "/usr/local/bin/$bin"
@@ -422,6 +423,45 @@ saved "$personal_store" studio
 jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --check-zones
 echo "PASS: gap and unresolved fold refused, second offset selected, weekly source time retained across DST"
 
+# Pin Work to the current UTC zone through Settings. Change the disposable
+# machine's actual time zone while both Fasti services are running.
+open_work_week
+click 606 60
+click 405 387
+grep -Fq '"pinned_zone":"UTC"' "$work_store/calendar.json"
+tzsetup -s Pacific/Auckland
+wait_clock() {
+    file="/var/run/atrium/fasti/$1/device-zone"
+    for i in $(jot 15); do
+        if [ "$(cat "$file")" = "$2" ]; then return; fi
+        sleep 1
+    done
+    return 1
+}
+wait_clock "$wu" Pacific/Auckland
+wait_clock "$pu" Pacific/Auckland
+work_search --check-pinned
+close_ui "$work_jail"
+# Personal remains open on March 2. Its 09:00 New York meeting now falls on March 3.
+sleep 3
+click 606 60
+cp screen.png follows-device.png
+click 82 60
+jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --check-travel
+click 75 143
+keys 77 42 32         # March 2 -> March 3
+click 76 184
+cp screen.png travel-agenda.png
+enter 7 4 26 17       # dawn
+saved "$personal_store" dawn
+grep -Fq '"date":"2026-03-03","title":"dawn"' "$personal_store/calendar.json"
+open_work_week
+work_search --check-pinned
+click 606 60
+cp screen.png fixed-work.png
+click 96 331
+work_search --check-follow
+echo "PASS: live device zone, midnight projection, independent Work pin, reopen and return to following"
 # Exercise the same authenticated SessionEnded message Ostiarius sends.
 printf '%s\n' '{"op":"hello","version":1}' '{"op":"session_ended","user":"calfixture"}' |
     su -m _ostiarius -c "nc -N -w 20 -U $psock" >logout.log

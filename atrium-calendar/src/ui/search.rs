@@ -136,6 +136,8 @@ impl SearchForm {
             Label::new(title).at(18., y).render(ctx);
             let when = if hit.kind == Kind::AllDay {
                 "All day".into()
+            } else if let Some(source) = hit.source {
+                source.clock_label()
             } else {
                 format!("{}–{}", clock(hit.span.start), clock(hit.span.end))
             };
@@ -150,7 +152,7 @@ impl SearchForm {
             };
             let basis = hit
                 .source_zone
-                .map(|z| format!(" UTC · {z}"))
+                .map(|z| format!(" {} · {z}", page.viewing_zone))
                 .unwrap_or_default();
             Label::new(format!("{}   {when}{basis}{detail}", hit.date))
                 .at(18., y + 21.)

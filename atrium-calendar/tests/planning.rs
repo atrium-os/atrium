@@ -56,6 +56,7 @@ fn synthetic_schedules() {
     ];
     for (name, busy, expected) in cases {
         let day = Day {
+            clock_gap: None,
             revision: 0,
             entries: busy
                 .iter()

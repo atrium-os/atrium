@@ -28,6 +28,15 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    Today {
+        view: Option<CalendarView>,
+    },
+    SetViewingZone {
+        revision: u64,
+        pinned: Option<chrono_tz::Tz>,
+        date: NaiveDate,
+        view: CalendarView,
+    },
     Search {
         query: SearchQuery,
         offset: usize,
@@ -205,6 +214,16 @@ fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, 
         .map_err(|e| format!("Refresh to check the saved state: {e}"))?
 }
 
+pub fn refuse(s: &mut UnixStream, reason: &str) -> io::Result<()> {
+    s.set_nonblocking(true)?;
+    let _: Request = receive(s, flag::RESPONSE_EXPECTED, 4096)?;
+    send(
+        s,
+        flag::IS_RESPONSE,
+        &Result::<CalendarPage, _>::Err(reason),
+    )
+}
+
 pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
     let reply: Result<CalendarPage, String> = match receive(s, flag::RESPONSE_EXPECTED, 4096) {
@@ -222,6 +241,29 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
         Ok(Request::OpenSearchHit { revision, id, date }) => {
             store.open_search_hit(revision, id, date)
         }
+        Ok(Request::Today { view }) => Ok(store.page(
+            chrono::Utc::now()
+                .with_timezone(&store.viewing_zone())
+                .date_naive(),
+            view,
+        )),
+        Ok(Request::SetViewingZone {
+            revision,
+            pinned,
+            date,
+            view,
+        }) => {
+            let now = chrono::Utc::now();
+            let today = date == now.with_timezone(&store.viewing_zone()).date_naive();
+            store.set_viewing_zone(revision, pinned).map(|()| {
+                let anchor = if today {
+                    now.with_timezone(&store.viewing_zone()).date_naive()
+                } else {
+                    date
+                };
+                store.page(anchor, Some(view))
+            })
+        }
         Ok(Request::Browse { date, view }) => Ok(store.page(date, view)),
         Ok(Request::SetOpeningView {
             revision,
@@ -234,7 +276,7 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
         Ok(Request::Day { date }) => Ok(store.page(date, Some(CalendarView::Today))),
         Ok(Request::Add { revision, entry }) => entry
             .fields_on(entry.date)
-            .agenda_date()
+            .agenda_date(store.viewing_zone())
             .map_err(str::to_owned)
             .and_then(|date| {
                 store
@@ -255,7 +297,7 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             let date = replacement
                 .as_ref()
                 .filter(|_| scope == EditScope::ThisEvent)
-                .map_or(Ok(shown), |edit| edit.agenda_date());
+                .map_or(Ok(shown), |edit| edit.agenda_date(store.viewing_zone()));
             date.map_err(str::to_owned).and_then(|date| {
                 store
                     .change(revision, id, shown, scope, replacement)

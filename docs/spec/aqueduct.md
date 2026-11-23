@@ -230,7 +230,7 @@ document and `aqueduct/src/classes.rs` together.
 
 Class 21 is Calendar's Fasti store. Operation 1 accepts a version-one local
 day, week or month query, event creation, edit or deletion, hold release or
-opening-view preference change. A browse request can ask for the stored opening
+opening-view or viewing-zone preference change. A browse request can ask for the stored opening
 view. Edits name the local record, displayed date, scope and an explicit update
 or delete operation. Fasti owns series links and exceptions. All writes carry
 the current store revision. A title search includes two civil dates and returns
@@ -238,7 +238,11 @@ one page of effective occurrences. Results and continuations use the store
 revision. Opening a search result requires its record ID, effective date and
 revision. A timed meeting may carry an IANA source zone and an offset choice
 for either endpoint of a repeated hour. A projected day row carries its original
-source date, span and series start so either UTC date can open the source editor.
+source date, span and series start so either displayed date can open the source editor.
+Pages include the effective viewing zone and an optional persona pin. Today is
+resolved by Fasti. A projected occurrence carries clock spans with their offsets
+so a repeated hour keeps both instants distinct. A change to the effective
+device-following zone invalidates earlier revisions.
 Fasti refuses projected rows on creation. These reads use the same instance
 authorization as day queries.
 The envelope carries at most 4 KiB for a

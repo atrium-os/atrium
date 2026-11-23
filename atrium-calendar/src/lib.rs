@@ -71,9 +71,13 @@ pub struct EventEdit {
 }
 
 impl EventEdit {
-    pub fn agenda_date(&self) -> Result<NaiveDate, &'static str> {
+    pub fn agenda_date(&self, viewing: chrono_tz::Tz) -> Result<NaiveDate, &'static str> {
         match self.zone {
-            Some(zone) => Ok(zone.interval(self.date, self.span, false)?.0.date_naive()),
+            Some(zone) => Ok(zone
+                .interval(self.date, self.span, false)?
+                .0
+                .with_timezone(&viewing)
+                .date_naive()),
             None => Ok(self.date),
         }
     }
@@ -111,7 +115,18 @@ impl Entry {
             if matches!(self.kind, Kind::Hold | Kind::AllDay) {
                 return Err("Only timed meetings have a source zone");
             }
-            if self.source.is_none() {
+            if let Some(source) = self.source {
+                if source.parts[0].is_none()
+                    || source.parts.into_iter().flatten().any(|p| {
+                        !p.span.valid()
+                            || p.span.start < self.span.start
+                            || p.span.end > self.span.end
+                            || chrono::FixedOffset::east_opt(p.offset).is_none()
+                    })
+                {
+                    return Err("Invalid projected interval");
+                }
+            } else {
                 zone.interval(self.date, self.span, false)?;
                 return validate_identity_title(self.id, &self.title);
             }
@@ -157,6 +172,8 @@ fn validate_identity_title(id: Uuid, title: &str) -> Result<(), &'static str> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Day {
+    #[serde(default)]
+    pub clock_gap: Option<Span>,
     pub revision: u64,
     pub entries: Vec<Entry>,
 }
@@ -167,7 +184,8 @@ impl Day {
         if !window.valid() || minutes == 0 {
             return Err("Invalid search range or duration");
         }
-        let mut busy: Vec<_> = self.entries.iter().map(|e| e.span).collect();
+        let mut busy: Vec<_> = self.entries.iter().flat_map(Entry::busy_spans).collect();
+        busy.extend(self.clock_gap);
         busy.sort_by_key(|s| s.start);
         let mut cursor = window.start;
         let mut gaps = Vec::new();

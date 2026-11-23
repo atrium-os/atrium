@@ -639,6 +639,10 @@ impl Supervisor {
     }
 
     pub fn run_until(&mut self, stopping: &AtomicBool) -> io::Result<()> {
+        self.run_until_with_tick(stopping, || {})
+    }
+
+    pub fn run_until_with_tick(&mut self, stopping: &AtomicBool, mut tick: impl FnMut()) -> io::Result<()> {
         while self.services.iter().any(|s| !s.retired)
             || self.graph.as_ref().is_some_and(|g| !g.launchable().is_empty())
         {
@@ -648,6 +652,7 @@ impl Supervisor {
                 self.graceful_shutdown();
                 return Ok(());
             }
+            tick();
             /* Bound the wait so that pending burst-cooldowns
              * get re-checked AND the shutdown flag is polled at
              * least once per second. 1s is fine; the cost is one

@@ -518,7 +518,7 @@ fn zoned_write_preserves_version_two_floating_and_all_day_entries() {
     drop(store);
     let snapshot: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(snapshot["version"], 3);
+    assert_eq!(snapshot["version"], 4);
     let page = Store::open(dir.path()).unwrap().page(day, None);
     assert_eq!((page.revision, page.view), (9, CalendarView::Week));
     let rows: Vec<_> = page
@@ -554,4 +554,139 @@ fn zoned_write_preserves_version_two_floating_and_all_day_entries() {
             )
         ]
     );
+}
+
+#[test]
+fn following_device_and_pinning_are_persona_local_and_survive_restart() {
+    use atrium_calendar::SearchQuery;
+    use chrono_tz::{America::Los_Angeles, Asia::Kolkata, Pacific::Auckland, UTC};
+    let work = tempfile::tempdir().unwrap();
+    let personal = tempfile::tempdir().unwrap();
+    let mut w = Store::open(work.path()).unwrap();
+    let mut p = Store::open(personal.path()).unwrap();
+    for store in [&mut w, &mut p] {
+        store.sync_device(Los_Angeles).unwrap();
+        store
+            .add(
+                0,
+                zoned("Handover", "2026-03-02", 1350, 1410, UTC, Kind::Weekly),
+            )
+            .unwrap();
+    }
+    w.set_viewing_zone(1, Some(Kolkata)).unwrap();
+    let local = date("2026-03-02");
+    let next = local.succ_opt().unwrap();
+    assert_eq!(p.day(local).entries[0].span.start, 870);
+    assert_eq!(w.day(next).entries[0].span.start, 240);
+    let stale = p.day(local).revision;
+    p.sync_device(Auckland).unwrap();
+    w.sync_device(Auckland).unwrap();
+    assert_eq!(w.day(next).revision, 2);
+    assert!(p.day(local).entries.is_empty());
+    assert!(p.set_viewing_zone(stale, Some(UTC)).is_err());
+    for view in CalendarView::ALL {
+        let page = p.page(next, Some(view));
+        assert_eq!(page.viewing_zone, Auckland);
+        assert_eq!(page.pinned_zone, None);
+        let row = page.on(next).next().unwrap();
+        assert_eq!(
+            row.span,
+            Span {
+                start: 690,
+                end: 750
+            }
+        );
+        assert_eq!(row.source.unwrap().date, local);
+        assert_eq!(row.source.unwrap().span.start, 1350);
+    }
+    let query = SearchQuery {
+        text: "handover".into(),
+        start: local,
+        end: next,
+    };
+    let hit = &p.search(&query, 0, None).unwrap().hits[0];
+    assert_eq!((hit.date, hit.span.start), (next, 690));
+    assert!(p.day(next).openings(hit.span, 45).unwrap().is_empty());
+    let mut hold = zoned("Hold", "2026-03-03", 700, 745, UTC, Kind::Hold);
+    hold.zone = None;
+    assert!(p.add(2, hold).is_err());
+    drop(w);
+    let mut w = Store::open(work.path()).unwrap();
+    w.sync_device(Auckland).unwrap();
+    assert_eq!(w.viewing_zone(), Kolkata);
+    w.set_viewing_zone(2, None).unwrap();
+    assert_eq!(w.day(next).entries[0].span, hit.span);
+}
+
+#[test]
+fn viewing_zone_repeated_hour_has_two_offsets_and_no_false_overlap() {
+    use chrono_tz::{America::New_York, UTC};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store.sync_device(New_York).unwrap();
+    let day = date("2026-11-01");
+    for (i, (name, start, end)) in [
+        ("First", 345, 355),
+        ("Second", 405, 415),
+        ("Bridge", 355, 365),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .add(
+                i as u64,
+                zoned(name, "2026-11-01", start, end, UTC, Kind::Appointment),
+            )
+            .unwrap();
+    }
+    let page = store.page(day, Some(CalendarView::Today));
+    let titles = page.on(day).map(|e| e.title).collect::<Vec<_>>();
+    assert_eq!(titles, ["First", "Bridge", "Second"]);
+    assert_eq!(page.half_hours(day)[2..4], [1, 1]);
+    let bridge = page.entries.iter().find(|e| e.title == "Bridge").unwrap();
+    assert_eq!(
+        bridge.source.unwrap().clock_label(),
+        "01:55–02:00 -04:00 / 01:00–01:05 -05:00"
+    );
+    let spring = date("2026-03-08");
+    let skipped = Span {
+        start: 120,
+        end: 180,
+    };
+    assert!(store.day(spring).openings(skipped, 15).unwrap().is_empty());
+    let mut hold = zoned("Hold", "2026-03-08", 125, 160, UTC, Kind::Hold);
+    hold.zone = None;
+    assert!(store.add(3, hold).is_err());
+}
+
+#[test]
+fn meetings_crossing_the_date_line_use_the_same_day_in_search_and_browse() {
+    use chrono_tz::{Etc::GMTPlus12, Pacific::Kiritimati};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store.sync_device(GMTPlus12).unwrap();
+    let event = zoned("Date line", "2027-01-02", 10, 30, Kiritimati, Kind::Weekly);
+    store.add(0, event).unwrap();
+    let day = date("2026-12-31");
+    let page = store.page(day, Some(CalendarView::Month));
+    assert_eq!(
+        page.on(day).next().unwrap().span,
+        Span {
+            start: 1330,
+            end: 1350
+        }
+    );
+    let query = atrium_calendar::SearchQuery {
+        text: "Date line".into(),
+        start: day,
+        end: day,
+    };
+    assert_eq!(store.search(&query, 0, None).unwrap().total, 1);
+    let id = page.on(day).next().unwrap().id;
+    store
+        .change(1, id, day, atrium_calendar::EditScope::ThisEvent, None)
+        .unwrap();
+    assert_eq!(store.search(&query, 0, None).unwrap().total, 0);
+    assert_eq!(store.day(day + Days::new(7)).entries.len(), 1);
 }

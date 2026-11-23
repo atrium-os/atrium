@@ -81,6 +81,23 @@ fn main() -> io::Result<()> {
         if bindings.uid_for_instance(&user, "org.atrium.calendar", Some(&publisher), persona)
             == Some(uid)
         {
+            if installed {
+                let result = fs::read_to_string("/endpoint/device-zone")
+                    .map_err(|_| "Device time zone unavailable".to_owned())
+                    .and_then(|name| {
+                        name.trim()
+                            .parse()
+                            .map_err(|_| "Unrecognized device time zone".to_owned())
+                    })
+                    .and_then(|zone| store.sync_device(zone));
+                if let Err(error) = result {
+                    store.device_unavailable();
+                    if !store.has_pinned_zone() {
+                        let _ = wire::refuse(&mut conn, &error);
+                        continue;
+                    }
+                }
+            }
             if let Err(error) = wire::serve(&mut conn, &mut store) {
                 eprintln!("fastid: reply failed ({:?})", error.kind());
             }

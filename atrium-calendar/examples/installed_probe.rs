@@ -265,6 +265,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [socket, date, expected] = args.as_slice() else {
         return Err("expected socket, date and title (or --denied)".into());
     };
+    if matches!(
+        expected.as_str(),
+        "--check-travel" | "--check-pinned" | "--check-follow"
+    ) {
+        let socket = Path::new(socket);
+        let date: NaiveDate = "2026-03-03".parse()?;
+        let day = atrium_calendar::wire::page(socket, &Request::Day { date })?;
+        let pinned = expected == "--check-pinned";
+        if day.viewing_zone
+            != if pinned {
+                chrono_tz::UTC
+            } else {
+                chrono_tz::Pacific::Auckland
+            }
+            || day.pinned_zone != pinned.then_some(chrono_tz::UTC)
+        {
+            return Err("Viewing zone or persona preference differs".into());
+        }
+        if expected == "--check-travel" {
+            for view in CalendarView::ALL {
+                let page = atrium_calendar::wire::page(
+                    socket,
+                    &Request::Browse {
+                        date,
+                        view: Some(view),
+                    },
+                )?;
+                let row = page
+                    .on(date)
+                    .find(|e| e.title == "studio")
+                    .ok_or("Missing projected weekly meeting")?;
+                let source = row.source.ok_or("Missing source schedule")?;
+                if row.span
+                    != (Span {
+                        start: 180,
+                        end: 240,
+                    })
+                    || source.date != date.pred_opt().unwrap()
+                    || source.span.start != 540
+                {
+                    return Err("Wrong projected time or source date".into());
+                }
+            }
+            let result = search(
+                socket,
+                SearchQuery {
+                    text: "studio".into(),
+                    start: date.pred_opt().unwrap(),
+                    end: date,
+                },
+                0,
+                None,
+            )?;
+            if result.total != 1
+                || result.hits[0].date != date
+                || result.hits[0].span.start != 180
+                || !day
+                    .into_day()
+                    .openings(
+                        Span {
+                            start: 180,
+                            end: 240,
+                        },
+                        45,
+                    )?
+                    .is_empty()
+            {
+                return Err("Search or availability disagreed with the agenda".into());
+            }
+        }
+        return Ok(());
+    }
     if expected == "--check-zones" {
         for (d, title, start, end) in [
             ("2026-11-01", "night", 370, 400),

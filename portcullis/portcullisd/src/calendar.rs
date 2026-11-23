@@ -123,6 +123,64 @@ pub fn socket_mountpoint(root: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+// FreeBSD tzsetup either links /etc/localtime or copies it and records its
+// IANA name in /var/db/zoneinfo. Publish only the public zone name to Fasti.
+fn device_zone_name() -> io::Result<String> {
+    let local = match fs::canonicalize("/etc/localtime") {
+        Ok(path) => path,
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound
+                && fs::symlink_metadata("/etc/localtime")
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok("UTC".into())
+        }
+        Err(e) => return Err(e),
+    };
+    let database = Path::new("/usr/share/zoneinfo");
+    if let Ok(name) = local.strip_prefix(database) {
+        return Ok(name
+            .to_str()
+            .ok_or_else(|| io::Error::other("invalid zone name"))?
+            .into());
+    }
+    if local != Path::new("/etc/localtime") {
+        return Err(io::Error::other("unrecognized localtime link"));
+    }
+    let bytes = fs::read(local)?;
+    let name = fs::read_to_string("/var/db/zoneinfo").unwrap_or_default();
+    for candidate in [name.trim(), "UTC"] {
+        if !candidate.is_empty()
+            && candidate.len() <= 128
+            && candidate.split('/').all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_+".contains(&b))
+            })
+            && fs::read(database.join(candidate)).is_ok_and(|data| data == bytes)
+        {
+            return Ok(candidate.into());
+        }
+    }
+    Err(io::Error::other(
+        "device time zone has no matching IANA name",
+    ))
+}
+
+fn publish_device_zone(endpoint: &Path) -> io::Result<()> {
+    let value = device_zone_name().unwrap_or_else(|_| "unavailable".into());
+    let file = endpoint.join("device-zone");
+    if fs::read_to_string(&file).ok().as_ref() == Some(&value) {
+        return Ok(());
+    }
+    let staged = endpoint.join(".device-zone");
+    fs::write(&staged, value)?;
+    fs::rename(staged, file)
+}
+
 pub fn endpoint(
     owner: &str,
     persona: Option<&str>,
@@ -186,6 +244,8 @@ pub fn endpoint(
         group: app_uid,
         mode: "0600".into(),
     });
+    publish_device_zone(&endpoint)?;
+    let clock_endpoint = endpoint.clone();
     let fds = listeners::bind_all(&manifest.sockets)?;
     let mut create_req = manifest.to_create_request();
     create_req.syscall_profile = Some("calendar-store".into());
@@ -201,7 +261,15 @@ pub fn endpoint(
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = Arc::clone(&stop);
     let worker = thread::spawn(move || {
-        if let Err(e) = supervisor.run_until(&stopping) {
+        let mut checked = std::time::Instant::now();
+        if let Err(e) = supervisor.run_until_with_tick(&stopping, || {
+            if checked.elapsed() >= std::time::Duration::from_secs(2) {
+                if let Err(e) = publish_device_zone(&clock_endpoint) {
+                    eprintln!("portcullisd: cannot update Calendar device zone: {e}");
+                }
+                checked = std::time::Instant::now();
+            }
+        }) {
             eprintln!("portcullisd: Fasti supervisor: {e}");
         }
         drop(lease);

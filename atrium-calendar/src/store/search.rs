@@ -19,6 +19,8 @@ pub struct SearchQuery {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchHit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::SourceSlot>,
     pub id: Uuid,
     pub date: NaiveDate,
     pub span: Span,
@@ -31,6 +33,7 @@ pub struct SearchHit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchPage {
+    pub viewing_zone: chrono_tz::Tz,
     pub revision: u64,
     pub total: usize,
     pub hits: Vec<SearchHit>,
@@ -91,8 +94,8 @@ impl Store {
             }
             let (first, last) = if entry.zone.is_some() {
                 (
-                    query.start.pred_opt().unwrap_or(query.start),
-                    query.end.succ_opt().unwrap_or(query.end),
+                    crate::zone::nearby(query.start, -2),
+                    crate::zone::nearby(query.end, 2),
                 )
             } else {
                 (query.start, query.end)
@@ -106,21 +109,16 @@ impl Store {
                     return Err("Too many occurrences. Narrow the dates or title.".into());
                 }
                 if entry.appears(date) {
-                    if let Some(zone) = entry.zone {
-                        if let Ok((start, _)) = zone.interval(
-                            date,
-                            entry.span,
-                            entry.kind == Kind::Weekly && date != entry.date,
-                        ) {
-                            let shown = start.date_naive().max(query.start);
-                            if shown <= query.end {
-                                if let Some(span) = entry.segment(date, shown) {
-                                    matches.push((shown, span, entry));
-                                }
-                            }
+                    if entry.zone.is_some() {
+                        let row = (-2..=2)
+                            .map(|n| crate::zone::nearby(date, n))
+                            .filter(|d| (query.start..=query.end).contains(d))
+                            .find_map(|shown| entry.project(date, shown, self.viewing_zone()));
+                        if let Some(row) = row {
+                            matches.push((row.date, row.span, entry, row.source));
                         }
                     } else {
-                        matches.push((date, entry.span, entry));
+                        matches.push((date, entry.span, entry, None));
                     }
                 }
                 if entry.kind != Kind::Weekly {
@@ -132,7 +130,14 @@ impl Store {
                 date = next;
             }
         }
-        matches.sort_unstable_by_key(|(date, span, e)| (*date, span.start, span.end, e.id));
+        matches.sort_by_cached_key(|(date, span, e, source)| {
+            (
+                *date,
+                crate::zone::sort_time(*source, *span, *date, self.viewing_zone()),
+                span.end,
+                e.id,
+            )
+        });
         let total = matches.len();
         if offset != 0 && offset >= total {
             return Err("Result page is unavailable. Search again.".into());
@@ -141,7 +146,8 @@ impl Store {
             .into_iter()
             .skip(offset)
             .take(SEARCH_PAGE_SIZE)
-            .map(|(date, span, entry)| SearchHit {
+            .map(|(date, span, entry, source)| SearchHit {
+                source,
                 id: entry.id,
                 date,
                 span,
@@ -151,6 +157,7 @@ impl Store {
             })
             .collect();
         Ok(SearchPage {
+            viewing_zone: self.viewing_zone(),
             revision: self.state.revision,
             total,
             hits,
@@ -168,7 +175,7 @@ impl Store {
                 .state
                 .entries
                 .iter()
-                .any(|e| e.id == id && e.on_day(date).is_some())
+                .any(|e| e.id == id && e.on_day(date, self.viewing_zone()).is_some())
         {
             return Err("Calendar changed. Search again.".into());
         }

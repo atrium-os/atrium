@@ -70,13 +70,10 @@ impl Planner {
                     .render(ctx);
                 let mut detail = if first.kind == Kind::AllDay {
                     "All day".into()
+                } else if let Some(source) = first.source {
+                    source.clock_label()
                 } else {
-                    format!(
-                        "{}–{}{}",
-                        clock(first.span.start),
-                        clock(first.span.end),
-                        if first.zone.is_some() { " UTC" } else { "" }
-                    )
+                    format!("{}–{}", clock(first.span.start), clock(first.span.end),)
                 };
                 let more = entries.count();
                 if more > 0 {

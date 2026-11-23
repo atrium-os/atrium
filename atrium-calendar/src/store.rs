@@ -2,6 +2,7 @@
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind};
 use chrono::NaiveDate;
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::{
@@ -22,12 +23,17 @@ struct Snapshot {
     revision: u64,
     #[serde(default)]
     opening_view: CalendarView,
+    #[serde(default)]
+    pinned_zone: Option<Tz>,
+    #[serde(default)]
+    device_zone: Option<Tz>,
     entries: Vec<Entry>,
 }
 
 pub struct Store {
     dir: PathBuf,
     _lock: File,
+    device_available: bool,
     state: Snapshot,
 }
 
@@ -50,7 +56,7 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1 | 2 | 3)
+                if !matches!(snapshot.version, 1..=4)
                     || validate_records(&snapshot.entries).is_err()
                 {
                     return Err(io::Error::other("Invalid calendar snapshot"));
@@ -59,6 +65,8 @@ impl Store {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot {
                 version: 1,
+                pinned_zone: None,
+                device_zone: None,
                 revision: 0,
                 opening_view: CalendarView::Today,
                 entries: Vec::new(),
@@ -68,8 +76,63 @@ impl Store {
         Ok(Self {
             dir: dir.into(),
             _lock: lock,
+            device_available: true,
             state,
         })
+    }
+
+    pub fn has_pinned_zone(&self) -> bool {
+        self.state.pinned_zone.is_some()
+    }
+
+    pub fn viewing_zone(&self) -> Tz {
+        self.state
+            .pinned_zone
+            .or(self.state.device_zone)
+            .unwrap_or(chrono_tz::UTC)
+    }
+
+    pub fn device_unavailable(&mut self) {
+        self.device_available = false;
+    }
+
+    pub fn sync_device(&mut self, device: Tz) -> Result<(), String> {
+        self.device_available = true;
+        if self.state.device_zone.is_some_and(|old| old != device)
+            && self.state.pinned_zone.is_none()
+        {
+            return self.commit_zones(self.state.revision, None, Some(device));
+        }
+        self.state.device_zone = Some(device);
+        Ok(())
+    }
+
+    pub fn set_viewing_zone(&mut self, revision: u64, pinned: Option<Tz>) -> Result<(), String> {
+        if revision != self.state.revision {
+            return Err("Calendar changed. Refresh before saving.".into());
+        }
+        if pinned.is_none() && !self.device_available {
+            return Err("Device time zone unavailable".into());
+        }
+        if self.state.pinned_zone == pinned {
+            return Ok(());
+        }
+        self.commit_zones(revision, pinned, self.state.device_zone)
+    }
+
+    fn commit_zones(
+        &mut self,
+        revision: u64,
+        pinned_zone: Option<Tz>,
+        device_zone: Option<Tz>,
+    ) -> Result<(), String> {
+        self.publish(
+            revision,
+            self.state.entries.clone(),
+            self.state.opening_view,
+            pinned_zone,
+            device_zone,
+        )
     }
 
     pub fn day(&self, date: NaiveDate) -> Day {
@@ -85,10 +148,10 @@ impl Store {
             .iter()
             .filter_map(|e| {
                 if view == CalendarView::Today {
-                    e.on_day(date)
+                    e.on_day(date, self.viewing_zone())
                 } else if dates.iter().any(|&d| {
                     if e.zone.is_some() {
-                        e.on_day(d).is_some()
+                        e.on_day(d, self.viewing_zone()).is_some()
                     } else {
                         e.appears(d)
                     }
@@ -99,7 +162,13 @@ impl Store {
                 }
             })
             .collect();
-        entries.sort_by_key(|e| (e.span.start, e.span.end, e.id));
+        entries.sort_by_cached_key(|e| {
+            (
+                crate::zone::sort_time(e.source, e.span, date, self.viewing_zone()),
+                e.span.end,
+                e.id,
+            )
+        });
         let visible: HashSet<_> = entries.iter().map(|e| e.id).collect();
         let missing: HashSet<_> = entries
             .iter()
@@ -115,11 +184,15 @@ impl Store {
             .collect();
         for entry in &mut entries {
             entry.excluded.retain(|date| {
-                *date >= dates[0].pred_opt().unwrap_or(dates[0])
-                    && *date <= dates.last().unwrap().succ_opt().unwrap_or(NaiveDate::MAX)
+                *date >= crate::zone::nearby(dates[0], -2)
+                    && *date <= crate::zone::nearby(*dates.last().unwrap(), 2)
             });
         }
         CalendarPage {
+            clock_gap: crate::zone::missing_minutes(date, self.viewing_zone()),
+            date,
+            viewing_zone: self.viewing_zone(),
+            pinned_zone: self.state.pinned_zone,
             series,
             view,
             opening_view: self.state.opening_view,
@@ -156,12 +229,18 @@ impl Store {
             return Err("Entry already exists".into());
         }
         if event.kind == Kind::Hold
+            && crate::zone::missing_minutes(event.date, self.viewing_zone())
+                .is_some_and(|gap| gap.overlaps(event.span))
+        {
+            return Err("That time does not exist in the viewing zone".into());
+        }
+        if event.kind == Kind::Hold
             && self
                 .state
                 .entries
                 .iter()
-                .filter_map(|e| e.on_day(event.date))
-                .any(|e| e.span.overlaps(event.span))
+                .filter_map(|e| e.on_day(event.date, self.viewing_zone()))
+                .any(|e| e.busy_spans().any(|s| s.overlaps(event.span)))
         {
             return Err("That time is already busy".into());
         }
@@ -203,10 +282,10 @@ impl Store {
         let mut entries = self.state.entries.clone();
         let selected = entries
             .iter()
-            .position(|e| e.id == id && e.on_day(shown).is_some())
+            .position(|e| e.id == id && e.on_day(shown, self.viewing_zone()).is_some())
             .ok_or("Event is no longer on this day")?;
         let shown = entries[selected]
-            .on_day(shown)
+            .on_day(shown, self.viewing_zone())
             .and_then(|e| e.source)
             .map_or(shown, |s| s.date);
         let kind = entries[selected].kind;
@@ -273,10 +352,29 @@ impl Store {
         entries: Vec<Entry>,
         opening_view: CalendarView,
     ) -> Result<(), String> {
+        self.publish(
+            revision,
+            entries,
+            opening_view,
+            self.state.pinned_zone,
+            self.state.device_zone,
+        )
+    }
+
+    fn publish(
+        &mut self,
+        revision: u64,
+        entries: Vec<Entry>,
+        opening_view: CalendarView,
+        pinned_zone: Option<Tz>,
+        device_zone: Option<Tz>,
+    ) -> Result<(), String> {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 3,
+            version: 4,
+            pinned_zone,
+            device_zone,
             revision: revision.checked_add(1).ok_or("Revision limit reached")?,
             entries,
         };
