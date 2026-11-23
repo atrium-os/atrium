@@ -86,7 +86,7 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
             end: 900,
         },
     };
-    let saved = call(
+    let saved = page(
         &socket,
         &Request::Add {
             revision: 0,
@@ -95,6 +95,10 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     )
     .unwrap();
     assert_eq!(saved.entries[0].id, event.id);
+    let undo = Request::Undo {
+        receipt: saved.undo.unwrap(),
+    };
+    assert!(page(&socket, &query).unwrap().undo.is_none());
     let search = || {
         atrium_calendar::wire::search(
             &socket,
@@ -148,6 +152,7 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
         assert!(search().is_err());
         assert!(page(&socket, &open_hit).is_err());
         assert!(page(&socket, &resume).is_err());
+        assert!(page(&socket, &undo).is_err());
         assert!(page(&socket, &set_week).is_err());
         assert!(page(
             &socket,
@@ -194,6 +199,7 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     );
     drop(daemon);
     let (_daemon, socket) = start(dir, &publisher);
+    assert!(page(&socket, &undo).unwrap_err().contains("expired"));
     let reloaded = call(&socket, &query).unwrap();
     assert_eq!(reloaded.revision, 1);
     assert_eq!(reloaded.entries.len(), 1);

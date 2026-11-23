@@ -31,6 +31,7 @@ const WORKDAY: Span = Span {
 
 #[derive(Clone, Copy)]
 enum Action {
+    Undo(atrium_calendar::UndoReceipt),
     Resume,
     Load,
     Browse(CalendarView, NaiveDate),
@@ -61,6 +62,7 @@ enum Reply {
 }
 
 struct Planner {
+    undo: Mutable<Option<(atrium_calendar::UndoReceipt, &'static str)>>,
     search: Mutable<Option<SearchForm>>,
     selected_row: Mutable<Option<usize>>,
     calendar_name: String,
@@ -123,6 +125,9 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<Request, String> {
+        if let Action::Undo(receipt) = action {
+            return Ok(Request::Undo { receipt });
+        }
         if let Action::Search(offset) = action {
             let form = self.search.get_cloned().ok_or("Open Search first")?;
             return form.request(offset);
@@ -391,6 +396,9 @@ impl View for Planner {
         Label::new(self.status.get_cloned())
             .at(18., 565.)
             .render(ctx);
+        if let Some((receipt, label)) = self.undo.get() {
+            self.button(ctx, 500., 548., 181., label, Action::Undo(receipt));
+        }
         if view != CalendarView::Today {
             self.overview(ctx, shown, &data);
             return;
@@ -571,6 +579,7 @@ pub fn run() -> io::Result<()> {
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
     let planner = Arc::new(Planner {
+        undo: Mutable::with_dirty(None, dirty.clone()),
         search: Mutable::with_dirty(None, dirty.clone()),
         selected_row: Mutable::with_dirty(None, dirty.clone()),
         zone_field: field(""),
@@ -731,6 +740,23 @@ pub fn run() -> io::Result<()> {
                 }
                 Ok(Reply::Calendar(data)) => {
                     let date = data.date;
+                    if let Some(receipt) = data.undo {
+                        let label = match action {
+                            Action::Change(true) => "Undo deletion",
+                            Action::Change(false) => "Undo edit",
+                            Action::Hold(_) => "Undo hold",
+                            Action::Release(_) => "Undo release",
+                            _ => "Undo creation",
+                        };
+                        planner.undo.set(Some((receipt, label)));
+                    } else if planner
+                        .undo
+                        .get()
+                        .is_some_and(|(r, _)| r.revision != data.revision)
+                        || matches!(action, Action::Undo(_))
+                    {
+                        planner.undo.set(None);
+                    }
                     let selected = match action {
                         Action::OpenHit(id, ..) => data.entries.iter().position(|e| e.id == id),
                         _ => None,
@@ -740,7 +766,8 @@ pub fn run() -> io::Result<()> {
                     planner.view.set(Some(data.view));
                     if matches!(
                         action,
-                        Action::Today(_)
+                        Action::Undo(_)
+                            | Action::Today(_)
                             | Action::SetZone(_)
                             | Action::Resume
                             | Action::Load
@@ -762,6 +789,7 @@ pub fn run() -> io::Result<()> {
                     }
                     planner.status.set(
                         match action {
+                            Action::Undo(_) => "Change undone on this device",
                             Action::OpenHit(..) => "Selected search result",
                             Action::Change(true) => "Deleted on this device",
                             Action::Change(false) => "Changes saved on this device",
@@ -783,6 +811,11 @@ pub fn run() -> io::Result<()> {
                     planner.status.set(e);
                 }
                 Err(e) => {
+                    if matches!(action, Action::Undo(_))
+                        && e == atrium_calendar::store::UNDO_EXPIRED
+                    {
+                        planner.undo.set(None);
+                    }
                     planner.data.set(None);
                     planner.settings.set(false);
                     planner.status.set(e);

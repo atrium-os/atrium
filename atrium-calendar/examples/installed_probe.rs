@@ -390,7 +390,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let date = date.parse()?;
-    let request = if expected == "--denied-search" {
+    if expected == "--parallel-write" {
+        let socket = Path::new(socket);
+        let revision = call(socket, &Request::Day { date })?.revision;
+        let entry = Entry {
+            id: Uuid::new_v4(),
+            date,
+            title: "Concurrent save".into(),
+            span: Span {
+                start: 1140,
+                end: 1155,
+            },
+            kind: Kind::Appointment,
+            zone: None,
+            source: None,
+            excluded: vec![],
+        };
+        let id = entry.id;
+        let saved = atrium_calendar::wire::page(socket, &Request::Add { revision, entry })?;
+        if saved.undo.is_none()
+            || !saved
+                .entries
+                .iter()
+                .any(|e| e.id == id && e.title == "Concurrent save")
+        {
+            return Err("The concurrent event was not saved".into());
+        }
+        return Ok(());
+    }
+    let request = if expected == "--denied-undo" {
+        Request::Undo {
+            receipt: atrium_calendar::UndoReceipt {
+                revision: 1,
+                token: Uuid::new_v4(),
+            },
+        }
+    } else if expected == "--denied-search" {
         Request::Search {
             query: SearchQuery {
                 text: "lantern".into(),

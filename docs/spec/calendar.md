@@ -205,7 +205,15 @@ Portcullis publishes the device’s IANA name through the existing persona endpo
 
 The synthetic desktop check pins Work to UTC, changes the disposable machine to Auckland while both services are live, and finds Personal’s meeting on the following date in all three views, search and availability. It reopens Work, checks its pin and switches it back to **Follow device**. Separate fixtures exercise skipped and repeated hours, stale writes and a two-date jump across the International Date Line. [Installed check](../../scripts/calendar-installed-guest-check.sh) · [Synthetic schedules](../../atrium-calendar/tests/views.rs)
 
-**Next C0 increment.** Add local undo for a device-only edit. Exercise an occurrence move and a concurrent calendar change before applying undo.
+### 7.8 Undo the last local change
+
+After saving an event, editing or deleting it, holding a slot or releasing a hold, the window offers one **Undo** action named for the change. It stays available while the person browses Today, Week or Month in that window. Undo returns to the agenda date where the change started. Undoing a moved occurrence puts the original meeting back, frees the replacement slot and preserves the other weeks. Undoing deletion of a whole series also restores its individually moved and skipped occurrences.
+
+Each persona’s Fasti keeps the preceding entries in memory for one committed schedule change. Only the successful write reply carries the single-use receipt. The window submits that receipt to its existing authenticated persona endpoint. Fasti checks the random token and exact revision and publishes the restored entries as a new revision. A later committed write in the same calendar expires the receipt. Reads, failed writes and saves with no changes preserve it. Closing the window discards its receipt, and restarting Fasti clears its undo state. The on-disk snapshot contains the current schedule. [Local store](../../atrium-calendar/src/store.rs) · [Class 21](aqueduct.md)
+
+**Synthetic verification.** Move Thursday’s 14:00 review to 15:00, switch to Week, and press **Undo edit**. Read the original occurrence and both time slots through the installed Work socket. Move the meeting again, save a second event through another authorized connection, and press the older undo button. Require an expired-undo message and an identical on-disk snapshot after the attempt. Fixtures also exercise cross-persona receipts, replay, restart, a failed publication, release of a private hold and deletion of a series with exceptions. [Installed check](../../scripts/calendar-installed-guest-check.sh) · [Schedule fixtures](../../atrium-calendar/tests/planning.rs)
+
+**Next C0 check.** Run the first-use planning flow entirely by keyboard on the installed desktop, including finding and holding a slot, moving a weekly occurrence, undoing the move and reopening each persona’s selected view.
 
 ## 8. Accepted decisions
 

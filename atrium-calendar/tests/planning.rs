@@ -323,3 +323,160 @@ fn exception_limit_and_invalid_series_links_preserve_the_last_snapshot() {
     assert!(Store::open(dir.path()).is_err());
     assert_eq!(std::fs::read(path).unwrap(), damaged);
 }
+
+fn stored_entries(dir: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(dir.join("calendar.json")).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    saved["entries"].clone()
+}
+
+#[test]
+fn undo_zoned_weekly_move_restores_original_date_identity_and_openings() {
+    use atrium_calendar::{EditScope::ThisEvent, Zone};
+    use chrono::Days;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let mut series = entry(Kind::Weekly, span(30, 75));
+    series.zone = Some(Zone {
+        name: chrono_tz::Asia::Kolkata,
+        start_fold: None,
+        end_fold: None,
+    });
+    store.add(0, series.clone()).unwrap();
+    let before = stored_entries(dir.path());
+    let source_date = series.date + Days::new(7);
+    let shown = source_date.pred_opt().unwrap(); // The source meeting falls on the previous UTC day.
+    let old_slot = span(1140, 1185);
+    let mut fields = series.fields_on(source_date);
+    fields.date = source_date.succ_opt().unwrap();
+    fields.title = "Moved review".into();
+    let receipt = store
+        .change(1, series.id, shown, ThisEvent, Some(fields))
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.day(shown).openings(old_slot, 45).unwrap(), [old_slot]);
+    assert_eq!(store.day(source_date).entries[0].title, "Moved review");
+    let following = shown + Days::new(7);
+    assert!(store
+        .change(
+            2,
+            series.id,
+            following,
+            ThisEvent,
+            Some(series.fields_on(following + Days::new(1)))
+        )
+        .unwrap()
+        .is_none());
+    let mut invalid = series.fields_on(source_date);
+    invalid.title.clear();
+    assert!(store
+        .change(2, series.id, following, ThisEvent, Some(invalid))
+        .is_err());
+    assert_eq!(store.undo(receipt).unwrap(), shown);
+    assert_eq!(stored_entries(dir.path()), before);
+    assert_eq!(store.day(shown).entries[0].id, series.id);
+    assert!(store.day(shown).openings(old_slot, 45).unwrap().is_empty());
+    assert!(store.day(source_date).entries.is_empty());
+    assert_eq!(store.day(following).entries[0].span, old_slot);
+    assert!(store.undo(receipt).is_err());
+    drop(store);
+    assert_eq!(Store::open(dir.path()).unwrap().day(shown).revision, 3);
+}
+
+#[test]
+fn undo_series_deletion_restores_skips_and_overrides_in_one_revision() {
+    use atrium_calendar::EditScope::{ThisEvent, WholeSeries};
+    use chrono::Days;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let series = entry(Kind::Weekly, span(600, 645));
+    store.add(0, series.clone()).unwrap();
+    let moved = series.date.succ_opt().unwrap();
+    let skipped = series.date + Days::new(7);
+    store
+        .change(
+            1,
+            series.id,
+            series.date,
+            ThisEvent,
+            Some(series.fields_on(moved)),
+        )
+        .unwrap();
+    store
+        .change(2, series.id, skipped, ThisEvent, None)
+        .unwrap();
+    let before = stored_entries(dir.path());
+    let occurrence = store.day(moved).entries[0].id;
+    let receipt = store
+        .change(3, occurrence, moved, WholeSeries, None)
+        .unwrap()
+        .unwrap();
+    assert!(store.day(moved).entries.is_empty());
+    assert!(!std::fs::read_to_string(dir.path().join("calendar.json"))
+        .unwrap()
+        .contains(&series.title));
+    assert_eq!(store.undo(receipt).unwrap(), moved);
+    assert_eq!(stored_entries(dir.path()), before);
+    assert!(store.day(skipped).entries.is_empty());
+    assert_eq!(store.day(moved).entries[0].id, occurrence);
+    assert_eq!(store.day(skipped + Days::new(7)).entries[0].id, series.id);
+}
+
+#[test]
+fn receipts_are_single_use_persona_local_and_invalidated_by_later_writes() {
+    use atrium_calendar::{CalendarView, UndoReceipt};
+    let work = tempfile::tempdir().unwrap();
+    let personal = tempfile::tempdir().unwrap();
+    let mut w = Store::open(work.path()).unwrap();
+    let mut p = Store::open(personal.path()).unwrap();
+    let hold = entry(Kind::Hold, span(540, 585));
+    let first = w.add(0, hold.clone()).unwrap();
+    let other = p.add(0, hold.clone()).unwrap();
+    assert_eq!(first.revision, other.revision);
+    assert!(w.undo(other).is_err() && p.undo(first).is_err());
+    let release = w.release(1, hold.date, hold.id).unwrap();
+    let path = work.path().join("calendar.json");
+    let saved = std::fs::read(&path).unwrap();
+    assert!(w.undo(first).is_err());
+    assert!(w
+        .undo(UndoReceipt {
+            revision: release.revision,
+            ..first
+        })
+        .is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+    w.undo(release).unwrap();
+    assert_eq!(w.day(hold.date).entries[0].id, hold.id);
+    assert!(w.undo(release).is_err());
+    p.undo(other).unwrap();
+    assert_eq!(
+        p.day(hold.date).openings(hold.span, 45).unwrap(),
+        [hold.span]
+    );
+    let second = w.add(3, entry(Kind::Appointment, span(600, 645))).unwrap();
+    w.set_opening_view(4, CalendarView::Week).unwrap();
+    assert!(w.undo(second).is_err());
+    w.sync_device(chrono_tz::UTC).unwrap();
+    let third = w.release(5, hold.date, hold.id).unwrap();
+    w.sync_device(chrono_tz::Asia::Kolkata).unwrap();
+    assert!(w.undo(third).is_err());
+}
+
+#[test]
+fn undo_can_retry_after_failed_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let added = store
+        .add(0, entry(Kind::Appointment, span(600, 660)))
+        .unwrap();
+    let saved = dir.path().join("calendar.json");
+    let parked = dir.path().join("original");
+    std::fs::rename(&saved, &parked).unwrap();
+    std::fs::create_dir(&saved).unwrap();
+    assert!(store.undo(added).unwrap_err().contains("publish"));
+    assert_eq!(store.day(date()).revision, 1);
+    std::fs::remove_dir(&saved).unwrap();
+    std::fs::rename(parked, saved).unwrap();
+    store.undo(added).unwrap();
+    assert!(store.day(date()).entries.is_empty());
+}

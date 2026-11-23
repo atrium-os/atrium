@@ -149,7 +149,7 @@ cross() {
     mount -t nullfs -o ro "$from" "$root/test-endpoint"
     chmod 666 "$from/calendar.sock"
     result=0
-    for mode in --denied --denied-search; do
+    for mode in --denied --denied-search --denied-undo; do
         jexec -u "$(id -nu "$2")" "$1" /bin/installed-probe /test-endpoint/calendar.sock "$(date -u +%Y-%m-%d)" "$mode" || result=$?
     done
     chmod 600 "$from/calendar.sock"
@@ -286,18 +286,37 @@ check_review --original-review
 click 62 349  # Thursday in Week
 review_y=269
 if [ "$weekday" -eq 4 ]; then review_y=307; fi
-click 452 "$review_y"   # Edit occurrence
 # The title takes initial focus. Tab through date and times to Save.
 keys() {
     for code in "$@"; do inj "KEY $code 1 0" "KEY $code 0 0"; done
 }
-# Home, Right, forward Delete, digit 5: change 14:xx to 15:xx.
-keys 43 43 74 79 76 34 43 74 79 76 34
-sleep 1
-cp screen.png edit-occurrence.png
-keys 43 40
-sleep 1
+move_review() {
+    click 452 "$review_y"   # Edit occurrence
+    # Home, Right, forward Delete, digit 5: change 14:xx to 15:xx.
+    keys 43 43 74 79 76 34 43 74 79 76 34
+    sleep 1
+    cp screen.png edit-occurrence.png
+    keys 43 40
+    sleep 1
+    check_review --moved-review
+}
+move_review
+cp screen.png undo-offered.png
+click 150 60  # Browsing Week preserves this window's undo.
+click 590 564
+check_review --original-review
+cp screen.png undo-restored.png
+move_review
+# Another authorized writer changes the same calendar while the old button is visible.
+check_review --parallel-write
+before_undo=$(sha256 -q "$work_store/calendar.json")
+click 590 564
+cp screen.png undo-expired.png
+test "$(sha256 -q "$work_store/calendar.json")" = "$before_undo"
+saved "$work_store" "Concurrent save"
 check_review --moved-review
+click 78 60  # Refresh the stale window.
+echo "PASS: undo restores the original occurrence and availability, stale undo preserves both newer writes"
 close_ui "$work_jail"
 restart_work
 open_work_week

@@ -59,6 +59,14 @@ pub enum EditScope {
     WholeSeries,
 }
 
+/// Issued only with the reply to a committed local schedule change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UndoReceipt {
+    pub revision: u64,
+    pub token: Uuid,
+}
+
 /// Editable local fields. Fasti retains ownership of identity and recurrence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

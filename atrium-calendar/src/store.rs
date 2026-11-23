@@ -1,6 +1,6 @@
 //! One Fasti process owns one private, supervisor-provisioned persona directory.
 pub mod search;
-use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind};
+use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 const MAX_ENTRIES: usize = 1024;
 const MAX_BYTES: u64 = 1024 * 1024;
+pub const UNDO_EXPIRED: &str = "Undo expired. Refresh to see the current calendar.";
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
@@ -30,7 +31,14 @@ struct Snapshot {
     entries: Vec<Entry>,
 }
 
+struct UndoState {
+    receipt: UndoReceipt,
+    date: NaiveDate,
+    entries: Vec<Entry>,
+}
+
 pub struct Store {
+    undo: Option<UndoState>,
     dir: PathBuf,
     _lock: File,
     device_available: bool,
@@ -74,6 +82,7 @@ impl Store {
             Err(e) => return Err(e),
         };
         Ok(Self {
+            undo: None,
             dir: dir.into(),
             _lock: lock,
             device_available: true,
@@ -133,6 +142,7 @@ impl Store {
             pinned_zone,
             device_zone,
         )
+        .map(drop)
     }
 
     pub fn day(&self, date: NaiveDate) -> Day {
@@ -189,6 +199,7 @@ impl Store {
             });
         }
         CalendarPage {
+            undo: None,
             clock_gap: crate::zone::missing_minutes(date, self.viewing_zone()),
             date,
             viewing_zone: self.viewing_zone(),
@@ -208,10 +219,17 @@ impl Store {
         if view == self.state.opening_view {
             return Ok(());
         }
-        self.commit(revision, self.state.entries.clone(), view)
+        self.publish(
+            revision,
+            self.state.entries.clone(),
+            view,
+            self.state.pinned_zone,
+            self.state.device_zone,
+        )
+        .map(drop)
     }
 
-    pub fn add(&mut self, revision: u64, event: Entry) -> Result<(), String> {
+    pub fn add(&mut self, revision: u64, event: Entry) -> Result<UndoReceipt, String> {
         event.validate()?;
         if event.source.is_some()
             || !event.excluded.is_empty()
@@ -245,8 +263,11 @@ impl Store {
             return Err("That time is already busy".into());
         }
         let mut entries = self.state.entries.clone();
+        let date = event
+            .fields_on(event.date)
+            .agenda_date(self.viewing_zone())?;
         entries.push(event);
-        self.commit(revision, entries, self.state.opening_view)
+        self.commit_event(revision, entries, date)
     }
 
     pub fn release(
@@ -254,7 +275,7 @@ impl Store {
         revision: u64,
         date: NaiveDate,
         id: uuid::Uuid,
-    ) -> Result<(), String> {
+    ) -> Result<UndoReceipt, String> {
         if revision != self.state.revision {
             return Err("Calendar changed. Refresh before saving.".into());
         }
@@ -264,7 +285,7 @@ impl Store {
             .position(|e| e.id == id && e.date == date && e.kind == Kind::Hold)
             .ok_or("Hold no longer exists")?;
         entries.remove(index);
-        self.commit(revision, entries, self.state.opening_view)
+        self.commit_event(revision, entries, date)
     }
 
     /// Both the weekly exclusion and its replacement are published in one revision.
@@ -275,7 +296,7 @@ impl Store {
         shown: NaiveDate,
         scope: EditScope,
         replacement: Option<EventEdit>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<UndoReceipt>, String> {
         if revision != self.state.revision {
             return Err("Calendar changed. Refresh before saving.".into());
         }
@@ -284,6 +305,7 @@ impl Store {
             .iter()
             .position(|e| e.id == id && e.on_day(shown, self.viewing_zone()).is_some())
             .ok_or("Event is no longer on this day")?;
+        let agenda_date = shown;
         let shown = entries[selected]
             .on_day(shown, self.viewing_zone())
             .and_then(|e| e.source)
@@ -295,7 +317,7 @@ impl Store {
         if scope == EditScope::ThisEvent
             && replacement.as_ref() == Some(&entries[selected].fields_on(shown))
         {
-            return Ok(());
+            return Ok(None);
         }
         let mut index = selected;
         if scope == EditScope::WholeSeries {
@@ -308,14 +330,14 @@ impl Store {
                 .ok_or("Series is missing")?;
             if let Some(fields) = &replacement {
                 if *fields == entries[index].fields_on(entries[index].date) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 if fields.date != entries[index].date {
                     return Err("Keep the series start date when changing its weekly time".into());
                 }
             } else {
                 entries.retain(|e| e.series_id() != Some(series));
-                return self.commit(revision, entries, self.state.opening_view);
+                return self.commit_event(revision, entries, agenda_date).map(Some);
             }
         } else if kind == Kind::Weekly {
             let excluded = &mut entries[index].excluded;
@@ -332,7 +354,7 @@ impl Store {
                 index = entries.len();
                 entries.push(occurrence);
             } else {
-                return self.commit(revision, entries, self.state.opening_view);
+                return self.commit_event(revision, entries, agenda_date).map(Some);
             }
         }
         if let Some(fields) = replacement {
@@ -343,22 +365,50 @@ impl Store {
         } else {
             entries.remove(index);
         }
-        self.commit(revision, entries, self.state.opening_view)
+        self.commit_event(revision, entries, agenda_date).map(Some)
     }
 
-    fn commit(
+    fn commit_event(
         &mut self,
         revision: u64,
         entries: Vec<Entry>,
-        opening_view: CalendarView,
-    ) -> Result<(), String> {
-        self.publish(
+        date: NaiveDate,
+    ) -> Result<UndoReceipt, String> {
+        let previous = self.publish(
             revision,
             entries,
-            opening_view,
+            self.state.opening_view,
             self.state.pinned_zone,
             self.state.device_zone,
-        )
+        )?;
+        let receipt = UndoReceipt {
+            revision: self.state.revision,
+            token: Uuid::new_v4(),
+        };
+        self.undo = Some(UndoState {
+            receipt,
+            date,
+            entries: previous,
+        });
+        Ok(receipt)
+    }
+
+    pub fn undo(&mut self, receipt: UndoReceipt) -> Result<NaiveDate, String> {
+        let previous = self
+            .undo
+            .as_ref()
+            .filter(|u| u.receipt == receipt && self.state.revision == receipt.revision)
+            .ok_or(UNDO_EXPIRED)?;
+        let date = previous.date;
+        // Keep the receipt usable if staging fails. Publishing consumes it at rename.
+        self.publish(
+            receipt.revision,
+            previous.entries.clone(),
+            self.state.opening_view,
+            self.state.pinned_zone,
+            self.state.device_zone,
+        )?;
+        Ok(date)
     }
 
     fn publish(
@@ -368,7 +418,7 @@ impl Store {
         opening_view: CalendarView,
         pinned_zone: Option<Tz>,
         device_zone: Option<Tz>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<Entry>, String> {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
@@ -388,10 +438,14 @@ impl Store {
             .map_err(|_| "Cannot write calendar")?;
         tmp.persist(self.dir.join("calendar.json"))
             .map_err(|_| "Cannot publish calendar")?;
-        self.state = next;
+        let previous = std::mem::replace(&mut self.state, next);
+        self.undo = None;
         File::open(&self.dir)
             .and_then(|d| d.sync_all())
-            .map_err(|_| "Saved, but durability is uncertain. Refresh before retrying.".to_string())
+            .map_err(|_| {
+                "Saved, but durability is uncertain. Refresh before retrying.".to_string()
+            })?;
+        Ok(previous.entries)
     }
 }
 

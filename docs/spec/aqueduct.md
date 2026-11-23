@@ -243,7 +243,11 @@ Pages include the effective viewing zone and an optional persona pin. Today is
 resolved by Fasti. A projected occurrence carries clock spans with their offsets
 so a repeated hour keeps both instants distinct. A change to the effective
 device-following zone invalidates earlier revisions.
-Fasti refuses projected rows on creation. These reads use the same instance
+A committed local event or hold mutation can return a single-use undo receipt.
+Only its originating reply carries the receipt. An undo request supplies the
+token and revision. Fasti restores the prior entries from persona-local memory
+and returns the original agenda date at a new revision. Later writes and a
+service restart invalidate the receipt. Fasti refuses projected rows on creation. These reads use the same instance
 authorization as day queries.
 The envelope carries at most 4 KiB for a
 request and 1 MiB for a reply. Only the registered Calendar

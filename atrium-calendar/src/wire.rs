@@ -28,6 +28,9 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    Undo {
+        receipt: super::UndoReceipt,
+    },
     Today {
         view: Option<CalendarView>,
     },
@@ -180,6 +183,20 @@ pub fn call(socket: &Path, request: &Request) -> Result<Day, String> {
 
 pub fn page(socket: &Path, request: &Request) -> Result<CalendarPage, String> {
     let page: CalendarPage = exchange(socket, request)?;
+    if let Some(receipt) = page.undo {
+        let revision = match request {
+            Request::Add { revision, .. }
+            | Request::Release { revision, .. }
+            | Request::Change { revision, .. } => *revision,
+            _ => return Err("Unexpected undo receipt".into()),
+        };
+        if receipt.token.is_nil()
+            || receipt.revision != page.revision
+            || revision.checked_add(1) != Some(page.revision)
+        {
+            return Err("Invalid undo receipt".into());
+        }
+    }
     if page.entries.iter().any(|entry| entry.validate().is_err()) {
         return Err("Invalid Calendar reply".into());
     }
@@ -241,6 +258,9 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
         Ok(Request::OpenSearchHit { revision, id, date }) => {
             store.open_search_hit(revision, id, date)
         }
+        Ok(Request::Undo { receipt }) => store
+            .undo(receipt)
+            .map(|date| store.page(date, Some(CalendarView::Today))),
         Ok(Request::Today { view }) => Ok(store.page(
             chrono::Utc::now()
                 .with_timezone(&store.viewing_zone())
@@ -281,7 +301,7 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             .and_then(|date| {
                 store
                     .add(revision, entry)
-                    .map(|_| store.page(date, Some(CalendarView::Today)))
+                    .map(|receipt| mutation_page(store, date, Some(receipt)))
             }),
         Ok(Request::Change {
             revision,
@@ -301,13 +321,20 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             date.map_err(str::to_owned).and_then(|date| {
                 store
                     .change(revision, id, shown, scope, replacement)
-                    .map(|()| store.page(date, Some(CalendarView::Today)))
+                    .map(|receipt| mutation_page(store, date, receipt))
             })
         }
         Ok(Request::Release { revision, date, id }) => store
             .release(revision, date, id)
-            .map(|()| store.page(date, Some(CalendarView::Today))),
+            .map(|receipt| mutation_page(store, date, Some(receipt))),
         Err(_) => Err("Invalid Calendar request".into()),
     };
     send(s, flag::IS_RESPONSE, &reply)
+}
+
+fn mutation_page(store: &Store, date: NaiveDate, undo: Option<super::UndoReceipt>) -> CalendarPage {
+    CalendarPage {
+        undo,
+        ..store.page(date, Some(CalendarView::Today))
+    }
 }

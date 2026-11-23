@@ -70,6 +70,8 @@ impl CalendarView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalendarPage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo: Option<crate::UndoReceipt>,
     pub date: NaiveDate,
     pub pinned_zone: Option<chrono_tz::Tz>,
     pub viewing_zone: chrono_tz::Tz,
