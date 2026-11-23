@@ -55,6 +55,15 @@ impl ShowAs {
         }
     }
 
+    pub fn remap_field(&mut self, map: impl FnOnce(u32) -> u32) {
+        match self {
+            Self::Reference { field, .. } | Self::RunningTotal(field)
+            | Self::PercentOfParent(field) | Self::PercentOfRunningTotal(field)
+            | Self::Rank { field, .. } => *field = map(*field),
+            _ => {}
+        }
+    }
+
     pub fn is_excel_extension(&self) -> bool {
         matches!(
             self,

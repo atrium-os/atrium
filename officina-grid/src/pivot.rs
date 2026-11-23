@@ -17,10 +17,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod calculate;
 mod display;
 mod group;
 mod order;
 
+pub use calculate::CalculatedField;
 pub use display::{BaseItem, ReferenceCalc, ShowAs};
 pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
 use display::{Display, Slot};
@@ -55,10 +57,11 @@ pub enum Agg {
     StdDevP,
     Var,
     VarP,
+    Auto,
 }
 
 impl Agg {
-    pub const ALL: [Agg; 11] = [Agg::Sum, Agg::Count, Agg::Average, Agg::Max, Agg::Min, Agg::Product, Agg::CountNums, Agg::StdDev, Agg::StdDevP, Agg::Var, Agg::VarP];
+    pub const ALL: [Agg; 12] = [Agg::Sum, Agg::Count, Agg::Average, Agg::Max, Agg::Min, Agg::Product, Agg::CountNums, Agg::StdDev, Agg::StdDevP, Agg::Var, Agg::VarP, Agg::Auto];
 
     /// The word Excel puts before a value field's name ("Sum of Units").
     pub fn label(self) -> &'static str {
@@ -74,6 +77,7 @@ impl Agg {
             Agg::StdDevP => "StdDevp",
             Agg::Var => "Var",
             Agg::VarP => "Varp",
+            Agg::Auto => "Automatic",
         }
     }
 }
@@ -115,6 +119,7 @@ pub struct Pivot {
     pub pages: Vec<PivotField>,
     pub data: Vec<DataField>,
     pub groups: Vec<GroupField>,
+    pub calculations: Vec<CalculatedField>,
     /// The Grand Total row at the bottom.
     pub grand_row: bool,
     /// The Grand Total column at the right.
@@ -128,8 +133,35 @@ pub struct Pivot {
 }
 
 impl Pivot {
+    /// Validate group dependencies before resolving their members.
+    pub fn check_groups(&self) -> Result<(), &'static str> {
+        let width = self.source.c1.checked_sub(self.source.c0).ok_or("an invalid pivot source")? + 1;
+        if self.groups.len() > MAX_GROUPS {
+            return Err("too many grouped fields");
+        }
+        let mut grouped = Vec::new();
+        for group in &self.groups {
+            if !group.valid(width) || grouped.contains(&group.field) {
+                return Err("an invalid grouped field");
+            }
+            grouped.push(group.field);
+        }
+        for group in &self.groups {
+            let mut source = group.source;
+            for _ in 0..self.groups.len() {
+                if source < width { break; }
+                source = self.groups.iter().find(|group| group.field == source)
+                    .ok_or("a grouped field has no source")?.source;
+            }
+            if source >= width {
+                return Err("a pivot group depends on itself");
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
-        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
+        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), calculations: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
     }
 
     /// Swap value fields without changing the measure referenced by a sort.
@@ -258,6 +290,10 @@ fn key(v: &Value) -> Key {
 }
 
 /// Whether two values are the same pivot item (text in any case).
+pub fn item_key(value: &Value) -> impl Eq + std::hash::Hash + use<> {
+    key(value)
+}
+
 pub fn same_item(a: &Value, b: &Value) -> bool {
     key(a) == key(b)
 }
@@ -393,6 +429,7 @@ impl Acc {
             Agg::StdDevP => num(var(true).map(f64::sqrt)),
             Agg::Var => num(var(false)),
             Agg::VarP => num(var(true)),
+            Agg::Auto => unreachable!("automatic aggregates resolve per source field"),
         }
     }
 }
@@ -456,8 +493,9 @@ impl Workbook {
     /// A source column's name, or a grouped field's own name.
     pub fn pivot_field_name(&self, p: &Pivot, field: u32) -> String {
         if field >= MAX_COLS {
-            return p.groups.iter().find(|group| group.field == field)
-                .map_or_else(String::new, |group| group.name.to_string());
+            return p.groups.iter().find(|group| group.field == field).map(|group| &group.name)
+                .or_else(|| p.calculations.iter().find(|calc| calc.field == field).map(|calc| &calc.name))
+                .map_or_else(String::new, |name| name.to_string());
         }
         let v = self.get(CellAddr::new(p.source.sheet, p.source.r0, p.source.c0 + field));
         match v {
@@ -491,6 +529,22 @@ impl Workbook {
         matches.next().is_none().then_some((i, field.agg))
     }
 
+    pub fn check_pivot_calculations(&self, p: &Pivot) -> Result<(), &'static str> {
+        if p.groups.len() + p.calculations.len() > MAX_GROUPS {
+            return Err("too many derived pivot fields");
+        }
+        let mut ids = std::collections::HashSet::new();
+        for field in &p.calculations {
+            if !ids.insert(field.field) || p.groups.iter().any(|group| group.field == field.field)
+                || !(MAX_COLS..MAX_COLS + MAX_GROUPS as u32).contains(&field.field)
+                || field.name.is_empty() || field.name.len() > 255
+            {
+                return Err("an invalid calculated pivot field");
+            }
+        }
+        calculate::Plan::new(self, p).map(|_| ())
+    }
+
     fn check_pivot(&self, p: &Pivot) -> Result<(), &'static str> {
         let s = &p.source;
         if s.sheet as usize >= self.sheet_count() || p.dest.sheet as usize >= self.sheet_count() {
@@ -504,16 +558,8 @@ impl Workbook {
         if p.rows.len() > MAX_FIELDS || p.cols.len() > MAX_FIELDS || p.pages.len() > MAX_FIELDS || p.data.len() > MAX_FIELDS {
             return Err("too many fields");
         }
-        if p.groups.len() > MAX_GROUPS {
-            return Err("too many grouped fields");
-        }
-        let mut grouped = Vec::new();
-        for group in &p.groups {
-            if !group.valid(width) || grouped.contains(&group.field) {
-                return Err("an invalid grouped field");
-            }
-            grouped.push(group.field);
-        }
+        p.check_groups()?;
+        let grouped: Vec<_> = p.groups.iter().map(|group| group.field).collect();
         let mut seen = Vec::new();
         for f in all {
             if f.field >= width && !grouped.contains(&f.field) {
@@ -527,8 +573,11 @@ impl Workbook {
             }
             seen.push(f.field);
         }
-        if p.data.iter().any(|d| d.field >= width) {
-            return Err("a field outside the source");
+        self.check_pivot_calculations(p)?;
+        if p.data.iter().any(|d| d.field >= width
+            && !(d.agg == Agg::Sum && p.calculations.iter().any(|field| field.field == d.field)))
+        {
+            return Err("an invalid pivot value field");
         }
         if p.data.iter().filter_map(|d| d.show_as.base_field()).any(|field| {
             !p.rows.iter().chain(&p.cols).any(|f| f.field == field)
@@ -652,6 +701,7 @@ impl Workbook {
                 if state.iter().enumerate().any(|(j, (q, _))| Some(j) != i && q.name.eq_ignore_ascii_case(&p.name)) {
                     return Err("a pivot table of that name exists");
                 }
+                self.check_pivot_refresh(&p)?;
                 let out = self.pivot_output(&p)?;
                 let new = out.shape.area.ok_or("the pivot table would be empty")?;
                 for (j, (_, area)) in state.iter().enumerate() {
@@ -732,6 +782,7 @@ impl Workbook {
     /// its own, or another pivot.
     pub fn refresh_pivot(&mut self, i: usize) -> Result<(), &'static str> {
         let p = self.pivots[i].clone();
+        self.check_pivot_refresh(&p)?;
         let out = self.pivot_output(&p)?;
         let old = self.pivot_shapes[i].area;
         if let Some(new) = out.shape.area {
@@ -789,11 +840,17 @@ impl Workbook {
 
     /// Items of a source or grouped column in field order before aggregate sorting.
     pub fn pivot_items(&self, p: &Pivot, field: u32) -> Vec<Value> {
+        if p.check_groups().is_err() { return Vec::new(); }
         let grouping = p.groups.iter().find(|group| group.field == field)
             .map(|group| Grouping::new(self, p, group));
         let sort = p.rows.iter().chain(&p.cols).chain(&p.pages).find(|f| f.field == field)
             .map_or(&AxisSort::Default, |f| &f.sort);
         self.axis(p, field, grouping.as_ref(), sort).map(|a| a.items).unwrap_or_default()
+    }
+
+    /// Ungrouped cache items for a physical source column.
+    pub fn pivot_source_items(&self, p: &Pivot, field: u32) -> Vec<Value> {
+        self.axis(p, field, None, &AxisSort::Default).map(|axis| axis.items).unwrap_or_default()
     }
 
     /// Items to serialize, including saved manual positions for absent members.
@@ -845,8 +902,46 @@ impl Workbook {
         Ok(Axis { items })
     }
 
+    /// Calc's automatic aggregate uses Count when the source contains nonnumeric values.
+    pub fn pivot_auto_agg(&self, p: &Pivot, field: u32) -> Agg {
+        if p.source.r0 == p.source.r1 { return Agg::Sum; }
+        let col = p.source.c0 + field;
+        let range = Rect { r0: p.source.r0 + 1, c0: col, c1: col, ..p.source };
+        let mut nonnumeric = false;
+        self.each(&range, &mut |_, _, v| nonnumeric |= !matches!(v, Value::Num(_) | Value::Empty));
+        if nonnumeric { Agg::Count } else { Agg::Sum }
+    }
+
+    fn check_pivot_refresh(&self, p: &Pivot) -> Result<(), &'static str> {
+        let s = &p.source;
+        for group in &p.groups {
+            if matches!(group.kind, GroupKind::NumericBins { .. }) {
+                let col = s.c0 + group.source;
+                if group.source > s.c1 - s.c0 || (s.r0 + 1..=s.r1).any(|row| {
+                    !matches!(self.get(CellAddr::new(s.sheet, row, col)), Value::Num(n) if n.is_finite())
+                }) {
+                    return Err("numeric pivot bins require a numeric source column");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The pivot's output, computed, not written.
     pub fn pivot_output(&self, p: &Pivot) -> Result<Output, &'static str> {
+        p.check_groups()?;
+        let resolved = p.data.iter().any(|field| field.agg == Agg::Auto).then(|| {
+            let mut pivot = p.clone();
+            for field in &mut pivot.data {
+                if field.agg == Agg::Auto {
+                    // An explicit caption and the saved sort-by-measure caption remain addressable.
+                    if field.name.is_none() { field.name = Some(Arc::from(self.data_caption(p, field))); }
+                    field.agg = self.pivot_auto_agg(p, field.field);
+                }
+            }
+            pivot
+        });
+        let p = resolved.as_ref().unwrap_or(p);
         let s = &p.source;
         let fields: Vec<&PivotField> = p.rows.iter().chain(&p.cols).chain(&p.pages).collect();
         let groups: HashMap<_, _> = p.groups.iter()
@@ -861,6 +956,8 @@ impl Workbook {
             axes.insert(f.field, (Axis { items: kept }, idx));
         }
         let nd = p.data.len().max(1);
+        let calc = calculate::Plan::new(self, p)?;
+        let accumulators = nd + calc.source.len();
         let (k, m) = (p.rows.len(), p.cols.len());
         // Sums by leaf (full row path, full column path), one lookup a row; then
         // each leaf adds into every (row prefix, column prefix) it belongs to.
@@ -879,10 +976,15 @@ impl Workbook {
             keybuf.truncate(k + m);
             let e = match leaves.get_mut(&keybuf[..]) {
                 Some(e) => e,
-                None => leaves.entry(keybuf.clone()).or_insert_with(|| vec![Acc::default(); nd]),
+                None => leaves.entry(keybuf.clone()).or_insert_with(|| vec![Acc::default(); accumulators]),
             };
             for (x, d) in e.iter_mut().zip(&p.data) {
-                x.add(&at(d.field));
+                if d.field < MAX_COLS {
+                    x.add(&at(d.field));
+                }
+            }
+            for (acc, field) in e[nd..].iter_mut().zip(&calc.source) {
+                acc.add(&at(*field));
             }
         }
         let mut acc: HashMap<(Path, Path), Vec<Acc>> = HashMap::new();
@@ -892,7 +994,7 @@ impl Workbook {
             let (rp, cp) = leaf.split_at(k);
             for a in 0..=k {
                 for b in 0..=m {
-                    let e = acc.entry((rp[..a].to_vec(), cp[..b].to_vec())).or_insert_with(|| vec![Acc::default(); nd]);
+                    let e = acc.entry((rp[..a].to_vec(), cp[..b].to_vec())).or_insert_with(|| vec![Acc::default(); accumulators]);
                     for (x, y) in e.iter_mut().zip(sums) {
                         x.merge(y);
                     }
@@ -900,6 +1002,11 @@ impl Workbook {
             }
             row_paths.insert(rp.to_vec(), ());
             col_paths.insert(cp.to_vec(), ());
+        }
+        if !p.calculations.is_empty() {
+            for totals in acc.values_mut() {
+                calc.apply(p, totals);
+            }
         }
         let mut row_paths: Vec<Path> = row_paths.into_keys().collect();
         row_paths.sort();
@@ -1242,7 +1349,7 @@ impl Pivot {
         let grouped = !self.groups.is_empty();
         let sorted = self.rows.iter().chain(&self.cols).chain(&self.pages).any(|f| f.sort != AxisSort::Default);
         w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2
-            | (self.compact as u8) << 3 | (display as u8) << 4 | (grouped as u8) << 5 | (sorted as u8) << 6);
+            | (self.compact as u8) << 3 | (display as u8) << 4 | (grouped as u8) << 5 | (sorted as u8) << 6 | ((!self.calculations.is_empty()) as u8) << 7);
         for axis in [&self.rows, &self.cols, &self.pages] {
             w.var(axis.len() as u64);
             for f in axis {
@@ -1271,6 +1378,14 @@ impl Pivot {
                 group.encode(w);
             }
         }
+        if !self.calculations.is_empty() {
+            w.var(self.calculations.len() as u64);
+            for field in &self.calculations {
+                w.var(u64::from(field.field));
+                w.str(&field.name);
+                w.str(&field.formula);
+            }
+        }
         match area {
             Some(a) => {
                 w.u8(1);
@@ -1289,9 +1404,6 @@ impl Pivot {
             return Err(WireError::Invalid("pivot place"));
         }
         let flags = r.u8()?;
-        if flags & !127 != 0 {
-            return Err(WireError::Invalid("pivot flags"));
-        }
         let mut axes = Vec::new();
         for _ in 0..3 {
             let n = r.count("pivot fields", MAX_FIELDS as u64, 2)?;
@@ -1325,6 +1437,17 @@ impl Pivot {
                 groups.push(GroupField::decode(r)?);
             }
         }
+        let mut calculations = Vec::new();
+        if flags & 128 != 0 {
+            let n = r.count("pivot calculated fields", MAX_GROUPS as u64, 3)?;
+            for _ in 0..n {
+                calculations.push(CalculatedField {
+                    field: get_field(r)?,
+                    name: Arc::from(r.str("pivot calculated field name", 255)?),
+                    formula: Arc::from(r.str("pivot calculated formula", 1024)?),
+                });
+            }
+        }
         let area = match r.u8()? {
             0 => None,
             _ => Some(get_rect(r)?),
@@ -1332,6 +1455,6 @@ impl Pivot {
         let pages = axes.pop().unwrap();
         let cols = axes.pop().unwrap();
         let rows = axes.pop().unwrap();
-        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
+        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, calculations, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
     }
 }

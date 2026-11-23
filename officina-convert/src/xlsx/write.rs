@@ -750,7 +750,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     let mut z = ZipWriter::new(out);
     let code_of = |s: usize| macros.and_then(|m| m.sheet_codes.iter().find(|(i, _)| *i as usize == s)).map(|(_, c)| &**c);
     let n = wb.sheet_count();
-    let pivots: Vec<_> = wb.pivots().iter().enumerate().filter(|(_, p)| p.groups.is_empty()).collect();
+    let pivots: Vec<_> = wb.pivots().iter().enumerate().filter(|(_, p)| super::pivot::supports(p)).collect();
     let threads = super::threaded::Export::new(wb);
     let mut strings = Strings { ids: HashMap::new(), list: Vec::new(), uses: 0 };
     let mut parts = Vec::with_capacity(n);

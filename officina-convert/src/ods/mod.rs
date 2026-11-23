@@ -17,3 +17,4 @@ pub mod write;
 #[cfg(feature = "read")]
 pub use read::{read, OdsError};
 pub use write::write;
+pub use pivot::supports as supports_pivot;

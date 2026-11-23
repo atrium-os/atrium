@@ -47,6 +47,7 @@ pub struct PivotPane {
 pub fn fields(wb: &Workbook, p: &Pivot) -> Vec<(u32, String, Option<Area>)> {
     let width = p.source.c1 - p.source.c0 + 1;
     (0..width).chain(p.groups.iter().map(|group| group.field).filter(|&field| field >= width))
+        .chain(p.calculations.iter().map(|calc| calc.field))
         .map(|field| (field, wb.pivot_field_name(p, field), area_of(p, field))).collect()
 }
 
@@ -114,8 +115,15 @@ fn change(d: &mut Doc, i: usize, f: impl FnOnce(&Workbook, &mut Pivot)) -> Resul
 
 /// Puts field `f` of pivot `i` in `to` (last there), or out of the pivot (`None`).
 pub fn place(d: &mut Doc, i: usize, f: u32, to: Option<Area>) -> Result<(), String> {
-    if f >= officina_grid::addr::MAX_COLS && to == Some(Area::Values) {
-        return Err("Use the source field to add values for this group.".into());
+    let p = d.wb.pivots().get(i).ok_or("That pivot table is gone.")?;
+    let calculated = p.calculations.iter().any(|calc| calc.field == f);
+    if let Some(area) = to {
+        if calculated && area != Area::Values {
+            return Err("A calculated field can only go in Values.".into());
+        }
+        if !calculated && f >= officina_grid::addr::MAX_COLS && area == Area::Values {
+            return Err("Use the source field to add values for this group.".into());
+        }
     }
     change(d, i, |wb, p| {
         if area_of(p, f) == to {
@@ -124,7 +132,7 @@ pub fn place(d: &mut Doc, i: usize, f: u32, to: Option<Area>) -> Result<(), Stri
         let field = take(p, f);
         match to {
             Some(Area::Values) => {
-                let agg = if numeric(wb, p, f) { Agg::Sum } else { Agg::Count };
+                let agg = if calculated || numeric(wb, p, f) { Agg::Sum } else { Agg::Count };
                 p.data.push(DataField { field: f, agg, name: None, show_as: Default::default() });
             }
             Some(a) => axis_mut(p, a).unwrap().push(field.unwrap_or_else(|| PivotField::new(f))),

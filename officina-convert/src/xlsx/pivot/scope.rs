@@ -34,7 +34,7 @@ impl<'a> Scope<'a> {
         })
     }
 
-    pub fn write(&self, out: &mut String, wb: &Workbook, pivot: &Pivot, level: usize) {
+    pub fn write(&self, out: &mut String, wb: &Workbook, pivot: &Pivot, level: usize, ids: &super::Fields) {
         let count = self.members.len() + 1;
         let _ = write!(
             out,
@@ -49,7 +49,7 @@ impl<'a> Scope<'a> {
                 .iter()
                 .position(|item| same_item(item, value))
                 .expect("sort scope members are included in the exported items");
-            write_reference(out, *field, index);
+            write_reference(out, ids.raw(*field), index);
         }
         out.push_str("</references></pivotArea></autoSortScope>");
     }

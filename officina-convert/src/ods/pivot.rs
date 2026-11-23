@@ -35,6 +35,7 @@ fn func(a: Agg) -> &'static str {
         Agg::StdDevP => "stdevp",
         Agg::Var => "var",
         Agg::VarP => "varp",
+        Agg::Auto => "auto",
     }
 }
 
@@ -128,6 +129,7 @@ fn group_xml(out: &mut String, wb: &Workbook, p: &Pivot, field: u32) {
             bounds(*start, *end, *dates);
             let _ = write!(out, r#" table:step="{step}"/>"#);
         }
+        GroupKind::Discrete(_) | GroupKind::NumericBins { .. } => unreachable!(),
         GroupKind::DateParts { start, end, part } => {
             bounds(*start, *end, true);
             let _ = write!(out, r#" table:grouped-by="{}" table:step="1"/>"#, DATE_PARTS[*part as usize]);
@@ -156,10 +158,16 @@ fn sort_xml(out: &mut String, wb: &Workbook, pivot: &Pivot, sort: &AxisSort) {
     out.push_str("/>");
 }
 
+pub fn supports(pivot: &Pivot) -> bool {
+    pivot.calculations.is_empty()
+        && pivot.data.iter().all(|d| !d.show_as.is_excel_extension())
+        && pivot.groups.iter().all(|group| !matches!(group.kind, GroupKind::Discrete(_) | GroupKind::NumericBins { .. }))
+}
+
 /// `table:data-pilot-tables`, or nothing.
 pub fn tables_xml(wb: &Workbook) -> String {
     let mut pivots = wb.pivots().iter().enumerate()
-        .filter(|(_, p)| p.data.iter().all(|d| !d.show_as.is_excel_extension()))
+        .filter(|(_, p)| supports(p))
         .peekable();
     if pivots.peek().is_none() {
         return String::new();
@@ -346,26 +354,33 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
         let probe = p.clone();
         let source_index = |name: &str| (0..width).find(|&f| wb.pivot_field_name(&probe, f) == name);
         let mut bad = None;
-        for field in &t.fields {
-            let Some(group) = &field.group else { continue };
-            let source = if group.source.is_empty() { &field.name } else { &group.source };
-            let (Some(source), Some(kind)) = (source_index(source), group.kind()) else {
+        let grouped: Vec<_> = t.fields.iter().filter(|field| field.group.is_some()).collect();
+        if grouped.len() > MAX_GROUPS {
+            why(rep, "too many grouped fields");
+            continue;
+        }
+        let index = |name: &str| source_index(name).or_else(|| {
+            let mut matches = grouped.iter().enumerate().filter(|(_, field)| field.name == name);
+            let (i, _) = matches.next()?;
+            matches.next().is_none().then_some(MAX_COLS + i as u32)
+        });
+        for field in grouped.iter().copied() {
+            let group = field.group.as_ref().unwrap();
+            let source_name = if group.source.is_empty() { &field.name } else { &group.source };
+            let (Some(field_id), Some(source), Some(kind)) = (index(&field.name), index(source_name), group.kind()) else {
                 bad = Some(format!("unsupported grouping for {}", field.name));
                 break;
             };
-            if p.groups.len() == MAX_GROUPS {
-                bad = Some("too many grouped fields".to_string());
-                break;
-            }
-            let index = source_index(&field.name).unwrap_or(MAX_COLS + p.groups.len() as u32);
-            p.groups.push(GroupField { field: index, source, name: Arc::from(field.name.as_str()), kind });
+            p.groups.push(GroupField { field: field_id, source, name: Arc::from(field.name.as_str()), kind });
         }
         if let Some(w) = bad {
             why(rep, &w);
             continue;
         }
-        let index = |name: &str, p: &Pivot| source_index(name)
-            .or_else(|| p.groups.iter().find(|group| group.name.as_ref() == name).map(|group| group.field));
+        if let Err(reason) = p.check_groups() {
+            why(rep, reason);
+            continue;
+        }
         let mut subtotals = false;
         let mut multi_on_rows = false;
         let mut compact = None;
@@ -377,7 +392,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             if f.orient == "hidden" {
                 continue;
             }
-            let Some(x) = index(&f.name, &p) else {
+            let Some(x) = index(&f.name) else {
                 bad = Some(format!("no field {}", f.name));
                 break;
             };
@@ -388,7 +403,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                 };
                 let mut show_as = ShowAs::Normal;
                 if let Some(reference) = &f.reference {
-                    let field = || index(&reference.field, &p).filter(|&index| t.fields.iter().any(|f| {
+                    let field = || index(&reference.field).filter(|&index| t.fields.iter().any(|f| {
                         f.name == reference.field && matches!(f.orient.as_str(), "row" | "column")
                             && !f.data_layout && wb.pivot_field_name(&p, index) == f.name
                     }));

@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
-use officina_grid::pivot::{same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
+use officina_grid::pivot::{GroupKind, item_key,same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
 use officina_grid::{CellAddr, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
@@ -46,12 +46,13 @@ fn agg_name(a: Agg) -> &'static str {
         Agg::StdDevP => "stdDevp",
         Agg::Var => "var",
         Agg::VarP => "varp",
+        Agg::Auto => unreachable!("Excel needs an explicit aggregate"),
     }
 }
 
 #[cfg(feature = "read")]
 fn agg_of(s: &str) -> Option<Agg> {
-    Agg::ALL.into_iter().find(|a| agg_name(*a) == s)
+    Agg::ALL.into_iter().filter(|a| *a != Agg::Auto).find(|a| agg_name(*a) == s)
 }
 
 /// The fields every pivot puts on an axis (rows, columns, pages), in source order.
@@ -79,10 +80,138 @@ fn field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
             }
         }
     }
+    if let Some(GroupKind::NumericBins { items: domain, .. }) = p.groups.iter().find(|group| group.field == field).map(|group| &group.kind) {
+        let domain: std::collections::HashSet<_> = domain.iter().map(item_key).collect();
+        items.retain(|value| domain.contains(&item_key(value)));
+    }
     items
 }
 
-fn show_as_xml(out: &mut String, wb: &Workbook, p: &Pivot, mode: &ShowAs) {
+fn model_field(width: u32, index: u32) -> u32 {
+    if index < width { index } else { officina_grid::addr::MAX_COLS.saturating_add(index - width) }
+}
+
+struct Fields {
+    width: u32,
+    derived: Vec<u32>,
+}
+
+impl Fields {
+    fn new(p: &Pivot) -> Self {
+        let width = p.source.c1 - p.source.c0 + 1;
+        let mut derived: Vec<_> = p.groups.iter().map(|group| group.field).filter(|&f| f >= width)
+            .chain(p.calculations.iter().map(|field| field.field)).collect();
+        derived.sort_unstable();
+        Self { width, derived }
+    }
+
+    fn count(&self) -> usize { self.width as usize + self.derived.len() }
+
+    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.width).chain(self.derived.iter().copied())
+    }
+
+    fn raw(&self, field: u32) -> u32 {
+        if field < self.width { field }
+        else { self.width + self.derived.binary_search(&field).expect("validated virtual field") as u32 }
+    }
+}
+
+pub fn supports(p: &Pivot) -> bool {
+    p.groups.iter().all(|group| match &group.kind {
+        GroupKind::Discrete(_) => {
+            p.groups.iter().filter(|other| matches!(other.kind, GroupKind::Discrete(_)) && other.source == group.source).count() == 1
+                && !p.groups.iter().any(|other| other.field == group.source && !matches!(other.kind, GroupKind::Discrete(_)))
+        }
+        GroupKind::NumericBins { .. } => true,
+        _ => false,
+    })
+}
+
+/// In a grouped cache, some fields have two lists. The pivot references the group list.
+fn cache_field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
+    let group = p.groups.iter().find(|g| g.field == field);
+    if let Some(GroupKind::NumericBins { items, .. }) = group.map(|g| &g.kind) {
+        return items.clone();
+    }
+    let mut items = field_items(wb, p, field);
+    if p.groups.is_empty() { return items; }
+    let mut seen: std::collections::HashSet<_> = items.iter().map(item_key).collect();
+    if let Some(group) = group.filter(|g| matches!(g.kind, GroupKind::Discrete(_))) {
+        let GroupKind::Discrete(mapping) = &group.kind else { unreachable!() };
+        let translated: std::collections::HashSet<_> = mapping.iter().map(|(from, _)| item_key(from)).collect();
+        for item in cache_field_items(wb, p, group.source) {
+            if !translated.contains(&item_key(&item)) && seen.insert(item_key(&item)) {
+                items.push(item);
+            }
+        }
+    }
+    let maps = p.groups.iter().filter_map(|g| {
+        let GroupKind::Discrete(items) = &g.kind else { return None };
+        if g.field == field { Some((items, false)) }
+        else if g.source == field { Some((items, true)) }
+        else { None }
+    });
+    for (pairs, source) in maps {
+        for (from, to) in pairs {
+            let item = if source { from } else { to };
+            if seen.insert(item_key(item)) {
+                items.push(item.clone());
+            }
+        }
+    }
+    items
+}
+
+fn write_cache_item(o: &mut String, v: &Value) {
+    match v {
+        Value::Num(x) => { let _ = write!(o, r#"<n v="{}"/>"#, num(*x)); }
+        Value::Str(t) => { let _ = write!(o, r#"<s v="{}"/>"#, esc(t)); }
+        Value::Bool(b) => { let _ = write!(o, r#"<b v="{}"/>"#, *b as u8); }
+        Value::Err(e) => { let _ = write!(o, r#"<e v="{}"/>"#, e.text()); }
+        Value::Empty => o.push_str("<m/>"),
+    }
+}
+
+fn write_group(o: &mut String, wb: &Workbook, p: &Pivot, ids: &Fields, field: u32) {
+    let parent = p.groups.iter().find(|group| group.source == field && matches!(group.kind, GroupKind::Discrete(_)));
+    let group = p.groups.iter().find(|group| group.field == field);
+    if parent.is_none() && group.is_none() { return; }
+    o.push_str("<fieldGroup");
+    if let Some(parent) = parent {
+        let _ = write!(o, r#" par="{}""#, ids.raw(parent.field));
+    }
+    let Some(group) = group else { o.push_str("/>"); return };
+    let mut base = group.source;
+    while base >= ids.width {
+        base = p.groups.iter().find(|group| group.field == base).expect("validated group dependency").source;
+    }
+    let _ = write!(o, r#" base="{base}">"#);
+    let items = cache_field_items(wb, p, field);
+    match &group.kind {
+        GroupKind::NumericBins { start, end, step, .. } => {
+            let _ = write!(o, r#"<rangePr autoStart="0" autoEnd="0" startNum="{start}" endNum="{end}" groupInterval="{step}"/>"#);
+        }
+        GroupKind::Discrete(mapping) => {
+            let source = cache_field_items(wb, p, group.source);
+            let indices: std::collections::HashMap<_, _> = items.iter().enumerate().map(|(i, value)| (item_key(value), i)).collect();
+            let targets: std::collections::HashMap<_, _> = mapping.iter().map(|(from, to)| (item_key(from), to)).collect();
+            let _ = write!(o, r#"<discretePr count="{}">"#, source.len());
+            for value in &source {
+                let target = targets.get(&item_key(value)).copied().unwrap_or(value);
+                let index = indices[&item_key(target)];
+                let _ = write!(o, r#"<x v="{index}"/>"#);
+            }
+            o.push_str("</discretePr>");
+        }
+        _ => unreachable!(),
+    }
+    let _ = write!(o, r#"<groupItems count="{}">"#, items.len());
+    for item in &items { write_cache_item(o, item); }
+    o.push_str("</groupItems></fieldGroup>");
+}
+
+fn show_as_xml(out: &mut String, wb: &Workbook, p: &Pivot, mode: &ShowAs, ids: &Fields) {
     let (name, field, item) = match mode {
         ShowAs::Normal => ("normal", 0, 0),
         ShowAs::PercentOfRow => ("percentOfRow", 0, 0),
@@ -117,6 +246,7 @@ fn show_as_xml(out: &mut String, wb: &Workbook, p: &Pivot, mode: &ShowAs) {
     if mode.is_percent() {
         out.push_str(r#" numFmtId="10""#);
     }
+    let field = ids.raw(field);
     let _ = write!(out, r#" baseField="{field}" baseItem="{item}""#);
     if extended {
         let _ = write!(out, r#"><extLst><ext uri="{{E15A36E0-9728-4E99-A89B-3F7291B0FE68}}"><x14:dataField xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" pivotShowAs="{name}"/></ext></extLst></dataField>"#);
@@ -130,13 +260,13 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
     let s = &p.source;
     let r = format!("{}:{}", a1(s.r0, s.c0), a1(s.r1, s.c1));
     let mut o = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotCacheDefinition {NS} refreshOnLoad="1" saveData="0" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="{}"><cacheSource type="worksheet"><worksheetSource ref="{r}" sheet="{}"/></cacheSource>"#, s.r1 - s.r0, esc(&wb.sheet_name(s.sheet)));
-    let width = s.c1 - s.c0 + 1;
-    let _ = write!(o, r#"<cacheFields count="{width}">"#);
+    let ids = Fields::new(p);
+    let _ = write!(o, r#"<cacheFields count="{}">"#, ids.count());
     let on_axis: Vec<u32> = axis_fields(p).iter().map(|f| f.field)
-        .chain(p.data.iter().filter_map(|d| d.show_as.base_field())).collect();
+        .chain(p.data.iter().filter_map(|d| d.show_as.base_field()))
+        .chain(p.groups.iter().map(|group| group.source)).collect();
     let mut names: Vec<String> = Vec::new();
-    for f in 0..width {
-        // Field names are unique in a cache: a repeat gets a number.
+    for f in ids.ids() {
         let mut name = wb.pivot_field_name(p, f);
         let base = name.clone();
         let mut k = 2;
@@ -145,8 +275,20 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
             k += 1;
         }
         names.push(name.clone());
-        let _ = write!(o, r#"<cacheField name="{}" numFmtId="0">"#, esc(&name));
-        let items = field_items(wb, p, f);
+        let _ = write!(o, r#"<cacheField name="{}" numFmtId="0""#, esc(&name));
+        if let Some(calc) = p.calculations.iter().find(|calc| calc.field == f) {
+            let _ = write!(o, r#" databaseField="0" formula="{}"/>"#, esc(&calc.formula));
+            continue;
+        }
+        if f >= ids.width {
+            o.push_str(r#" databaseField="0">"#);
+            write_group(&mut o, wb, p, &ids, f);
+            o.push_str("</cacheField>");
+            continue;
+        }
+        o.push('>');
+        let grouped = p.groups.iter().any(|group| group.field == f);
+        let items = if grouped { wb.pivot_source_items(p, f) } else { cache_field_items(wb, p, f) };
         let (mut str_, mut nums, mut blank, mut other, mut ints) = (false, false, false, false, true);
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for v in &items {
@@ -181,27 +323,12 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
         }
         if on_axis.contains(&f) {
             let _ = write!(o, r#"<sharedItems{a} count="{}">"#, items.len());
-            for v in &items {
-                match v {
-                    Value::Num(x) => {
-                        let _ = write!(o, r#"<n v="{}"/>"#, num(*x));
-                    }
-                    Value::Str(t) => {
-                        let _ = write!(o, r#"<s v="{}"/>"#, esc(t));
-                    }
-                    Value::Bool(b) => {
-                        let _ = write!(o, r#"<b v="{}"/>"#, *b as u8);
-                    }
-                    Value::Err(e) => {
-                        let _ = write!(o, r#"<e v="{}"/>"#, e.text());
-                    }
-                    Value::Empty => o.push_str("<m/>"),
-                }
-            }
+            for v in &items { write_cache_item(&mut o, v); }
             o.push_str("</sharedItems>");
         } else {
             let _ = write!(o, "<sharedItems{a}/>");
         }
+        write_group(&mut o, wb, p, &ids, f);
         o.push_str("</cacheField>");
     }
     o.push_str("</cacheFields></pivotCacheDefinition>");
@@ -211,7 +338,7 @@ pub fn cache_xml(wb: &Workbook, p: &Pivot) -> String {
 /// `xl/pivotTables/pivotTableN.xml` for pivot `p` with cache `cache_id`.
 pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String {
     let shape = wb.pivot_shape(i).cloned().unwrap_or_default();
-    let width = p.source.c1 - p.source.c0 + 1;
+    let ids = Fields::new(p);
     let multi = p.data.len() > 1;
     let col_dims = p.cols.len() + multi as usize;
     let loc = shape.table().unwrap_or(Rect { sheet: p.dest.sheet, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row, c1: p.dest.col });
@@ -228,8 +355,8 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         let _ = write!(o, r#" rowPageCount="{}" colPageCount="1""#, p.pages.len());
     }
     o.push_str("/>");
-    let _ = write!(o, r#"<pivotFields count="{width}">"#);
-    for f in 0..width {
+    let _ = write!(o, r#"<pivotFields count="{}">"#, ids.count());
+    for f in ids.ids() {
         let axis = if p.rows.iter().any(|x| x.field == f) {
             Some("axisRow")
         } else if p.cols.iter().any(|x| x.field == f) {
@@ -267,9 +394,15 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         match pf {
             Some(pf) => {
                 let items = field_items(wb, p, f);
+                let cache_indices = p.groups.iter().find(|group| group.field == f).and_then(|group| match &group.kind {
+                    GroupKind::NumericBins { items, .. } => Some(items.iter()
+                        .enumerate().map(|(i, value)| (item_key(value), i)).collect::<std::collections::HashMap<_, _>>()),
+                    _ => None,
+                });
                 let n = items.len() + p.subtotals as usize;
                 let _ = write!(o, r#"><items count="{n}">"#);
-                for (x, v) in items.iter().enumerate() {
+                for (i, v) in items.iter().enumerate() {
+                    let x = cache_indices.as_ref().map_or(i, |indices| indices[&item_key(v)]);
                     let hide = pf.hidden.iter().any(|h| officina_grid::pivot::same_item(h, v));
                     let _ = write!(o, r#"<item x="{x}"{}/>"#, if hide { r#" h="1""# } else { "" });
                 }
@@ -281,7 +414,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
                     let level = p.rows.iter().position(|field| field.field == f)
                         .or_else(|| p.cols.iter().position(|field| field.field == f))
                         .unwrap_or(0);
-                    scope.write(&mut o, wb, p, level);
+                    scope.write(&mut o, wb, p, level, &ids);
                 }
                 o.push_str("</pivotField>");
             }
@@ -292,14 +425,14 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
     if !p.rows.is_empty() {
         let _ = write!(o, r#"<rowFields count="{}">"#, p.rows.len());
         for f in &p.rows {
-            let _ = write!(o, r#"<field x="{}"/>"#, f.field);
+            let _ = write!(o, r#"<field x="{}"/>"#, ids.raw(f.field));
         }
         o.push_str("</rowFields>");
     }
     if col_dims > 0 {
         let _ = write!(o, r#"<colFields count="{col_dims}">"#);
         for f in &p.cols {
-            let _ = write!(o, r#"<field x="{}"/>"#, f.field);
+            let _ = write!(o, r#"<field x="{}"/>"#, ids.raw(f.field));
         }
         if multi {
             o.push_str(r#"<field x="-2"/>"#);
@@ -309,18 +442,19 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
     if !p.pages.is_empty() {
         let _ = write!(o, r#"<pageFields count="{}">"#, p.pages.len());
         for f in &p.pages {
-            let _ = write!(o, r#"<pageField fld="{}" hier="-1"/>"#, f.field);
+            let _ = write!(o, r#"<pageField fld="{}" hier="-1"/>"#, ids.raw(f.field));
         }
         o.push_str("</pageFields>");
     }
     if !p.data.is_empty() {
         let _ = write!(o, r#"<dataFields count="{}">"#, p.data.len());
         for d in &p.data {
-            let _ = write!(o, r#"<dataField name="{}" fld="{}""#, esc(&wb.data_caption(p, d)), d.field);
-            if d.agg != Agg::Sum {
-                let _ = write!(o, r#" subtotal="{}""#, agg_name(d.agg));
+            let _ = write!(o, r#"<dataField name="{}" fld="{}""#, esc(&wb.data_caption(p, d)), ids.raw(d.field));
+            let agg = if d.agg == Agg::Auto { wb.pivot_auto_agg(p, d.field) } else { d.agg };
+            if agg != Agg::Sum {
+                let _ = write!(o, r#" subtotal="{}""#, agg_name(agg));
             }
-            show_as_xml(&mut o, wb, p, &d.show_as);
+            show_as_xml(&mut o, wb, p, &d.show_as, &ids);
         }
         o.push_str("</dataFields>");
     }
@@ -508,6 +642,12 @@ fn read_table(
     };
     let page_top = r0.saturating_sub(if pages_n > 0 { pages_n + 1 } else { 0 });
     let mut p = Pivot::new(&name, source, CellAddr::new(sheet, page_top, c0));
+    if let Err(reason) = c.definitions(&mut p) {
+        why(rep, reason);
+        return Ok(());
+    }
+    let width = source.c1 - source.c0 + 1;
+    let model = |raw| model_field(width, raw);
     p.rows = rows.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
     p.cols = cols.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
     if rows.contains(&-2) {
@@ -577,7 +717,7 @@ fn read_table(
             return Ok(());
         }
         let d = DataField { field: f, agg, name: None, show_as };
-        let default = wb.data_caption(&p, &d);
+        let default = wb.data_caption(&p, &DataField { field: model(f), ..d.clone() });
         data.push(DataField { name: (!n.is_empty() && n != default).then(|| Arc::from(n.as_str())), ..d });
     }
     p.data = data;
@@ -629,6 +769,16 @@ fn read_table(
     if area.intersects(&source) {
         why(rep, "its source overlaps the saved pivot output");
         return Ok(());
+    }
+    for field in p.rows.iter_mut().chain(&mut p.cols).chain(&mut p.pages) {
+        field.field = model(field.field);
+        if let AxisSort::Scoped { members, .. } = &mut field.sort {
+            for (field, _) in members { *field = model(*field); }
+        }
+    }
+    for data in &mut p.data {
+        data.field = model(data.field);
+        data.show_as.remap_field(model);
     }
     if let Err(w) = wb.add_pivot_as_is(p, Some(area)) {
         why(rep, w);

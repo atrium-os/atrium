@@ -341,9 +341,9 @@ and their associated import or Save behavior.
 | Excel appearance filters | XLSX, XLSM | Sheets keeps solid cell colors, cell-level font colors, No Fill, Automatic font color, and built-in icon selections, including Office 2010 icon sets and No Cell Icon. Pattern filters distinguish geometry and resolved foreground and background colors. Excel Save preserves the patterns, and the Sheets grid previews them with a solid color. Office 2010 custom icon rules retain their threshold slots, including mixed icon sets and empty slots. **Data → Reapply Filter** uses the current cell style and conditional formatting. Save keeps the last applied row visibility. |
 | Table-local filters | XLSX, XLSM, ODS | Each table owns its filter rules and last applied row visibility. The Data menu and header dropdown act on that table. Worksheet filters stay independent. A row is hidden while any applicable filter hides it. Excel table parts and ODS named database ranges keep supported rules across Save and reopen. |
 | Static filter visibility | XLSX, XLSM, ODS | Unknown calendar tags, gradient filter targets, malformed custom icons and unsupported ODS conditions can leave only the saved row visibility. ODS regex uses the bounded Rust regex syntax. Rules that need unsupported syntax, such as backreferences or look-around, receive a fidelity notice. Excel export reports when an ODS filter cannot be carried as a live rule. ODS export reports when it keeps only the saved row visibility of Excel calendar or appearance rules, or omits Excel custom conditional icons. |
-| Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references and named, numeric and calendar groups based on a source field. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |
+| Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references, derived group chains and automatic aggregation. Excel retains discrete groups, fixed numeric bins and arithmetic calculated fields over local worksheet sources. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |
 | Recovered pivot caches | XLSX, XLSM | Sheets uses the workbook cache ID when a pivot cache link is broken. A damaged definition can be rebuilt when it still identifies a local source. Saved output stays visible until Refresh. |
-| Static pivot results | XLSX, XLSM, ODS | Calculated and grouped Excel caches stay as saved cells, as do missing or damaged caches with an unknown or external source or unresolved filter and display references. Unsupported ODS fields, aggregate functions and group chains can also leave the saved cells as plain values. |
+| Static pivot results | XLSX, XLSM, ODS | Excel calculated items, unsupported calculated formulas, automatic numeric or calendar bins, and missing or damaged caches with an unknown or external source stay as saved cells. ODS groups with missing or circular dependencies, unsupported aggregates and external or database sources also keep their saved cells and carry a fidelity notice. |
 | Pivot item order | XLSX, XLSM, ODS | Sheets preserves Excel manual order and value sorting by grand total or a selected opposite-axis member, along with ODS manual, source, label and value sorting. Previous, Next and Running Total follow the visible member order after refresh. |
 | Pivot layout | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Outline layout and values down the rows can change on refresh. |
 
@@ -2466,8 +2466,10 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   functions and captions, grand totals, subtotals; the workbook's
   `pivotCaches`. The reader accepts sources on a sheet or a table's name.
   Whole-column sources end at the last row in use. Outline layout and values
-  down the rows carry fidelity notices. Calculated fields and grouped Excel
-  cache fields keep the pivot's cells as values.
+  down the rows carry fidelity notices. Excel discrete groups preserve the
+  values that map to each group, including typed members. Fixed numeric bins
+  retain their range and cache labels. Refresh rejects a numeric grouping when
+  its source has nonnumeric values and leaves the existing output in place.
 - **Excel cache recovery.** A pivot's workbook cache ID can recover a
   definition when the direct relationship is missing or broken. When a
   damaged definition still identifies a local worksheet range, table or
@@ -2478,6 +2480,13 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   when an item essential to the pivot cannot be identified, or when all
   source metadata is missing. Import reports the recovery or the reason the
   pivot stayed static. [Microsoft PivotTable package structure](https://learn.microsoft.com/en-us/office/open-xml/spreadsheet/working-with-pivottables)
+- **Calculated value fields.** Excel worksheet-backed calculated fields
+  retain numeric constants, field references, parentheses, arithmetic, powers
+  and percent. Each result evaluates over the sums for its row, column, or
+  grand-total slice. It can use another calculated field. The native pivot
+  keeps the definitions. Unsupported functions, item references, invalid field
+  references and cycles leave the saved cells as values with a fidelity notice.
+  [Microsoft calculated field semantics](https://support.microsoft.com/en-us/excel/calculate-values-in-a-pivottable)
 - **Display calculations.** XLSX retains `showDataAs` and the Office 2010
   `pivotShowAs` extension. Named base items resolve through the pivot field's
   item list and cache, so Save can rebuild their indices. Differences,
@@ -2490,11 +2499,13 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   reference calculation and its base field or item. `table:data-pilot-groups`
   keeps named item groups, numeric intervals and calendar groups, including
   fixed or automatic bounds. The grouped field can have its own name and
-  appear beside the original source field. Group chains that reference
-  another derived group, external sources and database sources leave the
-  saved cells as values. When exporting to a different format, grouped ODS
-  pivots in XLSX and Excel-only display modes in ODS keep their visible
-  cells as values and receive Save notices.
+  appear beside the original source field. A group can take another derived
+  group as its input. An automatic measure uses Sum for numeric source data and
+  Count when the source contains nonnumeric values. ODS preserves the automatic
+  setting. Excel export writes the currently selected aggregate. External and
+  database sources keep their saved cells. When exporting to another format,
+  unsupported groups and calculations retain their output cells with a Save
+  notice.
 - **Item order.** Excel manual order comes from the pivot field's item
   list, whose indices address shared cache values. Save keeps manual
   positions for missing members and places new members after the saved
@@ -2515,7 +2526,9 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   group definitions, item sort settings and the last output area. The pivot operation journals
   the definition, cell edits and percentage format changes together.
 - **Remaining gaps.** Positional and multi-item Excel sort scopes,
-  outline layouts, calculated fields, GETPIVOTDATA and pivot charts.
+  outline layouts, automatic numeric bins and Excel calendar bins, calculated
+  items, calculated fields with worksheet functions, GETPIVOTDATA and pivot
+  charts.
   [Excel display modes](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.showdataasvalues?view=openxml-3.0.1) · [Excel extended modes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/f5b294f2-a168-46c3-b9a9-8e4f0132b78d) · [OpenDocument data pilots](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
 
 The installed Sheets desktop gate `SHEETS_INTEROP_CASE=pivot_display`
@@ -2537,6 +2550,12 @@ alternate workbook relationship and a truncated cache with a local named
 source. It checks the saved output after Save and picker reopen, then edits
 the source and verifies that only Refresh changes the output. It saves and
 reopens each refreshed workbook again.
+
+The paired `pivot_sources` desktop gate covers a chained ODS group with
+automatic aggregation and an Excel workbook with discrete groups, fixed
+numeric bins and a calculated ratio. It checks the saved output, opens from the
+picker, edits the source, saves the unchanged results, then refreshes both
+formats and saves and reopens again.
 
 
 Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows

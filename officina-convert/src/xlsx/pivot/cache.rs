@@ -6,7 +6,8 @@ use crate::zip::Archive;
 use officina_grid::addr::{MAX_ROWS, Rect};
 use officina_grid::eval::dates::DateSystem;
 use officina_grid::formula::ast::{Coord, Expr};
-use officina_grid::pivot::MAX_ITEMS;
+use officina_grid::pivot::{CalculatedField, GroupField, GroupKind, MAX_GROUP_MEMBERS, MAX_GROUPS, MAX_ITEMS, Pivot};
+use std::sync::Arc;
 use officina_grid::{ErrorKind, Value, Workbook};
 use quick_xml::events::{BytesStart, Event};
 
@@ -21,7 +22,7 @@ struct Source {
 #[derive(Default)]
 pub(super) struct Cache {
     source: Option<Source>,
-    fields: Vec<Option<Vec<Value>>>,
+    fields: Vec<FieldItems>,
     pub rebuilt: bool,
     unsupported: Option<&'static str>,
 }
@@ -66,30 +67,24 @@ impl Cache {
                             attr(&e, b"count")?.and_then(|count| count.parse::<usize>().ok());
                     }
                     b"cacheField" if fields => {
-                        if self.fields.len() >= XLSX_COLS as usize {
+                        if self.fields.len() >= XLSX_COLS as usize + MAX_GROUPS {
                             self.unsupported = Some("it has too many cache fields");
                             break;
                         }
-                        if attr(&e, b"formula")?.is_some()
-                            || attr(&e, b"databaseField")?
-                                .is_some_and(|v| matches!(v.as_str(), "0" | "false"))
-                        {
-                            self.unsupported = Some("it uses calculated Excel cache fields");
-                        }
-                        let parsed = if start {
+                        let name = attr(&e, b"name")?.unwrap_or_default();
+                        let formula = attr(&e, b"formula")?;
+                        let derived = off(attr(&e, b"databaseField")?) || formula.is_some();
+                        let mut parsed = if start {
                             let span = reader.read_to_end(e.name())?;
                             cache_items(&data[span.start as usize..span.end as usize], dates)?
                         } else {
-                            FieldItems {
-                                items: Some(Vec::new()),
-                                grouped: false,
-                            }
+                            FieldItems { items: Some(Vec::new()), ..FieldItems::default() }
                         };
-                        if parsed.grouped {
-                            self.unsupported = Some("it uses grouped Excel cache fields");
-                        }
+                        parsed.name = name;
+                        parsed.formula = formula;
+                        parsed.derived = derived;
                         self.rebuilt |= parsed.items.is_none();
-                        self.fields.push(parsed.items);
+                        self.fields.push(parsed);
                     }
                     b"calculatedItems" if start && root => {
                         self.unsupported = Some("it uses calculated Excel cache items");
@@ -110,7 +105,76 @@ impl Cache {
     }
 
     pub fn items(&self, field: u32) -> Option<&[Value]> {
-        self.fields.get(field as usize)?.as_deref()
+        let field = self.fields.get(field as usize)?;
+        match &field.group {
+            Some(group) if group.mode.is_some() => group.items.as_deref(),
+            _ => field.items.as_deref(),
+        }
+    }
+
+    /// Resolve cache metadata into the grid's virtual fields after the source range is known.
+    pub fn definitions(&self, pivot: &mut Pivot) -> Result<(), &'static str> {
+        let width = pivot.source.c1 - pivot.source.c0 + 1;
+        let invalid = "it uses an unsupported or incomplete grouped Excel cache";
+        for (raw, field) in self.fields.iter().enumerate() {
+            let raw = raw as u32;
+            let id = super::model_field(width, raw);
+            if let Some(formula) = &field.formula {
+                if raw < width || field.group.is_some() {
+                    return Err("its calculated field overlaps the worksheet source");
+                }
+                pivot.calculations.push(CalculatedField {
+                    field: id, name: Arc::from(field.name.as_str()), formula: Arc::from(formula.as_str()),
+                });
+                continue;
+            }
+            if raw >= width && !field.derived && field.group.is_none() {
+                // An old cache may outlive a source that was narrowed. Axes or
+                // measures that still address the extra columns fail validation.
+                continue;
+            }
+            if field.derived != (raw >= width) {
+                return Err("its cache fields do not match the worksheet source");
+            }
+            let Some(group) = &field.group else {
+                if field.derived { return Err(invalid); }
+                continue;
+            };
+            let Some(mode) = &group.mode else {
+                if group.parent.is_some() && !field.derived { continue; }
+                return Err(invalid);
+            };
+            let base = group.base.filter(|&base| base < width).ok_or(invalid)?;
+            let items = group.items.as_ref().filter(|items| (1..=MAX_GROUP_MEMBERS + 2).contains(&items.len())).ok_or(invalid)?;
+            let unique: std::collections::HashSet<_> = items.iter().map(officina_grid::pivot::item_key).collect();
+            if unique.len() != items.len() { return Err(invalid); }
+            let (parent, kind) = match mode {
+                GroupMode::Discrete(indices) => {
+                    if raw < width { return Err(invalid); }
+                    let mut children = self.fields.iter().enumerate().filter(|(_, child)| {
+                        child.group.as_ref().is_some_and(|child| child.parent == Some(raw))
+                    });
+                    let (child, input) = match children.next() {
+                        Some((child, _)) if children.next().is_none() =>
+                            (child as u32, self.items(child as u32).ok_or(invalid)?),
+                        None => (base, self.fields.get(base as usize).and_then(|f| f.items.as_deref()).ok_or(invalid)?),
+                        _ => return Err(invalid),
+                    };
+                    if input.len() != indices.len() { return Err(invalid); }
+                    let mapping = input.iter().zip(indices).map(|(from, &to)| {
+                        items.get(to).map(|to| (from.clone(), to.clone())).ok_or(invalid)
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    (child, GroupKind::Discrete(mapping.into_iter().filter(|(from, to)| from != to).collect()))
+                }
+                GroupMode::Numeric { start, end, step } => (base, GroupKind::NumericBins {
+                    start: *start, end: *end, step: *step, items: items.clone(),
+                }),
+                GroupMode::Unsupported => return Err(invalid),
+            };
+            pivot.groups.push(GroupField { field: id, source: super::model_field(width, parent),
+                name: Arc::from(field.name.as_str()), kind });
+        }
+        pivot.check_groups()
     }
 
     pub fn resolve(
@@ -191,8 +255,12 @@ impl Cache {
     }
 
     pub fn needs_rebuild(&self, source: Rect) -> bool {
-        self.rebuilt || self.fields.len() != (source.c1 - source.c0 + 1) as usize
+        self.rebuilt || self.fields.iter().filter(|f| !f.derived).count() != (source.c1 - source.c0 + 1) as usize
     }
+}
+
+fn off(value: Option<String>) -> bool {
+    value.is_some_and(|value| matches!(value.as_str(), "false" | "0"))
 }
 
 fn on(value: Option<String>) -> bool {
@@ -248,17 +316,89 @@ fn named_source(wb: &Workbook, sheet: u16, name: &str) -> Option<Rect> {
     })
 }
 
+#[derive(Default)]
 struct FieldItems {
+    name: String,
+    formula: Option<String>,
+    derived: bool,
     items: Option<Vec<Value>>,
-    grouped: bool,
+    group: Option<GroupIn>,
+}
+
+struct GroupIn {
+    base: Option<u32>,
+    parent: Option<u32>,
+    mode: Option<GroupMode>,
+    items: Option<Vec<Value>>,
+}
+
+enum GroupMode {
+    Discrete(Vec<usize>),
+    Numeric { start: f64, end: f64, step: f64 },
+    Unsupported,
+}
+
+fn cache_group(tag: &BytesStart<'_>, data: &[u8], dates: DateSystem) -> Result<GroupIn, XlsxError> {
+    let mut group = GroupIn {
+        base: attr(tag, b"base")?.and_then(|v| v.parse().ok()),
+        parent: attr(tag, b"par")?.and_then(|v| v.parse().ok()),
+        mode: None,
+        items: None,
+    };
+    let mut reader = xml(data);
+    loop {
+        let event = reader.read_event()?;
+        let start = matches!(event, Event::Start(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag) => match tag.local_name().as_ref() {
+                b"groupItems" if start && group.items.is_none() => {
+                    let count = attr(&tag, b"count")?.and_then(|v| v.parse().ok());
+                    let span = reader.read_to_end(tag.name())?;
+                    group.items = shared_items(&data[span.start as usize..span.end as usize], dates, count)?;
+                }
+                b"discretePr" if start && group.mode.is_none() => {
+                    let count = attr(&tag, b"count")?.and_then(|v| v.parse::<usize>().ok());
+                    let span = reader.read_to_end(tag.name())?;
+                    let mut indices = Vec::new();
+                    let mut items = xml(&data[span.start as usize..span.end as usize]);
+                    group.mode = Some(loop {
+                        match items.read_event()? {
+                            Event::Empty(x) if x.local_name().as_ref() == b"x" && indices.len() < MAX_GROUP_MEMBERS => {
+                                let Some(index) = attr(&x, b"v")?.and_then(|v| v.parse().ok()) else { break GroupMode::Unsupported };
+                                indices.push(index);
+                            }
+                            Event::Eof if count.is_none_or(|n| n == indices.len()) => break GroupMode::Discrete(indices),
+                            _ => break GroupMode::Unsupported,
+                        }
+                    });
+                }
+                b"rangePr" if group.mode.is_none() => {
+                    let numeric = attr(&tag, b"groupBy")?.is_none_or(|kind| kind == "range")
+                        && off(attr(&tag, b"autoStart")?) && off(attr(&tag, b"autoEnd")?)
+                        && group.parent.is_none() && attr(&tag, b"startDate")?.is_none();
+                    let start_num = attr(&tag, b"startNum")?.and_then(|v| v.parse().ok());
+                    let end_num = attr(&tag, b"endNum")?.and_then(|v| v.parse().ok());
+                    let step = attr(&tag, b"groupInterval")?.and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                    group.mode = Some(match (numeric, start_num, end_num) {
+                        (true, Some(start), Some(end)) => GroupMode::Numeric { start, end, step },
+                        _ => GroupMode::Unsupported,
+                    });
+                    if start { reader.read_to_end(tag.name())?; }
+                }
+                _ => {
+                    group.mode = Some(GroupMode::Unsupported);
+                    if start { reader.read_to_end(tag.name())?; }
+                }
+            },
+            Event::Eof => return Ok(group),
+            _ => {}
+        }
+    }
 }
 
 fn cache_items(data: &[u8], dates: DateSystem) -> Result<FieldItems, XlsxError> {
     let mut reader = xml(data);
-    let mut out = FieldItems {
-        items: Some(Vec::new()),
-        grouped: false,
-    };
+    let mut out = FieldItems { items: Some(Vec::new()), ..FieldItems::default() };
     let mut seen = false;
     loop {
         match reader.read_event()? {
@@ -279,8 +419,12 @@ fn cache_items(data: &[u8], dates: DateSystem) -> Result<FieldItems, XlsxError> 
                 }
                 seen = true;
             }
-            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"fieldGroup" => {
-                out.grouped = true
+            Event::Start(e) if e.local_name().as_ref() == b"fieldGroup" => {
+                let span = reader.read_to_end(e.name())?;
+                out.group = Some(cache_group(&e, &data[span.start as usize..span.end as usize], dates)?);
+            }
+            Event::Empty(e) if e.local_name().as_ref() == b"fieldGroup" => {
+                out.group = Some(cache_group(&e, &[], dates)?);
             }
             Event::Eof => return Ok(out),
             _ => {}

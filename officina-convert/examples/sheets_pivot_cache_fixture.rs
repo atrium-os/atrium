@@ -319,3 +319,24 @@ fn an_intact_table_cache_for_the_same_source_keeps_indexed_filters() {
     assert_eq!(wb.get(at(1, 6)), Value::Num(20.0));
     assert_eq!(wb.get(at(2, 6)), Value::Num(20.0));
 }
+
+#[cfg(test)]
+#[test]
+fn unused_columns_in_an_older_cache_do_not_prevent_source_recovery() {
+    let source = xlsx::write(&fixture(), Vec::new()).unwrap();
+    let bytes = rewrite(&source, |part, data| {
+        Some(if part == CACHE {
+            String::from_utf8(data).unwrap()
+                .replace(r#"<cacheFields count="2">"#, r#"<cacheFields count="3">"#)
+                .replace("</cacheFields>", r#"<cacheField name="Former Column"/></cacheFields>"#)
+                .into_bytes()
+        } else {
+            data
+        })
+    }, &[]);
+    let mut book = read(&bytes, Some("unusable"));
+    assert_eq!(book.pivots().len(), 1);
+    cells(&book, 9.0);
+    book.refresh_pivot(0).unwrap();
+    cells(&book, 15.0);
+}

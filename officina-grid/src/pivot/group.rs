@@ -1,6 +1,6 @@
 //! Source item groupings for pivot axes.
 
-use super::{MAX_GROUP_MEMBERS, MAX_GROUPS, Pivot};
+use super::{get_value, key, put_value, Key, MAX_GROUP_MEMBERS, MAX_GROUPS, Pivot};
 use crate::Workbook;
 use crate::addr::{CellAddr, MAX_COLS, Rect};
 use crate::eval::dates::DateSystem;
@@ -40,6 +40,10 @@ impl DatePart {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupKind {
     Named(Vec<ItemGroup>),
+    /// Excel discrete groups map typed source items to typed group values.
+    Discrete(Vec<(Value, Value)>),
+    /// Fixed Excel numeric bins, with the original labels in cache order.
+    NumericBins { start: f64, end: f64, step: f64, items: Vec<Value> },
     Intervals {
         start: Option<f64>,
         end: Option<f64>,
@@ -64,8 +68,7 @@ pub struct GroupField {
 
 impl GroupField {
     pub(super) fn valid(&self, width: u32) -> bool {
-        if self.source >= width
-            || (self.field < width && self.field != self.source)
+        if (self.field < width && self.field != self.source)
             || (self.field >= width
                 && !(MAX_COLS..MAX_COLS + MAX_GROUPS as u32).contains(&self.field))
             || self.name.len() > 255
@@ -83,6 +86,9 @@ impl GroupField {
                 groups.len() <= MAX_GROUP_MEMBERS
                     && groups.iter().map(|g| g.members.len()).sum::<usize>() <= MAX_GROUP_MEMBERS
             }
+            GroupKind::Discrete(items) => self.field >= MAX_COLS && items.len() <= MAX_GROUP_MEMBERS,
+            GroupKind::NumericBins { start, end, step, items } =>
+                self.source < width && numeric_bins(*start, *end, *step).is_some_and(|n| n + 2 == items.len()),
             GroupKind::Intervals {
                 start, end, step, ..
             } => bounds(*start, *end) && step.is_finite() && *step > 0.0,
@@ -104,6 +110,24 @@ impl GroupField {
                     for member in &group.members {
                         w.str(member);
                     }
+                }
+            }
+            GroupKind::Discrete(items) => {
+                w.u8(4);
+                w.var(items.len() as u64);
+                for (source, target) in items {
+                    put_value(w, source);
+                    put_value(w, target);
+                }
+            }
+            GroupKind::NumericBins { start, end, step, items } => {
+                w.u8(5);
+                w.f64(*start);
+                w.f64(*end);
+                w.f64(*step);
+                w.var(items.len() as u64);
+                for item in items {
+                    put_value(w, item);
                 }
             }
             GroupKind::Intervals {
@@ -161,6 +185,17 @@ impl GroupField {
                     .ok_or(WireError::Invalid("pivot date group"))?;
                 GroupKind::DateParts { start, end, part }
             }
+            4 => {
+                let len = r.count("pivot discrete group items", MAX_GROUP_MEMBERS as u64, 2)?;
+                let items = (0..len).map(|_| Ok((get_value(r)?, get_value(r)?))).collect::<Result<_, WireError>>()?;
+                GroupKind::Discrete(items)
+            }
+            5 => {
+                let (start, end, step) = (r.f64()?, r.f64()?, r.f64()?);
+                let len = r.count("pivot numeric group items", (MAX_GROUP_MEMBERS + 2) as u64, 1)?;
+                let items = (0..len).map(|_| get_value(r)).collect::<Result<_, _>>()?;
+                GroupKind::NumericBins { start, end, step, items }
+            }
             _ => return Err(WireError::Invalid("pivot grouping type")),
         };
         Ok(Self {
@@ -170,6 +205,14 @@ impl GroupField {
             kind,
         })
     }
+}
+
+fn numeric_bins(start: f64, end: f64, step: f64) -> Option<usize> {
+    if ![start, end, step].iter().all(|n| n.is_finite()) || start > end || step <= 0.0 {
+        return None;
+    }
+    let count = ((end - start) / step).ceil().max(1.0);
+    (count <= MAX_GROUP_MEMBERS as f64).then_some(count as usize)
 }
 
 fn put_bounds(w: &mut Writer, start: Option<f64>, end: Option<f64>) {
@@ -193,7 +236,9 @@ fn get_bound(r: &mut Reader) -> Result<Option<f64>, WireError> {
 pub(super) struct Grouping<'a> {
     source: u32,
     kind: &'a GroupKind,
+    parent: Option<Box<Self>>,
     named: HashMap<String, &'a Arc<str>>,
+    discrete: HashMap<Key, &'a Value>,
     start: f64,
     end: f64,
     integer_only: bool,
@@ -201,11 +246,15 @@ pub(super) struct Grouping<'a> {
 }
 
 impl<'a> Grouping<'a> {
-    pub fn new(wb: &Workbook, p: &Pivot, group: &'a GroupField) -> Self {
+    pub fn new(wb: &Workbook, p: &'a Pivot, group: &'a GroupField) -> Self {
+        let parent = p.groups.iter().find(|field| group.source >= MAX_COLS && field.field == group.source)
+            .map(|field| Box::new(Self::new(wb, p, field)));
         let mut this = Self {
             source: group.source,
             kind: &group.kind,
+            parent,
             named: HashMap::new(),
+            discrete: HashMap::new(),
             start: f64::INFINITY,
             end: f64::NEG_INFINITY,
             integer_only: true,
@@ -222,6 +271,11 @@ impl<'a> Grouping<'a> {
                 }
                 return this;
             }
+            GroupKind::Discrete(items) => {
+                this.discrete.extend(items.iter().map(|(source, target)| (key(source), target)));
+                return this;
+            }
+            GroupKind::NumericBins { .. } => return this,
             GroupKind::Intervals { start, end, .. } | GroupKind::DateParts { start, end, .. } => {
                 (*start, *end)
             }
@@ -229,14 +283,7 @@ impl<'a> Grouping<'a> {
         this.auto_end = end.is_none();
         let interval = matches!(group.kind, GroupKind::Intervals { .. });
         if (interval || start.is_none() || end.is_none()) && p.source.r0 < p.source.r1 {
-            let col = p.source.c0 + group.source;
-            let range = Rect {
-                r0: p.source.r0 + 1,
-                c0: col,
-                c1: col,
-                ..p.source
-            };
-            wb.each(&range, &mut |_, _, value| {
+            let mut include = |value| {
                 if let Value::Num(n) = value {
                     if n.is_finite() {
                         this.start = this.start.min(n);
@@ -244,7 +291,16 @@ impl<'a> Grouping<'a> {
                         this.integer_only &= n.fract() == 0.0;
                     }
                 }
-            });
+            };
+            if let Some(parent) = &this.parent {
+                for row in p.source.r0 + 1..=p.source.r1 {
+                    include(parent.item(wb, p, row).0);
+                }
+            } else {
+                let col = p.source.c0 + group.source;
+                let range = Rect { r0: p.source.r0 + 1, c0: col, c1: col, ..p.source };
+                wb.each(&range, &mut |_, _, value| include(value));
+            }
         }
         this.start = start.unwrap_or(this.start);
         this.end = end.unwrap_or(this.end);
@@ -257,26 +313,36 @@ impl<'a> Grouping<'a> {
     }
 
     pub fn item(&self, wb: &Workbook, p: &Pivot, row: u32) -> (Value, Option<f64>) {
-        let addr = CellAddr::new(p.source.sheet, row, p.source.c0 + self.source);
-        let value = wb.get(addr);
+        let addr = || CellAddr::new(p.source.sheet, row, p.source.c0 + self.source);
+        let (value, parent_order) = self.parent.as_ref()
+            .map_or_else(|| (wb.get(addr()), None), |parent| parent.item(wb, p, row));
         if let GroupKind::Named(_) = self.kind {
             let member = match &value {
                 Value::Empty => String::new(),
                 Value::Str(text) => text.to_lowercase(),
-                _ => wb.formatted(addr).text.to_lowercase(),
+                _ if self.parent.is_none() => wb.formatted(addr()).text.to_lowercase(),
+                _ => value.display().to_lowercase(),
             };
-            return (
-                self.named
-                    .get(&member)
-                    .map_or(value, |name| Value::Str((*name).clone())),
-                None,
-            );
+            return match self.named.get(&member) {
+                Some(name) => (Value::Str((*name).clone()), None),
+                None => (value, parent_order),
+            };
+        }
+        if matches!(self.kind, GroupKind::Discrete(_)) {
+            return (self.discrete.get(&key(&value)).map_or(value, |target| (*target).clone()), parent_order);
         }
         let Value::Num(n) = value else {
             return (value, None);
         };
         if !n.is_finite() {
             return (value, None);
+        }
+        if let GroupKind::NumericBins { start, end, step, items } = self.kind {
+            let last = items.len() - 1;
+            let index = if n < *start { 0 }
+                else if n > *end { last }
+                else { (1 + ((n - start) / step).floor() as usize).min(last - 1) };
+            return (items[index].clone(), Some(index as f64));
         }
         let calendar = wb.date_system();
         let dates = matches!(
@@ -340,7 +406,7 @@ impl<'a> Grouping<'a> {
                 .map_or((value, None), |(name, rank)| {
                     (Value::str(&name), Some(rank as f64))
                 }),
-            GroupKind::Named(_) => unreachable!(),
+            GroupKind::Named(_) | GroupKind::Discrete(_) | GroupKind::NumericBins { .. } => unreachable!(),
         }
     }
 }

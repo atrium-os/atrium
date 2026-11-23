@@ -119,8 +119,8 @@ fn saved_status(d: &Doc, format: Format) -> String {
     } else {
         format!("Saved “{}”.", d.name)
     };
-    if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !p.groups.is_empty()) {
-        status.push_str(" Excel export saved grouped ODS pivot tables as cell values.");
+    if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !officina_convert::xlsx::pivot::supports(p)) {
+        status.push_str(" Excel export saved pivot tables with unsupported groups as cell values.");
     }
     if matches!(format, Format::Xlsx | Format::Xlsm)
         && (d.wb.filter_conditions().any(|cond| !officina_convert::xlsx::write::supports_filter(cond))
@@ -145,8 +145,8 @@ fn saved_status(d: &Doc, format: Format) -> String {
         })) {
             changes.push("uses label sort for pivots sorted by a selected Excel member");
         }
-        if d.wb.pivots().iter().any(|p| p.data.iter().any(|f| f.show_as.is_excel_extension())) {
-            changes.push("saved pivot tables with Excel-only display calculations as cell values");
+        if d.wb.pivots().iter().any(|p| !officina_convert::ods::supports_pivot(p)) {
+            changes.push("saved pivot tables with Excel-only calculations or groups as cell values");
         }
         if d.wb.groups().any(|(_, group)| {
             let mut referenced = false;
