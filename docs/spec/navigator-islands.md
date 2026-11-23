@@ -639,6 +639,13 @@ IPv4 stayed blocked until fresh confirmation. The gateway then received
 one POST, accepted one assertion, and redeemed one token. The guest
 fetched `crypta-ac-ok` through ocserv on `tun8`.
 
+The follow-up cancelled that queued request, reconnected on a distinct
+Crypta attempt and queued Sign In before the old jail closed. After
+teardown only the newest request launched, without another Sign In
+press. The stale confirmation sent zero POSTs. IPv4 stayed blocked
+until fresh confirmation sent one POST, and the guest fetched
+`crypta-ac-ok` through ocserv on `tun8`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
