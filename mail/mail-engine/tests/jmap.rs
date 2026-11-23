@@ -62,6 +62,10 @@ struct Server {
     no_vacation: bool,
     fail_mailbox_sync: bool,
     rewrite_import_message_ids: bool,
+    upload_overrides: Map<String, Value>,
+    import_requests: usize,
+    import_overrides: Map<String, Value>,
+    repeat_import_reply: bool,
     presence_limit: Option<usize>,
     presence_queries: Vec<Vec<String>>,
     wrong_presence_account: bool,
@@ -277,6 +281,10 @@ impl Server {
                 }
                 "Identity/get" => json!({ "state": "i", "list": [{ "id": "id1", "email": "ada@example.org", "name": "Ada" }] }),
                 "Email/import" => {
+                    self.import_requests += 1;
+                    let old = self.state;
+                    assert_eq!(args["accountId"], ACCOUNT);
+                    assert_eq!(args["emails"].as_object().unwrap().len(), 1);
                     let e = &args["emails"]["m"];
                     let bytes = self.uploads[e["blobId"].as_str().unwrap()].clone();
                     let bytes = if self.rewrite_import_message_ids {
@@ -291,7 +299,10 @@ impl Server {
                     let boxes: Vec<String> = e["mailboxIds"].as_object().unwrap().keys().cloned().collect();
                     let b: Vec<&str> = boxes.iter().map(String::as_str).collect();
                     let id = self.add(bytes, &b, &["$seen"], 1_800_000_000);
-                    json!({ "created": { "m": { "id": id, "blobId": self.mails[&id].blob } } })
+                    let imported = &self.mails[&id];
+                    json!({ "accountId": ACCOUNT, "oldState": old.to_string(), "newState": self.state.to_string(),
+                        "created": { "m": { "id": id, "blobId": imported.blob,
+                            "threadId": format!("T{id}"), "size": imported.bytes.len() } } })
                 }
                 "EmailSubmission/set" => {
                     let s = &args["create"]["s"];
@@ -309,6 +320,14 @@ impl Server {
             if cid == "g" && name == "Email/get" && call[1].get("#ids").is_none() {
                 for (key, value) in &self.direct_get_overrides {
                     answer[key] = value.clone();
+                }
+            }
+            if name == "Email/import" {
+                for (key, value) in &self.import_overrides {
+                    answer[key] = value.clone();
+                }
+                if self.repeat_import_reply {
+                    out.push(json!([name, &answer, cid]));
                 }
             }
             if name == "Email/set" {
@@ -387,7 +406,11 @@ impl Http for Fake {
                 assert!(content_type == "message/rfc822" || content_type == "application/sieve", "{content_type}");
                 let id = format!("U{}", s.uploads.len() + 1);
                 s.uploads.insert(id.clone(), body.to_vec());
-                Ok(serde_json::to_vec(&json!({ "accountId": ACCOUNT, "blobId": id, "type": content_type, "size": body.len() })).unwrap())
+                let mut answer = json!({ "accountId": ACCOUNT, "blobId": id, "type": content_type, "size": body.len() });
+                for (key, value) in &s.upload_overrides {
+                    answer[key] = value.clone();
+                }
+                Ok(serde_json::to_vec(&answer).unwrap())
             }
             _ => Err(format!("404 {url}")),
         }
@@ -1085,6 +1108,83 @@ fn mbox_legacy_upload_is_protected_before_its_first_readback() {
     let mut mbox = Vec::new();
     mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), Imported { queued: 0, already: 1, refused: 0 });
+}
+
+#[test]
+fn jmap_upload_verifies_the_receipt_before_requesting_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let raw = message(38, "Saved mail", "body");
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+
+    for (overrides, reason) in [
+        (json!({"accountId": "other"}), "wrong account"),
+        (json!({"type": "application/sieve"}), "wrong type"),
+        (json!({"size": raw.len() + 1}), "wrong size"),
+        (json!({"blobId": "invalid/id"}), "bad blobId"),
+    ] {
+        server.borrow_mut().upload_overrides = overrides.as_object().unwrap().clone();
+        assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+        assert_eq!(server.borrow().import_requests, 0);
+        let rows = engine.store.imports().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.why.as_deref().unwrap().contains(reason), "{rows:?}");
+        assert!(engine.store.jmap_import_ids(account, "", 32).unwrap().is_empty());
+    }
+
+    server.borrow_mut().upload_overrides = json!({"type": "Message/RFC822"}).as_object().unwrap().clone();
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    assert_eq!(server.borrow().import_requests, 1);
+    assert!(engine.store.imports().unwrap().is_empty());
+    assert_eq!(engine.store.jmap_import_ids(account, "", 32).unwrap(), ["M1"]);
+    client.sync(&mut engine.sink(account)).unwrap();
+    let id = engine.store.by_server_id(account, "M1").unwrap().unwrap();
+    assert_eq!(engine.store.blob(&engine.store.message(id).unwrap().full.unwrap()).unwrap(), raw);
+}
+
+#[test]
+fn jmap_import_only_accepts_a_matching_creation_outcome() {
+    let raw = message(39, "Saved mail", "body");
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+    let parser = jail();
+
+    for (overrides, repeat, reason) in [
+        (json!({"accountId": "other"}), false, "wrong account"),
+        (json!({"created": {"other": {"id": "foreign"}}}), false, "unexpected Email/import creation ID"),
+        (json!({"notCreated": {"other": {"type": "overQuota"}}}), false, "unexpected Email/import creation ID"),
+        (json!({"notCreated": {"m": {"type": "overQuota"}}}), false, "conflicting Email/import"),
+        (json!({"created": null}), false, "missing or conflicting Email/import"),
+        (json!({"created": {"m": {"id": "M1", "blobId": "B1"}}}), false, "bad threadId"),
+        (json!({}), true, "repeated Email/import reply"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+        let account = engine.store.add_account("ada@example.org").unwrap();
+        let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+        let server = Rc::new(RefCell::new(Server {
+            import_overrides: overrides.as_object().unwrap().clone(),
+            repeat_import_reply: repeat,
+            ..Default::default()
+        }));
+        let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+        assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+        assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+        // Server-side storage alone does not provide a trustworthy local receipt.
+        assert_eq!(server.borrow().import_requests, 1);
+        assert_eq!(server.borrow().mails.len(), 1);
+        assert_eq!(engine.imports_waiting(account).unwrap(), 1);
+        let rows = engine.store.imports().unwrap();
+        assert!(rows[0].1.why.as_deref().unwrap().contains(reason), "{rows:?}");
+        assert!(engine.store.jmap_import_ids(account, "", 32).unwrap().is_empty());
+        assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().already, 1);
+    }
 }
 
 #[test]

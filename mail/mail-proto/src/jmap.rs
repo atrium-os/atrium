@@ -442,6 +442,20 @@ pub fn get_identities(account: &str) -> Vec<u8> {
     request(vec![json!(["Identity/get", { "accountId": account, "ids": null }, "i"])], true)
 }
 
+const IMPORT_TAG: &str = "i";
+const IMPORT_CREATION_ID: &str = "m";
+
+fn import_call(account: &str, blob: &str, mailbox: &str) -> Value {
+    json!(["Email/import", {
+        "accountId": account,
+        "emails": { (IMPORT_CREATION_ID): {
+            "blobId": blob,
+            "mailboxIds": { (mailbox): true },
+            "keywords": { "$seen": true }
+        } }
+    }, IMPORT_TAG])
+}
+
 /// Send uploaded message `blob`: import it into `sent` (seen), then submit
 /// it as `identity` to `rcpts`, at `send_at` if the server holds sends.
 pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str, rcpts: &[String], send_at: Option<&str>) -> Vec<u8> {
@@ -452,8 +466,8 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
     let rcpt: Vec<Value> = rcpts.iter().map(|r| json!({ "email": r })).collect();
     request(
         vec![
-            json!(["Email/import", { "accountId": account, "emails": { "m": { "blobId": blob, "mailboxIds": { sent: true }, "keywords": { "$seen": true } } } }, "i"]),
-            json!(["EmailSubmission/set", { "accountId": account, "create": { "s": { "identityId": identity, "emailId": "#m", "envelope": { "mailFrom": mail_from, "rcptTo": rcpt } } } }, "s"]),
+            import_call(account, blob, sent),
+            json!(["EmailSubmission/set", { "accountId": account, "create": { "s": { "identityId": identity, "emailId": format!("#{IMPORT_CREATION_ID}"), "envelope": { "mailFrom": mail_from, "rcptTo": rcpt } } } }, "s"]),
         ],
         true,
     )
@@ -462,7 +476,7 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
 /// Store uploaded message `blob` in `mailbox` (an import, mail.md §6.5),
 /// seen: it is old mail.
 pub fn import(account: &str, blob: &str, mailbox: &str) -> Vec<u8> {
-    request(vec![json!(["Email/import", { "accountId": account, "emails": { "m": { "blobId": blob, "mailboxIds": { mailbox: true }, "keywords": { "$seen": true } } } }, "i"])], true)
+    request(vec![import_call(account, blob, mailbox)], true)
 }
 
 /// The automatic reply (RFC 8621 §8): on or off, between two times if
@@ -820,13 +834,8 @@ pub fn identities(a: &Answers) -> Result<Vec<Identity>> {
 }
 
 /// The answer to [`submit`]: the sent message's id, or why not.
-pub fn submitted(a: &Answers) -> Result<String> {
-    let i = a.of("i", "Email/import")?;
-    if let Some(e) = i.get("notCreated").and_then(|n| n.get("m")) {
-        return err(format!("not stored: {}", e.get("type").and_then(Value::as_str).unwrap_or("?").chars().take(64).collect::<String>()));
-    }
-    let id = i.get("created").and_then(|c| c.get("m")).and_then(Value::as_object).ok_or(Error("not stored".into()))?;
-    let id = need_id(id, "id")?;
+pub fn submitted(a: &Answers, account: &str) -> Result<String> {
+    let id = imported(a, account)?;
     let s = a.of("s", "EmailSubmission/set")?;
     if let Some(e) = s.get("notCreated").and_then(|n| n.get("s")) {
         let t = e.get("type").and_then(Value::as_str).unwrap_or("?");
@@ -840,13 +849,44 @@ pub fn submitted(a: &Answers) -> Result<String> {
 }
 
 /// The answer to [`import`]: the stored message's id, or why not.
-pub fn imported(a: &Answers) -> Result<String> {
-    let i = a.of("i", "Email/import")?;
-    if let Some(e) = i.get("notCreated").and_then(|n| n.get("m")) {
-        return err(format!("not stored: {}", e.get("type").and_then(Value::as_str).unwrap_or("?").chars().take(64).collect::<String>()));
+pub fn imported(a: &Answers, account: &str) -> Result<String> {
+    let reply = a.account_reply(IMPORT_TAG, "Email/import", account)?;
+    need_state(reply, "newState")?;
+    if reply.get("oldState").is_some_and(|v| !v.is_null()) {
+        need_state(reply, "oldState")?;
     }
-    let id = i.get("created").and_then(|c| c.get("m")).and_then(Value::as_object).ok_or(Error("not stored".into()))?;
-    need_id(id, "id")
+    let created = import_result(reply, "created")?;
+    let refused = import_result(reply, "notCreated")?;
+    match (created, refused) {
+        (Some(email), None) => {
+            let email = email.as_object().ok_or(Error("bad Email/import creation result".into()))?;
+            let id = need_id(email, "id")?;
+            // The server can repair a malformed email, producing a new blob.
+            need_id(email, "blobId")?;
+            need_id(email, "threadId")?;
+            if email.get("size").and_then(Value::as_u64).is_none() {
+                return err("bad Email/import size");
+            }
+            Ok(id)
+        }
+        (None, Some(error)) => {
+            let kind = error.as_object().and_then(|o| get_str(o, "type"))
+                .filter(|t| !t.is_empty()).ok_or(Error("bad Email/import refusal".into()))?;
+            err(format!("not stored: {}", kind.chars().filter(|c| c.is_ascii_graphic()).take(64).collect::<String>()))
+        }
+        _ => err("missing or conflicting Email/import creation outcome"),
+    }
+}
+
+fn import_result<'a>(reply: &'a Map<String, Value>, field: &str) -> Result<Option<&'a Value>> {
+    match reply.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) if map.is_empty() => Ok(None),
+        Some(Value::Object(map)) if map.len() == 1 => map.get(IMPORT_CREATION_ID).map(Some)
+            .ok_or_else(|| Error(format!("unexpected Email/import creation ID in {field}"))),
+        Some(Value::Object(_)) => err(format!("unexpected Email/import creation ID in {field}")),
+        Some(_) => err(format!("bad Email/import {field} map")),
+    }
 }
 
 /// The answer to [`get_vacation`].
@@ -873,13 +913,23 @@ pub fn vacation_set(a: &Answers) -> Result<()> {
     Ok(())
 }
 
-/// The blob id from an upload's answer.
-pub fn uploaded(body: &[u8]) -> Result<String> {
+/// A blob ID acknowledged for these uploaded bytes and account.
+pub fn uploaded(body: &[u8], account: &str, media_type: &str, size: usize) -> Result<String> {
     if body.len() > 64 << 10 {
         return err("upload answer too large");
     }
     let v: Value = serde_json::from_slice(body).map_err(|e| Error(format!("upload: {e}")))?;
-    need_id(v.as_object().ok_or(Error("upload answer".into()))?, "blobId")
+    let reply = v.as_object().ok_or(Error("bad JMAP upload reply".into()))?;
+    if get_str(reply, "accountId") != Some(account) {
+        return err("wrong account in JMAP upload reply");
+    }
+    if !get_str(reply, "type").is_some_and(|ty| ty.eq_ignore_ascii_case(media_type)) {
+        return err("wrong type in JMAP upload reply");
+    }
+    if reply.get("size").and_then(Value::as_u64) != Some(size as u64) {
+        return err("wrong size in JMAP upload reply");
+    }
+    need_id(reply, "blobId")
 }
 
 /// RFC 3339 UTC (`2026-11-17T10:00:00Z`) to seconds; other zones too.

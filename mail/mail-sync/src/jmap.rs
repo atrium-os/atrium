@@ -632,6 +632,11 @@ impl<H: Http> Client<H> {
         Ok(())
     }
 
+    fn upload(&mut self, media_type: &str, bytes: &[u8]) -> Result<String> {
+        let answer = self.h.post(&self.session.upload(), media_type, bytes, 64 << 10).map_err(Error)?;
+        Ok(jmap::uploaded(&answer, &self.session.account, media_type, bytes.len())?)
+    }
+
     /// Send `message` (as written, with Bcc left out) from `from` to
     /// `rcpts`; the server keeps the copy in Sent. `send_at`: hold it until
     /// then, where the server holds sends. The new message's id.
@@ -650,12 +655,10 @@ impl<H: Http> Client<H> {
         let a = self.call(jmap::get_identities(&self.session.account))?;
         let from_l = from.to_ascii_lowercase();
         let identity = jmap::identities(&a)?.into_iter().find(|i| i.email == from_l).ok_or_else(|| Error(format!("the server doesn't let this account send as {from}")))?;
-        let url = self.session.upload();
-        let r = self.h.post(&url, "message/rfc822", message, 64 << 10).map_err(Error)?;
-        let blob = jmap::uploaded(&r)?;
+        let blob = self.upload("message/rfc822", message)?;
         let hold = send_at.filter(|_| self.session.max_delayed_send > 0).map(jmap::utc_string);
         let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))?;
-        Ok(jmap::submitted(&a)?)
+        Ok(jmap::submitted(&a, &self.session.account)?)
     }
 
     /// The vacation reply, set to `set` first if given; `None` when the
@@ -702,8 +705,7 @@ impl<H: Http> Client<H> {
         let caps = mail_proto::sieve::Caps { implementation: String::new(), sieve: exts };
         let (text, no_vacation, skipped) = crate::sieve::script(plan, &caps);
         (done.no_vacation, done.skipped) = (no_vacation, skipped);
-        let r = self.h.post(&self.session.upload(), "application/sieve", text.as_bytes(), 64 << 10).map_err(Error)?;
-        let blob = jmap::uploaded(&r)?;
+        let blob = self.upload("application/sieve", text.as_bytes())?;
         let ours = ours.as_deref();
         let a = self.call(jmap::put_sieve_script(&self.session.account, ours, crate::sieve::SCRIPT, &blob))?;
         jmap::sieve_put(&a)?;
@@ -722,11 +724,9 @@ impl<H: Http> Client<H> {
             self.mailboxes = jmap::mailboxes(&a, &self.session.account)?.0;
         }
         let mailbox = self.id_of(folder).ok_or_else(|| Error(format!("the server has no folder {folder}")))?;
-        let url = self.session.upload();
-        let r = self.h.post(&url, "message/rfc822", message, 64 << 10).map_err(Error)?;
-        let blob = jmap::uploaded(&r)?;
+        let blob = self.upload("message/rfc822", message)?;
         let a = self.call(jmap::import(&self.session.account, &blob, &mailbox))?;
-        Ok(jmap::imported(&a)?)
+        Ok(jmap::imported(&a, &self.session.account)?)
     }
 
     /// Whether the server can hold a send until `t` (seconds from now).

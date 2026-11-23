@@ -487,8 +487,14 @@ as **making the account usable first, then filling in what's worth having, polit
   the next import or upload. After upload acceptance, Mail atomically removes the
   retryable queue row and retains its Message-ID across restarts until mailbox sync
   indexes it for that account. Cancelling or discarding a queued upload releases
-  its queue identity. For JMAP, Mail uses the Email ID from `Email/import` to retain
-  the original Message-ID as an account-scoped import alias. Readback uses the
+  its queue identity. For JMAP, Mail verifies the upload account, media type, byte
+  count and blob ID before requesting `Email/import`. Mail requires a single
+  successful outcome for the expected account and creation ID before using the
+  returned Email ID to retain the original Message-ID as an account-scoped import
+  alias. Mail accepts a different stored blob ID if the server repairs the message.
+  Malformed acknowledgments leave the import queued and record the failure. A
+  server may already have stored the message by the time its reply is rejected,
+  so retrying can create a second server copy. Readback uses the
   message's actual headers, and a mailbox move preserves the alias. Mail
   releases it on a destruction report only after validating the changes page
   and its chained reads for the requested account and starting state. A fetched
