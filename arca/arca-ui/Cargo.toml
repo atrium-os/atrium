@@ -15,7 +15,7 @@ name = "arca-ui"
 path = "src/bin/arca-ui.rs"
 
 [features]
-legacy-smime-integration = ["arcad/legacy-smime-integration", "limen/legacy-smime-integration", "dep:portcullis-ipc"]
+legacy-smime-integration = ["arcad/legacy-smime-integration", "limen/legacy-smime-integration"]
 
 [[bin]]
 name = "arca-legacy-smime-fixture"
@@ -34,8 +34,6 @@ postcard        = { version = "1", features = ["use-std"] }
 # Only for the visual language's tokens (pergola::theme::Semantic).
 pergola         = { path = "../../pergola" }
 libc            = "0.2"
-
-portcullis-ipc = { path = "../../portcullis/portcullis-ipc", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

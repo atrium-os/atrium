@@ -179,6 +179,9 @@ pub mod op {
     /// Trusted UI: `str user | str persona (empty for Personal) | str label |
     /// bytes certificate DER | bytes unencrypted PKCS#8 DER` → `sha256(spki)[32]`.
     pub const U_SMIME_PROVISION: u16 = 0x6E;
+    /// Non-default synthetic gate, trusted UI only: Portcullis Mail uid → outcome status and synthetic clean-exit marker.
+    #[cfg(feature = "legacy-smime-integration")]
+    pub const U_SMIME_SYNTHETIC_OPEN: u16 = 0x6F;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).

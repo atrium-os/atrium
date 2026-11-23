@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "atrium-mail"
 path = "src/bin/atrium-mail.rs"
 
+[features]
+# Signed disposable bundle only. The installed production manifest omits the role.
+legacy-smime-integration = []
+
 [dependencies]
 mail-office-copy = { path = "../mail-office-copy", default-features = false }
 pergola = { path = "../../pergola" }

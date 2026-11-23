@@ -877,8 +877,8 @@ identity or erasing its persona invalidates its pending opens.
    padding validity or partial plaintext. Arca clears transient key
    material when the attempt ends. Public replies, audit statuses and
    logs must expose no cryptographic failure distinctions. The
-   local cross sysroot has OpenSSL 3.5.9 and the implicit-rejection
-   parameter. The jailed runtime is still unverified.
+   FreeBSD 16.0-CURRENT on Tessera has exercised the OpenSSL 3.5.9
+   default provider and implicit rejection with synthetic input.
 
 The non-default `legacy-smime-prototype` Cargo feature builds a test
 adapter for the bounded reader and the native default-provider operation.
@@ -893,10 +893,21 @@ synthetic fixture provider for a Limen sheet and uses real Fresco
 approval and a one-shot Portcullis worker. The worker checks it is
 jailed and enters Capsicum before accepting any input. The trusted
 fixture owns the private worker connection, and the parent receives
-only a typed outcome. The fixture uses a fixed test message, a
-synthetic launch registry and a private persistent Arca store. Normal
-Mail and arcad expose no legacy dispatch. The legacy store recipient
-and item kind are distinct from OAEP. Enrollment checks the opposite
+only a typed outcome. The isolated provider gate uses a fixed test
+message, a synthetic launch registry and a private persistent Arca
+store. The signed gate instead launches Mail from a content-signed
+bundle and Arca from its normal service manifest with a gate-only
+override. The fixture UI spends the Fresco press and sends the parent
+UID through Arca’s trusted-UI socket dispatch. Arca resolves the
+expected publisher, disposable user and persona through Portcullis’s
+live launch registry. Its operation accepts only the built-in test
+certificate and ciphertext, and the private candidate goes directly
+from Arca to the worker. The daemon retains the launch socket until
+Portcullis reports the worker’s exit, including when the worker reads
+EOF before receiving a candidate. The fixture checks the exit
+acknowledgment and returns only the public sheet outcome to Mail.
+Default builds and their installed manifests keep legacy receiving
+disabled. The legacy store recipient and item kind are distinct from OAEP. Enrollment checks the opposite
 purpose across the same user's stored personas and publishers. The
 default OAEP operation keeps legacy items out of certificate discovery
 and refuses to provision a key that exists as a legacy enrollment.

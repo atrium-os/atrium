@@ -746,7 +746,12 @@ fn main() {
             }
             if sw.s.take_smime_ask() && !close_settings && sw.smime.is_none() && sw.microsoft.is_none() {
                 let request = embeds.as_ref().zip(sw.win.embed_token()).and_then(|(e, token)| {
-                    e.borrow_mut().request("smime-provision", token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()
+                    let role = if atrium_mail::settings::synthetic_legacy_sheet() {
+                        "smime-legacy-read"
+                    } else {
+                        "smime-provision"
+                    };
+                    e.borrow_mut().request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()
                 });
                 sw.smime = request.map(|id| (id, Some(Instant::now() + Duration::from_secs(12))));
                 sw.s.smime_note(request.is_none().then_some("Arca’s S/MIME sheet is unavailable."));
@@ -1297,6 +1302,22 @@ fn main() {
                     }
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes }))
                         if settings.as_ref().is_some_and(|sw| sw.smime.is_some_and(|(id, _)| id == embed)) => {
+                        #[cfg(feature = "legacy-smime-integration")]
+                        if atrium_mail::settings::synthetic_legacy_sheet() {
+                            let outcome = match bytes.as_slice() {
+                                b"opened" => Some(("OPENED", "Opened the synthetic legacy S/MIME message.")),
+                                b"closed" => Some(("CLOSED", "Couldn’t open this legacy S/MIME message.")),
+                                b"cancelled" => Some(("CANCELLED", "Legacy S/MIME open cancelled.")),
+                                _ => None,
+                            };
+                            if let (Some(sw), Some((marker, note))) = (settings.as_mut(), outcome) {
+                                sw.smime = None;
+                                let _ = embeds.borrow_mut().detach_embed(embed);
+                                sw.s.smime_note(Some(note));
+                                println!("MAIL_SIGNED_LEGACY_{marker}");
+                            }
+                            continue;
+                        }
                         use limen::smime_provision::Outcome;
                         if let (Some(sw), Some(outcome)) = (settings.as_mut(), Outcome::decode(&bytes)) {
                             sw.smime = None;

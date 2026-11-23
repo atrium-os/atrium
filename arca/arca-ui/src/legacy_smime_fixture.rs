@@ -2,7 +2,6 @@
 //! and a real Portcullis reader. Regular arca-ui does not start this provider.
 
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -14,14 +13,12 @@ use fresco_protocol::WindowHints;
 use limen::client::Child;
 use limen::proto::{ChildEvent, EmbedId};
 use pergola::theme::Semantic;
-use portcullis_ipc::{Request, Response};
 
 use crate::gate::Frescod;
 use crate::view::{Font, Px, Rect};
 
 const ROLE: &str = "smime-legacy-read";
 const APP: &str = "org.atrium.mail";
-const WORKER: &str = "org.atrium.smime-legacy-reader";
 const USER: &str = "maillegacyfixture";
 const CERT: &[u8] = include_bytes!("../../../mail/mail-smime/tests/data/leaf.der");
 const KEY: &[u8] = include_bytes!("../../../mail/mail-smime/tests/data/leaf.p8");
@@ -43,47 +40,22 @@ fn closed() -> io::Error {
     io::Error::other(FAILURE)
 }
 
-fn launch() -> io::Result<(UnixStream, UnixStream)> {
-    let mut launch =
-        UnixStream::connect(portcullis_ipc::resolve_socket_path().ok_or_else(closed)?)?;
-    let timeout = Some(Duration::from_secs(8));
-    launch.set_read_timeout(timeout)?;
-    launch.set_write_timeout(timeout)?;
-    match portcullis_ipc::round_trip(
-        &mut launch,
-        &Request::Hello {
-            version: portcullis_ipc::PROTO_VERSION,
-        },
-    )? {
-        Response::Hello { .. } => {}
-        _ => return Err(closed()),
-    }
-    portcullis_ipc::write_request(
-        &mut launch,
-        &Request::ExecInstance {
-            app_id: WORKER.into(),
-            instance: None,
-            tmpfs_mb: 16,
-            memory_mb: None,
-            cpu_pct: None,
-            require_memory_limit: true,
-            serves: None,
-            persona: None,
-        },
+fn open_via_arcad(uid: u32) -> io::Result<bool> {
+    use arcad::proto;
+    let mut stream = UnixStream::connect("/atrium/sockets/arca/arcad.sock")?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(24)))?;
+    proto::write_request(
+        &mut stream,
+        proto::op::U_SMIME_SYNTHETIC_OPEN,
+        &uid.to_le_bytes(),
     )?;
-    if !matches!(
-        portcullis_ipc::read_response(&mut launch)?,
-        Response::ReadyForFds
-    ) {
+    let (status, body) = proto::read_reply(&mut stream)?;
+    if body.as_ref() != [0] {
         return Err(closed());
     }
-    let (control, child) = UnixStream::pair()?;
-    let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
-    portcullis_ipc::send_fds(
-        &launch,
-        &[child.as_raw_fd(), null.as_raw_fd(), null.as_raw_fd()],
-    )?;
-    Ok((control, launch))
+    println!("LEGACY_JAILED_WORKER_EXIT=0");
+    Ok(status == proto::status::OK)
 }
 
 fn valid_parent(registry: &str, uid: u32, publisher: [u8; 32], persona: Option<&str>) -> bool {
@@ -175,7 +147,7 @@ struct Sheet<'a> {
 impl Sheet<'_> {
     fn serve(
         &mut self,
-        store: &Store,
+        store: Option<&Store>,
         fresco: &str,
         activation: &str,
     ) -> io::Result<&'static [u8]> {
@@ -263,11 +235,7 @@ impl Sheet<'_> {
                 if !valid_parent(self.registry, self.uid, self.publisher, persona) {
                     return Err(closed());
                 }
-                let (control, _jail_lifetime) = launch().map_err(|_| closed())?;
-                let prepared = Prepared::start(control, CERT, CMS)?;
-                println!("LEGACY_JAILED_WORKER_READY");
-                let digest = prepared.message_digest();
-                prepared.finish(store, persona, self.publisher, |approved| {
+                let mut still_approved = || {
                     let still_attached = match self.child.poll(Duration::ZERO) {
                         Ok(Some(
                             ChildEvent::Detaching { embed } | ChildEvent::Suspended { embed },
@@ -275,15 +243,35 @@ impl Sheet<'_> {
                         Ok(_) => true,
                         Err(_) => false,
                     };
-                    approved == digest
-                        && approved_at.elapsed() < Duration::from_secs(5)
+                    approved_at.elapsed() < Duration::from_secs(5)
                         && still_attached
                         && valid_parent(self.registry, self.uid, self.publisher, persona)
-                })
+                };
+                if let Some(store) = store {
+                    integration::with_worker(|control| {
+                        let prepared = Prepared::start(control, CERT, CMS)?;
+                        println!("LEGACY_JAILED_WORKER_READY");
+                        let digest = prepared.message_digest();
+                        prepared.finish(store, persona, self.publisher, |approved| {
+                            approved == digest && still_approved()
+                        })
+                    })?
+                    .map(|text| text.as_str() == integration::SYNTHETIC_PREVIEW)
+                } else if still_approved() {
+                    open_via_arcad(self.uid)
+                } else {
+                    Err(closed())
+                }
             })();
             let outcome: &'static [u8] = match result {
-                Ok(text) if text.as_str() == "From OpenSSL.\r\n" => {
-                    draw(&mut win, font, scale, shown_persona, Some(text.as_str()))?;
+                Ok(true) => {
+                    draw(
+                        &mut win,
+                        font,
+                        scale,
+                        shown_persona,
+                        Some(integration::SYNTHETIC_PREVIEW),
+                    )?;
                     b"opened"
                 }
                 _ => {
@@ -336,11 +324,15 @@ pub fn run() -> io::Result<()> {
         println!("LEGACY_FIXTURE_STORED");
         return Ok(());
     }
-    if mode != "serve" {
-        return Err(closed());
-    }
-    let mut store = Store::open(&store_path, USER).map_err(|_| closed())?;
-    store.unlock(&root).map_err(|_| closed())?;
+    let store = match mode.as_str() {
+        "serve" => {
+            let mut store = Store::open(&store_path, USER).map_err(|_| closed())?;
+            store.unlock(&root).map_err(|_| closed())?;
+            Some(store)
+        }
+        "signed" => None,
+        _ => return Err(closed()),
+    };
     let fresco = std::env::var("FRESCO_SOCKET").map_err(|_| closed())?;
     let activation = std::env::var("FRESCO_ACTIVATION").map_err(|_| closed())?;
     let registry = std::env::var("ARCA_APP_REGISTRY").map_err(|_| closed())?;
@@ -372,7 +364,7 @@ pub fn run() -> io::Result<()> {
                     publisher,
                     registry: &registry,
                 };
-                let result = sheet.serve(&store, &fresco, &activation)?;
+                let result = sheet.serve(store.as_ref(), &fresco, &activation)?;
                 if result == b"cancelled" {
                     let _ = sheet.child.emit(embed, result.to_vec());
                 }

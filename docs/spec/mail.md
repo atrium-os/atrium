@@ -1112,6 +1112,13 @@ receive-only path and its verification gate.
   unsigned. A valid inner signature is required for a verified-sender
   indicator.
 
+The disposable verification bundle adds an explicit synthetic open in Mail
+Settings. It uses the signed Mail launch’s persona, a fixed test message,
+and the jailed Arca daemon’s trusted-UI dispatch. The ordinary bundle
+omits that action and role grant. The signed gate checks Work
+cancellation, approved Work opening, and approved Personal refusal in
+one private overlay, with clean worker exit for both approved scenarios.
+
 See [Arca §9.2.1](arca.md#921-proposed-legacy-smime-receive-operation),
 [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),
 and [RFC 3218](https://www.rfc-editor.org/rfc/rfc3218.html).

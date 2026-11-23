@@ -72,6 +72,12 @@ fn main() -> ExitCode {
             s.mail_sign_ins.mail_publisher = std::env::var("ARCA_MAIL_PUBLISHER").ok()
                 .and_then(|hex| arcad::label::parse_web_broker(&format!("org.atrium.mail {hex}")))
                 .map(|(publisher, _)| publisher);
+            #[cfg(all(target_os = "freebsd", feature = "legacy-smime-integration"))]
+            if std::env::var("ARCA_LEGACY_SMIME_SYNTHETIC_USER").as_deref()
+                == Ok(arcad::server::integration::SYNTHETIC_USER)
+            {
+                s.legacy_smime_registry = Some(resolver.registry.clone());
+            }
             // The machine store (§6.4) serves system services at the login
             // screen; a failure here leaves users' stores working.
             if let Err(e) = s.open_machine() {

@@ -48,8 +48,7 @@ fn enter_for_picker(wm: &mut Connection, inject: &str, sheet: u32) {
     panic!("Scrinium did not attach within Arca");
 }
 
-fn drive(wm_path: &str, inject: &str, uid: u32) {
-    let mut wm = Connection::connect(wm_path).unwrap();
+fn settings_sheet(wm: &mut Connection, inject: &str, uid: u32) -> u32 {
     let settings = wait("Mail Settings surface", || {
         let reply = wm.wm_enumerate_all().unwrap();
         reply
@@ -58,16 +57,23 @@ fn drive(wm_path: &str, inject: &str, uid: u32) {
             .filter(|w| w.owner_uid == uid)
             .find(|w| w.rect.w == 1040 && w.rect.h == 720)
     });
+    // The WM can enumerate the surface before the first Settings frame.
+    sleep(Duration::from_secs(3));
     let (x, y) = (settings.rect.x + 80, settings.rect.y + 222);
     input(inject, &format!("MOVE {x} {y}\nBTN 1 1\nBTN 1 0\n"));
-    let sheet = wait("Mail Settings opens the Arca sheet", || {
+    wait("Mail Settings opens the Arca sheet", || {
         wm.wm_enumerate_all()
             .unwrap()
             .embeds
             .into_iter()
             .find(|e| e[1] == settings.surface_id)
             .map(|e| e[0])
-    });
+    })
+}
+
+fn drive(wm_path: &str, inject: &str, uid: u32) {
+    let mut wm = Connection::connect(wm_path).unwrap();
+    let sheet = settings_sheet(&mut wm, inject, uid);
     println!("MAIL_SETTINGS_ARCA_SHEET={sheet}");
     for certificate in [true, false] {
         sleep(Duration::from_millis(1800));
@@ -103,6 +109,52 @@ fn drive(wm_path: &str, inject: &str, uid: u32) {
     });
 }
 
+#[cfg(feature = "legacy-smime-integration")]
+fn drive_legacy(wm_path: &str, inject: &str, uid: u32, action: &str) {
+    assert!(matches!(action, "approve" | "cancel"));
+    let mut wm = Connection::connect(wm_path).unwrap();
+    let sheet = settings_sheet(&mut wm, inject, uid);
+    sleep(Duration::from_secs(2));
+    assert!(
+        wm.wm_enumerate_all()
+            .unwrap()
+            .embeds
+            .iter()
+            .any(|e| e[0] == sheet),
+        "legacy sheet resolved before the user's press"
+    );
+    key(inject, if action == "approve" { 40 } else { 41 });
+    wait("Mail dismisses the legacy Arca sheet", || {
+        (!wm.wm_enumerate_all()
+            .unwrap()
+            .embeds
+            .iter()
+            .any(|e| e[0] == sheet))
+        .then_some(())
+    });
+}
+
+#[cfg(feature = "legacy-smime-integration")]
+fn expect_legacy_denied(socket: &str, uid: u32) {
+    use std::io::Read;
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    proto::write_request(
+        &mut stream,
+        proto::op::U_SMIME_SYNTHETIC_OPEN,
+        &uid.to_le_bytes(),
+    )
+    .unwrap();
+    // Read the fixed result header in the Mail jail without locking memory.
+    let mut reply = [0; 5];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[..4], &1u32.to_le_bytes());
+    assert_ne!(reply[4], proto::status::OK);
+    println!("MAIL_SIGNED_LEGACY_DIRECT_DENIED");
+}
+
 fn expect_certs(socket: &str, expected: &str) {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream
@@ -134,6 +186,14 @@ fn main() {
     match args.as_slice() {
         [mode, wm, inject, uid] if mode == "drive" => drive(wm, inject, uid.parse().unwrap()),
         [mode, socket, expected] if mode == "certs" => expect_certs(socket, expected),
+        #[cfg(feature = "legacy-smime-integration")]
+        [mode, wm, inject, uid, action] if mode == "drive-legacy" => {
+            drive_legacy(wm, inject, uid.parse().unwrap(), action)
+        }
+        #[cfg(feature = "legacy-smime-integration")]
+        [mode, socket, uid] if mode == "legacy-denied" => {
+            expect_legacy_denied(socket, uid.parse().unwrap())
+        }
         _ => panic!("use drive WM INPUT UID, or certs ARCA_SOCKET DER_OR_EMPTY"),
     }
 }

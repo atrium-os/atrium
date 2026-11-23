@@ -19,8 +19,8 @@ path = "src/bin/arcad.rs"
 host-openssl-tests = []
 # Compiles the synthetic gate only. No socket or UI dispatch is enabled.
 legacy-smime-prototype = ["dep:mail-smime", "dep:subtle"]
-# Integration lab only. No ordinary Mail or daemon dispatch uses this.
-legacy-smime-integration = ["dep:subtle", "dep:mail-smime"]
+# Integration lab only. Daemon dispatch requires a separate synthetic setup.
+legacy-smime-integration = ["dep:subtle", "dep:mail-smime", "dep:portcullis-ipc"]
 
 [dependencies]
 arca-store      = { path = "../arca-store" }
@@ -37,6 +37,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 psl = "2"
 
 mail-smime      = { path = "../../mail/mail-smime", optional = true, features = ["legacy-receive-prototype"] }
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc", optional = true }
 subtle         = { version = "2.6", optional = true }
 
 [dev-dependencies]

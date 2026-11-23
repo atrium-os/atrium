@@ -1146,6 +1146,20 @@ impl SettingsView {
 
 pub const SYSTEM_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
 
+/// Staged into the signed synthetic bundle only. The feature is off by default.
+pub fn synthetic_legacy_sheet() -> bool {
+    #[cfg(feature = "legacy-smime-integration")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::fs::read("/bin/mail-legacy-synthetic-gate")
+                .is_ok_and(|marker| marker == b"atrium-mail-legacy-synthetic-v1\n")
+        })
+    }
+    #[cfg(not(feature = "legacy-smime-integration"))]
+    false
+}
+
 impl View for SettingsView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
@@ -1339,7 +1353,12 @@ impl SettingsView {
         y += em(16.0);
         section(ctx, x, &mut y, "S/MIME");
         let s = self.s.clone();
-        button(ctx, x, y + em(14.0), "Add S/MIME identity", true, true, move || s.smime_asked.set(true));
+        let label = if synthetic_legacy_sheet() {
+            "Open synthetic legacy S/MIME message"
+        } else {
+            "Add S/MIME identity"
+        };
+        button(ctx, x, y + em(14.0), label, true, true, move || s.smime_asked.set(true));
         y += em(36.0);
         if let Some(note) = self.s.smime_note.get() {
             y += para(ctx, x, y, inner, note, type_size::SM, t.text_primary()) + em(8.0);

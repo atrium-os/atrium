@@ -61,7 +61,13 @@ mod freebsd {
         wire::write(socket, &wrapped, 512)?;
 
         let mut key = Zeroizing::new([0u8; 32]);
-        socket.read_exact(&mut key[..key_bytes])?;
+        match socket.read_exact(&mut key[..key_bytes]) {
+            Ok(()) => {}
+            // The broker can close without sending a candidate, for example
+            // when this persona has no enrollment. EOF completes that call.
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) => return Err(err),
+        }
         let plain =
             Zeroizing::new(envelope::decrypt(&cms, &key[..key_bytes]).map_err(|_| invalid())?);
         let text = wire::plain_text(&plain).ok_or_else(invalid)?;
