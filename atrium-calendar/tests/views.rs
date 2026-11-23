@@ -13,6 +13,8 @@ fn add(store: &mut Store, date: NaiveDate, kind: Kind, title: &str, start: u16, 
             revision,
             Entry {
                 excluded: Vec::new(),
+                zone: None,
+                source: None,
                 id: Uuid::new_v4(),
                 date,
                 kind,
@@ -102,7 +104,7 @@ fn week_and_month_project_repeating_series_once_and_distinguish_real_overlap() {
     assert_eq!(
         month
             .on(date("2028-02-21"))
-            .map(|e| &*e.title)
+            .map(|e| e.title)
             .collect::<Vec<_>>(),
         ["Design"]
     );
@@ -245,6 +247,8 @@ fn search_pages_are_ordered_bounded_and_revision_checked() {
             },
             title: "Weekly team".into(),
             excluded: Vec::new(),
+            zone: None,
+            source: None,
         })
         .rev()
         .collect();
@@ -289,4 +293,265 @@ fn search_pages_are_ordered_bounded_and_revision_checked() {
         q.text = invalid;
         assert!(store.search(&q, 0, None).is_err());
     }
+}
+
+fn zoned(title: &str, day: &str, start: u16, end: u16, name: chrono_tz::Tz, kind: Kind) -> Entry {
+    Entry {
+        id: Uuid::new_v4(),
+        title: title.into(),
+        date: date(day),
+        span: Span { start, end },
+        kind,
+        zone: Some(atrium_calendar::Zone {
+            name,
+            start_fold: None,
+            end_fold: None,
+        }),
+        source: None,
+        excluded: vec![],
+    }
+}
+
+#[test]
+fn gaps_and_both_fold_offsets_validate_before_publication() {
+    use atrium_calendar::Fold::{Earlier, Later};
+    use chrono_tz::America::New_York;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let mut event = zoned(
+        "Night handover",
+        "2026-03-08",
+        130,
+        160,
+        New_York,
+        Kind::Appointment,
+    );
+    assert!(store
+        .add(0, event.clone())
+        .unwrap_err()
+        .contains("does not exist"));
+    assert!(!dir.path().join("calendar.json").exists());
+    event.date = date("2026-11-01");
+    event.span = Span {
+        start: 70,
+        end: 100,
+    };
+    assert!(store.add(0, event.clone()).unwrap_err().contains("repeats"));
+    event.zone.as_mut().unwrap().start_fold = Some(Earlier);
+    assert!(store.add(0, event.clone()).unwrap_err().contains("repeats"));
+    event.zone.as_mut().unwrap().end_fold = Some(Earlier);
+    store.add(0, event.clone()).unwrap();
+    event.id = Uuid::new_v4();
+    event.zone.as_mut().unwrap().start_fold = Some(Later);
+    let path = dir.path().join("calendar.json");
+    let before = std::fs::read(&path).unwrap();
+    assert!(store.add(1, event.clone()).unwrap_err().contains("after"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    event.zone.as_mut().unwrap().end_fold = Some(Later);
+    store.add(1, event.clone()).unwrap();
+    event.id = Uuid::new_v4();
+    event.zone.as_mut().unwrap().start_fold = Some(Earlier);
+    event.span = Span {
+        start: 110,
+        end: 70,
+    }; // 01:50 EDT to 01:10 EST is twenty minutes.
+    store.add(2, event.clone()).unwrap();
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    let day = store.day(event.date);
+    let spans: Vec<_> = day
+        .entries
+        .iter()
+        .map(|e| (e.span.start, e.span.end))
+        .collect();
+    assert_eq!(spans, [(310, 340), (350, 370), (370, 400)]);
+    assert_eq!(
+        day.entries[1].fields_on(event.date),
+        event.fields_on(event.date)
+    );
+    assert!(store.add(3, day.entries[1].clone()).is_err());
+}
+
+#[test]
+fn weekly_meetings_follow_the_source_clock_across_transitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let zone = chrono_tz::America::New_York;
+    let event = zoned("Monday review", "2026-03-02", 540, 600, zone, Kind::Weekly);
+    store.add(0, event).unwrap();
+    for (d, start) in [("2026-03-02", 840), ("2026-03-09", 780)] {
+        let day = date(d);
+        for view in CalendarView::ALL {
+            let row = store.page(day, Some(view)).on(day).next().unwrap();
+            assert_eq!(
+                row.span,
+                Span {
+                    start,
+                    end: start + 60
+                }
+            );
+            assert_eq!(row.fields_on(day).span.start, 540);
+        }
+        let mut hold = zoned("Hold", d, start, start + 30, zone, Kind::Hold);
+        hold.zone = None;
+        assert!(store.add(1, hold).unwrap_err().contains("busy"));
+    }
+    let event = zoned("Early Sunday", "2026-03-01", 130, 160, zone, Kind::Weekly);
+    store.add(1, event).unwrap();
+    assert!(store.day(date("2026-03-08")).entries.is_empty());
+    assert_eq!(store.day(date("2026-03-15")).entries[0].span.start, 370);
+    let event = zoned("Night duty", "2026-10-25", 70, 100, zone, Kind::Weekly);
+    store.add(2, event).unwrap();
+    assert_eq!(store.day(date("2026-11-01")).entries[0].span.start, 310);
+}
+
+#[test]
+fn midnight_segments_share_a_source_occurrence_for_search_and_editing() {
+    use atrium_calendar::{EditScope, SearchQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let event = zoned(
+        "Evening review",
+        "2026-12-31",
+        1110,
+        1170,
+        chrono_tz::America::New_York,
+        Kind::Weekly,
+    );
+    store.add(0, event.clone()).unwrap();
+    let tail = date("2027-01-01");
+    let day = store.day(tail);
+    assert_eq!(day.entries[0].span, Span { start: 0, end: 30 });
+    assert_eq!(
+        store
+            .page(tail, Some(CalendarView::Month))
+            .on(tail)
+            .next()
+            .unwrap()
+            .source
+            .unwrap()
+            .date,
+        event.date
+    );
+    let mut query = SearchQuery {
+        text: "review".into(),
+        start: event.date,
+        end: tail,
+    };
+    let results = store.search(&query, 0, None).unwrap();
+    assert_eq!(results.total, 1);
+    assert_eq!(
+        results.hits[0].span,
+        Span {
+            start: 1410,
+            end: 1440
+        }
+    );
+    query.start = tail;
+    let hit = &store.search(&query, 0, None).unwrap().hits[0];
+    assert_eq!(hit.date, tail);
+    assert_eq!(hit.source_zone, Some(chrono_tz::America::New_York));
+    let selected = store
+        .open_search_hit(1, hit.id, hit.date)
+        .unwrap()
+        .on(tail)
+        .next()
+        .unwrap();
+    let mut edit = selected.fields_on(tail);
+    assert_eq!(edit, event.fields_on(event.date));
+    edit.zone.as_mut().unwrap().name = chrono_tz::Asia::Kolkata;
+    edit.date = tail;
+    edit.span = Span { start: 30, end: 90 };
+    store
+        .change(1, event.id, tail, EditScope::ThisEvent, Some(edit))
+        .unwrap();
+    assert!(store.day(tail).entries.is_empty());
+    let moved = store.day(event.date).entries.remove(0);
+    assert_eq!(
+        moved.span,
+        Span {
+            start: 1140,
+            end: 1200
+        }
+    );
+    assert_eq!(
+        moved.kind,
+        Kind::Occurrence {
+            series: event.id,
+            original: event.date
+        }
+    );
+    assert_eq!(moved.source.unwrap().date, tail);
+    store
+        .change(2, moved.id, event.date, EditScope::ThisEvent, None)
+        .unwrap();
+    assert!(store.day(event.date).entries.is_empty());
+    assert_eq!(store.day(tail + Days::new(7)).entries[0].id, event.id);
+}
+
+#[test]
+fn zoned_write_preserves_version_two_floating_and_all_day_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calendar.json");
+    let legacy = br#"{"version":2,"revision":8,"opening_view":"Week","entries":[
+        {"id":"00000000-0000-0000-0000-000000000001","date":"2026-03-09","title":"Desk","span":{"start":540,"end":600},"kind":"Appointment"},
+        {"id":"00000000-0000-0000-0000-000000000002","date":"2026-03-09","title":"Travel","span":{"start":0,"end":1440},"kind":"AllDay"}
+    ]}"#;
+    std::fs::write(&path, legacy).unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let day = date("2026-03-09");
+    assert_eq!(store.page(day, None).view, CalendarView::Week);
+    assert_eq!(std::fs::read(&path).unwrap(), legacy);
+    store
+        .add(
+            8,
+            zoned(
+                "Zoned review",
+                "2026-03-09",
+                540,
+                600,
+                chrono_tz::America::New_York,
+                Kind::Appointment,
+            ),
+        )
+        .unwrap();
+    drop(store);
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(snapshot["version"], 3);
+    let page = Store::open(dir.path()).unwrap().page(day, None);
+    assert_eq!((page.revision, page.view), (9, CalendarView::Week));
+    let rows: Vec<_> = page
+        .on(day)
+        .map(|e| (e.title, e.span, e.zone.is_some()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "Travel".into(),
+                Span {
+                    start: 0,
+                    end: 1440
+                },
+                false
+            ),
+            (
+                "Desk".into(),
+                Span {
+                    start: 540,
+                    end: 600
+                },
+                false
+            ),
+            (
+                "Zoned review".into(),
+                Span {
+                    start: 780,
+                    end: 840
+                },
+                true
+            )
+        ]
+    );
 }

@@ -183,7 +183,19 @@ The window sends the query to its own Fasti over its existing authenticated sock
 
 **Synthetic verification.** The installed desktop check creates “Lantern” in both calendars. In Work the first weekly meeting moves from the first to the second of the month, and the second weekly meeting is skipped. Personal has one appointment on the third. The check searches by keyboard, opens each persona’s result and saves a marker event on the opened date. It also cancels the Work result from a second authorized connection while the results are visible, tries to open the stale row, searches again and opens the first remaining meeting on the fifteenth. The moved meeting opens on the second agenda page, after seven earlier entries. Both foreign peers are refused when they reach the opposite search socket. All 13 Calendar tests passed on the host and arm64 FreeBSD. [Installed desktop check](../../scripts/calendar-installed-guest-check.sh) · [Search and pagination fixtures](../../atrium-calendar/tests/views.rs)
 
-**Next C0 increment.** Add zoned local appointments. Preserve the source zone and distinguish both offsets in a repeated wall time. Verify a nonexistent time, a repeated time and a weekly meeting crossing a daylight-saving transition. Local undo remains open.
+### 7.6 Zoned appointments and weekly meetings
+
+Open **Zoned event…** from Today, Week or Month. Enter the date and wall times where the meeting is scheduled, then an IANA zone such as `America/New_York` or `Asia/Kolkata`. The editor previews both UTC offsets and the corresponding agenda times. **Save event** creates one appointment. **Save weekly** repeats at the source wall time. For example, a Monday 09:00 New York meeting appears at 14:00 UTC on March 2, 2026 and at 13:00 UTC on March 9.
+
+A wall time skipped by a clock change keeps the editor open so the person can choose another time. For a repeated hour, choose the first or second offset separately for each ambiguous endpoint. Calendar checks that the selected end instant follows the start, including meetings that cross the repeated hour. For a later weekly occurrence, a nonexistent endpoint skips that occurrence. A repeated endpoint uses the series’ saved choice or the first occurrence of the hour by default.
+
+The first implementation displays zoned commitments in UTC. Day, Week, Month, Find time, explicit holds and search use the same projected intervals. An interval crossing UTC midnight occupies both dates. A search covering both dates returns the occurrence once. Editing from either date reopens the source date, wall times and zone. Floating events keep their entered times and all-day entries keep their civil dates.
+
+Fasti stores the source schedule and optional offset choices in the persona’s private snapshot. Version 3 reads earlier snapshots and upgrades on the next successful write. Calendar and Fasti use the same embedded IANA rules (2025b) offline. The change requires no new jail grants. [Zone resolution](../../atrium-calendar/src/zone.rs) · [Synthetic transition fixtures](../../atrium-calendar/tests/views.rs)
+
+**Synthetic verification.** All 17 Calendar tests passed on the host and arm64 FreeBSD, including the first zoned write to a version-two store with floating and all-day entries. The installed check enters a nonexistent 02:10 and an ambiguous 01:10 through the Personal window, compares snapshot hashes after refused saves, selects the second offset and reads back the UTC interval. It also creates a weekly meeting through the window and checks both sides of the spring transition through the authorized persona socket. [Installed desktop check](../../scripts/calendar-installed-guest-check.sh)
+
+**Next C0 increment.** Add a viewing-zone setting per persona. Verify a change of viewing zone across midnight in day, week, search and Find time while preserving the source schedule. Local undo remains open.
 
 ## 8. Accepted decisions
 

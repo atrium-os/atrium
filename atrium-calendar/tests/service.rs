@@ -75,6 +75,8 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     assert_eq!(call(&socket, &query).unwrap().revision, 0);
     let event = Entry {
         excluded: Vec::new(),
+        zone: None,
+        source: None,
         id: Uuid::new_v4(),
         date,
         kind: Kind::Appointment,

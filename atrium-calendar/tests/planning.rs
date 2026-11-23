@@ -11,6 +11,8 @@ fn span(start: u16, end: u16) -> Span {
 fn entry(kind: Kind, time: Span) -> Entry {
     Entry {
         excluded: Vec::new(),
+        zone: None,
+        source: None,
         id: Uuid::new_v4(),
         kind,
         span: time,

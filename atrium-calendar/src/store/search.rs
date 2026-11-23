@@ -24,6 +24,8 @@ pub struct SearchHit {
     pub span: Span,
     pub title: String,
     pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_zone: Option<chrono_tz::Tz>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,16 +89,39 @@ impl Store {
             if !words.iter().all(|word| title.contains(word)) {
                 continue;
             }
-            let Some(mut date) = first_candidate(entry, query.start) else {
+            let (first, last) = if entry.zone.is_some() {
+                (
+                    query.start.pred_opt().unwrap_or(query.start),
+                    query.end.succ_opt().unwrap_or(query.end),
+                )
+            } else {
+                (query.start, query.end)
+            };
+            let Some(mut date) = first_candidate(entry, first) else {
                 continue;
             };
-            while date <= query.end {
+            while date <= last {
                 candidates += 1;
                 if candidates > MAX_CANDIDATES {
                     return Err("Too many occurrences. Narrow the dates or title.".into());
                 }
                 if entry.appears(date) {
-                    matches.push((date, entry));
+                    if let Some(zone) = entry.zone {
+                        if let Ok((start, _)) = zone.interval(
+                            date,
+                            entry.span,
+                            entry.kind == Kind::Weekly && date != entry.date,
+                        ) {
+                            let shown = start.date_naive().max(query.start);
+                            if shown <= query.end {
+                                if let Some(span) = entry.segment(date, shown) {
+                                    matches.push((shown, span, entry));
+                                }
+                            }
+                        }
+                    } else {
+                        matches.push((date, entry.span, entry));
+                    }
                 }
                 if entry.kind != Kind::Weekly {
                     break;
@@ -107,7 +132,7 @@ impl Store {
                 date = next;
             }
         }
-        matches.sort_unstable_by_key(|(date, e)| (*date, e.span.start, e.span.end, e.id));
+        matches.sort_unstable_by_key(|(date, span, e)| (*date, span.start, span.end, e.id));
         let total = matches.len();
         if offset != 0 && offset >= total {
             return Err("Result page is unavailable. Search again.".into());
@@ -116,10 +141,11 @@ impl Store {
             .into_iter()
             .skip(offset)
             .take(SEARCH_PAGE_SIZE)
-            .map(|(date, entry)| SearchHit {
+            .map(|(date, span, entry)| SearchHit {
                 id: entry.id,
                 date,
-                span: entry.span,
+                span,
+                source_zone: entry.zone.map(|z| z.name),
                 title: entry.title.clone(),
                 kind: entry.kind,
             })
@@ -142,7 +168,7 @@ impl Store {
                 .state
                 .entries
                 .iter()
-                .any(|e| e.id == id && e.appears(date))
+                .any(|e| e.id == id && e.on_day(date).is_some())
         {
             return Err("Calendar changed. Search again.".into());
         }

@@ -366,6 +366,62 @@ target=$(date -u -v3d +%Y-%m-%d)
 grep -Fq "\"date\":\"$target\",\"title\":\"home\"" "$personal_store/calendar.json"
 echo "PASS: persona-local title search, moved occurrence selection, stale result refusal and refreshed dates"
 
+# Enter the wall time in the native form. Keep the colon already in each field.
+zone_date() {
+    click 88 272
+    keys 74 76 76 76 76 76 76 76 76 76 76
+    keys "$@"
+}
+zone_time() {
+    click "$1" 272
+    keys 74 76 76 "$2" "$3" 79 76 76 "$4" "$5"
+}
+eastern() {
+    click 505 272
+    keys 74 76 76 76 24 22 56 8 4 22 23 8 21 17  # UTC -> us/eastern
+}
+sleep 1
+click 333 60
+click 120 193
+keys 17 12 10 11 23  # night
+zone_date 31 39 31 35 45 39 32 45 39 37  # 2026-03-08
+zone_time 225 39 31 30 39  # 02:10
+zone_time 325 39 31 33 39  # 02:40
+eastern
+before=$(sha256 -q "$personal_store/calendar.json")
+click 87 508
+test "$(sha256 -q "$personal_store/calendar.json")" = "$before"
+cp screen.png zone-gap.png
+zone_date 31 39 31 35 45 30 30 45 39 30  # 2026-11-01
+zone_time 225 39 30 30 39
+zone_time 325 39 30 33 39
+click 87 508
+test "$(sha256 -q "$personal_store/calendar.json")" = "$before"
+click 550 321
+click 550 375
+cp screen.png zone-fold.png
+click 87 508
+saved "$personal_store" night
+cp screen.png zone-agenda.png
+click 593 269          # Reopen the saved event, review deletion, then leave it in place.
+cp screen.png zone-reopened.png
+click 260 508
+cp screen.png zone-delete-review.png
+click 76 60
+saved "$personal_store" night
+
+click 333 60
+click 120 193
+keys 22 23 24 7 12 18  # studio
+zone_date 31 39 31 35 45 39 32 45 39 31  # 2026-03-02
+zone_time 225 39 38 39 39
+zone_time 325 30 39 39 39
+eastern
+click 248 508
+saved "$personal_store" studio
+jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --check-zones
+echo "PASS: gap and unresolved fold refused, second offset selected, weekly source time retained across DST"
+
 # Exercise the same authenticated SessionEnded message Ostiarius sends.
 printf '%s\n' '{"op":"hello","version":1}' '{"op":"session_ended","user":"calfixture"}' |
     su -m _ostiarius -c "nc -N -w 20 -U $psock" >logout.log

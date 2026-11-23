@@ -80,9 +80,11 @@ pub struct CalendarPage {
 }
 
 impl CalendarPage {
-    /// Fasti sorted the series by civil start, end and ID before sending them.
-    pub fn on(&self, date: NaiveDate) -> impl Iterator<Item = &Entry> + Clone {
-        self.entries.iter().filter(move |e| e.appears(date))
+    /// Sort after projection so each occurrence uses its offset on this date.
+    pub fn on(&self, date: NaiveDate) -> std::vec::IntoIter<Entry> {
+        let mut rows: Vec<_> = self.entries.iter().filter_map(|e| e.on_day(date)).collect();
+        rows.sort_by_key(|e| (e.span.start, e.span.end, e.id));
+        rows.into_iter()
     }
 
     /// Peak simultaneous commitments per half-hour. A pair of adjacent

@@ -148,7 +148,11 @@ impl SearchForm {
                 Kind::Hold => " · Private hold".into(),
                 _ => String::new(),
             };
-            Label::new(format!("{}   {when}{detail}", hit.date))
+            let basis = hit
+                .source_zone
+                .map(|z| format!(" UTC · {z}"))
+                .unwrap_or_default();
+            Label::new(format!("{}   {when}{basis}{detail}", hit.date))
                 .at(18., y + 21.)
                 .color(ctx.theme.text_secondary())
                 .render(ctx);

@@ -232,12 +232,15 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             .set_opening_view(revision, opening_view)
             .map(|()| store.page(date, Some(view))),
         Ok(Request::Day { date }) => Ok(store.page(date, Some(CalendarView::Today))),
-        Ok(Request::Add { revision, entry }) => {
-            let date = entry.date;
-            store
-                .add(revision, entry)
-                .map(|_| store.page(date, Some(CalendarView::Today)))
-        }
+        Ok(Request::Add { revision, entry }) => entry
+            .fields_on(entry.date)
+            .agenda_date()
+            .map_err(str::to_owned)
+            .and_then(|date| {
+                store
+                    .add(revision, entry)
+                    .map(|_| store.page(date, Some(CalendarView::Today)))
+            }),
         Ok(Request::Change {
             revision,
             id,
@@ -252,10 +255,12 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             let date = replacement
                 .as_ref()
                 .filter(|_| scope == EditScope::ThisEvent)
-                .map_or(shown, |edit| edit.date);
-            store
-                .change(revision, id, shown, scope, replacement)
-                .map(|()| store.page(date, Some(CalendarView::Today)))
+                .map_or(Ok(shown), |edit| edit.agenda_date());
+            date.map_err(str::to_owned).and_then(|date| {
+                store
+                    .change(revision, id, shown, scope, replacement)
+                    .map(|()| store.page(date, Some(CalendarView::Today)))
+            })
         }
         Ok(Request::Release { revision, date, id }) => store
             .release(revision, date, id)

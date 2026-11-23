@@ -50,7 +50,7 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1 | 2)
+                if !matches!(snapshot.version, 1 | 2 | 3)
                     || validate_records(&snapshot.entries).is_err()
                 {
                     return Err(io::Error::other("Invalid calendar snapshot"));
@@ -83,8 +83,21 @@ impl Store {
             .state
             .entries
             .iter()
-            .filter(|e| dates.iter().any(|&d| e.appears(d)))
-            .cloned()
+            .filter_map(|e| {
+                if view == CalendarView::Today {
+                    e.on_day(date)
+                } else if dates.iter().any(|&d| {
+                    if e.zone.is_some() {
+                        e.on_day(d).is_some()
+                    } else {
+                        e.appears(d)
+                    }
+                }) {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         entries.sort_by_key(|e| (e.span.start, e.span.end, e.id));
         let visible: HashSet<_> = entries.iter().map(|e| e.id).collect();
@@ -101,9 +114,10 @@ impl Store {
             .map(|e| (e.id, e.fields_on(e.date)))
             .collect();
         for entry in &mut entries {
-            entry
-                .excluded
-                .retain(|date| dates.binary_search(date).is_ok());
+            entry.excluded.retain(|date| {
+                *date >= dates[0].pred_opt().unwrap_or(dates[0])
+                    && *date <= dates.last().unwrap().succ_opt().unwrap_or(NaiveDate::MAX)
+            });
         }
         CalendarPage {
             series,
@@ -126,7 +140,10 @@ impl Store {
 
     pub fn add(&mut self, revision: u64, event: Entry) -> Result<(), String> {
         event.validate()?;
-        if !event.excluded.is_empty() || matches!(event.kind, Kind::Occurrence { .. }) {
+        if event.source.is_some()
+            || !event.excluded.is_empty()
+            || matches!(event.kind, Kind::Occurrence { .. })
+        {
             return Err("Use the occurrence editor to change a series".into());
         }
         if revision != self.state.revision {
@@ -143,7 +160,8 @@ impl Store {
                 .state
                 .entries
                 .iter()
-                .any(|e| e.appears(event.date) && e.span.overlaps(event.span))
+                .filter_map(|e| e.on_day(event.date))
+                .any(|e| e.span.overlaps(event.span))
         {
             return Err("That time is already busy".into());
         }
@@ -185,8 +203,12 @@ impl Store {
         let mut entries = self.state.entries.clone();
         let selected = entries
             .iter()
-            .position(|e| e.id == id && e.appears(shown))
+            .position(|e| e.id == id && e.on_day(shown).is_some())
             .ok_or("Event is no longer on this day")?;
+        let shown = entries[selected]
+            .on_day(shown)
+            .and_then(|e| e.source)
+            .map_or(shown, |s| s.date);
         let kind = entries[selected].kind;
         if kind == Kind::Hold {
             return Err("Release the hold from the agenda".into());
@@ -238,6 +260,7 @@ impl Store {
             entries[index].date = fields.date;
             entries[index].title = fields.title;
             entries[index].span = fields.span;
+            entries[index].zone = fields.zone;
         } else {
             entries.remove(index);
         }
@@ -253,7 +276,7 @@ impl Store {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 2,
+            version: 3,
             revision: revision.checked_add(1).ok_or("Revision limit reached")?,
             entries,
         };
@@ -283,6 +306,9 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
     }
     let mut by_id = BTreeMap::new();
     for e in entries {
+        if e.source.is_some() {
+            return Err("A projected row cannot be stored");
+        }
         e.validate()?;
         if by_id.insert(e.id, e).is_some() {
             return Err("Duplicate event identity");

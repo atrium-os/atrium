@@ -60,6 +60,8 @@ fn seed(socket: &Path, date: NaiveDate, work: bool) -> Result<(), String> {
     for (date, kind, title, start, end) in entries {
         let entry = Entry {
             excluded: Vec::new(),
+            zone: None,
+            source: None,
             id: Uuid::new_v4(),
             date,
             kind,
@@ -156,6 +158,8 @@ fn search_fixture(socket: &Path, today: NaiveDate, mode: &str) -> Result<(), Str
             date: if personal { private } else { first },
             title: "Lantern".into(),
             excluded: Vec::new(),
+            zone: None,
+            source: None,
             kind: if personal {
                 Kind::Appointment
             } else {
@@ -207,6 +211,8 @@ fn search_fixture(socket: &Path, today: NaiveDate, mode: &str) -> Result<(), Str
                         end: 495 + n * 15,
                     },
                     excluded: vec![],
+                    zone: None,
+                    source: None,
                 };
                 revision = call(
                     socket,
@@ -259,6 +265,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [socket, date, expected] = args.as_slice() else {
         return Err("expected socket, date and title (or --denied)".into());
     };
+    if expected == "--check-zones" {
+        for (d, title, start, end) in [
+            ("2026-11-01", "night", 370, 400),
+            ("2026-03-02", "studio", 840, 900),
+            ("2026-03-09", "studio", 780, 840),
+        ] {
+            let date = d.parse()?;
+            let day = call(Path::new(socket), &Request::Day { date })?;
+            let mut rows = day.entries.iter().filter(|e| e.title == title);
+            let row = rows.next().ok_or("Missing zoned meeting")?;
+            let zone = row.zone.ok_or("Missing source zone")?;
+            let source = row.source.ok_or("Missing source schedule")?;
+            if rows.next().is_some()
+                || row.span != (Span { start, end })
+                || source.date != date
+                || zone.name != chrono_tz::US::Eastern
+                || (title == "studio" && (row.kind != Kind::Weekly || source.span.start != 540))
+                || (title == "night"
+                    && (zone.start_fold != Some(atrium_calendar::Fold::Later)
+                        || zone.end_fold != zone.start_fold))
+            {
+                return Err("Incorrect source schedule, UTC span or offset choice".into());
+            }
+        }
+        return Ok(());
+    }
     if matches!(
         expected.as_str(),
         "--seed-search-personal"

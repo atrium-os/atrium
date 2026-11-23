@@ -1,4 +1,6 @@
-//! Manual local planning. Times are floating civil minutes within the selected date.
+//! Persona-local planning with floating, all-day and source-zoned commitments.
+pub mod zone;
+pub use zone::{Fold, SourceSlot, Zone};
 mod period;
 pub use period::{CalendarPage, CalendarView};
 pub mod store;
@@ -36,6 +38,10 @@ pub struct Entry {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<Zone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceSlot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,17 +63,29 @@ pub enum EditScope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<Zone>,
     pub date: NaiveDate,
     pub title: String,
     pub span: Span,
 }
 
+impl EventEdit {
+    pub fn agenda_date(&self) -> Result<NaiveDate, &'static str> {
+        match self.zone {
+            Some(zone) => Ok(zone.interval(self.date, self.span, false)?.0.date_naive()),
+            None => Ok(self.date),
+        }
+    }
+}
+
 impl Entry {
     pub fn fields_on(&self, date: NaiveDate) -> EventEdit {
         EventEdit {
-            date,
+            date: self.source.map_or(date, |s| s.date),
             title: self.title.clone(),
-            span: self.span,
+            span: self.source.map_or(self.span, |s| s.span),
+            zone: self.zone,
         }
     }
 
@@ -89,6 +107,17 @@ impl Entry {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(zone) = self.zone {
+            if matches!(self.kind, Kind::Hold | Kind::AllDay) {
+                return Err("Only timed meetings have a source zone");
+            }
+            if self.source.is_none() {
+                zone.interval(self.date, self.span, false)?;
+                return validate_identity_title(self.id, &self.title);
+            }
+        } else if self.source.is_some() {
+            return Err("Missing source zone");
+        }
         validate_event_fields(self.id, &self.title, self.span, self.kind)
     }
 }
@@ -99,15 +128,7 @@ fn validate_event_fields(
     span: Span,
     kind: Kind,
 ) -> Result<(), &'static str> {
-    if id.is_nil()
-        || title.trim().is_empty()
-        || title.len() > 160
-        || title.chars().any(|c| {
-            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
-    {
-        return Err("Enter a title of up to 160 bytes without control characters");
-    }
+    validate_identity_title(id, title)?;
     if !span.valid()
         || (kind == Kind::AllDay
             && span
@@ -117,6 +138,19 @@ fn validate_event_fields(
                 }))
     {
         return Err("Invalid event time range");
+    }
+    Ok(())
+}
+
+fn validate_identity_title(id: Uuid, title: &str) -> Result<(), &'static str> {
+    if id.is_nil()
+        || title.trim().is_empty()
+        || title.len() > 160
+        || title.chars().any(|c| {
+            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return Err("Enter a title of up to 160 bytes without control characters");
     }
     Ok(())
 }

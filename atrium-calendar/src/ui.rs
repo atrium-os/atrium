@@ -46,6 +46,9 @@ enum Action {
     SearchPanel(bool),
     Search(Option<usize>),
     OpenHit(Uuid, NaiveDate, u64),
+    NewZoned,
+    CreateZoned(Kind),
+    ChooseFold(bool, atrium_calendar::Fold),
     Find,
     Page(usize),
 }
@@ -150,6 +153,13 @@ impl Planner {
                 },
             ));
         }
+        if let Action::CreateZoned(kind) = action {
+            return self
+                .editor
+                .get_cloned()
+                .ok_or("Open the zoned event form first")?
+                .create(kind);
+        }
         if let Action::Change(delete) = action {
             return self
                 .editor
@@ -207,6 +217,8 @@ impl Planner {
         };
         let entry = Entry {
             excluded: Vec::new(),
+            zone: None,
+            source: None,
             id: Uuid::new_v4(),
             date,
             title,
@@ -238,8 +250,11 @@ impl View for Planner {
         rect(ctx, 0., 0., 700., 84., theme.bg_surface());
         rect(ctx, 0., 84., 700., 1., theme.border_default());
         let search = self.search.get_cloned();
+        let editor = self.editor.get_cloned();
         Label::new(if search.is_some() {
             "Search".into()
+        } else if editor.is_some() {
+            "Calendar".into()
         } else {
             heading
         })
@@ -259,7 +274,7 @@ impl View for Planner {
             form.render(self, ctx);
             return;
         }
-        if let Some(edit) = self.editor.get_cloned() {
+        if let Some(edit) = editor {
             self.render_editor(ctx, &edit);
             return;
         }
@@ -328,6 +343,7 @@ impl View for Planner {
                 Action::Browse(choice, date),
             );
         }
+        self.button(ctx, 283., 44., 104., "Zoned event…", Action::NewZoned);
         self.button(ctx, 396., 44., 121., "Search…", Action::SearchPanel(true));
         self.button(
             ctx,
@@ -397,9 +413,13 @@ impl View for Planner {
         let page = self.page.get();
         let mut rows = Vec::new();
         if self.finding.get() {
-            Label::new("45 minutes between 09:00 and 17:00")
-                .at(18., 222.)
-                .render(ctx);
+            Label::new(if day.entries.iter().any(|e| e.zone.is_some()) {
+                "45 minutes between 09:00 and 17:00 · zoned events in UTC"
+            } else {
+                "45 minutes between 09:00 and 17:00"
+            })
+            .at(18., 222.)
+            .render(ctx);
             for gap in day.openings(WORKDAY, 45).expect("constant valid window") {
                 let span = Span {
                     start: gap.start,
@@ -417,7 +437,13 @@ impl View for Planner {
                 ));
             }
         } else {
-            Label::new("Agenda · local time").at(18., 222.).render(ctx);
+            Label::new(if day.entries.iter().any(|e| e.zone.is_some()) {
+                "Agenda · zoned events in UTC"
+            } else {
+                "Agenda · local time"
+            })
+            .at(18., 222.)
+            .render(ctx);
             for e in day.entries {
                 let label = match e.kind {
                     Kind::Weekly | Kind::Occurrence { .. } => "Weekly · ",
@@ -428,7 +454,12 @@ impl View for Planner {
                 let time = if e.kind == Kind::AllDay {
                     String::new()
                 } else {
-                    format!("{}–{}   ", clock(e.span.start), clock(e.span.end))
+                    format!(
+                        "{}–{}{}   ",
+                        clock(e.span.start),
+                        clock(e.span.end),
+                        if e.zone.is_some() { " UTC" } else { "" }
+                    )
                 };
                 let title: String = e
                     .title
@@ -549,6 +580,18 @@ pub fn run() -> io::Result<()> {
                         planner.status.set(e);
                     }
                 }
+                Action::NewZoned => {
+                    if let Err(e) = planner.new_zoned() {
+                        planner.status.set(e);
+                    }
+                }
+                Action::ChooseFold(end, choice) => {
+                    if let Some(mut edit) = planner.editor.get_cloned() {
+                        edit.choose_fold(end, choice);
+                        planner.editor.set(Some(edit));
+                        planner.status.set(String::new());
+                    }
+                }
                 Action::Review(stage) => {
                     if let Err(e) = planner.review(stage) {
                         planner.status.set(e);
@@ -626,6 +669,7 @@ pub fn run() -> io::Result<()> {
                             | Action::Browse(..)
                             | Action::Change(_)
                             | Action::OpenHit(..)
+                            | Action::CreateZoned(_)
                     ) {
                         planner.date.set(TextEdit::new(&date.to_string()));
                         planner.finding.set(false);
@@ -635,7 +679,7 @@ pub fn run() -> io::Result<()> {
                     planner.shown.set(date);
                     planner.data.set(Some(data));
                     planner.page.set(selected.unwrap_or(0) / PAGE);
-                    if matches!(action, Action::Save(_)) {
+                    if matches!(action, Action::Save(_) | Action::CreateZoned(_)) {
                         planner.title.set(TextEdit::new(""));
                     }
                     planner.status.set(
@@ -646,7 +690,7 @@ pub fn run() -> io::Result<()> {
                             Action::SetOpening(_) => "Opening view saved",
                             Action::Hold(_) => "Held on this device",
                             Action::Release(_) => "Hold released",
-                            Action::Save(_) => "Event saved",
+                            Action::Save(_) | Action::CreateZoned(_) => "Event saved",
                             _ => "On this device",
                         }
                         .into(),

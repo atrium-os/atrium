@@ -71,7 +71,12 @@ impl Planner {
                 let mut detail = if first.kind == Kind::AllDay {
                     "All day".into()
                 } else {
-                    format!("{}–{}", clock(first.span.start), clock(first.span.end))
+                    format!(
+                        "{}–{}{}",
+                        clock(first.span.start),
+                        clock(first.span.end),
+                        if first.zone.is_some() { " UTC" } else { "" }
+                    )
                 };
                 let more = entries.count();
                 if more > 0 {
