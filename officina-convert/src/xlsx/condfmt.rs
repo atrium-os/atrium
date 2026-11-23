@@ -32,8 +32,8 @@ pub fn dxfs(wb: &Workbook) -> Vec<Dxf> {
 /// The same workbook-wide indices are used by the styles part and each sheet.
 pub(super) struct DxfTable {
     pub rules: Vec<Dxf>,
-    colors: Vec<ColorFilter>,
-    color_ids: HashMap<ColorFilter, usize>,
+    colors: Vec<AppearanceFilter>,
+    color_ids: HashMap<AppearanceFilter, usize>,
 }
 
 impl DxfTable {
@@ -45,7 +45,7 @@ impl DxfTable {
         let tables = wb.tables().iter().filter_map(|t| t.filter.as_ref()).map(|f| f.conds.as_slice());
         for conds in worksheet.chain(tables) {
             for (_, cond) in conds {
-                if let Cond::Appearance(AppearanceFilter::Color(color)) = cond {
+                if let Cond::Appearance(color @ (AppearanceFilter::Color(_) | AppearanceFilter::Pattern(_))) = cond {
                     color_ids.entry(*color).or_insert_with(|| {
                         let id = rules.len() + colors.len();
                         colors.push(*color);
@@ -57,7 +57,7 @@ impl DxfTable {
         Self { rules, colors, color_ids }
     }
 
-    pub fn color_id(&self, color: ColorFilter) -> usize {
+    pub fn color_id(&self, color: AppearanceFilter) -> usize {
         self.color_ids[&color]
     }
 }
@@ -93,12 +93,22 @@ pub(super) fn dxfs_xml(table: &DxfTable, num_fmt_id: &mut dyn FnMut(&str) -> u32
         if let Some(code) = &d.num_fmt {
             let _ = write!(o, r#"<numFmt numFmtId="{}" formatCode="{}"/>"#, num_fmt_id(code), esc(code));
         }
-        if let Some(c) = d.fill {
+        if let Some(pattern) = d.pattern {
+            super::styles::write_pattern(&mut o, pattern);
+        } else if let Some(c) = d.fill {
             let _ = write!(o, r#"<fill><patternFill patternType="solid"><fgColor rgb="FF{c:06X}"/><bgColor rgb="FF{c:06X}"/></patternFill></fill>"#);
         }
         o.push_str("</dxf>");
     }
     for color in &table.colors {
+        let AppearanceFilter::Color(color) = color else {
+            if let AppearanceFilter::Pattern(pattern) = color {
+                o.push_str("<dxf>");
+                super::styles::write_pattern(&mut o, *pattern);
+                o.push_str("</dxf>");
+            }
+            continue;
+        };
         match (color.cell, color.rgb) {
             (true, Some(c)) => {
                 let _ = write!(o, r#"<dxf><fill><patternFill patternType="solid"><fgColor rgb="FF{c:06X}"/></patternFill></fill></dxf>"#);
@@ -146,14 +156,15 @@ pub(super) fn sheet_xml(wb: &Workbook, s: u16, dxfs: &[Dxf], o: &mut Vec<u8>, ex
         let mut x = format!(r#"<conditionalFormatting sqref="{refs}">"#);
         let start = x.len();
         for rule in &f.rules {
-            if let RuleKind::IconSet { set, points, reverse, show_value } = &rule.kind {
-                if extended_icon_set(*set) {
+            if let RuleKind::IconSet { set, points, reverse, show_value, icons } = &rule.kind {
+                if extended_icon_set(*set) || icons.is_some() {
                     let name = ICON_SETS[*set as usize].0;
                     let _ = write!(extended, concat!(
                         r#"<x14:conditionalFormatting><x14:cfRule type="iconSet" priority="{priority}" "#,
                         r#"id="{{00000000-0000-4000-8000-{s:04X}{priority:08X}}}">"#,
-                        r#"<x14:iconSet iconSet="{name}" reverse="{}" showValue="{}">"#,
-                    ), u8::from(*reverse), u8::from(*show_value), priority = priority, s = s, name = name);
+                        r#"<x14:iconSet iconSet="{name}" reverse="{}" showValue="{}"{}>"#,
+                    ), u8::from(*reverse && icons.is_none()), u8::from(*show_value),
+                        if icons.is_some() { r#" custom="1""# } else { "" }, priority = priority, s = s, name = name);
                     for (point, gte) in points {
                         let (kind, value) = match point {
                             Cfvo::Min => ("percent", "0".into()),
@@ -164,6 +175,12 @@ pub(super) fn sheet_xml(wb: &Workbook, s: u16, dxfs: &[Dxf], o: &mut Vec<u8>, ex
                             Cfvo::Formula(expr) => ("formula", ftext(expr)),
                         };
                         let _ = write!(extended, r#"<x14:cfvo type="{kind}" gte="{}"><xm:f>{value}</xm:f></x14:cfvo>"#, u8::from(*gte));
+                    }
+                    if let Some(icons) = icons {
+                        for &icon in icons {
+                            let (set, index) = icon.map_or(("NoIcons", 0), |(set, index)| (ICON_SETS[set as usize].0, index));
+                            let _ = write!(extended, r#"<x14:cfIcon iconSet="{set}" iconId="{index}"/>"#);
+                        }
                     }
                     let _ = write!(extended, "</x14:iconSet></x14:cfRule><xm:sqref>{refs}</xm:sqref></x14:conditionalFormatting>");
                     priority += 1;
@@ -260,7 +277,7 @@ pub(super) fn sheet_xml(wb: &Workbook, s: u16, dxfs: &[Dxf], o: &mut Vec<u8>, ex
                     cfvo(&mut x, max);
                     let _ = write!(x, r#"<color rgb="FF{color:06X}"/></dataBar>"#);
                 }
-                RuleKind::IconSet { set, points, reverse, show_value } => {
+                RuleKind::IconSet { set, points, reverse, show_value, .. } => {
                     head(&mut x, "iconSet", "", false);
                     let name = ICON_SETS[*set as usize].0;
                     let _ = write!(x, r#"<iconSet iconSet="{name}""#);
@@ -309,13 +326,16 @@ pub(super) struct DxfIn {
 
 #[cfg(feature = "read")]
 impl DxfIn {
-    pub fn filter_color(&self, cell: bool) -> Option<ColorFilter> {
+    pub fn filter_color(&self, cell: bool) -> Option<AppearanceFilter> {
+        if let Some(pattern) = self.style.pattern.filter(|_| cell && !self.unsupported_fill) {
+            return Some(AppearanceFilter::Pattern(pattern));
+        }
         let (unsupported, rgb) = if cell {
             (self.unsupported_fill, self.style.fill)
         } else {
             (self.unsupported_font, self.style.color)
         };
-        (!unsupported).then_some(ColorFilter { cell, rgb })
+        (!unsupported).then_some(AppearanceFilter::Color(ColorFilter { cell, rgb }))
     }
 }
 
@@ -328,6 +348,7 @@ pub(super) fn read_dxfs(xml: &[u8], colors: &super::styles::Colors<'_>) -> Vec<D
     let (mut in_dxfs, mut cur, mut where_) = (false, None::<DxfIn>, 0u8);
     let mut pattern = None::<String>;
     let mut foreground = None;
+    let mut background = None;
     let mut has_fill_color = false;
     let mut fmts: HashMap<u32, String> = HashMap::new();
     loop {
@@ -343,7 +364,12 @@ pub(super) fn read_dxfs(xml: &[u8], colors: &super::styles::Colors<'_>) -> Vec<D
                             if pattern.as_deref() == Some("solid") {
                                 record.style.fill = foreground.or(record.style.fill);
                             }
-                            if (has_fill_color || pattern.as_deref() == Some("solid")) && record.style.fill.is_none() {
+                            if let Some(name) = pattern.as_deref().filter(|name| !matches!(*name, "none" | "solid")) {
+                                record.style.pattern = officina_grid::style::PatternFill::new(name, foreground, background);
+                                record.unsupported_fill |= record.style.pattern.is_none();
+                                record.style.fill = record.style.pattern.and_then(|pattern| pattern.preview()).or(record.style.fill);
+                            }
+                            if record.style.pattern.is_none() && (has_fill_color || pattern.as_deref() == Some("solid")) && record.style.fill.is_none() {
                                 record.unsupported_fill = true;
                             }
                             out.push(record);
@@ -370,6 +396,7 @@ pub(super) fn read_dxfs(xml: &[u8], colors: &super::styles::Colors<'_>) -> Vec<D
                     cur = Some(DxfIn::default());
                     pattern = None;
                     foreground = None;
+                    background = None;
                     has_fill_color = false;
                 }
             }
@@ -397,13 +424,13 @@ pub(super) fn read_dxfs(xml: &[u8], colors: &super::styles::Colors<'_>) -> Vec<D
                     b"gradientFill" if where_ == 2 => record.unsupported_fill = true,
                     b"patternFill" if where_ == 2 => {
                         pattern = a.get(b"patternType".as_slice()).cloned();
-                        record.unsupported_fill |= pattern.as_deref().is_some_and(|s| !matches!(s, "none" | "solid"));
                     }
                     // Excel also writes differential colors as a lone bgColor
                     // without patternType. An explicit solid uses its foreground.
                     b"bgColor" if where_ == 2 && pattern.as_deref() != Some("none") => {
                         has_fill_color = true;
-                        d.fill = colors.of(&a).or(d.fill);
+                        background = colors.of(&a);
+                        d.fill = background.or(d.fill);
                     }
                     b"fgColor" if where_ == 2 && pattern.as_deref() != Some("none") => {
                         has_fill_color = true;
@@ -493,6 +520,7 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
         let (mut formulas, mut cfvos, mut colors): (Vec<String>, Vec<(String, Option<String>)>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
         // Each point's gte (icon sets), as read.
         let mut gtes: Vec<bool> = Vec::new();
+        let mut icons = Vec::new();
         let mut in_formula = false;
         let mut in_point = false;
         loop {
@@ -511,9 +539,10 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
                     cfvos.clear();
                     colors.clear();
                     gtes.clear();
+                    icons.clear();
                 }
                 Ok(Event::Empty(e)) if e.local_name().as_ref() == b"cfRule" && !raw.extended => {
-                    if let Some(x) = make(wb, s, origin, attrs(&e), &[], &[], &[], &[], dxfs, rep) {
+                    if let Some(x) = make(wb, s, origin, attrs(&e), &[], &[], &[], &[], &[], dxfs, rep) {
                         rules.push(x);
                     }
                 }
@@ -541,14 +570,14 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
                         }
                         b"color" => colors.push(palette.of(&a).unwrap_or(0)),
                         // The set's own attributes join the rule's (cfRule has none of these names).
-                        b"iconSet" if raw.extended && a.get(b"custom".as_slice()).is_some_and(|v| matches!(v.as_str(), "1" | "true")) => {
-                            rep.note(Kind::Dropped, "conditional formats with custom icon combinations");
-                            unsupported_icon_filter |= affects_icon_filter(&ranges);
-                            rule = None;
+                        b"cfIcon" if raw.extended => {
+                            if icons.len() < 6 {
+                                icons.push(read_custom_icon(&a));
+                            }
                         }
                         b"iconSet" => {
                             if let Some(r) = rule.as_mut() {
-                                for k in ["iconSet", "reverse", "showValue"] {
+                                for k in ["iconSet", "reverse", "showValue", "custom"] {
                                     if let Some(v) = a.get(k.as_bytes()) {
                                         r.insert(format!("icon.{k}").into_bytes(), v.clone());
                                     }
@@ -564,8 +593,12 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
                     b"cfvo" => in_point = false,
                     b"cfRule" => {
                         if let Some(a) = rule.take() {
-                            if let Some(x) = make(wb, s, origin, a, &formulas, &cfvos, &gtes, &colors, dxfs, rep) {
+                            let custom = a.get(b"icon.custom".as_slice()).is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+                            if let Some(x) = make(wb, s, origin, a, &formulas, &cfvos, &gtes, &colors, &icons, dxfs, rep) {
                                 rules.push(x);
+                            } else if custom {
+                                rep.note(Kind::Dropped, "malformed custom conditional icons");
+                                unsupported_icon_filter |= affects_icon_filter(&ranges);
                             }
                         }
                     }
@@ -586,7 +619,7 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
 
     if unsupported_icon_filter {
         wb.sheet_mut(s).filter = None;
-        rep.note(Kind::Approximate, "filters using custom icon combinations (rows stay as the file hid them)");
+        rep.note(Kind::Approximate, "filters using malformed custom icons (rows stay as the file hid them)");
     }
 
     // The priority applies to the whole sheet. Keep consecutive rules with the
@@ -606,12 +639,24 @@ pub(super) fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[DxfIn]
 }
 
 #[cfg(feature = "read")]
+fn read_custom_icon(attrs: &HashMap<Vec<u8>, String>) -> Option<Option<(u8, u8)>> {
+    let set = attrs.get(b"iconSet".as_slice())?;
+    let index: u8 = attrs.get(b"iconId".as_slice())?.parse().ok()?;
+    if set == "NoIcons" { return (index == 0).then_some(None); }
+    let set = officina_grid::condfmt::icon_set(set)?;
+    (index < ICON_SETS[set as usize].1).then_some(Some((set, index)))
+}
+
+#[cfg(feature = "read")]
 #[allow(clippy::too_many_arguments)]
-fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, formulas: &[String], cfvos: &[(String, Option<String>)], gtes: &[bool], colors: &[u32], dxfs: &[DxfIn], rep: &mut Report) -> Option<(u32, Rule)> {
+fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, formulas: &[String], cfvos: &[(String, Option<String>)], gtes: &[bool], colors: &[u32], icons: &[Option<Option<(u8, u8)>>], dxfs: &[DxfIn], rep: &mut Report) -> Option<(u32, Rule)> {
     let get = |k: &str| a.get(k.as_bytes()).map(String::as_str);
     let flag = |k: &str| get(k).is_some_and(|v| v == "1" || v == "true");
     let priority = get("priority").and_then(|v| v.parse().ok()).unwrap_or(u32::MAX);
     let dxf = get("dxfId").and_then(|v| v.parse::<usize>().ok()).and_then(|i| dxfs.get(i)).map(|d| d.style.clone()).unwrap_or_default();
+    if dxf.pattern.is_some() {
+        rep.note(Kind::Approximate, "patterned fills shown solid");
+    }
     let fx = |t: &str| wb.cond_formula(&super::read::formula_in(t), s, origin).ok();
     let point = |(t, v): &(String, Option<String>)| -> Option<Cfvo> {
         let num = || v.as_deref().and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite());
@@ -664,14 +709,25 @@ fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, 
                 rep.note_at(Kind::Dropped, "icon sets Officina doesn't have", || name.to_string());
                 return None;
             };
-            let n = officina_grid::condfmt::ICON_SETS[set as usize].1 as usize;
+            let custom = flag("icon.custom");
+            let n = if custom { icons.len() } else { ICON_SETS[set as usize].1 as usize };
+            if !(3..=5).contains(&n) {
+                return None;
+            }
             let points: Option<Vec<(Cfvo, bool)>> = cfvos.iter().zip(gtes.iter().chain(std::iter::repeat(&true))).map(|(c, g)| point(c).map(|p| (p, *g))).collect();
             let points = match points {
                 Some(p) if p.len() == n => p,
-                _ => officina_grid::condfmt::icon_points(n as u8),
+                _ if !custom => officina_grid::condfmt::icon_points(n as u8),
+                _ => return None,
+            };
+            let icons = if custom {
+                Some(icons.iter().copied().collect::<Option<Vec<_>>>()?)
+            } else {
+                None
             };
             let off = |k: &str| get(k).is_some_and(|v| v == "0" || v == "false");
-            RuleKind::IconSet { set, points, reverse: flag("icon.reverse"), show_value: !off("icon.showValue") }
+            RuleKind::IconSet { set, points, reverse: !custom && flag("icon.reverse"), show_value: !off("icon.showValue"), icons }
+
         }
         other => {
             rep.note_at(Kind::Dropped, "conditional format rules of kinds Officina doesn't have", || other.to_string());

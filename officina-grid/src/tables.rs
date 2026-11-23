@@ -66,8 +66,14 @@ impl Table {
     fn valid_filter(&self) -> bool {
         let Some(filter) = &self.filter else { return true };
         let Some(rect) = self.relative_filter_rect() else { return false };
-        let unique: std::collections::HashSet<_> = filter.conds.iter().map(|(c, _)| *c).collect();
-        unique.len() == filter.conds.len()
+        let unique: std::collections::HashSet<_> = filter.conds.iter().filter(|(_, cond)| !cond.is_expression()).map(|(c, _)| *c).collect();
+        let expressions: Vec<_> = filter.conds.iter().filter_map(|(c, cond)| match cond {
+            Cond::Expression(expr) => Some((*c, expr)),
+            _ => None,
+        }).collect();
+        expressions.len() <= 1
+            && expressions.iter().all(|(c, expr)| *c == 0 && expr.fits(rect.c1 + 1))
+            && unique.len() + expressions.len() == filter.conds.len()
             && unique.iter().all(|c| *c <= rect.c1)
             && filter.hidden.iter().all(|(lo, hi)| *lo >= u32::from(self.header) && lo <= hi && *hi <= rect.r1)
             && filter.hidden.windows(2).all(|w| w[0].1 + 1 < w[1].0)

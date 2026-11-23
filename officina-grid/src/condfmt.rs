@@ -10,6 +10,7 @@ use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
 use crate::eval::{to_bool, Ctx};
 use crate::formula::{self, Expr, ParseError};
+use crate::style::PatternFill;
 use crate::value::{cmp_text, compare, Value};
 use officina_core::wire::{Reader, WireError, Writer};
 use std::cmp::Ordering;
@@ -36,6 +37,7 @@ pub struct Dxf {
     pub strike: Option<bool>,
     /// Background, 0xRRGGBB.
     pub fill: Option<u32>,
+    pub pattern: Option<PatternFill>,
     /// A number format code.
     pub num_fmt: Option<Arc<str>>,
 }
@@ -120,7 +122,7 @@ pub enum RuleKind {
     /// usually 0 %), each met by values at or above it (`true`) or above it.
     /// `reverse` gives the highest values the first icon; `show_value: false`
     /// shows only the icon.
-    IconSet { set: u8, points: Vec<(Cfvo, bool)>, reverse: bool, show_value: bool },
+    IconSet { set: u8, points: Vec<(Cfvo, bool)>, reverse: bool, show_value: bool, icons: Option<Vec<Option<(u8, u8)>>> },
 }
 
 /// Icon sets, by their file names, and how many icons each has. The first
@@ -180,8 +182,8 @@ impl RuleKind {
             RuleKind::Expression(e) => RuleKind::Expression(m(e)),
             RuleKind::ColorScale(pts) => RuleKind::ColorScale(pts.iter().map(|(c, k)| (v(c), *k)).collect()),
             RuleKind::DataBar { min, max, color } => RuleKind::DataBar { min: v(min), max: v(max), color: *color },
-            RuleKind::IconSet { set, points, reverse, show_value } => {
-                RuleKind::IconSet { set: *set, points: points.iter().map(|(c, k)| (v(c), *k)).collect(), reverse: *reverse, show_value: *show_value }
+            RuleKind::IconSet { set, points, reverse, show_value, icons } => {
+                RuleKind::IconSet { set: *set, points: points.iter().map(|(c, k)| (v(c), *k)).collect(), reverse: *reverse, show_value: *show_value, icons: icons.clone() }
             }
             other => other.clone(),
         }
@@ -218,6 +220,7 @@ pub struct Look {
     pub icon: Option<(u8, u8)>,
     /// Only the icon shows, not the value.
     pub hide_value: bool,
+    pub icon_assigned: bool,
 }
 
 impl Look {
@@ -456,7 +459,7 @@ impl Workbook {
                 }
             }
             RuleKind::ColorScale(points) => {
-                if out.scale.is_some() || out.dxf.fill.is_some() {
+                if out.scale.is_some() || out.dxf.fill.is_some() || out.dxf.pattern.is_some() {
                     return false;
                 }
                 let Value::Num(x) = v else { return false };
@@ -477,13 +480,13 @@ impl Workbook {
                 out.bar = Some(((0.1 + 0.9 * frac) as f32, *color));
                 false
             }
-            RuleKind::IconSet { set, points, reverse, show_value } => {
-                if out.icon.is_some() {
+            RuleKind::IconSet { set, points, reverse, show_value, icons } => {
+                if out.icon_assigned {
                     return false;
                 }
                 let Value::Num(x) = v else { return false };
-                let n = ICON_SETS.get(*set as usize).map_or(0, |s| s.1) as usize;
-                if n == 0 || points.len() != n {
+                let n = icons.as_ref().map_or_else(|| ICON_SETS.get(*set as usize).map_or(0, |s| s.1 as usize), Vec::len);
+                if !(3..=5).contains(&n) || points.len() != n {
                     return false;
                 }
                 let st = self.stats(fi, ri, f);
@@ -495,8 +498,12 @@ impl Workbook {
                         k = i;
                     }
                 }
-                let k = if *reverse { n - 1 - k } else { k };
-                out.icon = Some((*set, k as u8));
+                let k = if *reverse && icons.is_none() { n - 1 - k } else { k };
+                out.icon = match icons {
+                    Some(icons) => icons.get(k).copied().flatten(),
+                    None => Some((*set, k as u8)),
+                };
+                out.icon_assigned = true;
                 out.hide_value = !show_value;
                 false
             }
@@ -595,7 +602,10 @@ fn merge(into: &mut Dxf, d: &Dxf) {
     into.italic = into.italic.or(d.italic);
     into.underline = into.underline.or(d.underline);
     into.strike = into.strike.or(d.strike);
-    into.fill = into.fill.or(d.fill);
+    if into.fill.is_none() && into.pattern.is_none() {
+        into.fill = d.fill;
+        into.pattern = d.pattern;
+    }
     into.num_fmt = into.num_fmt.clone().or(d.num_fmt.clone());
 }
 
@@ -647,7 +657,10 @@ impl CondFormat {
                 tri(w, b);
             }
             w.str(d.num_fmt.as_deref().unwrap_or(""));
-            w.u8(rule.stop as u8);
+            w.u8(rule.stop as u8 | (d.pattern.is_some() as u8) << 1);
+            if let Some(pattern) = d.pattern {
+                pattern.encode(w);
+            }
             let cfvo = |w: &mut Writer, p: &Cfvo| match p {
                 Cfvo::Min => w.u8(0),
                 Cfvo::Max => w.u8(1),
@@ -720,14 +733,25 @@ impl CondFormat {
                     cfvo(w, max);
                     w.u32(*color);
                 }
-                RuleKind::IconSet { set, points, reverse, show_value } => {
+                RuleKind::IconSet { set, points, reverse, show_value, icons } => {
                     w.u8(10);
                     w.u8(*set);
-                    w.u8(*reverse as u8 | (*show_value as u8) << 1);
+                    w.u8(*reverse as u8 | (*show_value as u8) << 1 | (icons.is_some() as u8) << 2);
                     w.var(points.len() as u64);
                     for (p, gte) in points {
                         cfvo(w, p);
                         w.u8(*gte as u8);
+                    }
+                    if let Some(icons) = icons {
+                        for icon in icons {
+                            match icon {
+                                None => w.u8(u8::MAX),
+                                Some((set, index)) => {
+                                    w.u8(*set);
+                                    w.u8(*index);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -768,8 +792,10 @@ impl CondFormat {
             let fill = read_color(r)?;
             let (bold, italic, underline, strike) = (read_tri(r)?, read_tri(r)?, read_tri(r)?, read_tri(r)?);
             let nf = r.str("number format", 255)?;
-            let dxf = Dxf { color, bold, italic, underline, strike, fill, num_fmt: (!nf.is_empty()).then(|| Arc::from(nf)) };
-            let stop = r.u8()? != 0;
+            let flags = r.u8()?;
+            let pattern = if flags & 2 != 0 { Some(PatternFill::decode(r)?) } else { None };
+            let dxf = Dxf { color, bold, italic, underline, strike, fill, pattern, num_fmt: (!nf.is_empty()).then(|| Arc::from(nf)) };
+            let stop = flags & 1 != 0;
             let cfvo = |r: &mut Reader| -> Result<Cfvo, WireError> {
                 Ok(match r.u8()? {
                     0 => Cfvo::Min,
@@ -828,7 +854,8 @@ impl CondFormat {
                     let Some(&(_, n)) = ICON_SETS.get(set as usize) else { return Err(WireError::Invalid("icon set")) };
                     let b = r.u8()?;
                     let k = r.count("icon points", 5, 2)?;
-                    if k != n as usize {
+                    let custom = b & 4 != 0;
+                    if if custom { !(3..=5).contains(&k) } else { k != n as usize } {
                         return Err(WireError::Invalid("icon set points"));
                     }
                     let mut points = Vec::with_capacity(k);
@@ -836,7 +863,23 @@ impl CondFormat {
                         let p = cfvo(r)?;
                         points.push((p, r.u8()? != 0));
                     }
-                    RuleKind::IconSet { set, points, reverse: b & 1 != 0, show_value: b & 2 != 0 }
+                    let icons = if custom {
+                        let mut icons = Vec::with_capacity(k);
+                        for _ in 0..k {
+                            let set = r.u8()?;
+                            if set == u8::MAX {
+                                icons.push(None);
+                            } else {
+                                let index = r.u8()?;
+                                if ICON_SETS.get(set as usize).is_none_or(|s| index >= s.1) {
+                                    return Err(WireError::Invalid("custom icon entry"));
+                                }
+                                icons.push(Some((set, index)));
+                            }
+                        }
+                        Some(icons)
+                    } else { None };
+                    RuleKind::IconSet { set, points, reverse: b & 1 != 0, show_value: b & 2 != 0, icons }
                 }
                 _ => return Err(WireError::Invalid("conditional format rule")),
             };

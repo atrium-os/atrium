@@ -12,7 +12,9 @@ use crate::eval::{
 pub const GROUP_FIELDS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
 pub const MAX_SELECTIONS: usize = 1 << 20;
 
-pub fn gregorian_calendar(name: &str) -> bool {
+/// Office evaluates group fields in its Gregorian date system even when the
+/// SpreadsheetML calendarType annotation names another calendar (MS-OE376).
+pub fn valid_calendar_type(name: &str) -> bool {
     matches!(
         name,
         "none"
@@ -22,6 +24,7 @@ pub fn gregorian_calendar(name: &str) -> bool {
             | "gregorianArabic"
             | "gregorianXlitEnglish"
             | "gregorianXlitFrench"
+            | "japan" | "taiwan" | "korea" | "hijri" | "thai" | "hebrew"
     )
 }
 
@@ -89,7 +92,7 @@ impl CalendarSelection {
     pub(super) fn decode(r: &mut Reader) -> Result<Self, WireError> {
         let calendar = match r.str("filter calendar", 32)? {
             "" => None,
-            name if gregorian_calendar(name) => Some(name.to_string()),
+            name if valid_calendar_type(name) => Some(name.to_string()),
             _ => return Err(WireError::Invalid("filter calendar")),
         };
         let k = r.count("calendar values", MAX_SELECTIONS as u64, 1)?;

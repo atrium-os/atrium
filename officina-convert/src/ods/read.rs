@@ -1641,7 +1641,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Auto-filters: their range names the sheet.
     for (name, target, mut conds) in filters {
         let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
-        if conds.iter().any(|(c, _)| *c > c1 - c0) {
+        if conds.iter().any(|(c, cond)| *c > c1 - c0 || matches!(cond, Cond::Expression(expr) if !expr.fits(c1 - c0 + 1))) {
             rep.note(Kind::Approximate, "filter field outside its range (rows stay as the file hid them)");
             continue;
         }

@@ -15,7 +15,7 @@ use officina_grid::addr::Rect;
 use officina_grid::eval::dates;
 use officina_grid::formula::{self, Coord, Expr, RangeKind, RangeRef};
 use officina_grid::numfmt::PALETTE;
-use officina_grid::filter::{wildcard_regex, Cond, Test, TextOp, TextTest};
+use officina_grid::filter::{wildcard_regex, Cond, FilterExpr, Test, TextOp, TextTest};
 use officina_grid::style::{HAlign, Line, Style, StyleId, VAlign};
 use officina_grid::{ErrorKind, Value, Workbook};
 
@@ -1260,7 +1260,80 @@ fn number_condition(out: &mut String, field: u32, op: &str, x: f64) {
 }
 
 pub fn supports_filter(cond: &Cond) -> bool {
-    !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_))
+    fn supported_expr(expr: &FilterExpr) -> bool {
+        match expr {
+            FilterExpr::Column(_, cond) => supports_filter(cond),
+            FilterExpr::All(items) | FilterExpr::Any(items) => items.iter().all(supported_expr),
+        }
+    }
+    match cond {
+        Cond::Expression(expr) => supported_expr(expr),
+        _ => !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_)),
+    }
+}
+
+fn filter_expr(out: &mut String, expr: &FilterExpr, whole_cell: bool, parent: &str) {
+    match expr {
+        FilterExpr::Column(col, cond) => filter_condition(out, cond, *col, whole_cell, parent),
+        FilterExpr::All(items) | FilterExpr::Any(items) => {
+            let group = if matches!(expr, FilterExpr::All(_)) { "and" } else { "or" };
+            if group != parent { let _ = write!(out, "<table:filter-{group}>"); }
+            for item in items { filter_expr(out, item, whole_cell, group); }
+            if group != parent { let _ = write!(out, "</table:filter-{group}>"); }
+        }
+    }
+}
+
+fn filter_condition(out: &mut String, cond: &Cond, field: u32, whole_cell: bool, parent: &str) {
+    match cond {
+        Cond::Values(v) => {
+            let first = v.first().cloned().unwrap_or_default();
+            let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
+            esc(out, &first);
+            out.push_str(r#"" table:operator="=" table:data-type="text""#);
+            if v.len() > 1 || (!whole_cell && !v.is_empty()) {
+                out.push('>');
+                for x in v {
+                    out.push_str(r#"<table:filter-set-item table:value=""#);
+                    esc(out, x);
+                    out.push_str(r#""/>"#);
+                }
+                out.push_str("</table:filter-condition>");
+            } else {
+                out.push_str("/>");
+            }
+        }
+        Cond::Compare(cs, and) => {
+            let group = (cs.len() > 1).then_some(if *and { "and" } else { "or" }).filter(|&g| g != parent);
+            if let Some(g) = group { let _ = write!(out, "<table:filter-{g}>"); }
+            for (op, x) in cs {
+                number_condition(out, field, op, *x);
+            }
+            if let Some(g) = group { let _ = write!(out, "</table:filter-{g}>"); }
+        }
+        Cond::Custom(tests, and) => {
+            let group = (tests.len() > 1).then_some(if *and { "and" } else { "or" }).filter(|&g| g != parent);
+            if let Some(g) = group { let _ = write!(out, "<table:filter-{g}>"); }
+            for test in tests {
+                match test {
+                    Test::Text(text) => text_condition(out, field, text, whole_cell),
+                    Test::Number(op, x) => number_condition(out, field, op, *x),
+                }
+            }
+            if let Some(g) = group { let _ = write!(out, "</table:filter-{g}>"); }
+        }
+        Cond::Expression(expr) => filter_expr(out, expr, whole_cell, parent),
+        Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
+        Cond::Rank(rank) => {
+            let op = match (rank.bottom, rank.percent) {
+                (false, false) => "top values",
+                (false, true) => "top percent",
+                (true, false) => "bottom values",
+                (true, true) => "bottom percent",
+            };
+            let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{op}" table:data-type="number"/>"#, rank.limit());
+        }
+    }
 }
 
 fn filter_conditions(out: &mut String, conds: &[(u32, Cond)], start_col: u32, whole_cell: bool) {
@@ -1268,62 +1341,7 @@ fn filter_conditions(out: &mut String, conds: &[(u32, Cond)], start_col: u32, wh
         out.push_str("<table:filter><table:filter-and>");
         for (c, cond) in conds {
             let field = c - start_col;
-            match cond {
-                Cond::Values(v) => {
-                    let first = v.first().cloned().unwrap_or_default();
-                    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
-                    esc(out, &first);
-                    out.push_str(r#"" table:operator="=" table:data-type="text""#);
-                    if v.len() > 1 || (!whole_cell && !v.is_empty()) {
-                        out.push('>');
-                        for x in v {
-                            out.push_str(r#"<table:filter-set-item table:value=""#);
-                            esc(out, x);
-                            out.push_str(r#""/>"#);
-                        }
-                        out.push_str("</table:filter-condition>");
-                    } else {
-                        out.push_str("/>");
-                    }
-                }
-                Cond::Compare(cs, and) => {
-                    let or = !and && cs.len() > 1;
-                    if or {
-                        out.push_str("<table:filter-or>");
-                    }
-                    for (op, x) in cs {
-                        number_condition(out, field, op, *x);
-                    }
-                    if or {
-                        out.push_str("</table:filter-or>");
-                    }
-                }
-                Cond::Custom(tests, and) => {
-                    let or = !and && tests.len() > 1;
-                    if or {
-                        out.push_str("<table:filter-or>");
-                    }
-                    for test in tests {
-                        match test {
-                            Test::Text(text) => text_condition(out, field, text, whole_cell),
-                            Test::Number(op, x) => number_condition(out, field, op, *x),
-                        }
-                    }
-                    if or {
-                        out.push_str("</table:filter-or>");
-                    }
-                }
-                Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
-                Cond::Rank(rank) => {
-                    let op = match (rank.bottom, rank.percent) {
-                        (false, false) => "top values",
-                        (false, true) => "top percent",
-                        (true, false) => "bottom values",
-                        (true, true) => "bottom percent",
-                    };
-                    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{op}" table:data-type="number"/>"#, rank.limit());
-                }
-            }
+            filter_condition(out, cond, field, whole_cell, "and");
         }
         out.push_str("</table:filter-and></table:filter>");
     }
@@ -1499,9 +1517,22 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         faces.push_str(r#""/>"#);
     }
     let mut content = String::with_capacity(tables.len() + auto.len() + 1024);
-    let whole_cell = !wb.filter_conditions().any(|cond| matches!(cond, Cond::Custom(tests, _) if tests.iter().any(|test| {
-        matches!(test, Test::Text(t) if matches!(t.op, TextOp::PartialRegex | TextOp::NotPartialRegex))
-    })));
+    fn partial_regex(cond: &Cond) -> bool {
+        fn in_expr(expr: &FilterExpr) -> bool {
+            match expr {
+                FilterExpr::Column(_, cond) => partial_regex(cond),
+                FilterExpr::All(items) | FilterExpr::Any(items) => items.iter().any(in_expr),
+            }
+        }
+        match cond {
+            Cond::Expression(expr) => in_expr(expr),
+            Cond::Custom(tests, _) => tests.iter().any(|test| {
+                matches!(test, Test::Text(t) if matches!(t.op, TextOp::PartialRegex | TextOp::NotPartialRegex))
+            }),
+            _ => false,
+        }
+    }
+    let whole_cell = !wb.filter_conditions().any(partial_regex);
     let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
     content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);

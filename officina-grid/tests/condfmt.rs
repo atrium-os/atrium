@@ -139,7 +139,7 @@ fn icon_sets_pick_by_threshold() {
     let arrows = icon_set("3Arrows").unwrap();
     // 1..10 over 0 / 33 / 67 percent of the way from 1 to 10 (3.97, 7.03):
     // 1–3 the lowest icon, 4–7 the middle, 8–10 the top.
-    let kind = RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true };
+    let kind = RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true, icons: None };
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
     let icons: Vec<u8> = (0..10).map(|r| wb.look(CellAddr::new(0, r, 0)).icon.unwrap().1).collect();
     assert_eq!(icons, [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]);
@@ -148,7 +148,7 @@ fn icon_sets_pick_by_threshold() {
     wb.remove_cond_format(0);
     let rating = icon_set("4Rating").unwrap();
     let points = vec![(Cfvo::Num(0.0), true), (Cfvo::Num(5.0), false), (Cfvo::Num(8.0), true), (Cfvo::Percentile(100.0), true)];
-    let kind = RuleKind::IconSet { set: rating, points, reverse: true, show_value: false };
+    let kind = RuleKind::IconSet { set: rating, points, reverse: true, show_value: false, icons: None };
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
     let at = |r: u32| wb.look(CellAddr::new(0, r, 0));
     assert_eq!((at(4).icon, at(5).icon, at(7).icon, at(9).icon), (Some((rating, 3)), Some((rating, 2)), Some((rating, 1)), Some((rating, 0))));
@@ -203,8 +203,8 @@ fn appearance_filters_follow_the_displayed_priority() {
     let rules = vec![
         Rule { kind: RuleKind::Expression(formula), dxf: fill(), stop: false },
         Rule { kind: RuleKind::ColorScale(vec![(Cfvo::Min, 0x008000), (Cfvo::Max, 0xFFFF00)]), dxf: Dxf::default(), stop: false },
-        Rule { kind: RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true }, dxf: Dxf::default(), stop: false },
-        Rule { kind: RuleKind::IconSet { set: stars, points: icon_points(3), reverse: true, show_value: false }, dxf: Dxf::default(), stop: false },
+        Rule { kind: RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true, icons: None }, dxf: Dxf::default(), stop: false },
+        Rule { kind: RuleKind::IconSet { set: stars, points: icon_points(3), reverse: true, show_value: false, icons: None }, dxf: Dxf::default(), stop: false },
     ];
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![range], rules }).unwrap();
     let top = wb.look(CellAddr::new(0, 9, 0));

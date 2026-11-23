@@ -380,6 +380,10 @@ pub(crate) fn shift_with_ids(
         if let Some(filter) = &mut t.filter {
             match axis {
                 Axis::Cols => filter.conds = filter.conds.iter().filter_map(|(c, cond)| {
+                    if let crate::filter::Cond::Expression(expr) = cond {
+                        let moved = expr.clone().remap(&|c| s.map(t.rect.c0 + c).map(|c| c - rect.c0))?;
+                        return Some((0, crate::filter::Cond::Expression(Box::new(moved))));
+                    }
                     s.map(t.rect.c0 + c).map(|c| (c - rect.c0, cond.clone()))
                 }).collect(),
                 Axis::Rows => {
@@ -544,9 +548,16 @@ pub(crate) fn shift_with_ids(
     if let Some(f) = st2.filter.as_mut() {
         match s.map_rect(f.rect) {
             Some(r) => {
+                let old = f.rect;
                 f.rect = r;
                 if axis == Axis::Cols {
-                    f.conds = f.conds.iter().filter_map(|(c, k)| s.map(*c).map(|c| (c, k.clone()))).collect();
+                    f.conds = f.conds.iter().filter_map(|(c, cond)| {
+                        if let crate::filter::Cond::Expression(expr) = cond {
+                            let moved = expr.clone().remap(&|c| s.map(old.c0 + c).map(|c| c - r.c0))?;
+                            return Some((r.c0, crate::filter::Cond::Expression(Box::new(moved))));
+                        }
+                        s.map(*c).map(|c| (c, cond.clone()))
+                    }).collect();
                 }
             }
             None => st2.filter = None,

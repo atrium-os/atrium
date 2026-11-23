@@ -451,7 +451,11 @@ pub fn build(wb: &Workbook, sheet: u16, e: &Editor, range: &str, a: &str, b: &st
                 Some(RuleKind::IconSet { set: s, points, .. }) if *s == set => points.clone(),
                 _ => officina_grid::condfmt::icon_points(ICON_SETS[set as usize].1),
             };
-            RuleKind::IconSet { set, points, reverse: e.reverse, show_value: !e.icon_only }
+            let icons = match orig {
+                Some(RuleKind::IconSet { set: old, icons, .. }) if *old == set => icons.clone(),
+                _ => None,
+            };
+            RuleKind::IconSet { set, points, reverse: e.reverse && icons.is_none(), show_value: !e.icon_only, icons }
         }
         _ => return Err("Pick a kind of rule.".into()),
     };

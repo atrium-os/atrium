@@ -157,7 +157,7 @@ pub fn pivot_view(cv: Option<CellView>, role: officina_grid::pivot::Role) -> Opt
 /// colour, weight and number format, and the data bar under the text.
 fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value, system: DateSystem) -> Option<CellView> {
     let d = &look.dxf;
-    if look.scale.is_none() && look.bar.is_none() && look.icon.is_none() && *d == officina_grid::condfmt::Dxf::default() {
+    if look.scale.is_none() && look.bar.is_none() && look.icon.is_none() && !look.hide_value && *d == officina_grid::condfmt::Dxf::default() {
         return cv;
     }
     let mut cv = cv.unwrap_or_else(|| CellView::text(""));
@@ -179,7 +179,7 @@ fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Valu
     }
     cv.bar = look.bar.map(|(share, c)| (share, rgb(c)));
     cv.icon = look.icon.and_then(|(set, k)| icon_of(set, k));
-    if look.icon.is_some() && look.hide_value {
+    if look.hide_value {
         cv.text.clear();
     }
     Some(cv)
@@ -381,7 +381,10 @@ impl SheetSource {
                     if offset.is_none() && d.wb.table_at(s, r.r0, c).is_some_and(|t| t.rect.r0 == r.r0 && t.header && t.filter.is_some()) {
                         continue;
                     }
-                    let lit = conds.iter().any(|(k, _)| *k + offset.unwrap_or(0) == c);
+                    let lit = conds.iter().any(|(k, cond)| match cond {
+                        officina_grid::filter::Cond::Expression(expr) => expr.uses_column(c - r.c0),
+                        _ => *k + offset.unwrap_or(0) == c,
+                    });
                     let size = 14.0f32.min((y1 - y0) as f32 - 2.0).max(6.0);
                     let x = col_x(c + 1) - size as f64 - 3.0;
                     let y = y0 + ((y1 - y0) - size as f64) / 2.0;

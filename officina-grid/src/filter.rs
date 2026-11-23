@@ -15,7 +15,7 @@ use crate::value::Value;
 mod appearance;
 pub use appearance::{AppearanceFilter, ColorFilter, IconFilter};
 mod calendar;
-pub use calendar::{gregorian_calendar, CalendarSelection, DateBounds, DateGroup, DynamicDate, GROUP_FIELDS, MAX_SELECTIONS};
+pub use calendar::{valid_calendar_type, CalendarSelection, DateBounds, DateGroup, DynamicDate, GROUP_FIELDS, MAX_SELECTIONS};
 mod text;
 pub use text::{wildcard_regex, Test, TextOp, TextTest, MAX_TESTS};
 
@@ -32,8 +32,108 @@ pub enum Cond {
     Calendar(CalendarSelection),
     DynamicDate(DynamicDate),
     Appearance(AppearanceFilter),
+    Expression(Box<FilterExpr>),
     /// Custom numeric and text tests joined by AND (true) or OR.
     Custom(Vec<Test>, bool),
+}
+
+/// Boolean filter conditions with columns relative to the filter's left edge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterExpr {
+    Column(u32, Cond),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+}
+
+pub const MAX_FILTER_DEPTH: usize = 16;
+pub const MAX_FILTER_NODES: usize = 1024;
+
+impl FilterExpr {
+    pub fn fits(&self, width: u32) -> bool {
+        match self {
+            Self::Column(c, _) => *c < width,
+            Self::All(children) | Self::Any(children) => children.iter().all(|child| child.fits(width)),
+        }
+    }
+
+    pub fn uses_column(&self, col: u32) -> bool {
+        match self {
+            Self::Column(c, _) => *c == col,
+            Self::All(children) | Self::Any(children) => children.iter().any(|child| child.uses_column(col)),
+        }
+    }
+
+    pub(crate) fn remap(self, map: &impl Fn(u32) -> Option<u32>) -> Option<Self> {
+        let (all, children) = match self {
+            Self::Column(c, cond) => return Some(Self::Column(map(c)?, cond)),
+            Self::All(children) => (true, children),
+            Self::Any(children) => (false, children),
+        };
+        let children: Vec<_> = children.into_iter().filter_map(|child| child.remap(map)).collect();
+        if children.is_empty() { return None; }
+        Some(if all { Self::All(children) } else { Self::Any(children) })
+    }
+
+    fn encode(&self, w: &mut Writer) {
+        match self {
+            Self::Column(c, cond) => {
+                w.u8(0);
+                w.var(u64::from(*c));
+                cond.encode(w);
+            }
+            Self::All(children) | Self::Any(children) => {
+                w.u8(if matches!(self, Self::All(_)) { 1 } else { 2 });
+                w.var(children.len() as u64);
+                for child in children { child.encode(w); }
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader, depth: usize, remaining: &mut usize) -> Result<Self, WireError> {
+        if depth > MAX_FILTER_DEPTH || *remaining == 0 {
+            return Err(WireError::Invalid("filter expression limit"));
+        }
+        *remaining -= 1;
+        match r.u8()? {
+            0 => {
+                let c = r.len("filter expression column", u64::from(MAX_COLS - 1))? as u32;
+                Ok(Self::Column(c, Cond::decode(r, false)?))
+            }
+            tag @ (1 | 2) => {
+                let n = r.count("filter branches", *remaining as u64, 3)?;
+                if n == 0 { return Err(WireError::Invalid("empty filter expression")); }
+                let children = (0..n).map(|_| Self::decode(r, depth + 1, remaining)).collect::<Result<_, _>>()?;
+                Ok(if tag == 1 { Self::All(children) } else { Self::Any(children) })
+            }
+            _ => Err(WireError::Invalid("filter expression kind")),
+        }
+    }
+
+    fn prepare(&self, wb: &Workbook, rect: Rect, first: u32, col: u32) -> PreparedExpr<'_> {
+        match self {
+            Self::Column(offset, rule) => {
+                let column = col + offset;
+                PreparedExpr::Column(column, rule, rule.prepare(wb, rect, first, column))
+            }
+            Self::All(items) | Self::Any(items) => PreparedExpr::Group(matches!(self, Self::All(_)),
+                items.iter().map(|item| item.prepare(wb, rect, first, col)).collect()),
+        }
+    }
+}
+
+enum PreparedExpr<'a> {
+    Column(u32, &'a Cond, Prepared<'a>),
+    Group(bool, Vec<Self>),
+}
+
+impl PreparedExpr<'_> {
+    fn keeps(&self, wb: &Workbook, addr: CellAddr) -> bool {
+        match self {
+            Self::Column(c, rule, prepared) => rule.keeps(wb, CellAddr { col: *c, ..addr }, prepared),
+            Self::Group(true, children) => children.iter().all(|item| item.keeps(wb, addr)),
+            Self::Group(false, children) => children.iter().any(|item| item.keeps(wb, addr)),
+        }
+    }
 }
 
 /// Top or bottom numeric cells by count or percentage.
@@ -98,47 +198,7 @@ impl FilterState {
                 w.var(f.conds.len() as u64);
                 for (c, cond) in &f.conds {
                     w.var(*c as u64);
-                    match cond {
-                        Cond::Values(v) => {
-                            w.u8(0);
-                            w.var(v.len() as u64);
-                            for s in v {
-                                w.str(s);
-                            }
-                        }
-                        Cond::Compare(cs, and) => {
-                            w.u8(if *and { 2 } else { 1 });
-                            w.var(cs.len() as u64);
-                            for (op, x) in cs {
-                                w.str(op);
-                                w.f64(*x);
-                            }
-                        }
-                        Cond::Custom(tests, and) => {
-                            w.u8(if *and { 5 } else { 4 });
-                            w.var(tests.len() as u64);
-                            for test in tests {
-                                test.encode(w);
-                            }
-                        }
-                        Cond::Calendar(selection) => {
-                            w.u8(6);
-                            selection.encode(w);
-                        }
-                        Cond::DynamicDate(rule) => {
-                            w.u8(7);
-                            rule.encode(w);
-                        }
-                        Cond::Appearance(rule) => {
-                            w.u8(8);
-                            rule.encode(w);
-                        }
-                        Cond::Rank(rank) => {
-                            w.u8(3);
-                            w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
-                            w.var(u64::from(rank.limit()));
-                        }
-                    }
+                    cond.encode(w);
                 }
             }
         }
@@ -168,60 +228,19 @@ impl FilterState {
                 if r0 > r1 || c0 > c1 {
                     return Err(WireError::Invalid("filter range"));
                 }
-                let k = r.count("filter columns", (c1 - c0 + 1) as u64, 2)?;
+                let k = r.count("filter columns", (c1 - c0 + 2) as u64, 2)?;
                 let mut conds = Vec::with_capacity(k);
                 for _ in 0..k {
                     let c = col(r)?;
                     if c < c0 || c > c1 {
                         return Err(WireError::Invalid("filter column outside its range"));
                     }
-                    let cond = match r.u8()? {
-                        0 => {
-                            let m = r.count("filter values", 1 << 20, 1)?;
-                            let mut v = Vec::with_capacity(m);
-                            for _ in 0..m {
-                                v.push(r.str("filter value", crate::strings::MAX_TEXT as u64)?.to_string());
-                            }
-                            Cond::Values(v)
+                    let cond = Cond::decode(r, true)?;
+                    if let Cond::Expression(expr) = &cond {
+                        if c != c0 || !expr.fits(c1 - c0 + 1) || conds.iter().any(|(_, prev)| matches!(prev, Cond::Expression(_))) {
+                            return Err(WireError::Invalid("filter expression outside its range"));
                         }
-                        t @ (1 | 2) => {
-                            let m = r.count("filter tests", 2, 9)?;
-                            let mut cs = Vec::with_capacity(m);
-                            for _ in 0..m {
-                                let op = r.str("operator", 2)?;
-                                if !["=", "<>", "<", "<=", ">", ">="].contains(&op) {
-                                    return Err(WireError::Invalid("filter operator"));
-                                }
-                                let x = r.f64()?;
-                                if !x.is_finite() {
-                                    return Err(WireError::Invalid("filter number"));
-                                }
-                                cs.push((op.to_string(), x));
-                            }
-                            Cond::Compare(cs, t == 2)
-                        }
-                        3 => {
-                            let flags = r.u8()?;
-                            if flags > 3 {
-                                return Err(WireError::Invalid("rank filter flags"));
-                            }
-                            let limit = r.len("rank filter limit", u64::from(MAX_ROWS))? as u32;
-                            Cond::Rank(Rank::new(limit, flags & 1 != 0, flags & 2 != 0)
-                                .ok_or(WireError::Invalid("rank filter limit"))?)
-                        }
-                        t @ (4 | 5) => {
-                            let n = r.count("custom tests", MAX_TESTS as u64, 4)?;
-                            if n == 0 {
-                                return Err(WireError::Invalid("empty custom filter"));
-                            }
-                            let tests = (0..n).map(|_| Test::decode(r)).collect::<Result<_, _>>()?;
-                            Cond::Custom(tests, t == 5)
-                        }
-                        6 => Cond::Calendar(CalendarSelection::decode(r)?),
-                        7 => Cond::DynamicDate(DynamicDate::decode(r)?),
-                        8 => Cond::Appearance(AppearanceFilter::decode(r)?),
-                        _ => return Err(WireError::Invalid("filter kind")),
-                    };
+                    }
                     conds.push((c, cond));
                 }
                 Some(AutoFilter { rect: Rect { sheet, r0, c0, r1, c1 }, conds })
@@ -233,6 +252,120 @@ impl FilterState {
 }
 
 impl Cond {
+    fn encode(&self, w: &mut Writer) {
+        match self {
+            Cond::Values(v) => {
+                w.u8(0);
+                w.var(v.len() as u64);
+                for s in v {
+                    w.str(s);
+                }
+            }
+            Cond::Compare(cs, and) => {
+                w.u8(if *and { 2 } else { 1 });
+                w.var(cs.len() as u64);
+                for (op, x) in cs {
+                    w.str(op);
+                    w.f64(*x);
+                }
+            }
+            Cond::Custom(tests, and) => {
+                w.u8(if *and { 5 } else { 4 });
+                w.var(tests.len() as u64);
+                for test in tests {
+                    test.encode(w);
+                }
+            }
+            Cond::Calendar(selection) => {
+                w.u8(6);
+                selection.encode(w);
+            }
+            Cond::DynamicDate(rule) => {
+                w.u8(7);
+                rule.encode(w);
+            }
+            Cond::Appearance(rule) => {
+                w.u8(8);
+                rule.encode(w);
+            }
+            Cond::Rank(rank) => {
+                w.u8(3);
+                w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
+                w.var(u64::from(rank.limit()));
+            }
+            Cond::Expression(expr) => {
+                w.u8(9);
+                expr.encode(w);
+            }
+        }
+    }
+
+    fn decode(r: &mut Reader, expressions: bool) -> Result<Self, WireError> {
+        Ok(match r.u8()? {
+            0 => {
+                let m = r.count("filter values", 1 << 20, 1)?;
+                let mut v = Vec::with_capacity(m);
+                for _ in 0..m {
+                    v.push(r.str("filter value", crate::strings::MAX_TEXT as u64)?.to_string());
+                }
+                Cond::Values(v)
+            }
+            t @ (1 | 2) => {
+                let m = r.count("filter tests", 2, 9)?;
+                let mut cs = Vec::with_capacity(m);
+                for _ in 0..m {
+                    let op = r.str("operator", 2)?;
+                    if !["=", "<>", "<", "<=", ">", ">="].contains(&op) {
+                        return Err(WireError::Invalid("filter operator"));
+                    }
+                    let x = r.f64()?;
+                    if !x.is_finite() {
+                        return Err(WireError::Invalid("filter number"));
+                    }
+                    cs.push((op.to_string(), x));
+                }
+                Cond::Compare(cs, t == 2)
+            }
+            3 => {
+                let flags = r.u8()?;
+                if flags > 3 {
+                    return Err(WireError::Invalid("rank filter flags"));
+                }
+                let limit = r.len("rank filter limit", u64::from(MAX_ROWS))? as u32;
+                Cond::Rank(Rank::new(limit, flags & 1 != 0, flags & 2 != 0)
+                    .ok_or(WireError::Invalid("rank filter limit"))?)
+            }
+            t @ (4 | 5) => {
+                let n = r.count("custom tests", MAX_TESTS as u64, 4)?;
+                if n == 0 {
+                    return Err(WireError::Invalid("empty custom filter"));
+                }
+                let tests = (0..n).map(|_| Test::decode(r)).collect::<Result<_, _>>()?;
+                Cond::Custom(tests, t == 5)
+            }
+            6 => Cond::Calendar(CalendarSelection::decode(r)?),
+            7 => Cond::DynamicDate(DynamicDate::decode(r)?),
+            8 => Cond::Appearance(AppearanceFilter::decode(r)?),
+            9 if expressions => {
+                let mut remaining = MAX_FILTER_NODES;
+                Cond::Expression(Box::new(FilterExpr::decode(r, 0, &mut remaining)?))
+            }
+            _ => return Err(WireError::Invalid("filter kind")),
+        })
+    }
+
+    pub fn is_expression(&self) -> bool { matches!(self, Self::Expression(_)) }
+
+    fn prepare(&self, wb: &Workbook, rect: Rect, first: u32, col: u32) -> Prepared<'_> {
+        match self {
+            Self::Rank(rank) => Prepared::Rank(wb.rank_cutoff(rect, first, col, *rank)),
+            Self::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
+            Self::Calendar(selection) => Prepared::Calendar(selection.prepare()),
+            Self::Expression(expr) => Prepared::Expression(Box::new(expr.prepare(wb, rect, first, rect.c0))),
+            _ => Prepared::Other,
+        }
+    }
+
     pub fn is_excel_date(&self) -> bool {
         matches!(self, Self::Calendar(_) | Self::DynamicDate(_))
     }
@@ -284,6 +417,10 @@ impl Cond {
                 calendar_serial(wb, addr).is_some_and(|serial| selection.matches_date(wb.date_system(), serial))
                     || (!selection.values.is_empty() && selection.values.contains(&text_key(&wb.formatted(addr).text)))
             }
+            Cond::Expression(_) => {
+                let Prepared::Expression(expr) = prepared else { unreachable!() };
+                expr.keeps(wb, addr)
+            }
             Cond::Appearance(rule) => rule.keeps(wb, addr),
             Cond::DynamicDate(rule) => calendar_serial(wb, addr).is_some_and(|serial| rule.keeps(wb.date_system(), serial)),
             Cond::Rank(rank) => {
@@ -304,6 +441,7 @@ enum Prepared<'a> {
     Rank(Option<f64>),
     Custom(Vec<text::Prepared<'a>>),
     Calendar(calendar::CalendarMatcher),
+    Expression(Box<PreparedExpr<'a>>),
 }
 
 /// Merges sorted row ranges, joining touching ones.
@@ -462,12 +600,7 @@ impl Workbook {
                 }
             }
         }
-        let prepared: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
-            Cond::Rank(rank) => Prepared::Rank(self.rank_cutoff(f.rect, first, *col, *rank)),
-            Cond::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
-            Cond::Calendar(selection) => Prepared::Calendar(selection.prepare()),
-            _ => Prepared::Other,
-        }).collect();
+        let prepared: Vec<_> = f.conds.iter().map(|(col, cond)| cond.prepare(self, f.rect, first, *col)).collect();
         let mut run: Option<(u32, u32)> = None;
         for r in first..=f.rect.r1 {
             let keep = f.conds.iter().zip(&prepared).all(|((c, cond), prepared)| {

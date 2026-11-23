@@ -312,7 +312,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let in_filter = filter.filter(|f| (f.first()..=f.rect().r1).contains(&row) && (f.rect().c0..=f.rect().c1).contains(&col));
     let value = short(&wb.formatted(CellAddr::new(s, row, col)).text);
     let shown = if value.is_empty() { "(empty)".to_string() } else { format!("“{value}”") };
-    let col_filtered = filter.is_some_and(|f| f.conds().iter().any(|(c, _)| *c + f.offset() == col));
+    let col_filtered = filter.is_some_and(|f| f.conds().iter().any(|(c, cond)| *c + f.offset() == col && !cond.is_expression()));
     let any_cond = filter.is_some_and(|f| !f.conds().is_empty());
     let table = wb.table_at(s, row, col);
     let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
@@ -604,7 +604,7 @@ pub fn column_values(d: &Doc, row: u32, col: u32) -> Result<Vec<(String, u32, bo
     if all.len() > MAX_VALUES {
         return Err(format!("This column has more than {MAX_VALUES} different values; use Show Only or Hide."));
     }
-    let now = scope.conds().iter().find(|(c, _)| *c + scope.offset() == col).map(|(_, c)| c);
+    let now = scope.conds().iter().find(|(c, cond)| *c + scope.offset() == col && !cond.is_expression()).map(|(_, c)| c);
     let key = officina_grid::eval::funcs::text_key;
     Ok(all
         .into_iter()
@@ -646,7 +646,7 @@ pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bo
     let msg = (|| {
         let mut f = filter_scope(d, row, col).ok_or("There is no filter here.")?.auto_filter();
         let mut conds = f.conds.clone();
-        conds.retain(|(c, _)| *c != col);
+        conds.retain(|(c, cond)| *c != col || cond.is_expression());
         if !every {
             conds.push((col, Cond::Values(keep)));
             conds.sort_by_key(|(c, _)| *c);
@@ -1022,7 +1022,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             match cmd {
                 DataCmd::ReapplyFilter => {}
                 DataCmd::ShowAll => conds.clear(),
-                DataCmd::ClearColumn => conds.retain(|(c, _)| *c != col),
+                DataCmd::ClearColumn => conds.retain(|(c, cond)| *c != col || cond.is_expression()),
                 _ => {
                     if !(first..=f.rect.r1).contains(&row) || !(f.rect.c0..=f.rect.c1).contains(&col) {
                         return Err("Put the cursor on a value under the filter's header.".into());
@@ -1036,14 +1036,14 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                         if all.len() > MAX {
                             return Err("This column has too many different values to hide one; use Show Only.".into());
                         }
-                        let now: Option<Vec<String>> = conds.iter().find(|(c, _)| *c == col).and_then(|(_, c)| match c {
+                        let now: Option<Vec<String>> = conds.iter().find(|(c, cond)| *c == col && !cond.is_expression()).and_then(|(_, c)| match c {
                             Cond::Values(v) => Some(v.clone()),
                             _ => None,
                         });
                         let key = officina_grid::eval::funcs::text_key(&text);
                         all.into_iter().map(|(t, _)| t).filter(|t| now.as_ref().is_none_or(|n| n.iter().any(|x| officina_grid::eval::funcs::text_key(x) == officina_grid::eval::funcs::text_key(t)))).filter(|t| officina_grid::eval::funcs::text_key(t) != key).collect()
                     };
-                    conds.retain(|(c, _)| *c != col);
+                    conds.retain(|(c, cond)| *c != col || cond.is_expression());
                     conds.push((col, Cond::Values(keep)));
                     conds.sort_by_key(|(c, _)| *c);
                 }

@@ -20,7 +20,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use officina_grid::eval::dates::DateSystem;
-use officina_grid::filter::{gregorian_calendar, AppearanceFilter, AutoFilter, CalendarSelection, Cond, DateBounds, DateGroup, IconFilter,
+use officina_grid::filter::{valid_calendar_type, AppearanceFilter, AutoFilter, CalendarSelection, Cond, DateBounds, DateGroup, IconFilter,
     DynamicDate, Rank, Test, TextOp, TextTest, GROUP_FIELDS, MAX_SELECTIONS};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
@@ -1137,7 +1137,7 @@ fn appearance_filter(tag: &BytesStart, dxfs: &[super::condfmt::DxfIn]) -> Result
         };
         let color = attr(tag, b"dxfId")?.and_then(|i| i.parse::<usize>().ok())
             .and_then(|i| dxfs.get(i)).and_then(|dxf| dxf.filter_color(cell));
-        return Ok(color.map(|color| Some(AppearanceFilter::Color(color))));
+        return Ok(color.map(Some));
     }
     let name = attr(tag, b"iconSet")?;
     let index = attr(tag, b"iconId")?;
@@ -1208,7 +1208,7 @@ fn read_value_filter(r: &mut Reader<&[u8]>, tag: &BytesStart, empty: bool) -> Re
             }
         }
     }
-    if !valid || (!groups.is_empty() && calendar.as_deref().is_some_and(|name| !gregorian_calendar(name))) {
+    if !valid || (!groups.is_empty() && calendar.as_deref().is_some_and(|name| !valid_calendar_type(name))) {
         return Ok(None);
     }
     Ok(Some(if groups.is_empty() {

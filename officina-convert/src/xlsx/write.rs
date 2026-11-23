@@ -125,6 +125,7 @@ pub fn supports_filter(cond: &Cond) -> bool {
             Test::Number(..) => true,
             Test::Text(text) => excel_text_test(text).is_some(),
         }),
+        Cond::Expression(_) => false,
         _ => true,
     }
 }
@@ -594,6 +595,7 @@ fn write_filter(
             for (c, cond) in &f.conds {
                 let _ = write!(o, r#"<filterColumn colId="{}">"#, c - f.rect.c0);
                 match cond {
+                    Cond::Expression(_) => unreachable!(),
                     Cond::Values(values) => filter_values(o, values, None),
                     Cond::Calendar(selection) => filter_values(o, &selection.values, Some(selection)),
                     Cond::DynamicDate(rule) => {
@@ -628,7 +630,10 @@ fn write_filter(
                         o.extend_from_slice(b"</customFilters>");
                     }
                     Cond::Appearance(AppearanceFilter::Color(color)) => {
-                        let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="{}"/>"#, dxfs.color_id(*color), u8::from(color.cell));
+                        let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="{}"/>"#, dxfs.color_id(AppearanceFilter::Color(*color)), u8::from(color.cell));
+                    }
+                    Cond::Appearance(color @ AppearanceFilter::Pattern(_)) => {
+                        let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="1"/>"#, dxfs.color_id(*color));
                     }
                     Cond::Appearance(AppearanceFilter::Icon(icon)) => {
                         let (set, index) = icon.selection();

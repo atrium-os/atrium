@@ -1,7 +1,6 @@
-//! The representable subset of ODF filter expressions: columns combined with
-//! AND, with a conjunction or disjunction of tests within each column.
+//! ODF filter expressions, with a compact form for independent column rules.
 
-use officina_grid::filter::{Cond, Rank, Test, TextOp, TextTest, MAX_TESTS};
+use officina_grid::filter::{Cond, FilterExpr, Rank, Test, TextOp, TextTest, MAX_FILTER_DEPTH, MAX_FILTER_NODES, MAX_TESTS};
 use quick_xml::{
     events::{BytesEnd, BytesStart, Event},
     Reader,
@@ -12,7 +11,11 @@ use super::read::attrs;
 type Columns = Vec<(u32, Cond)>;
 
 pub(super) fn parse(xml: &[u8], whole_cell: bool) -> Option<Columns> {
-    group(&mut Reader::from_reader(xml), None, true, 0, whole_cell)
+    group(&mut Reader::from_reader(xml), None, true, 0, whole_cell).or_else(|| {
+        let mut remaining = MAX_FILTER_NODES;
+        let expr = expression(&mut Reader::from_reader(xml), None, true, 0, whole_cell, &mut remaining)?;
+        Some(vec![(0, Cond::Expression(Box::new(expr)))])
+    })
 }
 
 fn group(
@@ -58,6 +61,42 @@ fn group(
         }
     }
     Some(columns)
+}
+
+fn expression(
+    reader: &mut Reader<&[u8]>, end: Option<BytesEnd<'_>>, and: bool, depth: usize,
+    whole_cell: bool, remaining: &mut usize,
+) -> Option<FilterExpr> {
+    if depth > MAX_FILTER_DEPTH || *remaining == 0 { return None; }
+    *remaining -= 1;
+    let mut items = Vec::new();
+    loop {
+        match reader.read_event().ok()? {
+            Event::End(tag) if end.as_ref() == Some(&tag) => break,
+            Event::Eof if end.is_none() => break,
+            Event::Text(t) if t.iter().all(u8::is_ascii_whitespace) => continue,
+            Event::Comment(_) => continue,
+            event @ (Event::Start(_) | Event::Empty(_)) => {
+                let empty = matches!(event, Event::Empty(_));
+                let (Event::Start(tag) | Event::Empty(tag)) = event else { unreachable!() };
+                let item = match tag.name().as_ref() {
+                    b"table:filter-and" | b"table:filter-or" if !empty =>
+                        expression(reader, Some(tag.to_end()), tag.name().as_ref() == b"table:filter-and", depth + 1, whole_cell, remaining)?,
+                    b"table:filter-condition" if *remaining > 0 && depth < MAX_FILTER_DEPTH => {
+                        *remaining -= 1;
+                        let (col, cond) = condition(reader, &tag, empty, whole_cell)?;
+                        FilterExpr::Column(col, cond)
+                    }
+                    _ => return None,
+                };
+                items.push(item);
+            }
+            _ => return None,
+        }
+    }
+    if items.is_empty() { return None; }
+    if items.len() == 1 { return items.pop(); }
+    Some(if and { FilterExpr::All(items) } else { FilterExpr::Any(items) })
 }
 
 fn truth(value: &str) -> bool {
@@ -235,12 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn cross_column_or_and_unsupported_regex_never_become_partial_filters() {
+    fn cross_column_or_keeps_both_branches_and_invalid_regex_is_rejected() {
         let xml = br#"<table:filter-or>
             <table:filter-condition table:field-number="0" table:operator="begins" table:value="A"/>
             <table:filter-condition table:field-number="1" table:operator="begins" table:value="B"/>
           </table:filter-or>"#;
-        assert_eq!(parse(xml, true), None);
+        assert!(matches!(parse(xml, true).unwrap().as_slice(), [(0, Cond::Expression(_))]));
         let xml = br#"<table:filter-condition table:field-number="0" table:operator="match" table:value="(?=A)"/>"#;
         assert_eq!(parse(xml, true), None);
     }

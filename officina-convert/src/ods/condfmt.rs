@@ -171,7 +171,8 @@ fn condition(wb: &Workbook, f: &CondFormat, rule: &Rule) -> String {
 pub fn sheet_xml(wb: &Workbook, s: u16, list: &[Dxf]) -> String {
     let mut out = String::new();
     let sh = sheet_a1(&wb.sheet_name(s));
-    for f in wb.cond_formats().iter().filter(|f| f.sheet == s) {
+    let supported_rule = |rule: &Rule| !matches!(rule.kind, RuleKind::IconSet { icons: Some(_), .. });
+    for f in wb.cond_formats().iter().filter(|f| f.sheet == s && f.rules.iter().any(supported_rule)) {
         if out.is_empty() {
             out.push_str("<calcext:conditional-formats>");
         }
@@ -179,7 +180,7 @@ pub fn sheet_xml(wb: &Workbook, s: u16, list: &[Dxf]) -> String {
         let target = f.ranges.iter().map(|r| rect_addr(&sh, r)).collect::<Vec<_>>().join(" ");
         let _ = write!(out, r#"<calcext:conditional-format calcext:target-range-address="{}">"#, esc(&target));
         let base = esc(&cell_addr(&sh, o.0, o.1));
-        for rule in &f.rules {
+        for rule in f.rules.iter().filter(|rule| supported_rule(rule)) {
             match &rule.kind {
                 RuleKind::ColorScale(points) => {
                     out.push_str("<calcext:color-scale>");
@@ -332,7 +333,7 @@ pub fn make(wb: &Workbook, f: &FormatIn, style: &dyn Fn(&str) -> Dxf) -> Result<
                 let n = officina_grid::condfmt::ICON_SETS[set as usize].1 as usize;
                 let pts = points.iter().map(|(t, v)| Ok((point(t, v)?, true))).collect::<Result<Vec<_>, String>>()?;
                 let pts = if pts.len() == n { pts } else { officina_grid::condfmt::icon_points(n as u8) };
-                rules.push(Rule { kind: RuleKind::IconSet { set, points: pts, reverse: false, show_value: *show_value }, dxf: Dxf::default(), stop: false });
+                rules.push(Rule { kind: RuleKind::IconSet { set, points: pts, reverse: false, show_value: *show_value, icons: None }, dxf: Dxf::default(), stop: false });
             }
             EntryIn::Other(what) => return Err(what.trim_start_matches("calcext:").into()),
             EntryIn::Condition { style: st, value, base } => {

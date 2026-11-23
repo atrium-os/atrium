@@ -2,7 +2,7 @@
 
 use officina_core::wire::{Reader, WireError, Writer};
 
-use crate::{addr::CellAddr, book::Workbook, condfmt::ICON_SETS};
+use crate::{addr::CellAddr, book::Workbook, condfmt::ICON_SETS, style::PatternFill};
 
 /// The selected fill or font color. None denotes No Fill or Automatic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12,7 +12,7 @@ pub struct ColorFilter {
 }
 
 /// The selected icon, or the absence of an icon. The set is retained for Excel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IconFilter {
     set: u8,
     index: Option<u8>,
@@ -31,19 +31,28 @@ impl IconFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppearanceFilter {
     Color(ColorFilter),
+    Pattern(PatternFill),
     Icon(IconFilter),
 }
 
 impl AppearanceFilter {
     pub(super) fn keeps(self, wb: &Workbook, addr: CellAddr) -> bool {
         let look = wb.look(addr);
+        let (fill, pattern) = if let Some(scale) = look.scale {
+            (Some(scale), None)
+        } else if look.dxf.fill.is_some() || look.dxf.pattern.is_some() {
+            (look.dxf.fill, look.dxf.pattern)
+        } else {
+            let style = wb.style(addr);
+            (style.fill, style.pattern)
+        };
         match self {
+            Self::Pattern(expected) => pattern == Some(expected),
             Self::Color(ColorFilter { cell: true, rgb }) => {
-                let fill = look.scale.or(look.dxf.fill).or_else(|| wb.style(addr).fill);
-                fill == rgb
+                pattern.is_none() && fill == rgb
             }
             Self::Color(ColorFilter { cell: false, rgb }) => {
                 let font = look.dxf.color.or_else(|| wb.style(addr).font.color);
@@ -58,6 +67,10 @@ impl AppearanceFilter {
             Self::Color(color) => {
                 w.u8(u8::from(!color.cell));
                 w.u32(color.rgb.unwrap_or(u32::MAX));
+            }
+            Self::Pattern(pattern) => {
+                w.u8(3);
+                pattern.encode(w);
             }
             Self::Icon(icon) => {
                 w.u8(2);
@@ -87,6 +100,7 @@ impl AppearanceFilter {
                     .ok_or(WireError::Invalid("filter icon"))?;
                 Ok(Self::Icon(icon))
             }
+            3 => Ok(Self::Pattern(PatternFill::decode(r)?)),
             _ => Err(WireError::Invalid("appearance filter type")),
         }
     }

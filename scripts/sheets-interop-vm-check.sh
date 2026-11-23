@@ -25,6 +25,7 @@
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
 # Use SHEETS_INTEROP_CASE=table_filters and /tmp/sheets-table-filter-fixture for table-local filters.
+# Use SHEETS_INTEROP_CASE=advanced_filters and /tmp/sheets-advanced-filter-fixture for nested ODS and advanced Excel filters.
 # Use SHEETS_INTEROP_CASE=appearance_filters and /tmp/sheets-appearance-filter-fixture for Excel color and icon filters.
 # Use SHEETS_INTEROP_CASE=date_filters and /tmp/sheets-date-filter-fixture for Excel date filters.
 # Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
@@ -33,7 +34,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|appearance_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -41,6 +42,7 @@ case "$profile" in
     pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     table_filters) test "$(ls "$books")" = "$(printf 'tables.ods\ntables.xlsm\ntables.xlsx')" ;;
+    advanced_filters) test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')" ;;
     appearance_filters) test "$(ls "$books")" = "$(printf '01-base.xlsx\n02-extended.xlsx')" ;;
     date_filters) test "$(ls "$books")" = "$(printf 'dates-1900.xlsx\ndates-1904.xlsx')" ;;
     dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
@@ -86,6 +88,7 @@ checkpoint() {
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
         protection) /tmp/sheets-protection-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         table_filters) /tmp/sheets-table-filter-fixture check "$1" "$2" "$format" ;;
+        advanced_filters) /tmp/sheets-advanced-filter-fixture check "$1" "$2" "$format" ;;
         appearance_filters) /tmp/sheets-appearance-filter-fixture check "$1" "$2" "$kind" ;;
         date_filters) /tmp/sheets-date-filter-fixture check "$1" "$2" "$format" ;;
         dates) /tmp/sheets-date-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
@@ -752,6 +755,55 @@ table_filters() {
     done
 }
 
+advanced_filters() {
+    row=183
+    for format in ods xlsx; do
+        book=sales.$format
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        click 319 133 # E2, outside the filter.
+        key 0x25 # 8
+        key 0x28
+        save "$book" saved
+        close_book
+
+        open_book "$row" "$book" saved
+        if test "$format" = xlsx; then
+            type_epoch_date 133 126 # B2, edit the date seen by the calendar group.
+        else
+            click 126 133
+            key 0x1e
+            key 0x28
+        fi
+        click 191 153
+        key 0x1e
+        key 0x28
+        click 257 173
+        key 0x1e
+        key 0x28
+        save "$book" edited
+        cp "$books/$book" "$results/$format-edited.$format"
+        cp selectscreen.png "$results/$format-before-reapply.png"
+
+        click 126 133
+        if test "$format" = ods; then
+            data_from_bottom 18 # No separate per-column rule to clear.
+        else
+            data_from_bottom 19
+        fi
+        save "$book" reapplied
+        cp "$books/$book" "$results/$format-reapplied.$format"
+        close_book
+
+        open_book "$row" "$book" reapplied
+        sleep .4
+        cp selectscreen.png "$results/$format-reapplied-reopened.png"
+        close_book
+        echo "PASS $format advanced filters through Save, edit, reapply, and reopen"
+        row=$((row + 30))
+    done
+}
+
 appearance_filters() {
     row=183
     for kind in base extended; do
@@ -986,6 +1038,7 @@ test "$launcher" -gt 0
 case "$profile" in
     pivot_cache) pivot_cache; exit ;;
     date_filters) date_filters; exit ;;
+    advanced_filters) advanced_filters; exit ;;
     appearance_filters) appearance_filters; exit ;;
     table_filters) table_filters; exit ;;
     pivot_scope) pivot_scope; exit ;;

@@ -135,6 +135,11 @@ fn saved_status(d: &Doc, format: Format) -> String {
         if d.wb.filter_conditions().any(|cond| !officina_convert::ods::write::supports_filter(cond)) {
             changes.push("kept the last row visibility for Excel calendar and appearance filters");
         }
+        if d.wb.cond_formats().iter().flat_map(|f| &f.rules).any(|r| {
+            matches!(r.kind, officina_grid::condfmt::RuleKind::IconSet { icons: Some(_), .. })
+        }) {
+            changes.push("omitted Excel custom conditional icons");
+        }
         if d.wb.pivots().iter().any(|pivot| pivot.rows.iter().chain(&pivot.cols).any(|f| {
             matches!(&f.sort, officina_grid::pivot::AxisSort::Scoped { members, .. } if !members.is_empty())
         })) {

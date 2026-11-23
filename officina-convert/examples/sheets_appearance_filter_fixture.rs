@@ -161,6 +161,7 @@ fn fixture(set: u8) -> Workbook {
                 points: [0.0, 4.0, 7.0].map(|v| (Cfvo::Num(v), true)).to_vec(),
                 reverse: true,
                 show_value: true,
+                icons: None,
             },
             dxf: Dxf::default(),
             stop: false,

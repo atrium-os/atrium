@@ -58,11 +58,11 @@ fn book(lo: bool) -> Workbook {
     // where LibreOffice keeps those (not in .ods, which it reads without them).
     // LibreOffice drops gte="0" both ways.
     let arrows = officina_grid::condfmt::icon_set("3Arrows").unwrap();
-    let e = RuleKind::IconSet { set: arrows, points: officina_grid::condfmt::icon_points(3), reverse: false, show_value: true };
+    let e = RuleKind::IconSet { set: arrows, points: officina_grid::condfmt::icon_points(3), reverse: false, show_value: true, icons: None };
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(4)], rules: vec![Rule { kind: e, dxf: Dxf::default(), stop: false }] }).unwrap();
     let rating = officina_grid::condfmt::icon_set("5Rating").unwrap();
     let points = vec![(Cfvo::Num(0.0), true), (Cfvo::Num(3.0), true), (Cfvo::Percent(50.0), true), (Cfvo::Percentile(70.0), true), (Cfvo::Num(9.0), true)];
-    let g = RuleKind::IconSet { set: rating, points, reverse: !lo, show_value: lo };
+    let g = RuleKind::IconSet { set: rating, points, reverse: !lo, show_value: lo, icons: None };
     wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(5)], rules: vec![Rule { kind: g, dxf: Dxf::default(), stop: false }] }).unwrap();
     wb.recalc();
     wb

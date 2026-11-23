@@ -122,6 +122,49 @@ impl Default for Font {
     }
 }
 
+/// SpreadsheetML patterned fill, with resolved foreground and background colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PatternFill {
+    kind: u8,
+    pub foreground: Option<u32>,
+    pub background: Option<u32>,
+}
+
+impl PatternFill {
+    const KINDS: [&str; 17] = [
+        "darkGray", "mediumGray", "lightGray", "darkHorizontal", "darkVertical",
+        "darkDown", "darkUp", "darkGrid", "darkTrellis", "lightHorizontal",
+        "lightVertical", "lightDown", "lightUp", "lightGrid", "lightTrellis", "gray125", "gray0625",
+    ];
+
+    pub fn new(kind: &str, foreground: Option<u32>, background: Option<u32>) -> Option<Self> {
+        let kind = Self::KINDS.iter().position(|&name| name == kind)? as u8;
+        Some(Self { kind, foreground, background })
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::KINDS[self.kind as usize]
+    }
+
+    pub fn preview(self) -> Option<u32> {
+        self.foreground.or(self.background)
+    }
+
+    pub(crate) fn encode(self, w: &mut Writer) {
+        w.u8(self.kind);
+        color_out(w, self.foreground);
+        color_out(w, self.background);
+    }
+
+    pub(crate) fn decode(r: &mut Reader) -> Result<Self, WireError> {
+        let kind = r.u8()?;
+        if kind as usize >= Self::KINDS.len() {
+            return Err(WireError::Invalid("fill pattern"));
+        }
+        Ok(Self { kind, foreground: color_in(r)?, background: color_in(r)? })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Style {
     /// The number format code ("General" by default).
@@ -129,6 +172,7 @@ pub struct Style {
     pub font: Font,
     /// Solid background, 0xRRGGBB.
     pub fill: Option<u32>,
+    pub pattern: Option<PatternFill>,
     pub h_align: HAlign,
     pub v_align: VAlign,
     pub wrap: bool,
@@ -149,6 +193,7 @@ impl Default for Style {
             num_fmt: Arc::from("General"),
             font: Font::default(),
             fill: None,
+            pattern: None,
             h_align: HAlign::General,
             v_align: VAlign::Bottom,
             wrap: false,
@@ -176,7 +221,13 @@ impl Style {
         w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4
             | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
-        color_out(w, self.fill);
+        if let Some(pattern) = self.pattern {
+            w.u8(2);
+            pattern.encode(w);
+            color_out(w, self.fill);
+        } else {
+            color_out(w, self.fill);
+        }
         w.u8(self.h_align as u8);
         w.u8(self.v_align as u8);
         w.u8(self.indent);
@@ -193,7 +244,13 @@ impl Style {
         let size = r.len("font size", 409 * 20)? as u16;
         let flags = r.u8()?;
         let color = color_in(r)?;
-        let fill = color_in(r)?;
+        let fill_tag = r.u8()?;
+        let (fill, pattern) = if fill_tag == 2 {
+            let pattern = PatternFill::decode(r)?;
+            (color_in(r)?, Some(pattern))
+        } else {
+            (color_with_tag(r, fill_tag)?, None)
+        };
         const H: [HAlign; 8] = [HAlign::General, HAlign::Left, HAlign::Center, HAlign::Right, HAlign::Fill, HAlign::Justify, HAlign::CenterAcross, HAlign::Distributed];
         const V: [VAlign; 5] = [VAlign::Top, VAlign::Center, VAlign::Bottom, VAlign::Justify, VAlign::Distributed];
         let h_align = *H.get(r.u8()? as usize).ok_or(WireError::Invalid("alignment"))?;
@@ -220,6 +277,7 @@ impl Style {
                 color,
             },
             fill,
+            pattern,
             h_align,
             v_align,
             wrap: flags & 16 != 0,
@@ -244,7 +302,12 @@ fn color_out(w: &mut Writer, c: Option<u32>) {
 }
 
 fn color_in(r: &mut Reader) -> Result<Option<u32>, WireError> {
-    Ok(match r.u8()? {
+    let tag = r.u8()?;
+    color_with_tag(r, tag)
+}
+
+fn color_with_tag(r: &mut Reader, tag: u8) -> Result<Option<u32>, WireError> {
+    Ok(match tag {
         0 => None,
         1 => Some(r.u32()? & 0xFF_FFFF),
         _ => return Err(WireError::Invalid("colour")),
