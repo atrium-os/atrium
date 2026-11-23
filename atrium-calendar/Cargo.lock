@@ -45,6 +45,7 @@ name = "atrium-calendar"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "chrono",
  "libc",
  "pergola",

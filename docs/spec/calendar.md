@@ -1,6 +1,6 @@
 # Calendar for Atrium
 
-**Product review complete · 2026-11-23.** Decisions D1–D4 are accepted. Calendar is the display name, `atrium-calendar` the binary, and `org.atrium.calendar` the proposed app ID. The first milestone is usable with an empty calendar, no account and the network disconnected.
+**Product review complete · 2026-11-23.** Decisions D1–D4 are accepted. Calendar is the display name, `atrium-calendar` the binary, and `org.atrium.calendar` the installed app ID. The first milestone is usable with an empty calendar, no account and the network disconnected.
 
 ## 1. What Calendar gives the person
 
@@ -145,7 +145,19 @@ One Fasti instance owns a locked, versioned snapshot in its provisioned private 
 
 Run `cargo test --locked` in `atrium-calendar/` on the host. For the guest check, cross-build with `cargo test --locked --release --target aarch64-unknown-freebsd --no-run`. Stage the two binaries, the printed `planning` and `service` integration-test executables under those names, a headless-capable `frescod`, and the guest script in a fresh guest-local directory. Run the script there as root on a disposable guest. It starts the UI and service under separate test UIDs and records the rendered frames and logs.
 
-**Next C0 increment.** Wire the signed app and a supervised Fasti instance into the installed desktop launch path. Provision the private store and socket for each persona and mount only its socket into Calendar's jail. Verify Work and Personal isolation using the live launch registry. Week and Month, saved opening views, local search, event editing and deletion, single-occurrence moves and zoned-time handling remain C0 work.
+### 7.2 Installed Work and Personal calendars
+
+Forum launches the signed `org.atrium.calendar` bundle through Portcullis. The heading and window title name the selected calendar. Portcullis checks the verified manifest publisher against the operator’s Calendar grant before provisioning Fasti. The display name passed to the window carries no authority. [Launch binding](../../portcullis/portcullisd/src/calendar.rs)
+
+On first use in a login session, jaild starts Fasti as `_fasti` in a separate jail with IPv4 and IPv6 disabled. The supervisor binds a socket owned by the Calendar instance UID, mode 0600. The window sees its endpoint directory read-only at `/atrium/sockets/calendar`. Its own Fasti sees the private store writable at `/store` and the live launch registry read-only. Personal’s store lives under `~/.atrium/apps/.fasti/<publisher>`. Work’s lives under `~/.atrium/persona-apps/work/.fasti/<publisher>`. These directories follow the platform’s persona key-group provisioning. The supervisor retains the listener across service restarts and keeps the store available after the window closes. Logout stops the person’s Fasti services. Removing a named persona stops its Fasti before the platform erases the persona data. [Service template](../../atrium-calendar/fasti-service.toml) · [Jail policy](../../etc/jaild.policy.toml)
+
+**Disposable FreeBSD verification.** Open Work and Personal through Forum’s launcher and enter “design review” and “piano lesson” through their respective windows. Query each live service from its installed UI jail and require exactly the corresponding record. Check the registry signer, UIDs, mount sources, socket permissions and jailed network settings. Temporarily expose the opposite socket to each test peer and grant connect permission. Both requests must reach the listener and receive zero response bytes. Restart Work’s daemon, then close and reopen its window. Both calendars must retain their own entries. A manifest signed by a second trusted test publisher must fail the Calendar grant check. Deliver the authenticated session-ended message and verify both UIs, services and service mounts are gone. This gate uses a stock arm64 guest with plain persona directories. Tessera encryption and kernel syscall-filter enforcement need a capable image for verification. [Installed guest check](../../scripts/calendar-installed-guest-check.sh)
+
+**Installation and reproduction.** Cross-build Calendar and Fasti in `atrium-calendar/` and Portcullis in `portcullis/` on the host. Stage the binaries on the guest’s local disk. Install the matching jaild policy and restart jaild when applying a policy change. Run `sh calendar-bundle.sh ./atrium-calendar ./fastid ./atrium.toml signing-key.pem` as the operator with an existing trusted P-256 key. The installer pins its public fingerprint and refuses an implicit publisher change. The normal app approval and persona selection apply on launch. [Bundle installer](../../scripts/calendar-bundle.sh)
+
+To run the gate, use a fresh disposable desktop guest with its test publisher at `/root/of-key.pem` and its Ostiarius session grant configured. Cross-build the `installed_probe` Calendar example and `forum-dock` in addition to the two Calendar binaries, `atrium-jaild`, `opifex`, `portcullis` and `portcullisd`. Stage them, a headless-capable `frescod`, `atrium.toml`, `jaild.policy.toml`, the installer and the installed guest check in one fresh directory. The disposable host runner writes a unique marker to `.isolated-gate` there and runs `sh calendar-installed-guest-check.sh "$marker"` in that directory. It produces `work.png` and `personal.png`.
+
+**Next C0 increment.** Implement Week and Month and a separate opening-view preference in each Fasti store. Exercise first launch, temporary browsing and reopening both installed windows against distinct saved defaults. Local search, event editing and deletion, single-occurrence moves and zoned-time handling also remain in C0.
 
 ## 8. Accepted decisions
 

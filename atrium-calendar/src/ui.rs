@@ -33,6 +33,7 @@ enum Action {
 }
 
 struct Planner {
+    calendar_name: String,
     date: Mutable<TextEdit>,
     title: Mutable<TextEdit>,
     start: Mutable<TextEdit>,
@@ -168,6 +169,10 @@ impl View for Planner {
         .size(22.)
         .at(18., 16.)
         .render(ctx);
+        Label::new(&self.calendar_name)
+            .at(320., 18.)
+            .size(16.)
+            .render(ctx);
         for (label, field, x, w) in [
             ("Date", &self.date, 18., 140.),
             ("Title", &self.title, 174., 238.),
@@ -304,11 +309,25 @@ impl View for Planner {
 
 pub fn run() -> io::Result<()> {
     let today = Local::now().date_naive();
-    let mut win = Window::open(&WindowDesc::new("Calendar", SizeSpec::Fixed(700, 540)))?;
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let calendar_name = match args.as_slice() {
+        [] => "Calendar".to_owned(),
+        [flag, name]
+            if flag == "--persona"
+                && (name == "personal" || portcullis_peer::valid_person_persona(name)) =>
+        {
+            let mut name = name.clone();
+            name[..1].make_ascii_uppercase();
+            format!("{name} calendar")
+        }
+        _ => return Err(io::Error::other("Invalid Calendar launch arguments")),
+    };
+    let mut win = Window::open(&WindowDesc::new(&calendar_name, SizeSpec::Fixed(700, 540)))?;
     let dirty = Arc::new(AtomicBool::new(true));
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
     let planner = Arc::new(Planner {
+        calendar_name,
         date: field(&today.to_string()),
         title: field(""),
         start: field("09:00"),

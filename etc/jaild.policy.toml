@@ -30,6 +30,7 @@ ro_paths = [
     # Atrium runtime libs, bundles, fonts (read by every jailed
     # process).
     "/usr/local/lib",
+    "/usr/local/libexec/atrium/fasti",
     "/usr/local/share/atrium",
     "/usr/local/etc/fonts",
     "/usr/local/share/fonts",
@@ -150,6 +151,16 @@ rw_paths = [
     "/var/run/atrium",
 ]
 rw_patterns = [
+    # Fasti gets one publisher's store in the selected persona and the
+    # directory for its supervisor-bound Calendar socket (peer UID checked).
+    "/usr/home/*/.atrium/apps/.fasti/*",
+    "/usr/home/*/.atrium/persona-apps/*/.fasti/*",
+    "/home/*/.atrium/apps/.fasti/*",
+    "/home/*/.atrium/persona-apps/*/.fasti/*",
+    "/root/.atrium/apps/.fasti/*",
+    "/root/.atrium/persona-apps/*/.fasti/*",
+    "/var/run/atrium/fasti/*",
+
     # A folder of a USB stick granted into an app's jail: dispensatord's
     # FUSE mount of the stick's own server (device-assignment.md §4.8).
     "/media/.grants/*",
@@ -489,6 +500,7 @@ allowed_prefixes = [
 min_user_uid        = 1000
 max_user_uid        = 65000
 allowed_system_uids = [
+    65055,   # _fasti: Calendar store service
     # Atrium's system uids sit above the user range and below nobody
     # (65534), clear of base and ports: 65 and 66, reserved here at first,
     # are FreeBSD's _dhcp and uucp.
@@ -552,6 +564,7 @@ allowed_system_uids = [
 
 [gid]
 allowed_system_gids = [
+    65055,   # _fasti
     # mirrors uid table
     65010,   # _frescod
     65011,   # _fresco-render
@@ -843,6 +856,11 @@ sockopts = [
     "0:1",          # LOCAL_PEERCRED (getpeereid); level 0 is also IPPROTO_IP
 ]
 families = ["unix"]
+
+# Fasti validates its inherited listener with getsockopt(SO_ACCEPTCONN).
+[sysfil.profiles.calendar-store]
+include = ["base"]
+sockopts = ["0xffff:2"]
 
 # Fresco renderers, decoders, the Tier-2 executor, Navigator workers.
 [sysfil.profiles.renderer]

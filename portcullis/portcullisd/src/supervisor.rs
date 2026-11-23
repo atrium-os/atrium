@@ -360,6 +360,12 @@ pub struct Supervisor {
     settled_logged: bool,
 }
 
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let _ = ffi::close_fd(self.kq);
+    }
+}
+
 impl Supervisor {
     pub fn new(client: Client, jaild_socket_path: std::path::PathBuf) -> io::Result<Self> {
         let kq = ffi::kqueue()?;
@@ -393,7 +399,10 @@ impl Supervisor {
         listeners:   Vec<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
         let idx = self.services.len();
-        ffi::register_procdesc_exit(self.kq, procdesc_fd, idx)?;
+        if let Err(e) = ffi::register_procdesc_exit(self.kq, procdesc_fd, idx) {
+            let _ = ffi::close_fd(procdesc_fd);
+            return Err(e);
+        }
         info!("supervising {}: pid={pid} procdesc={procdesc_fd}", manifest.name);
         let initial_budget = manifest.supervision.failure_budget_secs as f64;
         self.services.push(ServiceState {
@@ -458,6 +467,14 @@ impl Supervisor {
             self.release_client();
             self.write_status();
         }
+    }
+
+    /// Start a service owned by a login session with the same restart budget
+    /// and socket handoff used at boot.
+    pub fn start_session_service(&mut self, p: Pending) -> Result<(), String> {
+        let result = self.launch(p);
+        self.release_client();
+        result
     }
 
     fn launch(&mut self, p: Pending) -> Result<(), String> {
@@ -618,11 +635,15 @@ impl Supervisor {
     /// services (all have retired into "never restart" state)
     /// OR a shutdown signal flips `SHUTDOWN_REQUESTED`.
     pub fn run(&mut self) -> io::Result<()> {
+        self.run_until(&SHUTDOWN_REQUESTED)
+    }
+
+    pub fn run_until(&mut self, stopping: &AtomicBool) -> io::Result<()> {
         while self.services.iter().any(|s| !s.retired)
             || self.graph.as_ref().is_some_and(|g| !g.launchable().is_empty())
         {
-            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-                info!("supervisor: shutdown signal received; tearing down \
+            if stopping.load(Ordering::SeqCst) {
+                info!("supervisor: shutdown requested; tearing down \
                        {} live service(s)", self.watched_count());
                 self.graceful_shutdown();
                 return Ok(());
@@ -639,7 +660,7 @@ impl Supervisor {
                      * the top of the loop runs immediately. */
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => { self.graceful_shutdown(); return Err(e); }
             };
             for ev in evs {
                 if ev.filter == READ_FILTER {
@@ -668,6 +689,7 @@ impl Supervisor {
             self.check_ready_deadlines();
             self.process_pending_restarts();
             self.launch_ready();
+            self.release_client();
         }
         info!("supervisor: all services retired; exit");
         Ok(())

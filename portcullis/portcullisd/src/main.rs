@@ -51,6 +51,7 @@ use portcullis_ipc::{
 };
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
+mod calendar;
 mod console;
 mod dev;
 mod egress;
@@ -2678,6 +2679,7 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
     }
     publish_colours(&owner, &tp.policy);
     if removing {
+        calendar::stop(&owner, Some(&name));
         let gone = portcullis_overlay::remove_persona_places(&owner, &name);
         // Its files too (personas.md §4.1): encrypted, the key goes and the
         // kernel crypto-erases them (tessera-encryption.md E4.6).
@@ -3684,6 +3686,7 @@ fn session_ended(user: &str) -> Response {
     launch::stop_files_for_logout(user);
     let uids = launch::user_uids(user);
     launch::end_processes(&uids);
+    calendar::stop(user, None);
     if let Ok(list) = workspace::list(user) {
         for (r, running) in list {
             if running {

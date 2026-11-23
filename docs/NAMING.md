@@ -24,6 +24,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **Session manager** | **Ostiarius** | the Roman doorkeeper who guarded the entrance & controlled who came in | the privileged display-manager / orchestrator (a trusted system service, NOT an Insula app): on auth, binds the seat + requests Portcullis→jaild to launch the session (Forum + Choragus + apps for GUI; a zsh console-shell for CLI). Never execs — jaild is the sole launcher. *Vestibulum is the entrance hall; the Ostiarius admits you and sets up your stay.* |
 | **Audio server** | **Lyra** | stringed instrument | per-stream submission, content-addressed sample buffers |
 | **Audio policy / session layer** | **Choragus** | the citizen who organised, arranged & directed the chorus in Greek theatre | the "audio window manager" — routing, ducking, per-app volume, hotplug-follow, exclusive-claim; mechanism/policy split from lyrad (the RT engine). *Lyra plays; the Choragus arranges who plays.* |
+| **Calendar store** | **Fasti** | Roman calendar | Per-persona local appointments and holds for Calendar. [Calendar spec](spec/calendar.md) |
 | **Clipboard** | **Tabula** | wax tablet | clipboard service; entries are CAS blobs, multi-format |
 | **Notifications** | **Praeco** | town crier / herald | toast notifications + history |
 | **Package manager** | **Opifex** | craftsman / maker | fetch + verify + install + rollback of jail trees |
@@ -59,6 +60,7 @@ User-facing apps don't take Latin names — they keep plain descriptive names wi
 - `atrium-files` — file browser (built atop Scrinium)
 - `atrium-image` — image viewer
 - `atrium-pdf` — PDF viewer
+- `atrium-calendar` — Calendar. [Calendar spec](spec/calendar.md)
 - `atrium-mail` — email (Mail); see [`spec/mail.md`](spec/mail.md)
 - `atrium-doc` — document viewer (HTML/Markdown/PDF) — see [`spec/insula.md`](spec/insula.md) §10.6
 - `atrium-clock` — clock widget

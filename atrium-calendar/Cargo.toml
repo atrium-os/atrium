@@ -8,6 +8,7 @@ default-run = "atrium-calendar"
 
 [dependencies]
 libc = "0.2"
+atrium-listen = { path = "../atrium-listen" }
 aqueduct = { path = "../aqueduct" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 chrono = { version = "0.4.45", features = ["serde"] }

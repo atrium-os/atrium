@@ -11,6 +11,8 @@ into typed structures (Rust serde), keeps in memory. Hot-reload is
 **not** supported — restart jaild to apply changes (rare; this is
 system config).
 
+Calendar’s store jail mounts one publisher directory from the selected persona’s app-data group, its own listener directory, the launch registry and the runtime it needs to execute. The `calendar-store` syscall profile extends `base` with the socket option Fasti uses to validate its inherited listener. [Calendar §7.2](calendar.md#72-installed-work-and-personal-calendars)
+
 This is the de-facto root of trust for Atrium's runtime. If
 portcullisd is fully compromised, the worst it can do is whatever
 this policy permits. So the policy is conservative: each entry is

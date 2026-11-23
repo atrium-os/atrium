@@ -554,6 +554,13 @@ fn launch_inner(
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("parse error: {e}")))?;
+    let calendar_window = if app_id == crate::calendar::APP {
+        if manifest.app.id != app_id {
+            return Err(LaunchError::Failed("signature", "Calendar bundle ID mismatch".into()));
+        }
+        Some(crate::calendar::reserve_window(publisher.as_ref(), persona)
+            .map_err(|e| LaunchError::Failed("signature", e.to_string()))?)
+    } else { None };
     let refresh_groups = files_bundle.is_some();
     if let Some(pinned) = files_bundle {
         // A changed manifest or publisher must go through a new launch
@@ -837,6 +844,16 @@ fn launch_inner(
     /* A named persona's instance has a channel of its own, keyed
      * `<id>@<persona>`: what reaches it comes from its own persona
      * (personas.md §3; crossing is P3, off by default). */
+    if let Some((signer, _lease)) = &calendar_window {
+        let mountpoint = crate::calendar::socket_mountpoint(&jail_path)
+            .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("mount", e.to_string()) })?;
+        let dir = crate::calendar::endpoint(user, persona, signer, app_uid)
+            .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("fasti", e.to_string()) })?;
+        jc.add_mount(&dir, &mountpoint, "nullfs", &["ro", "nosuid", "noexec"]);
+        // Presentation only. Fasti authorizes commands from kernel credentials.
+        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} --persona {}",
+            manifest.entry(), persona.unwrap_or("personal"))));
+    }
     let mut recovery_mount = None;
     if let Some(doc) = &mut document {
         let mount = RecoveryMount::attach(doc, app_uid, &jail_path, &mut jc)?;

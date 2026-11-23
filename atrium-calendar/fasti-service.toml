@@ -1,0 +1,38 @@
+# Portcullis completes this template from the verified launch identity.
+# The service starts on first use in the session.
+name = "system-fasti"
+path = "/var/lib/atrium/jails/system-fasti"
+
+[[mounts]]
+source = "/libexec"
+dest = "libexec"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/lib"
+dest = "lib"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/usr/lib"
+dest = "usr/lib"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/usr/local/libexec/atrium/fasti"
+dest = "usr/local/bin"
+kind = "ro_nullfs"
+
+[[mounts]]
+source = "/var/run/atrium/app-registry"
+dest = "registry"
+kind = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-fastid"
+argv = ["atrium-fastid", "--installed"]
+uid = 65055
+gid = 65055
+
+[supervision]
+restart = "always"
