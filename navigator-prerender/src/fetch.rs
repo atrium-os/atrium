@@ -339,9 +339,15 @@ impl FetchdFetcher {
     /// Kept in step with navigator-fetch's body limit.
     pub const MAX_BODY: usize = 8 * 1024 * 1024;
     const MAX_HEADER: usize = 16 * 1024;
-    /// A single anonymous HTML GET. The fetch worker validates MIME and never follows a redirect.
-    pub fn widget_document(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        match self.exchange_line(url, "", "I ")? {
+    /// A single anonymous GET with exact response type and no redirects.
+    pub fn widget_resource(&mut self, url: &str, mime: &str) -> Result<Vec<u8>, String> {
+        let verb = match mime {
+            "text/html" => "I ",
+            "text/javascript" => "I-js ",
+            "video/webm" => "I-webm ",
+            _ => return Err("unsupported widget resource type".into()),
+        };
+        match self.exchange_line(url, "", verb)? {
             Reply::Ok { status: 200, rest, body } if rest == format!("0 {} {url}", body.len()) && body.len() <= 65536 => Ok(body),
             Reply::Err(why) => Err(why),
             _ => Err("unexpected widget document reply".into()),

@@ -933,6 +933,13 @@ fn fetched_island_reports_follow_attachment_direction_and_lifecycle() {
     assert_eq!(refused(child.emit(id, padded)), refusal::MALFORMED);
     child.emit(id, started.clone()).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes: started.clone() });
+    let seek = limen::web_island::ChapterSeek::from_link("#t=1.5").unwrap().encode();
+    assert_eq!(refused(app.send(id, seek.clone())), refusal::MALFORMED);
+    let ready = Report::MediaReady.encode().unwrap();
+    child.emit(id, ready.clone()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed: id, bytes: ready });
+    app.send(id, seek.clone()).unwrap();
+    assert_eq!(next_c(&mut child), ChildEvent::Message { embed: id, bytes: seek });
     let ask = Report::BeforeUnload { query: 3 }.encode().unwrap();
     let reply = limen::web_island::UnloadAnswer { query: 3, leave: false }.encode();
     assert_eq!(refused(app.send(id, reply.clone())), refusal::MALFORMED);

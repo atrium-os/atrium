@@ -13,6 +13,7 @@ pub enum Report<'a> {
     Resize { width: u16, height: u16 },
     Ended(EndReason),
     BeforeUnload { query: u32 },
+    MediaReady,
 }
 
 impl Report<'_> {
@@ -22,7 +23,7 @@ impl Report<'_> {
                 !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))),
             Self::Title(text) => text.len() <= 256 && !text.chars().any(char::is_control),
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
-            Self::Ended(_) => true,
+            Self::Ended(_) | Self::MediaReady => true,
             Self::BeforeUnload { query } => *query != 0,
         }
     }
@@ -59,7 +60,38 @@ impl UnloadAnswer {
     }
 }
 
+/// Chapter control carries only a finite time on the native media clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChapterSeek(f64);
+
+impl ChapterSeek {
+    pub fn from_link(href: &str) -> Option<Self> {
+        let time = href.strip_prefix("#t=")?;
+        let (seconds, fraction) = time.split_once('.').unwrap_or((time, "0"));
+        if seconds.is_empty() || fraction.is_empty() ||
+            !seconds.bytes().chain(fraction.bytes()).all(|c| c.is_ascii_digit()) { return None; }
+        Self::new(time.parse().ok()?)
+    }
+    pub fn new(seconds: f64) -> Option<Self> {
+        crate::media_player::finite_secs(seconds).then_some(Self(seconds))
+    }
+    pub fn seconds(self) -> f64 { self.0 }
+    pub fn encode(self) -> Vec<u8> {
+        let mut bytes = vec![b'S'];
+        bytes.extend(self.0.to_le_bytes());
+        bytes
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::new(f64::from_le_bytes(bytes.strip_prefix(b"S")?.try_into().ok()?))
+    }
+}
+
 impl Lifecycle {
+    pub fn accepts_control(&mut self, bytes: &[u8], media_ready: bool) -> bool {
+        if let Some(answer) = UnloadAnswer::decode(bytes) { return self.answer(answer); }
+        media_ready && matches!(self, Self::Running { .. }) && ChapterSeek::decode(bytes).is_some()
+    }
+
     pub fn answer(&mut self, answer: UnloadAnswer) -> bool {
         if !matches!(*self, Self::AwaitingUnload(query) if query == answer.query) { return false; }
         *self = Self::Running { last_query: answer.query };
@@ -73,7 +105,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. }) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,

@@ -87,6 +87,7 @@ struct Child {
 
 #[derive(Clone, Copy)]
 struct ActiveWidget {
+    media_ready: bool,
     page: Key,
     document: Ticket,
     press: ctl::Press,
@@ -751,6 +752,11 @@ impl Live {
                         }
                     }
                 }
+                Event::WidgetMediaReady { document, start } => {
+                    if let Some(active) = self.widget.as_mut().filter(|w| w.document == document && w.press == start) {
+                        active.media_ready = true;
+                    }
+                }
                 Event::WidgetStopped { document, press } => {
                     if let Some(active) = retire_widget(&mut self.widget, document, press) {
                         active.set_origin(s, None);
@@ -866,7 +872,16 @@ impl Live {
                 },
                 ParentEvent::Message { bytes, .. } => match ToParent::decode(&bytes) {
                     Some(ToParent::LinkActivated { url }) if on_screen => {
-                        s.link_pressed(&url);
+                        let child = &self.children[i];
+                        if let (Some(active), Some(seek)) = (self.widget.filter(|w| w.media_ready
+                            && w.page == child.key && child.document == Some(w.document)),
+                            limen::web_island::ChapterSeek::from_link(&url)) {
+                            send(&mut self.w, &Request::SeekWidgetChapter {
+                                document: active.document, start: active.press, seconds_bits: seek.seconds().to_bits(),
+                            });
+                        } else {
+                            s.link_pressed(&url);
+                        }
                         changed = true;
                     }
                     Some(ToParent::LinkHover { url }) if on_screen => {
@@ -1039,7 +1054,7 @@ impl Live {
                     if let Some((document, rect)) = self.widget_bounds(s, page, key, Some(&src)) {
                         send(&mut self.w, &Request::StartWidget { document, source: src, rect, press });
                         if let Some(old) = self.widget { old.set_origin(s, None); }
-                        self.widget = Some(ActiveWidget { page, document, key, rect, press });
+                        self.widget = Some(ActiveWidget { media_ready: false, page, document, key, rect, press });
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
@@ -1239,7 +1254,7 @@ mod widget_lifecycle_tests {
 
     #[test]
     fn late_failure_cannot_retire_a_replacement_in_the_same_slot() {
-        let mut active = Some(ActiveWidget { page: (1, 1), document: [1; 16], press: [3; 16], key: 9, rect: [0, 0, 20, 20] });
+        let mut active = Some(ActiveWidget { media_ready: false, page: (1, 1), document: [1; 16], press: [3; 16], key: 9, rect: [0, 0, 20, 20] });
         assert!(retire_widget(&mut active, [1; 16], [2; 16]).is_none());
         assert!(retire_widget(&mut active, [0; 16], [3; 16]).is_none());
         assert_eq!(retire_widget(&mut active, [1; 16], [3; 16]).unwrap().key, 9);

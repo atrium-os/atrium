@@ -204,13 +204,8 @@ impl Media {
     /// Activate a document chapter in this media slot. Only local temporal
     /// fragments in decimal seconds belong to the prototype.
     pub fn seek_chapter(&mut self, href: &str) -> bool {
-        let Some(time) = href.strip_prefix("#t=") else { return false };
-        let (seconds, fraction) = time.split_once('.').unwrap_or((time, "0"));
-        if !self.loaded || seconds.is_empty() || fraction.is_empty()
-            || !seconds.bytes().chain(fraction.bytes()).all(|c| c.is_ascii_digit()) {
-            return false;
-        }
-        time.parse::<f64>().is_ok_and(|seconds| limen::media_player::finite_secs(seconds) && self.seek(seconds).is_ok())
+        self.loaded && limen::web_island::ChapterSeek::from_link(href)
+            .is_some_and(|seek| self.seek(seek.seconds()).is_ok())
     }
 
     /// `currentTime = t`.

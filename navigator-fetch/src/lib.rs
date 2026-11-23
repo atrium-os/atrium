@@ -627,9 +627,10 @@ pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration
             // may pull (prefetch::DEFAULT_BUDGET until told).
             if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }
             if url == "--gate" { let _ = out.flush(); gate(&mut out); continue }
-            // One anonymous widget document, without following redirects.
-            if let Some(u) = url.strip_prefix("I ") {
-                match pf.widget_document(u) {
+            // Anonymous island resources have an explicit expected response type.
+            if let Some((u, mime)) = [("I ", "text/html"), ("I-js ", "text/javascript"), ("I-webm ", "video/webm")]
+                .iter().find_map(|(prefix, mime)| url.strip_prefix(prefix).map(|u| (u, *mime))) {
+                match pf.widget_resource(u, mime) {
                     Ok(body) => {
                         let _ = writeln!(out, "ok 200 0 {} {u}", body.len());
                         let _ = out.write_all(&body);

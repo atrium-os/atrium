@@ -311,7 +311,7 @@ impl<'a> Prefetcher<'a> {
         self.conv.fetch(url)
     }
 
-    pub fn widget_document(&mut self, url: &str) -> Result<Vec<u8>, String> {
+    pub fn widget_resource(&mut self, url: &str, expected_mime: &str) -> Result<Vec<u8>, String> {
         let u = url::Url::parse(url).map_err(|e| e.to_string())?;
         if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
             return Err("widget requires an HTTPS address".into());
@@ -324,8 +324,8 @@ impl<'a> Prefetcher<'a> {
             return Err(format!("widget document returned HTTP {}", r.status));
         }
         let mime = r.header("content-type").and_then(|value| value.split(';').next());
-        if !mime.is_some_and(|t| t.trim().eq_ignore_ascii_case("text/html")) {
-            return Err("widget document requires text/html".into());
+        if !mime.is_some_and(|t| t.trim().eq_ignore_ascii_case(expected_mime)) {
+            return Err(format!("widget resource requires {expected_mime}"));
         }
         if r.body.len() > 65536 {
             return Err("widget document exceeds 64 KiB".into());

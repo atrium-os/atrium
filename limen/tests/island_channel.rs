@@ -139,3 +139,26 @@ fn generated_bidirectional_frames_preserve_lifecycle() {
     assert!(accepted_reports.iter().all(|&n| n > 0));
     assert!(accepted_answers.iter().all(|&n| n > 0));
 }
+
+#[test]
+fn chapter_controls_require_live_media_and_an_exact_finite_payload() {
+    use limen::web_island::ChapterSeek;
+    let seek = ChapterSeek::from_link("#t=1.5").unwrap();
+    let valid = seek.encode();
+    let mut running = Lifecycle::Running { last_query: 3 };
+    assert_eq!(ChapterSeek::decode(&valid), Some(seek));
+    assert!(running.accepts_control(&valid, true));
+    assert!(!running.accepts_control(&valid, false));
+    for mut state in [Lifecycle::Waiting, Lifecycle::AwaitingUnload(4), Lifecycle::Ended] {
+        assert!(!state.accepts_control(&valid, true));
+    }
+    for value in [f64::NAN, f64::INFINITY, -1.0, 1e9 + 1.0] {
+        let mut bad = vec![b'S'];
+        bad.extend(value.to_le_bytes());
+        assert!(!running.accepts_control(&bad, true));
+    }
+    assert!(!running.accepts_control(&valid[..8], true));
+    let mut padded = valid;
+    padded.push(0);
+    assert!(!running.accepts_control(&padded, true));
+}

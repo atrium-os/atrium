@@ -12,14 +12,16 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#ifdef ATRIUM_MAIL_PAGE
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO)
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #endif
 #include <LibWeb/Platform/EventLoopPlugin.h>
 
 static constexpr char fixture[] = {
-#if defined(ATRIUM_I1_COUNTER)
+#if defined(ATRIUM_I4_VIDEO)
+#embed "local-player.html"
+#elif defined(ATRIUM_I1_COUNTER)
 #embed "counter.html"
 #elif defined(ATRIUM_I0_SIGN_IN)
 #embed "sign-in.html"
@@ -89,7 +91,7 @@ int main(int argc, char** argv)
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
-#ifdef ATRIUM_MAIL_PAGE
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO)
     auto& agent = Web::HTML::surrounding_agent();
     agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 #endif
@@ -100,7 +102,11 @@ int main(int argc, char** argv)
     auto client = Navigator::EditorPage::create(move(palette));
 #if defined(ATRIUM_I1_COUNTER)
     if (!embedded) return 1;
+#ifdef ATRIUM_I4_VIDEO
+    constexpr auto location = "https://widget.example/navigator-i4/local-player.html"sv;
+#else
     constexpr auto location = "https://widget.example/counter.html"sv;
+#endif
     auto* scene = navigator_counter_scene_create();
     if (!scene) return 4;
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };

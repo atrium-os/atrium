@@ -1,5 +1,5 @@
-//! I0 fixtures use one preconnected Nuntius channel and a fixed GET sequence.
-//! Its response must be a bounded, contiguous HTML body at the exact fixture URL.
+//! The fixtures use one preconnected Nuntius channel and a fixed GET sequence.
+//! Its response must be a bounded, contiguous body with the expected media type at the exact fixture URL.
 use nuntius::{Client, Event, Open};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -14,7 +14,13 @@ const SIGN_IN: [&str; 4] = [
     "https://idp.example/sign-in.html?step=password",
     "https://idp.example/sign-in.html?step=callback",
 ];
-static CLIENT: OnceLock<Mutex<Option<(Client, usize)>>> = OnceLock::new();
+const VIDEO: [&str; 3] = [
+    "https://widget.example/navigator-i4/local-player.html",
+    "https://widget.example/navigator-i4/local-player.js",
+    "https://widget.example/media/red-blue.webm",
+];
+type Sequence = &'static [&'static str];
+static CLIENT: OnceLock<Mutex<Option<(Client, usize, Option<Sequence>)>>> = OnceLock::new();
 
 /// # Safety
 /// The caller transfers sole ownership of a connected descriptor.
@@ -28,7 +34,7 @@ pub unsafe extern "C" fn navigator_fixture_channel(fd: i32) -> bool {
     {
         return false;
     }
-    Client::from_stream(socket).is_ok_and(|c| CLIENT.set(Mutex::new(Some((c, 0)))).is_ok())
+    Client::from_stream(socket).is_ok_and(|c| CLIENT.set(Mutex::new(Some((c, 0, None)))).is_ok())
 }
 
 /// # Safety
@@ -49,12 +55,20 @@ pub unsafe extern "C" fn navigator_fixture_get(
     let Some(mut state) = CLIENT.get().and_then(|c| c.lock().ok()) else {
         return 0;
     };
-    let Some((mut client, step)) = state.take() else {
+    let Some((mut client, step, sequence)) = state.take() else {
         return 0;
     };
-    if !(step == 0 && matches!(url, URL | COUNTER)) && SIGN_IN.get(step).copied() != Some(url) {
-        return 0;
-    }
+    let sequence: &[&str] = match sequence {
+        Some(sequence) => sequence,
+        None if url == URL => &[URL],
+        None if url == COUNTER => &[COUNTER],
+        None if url == VIDEO[0] => &VIDEO,
+        None if url == SIGN_IN[0] => &SIGN_IN,
+        _ => return 0,
+    };
+    if sequence.get(step).copied() != Some(url) { return 0; }
+    let expected_mime = if url == VIDEO[1] { "text/javascript" }
+        else if url == VIDEO[2] { "video/webm" } else { "text/html" };
     let request_id = step as u32 + 1;
     let mut open = Open::get(request_id, url);
     open.limits.max_bytes = capacity as u64;
@@ -79,7 +93,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
             })) if id == request_id
                 && total.is_none()
                 && final_url == url
-                && mime == "text/html"
+                && mime == expected_mime
                 && n <= capacity as u64 =>
             {
                 total = Some(n as usize)
@@ -95,8 +109,8 @@ pub unsafe extern "C" fn navigator_fixture_get(
             Ok(Some(Event::Done { id, bytes }))
                 if id == request_id && total == Some(used) && bytes == used as u64 =>
             {
-                if SIGN_IN.get(step).copied() == Some(url) && step + 1 < SIGN_IN.len() {
-                    *state = Some((client, step + 1));
+                if step + 1 < sequence.len() {
+                    *state = Some((client, step + 1, Some(sequence)));
                 }
                 return used;
             }

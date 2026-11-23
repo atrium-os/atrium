@@ -11,6 +11,21 @@ use std::{
 
 pub const COUNTER: &str = "https://widget.example/counter.html";
 
+pub const VIDEO: &str = "https://widget.example/navigator-i4/local-player.html";
+const VIDEO_RESOURCES: &[(&str, &str)] = &[
+    (VIDEO, "text/html"),
+    ("https://widget.example/navigator-i4/local-player.js", "text/javascript"),
+    ("https://widget.example/media/red-blue.webm", "video/webm"),
+];
+const COUNTER_RESOURCES: &[(&str, &str)] = &[(COUNTER, "text/html")];
+
+pub fn enabled_source(base: &str, src: &str) -> Option<&'static str> {
+    let url = url::Url::parse(base).ok()?.join(src).ok()?;
+    [(COUNTER, "NAVIGATORD_I1_COUNTER"), (VIDEO, "NAVIGATORD_I4_VIDEO")].into_iter()
+        .find(|(exact, setting)| url.as_str() == *exact && crate::settings::get(setting).as_deref() == Some(*exact))
+        .map(|(exact, _)| exact)
+}
+
 pub fn bounds(r: [u32; 4]) -> Result<[f32; 4], String> {
     let [x, y, w, h] = r;
     if w == 0 || h == 0 || x.saturating_add(w) > 65535 || y.saturating_add(h) > 65535 {
@@ -30,12 +45,14 @@ pub struct Widget {
 impl Widget {
     pub fn start(
         socket: &Path,
+        source: &'static str,
         window: [u8; 16],
         document: Ticket,
         press: navigator_control::Press,
         rect: [u32; 4],
         cfg: Arc<Config>,
         attached: impl FnOnce() + Send + 'static,
+        media_ready: impl FnOnce() + Send + 'static,
         unload: impl Fn(u32, bool) + Send + 'static,
         finished: impl FnOnce(Option<navigator_control::WidgetFailure>) + Send + 'static,
     ) -> Result<Self, String> {
@@ -70,18 +87,19 @@ impl Widget {
         // A slow document GET must not delay Stop or placement retirement.
         let (done, fetched) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = fetch(channel, &cfg);
+            let result = fetch(channel, &cfg, source);
             if let Err(e) = &result { eprintln!("navigatord: widget fetch: {e}"); }
             let _ = done.send(result);
         });
         std::thread::spawn(move || {
             use navigator_control::WidgetFailure;
             use limen::web_island::{EndReason, Lifecycle, Report};
-            let granted_origin = crate::origin(COUNTER);
+            let granted_origin = crate::origin(source);
             let mut reports = Lifecycle::default();
             let mut question = None;
             let mut first_title = true;
             let mut first_resize = true;
+            let mut media_ready = Some(media_ready);
             let mut attached = Some(attached);
             let failure = loop {
                 let mut slot = watched.lock().unwrap();
@@ -109,6 +127,9 @@ impl Widget {
                         match reports.receive(&bytes) {
                             Some(Report::Started { origin }) if granted_origin.as_deref() == Some(origin) => {
                                 eprintln!("navigatord: widget reported start for {origin}");
+                            }
+                            Some(Report::MediaReady) => {
+                                if let Some(notify) = media_ready.take() { notify(); }
                             }
                             Some(Report::BeforeUnload { query }) => {
                                 question = Some((query, Instant::now() + Duration::from_secs(30)));
@@ -159,6 +180,11 @@ impl Widget {
         })
     }
 
+    pub fn seek(&self, seek: limen::web_island::ChapterSeek) -> Result<(), String> {
+        let mut slot = self.parent.lock().unwrap();
+        slot.as_mut().ok_or("island retired")?.send(self.embed, seek.encode()).map_err(|e| format!("{e:?}"))
+    }
+
     pub fn place(&mut self, rect: [u32; 4]) -> Result<(), String> {
         if let Some(p) = self.parent.lock().unwrap().as_mut() {
             p.place(self.embed, Some(bounds(rect)?))
@@ -174,7 +200,7 @@ impl Drop for Widget {
     }
 }
 
-fn fetch(socket: UnixStream, cfg: &Config) -> Result<(), String> {
+fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
     use nuntius::{Deliver, Event, Method, Request};
     let timeout = Some(Duration::from_secs(5));
     socket
@@ -182,45 +208,53 @@ fn fetch(socket: UnixStream, cfg: &Config) -> Result<(), String> {
         .and_then(|_| socket.set_write_timeout(timeout))
         .map_err(|e| e.to_string())?;
     let (mut input, mut output) = nuntius::server::channel(socket).map_err(|e| e.to_string())?;
-    let Some(Request::Open(open)) = input.recv().map_err(|e| e.to_string())? else {
-        return Err("expected a document GET".into());
-    };
-    let id = open.id;
-    if open.url != COUNTER
-        || open.method != Method::Get
-        || open.body.is_some()
-        || open.range.is_some()
-        || open.if_range.is_some()
-        || open.deliver != Deliver::Stream
-    {
-        return Err("request outside the widget grant".into());
-    }
     let Upstream::Fetchd(mut fetcher, _worker) = upstream(cfg, &crate::instance())? else {
         return Err("widget requires the plain fetch worker".into());
     };
-    let body = fetcher.widget_document(COUNTER)?;
-    let length = body.len() as u64;
-    if length == 0 || length > open.limits.max_bytes.min(65536) {
-        return Err("widget document size".into());
-    }
-    eprintln!("navigatord: widget GET {COUNTER} bytes={length}");
-    let mut send = |event| output.send(event).map_err(|e| e.to_string());
-    send(Event::Head {
-        id,
-        status: 200,
-        final_url: COUNTER.into(),
-        redirects: 0,
-        content_type: Some("text/html".into()),
-        length: Some(length),
-        accept_ranges: false,
-        validator: None,
-    })?;
-    for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
-        send(Event::Data {
+    let resources = match source {
+        COUNTER => COUNTER_RESOURCES,
+        VIDEO => VIDEO_RESOURCES,
+        _ => return Err("unknown widget source".into()),
+    };
+    for &(url, mime) in resources {
+        let Some(Request::Open(open)) = input.recv().map_err(|e| e.to_string())? else {
+            return Err("expected a document GET".into());
+        };
+        let id = open.id;
+        if open.url != url
+            || open.method != Method::Get
+            || open.body.is_some()
+            || open.range.is_some()
+            || open.if_range.is_some()
+            || open.deliver != Deliver::Stream
+        {
+            return Err("request outside the widget grant".into());
+        }
+        let body = fetcher.widget_resource(url, mime)?;
+        let length = body.len() as u64;
+        if length == 0 || length > open.limits.max_bytes.min(65536) {
+            return Err("widget document size".into());
+        }
+        eprintln!("navigatord: widget GET {url} bytes={length}");
+        let mut send = |event| output.send(event).map_err(|e| e.to_string());
+        send(Event::Head {
             id,
-            offset: (i * nuntius::DATA_MAX) as u64,
-            bytes: bytes.to_vec(),
+            status: 200,
+            final_url: url.into(),
+            redirects: 0,
+            content_type: Some(mime.into()),
+            length: Some(length),
+            accept_ranges: false,
+            validator: None,
         })?;
+        for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
+            send(Event::Data {
+                id,
+                offset: (i * nuntius::DATA_MAX) as u64,
+                bytes: bytes.to_vec(),
+            })?;
+        }
+        send(Event::Done { id, bytes: length })?;
     }
-    send(Event::Done { id, bytes: length })
+    Ok(())
 }

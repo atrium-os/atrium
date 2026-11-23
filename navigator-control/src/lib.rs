@@ -201,6 +201,7 @@ pub enum Request {
     WidgetUnloadAnswer { document: Ticket, start: Press, query: u32, leave: bool, press: Press },
     /// Like OpenWithIslands, also report a tier-two recording before Opened.
     OpenWithRecordingTier { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
+    SeekWidgetChapter { document: Ticket, start: Press, seconds_bits: u64 },
 }
 
 /// The single whole-page fixture granted during I0.
@@ -364,6 +365,7 @@ pub enum Event {
     ReplayedRecording { id: u32 },
     /// A sealed VPN document descriptor follows on the installed UI channel.
     VpnDocument { id: u32, url: String },
+    WidgetMediaReady { document: Ticket, start: Press },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

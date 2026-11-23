@@ -16,6 +16,9 @@
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <sys/resource.h>
+#ifdef ATRIUM_I4_VIDEO
+#include <LibWeb/HTML/HTMLMediaElement.h>
+#endif
 
 struct NavigatorScene;
 extern "C" NavigatorScene* navigator_scene_create(bool);
@@ -64,6 +67,8 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
 extern "C" int navigator_page_pointer(NavigatorScene*, float*, float*);
 
 #ifdef ATRIUM_I1_COUNTER
+extern "C" bool navigator_take_chapter(NavigatorScene*, double*);
+extern "C" bool navigator_video_ready(NavigatorScene*);
 extern "C" bool navigator_counter_resize(NavigatorScene*, u16, u16);
 #endif
 
@@ -72,6 +77,9 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
     auto doc = client.page().local_traversable()->active_document();
     auto tree = doc->dom_tree_version();
     auto text = doc->character_data_version();
+#ifdef ATRIUM_I4_VIDEO
+    bool video_reported = false;
+#endif
 #ifdef ATRIUM_I1_COUNTER
     Gfx::IntSize last_extent { 640, 360 };
 #endif
@@ -82,6 +90,22 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #endif
         float x = 0, y = 0;
         auto action = navigator_page_pointer(scene, &x, &y);
+#ifdef ATRIUM_I4_VIDEO
+        if (!video_reported || action == 4) {
+            auto element = doc->get_element_by_id(u"clip"sv);
+            if (element && is<Web::HTML::HTMLMediaElement>(*element)) {
+                auto& video = as<Web::HTML::HTMLMediaElement>(*element);
+                if (video.ready_state() >= Web::HTML::HTMLMediaElement::ReadyState::HaveMetadata) {
+                    if (!video_reported) {
+                        if (!navigator_video_ready(scene)) return 4;
+                        video_reported = true;
+                    }
+                    double seconds = 0;
+                    if (action == 4 && navigator_take_chapter(scene, &seconds)) video.set_current_time(seconds);
+                }
+            }
+        }
+#endif
         if (action < 0) break;
         Web::DevicePixelPoint point { static_cast<int>(x), static_cast<int>(y) };
         if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);

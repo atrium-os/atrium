@@ -399,11 +399,26 @@ A host GET of the real embed on 2026-11-23 returned HTTP 200 in both
 cases. Its preview playability status reported error 153
 (`EMBEDDER_IDENTITY_MISSING_REFERRER`) with no Referer and OK with the
 served watch document's loopback origin as Referer. This checks the
-provider configuration only. Before the live gate, bind the installed
-Ladybird worker's HTMLMediaElement and SourceBuffer to the native role,
-give its broker the document-scoped embed and segment fetches, and route
-the installed viewer's chapter action to that live slot. The existing
-widget grant is scoped to the counter fixture. Fingerprint testing is
+provider configuration only. The installed viewer sends chapter seeks for an on-screen recording only after
+the island reports media readiness. The broker checks the document ticket
+and Start receipt. Limen delivers the typed seek only while that instance
+is running. The video worker applies it to the fixture element's DOM
+`currentTime`. The host verified the transport and linked the arm64 worker.
+
+For the [local watch document](../../test-assets/navigator-i4/local-watch.html),
+build the worker with `I4_VIDEO` and enable the exact iframe URL with
+`NAVIGATORD_I4_VIDEO`. The anonymous fetch grant covers its HTML, external
+script and VP9 WebM in order, with a 64 KiB limit per response, an exact
+media type and zero redirects. A loopback TLS test of the host fetch service
+compared all three bodies byte-for-byte and verified refusal of a wrong MIME
+type, a redirect and a 65,537-byte response. The counter retains its single-document grant.
+
+The DOM-to-player binding is still pending. LibWeb's local MSE attachment
+constructs a remote playback manager, and its SourceBuffer constructs a
+remote buffer through that manager. Route both to the native player before
+running the installed fixture. Verify append completion, metadata, each
+chapter press and the corresponding paused Fresco frame on Tessera.
+Fingerprint testing is
 deferred.
 
 ## 6a. Sign-in: SSO and WebAuthn

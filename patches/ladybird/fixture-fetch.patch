@@ -12,7 +12,7 @@
  
  namespace Web {
  
-@@ -507,6 +512,39 @@
+@@ -507,6 +512,41 @@
          return nullptr;
      }
  
@@ -33,6 +33,8 @@
 +                mime = script ? "text/javascript"sv : stylesheet ? "text/css"sv : "application/json"sv;
 +                length = navigator_page_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            } else {
++                if (name == "https://widget.example/navigator-i4/local-player.js"sv) mime = "text/javascript"sv;
++                if (name == "https://widget.example/media/red-blue.webm"sv) mime = "video/webm"sv;
 +                length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            }
 +            if (length && length <= body.size()) {

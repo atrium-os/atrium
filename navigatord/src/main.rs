@@ -1450,11 +1450,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     send(&w, &Event::ReplayedRecording { id });
                                 }
                                 let sources = meta.map_or_else(Vec::new, |m| m.island_sources(&p.url));
-                                if ctx == Ctx::ANON && cfg.vpn.is_none() && cfg.portal.is_none()
-                                    && settings::get("NAVIGATORD_I1_COUNTER").as_deref() == Some(widget::COUNTER) {
-                                    let base = url::Url::parse(&p.url).ok();
+                                if ctx == Ctx::ANON && cfg.vpn.is_none() && cfg.portal.is_none() {
                                     if let Some((source, _)) = sources.iter().find(|(src, _)|
-                                        base.as_ref().and_then(|b| b.join(src).ok()).is_some_and(|u| u.as_str() == widget::COUNTER)) {
+                                        widget::enabled_source(&p.url, src).is_some()) {
                                         let mut st = strip.lock().unwrap();
                                         if st.widget_records.len() >= 64 { st.widget_records.pop_front(); }
                                         st.widget_records.push_back((ticket, p.url.clone(), source.clone()));
@@ -1619,23 +1617,26 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 });
             }
             Request::StartWidget { document, source, rect, press } => {
-                let window = {
+                let grant = {
                     let st = strip.lock().unwrap();
-                    st.window_token.filter(|_| st.widget_document == Some(document)
-                        && st.widget_records.iter().any(|(d, _, src)| *d == document && src == &source))
+                    st.widget_records.iter().find(|(d, _, src)| *d == document && src == &source)
+                        .filter(|_| st.widget_document == Some(document))
+                        .and_then(|(_, base, src)| st.window_token.zip(widget::enabled_source(base, src)))
                 };
                 let result = (|| {
-                    let window = window.ok_or("widget no longer belongs to the displayed recording")?;
+                    let (window, source) = grant.ok_or("widget no longer belongs to the displayed recording")?;
                     widget::bounds(rect)?;
                     if cfg.activation.is_none() { return Err("no compositor guard".into()); }
                     spend(press)?;
                     widget = None;
-                    let granted_origin = origin(widget::COUNTER).ok_or("invalid island grant origin")?;
+                    let granted_origin = origin(source).ok_or("invalid island grant origin")?;
                     let on_attach = w.clone();
                     let on_unload = w.clone();
+                    let on_media_ready = w.clone();
                     let writer = w.clone();
-                    widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, document, press, rect, cfg.clone(),
+                    widget::Widget::start(cfg.limen.as_deref().ok_or("no Limen service")?, source, window, document, press, rect, cfg.clone(),
                         move || send(&on_attach, &Event::WidgetAttached { document, press, origin: granted_origin }),
+                        move || send(&on_media_ready, &Event::WidgetMediaReady { document, start: press }),
                         move |query, pending| send(&on_unload, &Event::WidgetUnload { document, start: press, query, pending }),
                         move |failure| send(&writer, &match failure {
                             Some(failure) => Event::WidgetFailed { document, press, failure },
@@ -1648,6 +1649,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                         eprintln!("navigatord: widget start: {why}");
                         send(&w, &Event::WidgetFailed { document, press, failure: ctl::WidgetFailure::Start });
                     }
+                }
+            }
+            Request::SeekWidgetChapter { document, start, seconds_bits } => {
+                if let (Some(active), Some(seek)) = (widget.as_ref().filter(|w| w.document == document && w.press == start),
+                    limen::web_island::ChapterSeek::new(f64::from_bits(seconds_bits))) {
+                    if let Err(e) = active.seek(seek) { eprintln!("navigatord: chapter seek refused: {e}"); }
                 }
             }
             Request::WidgetUnloadAnswer { document, start, query, leave, press } => {

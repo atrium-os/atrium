@@ -762,6 +762,7 @@ pub mod host {
         interactive_island: bool,
         vpn_page: bool,
         unload_query: u32,
+        chapter_seconds: Option<f64>,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -849,6 +850,19 @@ pub mod host {
             }
         }
         true
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_take_chapter(state: &mut SceneState, seconds: &mut f64) -> bool {
+        let Some(value) = state.chapter_seconds.take() else { return false };
+        *seconds = value;
+        true
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_video_ready(state: &SceneState) -> bool {
+        let Some((child, embed, _)) = &state.embed else { return false };
+        child.borrow_mut().emit(*embed, limen::web_island::Report::MediaReady.encode().unwrap()).is_ok()
     }
 
     #[unsafe(no_mangle)]
@@ -1138,6 +1152,12 @@ pub mod host {
         if state.interactive_island {
             match child.borrow_mut().poll(std::time::Duration::ZERO) {
                 Ok(Some(limen::proto::ChildEvent::Detaching { embed: id })) if id == *embed => return -1,
+                Ok(Some(limen::proto::ChildEvent::Message { embed: id, bytes })) if id == *embed => {
+                    if let Some(seek) = limen::web_island::ChapterSeek::decode(&bytes) {
+                        state.chapter_seconds = Some(seek.seconds());
+                        return 4;
+                    }
+                }
                 Err(_) => return -1,
                 _ => {}
             }
