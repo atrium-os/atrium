@@ -667,6 +667,14 @@ the gateway received zero POSTs. The separate reconnect required fresh
 confirmation before its first POST and tunnel handshake. The guest
 fetched `crypta-ac-ok` through ocserv on `tun10`.
 
+The follow-up reconnected after that cancellation and queued Sign In
+while the prior jail was still open. Portcullis launched only the
+newest queued request after teardown, with no additional Sign In
+press. The stale confirmation sent zero POSTs. The tunnel handshake
+and IPv4 sentinel waited for fresh confirmation. The gateway received
+one POST, and the guest fetched `crypta-ac-ok` through ocserv on
+`tun10`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
