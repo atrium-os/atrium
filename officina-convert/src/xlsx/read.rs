@@ -19,7 +19,7 @@ use std::sync::Arc;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
-use officina_grid::filter::{AutoFilter, Cond};
+use officina_grid::filter::{AutoFilter, Cond, Rank};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
@@ -703,7 +703,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
                 }
             }
-            b"filter" | b"filters" | b"customFilters" | b"customFilter" => {
+            b"filter" | b"filters" | b"customFilters" | b"customFilter" | b"top10" => {
                 let Some((_, conds)) = seg.filter.as_mut() else { continue };
                 let Some(c) = fcol else { continue };
                 let name = e.local_name();
@@ -720,6 +720,14 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                         }
                     }
                     b"customFilters" => conds.push((c, Cond::Compare(Vec::new(), attr(&e, b"and")?.is_some_and(|v| v == "1" || v == "true")))),
+                    b"top10" => {
+                        let percent = attr(&e, b"percent")?.is_some_and(|v| v == "1" || v == "true");
+                        let bottom = attr(&e, b"top")?.is_some_and(|v| v == "0" || v == "false");
+                        match attr(&e, b"val")?.and_then(|v| Rank::parse(&v, percent, bottom)) {
+                            Some(rank) => conds.push((c, Cond::Rank(rank))),
+                            None => seg.rep.note(Kind::Approximate, "invalid top/bottom filter (rows stay as the file hid them)"),
+                        }
+                    }
                     _ => {
                         let op = match attr(&e, b"operator")?.as_deref() {
                             None | Some("equal") => "=",
@@ -738,7 +746,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     }
                 }
             }
-            b"dynamicFilter" | b"top10" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, top-10, colour and icon filters (rows stay as the file hid them)"),
+            b"dynamicFilter" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, colour and icon filters (rows stay as the file hid them)"),
             b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from

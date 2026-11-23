@@ -1271,6 +1271,15 @@ fn filters_xml(wb: &Workbook) -> String {
                             out.push_str("</table:filter-or>");
                         }
                     }
+                    Cond::Rank(rank) => {
+                        let op = match (rank.bottom, rank.percent) {
+                            (false, false) => "top values",
+                            (false, true) => "top percent",
+                            (true, false) => "bottom values",
+                            (true, true) => "bottom percent",
+                        };
+                        let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{op}" table:data-type="number"/>"#, rank.limit());
+                    }
                 }
             }
             out.push_str("</table:filter-and></table:filter>");

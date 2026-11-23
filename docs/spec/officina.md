@@ -325,10 +325,25 @@ and their associated import or Save behavior.
 | 1 | XLSX, XLSM | **Input validation.** Formula-backed Excel extension rules previously disappeared on open and ordinary Save. Sheets now reads them and writes direct cross-sheet rules in the extension. Extension-only list encodings and rules with missing or unparseable formulas still receive loss notices. |
 | 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells are handled within the supported date range. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. |
 | 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Sheets keeps active XLSX, XLSM and ODS sheet locks and their cell styles. Foreign passwords and custom Excel permissions have fidelity notices. XLS still drops validation rules when importing to a native copy. |
-| 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Specialized filters may retain hidden rows without live predicates. Unsupported or calculated pivot fields, table features and some formulas may become static values or plain cells. ODS Save can turn spill and table references into fixed ranges. |
+| 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Top and bottom sheet filters by count and percentage stay live in XLSX, XLSM and ODS. The remaining static cases are grouped below. ODS Save can turn spill and table references into fixed ranges. |
 | 5 | XLSX, XLSM, ODS, XLS | **Review and output.** ODS can flatten comment threads. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can lose content or change output. Legacy XLS also drops comments and hyperlinks. |
 | 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Rotation, shrink-to-fit, patterned or gradient fills, diagonal borders and styles on empty rows can change how a sheet looks. |
 | Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
+
+#### Advanced filters and pivot fidelity
+
+| Group | Formats | What the user sees |
+|---|---|---|
+| Sheet rank filters | XLSX, XLSM, ODS | Sheets retains top and bottom numeric rules by count and percentage. **Data → Reapply Filter** recalculates the cutoff after edits. See §16.6 for rounding and ties. |
+| Static filter visibility | XLSX, XLSM, ODS | Text and wildcard tests, dynamic date and appearance filters, table-local filters, and complex ODS predicates can leave only the saved row visibility. A later filter change can expose rows that were excluded by a rule Sheets could not import. |
+| Static pivot results | XLSX, XLSM, ODS | Calculated Excel pivot fields, missing pivot caches, unavailable sources, and unsupported ODS pivot fields or functions can leave the saved cells as plain values. They cannot be refreshed from the source. |
+| Pivot results that change on refresh | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Display calculations such as percentages and differences and ODS grouping or field references can appear in the saved cells, then give way to plain items and aggregates on Refresh. |
+
+Ranked sheet filters were the first fix in this group because losing the
+predicate can change which source rows feed a report as soon as a user works
+with the filter. Pivot display calculations and grouping are the next
+related set to investigate. Cover the saved output and a refresh after a
+source edit together.
 
 #### Sheet and cell protection in Sheets
 
@@ -1136,14 +1151,19 @@ column first and finish with the primary column.
   whole rows of the range (values, formulas copied with their relative references, as
   Excel does, and styles); a sorted fill stays one fill.
 - **Filter** (`officina-grid::filter`): one auto-filter per sheet (value lists matched
-  on shown text ignoring case; one or two numeric tests joined by and/or) and hidden
+  on shown text ignoring case, one or two numeric tests joined by and/or, or a
+  top/bottom numeric rule by count or percentage) and hidden
   row ranges, swapped as one undoable `GridOp::Filter` (journal kind 4, native chunk 8);
   hidden rows have height 0 in the view. `.xlsx`: `row hidden`, `autoFilter` with
-  `filters`/`customFilters`, the hidden `_xlnm._FilterDatabase` name Excel expects.
+  `filters`/`customFilters`/`top10`, the hidden `_xlnm._FilterDatabase` name Excel expects.
   `.ods`: row `visibility` (`filter` / `collapse`) and anonymous database ranges with
   their conditions (LibreOffice leaves numeric order tests untyped and repeats the first
-  set item; both handled). Text, wildcard and top-N filters are reported and their rows
-  stay as the file hid them.
+  set item; both handled). Imported rank filters and the last applied visibility
+  survive ordinary Save. Reapply ranks the finite numeric cells in the whole column
+  range below the header, then intersects the result with other column conditions.
+  Percentage counts round up in Sheets, and every tie at the cutoff stays visible.
+  Other specialized filters can retain the saved hidden rows as described in §5.2.
+  [XLSX rank filters](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.top10?view=openxml-3.0.1) · [ODF filter operators](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html#attribute-table_operator)
 - **Structured tables** (`officina-grid::tables`): named range, header and totals rows,
   named columns, style name kept; tables and names share one namespace; tables don't
   overlap. Formulas keep structured references as written (`Sales[Amount]`,

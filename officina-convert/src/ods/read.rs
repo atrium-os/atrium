@@ -22,7 +22,7 @@ use officina_grid::column::Sizes;
 use officina_grid::eval::dates;
 use officina_grid::strings::MAX_TEXT;
 use officina_grid::style::{Edge, HAlign, Line, Style, StyleId, StyleRuns, VAlign};
-use officina_grid::filter::Cond;
+use officina_grid::filter::{Cond, Rank};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::report::{Kind, Report};
@@ -838,7 +838,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Data pilots (pivot tables) and the one being read.
     let mut pilot: Option<super::pivot::TableIn> = None;
     let mut pilots: Vec<super::pivot::TableIn> = Vec::new();
-    let mut filter_and = true;
+    let mut filter_or_depth = 0usize;
+    let mut unsupported_rank = false;
     let mut in_set = false;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
     let mut names: Vec<(String, Option<u16>, String, Option<String>)> = Vec::new();
@@ -1268,13 +1269,14 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         } else if a.get("table:display-filter-buttons").is_some_and(|v| v == "true") {
                             if let Some(t) = a.get("table:target-range-address") {
                                 db = Some((t.clone(), Vec::new()));
+                                filter_or_depth = 0;
+                                unsupported_rank = false;
                             }
                         } else {
                             rep.note(Kind::Dropped, "database ranges");
                         }
                     }
-                    b"table:filter-and" => filter_and = true,
-                    b"table:filter-or" => filter_and = false,
+                    b"table:filter-or" if !empty => filter_or_depth += 1,
                     b"table:filter-condition" | b"table:filter-set-item" => {
                         let a = attrs(e);
                         let Some((_, conds)) = db.as_mut() else { continue };
@@ -1294,6 +1296,20 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         let Some(field) = a.get("table:field-number").and_then(|v| v.parse::<u32>().ok()) else { continue };
                         let op = a.get("table:operator").map(String::as_str).unwrap_or("=");
                         let value = a.get("table:value").cloned().unwrap_or_default();
+                        let rank = match op {
+                            "top values" => Some((false, false)),
+                            "top percent" => Some((true, false)),
+                            "bottom values" => Some((false, true)),
+                            "bottom percent" => Some((true, true)),
+                            _ => None,
+                        };
+                        if let Some((percent, bottom)) = rank {
+                            match Rank::parse(&value, percent, bottom) {
+                                Some(rank) if filter_or_depth == 0 => conds.push((field, Cond::Rank(rank))),
+                                _ => unsupported_rank = true,
+                            }
+                            continue;
+                        }
                         // LibreOffice leaves the type out of its numeric tests: an order
                         // test on a number is numeric unless the file says text.
                         let number = match a.get("table:data-type").map(String::as_str) {
@@ -1307,7 +1323,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Compare(..))) {
                                     Some((_, Cond::Compare(v, _))) if v.len() < 2 => v.push((op, x)),
                                     Some(_) => rep.note(Kind::Approximate, "filters with more than two tests on a column (rows stay as the file hid them)"),
-                                    None => conds.push((field, Cond::Compare(vec![(op, x)], filter_and))),
+                                    None => conds.push((field, Cond::Compare(vec![(op, x)], filter_or_depth == 0))),
                                 }
                             }
                             (false, _, _) if op == "=" => match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Values(_))) {
@@ -1318,7 +1334,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 }
                                 _ => conds.push((field, Cond::Values(if empty || !value.is_empty() { vec![value] } else { Vec::new() }))),
                             },
-                            _ => rep.note(Kind::Approximate, "text, pattern and top-N filters (rows stay as the file hid them)"),
+                            _ => rep.note(Kind::Approximate, "text and pattern filters (rows stay as the file hid them)"),
                         }
                     }
                     _ => {}
@@ -1387,7 +1403,22 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             cond_formats.extend(cf.take());
                         }
                     }
-                    b"table:database-range" => filters.extend(db.take()),
+                    b"table:filter-or" => filter_or_depth = filter_or_depth.saturating_sub(1),
+                    b"table:database-range" => {
+                        if let Some((_, conds)) = db.as_mut() {
+                            let mut fields = std::collections::HashMap::new();
+                            let repeated_rank = conds.iter().any(|(_, cond)| matches!(cond, Cond::Rank(_)))
+                                && conds.iter().any(|(field, cond)| {
+                                    let rank = matches!(cond, Cond::Rank(_));
+                                    fields.insert(*field, rank).is_some_and(|previous| previous || rank)
+                                });
+                            if unsupported_rank || repeated_rank {
+                                rep.note(Kind::Approximate, "invalid or combined top/bottom filters (rows stay as the file hid them)");
+                                conds.clear();
+                            }
+                        }
+                        filters.extend(db.take());
+                    }
                     b"text:p" | b"text:h" => in_p = false,
                     b"table:table-cell" | b"table:covered-table-cell" => {
                         if let Some(mut c) = cell.take() {

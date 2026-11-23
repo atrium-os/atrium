@@ -464,6 +464,10 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
                             }
                             o.extend_from_slice(b"</customFilters>");
                         }
+                        Cond::Rank(rank) => {
+                            let _ = write!(o, r#"<top10 top="{}" percent="{}" val="{}"/>"#,
+                                u8::from(!rank.bottom), u8::from(rank.percent), rank.limit());
+                        }
                     }
                     o.extend_from_slice(b"</filterColumn>");
                 }

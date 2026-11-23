@@ -13,6 +13,7 @@
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
 # Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
+# Use SHEETS_INTEROP_CASE=rank_filter and /tmp/sheets-rank-filter-fixture for rank filters.
 # Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
 # Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
@@ -24,7 +25,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -61,6 +62,7 @@ checkpoint() {
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
+        rank_filter) /tmp/sheets-rank-filter-fixture check "$1" "$2" "$format" ;;
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
@@ -466,6 +468,21 @@ sort_filter() {
     final=filtered
 }
 
+rank_edit_and_save() {
+    click 126 133 # First visible score in B.
+    case "$format" in ods) key 0x26 ;; xlsx) key 0x1e ;; esac # 9 or 1
+    key 0x28
+    data_from_bottom 19 # Reapply Filter with a filter on the current column.
+    save "$book" "$1"
+    cp selectscreen.png "$results/$format-$1.png"
+    cp "$books/$book" "$results/$1.$format"
+}
+
+rank_filter() {
+    rank_edit_and_save edited
+    final=edited
+}
+
 delimited() {
     row=183
     for book in 01-utf8.csv 02-utf8.tsv 03-ansi.csv 04-ansi.tsv; do
@@ -733,6 +750,7 @@ for format in ods xlsx; do
         formulas) formulas_reopened ;;
         validation) validation_reopened ;;
         condfmt) condfmt_reopened ;;
+        rank_filter) rank_edit_and_save edited_again ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"

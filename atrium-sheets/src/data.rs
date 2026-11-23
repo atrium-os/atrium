@@ -70,6 +70,8 @@ pub enum DataCmd {
     SortDesc,
     /// Turn the auto-filter on (on the data) or off.
     Filter,
+    /// Recalculate row visibility from the current filter conditions.
+    ReapplyFilter,
     /// Show only rows with the cursor's value in its column.
     KeepValue,
     /// Hide rows with the cursor's value in its column.
@@ -377,6 +379,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Align Top").checked(v_at(wb, s, sel) == VAlign::Top), Some(DataCmd::AlignTop)),
         (MenuItem::new("Align Middle").checked(v_at(wb, s, sel) == VAlign::Center), Some(DataCmd::AlignMiddle)),
         (MenuItem::new("Align Bottom").checked(v_at(wb, s, sel) == VAlign::Bottom), Some(DataCmd::AlignBottom)),
+        (MenuItem::new("Reapply Filter").enabled(any_cond).separated(), Some(DataCmd::ReapplyFilter)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
@@ -552,7 +555,7 @@ pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, Stri
             let on = match &now {
                 Some(Cond::Values(v)) => v.iter().any(|x| key(x) == key(&t)),
                 // A number condition: what it keeps now, as rows show it.
-                Some(Cond::Compare(..)) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
+                Some(Cond::Compare(..) | Cond::Rank(_)) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
                 None => true,
             };
             (t, n, on)
@@ -923,11 +926,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run("Filter", vec![GridOp::Filter(st)]);
             Ok(format!("Filter on {}: pick a cell and use Show Only or Hide.", range_text(&t.rect)))
         }
-        DataCmd::KeepValue | DataCmd::HideValue | DataCmd::ClearColumn | DataCmd::ShowAll => {
+        DataCmd::KeepValue | DataCmd::HideValue | DataCmd::ClearColumn | DataCmd::ShowAll | DataCmd::ReapplyFilter => {
             let f = d.wb.sheet(s).filter.clone().ok_or("There is no filter on this sheet.")?;
             let mut conds = f.conds.clone();
             let text = d.wb.formatted(CellAddr::new(s, row, col)).text;
             match cmd {
+                DataCmd::ReapplyFilter => {}
                 DataCmd::ShowAll => conds.clear(),
                 DataCmd::ClearColumn => conds.retain(|(c, _)| *c != col),
                 _ => {

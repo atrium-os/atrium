@@ -21,6 +21,34 @@ pub enum Cond {
     /// Numbers compared with a constant: (operator, value), `op` one of
     /// `= <> < <= > >=`; two joined by and (`true`) or or.
     Compare(Vec<(String, f64)>, bool),
+    Rank(Rank),
+}
+
+/// Top or bottom numeric cells by count or percentage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rank {
+    limit: u32,
+    pub percent: bool,
+    pub bottom: bool,
+}
+
+impl Rank {
+    pub fn new(limit: u32, percent: bool, bottom: bool) -> Option<Self> {
+        let max = if percent { 100 } else { MAX_ROWS };
+        (1..=max).contains(&limit).then_some(Self { limit, percent, bottom })
+    }
+
+    pub fn parse(limit: &str, percent: bool, bottom: bool) -> Option<Self> {
+        let limit: f64 = limit.parse().ok()?;
+        if !limit.is_finite() || limit.fract() != 0.0 || limit > f64::from(MAX_ROWS) {
+            return None;
+        }
+        Self::new(limit as u32, percent, bottom)
+    }
+
+    pub fn limit(self) -> u32 {
+        self.limit
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +101,11 @@ impl FilterState {
                                 w.str(op);
                                 w.f64(*x);
                             }
+                        }
+                        Cond::Rank(rank) => {
+                            w.u8(3);
+                            w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
+                            w.var(u64::from(rank.limit()));
                         }
                     }
                 }
@@ -136,6 +169,15 @@ impl FilterState {
                             }
                             Cond::Compare(cs, t == 2)
                         }
+                        3 => {
+                            let flags = r.u8()?;
+                            if flags > 3 {
+                                return Err(WireError::Invalid("rank filter flags"));
+                            }
+                            let limit = r.len("rank filter limit", u64::from(MAX_ROWS))? as u32;
+                            Cond::Rank(Rank::new(limit, flags & 1 != 0, flags & 2 != 0)
+                                .ok_or(WireError::Invalid("rank filter limit"))?)
+                        }
                         _ => return Err(WireError::Invalid("filter kind")),
                     };
                     conds.push((c, cond));
@@ -149,21 +191,21 @@ impl FilterState {
 }
 
 impl Cond {
-    fn keeps(&self, shown: &str, v: &Value) -> bool {
+    fn keeps(&self, wb: &Workbook, addr: CellAddr, cutoff: Option<f64>) -> bool {
         match self {
             Cond::Values(vals) => {
-                let k = text_key(shown);
+                let k = text_key(&wb.formatted(addr).text);
                 vals.iter().any(|x| text_key(x) == k)
             }
             Cond::Compare(cs, and) => {
-                let Value::Num(x) = v else { return false };
+                let Value::Num(x) = wb.get(addr) else { return false };
                 let test = |(op, y): &(String, f64)| match op.as_str() {
-                    "=" => x == y,
-                    "<>" => x != y,
-                    "<" => x < y,
-                    "<=" => x <= y,
-                    ">" => x > y,
-                    ">=" => x >= y,
+                    "=" => x == *y,
+                    "<>" => x != *y,
+                    "<" => x < *y,
+                    "<=" => x <= *y,
+                    ">" => x > *y,
+                    ">=" => x >= *y,
                     _ => true,
                 };
                 if *and {
@@ -171,6 +213,10 @@ impl Cond {
                 } else {
                     cs.iter().any(test)
                 }
+            }
+            Cond::Rank(rank) => {
+                let (Value::Num(x), Some(y)) = (wb.get(addr), cutoff) else { return false };
+                x.is_finite() && if rank.bottom { x <= y } else { x >= y }
             }
         }
     }
@@ -229,6 +275,31 @@ impl Workbook {
         old
     }
 
+    /// The cutoff over the numeric data rows before intersecting other column
+    /// conditions. All values tied at the cutoff are kept.
+    fn rank_cutoff(&self, rect: Rect, col: u32, rank: Rank) -> Option<f64> {
+        if rect.r0 >= rect.r1 {
+            return None;
+        }
+        let mut numbers = Vec::new();
+        let column = Rect { r0: rect.r0 + 1, c0: col, c1: col, ..rect };
+        self.each(&column, &mut |_, _, value| {
+            if let Value::Num(x) = value {
+                if x.is_finite() {
+                    numbers.push(x);
+                }
+            }
+        });
+        let n = numbers.len();
+        if n == 0 {
+            return None;
+        }
+        let limit = rank.limit() as usize;
+        let count = if rank.percent { (n * limit).div_ceil(100) } else { limit.min(n) };
+        let index = if rank.bottom { count - 1 } else { n - count };
+        Some(*numbers.select_nth_unstable_by(index, f64::total_cmp).1)
+    }
+
     /// The state `filter` leaves the sheet in: rows of its range (below the header)
     /// failing a condition hidden, rows hidden outside the range kept hidden.
     pub fn filtered(&self, sheet: u16, filter: Option<AutoFilter>) -> FilterState {
@@ -250,11 +321,14 @@ impl Workbook {
             }
         }
         if let Some(f) = &filter {
+            let cutoffs: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
+                Cond::Rank(rank) => self.rank_cutoff(f.rect, *col, *rank),
+                _ => None,
+            }).collect();
             let mut run: Option<(u32, u32)> = None;
             for r in f.rect.r0 + 1..=f.rect.r1 {
-                let keep = f.conds.iter().all(|(c, cond)| {
-                    let a = CellAddr::new(sheet, r, *c);
-                    cond.keeps(&self.formatted(a).text, &self.get(a))
+                let keep = f.conds.iter().zip(&cutoffs).all(|((c, cond), cutoff)| {
+                    cond.keeps(self, CellAddr::new(sheet, r, *c), *cutoff)
                 });
                 if !keep {
                     run = match run {
@@ -293,6 +367,35 @@ mod tests {
     use super::*;
     use crate::ops::GridOp;
     use officina_core::history::Op;
+
+    #[test]
+    fn rank_filter_reapplies_and_undo_keeps_the_rule() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Scores").unwrap();
+        for (row, (group, score)) in (1..).zip([("away", 9.0), ("home", 8.0), ("home", 7.0)]) {
+            wb.set_value(CellAddr::new(0, row, 0), Value::str(group));
+            wb.set_value(CellAddr::new(0, row, 1), Value::Num(score));
+        }
+        let filter = AutoFilter {
+            rect: Rect { sheet: 0, r0: 0, r1: 3, c0: 0, c1: 1 },
+            conds: vec![
+                (0, Cond::Values(vec!["home".into()])),
+                (1, Cond::Rank(Rank::new(2, false, false).unwrap())),
+            ],
+        };
+        wb.replace_filter(wb.filtered(0, Some(filter.clone())));
+        assert_eq!(wb.sheet(0).hidden, [(1, 1), (3, 3)]);
+        wb.set_value(CellAddr::new(0, 1, 1), Value::Num(1.0));
+
+        let previous = wb.filter_state(0);
+        let undo = GridOp::Filter(wb.filtered(0, Some(filter))).apply(&mut wb);
+        assert_eq!(wb.sheet(0).hidden, [(1, 1)]);
+        let reopened = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+        assert_eq!(reopened.filter_state(0), wb.filter_state(0));
+
+        GridOp::decode(&undo.encode()).unwrap().apply(&mut wb);
+        assert_eq!(wb.filter_state(0), previous);
+    }
 
     #[test]
     fn filter_hides_and_undo_shows() {
