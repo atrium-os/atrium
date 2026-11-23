@@ -176,7 +176,7 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn sync(&mut self, sink: &mut dyn mail_sync::Sink) -> mail_sync::jmap::Result<mail_sync::Report> {
         mail_sync::jmap::Jmap::sync(&mut self.remote, sink)
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> mail_sync::jmap::Result<String> {
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> mail_sync::jmap::SendResult {
         mail_sync::jmap::Jmap::send(&mut self.remote, message, from, rcpts, send_at)
     }
     fn can_hold(&self, secs: i64) -> bool {

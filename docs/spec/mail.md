@@ -1730,7 +1730,16 @@ Stalwart in the cloud VM, and later a real account):
    back only acknowledged snooze updates. Send: upload, `Email/import` into Sent (seen),
    `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
    `maxDelayedSend` covers a send-later time, else the engine holds it
-   (`Engine::deliver_jmap`). The store keeps the Email state per account. Test: the
+   (`Engine::deliver_jmap`). Mail validates both acknowledgments against the
+   account and their requested creation IDs. If the submission echoes an
+   Email ID, it must match the verified import. An explicit submission refusal
+   stops the send. A lost or invalid reply after submission dispatch, a lost
+   worker reply, or a restart during an in-flight JMAP send leaves an
+   uncertain outbox item for review. Automatic retries and Send again leave
+   it held. A copy in Sent alone is insufficient to establish delivery, since
+   the import can succeed before submission is refused. Failures known to
+   precede submission retain the normal retry policy. The store keeps the
+   Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in
    two mailboxes, a large one by headers only, archive + read made on the server, changes
    from elsewhere, a too-old state, send with Bcc only in the envelope, refused sender).

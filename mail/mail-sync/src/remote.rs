@@ -114,6 +114,7 @@ pub enum Reply {
     AppendedIdentity(Option<AppendUid>),
     JmapPreparedImport(std::result::Result<crate::jmap::PreparedImport, String>),
     JmapFinishedImport(std::result::Result<crate::jmap::ImportResult, String>),
+    JmapSubmitted(crate::jmap::SendResult),
 }
 
 /// A [`Sink`] call, from the worker.
@@ -547,7 +548,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     }
                     (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
-                    (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
+                    (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSubmitted(c.send(&message, &from, &rcpts, send_at)),
                     (Call::JmapImport { folder, message }, Some(c)) => Reply::JmapSent(c.import(&folder, &message).map_err(|e| e.0)),
                     (Call::JmapPrepareImport { folder, message }, Some(c)) => {
                         Reply::JmapPreparedImport(c.prepare_import(&folder, &message).map_err(|e| e.0))
@@ -974,13 +975,13 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
             Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
         }
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> crate::jmap::Result<String> {
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> crate::jmap::SendResult {
         let c = Call::JmapSend { message: message.to_vec(), from: from.into(), rcpts: rcpts.to_vec(), send_at };
         match self.call(&c, None, QUIET) {
-            Ok(Reply::JmapSent(r)) => r.map_err(crate::jmap::Error),
-            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
-            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
-            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+            Ok(Reply::JmapSubmitted(result)) => result,
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::SendError::Uncertain(t)),
+            Ok(other) => Err(crate::jmap::SendError::Uncertain(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::SendError::Uncertain(format!("the sync worker: {e}"))),
         }
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> crate::jmap::Result<crate::jmap::Pushed> {

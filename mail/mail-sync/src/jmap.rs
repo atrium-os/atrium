@@ -43,7 +43,7 @@ impl<T: Http + ?Sized> Http for Box<T> {
 /// worker (remote.rs).
 pub trait Jmap {
     fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report>;
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> Result<String>;
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult;
     fn can_hold(&self, secs: i64) -> bool;
     /// See [`Client::watch`].
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed>;
@@ -69,6 +69,27 @@ pub trait Jmap {
         Filters::default()
     }
 }
+
+/// Whether it is safe to retry a JMAP send. A failed worker call may
+/// have reached submission and is always treated as uncertain.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SendError {
+    BeforeSubmission { why: String, transient: bool },
+    Refused(String),
+    Uncertain(String),
+}
+
+impl SendError {
+    fn preflight(error: impl std::fmt::Display) -> Self {
+        Self::BeforeSubmission { why: error.to_string(), transient: true }
+    }
+
+    fn unavailable(why: &str) -> Self {
+        Self::BeforeSubmission { why: why.into(), transient: false }
+    }
+}
+
+pub type SendResult = std::result::Result<String, SendError>;
 
 /// A validated preflight, saved before a queued import can modify the server.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -120,7 +141,7 @@ impl<H: Http> Jmap for Client<H> {
     fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
         Client::sync(self, sink)
     }
-    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> Result<String> {
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult {
         Client::send(self, message, from, rcpts, send_at)
     }
     fn can_hold(&self, secs: i64) -> bool {
@@ -666,25 +687,29 @@ impl<H: Http> Client<H> {
     /// Send `message` (as written, with Bcc left out) from `from` to
     /// `rcpts`; the server keeps the copy in Sent. `send_at`: hold it until
     /// then, where the server holds sends. The new message's id.
-    pub fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> Result<String> {
+    pub fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> SendResult {
         if !self.session.can_submit {
-            return Err(Error("this account can't send over JMAP".into()));
+            return Err(SendError::unavailable("this account can't send over JMAP"));
         }
         if self.session.max_size_upload > 0 && message.len() as u64 > self.session.max_size_upload {
-            return Err(Error("the message is larger than the server takes".into()));
+            return Err(SendError::unavailable("the message is larger than the server takes"));
         }
         if self.mailboxes.is_empty() {
-            let a = self.call(jmap::get_mailboxes(&self.session.account))?;
-            self.mailboxes = jmap::mailboxes(&a, &self.session.account)?.0;
+            let a = self.call(jmap::get_mailboxes(&self.session.account)).map_err(SendError::preflight)?;
+            self.mailboxes = jmap::mailboxes(&a, &self.session.account).map_err(SendError::preflight)?.0;
         }
-        let sent = self.mailboxes.iter().find(|m| m.role.as_deref() == Some("sent")).map(|m| m.id.clone()).ok_or(Error("the account has no Sent mailbox".into()))?;
-        let a = self.call(jmap::get_identities(&self.session.account))?;
+        let sent = self.mailboxes.iter().find(|m| m.role.as_deref() == Some("sent")).map(|m| m.id.clone()).ok_or_else(|| SendError::unavailable("the account has no Sent mailbox"))?;
+        let a = self.call(jmap::get_identities(&self.session.account)).map_err(SendError::preflight)?;
         let from_l = from.to_ascii_lowercase();
-        let identity = jmap::identities(&a)?.into_iter().find(|i| i.email == from_l).ok_or_else(|| Error(format!("the server doesn't let this account send as {from}")))?;
-        let blob = self.upload("message/rfc822", message)?;
+        let identity = jmap::identities(&a).map_err(SendError::preflight)?.into_iter().find(|i| i.email == from_l).ok_or_else(|| SendError::unavailable(&format!("the server doesn't let this account send as {from}")))?;
+        let blob = self.upload("message/rfc822", message).map_err(SendError::preflight)?;
         let hold = send_at.filter(|_| self.session.max_delayed_send > 0).map(jmap::utc_string);
-        let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))?;
-        Ok(jmap::submitted(&a, &self.session.account)?)
+        let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))
+            .map_err(|err| SendError::Uncertain(err.0))?;
+        match jmap::submitted(&a, &self.session.account).map_err(|err| SendError::Uncertain(err.to_string()))? {
+            jmap::SubmissionAck::Accepted(id) => Ok(id),
+            jmap::SubmissionAck::Refused(why) => Err(SendError::Refused(why)),
+        }
     }
 
     /// The vacation reply, set to `set` first if given; `None` when the

@@ -22,6 +22,18 @@ pub enum SendState {
     /// Not sent, and won't be tried again without the person: the server
     /// refused it, or Mail stopped while sending (it may have gone).
     Stopped { why: String },
+    /// A JMAP attempt ended before it could submit. It is safe to retry.
+    JmapRetry,
+    /// A claimed JMAP send may reach the server before Mail records its reply.
+    JmapSending,
+    /// Submission may have succeeded. Neither sync nor Send again resends it.
+    Uncertain { why: String },
+}
+
+impl SendState {
+    fn waiting(&self) -> bool {
+        matches!(self, Self::Waiting | Self::JmapRetry)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +79,7 @@ impl Writer<'_> {
     pub fn take_back(&mut self, id: u64) -> Result<Option<Outgoing>> {
         let mut t = self.tx.open_table(OUTBOX)?;
         let Some(o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Ok(None) };
-        if o.state == SendState::Sending {
+        if matches!(o.state, SendState::Sending | SendState::JmapSending) {
             return Ok(None);
         }
         t.remove(id)?;
@@ -77,14 +89,31 @@ impl Writer<'_> {
     /// Claim a waiting send that is due by `now`, so Undo can't take it
     /// any more. False when it isn't waiting (taken back, or claimed).
     pub fn claim_send(&mut self, id: u64, now: i64) -> Result<bool> {
+        self.claim(id, now, false)
+    }
+
+    pub fn claim_jmap_send(&mut self, id: u64, now: i64) -> Result<bool> {
+        self.claim(id, now, true)
+    }
+
+    fn claim(&mut self, id: u64, now: i64, jmap: bool) -> Result<bool> {
         let mut t = self.tx.open_table(OUTBOX)?;
         let Some(mut o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Ok(false) };
-        if o.state != SendState::Waiting || o.due > now {
+        if !o.state.waiting() || o.due > now {
             return Ok(false);
         }
-        o.state = SendState::Sending;
+        // Older builds put uncertain submissions back in the waiting queue.
+        // A preflight-only failure from this build is marked JmapRetry.
+        let legacy_retry = jmap && o.state == SendState::Waiting && o.tries != 0;
+        o.state = if legacy_retry {
+            uncertain("An earlier JMAP send may have gone through. Check with the recipient before sending again.")
+        } else if jmap {
+            SendState::JmapSending
+        } else {
+            SendState::Sending
+        };
         t.insert(id, enc(&o).as_slice())?;
-        Ok(true)
+        Ok(!legacy_retry)
     }
 
     /// The server took send `id`: it leaves the outbox.
@@ -101,10 +130,19 @@ impl Writer<'_> {
         if transient {
             o.due = now + retry_after(o.tries);
             o.tries += 1;
-            o.state = SendState::Waiting;
+            o.state = if o.state == SendState::JmapSending { SendState::JmapRetry } else { SendState::Waiting };
         } else {
             o.state = SendState::Stopped { why: why.to_string() };
         }
+        t.insert(id, enc(&o).as_slice())?;
+        Ok(())
+    }
+
+    pub fn send_uncertain(&mut self, id: u64, why: &str) -> Result<()> {
+        let mut t = self.tx.open_table(OUTBOX)?;
+        let Some(mut o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Err(Error::NotFound) };
+        o.last_error = Some(why.to_string());
+        o.state = uncertain(why);
         t.insert(id, enc(&o).as_slice())?;
         Ok(())
     }
@@ -115,7 +153,7 @@ impl Writer<'_> {
         let Some(mut o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Err(Error::NotFound) };
         o.hold_on_server = false;
         o.due = until;
-        o.state = SendState::Waiting;
+        o.state = if o.state == SendState::JmapSending { SendState::JmapRetry } else { SendState::Waiting };
         t.insert(id, enc(&o).as_slice())?;
         Ok(())
     }
@@ -125,7 +163,7 @@ impl Writer<'_> {
     pub fn send_now(&mut self, id: u64, now: i64) -> Result<bool> {
         let mut t = self.tx.open_table(OUTBOX)?;
         let Some(mut o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Ok(false) };
-        if o.state != SendState::Waiting {
+        if !o.state.waiting() {
             return Ok(false);
         }
         o.due = now;
@@ -141,11 +179,19 @@ impl Writer<'_> {
         if !matches!(o.state, SendState::Stopped { .. }) {
             return Ok(false);
         }
-        o.state = SendState::Waiting;
+        o.state = if self.jmap_account(o.account)? { SendState::JmapRetry } else { SendState::Waiting };
         o.due = now;
         o.later = None;
         t.insert(id, enc(&o).as_slice())?;
         Ok(true)
+    }
+
+    fn jmap_account(&self, account: AccountId) -> Result<bool> {
+        use crate::config::{AccountConfig, Protocol, CONFIG};
+
+        let table = self.tx.open_table(CONFIG)?;
+        let config = table.get(account)?.map(|value| dec::<AccountConfig>(value.value())).transpose()?;
+        Ok(config.is_some_and(|config| matches!(config.protocol, Protocol::Jmap { .. })))
     }
 
     /// At start: a send claimed when Mail stopped may or may not have left,
@@ -157,16 +203,25 @@ impl Writer<'_> {
         for e in t.iter()? {
             let (k, v) = e?;
             let o: Outgoing = dec(v.value())?;
-            if o.state == SendState::Sending {
+            if matches!(o.state, SendState::Sending | SendState::JmapSending) {
                 hit.push((k.value(), o));
             }
         }
         for (k, mut o) in hit.iter().cloned() {
-            o.state = SendState::Stopped { why: "Mail stopped while sending this; it may have gone".into() };
+            let why = "Mail stopped while sending this; it may have gone";
+            o.state = if o.state == SendState::JmapSending || self.jmap_account(o.account)? {
+                uncertain(why)
+            } else {
+                SendState::Stopped { why: why.into() }
+            };
             t.insert(k, enc(&o).as_slice())?;
         }
         Ok(hit.len())
     }
+}
+
+fn uncertain(why: &str) -> SendState {
+    SendState::Uncertain { why: why.into() }
 }
 
 impl Store {
@@ -184,7 +239,7 @@ impl Store {
     /// Waiting sends due by `now` (overdue ones included: see
     /// [`Store::sends_overdue`]).
     pub fn sends_due(&self, now: i64) -> Result<Vec<(u64, Outgoing)>> {
-        Ok(self.outbox()?.into_iter().filter(|(_, o)| o.state == SendState::Waiting && o.due <= now).collect())
+        Ok(self.outbox()?.into_iter().filter(|(_, o)| o.state.waiting() && o.due <= now).collect())
     }
 
     /// Sends the person scheduled whose time passed more than `grace`

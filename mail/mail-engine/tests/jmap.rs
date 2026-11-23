@@ -51,6 +51,10 @@ struct Server {
     next: u64,
     uploads: BTreeMap<String, Vec<u8>>,
     submitted: Vec<Value>,
+    submission_overrides: Map<String, Value>,
+    repeat_submission_reply: bool,
+    refuse_submission: bool,
+    drop_submission_reply: bool,
     downloads: usize,
     snoozed: Option<String>,
     hold: u64,
@@ -332,10 +336,20 @@ impl Server {
                             "threadId": format!("T{id}"), "size": imported.bytes.len() } } })
                 }
                 "EmailSubmission/set" => {
+                    assert_eq!(args["accountId"], ACCOUNT);
                     let s = &args["create"]["s"];
                     assert_eq!(s["emailId"], "#m");
-                    self.submitted.push(s.clone());
-                    json!({ "created": { "s": { "id": "S1" } } })
+                    if self.refuse_submission {
+                        json!({ "accountId": ACCOUNT, "newState": "sub0",
+                            "notCreated": { "s": { "type": "forbiddenFrom" } } })
+                    } else {
+                        self.submitted.push(s.clone());
+                        let imported = out.iter().find(|entry| entry[0] == "Email/import").unwrap();
+                        let email = &imported[1]["created"]["m"]["id"];
+                        json!({ "accountId": ACCOUNT, "oldState": null,
+                            "newState": format!("sub{}", self.submitted.len()),
+                            "created": { "s": { "id": format!("S{}", self.submitted.len()), "emailId": email } } })
+                    }
                 }
                 other => panic!("unexpected {other}"),
             };
@@ -347,6 +361,14 @@ impl Server {
             if cid == "g" && name == "Email/get" && call[1].get("#ids").is_none() {
                 for (key, value) in &self.direct_get_overrides {
                     answer[key] = value.clone();
+                }
+            }
+            if name == "EmailSubmission/set" {
+                for (key, value) in &self.submission_overrides {
+                    answer[key] = value.clone();
+                }
+                if self.repeat_submission_reply {
+                    out.push(json!([name, &answer, cid]));
                 }
             }
             if name == "Email/import" {
@@ -446,6 +468,10 @@ impl Http for Fake {
                 let answer = s.api(&req);
                 if import.is_some() && std::mem::take(&mut s.drop_import_after) {
                     return Err("test acknowledgment lost after the server stored the import".into());
+                }
+                if req["methodCalls"].as_array().unwrap().iter().any(|call| call[0] == "EmailSubmission/set")
+                    && std::mem::take(&mut s.drop_submission_reply) {
+                    return Err("test connection lost after submission".into());
                 }
                 Ok(serde_json::to_vec(&answer).unwrap())
             }
@@ -733,6 +759,130 @@ fn jmap_inbox_import_from_another_client_is_unverified() {
     assert_eq!(stored.summary.sender_check, SenderCheck::NotVerified);
     let opened = engine.open(id).unwrap();
     assert_eq!(opened.summary.sender_check, SenderCheck::NotVerified);
+}
+
+fn submission_draft() -> Draft {
+    Draft {
+        from: Mailbox::new("Ada", "ada@example.org"),
+        to: vec![Mailbox::new("Grace", "grace@example.net")],
+        subject: "Check the submission".into(),
+        text: "One copy, please.\n".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn jmap_invalid_submission_acks_stay_uncertain_across_restart() {
+    use mail_store::SendState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut ids = Vec::new();
+    for (overrides, duplicate, drop_reply, detail) in [
+        (json!({"accountId": "other"}), false, false, "wrong account"),
+        (json!({"created": {"other": {"id": "S1"}}}), false, false, "unexpected EmailSubmission/set creation ID"),
+        (json!({"created": {"s": {"id": "S1"}, "other": {"id": "S2"}}}), false, false, "unexpected EmailSubmission/set creation ID"),
+        (json!({"created": {"s": {"id": "bad/id"}}}), false, false, "bad id"),
+        (json!({"created": {"s": {"id": "S1", "emailId": "other"}}}), false, false, "wrong EmailSubmission/set emailId"),
+        (json!({"created": null}), false, false, "missing or conflicting"),
+        (json!({"notCreated": {"s": {"type": "forbiddenFrom"}}}), false, false, "missing or conflicting"),
+        (json!({}), true, false, "repeated EmailSubmission/set reply"),
+        (json!({}), false, true, "test connection lost after submission"),
+    ] {
+        {
+            let mut s = server.borrow_mut();
+            s.submission_overrides = overrides.as_object().unwrap().clone();
+            s.repeat_submission_reply = duplicate;
+            s.drop_submission_reply = drop_reply;
+        }
+        let id = engine.send(account, &submission_draft(), When::default()).unwrap();
+        assert!(engine.send_now(id).unwrap());
+        let delivery = engine.deliver_jmap(id, client.as_mut()).unwrap();
+        assert!(matches!(&delivery, Delivery::Failed { why, transient: false } if why.contains(detail)), "{delivery:?}");
+        let row = engine.store.outbox().unwrap().into_iter().find(|(key, _)| *key == id).unwrap().1;
+        assert!(matches!(row.state, SendState::Uncertain { .. }));
+        assert!(!engine.store.write(|w| w.send_again(id, 1_800_000_000)).unwrap());
+        assert_eq!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::NotDue);
+        ids.push(id);
+        assert_eq!(server.borrow().submitted.len(), ids.len());
+    }
+    drop((client, engine));
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.recover_sends().unwrap(), 0);
+    assert!(engine.due_sends().unwrap().is_empty());
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    for id in &ids {
+        assert!(!engine.send_now(*id).unwrap());
+        assert_eq!(engine.deliver_jmap(*id, client.as_mut()).unwrap(), Delivery::NotDue);
+    }
+    assert_eq!(server.borrow().submitted.len(), ids.len());
+}
+
+#[test]
+fn jmap_preflight_retry_and_explicit_submission_refusal_remain_distinct() {
+    use mail_store::SendState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server { fail_mailbox_sync: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let id = engine.send(account, &submission_draft(), When::default()).unwrap();
+    assert!(engine.send_now(id).unwrap());
+    assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Failed { transient: true, .. }));
+    assert_eq!(engine.store.outbox().unwrap()[0].1.state, SendState::JmapRetry);
+    assert!(server.borrow().submitted.is_empty());
+    server.borrow_mut().fail_mailbox_sync = false;
+    assert!(engine.send_now(id).unwrap());
+    assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Sent { .. }));
+    assert!(engine.store.outbox().unwrap().is_empty());
+    assert_eq!(server.borrow().submitted.len(), 1);
+
+    server.borrow_mut().refuse_submission = true;
+    let id = engine.send(account, &submission_draft(), When::default()).unwrap();
+    assert!(engine.send_now(id).unwrap());
+    let delivery = engine.deliver_jmap(id, client.as_mut()).unwrap();
+    assert!(matches!(delivery, Delivery::Failed { why, transient: false } if why.contains("forbiddenFrom")));
+    assert!(matches!(engine.store.outbox().unwrap()[0].1.state, SendState::Stopped { .. }));
+    assert_eq!(server.borrow().submitted.len(), 1);
+}
+
+#[test]
+fn jmap_interrupted_and_legacy_retries_are_held_without_submission() {
+    use mail_store::SendState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let interrupted = engine.send(account, &submission_draft(), When::default()).unwrap();
+    assert!(engine.send_now(interrupted).unwrap());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert!(engine.store.write(|w| w.claim_jmap_send(interrupted, now)).unwrap());
+    let legacy = engine.send(account, &submission_draft(), When::default()).unwrap();
+    assert!(engine.send_now(legacy).unwrap());
+    engine.store.write(|w| {
+        assert!(w.claim_send(legacy, i64::MAX)?);
+        w.send_failed(legacy, "older timeout", true, now - 120)
+    }).unwrap();
+    drop(engine);
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    assert_eq!(engine.recover_sends().unwrap(), 1);
+    let server = Rc::new(RefCell::new(Server::default()));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    for id in [interrupted, legacy] {
+        assert_eq!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::NotDue);
+        assert!(!engine.store.write(|w| w.send_again(id, now)).unwrap());
+    }
+    assert!(engine.due_sends().unwrap().is_empty());
+    assert!(engine.store.outbox().unwrap().iter().all(|(_, row)| matches!(row.state, SendState::Uncertain { .. })));
+    assert!(server.borrow().submitted.is_empty());
 }
 
 #[test]

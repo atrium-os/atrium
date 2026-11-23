@@ -444,6 +444,8 @@ pub fn get_identities(account: &str) -> Vec<u8> {
 
 const IMPORT_TAG: &str = "i";
 const IMPORT_CREATION_ID: &str = "m";
+const SUBMISSION_TAG: &str = "s";
+const SUBMISSION_CREATION_ID: &str = "s";
 
 fn import_call(account: &str, blob: &str, mailbox: &str) -> Value {
     json!(["Email/import", {
@@ -467,7 +469,7 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
     request(
         vec![
             import_call(account, blob, sent),
-            json!(["EmailSubmission/set", { "accountId": account, "create": { "s": { "identityId": identity, "emailId": format!("#{IMPORT_CREATION_ID}"), "envelope": { "mailFrom": mail_from, "rcptTo": rcpt } } } }, "s"]),
+            json!(["EmailSubmission/set", { "accountId": account, "create": { (SUBMISSION_CREATION_ID): { "identityId": identity, "emailId": format!("#{IMPORT_CREATION_ID}"), "envelope": { "mailFrom": mail_from, "rcptTo": rcpt } } } }, SUBMISSION_TAG]),
         ],
         true,
     )
@@ -836,19 +838,49 @@ pub fn identities(a: &Answers) -> Result<Vec<Identity>> {
     Ok(list.iter().take(256).filter_map(|i| i.as_object()).filter_map(|i| Some(Identity { id: need_id(i, "id").ok()?, email: get_str(i, "email")?.to_ascii_lowercase() })).collect())
 }
 
-/// The answer to [`submit`]: the sent message's id, or why not.
-pub fn submitted(a: &Answers, account: &str) -> Result<String> {
-    let id = imported(a, account)?;
-    let s = a.of("s", "EmailSubmission/set")?;
-    if let Some(e) = s.get("notCreated").and_then(|n| n.get("s")) {
-        let t = e.get("type").and_then(Value::as_str).unwrap_or("?");
-        let d = e.get("description").and_then(Value::as_str).unwrap_or("");
-        return err(format!("not sent: {} {}", t.chars().take(64).collect::<String>(), d.chars().filter(|c| !c.is_control()).take(200).collect::<String>()));
+pub enum SubmissionAck {
+    Accepted(String),
+    Refused(String),
+}
+
+/// An explicit refusal is conclusive. A success must match both parts of
+/// the request, including the Email referenced by the submission.
+pub fn submitted(a: &Answers, account: &str) -> Result<SubmissionAck> {
+    const METHOD: &str = "EmailSubmission/set";
+    let reply = a.account_reply(SUBMISSION_TAG, METHOD, account)?;
+    need_state(reply, "newState")?;
+    if reply.get("oldState").is_some_and(|v| !v.is_null()) {
+        need_state(reply, "oldState")?;
     }
-    if s.get("created").and_then(|c| c.get("s")).is_none() {
-        return err("not sent");
+    let created = creation_result(reply, METHOD, SUBMISSION_CREATION_ID, "created")?;
+    let refused = creation_result(reply, METHOD, SUBMISSION_CREATION_ID, "notCreated")?;
+    for field in ["updated", "notUpdated", "notDestroyed"] {
+        if set_result_map(reply, field)?.is_some_and(|map| !map.is_empty()) {
+            return err(format!("unexpected {METHOD} {field}"));
+        }
     }
-    Ok(id)
+    if !ids(reply.get("destroyed"), "EmailSubmission/set destroyed")?.is_empty() {
+        return err("unexpected EmailSubmission/set destroyed");
+    }
+    match (created, refused) {
+        (Some(submission), None) => {
+            let submission = submission.as_object().ok_or(Error("bad EmailSubmission/set creation result".into()))?;
+            need_id(submission, "id")?;
+            let email = imported(a, account)?;
+            if submission.get("emailId").is_some_and(|id| id.as_str() != Some(email.as_str())) {
+                return err("wrong EmailSubmission/set emailId");
+            }
+            Ok(SubmissionAck::Accepted(email))
+        }
+        (None, Some(error)) => {
+            let error = error.as_object().ok_or(Error("bad EmailSubmission/set refusal".into()))?;
+            let kind = get_str(error, "type").filter(|kind| !kind.is_empty())
+                .ok_or(Error("bad EmailSubmission/set refusal type".into()))?;
+            let detail = get_str(error, "description").unwrap_or("");
+            Ok(SubmissionAck::Refused(format!("not sent: {} {}", kind.chars().filter(|c| c.is_ascii_graphic()).take(64).collect::<String>(), detail.chars().filter(|c| !c.is_control()).take(200).collect::<String>())))
+        }
+        _ => err("missing or conflicting EmailSubmission/set creation outcome"),
+    }
 }
 
 /// The answer to [`import`]: the stored message's id, or why not.
@@ -879,8 +911,8 @@ pub fn import_acknowledgment(a: &Answers, account: &str, state: Option<&str>) ->
             return err("wrong oldState in Email/import reply");
         }
     }
-    let created = import_result(reply, "created")?;
-    let refused = import_result(reply, "notCreated")?;
+    let created = creation_result(reply, "Email/import", IMPORT_CREATION_ID, "created")?;
+    let refused = creation_result(reply, "Email/import", IMPORT_CREATION_ID, "notCreated")?;
     match (created, refused) {
         (Some(email), None) => {
             let email = email.as_object().ok_or(Error("bad Email/import creation result".into()))?;
@@ -905,14 +937,14 @@ pub fn import_acknowledgment(a: &Answers, account: &str, state: Option<&str>) ->
     }
 }
 
-fn import_result<'a>(reply: &'a Map<String, Value>, field: &str) -> Result<Option<&'a Value>> {
+fn creation_result<'a>(reply: &'a Map<String, Value>, method: &str, id: &str, field: &str) -> Result<Option<&'a Value>> {
     match reply.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(map)) if map.is_empty() => Ok(None),
-        Some(Value::Object(map)) if map.len() == 1 => map.get(IMPORT_CREATION_ID).map(Some)
-            .ok_or_else(|| Error(format!("unexpected Email/import creation ID in {field}"))),
-        Some(Value::Object(_)) => err(format!("unexpected Email/import creation ID in {field}")),
-        Some(_) => err(format!("bad Email/import {field} map")),
+        Some(Value::Object(map)) if map.len() == 1 => map.get(id).map(Some)
+            .ok_or_else(|| Error(format!("unexpected {method} creation ID in {field}"))),
+        Some(Value::Object(_)) => err(format!("unexpected {method} creation ID in {field}")),
+        Some(_) => err(format!("bad {method} {field} map")),
     }
 }
 

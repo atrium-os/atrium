@@ -55,7 +55,7 @@ pub enum Delivery {
     /// The server can't hold it until `until`: the engine keeps it and sends
     /// it then.
     HeldHere { until: i64 },
-    /// Not sent; tried again later (`transient`), or stopped for the person.
+    /// A failed attempt, or an uncertain submission held for review.
     Failed { why: String, transient: bool },
     /// Not due, or taken back, or already being sent: nothing done.
     NotDue,
@@ -224,8 +224,10 @@ impl Engine {
     /// [`Engine::deliver`] over JMAP (§6.1): the server files the copy in
     /// Sent itself, and holds it until later when it can.
     pub fn deliver_jmap(&self, id: u64, client: &mut dyn mail_sync::jmap::Jmap) -> Result<Delivery, Error> {
+        use mail_sync::jmap::SendError;
+
         let t = now();
-        if !self.store.write(|w| w.claim_send(id, t))? {
+        if !self.store.write(|w| w.claim_jmap_send(id, t))? {
             return Ok(Delivery::NotDue);
         }
         let Some((_, o)) = self.store.outbox()?.into_iter().find(|(k, _)| *k == id) else { return Ok(Delivery::NotDue) };
@@ -255,9 +257,13 @@ impl Engine {
                 })?;
                 Ok(Delivery::Sent { copy: None, rejected: Vec::new(), held: send_at.is_some() })
             }
-            // The server said no to this message: trying again won't help.
-            Err(e) if e.0.starts_with("not sent") || e.0.starts_with("not stored") || e.0.starts_with("the ") => failed(e.0, false),
-            Err(e) => failed(format!("couldn't reach the server: {e}"), true),
+            Err(SendError::BeforeSubmission { why, transient }) => failed(why, transient),
+            Err(SendError::Refused(why)) => failed(why, false),
+            Err(SendError::Uncertain(detail)) => {
+                let why = format!("JMAP submission could not be confirmed and may have gone through: {detail}");
+                self.store.write(|w| w.send_uncertain(id, &why))?;
+                Ok(Delivery::Failed { why, transient: false })
+            }
         }
     }
 
