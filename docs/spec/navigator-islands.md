@@ -541,9 +541,17 @@ LibJS features and jail evidence are in
 For the restricted YouTube entry, navigatord now passes the same native
 player descriptor used by the two-track fixture. On trusted Start the
 worker receives the descriptor before entering capability mode. The
-provider continues to use its existing restricted fetch path. The broker
-and worker cross-link for FreeBSD arm64. Guest verification of codec
-readiness and the provider Play control with this descriptor is pending.
+provider continues to use its existing restricted fetch path. Two trusted Starts on arm64 Tessera exercised the real channel with JIT off.
+The page reported VP9 and Opus support, fetched two styles and three scripts,
+and laid out the provider’s Play button at (284, 144) with a 72 × 72 CSS px
+box in the 640 × 360 viewport. Each time, the native painter rejected
+`DeclareMaskContent` at chunk 4, record 3 before submitting that frame.
+Both the engine and player had IPv4 disabled. The engine reported Capsicum
+mode and ECAPMODE on a path lookup. Limen reported no audio attribution
+ticket during this run. Audible playback and chapter seeks on the real
+provider still need verification. The corrected fixture used the multi-asset
+helper and verified the installed public CA and hostname map.
+See `~/atrium-vm/evidence/navigator-i4-youtube-channel-20261124/`.
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
