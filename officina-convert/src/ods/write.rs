@@ -1263,6 +1263,9 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
     let mut out = String::new();
     for s in 0..wb.sheet_count() as u16 {
         let Some(f) = &wb.sheet(s).filter else { continue };
+        if f.conds.iter().any(|(_, cond)| cond.is_excel_date()) {
+            continue;
+        }
         let sh = super::formula::sheet_a1(&wb.sheet_name(s));
         let addr = format!("{sh}.{}{}:{sh}.{}{}", officina_grid::addr::col_name(f.rect.c0), f.rect.r0 + 1, officina_grid::addr::col_name(f.rect.c1), f.rect.r1 + 1);
         let _ = write!(out, r#"<table:database-range table:name="__Anonymous_Sheet_DB__{s}" table:target-range-address=""#);
@@ -1317,6 +1320,7 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
                             out.push_str("</table:filter-or>");
                         }
                     }
+                    Cond::Calendar(_) | Cond::DynamicDate(_) => unreachable!(),
                     Cond::Rank(rank) => {
                         let op = match (rank.bottom, rank.percent) {
                             (false, false) => "top values",

@@ -19,7 +19,9 @@ use std::sync::Arc;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
-use officina_grid::filter::{AutoFilter, Cond, Rank, Test, TextOp, TextTest};
+use officina_grid::eval::dates::DateSystem;
+use officina_grid::filter::{gregorian_calendar, AutoFilter, CalendarSelection, Cond, DateBounds, DateGroup,
+    DynamicDate, Rank, Test, TextOp, TextTest, GROUP_FIELDS, MAX_SELECTIONS};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
@@ -419,7 +421,7 @@ struct Seg {
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
-fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: officina_grid::eval::dates::DateSystem) -> Result<Seg, XlsxError> {
+fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: DateSystem) -> Result<Seg, XlsxError> {
     let mut seg = Seg::default();
     let mut r = xml(data);
     r.config_mut().check_end_names = false;
@@ -703,19 +705,29 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
                 }
             }
-            b"filter" | b"filters" | b"customFilters" | b"top10" => {
+            b"filters" | b"customFilters" | b"top10" | b"dynamicFilter" => {
                 let Some((_, conds)) = seg.filter.as_mut() else { continue };
                 let Some(c) = fcol else { continue };
                 let name = e.local_name();
                 match name.as_ref() {
                     b"filters" => {
-                        let blank = attr(&e, b"blank")?.is_some_and(|v| v == "1" || v == "true");
-                        conds.push((c, Cond::Values(if blank { vec![String::new()] } else { Vec::new() })));
+                        match read_value_filter(&mut r, &e, empty)? {
+                            Some(cond) => conds.push((c, cond)),
+                            None => {
+                                seg.filter = None;
+                                seg.rep.note(Kind::Approximate, "unsupported calendar or value filters (rows stay as the file hid them)");
+                            }
+                        }
                     }
-                    b"filter" => {
-                        if let (Some((cc, Cond::Values(v))), Some(val)) = (conds.last_mut(), attr(&e, b"val")?) {
-                            if *cc == c && v.len() < 1 << 20 {
-                                v.push(val);
+                    b"dynamicFilter" => {
+                        let kind = attr(&e, b"type")?;
+                        if kind.as_deref() != Some("null") {
+                            match read_dynamic_date(&e, kind.as_deref().unwrap_or_default(), system)? {
+                                Some(rule) => conds.push((c, Cond::DynamicDate(rule))),
+                                None => {
+                                    seg.filter = None;
+                                    seg.rep.note(Kind::Approximate, "unsupported dynamic filter (rows stay as the file hid them)");
+                                }
                             }
                         }
                     }
@@ -739,7 +751,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     _ => {}
                 }
             }
-            b"dynamicFilter" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, colour and icon filters (rows stay as the file hid them)"),
+            b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "colour and icon filters (rows stay as the file hid them)"),
             b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
@@ -1059,6 +1071,80 @@ fn read_text(r: &mut Reader<&[u8]>, end: &[u8], out: &mut String) -> Result<(), 
             _ => {}
         }
     }
+}
+
+fn date_group(tag: &BytesStart) -> Result<Option<DateGroup>, XlsxError> {
+    let kind = attr(tag, b"dateTimeGrouping")?;
+    let Some(precision) = GROUP_FIELDS.iter().position(|&field| Some(field) == kind.as_deref()) else {
+        return Ok(None);
+    };
+    let mut fields = [0; 6];
+    for (index, name) in GROUP_FIELDS[..=precision].iter().enumerate() {
+        let Some(value) = attr(tag, name.as_bytes())?.and_then(|v| v.parse().ok()) else {
+            return Ok(None);
+        };
+        fields[index] = value;
+    }
+    Ok(DateGroup::new(&fields[..=precision]))
+}
+
+fn read_value_filter(r: &mut Reader<&[u8]>, tag: &BytesStart, empty: bool) -> Result<Option<Cond>, XlsxError> {
+    let calendar = attr(tag, b"calendarType")?;
+    let blank = attr(tag, b"blank")?.is_some_and(|v| v == "1" || v == "true");
+    let mut values = if blank { vec![String::new()] } else { Vec::new() };
+    let mut groups = Vec::new();
+    let mut valid = true;
+    if !empty {
+        loop {
+            let (child, empty) = match r.read_event()? {
+                Event::Start(child) => (child, false),
+                Event::Empty(child) => (child, true),
+                Event::End(end) if end.name() == tag.name() => break,
+                Event::Eof => return Err(bad("value filters ended early")),
+                _ => continue,
+            };
+            if valid {
+                match child.local_name().as_ref() {
+                    b"filter" if values.len() < MAX_SELECTIONS => {
+                        match attr(&child, b"val")? {
+                            Some(value) => values.push(value),
+                            None => valid = false,
+                        }
+                    }
+                    b"dateGroupItem" if groups.len() < MAX_SELECTIONS => {
+                        match date_group(&child)? {
+                            Some(group) => groups.push(group),
+                            None => valid = false,
+                        }
+                    }
+                    _ => valid = false,
+                }
+            }
+            if !empty {
+                skip(r, &child)?;
+            }
+        }
+    }
+    if !valid || (!groups.is_empty() && calendar.as_deref().is_some_and(|name| !gregorian_calendar(name))) {
+        return Ok(None);
+    }
+    Ok(Some(if groups.is_empty() {
+        Cond::Values(values)
+    } else {
+        Cond::Calendar(CalendarSelection { groups, values, calendar })
+    }))
+}
+
+fn read_dynamic_date(tag: &BytesStart, name: &str, system: DateSystem) -> Result<Option<DynamicDate>, XlsxError> {
+    let bound = |name, iso| -> Result<Option<f64>, XlsxError> {
+        if let Some(x) = attr(tag, name)?.and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite()) {
+            return Ok(Some(x));
+        }
+        Ok(attr(tag, iso)?.and_then(|v| system.iso(&v)).map(|(serial, _)| serial))
+    };
+    let cached = bound(b"val", b"valIso")?.zip(bound(b"maxVal", b"maxValIso")?)
+        .and_then(|(start, end)| DateBounds::new(start, end));
+    Ok(DynamicDate::parse(name, cached))
 }
 
 fn custom_test(tag: &BytesStart) -> Result<Option<Test>, XlsxError> {

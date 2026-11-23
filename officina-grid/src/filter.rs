@@ -12,6 +12,8 @@ use crate::column::Sizes;
 use crate::eval::funcs::text_key;
 use crate::value::Value;
 
+mod calendar;
+pub use calendar::{gregorian_calendar, CalendarSelection, DateBounds, DateGroup, DynamicDate, GROUP_FIELDS, MAX_SELECTIONS};
 mod text;
 pub use text::{wildcard_regex, Test, TextOp, TextTest, MAX_TESTS};
 
@@ -25,6 +27,8 @@ pub enum Cond {
     /// `= <> < <= > >=`; two joined by and (`true`) or or.
     Compare(Vec<(String, f64)>, bool),
     Rank(Rank),
+    Calendar(CalendarSelection),
+    DynamicDate(DynamicDate),
     /// Custom numeric and text tests joined by AND (true) or OR.
     Custom(Vec<Test>, bool),
 }
@@ -114,6 +118,14 @@ impl FilterState {
                                 test.encode(w);
                             }
                         }
+                        Cond::Calendar(selection) => {
+                            w.u8(6);
+                            selection.encode(w);
+                        }
+                        Cond::DynamicDate(rule) => {
+                            w.u8(7);
+                            rule.encode(w);
+                        }
                         Cond::Rank(rank) => {
                             w.u8(3);
                             w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
@@ -198,6 +210,8 @@ impl FilterState {
                             let tests = (0..n).map(|_| Test::decode(r)).collect::<Result<_, _>>()?;
                             Cond::Custom(tests, t == 5)
                         }
+                        6 => Cond::Calendar(CalendarSelection::decode(r)?),
+                        7 => Cond::DynamicDate(DynamicDate::decode(r)?),
                         _ => return Err(WireError::Invalid("filter kind")),
                     };
                     conds.push((c, cond));
@@ -211,6 +225,10 @@ impl FilterState {
 }
 
 impl Cond {
+    pub fn is_excel_date(&self) -> bool {
+        matches!(self, Self::Calendar(_) | Self::DynamicDate(_))
+    }
+
     /// Keep the original numeric wire kind for existing one- and two-test rules.
     pub fn custom(tests: Vec<Test>, and: bool) -> Self {
         if tests.len() <= 2 && tests.iter().all(|t| matches!(t, Test::Number(..))) {
@@ -223,7 +241,7 @@ impl Cond {
         }
     }
 
-    fn keeps(&self, wb: &Workbook, addr: CellAddr, cutoff: Option<f64>, prepared: &[text::Prepared<'_>]) -> bool {
+    fn keeps(&self, wb: &Workbook, addr: CellAddr, prepared: &Prepared<'_>) -> bool {
         match self {
             Cond::Values(vals) => {
                 let k = text_key(&wb.formatted(addr).text);
@@ -250,14 +268,33 @@ impl Cond {
                 let value = wb.get(addr);
                 let shown = wb.formatted(addr).text;
                 let test = |t: &text::Prepared<'_>| t.keeps(&value, &shown);
-                if *and { prepared.iter().all(test) } else { prepared.iter().any(test) }
+                let Prepared::Custom(tests) = prepared else { unreachable!() };
+                if *and { tests.iter().all(test) } else { tests.iter().any(test) }
             }
+            Cond::Calendar(_) => {
+                let Prepared::Calendar(selection) = prepared else { unreachable!() };
+                calendar_serial(wb, addr).is_some_and(|serial| selection.matches_date(wb.date_system(), serial))
+                    || (!selection.values.is_empty() && selection.values.contains(&text_key(&wb.formatted(addr).text)))
+            }
+            Cond::DynamicDate(rule) => calendar_serial(wb, addr).is_some_and(|serial| rule.keeps(wb.date_system(), serial)),
             Cond::Rank(rank) => {
-                let (Value::Num(x), Some(y)) = (wb.get(addr), cutoff) else { return false };
-                x.is_finite() && if rank.bottom { x <= y } else { x >= y }
+                let (Value::Num(x), Prepared::Rank(Some(y))) = (wb.get(addr), prepared) else { return false };
+                x.is_finite() && if rank.bottom { x <= *y } else { x >= *y }
             }
         }
     }
+}
+
+fn calendar_serial(wb: &Workbook, addr: CellAddr) -> Option<f64> {
+    let Value::Num(serial) = wb.get(addr) else { return None };
+    wb.styles.format(wb.style_id(addr)).is_date().then_some(serial)
+}
+
+enum Prepared<'a> {
+    Other,
+    Rank(Option<f64>),
+    Custom(Vec<text::Prepared<'a>>),
+    Calendar(calendar::CalendarMatcher),
 }
 
 /// Merges sorted row ranges, joining touching ones.
@@ -340,7 +377,7 @@ impl Workbook {
 
     /// The state `filter` leaves the sheet in: rows of its range (below the header)
     /// failing a condition hidden, rows hidden outside the range kept hidden.
-    pub fn filtered(&self, sheet: u16, filter: Option<AutoFilter>) -> FilterState {
+    pub fn filtered(&self, sheet: u16, mut filter: Option<AutoFilter>) -> FilterState {
         let sh = self.sheet(sheet);
         // Rows hidden outside the old filter's range stay hidden by hand.
         let old = sh.filter.as_ref().map(|f| (f.rect.r0 + 1, f.rect.r1));
@@ -358,19 +395,26 @@ impl Workbook {
                 _ => hidden.push((a, b)),
             }
         }
-        if let Some(f) = &filter {
-            let cutoffs: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
-                Cond::Rank(rank) => self.rank_cutoff(f.rect, *col, *rank),
-                _ => None,
-            }).collect();
-            let prepared: Vec<Vec<_>> = f.conds.iter().map(|(_, cond)| match cond {
-                Cond::Custom(tests, _) => tests.iter().map(Test::prepare).collect(),
-                _ => Vec::new(),
+        if let Some(f) = &mut filter {
+            if f.conds.iter().any(|(_, cond)| matches!(cond, Cond::DynamicDate(_))) {
+                let system = self.date_system();
+                let today = system.now();
+                for (_, cond) in &mut f.conds {
+                    if let Cond::DynamicDate(rule) = cond {
+                        rule.cached = rule.bounds(system, today);
+                    }
+                }
+            }
+            let prepared: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
+                Cond::Rank(rank) => Prepared::Rank(self.rank_cutoff(f.rect, *col, *rank)),
+                Cond::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
+                Cond::Calendar(selection) => Prepared::Calendar(selection.prepare()),
+                _ => Prepared::Other,
             }).collect();
             let mut run: Option<(u32, u32)> = None;
             for r in f.rect.r0 + 1..=f.rect.r1 {
-                let keep = f.conds.iter().zip(&cutoffs).zip(&prepared).all(|(((c, cond), cutoff), tests)| {
-                    cond.keeps(self, CellAddr::new(sheet, r, *c), *cutoff, tests)
+                let keep = f.conds.iter().zip(&prepared).all(|((c, cond), prepared)| {
+                    cond.keeps(self, CellAddr::new(sheet, r, *c), prepared)
                 });
                 if !keep {
                     run = match run {

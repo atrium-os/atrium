@@ -24,19 +24,21 @@
 # Approve the Sheets manifest that requests clipboard access for the fixture user.
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
+# Use SHEETS_INTEROP_CASE=date_filters and /tmp/sheets-date-filter-fixture for Excel date filters.
 # Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
 # Use SHEETS_INTEROP_CASE=protection and /tmp/sheets-protection-fixture with that VBA source.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
     pivot_cache) test "$(ls "$books")" = "$(printf 'missing.xlsx\nunusable.xlsx')" ;;
     pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
+    date_filters) test "$(ls "$books")" = "$(printf 'dates-1900.xlsx\ndates-1904.xlsx')" ;;
     dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
     native_copy) test "$(ls "$books")" = "$(printf 'orders.ods\nsales.xlsx')" ;;
     legacy) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')" ;;
@@ -79,6 +81,7 @@ checkpoint() {
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
         protection) /tmp/sheets-protection-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
+        date_filters) /tmp/sheets-date-filter-fixture check "$1" "$2" "$format" ;;
         dates) /tmp/sheets-date-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
@@ -697,10 +700,46 @@ protection() {
 }
 
 type_epoch_date() {
-    click 62 "$1"
+    click "${2:-62}" "$1"
     for digit in 0x1e 0x26 0x27 0x21 0x2d 0x27 0x1e 0x2d 0x27 0x26; do key "$digit"; done # 1904-01-09
     key 0x28
 }
+date_filters() {
+    row=183
+    for format in 1900 1904; do
+        book=dates-$format.xlsx
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        click 257 133 # D2, outside the filter.
+        key 0x25 # 8
+        key 0x28
+        save "$book" saved
+        close_book
+
+        open_book "$row" "$book" saved
+        sleep .4
+        cp selectscreen.png "$results/$format-reopened.png"
+        type_epoch_date 133 126 # B2, calendar selection.
+        type_epoch_date 153 191 # C3, dynamic Today.
+        save "$book" edited
+        cp "$books/$book" "$results/$format-edited.xlsx"
+        cp selectscreen.png "$results/$format-before-reapply.png"
+
+        click 126 133
+        data_from_bottom 19 # Reapply both rules on the sheet.
+        save "$book" reapplied
+        cp "$books/$book" "$results/$format-reapplied.xlsx"
+        close_book
+
+        open_book "$row" "$book" reapplied
+        sleep .4
+        cp selectscreen.png "$results/$format-reapplied-reopened.png"
+        close_book
+        echo "PASS XLSX $format calendar and dynamic date filters through Save, edit, reapply, and reopen"
+        row=$((row + 30))
+    done
+}
+
 dates() {
     for format in xlsx xlsm; do
         case "$format" in xlsx) book=dates.xlsx; row=183 ;; xlsm) book=macro.xlsm; row=243 ;; esac
@@ -854,6 +893,7 @@ launcher=$(win_at 48 24)
 test "$launcher" -gt 0
 case "$profile" in
     pivot_cache) pivot_cache; exit ;;
+    date_filters) date_filters; exit ;;
     pivot_scope) pivot_scope; exit ;;
     legacy) legacy; exit ;;
     delimited) delimited; exit ;;

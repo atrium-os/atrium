@@ -133,6 +133,13 @@ fn saved_status(d: &Doc, format: Format) -> String {
         use officina_grid::formula::ast::Expr;
 
         let mut changes = Vec::new();
+        if (0..d.wb.sheet_count() as u16).any(|sheet| {
+            d.wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
+                filter.conds.iter().any(|(_, cond)| cond.is_excel_date())
+            })
+        }) {
+            changes.push("kept the last row visibility for Excel calendar filters");
+        }
         if d.wb.pivots().iter().any(|pivot| pivot.rows.iter().chain(&pivot.cols).any(|f| {
             matches!(&f.sort, officina_grid::pivot::AxisSort::Scoped { members, .. } if !members.is_empty())
         })) {

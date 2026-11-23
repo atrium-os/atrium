@@ -12,7 +12,7 @@ use std::sync::Arc;
 use officina_grid::addr::{a1, Rect};
 use officina_grid::eval::arrays;
 use officina_grid::formula;
-use officina_grid::filter::{Cond, Test, TextOp, TextTest};
+use officina_grid::filter::{Cond, Test, TextOp, TextTest, GROUP_FIELDS};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::xlsx::MDW;
@@ -33,6 +33,35 @@ const FUTURE_WS: &[&str] = &["FILTER", "SORT"];
 
 /// The cell-metadata part dynamic array formulas point at (`cm="1"`).
 const METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#;
+
+fn filter_values(out: &mut Vec<u8>, values: &[String], calendar: Option<&officina_grid::filter::CalendarSelection>) {
+    out.extend_from_slice(b"<filters");
+    if values.iter().any(|x| x.is_empty()) {
+        out.extend_from_slice(br#" blank="1""#);
+    }
+    if let Some(name) = calendar.and_then(|s| s.calendar.as_deref()) {
+        out.extend_from_slice(b" calendarType=\"");
+        esc(out, name);
+        out.push(b'"');
+    }
+    out.push(b'>');
+    for value in values.iter().filter(|x| !x.is_empty()) {
+        out.extend_from_slice(b"<filter val=\"");
+        esc(out, value);
+        out.extend_from_slice(b"\"/>");
+    }
+    if let Some(selection) = calendar {
+        for group in &selection.groups {
+            out.extend_from_slice(b"<dateGroupItem");
+            let parts = group.parts();
+            for (name, part) in GROUP_FIELDS.iter().zip(parts) {
+                let _ = write!(out, r#" {name}="{part}""#);
+            }
+            let _ = write!(out, r#" dateTimeGrouping="{}"/>"#, GROUP_FIELDS[parts.len() - 1]);
+        }
+    }
+    out.extend_from_slice(b"</filters>");
+}
 
 fn filter_comparison(op: &str) -> &'static str {
     match op {
@@ -506,14 +535,16 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
                 for (c, cond) in &f.conds {
                     let _ = write!(o, r#"<filterColumn colId="{}">"#, c - f.rect.c0);
                     match cond {
-                        Cond::Values(v) => {
-                            o.extend_from_slice(if v.iter().any(|x| x.is_empty()) { br#"<filters blank="1">"# as &[u8] } else { b"<filters>" });
-                            for x in v.iter().filter(|x| !x.is_empty()) {
-                                o.extend_from_slice(b"<filter val=\"");
-                                esc(&mut o, x);
-                                o.extend_from_slice(b"\"/>");
+                        Cond::Values(values) => filter_values(&mut o, values, None),
+                        Cond::Calendar(selection) => filter_values(&mut o, &selection.values, Some(selection)),
+                        Cond::DynamicDate(rule) => {
+                            let _ = write!(o, r#"<dynamicFilter type="{}""#, rule.name());
+                            let system = wb.date_system();
+                            if let Some(bounds) = rule.cached.or_else(|| rule.bounds(system, system.now())) {
+                                let (start, end) = bounds.limits();
+                                let _ = write!(o, r#" val="{start}" maxVal="{end}""#);
                             }
-                            o.extend_from_slice(b"</filters>");
+                            o.extend_from_slice(b"/>");
                         }
                         Cond::Compare(cs, and) => {
                             o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
