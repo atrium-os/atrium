@@ -1089,6 +1089,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
 
     // Sheets in order.
     let mut sheets: Vec<(String, String)> = Vec::new();
+    let mut pivot_caches: HashMap<u32, Option<String>> = HashMap::new();
     // Defined names: (name, sheet index it is local to, formula text).
     let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
     {
@@ -1108,6 +1109,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                             Some((t, p)) if t.ends_with("/worksheet") => sheets.push((name, p.clone())),
                             Some(_) => out.report.note_at(Kind::Dropped, "chart sheets and dialog sheets", || name.clone()),
                             None => return Err(bad("a sheet without its part")),
+                        }
+                    }
+                    b"pivotCache" => {
+                        if let (Some(cache), Some(rel)) = (attr(&e, b"cacheId")?.and_then(|id| id.parse::<u32>().ok()), attr(&e, b"id")?) {
+                            pivot_caches.entry(cache).and_modify(|known| {
+                                if known.as_deref() != Some(rel.as_str()) {
+                                    *known = None;
+                                }
+                            }).or_insert(Some(rel));
                         }
                     }
                     b"workbookPr" => out.date1904 = attr(&e, b"date1904")?.is_some_and(|v| v == "1" || v == "true"),
@@ -1241,7 +1251,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     }
     // Pivot tables, over the cells they wrote.
     let parts: Vec<String> = sheets.iter().map(|(_, p)| p.clone()).collect();
-    super::pivot::read_all(&mut wb, &z, &parts, &mut rep)?;
+    super::pivot::read_all(&mut wb, &z, &parts, &wb_part, &pivot_caches, &mut rep)?;
     // Conditional formats, once formulas (and the names they use) can be read.
     for (s, raws) in &conds {
         super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);

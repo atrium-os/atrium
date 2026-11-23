@@ -337,7 +337,8 @@ and their associated import or Save behavior.
 | Sheet rank filters | XLSX, XLSM, ODS | Sheets retains top and bottom numeric rules by count and percentage. **Data → Reapply Filter** recalculates the cutoff after edits. See §16.6 for rounding and ties. |
 | Static filter visibility | XLSX, XLSM, ODS | Text and wildcard tests, dynamic date and appearance filters, table-local filters, and complex ODS predicates can leave only the saved row visibility. A later filter change can expose rows that were excluded by a rule Sheets could not import. |
 | Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references and named, numeric and calendar groups based on a source field. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |
-| Static pivot results | XLSX, XLSM, ODS | Calculated fields and grouped Excel caches, missing caches, unavailable sources, and unsupported ODS fields, aggregate functions or group chains can leave the saved cells as plain values. These pivots cannot be refreshed from the source. |
+| Recovered pivot caches | XLSX, XLSM | Sheets uses the workbook cache ID when a pivot cache link is broken. A damaged definition can be rebuilt when it still identifies a local source. Saved output stays visible until Refresh. |
+| Static pivot results | XLSX, XLSM, ODS | Calculated and grouped Excel caches stay as saved cells, as do missing or damaged caches with an unknown or external source or unresolved filter and display references. Unsupported ODS fields, aggregate functions and group chains can also leave the saved cells as plain values. |
 | Pivot item order | XLSX, XLSM, ODS | Sheets preserves Excel manual order and value sorting by grand total or a selected opposite-axis member, along with ODS manual, source, label and value sorting. Previous, Next and Running Total follow the visible member order after refresh. |
 | Pivot layout | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Outline layout and values down the rows can change on refresh. |
 
@@ -2453,6 +2454,16 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   Whole-column sources end at the last row in use. Outline layout and values
   down the rows carry fidelity notices. Calculated fields and grouped Excel
   cache fields keep the pivot's cells as values.
+- **Excel cache recovery.** A pivot's workbook cache ID can recover a
+  definition when the direct relationship is missing or broken. When a
+  damaged definition still identifies a local worksheet range, table or
+  fixed defined name, Sheets rebuilds the pivot model and writes a fresh
+  definition on Save. The saved worksheet output stays until the user runs
+  Refresh in Sheets. Intact item indices can still supply hidden members,
+  selected pages and display references. Sheets leaves the cells static
+  when an item essential to the pivot cannot be identified, or when all
+  source metadata is missing. Import reports the recovery or the reason the
+  pivot stayed static. [Microsoft PivotTable package structure](https://learn.microsoft.com/en-us/office/open-xml/spreadsheet/working-with-pivottables)
 - **Display calculations.** XLSX retains `showDataAs` and the Office 2010
   `pivotShowAs` extension. Named base items resolve through the pivot field's
   item list and cache, so Save can rebuild their indices. Differences,
@@ -2507,6 +2518,12 @@ The `pivot_scope` desktop gate imports Excel grand-total and selected-member
 scopes on both axes. It checks the saved order, Previous, Next and Running
 Total after picker reopen, a source edit, Refresh, a second Save and a
 second picker reopen. [Microsoft pivot references](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/8e92a816-2bb4-4938-9f1c-1a9800714ede)
+The `pivot_cache` desktop gate imports a missing cache part with an
+alternate workbook relationship and a truncated cache with a local named
+source. It checks the saved output after Save and picker reopen, then edits
+the source and verifies that only Refresh changes the output. It saves and
+reopens each refreshed workbook again.
+
 
 Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows
 for two row fields and a column field, several value fields with and without

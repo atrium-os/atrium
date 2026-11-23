@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
 use officina_grid::pivot::{same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
-use officina_grid::{CellAddr, ErrorKind, Value, Workbook};
+use officina_grid::{CellAddr, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
 
@@ -18,6 +18,10 @@ use super::read::{attr, parse_ref, xml, XlsxError};
 use crate::report::{Kind, Report};
 
 mod scope;
+#[cfg(feature = "read")]
+mod cache;
+#[cfg(feature = "read")]
+use cache::Cache;
 
 const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 
@@ -328,70 +332,6 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
 // Reading.
 
 #[cfg(feature = "read")]
-/// A cache definition as read: source range (sheet, rect) and each field's items.
-struct Cache {
-    sheet: Option<String>,
-    rf: Option<String>,
-    name: Option<String>,
-    items: Vec<Vec<Value>>,
-    calculated: bool,
-    grouped: bool,
-}
-
-#[cfg(feature = "read")]
-fn read_cache(data: &[u8], dates: officina_grid::eval::dates::DateSystem) -> Result<Cache, XlsxError> {
-    let mut c = Cache { sheet: None, rf: None, name: None, items: Vec::new(), calculated: false, grouped: false };
-    let mut r = xml(data);
-    let mut buf = Vec::new();
-    let mut depth_items = false;
-    loop {
-        buf.clear();
-        match r.read_event_into(&mut buf)? {
-            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
-                b"worksheetSource" => {
-                    c.sheet = attr(&e, b"sheet")?;
-                    c.rf = attr(&e, b"ref")?;
-                    c.name = attr(&e, b"name")?;
-                }
-                b"cacheField" => {
-                    if attr(&e, b"formula")?.is_some() || attr(&e, b"databaseField")?.is_some_and(|v| v == "0") {
-                        c.calculated = true;
-                    }
-                    c.items.push(Vec::new());
-                }
-                b"sharedItems" => depth_items = true,
-                b"fieldGroup" => {
-                    depth_items = false;
-                    c.grouped = true;
-                }
-                tag if depth_items => {
-                    let v = attr(&e, b"v")?.unwrap_or_default();
-                    let val = match tag {
-                        b"s" => Value::str(&v),
-                        b"n" => v.parse::<f64>().map(Value::Num).unwrap_or(Value::str(&v)),
-                        b"b" => Value::Bool(v == "1" || v == "true"),
-                        b"e" => Value::Err(ErrorKind::from_text(&v).unwrap_or(ErrorKind::NA)),
-                        b"m" => Value::Empty,
-                        b"d" => dates.iso(&v).map_or_else(|| Value::str(&v), |(date, _)| Value::Num(date)),
-                        _ => continue,
-                    };
-                    if let Some(l) = c.items.last_mut() {
-                        if l.len() < officina_grid::pivot::MAX_ITEMS {
-                            l.push(val);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Event::End(e) if e.local_name().as_ref() == b"sharedItems" => depth_items = false,
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    Ok(c)
-}
-
-#[cfg(feature = "read")]
 #[derive(Default)]
 struct FieldIn {
     hidden: Vec<u32>,
@@ -408,11 +348,14 @@ struct FieldIn {
 
 #[cfg(feature = "read")]
 /// One pivot table part (with its cache) into the workbook.
-pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep: &mut Report) -> Result<(), XlsxError> {
-    let c = read_cache(cache, wb.date_system())?;
+fn read_table(
+    wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report,
+    resolve: impl FnOnce(&Workbook, Option<u32>) -> Result<(Cache, Rect, bool), &'static str>,
+) -> Result<(), XlsxError> {
     let mut r = xml(data);
     let mut buf = Vec::new();
     let mut name = String::from("PivotTable");
+    let mut cache_id = None;
     let (mut loc, mut pages_n) = (None, 0u32);
     let (mut grand_col, mut grand_row) = (true, true);
     let mut fields: Vec<FieldIn> = Vec::new();
@@ -432,6 +375,7 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"pivotTableDefinition" => {
                     name = attr(&e, b"name")?.unwrap_or(name);
+                    cache_id = attr(&e, b"cacheId")?.and_then(|id| id.parse::<u32>().ok());
                     grand_col = attr(&e, b"rowGrandTotals")?.is_none_or(|v| v != "0" && v != "false");
                     grand_row = attr(&e, b"colGrandTotals")?.is_none_or(|v| v != "0" && v != "false");
                     compact |= attr(&e, b"compact")?.is_none_or(|v| v != "0" && v != "false");
@@ -510,33 +454,36 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         }
     }
     let why = |rep: &mut Report, w: &str| rep.note_at(Kind::Dropped, "pivot tables this engine can't use (their cells kept as values)", || format!("{name}: {w}"));
-    if c.calculated {
-        rep.note(Kind::Dropped, "calculated pivot fields (pivot tables kept as values)");
-        return Ok(());
-    }
-    if c.grouped {
-        why(rep, "it uses grouped Excel cache fields");
-        return Ok(());
-    }
-    // The source: a range on a sheet, or a table's name.
-    let source = match (&c.sheet, &c.rf, &c.name) {
-        (Some(sh), Some(rf), _) => wb.sheet_id(sh).zip(parse_ref(rf)).map(|(s, (r0, c0, r1, c1))| Rect { sheet: s, r0, c0, r1, c1 }),
-        (None, Some(rf), _) => parse_ref(rf).map(|(r0, c0, r1, c1)| Rect { sheet, r0, c0, r1, c1 }),
-        (_, _, Some(n)) => wb.tables().iter().find(|t| t.name.eq_ignore_ascii_case(n)).map(|t| Rect { r1: t.rect.r1 - t.totals as u32, ..t.rect }),
-        _ => None,
-    };
-    let Some(mut source) = source else {
-        why(rep, "its source is not a range in this workbook");
-        return Ok(());
-    };
-    // Whole columns: down to the last row in use.
-    source.r1 = source.r1.min(wb.extent(source.sheet).0.saturating_sub(1).max(source.r0));
     let Some((r0, c0, r1, c1)) = loc else {
         why(rep, "no location");
         return Ok(());
     };
+    let (c, source, relinked) = match resolve(wb, cache_id) {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            why(rep, reason);
+            return Ok(());
+        }
+    };
+    let axes = rows.iter().chain(&cols).filter_map(|&f| u32::try_from(f).ok())
+        .chain(pages.iter().map(|(f, _)| *f));
+    if axes.clone().any(|f| {
+        fields.get(f as usize).is_some_and(|info| {
+            info.hidden.iter().any(|&index| c.items(f).and_then(|items| items.get(index as usize)).is_none())
+        })
+    }) {
+        why(rep, "hidden pivot items could not be identified without their cache entries");
+        return Ok(());
+    }
+    let missing_items: Vec<_> = axes.filter(|&f| fields.get(f as usize).is_some_and(|info| {
+        info.items.iter().flatten().any(|&index| c.items(f).and_then(|items| items.get(index as usize)).is_none())
+    })).collect();
+    let rebuild = c.needs_rebuild(source) || !missing_items.is_empty();
+    let missing_order: Vec<_> = missing_items.into_iter().filter(|&f| {
+        matches!(fields[f as usize].sort.as_deref(), None | Some("manual"))
+    }).collect();
     let hidden = |f: u32| -> Vec<Value> {
-        let items = c.items.get(f as usize);
+        let items = c.items(f);
         fields.get(f as usize).map(|x| x.hidden.iter().filter_map(|&i| items.and_then(|v| v.get(i as usize)).cloned()).collect()).unwrap_or_default()
     };
     let field = |f: u32, rep: &mut Report| {
@@ -546,7 +493,7 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                 None | Some("manual") if !field.items.is_empty() => {
                     let mut items = Vec::new();
                     for index in field.items.iter().flatten() {
-                        if let Some(item) = c.items.get(f as usize).and_then(|items| items.get(*index as usize)) {
+                        if let Some(item) = c.items(f).and_then(|items| items.get(*index as usize)) {
                             items.push(item.clone());
                         } else {
                             rep.note(Kind::Approximate, "pivot manual item order with missing cache entries");
@@ -571,10 +518,13 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         if let Some(i) = item {
             // A page selection addresses the pivot items, not the shared cache.
             let index = fields.get(f as usize).and_then(|field| field.items.get(i as usize))
-                .copied().flatten().unwrap_or(i);
-            if let Some(all) = c.items.get(f as usize) {
-                pf.hidden = all.iter().enumerate().filter(|(k, _)| *k as u32 != index).map(|(_, v)| v.clone()).collect();
-            }
+                .copied().flatten();
+            let selection = index.and_then(|index| c.items(f).filter(|all| (index as usize) < all.len()).map(|all| (all, index)));
+            let Some((all, index)) = selection else {
+                why(rep, "its selected page item could not be identified without its cache entry");
+                return Ok(());
+            };
+            pf.hidden = all.iter().enumerate().filter(|(k, _)| *k as u32 != index).map(|(_, v)| v.clone()).collect();
         }
         p.pages.push(pf);
     }
@@ -588,7 +538,7 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
             index => {
                 let indices = &fields.get(field as usize)?.items;
                 let shared = if indices.is_empty() { index } else { (*indices.get(index as usize)?)? };
-                c.items.get(field as usize)?.get(shared as usize).cloned().map(BaseItem::Named)
+                c.items(field)?.get(shared as usize).cloned().map(BaseItem::Named)
             }
         };
         let show_as = match mode.as_deref().unwrap_or("normal") {
@@ -619,19 +569,31 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
             why(rep, "its display calculation or base item could not be resolved");
             return Ok(());
         };
+        if show_as.base_field().is_some_and(|field| missing_order.contains(&field))
+            && matches!(&show_as, ShowAs::RunningTotal(_) | ShowAs::PercentOfRunningTotal(_)
+                | ShowAs::Reference { item: BaseItem::Previous | BaseItem::Next, .. })
+        {
+            why(rep, "a display calculation depends on a manual item order that could not be recovered");
+            return Ok(());
+        }
         let d = DataField { field: f, agg, name: None, show_as };
         let default = wb.data_caption(&p, &d);
         data.push(DataField { name: (!n.is_empty() && n != default).then(|| Arc::from(n.as_str())), ..d });
     }
     p.data = data;
+    let missing_scope_item = std::cell::Cell::new(false);
     let mut apply_scopes = |axis: &mut [PivotField], opposite: &[PivotField]| {
         for field in axis {
             let Some(input) = fields.get(field.field as usize).filter(|input| input.scoped_sort) else { continue };
             let member = |field: u32, index: u32, cache_index: bool| {
-                let shared = if cache_index { index } else {
-                    fields.get(field as usize)?.items.get(index as usize).copied().flatten()?
+                let shared = if cache_index { Some(index) } else {
+                    fields.get(field as usize).and_then(|info| info.items.get(index as usize)).copied().flatten()
                 };
-                c.items.get(field as usize)?.get(shared as usize).cloned()
+                let value = shared.and_then(|index| c.items(field)?.get(index as usize)).cloned();
+                if value.is_none() {
+                    missing_scope_item.set(true);
+                }
+                value
             };
             let sort = input.scope.as_ref().and_then(|scope| {
                 scope.resolve(input.sort.as_deref(), opposite, &data_indices, member)
@@ -645,6 +607,10 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     };
     apply_scopes(&mut p.rows, &p.cols);
     apply_scopes(&mut p.cols, &p.rows);
+    if missing_scope_item.get() {
+        why(rep, "a selected sort member could not be identified without its cache entry");
+        return Ok(());
+    }
     if p.pages.iter().any(|field| fields.get(field.field as usize).is_some_and(|input| input.scoped_sort)) {
         rep.note(Kind::Approximate, "pivot value sort scope on a page field");
     }
@@ -660,34 +626,82 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         rep.note(Kind::Approximate, "pivot tables in outline form (shown in tabular form once refreshed)");
     }
     let area = Rect { sheet, r0: page_top, c0, r1, c1: c1.max(c0 + if pages_n > 0 { 1 } else { 0 }) };
+    if area.intersects(&source) {
+        why(rep, "its source overlaps the saved pivot output");
+        return Ok(());
+    }
     if let Err(w) = wb.add_pivot_as_is(p, Some(area)) {
         why(rep, w);
+    } else if rebuild {
+        rep.note_at(Kind::Approximate, "pivot cache recovered from its local source (saved cells kept until Refresh)", || name.clone());
+    } else if relinked {
+        rep.note_at(Kind::Approximate, "pivot cache recovered through the workbook cache ID", || name.clone());
     }
     Ok(())
 }
 
 #[cfg(feature = "read")]
 /// Every pivot table, from each sheet's relationships, in their parts' order.
-pub fn read_all(wb: &mut Workbook, z: &crate::zip::Archive, sheets: &[String], rep: &mut Report) -> Result<(), XlsxError> {
+pub fn read_all(
+    wb: &mut Workbook, z: &crate::zip::Archive, sheets: &[String], workbook: &str,
+    cache_ids: &std::collections::HashMap<u32, Option<String>>, rep: &mut Report,
+) -> Result<(), XlsxError> {
+    use super::read::internal_rels;
     let mut parts: Vec<(u16, String)> = Vec::new();
     for (s, part) in sheets.iter().enumerate() {
-        for (t, p) in super::read::rels(z, part)?.into_values() {
+        for (t, p) in internal_rels(z, part)?.into_values() {
             if t.ends_with("/pivotTable") {
                 parts.push((s as u16, p));
             }
         }
     }
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let workbook_links = internal_rels(z, workbook)?;
     // pivotTable2 before pivotTable10.
     let number = |p: &str| p.trim_end_matches(".xml").chars().rev().take_while(|c| c.is_ascii_digit()).collect::<String>().chars().rev().collect::<String>().parse::<u64>().unwrap_or(0);
     parts.sort_by(|a, b| (number(&a.1), &a.1).cmp(&(number(&b.1), &b.1)));
+    parts.dedup();
     for (sheet, p) in parts {
         let Some(data) = z.read_name(&p)? else { continue };
-        let cache = super::read::rels(z, &p)?.into_values().find(|(t, _)| t.ends_with("/pivotCacheDefinition")).map(|(_, c)| c);
-        let Some(cache) = cache.and_then(|c| z.read_name(&c).ok().flatten()) else {
-            rep.note(Kind::Dropped, "pivot tables without their cache (kept as values)");
-            continue;
-        };
-        read_table(wb, sheet, &data, &cache, rep)?;
+        let links = internal_rels(z, &p).unwrap_or_default();
+        let mut targets = links.values().filter(|(kind, _)| kind.ends_with("/pivotCacheDefinition")).map(|(_, path)| path.as_str());
+        let direct = targets.next().filter(|path| targets.all(|target| target == *path));
+        read_table(wb, sheet, &data, rep, |wb, id| {
+            let owner = id.and_then(|id| cache_ids.get(&id)?.as_deref())
+                .and_then(|rel| workbook_links.get(rel))
+                .filter(|(kind, _)| kind.ends_with("/pivotCacheDefinition"))
+                .map(|(_, path)| path.as_str());
+            let load = |path: &str| {
+                let bytes = z.read_name(path).map_err(|_| "its pivot cache part is unreadable")?
+                    .ok_or("its pivot cache part is missing")?;
+                let cache = Cache::read(&bytes, wb.date_system());
+                let source = cache.resolve(wb, z, path, sheets, sheet)?;
+                Ok((cache, source, Some(path) != direct))
+            };
+            // The workbook cache ID is authoritative. A separate table link
+            // can supply intact items if it names the same local source.
+            match (owner, direct) {
+                (Some(owner), Some(direct)) if owner != direct => match load(owner) {
+                    Ok(primary) if primary.0.needs_rebuild(primary.1) => {
+                        if let Ok(other) = load(direct) {
+                            if other.1 == primary.1 && !other.0.needs_rebuild(other.1) {
+                                return Ok(other);
+                            }
+                        }
+                        Ok(primary)
+                    }
+                    Ok(primary) => Ok(primary),
+                    Err(reason @ ("its pivot cache part is unreadable" | "its pivot cache part is missing" | "the cache has no local worksheet source")) => {
+                        load(direct).or(Err(reason))
+                    }
+                    Err(reason) => Err(reason),
+                },
+                (Some(path), _) | (_, Some(path)) => load(path),
+                _ => Err("its pivot cache is missing and no local source can be identified"),
+            }
+        })?;
     }
     Ok(())
 }
