@@ -614,6 +614,14 @@ The new attempt had no handshake or IPv4 sentinel response until fresh
 confirmation. One confirmed POST led to one accepted assertion, one
 redemption, and `crypta-ac-ok` through ocserv on `tun6`.
 
+The follow-up disconnected while the newest requeued proposal was
+pending. Its jail closed with zero POSTs or redemptions, and the
+IPv4 sentinel was unreachable. A separate reconnect used a distinct
+Crypta attempt. The gateway still recorded zero POSTs and IPv4 stayed
+blocked until fresh confirmation. Confirmation produced one POST,
+one accepted assertion, and one redemption, and the guest fetched
+`crypta-ac-ok` through ocserv on `tun7`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
