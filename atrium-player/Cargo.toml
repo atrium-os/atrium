@@ -8,3 +8,6 @@ license = "MIT OR Apache-2.0"
 
 [profile.release]
 debug = 1
+
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

@@ -48,6 +48,9 @@ atrium-worker = { path = "../../sdk/atrium-worker" }
 h264 = []
 
 [dev-dependencies]
+navigator-media = { path = "../../navigator-media" }
+navigator-normalize = { path = "../../navigator-normalize" }
+navigator-render = { path = "../../navigator-render" }
 # examples/media_probe.rs: limend in process, and the capture.
 aqueduct = { path = "../../aqueduct" }
 png      = "0.17"

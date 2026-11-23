@@ -74,3 +74,17 @@ fn a_page_video_is_still_a_media_player() {
     let r = render_html(&out, &fonts, &Env::default());
     assert_eq!(r.scene.embeds.iter().filter(|e| e.role == "media-player").count(), 1);
 }
+
+#[test]
+fn i4_watch_page_preserves_the_video_slot_and_chapter_hits() {
+    let (page, _) = normalize(include_str!("../../test-assets/navigator-i4/watch.html"), &Inputs::default());
+    let fonts = FontSet::load().unwrap();
+    let rendered = render_html(&page, &fonts, &Env::default());
+    let scene = rendered.scene;
+    assert_eq!(scene.embeds.len(), 1);
+    assert!(matches!(&scene.embeds[0].source, EmbedSource::Island { src }
+        if src == "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"));
+    let chapters: Vec<_> = scene.links.iter().filter(|link| link.w > 0 && link.h > 0)
+        .map(|link| link.href.as_str()).collect();
+    assert_eq!(chapters, ["#t=0.5", "#t=1.5"]);
+}

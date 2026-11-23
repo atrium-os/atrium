@@ -366,6 +366,34 @@ island's fetcher and their bytes are appended to the native player. The player d
 presents and draws its controls in its own jail. Any media backend Servo brings with it is
 left out of the build (its usual one is GStreamer, which is LGPL).
 
+### I4 video prototype
+
+The [watch document](../../test-assets/navigator-i4/watch.html) embeds the
+YouTube player demo and links to two local time fragments, `#t=0.5` and
+`#t=1.5`. The normalizer and renderer host test checks that the document
+produces one privacy-enhanced YouTube island and two chapter hit regions.
+The Navigator MSE test checks seeks in both directions, the pending seek
+state, the native time reply, and rejection of malformed or out-of-range
+targets.
+
+The arm64 `atrium-media-probe` now drives the native Limen player through
+Navigator's MSE adapter. The deterministic input is `red-blue.webm`. The
+probe asks the player about VP9 support, appends the clip, waits for native
+acknowledgements, then activates the rendered chapter targets while paused.
+It checks the Fresco slot for red at 0.5 s and blue at 1.5 s. The probe,
+player and decode worker cross-built; the Tessera frame check is pending.
+
+A host GET of the real embed on 2026-11-23 returned HTTP 200 in both
+cases. Its preview playability status reported error 153
+(`EMBEDDER_IDENTITY_MISSING_REFERRER`) with no Referer and OK with the
+served watch document's loopback origin as Referer. This checks the
+provider configuration only. Before the live gate, bind the installed
+Ladybird worker's HTMLMediaElement and SourceBuffer to the native role,
+give its broker the document-scoped embed and segment fetches, and route
+the installed viewer's chapter action to that live slot. The existing
+widget grant is scoped to the counter fixture. Fingerprint testing is
+deferred.
+
 ## 6a. Sign-in: SSO and WebAuthn
 
 An identity provider's page is a whole page of script: a redirect chain, a password step,

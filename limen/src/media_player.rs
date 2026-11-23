@@ -148,7 +148,8 @@ pub enum ToParent {
     Action { action: u16 },
 }
 
-fn finite_secs(s: f64) -> bool {
+/// Seconds representable on the native player's media clock.
+pub fn finite_secs(s: f64) -> bool {
     s.is_finite() && (0.0..=1.0e9).contains(&s)
 }
 

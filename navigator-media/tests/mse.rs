@@ -260,3 +260,27 @@ fn media_session_metadata_and_track_actions() {
     m.from_player(ToParent::Action { action: media_action::NEXT_TRACK });
     assert!(m.take_events().is_empty(), "a handler removed in between is not called");
 }
+
+#[test]
+fn local_chapter_link_seeks_an_attached_source_and_waits_for_player_time() {
+    let mut media = Media::new();
+    assert!(!media.seek_chapter("#t=0.5"));
+    media.attach_source().unwrap();
+    media.take_out();
+    media.take_events();
+    for invalid in ["#other", "#t=-2", "#t=NaN", "#t=1e9", "#t=1000000001", "#t=.", "#t=1.2.3",
+                    "https://other.test/#t=2"] {
+        assert!(!media.seek_chapter(invalid), "{invalid}");
+    }
+    assert!(media.take_out().is_empty());
+    for secs in [1.5, 0.5] {
+        assert!(media.seek_chapter(&format!("#t={secs}")));
+        assert_eq!(media.take_out(), [ToChild::Seek { secs }]);
+        assert_eq!(media.take_events(), [Fire::Element("seeking")]);
+        assert!(media.seeking);
+        media.from_player(ToParent::Time { secs });
+        assert_eq!(media.take_events(), [Fire::Element("seeked"), Fire::Element("timeupdate")]);
+        assert_eq!(media.current_time, secs);
+        assert!(!media.seeking);
+    }
+}

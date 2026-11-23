@@ -27,7 +27,7 @@ use fresco_client::{Connection, Event};
 use fresco_protocol::{RectParams, WindowHints};
 use limen::client::Parent;
 use limen::daemon::{serve, Launcher, Shared};
-use limen::media_player::{ToChild, ToParent, APPEND_MAX};
+use limen::media_player::{ToChild, ToParent};
 use limen::proto::{EmbedId, ParentEvent};
 
 const WIN_POS: (i32, i32) = (100, 100);
@@ -63,6 +63,7 @@ struct Probe {
     app: Parent,
     e: EmbedId,
     failed: u32,
+    media: navigator_media::mse::Media,
     /// Every message from the player, oldest first.
     heard: Vec<ToParent>,
     /// Those no `wait` has taken yet.
@@ -79,6 +80,11 @@ impl Probe {
     fn send(&mut self, m: ToChild) {
         self.app.send(self.e, m.encode()).expect("send");
     }
+    fn flush_media(&mut self) {
+        for message in self.media.take_out() {
+            self.send(message);
+        }
+    }
     /// Read the player's messages until `want` matches one or `t` passes.
     fn wait(&mut self, t: Duration, want: impl Fn(&ToParent) -> bool) -> Option<ToParent> {
         if let Some(i) = self.pending.iter().position(&want) {
@@ -93,6 +99,8 @@ impl Probe {
                         self.failed += 1;
                         continue;
                     };
+                    self.media.from_player(m.clone());
+                    self.flush_media();
                     self.heard.push(m.clone());
                     if want(&m) {
                         return Some(m);
@@ -183,7 +191,7 @@ fn main() {
     let mut app = Parent::wrap(aqueduct::Connection::wrap(a).unwrap());
     let e = app.request("media-player", token).expect("request");
     app.place(e, Some(SLOT)).unwrap();
-    let mut p = Probe { app, e, failed: 0, heard: Vec::new(), pending: Default::default() };
+    let mut p = Probe { app, e, failed: 0, media: Default::default(), heard: Vec::new(), pending: Default::default() };
     let until = Instant::now() + Duration::from_secs(20);
     let mut attached = false;
     while Instant::now() < until && !attached {
@@ -202,18 +210,24 @@ fn main() {
     p.app.send(e, vec![0xff, 0xff, 0xff, 0xff, 0x01]).unwrap();
 
     // The feed, in appends limend can carry, one in flight.
-    p.send(ToChild::OpenSource);
-    p.send(ToChild::AddTrack { track: 0, mime: "video/webm; codecs=vp9".into() });
-    let mut appended = 0;
-    for chunk in bytes.chunks(APPEND_MAX.min(4 << 10)) {
-        p.send(ToChild::Append { track: 0, bytes: chunk.to_vec(), timestamp_offset: None });
-        if p.wait(Duration::from_secs(10), |m| matches!(m, ToParent::Appended { track: 0 })).is_some() {
-            appended += 1;
+    let mime = "video/webm; codecs=vp9";
+    p.media.prime(&[mime]);
+    p.flush_media();
+    p.wait(Duration::from_secs(5), |m| matches!(m, ToParent::CanPlay { mime: t, .. } if t == mime))
+        .expect("native player must answer the source buffer type");
+    p.media.attach_source().unwrap();
+    let track = p.media.add_source_buffer(mime).unwrap();
+    p.flush_media();
+    for chunk in bytes.chunks(4 << 10) {
+        p.media.append_buffer(track, chunk).unwrap();
+        while p.media.updating(track) {
+            p.flush_media();
+            p.wait(Duration::from_secs(10), |m| matches!(m, ToParent::Appended { track: t } if *t == track))
+                .expect("native player must acknowledge each append");
         }
     }
-    let n = bytes.len().div_ceil(4 << 10);
-    p.check(appended == n, &format!("{appended} of {n} appends acknowledged one by one"));
-    p.send(ToChild::EndOfStream { error: None });
+    p.media.end_of_stream(None).unwrap();
+    p.flush_media();
     let whole = |m: &ToParent| matches!(m, ToParent::Buffered { track: 0, ranges } if ranges.last().is_some_and(|r| r.1 > 1.9));
     p.wait(Duration::from_secs(5), whole);
     let b = p.heard.iter().rev().find_map(|m| if let ToParent::Buffered { track: 0, ranges } = m { Some(ranges.clone()) } else { None });
@@ -234,9 +248,19 @@ fn main() {
     p.check(times.len() >= 2 && times.windows(2).all(|w| w[0] <= w[1]) && times.last().is_some_and(|t| *t > 1.0), &format!("Time advances ({times:?})"));
 
     // Ended leaves it paused; a seek shows the frame there.
-    p.send(ToChild::Seek { secs: 0.5 });
-    let c = slot_colour(Duration::from_secs(10), red);
-    p.check(c.is_some_and(red), &format!("a seek to 0.5 s while paused shows red ({c:?})"));
+    let (html, _) = navigator_normalize::normalize(
+        include_str!("../../../test-assets/navigator-i4/watch.html"), &Default::default());
+    let fonts = navigator_render::fontset::FontSet::load().expect("Navigator document fonts");
+    let page = navigator_render::html::render_html(&html, &fonts, &Default::default());
+    assert!(page.scene.embeds.iter().any(|slot| matches!(&slot.source,
+        navigator_render::EmbedSource::Island { src } if src == "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE")));
+    for (href, expected) in [("#t=0.5", red as fn(_) -> _), ("#t=1.5", blue)] {
+        let chapter = page.scene.links.iter().find(|link| link.href == href).expect("rendered chapter link");
+        assert!(p.media.seek_chapter(&chapter.href));
+        p.flush_media();
+        let colour = slot_colour(Duration::from_secs(10), expected);
+        p.check(colour.is_some_and(expected), &format!("paused chapter {href} displays {colour:?}"));
+    }
     if let (Ok(from), Ok(to)) = (std::env::var("PROBE_CAPTURE"), std::env::var("PROBE_SAVE")) {
         // Paused: the controls are up over the picture.
         std::thread::sleep(Duration::from_millis(600));
