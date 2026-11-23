@@ -55,6 +55,8 @@ struct Server {
     repeat_submission_reply: bool,
     refuse_submission: bool,
     drop_submission_reply: bool,
+    submission_records: BTreeMap<String, Value>,
+    submission_reads: Vec<String>,
     downloads: usize,
     snoozed: Option<String>,
     hold: u64,
@@ -346,10 +348,40 @@ impl Server {
                         self.submitted.push(s.clone());
                         let imported = out.iter().find(|entry| entry[0] == "Email/import").unwrap();
                         let email = &imported[1]["created"]["m"]["id"];
+                        let id = format!("S{}", self.submitted.len());
+                        self.submission_records.insert(id.clone(), json!({
+                            "id": id, "emailId": email, "identityId": s["identityId"],
+                            "envelope": s["envelope"], "undoStatus": "pending",
+                            "sendAt": mail_proto::jmap::utc_string(1_800_000_000), "deliveryStatus": null
+                        }));
                         json!({ "accountId": ACCOUNT, "oldState": null,
                             "newState": format!("sub{}", self.submitted.len()),
-                            "created": { "s": { "id": format!("S{}", self.submitted.len()), "emailId": email } } })
+                            "created": { "s": { "id": id, "emailId": email } } })
                     }
+                }
+                "EmailSubmission/query" => {
+                    self.submission_reads.push(name.into());
+                    assert_eq!(args["accountId"], ACCOUNT);
+                    assert_eq!(args["position"], 0);
+                    assert_eq!(args["calculateTotal"], true);
+                    let emails = args["filter"]["emailIds"].as_array().unwrap();
+                    let identities = args["filter"]["identityIds"].as_array().unwrap();
+                    let matches: Vec<_> = self.submission_records.iter().filter(|(_, row)| {
+                        emails.contains(&row["emailId"]) && identities.contains(&row["identityId"])
+                    }).map(|(id, _)| id).collect();
+                    let limit = args["limit"].as_u64().unwrap() as usize;
+                    json!({ "accountId": ACCOUNT, "queryState": "subq", "canCalculateChanges": false,
+                        "position": 0, "ids": matches.iter().take(limit).collect::<Vec<_>>(), "total": matches.len() })
+                }
+                "EmailSubmission/get" => {
+                    self.submission_reads.push(name.into());
+                    assert_eq!(args["accountId"], ACCOUNT);
+                    let ids = args["ids"].as_array().unwrap();
+                    let (list, missing): (Vec<Value>, Vec<&Value>) = (
+                        ids.iter().filter_map(|id| self.submission_records.get(id.as_str().unwrap()).cloned()).collect(),
+                        ids.iter().filter(|id| !self.submission_records.contains_key(id.as_str().unwrap())).collect(),
+                    );
+                    json!({ "accountId": ACCOUNT, "state": "subs", "list": list, "notFound": missing })
                 }
                 other => panic!("unexpected {other}"),
             };
@@ -771,6 +803,154 @@ fn submission_draft() -> Draft {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubmissionEvidence {
+    Pending,
+    Final,
+    Canceled,
+}
+
+// Test-only probe. The Email ID is independently established by the fixture.
+// An older outbox row with only an RFC 5322 Message-ID cannot supply it.
+fn probe_submission(http: &mut dyn Http, email: Option<&str>) -> Option<SubmissionEvidence> {
+    let email = email?;
+    let api = "https://jmap.test/api/";
+    let request = |name: &str, tag: &str, args: Value| json!({
+        "using": [mail_proto::jmap::CORE, mail_proto::jmap::MAIL, mail_proto::jmap::SUBMISSION],
+        "methodCalls": [[name, args, tag]]
+    });
+    let reply = |http: &mut dyn Http, name: &str, expected_tag: &str, args: Value| -> Option<Value> {
+        let bytes = http.post(api, "application/json", &request(name, expected_tag, args).to_string().into_bytes(), 64 << 10).ok()?;
+        let response: Value = serde_json::from_slice(&bytes).ok()?;
+        let [answer] = response["methodResponses"].as_array()?.as_slice() else { return None };
+        let [method, values, tag] = answer.as_array()?.as_slice() else { return None };
+        (method == name && tag == expected_tag && values["accountId"] == ACCOUNT).then(|| values.clone())
+    };
+    let query = reply(http, "EmailSubmission/query", "query", json!({
+        "accountId": ACCOUNT, "filter": {"emailIds": [email], "identityIds": ["id1"]},
+        "position": 0, "limit": 2, "calculateTotal": true
+    }))?;
+    let [id] = query["ids"].as_array()?.as_slice() else { return None };
+    if query["position"] != 0 || query["total"] != 1 || query["queryState"].as_str().is_none_or(str::is_empty)
+        || id.as_str().is_none_or(str::is_empty) {
+        return None;
+    }
+    let get = reply(http, "EmailSubmission/get", "get", json!({
+        "accountId": ACCOUNT, "ids": [id],
+        "properties": ["id", "emailId", "identityId", "envelope", "sendAt", "undoStatus", "deliveryStatus"]
+    }))?;
+    let [row] = get["list"].as_array()?.as_slice() else { return None };
+    if get["state"].as_str().is_none_or(str::is_empty)
+        || !get["notFound"].as_array()?.is_empty() || row["id"] != *id
+        || row["emailId"] != email || row["identityId"] != "id1"
+        || row["envelope"]["mailFrom"]["email"] != "ada@example.org"
+        || mail_proto::jmap::utc_date(row["sendAt"].as_str()?) != Some(1_800_000_000)
+    {
+        return None;
+    }
+    let rcpts = row["envelope"]["rcptTo"].as_array()?;
+    let addresses = rcpts.iter().map(|r| r["email"].as_str()).collect::<Option<BTreeSet<_>>>()?;
+    if rcpts.len() != 2 || addresses != BTreeSet::from(["grace@example.net", "sam@example.net"]) {
+        return None;
+    }
+    match row["undoStatus"].as_str()? {
+        "pending" => Some(SubmissionEvidence::Pending),
+        "final" => Some(SubmissionEvidence::Final),
+        "canceled" => Some(SubmissionEvidence::Canceled),
+        _ => None,
+    }
+}
+
+#[test]
+fn jmap_read_only_submission_status_distinguishes_retained_records_from_sent_copies() {
+    use mail_store::SendState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server { drop_submission_reply: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let draft = Draft { bcc: vec![Mailbox::new("", "sam@example.net")], ..submission_draft() };
+    let id = engine.send(account, &draft, When::default()).unwrap();
+    assert!(engine.send_now(id).unwrap());
+    assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Failed { transient: false, .. }));
+    let held = engine.store.outbox().unwrap();
+    assert!(matches!(held[0].1.state, SendState::Uncertain { .. }));
+    assert_eq!(server.borrow().submitted.len(), 1);
+    assert!(server.borrow().mails["M1"].boxes.contains("sent"));
+
+    let mut read = Fake(server.clone());
+    assert_eq!(probe_submission(&mut read, None), None);
+    assert!(server.borrow().submission_reads.is_empty());
+    // The synthetic server supplies the known Email ID as an oracle. The
+    // held record in the production store still lacks this linkage.
+    assert_eq!(probe_submission(&mut read, Some("M1")), Some(SubmissionEvidence::Pending));
+    for (status, expected) in [
+        ("final", SubmissionEvidence::Final),
+        ("canceled", SubmissionEvidence::Canceled),
+    ] {
+        let mut s = server.borrow_mut();
+        let record = s.submission_records.get_mut("S1").unwrap();
+        record["undoStatus"] = json!(status);
+        // No deliveryStatus is exposed, even in a final state.
+        assert!(record["deliveryStatus"].is_null());
+        drop(s);
+        assert_eq!(probe_submission(&mut read, Some("M1")), Some(expected));
+    }
+    assert_eq!(server.borrow().submission_reads, [
+        "EmailSubmission/query", "EmailSubmission/get",
+        "EmailSubmission/query", "EmailSubmission/get",
+        "EmailSubmission/query", "EmailSubmission/get",
+    ]);
+
+    // A server can retire the submission while keeping its Sent email.
+    server.borrow_mut().submission_records.clear();
+    assert_eq!(probe_submission(&mut read, Some("M1")), None);
+    assert_eq!(engine.store.outbox().unwrap(), held);
+    assert_eq!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::NotDue);
+    assert_eq!(server.borrow().submitted.len(), 1);
+    assert_eq!(server.borrow().uploads.len(), 1);
+}
+
+#[test]
+fn jmap_read_only_submission_status_rejects_ambiguous_or_mismatched_evidence() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let record = json!({
+        "id": "S1", "emailId": "M1", "identityId": "id1", "undoStatus": "final",
+        "sendAt": mail_proto::jmap::utc_string(1_800_000_000),
+        "envelope": {"mailFrom": {"email": "ada@example.org"},
+            "rcptTo": [{"email": "grace@example.net"}, {"email": "sam@example.net"}]}
+    });
+    server.borrow_mut().submission_records.insert("S1".into(), record.clone());
+    let mut read = Fake(server.clone());
+    for (tag, key, value) in [
+        ("query", "accountId", json!("other")),
+        ("query", "total", json!(2)),
+        ("get", "accountId", json!("other")),
+        ("get", "list", json!([])),
+        ("get", "list", json!([{"id": "S1", "emailId": "other"}])),
+        ("get", "notFound", json!(["S1"])),
+    ] {
+        server.borrow_mut().reply_override = Some((tag, key, value));
+        assert_eq!(probe_submission(&mut read, Some("M1")), None);
+    }
+    server.borrow_mut().reply_override = None;
+    let mut wrong_envelope = record.clone();
+    wrong_envelope["envelope"]["rcptTo"][1]["email"] = json!("other@example.net");
+    server.borrow_mut().submission_records.insert("S1".into(), wrong_envelope);
+    assert_eq!(probe_submission(&mut read, Some("M1")), None);
+    let mut duplicate = record.clone();
+    duplicate["id"] = json!("S2");
+    {
+        let mut s = server.borrow_mut();
+        s.submission_records.insert("S1".into(), record);
+        s.submission_records.insert("S2".into(), duplicate);
+    }
+    assert_eq!(probe_submission(&mut read, Some("M1")), None);
+    assert!(server.borrow().uploads.is_empty());
+    assert!(server.borrow().submitted.is_empty());
+}
+
 #[test]
 fn jmap_invalid_submission_acks_stay_uncertain_across_restart() {
     use mail_store::SendState;
@@ -850,6 +1030,8 @@ fn jmap_preflight_retry_and_explicit_submission_refusal_remain_distinct() {
     assert!(matches!(delivery, Delivery::Failed { why, transient: false } if why.contains("forbiddenFrom")));
     assert!(matches!(engine.store.outbox().unwrap()[0].1.state, SendState::Stopped { .. }));
     assert_eq!(server.borrow().submitted.len(), 1);
+    assert!(server.borrow().mails["M2"].boxes.contains("sent"));
+    assert_eq!(probe_submission(&mut Fake(server), Some("M2")), None);
 }
 
 #[test]

@@ -1737,7 +1737,17 @@ Stalwart in the cloud VM, and later a real account):
    worker reply, or a restart during an in-flight JMAP send leaves an
    uncertain outbox item for review. Automatic retries and Send again leave
    it held. A copy in Sent alone is insufficient to establish delivery, since
-   the import can succeed before submission is refused. Failures known to
+   the import can succeed before submission is refused. A read-only
+   `EmailSubmission/query` by verified server Email ID and identity, followed
+   by `EmailSubmission/get`, can confirm a uniquely correlated retained
+   record. Correlate the account, Email ID, identity, envelope and expected
+   release window. The record can show pending, final or canceled. Final
+   describes recallability. Per-recipient delivery uses a separate, optional
+   status. Servers may retire submission
+   records, so absence or an ambiguous match leaves the outcome unresolved.
+   The current outbox saves the RFC 5322 Message-ID. The test-only probe
+   gets the verified server Email ID independently from the fixture and
+   reports its findings without changing outbox state. Failures known to
    precede submission retain the normal retry policy. The store keeps the
    Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in
