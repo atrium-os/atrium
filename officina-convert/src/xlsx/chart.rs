@@ -207,6 +207,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
 #[cfg(feature = "read")]
 #[derive(Default)]
 struct SerIn {
+    order: Option<usize>,
     name: Option<ChartText>,
     cats: Option<Rect>,
     vals: Option<Rect>,
@@ -221,7 +222,7 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
     let mut path: Vec<Vec<u8>> = Vec::new();
     let mut kind: Option<ChartKind> = None;
     let mut grouping = Grouping::Standard;
-    let mut series: Vec<Series> = Vec::new();
+    let mut series: Vec<(usize, Series)> = Vec::new();
     let mut group_kind: Option<ChartKind> = None;
     let mut ser: Option<SerIn> = None;
     let mut title: Option<ChartText> = None;
@@ -271,6 +272,11 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
                         };
                     }
                     b"ser" if group_kind.is_some() => ser = Some(SerIn::default()),
+                    b"order" => {
+                        if let Some(s) = &mut ser {
+                            s.order = attr(e, b"val")?.and_then(|value| value.parse().ok());
+                        }
+                    }
                     b"autoTitleDeleted" => deleted = attr(e, b"val")?.map_or(true, |v| v == "1" || v == "true"),
                     b"legendPos" => {
                         legend = Some(match attr(e, b"val")?.as_deref() {
@@ -346,7 +352,8 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
                                 Some(vals) if vals.r0 == vals.r1 || vals.c0 == vals.c1 => {
                                     let k = *kind.get_or_insert(gk);
                                     if series.len() < officina_grid::charts::MAX_SERIES {
-                                        series.push(Series { name: s.name, cats: s.cats.filter(|c| c.r0 == c.r1 || c.c0 == c.c1), vals, kind: (gk != k).then_some(gk) });
+                                        let model = Series { name: s.name, cats: s.cats.filter(|c| c.r0 == c.r1 || c.c0 == c.c1), vals, kind: (gk != k).then_some(gk) };
+                                        series.push((s.order.unwrap_or(series.len()), model));
                                     }
                                 }
                                 _ => rep.note(Kind::Dropped, "chart series without a cell range (typed-in values)"),
@@ -354,7 +361,7 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
                         }
                     }
                     b"title" if inside(b"catAx") || inside(b"valAx") || inside(b"dateAx") => {
-                        let cat = inside(b"catAx") || inside(b"dateAx") || ax_pos_b;
+                        let cat = inside(b"catAx") || inside(b"dateAx") || (kind == Some(ChartKind::Scatter) && ax_pos_b);
                         axis_titles.push((cat, std::mem::take(&mut ax_text)));
                     }
                     b"catAx" | b"valAx" | b"dateAx" | b"serAx" => {
@@ -376,6 +383,9 @@ fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> R
     if title.is_none() && !title_text.is_empty() {
         title = Some(ChartText::Lit(decode_escapes(&title_text).as_ref().into()));
     }
+    // OOXML groups series by type. Display and legend order come from c:order.
+    series.sort_by_key(|(order, _)| *order);
+    let series: Vec<_> = series.into_iter().map(|(_, series)| series).collect();
     // Excel's automatic title: a chart of one series is named after it.
     if title.is_none() && !deleted && series.len() == 1 {
         title = series[0].name.clone();

@@ -88,6 +88,9 @@ fn read_all(f: &mut File) -> io::Result<Vec<u8>> {
 /// The file's bytes in `format`; a protected document's encrypted with its
 /// password (CSV has no way to carry one and is written as is).
 fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
+    if format != Format::Native && d.wb.has_outlines() {
+        return Err(io::Error::other("Choose an .osheet file to keep the workbook’s outline groups."));
+    }
     let protect = |kind: &str, b: Vec<u8>| match &d.protection {
         Some(p) => officina_convert::launch::protect(kind, &b, &p.password).map_err(|e| io::Error::other(e.to_string())),
         None => Ok(b),
@@ -172,6 +175,12 @@ fn saved_status(d: &Doc, format: Format) -> String {
             matches!(&series.name, Some(officina_grid::charts::ChartText::Lit(name)) if !name.is_empty())
         }) {
             changes.push("omitted typed chart series names");
+        }
+        if d.wb.charts().iter().any(|chart| {
+            let shared = chart.series.iter().find_map(|series| series.cats);
+            chart.series.iter().any(|series| series.kind.unwrap_or(chart.kind) != officina_grid::charts::ChartKind::Scatter && series.cats != shared)
+        }) {
+            changes.push("used a shared category range for chart series");
         }
         if (0..d.wb.sheet_count() as u16).any(|sheet| {
             d.wb.comments(sheet).values().any(|comment| !officina_convert::ods::supports_comment_thread(comment))
@@ -310,6 +319,10 @@ impl Run {
     fn save(&mut self) -> bool {
         let Some(Target::Path { path, format }) = self.target.as_ref() else { return false };
         let format = *format;
+        if format != Format::Native && self.sheets.doc.borrow().wb.has_outlines() {
+            self.set_status("Choose where to save an .osheet copy with its outline groups.");
+            return false;
+        }
         if format != Format::Native && self.sheets.doc.borrow().wb.tracked_cells().is_some() {
             self.set_status("Choose where to save an .osheet copy with its tracked cell changes.");
             return false;
@@ -663,6 +676,16 @@ fn main() {
         let wait = if printing.is_some() || print_pdf.is_some() { wait.min(20) } else { wait };
         let mut close_requested = false;
         let stepped = win.step_with(&mut app, Some(Duration::from_millis(wait)), |ev| match ev {
+            fresco_client::Event::Key { hid_usage: 0x29, pressed: true, repeat: false, .. } => {
+                let Some(cmd) = run.sheets.authoring_escape() else { return false };
+                run.sheets.cmds.lock().unwrap().push(cmd);
+                true
+            }
+            fresco_client::Event::Key { hid_usage: 0x09 | 0x0b, pressed: true, modifiers, repeat: false, .. }
+                if modifiers & 0b0001_0001 != 0 => {
+                run.sheets.cmds.lock().unwrap().push(Cmd::Author(atrium_sheets::app::AuthorCmd::FindOpen));
+                true
+            }
             fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
                 want_print = Some(false);
                 true
@@ -763,8 +786,10 @@ fn main() {
                 Cmd::Data(atrium_sheets::data::DataCmd::PrintComments) => want_print = Some(true),
                 Cmd::Save | Cmd::CloseSave if matches!(run.target, Some(Target::Picked { .. })) => {
                     close_after_save = matches!(c, Cmd::CloseSave);
-                    let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if format != Format::Native)
-                        && run.sheets.doc.borrow().wb.tracked_cells().is_some();
+                    let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if format != Format::Native) && {
+                        let doc = run.sheets.doc.borrow();
+                        doc.wb.tracked_cells().is_some() || doc.wb.has_outlines()
+                    };
                     want_picker = Some(if native_copy { Asking::SaveAs } else { Asking::Commit });
                 }
                 Cmd::Save => {
@@ -805,7 +830,7 @@ fn main() {
                     discard = true;
                     break 'main;
                 }
-                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose => {}
+                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Author(_) | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose => {}
             }
         }
         if let Some(include_comments) = want_print.take() {

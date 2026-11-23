@@ -140,7 +140,7 @@ pub fn snapshot_with_comments(doc: &Rc<RefCell<Doc>>, include_comments: bool) ->
         }
         let sh = d.wb.sheet(d.sheet);
         let rs = sh.view_row_sizes();
-        let cs = &sh.col_sizes;
+        let cs = sh.view_col_sizes();
         if area.is_none() && include_comments {
             for &(r, c) in d.wb.comments(d.sheet).keys() {
                 if !d.wb.hides_value(CellAddr::new(d.sheet, r, c)) && rs.size(r) > 0.0 && cs.size(c) > 0.0 {
@@ -178,7 +178,7 @@ pub fn snapshot_with_comments(doc: &Rc<RefCell<Doc>>, include_comments: bool) ->
                     && x < cs.offset(c1) - ox && y < rs.offset(r1) - oy;
             }
             object_rows = object_rows.max(past(&rs, y + h, officina_grid::addr::MAX_ROWS));
-            object_cols = object_cols.max(past(cs, x + w, officina_grid::addr::MAX_COLS));
+            object_cols = object_cols.max(past(&cs, x + w, officina_grid::addr::MAX_COLS));
             true
         };
         for picture in d.wb.pictures().iter().filter(|p| p.anchor.sheet == d.sheet) {
@@ -218,7 +218,7 @@ pub fn snapshot_with_comments(doc: &Rc<RefCell<Doc>>, include_comments: bool) ->
         if u64::from(rows.max(1)) * u64::from(cols.max(1)) > MAX_CELLS {
             return Err(format!("the print area has more than {MAX_CELLS} cells"));
         }
-        let col_px = (left..right).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect::<Vec<_>>();
+        let col_px = (left..right).map(|i| cs.offset(i + 1) - cs.offset(i)).collect::<Vec<_>>();
         let row_px = (top..bottom).map(|i| rs.offset(i + 1) - rs.offset(i)).collect::<Vec<_>>();
         let merges = all_merges.iter()
             .filter(|m| (top..bottom).contains(&m.r0) && (left..right).contains(&m.c0))

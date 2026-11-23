@@ -23,7 +23,7 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         | GridOp::Comments { sheet, .. }
         | GridOp::Links { sheet, .. }
         | GridOp::HiddenWidths { sheet, .. }
-        | GridOp::AxisIdentities { sheet, .. } => !wb.sheet_protected(*sheet),
+        | GridOp::AxisIdentities { sheet, .. } | GridOp::Outline { sheet, .. } => !wb.sheet_protected(*sheet),
         GridOp::Tables(tables) => tables
             .iter()
             .filter(|t| wb.sheet_protected(t.rect.sheet))

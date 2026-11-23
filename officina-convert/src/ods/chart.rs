@@ -58,8 +58,14 @@ fn attrs(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
 #[cfg(feature = "read")]
 /// `Data.B2:Data.B13`, `'My sheet'.$B$2:.$B$13` → the range.
 fn range(wb: &Workbook, a: &str) -> Option<Rect> {
-    // Several ranges (space-separated): the first.
-    let a = a.split(' ').next()?;
+    // A range list is whitespace-separated outside quoted sheet names.
+    let a = a.trim_start();
+    let mut quoted = false;
+    let end = a.char_indices().find_map(|(i, ch)| {
+        if ch == '\'' { quoted = !quoted; }
+        (ch.is_whitespace() && !quoted).then_some(i)
+    }).unwrap_or(a.len());
+    let a = &a[..end];
     let a1 = super::formula::from_of(&format!("of:=[{a}]"))?;
     let a1 = a1.trim_start_matches('=');
     let (sh, rf) = a1.rsplit_once('!')?;

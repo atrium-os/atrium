@@ -79,13 +79,11 @@ fn main() {
             // Each run starts fresh at the top left (a fling left going would carry
             // into the next run): the same document, a new view state.
             let dirty = Arc::new(AtomicBool::new(true));
-            let fresh = Sheets {
-                scroll: Mutable::with_dirty(ScrollState::default(), dirty.clone()),
-                grid: Mutable::with_dirty(GridState::default(), dirty.clone()),
-                ui: Mutable::with_dirty(Ui::default(), dirty.clone()),
-                rev: Mutable::with_dirty(0u64, dirty.clone()),
-                ..sheets.clone()
-            };
+            let mut fresh = sheets.clone();
+            fresh.scroll = Mutable::with_dirty(ScrollState::default(), dirty.clone());
+            fresh.grid = Mutable::with_dirty(GridState::default(), dirty.clone());
+            fresh.ui = Mutable::with_dirty(Ui::default(), dirty.clone());
+            fresh.rev = Mutable::with_dirty(0u64, dirty.clone());
             let (scroll, grid) = (fresh.scroll.clone(), fresh.grid.clone());
             let mut app = App::new_with_flag(fresh, dirty);
             app.set_time(base);

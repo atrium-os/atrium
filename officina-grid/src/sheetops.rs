@@ -162,6 +162,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
         ops.push(GridOp::Merges { sheet: s, list: Vec::new() });
     }
     for axis in [crate::shift::Axis::Rows, crate::shift::Axis::Cols] {
+        if !wb.sheet(s).outline(axis).groups().is_empty() {
+            ops.push(GridOp::Outline { sheet: s, axis, outline: Default::default() });
+        }
         if !wb.sheet(s).axis_ids[axis.index()].is_implicit() {
             ops.push(GridOp::AxisIdentities { sheet: s, axis, ids: Default::default() });
         }

@@ -267,7 +267,9 @@ fn cells(wb: &Workbook, r: &Rect, max: usize) -> Vec<CellAddr> {
             if out.len() >= max {
                 return out;
             }
-            out.push(CellAddr::new(r.sheet, row, col));
+            if !sh.outline(crate::shift::Axis::Cols).hides(col) {
+                out.push(CellAddr::new(r.sheet, row, col));
+            }
         }
     }
     out
@@ -315,10 +317,17 @@ impl Chart {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         // Hidden rows leave the chart: their state is part of its data.
-        let mut sheets: Vec<u16> = self.series.iter().map(|s| s.vals.sheet).filter(|&s| (s as usize) < wb.sheet_count()).collect();
+        let mut sheets: Vec<u16> = self.series.iter().flat_map(|s| [Some(s.vals), s.cats].into_iter().flatten())
+            .map(|r| r.sheet).filter(|&s| (s as usize) < wb.sheet_count()).collect();
+        sheets.sort_unstable();
         sheets.dedup();
         for s in sheets {
-            wb.sheet(s).hidden.hash(&mut h);
+            let sheet = wb.sheet(s);
+            sheet.hidden.hash(&mut h);
+            sheet.table_hidden().hash(&mut h);
+            for axis in [crate::shift::Axis::Rows, crate::shift::Axis::Cols] {
+                sheet.outline(axis).hidden().hash(&mut h);
+            }
         }
         let mut col = |sheet: u16, c: u32| {
             if (sheet as usize) < wb.sheet_count() {

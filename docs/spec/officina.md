@@ -664,6 +664,27 @@ grouping and outlines, pivot tables (computed over the column chunks, so a pivot
 rows is a scan, not a formula per cell), charts (§9.2), CSV import that streams into chunks
 (a 2 GB CSV loads without holding the text).
 
+**Find and Replace** opens from Data or Ctrl+F / Ctrl+H. It searches stored cell
+inputs, including formula source, in row order through the current sheet or all
+sheets. Searches wrap and offer case-sensitive and whole-cell matching. Find
+moves to the matching worksheet and cell. Replace operates on the selected cell
+and Replace All applies as one undo step. The replacement batch checks formula
+syntax, sheet protection and data validation before recording changes. Generated
+pivot and spill cells and hidden protected inputs are outside the search.
+
+**Split views** divide the worksheet horizontally, vertically, or both from Data.
+Each pane scrolls on its own. All panes show the same worksheet and share the
+selection, while the active pane owns the editor. Removing the split retains the
+active pane's scroll position. Split positions are view state for the open session.
+
+**Outlines** group selected rows or columns. Nested groups can be collapsed or
+expanded from their header buttons, and Data can group and ungroup the selection.
+Collapse leaves original dimensions, manual hides, and filters in place. Groups
+follow inserted and deleted rows or columns and participate in undo and crash
+recovery. Native files carry an optional per-sheet `OUTLINES` chunk (27), and the
+grid journal records the group change as operation 26. For a workbook with
+outlines, Save offers an `.osheet` copy from an imported file.
+
 ### 8.5 The grid on screen
 
 `GridView` (§10.2) draws the sheet: 2D tiles of (say) 64 rows × 16 columns are scene
@@ -3746,6 +3767,19 @@ chart, Escape or a press elsewhere puts it down.
 Pergola's `GridView` does the picking for any float marked `movable`
 (`GridAction::PlaceFloat`, `GridAction::DeleteFloat`); tables' and
 filters' floats stay fixed.
+
+Edit Chart opens a series editor from the chart bar or Data. Each series takes a
+one-row or one-column value range, an optional equally sized category or scatter
+X range, and a label typed or linked to a cell. A range may refer to another
+worksheet. The editor adds or removes series and sets category/X and value/Y
+axis titles. Column, line and area series can share the same axes in a combo chart
+with standard grouping. Apply records the complete chart edit as one undo step.
+
+The chart round-trip gate exercises charts with quoted cross-sheet sources in
+XLSX and ODS, including linked series labels and axis titles. XLSX reads series
+order independently of the chart type groups. ODS uses one shared categorical
+range and preserves cell-linked series labels, with a Save notice for typed
+series names or differing category ranges.
 
 ### 16.54 Choosing filter values from a list in Sheets (2026-11-17)
 

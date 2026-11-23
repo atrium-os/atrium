@@ -100,6 +100,7 @@ pub enum GridOp {
     /// A sheet's remembered widths of hidden columns
     /// ([`crate::book::Sheet::hidden_widths`]), swapped in whole.
     HiddenWidths { sheet: u16, list: Vec<(u32, f64)> },
+    Outline { sheet: u16, axis: crate::shift::Axis, outline: crate::outline::Outline },
     AxisIdentities { sheet: u16, axis: crate::shift::Axis, ids: crate::axis_ids::AxisIds },
 }
 
@@ -299,6 +300,13 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::Outline { sheet, axis, outline } => {
+                w.u8(26);
+                w.u16(*sheet);
+                w.u8(axis.index() as u8);
+                outline.encode(&mut w);
+                return w.into_bytes();
+            }
             GridOp::AxisIdentities { sheet, axis, ids } => {
                 w.u8(22);
                 w.u16(*sheet);
@@ -472,6 +480,17 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
+        }
+        if kind == 26 {
+            let sheet = r.u16()?;
+            let axis = match r.u8()? {
+                0 => crate::shift::Axis::Rows,
+                1 => crate::shift::Axis::Cols,
+                _ => return Err(WireError::Invalid("outline axis")),
+            };
+            let outline = crate::outline::Outline::decode(&mut r, axis)?;
+            if !r.is_empty() { return Err(WireError::Invalid("trailing bytes")); }
+            return Ok(GridOp::Outline { sheet, axis, outline });
         }
         if kind == 25 {
             let name = r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string();
@@ -736,6 +755,12 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::Links { sheet, set: wb.set_links(sheet, set) }
+            }
+            GridOp::Outline { sheet, axis, mut outline } => {
+                if let Some(sh) = wb.sheets.get_mut(sheet as usize) {
+                    std::mem::swap(&mut sh.outlines[axis.index()], &mut outline);
+                }
+                GridOp::Outline { sheet, axis, outline }
             }
             GridOp::AxisIdentities { sheet, axis, ids } => {
                 if sheet as usize >= wb.sheet_count() {

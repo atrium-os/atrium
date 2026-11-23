@@ -11,6 +11,10 @@ use officina_grid::addr::CellAddr;
 use officina_grid::Value;
 
 fn converter() -> PathBuf {
+    // The FreeBSD guest runs the worker cross-built and staged by the host.
+    if let Some(staged) = std::env::var_os("OFFICINA_CONVERT") {
+        return staged.into();
+    }
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../officina-convert");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--release", "--bin", "officina-convert"]).current_dir(&dir).status().unwrap();
     assert!(st.success());

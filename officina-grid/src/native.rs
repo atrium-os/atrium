@@ -61,6 +61,7 @@ pub const TRACKED_CELLS: u16 = 23;
 pub const AXIS_IDENTITIES: u16 = 24;
 pub const PICTURE: u16 = 25;
 pub const SHEET_IDENTITIES: u16 = 26;
+pub const OUTLINES: u16 = 27;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -173,6 +174,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         w.u16(sheet as u16);
         for ids in &sh.axis_ids { ids.encode(&mut w); }
         c.add(AXIS_IDENTITIES, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.outlines.iter().all(|axis| axis.groups().is_empty()) { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        for outline in &sh.outlines { outline.encode(&mut w); }
+        c.add(OUTLINES, &w.into_bytes())?;
     }
 
     // Cells, renumbering the strings they use (the pool also holds texts no cell
@@ -545,6 +554,19 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
     }
     done(&r)?;
+
+    let mut outlined = std::collections::BTreeSet::new();
+    for chunk in of(OUTLINES) {
+        let mut r = Reader::new(c.chunk(chunk)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !outlined.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated worksheet outline"));
+        }
+        let rows = crate::outline::Outline::decode(&mut r, crate::shift::Axis::Rows)?;
+        let cols = crate::outline::Outline::decode(&mut r, crate::shift::Axis::Cols)?;
+        if !r.is_empty() { return Err(LoadError::Bad("trailing worksheet outline data")); }
+        wb.sheet_mut(sheet).outlines = [rows, cols];
+    }
 
     let mut sheet_ids = of(SHEET_IDENTITIES);
     if let Some(index) = sheet_ids.next() {

@@ -318,6 +318,10 @@ pub trait GridSource {
     fn row_label(&self, r: u32) -> String {
         (r as u64 + 1).to_string()
     }
+    /// The outline button at a visible row or column header.
+    fn outline_control(&self, _rows: bool, _at: u32) -> Option<(u32, u32, bool)> {
+        None
+    }
     /// Ctrl + arrow from (`r`, `c`) by (`dr`, `dc`): where the data ends.
     /// The default goes to the sheet's edge.
     /// The merged area holding cell (`r`, `c`), drawn as one cell with the
@@ -515,6 +519,7 @@ impl GridState {
 /// What the user asked of the grid; the app applies it to its data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GridAction {
+    Outline { rows: bool, start: u32, end: u32 },
     /// The editor closed with this text for (`row`, `col`).
     Commit { row: u32, col: u32, text: String },
     /// Delete: empty these cells.
@@ -807,16 +812,28 @@ pub struct GridView {
     pub state: Mutable<GridState>,
     pub rect: Rect,
     on_action: Option<ActionFn>,
+    on_activate: Option<Rc<dyn Fn()>>,
+    display_editor: bool,
     key: u64,
 }
 
 impl GridView {
     pub fn new(source: Rc<dyn GridSource>, scroll: Mutable<ScrollState>, state: Mutable<GridState>, rect: Rect) -> Self {
-        Self { source, scroll, state, rect, on_action: None, key: 0x6772_6964 }
+        Self { source, scroll, state, rect, on_action: None, on_activate: None, display_editor: true, key: 0x6772_6964 }
     }
 
     pub fn on_action(mut self, f: impl Fn(GridAction) + 'static) -> Self {
         self.on_action = Some(Rc::new(f));
+        self
+    }
+
+    pub fn on_activate(mut self, f: impl Fn() + 'static) -> Self {
+        self.on_activate = Some(Rc::new(f));
+        self
+    }
+
+    pub fn display_editor(mut self, show: bool) -> Self {
+        self.display_editor = show;
         self
     }
 
@@ -878,11 +895,13 @@ impl GridView {
         }
 
         // The scroll state knows the extent (and keeps a grid's zoom).
-        if st.extent != Some(ext) || !st.fixed_zoom {
+        let ymax = (ext[1] - body.h() as f64).max(st.physics.min);
+        let xmax = (ext[0] - body.w() as f64).max(st.physics_x.min);
+        if st.extent != Some(ext) || !st.fixed_zoom || st.physics.max != ymax || st.physics_x.max != xmax {
             st.extent = Some(ext);
             st.fixed_zoom = true;
-            st.physics.set_max(ext[1] - body.h() as f64);
-            st.physics_x.set_max(ext[0] - body.w() as f64);
+            st.physics.set_max(ymax);
+            st.physics_x.set_max(xmax);
             self.scroll.set(st);
         }
         let (x, y) = (st.physics_x.y, st.physics.y);
@@ -925,7 +944,7 @@ impl GridView {
                 // The selection, cut to the resident tiles (it can be a
                 // whole column of a billion rows).
                 let vis = CellRange { r0: tiles_r.0 * TILE_ROWS, c0: tiles_c.0 * TILE_COLS, r1: ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1, c1: ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 };
-                emit_overlay(ctx, &*src, &t, &gs, vis, &at);
+                emit_overlay(ctx, &*src, &t, &gs, vis, &at, self.display_editor);
             }
             ctx.pop();
             // Floats (charts) over the cells, those meeting the view.
@@ -974,9 +993,11 @@ impl GridView {
         });
         let drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
+            let activate = self.on_activate.clone();
             let placed = placed.clone();
             let buttons = buttons.clone();
             Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
+                if phase == DragPhase::Start { if let Some(activate) = &activate { activate(); } }
                 let st = sc.get();
                 let (cx, cy) = geom.content(&st, p);
                 if geom.rows == 0 || geom.cols == 0 {
@@ -1127,11 +1148,13 @@ impl GridView {
         }
         let keys: Rc<dyn Fn(&Event)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
+            let activate = self.on_activate.clone();
             Rc::new(move |ev: &Event| {
                 let Event::Key { kind, key, modifiers, chars } = ev else { return };
                 if !kind.pressed() {
                     return;
                 }
+                if let Some(activate) = &activate { activate(); }
                 let mut g = gst.get_cloned();
                 let mut st = sc.get();
                 if on_key(&*src, &geom, &mut g, &mut st, *key, *modifiers, chars, &act) {
@@ -1189,7 +1212,7 @@ impl GridView {
                     ctx.key(u64::MAX);
                     let over = ctx.push(Node::vstack(rect, 0.0));
                     ctx.set_flex(over, FlexStyle { free: true, ..FlexStyle::default() });
-                    emit_overlay(ctx, &*src, &t, &gs, CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 }, &at);
+                    emit_overlay(ctx, &*src, &t, &gs, CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 }, &at, self.display_editor);
                     ctx.pop();
                     // Floats meeting the band's cells (a chart in the frozen rows
                     // stays with them; the part past the freeze line scrolls in
@@ -1265,6 +1288,9 @@ impl GridView {
                         ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
                     }
                     ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
+                    if w >= 30.0 {
+                        outline_mark(ctx, &*src, false, c, cx + 2.0, ch_rect.y() + 4.0, &hstyle, t.accent_bg());
+                    }
                     // Hidden columns after this one: a double line, as Excel marks them.
                     if w > 0.0 && c + 1 < cols && src.col_left(c + 2) <= xr {
                         ctx.add(Node::Rect { rect: Rect::new(cx + w - 4.0, ch_rect.y(), 1.0, HEADER_H), fill: t.text_secondary(), radius: 0.0 });
@@ -1280,6 +1306,7 @@ impl GridView {
         ctx.pop();
         let col_drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
+            let activate = self.on_activate.clone();
             Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 if geom.cols == 0 || geom.rows == 0 {
                     return;
@@ -1290,7 +1317,18 @@ impl GridView {
                 let mut g = gst.get_cloned();
                 match (phase, g.drag) {
                     (DragPhase::Start, _) => {
+                        if let Some(activate) = &activate { activate(); }
                         commit(&mut g, &act);
+                        if src.col_left(c + 1) - src.col_left(c) >= 30.0
+                            && (2.0..=15.0).contains(&(cx - src.col_left(c)))
+                        {
+                            if let (Some((start, end, _)), Some(action)) = (src.outline_control(false, c), &act) {
+                                g.drag = Drag::None;
+                                gst.set(g);
+                                action(GridAction::Outline { rows: false, start, end });
+                                return;
+                            }
+                        }
                         // Near a column's right edge: resize that column.
                         let edge_of = |c: u32| src.col_left(c + 1) - cx;
                         let grip = if edge_of(c).abs() <= RESIZE_GRIP as f64 {
@@ -1381,6 +1419,9 @@ impl GridView {
                     let lw = crate::text::measure_chars(&label, &st);
                     ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
                     ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
+                    if h >= 14.0 {
+                        outline_mark(ctx, &*src, true, row, rh_rect.x() + 2.0, cy + 1.0, &hstyle, t.accent_bg());
+                    }
                     // Hidden rows after this one: a double line.
                     if row + 1 < rows && src.row_top(row + 2) <= yb {
                         ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 4.0, header_w, 1.0), fill: t.text_secondary(), radius: 0.0 });
@@ -1396,6 +1437,7 @@ impl GridView {
         ctx.pop();
         let row_drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
+            let activate = self.on_activate.clone();
             Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 if geom.cols == 0 || geom.rows == 0 {
                     return;
@@ -1406,7 +1448,18 @@ impl GridView {
                 let mut g = gst.get_cloned();
                 match (phase, g.drag) {
                     (DragPhase::Start, _) => {
+                        if let Some(activate) = &activate { activate(); }
                         commit(&mut g, &act);
+                        if src.row_top(row + 1) - src.row_top(row) >= 14.0
+                            && (2.0..=15.0).contains(&(p.x - r.x()))
+                        {
+                            if let (Some((start, end, _)), Some(action)) = (src.outline_control(true, row), &act) {
+                                g.drag = Drag::None;
+                                gst.set(g);
+                                action(GridAction::Outline { rows: true, start, end });
+                                return;
+                            }
+                        }
                         // Near a row's bottom edge: resize that row. A
                         // double-click fits it, or just below a double line
                         // shows the hidden rows there.
@@ -1566,6 +1619,12 @@ pub fn grow_to_merges(src: &dyn GridSource, mut r: CellRange) -> CellRange {
 /// Floats placed by `at` (content px to window px); movable and pressable
 /// ones noted in `placed` and `buttons` for presses.
 type Spots = Rc<std::cell::RefCell<Vec<(u64, [f64; 4])>>>;
+fn outline_mark(ctx: &mut Ctx, source: &dyn GridSource, rows: bool, at: u32, x: f32, y: f32, style: &TextStyle, fill: Color) {
+    let Some((_, _, collapsed)) = source.outline_control(rows, at) else { return };
+    ctx.add(Node::Rect { rect: Rect::new(x, y, 13.0, 13.0), fill, radius: 2.0 });
+    ctx.add(Node::Text { rect: Rect::new(x + 3.0, y - 1.0, 10.0, 14.0), content: if collapsed { "+" } else { "−" }.into(), style: style.clone() });
+}
+
 fn emit_floats(ctx: &mut Ctx, floats: Vec<GridFloat>, t: &crate::theme::Semantic, gs: &GridState, at: &dyn Fn(f64, f64) -> (f32, f32), placed: &Spots, buttons: &Spots) {
     for f in floats {
         let (fx, fy) = at(f.at[0], f.at[1]);
@@ -1616,7 +1675,7 @@ fn emit_fill_handle(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Seman
     }
 }
 
-fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32)) {
+fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32), display_editor: bool) {
     // A selection meeting part of a merged area shows all of it.
     let sel = grow_to_merges(src, gs.selection());
     let one = src.merge_at(gs.cursor.0, gs.cursor.1).unwrap_or(CellRange::of(gs.cursor, gs.cursor));
@@ -1639,7 +1698,7 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
     let (sx, sy) = at(src.col_left(one.c0), src.row_top(one.r0));
     let (ex, ey) = at(src.col_left(one.c1 + 1), src.row_top(one.r1 + 1));
     let (w, h) = (ex - sx, ey - sy);
-    let Some(ed) = &gs.edit else {
+    let Some(ed) = gs.edit.as_ref().filter(|_| display_editor) else {
         ring(ctx, Rect::new(sx, sy, w, h), t.accent_fg());
         return;
     };

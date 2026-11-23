@@ -21,6 +21,10 @@ use crate::doc::Doc;
 use officina_grid::charts::{ChartKind, ChartText, Grouping, LegendPos};
 use crate::source::SheetSource;
 
+#[path = "authoring.rs"]
+mod authoring;
+pub use authoring::{AuthorCmd, OutlineCmd, Split};
+
 /// The slot the system picker's sheet goes into.
 pub const PICKER_SLOT: u64 = 1;
 pub const TOOLBAR_H: f32 = 48.0;
@@ -57,6 +61,7 @@ pub enum Cmd {
     RemoveMacros,
     /// A Data menu command, on the selection.
     Data(crate::data::DataCmd),
+    Author(AuthorCmd),
     /// A press in the Compare with… pane.
     Review(crate::review::ReviewCmd),
     /// A press on the sheet tabs or their rename bar.
@@ -252,6 +257,7 @@ pub struct Ui {
 /// Cheap to clone: every field is shared.
 #[derive(Clone)]
 pub struct Sheets {
+    authoring: authoring::Authoring,
     pub launcher: bool,
     pub pending_books: Mutable<Vec<portcullis_ipc::PendingWorkbook>>,
     pub doc: Rc<RefCell<Doc>>,
@@ -339,7 +345,15 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+    }
+
+    /// Escape closes an open authoring panel before reaching the worksheet.
+    pub fn authoring_escape(&self) -> Option<Cmd> {
+        if self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking {
+            return None;
+        }
+        self.authoring.escape().map(Cmd::Author)
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -531,19 +545,11 @@ impl Sheets {
 
     /// Selects change `ch`'s cell and scrolls it into view.
     fn show_change(&self, ch: &officina_grid::compare::Change) {
-        use pergola::widgets::GridSource;
         let Some((sheet, r, c)) = ch.at() else { return };
         if sheet as usize >= self.doc.borrow().wb.sheet_count() { return; }
         self.doc.borrow_mut().sheet = sheet;
-        let mut g = self.grid.get_cloned();
-        g.select(r, c);
-        self.grid.set(g);
-        let mut st = self.scroll.get();
-        st.physics.stop();
-        st.physics_x.stop();
-        st.physics.set_position((self.source.row_top(r) - 3.0 * (self.source.row_top(r + 1) - self.source.row_top(r))).max(0.0));
-        st.physics_x.set_position((self.source.col_left(c) - 60.0).max(0.0));
-        self.scroll.set(st);
+        self.reveal_tab();
+        self.show_cell(r, c);
     }
 
     fn clamp_review_scroll(&self, pane: &crate::review::ReviewPane) {
@@ -910,6 +916,7 @@ impl Sheets {
     pub fn replace(&self, doc: Doc) -> Doc {
         let old = std::mem::replace(&mut *self.doc.borrow_mut(), doc);
         self.close_comment_bar();
+        self.authoring.reset();
         self.import_notes_open.set(false);
         self.import_note.set(0);
         self.review.set(crate::review::ReviewPane::default());
@@ -921,10 +928,7 @@ impl Sheets {
     /// Back to the top left, nothing selected but A1.
     pub fn home(&self) {
         self.grid.set(GridState::default());
-        let mut st = self.scroll.get();
-        st.physics.set_position(0.0);
-        st.physics_x.set_position(0.0);
-        self.scroll.set(st);
+        self.authoring.reset_scrolls(self);
         self.changed();
     }
 
@@ -988,12 +992,13 @@ impl Sheets {
         let mut g = self.grid.get_cloned();
         g.select(r, c);
         self.grid.set(g);
-        let mut st = self.scroll.get();
+        let scroll = self.authoring.active_scroll(self);
+        let mut st = scroll.get();
         st.physics.stop();
         st.physics_x.stop();
         st.physics.set_position((self.source.row_top(r) - 3.0 * (self.source.row_top(r + 1) - self.source.row_top(r))).max(0.0));
         st.physics_x.set_position((self.source.col_left(c) - 60.0).max(0.0));
-        self.scroll.set(st);
+        scroll.set(st);
     }
 
     /// Shows sheet `s`: at its top left, the strip moved to show its tab,
@@ -1724,8 +1729,10 @@ impl Sheets {
         };
         // Content px to window px, as the grid places its body.
         use pergola::widgets::grid_view::{HEADER_H, TILE_ROWS};
-        let r = Self::grid_rect(w, h);
-        let st = self.scroll.get();
+        let rect = Self::grid_rect(w, h);
+        let active = self.authoring.active(rect);
+        let Some((_, r, scroll)) = self.authoring.panes(self, rect).nth(active) else { return };
+        let st = scroll.get();
         let (tiles_r, _) = GridView::tiles(&*self.source, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
         let hw = GridView::header_width((tiles_r.1 + 1) * TILE_ROWS);
         let x = r.x() + hw + (at[0] - st.physics_x.y) as f32;
@@ -1746,6 +1753,106 @@ impl Sheets {
         Rect::new(0.0, top, w, (h - top - STATUS_H - crate::tabs::TABS_H).max(40.0))
     }
 
+    fn emit_grid(&self, ctx: &mut Ctx, rect: Rect, scroll: Mutable<ScrollState>, pane: usize, editor: bool) {
+        let doc = self.doc.clone();
+        let rev = self.rev.clone();
+        let src = self.source.clone();
+        let (cmds, press) = (self.cmds.clone(), self.link_press.clone());
+        let grid = self.grid.clone();
+        let active = self.authoring.activation();
+        GridView::new(self.source.clone(), scroll, self.grid.clone(), rect)
+            .key(0x6772_6964 + pane as u64 * 16)
+            .display_editor(editor)
+            .on_activate(move || active.set(pane))
+            .on_action(move |a| match a {
+                GridAction::Outline { rows, start, end } => {
+                    use officina_grid::shift::Axis;
+                    let axis = if rows { Axis::Rows } else { Axis::Cols };
+                    cmds.lock().unwrap().push(Cmd::Author(AuthorCmd::Outline(axis, OutlineCmd::Toggle(start, end))));
+                }
+                // Ctrl+click: the cell is selected; follow its link with this click.
+                GridAction::Follow { .. } => {
+                    press.set(pergola::clipboard::current_activation());
+                    cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
+                }
+                // The cursor cell's list button, or Alt+Down: its list.
+                GridAction::PressFloat(crate::source::KEY_FILL) => cmds.lock().unwrap().push(Cmd::FillOptions),
+                GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
+                // A filter column's button: its value list.
+                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen(((k >> 32) & 0xF_FFFF) as u32, k as u32)),
+                // A double-click on a column's edge: as wide as its widest entry.
+                // With whole columns selected, every one of them.
+                // On the double line of hidden columns: show them.
+                // A row's edge: show hidden rows there, or fit the row (all
+                // the selected whole rows) to its tallest cell.
+                GridAction::FitRow(row) if crate::data::unhide_rows_at(&mut doc.borrow_mut(), row) => {
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::FitRow(row) => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
+                    let heights: Vec<(u32, f64)> = (lo..=hi).filter(|&r| !doc.borrow().wb.sheet(doc.borrow().sheet).row_hidden(r)).map(|r| (r, src.fit_height(r))).collect();
+                    let mut d = doc.borrow_mut();
+                    for (r, h) in heights {
+                        d.size_preview(true, r, r, h);
+                    }
+                    d.size_done();
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::FitCol(col) if crate::data::unhide_cols_at(&mut doc.borrow_mut(), col) => {
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::FitCol(col) => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
+                    let widths: Vec<(u32, f64)> = (lo..=hi).filter_map(|c| src.fit_width(c).map(|w| (c, w))).collect();
+                    let mut d = doc.borrow_mut();
+                    if widths.is_empty() {
+                        d.status = if lo == hi { "That column is empty.".into() } else { "Those columns are empty.".into() };
+                    }
+                    for (c, w) in widths {
+                        d.size_preview(false, c, c, w);
+                    }
+                    d.size_done();
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                // An edge dragged: with whole columns (rows) selected and the
+                // edge one of theirs, all of them take the size.
+                GridAction::ResizeCol { col, width } => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
+                    doc.borrow_mut().size_preview(false, lo, hi, width);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::ResizeRow { row, height } => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
+                    doc.borrow_mut().size_preview(true, lo, hi, height);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                // A double-click on the fill handle: down along the data beside it.
+                // Ctrl+E: the cursor's column by its examples.
+                GridAction::FlashFill { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::FlashFill)),
+                GridAction::FillToData(sel) => {
+                    let mut d = doc.borrow_mut();
+                    let from = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+                    match officina_grid::autofill::to_data_end(&d.wb, from) {
+                        Some(to) => {
+                            if d.fill(from, to, false) {
+                                let mut g = grid.get_cloned();
+                                g.anchor = (to.r0, to.c0);
+                                g.cursor = (to.r1, to.c1);
+                                grid.set(g);
+                            }
+                        }
+                        None => d.status = "There's no data beside the selection to fill down along.".into(),
+                    }
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                a => Self::act(&doc, &src, &rev, a),
+            })
+            .emit(ctx);
+    }
+
     fn act(doc: &Rc<RefCell<Doc>>, src: &SheetSource, rev: &Mutable<u64>, a: GridAction) {
         // A chart dragged: its anchor from where it was let go.
         let anchor = match &a {
@@ -1764,7 +1871,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -2004,94 +2111,11 @@ impl View for Sheets {
 
         // The grid, with the cursor cell's comment beside it while not editing.
         self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none() && self.linking.get().is_none()).then_some(g.cursor));
-        let doc = self.doc.clone();
-        let rev = self.rev.clone();
-        let src = self.source.clone();
-        let (cmds, press) = (self.cmds.clone(), self.link_press.clone());
-        let grid = self.grid.clone();
-        GridView::new(self.source.clone(), self.scroll.clone(), self.grid.clone(), Self::grid_rect(w, h))
-            .on_action(move |a| match a {
-                // Ctrl+click: the cell is selected; follow its link with this click.
-                GridAction::Follow { .. } => {
-                    press.set(pergola::clipboard::current_activation());
-                    cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
-                }
-                // The cursor cell's list button, or Alt+Down: its list.
-                GridAction::PressFloat(crate::source::KEY_FILL) => cmds.lock().unwrap().push(Cmd::FillOptions),
-                GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
-                // A filter column's button: its value list.
-                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen(((k >> 32) & 0xF_FFFF) as u32, k as u32)),
-                // A double-click on a column's edge: as wide as its widest entry.
-                // With whole columns selected, every one of them.
-                // On the double line of hidden columns: show them.
-                // A row's edge: show hidden rows there, or fit the row (all
-                // the selected whole rows) to its tallest cell.
-                GridAction::FitRow(row) if crate::data::unhide_rows_at(&mut doc.borrow_mut(), row) => {
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                GridAction::FitRow(row) => {
-                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
-                    let heights: Vec<(u32, f64)> = (lo..=hi).filter(|&r| !doc.borrow().wb.sheet(doc.borrow().sheet).row_hidden(r)).map(|r| (r, src.fit_height(r))).collect();
-                    let mut d = doc.borrow_mut();
-                    for (r, h) in heights {
-                        d.size_preview(true, r, r, h);
-                    }
-                    d.size_done();
-                    drop(d);
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                GridAction::FitCol(col) if crate::data::unhide_cols_at(&mut doc.borrow_mut(), col) => {
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                GridAction::FitCol(col) => {
-                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
-                    let widths: Vec<(u32, f64)> = (lo..=hi).filter_map(|c| src.fit_width(c).map(|w| (c, w))).collect();
-                    let mut d = doc.borrow_mut();
-                    if widths.is_empty() {
-                        d.status = if lo == hi { "That column is empty.".into() } else { "Those columns are empty.".into() };
-                    }
-                    for (c, w) in widths {
-                        d.size_preview(false, c, c, w);
-                    }
-                    d.size_done();
-                    drop(d);
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                // An edge dragged: with whole columns (rows) selected and the
-                // edge one of theirs, all of them take the size.
-                GridAction::ResizeCol { col, width } => {
-                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
-                    doc.borrow_mut().size_preview(false, lo, hi, width);
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                GridAction::ResizeRow { row, height } => {
-                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
-                    doc.borrow_mut().size_preview(true, lo, hi, height);
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                // A double-click on the fill handle: down along the data beside it.
-                // Ctrl+E: the cursor's column by its examples.
-                GridAction::FlashFill { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::FlashFill)),
-                GridAction::FillToData(sel) => {
-                    let mut d = doc.borrow_mut();
-                    let from = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
-                    match officina_grid::autofill::to_data_end(&d.wb, from) {
-                        Some(to) => {
-                            if d.fill(from, to, false) {
-                                let mut g = grid.get_cloned();
-                                g.anchor = (to.r0, to.c0);
-                                g.cursor = (to.r1, to.c1);
-                                grid.set(g);
-                            }
-                        }
-                        None => d.status = "There's no data beside the selection to fill down along.".into(),
-                    }
-                    drop(d);
-                    rev.set(rev.get().wrapping_add(1));
-                }
-                a => Self::act(&doc, &src, &rev, a),
-            })
-            .emit(ctx);
+        let rect = Self::grid_rect(w, h);
+        let active = self.authoring.active(rect);
+        for (pane, bounds, scroll) in self.authoring.panes(self, rect) {
+            self.emit_grid(ctx, bounds, scroll, pane, pane == active);
+        }
 
         self.render_tabs(ctx, w, h - STATUS_H - crate::tabs::TABS_H);
 
@@ -2199,7 +2223,7 @@ impl View for Sheets {
             let cmds = self.cmds.clone();
             MenuButton::new(kind_name(ch.kind).to_string(), self.chart_kind_menu.clone(), kinds, move |i| cmds.lock().unwrap().push(Cmd::ChartKind(i))).at(x, y + 8.0).width(110.0).render(ctx);
             x += 118.0;
-            let fw = (w - x - 470.0).max(120.0);
+            let fw = (w - x - if w >= 810.0 { 556.0 } else { 428.0 }).max(70.0);
             let cmds = self.cmds.clone();
             TextField::new(self.chart_title.clone()).placeholder("Title").at(x, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ChartTitle)).render(ctx);
             x += fw + 8.0;
@@ -2215,6 +2239,9 @@ impl View for Sheets {
                 let now = groups.iter().find(|g| g.1 == ch.grouping).map_or("Side by Side", |g| g.0);
                 let cmds = self.cmds.clone();
                 MenuButton::new(now.to_string(), self.chart_group_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::ChartGroup(i))).at(x, y + 8.0).width(130.0).render(ctx);
+            }
+            if w >= 810.0 {
+                Button::secondary("Edit Chart…").at(w - 258.0, y + 8.0).width(102.0).on_click(push(Cmd::Author(AuthorCmd::ChartOpen))).render(ctx);
             }
             Button::secondary("Delete").at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::ChartDelete)).render(ctx);
             Button::primary("Done").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ChartDone)).render(ctx);
@@ -2783,6 +2810,9 @@ impl View for Sheets {
             }
         }
 
+        if !pb.open && !self.closing.get() && !self.ui.get_cloned().asking {
+            self.authoring.render(self, ctx, w, h);
+        }
         self.picker_slot(ctx, w, h);
         ctx.pop();
     }
@@ -2811,6 +2841,10 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::Author(c) | Cmd::Data(crate::data::DataCmd::Author(c)) => {
+                    self.authoring.run(self, c);
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::CompareWith | crate::data::DataCmd::MergeCopies | crate::data::DataCmd::BrowseVersions | crate::data::DataCmd::PrintComments) => true,
@@ -3029,7 +3063,7 @@ impl Sheets {
                     {
                         // The row and column at the top left of the view.
                         use pergola::widgets::GridSource as _;
-                        let st = self.scroll.get();
+                        let st = self.authoring.active_scroll(self).get();
                         let top = (self.source.row_at(st.physics.y), self.source.col_at(st.physics_x.y));
                         self.doc.borrow_mut().view_top = top;
                     }
@@ -3039,7 +3073,16 @@ impl Sheets {
                 }
                 Cmd::ChartKind(k) => {
                     let k = ChartKind::ALL[k.min(ChartKind::ALL.len() - 1)];
-                    self.change_chart("Chart Type", |c| c.kind = k);
+                    self.change_chart("Chart Type", |c| {
+                        if c.kind != k {
+                            c.kind = k;
+                            for series in &mut c.series {
+                                if !series.kind.is_some_and(|kind| authoring::combo_kind(k) && authoring::combo_kind(kind) && kind != k) {
+                                    series.kind = None;
+                                }
+                            }
+                        }
+                    });
                     self.changed();
                     false
                 }
@@ -3051,7 +3094,15 @@ impl Sheets {
                 }
                 Cmd::ChartGroup(i) => {
                     let g = [Grouping::Standard, Grouping::Stacked, Grouping::Percent][i.min(2)];
-                    self.change_chart("Chart Stacking", |c| c.grouping = g);
+                    if g != Grouping::Standard && self.picked_chart().is_some_and(|i| {
+                        let d = self.doc.borrow();
+                        let c = &d.wb.charts()[i];
+                        c.series.iter().any(|s| s.kind.is_some_and(|kind| kind != c.kind))
+                    }) {
+                        self.set_status("Combo series use side-by-side grouping.");
+                    } else {
+                        self.change_chart("Chart Stacking", |c| c.grouping = g);
+                    }
                     self.changed();
                     false
                 }

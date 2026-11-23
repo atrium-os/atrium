@@ -60,6 +60,7 @@ pub struct Sheet {
     /// The width each hidden column (width 0) had, for showing it again as
     /// it was: (column, px), sorted. Files keep it with the column.
     pub hidden_widths: Vec<(u32, f64)>,
+    pub(crate) outlines: [crate::outline::Outline; 2],
     pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
 }
 
@@ -69,7 +70,18 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), outlines: Default::default(), axis_ids: Default::default() }
+    }
+    pub fn outline(&self, axis: crate::shift::Axis) -> &crate::outline::Outline {
+        &self.outlines[axis.index()]
+    }
+
+    pub fn view_col_sizes(&self) -> Sizes {
+        use crate::shift::Axis;
+        let hiding = self.outline(Axis::Cols);
+        let widths = self.col_sizes.overrides().iter().copied().filter(|(c, _)| !hiding.hides(*c));
+        let zeroes = hiding.hidden().iter().flat_map(|&(start, end)| (start..=end).map(|c| (c, 0.0)));
+        Sizes::from_overrides(self.col_sizes.default, widths.chain(zeroes).collect())
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -267,6 +279,9 @@ impl Workbook {
             }
             n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
             n += sh.axis_ids.iter().map(|ids| ids.bytes()).sum::<u64>();
+            for outline in &sh.outlines {
+                n += std::mem::size_of_val(outline.groups()) as u64 + std::mem::size_of_val(outline.hidden()) as u64;
+            }
             n += (sh.hidden.len() + sh.table_hidden.len()) as u64 * 8;
             n += sh.merges.len() as u64 * 20;
             n += sh.comments.values().map(crate::comments::Comment::estimated_bytes).sum::<u64>();
@@ -322,7 +337,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.freeze == (0, 0);
+        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.freeze == (0, 0);
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
@@ -348,6 +363,11 @@ impl Workbook {
     pub fn sheet_id(&self, name: &str) -> Option<u16> {
         self.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(name)).map(|i| i as u16)
     }
+    /// An outline has state that requires the native workbook format.
+    pub fn has_outlines(&self) -> bool {
+        self.sheets.iter().any(|sheet| sheet.outlines.iter().any(|axis| !axis.groups().is_empty()))
+    }
+
     pub fn sheet_name(&self, s: u16) -> String {
         self.sheets.get(s as usize).map_or_else(|| "#REF".into(), |s| s.name.clone())
     }

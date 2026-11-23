@@ -85,6 +85,10 @@ pub fn take_added_sheets(
             edits.extend(super::take(&preview, incoming, &entry)?);
         }
         for axis in [crate::shift::Axis::Rows, crate::shift::Axis::Cols] {
+            let outline = incoming.sheet(s).outline(axis);
+            if !outline.groups().is_empty() {
+                edits.push(GridOp::Outline { sheet: t, axis, outline: outline.clone() });
+            }
             let ids = &incoming.sheet(s).axis_ids[axis.index()];
             if !ids.is_implicit() {
                 edits.push(GridOp::AxisIdentities {

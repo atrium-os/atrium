@@ -599,6 +599,12 @@ pub(crate) fn shift_with_ids(
         ops.push(GridOp::Sizes { sheet, rows: axis == Axis::Rows, over });
     }
 
+    let outline = sh.outline(axis);
+    if !outline.groups().is_empty() {
+        let moved = outline.shifted(s)?;
+        if &moved != outline { ops.push(GridOp::Outline { sheet, axis, outline: moved }); }
+    }
+
     if let Some(inserted) = inserted {
         if inserted.iter().map(|r| i64::from(r.len)).sum::<i64>() != n.max(0) { return None; }
         let ids = wb.sheet(sheet).axis_ids[axis.index()].splice(at, (-n).max(0) as u32, inserted)?;

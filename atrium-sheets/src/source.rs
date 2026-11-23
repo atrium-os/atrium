@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use officina_grid::eval::dates::DateSystem;
 use officina_grid::addr::{CellAddr, MAX_COLS, MAX_ROWS};
+use officina_grid::shift::Axis;
 use officina_grid::style::{HAlign, Line, StyleId, StyleTable, VAlign};
 use officina_grid::Value;
 use pergola::Color;
@@ -26,34 +27,53 @@ pub struct SheetSource {
     /// Row sizes with hidden rows zero high, while the sheet hides any, keyed by what
     /// they were built from.
     view: RefCell<Option<(ViewKey, officina_grid::column::Sizes)>>,
+    col_view: RefCell<Option<(ColViewKey, officina_grid::column::Sizes)>>,
     /// The cell whose comment is shown beside it (the cursor's, while not
     /// editing); the window sets it each frame.
     pub note_at: std::cell::Cell<Option<(u32, u32)>>,
 }
 
-type ViewKey = (u16, usize, usize, usize, usize, usize, usize, u64);
+type ViewKey = (u16, u64, usize, usize, usize, usize, usize, usize, usize, u64);
+type ColViewKey = (u16, u64, usize, usize, usize, u64);
 type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
+        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
     fn rows_view<T>(&self, f: impl FnOnce(&officina_grid::column::Sizes) -> T) -> T {
         let d = self.doc.borrow();
         let sh = d.wb.sheet(d.sheet);
-        if sh.hidden.is_empty() && sh.table_hidden().is_empty() {
+        let outline = sh.outline(Axis::Rows).hidden();
+        if sh.hidden.is_empty() && sh.table_hidden().is_empty() && outline.is_empty() {
             return f(&sh.row_sizes);
         }
         let o = sh.row_sizes.overrides();
-        let key = (d.sheet, sh.hidden.as_ptr() as usize, sh.hidden.len(), sh.table_hidden().as_ptr() as usize, sh.table_hidden().len(), o.as_ptr() as usize, o.len(), sh.row_sizes.default.to_bits());
+        let key = (d.sheet, d.edits, outline.as_ptr() as usize, sh.hidden.as_ptr() as usize, sh.hidden.len(), sh.table_hidden().as_ptr() as usize, sh.table_hidden().len(), o.as_ptr() as usize, o.len(), sh.row_sizes.default.to_bits());
         let mut v = self.view.borrow_mut();
         if v.as_ref().is_none_or(|(k, _)| *k != key) {
             *v = Some((key, sh.view_row_sizes()));
         }
         f(&v.as_ref().unwrap().1)
     }
+    fn cols_view<T>(&self, f: impl FnOnce(&officina_grid::column::Sizes) -> T) -> T {
+        let d = self.doc.borrow();
+        let sh = d.wb.sheet(d.sheet);
+        let outline = sh.outline(Axis::Cols).hidden();
+        if outline.is_empty() {
+            return f(&sh.col_sizes);
+        }
+        let o = sh.col_sizes.overrides();
+        let key = (d.sheet, d.edits, outline.as_ptr() as usize, o.as_ptr() as usize, o.len(), sh.col_sizes.default.to_bits());
+        let mut v = self.col_view.borrow_mut();
+        if v.as_ref().is_none_or(|(k, _)| *k != key) {
+            *v = Some((key, sh.view_col_sizes()));
+        }
+        f(&v.as_ref().unwrap().1)
+    }
+
     fn used(&self) -> (u32, u32) {
         let d = self.doc.borrow();
         d.wb.extent(d.sheet)
@@ -342,7 +362,7 @@ impl SheetSource {
         let s = d.sheet;
         let mut out = Vec::new();
         let (vx0, vy0, vx1, vy1) = (view[0], view[1], view[0] + view[2], view[1] + view[3]);
-        let col_x = |c: u32| d.wb.sheet(s).col_sizes.offset(c);
+        let col_x = |c: u32| self.col_left(c);
         for (i, t) in d.wb.tables().iter().enumerate() {
             let r = t.rect;
             if r.sheet != s {
@@ -397,8 +417,8 @@ impl SheetSource {
         for (r, conds, offset) in sheet_filter.into_iter().chain(table_filters) {
             let (y0, y1) = (self.row_top(r.r0), self.row_top(r.r0 + 1));
             if y1 > y0 && y0 <= vy1 && y1 >= vy0 {
-                let a = d.wb.sheet(s).col_sizes.index_at(vx0.max(0.0)).max(r.c0);
-                let b = d.wb.sheet(s).col_sizes.index_at(vx1.max(0.0)).min(r.c1);
+                let a = self.col_at(vx0).max(r.c0);
+                let b = self.col_at(vx1).min(r.c1);
                 for c in a..=b {
                     // The table's button owns a shared header cell.
                     if offset.is_none() && d.wb.table_at(s, r.r0, c).is_some_and(|t| t.rect.r0 == r.r0 && t.header && t.filter.is_some()) {
@@ -812,11 +832,15 @@ impl GridSource for SheetSource {
 
     fn rows(&self) -> u32 {
         let (r, _) = self.used();
-        MIN_ROWS.max(r.saturating_add(1000)).min(MAX_ROWS)
+        let d = self.doc.borrow();
+        let end = d.wb.sheet(d.sheet).outline(Axis::Rows).last().unwrap_or(0);
+        MIN_ROWS.max(r.max(end).saturating_add(1000)).min(MAX_ROWS)
     }
     fn cols(&self) -> u32 {
         let (_, c) = self.used();
-        MIN_COLS.max(c.saturating_add(26)).min(MAX_COLS)
+        let d = self.doc.borrow();
+        let end = d.wb.sheet(d.sheet).outline(Axis::Cols).last().unwrap_or(0);
+        MIN_COLS.max(c.max(end).saturating_add(26)).min(MAX_COLS)
     }
     fn row_top(&self, r: u32) -> f64 {
         self.rows_view(|s| s.offset(r))
@@ -826,12 +850,33 @@ impl GridSource for SheetSource {
         self.rows_view(|s| s.index_at(y.max(0.0))).min(rows - 1)
     }
     fn col_left(&self, c: u32) -> f64 {
-        let d = self.doc.borrow();
-        d.wb.sheet(d.sheet).col_sizes.offset(c)
+        self.cols_view(|s| s.offset(c))
     }
     fn col_at(&self, x: f64) -> u32 {
+        self.cols_view(|s| s.index_at(x.max(0.0))).min(self.cols() - 1)
+    }
+    fn outline_control(&self, rows: bool, at: u32) -> Option<(u32, u32, bool)> {
         let d = self.doc.borrow();
-        d.wb.sheet(d.sheet).col_sizes.index_at(x.max(0.0)).min(self.cols() - 1)
+        let outline = d.wb.sheet(d.sheet).outline(if rows { Axis::Rows } else { Axis::Cols });
+        if outline.groups().is_empty() { return None; }
+        let limit = if rows { self.rows() } else { self.cols() };
+        let control = |sizes: &officina_grid::column::Sizes| {
+            outline.groups().iter().filter_map(|g| {
+                let pos = if g.collapsed {
+                    let origin = sizes.offset(g.start);
+                    let right = sizes.index_at(origin);
+                    if right < limit && sizes.size(right) >= if rows { 14.0 } else { 30.0 } { right }
+                    else if origin >= 0.01 { sizes.index_at(origin - 0.01) }
+                    else { return None; }
+                } else {
+                    let first = sizes.index_at(sizes.offset(g.start));
+                    if first > g.end { return None; }
+                    first
+                };
+                (pos == at).then_some((g.start, g.end, g.collapsed))
+            }).max_by_key(|&(start, end, collapsed)| (collapsed, end - start))
+        };
+        if rows { self.rows_view(control) } else { self.cols_view(control) }
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
         let d = self.doc.borrow();

@@ -485,7 +485,7 @@ fn contains_row(ranges: &[(u32, u32)], row: u32) -> bool {
 impl Sheet {
     /// Whether row `r` is hidden.
     pub fn row_hidden(&self, r: u32) -> bool {
-        contains_row(&self.hidden, r) || contains_row(&self.table_hidden, r)
+        contains_row(&self.hidden, r) || contains_row(&self.table_hidden, r) || self.outline(crate::shift::Axis::Rows).hides(r)
     }
 
     pub fn table_hidden(&self) -> &[(u32, u32)] {
@@ -499,11 +499,13 @@ impl Sheet {
     /// Row sizes as the view lays them out: hidden rows zero high. O(overrides +
     /// hidden ranges); the app keeps it until rows or sizes change.
     pub fn view_row_sizes(&self) -> Sizes {
-        if self.hidden.is_empty() && self.table_hidden.is_empty() {
+        let outlined = self.outline(crate::shift::Axis::Rows).hidden();
+        if self.hidden.is_empty() && self.table_hidden.is_empty() && outlined.is_empty() {
             return self.row_sizes.clone();
         }
         let mut over: Vec<(u32, f64)> = self.row_sizes.overrides().iter().copied().filter(|(r, _)| !self.row_hidden(*r)).collect();
-        for (a, b) in self.hidden_rows() {
+        let rows = merge(self.hidden_rows().into_iter().chain(outlined.iter().copied()).collect());
+        for (a, b) in rows {
             over.extend((a..=b).map(|r| (r, 0.0)));
         }
         Sizes::from_overrides(self.row_sizes.default, over)

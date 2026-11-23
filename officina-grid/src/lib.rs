@@ -37,6 +37,8 @@ pub mod names;
 pub mod native;
 pub mod numfmt;
 pub mod ops;
+pub mod outline;
+pub mod find;
 pub mod pivot;
 pub mod print;
 pub mod protection;
