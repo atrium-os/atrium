@@ -5,6 +5,7 @@
   <div class="toolbar">
     <div class="views" aria-label="Calendar views"><button data-view="Today" aria-pressed="true">Today</button><button data-view="Week" aria-pressed="false">Week</button></div>
     <button id="cal-find">Find 45 min</button><button id="cal-offer">Offer times…</button>
+    <label>Sample schedule <select id="cal-sample"></select></label>
   </div>
   <div class="workspace">
     <aside>
@@ -15,13 +16,24 @@
       <div class="heading"><div><small id="cal-kicker">Today</small><h2 id="cal-date">Tuesday, 24 November</h2></div><small>Kolkata · UTC+05:30</small></div>
       <div id="cal-agenda"></div>
       <div class="sheet" hidden aria-label="Offer times">
-        <h3>Offer times</h3><p>Choose the openings to include.</p>
+        <h3>Offer times</h3><p>Choose up to three openings.</p>
         <div id="cal-options"></div><small>Message preview</small><blockquote id="cal-message"></blockquote>
         <button id="cal-done">Close preview</button>
       </div>
     </section>
   </div>
   <footer aria-live="polite" id="cal-status">Work calendar · On this device</footer>
+  <details class="alert-samples">
+    <summary>Try notification scenarios</summary>
+    <label>Sample activity <select id="cal-activity">
+      <option value="moves">Organizer keeps moving a meeting</option>
+      <option value="list">Attendee list changes</option>
+      <option value="wake">Wake with 20 overdue reminders</option>
+      <option value="fresh">A requested reminder falls due after wake</option>
+    </select></label>
+    <button id="cal-replay">Replay sample</button>
+    <p id="cal-alert-result" role="status"></p>
+  </details>
 </div>
 <style>
 #atrium-calendar-planning{color-scheme:light dark;--paper:light-dark(#fafbfc,#1e2328);--panel:light-dark(#fff,#282e34);--rail:light-dark(#f2f4f6,#242a2f);--ink:light-dark(#181c20,#ecedef);--soft:light-dark(#59636c,#b4bec7);--rule:light-dark(#d7dce0,#444c54);--amber:light-dark(#925c21,#edba7b);--wash:light-dark(#fbf1e5,#3c3024);--work:light-dark(#497ba9,#8bb6db);font:14px/1.45 "IBM Plex Sans","Helvetica Neue",sans-serif;color:var(--ink);background:var(--paper);border:1px solid var(--rule);border-radius:7px;overflow:hidden;container-type:inline-size;text-align:left}
@@ -67,6 +79,8 @@
 #atrium-calendar-planning .sheet label{display:flex;align-items:center;gap:8px}
 #atrium-calendar-planning blockquote{margin:5px 0 12px;padding:8px 12px;border-left:3px solid var(--amber);background:var(--panel)}
 #atrium-calendar-planning footer{border-top:1px solid var(--rule);padding:6px 14px;background:var(--rail);color:var(--soft);font-size:12px}
+#atrium-calendar-planning .alert-samples{padding:10px 14px;background:var(--panel);border-top:1px solid var(--rule)}
+#atrium-calendar-planning .alert-samples label{display:inline-block;margin:8px 4px 8px 0}
 @container(max-width:690px){#atrium-calendar-planning .workspace{grid-template-columns:1fr}#atrium-calendar-planning aside{display:none}}
 @container(max-width:475px){#atrium-calendar-planning .row{grid-template-columns:94px 1fr}#atrium-calendar-planning .row button{grid-column:2;justify-self:start}#atrium-calendar-planning .canvas{padding:12px}}
 </style>
@@ -74,12 +88,43 @@
 (() => {
   const root = document.getElementById('atrium-calendar-planning');
   const get = id => root.querySelector('#cal-' + id);
-  const events = [
-    ['09:00–09:30','Team check-in'], ['09:30–10:30','1 hour open'],
-    ['10:30–12:00','Interviews'], ['12:00–13:00','Lunch'],
-    ['13:00–14:00','1 hour open'], ['14:00–15:00','Budget review']
-  ];
-  const choices = {1:['09:30–10:15','10:15–10:30'],4:['13:00–13:45','13:45–14:00']};
+  // Wall-clock minutes on the sample Tuesday. Search 09:00 up to the 14:00 review.
+  const samples = {
+    'Review day': [[540,570,'Team check-in'],[630,720,'Interviews'],[720,780,'Lunch']],
+    'Packed morning': [[540,630,'Studio session'],[630,735,'Research review'],[735,840,'Interviews']],
+    'One exact fit': [[540,600,'Workshop'],[645,796,'Planning'],[840,870,'Debrief']],
+    'Overlapping meetings': [[630,660,'Portfolio review'],[510,600,'Early review'],[555,630,'Handover'],[570,585,'Check-in'],[705,855,'Design session']],
+    'Open morning': [],
+    'Mixed invitations': [[540,600,'Tentative visit','tentative'],[600,680,'Optional office hours','free'],[620,690,'Declined briefing','declined'],[690,840,'Project work']],
+    'Four openings': [[585,600,'Stand-up'],[645,660,'Call'],[705,720,'Debrief'],[765,840,'Workshop']]
+  };
+  const startOfSearch = 540, endOfSearch = 840, duration = 45;
+  const samplePicker = get('sample');
+  for (const name of Object.keys(samples)) samplePicker.add(new Option(name, name));
+  const clockTime = minute => String(Math.floor(minute / 60)).padStart(2,'0') + ':' + String(minute % 60).padStart(2,'0');
+  const interval = (start,end) => clockTime(start) + '–' + clockTime(end);
+  const slot = start => interval(start, start + duration);
+
+  function schedule() {
+    const items = samples[samplePicker.value].concat([[840,900,'Budget review']]).map(
+      ([start,end,title,kind='busy']) => ({start,end,title,kind})
+    );
+    for (const start of holds) items.push({start,end:start+duration,title:'Preparation · Private hold',kind:'held'});
+    items.sort((a,b) => a.start - b.start || a.end - b.end);
+    const gaps = [];
+    let cursor = startOfSearch;
+    for (const item of items) {
+      if (item.kind === 'free' || item.kind === 'declined' || item.end <= cursor) continue;
+      if (item.start >= endOfSearch) break;
+      if (item.start > cursor) gaps.push({start:cursor,end:item.start,kind:'gap'});
+      cursor = Math.max(cursor,item.end);
+    }
+    if (cursor < endOfSearch) gaps.push({start:cursor,end:endOfSearch,kind:'gap'});
+    return {items,gaps};
+  }
+  function candidates() {
+    return schedule().gaps.filter(gap => gap.end - gap.start >= duration);
+  }
   const month = root.querySelector('.month');
   for (const day of ['M','T','W','T','F','S','S']) month.insertAdjacentHTML('beforeend','<span class="dayname">'+day+'</span>');
   for (let d=-5; d<=30; d++) {
@@ -113,7 +158,8 @@
     root.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.view===view)));
     get('find').setAttribute('aria-pressed',String(finding && view==='Today'));
     if(view==='Week'){
-      const week=[['Mon 23',['14:00 · Project planning']],['Tue 24',events.flatMap(([time,title],i)=>choices[i]?(holds.has(i)?[choices[i][0]+' · Preparation (held)']:[]):[time+' · '+title])],['Wed 25',['10:30 · Interviews']],['Thu 26',['11:00 · Design review']],['Fri 27',['14:00 · Team retrospective']],['Sat 28',['Open']],['Sun 29',['Open']]];
+      const tuesday = schedule().items.map(item => interval(item.start,item.end) + ' · ' + item.title);
+      const week=[['Mon 23',['14:00 · Project planning']],['Tue 24',tuesday],['Wed 25',['10:30 · Interviews']],['Thu 26',['11:00 · Design review']],['Fri 27',['14:00 · Team retrospective']],['Sat 28',['Open']],['Sun 29',['Open']]];
       week.forEach(([date,items])=>{
         const line=document.createElement('div');line.className='weekline';
         const day=document.createElement('b');day.textContent=date;
@@ -123,40 +169,111 @@
       });
       return;
     }
-    events.forEach(([time,title],i)=>{
-      if(!choices[i]) {agenda.append(row(time,title,''));return;}
-      const held=holds.has(i);
-      if(held) {
-        agenda.append(row(choices[i][0],'Preparation · Private hold','held',{slot:i,label:'Release hold',run:()=>changeHold(i,false)}),row(choices[i][1],'15 min open','gap'));
+    const {items,gaps} = schedule();
+    items.concat(gaps).sort((a,b)=>a.start-b.start).forEach(({start,end,title,kind})=>{
+      const time = interval(start,end);
+      if (kind === 'gap') {
+        const match = finding && end-start >= duration;
+        const action = match ? {slot:start,label:'Hold 45 min',run:()=>changeHold(start,true)} : null;
+        agenda.append(row(time,(end-start)+' min open', match?'gap match':'gap',action));
+      } else if (kind === 'held') {
+        agenda.append(row(time,title,'held',{slot:start,label:'Release hold',run:()=>changeHold(start,false)}));
       } else {
-        const action=finding?{slot:i,label:'Hold 45 min',run:()=>changeHold(i,true)}:null;
-        agenda.append(row(time,title,finding?'gap match':'gap',action));
+        agenda.append(row(time,kind==='busy'?title:title+' · '+kind,''));
       }
     });
   }
   function changeHold(i,held){
     if(held) holds.add(i); else holds.delete(i);
-    get('status').textContent=choices[i][0]+(held?' held · Only on this device':' released · Open again');
+    get('status').textContent=slot(i)+(held?' held · Only on this device':' released · Open again');
     sheet.hidden=true; paint();
   }
   function preview(){
-    const selected=[...get('options').querySelectorAll('input:checked')].map(x=>choices[x.value][0]);
+    const boxes = [...get('options').querySelectorAll('input')];
+    const selected = boxes.filter(box=>box.checked).map(box=>slot(Number(box.value)));
+    for (const box of boxes) box.disabled = !box.checked && selected.length >= 3;
     get('message').textContent=selected.length?'Would '+selected.join(' or ')+' on Tuesday 24 November 2026 work for you? Kolkata (UTC+05:30).':'Choose an open time.';
   }
   get('offer').onclick=()=>{
     view='Today'; paint();const options=get('options');options.replaceChildren();
-    Object.keys(choices).filter(i=>!holds.has(Number(i))).forEach(i=>{
+    candidates().forEach(({start},index)=>{
       const label=document.createElement('label'),box=document.createElement('input');
-      box.type='checkbox';box.value=i;box.checked=true;box.onchange=preview;
-      label.append(box,choices[i][0]);options.append(label);
+      box.type='checkbox';box.value=start;box.checked=index<3;box.onchange=preview;
+      label.append(box,slot(start));options.append(label);
     });
     sheet.hidden=false;preview();
-    if(!options.children.length)get('message').textContent='Both openings are held.';
+    if(!options.children.length)get('message').textContent='No 45-minute opening before Budget review.';
     (options.querySelector('input')||get('done')).focus();
   };
   get('done').onclick=()=>{sheet.hidden=true;get('offer').focus();};
-  get('find').onclick=()=>{finding=view==='Week'||!finding; view='Today';sheet.hidden=true;paint();get('status').textContent=finding?(2-holds.size)+' openings of at least 45 minutes before Budget review':'Work calendar · On this device';};
+  function showFindStatus() {
+    const count = candidates().length;
+    get('status').textContent = finding ? count + (count===1?' opening':' openings') + ' of at least 45 minutes before Budget review' : 'Work calendar · On this device';
+  }
+  get('find').onclick=()=>{finding=view==='Week'||!finding; view='Today';sheet.hidden=true;paint();showFindStatus();};
+  samplePicker.onchange=()=>{holds.clear();view='Today';sheet.hidden=true;paint();showFindStatus();};
   root.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>{view=b.dataset.view;sheet.hidden=true;get('status').textContent='Work calendar · On this device';paint();});
+
+  // Replay a single persona's already-validated revisions and timer deliveries.
+  // Surfaces and sounds here are counters, not desktop notifications.
+  function simulateAlerts(deliveries) {
+    const revisions = new Map(), reviews = new Map(), fired = new Set();
+    let notices=0, sounds=0, history=0, upcoming=0;
+    for (const event of deliveries) {
+      if (event.type === 'reminder') {
+        if (fired.has(event.id) || event.obsolete) continue;
+        fired.add(event.id);
+        if (!event.missed) {
+          notices++;
+          sounds++;
+        } else if (event.end <= event.wake || event.start < event.wake-5) {
+          history++;
+        } else {
+          upcoming++;
+        }
+        continue;
+      }
+      if (event.revision <= (revisions.get(event.id) ?? -1)) continue;
+      revisions.set(event.id,event.revision);
+      if (event.type === 'roster') continue;
+      if (!reviews.has(event.id)) notices++;
+      reviews.set(event.id,event.label);
+    }
+    return {notices,sounds,history,upcoming,reviews,summaries:Number(upcoming>0)};
+  }
+  function replayActivity() {
+    const activity = get('activity').value;
+    let deliveries, caption;
+    if (activity === 'moves') {
+      const times = ['14:15','14:45','13:30','15:00','14:30'];
+      deliveries = times.map((time,index)=>({id:'budget',revision:index+1,type:'move',label:'14:00 → '+time}));
+      deliveries.push(deliveries[1],deliveries[4]);
+      caption = '5 time changes and 2 repeat deliveries';
+    } else if (activity === 'list') {
+      deliveries = Array.from({length:200},(_,i)=>({id:'forum',revision:i+1,type:'roster'}));
+      caption = '200 attendee updates';
+    } else if (activity === 'fresh') {
+      const reminder = {id:'live-review',type:'reminder',missed:false};
+      deliveries = [reminder,reminder];
+      caption = '1 fresh reminder with sound enabled, delivered twice';
+    } else {
+      const missed = Array.from({length:20},(_,i)=>({
+        id:'reminder-'+i,type:'reminder',missed:true,wake:720,
+        start:i<18 ? 650+i : 724+i-18,end:i<18 ? 700 : 750,obsolete:i===19
+      }));
+      deliveries = missed.concat(missed);
+      caption = '20 overdue reminders, delivered again on reconnect';
+    }
+    const result = simulateAlerts(deliveries);
+    const parts = [caption, result.notices+(result.notices===1?' individual alert':' individual alerts'),
+      result.sounds+(result.sounds===1?' sound':' sounds')];
+    if (result.reviews.size) parts.push('Latest change: '+[...result.reviews.values()].join(', '));
+    if (activity==='wake') parts.push(result.summaries+' silent summary',result.upcoming+' upcoming',result.history+' in history');
+    get('alert-result').textContent = parts.join(' · ');
+  }
+  get('activity').onchange=replayActivity;
+  get('replay').onclick=replayActivity;
+  replayActivity();
   paint();
 })();
 </script>
