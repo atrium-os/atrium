@@ -293,10 +293,13 @@ impl Engine {
         }
     }
 
-    fn note_jmap_acceptance(&self, w: &mut mail_store::Writer<'_>, row: &Outgoing) -> mail_store::Result<()> {
+    fn note_jmap_acceptance(&self, w: &mut mail_store::Writer<'_>, row: &Outgoing) -> mail_store::Result<bool> {
         let subject = self.draft_of(row).map(|draft| draft.subject).unwrap_or_default();
-        w.record_jmap_acceptance(row.account, &subject)?;
-        self.note_wrote(w, row)
+        if !w.record_jmap_acceptance(row.account, &subject)? {
+            return Ok(false);
+        }
+        self.note_wrote(w, row)?;
+        Ok(true)
     }
 
     pub fn jmap_send_rows(&self) -> Result<Vec<JmapSendRow>, Error> {
@@ -355,8 +358,7 @@ impl Engine {
                 let Some(outgoing) = w.resolve_jmap_submission(*id, &evidence, status == SendStatus::Canceled)? else {
                     return Ok(false);
                 };
-                self.note_jmap_acceptance(w, &outgoing)?;
-                Ok(true)
+                self.note_jmap_acceptance(w, &outgoing)
             })? {
                 accepted += 1;
             }

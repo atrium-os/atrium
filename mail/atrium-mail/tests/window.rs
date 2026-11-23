@@ -1673,7 +1673,8 @@ fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
         }
         assert!(w.resolve_jmap_submission(canceled, evidence, true)?.is_none());
         assert!(w.resolve_jmap_submission(accepted, evidence, false)?.is_some());
-        w.record_jmap_acceptance(account, "Planning")
+        assert!(w.record_jmap_acceptance(account, "Planning")?);
+        Ok(())
     }).unwrap();
 
     mail.refresh();
@@ -1699,7 +1700,8 @@ fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
 
     engine.store.write(|w| {
         assert!(w.resolve_jmap_submission(held, evidence, false)?.is_some());
-        w.record_jmap_acceptance(account, "Meeting")
+        assert!(w.record_jmap_acceptance(account, "Meeting")?);
+        Ok(())
     }).unwrap();
     mail.refresh();
     app.tick();

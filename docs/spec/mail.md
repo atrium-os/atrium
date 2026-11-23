@@ -1759,8 +1759,9 @@ Stalwart in the cloud VM, and later a real account):
    keeps the subjects of the 24 most recently confirmed sends across app
    restarts. A held send joins the top of the history when Mail confirms
    acceptance, even if it was queued earlier. Removing an account clears
-   its acceptance history. The existing acceptance and cancellation
-   records carry over on upgrade.
+   its acceptance history. An acknowledgment received after removal
+   cannot recreate a history entry or record the outgoing recipients.
+   The existing acceptance and cancellation records carry over on upgrade.
 
    The store keeps the Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in

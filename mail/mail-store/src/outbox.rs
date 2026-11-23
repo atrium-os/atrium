@@ -90,7 +90,11 @@ pub fn retry_after(tries: u32) -> i64 {
 }
 
 impl Writer<'_> {
-    pub fn record_jmap_acceptance(&mut self, account: AccountId, subject: &str) -> Result<()> {
+    /// A reply can arrive after Remove Account has cleared its history.
+    pub fn record_jmap_acceptance(&mut self, account: AccountId, subject: &str) -> Result<bool> {
+        if self.tx.open_table(ACCOUNTS)?.get(account)?.is_none() {
+            return Ok(false);
+        }
         // Share the outbox sequence so an acceptance sorts after the earlier
         // activity, including history written with the original outbox ID.
         let id = Store::next_id(self.tx, "send")?;
@@ -100,7 +104,7 @@ impl Writer<'_> {
         while table.len()? > RECENT_ACCEPTED {
             table.pop_first()?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn clear_jmap_acceptances(&mut self, account: AccountId) -> Result<()> {
@@ -331,11 +335,14 @@ impl Store {
                 outstanding.push((id.value(), row));
             }
         }
-        let accepted = tx.open_table(JMAP_ACCEPTED)?.iter()?.map(|entry| {
+        let mut accepted = Vec::new();
+        for entry in tx.open_table(JMAP_ACCEPTED)?.iter()? {
             let (id, value) = entry?;
             let row: AcceptedSend = dec(value.value())?;
-            Ok((id.value(), row.subject))
-        }).collect::<Result<_>>()?;
+            if accounts.get(row.account)?.is_some() {
+                accepted.push((id.value(), row.subject));
+            }
+        }
         Ok(JmapSendActivity { outstanding, accepted })
     }
 

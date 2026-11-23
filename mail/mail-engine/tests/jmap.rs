@@ -58,6 +58,7 @@ struct Server {
     submission_records: BTreeMap<String, Value>,
     submission_reads: Vec<String>,
     inspect_dispatch: Option<(Store, u64)>,
+    remove_before_reply: Option<(&'static str, Store, mail_store::AccountId)>,
     downloads: usize,
     snoozed: Option<String>,
     hold: u64,
@@ -512,6 +513,12 @@ impl Http for Fake {
                     }
                 }
                 let answer = s.api(&req);
+                if s.remove_before_reply.as_ref().is_some_and(|(method, _, _)| {
+                    req["methodCalls"].as_array().unwrap().iter().any(|call| call[0] == *method)
+                }) {
+                    let (_, store, account) = s.remove_before_reply.take().unwrap();
+                    store.write(|w| w.remove_account(account)).unwrap();
+                }
                 if import.is_some() && std::mem::take(&mut s.drop_import_after) {
                     return Err("test acknowledgment lost after the server stored the import".into());
                 }
@@ -867,6 +874,45 @@ fn jmap_persists_submission_evidence_before_dispatch_and_resolves_after_restart(
         assert_eq!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::NotDue);
         let s = server.borrow();
         assert_eq!(s.submission_reads, ["EmailSubmission/query", "EmailSubmission/get"]);
+        assert_eq!((s.import_requests, s.uploads.len(), s.submitted.len()), (1, 1, 1));
+    }
+}
+
+#[test]
+fn jmap_late_acceptance_cannot_restore_a_removed_accounts_history() {
+    for confirm_held in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+        let removed = engine.store.add_account("ada@example.org").unwrap();
+        let kept = engine.store.add_account("kept@example.org").unwrap();
+        engine.store.write(|w| {
+            for n in 1..=24 {
+                assert!(w.record_jmap_acceptance(kept, &format!("Keep {n:02}"))?);
+            }
+            Ok(())
+        }).unwrap();
+        let expected = engine.jmap_send_rows().unwrap();
+        assert_eq!(expected.len(), 24);
+        let server = Rc::new(RefCell::new(Server { drop_submission_reply: confirm_held, ..Default::default() }));
+        let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+        let id = engine.send(removed, &submission_draft(), When::default()).unwrap();
+        assert!(engine.send_now(id).unwrap());
+        if confirm_held {
+            assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Failed { transient: false, .. }));
+            assert!(engine.store.jmap_submission(id).unwrap().is_some());
+            server.borrow_mut().remove_before_reply = Some(("EmailSubmission/get", engine.store.clone(), removed));
+            assert_eq!(engine.reconcile_jmap_sends(removed, client.as_mut()).unwrap(), 0);
+        } else {
+            server.borrow_mut().remove_before_reply = Some(("EmailSubmission/set", engine.store.clone(), removed));
+            assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Sent { .. }));
+        }
+        assert_eq!(engine.store.accounts().unwrap()[0].0, kept);
+        assert_eq!(engine.jmap_send_rows().unwrap(), expected);
+        assert!(engine.store.outbox().unwrap().is_empty());
+        assert!(engine.store.jmap_submission(id).unwrap().is_none());
+        assert!(engine.complete("grace", 5).unwrap().is_empty());
+        let s = server.borrow();
+        assert!(s.remove_before_reply.is_none());
         assert_eq!((s.import_requests, s.uploads.len(), s.submitted.len()), (1, 1, 1));
     }
 }
