@@ -225,10 +225,27 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         YOUTUBE_ENTRY => &[(YOUTUBE_ENTRY, "text/html")],
         _ => return Err("unknown widget source".into()),
     };
-    for &(url, mime) in resources {
-        let Some(Request::Open(open)) = input.recv().map_err(|e| e.to_string())? else {
+    let mut provider = None;
+    let mut remaining = navigator_control::youtube::ASSET_BUDGET;
+    let requests = if source == YOUTUBE_ENTRY {
+        1 + navigator_control::youtube::ASSET_COUNT
+    } else {
+        resources.len()
+    };
+    for step in 0..requests {
+        let request = match input.recv() {
+            Ok(r) => r,
+            Err(e) if source == YOUTUBE_ENTRY && step > 0 && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+            Err(e) => return Err(e.to_string())
+        };
+        if request.is_none() && source == YOUTUBE_ENTRY && step > 0 { break; }
+        let Some(Request::Open(open)) = request else {
             return Err("expected a document GET".into());
         };
+        let (url, mime) = if source == YOUTUBE_ENTRY && step > 0 {
+            let mime = navigator_control::youtube::asset_mime(&open.url).ok_or("unknown provider asset")?;
+            (open.url.as_str(), mime)
+        } else { resources[step] };
         let id = open.id;
         if open.url != url
             || open.method != Method::Get
@@ -240,7 +257,13 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             return Err("request outside the widget grant".into());
         }
         let (body, limit) = if source == YOUTUBE_ENTRY {
-            (youtube_entry()?, YOUTUBE_ENTRY_LIMIT)
+            let limit = if step == 0 { YOUTUBE_ENTRY_LIMIT } else { navigator_control::youtube::ASSET_LIMIT };
+            if step > 0 && remaining == 0 { return Err("provider startup budget exhausted".into()); }
+            if provider.is_none() { provider = Some(youtube_worker()?); }
+            let (socket, _worker) = provider.as_mut().ok_or("provider worker missing")?;
+            let body = youtube_resource(socket, url, if step == 0 {limit} else {limit.min(remaining)})?;
+            if step > 0 { remaining -= body.len(); }
+            (body, limit)
         } else {
             let Some(Upstream::Fetchd(fetcher, _)) = &mut upstream else {
                 return Err("widget requires the plain fetch worker".into());
@@ -275,24 +298,29 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// This exec-only bundle accepts no destination, headers or commands.
-fn youtube_entry() -> Result<Vec<u8>, String> {
-    use std::io::{Read, Write};
+fn youtube_worker() -> Result<(UnixStream, crate::worker::Worker), String> {
     let spec = crate::worker::Spec::Jail("org.atrium.navigator.youtube-entry".into());
-    let (mut reader, peer) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let (reader, peer) = UnixStream::pair().map_err(|e| e.to_string())?;
     reader.set_read_timeout(Some(Duration::from_secs(12))).map_err(|e| e.to_string())?;
-    let mut worker = crate::worker::Worker::start_on(&spec, &format!("y{}", crate::instance()), peer.into())
+    let worker = crate::worker::Worker::start_on(&spec, &format!("y{}", crate::instance()), peer.into())
         .map_err(|e| e.to_string())?;
-    let result = (|| {
+    Ok((reader, worker))
+}
+
+fn youtube_resource(reader: &mut UnixStream, url: &str, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+
+    if url == YOUTUBE_ENTRY {
         reader.write_all(&[1]).map_err(|e| e.to_string())?;
-        let mut header = [0; 4];
-        reader.read_exact(&mut header).map_err(|e| format!("entry worker: {e}"))?;
-        let len = u32::from_be_bytes(header) as usize;
-        if !(1..=YOUTUBE_ENTRY_LIMIT).contains(&len) { return Err("invalid entry length".into()); }
-        let mut body = vec![0; len];
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-        Ok(body)
-    })();
-    worker.kill();
-    result
+    } else {
+        reader.write_all(&[2]).and_then(|_| reader.write_all(&(url.len() as u16).to_be_bytes()))
+            .and_then(|_| reader.write_all(url.as_bytes())).map_err(|e| e.to_string())?;
+    }
+    let mut header = [0; 4];
+    reader.read_exact(&mut header).map_err(|e| format!("entry worker: {e}"))?;
+    let len = u32::from_be_bytes(header) as usize;
+    if !(1..=limit).contains(&len) { return Err("invalid entry length".into()); }
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
 }

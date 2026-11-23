@@ -14,6 +14,7 @@ const SIGN_IN: [&str; 4] = [
     "https://idp.example/sign-in.html?step=password",
     "https://idp.example/sign-in.html?step=callback",
 ];
+const PROVIDER: &[&str] = &[navigator_control::YOUTUBE_ENTRY];
 const VIDEO: [&str; 3] = [
     "https://widget.example/navigator-i4/local-player.html",
     "https://widget.example/navigator-i4/local-player.js",
@@ -37,6 +38,16 @@ pub unsafe extern "C" fn navigator_fixture_channel(fd: i32) -> bool {
     Client::from_stream(socket).is_ok_and(|c| CLIENT.set(Mutex::new(Some((c, 0, None)))).is_ok())
 }
 
+/// Return the response type only while this engine has an active provider document.
+/// # Safety
+/// The caller provides a readable serialized URL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_youtube_asset(url: *const u8, len: usize) -> u8 {
+    let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {return 0};
+    if !CLIENT.get().and_then(|c| c.lock().ok()).is_some_and(|s| s.as_ref().is_some_and(|(_,_,seq)| *seq == Some(PROVIDER))) {return 0;}
+    match navigator_control::youtube::asset_mime(url) {Some("text/javascript") => 1, Some("text/css") => 2, _ => 0}
+}
+
 /// # Safety
 /// The URL and output buffer are valid for the duration of this call.
 #[unsafe(no_mangle)]
@@ -49,11 +60,13 @@ pub unsafe extern "C" fn navigator_fixture_get(
     let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {
         return 0;
     };
-    let limit = if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
+    let asset = navigator_control::youtube::asset_mime(url);
+    let limit = if asset.is_some() { navigator_control::youtube::ASSET_LIMIT } else if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
     if capacity > limit { return 0; }
     let Some(mut state) = CLIENT.get().and_then(|c| c.lock().ok()) else {
         return 0;
     };
+    if state.as_ref().is_some_and(|(_,step,seq)| *seq == Some(PROVIDER) && *step > 0 && asset.is_none()) {return 0;}
     let Some((mut client, step, sequence)) = state.take() else {
         return 0;
     };
@@ -61,13 +74,16 @@ pub unsafe extern "C" fn navigator_fixture_get(
         Some(sequence) => sequence,
         None if url == URL => &[URL],
         None if url == COUNTER => &[COUNTER],
-        None if url == navigator_control::YOUTUBE_ENTRY => &[navigator_control::YOUTUBE_ENTRY],
+        None if url == navigator_control::YOUTUBE_ENTRY => PROVIDER,
         None if url == VIDEO[0] => &VIDEO,
         None if url == SIGN_IN[0] => &SIGN_IN,
         _ => return 0,
     };
-    if sequence.get(step).copied() != Some(url) { return 0; }
-    let expected_mime = if url == VIDEO[1] { "text/javascript" }
+    let provider_asset = sequence == PROVIDER && step > 0;
+    if provider_asset {
+        if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT {return 0;}
+    } else if sequence.get(step).copied() != Some(url) { return 0; }
+    let expected_mime = if provider_asset { asset.unwrap() } else if url == VIDEO[1] { "text/javascript" }
         else if url == VIDEO[2] { "video/webm" } else { "text/html" };
     let request_id = step as u32 + 1;
     let mut open = Open::get(request_id, url);
@@ -109,7 +125,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
             Ok(Some(Event::Done { id, bytes }))
                 if id == request_id && total == Some(used) && bytes == used as u64 =>
             {
-                if step + 1 < sequence.len() {
+                if sequence == PROVIDER || step + 1 < sequence.len() {
                     *state = Some((client, step + 1, Some(sequence)));
                 }
                 return used;

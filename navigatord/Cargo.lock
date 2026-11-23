@@ -2451,6 +2451,7 @@ name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "navigator-control",
  "nuntius",
  "rustls",
  "rustls-pki-types",

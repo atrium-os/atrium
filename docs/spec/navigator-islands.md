@@ -472,9 +472,7 @@ GET for the fixed embed over TLS. It accepts one HTML response up to
 512 KiB and refuses redirects. The ordinary fetch worker, subresource
 requests and the reader's page URL are outside this exception.
 Build the entry island with `I4_YOUTUBE` and install the dedicated network
-worker with `scripts/navigator-youtube-entry-bundle.sh`. The initial
-document is the only resource this stage admits. Provider JS/CSS, API and
-media requests and the separate audio track remain future gates.
+worker with `scripts/navigator-youtube-entry-bundle.sh`. The initial HTML-only gate measured the cost of opening the embed.
 On arm64 Tessera the installed watch page and the open Start prompt made
 zero provider connections. The first run exposed an uninitialized LibWeb
 fetch executor while parsing the embed. After initializing it, two trusted
@@ -483,9 +481,28 @@ each. The JIT-off worker reported the provider origin in Capsicum, UID
 50007, IPv4 and IPv6 disabled. Stop retired it. Choosing Not now caused
 zero further connections. The player area stayed black: the inline
 bootstrap reached `writeEmbed`, which was undefined with the external
-player scripts unavailable. Next, grant bounded provider JS and CSS and
-verify the script defines and executes `writeEmbed` in the installed
-island. Evidence: `~/atrium-vm/evidence/navigator-i4-youtube-entry-20261123/`.
+player scripts unavailable. The HTML-only results are at
+`~/atrium-vm/evidence/navigator-i4-youtube-entry-20261123/`.
+
+The installed startup gate reuses one Capsicum fetch worker for the lifetime
+of the island. After the entry GET it admits same-origin versioned player
+scripts and styles over TLS, up to 12 assets, 3 MiB per body and 10 MiB
+delivered in total. The worker checks the path and response MIME type.
+Asset requests omit the referrer and follow no redirects.
+
+On arm64 Tessera the final Start delivered 143,823 HTML bytes, two styles
+and three scripts to jailed JIT-off Ladybird. The bootstrap defined
+`writeEmbed` and created a 640 × 360 player with 67 API methods. The
+provider remained in state −1 and the island stayed black. Chrome with
+the same resource policy displayed a 72 px “Play video” button. Timers,
+messages and animation-frame callbacks fired in the Ladybird diagnostic.
+A separate explicit `cueVideoById` probe reached a Fresco conversion
+error on `DrawRepeatedTile` with an inline clip or transform. The cause
+of the missing initial button is still open. Compare provider readiness
+and overlay creation in the two engines, and implement scene grouping
+for the repeated tile. Real-provider playback and chapter seeks remain
+unverified. The final frame, network trace and diagnostic are at
+`~/atrium-vm/evidence/navigator-i4-youtube-startup-20261123/`.
 
 Host control scripts and observations are at
 `~/atrium-vm/evidence/navigator-i4-youtube-provider-20261123/`.

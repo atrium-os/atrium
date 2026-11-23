@@ -627,3 +627,4 @@ mod parts_tests {
     }
 }
 pub mod video;
+pub mod youtube;

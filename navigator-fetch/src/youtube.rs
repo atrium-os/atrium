@@ -1,5 +1,5 @@
-//! One anonymous entry GET for the I4 installed embed. The caller cannot
-//! select a destination, set a header, or follow a redirect.
+//! Bounded HTTPS GETs for the installed I4 embed. Only its fixed entry sends
+//! the app ID. Its versioned bootstrap resources use anonymous requests.
 use crate::{http, Conn, Conversation};
 use std::io::{Read, Write};
 
@@ -7,7 +7,12 @@ pub const HOST: &str = "www.youtube-nocookie.com";
 pub const ENTRY_LIMIT: usize = 512 * 1024;
 const REQUEST: &[u8] = b"GET /embed/M7lc1UVf-VE HTTP/1.1\r\nHost: www.youtube-nocookie.com\r\nReferer: https://org.atrium.navigator/\r\nUser-Agent: atrium-navigator-fetch/0.1\r\nAccept: text/html\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n";
 
-pub fn entry(conv: &mut Conversation<'_>) -> Result<Vec<u8>, String> {
+pub fn resource(url: &str, conv: &mut Conversation<'_>) -> Result<Vec<u8>, String> {
+    let asset = if url == navigator_control::YOUTUBE_ENTRY {
+        None
+    } else {
+        Some(navigator_control::youtube::asset_mime(url).ok_or("outside startup grant")?)
+    };
     conv.site_check(HOST).map_err(|e| e.to_string())?;
     let Conn::Tls(mut stream) = conv
         .connect(HOST, 443, true, HOST)
@@ -15,7 +20,15 @@ pub fn entry(conv: &mut Conversation<'_>) -> Result<Vec<u8>, String> {
     else {
         return Err("YouTube entry requires TLS".into());
     };
-    exchange(&mut *stream)
+    if let Some(mime) = asset {
+        let path = url
+            .strip_prefix(navigator_control::youtube::ORIGIN)
+            .ok_or("invalid provider origin")?;
+        http::write_request(&mut stream, HOST, path).map_err(|e| e.to_string())?;
+        response(&mut *stream, mime, navigator_control::youtube::ASSET_LIMIT)
+    } else {
+        exchange(&mut *stream)
+    }
 }
 
 fn exchange(stream: &mut (impl Read + Write)) -> Result<Vec<u8>, String> {
@@ -23,7 +36,10 @@ fn exchange(stream: &mut (impl Read + Write)) -> Result<Vec<u8>, String> {
         .write_all(REQUEST)
         .and_then(|_| stream.flush())
         .map_err(|e| e.to_string())?;
-    let (response, _) = http::read_response_capped(stream, Some(ENTRY_LIMIT + 1))
+    response(stream, "text/html", ENTRY_LIMIT)
+}
+fn response(stream: &mut impl Read, expected: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let (response, _) = http::read_response_capped(stream, Some(limit + 1))
         .map_err(|e| format!("YouTube entry: {e:?}"))?;
     if response.status != 200 {
         return Err(format!("YouTube entry returned HTTP {}", response.status));
@@ -31,10 +47,16 @@ fn exchange(stream: &mut (impl Read + Write)) -> Result<Vec<u8>, String> {
     let mime = response
         .header("content-type")
         .and_then(|v| v.split(';').next());
-    if !mime.is_some_and(|v| v.trim().eq_ignore_ascii_case("text/html")) {
-        return Err("YouTube entry requires HTML".into());
+    if !mime.is_some_and(|v| {
+        v.trim().eq_ignore_ascii_case(expected)
+            || (expected == "text/javascript"
+                && v.trim().eq_ignore_ascii_case("application/javascript"))
+    }) {
+        return Err(format!(
+            "YouTube resource requires {expected}, received {mime:?}"
+        ));
     }
-    if response.body.is_empty() || response.body.len() > ENTRY_LIMIT {
+    if response.body.is_empty() || response.body.len() > limit {
         return Err("invalid YouTube entry size".into());
     }
     Ok(response.body)

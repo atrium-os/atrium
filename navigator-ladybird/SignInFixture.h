@@ -1,6 +1,10 @@
 #pragma once
 
 #include "EditorPage.h"
+#ifdef ATRIUM_I4_YOUTUBE
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
+#endif
 #include <LibWebCommon/UIEvents/MouseButton.h>
 #include <AK/ScopeGuard.h>
 #include <LibURL/Parser.h>
@@ -44,6 +48,9 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     auto& url = *parsed;
     doc->set_url(url);
     doc->set_origin(url.origin());
+#ifdef ATRIUM_I4_YOUTUBE
+    doc->set_referrer(u"https://org.atrium.navigator/"_utf16);
+#endif
 #if defined(ATRIUM_MAIL_PAGE) && !defined(ATRIUM_INBOX_PAGE)
     navigator_get_realm(&Web::HTML::relevant_realm(*doc));
 #endif
@@ -117,6 +124,14 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);
         if (action == 2) client.page().handle_mouseup(point, point, Web::UIEvents::MouseButton::Primary, 0, 0);
         bool requested = client.take_frame_request();
+#ifdef ATRIUM_I4_YOUTUBE
+        if (requested) {
+            auto& event_loop = Web::HTML::main_thread_event_loop();
+            event_loop.request_rendering_update();
+            event_loop.rendering_opportunity(Web::HighResolutionTime::unsafe_shared_current_time(), Web::HTML::EventLoop::RenderingOpportunitySource::LocalTimer);
+            loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        }
+#endif
         if (!requested && !action && tree == doc->dom_tree_version() && text == doc->character_data_version())
             continue;
         tree = doc->dom_tree_version();

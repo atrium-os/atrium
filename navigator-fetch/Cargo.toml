@@ -11,6 +11,7 @@ description = "M1: the Navigator's fetcher — the only component with network, 
 #   AR_aarch64_unknown_freebsd=/opt/homebrew/opt/llvm/bin/llvm-ar
 # The binary links libcasper, libcap_net and libnv from the base system.
 [dependencies]
+navigator-control = { path = "../navigator-control" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 url = "2"

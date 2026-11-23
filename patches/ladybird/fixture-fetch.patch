@@ -1,18 +1,21 @@
 --- a/Libraries/LibWeb/Loader/ResourceLoader.cpp
 +++ b/Libraries/LibWeb/Loader/ResourceLoader.cpp
-@@ -30,6 +30,11 @@
+@@ -30,6 +30,14 @@
  #include <LibWeb/Platform/EventLoopPlugin.h>
  #include <LibWeb/Platform/Timer.h>
  #include <LibWebCommon/Loader/UserAgent.h>
 +
 +#ifdef ATRIUM_I0_EDITOR
++#ifdef ATRIUM_I4_YOUTUBE
++extern "C" u8 navigator_youtube_asset(u8 const*, size_t);
++#endif
 +extern "C" size_t navigator_page_get(u8 const*, size_t, u8*, size_t);
 +extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
 +#endif
  
  namespace Web {
  
-@@ -507,6 +512,41 @@
+@@ -507,6 +515,47 @@
          return nullptr;
      }
  
@@ -20,8 +23,12 @@
 +    // The broker supplies only the resources granted to this fixture.
 +    // All other schemes, request methods, and resources fail closed.
 +    if (url.scheme() == "https"sv && request.method() == "GET"sv && request.body().is_empty()) {
-+        auto buffer = ByteBuffer::create_uninitialized(65536);
 +        auto const& name = url.serialize();
++        u8 provider_asset = 0;
++#ifdef ATRIUM_I4_YOUTUBE
++        provider_asset = navigator_youtube_asset(name.bytes().data(), name.bytes().size());
++#endif
++        auto buffer = ByteBuffer::create_uninitialized(provider_asset ? 3 * 1024 * 1024 : 65536);
 +        if (!buffer.is_error()) {
 +            auto body = buffer.release_value();
 +            StringView mime = "text/html"sv;
@@ -35,6 +42,8 @@
 +            } else {
 +                if (name == "https://widget.example/navigator-i4/local-player.js"sv) mime = "text/javascript"sv;
 +                if (name == "https://widget.example/media/red-blue.webm"sv) mime = "video/webm"sv;
++                if (provider_asset == 1) mime = "text/javascript"sv;
++                if (provider_asset == 2) mime = "text/css"sv;
 +                length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            }
 +            if (length && length <= body.size()) {
