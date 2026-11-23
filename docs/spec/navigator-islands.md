@@ -380,8 +380,13 @@ The arm64 `atrium-media-probe` now drives the native Limen player through
 Navigator's MSE adapter. The deterministic input is `red-blue.webm`. The
 probe asks the player about VP9 support, appends the clip, waits for native
 acknowledgements, then activates the rendered chapter targets while paused.
-It checks the Fresco slot for red at 0.5 s and blue at 1.5 s. The probe,
-player and decode worker cross-built; the Tessera frame check is pending.
+It checks the Fresco slot for red at 0.5 s and blue at 1.5 s. On arm64 Tessera, an isolated probe run captured RGB (254, 0, 0) at 0.5 s
+and (0, 0, 255) at 1.5 s. Independent sampling of both saved PNGs at
+desktop point (300, 204) matched the probe. The private guest used the
+jailed Fresco renderer and shut down cleanly. The probe drove the MSE
+adapter directly. Installed Ladybird DOM playback remains the next gate.
+Frames, binary hashes, player events and shutdown evidence are in
+`~/atrium-vm/evidence/navigator-i4-native-chapters-20261123/`.
 
 The [deterministic MSE page](../../test-assets/navigator-i4/local-player.html)
 loads its own script, fetches the VP9 clip, appends it to a DOM SourceBuffer
