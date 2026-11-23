@@ -19,11 +19,14 @@ use std::sync::Arc;
 
 mod display;
 mod group;
+mod order;
 
 pub use display::{BaseItem, ReferenceCalc, ShowAs};
 pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
 use display::{Display, Slot};
 use group::Grouping;
+pub use order::AxisSort;
+use order::Order;
 
 pub const MAX_GROUPS: usize = 64;
 pub const MAX_GROUP_MEMBERS: usize = 65_536;
@@ -82,11 +85,12 @@ pub struct PivotField {
     pub field: u32,
     /// Items not shown (and not counted), as their values.
     pub hidden: Vec<Value>,
+    pub sort: AxisSort,
 }
 
 impl PivotField {
     pub fn new(field: u32) -> Self {
-        PivotField { field, hidden: Vec::new() }
+        PivotField { field, hidden: Vec::new(), sort: AxisSort::Default }
     }
 }
 
@@ -247,6 +251,14 @@ pub fn item_order(a: &Value, b: &Value) -> Ordering {
         (Value::Err(x), Value::Err(y)) => (*x as u8).cmp(&(*y as u8)),
         _ => rank(a).cmp(&rank(b)),
     }
+}
+
+fn order_manual(items: &mut [Value], prior: &[Value]) {
+    let mut position = HashMap::new();
+    for (i, item) in prior.iter().enumerate() {
+        position.entry(key(item)).or_insert(i);
+    }
+    items.sort_by_cached_key(|item| position.get(&key(item)).copied().unwrap_or(usize::MAX));
 }
 
 /// How an item shows as a label.
@@ -434,6 +446,22 @@ impl Workbook {
         }
     }
 
+    /// Resolves a sort value field by its saved caption or unambiguous source name.
+    pub fn pivot_sort_value(&self, p: &Pivot, caption: &str) -> Option<(usize, Agg)> {
+        if let Some((i, field)) = p.data.iter().enumerate()
+            .find(|(_, field)| self.data_caption(p, field).eq_ignore_ascii_case(caption))
+        {
+            return Some((i, field.agg));
+        }
+        let mut matches = p.data.iter().enumerate().filter(|(_, field)| {
+            let name = self.pivot_field_name(p, field.field);
+            name.eq_ignore_ascii_case(caption)
+                || (field.name.is_none() && format!("{} - {name}", field.agg.label()).eq_ignore_ascii_case(caption))
+        });
+        let (i, field) = matches.next()?;
+        matches.next().is_none().then_some((i, field.agg))
+    }
+
     fn check_pivot(&self, p: &Pivot) -> Result<(), &'static str> {
         let s = &p.source;
         if s.sheet as usize >= self.sheet_count() || p.dest.sheet as usize >= self.sheet_count() {
@@ -461,6 +489,9 @@ impl Workbook {
         for f in all {
             if f.field >= width && !grouped.contains(&f.field) {
                 return Err("a field outside the source");
+            }
+            if !f.sort.valid() {
+                return Err("invalid pivot sort settings");
             }
             if seen.contains(&f.field) {
                 return Err("a field on two axes");
@@ -712,11 +743,23 @@ impl Workbook {
         bad
     }
 
-    /// The distinct items of a source or grouped column, in display order.
+    /// Items of a source or grouped column in field order before aggregate sorting.
     pub fn pivot_items(&self, p: &Pivot, field: u32) -> Vec<Value> {
         let grouping = p.groups.iter().find(|group| group.field == field)
             .map(|group| Grouping::new(self, p, group));
-        self.axis(p, field, grouping.as_ref()).map(|a| a.items).unwrap_or_default()
+        let sort = p.rows.iter().chain(&p.cols).chain(&p.pages).find(|f| f.field == field)
+            .map_or(&AxisSort::Default, |f| &f.sort);
+        self.axis(p, field, grouping.as_ref(), sort).map(|a| a.items).unwrap_or_default()
+    }
+
+    /// Items to serialize, including saved manual positions for absent members.
+    pub fn pivot_export_items(&self, p: &Pivot, field: &PivotField) -> Vec<Value> {
+        let mut items = self.pivot_items(p, field.field);
+        if let AxisSort::Manual(prior) = &field.sort {
+            order::add_missing(&mut items, prior);
+            order_manual(&mut items, prior);
+        }
+        items
     }
 
     fn pivot_item(&self, p: &Pivot, row: u32, field: u32, grouping: Option<&Grouping>) -> (Value, Option<f64>) {
@@ -726,7 +769,7 @@ impl Workbook {
         )
     }
 
-    fn axis(&self, p: &Pivot, field: u32, grouping: Option<&Grouping>) -> Result<Axis, &'static str> {
+    fn axis(&self, p: &Pivot, field: u32, grouping: Option<&Grouping>, sort: &AxisSort) -> Result<Axis, &'static str> {
         let s = &p.source;
         let mut seen: HashMap<Key, ()> = HashMap::new();
         let mut items = Vec::new();
@@ -740,13 +783,22 @@ impl Workbook {
                 }
             }
         }
-        items.sort_by(|(a, ak), (b, bk)| match (ak, bk) {
-            (Some(a), Some(b)) => a.total_cmp(b),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            _ => item_order(a, b),
-        });
-        Ok(Axis { items: items.into_iter().map(|(item, _)| item).collect() })
+        if *sort != AxisSort::Source {
+            items.sort_by(|(a, ak), (b, bk)| {
+                let order = match (ak, bk) {
+                    (Some(a), Some(b)) => a.total_cmp(b),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    _ => item_order(a, b),
+                };
+                if matches!(sort, AxisSort::Name { descending: true }) { order.reverse() } else { order }
+            });
+        }
+        let mut items: Vec<_> = items.into_iter().map(|(item, _)| item).collect();
+        if let AxisSort::Manual(prior) = sort {
+            order_manual(&mut items, prior);
+        }
+        Ok(Axis { items })
     }
 
     /// The pivot's output, computed, not written.
@@ -758,7 +810,7 @@ impl Workbook {
             .map(|group| (group.field, Grouping::new(self, p, group))).collect();
         let mut axes: HashMap<u32, (Axis, HashMap<Key, u32>)> = HashMap::new();
         for f in &fields {
-            let ax = self.axis(p, f.field, groups.get(&f.field))?;
+            let ax = self.axis(p, f.field, groups.get(&f.field), &f.sort)?;
             let hidden: Vec<Key> = f.hidden.iter().map(key).collect();
             let kept: Vec<Value> = ax.items.into_iter().filter(|v| !hidden.contains(&key(v))).collect();
             let idx = kept.iter().enumerate().map(|(i, v)| (key(v), i as u32)).collect();
@@ -809,6 +861,11 @@ impl Workbook {
         row_paths.sort();
         let mut col_paths: Vec<Path> = col_paths.into_keys().collect();
         col_paths.sort();
+        let value_field = |caption: &str| self.pivot_sort_value(p, caption);
+        let row_order = Order::new(&p.rows, false, &row_paths, &acc, value_field);
+        let col_order = Order::new(&p.cols, true, &col_paths, &acc, value_field);
+        row_order.sort(&mut row_paths);
+        col_order.sort(&mut col_paths);
         let items = |field: u32, i: u32| -> Value { label(&axes[&field].0.items[i as usize]) };
 
         // Rows of the body: (path, is a subtotal of that prefix).
@@ -979,7 +1036,8 @@ impl Workbook {
                     .or_else(|| p.cols.iter().position(|f| f.field == field).map(|level| Slot { column: true, level }))
             });
             let items = field.and_then(|field| axes.get(&field)).map(|(_, items)| items);
-            Display::new(&data.show_as, slot, items, &acc, i, data.agg)
+            let order = if slot.is_some_and(|slot| slot.column) { &col_order } else { &row_order };
+            Display::new(&data.show_as, slot, items, &acc, i, data.agg, order)
         }).collect();
         let value = |rp: &[u32], h: &ColHead| -> Value {
             let agg = p.data.get(h.data).map_or(Agg::Count, |d| d.agg);
@@ -1121,8 +1179,9 @@ impl Pivot {
         w.var(self.dest.col as u64);
         let display = self.data.iter().any(|d| d.show_as != ShowAs::Normal);
         let grouped = !self.groups.is_empty();
+        let sorted = self.rows.iter().chain(&self.cols).chain(&self.pages).any(|f| f.sort != AxisSort::Default);
         w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2
-            | (self.compact as u8) << 3 | (display as u8) << 4 | (grouped as u8) << 5);
+            | (self.compact as u8) << 3 | (display as u8) << 4 | (grouped as u8) << 5 | (sorted as u8) << 6);
         for axis in [&self.rows, &self.cols, &self.pages] {
             w.var(axis.len() as u64);
             for f in axis {
@@ -1130,6 +1189,9 @@ impl Pivot {
                 w.var(f.hidden.len() as u64);
                 for v in &f.hidden {
                     put_value(w, v);
+                }
+                if sorted {
+                    f.sort.encode(w);
                 }
             }
         }
@@ -1166,7 +1228,7 @@ impl Pivot {
             return Err(WireError::Invalid("pivot place"));
         }
         let flags = r.u8()?;
-        if flags & !63 != 0 {
+        if flags & !127 != 0 {
             return Err(WireError::Invalid("pivot flags"));
         }
         let mut axes = Vec::new();
@@ -1180,7 +1242,8 @@ impl Pivot {
                 for _ in 0..h {
                     hidden.push(get_value(r)?);
                 }
-                v.push(PivotField { field, hidden });
+                let sort = if flags & 64 == 0 { AxisSort::Default } else { AxisSort::decode(r)? };
+                v.push(PivotField { field, hidden, sort });
             }
             axes.push(v);
         }

@@ -82,16 +82,16 @@ fn axis_mut(p: &mut Pivot, a: Area) -> Option<&mut Vec<PivotField>> {
     }
 }
 
-/// Field `f` taken out of every area; its hidden items kept, for an axis it goes back to.
-fn take(p: &mut Pivot, f: u32) -> Vec<Value> {
-    let mut hidden = Vec::new();
+/// Preserve the field's settings when it moves from one axis to another.
+fn take(p: &mut Pivot, f: u32) -> Option<PivotField> {
+    let mut field = None;
     for v in [&mut p.rows, &mut p.cols, &mut p.pages] {
         if let Some(i) = v.iter().position(|x| x.field == f) {
-            hidden = v.remove(i).hidden;
+            field = Some(v.remove(i));
         }
     }
     p.data.retain(|d| d.field != f);
-    hidden
+    field
 }
 
 /// Runs `f` on a copy of pivot `i` and puts it in place (one undo step), or says why not.
@@ -119,13 +119,13 @@ pub fn place(d: &mut Doc, i: usize, f: u32, to: Option<Area>) -> Result<(), Stri
         if area_of(p, f) == to {
             return;
         }
-        let hidden = take(p, f);
+        let field = take(p, f);
         match to {
             Some(Area::Values) => {
                 let agg = if numeric(wb, p, f) { Agg::Sum } else { Agg::Count };
                 p.data.push(DataField { field: f, agg, name: None, show_as: Default::default() });
             }
-            Some(a) => axis_mut(p, a).unwrap().push(PivotField { field: f, hidden }),
+            Some(a) => axis_mut(p, a).unwrap().push(field.unwrap_or_else(|| PivotField::new(f))),
             None => {}
         }
     })

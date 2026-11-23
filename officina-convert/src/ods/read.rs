@@ -1196,9 +1196,22 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:data-pilot-member" => {
                         let a = attrs(e);
                         if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
-                            if a.get("table:display").is_some_and(|v| v == "false") && f.hidden.len() < officina_grid::pivot::MAX_ITEMS {
-                                f.hidden.push(a.get("table:name").cloned().unwrap_or_default());
+                            if let Some(name) = a.get("table:name").filter(|_| f.members.len() < officina_grid::pivot::MAX_ITEMS) {
+                                f.members.push(name.clone());
+                                if a.get("table:display").is_some_and(|v| v == "false") {
+                                    f.hidden.push(name.clone());
+                                }
                             }
+                        }
+                    }
+                    b"table:data-pilot-sort-info" => {
+                        if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            let a = attrs(e);
+                            f.sort = Some(super::pivot::SortIn {
+                                mode: a.get("table:sort-mode").cloned().unwrap_or_default(),
+                                descending: a.get("table:order").is_some_and(|v| v == "descending"),
+                                caption: a.get("table:data-field").cloned().unwrap_or_default(),
+                            });
                         }
                     }
                     b"table:data-pilot-field-reference" => {

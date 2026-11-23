@@ -123,8 +123,8 @@ fn several_values_counts_averages_and_no_subtotals() {
 fn filters_hidden_items_and_refresh() {
     let mut wb = book();
     let mut p = Pivot::new("P", src(), CellAddr::new(0, 10, 0));
-    p.rows = vec![PivotField { field: 1, hidden: vec![Value::str("BO")] }];
-    p.pages = vec![PivotField { field: 2, hidden: vec![Value::str("Q2")] }];
+    p.rows = vec![PivotField { hidden: vec![Value::str("BO")], ..PivotField::new(1) }];
+    p.pages = vec![PivotField { hidden: vec![Value::str("Q2")], ..PivotField::new(2) }];
     p.data = vec![sum(3)];
     let i = wb.add_pivot(p).unwrap();
     assert_eq!(grid(&wb, i), rows(&[&["Quarter", "Q1"], &[], &["Rep", "Sum of Units"], &["Ana", "11"], &["Cy", "7"], &["Grand Total", "18"]]));
@@ -167,7 +167,7 @@ fn bad_pivots_are_refused() {
 fn native_files_keep_pivots() {
     let mut wb = book();
     let mut p = Pivot::new("Sales by rep", src(), CellAddr::new(0, 0, 7));
-    p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo"), Value::Num(3.0)] }];
+    p.rows = vec![PivotField::new(0), PivotField { hidden: vec![Value::str("Bo"), Value::Num(3.0)], ..PivotField::new(1) }];
     p.cols = vec![PivotField::new(2)];
     p.data = vec![sum(3), DataField { field: 4, agg: Agg::Max, name: Some("Top".into()), show_as: Default::default() }];
     p.grand_col = false;

@@ -122,6 +122,11 @@ fn saved_status(d: &Doc, format: Format) -> String {
     if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !p.groups.is_empty()) {
         status.push_str(" Excel export saved grouped ODS pivot tables as cell values.");
     }
+    if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| {
+        p.rows.iter().chain(&p.cols).any(|f| matches!(f.sort, officina_grid::pivot::AxisSort::Data { .. }))
+    }) {
+        status.push_str(" Excel export uses label sort for ODS pivot fields sorted by values.");
+    }
     if format == Format::Ods {
         use officina_grid::formula::ast::Expr;
 

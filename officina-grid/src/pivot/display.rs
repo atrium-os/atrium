@@ -1,6 +1,6 @@
 //! Display calculations operate on the aggregates of a single value field.
 
-use super::{Acc, Key, get_value, key, put_value};
+use super::{Acc, Key, Order, get_value, key, put_value};
 use crate::value::{ErrorKind, Value};
 use officina_core::wire::{Reader, WireError, Writer};
 use std::collections::HashMap;
@@ -183,6 +183,7 @@ pub(super) struct Display<'a> {
     mode: &'a ShowAs,
     slot: Option<Slot>,
     named: Option<u32>,
+    order: &'a Order,
     peers: HashMap<Path, Vec<u32>>,
     series: HashMap<Path, Vec<Value>>,
 }
@@ -195,6 +196,7 @@ impl<'a> Display<'a> {
         acc: &HashMap<Path, Vec<Acc>>,
         field: usize,
         agg: super::Agg,
+        order: &'a Order,
     ) -> Self {
         let named = match mode {
             ShowAs::Reference {
@@ -222,7 +224,8 @@ impl<'a> Display<'a> {
                 }
             }
             for (paths, siblings) in &mut peers {
-                siblings.sort_unstable();
+                let parent = &slot.path(&paths.0, &paths.1)[..slot.level];
+                siblings.sort_unstable_by_key(|&item| order.key(parent, item));
                 if matches!(mode, ShowAs::Reference { .. }) {
                     continue;
                 }
@@ -260,13 +263,29 @@ impl<'a> Display<'a> {
             named,
             peers,
             series,
+            order,
         }
     }
 
     fn series_value(&self, row: &[u32], col: &[u32]) -> Option<(&[Value], usize)> {
         let (paths, item) = self.slot?.key(row, col)?;
-        let index = self.peers.get(&paths)?.binary_search(&item).ok()?;
+        let siblings = self.peers.get(&paths)?;
+        let index = self.peer_position(self.slot?, &paths, siblings, item)?;
         Some((self.series.get(&paths)?, index))
+    }
+
+    fn peer_position(
+        &self,
+        slot: Slot,
+        paths: &Path,
+        siblings: &[u32],
+        item: u32,
+    ) -> Option<usize> {
+        let parent = &slot.path(&paths.0, &paths.1)[..slot.level];
+        let target = self.order.key(parent, item);
+        siblings
+            .binary_search_by_key(&target, |&id| self.order.key(parent, id))
+            .ok()
     }
 
     pub fn value(&self, row: &[u32], col: &[u32], raw: impl Fn(&[u32], &[u32]) -> Value) -> Value {
@@ -312,7 +331,7 @@ impl<'a> Display<'a> {
                     BaseItem::Named(_) => self.named,
                     BaseItem::Previous | BaseItem::Next => {
                         self.peers.get(&paths).and_then(|peers| {
-                            let index = peers.binary_search(&current).ok()?;
+                            let index = self.peer_position(slot, &paths, peers, current)?;
                             let next = if matches!(item, BaseItem::Next) {
                                 index.checked_add(1)
                             } else {

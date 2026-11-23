@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
-use officina_grid::pivot::{same_item, Agg, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
+use officina_grid::pivot::{same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
 use officina_grid::{CellAddr, ErrorKind, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
@@ -54,7 +54,8 @@ fn axis_fields(p: &Pivot) -> Vec<&PivotField> {
 }
 
 fn field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
-    let mut items = wb.pivot_items(p, field);
+    let mut items = axis_fields(p).into_iter().find(|f| f.field == field)
+        .map_or_else(|| wb.pivot_items(p, field), |f| wb.pivot_export_items(p, f));
     // Keep named bases addressable if the source edit removes their last row.
     for data in &p.data {
         if let ShowAs::Reference { field: base, item: BaseItem::Named(value), .. } = &data.show_as {
@@ -235,6 +236,14 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         if pf.is_some() && axis == Some("axisPage") && pf.is_some_and(|x| x.hidden.len() > 0) {
             o.push_str(r#" multipleItemSelectionAllowed="1""#);
         }
+        if let Some(field) = pf {
+            let sort = match field.sort {
+                AxisSort::Manual(_) | AxisSort::Source => "manual",
+                AxisSort::Name { descending: true } => "descending",
+                _ => "ascending",
+            };
+            let _ = write!(o, r#" sortType="{sort}""#);
+        }
         if !p.subtotals && axis.is_some() {
             o.push_str(r#" defaultSubtotal="0""#);
         }
@@ -368,6 +377,8 @@ struct FieldIn {
     hidden: Vec<u32>,
     /// Shared-item index addressed by each position in this pivot field's items.
     items: Vec<Option<u32>>,
+    sort: Option<String>,
+    scoped_sort: bool,
     /// Shown in compact form (`compact`, default on) and outline form (`outline`).
     compact: bool,
     outline: bool,
@@ -411,7 +422,8 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                     let subtotal = attr(&e, b"defaultSubtotal")?.is_none_or(|v| v != "0" && v != "false");
                     let on = |v: Option<String>| v.is_none_or(|v| v != "0" && v != "false");
                     let (compact, outline) = (on(attr(&e, b"compact")?), on(attr(&e, b"outline")?));
-                    fields.push(FieldIn { subtotal, compact, outline, ..Default::default() });
+                    let sort = attr(&e, b"sortType")?;
+                    fields.push(FieldIn { subtotal, compact, outline, sort, ..Default::default() });
                 }
                 b"item" => {
                     if let Some(f) = fields.last_mut().filter(|f| f.items.len() < officina_grid::pivot::MAX_ITEMS) {
@@ -420,6 +432,11 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                         if attr(&e, b"h")?.is_some_and(|v| v == "1" || v == "true") {
                             f.hidden.extend(x);
                         }
+                    }
+                }
+                b"autoSortScope" => {
+                    if let Some(field) = fields.last_mut() {
+                        field.scoped_sort = true;
                     }
                 }
                 b"rowFields" => list = 1,
@@ -492,20 +509,44 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         let items = c.items.get(f as usize);
         fields.get(f as usize).map(|x| x.hidden.iter().filter_map(|&i| items.and_then(|v| v.get(i as usize)).cloned()).collect()).unwrap_or_default()
     };
-    let field = |f: i64| (f >= 0).then(|| PivotField { field: f as u32, hidden: hidden(f as u32) });
+    let field = |f: u32, rep: &mut Report| {
+        let sort = fields.get(f as usize).map_or(AxisSort::Default, |field| {
+            if field.scoped_sort {
+                rep.note(Kind::Approximate, "pivot sort by a scoped value field (refresh uses label order)");
+            }
+            match field.sort.as_deref() {
+                Some("descending") => AxisSort::Name { descending: true },
+                None | Some("manual") if !field.items.is_empty() => {
+                    let mut items = Vec::new();
+                    for index in field.items.iter().flatten() {
+                        if let Some(item) = c.items.get(f as usize).and_then(|items| items.get(*index as usize)) {
+                            items.push(item.clone());
+                        } else {
+                            rep.note(Kind::Approximate, "pivot manual item order with missing cache entries");
+                        }
+                    }
+                    if items.is_empty() { AxisSort::Default } else { AxisSort::Manual(items) }
+                }
+                _ => AxisSort::Default,
+            }
+        });
+        PivotField { field: f, hidden: hidden(f), sort }
+    };
     let page_top = r0.saturating_sub(if pages_n > 0 { pages_n + 1 } else { 0 });
     let mut p = Pivot::new(&name, source, CellAddr::new(sheet, page_top, c0));
-    p.rows = rows.iter().filter_map(|&f| field(f)).collect();
-    p.cols = cols.iter().filter_map(|&f| field(f)).collect();
+    p.rows = rows.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
+    p.cols = cols.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
     if rows.contains(&-2) {
         rep.note(Kind::Approximate, "pivot table values shown down the rows (shown across)");
     }
     for (f, item) in pages {
-        let mut pf = PivotField { field: f, hidden: hidden(f) };
+        let mut pf = field(f, rep);
         if let Some(i) = item {
-            // One item picked: the rest hidden.
+            // A page selection addresses the pivot items, not the shared cache.
+            let index = fields.get(f as usize).and_then(|field| field.items.get(i as usize))
+                .copied().flatten().unwrap_or(i);
             if let Some(all) = c.items.get(f as usize) {
-                pf.hidden = all.iter().enumerate().filter(|(k, _)| *k as u32 != i).map(|(_, v)| v.clone()).collect();
+                pf.hidden = all.iter().enumerate().filter(|(k, _)| *k as u32 != index).map(|(_, v)| v.clone()).collect();
             }
         }
         p.pages.push(pf);

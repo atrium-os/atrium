@@ -2,6 +2,7 @@
 # Run in the private 1280x720 Sheets desktop fixture. Stage the two books
 # from the sheets_interop_fixture example in the only Scrinium place, and
 # stage the arm64 FreeBSD build of that example at /tmp/sheets-interop-fixture.
+# Use SHEETS_INTEROP_CASE=pivot_order and /tmp/sheets-pivot-order-fixture for pivot item ordering.
 # Use SHEETS_INTEROP_CASE=pivot_display and /tmp/sheets-pivot-display-fixture for pivot calculations.
 # Set SHEETS_INTEROP_CASE=tables for the sheets_table_chart_fixture inputs
 # and stage its binary at /tmp/sheets-table-chart-fixture instead.
@@ -26,7 +27,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -61,6 +62,7 @@ checkpoint() {
         annotations) /tmp/sheets-annotations-fixture check "$1" "$2" "$format" ;;
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
         pivot_display) /tmp/sheets-pivot-display-fixture check "$1" "$2" "$format" ;;
+        pivot_order) /tmp/sheets-pivot-order-fixture check "$1" "$2" "$format" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
@@ -762,14 +764,17 @@ for format in ods xlsx; do
     sleep .4
     cp selectscreen.png "$results/$format-initial.png"
 
-    "$profile"
+    case "$profile" in
+        pivot_order) pivot_display ;;
+        *) "$profile" ;;
+    esac
     close_book
 
     open_book "$row" "$book" "$final"
     sleep .4
     cp selectscreen.png "$results/$format-reopened.png"
     case "$profile" in
-        pivot_display) pivot_display_reopened ;;
+        pivot_display|pivot_order) pivot_display_reopened ;;
         layout) scroll_layout ;;
         annotations) check_reopened_validation ;;
         print) print_pdf ;;

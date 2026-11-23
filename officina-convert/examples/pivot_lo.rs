@@ -34,7 +34,7 @@ fn book() -> Workbook {
     wb.recalc();
     let src = Rect { sheet: 0, r0: 0, c0: 0, r1: 8, c1: 4 };
     let mut p = Pivot::new("Units by region", src, CellAddr::new(1, 2, 1));
-    p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo")] }];
+    p.rows = vec![PivotField::new(0), PivotField { hidden: vec![Value::str("Bo")], ..PivotField::new(1) }];
     p.cols = vec![PivotField::new(2)];
     p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None, show_as: Default::default() }];
     // COMPACT=1: this one in compact form.
@@ -42,7 +42,7 @@ fn book() -> Workbook {
     wb.add_pivot(p).unwrap();
     let mut q = Pivot::new("Prices", src, CellAddr::new(0, 0, 7));
     q.rows = vec![PivotField::new(1)];
-    q.pages = vec![PivotField { field: 0, hidden: vec![Value::str("South")] }];
+    q.pages = vec![PivotField { hidden: vec![Value::str("South")], ..PivotField::new(0) }];
     q.data = vec![DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()), show_as: Default::default() }, DataField { field: 3, agg: Agg::Max, name: None, show_as: Default::default() }];
     q.subtotals = false;
     wb.add_pivot(q).unwrap();

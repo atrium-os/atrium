@@ -30,13 +30,13 @@ pub fn book() -> Workbook {
     wb.recalc();
     let src = Rect { sheet: 0, r0: 0, c0: 0, r1: 7, c1: 4 };
     let mut p = Pivot::new("Units by region", src, CellAddr::new(1, 2, 1));
-    p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo")] }];
+    p.rows = vec![PivotField::new(0), PivotField { hidden: vec![Value::str("Bo")], ..PivotField::new(1) }];
     p.cols = vec![PivotField::new(2)];
     p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None, show_as: Default::default() }];
     wb.add_pivot(p).unwrap();
     let mut q = Pivot::new("Prices", src, CellAddr::new(0, 0, 7));
     q.rows = vec![PivotField::new(1)];
-    q.pages = vec![PivotField { field: 0, hidden: vec![Value::str("South")] }];
+    q.pages = vec![PivotField { hidden: vec![Value::str("South")], ..PivotField::new(0) }];
     q.data = vec![DataField { field: 4, agg: Agg::Average, name: Some("Mean price".into()), show_as: Default::default() }, DataField { field: 3, agg: Agg::Count, name: None, show_as: Default::default() }];
     q.subtotals = false;
     q.grand_col = false;
@@ -72,7 +72,7 @@ fn xlsx_round_trip() {
     let file = xlsx::write(&wb, Vec::new()).unwrap();
     let t = part(&file, "xl/pivotTables/pivotTable1.xml");
     assert!(t.contains(r#"<location ref="B3:F12" firstHeaderRow="1" firstDataRow="2" firstDataCol="2"/>"#), "{t}");
-    assert!(t.contains(r#"<pivotField axis="axisRow" compact="0" outline="0" showAll="0"><items count="6"><item x="0"/><item x="1" h="1"/>"#), "{t}");
+    assert!(t.contains(r#"<pivotField axis="axisRow" compact="0" outline="0" showAll="0" sortType="ascending"><items count="6"><item x="0"/><item x="1" h="1"/>"#), "{t}");
     assert!(t.contains(r#"<rowFields count="2"><field x="0"/><field x="1"/></rowFields><colFields count="1"><field x="2"/></colFields><dataFields count="1"><dataField name="Sum of Units" fld="3" baseField="0" baseItem="0"/>"#), "{t}");
     let c = part(&file, "xl/pivotCache/pivotCacheDefinition1.xml");
     assert!(c.contains(r#"<worksheetSource ref="A1:E8" sheet="Data"/>"#), "{c}");
@@ -98,7 +98,7 @@ fn xlsx_compact_round_trip() {
     wb.set_pivot(0, p).unwrap();
     let file = xlsx::write(&wb, Vec::new()).unwrap();
     let t = part(&file, "xl/pivotTables/pivotTable1.xml");
-    assert!(!t.contains(r#"compact="0""#) && t.contains(r#"<pivotField axis="axisRow" showAll="0">"#), "{t}");
+    assert!(!t.contains(r#"compact="0""#) && t.contains(r#"<pivotField axis="axisRow" showAll="0" sortType="ascending">"#), "{t}");
     assert!(part(&file, "xl/pivotTables/pivotTable2.xml").contains(r#"compact="0""#));
     let (back, loaded) = xlsx::read(&file).unwrap();
     assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
@@ -221,4 +221,46 @@ fn ods_intervals_and_calendar_groups_survive_save_and_rebucket_source_edits() {
         let (reopened, _) = ods::read(&ods::write(&reopened, Vec::new()).unwrap()).unwrap();
         output(&reopened, after, [6.0, 12.0]);
     }
+}
+
+#[test]
+fn ods_value_sort_and_running_totals_are_independent_under_column_parents() {
+    use officina_grid::pivot::{AxisSort, ShowAs};
+
+    let at = |r, c| CellAddr::new(0, r, c);
+    let mut book = Workbook::new();
+    book.add_sheet("Source").unwrap();
+    for (col, header) in (0..).zip(["Region", "Store", "Sales"]) {
+        book.set_value(at(0, col), Value::str(header));
+    }
+    for (row, (region, store, sales)) in (1..).zip([
+        ("North", "A", 1.0), ("North", "B", 9.0), ("South", "A", 8.0), ("South", "B", 2.0),
+    ]) {
+        book.set_value(at(row, 0), Value::str(region));
+        book.set_value(at(row, 1), Value::str(store));
+        book.set_value(at(row, 2), Value::Num(sales));
+    }
+    let source = Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 2 };
+    let mut pivot = Pivot::new("By region", source, at(0, 4));
+    pivot.cols = vec![PivotField::new(0), PivotField {
+        sort: AxisSort::Data { caption: "Sum - Sales".into(), descending: true },
+        ..PivotField::new(1)
+    }];
+    pivot.data = vec![
+        DataField { field: 2, agg: Agg::Sum, name: None, show_as: ShowAs::Normal },
+        DataField { field: 2, agg: Agg::Sum, name: Some("Running total".into()), show_as: ShowAs::RunningTotal(1) },
+    ];
+    pivot.subtotals = false;
+    pivot.grand_col = false;
+    book.add_pivot(pivot).unwrap();
+    let (mut book, loaded) = ods::read(&ods::write(&book, Vec::new()).unwrap()).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report);
+    let check = |book: &Workbook, labels: [&str; 4], running: [f64; 4]| {
+        assert_eq!([5, 7, 9, 11].map(|col| book.get(at(2, col))), labels.map(Value::str));
+        assert_eq!([6, 8, 10, 12].map(|col| book.get(at(4, col))), running.map(Value::Num));
+    };
+    check(&book, ["B", "A", "A", "B"], [9.0, 10.0, 8.0, 10.0]);
+    book.set_value(at(1, 2), Value::Num(10.0));
+    book.refresh_pivot(0).unwrap();
+    check(&book, ["A", "B", "A", "B"], [10.0, 19.0, 8.0, 10.0]);
 }

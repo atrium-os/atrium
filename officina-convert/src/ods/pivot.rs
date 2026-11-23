@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use officina_grid::addr::{col_name, Rect, MAX_COLS};
 use officina_grid::pivot::{
-    same_item, Agg, BaseItem, DataField, DatePart, GroupField, GroupKind, ItemGroup,
+    same_item, Agg, AxisSort, BaseItem, DataField, DatePart, GroupField, GroupKind, ItemGroup,
     Pivot, PivotField, ReferenceCalc, ShowAs, MAX_GROUPS,
 };
 use officina_grid::{CellAddr, Value, Workbook};
@@ -135,6 +135,22 @@ fn group_xml(out: &mut String, wb: &Workbook, p: &Pivot, field: u32) {
     }
 }
 
+fn sort_xml(out: &mut String, sort: &AxisSort) {
+    let (mode, descending, caption) = match sort {
+        AxisSort::Default => return,
+        AxisSort::Manual(_) => ("manual", false, None),
+        AxisSort::Source => ("none", false, None),
+        AxisSort::Name { descending } => ("name", *descending, None),
+        AxisSort::Data { caption, descending } => ("data", *descending, Some(caption)),
+    };
+    let order = if descending { "descending" } else { "ascending" };
+    let _ = write!(out, r#"<table:data-pilot-sort-info table:sort-mode="{mode}" table:order="{order}""#);
+    if let Some(caption) = caption {
+        let _ = write!(out, r#" table:data-field="{}""#, esc(caption));
+    }
+    out.push_str("/>");
+}
+
 /// `table:data-pilot-tables`, or nothing.
 pub fn tables_xml(wb: &Workbook) -> String {
     let mut pivots = wb.pivots().iter().enumerate()
@@ -156,9 +172,10 @@ pub fn tables_xml(wb: &Workbook) -> String {
         let field = |o: &mut String, f: &PivotField, orient: &str, sub: bool| {
             let _ = write!(o, r#"<table:data-pilot-field table:source-field-name="{}" table:orientation="{orient}" table:used-hierarchy="-1" table:function="auto""#, esc(&wb.pivot_field_name(p, f.field)));
             // A page with one item shown: that item is its selected page.
-            let items = wb.pivot_items(p, f.field);
-            let shown: Vec<&Value> = items.iter().filter(|v| !f.hidden.iter().any(|h| same_item(h, v))).collect();
+            let items = wb.pivot_export_items(p, f);
             if orient == "page" && !f.hidden.is_empty() {
+                let existing = wb.pivot_items(p, f.field);
+                let shown: Vec<_> = existing.iter().filter(|v| !f.hidden.iter().any(|h| same_item(h, v))).collect();
                 if let [one] = shown[..] {
                     let _ = write!(o, r#" table:selected-page="{}""#, esc(&member(one)));
                 } else {
@@ -176,7 +193,9 @@ pub fn tables_xml(wb: &Workbook) -> String {
             }
             // LibreOffice keeps the compact form as its own extension.
             let compact = if p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
-            let _ = write!(o, r#"</table:data-pilot-members><table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level>"#);
+            o.push_str("</table:data-pilot-members>");
+            sort_xml(o, &f.sort);
+            let _ = write!(o, r#"<table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level>"#);
             group_xml(o, wb, p, f.field);
             o.push_str("</table:data-pilot-field>");
         };
@@ -225,8 +244,17 @@ pub struct FieldIn {
     /// LibreOffice's compact form (`loext:layout-mode="compact-layout"`).
     pub compact: bool,
     pub hidden: Vec<String>,
+    pub members: Vec<String>,
+    pub sort: Option<SortIn>,
     pub reference: Option<ReferenceIn>,
     pub group: Option<GroupIn>,
+}
+
+#[derive(Default, Debug)]
+pub struct SortIn {
+    pub mode: String,
+    pub descending: bool,
+    pub caption: String,
 }
 
 #[derive(Default, Debug)]
@@ -397,7 +425,12 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                 continue;
             }
             let items = wb.pivot_items(&p, x);
-            let find = |n: &str| items.iter().find(|v| member(v).eq_ignore_ascii_case(n)).cloned().unwrap_or_else(|| if n.is_empty() { Value::Empty } else { Value::str(n) });
+            let mut members = std::collections::HashMap::new();
+            for value in &items {
+                members.entry(member(value).to_lowercase()).or_insert(value);
+            }
+            let find = |name: &str| members.get(&name.to_lowercase()).map(|value| (*value).clone())
+                .unwrap_or_else(|| if name.is_empty() { Value::Empty } else { Value::str(name) });
             let mut hidden: Vec<Value> = f.hidden.iter().map(|n| find(n)).collect();
             if let Some(sel) = f.selected.as_ref().filter(|_| !f.ignore_selected) {
                 if f.orient == "page" {
@@ -405,7 +438,22 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                     hidden = items.iter().filter(|v| !same_item(v, &keep)).cloned().collect();
                 }
             }
-            let pf = PivotField { field: x, hidden };
+            let sort = match f.sort.as_ref() {
+                None => AxisSort::Default,
+                Some(sort) => match sort.mode.as_str() {
+                    "none" => AxisSort::Source,
+                    "manual" => AxisSort::Manual(f.members.iter().map(|n| find(n)).collect()),
+                    "name" => AxisSort::Name { descending: sort.descending },
+                    "data" if !sort.caption.is_empty() && sort.caption.len() <= officina_grid::strings::MAX_TEXT => AxisSort::Data {
+                        caption: Arc::from(sort.caption.as_str()), descending: sort.descending,
+                    },
+                    _ => {
+                        rep.note(Kind::Approximate, "unrecognized pivot item sort (refresh uses label order)");
+                        AxisSort::Default
+                    }
+                },
+            };
+            let pf = PivotField { field: x, hidden, sort };
             match f.orient.as_str() {
                 "row" => {
                     subtotals |= f.subtotals;
@@ -423,6 +471,14 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
         if let Some(w) = bad {
             why(rep, &w);
             continue;
+        }
+        for field in p.rows.iter().chain(&p.cols) {
+            if let AxisSort::Data { caption, .. } = &field.sort {
+                if wb.pivot_sort_value(&p, caption).is_none() {
+                    rep.note_at(Kind::Approximate, "pivot sort refers to an unavailable value field (refresh uses label order)",
+                        || format!("{}: {caption}", t.name));
+                }
+            }
         }
         if multi_on_rows && p.data.len() > 1 {
             rep.note(Kind::Approximate, "pivot table values shown down the rows (shown across)");
