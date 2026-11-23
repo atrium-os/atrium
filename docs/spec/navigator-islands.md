@@ -430,10 +430,19 @@ for `org.atrium.player.embedded`. Native placement failed before the clip
 GET. The separate native probe received correlated decoder acknowledgements
 for 0.5 and 1.5 seconds while paused and verified both Fresco frame colours.
 See `~/atrium-vm/evidence/navigator-i4-installed-chapters-20261123/`.
-The installed page still needs clip fetch, append, both chapter presses and
-corresponding frames verified before attempting YouTube.
-Fingerprint testing is
-deferred.
+On 2026-11-23 the installed gate passed after adding the single writable
+mount source `/atrium/sockets/workers` to the private overlay's jaild
+policy, validating it and restarting jaild. The installed browser fetched
+the local watch document, island HTML, external script and 1,672-byte VP9
+clip. Ladybird and the native player ran in separate jails with IPv4 and
+IPv6 disabled. With playback paused, pressing Next chapter, Opening and
+Next chapter again produced blue, red and blue frames. The native playhead
+moved to x=471, 371 and 471 on the two-second timeline, matching 1.5,
+0.5 and 1.5 seconds. The installed gate observed the compositor output;
+the earlier probe recorded the decoder acknowledgements separately.
+See `~/atrium-vm/evidence/navigator-i4-installed-chapters-worker-20261123/`.
+The real YouTube embed remains the next playback test. Fingerprint
+verification is deferred.
 
 ## 6a. Sign-in: SSO and WebAuthn
 
