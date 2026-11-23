@@ -201,7 +201,7 @@ pub fn invite(text: &str, me: &[String]) -> Option<Invite> {
                 inv.attendees = inv.attendees.saturating_add(1);
                 let a = mailto(&value);
                 if me.iter().any(|m| *m == a) {
-                    inv.my_status = params.iter().find(|(k, _)| k == "PARTSTAT").map(|(_, v)| clean(&v.to_ascii_uppercase(), 32));
+                    inv.my_status = Some(params.iter().find(|(k, _)| k == "PARTSTAT").map_or_else(|| "NEEDS-ACTION".into(), |(_, v)| clean(&v.to_ascii_uppercase(), 32)));
                 }
             }
             _ => {}
@@ -219,7 +219,7 @@ pub fn invite(text: &str, me: &[String]) -> Option<Invite> {
 
 fn mailto(v: &str) -> String {
     let v = v.trim();
-    let v = if v.len() >= 7 && v[..7].eq_ignore_ascii_case("mailto:") { &v[7..] } else { v };
+    let v = if v.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) { &v[7..] } else { v };
     clean(v, 320).to_ascii_lowercase()
 }
 

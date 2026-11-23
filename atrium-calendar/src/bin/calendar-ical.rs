@@ -208,6 +208,7 @@ impl Event {
             excluded: vec![],
             source: None,
             import_hash: None,
+            invitation: None,
         };
         for d in &self.skipped {
             if !self.weekly
@@ -229,7 +230,20 @@ impl Event {
     }
 }
 
+#[cfg(test)]
 fn parse(bytes: &[u8]) -> Result<Candidates> {
+    match parse_mode(bytes, false)? {
+        Outcome::Ready(c) => Ok(c),
+        _ => Err(Issue::Format),
+    }
+}
+fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
+    use portcullis_ipc::calendar::address;
+    let mut organizer = None;
+    let mut sequence = None;
+    let mut attendees = Vec::new();
+    let mut location = None;
+    let mut request = false;
     if bytes.len() > FILE_LIMIT {
         return Err(Issue::Limit);
     }
@@ -303,11 +317,67 @@ fn parse(bytes: &[u8]) -> Result<Candidates> {
                     "VERSION" if !version && v == "2.0" => version = true,
                     "CALSCALE" if v.eq_ignore_ascii_case("GREGORIAN") => {}
                     "PRODID" => {}
-                    "METHOD" if v.eq_ignore_ascii_case("PUBLISH") => {}
+                    "METHOD"
+                        if invitation
+                            && !request
+                            && params.is_empty()
+                            && v.eq_ignore_ascii_case("REQUEST") =>
+                    {
+                        request = true
+                    }
+                    "METHOD" if !invitation && v.eq_ignore_ascii_case("PUBLISH") => {}
                     "METHOD" => return Err(Issue::Scheduling),
                     "X-WR-TIMEZONE" => return Err(Issue::Zone),
                     k if k.starts_with("X-") => omitted = true,
                     _ => return Err(Issue::Format),
+                },
+                Some("VEVENT") if invitation => match key.as_str() {
+                    "ORGANIZER" | "ATTENDEE" => {
+                        let a = v
+                            .get(..7)
+                            .filter(|s| s.eq_ignore_ascii_case("mailto:"))
+                            .and_then(|_| v.get(7..))
+                            .filter(|a| address(a))
+                            .ok_or(Issue::Scheduling)?
+                            .to_ascii_lowercase();
+                        if params.iter().any(|p| {
+                            let name = p.split_once('=').map(|(k, _)| k.to_ascii_uppercase());
+                            !matches!(
+                                name.as_deref(),
+                                Some("CN")
+                                    | Some("PARTSTAT")
+                                    | Some("RSVP")
+                                    | Some("ROLE")
+                                    | Some("CUTYPE")
+                            )
+                        }) {
+                            return Err(Issue::Scheduling);
+                        }
+                        if key == "ORGANIZER" {
+                            once(&mut organizer, a)?;
+                        } else if attendees.len() < 256 {
+                            attendees.push(a);
+                        } else {
+                            return Err(Issue::Limit);
+                        }
+                    }
+                    "SEQUENCE" if params.is_empty() => once(
+                        &mut sequence,
+                        v.parse::<u32>().map_err(|_| Issue::Scheduling)?,
+                    )?,
+                    "LOCATION" if params.is_empty() => once(
+                        &mut location,
+                        if v.is_empty() {
+                            String::new()
+                        } else {
+                            title(v)?
+                        },
+                    )?,
+                    "RECURRENCE-ID" | "EXDATE" | "RRULE" | "RDATE" | "EXRULE" => {
+                        return Err(Issue::Recurrence)
+                    }
+                    "URL" | "ATTACH" | "LOCATION" | "SEQUENCE" => return Err(Issue::Component),
+                    _ => event.property(&key, &params, v, &mut omitted)?,
                 },
                 Some("VEVENT") => event.property(&key, &params, v, &mut omitted)?,
                 Some("VALARM") => {}
@@ -317,6 +387,20 @@ fn parse(bytes: &[u8]) -> Result<Candidates> {
     }
     if !ended || !version || events.is_empty() {
         return Err(Issue::Format);
+    }
+    if invitation {
+        if !request || events.len() != 1 {
+            return Err(Issue::Scheduling);
+        }
+        let e = &events[0];
+        return Ok(Outcome::Invitation(atrium_calendar::invitation::Proposal {
+            uid: e.uid.clone().ok_or(Issue::Format)?,
+            sequence: sequence.unwrap_or(0),
+            organizer: organizer.ok_or(Issue::Scheduling)?,
+            attendees,
+            location: location.unwrap_or_default(),
+            row: e.row()?,
+        }));
     }
     let mut masters = HashMap::new();
     let mut rows = Vec::new();
@@ -354,20 +438,20 @@ fn parse(bytes: &[u8]) -> Result<Candidates> {
         }
     }
     rows.sort_by_key(|e| (e.date, e.span.start));
-    Ok(Candidates {
+    Ok(Outcome::Ready(Candidates {
         rows,
         omitted_details: omitted,
-    })
+    }))
 }
 
-fn handle(_: Parse, file: Option<File>) -> std::result::Result<Parsed, String> {
+fn handle(ask: Parse, file: Option<File>) -> std::result::Result<Parsed, String> {
     let mut bytes = Vec::new();
     file.ok_or("missing file")?
         .take(FILE_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "read failed")?;
-    let outcome = match parse(&bytes) {
-        Ok(rows) => Outcome::Ready(rows),
+    let outcome = match parse_mode(&bytes, ask.invitation) {
+        Ok(outcome) => outcome,
         Err(issue) => Outcome::Blocked(issue),
     };
     let schedule = serde_json::to_vec(&outcome).map_err(|_| "encoding failed")?;
@@ -400,6 +484,98 @@ mod tests {
     const STUDIO: &str = include_str!("../../tests/fixtures/studio.ics");
     fn date(s: &str) -> NaiveDate {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn reviewed_mail_invitation_changes_only_after_confirmation() {
+        use portcullis_ipc::calendar::Source;
+        let file = include_str!("../../tests/fixtures/invitation.ics");
+        let read = |s: &str| match parse_mode(s.as_bytes(), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!(),
+        };
+        let week = date("2026-12-01");
+        let src = Source {
+            account: 7,
+            from: "mina@fixture.invalid".into(),
+            identities: vec!["dev@fixture.invalid".into()],
+            verified: true,
+            reply_destination_matches: true,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let proposal = read(file);
+        let review = s.review_invitation(0, &src, proposal.clone()).unwrap();
+        assert!(review.previous.is_none());
+        assert!(s.day(week).entries.is_empty());
+        s.apply_invitation(0, review.token.unwrap()).unwrap();
+        let changed = file
+            .replace("SEQUENCE:1", "SEQUENCE:2")
+            .replace("T140000Z", "T150000Z")
+            .replace("T144500Z", "T154500Z")
+            .replace("Studio A", "Studio B");
+        let r = s.review_invitation(1, &src, read(&changed)).unwrap();
+        assert_eq!(r.previous.unwrap().span.start, 840);
+        assert_eq!(s.day(week).entries[0].span.start, 840);
+        let original_token = r.token.unwrap();
+        for source in [
+            Source {
+                from: "other@fixture.invalid".into(),
+                ..src.clone()
+            },
+            Source {
+                verified: false,
+                ..src.clone()
+            },
+            Source {
+                reply_destination_matches: false,
+                ..src.clone()
+            },
+        ] {
+            assert!(s
+                .review_invitation(1, &source, read(&changed))
+                .unwrap()
+                .token
+                .is_none());
+        }
+        assert!(s.apply_invitation(1, original_token).is_err());
+        let r = s.review_invitation(1, &src, read(&changed)).unwrap();
+        s.apply_invitation(1, r.token.unwrap()).unwrap();
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.day(week).entries[0].span.start, 900);
+        assert!(s
+            .review_invitation(2, &src, proposal)
+            .unwrap()
+            .token
+            .is_none());
+        let same = s.review_invitation(2, &src, read(&changed)).unwrap();
+        assert!(!same.can_save);
+        assert!(s.apply_invitation(2, same.token.unwrap()).is_err());
+        assert!(s
+            .review_invitation(2, &src, read(&changed.replace("Studio B", "Studio C")))
+            .unwrap()
+            .token
+            .is_none());
+        assert!(s
+            .review_invitation(
+                2,
+                &Source {
+                    identities: vec!["other@fixture.invalid".into()],
+                    ..src
+                },
+                read(file)
+            )
+            .is_err());
+        for bad in [
+            file.replace("METHOD:REQUEST", "METHOD:CANCEL"),
+            file.replace("SUMMARY:", "RRULE:FREQ=WEEKLY\nSUMMARY:"),
+            file.replace("END:VCALENDAR", "BEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR"),
+            file.replace("END:VEVENT", "URL:https://fixture.invalid\nEND:VEVENT"),
+        ] {
+            assert!(parse_mode(bad.as_bytes(), true).is_err());
+        }
+        assert!(parse(file.as_bytes()).is_err());
     }
 
     #[test]

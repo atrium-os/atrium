@@ -7,6 +7,7 @@ publish = false
 default-run = "atrium-calendar"
 
 [dependencies]
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 atrium-message = { path = "../sdk/atrium-message" }
 atrium-worker = { path = "../sdk/atrium-worker" }
 sha2 = "0.10"
@@ -22,5 +23,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
+atrium-open = { path = "../atrium-open" }
 limen = { path = "../limen" }
 pergola = { path = "../pergola" }

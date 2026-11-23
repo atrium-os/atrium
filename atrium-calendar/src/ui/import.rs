@@ -17,6 +17,9 @@ const SLOT: u64 = 1;
 
 #[derive(Clone)]
 pub(super) enum Screen {
+    Invitation(super::invitations::Sheet),
+    InvitationProblem(String),
+    ReplyPrepared,
     Picking,
     Reading,
     Problem(String),
@@ -164,13 +167,14 @@ pub(super) fn prepare(file: File, revision: u64, socket: &Path) -> Result<Screen
         .map_err(|_| "Calendar format worker unavailable")?;
     let parsed: Parsed = workers
         .max_answer(FRAME_LIMIT + 16)
-        .call("ical", &Parse {}, Some(File::from(fd)))
+        .call("ical", &Parse { invitation: false }, Some(File::from(fd)))
         .map_err(|_| "Calendar format worker failed")?;
     let data: Candidates = match serde_json::from_slice(&parsed.schedule)
         .map_err(|_| "Invalid format worker reply")?
     {
         Outcome::Blocked(issue) => return Err(issue.message().into()),
         Outcome::Ready(c) => c,
+        _ => return Err("Expected a local calendar file".into()),
     };
     if data.rows.is_empty()
         || data.rows.len() > atrium_calendar::import::ROW_LIMIT
@@ -198,6 +202,47 @@ pub(super) fn prepare(file: File, revision: u64, socket: &Path) -> Result<Screen
 
 impl Planner {
     pub(super) fn render_import(&self, ctx: &mut Ctx, screen: Screen) {
+        match &screen {
+            Screen::Invitation(sheet) => {
+                sheet.render(self, ctx);
+                return;
+            }
+            Screen::InvitationProblem(reason) => {
+                Label::new("Invitation needs review")
+                    .at(18., 65.)
+                    .size(22.)
+                    .render(ctx);
+                Label::new(reason.clone()).at(18., 125.).render(ctx);
+                self.button(
+                    ctx,
+                    18.,
+                    535.,
+                    150.,
+                    "Back to calendar",
+                    Action::CloseImport,
+                );
+                return;
+            }
+            Screen::ReplyPrepared => {
+                Label::new("Review your response in Mail")
+                    .at(18., 65.)
+                    .size(22.)
+                    .render(ctx);
+                Label::new("Send in Mail delivers the response to the organizer.")
+                    .at(18., 125.)
+                    .render(ctx);
+                self.button(
+                    ctx,
+                    18.,
+                    535.,
+                    150.,
+                    "Back to calendar",
+                    Action::CloseImport,
+                );
+                return;
+            }
+            _ => {}
+        }
         Label::new("Import calendar file")
             .at(18., 65.)
             .size(22.)
@@ -206,6 +251,9 @@ impl Planner {
             .at(18., 107.)
             .render(ctx);
         match screen {
+            Screen::Invitation(_) | Screen::InvitationProblem(_) | Screen::ReplyPrepared => {
+                unreachable!()
+            }
             Screen::Picking => {
                 Label::new("Choose an .ics file in Files.")
                     .at(18., 160.)

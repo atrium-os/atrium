@@ -98,6 +98,13 @@ impl Engine {
 
     /// [`Engine::send`], signed and/or encrypted with S/MIME (§10.1).
     pub fn send_protected(&self, account: AccountId, draft: &Draft, when: When, protect: crate::smime::Protect) -> Result<u64, Error> {
+        self.queue_message(account, draft, when, protect, None)
+    }
+
+    pub(crate) fn queue_message(
+        &self, account: AccountId, draft: &Draft, when: When,
+        protect: crate::smime::Protect, invitation: Option<(&str, u32)>,
+    ) -> Result<u64, Error> {
         let t = now();
         let undo = when.undo_secs.clamp(*UNDO_SEND_RANGE.start(), *UNDO_SEND_RANGE.end());
         let later = when.later.filter(|l| *l > t + undo);
@@ -125,7 +132,10 @@ impl Engine {
             if let Some(due) = follow_up {
                 wr.set_follow_up(&o.message_id, account, due)?;
             }
-            wr.queue_send(&o)
+            match invitation {
+                Some((key, sequence)) => wr.queue_invitation(key, sequence, &o),
+                None => wr.queue_send(&o),
+            }
         })?)
     }
 

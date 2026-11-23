@@ -11,7 +11,9 @@ pub const FRAME_LIMIT: usize = 256 << 10;
 
 #[derive(Message)]
 #[message(version = 1)]
-pub struct Parse {}
+pub struct Parse {
+    pub invitation: bool,
+}
 #[derive(Message)]
 #[message(version = 1)]
 pub struct Parsed {
@@ -35,6 +37,7 @@ pub enum Prepared {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Outcome {
     Ready(Candidates),
+    Invitation(crate::invitation::Proposal),
     Blocked(Issue),
 }
 

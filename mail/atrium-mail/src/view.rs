@@ -120,6 +120,7 @@ pub const FRAME_SLOT: pergola::slot::SlotKey = 0x4d41_494c;
 /// A message's body in the reader.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Body {
+    pub invitation: bool,
     pub plain: Option<Plain>,
     /// The HTML body, shown in the doc-viewer when this message is framed.
     pub document: Option<Doc>,
@@ -598,6 +599,7 @@ pub struct Mail {
     dark: Rc<std::cell::Cell<bool>>,
     /// Messages whose remote pictures the person asked for, for the app
     /// to fetch through Nuntius (§7.4); Mail itself has no network.
+    pub invitation_ask: Rc<RefCell<Option<(MsgId,[u8;16])>>>,
     loads: Rc<RefCell<Vec<MsgId>>>,
     /// Monstrator's answer to *Open*, from the thread that asked.
     opened: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
@@ -1098,13 +1100,14 @@ impl Mail {
                 }
                 let note = match (&r.text, &r.document) {
                     _ if r.pgp_encrypted => Some("This message is encrypted with OpenPGP. Mail can't decrypt it here yet: reading it needs your private key in Arca, which is still to come.".to_string()),
+                    (None, _) if r.summary.parts.iter().any(|p| p.kind == mail_schema::PartKind::Calendar) => None,
                     (None, _) => Some("Only the headers are here so far; the text comes with the next sync.".to_string()),
                     (Some(t), None) if r.has_html && t.trim().is_empty() => Some("This message's HTML couldn't be shown.".to_string()),
                     _ => None,
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
                 let files = r.attachments.iter().map(crate::files::file).collect();
-                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files, card: r.card, pgp: r.pgp.as_ref().map(sender::pgp_line) }
+                Body { invitation: r.summary.parts.iter().any(|p| p.kind == mail_schema::PartKind::Calendar), plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files, card: r.card, pgp: r.pgp.as_ref().map(sender::pgp_line) }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -3123,6 +3126,7 @@ pub enum Item {
     Smime(usize),
     /// "Signed with OpenPGP by …" (§10.2).
     Pgp(usize),
+    Invitation(usize),
     /// A note (headers only, HTML only, couldn't open), one line of it.
     Note(String),
     /// "New since you last looked" (§11.1).
@@ -3208,6 +3212,7 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        if b.invitation { out.push(Item::Invitation(k)); }
         if b.pgp.is_some() {
             out.push(Item::Pgp(k));
             out.push(Item::Gap);
@@ -3332,6 +3337,7 @@ impl MailView {
             chips_h: Rc::default(),
             now: Rc::new(now),
             dark: Rc::default(),
+            invitation_ask: Rc::default(),
             loads: Rc::default(),
             opened: Default::default(),
             monstrator: Rc::new(monstrator::socket()),
@@ -4509,6 +4515,15 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         Item::RepliesTo(k) => {
             let r = s.msgs[*k].sender.replies_to.clone().unwrap_or_default();
             text(ctx, x, cy, &fit(&format!("Replies go to {r}"), type_size::XS, Weight::Regular, tw), type_size::XS, Weight::Regular, t.warning_fg());
+        }
+        Item::Invitation(k) => {
+            let m=mail.clone();
+            let msg=s.msgs[*k].msg;
+            area(ctx,Rect::new(x,cy-em(12.),em(205.),em(24.)),t.bg_window(),move || {
+                if let Some(press)=pergola::clipboard::current_activation() { *m.invitation_ask.borrow_mut()=Some((msg,press)); }
+            });
+            text(ctx,x+em(8.),cy,"Review in Calendar…",type_size::SM,Weight::Semibold,t.text_primary());
+            ctx.pop();
         }
         Item::Smime(k) | Item::Pgp(k) => {
             let line = match item { Item::Smime(_) => s.msgs[*k].smime.as_ref(), _ => s.msgs[*k].body.as_ref().and_then(|b| b.pgp.as_ref()) };

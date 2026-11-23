@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 pub mod attachments;
+pub mod invitations;
 pub mod clock;
 pub mod compose;
 pub mod search;
@@ -218,9 +219,13 @@ impl Parser {
 
     /// As [`Parser::summarize_keyed`], answering DKIM/DMARC lookups with `dns`.
     pub fn summarize_with(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>], dns: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Option<Summary>>, Vec<(usize, String, Vec<u8>)>), Error> {
+        self.summarize_for(batch, headers_only, roots, dns, Vec::new())
+    }
+
+    fn summarize_for(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>], dns: &dyn Fn(&str) -> Option<String>, me: Vec<String>) -> Result<(Vec<Option<Summary>>, Vec<(usize, String, Vec<u8>)>), Error> {
         let mut j = self.start()?;
         let msgs: Vec<wire::Raw> = batch.iter().map(|(id, b)| wire::Raw { id: *id, bytes: b.to_vec() }).collect();
-        wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
+        wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me, now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let lens = |id: u64| batch.iter().find(|(i, _)| *i == id).map(|(_, b)| b.len() as u64);
         let lookup_ids: Vec<_> = if headers_only { Vec::new() } else { batch.iter().map(|(id, _)| *id).collect() };

@@ -31,6 +31,8 @@ use mail_store::Store;
 use pergola::window::StepResult;
 use pergola::{App, SizeSpec, Window, WindowDesc};
 
+#[path = "atrium-mail/invitation.rs"]
+mod invitation;
 mod thumbnails;
 mod sanitized;
 
@@ -461,6 +463,9 @@ fn main() {
     let trace = std::env::var_os("MAIL_TRACE").is_some();
     let mut last = String::new();
     let mut refreshed = Instant::now();
+    let (reviewed, responses) = mpsc::channel();
+    let mut invite_pending = false;
+    let mut response_window: Option<invitation::ResponseWindow> = None;
     let mut composes: Vec<ComposeWin> = Vec::new();
     // Drafts whose windows were open last time open again.
     let reopen: Vec<u64> = std::fs::read_to_string(store_dir.join("open-drafts")).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect();
@@ -506,7 +511,7 @@ fn main() {
             };
             pergola::input::translate(ev).is_some_and(|e| mail.key(&e, activation))
         };
-        let wait = if !composes.is_empty() || settings.is_some() {
+        let wait = if response_window.is_some() || !composes.is_empty() || settings.is_some() {
             16
         } else if thumbnails.pending() {
             50
@@ -522,6 +527,38 @@ fn main() {
             }
         }
         mail.set_size(win.width, win.height);
+        if let Some((msg, press)) = mail.invitation_ask.borrow_mut().take() {
+            if invite_pending || response_window.is_some() {
+                mail.file_note("Finish the open invitation review first.".into());
+            } else {
+                match engine.selected_invitation(msg) {
+                    Ok(selected) => {
+                        let blob = selected.blob;
+                        let tx = reviewed.clone();
+                        invite_pending = true;
+                        std::thread::spawn(move || {
+                            let _ = tx.send((msg, blob, invitation::offer(selected, press)));
+                        });
+                    }
+                    Err(e) => mail.file_note(e.to_string()),
+                }
+            }
+        }
+        if let Ok((msg, blob, result)) = responses.try_recv() {
+            invite_pending = false;
+            match result.and_then(|reply| {
+                reply
+                    .map(|r| invitation::ResponseWindow::new(&engine, msg, blob, r))
+                    .transpose()
+            }) {
+                Ok(w) => response_window = w,
+                Err(e) => mail.file_note(e),
+            }
+        }
+        if let Some(note) = response_window.as_mut().and_then(|w| w.tick(&engine)) {
+            response_window = None;
+            mail.file_note(note);
+        }
         mail.poll_link();
         mail.tick();
         // Compose windows: links from other apps, replies, Undo of a send.

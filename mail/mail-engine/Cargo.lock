@@ -366,6 +366,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1256,6 +1265,7 @@ dependencies = [
  "arca-store",
  "atrium-links",
  "atrium-worker",
+ "chrono",
  "getrandom 0.2.17",
  "idna",
  "libc",
@@ -1269,6 +1279,7 @@ dependencies = [
  "navigator-fetch",
  "nuntius",
  "pgp",
+ "portcullis-ipc",
  "postcard",
  "rand",
  "rcgen",
@@ -1360,10 +1371,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "navigator-control"
+version = "0.1.0"
+dependencies = [
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "navigator-control",
  "nuntius",
  "rustls",
  "rustls-pki-types",

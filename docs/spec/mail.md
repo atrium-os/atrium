@@ -1359,11 +1359,7 @@ email" kind) are Loculus's aliased-identity item (loculus.md), out of scope here
 
 ### 14.1 Invites
 
-`text/calendar` parts (iTIP, RFC 5546) are parsed in the parse jail into a bounded card:
-title, time in the person's zone, organiser, location as text, attendees count, and
-conflicts with other invites Mail knows about. *Accept / Maybe / Decline* sends the iTIP
-reply by mail. Adding to a calendar waits for a calendar app (CalDAV), which is its own
-spec. No URL in an invite is fetched.
+Mail parses a bounded invitation summary in its parse jail. **Review in Calendar…** opens the selected calendar part in the same persona. Calendar compares a proposed move with the saved meeting. **Accept…**, **Maybe…** or **Decline…** returns a choice to the Mail message that started the review. Mail shows the sending identity, organizer, proposed time and response before **Send response**. Cancel leaves the outbox empty. Mail revalidates the original request and queues the single-recipient iTIP reply atomically with its revision receipt. The receipt survives delivery and restart. [Calendar invitation review and synthetic gate](calendar.md#711-reviewing-an-invitation-from-mail)
 
 ### 14.2 People
 

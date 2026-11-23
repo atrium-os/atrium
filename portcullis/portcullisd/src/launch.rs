@@ -861,7 +861,7 @@ fn launch_inner(
         recovery_mount = Some(mount);
         let option = if doc.recover { "--recover-document" } else if doc.blank { "--blank-document" } else { "--document" };
         jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option} {recovery_id}", manifest.entry())));
-    } else if (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
+    } else if calendar_window.is_some() || (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
         || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;

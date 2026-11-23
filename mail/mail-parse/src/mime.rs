@@ -31,6 +31,7 @@ pub struct Part {
     pub kind: PartKind,
     /// `type/subtype`, lower case.
     pub content_type: String,
+    pub calendar_method: Option<String>,
     pub charset: Option<String>,
     pub filename: Option<String>,
     pub content_id: Option<String>,
@@ -107,6 +108,7 @@ impl Walk<'_> {
                     path: path.clone(),
                     kind: PartKind::Multipart,
                     content_type: ct.value.clone(),
+            calendar_method: ct.get("method").map(|v| v.to_ascii_uppercase()),
                     charset: None,
                     filename: None,
                     content_id: None,
@@ -204,6 +206,7 @@ impl Walk<'_> {
             path,
             kind,
             content_type: ct.value.clone(),
+            calendar_method: ct.get("method").map(|v| v.to_ascii_uppercase()),
             charset,
             filename,
             content_id,

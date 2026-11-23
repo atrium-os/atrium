@@ -21,6 +21,7 @@ use search::{Results, SearchForm};
 mod editor;
 use editor::{Editor, Stage};
 mod import;
+mod invitations;
 use import::{Picker, Screen};
 mod overview;
 use overview::rect;
@@ -53,6 +54,8 @@ enum Action {
     OpenHit(Uuid, NaiveDate, u64),
     PickImport,
     CloseImport,
+    ApplyInvitation,
+    ReplyInvitation(portcullis_ipc::calendar::Answer),
     SaveImport,
     ImportPage(usize),
     NewZoned,
@@ -132,6 +135,12 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<Request, String> {
+        if matches!(action, Action::ApplyInvitation) {
+            let Some(Screen::Invitation(sheet)) = self.import.get_cloned() else {
+                return Err("Review the invitation first".into());
+            };
+            return sheet.save();
+        }
         if matches!(action, Action::SaveImport) {
             let Some(Screen::Ready {
                 revision, token, ..
@@ -255,6 +264,7 @@ impl Planner {
         };
         let entry = Entry {
             import_hash: None,
+            invitation: None,
             excluded: Vec::new(),
             zone: None,
             source: None,
@@ -647,10 +657,30 @@ pub fn run() -> io::Result<()> {
     let mut clock_name = std::fs::read_to_string(&clock_path).ok();
     let mut checked = std::time::Instant::now();
     let mut refresh_zone = false;
+    let invitations = invitations::listen();
     let mut picker: Option<Picker> = None;
     let (parsed, previews) = mpsc::channel();
 
     loop {
+        if matches!(
+            planner.import.get_cloned(),
+            None | Some(Screen::ReplyPrepared | Screen::InvitationProblem(_))
+        ) && planner.editor.get_cloned().is_none()
+            && planner.search.get_cloned().is_none()
+            && !planner.settings.get()
+            && !planner.waiting.get()
+        {
+            if let Some(day) = planner.data.get_cloned() {
+                if let Ok(incoming) = invitations.try_recv() {
+                    planner.import.set(Some(
+                        match incoming.and_then(|i| i.review(&socket, day.revision)) {
+                            Ok(sheet) => Screen::Invitation(sheet),
+                            Err(e) => Screen::InvitationProblem(e),
+                        },
+                    ));
+                }
+            }
+        }
         if let Some(result) = picker.as_mut().and_then(Picker::poll) {
             picker.take();
             match result {
@@ -707,6 +737,14 @@ pub fn run() -> io::Result<()> {
                 continue;
             }
             match action {
+                Action::ReplyInvitation(answer) => {
+                    if let Some(Screen::Invitation(sheet)) = planner.import.get_cloned() {
+                        planner.import.set(Some(match sheet.reply(&socket, answer) {
+                            Ok(()) => Screen::ReplyPrepared,
+                            Err(e) => Screen::InvitationProblem(e),
+                        }));
+                    }
+                }
                 Action::PickImport => {
                     match Picker::open(&mut win, args.get(1).map_or("personal", String::as_str)) {
                         Ok(p) => {
@@ -836,6 +874,7 @@ pub fn run() -> io::Result<()> {
                     let date = data.date;
                     if let Some(receipt) = data.undo {
                         let label = match action {
+                            Action::ApplyInvitation => "Undo invitation change",
                             Action::SaveImport => "Undo import",
                             Action::Change(true) => "Undo deletion",
                             Action::Change(false) => "Undo edit",
@@ -862,6 +901,7 @@ pub fn run() -> io::Result<()> {
                     if matches!(
                         action,
                         Action::Undo(_)
+                            | Action::ApplyInvitation
                             | Action::SaveImport
                             | Action::Today(_)
                             | Action::SetZone(_)
@@ -885,6 +925,7 @@ pub fn run() -> io::Result<()> {
                     }
                     planner.status.set(
                         match action {
+                            Action::ApplyInvitation => "Invitation saved on this device",
                             Action::SaveImport => "Local copies saved",
                             Action::Undo(_) => "Change undone on this device",
                             Action::OpenHit(..) => "Selected search result",
@@ -899,6 +940,9 @@ pub fn run() -> io::Result<()> {
                         }
                         .into(),
                     );
+                }
+                Err(e) if matches!(action, Action::ApplyInvitation) => {
+                    planner.import.set(Some(Screen::InvitationProblem(e)))
                 }
                 Err(e) if matches!(action, Action::SaveImport) => {
                     planner.import.set(Some(Screen::Problem(e)))

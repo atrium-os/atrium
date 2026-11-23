@@ -287,7 +287,12 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     let invite = s.parts.iter().find(|p| p.kind == mime::PartKind::Calendar).and_then(|p| {
         let bytes = mime::part_bytes(raw, p);
         let (text, _) = crate::decode::to_utf8(&bytes, p.charset.as_deref());
-        ical::invite(&text, ctx.me)
+        let i = ical::invite(&text, ctx.me)?;
+        let method = match i.method {
+            ical::Method::Request => "REQUEST", ical::Method::Reply => "REPLY", ical::Method::Cancel => "CANCEL",
+            ical::Method::Publish => "PUBLISH", ical::Method::Counter => "COUNTER", ical::Method::Other => "",
+        };
+        p.calendar_method.as_deref().is_none_or(|v| v == method).then_some(i)
     }).map(invite_wire);
 
     let addr = |a: &crate::address::Address| wire::Address { name: a.name.clone(), addr: a.addr.clone(), name_looks_like_address: a.name_looks_like_address };

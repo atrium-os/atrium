@@ -1,5 +1,6 @@
 //! One Fasti process owns one private, supervisor-provisioned persona directory.
 mod import;
+mod invitations;
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
 use chrono::NaiveDate;
@@ -40,6 +41,7 @@ struct UndoState {
 
 pub struct Store {
     preview: Option<import::Pending>,
+    invite: Option<invitations::Pending>,
     undo: Option<UndoState>,
     dir: PathBuf,
     _lock: File,
@@ -85,6 +87,7 @@ impl Store {
         };
         Ok(Self {
             preview: None,
+            invite: None,
             undo: None,
             dir: dir.into(),
             _lock: lock,
@@ -234,7 +237,8 @@ impl Store {
 
     pub fn add(&mut self, revision: u64, event: Entry) -> Result<UndoReceipt, String> {
         event.validate()?;
-        if event.import_hash.is_some()
+        if event.invitation.is_some()
+            || event.import_hash.is_some()
             || event.source.is_some()
             || !event.excluded.is_empty()
             || matches!(event.kind, Kind::Occurrence { .. })
@@ -444,6 +448,7 @@ impl Store {
             .map_err(|_| "Cannot publish calendar")?;
         let previous = std::mem::replace(&mut self.state, next);
         self.preview = None;
+        self.invite = None;
         self.undo = None;
         File::open(&self.dir)
             .and_then(|d| d.sync_all())

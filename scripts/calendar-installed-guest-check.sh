@@ -74,6 +74,27 @@ calendar_paths() {
     personal_jail=org_atrium_calendar
 }
 
+mail_jail=org_atrium_mail__p_work
+mail_folder="$home/.atrium/persona-apps/work/org.atrium.mail/nonexistent/.local/share/atrium-mail"
+start_mail() {
+    daemon -f -p "$D/mail-launch.pid" -o "$D/mail-work.log" su -m "$person" -c "$D/forum-dock launch org.atrium.mail --persona work"
+    for i in $(jot 30); do pgrep -j "$mail_jail" -x atrium-mail >/dev/null 2>&1 && break; sleep 1; done
+    pgrep -j "$mail_jail" -x atrium-mail >/dev/null
+}
+stop_mail() {
+    launcher=$(cat "$D/mail-launch.pid" 2>/dev/null || :)
+    if pid=$(pgrep -j "$mail_jail" -x atrium-mail 2>/dev/null); then kill -TERM "$pid"; fi
+    # Forum returns after Portcullis has finished unmounting the previous
+    # launch. The jail disappears earlier, while those mounts can still race.
+    for i in $(jot 25); do
+        if ! jls -j "$mail_jail" jid >/dev/null 2>&1; then
+            if [ -z "$launcher" ] || ! kill -0 "$launcher" 2>/dev/null; then return 0; fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # The keyboard driver observes compositor frames and sends only HID keys.
 # These commands handle the trusted lifecycle on the marked disposable guest.
 case "${2-}" in
@@ -105,7 +126,16 @@ case "${2-}" in
                 ;;
         esac
         exit 0 ;;
-    keyboard-setup|import-setup|'') ;;
+    invitation-check-empty)
+        stop_mail
+        ./invitation_probe empty "$mail_folder" "$D/mail-parse-jail"
+        start_mail
+        exit 0 ;;
+    invitation-submit)
+        stop_mail
+        ./invitation_probe submit "$mail_folder" "$D/mail-parse-jail"
+        exit 0 ;;
+    keyboard-setup|import-setup|invitation-setup|'') ;;
     *) exit 2 ;;
 esac
 
@@ -128,10 +158,11 @@ mkdir -p "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 daemon -f -o "$D/portcullis.log" env RUST_LOG=info /usr/local/bin/portcullisd --socket "$psock"
 activation="$D/act.sock"
-if [ "${2-}" = import-setup ]; then
+if [ "${2-}" = import-setup ] || [ "${2-}" = invitation-setup ]; then
     activation=/atrium/sockets/fresco-activation/fresco-activation.sock
     if sockstat -ul | grep -Fq "$activation"; then echo "activation socket in use" >&2; exit 1; fi
 fi
+if [ "${2-}" = invitation-setup ]; then export FRESCOD_INJECT_ACTIVATION=1; fi
 daemon -f -o "$D/fresco.log" env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG="$D/screen" FRESCOD_SOCK="$fsock" FRESCOD_WM_SOCK="$D/wm.sock" FRESCOD_INPUT_SOCK="$D/inject.sock" FRESCOD_ACTIVATION_SOCK="$activation" FRESCOD_DEV_CAPS=all "$D/frescod"
 for socket in "$psock" "$fsock" "$D/inject.sock"; do
     for i in $(jot 20); do test -S "$socket" && break; sleep 1; done
@@ -140,6 +171,47 @@ done
 chmod 666 "$psock" "$fsock"
 su -m "$person" -c "portcullis policy grant $app"
 su -m "$person" -c "$D/forum-dock list" | grep -F "$app"
+if [ "${2-}" = invitation-setup ]; then
+    if [ -d /var/lib/atrium/apps/org.atrium.mail ]; then
+        test -z "$(jls -n name | grep org_atrium_mail || :)"
+        mv /var/lib/atrium/apps/org.atrium.mail "$D/stock-mail"
+    fi
+    mkdir -p mail-app/bin
+    install -m 0555 atrium-mail mail-parse-jail mail-app/bin/
+    cat >mail-app/atrium.toml <<'MANIFEST'
+[app]
+id = "org.atrium.mail"
+name = "Mail"
+version = "0.1.0"
+entry = "bin/atrium-mail"
+[capabilities]
+graphics = "fresco"
+network = "none"
+open-attachments = true
+net-fetch = true
+[[workers]]
+name = "parse"
+entry = "bin/mail-parse-jail"
+[[links]]
+schemes = ["mailto"]
+[supervision]
+instances = "single"
+MANIFEST
+    opifex pack mail-app
+    openssl dgst -sha256 -sign /root/of-key.pem -out mail-app/atrium.toml.sig mail-app/atrium.toml
+    opifex install mail-app
+    su -m "$person" -c 'portcullis policy grant org.atrium.mail'
+    ./invitation_probe exercise "$D/standalone-store" "$D/mail-parse-jail"
+    ./invitation_probe seed "$D/seeded" "$D/mail-parse-jail"
+    start_mail
+    for i in $(jot 20); do test -f "$mail_folder/index.redb" && break; sleep 1; done
+    uid=$(stat -f %u "$mail_folder/index.redb")
+    stop_mail
+    cp -R seeded/. "$mail_folder"
+    chown -R "$uid:$uid" "$mail_folder"
+    start_mail
+    exit 0
+fi
 if [ "${2-}" = import-setup ]; then
     # Refresh the stock image's broker and its registry mount after restarting jaild.
     install -m 0555 limend /usr/local/bin/atrium-limend

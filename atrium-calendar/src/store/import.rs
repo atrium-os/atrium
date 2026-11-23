@@ -63,7 +63,8 @@ impl Store {
         // A format worker cannot point an exception at an existing meeting.
         validate_records(&rows)?;
         for row in &mut rows {
-            if row.kind == Kind::Hold
+            if row.invitation.is_some()
+                || row.kind == Kind::Hold
                 || row.import_hash.is_some()
                 || !row.span.valid()
                 || self.state.entries.iter().any(|e| e.id == row.id)
@@ -138,6 +139,7 @@ mod tests {
             excluded: vec![date],
             source: None,
             import_hash: None,
+            invitation: None,
         };
         let Prepared::New(token) = work
             .prepare_import(0, [1; 32], vec![weekly.clone()])

@@ -75,6 +75,7 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     assert_eq!(call(&socket, &query).unwrap().revision, 0);
     let event = Entry {
         import_hash: None,
+        invitation: None,
         excluded: Vec::new(),
         zone: None,
         source: None,

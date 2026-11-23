@@ -29,6 +29,20 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    ReviewInvitation {
+        revision: u64,
+        source: portcullis_ipc::calendar::Source,
+        proposal: crate::invitation::Proposal,
+    },
+    ApplyInvitation {
+        revision: u64,
+        token: uuid::Uuid,
+    },
+    CheckInvitation {
+        revision: u64,
+        token: uuid::Uuid,
+    },
+
     PrepareImport {
         revision: u64,
         hash: [u8; 32],
@@ -213,7 +227,8 @@ pub fn page(socket: &Path, request: &Request) -> Result<CalendarPage, String> {
     let page: CalendarPage = exchange(socket, request)?;
     if let Some(receipt) = page.undo {
         let revision = match request {
-            Request::SaveImport { revision, .. }
+            Request::ApplyInvitation { revision, .. }
+            | Request::SaveImport { revision, .. }
             | Request::Add { revision, .. }
             | Request::Release { revision, .. }
             | Request::Change { revision, .. } => *revision,
@@ -270,11 +285,14 @@ pub fn discard_import(socket: &Path, token: uuid::Uuid) -> Result<(), String> {
     exchange(socket, &Request::DiscardImport { token })
 }
 
-fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, String> {
+pub fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, String> {
     let mut s =
         UnixStream::connect(socket).map_err(|e| format!("Calendar service unavailable: {e}"))?;
     s.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let op = if matches!(request, Request::PrepareImport { .. }) {
+    let op = if matches!(
+        request,
+        Request::PrepareImport { .. } | Request::ReviewInvitation { .. }
+    ) {
         OP_PREPARE_IMPORT
     } else {
         OP_V1
@@ -300,11 +318,38 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
     let reply: Result<CalendarPage, String> =
         match read_frame(s, flag::RESPONSE_EXPECTED, 4096, None).and_then(|(op, req)| {
-            if (op == OP_PREPARE_IMPORT) != matches!(req, Request::PrepareImport { .. }) {
+            if (op == OP_PREPARE_IMPORT)
+                != matches!(
+                    req,
+                    Request::PrepareImport { .. } | Request::ReviewInvitation { .. }
+                )
+            {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             Ok(req)
         }) {
+            Ok(Request::ReviewInvitation {
+                revision,
+                source,
+                proposal,
+            }) => {
+                return send_op(
+                    s,
+                    flag::IS_RESPONSE,
+                    OP_PREPARE_IMPORT,
+                    &store.review_invitation(revision, &source, proposal),
+                );
+            }
+            Ok(Request::CheckInvitation { revision, token }) => {
+                return send(
+                    s,
+                    flag::IS_RESPONSE,
+                    &store.check_invitation(revision, token),
+                );
+            }
+            Ok(Request::ApplyInvitation { revision, token }) => store
+                .apply_invitation(revision, token)
+                .map(|(date, receipt)| mutation_page(store, date, Some(receipt))),
             Ok(Request::PrepareImport {
                 revision,
                 hash,

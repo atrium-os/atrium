@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use portcullis_toml::Capabilities;
 
+pub mod calendar;
 pub mod fdpass;
 pub use fdpass::{recv_fds, send_fds, send_fds_with};
 
@@ -433,6 +434,9 @@ pub enum Request {
 
     /// Issue or check a native bookmark against one held workbook descriptor.
     WorkbookBookmark { expected: Option<WorkbookBookmark> },
+
+    /// Mail spends a fresh press to open a private invitation session in its persona.
+    CalendarInvitation { activation: [u8; 16] },
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with

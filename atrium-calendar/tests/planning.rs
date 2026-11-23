@@ -11,6 +11,7 @@ fn span(start: u16, end: u16) -> Span {
 fn entry(kind: Kind, time: Span) -> Entry {
     Entry {
         import_hash: None,
+        invitation: None,
         excluded: Vec::new(),
         zone: None,
         source: None,

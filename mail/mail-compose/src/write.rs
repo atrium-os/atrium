@@ -318,6 +318,7 @@ fn param(name: &str, v: &str) -> String {
 
 fn mime_type(m: &str) -> String {
     let m = m.trim().to_ascii_lowercase();
+    if m == "text/calendar; method=reply" { return "text/calendar; method=REPLY".into(); }
     let token = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "!#$&-^_.+".contains(c));
     match m.split_once('/') {
         Some((a, b)) if token(a) && token(b) => m,

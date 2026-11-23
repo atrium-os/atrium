@@ -749,6 +749,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Attachments (mail.md §8.2): from a mail app, by its installed
          * manifest's `open-attachments`; a sealed memory file follows. */
+        if let Request::CalendarInvitation { activation } = req {
+            handle_calendar_invitation(uid, &owner, activation, &shared, &mut writer)?;
+            continue;
+        }
         if let Request::OpenAttachment { name, activation, app } = req {
             handle_open_attachment(uid, &owner, &name, activation, app.as_deref(), &shared, &mut writer, &reader)?;
             continue;
@@ -1833,6 +1837,77 @@ fn handle_open_download(
     }
     eprintln!("portcullisd: a download “{name}” ({}) from {} opened in {key} for {owner}", t.mime, caller.as_deref().unwrap_or("?"));
     write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })
+}
+
+/// Bind one private conversation between the signed Mail launch and its persona's
+/// Calendar. Neither application can name another recipient or persona.
+fn handle_calendar_invitation(
+    uid: u32,
+    owner: &str,
+    activation: [u8; 16],
+    shared: &Mutex<Tenants>,
+    writer: &mut UnixStream,
+) -> std::io::Result<()> {
+    use portcullisd::opens;
+    let result = (|| -> Result<UnixStream, String> {
+        let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .map_err(|e| e.to_string())?;
+        let pin = std::fs::read_to_string("/etc/atrium/calendar-publisher")
+            .map_err(|_| "Calendar is not provisioned")?;
+        let publisher = reg
+            .publisher(uid)
+            .flatten()
+            .ok_or("A signed Mail launch is required")?;
+        if reg.resolve(uid) != Some((owner, "org.atrium.mail"))
+            || hex::encode(publisher) != pin.trim()
+            || !launch::app_opens_attachments("org.atrium.mail")
+        {
+            return Err("This Mail launch cannot offer invitations".into());
+        }
+        let persona = reg.persona(uid).ok_or("Unknown Mail persona")?;
+        may_run_unasked(calendar::APP, owner, shared)?;
+        let socket = opens::activation_socket();
+        opens::spend_press_for(
+            &socket,
+            activation,
+            uid,
+            fresco_protocol::activation::purpose::LINK,
+        )?;
+        let (mail, cal) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let key = opens::channel_key(calendar::APP, persona);
+        let hub = opens::Hub::global();
+        hub.listen(&key).map_err(|e| e.to_string())?;
+        match hub
+            .deliver(
+                owner,
+                &key,
+                "Invitation",
+                portcullis_ipc::calendar::MIME,
+                false,
+                cal.into(),
+            )
+            .map_err(|e| e.to_string())?
+        {
+            opens::Delivery::Queued => {
+                start_for_instance(calendar::APP, persona, owner, "to review an invitation")
+            }
+            opens::Delivery::Sent => {
+                if let Some(target) = launch::instance_uid(owner, calendar::APP, persona) {
+                    if let Err(why) = opens::raise(&socket, target) {
+                        eprintln!("portcullisd: could not raise Calendar: {why}");
+                    }
+                }
+            }
+        }
+        Ok(mail)
+    })();
+    match result {
+        Ok(s) => {
+            write_response(writer, &Response::ReadyForFds)?;
+            portcullis_ipc::send_fds(writer, &[s.as_raw_fd()])
+        }
+        Err(message) => write_response(writer, &Response::Error { message }),
+    }
 }
 
 /// OpenAttachment (mail.md §8.2): the caller holds `open-attachments`;
@@ -3982,7 +4057,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::CalendarInvitation { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

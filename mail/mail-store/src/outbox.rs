@@ -16,6 +16,8 @@ pub(crate) const OUTBOX: TableDefinition<u64, &[u8]> = TableDefinition::new("out
 pub(crate) const JMAP_SUBMISSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_submissions");
 pub(crate) const JMAP_ACCEPTED: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_accepted_sends");
 
+// (source key, organizer revision) -> outbox operation. Keep after submission.
+const INVITE_REPLIES: TableDefinition<(&str, u32), u64> = TableDefinition::new("invitation_responses");
 const RECENT_ACCEPTED: u64 = 24;
 const CANCELED_BY_SERVER: &str = "The JMAP server canceled this submission.";
 
@@ -122,7 +124,23 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Put `o` in the outbox; its id.
+    pub(crate) fn clear_invitation_replies(&mut self, account: AccountId) -> Result<()> {
+        let prefix = format!("{account}/");
+        self.tx.open_table(INVITE_REPLIES)?.retain(|(key, _), _| !key.starts_with(&prefix))?;
+        Ok(())
+    }
+
+    /// Atomically record the RSVP and the outgoing message.
+    pub fn queue_invitation(&mut self, key: &str, sequence: u32, o: &Outgoing) -> Result<u64> {
+        if self.tx.open_table(INVITE_REPLIES)?
+            .range((key, sequence)..=(key, u32::MAX))?.next().transpose()?.is_some() {
+            return Err(Error::Db("A response is already queued or sent for this or a newer revision".into()));
+        }
+        let id = self.queue_send(o)?;
+        self.tx.open_table(INVITE_REPLIES)?.insert((key, sequence), id)?;
+        Ok(id)
+    }
+
     pub fn queue_send(&mut self, o: &Outgoing) -> Result<u64> {
         let id = Store::next_id(self.tx, "send")?;
         self.tx.open_table(OUTBOX)?.insert(id, enc(o).as_slice())?;
@@ -139,6 +157,7 @@ impl Writer<'_> {
             return Ok(None);
         }
         t.remove(id)?;
+        self.tx.open_table(INVITE_REPLIES)?.retain(|_, queued| queued != id)?;
         self.tx.open_table(JMAP_SUBMISSIONS)?.remove(id)?;
         Ok(Some(o))
     }

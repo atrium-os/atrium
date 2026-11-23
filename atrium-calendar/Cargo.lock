@@ -47,12 +47,14 @@ dependencies = [
  "aqueduct",
  "atrium-listen",
  "atrium-message",
+ "atrium-open",
  "atrium-worker",
  "chrono",
  "chrono-tz",
  "libc",
  "limen",
  "pergola",
+ "portcullis-ipc",
  "portcullis-peer",
  "serde",
  "serde_json",
@@ -98,6 +100,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "atrium-open"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
