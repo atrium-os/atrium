@@ -682,6 +682,14 @@ unreachable. A separate reconnect used a distinct Crypta attempt.
 Fresh confirmation produced one POST, one redemption, and
 `crypta-ac-ok` through ocserv on `tun11`.
 
+The overlap variant disconnected that newest requeued proposal and
+queued Sign In for a distinct attempt before the old jail closed. A
+press on the stale confirmation sent zero POSTs. The queued window
+opened after teardown without another Sign In request. The tunnel
+handshake and IPv4 sentinel waited for fresh confirmation. Exactly
+one POST led to one token redemption and `crypta-ac-ok` through ocserv
+on `tun11`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
