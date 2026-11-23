@@ -312,7 +312,7 @@ fn settings_window() {
         let qid = engine.store.imports().unwrap().first().map(|(q, _)| *q);
         engine.store.write(|w| {
             let q = match qid { Some(q) => q, None => w.queue_import(nowhere, blob)? };
-            (0..mail_store::imports::TRIES_MAX).try_for_each(|_| w.import_failed(q, "the server has no folder Nowhere"))
+            (0..mail_store::imports::TRIES_MAX).try_for_each(|_| w.jmap_import_refused(q, "the server has no folder Nowhere"))
         }).unwrap();
     };
     give_up();
