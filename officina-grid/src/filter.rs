@@ -12,6 +12,9 @@ use crate::column::Sizes;
 use crate::eval::funcs::text_key;
 use crate::value::Value;
 
+mod text;
+pub use text::{wildcard_regex, Test, TextOp, TextTest, MAX_TESTS};
+
 /// What a filtered column keeps.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cond {
@@ -22,6 +25,8 @@ pub enum Cond {
     /// `= <> < <= > >=`; two joined by and (`true`) or or.
     Compare(Vec<(String, f64)>, bool),
     Rank(Rank),
+    /// Custom numeric and text tests joined by AND (true) or OR.
+    Custom(Vec<Test>, bool),
 }
 
 /// Top or bottom numeric cells by count or percentage.
@@ -102,6 +107,13 @@ impl FilterState {
                                 w.f64(*x);
                             }
                         }
+                        Cond::Custom(tests, and) => {
+                            w.u8(if *and { 5 } else { 4 });
+                            w.var(tests.len() as u64);
+                            for test in tests {
+                                test.encode(w);
+                            }
+                        }
                         Cond::Rank(rank) => {
                             w.u8(3);
                             w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
@@ -178,6 +190,14 @@ impl FilterState {
                             Cond::Rank(Rank::new(limit, flags & 1 != 0, flags & 2 != 0)
                                 .ok_or(WireError::Invalid("rank filter limit"))?)
                         }
+                        t @ (4 | 5) => {
+                            let n = r.count("custom tests", MAX_TESTS as u64, 4)?;
+                            if n == 0 {
+                                return Err(WireError::Invalid("empty custom filter"));
+                            }
+                            let tests = (0..n).map(|_| Test::decode(r)).collect::<Result<_, _>>()?;
+                            Cond::Custom(tests, t == 5)
+                        }
                         _ => return Err(WireError::Invalid("filter kind")),
                     };
                     conds.push((c, cond));
@@ -191,7 +211,19 @@ impl FilterState {
 }
 
 impl Cond {
-    fn keeps(&self, wb: &Workbook, addr: CellAddr, cutoff: Option<f64>) -> bool {
+    /// Keep the original numeric wire kind for existing one- and two-test rules.
+    pub fn custom(tests: Vec<Test>, and: bool) -> Self {
+        if tests.len() <= 2 && tests.iter().all(|t| matches!(t, Test::Number(..))) {
+            Self::Compare(tests.into_iter().filter_map(|t| match t {
+                Test::Number(op, x) => Some((op, x)),
+                Test::Text(_) => None,
+            }).collect(), and)
+        } else {
+            Self::Custom(tests, and)
+        }
+    }
+
+    fn keeps(&self, wb: &Workbook, addr: CellAddr, cutoff: Option<f64>, prepared: &[text::Prepared<'_>]) -> bool {
         match self {
             Cond::Values(vals) => {
                 let k = text_key(&wb.formatted(addr).text);
@@ -213,6 +245,12 @@ impl Cond {
                 } else {
                     cs.iter().any(test)
                 }
+            }
+            Cond::Custom(_, and) => {
+                let value = wb.get(addr);
+                let shown = wb.formatted(addr).text;
+                let test = |t: &text::Prepared<'_>| t.keeps(&value, &shown);
+                if *and { prepared.iter().all(test) } else { prepared.iter().any(test) }
             }
             Cond::Rank(rank) => {
                 let (Value::Num(x), Some(y)) = (wb.get(addr), cutoff) else { return false };
@@ -325,10 +363,14 @@ impl Workbook {
                 Cond::Rank(rank) => self.rank_cutoff(f.rect, *col, *rank),
                 _ => None,
             }).collect();
+            let prepared: Vec<Vec<_>> = f.conds.iter().map(|(_, cond)| match cond {
+                Cond::Custom(tests, _) => tests.iter().map(Test::prepare).collect(),
+                _ => Vec::new(),
+            }).collect();
             let mut run: Option<(u32, u32)> = None;
             for r in f.rect.r0 + 1..=f.rect.r1 {
-                let keep = f.conds.iter().zip(&cutoffs).all(|((c, cond), cutoff)| {
-                    cond.keeps(self, CellAddr::new(sheet, r, *c), *cutoff)
+                let keep = f.conds.iter().zip(&cutoffs).zip(&prepared).all(|(((c, cond), cutoff), tests)| {
+                    cond.keeps(self, CellAddr::new(sheet, r, *c), *cutoff, tests)
                 });
                 if !keep {
                     run = match run {

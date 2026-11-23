@@ -12,7 +12,7 @@ use std::sync::Arc;
 use officina_grid::addr::{a1, Rect};
 use officina_grid::eval::arrays;
 use officina_grid::formula;
-use officina_grid::filter::Cond;
+use officina_grid::filter::{Cond, Test, TextOp, TextTest};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::xlsx::MDW;
@@ -33,6 +33,72 @@ const FUTURE_WS: &[&str] = &["FILTER", "SORT"];
 
 /// The cell-metadata part dynamic array formulas point at (`cm="1"`).
 const METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray"><metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#;
+
+fn filter_comparison(op: &str) -> &'static str {
+    match op {
+        "<>" => "notEqual",
+        "<" => "lessThan",
+        "<=" => "lessThanOrEqual",
+        ">" => "greaterThan",
+        ">=" => "greaterThanOrEqual",
+        _ => "equal",
+    }
+}
+
+fn excel_text_test(test: &TextTest) -> Option<(&'static str, String)> {
+    use TextOp::*;
+    if test.case_sensitive {
+        return None;
+    }
+    let quoted = || {
+        let mut quoted = String::new();
+        for ch in test.value.chars() {
+            if matches!(ch, '~' | '*' | '?') {
+                quoted.push('~');
+            }
+            quoted.push(ch);
+        }
+        quoted
+    };
+    Some(match test.op {
+        Wildcard => ("equal", test.value.clone()),
+        NotWildcard => ("notEqual", test.value.clone()),
+        Begins | NotBegins | Ends | NotEnds | Contains | NotContains => {
+            let needle = quoted();
+            let value = match test.op {
+                Begins | NotBegins => format!("{needle}*"),
+                Ends | NotEnds => format!("*{needle}"),
+                _ => format!("*{needle}*"),
+            };
+            let op = if matches!(test.op, NotBegins | NotEnds | NotContains) { "notEqual" } else { "equal" };
+            (op, value)
+        }
+        Eq | Ne => {
+            // A bare numeric operand would be imported as a numeric test.
+            if test.value.parse::<f64>().is_ok_and(f64::is_finite) {
+                return None;
+            }
+            (filter_comparison(test.op.comparison_symbol()?), quoted())
+        }
+        _ => {
+            if test.value.parse::<f64>().is_ok_and(f64::is_finite) {
+                return None;
+            }
+            (filter_comparison(test.op.comparison_symbol()?), test.value.clone())
+        }
+    })
+}
+
+/// Whether an Excel export can carry this column's filter as a live rule.
+pub fn supports_filter(cond: &Cond) -> bool {
+    match cond {
+        Cond::Custom(tests, _) => (1..=2).contains(&tests.len()) && tests.iter().all(|test| match test {
+            Test::Number(..) => true,
+            Test::Text(text) => excel_text_test(text).is_some(),
+        }),
+        _ => true,
+    }
+}
 
 fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'.'
@@ -430,7 +496,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         }
         o.extend_from_slice(b"/>");
     }
-    if let Some(f) = &sh.filter {
+    if let Some(f) = sh.filter.as_ref().filter(|f| f.conds.iter().all(|(_, cond)| supports_filter(cond))) {
         if f.rect.r1 < XLSX_ROWS && f.rect.c1 < XLSX_COLS {
             let _ = write!(o, r#"<autoFilter ref="{}:{}""#, a1(f.rect.r0, f.rect.c0), a1(f.rect.r1, f.rect.c1));
             if f.conds.is_empty() {
@@ -452,15 +518,23 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
                         Cond::Compare(cs, and) => {
                             o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
                             for (op, x) in cs {
-                                let name = match op.as_str() {
-                                    "<>" => "notEqual",
-                                    "<" => "lessThan",
-                                    "<=" => "lessThanOrEqual",
-                                    ">" => "greaterThan",
-                                    ">=" => "greaterThanOrEqual",
-                                    _ => "equal",
-                                };
+                                let name = filter_comparison(op);
                                 let _ = write!(o, r#"<customFilter operator="{name}" val="{x}"/>"#);
+                            }
+                            o.extend_from_slice(b"</customFilters>");
+                        }
+                        Cond::Custom(tests, and) => {
+                            o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
+                            for test in tests {
+                                let test = match test {
+                                    Test::Number(op, x) => Some((filter_comparison(op), x.to_string())),
+                                    Test::Text(text) => excel_text_test(text),
+                                };
+                                if let Some((op, value)) = test {
+                                    let _ = write!(o, r#"<customFilter operator="{op}" val=""#);
+                                    esc(&mut o, &value);
+                                    o.extend_from_slice(b"\"/>");
+                                }
                             }
                             o.extend_from_slice(b"</customFilters>");
                         }

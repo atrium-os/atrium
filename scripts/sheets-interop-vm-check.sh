@@ -17,6 +17,7 @@
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
 # Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
+# Use SHEETS_INTEROP_CASE=text_filter and /tmp/sheets-text-filter-fixture for text filters.
 # Use SHEETS_INTEROP_CASE=rank_filter and /tmp/sheets-rank-filter-fixture for rank filters.
 # Use SHEETS_INTEROP_CASE=sort_filter and /tmp/sheets-sort-filter-fixture for sorting.
 # Use SHEETS_INTEROP_CASE=validation and /tmp/sheets-validation-fixture with Tabula.
@@ -29,7 +30,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -72,6 +73,7 @@ checkpoint() {
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
+        text_filter) /tmp/sheets-text-filter-fixture check "$1" "$2" "$format" ;;
         rank_filter) /tmp/sheets-rank-filter-fixture check "$1" "$2" "$format" ;;
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
@@ -582,6 +584,35 @@ rank_filter() {
     final=edited
 }
 
+text_filter() {
+    click 257 133 # D2, outside the filter.
+    key 0x25 # 8
+    key 0x28
+    save "$book" saved
+    final=saved
+}
+
+text_filter_reopened() {
+    click 126 133 # B2, still the first visible row below the header.
+    key 0x05 # b
+    key 0x04 # a
+    key 0x07 # d
+    key 0x28
+    save "$book" edited
+    cp selectscreen.png "$results/$format-before-reapply.png"
+    cp "$books/$book" "$results/edited.$format"
+
+    click 126 133
+    data_from_bottom 19 # Reapply Filter with a filter on the current column.
+    save "$book" reapplied
+    cp selectscreen.png "$results/$format-reapplied.png"
+    cp "$books/$book" "$results/reapplied.$format"
+    close_book
+    open_book "$row" "$book" reapplied
+    sleep .4
+    cp selectscreen.png "$results/$format-reapplied-reopened.png"
+}
+
 delimited() {
     row=183
     for book in 01-utf8.csv 02-utf8.tsv 03-ansi.csv 04-ansi.tsv; do
@@ -856,6 +887,7 @@ for format in ods xlsx; do
         validation) validation_reopened ;;
         condfmt) condfmt_reopened ;;
         rank_filter) rank_edit_and_save edited_again ;;
+        text_filter) text_filter_reopened ;;
     esac
     close_book
     echo "PASS $format $profile desktop save and converter reopen"

@@ -13,5 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 officina-core = { path = "../officina-core" }
 
+regex = "1.12"
+
 [profile.release]
 debug = 1

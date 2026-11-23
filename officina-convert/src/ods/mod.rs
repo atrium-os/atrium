@@ -3,6 +3,8 @@
 
 pub(crate) mod chart;
 pub(crate) mod condfmt;
+#[cfg(feature = "read")]
+mod filter;
 pub mod formula;
 pub(crate) mod macros;
 pub(crate) mod pivot;

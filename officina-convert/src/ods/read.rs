@@ -22,7 +22,7 @@ use officina_grid::column::Sizes;
 use officina_grid::eval::dates;
 use officina_grid::strings::MAX_TEXT;
 use officina_grid::style::{Edge, HAlign, Line, Style, StyleId, StyleRuns, VAlign};
-use officina_grid::filter::{Cond, Rank};
+use officina_grid::filter::Cond;
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::report::{Kind, Report};
@@ -824,11 +824,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut buf = Vec::new();
     let mut sheet: Option<u16> = None;
     // Hidden rows of the sheet being read; an auto-filter being read (target range,
-    // conditions by field) and the filters read.
+    // visible buttons, conditions by field) and the filters read.
     let mut hidden_rows: Vec<(u32, u32)> = Vec::new();
     // Merged cells of the sheet being read (`table:number-*-spanned`).
     let mut merges: Vec<officina_grid::addr::Rect> = Vec::new();
-    let mut db: Option<(String, Vec<(u32, Cond)>)> = None;
+    let mut db: Option<(String, bool, Vec<(u32, Cond)>)> = None;
     let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
     let mut db_tables: Vec<(String, String, bool)> = Vec::new();
@@ -839,9 +839,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut pilot: Option<super::pivot::TableIn> = None;
     let mut pilots: Vec<super::pivot::TableIn> = Vec::new();
     let mut in_pilot_group = false;
-    let mut filter_or_depth = 0usize;
-    let mut unsupported_rank = false;
-    let mut in_set = false;
+    let mut whole_cell_filter = true;
     // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
     let mut names: Vec<(String, Option<u16>, String, Option<String>)> = Vec::new();
     let (mut row, mut col): (u64, u64) = (0, 0);
@@ -1327,75 +1325,42 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             if db_tables.len() < officina_grid::tables::MAX_TABLES {
                                 db_tables.push((n.clone(), t.clone(), a.get("table:contains-header").map_or(true, |v| v != "false")));
                             }
-                        } else if a.get("table:display-filter-buttons").is_some_and(|v| v == "true") {
-                            if let Some(t) = a.get("table:target-range-address") {
-                                db = Some((t.clone(), Vec::new()));
-                                filter_or_depth = 0;
-                                unsupported_rank = false;
+                        } else if let Some(t) = a.get("table:target-range-address") {
+                            let buttons = a.get("table:display-filter-buttons").is_some_and(|v| matches!(v.as_str(), "true" | "1"));
+                            if !empty {
+                                db = Some((t.clone(), buttons, Vec::new()));
+                            } else if buttons {
+                                filters.push((t.clone(), Vec::new()));
+                            } else {
+                                rep.note(Kind::Dropped, "database ranges");
                             }
                         } else {
                             rep.note(Kind::Dropped, "database ranges");
                         }
                     }
-                    b"table:filter-or" if !empty => filter_or_depth += 1,
-                    b"table:filter-condition" | b"table:filter-set-item" => {
+                    b"table:calculation-settings" => {
+                        if let Some(value) = attrs(e).get("table:search-criteria-must-apply-to-whole-cell") {
+                            whole_cell_filter = !matches!(value.as_str(), "false" | "0");
+                        }
+                    }
+                    b"table:filter" if !empty && db.is_some() => {
                         let a = attrs(e);
-                        let Some((_, conds)) = db.as_mut() else { continue };
-                        if name == b"table:filter-set-item" {
-                            if let (Some((_, Cond::Values(v))), Some(x)) = (conds.last_mut(), a.get("table:value")) {
-                                // The condition's own value repeats the first item.
-                                if !std::mem::replace(&mut in_set, true) {
-                                    v.clear();
-                                }
-                                if v.len() < 1 << 20 {
-                                    v.push(x.clone());
-                                }
-                            }
-                            continue;
-                        }
-                        in_set = false;
-                        let Some(field) = a.get("table:field-number").and_then(|v| v.parse::<u32>().ok()) else { continue };
-                        let op = a.get("table:operator").map(String::as_str).unwrap_or("=");
-                        let value = a.get("table:value").cloned().unwrap_or_default();
-                        let rank = match op {
-                            "top values" => Some((false, false)),
-                            "top percent" => Some((true, false)),
-                            "bottom values" => Some((false, true)),
-                            "bottom percent" => Some((true, true)),
-                            _ => None,
-                        };
-                        if let Some((percent, bottom)) = rank {
-                            match Rank::parse(&value, percent, bottom) {
-                                Some(rank) if filter_or_depth == 0 => conds.push((field, Cond::Rank(rank))),
-                                _ => unsupported_rank = true,
-                            }
-                            continue;
-                        }
-                        // LibreOffice leaves the type out of its numeric tests: an order
-                        // test on a number is numeric unless the file says text.
-                        let number = match a.get("table:data-type").map(String::as_str) {
-                            Some(t) => t == "number",
-                            None => !matches!(op, "=" | "!=") && value.parse::<f64>().is_ok(),
-                        };
-                        let cmp = ["=", "!=", "<", "<=", ">", ">="].contains(&op);
-                        match (number, cmp, value.parse::<f64>()) {
-                            (true, true, Ok(x)) if x.is_finite() => {
-                                let op = if op == "!=" { "<>" } else { op }.to_string();
-                                match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Compare(..))) {
-                                    Some((_, Cond::Compare(v, _))) if v.len() < 2 => v.push((op, x)),
-                                    Some(_) => rep.note(Kind::Approximate, "filters with more than two tests on a column (rows stay as the file hid them)"),
-                                    None => conds.push((field, Cond::Compare(vec![(op, x)], filter_or_depth == 0))),
+                        let end = name.to_vec();
+                        let span = r.read_to_end_into(quick_xml::name::QName(&end), &mut Vec::new())?;
+                        let inner = content.get(span.start as usize..span.end as usize).unwrap_or_default();
+                        let local = !a.contains_key("table:target-range-address")
+                            && !a.contains_key("table:condition-source-range-address")
+                            && !a.get("table:display-duplicates").is_some_and(|v| matches!(v.as_str(), "false" | "0"));
+                        match local.then(|| super::filter::parse(inner, whole_cell_filter)).flatten() {
+                            Some(conds) => {
+                                if let Some((_, _, current)) = &mut db {
+                                    *current = conds;
                                 }
                             }
-                            (false, _, _) if op == "=" => match conds.iter_mut().find(|(c, k)| *c == field && matches!(k, Cond::Values(_))) {
-                                Some((_, Cond::Values(v))) => {
-                                    if !value.is_empty() || empty {
-                                        v.push(value);
-                                    }
-                                }
-                                _ => conds.push((field, Cond::Values(if empty || !value.is_empty() { vec![value] } else { Vec::new() }))),
-                            },
-                            _ => rep.note(Kind::Approximate, "text and pattern filters (rows stay as the file hid them)"),
+                            None => {
+                                db = None;
+                                rep.note(Kind::Approximate, "unsupported filter expression (rows stay as the file hid them)");
+                            }
                         }
                     }
                     _ => {}
@@ -1467,21 +1432,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             cond_formats.extend(cf.take());
                         }
                     }
-                    b"table:filter-or" => filter_or_depth = filter_or_depth.saturating_sub(1),
                     b"table:database-range" => {
-                        if let Some((_, conds)) = db.as_mut() {
-                            let mut fields = std::collections::HashMap::new();
-                            let repeated_rank = conds.iter().any(|(_, cond)| matches!(cond, Cond::Rank(_)))
-                                && conds.iter().any(|(field, cond)| {
-                                    let rank = matches!(cond, Cond::Rank(_));
-                                    fields.insert(*field, rank).is_some_and(|previous| previous || rank)
-                                });
-                            if unsupported_rank || repeated_rank {
-                                rep.note(Kind::Approximate, "invalid or combined top/bottom filters (rows stay as the file hid them)");
-                                conds.clear();
+                        if let Some((target, buttons, conds)) = db.take() {
+                            if buttons || !conds.is_empty() {
+                                if !buttons {
+                                    rep.note(Kind::Approximate, "filter buttons shown for a standard filter");
+                                }
+                                filters.push((target, conds));
+                            } else {
+                                rep.note(Kind::Dropped, "database ranges");
                             }
                         }
-                        filters.extend(db.take());
                     }
                     b"text:p" | b"text:h" => in_p = false,
                     b"table:table-cell" | b"table:covered-table-cell" => {
@@ -1653,10 +1614,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Auto-filters: their range names the sheet.
     for (target, mut conds) in filters {
         let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
-        conds.retain_mut(|(c, _)| {
+        if conds.iter().any(|(c, _)| *c > c1 - c0) {
+            rep.note(Kind::Approximate, "filter field outside its range (rows stay as the file hid them)");
+            continue;
+        }
+        for (c, _) in &mut conds {
             *c += c0;
-            *c <= c1
-        });
+        }
         wb.sheet_mut(s).filter = Some(officina_grid::filter::AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
     }
 

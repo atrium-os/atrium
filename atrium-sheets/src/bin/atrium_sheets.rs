@@ -122,6 +122,13 @@ fn saved_status(d: &Doc, format: Format) -> String {
     if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !p.groups.is_empty()) {
         status.push_str(" Excel export saved grouped ODS pivot tables as cell values.");
     }
+    if matches!(format, Format::Xlsx | Format::Xlsm) && (0..d.wb.sheet_count() as u16).any(|sheet| {
+        d.wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
+            filter.conds.iter().any(|(_, cond)| !officina_convert::xlsx::write::supports_filter(cond))
+        })
+    }) {
+        status.push_str(" Excel export kept the last row visibility for filters with unsupported rules.");
+    }
     if format == Format::Ods {
         use officina_grid::formula::ast::Expr;
 

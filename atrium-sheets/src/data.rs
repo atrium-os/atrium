@@ -555,7 +555,7 @@ pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, Stri
             let on = match &now {
                 Some(Cond::Values(v)) => v.iter().any(|x| key(x) == key(&t)),
                 // A number condition: what it keeps now, as rows show it.
-                Some(Cond::Compare(..) | Cond::Rank(_)) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
+                Some(Cond::Compare(..) | Cond::Rank(_) | Cond::Custom(..)) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
                 None => true,
             };
             (t, n, on)

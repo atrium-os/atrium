@@ -19,7 +19,7 @@ use std::sync::Arc;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
-use officina_grid::filter::{AutoFilter, Cond, Rank};
+use officina_grid::filter::{AutoFilter, Cond, Rank, Test, TextOp, TextTest};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
@@ -703,7 +703,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
                 }
             }
-            b"filter" | b"filters" | b"customFilters" | b"customFilter" | b"top10" => {
+            b"filter" | b"filters" | b"customFilters" | b"top10" => {
                 let Some((_, conds)) = seg.filter.as_mut() else { continue };
                 let Some(c) = fcol else { continue };
                 let name = e.local_name();
@@ -719,7 +719,15 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                             }
                         }
                     }
-                    b"customFilters" => conds.push((c, Cond::Compare(Vec::new(), attr(&e, b"and")?.is_some_and(|v| v == "1" || v == "true")))),
+                    b"customFilters" => {
+                        match read_custom_filter(&mut r, &e, empty)? {
+                            Some(cond) => conds.push((c, cond)),
+                            None => {
+                                seg.filter = None;
+                                seg.rep.note(Kind::Approximate, "invalid custom filters (rows stay as the file hid them)");
+                            }
+                        }
+                    }
                     b"top10" => {
                         let percent = attr(&e, b"percent")?.is_some_and(|v| v == "1" || v == "true");
                         let bottom = attr(&e, b"top")?.is_some_and(|v| v == "0" || v == "false");
@@ -728,22 +736,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                             None => seg.rep.note(Kind::Approximate, "invalid top/bottom filter (rows stay as the file hid them)"),
                         }
                     }
-                    _ => {
-                        let op = match attr(&e, b"operator")?.as_deref() {
-                            None | Some("equal") => "=",
-                            Some("notEqual") => "<>",
-                            Some("lessThan") => "<",
-                            Some("lessThanOrEqual") => "<=",
-                            Some("greaterThan") => ">",
-                            Some("greaterThanOrEqual") => ">=",
-                            Some(_) => "",
-                        };
-                        let val = attr(&e, b"val")?.and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite());
-                        match (conds.last_mut(), val) {
-                            (Some((cc, Cond::Compare(v, _))), Some(x)) if *cc == c && !op.is_empty() && v.len() < 2 => v.push((op.to_string(), x)),
-                            _ => seg.rep.note(Kind::Approximate, "text and wildcard custom filters (rows stay as the file hid them)"),
-                        }
-                    }
+                    _ => {}
                 }
             }
             b"dynamicFilter" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, colour and icon filters (rows stay as the file hid them)"),
@@ -986,9 +979,12 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         sh.hidden = officina_grid::filter::merge(hidden.into_iter().map(|r| (r, r)).collect());
         if let Some((rf, mut conds)) = filter {
             if let Some((r0, c0, r1, c1)) = parse_ref(&rf) {
-                conds.retain_mut(|(c, cond)| {
+                conds.retain_mut(|(c, _)| {
+                    if *c > c1 - c0 {
+                        return false;
+                    }
                     *c += c0;
-                    *c <= c1 && !matches!(cond, Cond::Compare(v, _) if v.is_empty())
+                    true
                 });
                 sh.filter = Some(AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
             }
@@ -1063,6 +1059,59 @@ fn read_text(r: &mut Reader<&[u8]>, end: &[u8], out: &mut String) -> Result<(), 
             _ => {}
         }
     }
+}
+
+fn custom_test(tag: &BytesStart) -> Result<Option<Test>, XlsxError> {
+    let op = match attr(tag, b"operator")?.as_deref() {
+        None | Some("equal") => "=",
+        Some("notEqual") => "<>",
+        Some("lessThan") => "<",
+        Some("lessThanOrEqual") => "<=",
+        Some("greaterThan") => ">",
+        Some("greaterThanOrEqual") => ">=",
+        Some(_) => return Ok(None),
+    };
+    let Some(value) = attr(tag, b"val")? else { return Ok(None) };
+    if let Some(x) = value.parse::<f64>().ok().filter(|x| x.is_finite()) {
+        return Ok(Some(Test::Number(op.to_string(), x)));
+    }
+    let op = match op {
+        "=" => TextOp::Wildcard,
+        "<>" => TextOp::NotWildcard,
+        _ => TextOp::comparison(op).unwrap(),
+    };
+    let text = TextTest { op, value, case_sensitive: false };
+    Ok(text.valid().then_some(Test::Text(text)))
+}
+
+fn read_custom_filter(r: &mut Reader<&[u8]>, tag: &BytesStart, empty: bool) -> Result<Option<Cond>, XlsxError> {
+    if empty {
+        return Ok(None);
+    }
+    let and = attr(tag, b"and")?.is_some_and(|v| v == "1" || v == "true");
+    let mut tests = Vec::new();
+    let mut valid = true;
+    loop {
+        let (child, empty) = match r.read_event()? {
+            Event::Start(child) => (child, false),
+            Event::Empty(child) => (child, true),
+            Event::End(end) if end.name() == tag.name() => break,
+            Event::Eof => return Err(bad("custom filters ended early")),
+            _ => continue,
+        };
+        if valid && tests.len() < 2 && child.local_name().as_ref() == b"customFilter" {
+            match custom_test(&child)? {
+                Some(test) => tests.push(test),
+                None => valid = false,
+            }
+        } else {
+            valid = false;
+        }
+        if !empty {
+            skip(r, &child)?;
+        }
+    }
+    Ok((valid && !tests.is_empty()).then(|| Cond::custom(tests, and)))
 }
 
 fn skip(r: &mut Reader<&[u8]>, e: &BytesStart) -> Result<(), XlsxError> {

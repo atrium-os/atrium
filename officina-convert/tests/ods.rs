@@ -264,3 +264,32 @@ fn ods_tables_become_ranges_and_named_database_ranges() {
     // As plain references: OpenFormula has no structured ones.
     assert_eq!(back.formula_text(CellAddr::new(1, 20, 0)).unwrap(), "=SUM(Data!$G$2:$G$5)");
 }
+
+#[test]
+fn standard_text_filter_without_dropdown_buttons_reapplies() {
+    let content = br#"<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0">
+      <office:body><office:spreadsheet>
+        <table:calculation-settings table:search-criteria-must-apply-to-whole-cell="false"/>
+        <table:table table:name="Data">
+          <table:table-row><table:table-cell office:value-type="string" office:string-value="Code"/></table:table-row>
+          <table:table-row><table:table-cell office:value-type="string" office:string-value="ref-123-A"/></table:table-row>
+          <table:table-row table:visibility="filter"><table:table-cell office:value-type="string" office:string-value="ref-none"/></table:table-row>
+        </table:table>
+        <table:database-ranges><table:database-range table:name="__Anonymous_Sheet_DB__0" table:target-range-address="Data.A1:Data.A3">
+          <table:filter><table:filter-condition table:field-number="0" table:operator="match" table:data-type="text" table:value="[0-9]+"/></table:filter>
+        </table:database-range></table:database-ranges>
+      </office:spreadsheet></office:body>
+    </office:document-content>"#;
+    let file = rezip(&[("mimetype".into(), b"application/vnd.oasis.opendocument.spreadsheet".to_vec()), ("content.xml".into(), content.to_vec())]);
+    let (book, loaded) = ods::read(&file).unwrap();
+    assert!(loaded.report.human().iter().any(|note| note.contains("filter buttons shown")));
+    assert_eq!(book.filter_state(0).hidden, vec![(2, 2)]);
+    let saved = ods::write(&book, Vec::new()).unwrap();
+    let (mut reopened, loaded) = ods::read(&saved).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(reopened.filter_state(0), book.filter_state(0));
+    reopened.set_value(CellAddr::new(0, 1, 0), Value::str("no digits"));
+    reopened.set_value(CellAddr::new(0, 2, 0), Value::str("ref-777"));
+    assert_eq!(reopened.filter_state(0).hidden, vec![(2, 2)]);
+    assert_eq!(reopened.filtered(0, reopened.sheet(0).filter.clone()).hidden, vec![(1, 1)]);
+}

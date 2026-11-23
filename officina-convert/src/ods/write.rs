@@ -15,7 +15,7 @@ use officina_grid::addr::Rect;
 use officina_grid::eval::dates;
 use officina_grid::formula::{self, Coord, Expr, RangeKind, RangeRef};
 use officina_grid::numfmt::PALETTE;
-use officina_grid::filter::Cond;
+use officina_grid::filter::{wildcard_regex, Cond, Test, TextOp, TextTest};
 use officina_grid::style::{HAlign, Line, Style, StyleId, VAlign};
 use officina_grid::{ErrorKind, Value, Workbook};
 
@@ -1222,9 +1222,44 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     Ok(())
 }
 
+fn text_condition(out: &mut String, field: u32, test: &TextTest, whole_cell: bool) {
+    use TextOp::*;
+    let pattern;
+    let (op, value) = match test.op {
+        Begins => ("begins", test.value.as_str()),
+        NotBegins => ("!begins", test.value.as_str()),
+        Ends => ("ends", test.value.as_str()),
+        NotEnds => ("!ends", test.value.as_str()),
+        Contains => ("contains", test.value.as_str()),
+        NotContains => ("!contains", test.value.as_str()),
+        Wildcard | NotWildcard => {
+            pattern = wildcard_regex(&test.value);
+            (if test.op == Wildcard { "match" } else { "!match" }, pattern.as_str())
+        }
+        Regex | NotRegex if !whole_cell => {
+            pattern = format!(r"\A(?:{})\z", test.value);
+            (if test.op == Regex { "match" } else { "!match" }, pattern.as_str())
+        }
+        Regex | PartialRegex => ("match", test.value.as_str()),
+        NotRegex | NotPartialRegex => ("!match", test.value.as_str()),
+        Ne => ("!=", test.value.as_str()),
+        comparison => (comparison.comparison_symbol().unwrap_or("="), test.value.as_str()),
+    };
+    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:case-sensitive="{}" table:operator="{}" table:value=""#, test.case_sensitive, esc_attr(op));
+    esc(out, value);
+    out.push_str(r#"" table:data-type="text"/>"#);
+}
+
+fn number_condition(out: &mut String, field: u32, op: &str, x: f64) {
+    let op = if op == "<>" { "!=" } else { op };
+    // LibreOffice leaves the type out of numeric order comparisons.
+    let ty = if matches!(op, "=" | "!=") { r#" table:data-type="number""# } else { "" };
+    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{}"{ty}/>"#, num(x), esc_attr(op));
+}
+
 /// `table:database-ranges` holding each sheet's auto-filter, as LibreOffice writes
 /// them: columns joined by and; a column's values as one condition with set items.
-fn filters_xml(wb: &Workbook) -> String {
+fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
     let mut out = String::new();
     for s in 0..wb.sheet_count() as u16 {
         let Some(f) = &wb.sheet(s).filter else { continue };
@@ -1242,8 +1277,8 @@ fn filters_xml(wb: &Workbook) -> String {
                         let first = v.first().cloned().unwrap_or_default();
                         let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
                         esc(&mut out, &first);
-                        out.push_str(r#"" table:operator="=""#);
-                        if v.len() > 1 {
+                        out.push_str(r#"" table:operator="=" table:data-type="text""#);
+                        if v.len() > 1 || (!whole_cell && !v.is_empty()) {
                             out.push('>');
                             for x in v {
                                 out.push_str(r#"<table:filter-set-item table:value=""#);
@@ -1261,11 +1296,22 @@ fn filters_xml(wb: &Workbook) -> String {
                             out.push_str("<table:filter-or>");
                         }
                         for (op, x) in cs {
-                            let op = if op == "<>" { "!=" } else { op.as_str() };
-                            // Typed only where untyped would read as text: LibreOffice
-                            // drops the value of a typed order test.
-                            let ty = if matches!(op, "=" | "!=") { r#" table:data-type="number""# } else { "" };
-                            let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{}"{ty}/>"#, num(*x), esc_attr(op));
+                            number_condition(&mut out, field, op, *x);
+                        }
+                        if or {
+                            out.push_str("</table:filter-or>");
+                        }
+                    }
+                    Cond::Custom(tests, and) => {
+                        let or = !and && tests.len() > 1;
+                        if or {
+                            out.push_str("<table:filter-or>");
+                        }
+                        for test in tests {
+                            match test {
+                                Test::Text(text) => text_condition(&mut out, field, text, whole_cell),
+                                Test::Number(op, x) => number_condition(&mut out, field, op, *x),
+                            }
                         }
                         if or {
                             out.push_str("</table:filter-or>");
@@ -1432,11 +1478,18 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         faces.push_str(r#""/>"#);
     }
     let mut content = String::with_capacity(tables.len() + auto.len() + 1024);
-    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="true" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
+    let whole_cell = !(0..wb.sheet_count() as u16).any(|sheet| {
+        wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
+            filter.conds.iter().any(|(_, cond)| matches!(cond, Cond::Custom(tests, _) if tests.iter().any(|test| {
+                matches!(test, Test::Text(t) if matches!(t.op, TextOp::PartialRegex | TextOp::NotPartialRegex))
+            })))
+        })
+    });
+    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
     content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);
     content.push_str(&names_xml(wb, None));
-    content.push_str(&filters_xml(wb));
+    content.push_str(&filters_xml(wb, whole_cell));
     content.push_str(&super::pivot::tables_xml(wb));
     content.push_str("</office:spreadsheet></office:body></office:document-content>");
     let styles = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-styles {NS}><office:styles><style:default-style style:family="table-cell"><style:paragraph-properties style:tab-stop-distance="0.5in"/></style:default-style><style:style style:name="Default" style:family="table-cell"/>{cf}</office:styles></office:document-styles>"#, cf = super::condfmt::styles_xml(&super::condfmt::dxfs(wb)));
