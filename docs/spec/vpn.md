@@ -616,8 +616,63 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
 - **SAML** against Keycloak (Apache-2.0) as the IdP in the Ubuntu VM, with the stand-in
   GlobalProtect gateway and ocserv behind it, once Navigator's live pages exist.
 - **IKEv2** (when built) against strongSwan in the Ubuntu VM.
+- **Installed AnyConnect Sign In:** run `python3 scripts/crypta-sign-in-gate.py`
+  against one dedicated arm64 Tessera overlay and the local Keycloak,
+  AnyConnect stand-in and ocserv fixtures. See the fixture recipe below.
 - **Fuzzing:** every engine parser on the host (WireGuard messages, ESP, CSTP framing, the
   XML subset, HTTP heads), and cryptad's `.conf` importer.
+
+### Installed Sign In gate fixture
+
+Use an approved disposable arm64 guest with Tessera as root, root SSH,
+and the Navigator live-sign-in development image. The image provides
+the `mailgate` and `gatevest` test users, the signed Fresco renderer
+bundle, and the mail sign-in seed under `/tmp/mail-button` (synthetic
+Arca state, `arcad`, `arca-probe`, `arca-courierd`, fixture publisher
+key, page-bundle template and `nav.conf`). The gate stages the other
+services, modifies the guest's test policy, and uses guest-local
+storage. Start from a fresh overlay for each invocation.
+
+Start the Ubuntu ocserv fixture with `scripts/crypta-ocserv-vm.sh`.
+Use `scripts/crypta-sso-stand.sh up` with
+`CRYPTA_SSO_EXTERNAL_JS=1` and `xmlsec1` available for the local Keycloak
+realm and signed SAML gateway fixture. The gate expects fresh gateway
+counters and the synthetic `alice` account from that script. The guest
+must forward `10.0.2.100:447` and `10.0.2.101:448` to host loopback
+`8447` and `8448`, respectively. The stand-in uses ocserv on host
+loopback `8443`. Use the local fixture CA for both guest HTTPS origins.
+
+Build on the host with the shared Cargo cache. Prepare the directory
+passed to `--fixtures` with these inputs from the arm64 development
+build:
+
+| Input | Contents |
+|---|---|
+| Executables | `arca-ui`, `limend`, `navigatord`, `navigator-ui`, the JIT-off Ladybird `mail-page`, and `atrium-cryptad` |
+| `ui-bundles.tgz` | `navigator-page`, `prerender` and `frescod` at the archive root |
+| `net.tgz` | `atrium-crypta-ac`, `atrium-net`, `atrium-lease`, `atrium-jaild`, `jaild.policy.toml` and `atrium.pf` at the archive root |
+| `portcullisd` | A fixture build with `scripts/crypta-sign-in-gate/queue-worker.patch` applied in an isolated worktree. Build offline with the shared cache using `cargo build --offline --locked --release --target aarch64-unknown-freebsd -p portcullisd` from `portcullis/`. The marker holds the first worker outside its mutex for deterministic replacements. The expiry check runs with the marker absent and uses the production timeout. |
+
+Run on the host with Python 3, curl and Tesseract:
+
+```sh
+python3 scripts/crypta-sign-in-gate.py \
+  --ssh /path/to/dedicated-vssh \
+  --fixtures /path/to/arm64-fixture-inputs \
+  --ca /path/to/test-ca.pem \
+  --renderer /guest/path/to/signed-renderer-bundle \
+  --evidence /path/to/new-evidence-directory
+```
+
+The runner combines two proposal reloads, disconnect with a pending
+proposal, duplicate Sign In requests at the Portcullis entry point,
+two in-place replacements, cancellation during teardown, expiry with
+a live attempt, and a separate reconnect. After the expired request
+has been discarded and the old window has closed, only explicit
+confirmation sends the POST and allows IPv4 through ocserv. Keep the
+gateway counters, Portcullis trace and screenshots from the evidence
+directory. Shut down both dedicated guests and release the shared slot
+through the fixture lifecycle wrappers.
 
 ## 12. Not in v1
 

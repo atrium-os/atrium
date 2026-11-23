@@ -1,0 +1,23 @@
+diff --git a/portcullis/portcullisd/src/main.rs b/portcullis/portcullisd/src/main.rs
+index 3aecb912e..42a957e03 100644
+--- a/portcullis/portcullisd/src/main.rs
++++ b/portcullis/portcullisd/src/main.rs
+@@ -2192,6 +2192,18 @@ fn vpn_window_busy(app: &str) -> bool {
+ /// Wait for the stale window without changing the attempt it sees.
+ fn open_queued_vpn_sign_in(app: String) {
+     use std::time::{Duration, Instant};
++    // Fixture-only scheduling barrier, outside the queue lock.
++    let hold = std::path::Path::new("/tmp/i3-hold-vpn-queue-worker");
++    if hold.exists() {
++        eprintln!("fixture: VPN queue worker held");
++        let deadline = Instant::now() + Duration::from_secs(50);
++        while hold.exists() && Instant::now() < deadline {
++            thread::sleep(Duration::from_millis(20));
++        }
++        if hold.exists() {
++            eprintln!("fixture: VPN queue worker hold expired");
++        }
++    }
+     loop {
+         let mut queue = QUEUED_VPN_SIGN_IN.lock().unwrap();
+         let Some(((_, sign_in, attempt), queued_at)) = queue.as_ref() else { return };
