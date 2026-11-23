@@ -24,3 +24,6 @@ fresco-client = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-client", optional
 fresco-protocol = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-protocol" }
 libxml_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibXML/Rust", default-features = false, optional = true }
 nuntius = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../nuntius", default-features = false, optional = true }
+
+[dev-dependencies]
+fresco-compute = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-compute" }

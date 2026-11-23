@@ -553,6 +553,19 @@ provider still need verification. The corrected fixture used the multi-asset
 helper and verified the installed public CA and hostname map.
 See `~/atrium-vm/evidence/navigator-i4-youtube-channel-20261124/`.
 
+The native painter collects mask declarations by effect ID. For a single
+solid rectangular source, it keeps the mask geometry as a Fresco rectangle
+or fill, colours it with the source RGB, multiplies the coverage by the
+source alpha, and intersects the source and mask bounds. Opaque rectangular
+masks can also clip overlapping source nodes. Translucent overlapping
+sources and multi-paint masks still require isolated composition.
+The host pixel fixture records a mask and draws through Fresco’s reference
+renderer. It checks clear, half-alpha and opaque coverage across both clip
+edges, plus the interior and transparent corner of an SVG triangle.
+The arm64 JIT-off worker links. A guest run is still required to establish
+which mask the provider uses and whether a user press reaches Play.
+Evidence is in `~/atrium-vm/evidence/navigator-i4-mask-20261124/`.
+
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
 now retains same-space intersecting rectangular clips and represents a

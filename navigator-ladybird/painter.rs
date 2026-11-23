@@ -233,6 +233,7 @@ fn scrollbar_nodes(
 }
 
 mod gradient;
+mod mask;
 
 pub fn recorded_leaves(
     list: &DisplayListStorage,
@@ -279,6 +280,7 @@ pub fn editor_leaves(
     let chunks = list.chunks();
     let mut occurrences = HashMap::new();
     let mut leaves = Vec::new();
+    let mut masks = HashMap::new();
     for index in 0..chunks.len() {
         let chunk = chunks.id(index);
         let occurrence = occurrences.entry(chunk).or_insert(0);
@@ -310,6 +312,16 @@ pub fn editor_leaves(
                             return Err("unsupported inline clip geometry");
                         }
                         intersect_clip(&mut inline_clip, clip.clip_rect_or_path_device_bounds)?;
+                    }
+                    if header.command_type == DisplayListCommandType::DeclareMaskContent {
+                        use libcompositing_rust::display_list::commands::DeclareMaskContent;
+                        let cmd = read_command::<DeclareMaskContent>(payload);
+                        if inline_clip.is_some() { return Err("unsupported clipped mask declaration"); }
+                        let paint = mask::declaration(payload)?;
+                        if masks.insert(cmd.effect, (run.context.spatial, cmd.rect, paint)).is_some() {
+                            return Err("duplicate mask declaration");
+                        }
+                        return Ok(());
                     }
                     let mut append = |part, node| {
                         leaves.push(PaintLeaf {
@@ -400,6 +412,10 @@ pub fn editor_leaves(
             }
         }
         *occurrence += 1;
+    }
+    if !masks.is_empty() {
+        let tree = list.visual_context_tree().ok_or("mask requires a visual context tree")?;
+        return mask::resolve(tree, leaves, &masks);
     }
     Ok(leaves)
 }
