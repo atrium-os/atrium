@@ -7,6 +7,8 @@
 //! lengths are held to the limits below, and an answer that breaks one is
 //! refused whole.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::{json, Map, Value};
 
 pub const CORE: &str = "urn:ietf:params:jmap:core";
@@ -329,40 +331,110 @@ pub enum Update {
     Destroy,
 }
 
-/// The person's changes, one call.
-pub fn set_emails(account: &str, changes: &[(String, Update)]) -> Vec<u8> {
-    let mut update = Map::new();
-    let mut destroy = Vec::new();
-    for (id, u) in changes {
-        // Several changes to one message are one patch.
-        let mut patch = match update.remove(id) {
-            Some(Value::Object(p)) => p,
-            _ => Map::new(),
-        };
-        match u {
-            Update::Keywords { set, unset } => {
-                for k in set {
-                    patch.insert(format!("keywords/{k}"), json!(true));
-                }
-                for k in unset {
-                    patch.insert(format!("keywords/{k}"), Value::Null);
-                }
-            }
-            Update::Move { from, to } => {
-                patch.insert(format!("mailboxIds/{from}"), Value::Null);
-                patch.insert(format!("mailboxIds/{to}"), json!(true));
-            }
-            Update::Remove { from } => {
-                patch.insert(format!("mailboxIds/{from}"), Value::Null);
-            }
-            Update::Destroy => {
-                destroy.push(json!(id));
+/// One Email/set request, retaining the exact IDs in each operation group.
+pub struct EmailSet {
+    account: String,
+    update: BTreeMap<String, Map<String, Value>>,
+    destroy: BTreeSet<String>,
+}
+
+impl EmailSet {
+    pub fn new(account: &str, changes: &[(String, Update)]) -> Self {
+        let mut update = BTreeMap::new();
+        let mut destroy = BTreeSet::new();
+        for (id, change) in changes {
+            if matches!(change, Update::Destroy) {
+                destroy.insert(id.clone());
                 continue;
             }
+            // Several changes to one message share one patch.
+            let patch = update.entry(id.clone()).or_insert_with(Map::new);
+            match change {
+                Update::Keywords { set, unset } => {
+                    for k in set {
+                        patch.insert(format!("keywords/{k}"), json!(true));
+                    }
+                    for k in unset {
+                        patch.insert(format!("keywords/{k}"), Value::Null);
+                    }
+                }
+                Update::Move { from, to } => {
+                    patch.insert(format!("mailboxIds/{from}"), Value::Null);
+                    patch.insert(format!("mailboxIds/{to}"), json!(true));
+                }
+                Update::Remove { from } => {
+                    patch.insert(format!("mailboxIds/{from}"), Value::Null);
+                }
+                Update::Destroy => unreachable!("destroy was handled separately"),
+            }
         }
-        update.insert(id.clone(), Value::Object(patch));
+        Self { account: account.into(), update, destroy }
     }
-    request(vec![json!(["Email/set", { "accountId": account, "update": update, "destroy": destroy }, "s"])], false)
+
+    pub fn body(&self) -> Vec<u8> {
+        request(vec![json!(["Email/set", {
+            "accountId": self.account, "update": self.update, "destroy": self.destroy
+        }, "s"])], false)
+    }
+
+    pub fn acknowledgments(&self, answers: &Answers) -> Result<EmailSetResult> {
+        let reply = answers.account_reply("s", "Email/set", &self.account)?;
+        need_state(reply, "newState")?;
+        if reply.get("oldState").is_some_and(|v| !v.is_null()) {
+            need_state(reply, "oldState")?;
+        }
+        for field in ["created", "notCreated"] {
+            if set_result_map(reply, field)?.is_some_and(|m| !m.is_empty()) {
+                return err(format!("unexpected Email/set {field}"));
+            }
+        }
+
+        let mut update_ids: BTreeSet<_> = self.update.keys().map(String::as_str).collect();
+        let mut destroy_ids: BTreeSet<_> = self.destroy.iter().map(String::as_str).collect();
+        let mut updated = BTreeSet::new();
+        for field in ["updated", "notUpdated", "notDestroyed"] {
+            let remaining = if field == "notDestroyed" { &mut destroy_ids } else { &mut update_ids };
+            if let Some(map) = set_result_map(reply, field)? {
+                for (id, value) in map {
+                    if !remaining.remove(id.as_str()) {
+                        return err(format!("unexpected or repeated Email/set ID in {field}"));
+                    }
+                    if field == "updated" {
+                        if !value.is_null() && !value.is_object() {
+                            return err("bad Email/set updated entry");
+                        }
+                        updated.insert(id.clone());
+                    } else if value.as_object().and_then(|error| get_str(error, "type")).is_none_or(str::is_empty) {
+                        return err(format!("bad Email/set error in {field}"));
+                    }
+                }
+            }
+        }
+
+        let destroyed = ids(reply.get("destroyed"), "Email/set destroyed")?;
+        for id in &destroyed {
+            if !destroy_ids.remove(id.as_str()) {
+                return err("unexpected or repeated Email/set ID in destroyed");
+            }
+        }
+        if !update_ids.is_empty() || !destroy_ids.is_empty() {
+            return err("incomplete Email/set acknowledgment");
+        }
+        Ok(EmailSetResult { updated, destroyed: destroyed.into_iter().collect() })
+    }
+}
+
+pub struct EmailSetResult {
+    pub updated: BTreeSet<String>,
+    pub destroyed: BTreeSet<String>,
+}
+
+fn set_result_map<'a>(reply: &'a Map<String, Value>, field: &str) -> Result<Option<&'a Map<String, Value>>> {
+    match reply.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map)),
+        Some(_) => err(format!("bad Email/set {field} map")),
+    }
 }
 
 /// The identities the account may send as.
@@ -735,18 +807,6 @@ pub fn changes(a: &Answers, account: &str, since: &str, max: u64) -> Result<Chan
     Ok(Changes { new_state, more, changed, destroyed })
 }
 
-/// The ids the server did not change, with its reason (the rest went).
-pub fn set_failures(a: &Answers) -> Result<Vec<String>> {
-    let o = a.of("s", "Email/set")?;
-    let mut out = Vec::new();
-    for k in ["notUpdated", "notDestroyed"] {
-        if let Some(m) = o.get(k).and_then(Value::as_object) {
-            out.extend(m.keys().filter(|k| id_ok(k)).take(MAX_IDS).cloned());
-        }
-    }
-    Ok(out)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub id: String,
@@ -953,6 +1013,30 @@ mod tests {
         assert_eq!(m[0].role.as_deref(), Some("inbox"));
         let a = answers(br#"{"methodResponses":[["error",{"type":"cannotCalculateChanges"},"c"]]}"#).unwrap();
         assert_eq!(changes(&a, "A1", "1", 256).unwrap_err().0, "Email/changes: cannotCalculateChanges");
+    }
+
+    #[test]
+    fn email_set_matches_update_and_destroy_outcomes_independently() {
+        let request = EmailSet::new("A1", &[
+            ("M1".into(), Update::Keywords { set: vec!["$seen".into()], unset: vec![] }),
+            ("M1".into(), Update::Destroy),
+            ("M1".into(), Update::Destroy),
+            ("M2".into(), Update::Remove { from: "Inbox".into() }),
+        ]);
+        let body: Value = serde_json::from_slice(&request.body()).unwrap();
+        let args = &body["methodCalls"][0][1];
+        assert_eq!(args["update"]["M1"], json!({"keywords/$seen": true}));
+        assert_eq!(args["destroy"], json!(["M1"]));
+
+        let a = answers(br#"{"methodResponses":[["Email/set",{"accountId":"A1","newState":"2",
+            "oldState":null,"updated":{"M2":null},"notUpdated":{"M1":{"type":"willDestroy"}},
+            "destroyed":["M1"],"notDestroyed":null},"s"]]}"#).unwrap();
+        let result = request.acknowledgments(&a).unwrap();
+        assert_eq!(result.updated, BTreeSet::from(["M2".into()]));
+        assert_eq!(result.destroyed, BTreeSet::from(["M1".into()]));
+        let mut ambiguous = a;
+        ambiguous.0.push(ambiguous.0[0].clone());
+        assert_eq!(request.acknowledgments(&ambiguous).err().unwrap().0, "repeated Email/set reply");
     }
 
     #[test]

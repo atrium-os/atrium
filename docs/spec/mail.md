@@ -1707,7 +1707,11 @@ Stalwart in the cloud VM, and later a real account):
    is skipped. A rejected post-snooze read leaves the server-side move in
    place so the next incremental sync can reconcile it. The person's
    changes go as one `Email/set` (several changes to one message are one patch); delete
-   from the last mailbox destroys. Send: upload, `Email/import` into Sent (seen),
+   from the last mailbox destroys. Mail checks the acknowledgment's account and
+   requires exactly one result for every requested update and destruction. An
+   invalid reply keeps queued changes pending and prevents snooze readback.
+   A complete mixed reply settles queued actions by operation outcome and reads
+   back only acknowledged snooze updates. Send: upload, `Email/import` into Sent (seen),
    `EmailSubmission/set` as the matching identity, with `HOLDUNTIL` when the server's
    `maxDelayedSend` covers a send-later time, else the engine holds it
    (`Engine::deliver_jmap`). The store keeps the Email state per account. Test: the

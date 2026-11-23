@@ -544,6 +544,12 @@ impl<H: Http> Client<H> {
         Ok(())
     }
 
+    fn set_emails(&mut self, updates: &[(String, Update)]) -> Result<jmap::EmailSetResult> {
+        let request = jmap::EmailSet::new(&self.session.account, updates);
+        let answer = self.call(request.body())?;
+        Ok(request.acknowledgments(&answer)?)
+    }
+
     fn snooze(&mut self, sink: &mut dyn Sink, report: &mut Report) -> Result<()> {
         let moves = sink.snooze_moves().map_err(Error)?;
         for changes in moves.chunks(PAGE as usize) {
@@ -566,15 +572,15 @@ impl<H: Http> Client<H> {
             if updates.is_empty() {
                 continue;
             }
-            let a = self.call(jmap::set_emails(&self.session.account, &updates))?;
-            let failed = jmap::set_failures(&a)?;
-            if !failed.is_empty() {
-                eprintln!("mail-sync: JMAP refused {} snooze move(s)", failed.len());
-                ids.retain(|id| !failed.contains(id));
+            let result = self.set_emails(&updates)?;
+            let refused = ids.iter().filter(|id| !result.updated.contains(*id)).count();
+            let accepted: Vec<_> = result.updated.into_iter().collect();
+            if refused != 0 {
+                eprintln!("mail-sync: JMAP refused {refused} snooze move(s)");
             }
-            if !ids.is_empty() {
-                let a = self.call(jmap::get_emails(&self.session.account, &ids))?;
-                for e in jmap::emails(&a, &self.session.account, &ids)? {
+            if !accepted.is_empty() {
+                let a = self.call(jmap::get_emails(&self.session.account, &accepted))?;
+                for e in jmap::emails(&a, &self.session.account, &accepted)? {
                     self.place(sink, &e, true, None, report)?;
                 }
             }
@@ -613,10 +619,15 @@ impl<H: Http> Client<H> {
             return Ok(());
         }
         let list: Vec<(String, Update)> = calls.iter().map(|(_, id, u)| (id.clone(), u.clone())).collect();
-        let a = self.call(jmap::set_emails(&self.session.account, &list))?;
-        let failed = jmap::set_failures(&a)?;
-        for (cid, id, _) in calls {
-            sink.change_done(cid, !failed.contains(&id)).map_err(Error)?;
+        let result = self.set_emails(&list)?;
+        // Undo refused optimistic changes in the reverse of their local order.
+        for (cid, id, update) in calls.into_iter().rev() {
+            let accepted = if matches!(update, Update::Destroy) {
+                result.destroyed.contains(&id)
+            } else {
+                result.updated.contains(&id)
+            };
+            sink.change_done(cid, accepted).map_err(Error)?;
         }
         Ok(())
     }

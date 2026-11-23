@@ -70,6 +70,9 @@ struct Server {
     override_mailbox: Option<&'static str>,
     missing_from_query_get: Option<&'static str>,
     direct_get_overrides: Map<String, Value>,
+    direct_get_requests: Vec<Vec<String>>,
+    set_overrides: Map<String, Value>,
+    set_refusals: BTreeSet<String>,
 }
 
 impl Server {
@@ -158,6 +161,9 @@ impl Server {
                 }
                 "Email/get" => {
                     let ids: Vec<String> = args["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+                    if cid == "g" && call[1].get("#ids").is_none() {
+                        self.direct_get_requests.push(ids.clone());
+                    }
                     let presence = cid == "importPresence";
                     if presence {
                         assert!(ids.len() <= self.presence_limit.unwrap_or(32));
@@ -190,9 +196,14 @@ impl Server {
                     json!({ "accountId": ACCOUNT, "oldState": since.to_string(), "newState": self.state.to_string(), "hasMoreChanges": false, "created": [], "updated": created, "destroyed": destroyed })
                 }
                 "Email/set" => {
+                    let old = self.state;
                     let mut updated = Map::new();
                     let mut not_updated = Map::new();
                     for (id, patch) in args["update"].as_object().unwrap() {
+                        if self.set_refusals.contains(id) {
+                            not_updated.insert(id.clone(), json!({ "type": "forbidden" }));
+                            continue;
+                        }
                         let Some(m) = self.mails.get_mut(id) else {
                             not_updated.insert(id.clone(), json!({ "type": "notFound" }));
                             continue;
@@ -206,14 +217,20 @@ impl Server {
                         self.touch(id, false);
                     }
                     let mut destroyed = Vec::new();
+                    let mut not_destroyed = Map::new();
                     for id in args["destroy"].as_array().unwrap() {
                         let id = id.as_str().unwrap();
-                        if self.mails.remove(id).is_some() {
+                        if self.set_refusals.contains(id) {
+                            not_destroyed.insert(id.into(), json!({ "type": "forbidden" }));
+                        } else if self.mails.remove(id).is_some() {
                             self.touch(id, true);
                             destroyed.push(id.to_string());
+                        } else {
+                            not_destroyed.insert(id.into(), json!({ "type": "notFound" }));
                         }
                     }
-                    json!({ "newState": self.state.to_string(), "updated": updated, "notUpdated": not_updated, "destroyed": destroyed })
+                    json!({ "accountId": ACCOUNT, "oldState": old.to_string(), "newState": self.state.to_string(),
+                        "updated": updated, "notUpdated": not_updated, "destroyed": destroyed, "notDestroyed": not_destroyed })
                 }
                 "VacationResponse/get" => {
                     let v = self.vacation.clone().unwrap_or(json!({ "isEnabled": false, "fromDate": null, "toDate": null, "subject": null, "textBody": null, "htmlBody": null }));
@@ -291,6 +308,11 @@ impl Server {
             }
             if cid == "g" && name == "Email/get" && call[1].get("#ids").is_none() {
                 for (key, value) in &self.direct_get_overrides {
+                    answer[key] = value.clone();
+                }
+            }
+            if name == "Email/set" {
+                for (key, value) in &self.set_overrides {
                     answer[key] = value.clone();
                 }
             }
@@ -374,6 +396,111 @@ impl Http for Fake {
 
 fn message(n: u32, subject: &str, body: &str) -> Vec<u8> {
     format!("From: Grace <grace@example.net>\r\nTo: Ada <ada@example.org>\r\nSubject: {subject}\r\nDate: Tue, 17 Nov 2026 10:{n:02}:00 +0000\r\nMessage-ID: <m{n}@example.net>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n").into_bytes()
+}
+
+#[test]
+fn jmap_queued_actions_wait_for_complete_set_acknowledgments() {
+    use mail_store::OpKind;
+
+    let server = Rc::new(RefCell::new(Server::default()));
+    {
+        let mut s = server.borrow_mut();
+        s.add(message(34, "Mark it read", "body"), &["in"], &[], 1_795_000_000);
+        s.add(message(35, "Delete it", "body"), &["in"], &[], 1_795_000_001);
+        s.set_refusals.insert("M2".into());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    let read = rows.iter().find(|r| r.subject == "Mark it read").unwrap().uid;
+    let delete = rows.iter().find(|r| r.subject == "Delete it").unwrap().uid;
+    engine.store.write(|w| {
+        w.queue(inbox, read, OpKind::Flags { add: flag::SEEN, remove: 0 }, 0)?;
+        w.queue(inbox, delete, OpKind::Flags { add: flag::SEEN, remove: 0 }, 0)?;
+        w.queue(inbox, delete, OpKind::Flags { add: flag::ANSWERED, remove: 0 }, 0)?;
+        w.queue(inbox, delete, OpKind::Expunge, 0)?;
+        Ok(())
+    }).unwrap();
+
+    for (overrides, detail) in [
+        (json!({"accountId": "other"}), "wrong account"),
+        (json!({"updated": null}), "incomplete Email/set"),
+        (json!({"updated": {"M1": null, "M3": null}}), "Email/set ID in updated"),
+        (json!({"notUpdated": {"M1": {"type": "forbidden"}, "M2": {"type": "forbidden"}}}), "Email/set ID in notUpdated"),
+        (json!({"notDestroyed": {"M2": null}}), "bad Email/set error"),
+        (json!({"notDestroyed": null, "destroyed": ["M2", "M2"]}), "repeated Email/set ID"),
+    ] {
+        server.borrow_mut().set_overrides = overrides.as_object().unwrap().clone();
+        let error = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+        assert!(error.contains(detail), "{error}");
+        assert_eq!(engine.store.ops_pending().unwrap(), 4);
+        assert_eq!(engine.store.list(inbox, 0, 10).unwrap().len(), 1);
+    }
+
+    server.borrow_mut().set_overrides.clear();
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.ops_pending().unwrap(), 0);
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    assert_eq!(rows.len(), 2, "explicit refusal restores the hidden message");
+    assert!(rows.iter().find(|r| r.uid == read).unwrap().flags & flag::SEEN != 0);
+    let restored = rows.iter().find(|r| r.uid == delete).unwrap();
+    assert_eq!(restored.flags & (flag::SEEN | flag::ANSWERED), 0);
+    assert!(server.borrow().mails["M1"].keywords.contains("$seen"));
+
+    server.borrow_mut().set_refusals.clear();
+    engine.store.write(|w| w.queue(inbox, delete, OpKind::Expunge, 0)).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.ops_pending().unwrap(), 0);
+    assert!(!server.borrow().mails.contains_key("M2"));
+    assert!(engine.store.by_server_id(account, "M2").unwrap().is_none());
+}
+
+#[test]
+fn jmap_snooze_reads_back_only_explicitly_acknowledged_moves() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    {
+        let mut s = server.borrow_mut();
+        s.add(message(36, "Park one", "body"), &["in"], &[], at);
+        s.add(message(37, "Park two", "body"), &["in"], &[], at);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    for id in ["M1", "M2"] {
+        let msg = engine.store.by_server_id(account, id).unwrap().unwrap();
+        engine.set_later(msg, mail_store::later::kind::READ, at + 3600, "").unwrap();
+    }
+    {
+        let mut s = server.borrow_mut();
+        s.direct_get_requests.clear();
+        s.set_refusals = ["M1".into(), "M2".into()].into();
+        s.set_overrides = json!({"accountId": "other"}).as_object().unwrap().clone();
+    }
+    let err = client.sync(&mut engine.sink(account)).unwrap_err().to_string();
+    assert!(err.contains("wrong account"), "{err}");
+    assert!(server.borrow().direct_get_requests.is_empty());
+
+    server.borrow_mut().set_overrides.clear();
+    server.borrow_mut().set_refusals.remove("M2");
+    client.sync(&mut engine.sink(account)).unwrap();
+    {
+        let s = server.borrow();
+        assert_eq!(s.direct_get_requests, [vec!["M2"]]);
+        assert!(s.mails["M1"].boxes.contains("in"));
+        assert!(s.mails["M2"].boxes.contains("snooze"));
+    }
+    server.borrow_mut().set_refusals.clear();
+    client.sync(&mut engine.sink(account)).unwrap();
+    let s = server.borrow();
+    assert_eq!(s.direct_get_requests, [vec!["M2"], vec!["M1"]]);
+    assert!(s.mails["M1"].boxes.contains("snooze"));
 }
 
 #[test]
