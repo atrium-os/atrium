@@ -883,6 +883,24 @@ authorization flow on the same overlay produced exactly one each of
 The screenshots, logs, worker hashes and shutdown evidence are in
 `~/atrium-vm/evidence/navigator-i3-platform-20261122/`.
 
+### I3 physical YubiKey on Tessera
+
+On 2026-11-23, installed Navigator's JIT-off Ladybird sign-in worker ran
+WebAuthn create and get against the local TLS fixture using a USB YubiKey
+(1050:0406). The arm64 guest mounted Tessera at `/`. The worker ran as uid
+50006 in Capsicum mode with IPv4 and IPv6 disabled. Dispensator assigned
+`/dev/u2f/0` mode 0600 to `_sigillum-dev` in the network-disabled
+`atrium-sigillum-fido-0` jail. Sigillum received both requests from
+`org.atrium.navigator`. Its trusted terminal client handled PIN and touch.
+
+The provider's `webauthn-physical` mode requests a cross-platform credential,
+discourages resident storage, and requires user verification. The sign-in
+page passed the registration's raw credential ID in `allowCredentials`.
+The provider verified the origin, RP hash, fresh challenge, presence and
+verification flags, counter and ES256 signature. Arca redeemed the PKCE
+code. The terminal client and local provider delimit the coverage of this run.
+Evidence is in `~/atrium-vm/evidence/navigator-i3-physical-yubikey-20261123/`.
+
 ### I3 installed WebAuthn get probe
 
 On 2026-11-21 the installed Navigator sign-in sheet opened a local TLS
