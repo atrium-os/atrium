@@ -213,7 +213,15 @@ Each persona’s Fasti keeps the preceding entries in memory for one committed s
 
 **Synthetic verification.** Move Thursday’s 14:00 review to 15:00, switch to Week, and press **Undo edit**. Read the original occurrence and both time slots through the installed Work socket. Move the meeting again, save a second event through another authorized connection, and press the older undo button. Require an expired-undo message and an identical on-disk snapshot after the attempt. Fixtures also exercise cross-persona receipts, replay, restart, a failed publication, release of a private hold and deletion of a series with exceptions. [Installed check](../../scripts/calendar-installed-guest-check.sh) · [Schedule fixtures](../../atrium-calendar/tests/planning.rs)
 
-**Next C0 check.** Run the first-use planning flow entirely by keyboard on the installed desktop, including finding and holding a slot, moving a weekly occurrence, undoing the move and reopening each persona’s selected view.
+### 7.9 Keyboard-only planning
+
+Tab follows the toolbar, entry fields, day actions and agenda rows in order. When a change can be undone, its button follows the last agenda or overview control. Shift+Tab retraces the same path. Enter activates the focused button. In Search, Enter in the title field runs the search. Opening a result selects its occurrence and preserves the pending undo in that window.
+
+The installed desktop check starts with two empty personas. In Work it types a weekly 14:00–14:45 review on December 1, 2026 and an all-day field day on December 2. **Find 45 min** leaves the saved schedule intact. Choosing **Hold 45 min** reserves 09:00–09:45 for preparation. Moving only the December 1 review to 15:00 opens 09:45–15:00. The tester finds and opens the December 8 review at 14:00, then activates **Undo edit** and checks the original records and availability. Personal opens on Today with December 1 free for its own piano lesson.
+
+The check sets Work to Week and Personal to Month, temporarily browses Today in each, and checks the rendered views after both windows reopen. It also restarts Work’s Fasti and reads the restored review and hold in the agenda. The host harness uses Forum for launches, waits for window teardown and observes Fasti. All schedule changes, searches and settings changes come through keyboard events. The check follows the visible focus ring and saves compositor frames at each checkpoint. [Keyboard driver](../../scripts/calendar-keyboard-check.py) · [Installed guest setup](../../scripts/calendar-installed-guest-check.sh)
+
+To repeat the keyboard check, stage the installed guest check’s binaries, policy and bundle files in a fresh disposable guest directory with its matching `.isolated-gate` marker. On the host run `python3 scripts/calendar-keyboard-check.py GUEST_DIR MARKER EVIDENCE_DIR ssh [options] root@GUEST`. Pillow reads the compositor frames and Tesseract checks the visible headings and agenda text. Both run on the host.
 
 ## 8. Accepted decisions
 

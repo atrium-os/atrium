@@ -396,13 +396,21 @@ impl View for Planner {
         Label::new(self.status.get_cloned())
             .at(18., 565.)
             .render(ctx);
+        if view == CalendarView::Today {
+            self.agenda(ctx, data);
+        } else {
+            self.overview(ctx, shown, &data);
+        }
+        // Render the footer last so Tab reaches Undo after the agenda or grid.
         if let Some((receipt, label)) = self.undo.get() {
             self.button(ctx, 500., 548., 181., label, Action::Undo(receipt));
         }
-        if view != CalendarView::Today {
-            self.overview(ctx, shown, &data);
-            return;
-        }
+    }
+}
+
+impl Planner {
+    fn agenda(&self, ctx: &mut Ctx, data: CalendarPage) {
+        let theme = ctx.theme;
         let viewing_zone = data.viewing_zone;
         let day = data.into_day();
         for (label, field, x, w) in [

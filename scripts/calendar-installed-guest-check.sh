@@ -54,6 +54,59 @@ saved() {
     return 1
 }
 
+restart_work() {
+    old=$(pgrep -j "system-fasti--$wu" -x atrium-fastid)
+    kill -TERM "$old"
+    for i in $(jot 20); do
+        new=$(pgrep -j "system-fasti--$wu" -x atrium-fastid 2>/dev/null || :)
+        if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
+        sleep 1
+    done
+    test -n "$new"
+    test "$new" != "$old"
+}
+
+calendar_paths() {
+    signer=$(cat /etc/atrium/calendar-publisher)
+    work_store="$home/.atrium/persona-apps/work/.fasti/$signer"
+    personal_store="$home/.atrium/apps/.fasti/$signer"
+    work_jail=org_atrium_calendar__p_work
+    personal_jail=org_atrium_calendar
+}
+
+# The keyboard driver observes compositor frames and sends only HID keys.
+# These commands handle the trusted lifecycle on the marked disposable guest.
+case "${2-}" in
+    keyboard-open|keyboard-close|keyboard-store|keyboard-restart|keyboard-review)
+        calendar_paths
+        case "${3-}" in
+            work) jail=$work_jail; store=$work_store ;;
+            personal) jail=$personal_jail; store=$personal_store ;;
+            *) exit 2 ;;
+        esac
+        case "$2" in
+            keyboard-open)
+                launch "$3"
+                wait_ui "$jail" "$3"
+                uid=$(ps -p "$(pgrep -j "$jail" -x atrium-calendar)" -o uid= | tr -d ' ')
+                echo "$uid" >"$3.uid"
+                test "$(ifconfig -j "$jail" -l)" = lo0
+                test "$(jls -j "system-fasti--$uid" ip4 ip6)" = 'disable disable'
+                install -m 0555 installed_probe "$(jls -j "$jail" path)/bin/installed-probe"
+                ;;
+            keyboard-close) close_ui "$jail" ;;
+            keyboard-store) cat "$store/calendar.json" ;;
+            keyboard-restart) test "$3" = work; wu=$(cat work.uid); restart_work ;;
+            keyboard-review)
+                case "$5" in --original-review|--moved-review) ;; *) exit 2 ;; esac
+                jexec -u "$(id -nu "$(cat "$3.uid")")" "$jail" /bin/installed-probe /atrium/sockets/calendar/calendar.sock "$4" "$5"
+                ;;
+        esac
+        exit 0 ;;
+    keyboard-setup|'') ;;
+    *) exit 2 ;;
+esac
+
 test ! -e "$home"
 tzsetup -s UTC
 test ! -e "/var/lib/atrium/apps/$app"
@@ -80,11 +133,8 @@ done
 chmod 666 "$psock" "$fsock"
 su -m "$person" -c "portcullis policy grant $app"
 su -m "$person" -c "$D/forum-dock list" | grep -F "$app"
-signer=$(cat /etc/atrium/calendar-publisher)
-work_store="$home/.atrium/persona-apps/work/.fasti/$signer"
-personal_store="$home/.atrium/apps/.fasti/$signer"
-work_jail=org_atrium_calendar__p_work
-personal_jail=org_atrium_calendar
+if [ "${2-}" = keyboard-setup ]; then exit 0; fi
+calendar_paths
 launch work
 wait_ui "$work_jail" work
 sleep 3
@@ -161,17 +211,6 @@ cross "$personal_jail" "$pu" "$wu"
 
 # Restart just Work's service. The same socket and open window must read
 # the accepted record after a new process has reopened the store.
-restart_work() {
-    old=$(pgrep -j "system-fasti--$wu" -x atrium-fastid)
-    kill -TERM "$old"
-    for i in $(jot 20); do
-        new=$(pgrep -j "system-fasti--$wu" -x atrium-fastid 2>/dev/null || :)
-        if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
-        sleep 1
-    done
-    test -n "$new"
-    test "$new" != "$old"
-}
 restart_work
 check_instance "$work_jail" work "$work_store" "design review"
 check_instance "$personal_jail" personal "$personal_store" "piano lesson"
