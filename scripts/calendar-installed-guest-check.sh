@@ -77,7 +77,7 @@ calendar_paths() {
 # The keyboard driver observes compositor frames and sends only HID keys.
 # These commands handle the trusted lifecycle on the marked disposable guest.
 case "${2-}" in
-    keyboard-open|keyboard-close|keyboard-store|keyboard-restart|keyboard-review)
+    keyboard-open|keyboard-close|keyboard-store|keyboard-fingerprint|keyboard-restart|keyboard-review)
         calendar_paths
         case "${3-}" in
             work) jail=$work_jail; store=$work_store ;;
@@ -95,6 +95,8 @@ case "${2-}" in
                 install -m 0555 installed_probe "$(jls -j "$jail" path)/bin/installed-probe"
                 ;;
             keyboard-close) close_ui "$jail" ;;
+            keyboard-fingerprint)
+                if [ -f "$store/calendar.json" ]; then sha256 -q "$store/calendar.json"; else echo empty; fi ;;
             keyboard-store) cat "$store/calendar.json" ;;
             keyboard-restart) test "$3" = work; wu=$(cat work.uid); restart_work ;;
             keyboard-review)
@@ -103,7 +105,7 @@ case "${2-}" in
                 ;;
         esac
         exit 0 ;;
-    keyboard-setup|'') ;;
+    keyboard-setup|import-setup|'') ;;
     *) exit 2 ;;
 esac
 
@@ -125,7 +127,12 @@ done
 mkdir -p "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 daemon -f -o "$D/portcullis.log" env RUST_LOG=info /usr/local/bin/portcullisd --socket "$psock"
-daemon -f -o "$D/fresco.log" env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG="$D/screen" FRESCOD_SOCK="$fsock" FRESCOD_WM_SOCK="$D/wm.sock" FRESCOD_INPUT_SOCK="$D/inject.sock" FRESCOD_ACTIVATION_SOCK="$D/act.sock" FRESCOD_DEV_CAPS=all "$D/frescod"
+activation="$D/act.sock"
+if [ "${2-}" = import-setup ]; then
+    activation=/atrium/sockets/fresco-activation/fresco-activation.sock
+    if sockstat -ul | grep -Fq "$activation"; then echo "activation socket in use" >&2; exit 1; fi
+fi
+daemon -f -o "$D/fresco.log" env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG="$D/screen" FRESCOD_SOCK="$fsock" FRESCOD_WM_SOCK="$D/wm.sock" FRESCOD_INPUT_SOCK="$D/inject.sock" FRESCOD_ACTIVATION_SOCK="$activation" FRESCOD_DEV_CAPS=all "$D/frescod"
 for socket in "$psock" "$fsock" "$D/inject.sock"; do
     for i in $(jot 20); do test -S "$socket" && break; sleep 1; done
     test -S "$socket"
@@ -133,6 +140,24 @@ done
 chmod 666 "$psock" "$fsock"
 su -m "$person" -c "portcullis policy grant $app"
 su -m "$person" -c "$D/forum-dock list" | grep -F "$app"
+if [ "${2-}" = import-setup ]; then
+    # Refresh the stock image's broker and its registry mount after restarting jaild.
+    install -m 0555 limend /usr/local/bin/atrium-limend
+    service atrium-portcullisd-bootstrap restart
+    mkdir -p files-app/bin /atrium/sockets/removable-media
+    install -m 0555 scrinium files-app/bin/scrinium
+    install -m 0444 scrinium-calendar-test.toml files-app/atrium.toml
+    opifex pack files-app
+    openssl dgst -sha256 -sign /root/of-key.pem -out files-app/atrium.toml.sig files-app/atrium.toml
+    opifex install files-app
+    su -m "$person" -c 'portcullis policy grant org.atrium.scrinium'
+    daemon -f -o "$D/files.log" su -m "$person" -c "$D/forum-dock launch org.atrium.scrinium --persona personal"
+    for i in $(jot 30); do grep -qs 'providing picker' files.log && break; sleep 1; done
+    grep -q 'providing picker' files.log
+    cp studio.ics unsupported.ics "$home/.atrium/personas/work/Documents/"
+    cp studio.ics "$home/Documents/personal-only.ics"
+    exit 0
+fi
 if [ "${2-}" = keyboard-setup ]; then exit 0; fi
 calendar_paths
 launch work

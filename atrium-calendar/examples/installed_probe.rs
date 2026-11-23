@@ -59,6 +59,7 @@ fn seed(socket: &Path, date: NaiveDate, work: bool) -> Result<(), String> {
     let mut revision = call(socket, &Request::Day { date })?.revision;
     for (date, kind, title, start, end) in entries {
         let entry = Entry {
+            import_hash: None,
             excluded: Vec::new(),
             zone: None,
             source: None,
@@ -157,6 +158,7 @@ fn search_fixture(socket: &Path, today: NaiveDate, mode: &str) -> Result<(), Str
             id: Uuid::new_v4(),
             date: if personal { private } else { first },
             title: "Lantern".into(),
+            import_hash: None,
             excluded: Vec::new(),
             zone: None,
             source: None,
@@ -210,6 +212,7 @@ fn search_fixture(socket: &Path, today: NaiveDate, mode: &str) -> Result<(), Str
                         start: 480 + n * 15,
                         end: 495 + n * 15,
                     },
+                    import_hash: None,
                     excluded: vec![],
                     zone: None,
                     source: None,
@@ -404,6 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kind: Kind::Appointment,
             zone: None,
             source: None,
+            import_hash: None,
             excluded: vec![],
         };
         let id = entry.id;

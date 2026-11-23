@@ -1,4 +1,5 @@
 //! Persona-local planning with floating, all-day and source-zoned commitments.
+pub mod import;
 pub mod zone;
 pub use zone::{Fold, SourceSlot, Zone};
 mod period;
@@ -38,6 +39,8 @@ pub struct Entry {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_hash: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<Zone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

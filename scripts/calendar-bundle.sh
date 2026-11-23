@@ -22,7 +22,9 @@ test "$(id -u _fasti):$(id -g _fasti)" = 65055:65055
 app="$stage/org.atrium.calendar"
 mkdir -p "$app/bin"
 install -m 0555 "$1" "$app/bin/atrium-calendar"
+install -m 0555 "$(dirname "$1")/calendar-ical" "$app/bin/calendar-ical"
 install -m 0444 "$3" "$app/atrium.toml"
+opifex pack "$app"
 openssl dgst -sha256 -sign "$4" -out "$app/atrium.toml.sig" "$app/atrium.toml"
 opifex install "$app"
 install -d -o root -g wheel -m 0755 /usr/local/libexec/atrium/fasti

@@ -116,6 +116,8 @@ embeds.send(e, ToChild::Open(Filter::file(&["txt", "md"])).encode())?;
 16 extensions of 16 bytes, a title of 80, 64 files, names of 255; anything
 over is refused by the decoder. The app never names a path or a stick.
 
+For a persona-sensitive selection, the app sends `OpenInPersona` with a single read-only file filter and its expected persona. Scrinium requires a matching `ParentPersona` event from Limen before it renders the listing. An absent identity or a mismatch returns a failure, including when the app requests Personal. Calendar uses this request for local calendar imports.
+
 ### 4.2 Files
 
 For each picked file Scrinium opens the path itself, `O_NOFOLLOW`, read-only

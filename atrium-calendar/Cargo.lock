@@ -46,13 +46,17 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "atrium-listen",
+ "atrium-message",
+ "atrium-worker",
  "chrono",
  "chrono-tz",
  "libc",
+ "limen",
  "pergola",
  "portcullis-peer",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]
@@ -81,8 +85,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-message"
+version = "0.1.0"
+dependencies = [
+ "atrium-message-derive",
+]
+
+[[package]]
+name = "atrium-message-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "atrium-types"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-worker"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "autocfg"

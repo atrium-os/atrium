@@ -7,6 +7,9 @@ publish = false
 default-run = "atrium-calendar"
 
 [dependencies]
+atrium-message = { path = "../sdk/atrium-message" }
+atrium-worker = { path = "../sdk/atrium-worker" }
+sha2 = "0.10"
 libc = "0.2"
 atrium-listen = { path = "../atrium-listen" }
 aqueduct = { path = "../aqueduct" }
@@ -19,4 +22,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
+limen = { path = "../limen" }
 pergola = { path = "../pergola" }

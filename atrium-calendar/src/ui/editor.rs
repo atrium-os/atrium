@@ -95,6 +95,7 @@ impl Editor {
             zone: f.zone,
             source: None,
             kind,
+            import_hash: None,
             excluded: Vec::new(),
         };
         Ok(Request::Add {
@@ -125,6 +126,7 @@ impl Editor {
             span: fields.span,
             title: fields.title.clone(),
             kind: self.kind,
+            import_hash: None,
             excluded: Vec::new(),
             zone: fields.zone,
             source: None,

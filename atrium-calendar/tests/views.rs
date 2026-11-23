@@ -12,6 +12,7 @@ fn add(store: &mut Store, date: NaiveDate, kind: Kind, title: &str, start: u16, 
         .add(
             revision,
             Entry {
+                import_hash: None,
                 excluded: Vec::new(),
                 zone: None,
                 source: None,
@@ -246,6 +247,7 @@ fn search_pages_are_ordered_bounded_and_revision_checked() {
                 end: 540,
             },
             title: "Weekly team".into(),
+            import_hash: None,
             excluded: Vec::new(),
             zone: None,
             source: None,
@@ -308,6 +310,7 @@ fn zoned(title: &str, day: &str, start: u16, end: u16, name: chrono_tz::Tz, kind
             end_fold: None,
         }),
         source: None,
+        import_hash: None,
         excluded: vec![],
     }
 }

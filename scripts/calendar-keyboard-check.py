@@ -87,7 +87,7 @@ class Desktop:
     def ring(image):
         # Only the focus ring has this solid stroke above the control and a
         # two-pixel halo above it. Wait for a *new* ring after each Tab.
-        region = image.crop((0, 38, 690, 592))
+        region = image.crop((0, 0, 690, 592))
 
         def color_mask(rgb):
             planes = [band.point([255 if i == value else 0 for i in range(256)])
@@ -136,7 +136,7 @@ class Desktop:
             ).stdout.decode()
             if all(re.search(label, text, re.I) for label in labels):
                 print(f"PASS {name}", flush=True)
-                return
+                return text
             time.sleep(0.2)
         raise RuntimeError(f"{name}: expected {labels} on screen, read {text!r}")
 
@@ -195,6 +195,7 @@ def plan(ui):
     ui.activate(580, 168)
     ui.see("moved-gaps", "Open for 315 minutes")
     ui.activate(455, 44)  # Search the month and open the following occurrence.
+    ui.see("search-open", "Event title", "Through", "2026-12-31")
     ui.field(160, 129, "release")
     ui.keys((40, 0))
     ui.see("weekly-search", r"2026-12-01\s+15:00", r"2026-12-08\s+14:00")

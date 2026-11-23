@@ -305,6 +305,7 @@ an app gets, so no app may register to be it. Built: [scrinium.md](scrinium.md) 
 | direction | message | payload |
 |---|---|---|
 | parent → child | `Open` | `filter: { kind: File \| Folder, extensions, multiple, write, title }` |
+| parent → child | `OpenInPersona` | One read-only file filter and the expected persona. Scrinium checks Limen’s independent parent identity before displaying files. |
 | child → parent | `File` | `name, size, write`; sent with `EMIT_FD`, the open file in the same frame |
 | parent → child | `Open(Save)` with descriptor | sealed workbook snapshot for Save As |
 | parent → child | `Commit` with descriptor | session save grant and sealed workbook snapshot |

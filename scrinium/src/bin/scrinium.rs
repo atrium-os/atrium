@@ -350,7 +350,8 @@ struct Embed {
     to_pane: Sender<ToPane>,
     parent_uid: u32,
     sheets: bool,
-    personal: bool,
+    persona_scoped: bool,
+    persona: Option<String>,
     recent: bool,
     write: bool,
     staged: Option<std::fs::File>,
@@ -387,7 +388,8 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
             for (name, size, f) in &open {
                 let msg = ToParent::File { name: name.clone(), size: *size, write: e.write };
                 child.emit_fd(embed, msg.encode(), f.as_fd()).map_err(|err| format!("limend refused the file ({err:?})"))?;
-                eprintln!("scrinium: picker {embed}: handed over {name}{}", if e.write { " (read-write)" } else { "" });
+                let label = if e.persona_scoped { "a file" } else { name };
+                eprintln!("scrinium: picker {embed}: handed over {label}{}", if e.write { " (read-write)" } else { "" });
             }
             let _ = child.emit(embed, ToParent::Done { files: open.len() as u32 }.encode());
             Ok(())
@@ -413,7 +415,7 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
             Ok(())
         }
         Outcome::RecentWorkbook { id, activation } => {
-            if !e.recent || !e.personal { return Err("Recent Workbooks is unavailable here.".into()); }
+            if !e.recent || e.persona.as_deref() != Some("personal") { return Err("Recent Workbooks is unavailable here.".into()); }
             let pick = scrinium::bookmarks::reopen(id).map_err(|err| err.to_string())?;
             let name = pick.name.to_str().map_err(|err| err.to_string())?;
             scrinium::open::reopen_workbook(e.parent_uid, name, activation, &pick)?;
@@ -494,14 +496,14 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                 Some(ChildEvent::Attach { embed, role, parent_app, parent_uid }) if role == "picker" => {
                     eprintln!("scrinium: picker {embed} for {parent_app} (uid {parent_uid})");
                     let (ptx, prx) = mpsc::channel();
-                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", personal: true, recent: false, write: false, staged: None, versions: None, requested: false });
+                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", persona_scoped: false, persona: None, recent: false, write: false, staged: None, versions: None, requested: false });
                     let (f, pl, t) = (fresco.clone(), places.clone(), tx.clone());
                     std::thread::spawn(move || picker_pane(embed, parent_app, f, pl, prx, t));
                 }
                 Some(ChildEvent::ParentPersona { embed, persona }) => {
                     if let Some(e) = embeds.get_mut(&embed) {
                         eprintln!("scrinium: picker {embed} is for {}", persona.as_deref().unwrap_or("personal"));
-                        e.personal = persona.is_none();
+                        e.persona = Some(persona.clone().unwrap_or_else(|| "personal".into()));
                         let _ = e.to_pane.send(ToPane::Persona(persona));
                     }
                 }
@@ -533,7 +535,18 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                     }
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
-                    let message = ToChild::decode(&bytes);
+                    let message = match ToChild::decode(&bytes) {
+                        Some(ToChild::OpenInPersona { filter, persona }) => {
+                            let Some(e) = embeds.get_mut(&embed) else { continue };
+                            if e.persona.as_ref() != Some(&persona) {
+                                let _ = child.emit(embed, ToParent::Failed { why: "Cannot verify the file picker persona".into() }.encode());
+                                continue;
+                            }
+                            e.persona_scoped = true;
+                            Some(ToChild::Open(filter))
+                        }
+                        other => other,
+                    };
                     if let (Some(e), Some(ToChild::RecentWorkbooks)) = (embeds.get_mut(&embed), &message) {
                         if !e.sheets || e.requested {
                             let _ = child.emit(embed, workbook_failure("Invalid Recent Workbooks request".into()).encode());
@@ -541,7 +554,7 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                         }
                         e.requested = true;
                         e.recent = true;
-                        let rows = if e.personal { scrinium::bookmarks::list() } else { Ok(Vec::new()) };
+                        let rows = if e.persona.as_deref() == Some("personal") { scrinium::bookmarks::list() } else { Ok(Vec::new()) };
                         match rows {
                             Ok(rows) => { let _ = e.to_pane.send(ToPane::Recent(rows)); }
                             Err(err) => { let _ = child.emit(embed, workbook_failure(err.to_string()).encode()); }
@@ -1340,7 +1353,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let window = !args.iter().any(|a| a == "--no-window");
     let picker = !args.iter().any(|a| a == "--no-picker");
-    let fresco = env("FRESCO_SOCKET", "/tmp/frescod.sock");
+    let fresco = fresco_client::default_socket_path().to_string_lossy().into_owned();
     let media_sock = places::media_socket();
 
     // Every stick, in this jail, for as long as it runs.

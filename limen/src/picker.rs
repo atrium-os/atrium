@@ -127,6 +127,9 @@ pub enum ToChild {
     BrowseVersions([u8; 16]),
     /// Show the Sheets launcher’s saved workbook bookmarks.
     RecentWorkbooks,
+    /// Open one read-only file only if the broker delivered this parent persona.
+    /// An older picker cannot interpret the request or expose its default place.
+    OpenInPersona { filter: Filter, persona: String },
 }
 
 impl ToChild {
@@ -137,7 +140,12 @@ impl ToChild {
     /// Decode the parent's message, refusing anything out of shape.
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
-        match &m { Self::Open(f) if !f.sane() => None, _ => Some(m) }
+        match &m {
+            Self::Open(f) if !f.sane() => None,
+            Self::OpenInPersona { filter, persona } if !filter.sane() || filter.kind != Kind::File
+                || filter.write || filter.multiple || (persona != "personal" && !portcullis_peer::valid_person_persona(persona)) => None,
+            _ => Some(m),
+        }
     }
 }
 
@@ -240,6 +248,26 @@ mod tests {
             ToParent::Failed { why: "\u{7}".into() },
         ] {
             assert_eq!(ToParent::decode(&bad.encode()), None, "{bad:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scoped_open_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_open_only_accepts_one_read_only_file_and_a_person_persona() {
+        for (persona, filter, allowed) in [
+            ("work", Filter::file(), true),
+            ("personal", Filter::file(), true),
+            ("../work", Filter::file(), false),
+            ("work", Filter::folder(), false),
+            ("work", Filter { write: true, ..Filter::file() }, false),
+            ("work", Filter { multiple: true, ..Filter::file() }, false),
+        ] {
+            let msg = ToChild::OpenInPersona { persona: persona.into(), filter };
+            assert_eq!(ToChild::decode(&msg.encode()).is_some(), allowed);
         }
     }
 }

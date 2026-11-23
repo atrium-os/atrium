@@ -9,7 +9,13 @@ icon = "calendar"
 [capabilities]
 graphics = "fresco"
 network = "none"
-embeds = []
+embeds = ["picker"]
+
+[[workers]]
+name = "ical"
+entry = "bin/calendar-ical"
+input = "fd"
+cpu = "10s"
 
 [supervision]
 restart = "on-crash"

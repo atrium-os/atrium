@@ -20,6 +20,8 @@ mod search;
 use search::{Results, SearchForm};
 mod editor;
 use editor::{Editor, Stage};
+mod import;
+use import::{Picker, Screen};
 mod overview;
 use overview::rect;
 
@@ -49,6 +51,10 @@ enum Action {
     SearchPanel(bool),
     Search(Option<usize>),
     OpenHit(Uuid, NaiveDate, u64),
+    PickImport,
+    CloseImport,
+    SaveImport,
+    ImportPage(usize),
     NewZoned,
     CreateZoned(Kind),
     ChooseFold(bool, atrium_calendar::Fold),
@@ -62,6 +68,7 @@ enum Reply {
 }
 
 struct Planner {
+    import: Mutable<Option<Screen>>,
     undo: Mutable<Option<(atrium_calendar::UndoReceipt, &'static str)>>,
     search: Mutable<Option<SearchForm>>,
     selected_row: Mutable<Option<usize>>,
@@ -125,6 +132,15 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<Request, String> {
+        if matches!(action, Action::SaveImport) {
+            let Some(Screen::Ready {
+                revision, token, ..
+            }) = self.import.get_cloned()
+            else {
+                return Err("Review the file first".into());
+            };
+            return Ok(Request::SaveImport { revision, token });
+        }
         if let Action::Undo(receipt) = action {
             return Ok(Request::Undo { receipt });
         }
@@ -238,6 +254,7 @@ impl Planner {
             _ => return Err("Unexpected calendar action".into()),
         };
         let entry = Entry {
+            import_hash: None,
             excluded: Vec::new(),
             zone: None,
             source: None,
@@ -295,6 +312,10 @@ impl View for Planner {
         let data = self.data.get_cloned();
         if self.waiting.get() {
             Label::new("Loading calendar…").at(18., 110.).render(ctx);
+            return;
+        }
+        if let Some(screen) = self.import.get_cloned() {
+            self.render_import(ctx, screen);
             return;
         }
         if let Some(form) = search {
@@ -377,6 +398,7 @@ impl View for Planner {
                 .render(ctx);
             return;
         }
+        self.button(ctx, 531., 5., 150., "Import .ics…", Action::PickImport);
         for (i, choice) in CalendarView::ALL.into_iter().enumerate() {
             let button = if choice == view {
                 Button::primary(choice.label())
@@ -587,6 +609,7 @@ pub fn run() -> io::Result<()> {
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
     let planner = Arc::new(Planner {
+        import: Mutable::with_dirty(None, dirty.clone()),
         undo: Mutable::with_dirty(None, dirty.clone()),
         search: Mutable::with_dirty(None, dirty.clone()),
         selected_row: Mutable::with_dirty(None, dirty.clone()),
@@ -624,7 +647,31 @@ pub fn run() -> io::Result<()> {
     let mut clock_name = std::fs::read_to_string(&clock_path).ok();
     let mut checked = std::time::Instant::now();
     let mut refresh_zone = false;
+    let mut picker: Option<Picker> = None;
+    let (parsed, previews) = mpsc::channel();
+
     loop {
+        if let Some(result) = picker.as_mut().and_then(Picker::poll) {
+            picker.take();
+            match result {
+                Ok(Some(file)) => {
+                    planner.import.set(Some(Screen::Reading));
+                    let tx = parsed.clone();
+                    let path = socket.clone();
+                    let revision = planner.data.get_cloned().unwrap().revision;
+                    std::thread::spawn(move || {
+                        let _ = tx.send(import::prepare(file, revision, &path));
+                    });
+                }
+                Ok(None) => planner.import.set(None),
+                Err(e) => planner.import.set(Some(Screen::Problem(e))),
+            }
+        }
+        if let Ok(result) = previews.try_recv() {
+            planner
+                .import
+                .set(Some(result.unwrap_or_else(Screen::Problem)));
+        }
         if checked.elapsed() >= Duration::from_secs(2) {
             let current = std::fs::read_to_string(&clock_path).ok();
             refresh_zone |= current != clock_name;
@@ -632,6 +679,7 @@ pub fn run() -> io::Result<()> {
             checked = std::time::Instant::now();
         }
         if refresh_zone
+            && planner.import.get_cloned().is_none()
             && !planner.waiting.get()
             && planner.editor.get_cloned().is_none()
             && planner.search.get_cloned().is_none()
@@ -659,6 +707,43 @@ pub fn run() -> io::Result<()> {
                 continue;
             }
             match action {
+                Action::PickImport => {
+                    match Picker::open(&mut win, args.get(1).map_or("personal", String::as_str)) {
+                        Ok(p) => {
+                            picker = Some(p);
+                            planner.import.set(Some(Screen::Picking));
+                        }
+                        Err(e) => planner.import.set(Some(Screen::Problem(e))),
+                    }
+                }
+                Action::CloseImport => {
+                    if let Some(Screen::Ready { token, .. }) = planner.import.get_cloned() {
+                        let path = socket.clone();
+                        std::thread::spawn(move || {
+                            let _ = atrium_calendar::wire::discard_import(&path, token);
+                        });
+                    }
+                    planner.import.set(None);
+                    let _ = tx.send(Action::Resume);
+                }
+                Action::ImportPage(next) => {
+                    if let Some(Screen::Ready {
+                        data,
+                        revision,
+                        token,
+                        ..
+                    }) = planner.import.get_cloned()
+                    {
+                        if next < data.rows.len() {
+                            planner.import.set(Some(Screen::Ready {
+                                data,
+                                revision,
+                                token,
+                                offset: next,
+                            }));
+                        }
+                    }
+                }
                 Action::Edit(id, scope) => {
                     if let Err(e) = planner.open_editor(id, scope) {
                         planner.status.set(e);
@@ -747,9 +832,11 @@ pub fn run() -> io::Result<()> {
                     planner.status.set(String::new());
                 }
                 Ok(Reply::Calendar(data)) => {
+                    planner.import.set(None);
                     let date = data.date;
                     if let Some(receipt) = data.undo {
                         let label = match action {
+                            Action::SaveImport => "Undo import",
                             Action::Change(true) => "Undo deletion",
                             Action::Change(false) => "Undo edit",
                             Action::Hold(_) => "Undo hold",
@@ -775,6 +862,7 @@ pub fn run() -> io::Result<()> {
                     if matches!(
                         action,
                         Action::Undo(_)
+                            | Action::SaveImport
                             | Action::Today(_)
                             | Action::SetZone(_)
                             | Action::Resume
@@ -797,6 +885,7 @@ pub fn run() -> io::Result<()> {
                     }
                     planner.status.set(
                         match action {
+                            Action::SaveImport => "Local copies saved",
                             Action::Undo(_) => "Change undone on this device",
                             Action::OpenHit(..) => "Selected search result",
                             Action::Change(true) => "Deleted on this device",
@@ -810,6 +899,9 @@ pub fn run() -> io::Result<()> {
                         }
                         .into(),
                     );
+                }
+                Err(e) if matches!(action, Action::SaveImport) => {
+                    planner.import.set(Some(Screen::Problem(e)))
                 }
                 Err(e) if matches!(action, Action::Search(_) | Action::OpenHit(..)) => {
                     if let Some(mut form) = planner.search.get_cloned() {
