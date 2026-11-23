@@ -54,6 +54,20 @@ document and an embed-only Fresco connection. See
 - **Not a pixel channel.** The parent never receives the child's pixels, and the child never
   receives the parent's.
 
+The `smime-provision` sheet is offered only for the configured signed
+Mail publisher and an installed embed grant. Only the fixed Arca UI uid
+may provide it. Mail can place or close the sheet and receive a typed
+public outcome. The sheet accepts neither app messages nor descriptors.
+Once the sheet is bound, Arca can open one nested Scrinium picker on its
+own Limen connection. Limen checks the sheet’s window ownership and
+passes the original Mail launch persona to Scrinium. The nested picker
+can return one read-only regular file, at most 16 KiB, to Arca. The
+descriptor’s actual length must agree with the picker’s report. Limen
+narrows its rights to read, seek and fstat. Hiding or detaching the
+provisioning sheet tears down its picker. A completed pick must detach
+before Arca starts the second pick for the other input. Mail receives
+only success with a public fingerprint, cancellation, lock or failure.
+
 The broker-fetched web-island role validates child reports against the attachment and session state. Its parent may answer one outstanding unload question using the matching number. Its wire limits and message directions are in [Navigator islands §5](navigator-islands.md#i2-installed-island-reports).
 
 ## 1. Architecture

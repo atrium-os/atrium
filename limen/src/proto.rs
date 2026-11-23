@@ -25,6 +25,8 @@ pub mod op {
     pub const REQUEST_ISLAND: u16 = 0x07;
     /// Irreversibly restrict this fresh connection before handing it to Navigator UI.
     pub const DELEGATE_NAVIGATOR_UI: u16 = 0x08;
+    /// Trusted Arca UI only: `(provisioning sheet, its window token)`.
+    pub const REQUEST_SMIME_PICKER: u16 = 0x09;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;

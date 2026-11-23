@@ -828,8 +828,10 @@ input redirected from the unencrypted PKCS#8 file. Use `personal` for the
 Personal persona. Both inputs must be bounded read-only regular files.
 The operator tool reads them into locked memory and prints only the public
 fingerprint. To remove the pair, use `arca-ui smime-forget USER PERSONA
-FINGERPRINT` under the same identity. The graphical import picker and
-PKCS#1 v1.5 compatibility remain separate work.
+FINGERPRINT` under the same identity. Limen has a restricted nested picker for the
+graphical path. It returns a selected read-only file to Arca’s trusted
+connection and gives Mail only a typed public outcome. The Arca sheet,
+Mail entry point and PKCS#1 v1.5 compatibility remain separate work.
 
 ## 10. Audit
 

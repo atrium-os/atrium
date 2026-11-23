@@ -959,3 +959,92 @@ fn fetched_island_reports_follow_attachment_direction_and_lifecycle() {
     }
     assert_eq!(refused(child.emit(id, title)), refusal::MALFORMED);
 }
+
+#[test]
+fn smime_key_picker_routes_a_single_read_only_file_to_arca() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use limen::picker::{Filter, ToChild, ToParent};
+
+    let w = World::new();
+    const MAIL_UID: u32 = 4111;
+    const W_MAIL: WindowToken = [25; 16];
+    w.fresco.0.lock().unwrap().0.insert(W_MAIL, MAIL_UID);
+    w.shared.set_system_uid(catalogue::ARCA, ARCA_UID);
+    w.shared.set_smime_mail(Box::new(|uid| (uid == MAIL_UID).then(|| Some("work".into()))));
+    assert!(provider(w.connect(OTHER), "smime-provision").is_err());
+    let mut arca = provider(w.connect(ARCA_UID), "smime-provision").unwrap();
+    let mut picker = provider(w.connect(SCRINIUM_UID), "picker").unwrap();
+    let mut mail = w.parent(MAIL_UID);
+    let mut arca_parent = w.parent(ARCA_UID);
+    assert_eq!(
+        refused(w.parent(4112).request("smime-provision", W_OTHER)),
+        refusal::NOT_AN_APP
+    );
+    let sheet = mail.request("smime-provision", W_MAIL).unwrap();
+    assert!(matches!(next_c(&mut arca), ChildEvent::Attach { embed, role, parent_uid, .. }
+        if embed == sheet && role == "smime-provision" && parent_uid == MAIL_UID));
+    assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_ARCA)), refusal::NOT_ATTACHED);
+    assert_eq!(refused(mail.request_smime_picker(sheet, W_ARCA)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(mail.send(sheet, b"forged persona".to_vec())), refusal::MALFORMED);
+    mail.place(sheet, Some([0.0, 0.0, 680.0, 520.0])).unwrap();
+    arca.ready(sheet, W_ARCA).unwrap();
+    assert_eq!(next_p(&mut mail), ParentEvent::Attached { embed: sheet });
+
+    assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_OTHER)), refusal::NOT_ATTACHED);
+    let pick = arca_parent.request_smime_picker(sheet, W_ARCA).unwrap();
+    assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_ARCA)), refusal::TOO_MANY);
+    assert_eq!(next_c(&mut picker), ChildEvent::Attach {
+        embed: pick, role: "picker".into(), parent_app: catalogue::ARCA.into(), parent_uid: ARCA_UID,
+    });
+    assert_eq!(next_c(&mut picker), ChildEvent::ParentPersona { embed: pick, persona: Some("work".into()) });
+    let invalid = ToChild::Open(Filter { write: true, ..Filter::file() });
+    assert_eq!(refused(arca_parent.send(pick, invalid.encode())), refusal::MALFORMED);
+    let open = ToChild::Open(Filter::file()).encode();
+    arca_parent.send(pick, open.clone()).unwrap();
+    assert_eq!(next_c(&mut picker), ChildEvent::Message { embed: pick, bytes: open });
+    arca_parent.place(pick, Some([0.0, 0.0, 640.0, 440.0])).unwrap();
+    picker.ready(pick, W_PICKER).unwrap();
+    assert_eq!(next_p(&mut arca_parent), ParentEvent::Attached { embed: pick });
+
+    let path = std::env::temp_dir().join(format!("limen-smime-picker-{}", std::process::id()));
+    let mut key = std::fs::OpenOptions::new().create_new(true).mode(0o600).read(true).write(true).open(&path).unwrap();
+    let bytes = b"synthetic private-key fixture";
+    key.write_all(bytes).unwrap();
+    let ro = std::fs::File::open(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let picked = ToParent::File { name: "test.pk8".into(), size: bytes.len() as u64, write: false }.encode();
+    assert_eq!(refused(picker.emit_fd(pick, picked.clone(), key.as_fd())), refusal::BAD_FD);
+    let wrong_size = ToParent::File { name: "test.pk8".into(), size: 1, write: false }.encode();
+    assert_eq!(refused(picker.emit_fd(pick, wrong_size, ro.as_fd())), refusal::BAD_FD);
+    key.set_len(16 * 1024 + 1).unwrap();
+    let oversized = ToParent::File { name: "oversized.pk8".into(), size: 16 * 1024 + 1, write: false }.encode();
+    assert_eq!(refused(picker.emit_fd(pick, oversized, ro.as_fd())), refusal::BAD_FD);
+    key.set_len(bytes.len() as u64).unwrap();
+    assert_eq!(refused(arca.emit_fd(sheet, picked.clone(), ro.as_fd())), refusal::MALFORMED);
+    picker.emit_fd(pick, picked.clone(), ro.as_fd()).unwrap();
+    assert_eq!(next_p(&mut arca_parent), ParentEvent::MessageFd { embed: pick, bytes: picked.clone() });
+    let mut arca_file = std::fs::File::from(arca_parent.take_fd().unwrap());
+    let mut private = Vec::new();
+    arca_file.read_to_end(&mut private).unwrap();
+    assert_eq!(private, bytes);
+    assert!(mail.poll(Duration::from_millis(40)).unwrap().is_none());
+    assert!(mail.take_fd().is_none());
+    assert_eq!(refused(picker.emit_fd(pick, picked.clone(), ro.as_fd())), refusal::MALFORMED);
+
+    let done = ToParent::Done { files: 1 }.encode();
+    picker.emit(pick, done.clone()).unwrap();
+    assert_eq!(next_p(&mut arca_parent), ParentEvent::Message { embed: pick, bytes: done });
+    assert_eq!(refused(arca.emit(sheet, bytes.to_vec())), refusal::MALFORMED);
+    let outcome = limen::smime_provision::Outcome::Provisioned { fingerprint: [6; 32] }.encode();
+    arca.emit(sheet, outcome.clone()).unwrap();
+    assert_eq!(next_p(&mut mail), ParentEvent::Message { embed: sheet, bytes: outcome });
+    mail.set_visible(sheet, false).unwrap();
+    assert_eq!(next_p(&mut arca_parent), ParentEvent::Detached { embed: pick });
+    assert_eq!(next_c(&mut picker), ChildEvent::Detaching { embed: pick });
+    assert_eq!(refused(picker.emit_fd(pick, picked, ro.as_fd())), refusal::NOT_YOURS);
+    assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_ARCA)), refusal::NOT_ATTACHED);
+    assert!(mail.take_fd().is_none());
+}

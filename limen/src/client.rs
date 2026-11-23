@@ -142,6 +142,16 @@ impl Parent {
         }
     }
 
+    /// Start a read-only picker nested in Arca's bound provisioning sheet.
+    /// The file is returned on this connection, owned by Arca.
+    pub fn request_smime_picker(&mut self, sheet: EmbedId, window: WindowToken) -> Result<EmbedId, Error> {
+        match self.0.call(op::REQUEST_SMIME_PICKER, &(sheet, window))? {
+            Reply::Embed { embed } => Ok(embed),
+            Reply::Refused { reason } => Err(Error::Refused(reason)),
+            Reply::Ok => Err(Error::Refused(proto::refusal::MALFORMED)),
+        }
+    }
+
     /// Where the slot is, in the parent window's surface px; `None` hides it.
     pub fn place(&mut self, embed: EmbedId, rect: Option<[f32; 4]>) -> Result<(), Error> {
         self.0.ok(op::PLACE, &proto::Place { embed, rect })

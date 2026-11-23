@@ -96,6 +96,8 @@ pub trait Attribution: Send {
 pub type Resolve = Box<dyn Fn(u32) -> Option<(String, String)> + Send + Sync>;
 /// A uid's named persona (`None`: Personal).
 pub type PersonaOf = Box<dyn Fn(u32) -> Option<String> + Send + Sync>;
+/// A signed Mail launch, including a distinct success for Personal.
+pub type SmimeMail = Box<dyn Fn(u32) -> Option<Option<String>> + Send + Sync>;
 /// (user, role) → the app that provides it (the user's default; limen.md §3.2).
 pub type Defaults = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 /// (parent app id, role) → whether its manifest lets it embed the role.
@@ -130,9 +132,20 @@ struct Embed {
     attached: bool,
     /// In picture-in-picture: out of the slot, in Forum's `pip` layer.
     pip: bool,
+    smime_scope: Option<Option<String>>,
+    smime_picker: Option<SmimePicker>,
     to_child: Rate,
     to_parent: Rate,
 }
+
+struct SmimePicker {
+    sheet: EmbedId,
+    opened: bool,
+    delivered: bool,
+    finished: bool,
+}
+
+const SMIME_PICK_MAX: u64 = 16 * 1024;
 
 #[derive(Default)]
 struct Rate { since: Option<Instant>, n: u32, told: bool }
@@ -209,6 +222,7 @@ pub struct Shared {
     /// A uid's persona, from the launch registry (`None`: Personal).
     persona: Mutex<Option<PersonaOf>>,
     mail_sheet_provider: Mutex<Option<Box<dyn Fn(u32) -> bool + Send + Sync>>>,
+    smime_mail: Mutex<Option<SmimeMail>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
     /// Without one (tests), any app may embed any role.
     embed_check: Mutex<Option<EmbedCheck>>,
@@ -231,6 +245,7 @@ impl Shared {
             system_uids: Mutex::new(HashMap::new()),
             persona: Mutex::new(None),
             mail_sheet_provider: Mutex::new(None),
+            smime_mail: Mutex::new(None),
             attribution: Mutex::new(None),
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
@@ -252,6 +267,10 @@ impl Shared {
     /// Only the Navigator signed by the configured web broker publisher can frame Mail sign-in.
     pub fn set_mail_sheet_provider(&self, check: Box<dyn Fn(u32) -> bool + Send + Sync>) {
         *self.mail_sheet_provider.lock().unwrap() = Some(check);
+    }
+
+    pub fn set_smime_mail(&self, resolve: SmimeMail) {
+        *self.smime_mail.lock().unwrap() = Some(resolve);
     }
 
     /// Where attribution tickets come from (choragusd). Without one, an
@@ -353,6 +372,10 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
     let r = (|| -> Result<Reply, Reply> {
         match opc {
             op::REQUEST => request(shared, conn, uid, de(payload)?, false),
+            op::REQUEST_SMIME_PICKER => {
+                let (sheet, window) = de(payload)?;
+                request_smime_picker(shared, conn, uid, sheet, window)
+            }
             op::REQUEST_ISLAND => {
                 let (window, z) = de(payload)?;
                 request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, true)
@@ -385,7 +408,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                     return Err(Reply::Refused { reason: refusal::NOT_YOURS });
                 }
                 let e = st.embeds.remove(&d.embed).unwrap();
-                end(shared, &st, d.embed, e, true);
+                end(shared, &mut st, d.embed, e, true);
                 Ok(Reply::Ok)
             }
             op::PROVIDE => provide(shared, conn, uid, de(payload)?),
@@ -429,6 +452,15 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         identity
     };
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
+    let smime_scope = if role.name == "smime-provision" {
+        let valid = shared.smime_mail.lock().unwrap().as_ref().and_then(|resolve| resolve(uid));
+        if app != "org.atrium.mail" || valid.is_none() {
+            return refuse(refusal::NOT_AN_APP);
+        }
+        valid
+    } else {
+        None
+    };
     // A chosen role needs no `embeds` of its own: the choice can only come
     // from a share sheet the parent opened, which did need it.
     if let (Provider::System(_) | Provider::Worker(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
@@ -552,6 +584,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
         child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, island: with_fetch.then(Default::default), media_ready: false, attached: false, pip: false,
+        smime_scope, smime_picker: None,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -568,6 +601,46 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
     if let Some(socket) = broker_fetch {
         st.to_parent_fd(&e, ParentEvent::IslandFetch { embed }, socket.into());
     }
+    st.embeds.insert(embed, e);
+    Ok(Reply::Embed { embed })
+}
+
+fn request_smime_picker(shared: &Arc<Shared>, conn: ConnId, uid: u32, sheet: EmbedId, window: WindowToken) -> Result<Reply, Reply> {
+    let refuse = |reason| Err(Reply::Refused { reason });
+    if shared.system_uids.lock().unwrap().get(catalogue::ARCA) != Some(&uid) {
+        return refuse(refusal::NOT_PROVIDER);
+    }
+    let mut st = shared.state.lock().unwrap();
+    let Some(outer) = st.embeds.get(&sheet).filter(|outer| {
+        outer.bound && outer.visible && outer.child_uid == uid && outer.child_window == Some(window)
+    }) else {
+        return refuse(refusal::NOT_ATTACHED);
+    };
+    let Some(persona) = outer.smime_scope.clone() else {
+        return refuse(refusal::NOT_PROVIDER);
+    };
+    if shared.smime_mail.lock().unwrap().as_ref().and_then(|resolve| resolve(outer.parent_uid)) != Some(persona.clone()) {
+        return refuse(refusal::NOT_PROVIDER);
+    }
+    if st.embeds.values().any(|e| e.smime_picker.as_ref().is_some_and(|pick| pick.sheet == sheet)) {
+        return refuse(refusal::TOO_MANY);
+    }
+    let Some(&(child, child_uid)) = st.providers.get("picker") else {
+        return refuse(refusal::NO_PROVIDER);
+    };
+    let role = catalogue::role("picker").expect("catalogued picker");
+    st.next_embed = st.next_embed.wrapping_add(1);
+    let embed = st.next_embed;
+    let e = Embed {
+        role, parent: conn, parent_uid: uid, parent_window: window, z: 0, child, child_uid,
+        spawned: false, audio_ticket: None, child_window: None, rect: None, visible: true,
+        bound: false, binding_generation: 0, island: None, media_ready: false, attached: false, pip: false,
+        smime_scope: None,
+        smime_picker: Some(SmimePicker { sheet, opened: false, delivered: false, finished: false }),
+        to_child: Rate::default(), to_parent: Rate::default(),
+    };
+    st.to_child(&e, ChildEvent::Attach { embed, role: "picker".into(), parent_app: catalogue::ARCA.into(), parent_uid: uid });
+    st.to_child(&e, ChildEvent::ParentPersona { embed, persona });
     st.embeds.insert(embed, e);
     Ok(Reply::Embed { embed })
 }
@@ -633,7 +706,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
                                 if st.embeds.get(&embed).is_some_and(|e| e.bound && e.binding_generation == generation && e.child_window == Some(child)) {
                                     let e = st.embeds.remove(&embed).unwrap();
                                     st.to_parent(&e, ParentEvent::IslandStopped { embed });
-                                    end(&shared, &st, embed, e, false);
+                                    end(&shared, &mut st, embed, e, false);
                                 }
                             });
                         }
@@ -666,6 +739,11 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
             let e = &st.embeds[&embed];
             st.to_parent(e, ParentEvent::Suspended { embed });
             st.to_child(e, ChildEvent::Suspended { embed });
+            let end_picker = e.smime_scope.is_some();
+            drop(comp);
+            if end_picker {
+                end_smime_picker(shared, st, embed);
+            }
         }
         None => {}
     }
@@ -680,6 +758,18 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     };
     if s.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
+    }
+    if e.smime_scope.is_some() {
+        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    }
+    if let Some(pick) = &mut e.smime_picker {
+        use crate::picker::{Kind, ToChild};
+        if pick.opened || fd.is_some() || !matches!(ToChild::decode(&s.bytes),
+            Some(ToChild::Open(filter)) if filter.kind == Kind::File && !filter.write && !filter.multiple)
+        {
+            return Err(Reply::Refused { reason: refusal::MALFORMED });
+        }
+        pick.opened = true;
     }
     if e.role.name == "web-island" && e.island.is_none() && s.bytes != b"advance" {
         return Err(Reply::Refused { reason: refusal::MALFORMED });
@@ -730,6 +820,9 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
     if m.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
+    if e.smime_scope.is_some() && (!e.bound || crate::smime_provision::Outcome::decode(&m.bytes).is_none()) {
+        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    }
     if fd.is_some() && !e.role.returns_fd {
         return Err(Reply::Refused { reason: refusal::MALFORMED });
     }
@@ -738,10 +831,31 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
     if fd.is_some() && !e.attached {
         return Err(Reply::Refused { reason: refusal::NOT_ATTACHED });
     }
-    if let Some(f) = fd.as_ref() {
+    if let Some(f) = fd.as_ref().filter(|_| e.smime_picker.is_none()) {
         match crate::fdpass::check_returned(f) {
             Ok(w) if crate::fdpass::narrow_returned(f, w).is_ok() => {}
             _ => return Err(Reply::Refused { reason: refusal::BAD_FD }),
+        }
+    }
+    if let Some(pick) = &mut e.smime_picker {
+        use crate::picker::ToParent;
+        if !e.bound || !pick.opened || pick.finished {
+            return Err(Reply::Refused { reason: refusal::MALFORMED });
+        }
+        match (ToParent::decode(&m.bytes), fd.as_ref()) {
+            (Some(ToParent::File { size, write: false, .. }), Some(f)) if !pick.delivered => {
+                if !matches!(crate::fdpass::check_returned(f), Ok(false))
+                    || !(1..=SMIME_PICK_MAX).contains(&size)
+                    || regular_file_size(f) != Some(size)
+                    || crate::fdpass::narrow_returned(f, false).is_err()
+                {
+                    return Err(Reply::Refused { reason: refusal::BAD_FD });
+                }
+                pick.delivered = true;
+            }
+            (Some(ToParent::Done { files: 1 }), None) if pick.delivered => pick.finished = true,
+            (Some(ToParent::Cancelled | ToParent::Failed { .. }), None) => pick.finished = true,
+            _ => return Err(Reply::Refused { reason: refusal::MALFORMED }),
         }
     }
     if e.role.name == "web-island" {
@@ -777,6 +891,19 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
         None => st.to_parent(e, ParentEvent::Message { embed: m.embed, bytes: m.bytes }),
     }
     Ok(Reply::Ok)
+}
+
+fn regular_file_size(fd: &OwnedFd) -> Option<u64> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes stat on success; the fd stays owned by limend.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return None;
+    }
+    u64::try_from(stat.st_size).ok()
 }
 
 /// The child's PiP request (atrium-player-pip-keys.md §3).
@@ -907,6 +1034,7 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
     // configured, otherwise by its registry identity.
     let fixed = shared.system_uids.lock().unwrap().get(app).copied();
     let ok = match fixed {
+        None if role.name == "smime-provision" => false,
         Some(u) => u == uid,
         None => matches!((shared.resolve)(uid), Some((_, a)) if a == app),
     };
@@ -928,7 +1056,10 @@ fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> R
 
 /// Take `e` (already removed) down: release the slot, tell the child, end
 /// a spawned child's jail after the grace period.
-fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: bool) {
+fn end(shared: &Arc<Shared>, st: &mut State, embed: EmbedId, e: Embed, tell_parent: bool) {
+    if e.smime_scope.is_some() {
+        end_smime_picker(shared, st, embed);
+    }
     // PiP doesn't outlive the embed: the child's window goes with it.
     if e.bound {
         if let Some(c) = e.child_window {
@@ -953,6 +1084,16 @@ fn end(shared: &Arc<Shared>, st: &State, embed: EmbedId, e: Embed, tell_parent: 
     }
 }
 
+fn end_smime_picker(shared: &Arc<Shared>, st: &mut State, sheet: EmbedId) {
+    let pick = st.embeds.iter().find_map(|(id, e)| {
+        e.smime_picker.as_ref().is_some_and(|pick| pick.sheet == sheet).then_some(*id)
+    });
+    if let Some(id) = pick {
+        let e = st.embeds.remove(&id).expect("picker is still registered");
+        end(shared, st, id, e, true);
+    }
+}
+
 /// A connection closed: its embeds end, as parent or as child.
 fn gone(shared: &Arc<Shared>, conn: ConnId) {
     let mut st = shared.state.lock().unwrap();
@@ -962,10 +1103,10 @@ fn gone(shared: &Arc<Shared>, conn: ConnId) {
     st.choices.remove(&conn);
     let mine: Vec<EmbedId> = st.embeds.iter().filter(|(_, e)| e.parent == conn || e.child == conn).map(|(k, _)| *k).collect();
     for id in mine {
-        let e = st.embeds.remove(&id).unwrap();
+        let Some(e) = st.embeds.remove(&id) else { continue };
         if e.child == conn {
             st.to_parent(&e, ParentEvent::ChildLost { embed: id });
         }
-        end(shared, &st, id, e, false);
+        end(shared, &mut st, id, e, false);
     }
 }

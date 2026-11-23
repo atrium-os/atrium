@@ -52,6 +52,7 @@ fn main() -> std::io::Result<()> {
         reg.persona(uid).flatten().map(String::from)
     });
     let sheet_registry = registry.clone();
+    let smime_registry = registry.clone();
     let resolve = Box::new(move |uid: u32| {
         let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
         reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string()))
@@ -69,6 +70,19 @@ fn main() -> std::io::Result<()> {
     // arca-ui, the credential provider, is a system service (`_arca-ui`),
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
+    if let Ok(publisher) = std::env::var("ARCA_MAIL_PUBLISHER") {
+        let publisher = publisher.trim().to_ascii_lowercase();
+        shared.set_smime_mail(Box::new(move |uid| {
+            let reg = portcullis_peer::AppRegistry::load(&smime_registry).ok()?;
+            let (_, app) = reg.resolve(uid)?;
+            let key = reg.publisher(uid)??;
+            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            if app != "org.atrium.mail" || key == [0; 32] || hex != publisher {
+                return None;
+            }
+            Some(reg.persona(uid)?.map(str::to_owned))
+        }));
+    }
     // The picker is told its parent's persona (personas.md §4.1).
     if let Ok(config) = std::env::var("ARCA_WEB_BROKER") {
         shared.set_mail_sheet_provider(Box::new(move |uid| {
