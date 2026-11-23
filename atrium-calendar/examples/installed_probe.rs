@@ -59,6 +59,7 @@ fn seed(socket: &Path, date: NaiveDate, work: bool) -> Result<(), String> {
     let mut revision = call(socket, &Request::Day { date })?.revision;
     for (date, kind, title, start, end) in entries {
         let entry = Entry {
+            excluded: Vec::new(),
             id: Uuid::new_v4(),
             date,
             kind,
@@ -66,6 +67,63 @@ fn seed(socket: &Path, date: NaiveDate, work: bool) -> Result<(), String> {
             span: Span { start, end },
         };
         revision = call(socket, &Request::Add { revision, entry })?.revision;
+    }
+    Ok(())
+}
+
+// Read back exactly the seeded series, including next week, through the app socket.
+fn check_review(socket: &Path, date: NaiveDate, moved: bool) -> Result<(), String> {
+    let current = call(socket, &Request::Day { date })?;
+    let next = call(
+        socket,
+        &Request::Day {
+            date: date + Days::new(7),
+        },
+    )?;
+    let old_slot = Span {
+        start: 840,
+        end: 885,
+    };
+    let new_slot = Span {
+        start: 900,
+        end: 945,
+    };
+    let siblings: Vec<_> = next
+        .entries
+        .iter()
+        .filter(|e| e.title == "Release review")
+        .collect();
+    let [series] = siblings.as_slice() else {
+        return Err("Missing or duplicated sibling".into());
+    };
+    let rows: Vec<_> = current
+        .entries
+        .iter()
+        .filter(|e| e.title == "Release review")
+        .collect();
+    let [row] = rows.as_slice() else {
+        return Err("Missing or duplicated review".into());
+    };
+    let (expected_kind, busy, open) = if moved {
+        (
+            Kind::Occurrence {
+                series: series.id,
+                original: date,
+            },
+            new_slot,
+            old_slot,
+        )
+    } else {
+        (Kind::Weekly, old_slot, new_slot)
+    };
+    if series.kind != Kind::Weekly
+        || series.span != old_slot
+        || row.kind != expected_kind
+        || row.span != busy
+        || !current.openings(busy, 45)?.is_empty()
+        || current.openings(open, 45)? != [open]
+    {
+        return Err("Unexpected occurrence or availability after editing".into());
     }
     Ok(())
 }
@@ -80,6 +138,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Path::new(socket),
             date.parse()?,
             expected == "--work-schedule",
+        )?;
+        return Ok(());
+    }
+    if matches!(expected.as_str(), "--original-review" | "--moved-review") {
+        check_review(
+            Path::new(socket),
+            date.parse()?,
+            expected == "--moved-review",
         )?;
         return Ok(());
     }

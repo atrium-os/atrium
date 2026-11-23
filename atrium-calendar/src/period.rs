@@ -1,7 +1,9 @@
 //! A bounded civil-date view. Each recurring series travels once in a reply.
-use super::{Day, Entry};
+use super::{Day, Entry, EventEdit};
 use chrono::{Datelike, Days, Months, NaiveDate};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalendarView {
@@ -72,6 +74,9 @@ pub struct CalendarPage {
     pub entries: Vec<Entry>,
     pub view: CalendarView,
     pub opening_view: CalendarView,
+    /// Original schedule for moved occurrences whose series is outside this page.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub series: BTreeMap<Uuid, EventEdit>,
 }
 
 impl CalendarPage {

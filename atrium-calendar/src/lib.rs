@@ -33,20 +33,58 @@ pub struct Entry {
     pub title: String,
     pub span: Span,
     pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<NaiveDate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Appointment,
     Weekly,
+    Occurrence { series: Uuid, original: NaiveDate },
     AllDay,
     Hold,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EditScope {
+    ThisEvent,
+    WholeSeries,
+}
+
+/// Editable local fields. Fasti retains ownership of identity and recurrence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventEdit {
+    pub date: NaiveDate,
+    pub title: String,
+    pub span: Span,
+}
+
 impl Entry {
-    pub fn appears(&self, date: NaiveDate) -> bool {
+    pub fn fields_on(&self, date: NaiveDate) -> EventEdit {
+        EventEdit {
+            date,
+            title: self.title.clone(),
+            span: self.span,
+        }
+    }
+
+    pub fn series_id(&self) -> Option<Uuid> {
+        match self.kind {
+            Kind::Weekly => Some(self.id),
+            Kind::Occurrence { series, .. } => Some(series),
+            _ => None,
+        }
+    }
+
+    pub fn scheduled_on(&self, date: NaiveDate) -> bool {
         let days = (date - self.date).num_days();
         days == 0 || (self.kind == Kind::Weekly && days > 0 && days % 7 == 0)
+    }
+
+    pub fn appears(&self, date: NaiveDate) -> bool {
+        self.scheduled_on(date) && self.excluded.binary_search(&date).is_err()
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {

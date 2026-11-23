@@ -143,15 +143,18 @@ cross "$personal_jail" "$pu" "$wu"
 
 # Restart just Work's service. The same socket and open window must read
 # the accepted record after a new process has reopened the store.
-old=$(pgrep -j "system-fasti--$wu" -x atrium-fastid)
-kill -TERM "$old"
-for i in $(jot 20); do
-    new=$(pgrep -j "system-fasti--$wu" -x atrium-fastid 2>/dev/null || :)
-    if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
-    sleep 1
-done
-test -n "$new"
-test "$new" != "$old"
+restart_work() {
+    old=$(pgrep -j "system-fasti--$wu" -x atrium-fastid)
+    kill -TERM "$old"
+    for i in $(jot 20); do
+        new=$(pgrep -j "system-fasti--$wu" -x atrium-fastid 2>/dev/null || :)
+        if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
+        sleep 1
+    done
+    test -n "$new"
+    test "$new" != "$old"
+}
+restart_work
 check_instance "$work_jail" work "$work_store" "design review"
 check_instance "$personal_jail" personal "$personal_store" "piano lesson"
 # A different trusted publisher may sign a manifest, but has no Fasti grant.
@@ -240,6 +243,61 @@ grep -q "\"date\":\"$target\",\"title\":\"ride\"" "$personal_store/calendar.json
 grep -q '"opening_view":"Week"' "$work_store/calendar.json"
 grep -q '"opening_view":"Month"' "$personal_store/calendar.json"
 echo "PASS: independent opening views, temporary browsing and date selection from both reopened windows"
+
+# The first agenda row is the newly created 09:00 ride on a non-today date.
+# The durable write precedes the window receiving its reply and showing Edit.
+sleep 2
+click 590 269
+click 262 341
+cp screen.png delete-review.png
+click 81 416  # Back from the deletion review
+saved "$personal_store" ride
+click 262 341
+click 273 416
+if grep -q '"title":"ride"' "$personal_store/calendar.json"; then exit 1; fi
+close_ui "$personal_jail"
+
+open_work_week() {
+    launch work
+    wait_ui "$work_jail" work
+    sleep 2
+    install -m 0555 installed_probe "$(jls -j "$work_jail" path)/bin/installed-probe"
+}
+thursday=$(date -u -v-$((weekday - 1))d -v+3d +%Y-%m-%d)
+check_review() {
+    jexec -u "$(id -nu "$wu")" "$work_jail" /bin/installed-probe "$cal_socket" "$thursday" "$1"
+}
+open_work_week
+check_review --original-review
+click 62 349  # Thursday in Week
+review_y=269
+if [ "$weekday" -eq 4 ]; then review_y=307; fi
+click 452 "$review_y"   # Edit occurrence
+# The title takes initial focus. Tab through date and times to Save.
+keys() {
+    for code in "$@"; do inj "KEY $code 1 0" "KEY $code 0 0"; done
+}
+# Home, Right, forward Delete, digit 5: change 14:xx to 15:xx.
+keys 43 43 74 79 76 34 43 74 79 76 34
+sleep 1
+cp screen.png edit-occurrence.png
+keys 43 40
+sleep 1
+check_review --moved-review
+close_ui "$work_jail"
+restart_work
+open_work_week
+check_review --moved-review
+click 62 349
+cp screen.png moved-agenda.png
+click 593 "$review_y"   # Whole series from the moved occurrence
+click 226 192
+for key in 77 44 25 31; do inj "KEY $key 1 0" "KEY $key 0 0"; done # End, space, v2
+click 85 341            # Review the proposed series title
+cp screen.png series-review.png
+click 77 60             # Cancel without applying a series change
+check_review --moved-review
+echo "PASS: native occurrence move, changed gaps, unchanged next week, restart and confirmed local deletion"
 
 # Exercise the same authenticated SessionEnded message Ostiarius sends.
 printf '%s\n' '{"op":"hello","version":1}' '{"op":"session_ended","user":"calfixture"}' |

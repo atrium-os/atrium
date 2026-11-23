@@ -1,5 +1,5 @@
 //! One bounded request and reply per connection. Version 1 uses inline JSON.
-use super::{store::Store, CalendarPage, CalendarView, Day, Entry};
+use super::{store::Store, CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit};
 use aqueduct::{classes::CLASS_CALENDAR, envelope, flag, Header};
 use chrono::NaiveDate;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -15,6 +15,13 @@ use std::{
 
 const OP_V1: u16 = 1;
 const WAIT: Duration = Duration::from_secs(2);
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum EventChange {
+    Update(EventEdit),
+    Delete,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
@@ -34,6 +41,13 @@ pub enum Request {
     Add {
         revision: u64,
         entry: Entry,
+    },
+    Change {
+        revision: u64,
+        id: uuid::Uuid,
+        shown: NaiveDate,
+        scope: EditScope,
+        operation: EventChange,
     },
     Release {
         revision: u64,
@@ -177,6 +191,25 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
             store
                 .add(revision, entry)
                 .map(|_| store.page(date, Some(CalendarView::Today)))
+        }
+        Ok(Request::Change {
+            revision,
+            id,
+            shown,
+            scope,
+            operation,
+        }) => {
+            let replacement = match operation {
+                EventChange::Update(fields) => Some(fields),
+                EventChange::Delete => None,
+            };
+            let date = replacement
+                .as_ref()
+                .filter(|_| scope == EditScope::ThisEvent)
+                .map_or(shown, |edit| edit.date);
+            store
+                .change(revision, id, shown, scope, replacement)
+                .map(|()| store.page(date, Some(CalendarView::Today)))
         }
         Ok(Request::Release { revision, date, id }) => store
             .release(revision, date, id)

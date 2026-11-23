@@ -74,6 +74,7 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     assert_eq!(page(&socket, &resume).unwrap().view, CalendarView::Today);
     assert_eq!(call(&socket, &query).unwrap().revision, 0);
     let event = Entry {
+        excluded: Vec::new(),
         id: Uuid::new_v4(),
         date,
         kind: Kind::Appointment,
@@ -124,6 +125,17 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
         assert!(call(&socket, &query).is_err());
         assert!(page(&socket, &resume).is_err());
         assert!(page(&socket, &set_week).is_err());
+        assert!(page(
+            &socket,
+            &Request::Change {
+                revision: 1,
+                id: event.id,
+                shown: date,
+                scope: atrium_calendar::EditScope::ThisEvent,
+                operation: atrium_calendar::wire::EventChange::Delete,
+            }
+        )
+        .is_err());
         assert!(call(
             &socket,
             &Request::Add {

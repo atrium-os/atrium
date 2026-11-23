@@ -12,6 +12,7 @@ fn add(store: &mut Store, date: NaiveDate, kind: Kind, title: &str, start: u16, 
         .add(
             revision,
             Entry {
+                excluded: Vec::new(),
                 id: Uuid::new_v4(),
                 date,
                 kind,

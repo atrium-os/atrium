@@ -1,7 +1,7 @@
 //! Calendar's native planner. Fasti is the only persistent writer.
 use atrium_calendar::{
     wire::{page, Request},
-    CalendarPage, CalendarView, Entry, Kind, Span,
+    CalendarPage, CalendarView, EditScope, Entry, EventEdit, Kind, Span,
 };
 use chrono::{Datelike, Local, NaiveDate};
 use pergola::{
@@ -16,6 +16,8 @@ use std::{
 };
 use uuid::Uuid;
 
+mod editor;
+use editor::{Editor, Stage};
 mod overview;
 use overview::rect;
 
@@ -35,6 +37,10 @@ enum Action {
     Save(Kind),
     Hold(Span),
     Release(Uuid),
+    Edit(Uuid, EditScope),
+    Review(Stage),
+    CloseEditor,
+    Change(bool),
     Find,
     Page(usize),
 }
@@ -49,6 +55,7 @@ struct Planner {
     data: Mutable<Option<CalendarPage>>,
     view: Mutable<Option<CalendarView>>,
     settings: Mutable<bool>,
+    editor: Mutable<Option<Editor>>,
     status: Mutable<String>,
     finding: Mutable<bool>,
     page: Mutable<usize>,
@@ -124,6 +131,13 @@ impl Planner {
                 },
             ));
         }
+        if let Action::Change(delete) = action {
+            return self
+                .editor
+                .get_cloned()
+                .ok_or("Open the event first")?
+                .request(delete);
+        }
         let date = self
             .date
             .get_cloned()
@@ -173,6 +187,7 @@ impl Planner {
             _ => return Err("Unexpected calendar action".into()),
         };
         let entry = Entry {
+            excluded: Vec::new(),
             id: Uuid::new_v4(),
             date,
             title,
@@ -211,6 +226,10 @@ impl View for Planner {
         let data = self.data.get_cloned();
         if self.waiting.get() {
             Label::new("Loading calendar…").at(18., 110.).render(ctx);
+            return;
+        }
+        if let Some(edit) = self.editor.get_cloned() {
+            self.render_editor(ctx, &edit);
             return;
         }
         let Some(data) = data else {
@@ -361,14 +380,15 @@ impl View for Planner {
                         clock(gap.end),
                         gap.end - gap.start
                     ),
-                    Some(("Hold 45 min", Action::Hold(span))),
+                    ("Hold 45 min", Action::Hold(span)),
+                    None,
                 ));
             }
         } else {
             Label::new("Agenda · local time").at(18., 222.).render(ctx);
             for e in day.entries {
                 let label = match e.kind {
-                    Kind::Weekly => "Weekly · ",
+                    Kind::Weekly | Kind::Occurrence { .. } => "Weekly · ",
                     Kind::AllDay => "All day · ",
                     Kind::Hold => "Private hold · ",
                     Kind::Appointment => "",
@@ -378,10 +398,22 @@ impl View for Planner {
                 } else {
                     format!("{}–{}   ", clock(e.span.start), clock(e.span.end))
                 };
-                let title: String = e.title.chars().take(40).collect();
+                let title: String = e
+                    .title
+                    .chars()
+                    .take(if e.series_id().is_some() { 24 } else { 36 })
+                    .collect();
                 rows.push((
                     format!("{time}{label}{title}"),
-                    (e.kind == Kind::Hold).then_some(("Release", Action::Release(e.id))),
+                    match e.kind {
+                        Kind::Hold => ("Release", Action::Release(e.id)),
+                        Kind::Weekly | Kind::Occurrence { .. } => {
+                            ("Edit occurrence", Action::Edit(e.id, EditScope::ThisEvent))
+                        }
+                        _ => ("Edit", Action::Edit(e.id, EditScope::ThisEvent)),
+                    },
+                    e.series_id()
+                        .map(|_| Action::Edit(e.id, EditScope::WholeSeries)),
                 ));
             }
         }
@@ -394,7 +426,9 @@ impl View for Planner {
             .at(18., 262.)
             .render(ctx);
         }
-        for (i, (label, action)) in rows.iter().skip(page * PAGE).take(PAGE).enumerate() {
+        for (i, (label, (action_label, action), series)) in
+            rows.iter().skip(page * PAGE).take(PAGE).enumerate()
+        {
             let y = 254. + i as f32 * 38.;
             ctx.add(pergola::node::Node::Rect {
                 rect: pergola::geom::Rect::new(18., y + 31., 636., 1.),
@@ -402,8 +436,11 @@ impl View for Planner {
                 radius: 0.,
             });
             Label::new(label).at(18., y + 6.).render(ctx);
-            if let Some((label, a)) = action {
-                self.button(ctx, 534., y, 120., label, *a);
+            if let Some(a) = series {
+                self.button(ctx, 393., y, 132., action_label, *action);
+                self.button(ctx, 534., y, 120., "Whole series…", *a);
+            } else {
+                self.button(ctx, 534., y, 120., action_label, *action);
             }
         }
         if page > 0 {
@@ -444,6 +481,7 @@ pub fn run() -> io::Result<()> {
         data: Mutable::with_dirty(None, dirty.clone()),
         view: Mutable::with_dirty(None, dirty.clone()),
         settings: Mutable::with_dirty(false, dirty.clone()),
+        editor: Mutable::with_dirty(None, dirty.clone()),
         status: Mutable::with_dirty(String::new(), dirty.clone()),
         finding: Mutable::with_dirty(false, dirty.clone()),
         page: Mutable::with_dirty(0, dirty.clone()),
@@ -469,6 +507,20 @@ pub fn run() -> io::Result<()> {
                 continue;
             }
             match action {
+                Action::Edit(id, scope) => {
+                    if let Err(e) = planner.open_editor(id, scope) {
+                        planner.status.set(e);
+                    }
+                }
+                Action::Review(stage) => {
+                    if let Err(e) = planner.review(stage) {
+                        planner.status.set(e);
+                    }
+                }
+                Action::CloseEditor => {
+                    planner.editor.set(None);
+                    let _ = tx.send(Action::Resume);
+                }
                 Action::Find => {
                     planner.finding.set(!planner.finding.get());
                     planner.page.set(0);
@@ -493,11 +545,15 @@ pub fn run() -> io::Result<()> {
             match reply {
                 Ok(data) => {
                     planner.view.set(Some(data.view));
-                    if matches!(action, Action::Resume | Action::Load | Action::Browse(..)) {
+                    if matches!(
+                        action,
+                        Action::Resume | Action::Load | Action::Browse(..) | Action::Change(_)
+                    ) {
                         planner.date.set(TextEdit::new(&date.to_string()));
                         planner.finding.set(false);
                     }
                     planner.settings.set(false);
+                    planner.editor.set(None);
                     planner.shown.set(date);
                     planner.data.set(Some(data));
                     planner.page.set(0);
@@ -506,6 +562,8 @@ pub fn run() -> io::Result<()> {
                     }
                     planner.status.set(
                         match action {
+                            Action::Change(true) => "Deleted on this device",
+                            Action::Change(false) => "Changes saved on this device",
                             Action::SetOpening(_) => "Opening view saved",
                             Action::Hold(_) => "Held on this device",
                             Action::Release(_) => "Hold released",
