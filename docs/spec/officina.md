@@ -338,7 +338,7 @@ and their associated import or Save behavior.
 | Static filter visibility | XLSX, XLSM, ODS | Text and wildcard tests, dynamic date and appearance filters, table-local filters, and complex ODS predicates can leave only the saved row visibility. A later filter change can expose rows that were excluded by a rule Sheets could not import. |
 | Live pivot display calculations and groups | XLSX, XLSM, ODS | Sheets preserves Excel value display modes, including the Office 2010 modes. ODS retains field references and named, numeric and calendar groups based on a source field. Save keeps the definition and the last refreshed cells. Refresh recomputes the values and group membership from the source. |
 | Static pivot results | XLSX, XLSM, ODS | Calculated fields and grouped Excel caches, missing caches, unavailable sources, and unsupported ODS fields, aggregate functions or group chains can leave the saved cells as plain values. These pivots cannot be refreshed from the source. |
-| Pivot item order | XLSX, XLSM, ODS | Sheets preserves Excel manual item order and ODS manual, source, label and value sorting. Previous, Next and Running Total follow the visible member order after refresh. Advanced Excel sort scopes can still fall back to label order. |
+| Pivot item order | XLSX, XLSM, ODS | Sheets preserves Excel manual order and value sorting by grand total or a selected opposite-axis member, along with ODS manual, source, label and value sorting. Previous, Next and Running Total follow the visible member order after refresh. |
 | Pivot layout | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Outline layout and values down the rows can change on refresh. |
 
 #### Sheet and cell protection in Sheets
@@ -2477,14 +2477,20 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   Manual order comes from its member list. No sort uses source order.
   Value sort uses the chosen measure's aggregate under each parent and
   uses label order to break ties. Previous, Next and Running Total use the
-  same order as the visible items. Scoped Excel value sorts can fall back
-  to label order with a fidelity notice. Exporting ODS value sorts to
-  XLSX uses label order on refresh and reports the change.
+  same order as the visible items. Excel `autoSortScope` resolves a measure
+  and the selected row or column members through the pivot field items
+  or the shared cache. A measure without selected members sorts by its
+  grand total. Refresh sorts by that measure's aggregate at the selected
+  opposite-axis cell or subtotal. Save rebuilds indices and keeps a
+  temporarily absent selected member in the cache. Subtotal functions,
+  positional references and multi-item selections outside this model
+  carry a fidelity notice. Grand-total value sorting translates between
+  XLSX and ODS. ODS export reports selected-member sorts as label sorts.
 - **Native file and recovery.** Pivot definitions carry display modes,
   group definitions, item sort settings and the last output area. The pivot operation journals
   the definition, cell edits and percentage format changes together.
-- **Remaining gaps.** Scoped Excel value sorting, outline layouts,
-  calculated fields, GETPIVOTDATA and pivot charts.
+- **Remaining gaps.** Positional and multi-item Excel sort scopes,
+  outline layouts, calculated fields, GETPIVOTDATA and pivot charts.
   [Excel display modes](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.showdataasvalues?view=openxml-3.0.1) · [Excel extended modes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/f5b294f2-a168-46c3-b9a9-8e4f0132b78d) · [OpenDocument data pilots](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
 
 The installed Sheets desktop gate `SHEETS_INTEROP_CASE=pivot_display`
@@ -2497,6 +2503,10 @@ The paired `pivot_order` desktop gate uses a manually ordered XLSX pivot
 and an ODS pivot sorted by an aggregate. After Save and picker reopen, a
 source edit changes the ODS order while the XLSX order stays fixed. Both
 recompute the adjacent-member differences and running totals on Refresh.
+The `pivot_scope` desktop gate imports Excel grand-total and selected-member
+scopes on both axes. It checks the saved order, Previous, Next and Running
+Total after picker reopen, a source edit, Refresh, a second Save and a
+second picker reopen. [Microsoft pivot references](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/8e92a816-2bb4-4938-9f1c-1a9800714ede)
 
 Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows
 for two row fields and a column field, several value fields with and without

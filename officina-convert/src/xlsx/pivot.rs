@@ -17,6 +17,8 @@ use quick_xml::events::Event;
 use super::read::{attr, parse_ref, xml, XlsxError};
 use crate::report::{Kind, Report};
 
+mod scope;
+
 const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 
 fn esc(s: &str) -> String {
@@ -61,6 +63,15 @@ fn field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
         if let ShowAs::Reference { field: base, item: BaseItem::Named(value), .. } = &data.show_as {
             if *base == field && !items.iter().any(|item| same_item(item, value)) {
                 items.push(value.clone());
+            }
+        }
+    }
+    for axis in axis_fields(p) {
+        if let AxisSort::Scoped { members, .. } = &axis.sort {
+            for (member_field, value) in members {
+                if *member_field == field && !items.iter().any(|item| same_item(item, value)) {
+                    items.push(value.clone());
+                }
             }
         }
     }
@@ -236,10 +247,12 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         if pf.is_some() && axis == Some("axisPage") && pf.is_some_and(|x| x.hidden.len() > 0) {
             o.push_str(r#" multipleItemSelectionAllowed="1""#);
         }
+        let value_sort = pf.and_then(|field| scope::Scope::new(wb, p, &field.sort));
         if let Some(field) = pf {
-            let sort = match field.sort {
-                AxisSort::Manual(_) | AxisSort::Source => "manual",
-                AxisSort::Name { descending: true } => "descending",
+            let sort = match (&field.sort, &value_sort) {
+                (_, Some(scope)) if scope.descending => "descending",
+                (AxisSort::Manual(_) | AxisSort::Source, _) => "manual",
+                (AxisSort::Name { descending: true }, _) => "descending",
                 _ => "ascending",
             };
             let _ = write!(o, r#" sortType="{sort}""#);
@@ -259,7 +272,14 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
                 if p.subtotals {
                     o.push_str(r#"<item t="default"/>"#);
                 }
-                o.push_str("</items></pivotField>");
+                o.push_str("</items>");
+                if let Some(scope) = &value_sort {
+                    let level = p.rows.iter().position(|field| field.field == f)
+                        .or_else(|| p.cols.iter().position(|field| field.field == f))
+                        .unwrap_or(0);
+                    scope.write(&mut o, wb, p, level);
+                }
+                o.push_str("</pivotField>");
             }
             None => o.push_str("/>"),
         }
@@ -379,6 +399,7 @@ struct FieldIn {
     items: Vec<Option<u32>>,
     sort: Option<String>,
     scoped_sort: bool,
+    scope: Option<scope::ScopeIn>,
     /// Shown in compact form (`compact`, default on) and outline form (`outline`).
     compact: bool,
     outline: bool,
@@ -399,6 +420,7 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     let mut cols: Vec<i64> = Vec::new();
     let mut pages: Vec<(u32, Option<u32>)> = Vec::new();
     let mut datas: Vec<(u32, Agg, String, Option<String>, Option<u32>, Option<u32>)> = Vec::new();
+    let mut data_indices = Vec::new();
     let mut list = 0u8; // 1 rows, 2 cols
     let mut compact = false;
     let mut active_data = None;
@@ -435,8 +457,15 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                     }
                 }
                 b"autoSortScope" => {
+                    let scope = if start {
+                        let span = r.read_to_end(e.name())?;
+                        scope::ScopeIn::read(data.get(span.start as usize..span.end as usize).unwrap_or_default())?
+                    } else {
+                        None
+                    };
                     if let Some(field) = fields.last_mut() {
                         field.scoped_sort = true;
+                        field.scope = scope;
                     }
                 }
                 b"rowFields" => list = 1,
@@ -454,12 +483,13 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                         pages.push((f, attr(&e, b"item")?.and_then(|v| v.parse().ok())));
                     }
                 }
-                b"dataField" if datas.len() < 64 => {
+                b"dataField" if data_indices.len() < 64 => {
                     if let Some(f) = attr(&e, b"fld")?.and_then(|v| v.parse::<u32>().ok()) {
                         let agg = attr(&e, b"subtotal")?.map_or(Some(Agg::Sum), |v| agg_of(&v));
                         let mode = attr(&e, b"showDataAs")?;
                         let field = attr(&e, b"baseField")?.and_then(|v| v.parse().ok());
                         let item = attr(&e, b"baseItem")?.and_then(|v| v.parse().ok());
+                        data_indices.push(agg.map(|_| datas.len() as u32));
                         match agg {
                             Some(a) => {
                                 active_data = start.then(|| (datas.len(), e.name().as_ref().to_vec()));
@@ -511,9 +541,6 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     };
     let field = |f: u32, rep: &mut Report| {
         let sort = fields.get(f as usize).map_or(AxisSort::Default, |field| {
-            if field.scoped_sort {
-                rep.note(Kind::Approximate, "pivot sort by a scoped value field (refresh uses label order)");
-            }
             match field.sort.as_deref() {
                 Some("descending") => AxisSort::Name { descending: true },
                 None | Some("manual") if !field.items.is_empty() => {
@@ -597,6 +624,30 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
         data.push(DataField { name: (!n.is_empty() && n != default).then(|| Arc::from(n.as_str())), ..d });
     }
     p.data = data;
+    let mut apply_scopes = |axis: &mut [PivotField], opposite: &[PivotField]| {
+        for field in axis {
+            let Some(input) = fields.get(field.field as usize).filter(|input| input.scoped_sort) else { continue };
+            let member = |field: u32, index: u32, cache_index: bool| {
+                let shared = if cache_index { index } else {
+                    fields.get(field as usize)?.items.get(index as usize).copied().flatten()?
+                };
+                c.items.get(field as usize)?.get(shared as usize).cloned()
+            };
+            let sort = input.scope.as_ref().and_then(|scope| {
+                scope.resolve(input.sort.as_deref(), opposite, &data_indices, member)
+            });
+            if let Some(sort) = sort {
+                field.sort = sort;
+            } else {
+                rep.note(Kind::Approximate, "unresolved pivot value sort scope (refresh uses label order)");
+            }
+        }
+    };
+    apply_scopes(&mut p.rows, &p.cols);
+    apply_scopes(&mut p.cols, &p.rows);
+    if p.pages.iter().any(|field| fields.get(field.field as usize).is_some_and(|input| input.scoped_sort)) {
+        rep.note(Kind::Approximate, "pivot value sort scope on a page field");
+    }
     let axis: Vec<u32> = p.rows.iter().chain(&p.cols).map(|f| f.field).collect();
     p.subtotals = axis.iter().any(|&f| fields.get(f as usize).is_some_and(|x| x.subtotal));
     p.grand_col = grand_col;

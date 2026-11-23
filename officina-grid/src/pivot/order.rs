@@ -1,6 +1,6 @@
 //! How visible members are ordered within each parent on a pivot axis.
 
-use super::{Acc, MAX_ITEMS, PivotField, get_value, key, put_value};
+use super::{Acc, Agg, MAX_FIELDS, MAX_ITEMS, PivotField, get_field, get_value, key, put_value};
 use crate::value::Value;
 use officina_core::wire::{Reader, WireError, Writer};
 use std::collections::HashMap;
@@ -19,6 +19,13 @@ pub enum AxisSort {
         caption: Arc<str>,
         descending: bool,
     },
+    /// The zero-based value field and a prefix of the opposite axis. An empty
+    /// prefix sorts by the grand total of that value field.
+    Scoped {
+        data: u32,
+        descending: bool,
+        members: Vec<(u32, Value)>,
+    },
 }
 
 impl AxisSort {
@@ -27,6 +34,9 @@ impl AxisSort {
             Self::Manual(items) => items.len() <= MAX_ITEMS,
             Self::Data { caption, .. } => {
                 !caption.is_empty() && caption.len() <= crate::strings::MAX_TEXT
+            }
+            Self::Scoped { data, members, .. } => {
+                (*data as usize) < MAX_FIELDS && members.len() <= MAX_FIELDS
             }
             _ => true,
         }
@@ -50,6 +60,19 @@ impl AxisSort {
             } => {
                 w.u8(5 + u8::from(*descending));
                 w.str(caption);
+            }
+            Self::Scoped {
+                data,
+                descending,
+                members,
+            } => {
+                w.u8(7 + u8::from(*descending));
+                w.var(u64::from(*data));
+                w.var(members.len() as u64);
+                for (field, item) in members {
+                    w.var(u64::from(*field));
+                    put_value(w, item);
+                }
             }
         }
     }
@@ -77,6 +100,19 @@ impl AxisSort {
                     descending: tag == 6,
                 }
             }
+            tag @ (7 | 8) => {
+                let data = r.len("pivot sort value field", (MAX_FIELDS - 1) as u64)? as u32;
+                let n = r.count("pivot sort members", MAX_FIELDS as u64, 2)?;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push((get_field(r)?, get_value(r)?));
+                }
+                Self::Scoped {
+                    data,
+                    descending: tag == 8,
+                    members,
+                }
+            }
             _ => return Err(WireError::Invalid("pivot item sort")),
         })
     }
@@ -84,6 +120,13 @@ impl AxisSort {
 
 type Path = Vec<u32>;
 type Positions = HashMap<Path, HashMap<u32, u32>>;
+
+pub(super) struct SortKey {
+    pub data: usize,
+    pub agg: Agg,
+    pub descending: bool,
+    pub opposite: Path,
+}
 
 /// Data sorting can give different orders to the same members under different parents.
 pub(super) struct Order {
@@ -96,20 +139,18 @@ impl Order {
         column: bool,
         paths: &[Path],
         acc: &HashMap<(Path, Path), Vec<Acc>>,
-        value_field: impl Fn(&str) -> Option<(usize, super::Agg)>,
+        resolve: impl Fn(&AxisSort) -> Option<SortKey>,
     ) -> Self {
         let levels = axis
             .iter()
             .enumerate()
             .map(|(level, field)| {
-                let AxisSort::Data {
-                    caption,
+                let SortKey {
+                    data,
+                    agg,
                     descending,
-                } = &field.sort
-                else {
-                    return None;
-                };
-                let (data, agg) = value_field(caption)?;
+                    opposite,
+                } = resolve(&field.sort)?;
                 let mut families: HashMap<Path, Vec<(u32, Option<f64>)>> = HashMap::new();
                 for path in paths {
                     let item = path[level];
@@ -120,12 +161,12 @@ impl Order {
                     }
                     let members = path[..=level].to_vec();
                     let target = if column {
-                        (Vec::new(), members)
+                        (opposite.clone(), members)
                     } else {
-                        (members, Vec::new())
+                        (members, opposite.clone())
                     };
-                    let amount = match acc[&target][data].result(agg) {
-                        Value::Num(n) if n.is_finite() => Some(n),
+                    let amount = match acc.get(&target).map(|values| values[data].result(agg)) {
+                        Some(Value::Num(n)) if n.is_finite() => Some(n),
                         _ => None,
                     };
                     siblings.push((item, amount));
@@ -137,7 +178,7 @@ impl Order {
                             siblings.sort_by(|(a, left), (b, right)| {
                                 match (left, right) {
                                     (Some(left), Some(right)) => {
-                                        if *descending {
+                                        if descending {
                                             right.total_cmp(left)
                                         } else {
                                             left.total_cmp(right)

@@ -135,18 +135,23 @@ fn group_xml(out: &mut String, wb: &Workbook, p: &Pivot, field: u32) {
     }
 }
 
-fn sort_xml(out: &mut String, sort: &AxisSort) {
+fn sort_xml(out: &mut String, wb: &Workbook, pivot: &Pivot, sort: &AxisSort) {
     let (mode, descending, caption) = match sort {
         AxisSort::Default => return,
         AxisSort::Manual(_) => ("manual", false, None),
         AxisSort::Source => ("none", false, None),
         AxisSort::Name { descending } => ("name", *descending, None),
-        AxisSort::Data { caption, descending } => ("data", *descending, Some(caption)),
+        AxisSort::Data { caption, descending } => ("data", *descending, Some(caption.to_string())),
+        AxisSort::Scoped { data, descending, members } if members.is_empty() => {
+            let Some(field) = pivot.data.get(*data as usize) else { return };
+            ("data", *descending, Some(wb.data_caption(pivot, field)))
+        }
+        AxisSort::Scoped { .. } => return,
     };
     let order = if descending { "descending" } else { "ascending" };
     let _ = write!(out, r#"<table:data-pilot-sort-info table:sort-mode="{mode}" table:order="{order}""#);
     if let Some(caption) = caption {
-        let _ = write!(out, r#" table:data-field="{}""#, esc(caption));
+        let _ = write!(out, r#" table:data-field="{}""#, esc(&caption));
     }
     out.push_str("/>");
 }
@@ -194,7 +199,7 @@ pub fn tables_xml(wb: &Workbook) -> String {
             // LibreOffice keeps the compact form as its own extension.
             let compact = if p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
             o.push_str("</table:data-pilot-members>");
-            sort_xml(o, &f.sort);
+            sort_xml(o, wb, p, &f.sort);
             let _ = write!(o, r#"<table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level>"#);
             group_xml(o, wb, p, f.field);
             o.push_str("</table:data-pilot-field>");

@@ -90,7 +90,9 @@ fn take(p: &mut Pivot, f: u32) -> Option<PivotField> {
             field = Some(v.remove(i));
         }
     }
-    p.data.retain(|d| d.field != f);
+    while let Some(index) = p.data.iter().position(|data| data.field == f) {
+        p.remove_data_field(index);
+    }
     field
 }
 
@@ -149,7 +151,7 @@ pub fn shift(d: &mut Doc, i: usize, f: u32, up: bool) -> Result<(), String> {
             None => {
                 let k = p.data.iter().position(|x| x.field == f).unwrap();
                 if let Some((k, j)) = swap(p.data.len(), k) {
-                    p.data.swap(k, j);
+                    p.swap_data_fields(k, j);
                 }
             }
         }

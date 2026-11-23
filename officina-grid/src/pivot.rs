@@ -26,7 +26,7 @@ pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
 use display::{Display, Slot};
 use group::Grouping;
 pub use order::AxisSort;
-use order::Order;
+use order::{Order, SortKey};
 
 pub const MAX_GROUPS: usize = 64;
 pub const MAX_GROUP_MEMBERS: usize = 65_536;
@@ -131,6 +131,35 @@ impl Pivot {
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
         Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
     }
+
+    /// Swap value fields without changing the measure referenced by a sort.
+    pub fn swap_data_fields(&mut self, a: usize, b: usize) {
+        self.data.swap(a, b);
+        for field in self.rows.iter_mut().chain(&mut self.cols) {
+            if let AxisSort::Scoped { data, .. } = &mut field.sort {
+                if *data as usize == a {
+                    *data = b as u32;
+                } else if *data as usize == b {
+                    *data = a as u32;
+                }
+            }
+        }
+    }
+
+    /// Removing a measure also removes sorts that used it.
+    pub fn remove_data_field(&mut self, index: usize) {
+        self.data.remove(index);
+        for field in self.rows.iter_mut().chain(&mut self.cols) {
+            if let AxisSort::Scoped { data, .. } = &mut field.sort {
+                match (*data as usize).cmp(&index) {
+                    Ordering::Equal => field.sort = AxisSort::Default,
+                    Ordering::Greater => *data -= 1,
+                    Ordering::Less => {}
+                }
+            }
+        }
+    }
+
 }
 
 /// What part of a pivot a cell is, for drawing.
@@ -506,6 +535,21 @@ impl Workbook {
         }) {
             return Err("a display calculation needs its base field in Rows or Columns");
         }
+        if p.pages.iter().any(|field| matches!(field.sort, AxisSort::Scoped { .. })) {
+            return Err("a pivot value sort needs a row or column field");
+        }
+        for (axis, other) in [(&p.rows, &p.cols), (&p.cols, &p.rows)] {
+            for field in axis {
+                if let AxisSort::Scoped { data, members, .. } = &field.sort {
+                    if *data as usize >= p.data.len()
+                        || members.len() > other.len()
+                        || members.iter().zip(other).any(|((field, _), other)| *field != other.field)
+                    {
+                        return Err("a pivot value sort needs its measure and selected members on the opposite axis");
+                    }
+                }
+            }
+        }
         if p.name.is_empty() || p.name.len() > 255 {
             return Err("a pivot table needs a name");
         }
@@ -861,9 +905,26 @@ impl Workbook {
         row_paths.sort();
         let mut col_paths: Vec<Path> = col_paths.into_keys().collect();
         col_paths.sort();
-        let value_field = |caption: &str| self.pivot_sort_value(p, caption);
-        let row_order = Order::new(&p.rows, false, &row_paths, &acc, value_field);
-        let col_order = Order::new(&p.cols, true, &col_paths, &acc, value_field);
+        let resolve = |sort: &AxisSort| -> Option<SortKey> {
+            let (data, agg, descending, opposite) = match sort {
+                AxisSort::Data { caption, descending } => {
+                    let (data, agg) = self.pivot_sort_value(p, caption)?;
+                    (data, agg, *descending, Vec::new())
+                }
+                AxisSort::Scoped { data, descending, members } => {
+                    let data = *data as usize;
+                    let agg = p.data.get(data)?.agg;
+                    let opposite = members.iter().map(|(field, item)| {
+                        axes.get(field)?.1.get(&key(item)).copied()
+                    }).collect::<Option<Vec<_>>>()?;
+                    (data, agg, *descending, opposite)
+                }
+                _ => return None,
+            };
+            Some(SortKey { data, agg, descending, opposite })
+        };
+        let row_order = Order::new(&p.rows, false, &row_paths, &acc, resolve);
+        let col_order = Order::new(&p.cols, true, &col_paths, &acc, resolve);
         row_order.sort(&mut row_paths);
         col_order.sort(&mut col_paths);
         let items = |field: u32, i: u32| -> Value { label(&axes[&field].0.items[i as usize]) };

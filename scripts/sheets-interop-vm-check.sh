@@ -2,6 +2,7 @@
 # Run in the private 1280x720 Sheets desktop fixture. Stage the two books
 # from the sheets_interop_fixture example in the only Scrinium place, and
 # stage the arm64 FreeBSD build of that example at /tmp/sheets-interop-fixture.
+# Use SHEETS_INTEROP_CASE=pivot_scope and /tmp/sheets-pivot-scope-fixture for Excel value sort scopes.
 # Use SHEETS_INTEROP_CASE=pivot_order and /tmp/sheets-pivot-order-fixture for pivot item ordering.
 # Use SHEETS_INTEROP_CASE=pivot_display and /tmp/sheets-pivot-display-fixture for pivot calculations.
 # Set SHEETS_INTEROP_CASE=tables for the sheets_table_chart_fixture inputs
@@ -27,10 +28,11 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
+    pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
     native_copy) test "$(ls "$books")" = "$(printf 'orders.ods\nsales.xlsx')" ;;
@@ -63,6 +65,7 @@ checkpoint() {
         pivots) /tmp/sheets-interop-fixture check "$1" "$2" ;;
         pivot_display) /tmp/sheets-pivot-display-fixture check "$1" "$2" "$format" ;;
         pivot_order) /tmp/sheets-pivot-order-fixture check "$1" "$2" "$format" ;;
+        pivot_scope) /tmp/sheets-pivot-scope-fixture check "$1" "$2" "$scope" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
@@ -168,6 +171,43 @@ pivot_display_reopened() {
     sleep .45
     cp selectscreen.png "$results/$format-refreshed.png"
     cp "$books/$book" "$results/refreshed.$format"
+}
+
+pivot_scope() {
+    row=183
+    for scope in grand member; do
+        book=$scope.xlsx
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        click 319 133 # E2, outside the source.
+        key 0x24 # 7
+        key 0x28
+        save "$book" saved
+        cp "$books/$book" "$results/$scope-saved.xlsx"
+        close_book
+
+        open_book "$row" "$book" saved
+        sleep .4
+        cp selectscreen.png "$results/$scope-reopened.png"
+        click 191 133 # C2, the first source sale.
+        key 0x21 # 4
+        key 0x27 # 0
+        key 0x28
+        save "$book" edited
+        cp selectscreen.png "$results/$scope-before-refresh.png"
+
+        data_from_bottom 6 # Refresh All Pivot Tables.
+        save "$book" refreshed
+        cp "$books/$book" "$results/$scope-refreshed.xlsx"
+        close_book
+
+        open_book "$row" "$book" refreshed
+        sleep .4
+        cp selectscreen.png "$results/$scope-refreshed-reopened.png"
+        close_book
+        echo "PASS $scope XLSX scoped pivot on both axes through Save, refresh, and reopen"
+        row=$((row + 30))
+    done
 }
 
 tables() {
@@ -750,6 +790,7 @@ legacy() {
 launcher=$(win_at 48 24)
 test "$launcher" -gt 0
 case "$profile" in
+    pivot_scope) pivot_scope; exit ;;
     legacy) legacy; exit ;;
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;
