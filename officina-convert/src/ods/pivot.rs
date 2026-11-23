@@ -9,7 +9,7 @@ use std::sync::Arc;
 use officina_grid::addr::{col_name, Rect, MAX_COLS};
 use officina_grid::pivot::{
     same_item, Agg, AxisSort, BaseItem, DataField, DatePart, GroupField, GroupKind, ItemGroup,
-    Pivot, PivotField, ReferenceCalc, ShowAs, MAX_GROUPS,
+    Pivot, PivotField, ReferenceCalc, ShowAs, Subtotal, MAX_GROUPS,
 };
 use officina_grid::{CellAddr, Value, Workbook};
 
@@ -148,7 +148,7 @@ fn sort_xml(out: &mut String, wb: &Workbook, pivot: &Pivot, sort: &AxisSort) {
             let Some(field) = pivot.data.get(*data as usize) else { return };
             ("data", *descending, Some(wb.data_caption(pivot, field)))
         }
-        AxisSort::Scoped { .. } => return,
+        AxisSort::Scoped { .. } | AxisSort::Selection { .. } => return,
     };
     let order = if descending { "descending" } else { "ascending" };
     let _ = write!(out, r#"<table:data-pilot-sort-info table:sort-mode="{mode}" table:order="{order}""#);
@@ -205,21 +205,25 @@ pub fn tables_xml(wb: &Workbook) -> String {
                 let _ = write!(o, r#"<table:data-pilot-member table:name="{}" table:display="{show}" table:show-details="true"/>"#, esc(&member(v)));
             }
             // LibreOffice keeps the compact form as its own extension.
-            let compact = if p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
+            let compact = if orient == "row" && p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
+            let layout = if orient == "row" && (f.outline || (!p.compact && f.subtotal == Subtotal::Top)) {
+                if p.subtotal_at(f, true) == Subtotal::Bottom { "outline-subtotals-bottom" } else { "outline-subtotals-top" }
+            } else { "tabular-layout" };
             o.push_str("</table:data-pilot-members>");
             sort_xml(o, wb, p, &f.sort);
-            let _ = write!(o, r#"<table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level>"#);
+            let _ = write!(o, r#"<table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="{layout}"{compact}/></table:data-pilot-level>"#);
             group_xml(o, wb, p, f.field);
             o.push_str("</table:data-pilot-field>");
         };
         for f in &p.rows {
-            field(&mut o, f, "row", p.subtotals);
+            field(&mut o, f, "row", p.subtotal_at(f, true) != Subtotal::Off);
         }
         for f in &p.cols {
-            field(&mut o, f, "column", p.subtotals);
+            field(&mut o, f, "column", p.subtotal_at(f, false) != Subtotal::Off);
         }
         if p.data.len() > 1 {
-            o.push_str(r#"<table:data-pilot-field table:source-field-name="" table:is-data-layout-field="true" table:orientation="column" table:used-hierarchy="-1" table:function="auto"><table:data-pilot-level/></table:data-pilot-field>"#);
+            let orient = if p.values_on_rows { "row" } else { "column" };
+            let _ = write!(o, r#"<table:data-pilot-field table:source-field-name="" table:is-data-layout-field="true" table:orientation="{orient}" table:used-hierarchy="-1" table:function="auto"><table:data-pilot-level/></table:data-pilot-field>"#);
         }
         for f in &p.pages {
             field(&mut o, f, "page", false);
@@ -254,6 +258,8 @@ pub struct FieldIn {
     /// LibreOffice's: the members shown say what the page shows, not `selected`.
     pub ignore_selected: bool,
     pub subtotals: bool,
+    pub custom_subtotal: bool,
+    pub outline_top: Option<bool>,
     /// LibreOffice's compact form (`loext:layout-mode="compact-layout"`).
     pub compact: bool,
     pub hidden: Vec<String>,
@@ -382,11 +388,15 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             continue;
         }
         let mut subtotals = false;
-        let mut multi_on_rows = false;
+        let mut values_position = None;
         let mut compact = None;
         for f in &t.fields {
             if f.data_layout {
-                multi_on_rows |= f.orient == "row";
+                values_position = match f.orient.as_str() {
+                    "row" => Some((true, p.rows.len())),
+                    "column" => Some((false, p.cols.len())),
+                    _ => None,
+                };
                 continue;
             }
             if f.orient == "hidden" {
@@ -473,7 +483,17 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                     }
                 },
             };
-            let pf = PivotField { field: x, hidden, sort };
+            let mut pf = PivotField { field: x, hidden, sort, ..PivotField::new(x) };
+            if matches!(f.orient.as_str(), "row" | "column") {
+                if f.custom_subtotal {
+                    bad = Some(format!("custom subtotal functions in {}", f.name));
+                    break;
+                }
+                pf.outline = f.orient == "row" && f.outline_top.is_some() && !f.compact;
+                pf.subtotal = if !f.subtotals { Subtotal::Off }
+                    else if pf.outline && f.outline_top == Some(false) { Subtotal::Bottom }
+                    else { Subtotal::Default };
+            }
             match f.orient.as_str() {
                 "row" => {
                     subtotals |= f.subtotals;
@@ -500,8 +520,15 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
                 }
             }
         }
-        if multi_on_rows && p.data.len() > 1 {
-            rep.note(Kind::Approximate, "pivot table values shown down the rows (shown across)");
+        if let Some((row, position)) = values_position.filter(|_| p.data.len() > 1) {
+            if position != if row { p.rows.len() } else { p.cols.len() } {
+                why(rep, "the Values field is between other fields on its axis");
+                continue;
+            }
+            p.values_on_rows = row;
+        }
+        if !subtotals {
+            for field in p.rows.iter_mut().chain(&mut p.cols) { field.subtotal = Subtotal::Default; }
         }
         p.subtotals = subtotals;
         p.compact = compact.unwrap_or(false);

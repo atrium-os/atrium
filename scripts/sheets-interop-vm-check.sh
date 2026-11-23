@@ -2,6 +2,7 @@
 # Run in the private 1280x720 Sheets desktop fixture. Stage the two books
 # from the sheets_interop_fixture example in the only Scrinium place, and
 # stage the arm64 FreeBSD build of that example at /tmp/sheets-interop-fixture.
+# Use SHEETS_INTEROP_CASE=pivot_layout and /tmp/sheets-pivot-layout-fixture for pivot sorting and layout.
 # Use SHEETS_INTEROP_CASE=pivot_sources and /tmp/sheets-pivot-sources-fixture for derived pivot fields.
 # Use SHEETS_INTEROP_CASE=pivot_cache and /tmp/sheets-pivot-cache-fixture for Excel cache recovery.
 # Use SHEETS_INTEROP_CASE=pivot_scope and /tmp/sheets-pivot-scope-fixture for Excel value sort scopes.
@@ -35,7 +36,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -78,6 +79,7 @@ checkpoint() {
         pivot_display) /tmp/sheets-pivot-display-fixture check "$1" "$2" "$format" ;;
         pivot_order) /tmp/sheets-pivot-order-fixture check "$1" "$2" "$format" ;;
         pivot_scope) /tmp/sheets-pivot-scope-fixture check "$1" "$2" "$scope" ;;
+        pivot_layout) /tmp/sheets-pivot-layout-fixture check "$1" "$2" "$format" ;;
         pivot_sources) /tmp/sheets-pivot-sources-fixture check "$1" "$2" "$format" ;;
         pivot_cache) /tmp/sheets-pivot-cache-fixture check "$1" "$2" "$format" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
@@ -170,7 +172,7 @@ pivots() {
 }
 
 pivot_display() {
-    click 256 133 # D2, outside the source. Make an ordinary Save after import.
+    click "${1:-256}" 133 # Outside the source. Make an ordinary Save after import.
     key 0x24 # 7
     key 0x28
     save "$book" saved
@@ -1060,6 +1062,7 @@ for format in ods xlsx; do
 
     case "$profile" in
         pivot_order|pivot_sources) pivot_display ;;
+        pivot_layout) pivot_display 319 ;;
         *) "$profile" ;;
     esac
     close_book
@@ -1068,7 +1071,7 @@ for format in ods xlsx; do
     sleep .4
     cp selectscreen.png "$results/$format-reopened.png"
     case "$profile" in
-        pivot_display|pivot_order|pivot_sources) pivot_display_reopened ;;
+        pivot_display|pivot_order|pivot_sources|pivot_layout) pivot_display_reopened ;;
         layout) scroll_layout ;;
         annotations) check_reopened_validation ;;
         print) print_pdf ;;
@@ -1079,7 +1082,7 @@ for format in ods xlsx; do
         text_filter) text_filter_reopened ;;
     esac
     close_book
-    if test "$profile" = pivot_sources; then
+    if test "$profile" = pivot_sources || test "$profile" = pivot_layout; then
         open_book "$row" "$book" refreshed
         sleep .4
         cp selectscreen.png "$results/$format-refreshed-reopened.png"

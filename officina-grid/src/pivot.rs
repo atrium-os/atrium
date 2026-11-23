@@ -27,7 +27,7 @@ pub use display::{BaseItem, ReferenceCalc, ShowAs};
 pub use group::{DatePart, GroupField, GroupKind, ItemGroup};
 use display::{Display, Slot};
 use group::Grouping;
-pub use order::AxisSort;
+pub use order::{AxisSort, ScopeItems, MAX_SCOPE_ITEMS};
 use order::{Order, SortKey};
 
 pub const MAX_GROUPS: usize = 64;
@@ -82,6 +82,20 @@ impl Agg {
     }
 }
 
+/// Per-field subtotal placement. Default follows the pivot-wide setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Subtotal {
+    #[default]
+    Default,
+    Off,
+    Top,
+    Bottom,
+}
+
+impl Subtotal {
+    const ALL: [Self; 4] = [Self::Default, Self::Off, Self::Top, Self::Bottom];
+}
+
 /// A source column on an axis, with the items left out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PivotField {
@@ -90,11 +104,13 @@ pub struct PivotField {
     /// Items not shown (and not counted), as their values.
     pub hidden: Vec<Value>,
     pub sort: AxisSort,
+    pub outline: bool,
+    pub subtotal: Subtotal,
 }
 
 impl PivotField {
     pub fn new(field: u32) -> Self {
-        PivotField { field, hidden: Vec::new(), sort: AxisSort::Default }
+        PivotField { field, hidden: Vec::new(), sort: AxisSort::Default, outline: false, subtotal: Subtotal::Default }
     }
 }
 
@@ -130,9 +146,21 @@ pub struct Pivot {
     /// indented under their outer item, whose row holds its subtotal (else the
     /// tabular form, a column per row field and subtotal rows under each group).
     pub compact: bool,
+    /// The implicit Values field is the innermost row field.
+    pub values_on_rows: bool,
 }
 
 impl Pivot {
+    pub fn subtotal_at(&self, field: &PivotField, row: bool) -> Subtotal {
+        if !self.subtotals { return Subtotal::Off; }
+        match field.subtotal {
+            Subtotal::Default if row && (self.compact || field.outline) => Subtotal::Top,
+            Subtotal::Default => Subtotal::Bottom,
+            Subtotal::Top if !row => Subtotal::Bottom,
+            subtotal => subtotal,
+        }
+    }
+
     /// Validate group dependencies before resolving their members.
     pub fn check_groups(&self) -> Result<(), &'static str> {
         let width = self.source.c1.checked_sub(self.source.c0).ok_or("an invalid pivot source")? + 1;
@@ -161,14 +189,14 @@ impl Pivot {
     }
 
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
-        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), calculations: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
+        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), groups: Vec::new(), calculations: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false, values_on_rows: false }
     }
 
     /// Swap value fields without changing the measure referenced by a sort.
     pub fn swap_data_fields(&mut self, a: usize, b: usize) {
         self.data.swap(a, b);
         for field in self.rows.iter_mut().chain(&mut self.cols) {
-            if let AxisSort::Scoped { data, .. } = &mut field.sort {
+            if let Some(data) = field.sort.scoped_measure_mut() {
                 if *data as usize == a {
                     *data = b as u32;
                 } else if *data as usize == b {
@@ -182,7 +210,7 @@ impl Pivot {
     pub fn remove_data_field(&mut self, index: usize) {
         self.data.remove(index);
         for field in self.rows.iter_mut().chain(&mut self.cols) {
-            if let AxisSort::Scoped { data, .. } = &mut field.sort {
+            if let Some(data) = field.sort.scoped_measure_mut() {
                 match (*data as usize).cmp(&index) {
                     Ordering::Equal => field.sort = AxisSort::Default,
                     Ordering::Greater => *data -= 1,
@@ -444,34 +472,71 @@ struct ColHead {
     total: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind { Detail, Heading, Top, Bottom, Grand }
+
 /// The computed output: cells relative to the area's top-left, and its shape.
 pub struct Output {
     pub cells: Vec<(u32, u32, Value)>,
     pub rows: u32,
     pub cols: u32,
-    percent_cols: Vec<u32>,
+    percent_ranges: Vec<Rect>,
+    percent_by_row: bool,
     pub shape: Shape,
 }
 
 impl Output {
-    fn percent_styles<'a>(&'a self, wb: &'a Workbook) -> impl Iterator<Item = crate::ops::GridOp> + 'a {
-        let body = self.shape.area.and_then(|area| {
-            let r0 = area.r0 + self.shape.page_rows + self.shape.header_rows;
-            (r0 <= area.r1).then_some(Rect { r0, ..area })
-        });
+    fn percent_styles(&self, wb: &Workbook) -> Vec<crate::ops::GridOp> {
+        use crate::ops::{GridOp, StyleRegion};
+        use crate::style::Style;
+
         let percent: Arc<str> = Arc::from("0.00%");
-        self.percent_cols.iter().filter_map(move |col| {
-            let area = body?;
-            let col = area.c0 + col;
-            let rect = Rect { c0: col, c1: col, ..area };
-            Some(crate::ops::GridOp::restyle(wb, rect, |style| {
-                let mut style = style.clone();
-                if style.num_fmt.eq_ignore_ascii_case("General") {
-                    style.num_fmt = percent.clone();
+        let style_percent = |style: &Style| {
+            let mut style = style.clone();
+            if style.num_fmt.eq_ignore_ascii_case("General") {
+                style.num_fmt = percent.clone();
+            }
+            style
+        };
+        if !self.percent_by_row {
+            return self.percent_ranges.iter().map(|rect| GridOp::restyle(wb, *rect, style_percent)).collect();
+        }
+
+        let (Some(&first), Some(last)) = (self.percent_ranges.first(), self.percent_ranges.last()) else {
+            return Vec::new();
+        };
+        // Use one journal operation even when the Values axis has many measure rows.
+        let rect = Rect { r1: last.r1, ..first };
+        let sheet = wb.sheet(rect.sheet);
+        let mut spans = Vec::new();
+        for col in rect.c0..=rect.c1 {
+            let parts = sheet.styles.get(col as usize).map_or_else(
+                || vec![(rect.r0, rect.r1, 0)],
+                |runs| runs.spans(rect.r0, rect.r1),
+            );
+            for (start, end, id) in parts {
+                let original = wb.styles.get(id);
+                if !original.num_fmt.eq_ignore_ascii_case("General") {
+                    spans.push((col, start, end, original.clone()));
+                    continue;
                 }
-                style
-            }))
-        })
+                let first = self.percent_ranges.partition_point(|range| range.r0 < start);
+                let last = self.percent_ranges.partition_point(|range| range.r0 <= end);
+                let mut next = start;
+                let styled = style_percent(original);
+                for range in &self.percent_ranges[first..last] {
+                    if id != 0 && next < range.r0 {
+                        spans.push((col, next, range.r0 - 1, original.clone()));
+                    }
+                    spans.push((col, range.r0, range.r0, styled.clone()));
+                    next = range.r0 + 1;
+                }
+                if id != 0 && next <= end {
+                    spans.push((col, next, end, original.clone()));
+                }
+            }
+        }
+        vec![GridOp::Restyle(StyleRegion { rect, spans })]
     }
 }
 
@@ -584,17 +649,21 @@ impl Workbook {
         }) {
             return Err("a display calculation needs its base field in Rows or Columns");
         }
-        if p.pages.iter().any(|field| matches!(field.sort, AxisSort::Scoped { .. })) {
+        if p.pages.iter().any(|field| field.sort.scoped_measure().is_some()) {
             return Err("a pivot value sort needs a row or column field");
         }
         for (axis, other) in [(&p.rows, &p.cols), (&p.cols, &p.rows)] {
             for field in axis {
-                if let AxisSort::Scoped { data, members, .. } = &field.sort {
-                    if *data as usize >= p.data.len()
-                        || members.len() > other.len()
-                        || members.iter().zip(other).any(|((field, _), other)| *field != other.field)
-                    {
+                let sort = &field.sort;
+                if let Some(index) = sort.scoped_measure() {
+                    let Some(measure) = p.data.get(index as usize).filter(|_| sort.matches_axis(other)) else {
                         return Err("a pivot value sort needs its measure and selected members on the opposite axis");
+                    };
+                    if matches!(sort, AxisSort::Selection { .. }) && p.calculations.iter().any(|field| field.field == measure.field) {
+                        return Err("a multi-item or positional sort needs an ordinary measure");
+                    }
+                    if sort.uses_positions() && other.iter().any(|field| field.sort.uses_values()) {
+                        return Err("a positional sort needs a label or manual order on the opposite axis");
                     }
                 }
             }
@@ -810,7 +879,7 @@ impl Workbook {
         if let Some(o) = old {
             self.clear_values(o);
         }
-        let styles: Vec<_> = out.percent_styles(self).collect();
+        let styles = out.percent_styles(self);
         for style in styles {
             use officina_core::history::Op;
             style.apply(self);
@@ -1012,11 +1081,11 @@ impl Workbook {
         row_paths.sort();
         let mut col_paths: Vec<Path> = col_paths.into_keys().collect();
         col_paths.sort();
-        let resolve = |sort: &AxisSort| -> Option<SortKey> {
+        let resolve = |sort: &AxisSort, column: bool| -> Option<SortKey> {
             let (data, agg, descending, opposite) = match sort {
                 AxisSort::Data { caption, descending } => {
                     let (data, agg) = self.pivot_sort_value(p, caption)?;
-                    (data, agg, *descending, Vec::new())
+                    (data, agg, *descending, vec![Vec::new()])
                 }
                 AxisSort::Scoped { data, descending, members } => {
                     let data = *data as usize;
@@ -1024,7 +1093,17 @@ impl Workbook {
                     let opposite = members.iter().map(|(field, item)| {
                         axes.get(field)?.1.get(&key(item)).copied()
                     }).collect::<Option<Vec<_>>>()?;
-                    (data, agg, *descending, opposite)
+                    (data, agg, *descending, vec![opposite])
+                }
+                AxisSort::Selection { data, descending, fields } => {
+                    let data = *data as usize;
+                    let agg = p.data.get(data)?.agg;
+                    let (paths, other) = if column { (&row_paths, &p.rows) } else { (&col_paths, &p.cols) };
+                    if !sort.matches_axis(other) { return None; }
+                    let prefixes = order::selected_paths(paths, fields, |field, item| {
+                        axes.get(&field)?.1.get(&key(item)).copied()
+                    });
+                    (data, agg, *descending, prefixes)
                 }
                 _ => return None,
             };
@@ -1036,72 +1115,76 @@ impl Workbook {
         col_order.sort(&mut col_paths);
         let items = |field: u32, i: u32| -> Value { label(&axes[&field].0.items[i as usize]) };
 
-        // Rows of the body: (path, is a subtotal of that prefix).
-        let mut body: Vec<(Path, bool)> = Vec::new();
+        let mut body = Vec::new();
         let compact = p.compact && k > 0;
+        let values_on_rows = p.values_on_rows && p.data.len() > 1;
+        let vertical_labels = values_on_rows && k > 0;
         if k == 0 {
-            body.push((Vec::new(), false));
-        } else if compact {
-            // A row for each outer item where its group starts, then its inner ones.
-            let mut prev: Option<&Path> = None;
-            for path in &row_paths {
-                for d in 1..=k {
-                    if prev.is_none_or(|q| q[..d] != path[..d]) {
-                        body.push((path[..d].to_vec(), false));
-                    }
+            body.push((Vec::new(), RowKind::Detail));
+        }
+        for (n, path) in row_paths.iter().enumerate().filter(|_| k > 0) {
+            let prev = n.checked_sub(1).and_then(|index| row_paths.get(index));
+            for depth in 1..k {
+                if prev.is_some_and(|q| q[..depth] == path[..depth]) { continue; }
+                let field = &p.rows[depth - 1];
+                let subtotal = p.subtotal_at(field, true);
+                if subtotal == Subtotal::Top {
+                    body.push((path[..depth].to_vec(), RowKind::Top));
+                } else if compact || field.outline {
+                    body.push((path[..depth].to_vec(), RowKind::Heading));
                 }
-                prev = Some(path);
             }
-        } else {
-            for (n, path) in row_paths.iter().enumerate() {
-                body.push((path.clone(), false));
-                if p.subtotals {
-                    // Subtotals for the outer fields whose group ends here.
-                    let next = row_paths.get(n + 1);
-                    for depth in (1..k).rev() {
-                        if next.is_none_or(|q| q[..depth] != path[..depth]) {
-                            body.push((path[..depth].to_vec(), true));
-                        }
-                    }
+            body.push((path.clone(), RowKind::Detail));
+            let next = row_paths.get(n + 1);
+            for depth in (1..k).rev() {
+                if p.subtotal_at(&p.rows[depth - 1], true) == Subtotal::Bottom
+                    && next.is_none_or(|q| q[..depth] != path[..depth])
+                {
+                    body.push((path[..depth].to_vec(), RowKind::Bottom));
                 }
             }
         }
+        if p.grand_row && k > 0 { body.push((Vec::new(), RowKind::Grand)); }
+        let copies = if values_on_rows { 1 } else { nd };
         // Column heads: column items (with the value fields innermost when there
         // are several).
         let mut heads: Vec<ColHead> = Vec::new();
         if m == 0 {
-            for d in 0..nd {
+            for d in 0..copies {
                 heads.push(ColHead { path: Vec::new(), data: d, total: false });
             }
         } else {
             for (n, path) in col_paths.iter().enumerate() {
-                for d in 0..nd {
+                for d in 0..copies {
                     heads.push(ColHead { path: path.clone(), data: d, total: false });
                 }
-                if p.subtotals {
-                    let next = col_paths.get(n + 1);
-                    for depth in (1..m).rev() {
-                        if next.is_none_or(|q| q[..depth] != path[..depth]) {
-                            for d in 0..nd {
-                                heads.push(ColHead { path: path[..depth].to_vec(), data: d, total: true });
-                            }
+                let next = col_paths.get(n + 1);
+                for depth in (1..m).rev() {
+                    if p.subtotal_at(&p.cols[depth - 1], false) != Subtotal::Off
+                        && next.is_none_or(|q| q[..depth] != path[..depth])
+                    {
+                        for d in 0..copies {
+                            heads.push(ColHead { path: path[..depth].to_vec(), data: d, total: true });
                         }
                     }
                 }
             }
             if p.grand_col {
-                for d in 0..nd {
+                for d in 0..copies {
                     heads.push(ColHead { path: Vec::new(), data: d, total: true });
                 }
             }
         }
-        let multi = p.data.len() > 1;
+        let multi = p.data.len() > 1 && !values_on_rows;
         // A header row for the column fields (and "Values") when there are any.
         let col_dims = m + multi as usize;
         let header_rows = if col_dims == 0 { 1 } else { 1 + col_dims } as u32;
-        let label_cols = if compact { 1 } else { k.max(1) as u32 };
+        let label_cols = (if compact { 1 } else { k.max(1) as u32 }) + u32::from(vertical_labels);
         let page_rows = if p.pages.is_empty() { 0 } else { p.pages.len() as u32 + 1 };
-        let rows_total = page_rows as u64 + header_rows as u64 + body.len() as u64 + (p.grand_row && k > 0) as u64;
+        let body_rows: u64 = body.iter().map(|(_, kind)| {
+            if values_on_rows && *kind != RowKind::Heading { nd as u64 } else { 1 }
+        }).sum();
+        let rows_total = page_rows as u64 + header_rows as u64 + body_rows;
         let cols_total = label_cols as u64 + heads.len() as u64;
         if rows_total * cols_total > MAX_OUTPUT {
             return Err("the pivot table would be too large");
@@ -1138,7 +1221,7 @@ impl Workbook {
                     put(top, label_cols, Value::str(&caption(0)));
                 }
             } else {
-                if !multi {
+                if !multi && !values_on_rows {
                     put(top, 0, Value::str(&caption(0)));
                 }
                 put(top, label_cols, Value::str("Column Labels"));
@@ -1155,7 +1238,7 @@ impl Workbook {
             }
         } else {
             if !compact {
-                if !multi {
+                if !multi && !values_on_rows {
                     put(top, 0, Value::str(&caption(0)));
                 }
                 for (j, f) in p.cols.iter().enumerate() {
@@ -1193,6 +1276,9 @@ impl Workbook {
                 prev = Some(h);
             }
         }
+        if values_on_rows {
+            put(top + header_rows - 1, label_cols - 1, Value::str("Values"));
+        }
         // Body.
         let first = top + header_rows;
         let mut total_rows = Vec::new();
@@ -1207,58 +1293,70 @@ impl Workbook {
             let order = if slot.is_some_and(|slot| slot.column) { &col_order } else { &row_order };
             Display::new(&data.show_as, slot, items, &acc, i, data.agg, order)
         }).collect();
-        let value = |rp: &[u32], h: &ColHead| -> Value {
-            let agg = p.data.get(h.data).map_or(Agg::Count, |d| d.agg);
+        let value = |rp: &[u32], h: &ColHead, data: usize| -> Value {
+            let agg = p.data.get(data).map_or(Agg::Count, |d| d.agg);
             let raw = |row: &[u32], col: &[u32]| acc.get(&(row.to_vec(), col.to_vec()))
-                .map_or(Value::Empty, |a| a[h.data].result(agg));
-            match displays.get(h.data) {
+                .map_or(Value::Empty, |a| a[data].result(agg));
+            match displays.get(data) {
                 Some(display) => display.value(rp, &h.path, raw),
                 None => raw(rp, &h.path),
             }
         };
         let mut row = first;
         let mut indents = Vec::new();
-        for (path, sub) in &body {
-            if compact {
-                let d = path.len();
-                put(row, 0, items(p.rows[d - 1].field, path[d - 1]));
-                if d > 1 || d < k {
-                    indents.push((row - first, (d - 1) as u8, d < k));
+        let mut percent_bands = Vec::new();
+        for (path, kind) in &body {
+            let depth = path.len();
+            match kind {
+                RowKind::Grand => put(row, 0, Value::str("Grand Total")),
+                RowKind::Heading | RowKind::Top | RowKind::Bottom => {
+                    let col = if compact { 0 } else { depth as u32 - 1 };
+                    let item = items(p.rows[depth - 1].field, path[depth - 1]);
+                    let shown = if *kind == RowKind::Bottom {
+                        Value::str(&format!("{} Total", label_text(&item)))
+                    } else { item };
+                    put(row, col, shown);
+                    if compact { indents.push((row - first, (depth - 1) as u8, true)); }
                 }
-                if d == k || p.subtotals {
-                    for (x, h) in heads.iter().enumerate() {
-                        put(row, label_cols + x as u32, value(path, h));
+                RowKind::Detail if compact => {
+                    put(row, 0, items(p.rows[depth - 1].field, path[depth - 1]));
+                    if depth > 1 { indents.push((row - first, (depth - 1) as u8, false)); }
+                }
+                RowKind::Detail => {
+                    for (lvl, &it) in path.iter().enumerate() {
+                        let field = &p.rows[lvl];
+                        let has_heading = lvl + 1 < k && (field.outline || p.subtotal_at(field, true) == Subtotal::Top);
+                        let new = prev.is_none_or(|q| q[..=lvl] != path[..=lvl]);
+                        if !has_heading && new { put(row, lvl as u32, items(field.field, it)); }
                     }
+                    if k == 0 && col_dims > 0 && !multi && !values_on_rows {
+                        put(row, 0, Value::str("Total"));
+                    }
+                    prev = Some(path);
                 }
+            }
+            if *kind == RowKind::Heading {
                 row += 1;
                 continue;
             }
-            if *sub {
-                let d = path.len();
-                put(row, d as u32 - 1, Value::str(&format!("{} Total", label_text(&items(p.rows[d - 1].field, path[d - 1])))));
-                total_rows.push(row - first);
-            } else {
-                for (lvl, &it) in path.iter().enumerate() {
-                    let new = prev.is_none_or(|q| q[..=lvl] != path[..=lvl]);
-                    if new {
-                        put(row, lvl as u32, items(p.rows[lvl].field, it));
+            let total = matches!(kind, RowKind::Top | RowKind::Bottom | RowKind::Grand);
+            if values_on_rows {
+                let col = label_cols - 1;
+                for d in 0..nd {
+                    put(row, col, Value::str(&caption(d)));
+                    for (x, h) in heads.iter().enumerate() {
+                        put(row, label_cols + x as u32, value(path, h, d));
                     }
+                    if total { total_rows.push(row - first); }
+                    if p.data[d].show_as.is_percent() { percent_bands.push(row); }
+                    row += 1;
                 }
-                if k == 0 && col_dims > 0 {
-                    put(row, 0, Value::str(if multi { "" } else { "Total" }));
+            } else {
+                if total && (!compact || *kind != RowKind::Top) { total_rows.push(row - first); }
+                for (x, h) in heads.iter().enumerate() {
+                    put(row, label_cols + x as u32, value(path, h, h.data));
                 }
-                prev = Some(path);
-            }
-            for (x, h) in heads.iter().enumerate() {
-                put(row, label_cols + x as u32, value(path, h));
-            }
-            row += 1;
-        }
-        if p.grand_row && k > 0 {
-            put(row, 0, Value::str("Grand Total"));
-            total_rows.push(row - first);
-            for (x, h) in heads.iter().enumerate() {
-                put(row, label_cols + x as u32, value(&[], h));
+                row += 1;
             }
         }
         let total_cols = heads.iter().enumerate().filter(|(_, h)| h.total).map(|(x, _)| label_cols + x as u32).collect();
@@ -1272,10 +1370,23 @@ impl Workbook {
             total_cols,
             indents,
         };
-        let percent_cols = heads.iter().enumerate()
-            .filter(|(_, head)| p.data.get(head.data).is_some_and(|data| data.show_as.is_percent()))
-            .map(|(col, _)| label_cols + col as u32).collect();
-        Ok(Output { cells, rows: rows_total as u32, cols: cols_total as u32, shape, percent_cols })
+        let mut percent_ranges = Vec::new();
+        if let Some(area) = shape.area.filter(|area| area.r0 + first <= area.r1) {
+            if values_on_rows {
+                for row in percent_bands {
+                    let r = area.r0 + row;
+                    percent_ranges.push(Rect { r0: r, r1: r, c0: area.c0 + label_cols, ..area });
+                }
+            } else {
+                for (col, head) in heads.iter().enumerate() {
+                    if p.data.get(head.data).is_some_and(|data| data.show_as.is_percent()) {
+                        let c = area.c0 + label_cols + col as u32;
+                        percent_ranges.push(Rect { r0: area.r0 + first, c0: c, c1: c, ..area });
+                    }
+                }
+            }
+        }
+        Ok(Output { cells, rows: rows_total as u32, cols: cols_total as u32, shape, percent_ranges, percent_by_row: values_on_rows })
     }
 }
 
@@ -1386,12 +1497,15 @@ impl Pivot {
                 w.str(&field.formula);
             }
         }
-        match area {
-            Some(a) => {
-                w.u8(1);
-                put_rect(w, &a);
+        let layout = self.values_on_rows || self.rows.iter().chain(&self.cols)
+            .any(|field| field.outline || field.subtotal != Subtotal::Default);
+        w.u8(u8::from(area.is_some()) | (u8::from(layout) << 1));
+        if let Some(area) = area { put_rect(w, &area); }
+        if layout {
+            w.u8(u8::from(self.values_on_rows));
+            for field in self.rows.iter().chain(&self.cols) {
+                w.u8(field.subtotal as u8 | (u8::from(field.outline) << 2));
             }
-            None => w.u8(0),
         }
     }
 
@@ -1416,7 +1530,7 @@ impl Pivot {
                     hidden.push(get_value(r)?);
                 }
                 let sort = if flags & 64 == 0 { AxisSort::Default } else { AxisSort::decode(r)? };
-                v.push(PivotField { field, hidden, sort });
+                v.push(PivotField { field, hidden, sort, ..PivotField::new(field) });
             }
             axes.push(v);
         }
@@ -1448,13 +1562,25 @@ impl Pivot {
                 });
             }
         }
-        let area = match r.u8()? {
-            0 => None,
-            _ => Some(get_rect(r)?),
-        };
+        let tag = r.u8()?;
+        if tag > 3 { return Err(WireError::Invalid("pivot layout flags")); }
+        let area = if tag & 1 != 0 { Some(get_rect(r)?) } else { None };
         let pages = axes.pop().unwrap();
-        let cols = axes.pop().unwrap();
-        let rows = axes.pop().unwrap();
-        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, calculations, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
+        let mut cols = axes.pop().unwrap();
+        let mut rows = axes.pop().unwrap();
+        let values_on_rows = if tag & 2 != 0 {
+            let values = match r.u8()? {
+                0 => false, 1 => true,
+                _ => return Err(WireError::Invalid("pivot values axis")),
+            };
+            for field in rows.iter_mut().chain(&mut cols) {
+                let flags = r.u8()?;
+                if flags > 7 { return Err(WireError::Invalid("pivot field layout")); }
+                field.subtotal = Subtotal::ALL[(flags & 3) as usize];
+                field.outline = flags & 4 != 0;
+            }
+            values
+        } else { false };
+        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, groups, calculations, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0, values_on_rows }, area))
     }
 }

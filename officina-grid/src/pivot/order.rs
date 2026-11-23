@@ -1,10 +1,27 @@
 //! How visible members are ordered within each parent on a pivot axis.
 
-use super::{Acc, Agg, MAX_FIELDS, MAX_ITEMS, PivotField, get_field, get_value, key, put_value};
+use super::{get_field, get_value, key, put_value, Acc, Agg, PivotField, MAX_FIELDS, MAX_ITEMS};
 use crate::value::Value;
 use officina_core::wire::{Reader, WireError, Writer};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+pub const MAX_SCOPE_ITEMS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScopeItems {
+    Members(Vec<Value>),
+    Positions(Vec<u32>),
+}
+
+impl ScopeItems {
+    fn len(&self) -> usize {
+        match self {
+            Self::Members(items) => items.len(),
+            Self::Positions(items) => items.len(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum AxisSort {
@@ -26,9 +43,60 @@ pub enum AxisSort {
         descending: bool,
         members: Vec<(u32, Value)>,
     },
+    Selection {
+        data: u32,
+        descending: bool,
+        fields: Vec<(u32, ScopeItems)>,
+    },
 }
 
 impl AxisSort {
+    pub fn is_selected_value_sort(&self) -> bool {
+        match self {
+            Self::Scoped { members, .. } => !members.is_empty(),
+            Self::Selection { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub fn uses_positions(&self) -> bool {
+        matches!(self, Self::Selection { fields, .. } if fields.iter().any(|(_, items)| matches!(items, ScopeItems::Positions(_))))
+    }
+
+    pub fn uses_values(&self) -> bool {
+        matches!(
+            self,
+            Self::Data { .. } | Self::Scoped { .. } | Self::Selection { .. }
+        )
+    }
+
+    pub fn scoped_measure(&self) -> Option<u32> {
+        match self {
+            Self::Scoped { data, .. } | Self::Selection { data, .. } => Some(*data),
+            _ => None,
+        }
+    }
+
+    pub(super) fn scoped_measure_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            Self::Scoped { data, .. } | Self::Selection { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
+    pub(super) fn matches_axis(&self, axis: &[PivotField]) -> bool {
+        let prefix = |len| axis.iter().take(len).map(|field| field.field);
+        match self {
+            Self::Scoped { members, .. } => {
+                prefix(members.len()).eq(members.iter().map(|(id, _)| *id))
+            }
+            Self::Selection { fields, .. } => {
+                prefix(fields.len()).eq(fields.iter().map(|(id, _)| *id))
+            }
+            _ => true,
+        }
+    }
+
     pub(super) fn valid(&self) -> bool {
         match self {
             Self::Manual(items) => items.len() <= MAX_ITEMS,
@@ -37,6 +105,13 @@ impl AxisSort {
             }
             Self::Scoped { data, members, .. } => {
                 (*data as usize) < MAX_FIELDS && members.len() <= MAX_FIELDS
+            }
+            Self::Selection { data, fields, .. } => {
+                (*data as usize) < MAX_FIELDS
+                    && !fields.is_empty()
+                    && fields.len() <= MAX_FIELDS
+                    && fields.iter().all(|(_, items)| items.len() > 0)
+                    && fields.iter().map(|(_, items)| items.len()).sum::<usize>() <= MAX_SCOPE_ITEMS
             }
             _ => true,
         }
@@ -72,6 +147,32 @@ impl AxisSort {
                 for (field, item) in members {
                     w.var(u64::from(*field));
                     put_value(w, item);
+                }
+            }
+            Self::Selection {
+                data,
+                descending,
+                fields,
+            } => {
+                w.u8(9 + u8::from(*descending));
+                w.var(u64::from(*data));
+                w.var(fields.len() as u64);
+                for (field, items) in fields {
+                    w.var(u64::from(*field));
+                    w.u8(u8::from(matches!(items, ScopeItems::Positions(_))));
+                    w.var(items.len() as u64);
+                    match items {
+                        ScopeItems::Members(items) => {
+                            for item in items {
+                                put_value(w, item);
+                            }
+                        }
+                        ScopeItems::Positions(items) => {
+                            for item in items {
+                                w.var(u64::from(*item));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -113,6 +214,38 @@ impl AxisSort {
                     members,
                 }
             }
+            tag @ (9 | 10) => {
+                let data = r.len("pivot sort value field", (MAX_FIELDS - 1) as u64)? as u32;
+                let n = r.count("pivot sort fields", MAX_FIELDS as u64, 3)?;
+                let mut fields = Vec::with_capacity(n);
+                let mut left = MAX_SCOPE_ITEMS;
+                for _ in 0..n {
+                    let field = get_field(r)?;
+                    let kind = r.u8()?;
+                    let n = r.count("pivot sort selections", left as u64, 1)?;
+                    left -= n;
+                    let items = match kind {
+                        0 => ScopeItems::Members(
+                            (0..n).map(|_| get_value(r)).collect::<Result<_, _>>()?,
+                        ),
+                        1 => ScopeItems::Positions(
+                            (0..n)
+                                .map(|_| {
+                                    r.len("pivot sort item position", MAX_ITEMS as u64)
+                                        .map(|v| v as u32)
+                                })
+                                .collect::<Result<_, _>>()?,
+                        ),
+                        _ => return Err(WireError::Invalid("pivot sort selector")),
+                    };
+                    fields.push((field, items));
+                }
+                Self::Selection {
+                    data,
+                    descending: tag == 10,
+                    fields,
+                }
+            }
             _ => return Err(WireError::Invalid("pivot item sort")),
         })
     }
@@ -125,7 +258,7 @@ pub(super) struct SortKey {
     pub data: usize,
     pub agg: Agg,
     pub descending: bool,
-    pub opposite: Path,
+    pub opposite: Vec<Path>,
 }
 
 /// Data sorting can give different orders to the same members under different parents.
@@ -139,7 +272,7 @@ impl Order {
         column: bool,
         paths: &[Path],
         acc: &HashMap<(Path, Path), Vec<Acc>>,
-        resolve: impl Fn(&AxisSort) -> Option<SortKey>,
+        resolve: impl Fn(&AxisSort, bool) -> Option<SortKey>,
     ) -> Self {
         let levels = axis
             .iter()
@@ -150,7 +283,27 @@ impl Order {
                     agg,
                     descending,
                     opposite,
-                } = resolve(&field.sort)?;
+                } = resolve(&field.sort, column)?;
+                // Merge only present intersections for a multi-item scope.
+                let combined = (opposite.len() > 1).then(|| {
+                    let selected: std::collections::HashSet<_> = opposite.iter().collect();
+                    let mut intersections: Vec<_> = acc
+                        .iter()
+                        .filter(|((row, col), _)| {
+                            let (own, other) = if column { (col, row) } else { (row, col) };
+                            own.len() == level + 1 && selected.contains(other)
+                        })
+                        .collect();
+                    intersections.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                    let mut totals: HashMap<&[u32], Acc> = HashMap::new();
+                    for ((row, col), values) in intersections {
+                        let own = if column { col } else { row };
+                        if let Some(value) = values.get(data) {
+                            totals.entry(own.as_slice()).or_default().merge(value);
+                        }
+                    }
+                    totals
+                });
                 let mut families: HashMap<Path, Vec<(u32, Option<f64>)>> = HashMap::new();
                 for path in paths {
                     let item = path[level];
@@ -160,12 +313,22 @@ impl Order {
                         continue;
                     }
                     let members = path[..=level].to_vec();
-                    let target = if column {
-                        (opposite.clone(), members)
-                    } else {
-                        (members, opposite.clone())
+                    let get = |path: &Path| {
+                        let target = if column {
+                            (path.clone(), members.clone())
+                        } else {
+                            (members.clone(), path.clone())
+                        };
+                        acc.get(&target).and_then(|values| values.get(data))
                     };
-                    let amount = match acc.get(&target).map(|values| values[data].result(agg)) {
+                    let value = match opposite.as_slice() {
+                        [path] => get(path).map(|acc| acc.result(agg)),
+                        _ => combined
+                            .as_ref()
+                            .and_then(|totals| totals.get(members.as_slice()))
+                            .map(|acc| acc.result(agg)),
+                    };
+                    let amount = match value {
                         Some(Value::Num(n)) if n.is_finite() => Some(n),
                         _ => None,
                     };
@@ -225,6 +388,56 @@ impl Order {
             None => a.len().cmp(&b.len()),
         });
     }
+}
+
+/// Select disjoint opposite-axis prefixes. Paths arrive in visible label/manual
+/// order, with hidden members already removed.
+pub(super) fn selected_paths(
+    paths: &[Path],
+    fields: &[(u32, ScopeItems)],
+    lookup: impl Fn(u32, &Value) -> Option<u32>,
+) -> Vec<Path> {
+    use std::collections::HashSet;
+    let mut parents = HashSet::from([Vec::new()]);
+    for (level, (field, items)) in fields.iter().enumerate() {
+        let wanted: HashSet<u32> = match items {
+            ScopeItems::Members(items) => items
+                .iter()
+                .filter_map(|item| lookup(*field, item))
+                .collect(),
+            ScopeItems::Positions(items) => items.iter().copied().collect(),
+        };
+        let mut matched = HashSet::new();
+        let mut previous: Option<&[u32]> = None;
+        let mut position = 0;
+        for path in paths {
+            let parent = &path[..level];
+            let member = &path[..=level];
+            if !parents.contains(parent) || previous == Some(member) {
+                continue;
+            }
+            position = if previous.is_some_and(|prev| &prev[..level] == parent) {
+                position + 1
+            } else {
+                0
+            };
+            previous = Some(member);
+            let id = match items {
+                ScopeItems::Members(_) => path[level],
+                ScopeItems::Positions(_) => position,
+            };
+            if wanted.contains(&id) {
+                matched.insert(member.to_vec());
+            }
+        }
+        parents = matched;
+        if parents.is_empty() {
+            break;
+        }
+    }
+    let mut prefixes: Vec<_> = parents.into_iter().collect();
+    prefixes.sort_unstable();
+    prefixes
 }
 
 /// Missing explicitly ordered members still need entries in a foreign definition.

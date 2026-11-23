@@ -1179,12 +1179,21 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     }
                     b"table:data-pilot-layout-info" => {
                         if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
-                            f.compact |= attrs(e).get("loext:layout-mode").is_some_and(|v| v == "compact-layout");
+                            let at = attrs(e);
+                            f.compact |= at.get("loext:layout-mode").is_some_and(|v| v == "compact-layout");
+                            f.outline_top = match at.get("table:layout-mode").map(String::as_str) {
+                                Some("outline-subtotals-top") => Some(true),
+                                Some("outline-subtotals-bottom") => Some(false),
+                                _ => None,
+                            };
                         }
                     }
                     b"table:data-pilot-subtotal" => {
                         if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
-                            f.subtotals |= attrs(e).get("table:function").is_some_and(|v| v != "none");
+                            if let Some(function) = attrs(e).get("table:function") {
+                                f.subtotals |= function != "none";
+                                f.custom_subtotal |= !matches!(function.as_str(), "auto" | "none");
+                            }
                         }
                     }
                     b"table:data-pilot-member" | b"table:data-pilot-group-member" if in_pilot_group => {

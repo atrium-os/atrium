@@ -2435,7 +2435,8 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   the columns and as page filters (each with the items it leaves out), value
   fields (sum, count, average, max, min, product, count of numbers, standard
   deviation and variance, sample and population; a caption of their own or
-  "Sum of Units"), grand totals for rows and columns and subtotals on or off.
+  "Sum of Units"), grand totals for rows and columns, and automatic subtotals
+  with per-field visibility and placement.
   Items group as Excel groups them: text in any case is one item, shown as first
   met, in Excel's order (numbers, text, FALSE/TRUE, errors, "(blank)").
 - **Refresh.** The output is ordinary cells, written when the pivot is made,
@@ -2465,8 +2466,7 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   (`compact="0" outline="0"`), with hidden items, page fields, value fields'
   functions and captions, grand totals, subtotals; the workbook's
   `pivotCaches`. The reader accepts sources on a sheet or a table's name.
-  Whole-column sources end at the last row in use. Outline layout and values
-  down the rows carry fidelity notices. Excel discrete groups preserve the
+  Whole-column sources end at the last row in use. Excel discrete groups preserve the
   values that map to each group, including typed members. Fixed numeric bins
   retain their range and cache labels. Refresh rejects a numeric grouping when
   its source has nonnumeric values and leaves the existing output in place.
@@ -2506,6 +2506,14 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   database sources keep their saved cells. When exporting to another format,
   unsupported groups and calculations retain their output cells with a Save
   notice.
+- **Layout.** XLSX and ODS preserve outline row fields, automatic subtotal
+  visibility per field, and subtotals above or below each row group. In outline
+  form the parent gets its own row. Tabular form keeps a column for each row
+  field. Values can be the innermost row or column field. Refresh puts each
+  vertical measure on its own row and formats percent measures independently
+  of numeric rows, preserving explicit formats. Saved cells stay static with a
+  fidelity notice for custom subtotal functions or a Values field placed
+  before other fields on its axis.
 - **Item order.** Excel manual order comes from the pivot field's item
   list, whose indices address shared cache values. Save keeps manual
   positions for missing members and places new members after the saved
@@ -2518,15 +2526,18 @@ recalculation of 1 M formulas: 324 → 346 ms (within its noise).
   or the shared cache. A measure without selected members sorts by its
   grand total. Refresh sorts by that measure's aggregate at the selected
   opposite-axis cell or subtotal. Save rebuilds indices and keeps a
-  temporarily absent selected member in the cache. Subtotal functions,
-  positional references and multi-item selections outside this model
-  carry a fidelity notice. Grand-total value sorting translates between
+  temporarily absent selected member in the cache. An Excel scope can select
+  several items within an opposite-axis prefix. The sort aggregates the
+  selected records, including the original counts for Average. Absolute
+  positions follow the visible label or manual order within each parent.
+  Relative positions, offsets and sorts that depend on a value-sorted
+  opposite axis carry fidelity notices. Grand-total value sorting translates between
   XLSX and ODS. ODS export reports selected-member sorts as label sorts.
 - **Native file and recovery.** Pivot definitions carry display modes,
-  group definitions, item sort settings and the last output area. The pivot operation journals
+  group definitions, item sort and field layout settings, and the last output area. The pivot operation journals
   the definition, cell edits and percentage format changes together.
-- **Remaining gaps.** Positional and multi-item Excel sort scopes,
-  outline layouts, automatic numeric bins and Excel calendar bins, calculated
+- **Remaining gaps.** Relative and offset sort references, custom subtotal
+  functions, non-innermost Values fields, automatic numeric bins and Excel calendar bins, calculated
   items, calculated fields with worksheet functions, GETPIVOTDATA and pivot
   charts.
   [Excel display modes](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.showdataasvalues?view=openxml-3.0.1) · [Excel extended modes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/f5b294f2-a168-46c3-b9a9-8e4f0132b78d) · [OpenDocument data pilots](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
@@ -2556,6 +2567,14 @@ automatic aggregation and an Excel workbook with discrete groups, fixed
 numeric bins and a calculated ratio. It checks the saved output, opens from the
 picker, edits the source, saves the unchanged results, then refreshes both
 formats and saves and reopens again.
+
+The `pivot_layout` desktop gate follows outline and subtotal layout and the
+Values row axis through Save and picker reopen in XLSX and ODS. A source edit
+leaves existing output visible until Refresh, then changes Previous in both
+workbooks. In XLSX it also changes the order and Running Total of a second
+pivot sorted by an absolute position on the opposite axis. The last Save and
+picker reopen keep the updated cells. Host fixtures also cover a selected-record
+average, bottom subtotals, percentage formats and native undo.
 
 
 Gates: `officina-grid` `tests/pivot.rs` (the cells Excel's tabular form shows

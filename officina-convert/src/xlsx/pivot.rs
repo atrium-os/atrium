@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use officina_grid::addr::{a1, Rect};
-use officina_grid::pivot::{GroupKind, item_key,same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
+use officina_grid::pivot::{GroupKind, ScopeItems, Subtotal, item_key, same_item, Agg, AxisSort, BaseItem, DataField, Pivot, PivotField, ReferenceCalc, ShowAs};
 use officina_grid::{CellAddr, Value, Workbook};
 #[cfg(feature = "read")]
 use quick_xml::events::Event;
@@ -71,13 +71,25 @@ fn field_items(wb: &Workbook, p: &Pivot, field: u32) -> Vec<Value> {
             }
         }
     }
+    let mut include = |value: &Value| {
+        if !items.iter().any(|item| same_item(item, value)) { items.push(value.clone()); }
+    };
     for axis in axis_fields(p) {
-        if let AxisSort::Scoped { members, .. } = &axis.sort {
-            for (member_field, value) in members {
-                if *member_field == field && !items.iter().any(|item| same_item(item, value)) {
-                    items.push(value.clone());
+        match &axis.sort {
+            AxisSort::Scoped { members, .. } => {
+                for (member_field, value) in members {
+                    if *member_field == field { include(value); }
                 }
             }
+            AxisSort::Selection { fields, .. } => {
+                for (member_field, selector) in fields {
+                    if *member_field != field { continue; }
+                    if let ScopeItems::Members(values) = selector {
+                        for value in values { include(value); }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if let Some(GroupKind::NumericBins { items: domain, .. }) = p.groups.iter().find(|group| group.field == field).map(|group| &group.kind) {
@@ -340,15 +352,24 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
     let shape = wb.pivot_shape(i).cloned().unwrap_or_default();
     let ids = Fields::new(p);
     let multi = p.data.len() > 1;
-    let col_dims = p.cols.len() + multi as usize;
+    let values_on_rows = multi && p.values_on_rows;
+    let col_dims = p.cols.len() + usize::from(multi && !values_on_rows);
+    let row_dims = p.rows.len() + usize::from(values_on_rows);
+    let outline = u8::from(p.compact || p.rows.iter().any(|field| field.outline));
     let loc = shape.table().unwrap_or(Rect { sheet: p.dest.sheet, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row, c1: p.dest.col });
+    let values_axis = if values_on_rows {
+        format!(r#" dataOnRows="1" dataPosition="{}""#, p.rows.len())
+    } else {
+        String::new()
+    };
     let first_data_row = if col_dims == 0 { 1 } else { shape.header_rows };
     let mut o = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotTableDefinition {NS} name="{}" cacheId="{cache_id}" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6"{} outline="1" outlineData="1" multipleFieldFilters="0"{}{}>"#,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotTableDefinition {NS} name="{}" cacheId="{cache_id}" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6"{} outline="{outline}" outlineData="{outline}" multipleFieldFilters="0"{}{}{}>"#,
         esc(&p.name),
         if p.compact { "" } else { r#" indent="0" compact="0" compactData="0""# },
         if p.grand_col { "" } else { r#" rowGrandTotals="0""# },
         if p.grand_row { "" } else { r#" colGrandTotals="0""# },
+        values_axis,
     );
     let _ = write!(o, r#"<location ref="{}:{}" firstHeaderRow="1" firstDataRow="{first_data_row}" firstDataCol="{}""#, a1(loc.r0, loc.c0), a1(loc.r1, loc.c1), shape.label_cols);
     if !p.pages.is_empty() {
@@ -373,8 +394,12 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         if p.data.iter().any(|d| d.field == f) {
             o.push_str(r#" dataField="1""#);
         }
-        o.push_str(if p.compact { r#" showAll="0""# } else { r#" compact="0" outline="0" showAll="0""# });
         let pf = axis_fields(p).into_iter().find(|x| x.field == f);
+        if !p.compact {
+            let outline = u8::from(pf.is_some_and(|field| field.outline));
+            let _ = write!(o, r#" compact="0" outline="{outline}""#);
+        }
+        o.push_str(r#" showAll="0""#);
         if pf.is_some() && axis == Some("axisPage") && pf.is_some_and(|x| x.hidden.len() > 0) {
             o.push_str(r#" multipleItemSelectionAllowed="1""#);
         }
@@ -388,7 +413,13 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
             };
             let _ = write!(o, r#" sortType="{sort}""#);
         }
-        if !p.subtotals && axis.is_some() {
+        let subtotal = pf.map_or(Subtotal::Off, |field| p.subtotal_at(field, axis == Some("axisRow")));
+        if subtotal == Subtotal::Bottom && axis == Some("axisRow") && (p.compact || pf.is_some_and(|field| field.outline)) {
+            o.push_str(r#" subtotalTop="0""#);
+        } else if subtotal == Subtotal::Top && !p.compact {
+            o.push_str(r#" subtotalTop="1""#);
+        }
+        if subtotal == Subtotal::Off && axis.is_some() {
             o.push_str(r#" defaultSubtotal="0""#);
         }
         match pf {
@@ -399,14 +430,14 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
                         .enumerate().map(|(i, value)| (item_key(value), i)).collect::<std::collections::HashMap<_, _>>()),
                     _ => None,
                 });
-                let n = items.len() + p.subtotals as usize;
+                let n = items.len() + usize::from(subtotal != Subtotal::Off);
                 let _ = write!(o, r#"><items count="{n}">"#);
                 for (i, v) in items.iter().enumerate() {
                     let x = cache_indices.as_ref().map_or(i, |indices| indices[&item_key(v)]);
                     let hide = pf.hidden.iter().any(|h| officina_grid::pivot::same_item(h, v));
                     let _ = write!(o, r#"<item x="{x}"{}/>"#, if hide { r#" h="1""# } else { "" });
                 }
-                if p.subtotals {
+                if subtotal != Subtotal::Off {
                     o.push_str(r#"<item t="default"/>"#);
                 }
                 o.push_str("</items>");
@@ -422,11 +453,12 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         }
     }
     o.push_str("</pivotFields>");
-    if !p.rows.is_empty() {
-        let _ = write!(o, r#"<rowFields count="{}">"#, p.rows.len());
+    if row_dims > 0 {
+        let _ = write!(o, r#"<rowFields count="{row_dims}">"#);
         for f in &p.rows {
             let _ = write!(o, r#"<field x="{}"/>"#, ids.raw(f.field));
         }
+        if values_on_rows { o.push_str(r#"<field x="-2"/>"#); }
         o.push_str("</rowFields>");
     }
     if col_dims > 0 {
@@ -434,7 +466,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         for f in &p.cols {
             let _ = write!(o, r#"<field x="{}"/>"#, ids.raw(f.field));
         }
-        if multi {
+        if multi && !values_on_rows {
             o.push_str(r#"<field x="-2"/>"#);
         }
         o.push_str("</colFields>");
@@ -476,8 +508,10 @@ struct FieldIn {
     scope: Option<scope::ScopeIn>,
     /// Shown in compact form (`compact`, default on) and outline form (`outline`).
     compact: bool,
-    outline: bool,
+    outline: Option<bool>,
     subtotal: bool,
+    subtotal_top: Option<bool>,
+    custom_subtotal: bool,
 }
 
 #[cfg(feature = "read")]
@@ -500,6 +534,9 @@ fn read_table(
     let mut data_indices = Vec::new();
     let mut list = 0u8; // 1 rows, 2 cols
     let mut compact = false;
+    let mut outline = false;
+    let mut data_on_rows = false;
+    let mut data_position = None;
     let mut active_data = None;
     loop {
         buf.clear();
@@ -513,6 +550,9 @@ fn read_table(
                     grand_col = attr(&e, b"rowGrandTotals")?.is_none_or(|v| v != "0" && v != "false");
                     grand_row = attr(&e, b"colGrandTotals")?.is_none_or(|v| v != "0" && v != "false");
                     compact |= attr(&e, b"compact")?.is_none_or(|v| v != "0" && v != "false");
+                    outline = attr(&e, b"outline")?.is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+                    data_on_rows = attr(&e, b"dataOnRows")?.is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+                    data_position = attr(&e, b"dataPosition")?.and_then(|v| v.parse::<usize>().ok());
                 }
                 b"location" => {
                     loc = attr(&e, b"ref")?.and_then(|v| parse_ref(&v));
@@ -521,9 +561,17 @@ fn read_table(
                 b"pivotField" if fields.len() < 16_384 => {
                     let subtotal = attr(&e, b"defaultSubtotal")?.is_none_or(|v| v != "0" && v != "false");
                     let on = |v: Option<String>| v.is_none_or(|v| v != "0" && v != "false");
-                    let (compact, outline) = (on(attr(&e, b"compact")?), on(attr(&e, b"outline")?));
+                    let compact = on(attr(&e, b"compact")?);
+                    let outline = attr(&e, b"outline")?.map(|v| on(Some(v)));
+                    let subtotal_top = attr(&e, b"subtotalTop")?.map(|v| on(Some(v)));
+                    let mut custom_subtotal = false;
+                    for attr_name in [b"sumSubtotal".as_slice(), b"countASubtotal", b"avgSubtotal",
+                        b"maxSubtotal", b"minSubtotal", b"productSubtotal", b"countSubtotal",
+                        b"stdDevSubtotal", b"stdDevPSubtotal", b"varSubtotal", b"varPSubtotal"] {
+                        custom_subtotal |= attr(&e, attr_name)?.is_some_and(|v| on(Some(v)));
+                    }
                     let sort = attr(&e, b"sortType")?;
-                    fields.push(FieldIn { subtotal, compact, outline, sort, ..Default::default() });
+                    fields.push(FieldIn { subtotal, compact, outline, subtotal_top, custom_subtotal, sort, ..Default::default() });
                 }
                 b"item" => {
                     if let Some(f) = fields.last_mut().filter(|f| f.items.len() < officina_grid::pivot::MAX_ITEMS) {
@@ -638,7 +686,7 @@ fn read_table(
                 _ => AxisSort::Default,
             }
         });
-        PivotField { field: f, hidden: hidden(f), sort }
+        PivotField { field: f, hidden: hidden(f), sort, ..PivotField::new(f) }
     };
     let page_top = r0.saturating_sub(if pages_n > 0 { pages_n + 1 } else { 0 });
     let mut p = Pivot::new(&name, source, CellAddr::new(sheet, page_top, c0));
@@ -650,8 +698,16 @@ fn read_table(
     let model = |raw| model_field(width, raw);
     p.rows = rows.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
     p.cols = cols.iter().filter_map(|&f| u32::try_from(f).ok()).map(|f| field(f, rep)).collect();
-    if rows.contains(&-2) {
-        rep.note(Kind::Approximate, "pivot table values shown down the rows (shown across)");
+    p.values_on_rows = datas.len() > 1 && (rows.contains(&-2) || data_on_rows);
+    if datas.len() > 1 && (if p.values_on_rows {
+        cols.contains(&-2) || rows.iter().position(|&f| f == -2).is_some_and(|i| i != p.rows.len())
+            || data_position.is_some_and(|pos| pos != p.rows.len())
+    } else {
+        cols.iter().position(|&f| f == -2).is_some_and(|i| i + 1 != cols.len())
+            || data_position.is_some_and(|pos| pos.saturating_add(1) != cols.len() && pos != cols.len())
+    }) {
+        why(rep, "the Values field is between other fields on its axis");
+        return Ok(());
     }
     for (f, item) in pages {
         let mut pf = field(f, rep);
@@ -754,16 +810,26 @@ fn read_table(
     if p.pages.iter().any(|field| fields.get(field.field as usize).is_some_and(|input| input.scoped_sort)) {
         rep.note(Kind::Approximate, "pivot value sort scope on a page field");
     }
-    let axis: Vec<u32> = p.rows.iter().chain(&p.cols).map(|f| f.field).collect();
-    p.subtotals = axis.iter().any(|&f| fields.get(f as usize).is_some_and(|x| x.subtotal));
+    let axis = p.rows.iter().chain(&p.cols);
+    if axis.clone().any(|f| fields.get(f.field as usize).is_some_and(|f| f.custom_subtotal)) {
+        why(rep, "it uses custom pivot subtotal functions");
+        return Ok(());
+    }
+    p.subtotals = axis.clone().any(|f| fields.get(f.field as usize).is_some_and(|f| f.subtotal));
     p.grand_col = grand_col;
     p.grand_row = grand_row;
-    // Compact form when the table and its row fields say so; outline form (a
-    // column per field without compact) is shown tabular.
-    let row_fields: Vec<&FieldIn> = p.rows.iter().filter_map(|f| fields.get(f.field as usize)).collect();
-    p.compact = compact && row_fields.iter().all(|f| f.compact);
-    if !p.compact && row_fields.len() > 1 && row_fields.iter().any(|f| f.outline) {
-        rep.note(Kind::Approximate, "pivot tables in outline form (shown in tabular form once refreshed)");
+    p.compact = compact && p.rows.iter().all(|f| fields.get(f.field as usize).is_none_or(|f| f.compact));
+    for (members, row) in [(&mut p.rows, true), (&mut p.cols, false)] {
+        for field in members {
+            let Some(input) = fields.get(field.field as usize) else { continue };
+            field.outline = row && !p.compact && input.outline.unwrap_or(outline);
+            let default_top = row && (p.compact || field.outline);
+            field.subtotal = match (p.subtotals, input.subtotal, row && input.subtotal_top.unwrap_or(default_top)) {
+                (true, false, _) => Subtotal::Off,
+                (true, true, top) if top != default_top => if top { Subtotal::Top } else { Subtotal::Bottom },
+                _ => Subtotal::Default,
+            };
+        }
     }
     let area = Rect { sheet, r0: page_top, c0, r1, c1: c1.max(c0 + if pages_n > 0 { 1 } else { 0 }) };
     if area.intersects(&source) {
@@ -772,8 +838,14 @@ fn read_table(
     }
     for field in p.rows.iter_mut().chain(&mut p.cols).chain(&mut p.pages) {
         field.field = model(field.field);
-        if let AxisSort::Scoped { members, .. } = &mut field.sort {
-            for (field, _) in members { *field = model(*field); }
+        match &mut field.sort {
+            AxisSort::Scoped { members, .. } => {
+                for (field, _) in members { *field = model(*field); }
+            }
+            AxisSort::Selection { fields, .. } => {
+                for (field, _) in fields { *field = model(*field); }
+            }
+            _ => {}
         }
     }
     for data in &mut p.data {

@@ -303,7 +303,7 @@ fn cache_index_scopes_use_shared_item_indices_and_unknown_scopes_are_reported() 
     let unknown = rewrite_pivot(&input, |xml| {
         xml.replace(
             r#"<reference field="1" count="1""#,
-            r#"<reference field="1" byPosition="1" count="1""#,
+            r#"<reference field="1" byPosition="1" relative="1" count="1""#,
         )
     });
     let (wb, loaded) = xlsx::read(&unknown).unwrap();

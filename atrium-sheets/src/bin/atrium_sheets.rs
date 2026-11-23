@@ -141,7 +141,7 @@ fn saved_status(d: &Doc, format: Format) -> String {
             changes.push("omitted Excel custom conditional icons");
         }
         if d.wb.pivots().iter().any(|pivot| pivot.rows.iter().chain(&pivot.cols).any(|f| {
-            matches!(&f.sort, officina_grid::pivot::AxisSort::Scoped { members, .. } if !members.is_empty())
+            f.sort.is_selected_value_sort()
         })) {
             changes.push("uses label sort for pivots sorted by a selected Excel member");
         }
