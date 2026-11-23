@@ -631,6 +631,14 @@ assertion, one redemption, and `crypta-ac-ok` through ocserv on `tun9`.
 The rerun restored the verified converter fixture after an installed
 binary hash mismatch caused the initial page to fail.
 
+The cancellation variant disconnected again while that request was
+queued. Portcullis discarded it before the prior jail closed. No new
+window launched, and the gateway served no additional page or script
+and received zero POSTs. A separate reconnect used a distinct attempt.
+IPv4 stayed blocked until fresh confirmation. The gateway then received
+one POST, accepted one assertion, and redeemed one token. The guest
+fetched `crypta-ac-ok` through ocserv on `tun8`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
