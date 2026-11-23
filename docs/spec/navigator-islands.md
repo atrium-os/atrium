@@ -646,6 +646,13 @@ press. The stale confirmation sent zero POSTs. IPv4 stayed blocked
 until fresh confirmation sent one POST, and the guest fetched
 `crypta-ac-ok` through ocserv on `tun8`.
 
+The pending-proposal variant disconnected that newest requeued attempt
+after its proposal appeared. The jail closed, the gateway received zero
+POSTs, and the IPv4 sentinel was unreachable. The next attempt used a
+fresh window and required confirmation before it sent one POST and
+completed the ocserv handshake. The guest fetched `crypta-ac-ok` on
+`tun9`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
