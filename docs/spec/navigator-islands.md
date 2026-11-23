@@ -562,8 +562,19 @@ sources and multi-paint masks still require isolated composition.
 The host pixel fixture records a mask and draws through Fresco’s reference
 renderer. It checks clear, half-alpha and opaque coverage across both clip
 edges, plus the interior and transparent corner of an SVG triangle.
-The arm64 JIT-off worker links. A guest run is still required to establish
-which mask the provider uses and whether a user press reaches Play.
+On Tessera, the isolated 192 px red ramp over white matched the reference
+samples, including the transparent exterior at both edges. The provider's
+title uses a horizontal fade over glyphs. The painter clips retained glyph
+runs into disjoint alpha bands and supports the translated vector paths,
+rational conics and single-path drop shadow in that frame.
+
+The installed JIT-off worker submitted the frame. The centre of the Play
+control remained black. Its settled DOM uses a red 72 × 72 div masked by
+`https://www.gstatic.com/youtube/img/icons/mweb/youtube_fill/logo/v2/67px.svg`.
+The embed grant admits scripts and styles on the embed origin only. A
+trusted press at framebuffer (577, 312) reached the provider button. Its
+first post-press frame stopped at chunk 13, record 1, `PaintTextShadow`.
+The click establishes input delivery. Visible Play and playback are open.
 Evidence is in `~/atrium-vm/evidence/navigator-i4-mask-20261124/`.
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient

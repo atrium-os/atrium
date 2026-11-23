@@ -247,6 +247,7 @@ pub fn recorded_leaves(
     })
 }
 
+#[derive(Clone)]
 pub struct PaintLeaf {
     pub chunk: ChunkId,
     pub occurrence: usize,
@@ -344,6 +345,7 @@ pub fn editor_leaves(
                         return Ok(());
                     }
                     let node = match header.command_type {
+                        DisplayListCommandType::FillPath => mask::vector_path(payload)?,
                         DisplayListCommandType::PaintLinearGradient => gradient::direct(payload)?,
                         DisplayListCommandType::DrawRepeatedTile => {
                             let Some(node) = gradient::repeated(payload)? else { return Ok(()) };
@@ -415,7 +417,7 @@ pub fn editor_leaves(
     }
     if !masks.is_empty() {
         let tree = list.visual_context_tree().ok_or("mask requires a visual context tree")?;
-        return mask::resolve(tree, leaves, &masks);
+        return mask::resolve(tree, snapshot, leaves, &masks);
     }
     Ok(leaves)
 }
