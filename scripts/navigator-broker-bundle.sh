@@ -29,6 +29,7 @@ entry = "bin/navigatord"
 
 [capabilities]
 navigator-broker = true
+audio = true  # Limen attributes the native player to Navigator after a user playback grant.
 graphics = "fresco"  # the broker owns the trusted sign-in sheet window
 # The captive portal's sign-in window (atrium-net.md §8.1 S3), restricted.
 network-portal = true

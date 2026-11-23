@@ -110,7 +110,8 @@ impl AudioOut {
     /// This player's media session, on the connection its stream counts
     /// on (so an embedded player's counts for its parent).
     pub fn session(&mut self, state: SessionState, title: &str, artist: &str, actions: u16, duration: Option<f64>, position: Option<f64>) {
-        if self.client.session(state, title, artist, actions, duration, position).is_err() {
+        if let Err(e) = self.client.session(state, title, artist, actions, duration, position) {
+            eprintln!("atrium-player: audio session: {e}");
             self.lost = true;
         }
     }
@@ -183,7 +184,13 @@ impl AudioOut {
                         self.session_actions.push((action, seek_offset, seek_time));
                     }
                 }
-                Ok(Some(ToApp::StreamLost { .. })) | Err(_) => {
+                Ok(Some(ToApp::StreamLost { .. })) => {
+                    eprintln!("atrium-player: audio stream lost");
+                    self.lost = true;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("atrium-player: reading audio events: {e}");
                     self.lost = true;
                     break;
                 }
@@ -222,6 +229,11 @@ impl AudioOut {
             let (n, pts) = p.read_pcm(&mut buf[..want]);
             if n == 0 {
                 self.buf = buf;
+                // A seek past the shorter audio track can leave only video.
+                // With no PCM in this run there is no device drain to request.
+                if ended && self.anchor.is_none() {
+                    self.drained = true;
+                }
                 if ended && self.started && !self.drain_sent && self.stretch.as_ref().map_or(true, |w| w.ready() == 0) {
                     // Everything is written: the last partial period plays
                     // out, and `Drained` says when it has been heard.

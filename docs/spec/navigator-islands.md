@@ -515,8 +515,28 @@ native track and returns buffered ranges for that track. The fixture appends
 the audio header first and checks that the video media append leaves the
 audio range empty. After the audio media append, its shorter range must
 remain distinct. A Chrome control passed in both buffer creation orders
-and decoded both tracks after seeking to 0.5 s. Installed Ladybird playback
-and audio output after seeking still require the Tessera gate.
+and decoded both tracks after seeking to 0.5 s.
+
+The installed arm64 Tessera gate passed with JIT off and Capsicum active.
+Both creation orders kept the audio range empty after the video append and
+reported video through 2.000 s and audio through 1.835 s after both appends.
+The external script set `data-resume-on-seek` on the video for both runs
+and `data-audio-first` for the reverse order, keeping the pinned HTML identical. A compositor press on **Load with sound** activated the page
+before it attached the native player. Both runs sought to the blue chapter
+at 1.5 s, sought back to red at 0.5 s, then resumed into blue. Lyra's stereo
+mix to FreeBSD's dummy sound device contained the fixture's 440 Hz tone
+across 27 consecutive 50 ms windows in each arm.
+The guest had the fixture persona on the active seat, a Portcullis playback
+grant for Navigator and a Limen attribution ticket for the embedded player.
+Its jaild mount-source allowlist included the playback and workers directories.
+
+LibWeb now calculates element readiness and buffered ranges from the native
+tracks. Previously a seek reset readiness to HAVE_METADATA and left the
+play promise pending. The native player now waits for Lyra's drain event
+before declaring playback ended. Previously the device played only the
+first queued portion of the post-seek tone. Frames, PCM, hashes, resolved
+LibJS features and jail evidence are in
+`~/atrium-vm/evidence/navigator-i4-opus-20261123/`.
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter

@@ -1,19 +1,77 @@
 --- a/Libraries/LibWeb/HTML/HTMLMediaElement.cpp
 +++ b/Libraries/LibWeb/HTML/HTMLMediaElement.cpp
-@@ -74,6 +74,12 @@
+@@ -65,6 +65,10 @@
+ #include <LibWeb/MediaCapture/MediaStream.h>
+ #include <LibWeb/MediaSession/ActiveMediaSessionTracker.h>
+ #include <LibWeb/MediaSourceExtensions/MediaSource.h>
++#ifdef ATRIUM_I4_VIDEO
++#include <LibWeb/MediaSourceExtensions/SourceBuffer.h>
++#include <LibWeb/MediaSourceExtensions/SourceBufferList.h>
++#endif
+ #include <LibWeb/Page/Page.h>
+ #include <LibWeb/Page/ScreenWakeLockHandle.h>
+ #include <LibWeb/Painting/BoxViews.h>
+@@ -73,6 +77,12 @@
+ #include <LibWeb/StorageAPI/StorageKey.h>
  #include <LibWeb/WebIDL/Promise.h>
  #include <LibWebCommon/MimeSniff/MimeType.h>
- 
++
 +#ifdef ATRIUM_I4_VIDEO
 +extern "C" bool navigator_video_open(u16, u16, u16, u16);
 +extern "C" bool navigator_video_seek(double);
 +extern "C" double navigator_video_time();
 +#endif
-+
+ 
  namespace Web::HTML {
  
- class HTMLMediaElement::ActiveVideoSink {
-@@ -599,6 +605,12 @@
+@@ -558,6 +568,32 @@
+     // NB: Cancelling the fetching process stops the resource selection algorithm when the error is set.
+ }
+ 
++#ifdef ATRIUM_I4_VIDEO
++// Both registered native tracks are selected in the fixture. At end of stream
++// the element extends each track's last range, leaving SourceBuffer.buffered intact.
++static Media::TimeRanges native_buffered(MediaSourceExtensions::MediaSource& source)
++{
++    auto buffers = source.source_buffers();
++    Vector<Media::TimeRanges> tracks;
++    AK::Duration highest_end;
++    for (size_t i = 0; i < buffers->length(); ++i) {
++        auto ranges = buffers->item(i)->buffered();
++        Media::TimeRanges track;
++        for (size_t j = 0; j < ranges->length(); ++j)
++            track.add_range(AK::Duration::from_seconds_f64(MUST(ranges->start(j))), AK::Duration::from_seconds_f64(MUST(ranges->end(j))));
++        highest_end = max(highest_end, track.highest_end_time());
++        tracks.append(move(track));
++    }
++    Media::TimeRanges common { { AK::Duration::zero(), highest_end } };
++    for (auto& track : tracks) {
++        if (!track.is_empty() && source.ready_state() == MediaSourceExtensions::ReadyState::Ended)
++            track.add_range(track.highest_end_time(), highest_end);
++        common = common.intersection(track);
++    }
++    return common;
++}
++#endif
++
+ // https://html.spec.whatwg.org/multipage/media.html#dom-media-buffered
+ GC::Ref<TimeRanges> HTMLMediaElement::buffered() const
+ {
+@@ -565,6 +601,13 @@
+     // The buffered attribute must return a new static normalized TimeRanges object that represents the ranges of the
+     // media resource, if any, that the user agent has buffered, at the time the attribute is evaluated.
+     auto time_ranges = TimeRanges::create();
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source) {
++        for (auto const& range : native_buffered(*m_attached_media_source))
++            time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
++        return time_ranges;
++    }
++#endif
+     if (m_playback_manager) {
+         for (auto const& range : m_playback_manager->buffered_time_ranges().time_ranges)
+             time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
+@@ -599,6 +642,12 @@
          time_ranges->add_range(0, m_duration);
          return time_ranges;
      }
@@ -26,7 +84,7 @@
      if (auto range = m_playback_manager->seekable_time_ranges(); range.has_value())
          time_ranges->add_range(range->start.to_seconds_f64(), range->end.to_seconds_f64());
      return time_ranges;
-@@ -707,6 +719,10 @@
+@@ -707,6 +756,10 @@
  // https://html.spec.whatwg.org/multipage/media.html#current-playback-position
  double HTMLMediaElement::current_playback_position() const
  {
@@ -37,7 +95,7 @@
      if (m_media_stream_playback)
          return m_media_stream_playback->current_time();
      if (!m_playback_manager)
-@@ -2038,7 +2054,17 @@
+@@ -2038,7 +2091,17 @@
                  media_source->set_assigned_to_media_element({}, *this);
                  m_attached_media_source = media_source;
                  update_pending_activity();
@@ -55,7 +113,27 @@
  
                  // 4. Set the readyState attribute to "open".
                  // 5. Queue a task to fire an event named sourceopen at the MediaSource.
-@@ -3466,6 +3492,20 @@
+@@ -3121,8 +3184,18 @@
+     // -> If HTMLMediaElement's buffered does not contain a TimeRanges for the current playback position:
+     auto current_time = m_playback_manager->current_time();
+     auto ranges = m_playback_manager->buffered_time_ranges().time_ranges;
++    auto available_data = m_playback_manager->available_data();
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source) {
++        current_time = AK::Duration::from_seconds_f64(navigator_video_time());
++        ranges = native_buffered(*m_attached_media_source);
++        auto range = ranges.range_at_or_after(current_time);
++        available_data = Media::AvailableData::None;
++        if (range.has_value() && range->start <= current_time)
++            available_data = current_time < range->end ? Media::AvailableData::Future : Media::AvailableData::Current;
++    }
++#endif
+     auto current_range = ranges.range_at_or_after(current_time);
+-    auto available_data = m_playback_manager->available_data();
+ 
+     if (available_data == Media::AvailableData::None
+         || (available_data == Media::AvailableData::Current && !current_range.has_value())) {
+@@ -3466,6 +3539,20 @@
      }));
  
      // 11. Set the current playback position to the new playback position.

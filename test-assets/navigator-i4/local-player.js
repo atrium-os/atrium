@@ -42,14 +42,38 @@ source.addEventListener("sourceopen", async () => {
         await append(a, sound[1]);
         if (!a.buffered.length || v.buffered.end(0) <= a.buffered.end(0))
             throw new Error("Independent track durations missing");
+        const ranges = [v, a].map(b => b.buffered.end(0).toFixed(3));
+        statusLine.style.color = "white";
         source.endOfStream();
-        statusLine.textContent = "Video and audio buffered";
+        statusLine.textContent = "Video and audio buffered " + ranges.join(" / ");
     } catch (error) {
         statusLine.textContent = error.message;
     }
 }, {once: true});
-video.addEventListener("seeked", () => {
+const soundTest = video.hasAttribute("data-resume-on-seek");
+video.addEventListener("seeked", async () => {
     statusLine.textContent = "Seeked to " + video.currentTime.toFixed(1);
+    if (soundTest && Math.abs(video.currentTime - 0.5) < 0.05) {
+        try {
+            // Give the frame readback gate a paused sample at the seek target.
+            await new Promise(resolve => setTimeout(resolve, 650));
+            await video.play();
+            statusLine.textContent = "Playing after seek";
+        } catch (error) {
+            statusLine.textContent = "Play failed: " + error.name;
+        }
+    }
 });
-video.src = url;
+if (soundTest) {
+    const enable = document.createElement("button");
+    enable.textContent = "Load with sound";
+    statusLine.after(enable);
+    enable.addEventListener("click", () => {
+        enable.remove();
+        video.muted = false;
+        video.src = url;
+    }, {once: true});
+} else {
+    video.src = url;
+}
 window.addEventListener("pagehide", () => URL.revokeObjectURL(url), {once: true});

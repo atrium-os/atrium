@@ -700,7 +700,10 @@ impl<H: Host> App<H> {
         // The end: everything decoded, and the last frame's had its time.
         if let Some(t) = self.ended_at {
             let playing = self.player.as_ref().is_some_and(|p| !p.paused());
-            if playing && !self.ended_sent && t.elapsed() > Duration::from_millis(300) && self.last_frame.elapsed() > Duration::from_millis(300) {
+            // Decode completion can precede the last audible sample by the
+            // duration of both PCM rings and the device buffer.
+            let audio_done = self.audio.as_ref().is_none_or(AudioOut::drained);
+            if playing && audio_done && !self.ended_sent && t.elapsed() > Duration::from_millis(300) && self.last_frame.elapsed() > Duration::from_millis(300) {
                 self.ended_sent = true;
                 self.ready();
                 self.host.emit(ToParent::Ended);
