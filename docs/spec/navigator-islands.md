@@ -690,6 +690,13 @@ handshake and IPv4 sentinel waited for fresh confirmation. Exactly
 one POST led to one token redemption and `crypta-ac-ok` through ocserv
 on `tun11`.
 
+The cancellation variant disconnected while that request was queued.
+Portcullis discarded it before the prior jail closed. No new window
+opened, gateway page and script counts stayed unchanged, and the
+gateway saw zero POSTs. A separate reconnect used a distinct attempt
+and kept IPv4 blocked until fresh confirmation. Confirmation produced
+one POST, one redemption, and `crypta-ac-ok` through ocserv on `tun12`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
