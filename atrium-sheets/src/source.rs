@@ -803,6 +803,9 @@ impl GridSource for SheetSource {
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
         let d = self.doc.borrow();
+        if d.wb.hides_value(CellAddr::new(d.sheet, r, c)) {
+            return None;
+        }
         let v = d.wb.value(d.sheet, r, c);
         let sh = d.wb.sheet(d.sheet);
         let id = sh.style_id(r, c);
@@ -842,6 +845,9 @@ impl GridSource for SheetSource {
     fn edit_text(&self, r: u32, c: u32) -> String {
         let d = self.doc.borrow();
         let a = CellAddr::new(d.sheet, r, c);
+        if d.wb.hides_value(a) || (d.wb.hides_formula(a) && d.wb.group_at(a.sheet, a.row, a.col).is_some()) {
+            return String::new();
+        }
         match d.wb.formula_text(a) {
             Some(f) => f,
             None => d.wb.get(a).display(),

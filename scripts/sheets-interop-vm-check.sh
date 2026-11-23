@@ -19,14 +19,16 @@
 # Use SHEETS_INTEROP_CASE=condfmt and /tmp/sheets-condfmt-fixture for conditional formatting.
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
 # Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
+# Use SHEETS_INTEROP_CASE=protection and /tmp/sheets-protection-fixture with that VBA source.
 set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy|dates) ;; *) exit 2 ;; esac
+case "$profile" in pivots|tables|layout|annotations|legacy|print|formulas|delimited|sort_filter|validation|condfmt|native_copy|dates|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
+    protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
     native_copy) test "$(ls "$books")" = "$(printf 'orders.ods\nsales.xlsx')" ;;
     legacy) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm')" ;;
@@ -62,6 +64,7 @@ checkpoint() {
         validation) /tmp/sheets-validation-fixture check "$1" "$2" ;;
         condfmt) /tmp/sheets-condfmt-fixture check "$1" "$2" ;;
         native_copy) /tmp/sheets-native-copy-fixture check "$1" "$format" "$2" ;;
+        protection) /tmp/sheets-protection-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         dates) /tmp/sheets-date-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         delimited) /tmp/sheets-delimited-fixture check "$1" "$2" "$format" "$encoding" ;;
         legacy) /tmp/sheets-legacy-fixture check "$1" "$2" /tmp/sheets-vba-source.xlsm ;;
@@ -496,6 +499,56 @@ delimited() {
 }
 
 
+
+protection() {
+    for format in xlsm ods xlsx; do
+        case "$format" in
+            xlsm) book=macro.xlsm; row=183 ;;
+            ods) book=open.ods; row=213 ;;
+            xlsx) book=plain.xlsx; row=243 ;;
+        esac
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        sleep .4
+        cp selectscreen.png "$results/$format-fidelity.png"
+
+        click 62 133 # A2 is locked by the default style.
+        key 0x26 # 9
+        key 0x28
+        sleep .4
+        cp selectscreen.png "$results/$format-typing-blocked.png"
+        click 126 133 # B2 is unlocked.
+        key 0x25 # 8
+        key 0x28
+        click 126 153 # B3 is blank but explicitly unlocked.
+        key 0x23 # 6
+        key 0x28
+
+        drag 126 133 191 133 # Fill Right would replace the locked C2 formula.
+        key 0x15 1
+        sleep .4
+        cp selectscreen.png "$results/$format-fill-blocked.png"
+        save "$book" edited
+        close_book
+
+        open_book "$row" "$book" edited
+        click 191 133 # C2 should show its result with an empty formula bar.
+        sleep .4
+        cp selectscreen.png "$results/$format-reopened.png"
+        click 62 133
+        key 0x4c # Delete the contents of locked A2.
+        sleep .4
+        cp selectscreen.png "$results/$format-delete-blocked.png"
+        click 126 133
+        key 0x24 # 7
+        key 0x28
+        save "$book" reopened-edit
+        cp "$books/$book" "$results/saved.$format"
+        close_book
+        echo "PASS $format locked and unlocked edits, ordinary Save and picker reopen"
+    done
+}
+
 type_epoch_date() {
     click 62 "$1"
     for digit in 0x1e 0x26 0x27 0x21 0x2d 0x27 0x1e 0x2d 0x27 0x26; do key "$digit"; done # 1904-01-09
@@ -657,6 +710,7 @@ case "$profile" in
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;
     dates) dates; exit ;;
+    protection) protection; exit ;;
 esac
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac

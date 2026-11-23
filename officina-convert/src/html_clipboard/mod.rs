@@ -27,6 +27,10 @@ pub fn write(wb: &Workbook, rect: Rect) -> Option<String> {
         html.push_str("<tr>");
         for col in rect.c0..=rect.c1 {
             let addr = CellAddr::new(rect.sheet, row, col);
+            if wb.hides_value(addr) {
+                html.push_str("<td></td>");
+                continue;
+            }
             html.push_str("<td");
             let value = wb.value(rect.sheet, row, col);
             match &value {

@@ -136,8 +136,20 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     // Older files end after the sheet settings and use the 1900 calendar.
-    if wb.date_system() == crate::eval::dates::DateSystem::Excel1904 {
-        w.u8(1);
+    let date1904 = wb.date_system() == crate::eval::dates::DateSystem::Excel1904;
+    let protected = wb.sheets.iter().filter(|s| s.protection.is_some()).count();
+    let flags = u8::from(date1904) | (u8::from(protected != 0) << 1);
+    if flags != 0 {
+        w.u8(flags);
+    }
+    if protected != 0 {
+        w.var(protected as u64);
+        for (index, sheet) in wb.sheets.iter().enumerate() {
+            if let Some(protection) = &sheet.protection {
+                w.u16(index as u16);
+                protection.encode(&mut w);
+            }
+        }
     }
     c.add(WORKBOOK, &w.into_bytes())?;
     if let Some(set) = wb.tracked_cells() {
@@ -504,10 +516,24 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
     }
     if r.remaining() != 0 {
-        if r.u8()? != 1 {
-            return Err(LoadError::Bad("unknown workbook date system"));
+        let flags = r.u8()?;
+        if flags & !3 != 0 {
+            return Err(LoadError::Bad("unknown workbook settings"));
         }
-        wb.date_system = crate::eval::dates::DateSystem::Excel1904;
+        if flags & 1 != 0 {
+            wb.date_system = crate::eval::dates::DateSystem::Excel1904;
+        }
+        if flags & 2 != 0 {
+            let count = r.count("protected sheets", wb.sheet_count() as u64, 4)?;
+            for _ in 0..count {
+                let index = r.u16()? as usize;
+                let sheet = wb.sheets.get_mut(index).ok_or(LoadError::Bad("invalid protected sheet"))?;
+                if sheet.protection.is_some() {
+                    return Err(LoadError::Bad("duplicate protected sheet"));
+                }
+                sheet.protection = Some(crate::protection::SheetProtection::decode(&mut r)?);
+            }
+        }
     }
     done(&r)?;
 

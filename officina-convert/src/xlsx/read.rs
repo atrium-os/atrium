@@ -404,6 +404,7 @@ struct Seg {
     valid: super::validation::Raw,
     /// Default formats for successful ISO date cells.
     iso_dates: Vec<(u32, u32, &'static str)>,
+    protection: Option<officina_grid::protection::SheetProtection>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
     /// A frozen `<pane>`: the first unfrozen row and column, and the first
@@ -640,6 +641,18 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: of
                     }
                 }
             }
+            b"sheetProtection" if attr(&e, b"sheet")?.is_some_and(|v| v == "1" || v == "true") => {
+                use officina_grid::protection::ProtectionFormat;
+                let attrs = e.attributes().with_checks(false).flatten().filter_map(|a| {
+                    let key = std::str::from_utf8(a.key.local_name().as_ref()).ok()?.to_string();
+                    Some((key, a.unescape_value().ok()?.into_owned()))
+                }).collect::<Vec<_>>();
+                seg.protection = Some(crate::sheet_protection::read(
+                    ProtectionFormat::Excel,
+                    attrs.iter().map(|(key, value)| (key.as_str(), value.as_str())),
+                    &mut seg.rep,
+                ));
+            }
             b"mergeCell" => {
                 if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
                     if seg.merges.len() < officina_grid::merges::MAX_MERGES {
@@ -869,6 +882,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 merges.extend(seg.merges);
                 links.extend(seg.links);
                 filter = seg.filter.or(filter);
+                if let Some(protection) = seg.protection {
+                    wb.sheet_mut(s).protection = Some(protection);
+                }
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
                 }

@@ -232,6 +232,7 @@ struct CellStyle {
     h: Option<HAlign>,
     v: Option<VAlign>,
     wrap: Option<bool>,
+    protection: Option<(bool, bool, bool)>,
 }
 
 #[derive(Default)]
@@ -352,6 +353,29 @@ impl Styles {
                         }
                         "style:table-cell-properties" => {
                             if let Some((_, c)) = cur_cell.as_mut() {
+                                if let Some(protection) = a.get("style:cell-protect") {
+                                    c.protection = match protection.as_str() {
+                                        "none" => Some((true, false, false)),
+                                        "hidden-and-protected" => Some((false, true, true)),
+                                        flags => {
+                                            let mut locked = false;
+                                            let mut hidden = false;
+                                            let mut known = false;
+                                            for flag in flags.split_whitespace() {
+                                                match flag {
+                                                    "protected" => locked = true,
+                                                    "formula-hidden" => hidden = true,
+                                                    _ => continue,
+                                                }
+                                                known = true;
+                                            }
+                                            if !known {
+                                                rep.note(Kind::Approximate, "unknown cell protection settings shown locked");
+                                            }
+                                            Some((known && !locked, hidden, false))
+                                        }
+                                    };
+                                }
                                 if let Some(bg) = a.get("fo:background-color") {
                                     c.fill = Some(bg.strip_prefix('#').and_then(|v| u32::from_str_radix(v, 16).ok()));
                                 }
@@ -706,6 +730,9 @@ impl Styles {
             if let Some(w) = c.wrap {
                 s.wrap = w;
             }
+            if let Some(flags) = c.protection {
+                (s.unlocked, s.hide_formula, s.hide_value) = flags;
+            }
         }
         s
     }
@@ -952,8 +979,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         row = 0;
                         col_x = 0;
                         col_defaults.clear();
-                        if a.get("table:protected").is_some_and(|v| v == "true") {
-                            rep.note(Kind::Dropped, "sheet protection");
+                        if a.get("table:protected").is_some_and(|v| matches!(v.as_str(), "true" | "1")) {
+                            wb.sheet_mut(id).protection = Some(crate::sheet_protection::read(
+                                officina_grid::protection::ProtectionFormat::Ods,
+                                a.iter().map(|(key, value)| (key.as_str(), value.as_str())),
+                                &mut rep,
+                            ));
                         }
                     }
                     b"table:table-header-rows" if !empty => header_row = Some(row),

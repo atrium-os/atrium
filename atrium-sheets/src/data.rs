@@ -481,10 +481,13 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
     if d.wb.recalc_pending() {
         d.wb.recalc();
     }
+    d.status.clear();
     let msg = match apply(d, sel, cursor, cmd) {
         Ok(m) | Err(m) => m,
     };
-    d.status = msg;
+    if d.status != crate::sheet_protection::REFUSED {
+        d.status = msg;
+    }
 }
 
 /// The most values a column's value list offers.

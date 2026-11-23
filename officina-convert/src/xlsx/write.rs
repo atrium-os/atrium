@@ -421,6 +421,15 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         hi += 1;
     }
     o.extend_from_slice(b"</sheetData>");
+    if let Some(protection) = &wb.sheet(s).protection {
+        o.extend_from_slice(br#"<sheetProtection sheet="1""#);
+        if protection.format() == officina_grid::protection::ProtectionFormat::Excel {
+            for (key, value) in protection.settings() {
+                let _ = write!(o, r#" {key}="{}""#, crate::xml::esc(value));
+            }
+        }
+        o.extend_from_slice(b"/>");
+    }
     if let Some(f) = &sh.filter {
         if f.rect.r1 < XLSX_ROWS && f.rect.c1 < XLSX_COLS {
             let _ = write!(o, r#"<autoFilter ref="{}:{}""#, a1(f.rect.r0, f.rect.c0), a1(f.rect.r1, f.rect.c1));

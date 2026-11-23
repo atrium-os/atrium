@@ -13,6 +13,10 @@ const CELLS: &str = "application/vnd.atrium.sheets.cells";
 const TEXT: &str = "text/plain";
 
 pub fn copy(doc: &mut crate::doc::Doc, rect: Rect, cut: bool) {
+    if cut && doc.wb.sheet_protected(rect.sheet) {
+        doc.status = crate::sheet_protection::REFUSED.into();
+        return;
+    }
     let clip = Clip::take(&doc.wb, rect, cut);
     let Some(text) = doc.copy_tsv_bounded(clip.from, MAX_FORMAT_BYTES) else {
         doc.status = "Selection exceeds the system clipboard size limit.".into();

@@ -132,6 +132,10 @@ pub struct Style {
     pub h_align: HAlign,
     pub v_align: VAlign,
     pub wrap: bool,
+    /// These settings take effect when the sheet is protected.
+    pub unlocked: bool,
+    pub hide_formula: bool,
+    pub hide_value: bool,
     pub indent: u8,
     /// Text rotation in degrees, -90..=90 (255 is vertical stacked, as in OOXML).
     pub rotation: i16,
@@ -148,6 +152,9 @@ impl Default for Style {
             h_align: HAlign::General,
             v_align: VAlign::Bottom,
             wrap: false,
+            unlocked: false,
+            hide_formula: false,
+            hide_value: false,
             indent: 0,
             rotation: 0,
             borders: [Edge::default(); 4],
@@ -166,7 +173,8 @@ impl Style {
         let f = &self.font;
         w.str(f.name.as_deref().unwrap_or(""));
         w.var(f.size.unwrap_or(0) as u64);
-        w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4);
+        w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4
+            | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
         color_out(w, self.fill);
         w.u8(self.h_align as u8);
@@ -215,6 +223,9 @@ impl Style {
             h_align,
             v_align,
             wrap: flags & 16 != 0,
+            unlocked: flags & 32 != 0,
+            hide_formula: flags & 64 != 0,
+            hide_value: flags & 128 != 0,
             indent,
             rotation: rotation as i16,
             borders,

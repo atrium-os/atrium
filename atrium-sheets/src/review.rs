@@ -59,7 +59,8 @@ pub fn merge_error(error: MergeError) -> &'static str {
 }
 
 pub fn writable(wb: &Workbook, addr: officina_grid::CellAddr) -> bool {
-    !wb.merge_at(addr).is_some_and(|r| (r.r0, r.c0) != (addr.row, addr.col))
+    wb.can_edit_cells(officina_grid::Rect::cell(addr))
+        && !wb.merge_at(addr).is_some_and(|r| (r.r0, r.c0) != (addr.row, addr.col))
         && wb.spilled_from(addr).is_none()
 }
 

@@ -324,11 +324,35 @@ and their associated import or Save behavior.
 |---|---|---|
 | 1 | XLSX, XLSM | **Input validation.** Formula-backed Excel extension rules previously disappeared on open and ordinary Save. Sheets now reads them and writes direct cross-sheet rules in the extension. Extension-only list encodings and rules with missing or unparseable formulas still receive loss notices. |
 | 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells are handled within the supported date range. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. |
-| 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Excel cell protection settings and ODS sheet protection can be lost. XLS still drops validation rules when importing to a native copy. Group enforcement checks with the corresponding import notices. |
+| 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Sheets keeps active XLSX, XLSM and ODS sheet locks and their cell styles. Foreign passwords and custom Excel permissions have fidelity notices. XLS still drops validation rules when importing to a native copy. |
 | 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Specialized filters may retain hidden rows without live predicates. Unsupported or calculated pivot fields, table features and some formulas may become static values or plain cells. ODS Save can turn spill and table references into fixed ranges. |
 | 5 | XLSX, XLSM, ODS, XLS | **Review and output.** ODS can flatten comment threads. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can lose content or change output. Legacy XLS also drops comments and hyperlinks. |
 | 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Rotation, shrink-to-fit, patterned or gradient fills, diagonal borders and styles on empty rows can change how a sheet looks. |
 | Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
+
+#### Sheet and cell protection in Sheets
+
+XLSX and XLSM preserve active `sheetProtection` and cell XF protection,
+including inheritance from a named style. ODS preserves `table:protected`
+and `style:cell-protect`. A protected sheet's default cells are locked.
+Explicitly unlocked cells, including styled blank cells, accept edits.
+A paste, fill or other batch touching a locked cell is refused as a whole.
+Ordinary paste and fill on a protected sheet keep the destination styles.
+Sheets restricts structural changes and changes to workbook-wide settings
+that can affect protected sheets.
+
+Hidden formulas still calculate. The formula bar and grid editor hide the
+formula, and Copy takes its calculated result. ODS cells marked
+`hidden-and-protected` also hide their value in the grid and clipboard.
+The underlying data and formulas remain in the workbook. [Excel cell protection](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.protection?view=openxml-3.0.1) · [ODF 1.3 cell protection](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html)
+
+Recognized password verifier fields and Excel's custom sheet permission
+attributes are retained on same-format Save. Fidelity notes explain that
+Sheets cannot remove imported password locks and applies its unlocked-cell
+editing policy. The native WORKBOOK settings store per-sheet protection,
+and native style flags store unlocked, hidden-formula and hidden-value
+settings. The `SHEETS_INTEROP_CASE=protection` gate covers all three foreign
+formats through ordinary Save and picker reopen.
 
 ### 5.3 What never runs, and what is kept inert
 

@@ -686,6 +686,16 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     if st.rotation != 0 {
         let _ = write!(tc, r#" style:rotation-angle="{}""#, st.rotation);
     }
+    let protection = match (st.unlocked, st.hide_formula, st.hide_value) {
+        (_, _, true) => Some("hidden-and-protected"),
+        (false, true, false) => Some("protected formula-hidden"),
+        (true, true, false) => Some("formula-hidden"),
+        (true, false, false) => Some("none"),
+        _ => None,
+    };
+    if let Some(protection) = protection {
+        let _ = write!(tc, r#" style:cell-protect="{protection}""#);
+    }
     if !tc.is_empty() {
         let _ = write!(out, "<style:table-cell-properties{tc}/>");
     }
@@ -1029,7 +1039,18 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         out.push_str(r#"" table:print-ranges=""#);
         esc(out, &format!("${sheet}.${c0}${}:${sheet}.${c1}${r1}", r0 + 1));
     }
-    out.push_str("\">");
+    out.push('"');
+    if let Some(protection) = &sh.protection {
+        out.push_str(r#" table:protected="true""#);
+        if protection.format() == officina_grid::protection::ProtectionFormat::Ods {
+            for (key, value) in protection.settings() {
+                let _ = write!(out, r#" {key}=""#);
+                esc(out, value);
+                out.push('"');
+            }
+        }
+    }
+    out.push('>');
     let (print_rows, print_cols) = officina_grid::print::titles(wb, s);
     // Drawings on this sheet, as frames anchored to it.
     let mut shapes = String::new();

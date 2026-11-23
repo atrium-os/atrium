@@ -27,6 +27,8 @@ pub mod pptx;
 pub mod report;
 pub mod sealed;
 #[cfg(feature = "read")]
+mod sheet_protection;
+#[cfg(feature = "read")]
 pub mod xls;
 pub mod xlsx;
 pub mod xml;

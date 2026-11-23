@@ -201,8 +201,20 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
     let mut borders: Vec<[Edge; 4]> = Vec::new();
     let mut indexed: Vec<u32> = PALETTE.to_vec();
     let mut custom_indexed: Vec<u32> = Vec::new();
-    // Raw xfs: (numFmtId, fontId, fillId, borderId, alignment attrs)
-    let mut xfs: Vec<(u32, usize, usize, usize, HashMap<Vec<u8>, String>)> = Vec::new();
+    // A cell XF can inherit lock flags from a named style XF.
+    #[derive(Default)]
+    struct Xf {
+        num_format: u32,
+        font: usize,
+        fill: usize,
+        border: usize,
+        alignment: HashMap<Vec<u8>, String>,
+        parent: usize,
+        applies_protection: bool,
+        protection: Option<(bool, bool)>,
+    }
+    let mut xfs: Vec<Xf> = Vec::new();
+    let mut base_protection: Vec<(bool, bool)> = Vec::new();
     #[derive(PartialEq, Clone, Copy)]
     enum In {
         None,
@@ -210,6 +222,7 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
         Fills,
         Borders,
         CellXfs,
+        CellStyleXfs,
         Indexed,
         Other,
     }
@@ -278,7 +291,8 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
             (_, b"borders") => sect = In::Borders,
             (_, b"cellXfs") => sect = In::CellXfs,
             (_, b"indexedColors") => sect = In::Indexed,
-            (_, b"cellStyleXfs") | (_, b"dxfs") => sect = In::Other,
+            (_, b"cellStyleXfs") => sect = In::CellStyleXfs,
+            (_, b"dxfs") => sect = In::Other,
             (In::Indexed, b"rgbColor") => {
                 if let Some(v) = attrs(&e).get(b"rgb".as_slice()).and_then(|v| u32::from_str_radix(v, 16).ok()) {
                     custom_indexed.push(v & 0xFF_FFFF);
@@ -346,7 +360,15 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
             (In::CellXfs, b"xf") => {
                 let a = attrs(&e);
                 let id = |k: &[u8]| a.get(k).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-                xfs.push((id(b"numFmtId") as u32, id(b"fontId"), id(b"fillId"), id(b"borderId"), HashMap::new()));
+                xfs.push(Xf {
+                    num_format: id(b"numFmtId") as u32,
+                    font: id(b"fontId"),
+                    fill: id(b"fillId"),
+                    border: id(b"borderId"),
+                    parent: id(b"xfId"),
+                    applies_protection: !a.get(b"applyProtection".as_slice()).is_some_and(|v| matches!(v.as_str(), "0" | "false")),
+                    ..Xf::default()
+                });
                 in_xf = !empty;
                 if xfs.len() > MAX_XFS {
                     rep.note(Kind::Approximate, "more cell styles than a workbook holds: the rest shown unstyled");
@@ -356,15 +378,27 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
             }
             (In::CellXfs, b"alignment") if in_xf => {
                 if let Some(x) = xfs.last_mut() {
-                    x.4 = attrs(&e);
+                    x.alignment = attrs(&e);
                 }
             }
-            (In::CellXfs, b"protection") => {
-                // Locked and shown is every cell's default; only a change is lost.
+            (In::CellStyleXfs, b"xf") => {
+                if base_protection.len() >= MAX_XFS {
+                    rep.note(Kind::Approximate, "extra named styles ignored");
+                    break;
+                }
+                base_protection.push((false, false));
+                in_xf = !empty;
+            }
+            (In::CellXfs | In::CellStyleXfs, b"protection") if in_xf => {
                 let a = attrs(&e);
-                let unlocked = a.get(b"locked".as_slice()).is_some_and(|v| v == "0" || v == "false");
-                if unlocked || truthy(a.get(b"hidden".as_slice())) {
-                    rep.note(Kind::Dropped, "cell protection settings (unlocked or hidden formulas)");
+                let unlocked = a.get(b"locked".as_slice()).is_some_and(|v| matches!(v.as_str(), "0" | "false"));
+                let flags = (unlocked, truthy(a.get(b"hidden".as_slice())));
+                if sect == In::CellXfs {
+                    if let Some(x) = xfs.last_mut() {
+                        x.protection = Some(flags);
+                    }
+                } else if let Some(base) = base_protection.last_mut() {
+                    *base = flags;
                 }
             }
             _ => {}
@@ -396,8 +430,11 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
         .collect();
     let base = fonts.first().cloned().unwrap_or_default();
     let mut out = Vec::with_capacity(xfs.len());
-    for (nf, fo, fi, bo, al) in xfs {
+    for xf in xfs {
+        let (nf, fo, fi, bo, al) = (xf.num_format, xf.font, xf.fill, xf.border, xf.alignment);
         let mut s = Style::default();
+        (s.unlocked, s.hide_formula) = xf.protection.filter(|_| xf.applies_protection)
+            .or_else(|| base_protection.get(xf.parent).copied()).unwrap_or_default();
         let code = fmts.get(&nf).cloned().or_else(|| numfmt::builtin(nf).map(str::to_string));
         match code {
             Some(c) => {
@@ -543,8 +580,20 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
         if bo != 0 {
             xfs.push_str(r#" applyBorder="1""#);
         }
+        let protection = s.unlocked || s.hide_formula || s.hide_value;
+        if protection {
+            xfs.push_str(r#" applyProtection="1""#);
+        }
         if align {
-            xfs.push_str(r#" applyAlignment="1"><alignment"#);
+            xfs.push_str(r#" applyAlignment="1""#);
+        }
+        if !align && !protection {
+            xfs.push_str("/>");
+            continue;
+        }
+        xfs.push('>');
+        if align {
+            xfs.push_str("<alignment");
             let h = match s.h_align {
                 HAlign::General => "",
                 HAlign::Left => "left",
@@ -578,10 +627,12 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
                 let r = if s.rotation < 0 && s.rotation >= -90 { 90 - s.rotation as i32 } else { s.rotation as i32 };
                 let _ = write!(xfs, r#" textRotation="{r}""#);
             }
-            xfs.push_str("/></xf>");
-        } else {
             xfs.push_str("/>");
         }
+        if protection {
+            let _ = write!(xfs, r#"<protection locked="{}" hidden="{}"/>"#, u8::from(!s.unlocked), u8::from(s.hide_formula || s.hide_value));
+        }
+        xfs.push_str("</xf>");
     }
     // Conditional formats' formats; their number formats join the list.
     let dxfs = super::condfmt::dxfs_xml(&super::condfmt::dxfs(wb), &mut |code| match numfmt::builtin_id(code) {
@@ -677,6 +728,22 @@ mod tests {
         assert_eq!(tint(0xFFFFFF, -0.1499984740745262), 0xD9D9D9);
         assert_eq!(tint(0x4472C4, 0.7999816888943144), 0xDAE3F3);
         assert_eq!(tint(0x123456, 0.0), 0x123456);
+    }
+
+    #[test]
+    fn cell_protection_inherits_named_style_unless_overridden() {
+        let mut report = Report::default();
+        let styles = read(br#"<styleSheet>
+            <cellStyleXfs><xf><protection locked="0" hidden="1"/></xf></cellStyleXfs>
+            <cellXfs>
+                <xf xfId="0"/>
+                <xf xfId="0" applyProtection="1"><protection locked="1" hidden="0"/></xf>
+                <xf xfId="0" applyProtection="0"><protection locked="1" hidden="0"/></xf>
+            </cellXfs>
+        </styleSheet>"#, &PALETTE, &mut report);
+        assert!(report.is_empty(), "{:?}", report.human());
+        let flags: Vec<_> = styles.iter().map(|style| (style.unlocked, style.hide_formula)).collect();
+        assert_eq!(flags, [(true, true), (false, false), (true, true)]);
     }
 
     #[test]

@@ -113,10 +113,20 @@ impl Clip {
         let snap = wb.snapshot(&used);
         let mut cells = Vec::new();
         for (r, c, v) in snap.values {
-            cells.push((r - rect.r0, c - rect.c0, Content::Value(v)));
+            if !wb.hides_value(CellAddr::new(rect.sheet, r, c)) {
+                cells.push((r - rect.r0, c - rect.c0, Content::Value(v)));
+            }
         }
         for f in &snap.fills {
             for r in f.r0..=f.r1 {
+                let address = CellAddr::new(rect.sheet, r, f.col);
+                if wb.hides_value(address) {
+                    continue;
+                }
+                if !cut && wb.hides_formula(address) {
+                    cells.push((r - rect.r0, f.col - rect.c0, Content::Value(wb.get(address))));
+                    continue;
+                }
                 let content = match (cut, wb.group_at(rect.sheet, r, f.col)) {
                     (false, Some(g)) => Content::Expr(wb.group(g).expr.clone(), wb.value(rect.sheet, r, f.col)),
                     (true, Some(g)) => Content::Moved(wb.group(g).expr.clone(), wb.value(rect.sheet, r, f.col)),

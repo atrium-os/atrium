@@ -16,5 +16,6 @@ pub mod pivotpane;
 pub mod print;
 pub mod review;
 pub mod source;
+mod sheet_protection;
 pub mod tabs;
 pub mod validation;

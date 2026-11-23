@@ -765,7 +765,18 @@ impl Doc {
         self.run_action(label, ops);
     }
 
+    fn check_protection(&mut self, ops: &[GridOp]) -> bool {
+        if crate::sheet_protection::allows(&self.wb, ops) {
+            return true;
+        }
+        self.status = crate::sheet_protection::REFUSED.into();
+        false
+    }
+
     fn run_action(&mut self, label: &str, ops: Vec<GridOp>) -> bool {
+        if !self.check_protection(&ops) {
+            return false;
+        }
         if ops.is_empty() {
             return true;
         }
@@ -800,6 +811,9 @@ impl Doc {
         }
 
         self.status.clear();
+        if !self.check_protection(&ops) {
+            return false;
+        }
         let mut writes = Vec::new();
         find_writes(&ops, &mut writes);
         let mut cells = std::collections::BTreeSet::new();
@@ -881,6 +895,9 @@ impl Doc {
     /// last action: grown when nobody has sized it and it needs more, or,
     /// grown here before, back down as far as the default height.
     pub fn grow_row(&mut self, row: u32, px: f64) {
+        if self.wb.sheet_protected(self.sheet) {
+            return;
+        }
         let s = self.sheet;
         let sizes = &self.wb.sheet(s).row_sizes;
         let grown = self.grown_rows.contains(&(s, row));
@@ -943,7 +960,7 @@ impl Doc {
             }
         }).collect()).collect();
         let mut ops = vec![GridOp::block(area.sheet, row, col, rows)];
-        if let Some(fmt) = date_fmt.filter(|_| &*self.wb.style(a).num_fmt == "General") {
+        if let Some(fmt) = date_fmt.filter(|_| !self.wb.sheet_protected(a.sheet) && &*self.wb.style(a).num_fmt == "General") {
             ops.push(GridOp::restyle(&self.wb, Rect::cell(a), |st| officina_grid::style::Style { num_fmt: fmt.as_str().into(), ..st.clone() }));
         }
         self.run_validated(if area.cells() == 1 { "Typing" } else { "Fill Selection" }, ops)
@@ -984,7 +1001,7 @@ impl Doc {
         use officina_grid::autofill::{fill, Mode};
         let from = Rect { sheet: self.sheet, ..from };
         let to = Rect { sheet: self.sheet, ..to };
-        let ops = match fill(&self.wb, from, to, mode) {
+        let mut ops = match fill(&self.wb, from, to, mode) {
             Ok(GridOp::Batch(ops)) => ops,
             Ok(op) => vec![op],
             Err(e) => {
@@ -992,6 +1009,9 @@ impl Doc {
                 return false;
             }
         };
+        if self.wb.sheet_protected(self.sheet) {
+            ops.retain(|op| !matches!(op, GridOp::Restyle(_)));
+        }
         if !self.run_validated(if mode == Mode::Series { "Fill Series" } else { "Fill" }, ops) {
             return false;
         }
@@ -1008,6 +1028,10 @@ impl Doc {
     /// The last fill done again as `how` (Excel's Auto Fill Options): one
     /// undo step in its place.
     pub fn refill(&mut self, how: FillHow) -> bool {
+        if self.wb.sheet_protected(self.sheet) {
+            self.status = crate::sheet_protection::REFUSED.into();
+            return false;
+        }
         use officina_grid::autofill::{fill, Mode};
         let Some((from, to, previous_mode, _)) = self.last_fill.filter(|_| self.can_refill()) else {
             self.status = "Fill first; then choose how it fills.".into();
@@ -1095,7 +1119,7 @@ impl Doc {
                 return;
             }
         };
-        let result = clip.paste_into(&self.wb, area);
+        let result = self.clip_paste(&clip, area);
         self.finish_clip_paste(result, false);
     }
 
@@ -1121,8 +1145,14 @@ impl Doc {
 
     fn paste_local_clip(&mut self, area: Rect) -> Option<Rect> {
         let clip = &self.clip.as_ref()?.clip;
-        let (result, cut) = (clip.paste_into(&self.wb, area), clip.cut);
+        let (result, cut) = (self.clip_paste(clip, area), clip.cut);
         self.finish_clip_paste(result, cut)
+    }
+
+    fn clip_paste(&self, clip: &officina_grid::clip::Clip, area: Rect) -> Result<(Vec<GridOp>, Rect), String> {
+        use officina_grid::clip::What;
+        let what = if self.wb.sheet_protected(area.sheet) && !clip.cut { What::Formulas } else { What::All };
+        clip.paste_into_as(&self.wb, area, what)
     }
 
     fn finish_clip_paste(&mut self, result: Result<(Vec<GridOp>, Rect), String>, cut: bool) -> Option<Rect> {
@@ -1186,7 +1216,8 @@ impl Doc {
                 if c > rect.c0 {
                     text.push('\t');
                 }
-                let value = self.wb.value(rect.sheet, r, c).display();
+                let address = CellAddr::new(rect.sheet, r, c);
+                let value = if self.wb.hides_value(address) { String::new() } else { self.wb.get(address).display() };
                 if text.len().saturating_add(value.len()) >= limit {
                     return None;
                 }
@@ -1239,6 +1270,10 @@ impl Doc {
     /// Columns (`rows` false) or rows `lo..=hi` shown at `px` while an edge
     /// is dragged; [`size_done`](Self::size_done) makes it one undo step.
     pub fn size_preview(&mut self, rows: bool, lo: u32, hi: u32, px: f64) {
+        if self.wb.sheet_protected(self.sheet) {
+            self.status = crate::sheet_protection::REFUSED.into();
+            return;
+        }
         let s = self.sheet;
         fn sizes(d: &Doc, s: u16, rows: bool) -> &officina_grid::column::Sizes {
             if rows { &d.wb.sheet(s).row_sizes } else { &d.wb.sheet(s).col_sizes }
@@ -1335,6 +1370,73 @@ mod tests {
         let d = std::env::temp_dir().join(format!("atrium-sheets-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn protected_edits_are_atomic_and_keep_destination_styles() {
+        use officina_grid::{autofill::Mode, protection::{ProtectionFormat, SheetProtection}, style::Style, Value};
+
+        let mut d = Doc::new("Orders");
+        let address = |col| CellAddr::new(0, 0, col);
+        d.wb.set_value(address(0), Value::Num(1.0));
+        d.wb.set_value(address(1), Value::Num(2.0));
+        d.wb.set_value(address(2), Value::Num(3.0));
+        d.wb.set_style(&Rect { sheet: 0, r0: 0, r1: 0, c0: 1, c1: 2 },
+            Style { unlocked: true, fill: Some(0xc6efce), ..Style::default() });
+        d.wb.sheet_mut(0).protection = Some(SheetProtection::new(ProtectionFormat::Excel));
+
+        assert!(!d.type_into(0, 0, "9"));
+        assert!(!d.dirty);
+        assert!(!d.history.can_undo());
+        assert!(d.type_into(0, 1, "8"));
+        assert!(!d.paste_tsv(0, 0, "7\t6"));
+        assert_eq!(d.wb.get(address(0)), Value::Num(1.0));
+        assert_eq!(d.wb.get(address(1)), Value::Num(8.0));
+
+        let from = Rect::cell(address(1));
+        let to = Rect { c1: 2, ..from };
+        assert!(d.fill_as(from, to, Mode::Copy));
+        assert_eq!(d.wb.get(address(2)), Value::Num(8.0));
+        assert_eq!(d.wb.style(address(2)).fill, Some(0xc6efce));
+        assert!(d.wb.style(address(2)).unlocked);
+        assert!(d.undo());
+        assert_eq!(d.wb.get(address(2)), Value::Num(3.0));
+        assert!(d.undo());
+        assert_eq!(d.wb.get(address(1)), Value::Num(2.0));
+        assert!(!d.history.can_undo());
+    }
+
+    #[test]
+    fn hidden_protected_cells_stay_hidden_in_grid_and_clipboard() {
+        use officina_grid::{protection::{ProtectionFormat, SheetProtection}, style::Style, Value};
+        use pergola::widgets::GridSource;
+
+        let mut d = Doc::new("Notes");
+        let formula = CellAddr::new(0, 0, 0);
+        let hidden = CellAddr::new(0, 0, 1);
+        d.wb.set_formula(formula, "=42").unwrap();
+        d.wb.set_value(hidden, Value::str("hidden"));
+        d.wb.set_style(&Rect::cell(formula), Style { hide_formula: true, ..Style::default() });
+        d.wb.set_style(&Rect::cell(hidden), Style { hide_value: true, ..Style::default() });
+        d.wb.sheet_mut(0).protection = Some(SheetProtection::new(ProtectionFormat::Ods));
+        d.wb.recalc();
+        assert_eq!(d.copy_tsv(0, 0, 0, 1), "42\t\n");
+        let clip = officina_grid::clip::Clip::take(&d.wb, Rect { sheet: 0, r0: 0, r1: 0, c0: 0, c1: 1 }, false);
+        let mut target = officina_grid::Workbook::new();
+        target.add_sheet("Target").unwrap();
+        let (ops, _) = clip.paste(&target, 0, 0, 0).unwrap();
+        for op in ops {
+            op.apply(&mut target);
+        }
+        assert_eq!(target.get(formula), Value::Num(42.0));
+        assert!(target.formula_text(formula).is_none());
+        assert_eq!(target.get(hidden), Value::Empty);
+
+        let d = std::rc::Rc::new(std::cell::RefCell::new(d));
+        let source = crate::source::SheetSource::new(d);
+        assert_eq!(source.cell(0, 0).unwrap().text, "42");
+        assert!(source.edit_text(0, 0).is_empty());
+        assert!(source.cell(0, 1).is_none());
     }
 
     #[test]
