@@ -1066,7 +1066,36 @@ the person's contacts quietly; going over shows a notice.
 - Decrypted messages are stored encrypted (as received) and decrypted again on view; the
   search index holds their text only in a named persona's encrypted volume, or not at all
   (setting, default: index).
-- Libraries: RustCrypto `cms`, `x509-cert`; no OpenSSL.
+- Mail's CMS, X.509 and MIME processing stays in Rust. Arca uses FreeBSD
+  base OpenSSL for the private-key operation.
+
+#### Legacy RSA key transport with Arca
+
+Mail can write RSAES-PKCS1-v1_5 envelopes. Its installed Arca reader
+supports the fixed OAEP profile in §16. As a result, even a Sent copy
+using the sender’s enrolled RSA certificate can be unreadable on this
+software-key path. Signature verification is a separate operation.
+
+Keep legacy decryption disabled on the Arca reader until there is a
+separately reviewed, receive-only path for explicit local opens.
+The initial candidate profile is CMS `EnvelopedData` containing
+`id-data`, one unambiguous recipient matching the selected local
+certificate, and AES-128-CBC or AES-256-CBC. The parse worker validates
+the envelope and bounds before use. Arca retains private-key custody
+and authorizes the enrollment for the signed Mail launch’s user and
+persona. A dedicated legacy enrollment must use a key distinct from
+the one enrolled for OAEP. A legacy envelope addressed to an existing
+OAEP-only key therefore remains unreadable through Arca.
+
+Legacy failures have one local reading outcome. The path cannot publish
+a padding or key-length verdict, send a receipt, fetch remote content,
+index decrypted content, or create a notification based on decryption.
+The CBC envelope alone provides confidentiality. A verified inner
+signature is needed for the signed-sender indicator. Keep the OAEP
+profile as a separate path with no automatic fallback to legacy RSA.
+See [Arca §9.2](arca.md#92-mail-smime-content-key-unwrap),
+[RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),
+and [RFC 3218](https://www.rfc-editor.org/rfc/rfc3218.html).
 
 ### 10.2 OpenPGP (later)
 
@@ -1738,8 +1767,8 @@ Stalwart in the cloud VM, and later a real account):
    sheet. It selects a DER leaf certificate and a separate unencrypted
    RSA PKCS#8 key using Scrinium in the verified launch persona. Mail
    receives a public outcome, and the newly registered public certificate
-   is eligible for the receiving account when its address matches. Legacy
-   PKCS#1 v1.5 messages still need separate support.
+   is eligible for the receiving account when its address matches. The
+   Arca reader's legacy RSA compatibility decision is in §10.1.
    **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
    request builders, bounded readers of every answer, RFC 3339 dates) and
    `mail-sync::jmap::Client` over the caller's HTTP (the HTTP courier, which adds the

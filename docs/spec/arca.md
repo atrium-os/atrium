@@ -841,7 +841,21 @@ on submission, suspension or dismissal. Arca uses the same pair
 validation as the operator tool. Mail receives a typed public outcome.
 Set the verified Mail publisher ID in `ARCA_MAIL_PUBLISHER` for both
 limend and arcad. Keep it unset on deployments without signed Mail.
-Legacy PKCS#1 v1.5 decryption remains separate work.
+Legacy RSA decryption remains disabled. `MAIL_SMIME_UNWRAP` is the
+fixed OAEP operation. Its variable-length content-key reply and its
+separate error response are part of the current OAEP interface. The
+local FreeBSD cross sysroot has OpenSSL 3.5.9 and the implicit-rejection
+parameter. OpenSSL documents implicit rejection for the default
+provider from 3.2. The header version alone leaves actual support in the
+jailed runtime unverified. Any separate legacy design must fail closed
+if that provider or protection is unavailable and preserve locked,
+zeroized key material. The caller must never receive the recovered key
+length or a verdict on legacy padding, including through logs or audit
+statuses. Verify the complete request and content path on Tessera
+before considering enablement. Keep legacy-only keys disjoint from
+OAEP keys or signing keys within Arca. See
+[OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
+and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).
 
 ## 10. Audit
 
