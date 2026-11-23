@@ -89,17 +89,89 @@ pub fn enveloped_data(bytes: &[u8]) -> Result<EnvelopedData, String> {
 /// wasn't encrypted to that certificate.
 pub fn wrapped_key(env: &EnvelopedData, my_cert: &[u8]) -> Option<Vec<u8>> {
     let c = cert::parse(my_cert).ok()?;
-    let ski = c.tbs_certificate.extensions.as_ref().and_then(|x| x.iter().find(|x| x.extn_id == der::asn1::ObjectIdentifier::new_unwrap("2.5.29.14"))).and_then(|x| x509_cert::ext::pkix::SubjectKeyIdentifier::from_der(x.extn_value.as_bytes()).ok());
-    env.recip_infos.0.iter().find_map(|ri| match ri {
-        RecipientInfo::Ktri(k) if k.key_enc_alg.oid == oid::RSA => {
-            let mine = match &k.rid {
-                RecipientIdentifier::IssuerAndSerialNumber(is) => is.issuer == c.tbs_certificate.issuer && is.serial_number == c.tbs_certificate.serial_number,
-                RecipientIdentifier::SubjectKeyIdentifier(s) => ski.as_ref().is_some_and(|m| m.0 == s.0),
-            };
-            mine.then(|| k.enc_key.as_bytes().to_vec())
-        }
-        _ => None,
+    let recipient = recipients_for(env, &c).find(|k| k.key_enc_alg.oid == oid::RSA)?;
+    Some(recipient.enc_key.as_bytes().to_vec())
+}
+
+fn recipients_for<'a>(env: &'a EnvelopedData, cert: &'a x509_cert::Certificate) -> impl Iterator<Item = &'a KeyTransRecipientInfo> {
+    let tbs = &cert.tbs_certificate;
+    let ski = tbs.extensions.as_ref()
+        .and_then(|ext| ext.iter().find(|x| x.extn_id == der::asn1::ObjectIdentifier::new_unwrap("2.5.29.14")))
+        .and_then(|x| x509_cert::ext::pkix::SubjectKeyIdentifier::from_der(x.extn_value.as_bytes()).ok());
+    env.recip_infos.0.iter().filter_map(move |ri| {
+        let RecipientInfo::Ktri(k) = ri else { return None };
+        let mine = match &k.rid {
+            RecipientIdentifier::IssuerAndSerialNumber(is) => is.issuer == tbs.issuer && is.serial_number == tbs.serial_number,
+            RecipientIdentifier::SubjectKeyIdentifier(s) => ski.as_ref().is_some_and(|m| m.0 == s.0),
+        };
+        mine.then_some(k)
     })
+}
+
+fn oaep_sha256(alg: &AlgorithmIdentifierOwned) -> Option<()> {
+    use der::asn1::OctetStringRef;
+    use rsa::pkcs1::RsaOaepParams;
+    use spki::AlgorithmIdentifierRef;
+
+    fn sha256(alg: AlgorithmIdentifierRef<'_>) -> bool {
+        alg.oid == oid::SHA256 && alg.parameters.map_or(true, |p| p == der::asn1::AnyRef::NULL)
+    }
+    if alg.oid != oid::RSA_OAEP {
+        return None;
+    }
+    let p = alg.parameters.as_ref()?.decode_as::<RsaOaepParams<'_>>().ok()?;
+    let empty = p.p_source.parameters?.decode_as::<OctetStringRef<'_>>().ok()?.as_bytes().is_empty();
+    (sha256(p.hash) && p.mask_gen.oid == oid::MGF1 && sha256(p.mask_gen.parameters?)
+        && p.p_source.oid == oid::PSPECIFIED && empty).then_some(())
+}
+
+fn oaep_public_key(c: &x509_cert::Certificate) -> Option<rsa::RsaPublicKey> {
+    use rsa::{pkcs1::DecodeRsaPublicKey, traits::PublicKeyParts};
+
+    let spki = &c.tbs_certificate.subject_public_key_info;
+    // This profile uses conventional rsaEncryption certificates. Canonical
+    // encoding below matches the public SPKI emitted by Arca from PKCS#8.
+    if spki.algorithm.oid != oid::RSA || !spki.algorithm.parameters.as_ref().map_or(true, |p| p.is_null()) {
+        return None;
+    }
+    let key = rsa::RsaPublicKey::from_pkcs1_der(spki.subject_public_key.as_bytes()?).ok()?;
+    matches!(key.n().bits(), 2048 | 3072 | 4096).then_some(key)
+}
+
+/// The fingerprint Arca uses and the exact wrapped-key length for this
+/// known certificate. Derive this from Mail’s certificate, not a worker reply.
+pub fn oaep_recipient(my_cert: &[u8]) -> Option<([u8; 32], usize)> {
+    use rsa::{pkcs8::EncodePublicKey, traits::PublicKeyParts};
+
+    let key = oaep_public_key(&cert::parse(my_cert).ok()?)?;
+    let spki = key.to_public_key_der().ok()?;
+    Some((cert::sha256(spki.as_bytes()), key.size()))
+}
+
+/// A wrapped key Mail may send to Arca. Validate the CMS parameters and
+/// all the supported content fields before making a private-key request.
+pub fn oaep_wrapped_key(env: &EnvelopedData, my_cert: &[u8]) -> Option<(u8, Vec<u8>)> {
+    use rsa::traits::PublicKeyParts;
+    let eci = &env.encrypted_content;
+    let key_bytes = match eci.content_enc_alg.oid {
+        oid::AES128_CBC => 16,
+        oid::AES256_CBC => 32,
+        _ => return None,
+    };
+    let iv = eci.content_enc_alg.parameters.as_ref()?.decode_as::<der::asn1::OctetStringRef<'_>>().ok()?;
+    let content = eci.encrypted_content.as_ref()?.as_bytes();
+    if eci.content_type != oid::DATA || iv.as_bytes().len() != 16 || content.is_empty() || content.len() % 16 != 0 {
+        return None;
+    }
+    let c = cert::parse(my_cert).ok()?;
+    let size = oaep_public_key(&c)?.size();
+    let mut matches = recipients_for(env, &c).filter(|k| k.key_enc_alg.oid == oid::RSA_OAEP);
+    let recipient = matches.next()?;
+    if matches.next().is_some() || recipient.enc_key.as_bytes().len() != size {
+        return None;
+    }
+    oaep_sha256(&recipient.key_enc_alg)?;
+    Some((key_bytes, recipient.enc_key.as_bytes().to_vec()))
 }
 
 /// Decrypt the content with the unwrapped content key.
@@ -119,5 +191,25 @@ pub fn decrypt(env: &EnvelopedData, key: &[u8]) -> Result<Vec<u8>, String> {
             cbc::Decryptor::<aes::Aes128>::new(&k.into(), &iv.into()).decrypt_padded_vec_mut::<Pkcs7>(ct).map_err(bad)
         }
         _ => Err("encrypted with a cipher mail can't read".into()),
+    }
+}
+
+#[cfg(test)]
+mod oaep_tests {
+    use super::*;
+    use rsa::pkcs1::RsaOaepParams;
+    use sha2::Sha256;
+
+    #[test]
+    fn oaep_requires_sha256_mgf1_sha256_and_the_empty_label() {
+        let supported = RsaOaepParams::new::<Sha256>();
+        let wrong_digest = RsaOaepParams::default();
+        let wrong_mgf = RsaOaepParams { mask_gen: wrong_digest.mask_gen.clone(), ..supported.clone() };
+        let wrong_label = RsaOaepParams::new_with_label::<Sha256>(b"other");
+        for (p, accepted) in [(supported, true), (wrong_digest, false), (wrong_mgf, false), (wrong_label, false)] {
+            let alg = AlgorithmIdentifierOwned { oid: oid::RSA_OAEP, parameters: Some(Any::encode_from(&p).unwrap()) };
+            assert_eq!(oaep_sha256(&alg).is_some(), accepted);
+        }
+        assert!(oaep_sha256(&AlgorithmIdentifierOwned { oid: oid::RSA_OAEP, parameters: None }).is_none());
     }
 }

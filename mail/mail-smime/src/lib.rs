@@ -27,6 +27,9 @@ pub mod oid {
     pub const SHA384: O = O::new_unwrap("2.16.840.1.101.3.4.2.2");
     pub const SHA512: O = O::new_unwrap("2.16.840.1.101.3.4.2.3");
     pub const RSA: O = O::new_unwrap("1.2.840.113549.1.1.1");
+    pub const RSA_OAEP: O = O::new_unwrap("1.2.840.113549.1.1.7");
+    pub const MGF1: O = O::new_unwrap("1.2.840.113549.1.1.8");
+    pub const PSPECIFIED: O = O::new_unwrap("1.2.840.113549.1.1.9");
     pub const RSA_PSS: O = O::new_unwrap("1.2.840.113549.1.1.10");
     pub const RSA_SHA256: O = O::new_unwrap("1.2.840.113549.1.1.11");
     pub const RSA_SHA384: O = O::new_unwrap("1.2.840.113549.1.1.12");

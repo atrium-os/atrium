@@ -360,6 +360,34 @@ impl Engine {
         Ok(true)
     }
 
+    /// Ask the persona key holder to unwrap a supported OAEP recipient.
+    /// None from the holder means this certificate has no available key.
+    pub fn unlock_oaep(
+        &self,
+        msg: MsgId,
+        certs: &[Vec<u8>],
+        unwrap: &dyn Fn(&[u8; 32], &[u8]) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<bool, Error> {
+        let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
+        let raw = self.store.blob(&m.full.ok_or(Error::NotFound)?)?;
+        for candidate in self.parser.keys_for_oaep(&raw, certs)? {
+            let cert = &certs[candidate.cert as usize];
+            let Some((fingerprint, size)) = mail_smime::envelope::oaep_recipient(cert) else {
+                return Err(Error::Jail("OAEP key for an unsupported certificate".into()));
+            };
+            if size != candidate.wrapped.len() {
+                return Err(Error::Jail("OAEP wrapped key has the wrong length".into()));
+            }
+            let Some(key) = unwrap(&fingerprint, &candidate.wrapped).map_err(Error::Compose)? else { continue };
+            if key.len() != usize::from(candidate.key_bytes) {
+                return Err(Error::Compose("the unwrapped key has the wrong length".into()));
+            }
+            self.keys.borrow_mut().insert(msg, key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Whether `msg` was unlocked this session.
     pub fn is_unlocked(&self, msg: MsgId) -> bool {
         self.keys.borrow().contains_key(&msg)

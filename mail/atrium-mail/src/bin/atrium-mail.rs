@@ -448,6 +448,10 @@ fn main() {
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine.clone(), dirty.clone(), (win.width, win.height), now);
     let mail = view.mail.clone();
+    let arca_socket = atrium_mail::accounts::arca_socket();
+    *mail.oaep_unwrapper.borrow_mut() = Some(std::rc::Rc::new(move |fingerprint, wrapped| {
+        atrium_mail::accounts::unwrap_smime(&arca_socket, fingerprint, wrapped)
+    }));
     let mut app = App::new_with_flag(view, dirty);
     let trace = std::env::var_os("MAIL_TRACE").is_some();
     let mut last = String::new();

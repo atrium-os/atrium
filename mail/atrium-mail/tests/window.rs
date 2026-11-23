@@ -1044,6 +1044,115 @@ fn an_encrypted_message_is_read_with_the_person_s_key() {
     assert!(texts(&app).iter().any(|x| x == "plan.csv"));
 }
 
+#[cfg(target_os = "freebsd")]
+#[test]
+fn oaep_mail_reaches_arca_in_work_and_opens_after_unlock() {
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use arca_store::codec::Writer;
+    use arcad::label::{Label, Resolver};
+    use arcad::proto::{op, status};
+    use arcad::server::State;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = State::new(dir.path().join("arca")).unwrap();
+    state.mail_sign_ins.mail_publisher = Some([7; 32]);
+    let mut unlock = Writer::new();
+    unlock.str("alice");
+    unlock.raw(&[1; 32]);
+    assert_eq!(state.handle(&Label::Vestibulum, op::V_CREATE, &unlock.buf).status, status::OK);
+    let mut import = Writer::new();
+    import.str("alice");
+    import.str("work");
+    import.str("Synthetic S/MIME key");
+    import.bytes(include_bytes!("../../mail-smime/tests/data/leaf.p8"));
+    let added = state.handle(&Label::TrustedUi, op::U_SMIME_IMPORT, &import.buf);
+    assert_eq!(added.status, status::OK);
+    let mut lock = Writer::new();
+    lock.str("alice");
+    assert_eq!(state.handle(&Label::Vestibulum, op::V_LOCK, &lock.buf).status, status::OK);
+
+    let registry = dir.path().join("launch-registry");
+    let uid = unsafe { libc::getuid() };
+    std::fs::write(&registry, format!("{uid} alice org.atrium.mail {} persona=work\n", "07".repeat(32))).unwrap();
+    let resolver = Resolver {
+        registry, vestibulum_uid: None, ui_uid: None, allow_unsigned: false,
+        courier_registry: None, web_broker: None, share_registry: None,
+        file_manager: None, services: vec![],
+    };
+    let socket = dir.path().join("arca.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let state = Arc::new(Mutex::new(state));
+    let broker = state.clone();
+    let server = std::thread::spawn(move || {
+        // Only the two OAEP opens should reach Arca.
+        let until = Instant::now() + Duration::from_secs(15);
+        for _ in 0..2 {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < until =>
+                        std::thread::sleep(Duration::from_millis(10)),
+                    Err(e) => panic!("Arca did not receive the expected request: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let (mut uid, mut gid) = (0, 0);
+            assert_eq!(unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) }, 0);
+            let label = resolver.resolve(uid);
+            assert!(matches!(&label, Label::App { persona: Some(name), .. } if name == "work"));
+            arcad::serve_conn(stream, &label, &broker).unwrap();
+        }
+    });
+
+    let mut engine = Engine::new(Store::open(&dir.path().join("mail")).unwrap(), Parser { program: jail() });
+    engine.set_roots(vec![include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()]);
+    let engine = Rc::new(engine);
+    let account = engine.store.add_account("grace@example.net").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let fetched = |uid, raw: &[u8]| Fetched {
+            uid, flags: vec![], size: raw.len() as u64, internal_date: Some(NOW),
+            server_id: None, bytes: raw.to_vec(), full: true,
+        };
+        sink.messages("INBOX", vec![
+            fetched(1, include_bytes!("../../mail-smime/tests/data/signed.eml")),
+            fetched(2, include_bytes!("../../mail-smime/tests/data/encrypted.eml")),
+            fetched(3, include_bytes!("../../mail-smime/tests/data/oaep.eml")),
+        ]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    *mail.oaep_unwrapper.borrow_mut() = Some(Rc::new(move |fingerprint, wrapped| {
+        atrium_mail::accounts::unwrap_smime(&socket, fingerprint, wrapped)
+    }));
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let row = |subject| (0..3).find(|&i| mail.row(i).is_some_and(|r| r.subject == subject)).unwrap();
+    mail.open(row("Encrypted plan"));
+    app.tick();
+    assert!(texts(&app).iter().any(|t| t.contains("supported S/MIME envelope")));
+
+    let oaep = row("OAEP encrypted plan");
+    mail.open(oaep);
+    app.tick();
+    assert!(texts(&app).iter().any(|t| t.contains("Unlock your Atrium session")));
+    assert!(texts(&app).iter().all(|t| !t.contains("OAEP content from OpenSSL.")));
+
+    assert_eq!(state.lock().unwrap().handle(&Label::Vestibulum, op::V_UNLOCK, &unlock.buf).status, status::OK);
+    mail.open(oaep);
+    app.tick();
+    assert!(texts(&app).iter().any(|t| t.contains("OAEP content from OpenSSL.")), "{:?}", texts(&app));
+    server.join().unwrap();
+}
+
 #[test]
 fn quick_filters_narrow_the_list() {
     let dir = tempfile::tempdir().unwrap();

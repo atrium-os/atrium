@@ -626,6 +626,7 @@ pub struct Mail {
     /// Unwraps an encrypted message's content key with the person's
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
+    pub oaep_unwrapper: Rc<RefCell<Option<OaepUnwrapper>>>,
     /// The settings window was asked for (`,`, or the sidebar).
     settings_asked: Rc<std::cell::Cell<bool>>,
     /// "Get mail" (`g`): the sync thread looks now.
@@ -634,6 +635,7 @@ pub struct Mail {
 
 /// See [`Mail::unwrapper`]: (certificate, wrapped key) → content key.
 pub type Unwrapper = Rc<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, String>>;
+pub type OaepUnwrapper = Rc<dyn Fn(&[u8; 32], &[u8]) -> Result<Option<Vec<u8>>, String>>;
 
 /// A reader version never used before, even after the reader was empty
 /// (the laid-out lines are cached by it).
@@ -1058,14 +1060,18 @@ impl Mail {
         let mut locked_note = None;
         if let Ok(m) = self.engine.store.message(msg) {
             if m.summary.encrypted && m.full.is_some() && !self.engine.is_unlocked(msg) {
-                let un = self.unwrapper.borrow().clone();
-                locked_note = match un {
-                    None => Some("This message is encrypted. Mail can't decrypt it here yet: your private key is on a token or in Arca, and reading with it is still to come.".to_string()),
-                    Some(u) => match self.engine.unlock(msg, &self.engine.my_certs(m.account, &[]), &*u) {
-                        Ok(true) => None,
-                        Ok(false) => Some("This message is encrypted, but not to any certificate of yours Mail knows.".to_string()),
-                        Err(e) => Some(format!("This message couldn't be decrypted: {e}")),
-                    },
+                let certs = self.engine.my_certs(m.account, &[]);
+                let result = if let Some(unwrap) = self.oaep_unwrapper.borrow().as_ref() {
+                    self.engine.unlock_oaep(msg, &certs, &**unwrap)
+                } else if let Some(unwrap) = self.unwrapper.borrow().as_ref() {
+                    self.engine.unlock(msg, &certs, &**unwrap)
+                } else {
+                    Ok(false)
+                };
+                locked_note = match result {
+                    Ok(true) => None,
+                    Ok(false) => Some("This message is encrypted. Mail needs a supported S/MIME envelope and a matching key.".to_string()),
+                    Err(e) => Some(format!("This message couldn't be decrypted: {e}")),
                 };
             }
         }
@@ -3334,6 +3340,7 @@ impl MailView {
             unsubs: Rc::default(),
             server_ask: Rc::default(),
             unwrapper: Rc::default(),
+            oaep_unwrapper: Rc::default(),
             settings_asked: Rc::default(),
             get_asked: Rc::default(),
         };

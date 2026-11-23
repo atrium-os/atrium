@@ -28,6 +28,29 @@ pub fn arca_socket() -> PathBuf {
     PathBuf::from(std::env::var("ARCA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into()))
 }
 
+/// Ask Arca to unwrap an OAEP content key using this launch’s persona.
+pub fn unwrap_smime(socket: &std::path::Path, fingerprint: &[u8; 32], wrapped: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    use arcad::proto::{self, AppReply};
+    use arca_store::codec::Writer;
+
+    let call = || -> std::io::Result<_> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let mut body = Writer::new();
+        body.raw(fingerprint);
+        body.bytes(wrapped);
+        proto::write_request(&mut stream, op::MAIL_SMIME_UNWRAP, &body.buf)?;
+        proto::read_app_reply(&mut stream, AppReply::SmimeContentKey)
+    };
+    match call().map_err(|_| "Arca couldn’t be reached".to_string())? {
+        (status::OK, key) => Ok(Some(key)),
+        (status::DENIED, _) => Ok(None),
+        (status::LOCKED, _) => Err("Unlock your Atrium session to read this message".into()),
+        _ => Err("Arca couldn’t unwrap the content key".into()),
+    }
+}
+
 fn scheme(name: &str) -> std::io::Result<arca_store::Scheme> {
     arca_store::Scheme::from_name(name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown scheme"))
 }

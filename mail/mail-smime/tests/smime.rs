@@ -152,18 +152,17 @@ fn rsa_sign_encrypt_decrypt() {
 #[test]
 fn openssl_ber_fixtures() {
     use rsa::pkcs8::DecodePrivateKey;
-    let d = |f: &str| std::fs::read(format!("{}/tests/data/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    let content = d("content.txt");
-    let roots = vec![d("ca.der")];
+    let content = include_bytes!("data/content.txt");
+    let roots = vec![include_bytes!("data/ca.der").to_vec()];
     let at = 1_800_000_000;
-    let c = verify::detached(&content, &d("sig.der"), &roots, at, "grace@example.net");
+    let c = verify::detached(content, include_bytes!("data/sig.der"), &roots, at, "grace@example.net");
     assert_eq!(c.state, State::Valid, "{c:?}");
     assert_eq!(c.signer.unwrap().name, "Grace Hopper");
-    assert!(matches!(verify::detached(b"other", &d("sig.der"), &roots, at, "grace@example.net").state, State::Invalid(_)));
+    assert!(matches!(verify::detached(b"other", include_bytes!("data/sig.der"), &roots, at, "grace@example.net").state, State::Invalid(_)));
 
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(&d("leaf.p8")).unwrap();
-    let ed = envelope::enveloped_data(&d("env.der")).unwrap();
-    let cek = key.decrypt(rsa::Pkcs1v15Encrypt, &envelope::wrapped_key(&ed, &d("leaf.der")).unwrap()).unwrap();
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(include_bytes!("data/leaf.p8")).unwrap();
+    let ed = envelope::enveloped_data(include_bytes!("data/env.der")).unwrap();
+    let cek = key.decrypt(rsa::Pkcs1v15Encrypt, &envelope::wrapped_key(&ed, include_bytes!("data/leaf.der")).unwrap()).unwrap();
     assert_eq!(envelope::decrypt(&ed, &cek).unwrap(), content);
 }
 
@@ -173,10 +172,9 @@ fn openssl_ber_fixtures() {
 fn write_for_openssl() {
     use rsa::pkcs8::DecodePrivateKey;
     let Ok(dir) = std::env::var("MAIL_SMIME_OUT") else { return };
-    let d = |f: &str| std::fs::read(format!("{}/tests/data/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(&d("leaf.p8")).unwrap();
-    let sig = sign::detached(CONTENT, &d("leaf.der"), &[], NOW, |h| key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), h).map_err(|e| e.to_string())).unwrap();
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(include_bytes!("data/leaf.p8")).unwrap();
+    let sig = sign::detached(CONTENT, include_bytes!("data/leaf.der"), &[], NOW, |h| key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), h).map_err(|e| e.to_string())).unwrap();
     std::fs::write(format!("{dir}/ours.sig"), sig).unwrap();
     std::fs::write(format!("{dir}/ours.txt"), CONTENT).unwrap();
-    std::fs::write(format!("{dir}/ours.env"), envelope::encrypt(CONTENT, &[d("leaf.der")]).unwrap()).unwrap();
+    std::fs::write(format!("{dir}/ours.env"), envelope::encrypt(CONTENT, &[include_bytes!("data/leaf.der").to_vec()]).unwrap()).unwrap();
 }

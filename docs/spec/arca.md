@@ -811,9 +811,10 @@ closed when the locked allocator is unavailable. The daemon consumes
 only the bounded transport fields. Mail’s parse worker remains responsible
 for CMS and MIME.
 
-The trusted UI provisioning screens and Mail’s OAEP CMS recognize-and-open
-path are separate integration work. Mail’s current PKCS#1 v1.5 envelopes
-need a separately reviewed compatibility path.
+Mail’s reader calls this operation after its parse worker validates the
+supported OAEP CMS parameters and Mail derives the fingerprint from its
+known certificate. Trusted UI provisioning screens and PKCS#1 v1.5
+compatibility remain separate work.
 
 ## 10. Audit
 

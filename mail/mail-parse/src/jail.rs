@@ -116,6 +116,18 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 });
                 port.borrow_mut().send(&wire::FromJail::KeyFor { id: message.id, which })?;
             }
+            wire::ToJail::KeyForOaep { message, certs } => {
+                if certs.len() > wire::MY_CERTS_MAX {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "too many certificates"));
+                }
+                let keys = envelope_of(&message.bytes).map(|env| {
+                    certs.iter().enumerate().filter_map(|(i, cert)| {
+                        let (key_bytes, wrapped) = mail_smime::envelope::oaep_wrapped_key(&env, cert)?;
+                        Some(wire::OaepKey { cert: i as u32, key_bytes, wrapped })
+                    }).collect()
+                }).unwrap_or_default();
+                port.borrow_mut().send(&wire::FromJail::KeyForOaep { id: message.id, keys })?;
+            }
             wire::ToJail::Answer { .. } => return Err(io::Error::new(io::ErrorKind::InvalidData, "answer with no query")),
         }
         port.borrow_mut().send(&wire::FromJail::Done)?;

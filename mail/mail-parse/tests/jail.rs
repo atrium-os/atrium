@@ -567,3 +567,24 @@ fn provider_verdict_requires_parent_supplied_identity_and_one_from_mailbox() {
         engine.finish();
     }
 }
+
+#[test]
+fn oaep_key_request_selects_only_supported_wrapping_and_known_certificates() {
+    let mut jail = Engine::start();
+    let oaep: &[u8] = include_bytes!("../../mail-smime/tests/data/oaep.eml");
+    let legacy: &[u8] = include_bytes!("../../mail-smime/tests/data/encrypted.eml");
+    for (raw, certs, expected) in [
+        (oaep, vec![SMIME_CA.to_vec(), SMIME_LEAF.to_vec()], Some(1)),
+        (oaep, vec![SMIME_CA.to_vec()], None),
+        (legacy, vec![SMIME_LEAF.to_vec()], None),
+    ] {
+        jail.send(&ToJail::KeyForOaep { message: wire::Raw { id: 42, bytes: raw.to_vec() }, certs });
+        let frames = jail.run(raw.len() as u64, &|_| None);
+        let [FromJail::KeyForOaep { id: 42, keys }] = frames.as_slice() else { panic!("{frames:?}") };
+        match expected {
+            Some(cert) => assert!(matches!(keys.as_slice(), [wire::OaepKey { cert: i, key_bytes: 32, wrapped }] if *i == cert && wrapped.len() == 256)),
+            None => assert!(keys.is_empty()),
+        }
+    }
+    jail.finish();
+}

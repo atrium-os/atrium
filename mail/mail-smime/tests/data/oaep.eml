@@ -1,0 +1,18 @@
+From: Grace Hopper <grace@example.net>
+To: Grace Hopper <grace@example.net>
+Subject: OAEP encrypted plan
+Message-ID: <oaep-plan@example.net>
+MIME-Version: 1.0
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data
+Content-Transfer-Encoding: base64
+
+MIICJQYJKoZIhvcNAQcDoIICFjCCAhICAQAxggGNMIIBiQIBADBGMC4xGjAYBgNVBAMMEU9wZW5T
+U0wgVGVzdCBSb290MRAwDgYDVQQKDAdGaXh0dXJlAhQgoy4Y7BO26q2ePmsNxlvBP8Xy8zA4Bgkq
+hkiG9w0BAQcwK6ANMAsGCWCGSAFlAwQCAaEaMBgGCSqGSIb3DQEBCDALBglghkgBZQMEAgEEggEA
+F+zgQ3glOQKn/S28Bgf033mzxhckXMnTQJe2OTM6PuitnUCJ+XSliKvee7zzXnGSAxRK27584gaM
+miGswIyZwLL9uVULH/yNO/tvztpFf3yxmWTzyXlGpviG6eDPws1x1GUoe+ApTkqZyZLU2YQ9lkGq
+zZ9CTYxpmrhVF4CBqyKImoC9bM3IfoTNwJbAlMdzBis7x0IBi7K5iJtW0b8x5IW3zsvMtZ5RdWo2
+20KLXxq5seG752DiiShVnsDfbySSyL+Rx8iP9Btkfxb5tT9YrWrOTjTjJ5GIhmwaa9ZE4naPPUd7
+ujacA17iWQA/oSJz5ZIrs6rx61SyuoR3LDQRZTB8BgkqhkiG9w0BBwEwHQYJYIZIAWUDBAEqBBAa
+UWIjJ5UrVChHLtZ8JhzxgFAZ1ytVA8QyM47eY42U9s6C9iZJNMMVhhxxRl6XUCywR14RT7AWf7t9
+DuLkypp5LeHN1m/NBnsPYBSXJjw5ez/Z8B/WZ4UiQ05yfblZTn9XMQ==

@@ -615,6 +615,8 @@ pub enum AppReply {
     Ticket,
     Count,
     AuthorizationUrl,
+    /// The per-message key is readable by the authorized Mail client.
+    SmimeContentKey,
 }
 
 pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<u8>)> {
@@ -628,6 +630,7 @@ pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<
             AppReply::Ticket => len == 16,
             AppReply::Count => len == 4,
             AppReply::AuthorizationUrl => (1..=8192).contains(&len),
+            AppReply::SmimeContentKey => matches!(len, 16 | 32),
         }
     };
     if !valid {
@@ -659,6 +662,8 @@ mod app_reply_tests {
         let mut frame = Vec::new();
         write_reply(&mut frame, status::OK, &[7; 16]).unwrap();
         assert_eq!(read_app_reply(&mut &frame[..], AppReply::Ticket).unwrap().1, [7; 16]);
+        assert_eq!(read_app_reply(&mut &frame[..], AppReply::SmimeContentKey).unwrap().1, [7; 16]);
+        assert!(read_app_reply(&mut &[49, 0, 0, 0, status::OK][..], AppReply::SmimeContentKey).is_err());
         assert!(read_app_reply(&mut &frame[..], AppReply::Count).is_err());
         assert!(read_app_reply(&mut &frame[..8], AppReply::Ticket).is_err());
 

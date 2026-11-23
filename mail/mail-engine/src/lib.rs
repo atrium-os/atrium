@@ -291,6 +291,24 @@ impl Parser {
         }
     }
 
+    pub fn keys_for_oaep(&self, raw: &[u8], certs: &[Vec<u8>]) -> Result<Vec<wire::OaepKey>, Error> {
+        let limit = certs.len().min(wire::MY_CERTS_MAX);
+        let mut j = self.start()?;
+        wire::write_frame(&mut j.w, &ToJail::KeyForOaep {
+            message: wire::Raw { id: 1, bytes: raw.to_vec() },
+            certs: certs[..limit].to_vec(),
+        }).map_err(|e| Error::Jail(e.to_string()))?;
+        let mut frames = Self::exchange(&mut j.r, &mut j.w, &|_| None, &[], &|_| None)?;
+        if frames.len() == 1 {
+            if let FromJail::KeyForOaep { id: 1, keys } = frames.remove(0) {
+                if keys.iter().all(|key| (key.cert as usize) < limit) {
+                    return Ok(keys);
+                }
+            }
+        }
+        Err(Error::Jail("invalid OAEP key reply".into()))
+    }
+
     pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>, pgp_keys: Vec<Vec<u8>>) -> Result<Option<Opened>, Error> {
         self.open_with(raw, loaded, roots, key, pgp_keys, &|_| None)
     }

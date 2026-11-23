@@ -1,3 +1,7 @@
 OpenSSL-made fixtures (throwaway test keys, never used anywhere else):
 streamed BER signature and envelope from `openssl cms -sign/-encrypt -stream -binary`.
 ca.der: test root; leaf.der/leaf.p8: grace@example.net cert and key; content.txt: what was signed/encrypted.
+
+oaep.eml is a synthetic Mail reader fixture for leaf.der / leaf.p8. The
+inner text is "OAEP content from OpenSSL." OpenSSL CMS encrypted it with
+AES-256-CBC and RSA-OAEP with SHA-256, MGF1-SHA-256, and the empty label.

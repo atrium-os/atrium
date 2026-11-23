@@ -124,12 +124,20 @@ pub enum ToJail {
     /// by whoever holds that key. The answer is [`FromJail::KeyFor`].
     KeyFor { message: Raw, certs: Vec<Vec<u8>> },
     HtmlAttachment { message: Raw, which: Which, key: Option<Vec<u8>> },
+    KeyForOaep { message: Raw, certs: Vec<Vec<u8>> },
 }
 
 /// Most of the person's certificates sent with a [`ToJail::KeyFor`].
 pub const MY_CERTS_MAX: usize = 16;
 /// Largest wrapped content key (RSA up to 8192 bits).
 pub const WRAPPED_KEY_MAX: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OaepKey {
+    pub cert: u32,
+    pub key_bytes: u8,
+    pub wrapped: Vec<u8>,
+}
 
 /// Which attachment of a message: a MIME part by its path, or the `n`th
 /// file unpacked from its `winmail.dat` parts.
@@ -163,6 +171,7 @@ pub enum FromJail {
     /// address: sent before that message's `Summary`.
     Autocrypt { id: u64, addr: String, key: Vec<u8> },
     Done,
+    KeyForOaep { id: u64, keys: Vec<OaepKey> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +720,15 @@ impl FromJail {
             }
             FromJail::KeyFor { which: Some((i, w)), .. } => {
                 if *i as usize >= MY_CERTS_MAX || w.is_empty() || w.len() > WRAPPED_KEY_MAX { return Err(Lie("wrapped key")) }
+                Ok(())
+            }
+            FromJail::KeyForOaep { keys, .. } => {
+                if keys.len() > MY_CERTS_MAX || keys.iter().any(|k|
+                    k.cert as usize >= MY_CERTS_MAX || !matches!(k.key_bytes, 16 | 32)
+                    || !matches!(k.wrapped.len(), 256 | 384 | 512)
+                ) || keys.windows(2).any(|pair| pair[0].cert >= pair[1].cert) {
+                    return Err(Lie("OAEP wrapped keys"));
+                }
                 Ok(())
             }
             _ => Ok(()),
