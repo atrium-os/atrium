@@ -841,20 +841,54 @@ on submission, suspension or dismissal. Arca uses the same pair
 validation as the operator tool. Mail receives a typed public outcome.
 Set the verified Mail publisher ID in `ARCA_MAIL_PUBLISHER` for both
 limend and arcad. Keep it unset on deployments without signed Mail.
-Legacy RSA decryption remains disabled. `MAIL_SMIME_UNWRAP` is the
-fixed OAEP operation. Its variable-length content-key reply and its
-separate error response are part of the current OAEP interface. The
-local FreeBSD cross sysroot has OpenSSL 3.5.9 and the implicit-rejection
-parameter. OpenSSL documents implicit rejection for the default
-provider from 3.2. The header version alone leaves actual support in the
-jailed runtime unverified. Any separate legacy design must fail closed
-if that provider or protection is unavailable and preserve locked,
-zeroized key material. The caller must never receive the recovered key
-length or a verdict on legacy padding, including through logs or audit
-statuses. Verify the complete request and content path on Tessera
-before considering enablement. Keep legacy-only keys disjoint from
-OAEP keys or signing keys within Arca. See
-[OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
+#### 9.2.1 Proposed legacy S/MIME receive operation
+
+Legacy RSA decryption is disabled. `MAIL_SMIME_UNWRAP` remains the
+fixed OAEP operation. The proposed legacy reader has its own broker
+operation and dedicated, receive-only key enrollment. Existing identities
+have no legacy permission. The trusted enrollment binds the certificate
+and key to the legacy purpose, user, launch persona, and Mail publisher.
+Arca checks the canonical public-key fingerprint against the same
+user’s OAEP and signing enrollments across personas and rejects reuse
+in either direction. A legacy key is excluded from OAEP certificate
+discovery, signing and outbound recipient selection. Forgetting the
+identity or erasing its persona invalidates its pending opens.
+
+1. A dedicated, network-disabled parse worker stages an immutable
+   local ciphertext and validates the envelope, expected content
+   cipher and unique recipient. The broker retains that immutable
+   input for the entire open. Arca handles only bounded key-transport
+   fields, and the worker has no private-key access.
+2. Fresco confirms a fresh `APPROVE` press on the trusted Arca read
+   sheet. The broker binds a short-lived authorization to the signed
+   Mail launch and window, user, persona, selected key fingerprint,
+   cipher profile, immutable message digest and the assigned worker
+   channel. Consume it once before attempting the read. Dismissal,
+   disconnect, a registry change, session lock or persona switch
+   invalidates it. Mail cannot redeem or transfer it as a general
+   unwrap grant.
+3. Any future implementation must establish default-provider
+   implicit rejection on the actual FreeBSD build and fail closed
+   when the provider, protection or locked allocation is unavailable.
+   Arca uses a private, operation-scoped channel to the worker with
+   only the fixed-size candidate required by the selected cipher. The
+   worker completes bounded content processing before it can return
+   the local view. Neither process exposes recovered key length,
+   padding validity or partial plaintext. Arca clears transient key
+   material when the attempt ends. Public replies, audit statuses and
+   logs must expose no cryptographic failure distinctions. The
+   local cross sysroot has OpenSSL 3.5.9 and the implicit-rejection
+   parameter. The jailed runtime is still unverified.
+
+The synthetic Tessera gate must cover a successful Work open, no key
+use without the trusted confirmation, rejection of stale or reused
+authorization and a changed message, Personal isolation, lock and
+dismissal, key-purpose separation, and one user-visible failure outcome.
+It must also verify that unsupported envelopes and failed OAEP opens
+cannot dispatch legacy RSA, and that legacy reads have no background
+or network effects. The complete request and content path needs
+review for externally observable differences before enablement.
+See [OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
 and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).
 
 ## 10. Audit

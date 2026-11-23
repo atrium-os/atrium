@@ -1076,24 +1076,43 @@ supports the fixed OAEP profile in §16. As a result, even a Sent copy
 using the sender’s enrolled RSA certificate can be unreadable on this
 software-key path. Signature verification is a separate operation.
 
-Keep legacy decryption disabled on the Arca reader until there is a
-separately reviewed, receive-only path for explicit local opens.
-The initial candidate profile is CMS `EnvelopedData` containing
-`id-data`, one unambiguous recipient matching the selected local
-certificate, and AES-128-CBC or AES-256-CBC. The parse worker validates
-the envelope and bounds before use. Arca retains private-key custody
-and authorizes the enrollment for the signed Mail launch’s user and
-persona. A dedicated legacy enrollment must use a key distinct from
-the one enrolled for OAEP. A legacy envelope addressed to an existing
-OAEP-only key therefore remains unreadable through Arca.
+Legacy receiving is disabled. The following design defines the proposed
+receive-only path and its verification gate.
 
-Legacy failures have one local reading outcome. The path cannot publish
-a padding or key-length verdict, send a receipt, fetch remote content,
-index decrypted content, or create a notification based on decryption.
-The CBC envelope alone provides confidentiality. A verified inner
-signature is needed for the signed-sender indicator. Keep the OAEP
-profile as a separate path with no automatic fallback to legacy RSA.
-See [Arca §9.2](arca.md#92-mail-smime-content-key-unwrap),
+- **Explicit local open.** Mail may offer **Open legacy S/MIME message**
+  when the selected, fully downloaded message has a supported legacy
+  envelope. The user confirms that action on a trusted Arca sheet in
+  the same persona. The sheet identifies the account and message without
+  treating the outer mail headers as authenticated. Merely selecting a
+  message, reopening a window, fetching mail, indexing or rendering a
+  preview never requests legacy key use. Each new open needs a new
+  confirmation.
+- **Profile and routing.** The first profile covers CMS `EnvelopedData`
+  carrying `id-data` with AES-128-CBC or AES-256-CBC and one unambiguous
+  match for a dedicated legacy certificate belonging to the selected
+  account in this persona. The jailed parser validates the envelope and
+  its bounds from the same immutable local bytes throughout the open.
+  Mail selects the route from the validated algorithm identifier.
+  Mixed or ambiguous matches, unsupported parameters, and an envelope
+  addressed only to an OAEP key stay closed. OAEP failure ends the OAEP
+  attempt without invoking legacy RSA. Legacy failure ends the legacy
+  attempt without trying OAEP, another key, or another persona.
+- **One failure outcome.** Authorization, enrollment, provider, unwrap,
+  content decryption, and parsing failures after the action all leave
+  the message closed with **Couldn’t open this legacy S/MIME message.**
+  Cancellation dismisses the sheet and keeps the message closed. Mail
+  gets only the completed local view or the generic outcome. It never
+  receives an intermediate decryption result or logs a cryptographic
+  failure reason.
+- **Local view.** The first version renders only bounded local text
+  from the decrypted message. It keeps the stored message encrypted
+  and discards the view on close, session lock, or persona switch.
+  The open does not trigger remote requests, receipts, notifications,
+  indexing or automatic mailbox changes. An unsigned message remains
+  unsigned. A valid inner signature is required for a verified-sender
+  indicator.
+
+See [Arca §9.2.1](arca.md#921-proposed-legacy-smime-receive-operation),
 [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),
 and [RFC 3218](https://www.rfc-editor.org/rfc/rfc3218.html).
 
