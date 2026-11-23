@@ -1,6 +1,6 @@
 # Calendar for Atrium
 
-**In review · 2026-11-23.** The opening view (D1) and the private Work slot check (D3) are accepted. Calendar is the display name, `atrium-calendar` the binary, and `org.atrium.calendar` the proposed app ID. The first milestone is usable with an empty calendar, no account and the network disconnected.
+**In review · 2026-11-23.** The opening view (D1), explicit holds (D2) and the private Work slot check (D3) are accepted. The first usable build (D4) is under review. Calendar is the display name, `atrium-calendar` the binary, and `org.atrium.calendar` the proposed app ID. The first milestone is usable with an empty calendar, no account and the network disconnected.
 
 ## 1. What Calendar gives the person
 
@@ -38,9 +38,9 @@ Drag has a keyboard equivalent through **Move to…**. Today has a chronological
 | **Offer times** | Select up to three gaps, adjust them, then read the exact outgoing text with dates, zone and offsets. Open the system share sheet to send that text to a chosen app. | Only the selected intervals and display zone. The chooser gets a generic title. The text contains no rejected slots, titles, attendee names, calendar IDs, live link or redemption token. The recipient can keep or forward it. Mail still requires its own Send press. |
 | **Prepare for this event** | Pin a workbook or other document from this persona's picker. At meeting time press **Open workbook**. A meeting URL is a separate **Join** action showing its destination. | The document pin is local, excluded from invitations, exports, sync and shared time offers. Scrinium resolves the pin on a fresh press and grants the chosen document to its opener. Monstrator takes the Join press. Opening the event, receiving an update or reaching the start time triggers neither action. |
 
-**Proposed offer flow (D2).** Mina selects two openings in Work. The preview reads “Could either of these work for you? Tuesday 24 November 2026, 13:00–13:45, or Wednesday 25 November 2026, 10:00–10:45. Kolkata (UTC+05:30).” Calendar rechecks those intervals against Work immediately before handing off the text. If either has filled, it returns to the preview, marks the conflict and lets Mina revise the offer. Choosing Mail opens a draft. Mina chooses the recipient and presses Send.
+**Offering a time.** Mina selects two openings in Work. The preview reads “Could either of these work for you? Tuesday 24 November 2026, 13:00–13:45, or Wednesday 25 November 2026, 10:00–10:45. Kolkata (UTC+05:30).” Calendar rechecks those intervals against Work immediately before handing off the text. If either has filled, it returns to the preview, marks the conflict and lets Mina revise the offer. Choosing Mail opens a draft. Mina chooses the recipient and presses Send.
 
-The recipient replies in ordinary text. A reply choosing Wednesday leaves the calendar untouched until Mina confirms the time by creating the event. If Wednesday has since filled, she can offer a replacement. An offer reserves nothing by default. Mina may use **Hold** separately on a slot she wants to protect. A new invitation that overlaps a hold appears for review alongside it. Moving the hold takes a separate edit.
+The recipient replies in ordinary text. A reply choosing Wednesday leaves the calendar untouched until Mina confirms the time by creating the event. If Wednesday has since filled, she can offer a replacement. Offered slots stay open. Only when Mina chooses **Hold** on a specific slot does Calendar mark that interval busy in her local calendar. A new invitation that overlaps a hold appears for review alongside it. Moving the hold takes a separate edit.
 
 ### 2.1 Check one Work slot against Personal
 
@@ -102,6 +102,10 @@ For writable collections, create with a stable resource name and If-None-Match, 
 
 ## 7. Delivery and evidence
 
+**Proposed first usable build (C0).** Start with a blank Work calendar offline. Add a weekly 14:00 review and an all-day item. Find a 45-minute gap before the review and explicitly hold it for preparation. Move this week’s review, see the gap change, then find next week’s review at its original time. Today, Week and Month, local search, event editing and deletion, and the separate opening preferences for Work and Personal are all part of this build. Closing and reopening Calendar restores the saved events and holds. Complete the same planning flow by keyboard.
+
+The scope decision is how people get their first events. In C0 they enter them by hand. Moving local ICS import forward from C1 would let someone start with their own week, at the cost of bringing the isolated parser, import preview and recurrence-fidelity checks into the first build. Mail invitations can still follow separately.
+
 | Milestone | Demonstration required before calling it ready |
 |---|---|
 | C0 · A day on the device | Host fixtures cover adjacent and overlapping intervals, gaps, date-only spans, DST folds/gaps, a moved occurrence and exhaustion of the recurrence budget. In a disposable arm64 VM, create a repeating event and a hold offline, restart the service, find both, edit one instance, complete the flow by keyboard and verify the opening-view preference. Launch fresh Work and Personal instances and observe Today in each. Set Work to Week and verify Personal still opens in Today. Set Personal to Month, browse Today in both, then close and relaunch each. Expect Week in Work and Month in Personal. Inspect actual jail identities, mounts and network reachability. |
@@ -109,15 +113,17 @@ For writable collections, create with a stable resource name and If-None-Match, 
 | C2 · Offers, preparation and reminders | Capture the actual share payload and compare it to the preview byte for byte. A foreign persona cannot query, pin or redeem it silently. Open the intended renamed workbook, then replace it and observe a refusal. Cancel and resume reminders over sleep, a locked seat and a user switch. Use the same observers on an allowed open, share and notification before relying on a zero count. |
 | C3 · Accounts | Interoperate with an independent CalDAV server over TLS. Sync a read-only collection, perform conditional writes on ordinary events, race two clients, kill the worker after server commit, invalidate a sync token and recover without duplicate or lost events. Verify account credentials reach only their bound server. A DAV change to an invited meeting must produce zero outgoing mail during this phase. |
 
+**C2 explicit holds.** Offer two free slots. After preview, cancellation, a completed share and Send in Mail, verify Find time still returns both intervals and the store contains no new hold. Press **Hold** on the second slot. Verify exactly one busy interval at the chosen time, the first slot still open, and the same result after restart.
+
 **C2 private slot check.** Seed a busy Personal event with a distinctive title. Check an overlapping Work slot, an adjacent free slot, then a slot with incomplete Personal coverage. Verify all three labels on the trusted surface and the same close response and unchanged Work record for each. Compare Work’s outgoing offer before and after the check byte for byte. Verify the answer and seeded title are absent from captured frames, Work’s accessibility tree and logs. Check that the private lookup leaves no interval in diagnostics. Exercise keyboard dismissal, cancellation and a seat switch. Count Personal lookups in the test fixture. One confirmed press yields one lookup. Find time, Offer times, a replayed press and a substituted interval yield zero additional lookups.
 
-The first reviewable build ends at C0. C1–C3 are separate increments. Full organizer scheduling, public subscriptions, live booking links and broader cross-persona availability sharing each need a later product and privacy decision.
+The proposed first usable build ends at C0. C1–C3 are separate increments. Full organizer scheduling, public subscriptions, live booking links and broader cross-persona availability sharing each need a later product and privacy decision.
 
 ## 8. Decisions for review
 
 | Decision | Recommendation or accepted choice | Cost or consequence |
 |---|---|---|
 | D1 · Opening view · **accepted** | Today on first launch in each persona. Set Today, Week or Month independently for Work and Personal in Calendar settings. | Browsing another view is temporary. The next ordinary launch uses that persona’s saved choice. |
-| D2 · What an offer promises | Share up to three hand-picked times as plain text. The person may place separate private holds. | No account required at either end. The recipient must reply, and a slot can fill meanwhile. |
+| D2 · What an offer promises · **accepted** | Share up to three hand-picked times as plain text. Each slot stays open unless the person explicitly chooses **Hold** on that slot. | No account required at either end. The recipient must reply, and a slot can fill meanwhile. |
 | D3 · Work and Personal · **accepted** | Separate by default. The person may check one selected Work slot against Personal once in the private system sheet (§2.1). | Only the person sees the answer. Work suggestions continue to use Work calendars alone. |
 | D4 · First usable build | Offline planning first, then Mail and file invitations, then offers and preparation, then CalDAV. | C0 can prove the daily experience early. People with an existing calendar cannot use it as their main planner until import or account sync lands. |
