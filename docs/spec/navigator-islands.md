@@ -383,6 +383,13 @@ acknowledgements, then activates the rendered chapter targets while paused.
 It checks the Fresco slot for red at 0.5 s and blue at 1.5 s. The probe,
 player and decode worker cross-built; the Tessera frame check is pending.
 
+The [deterministic MSE page](../../test-assets/navigator-i4/local-player.html)
+loads its own script, fetches the VP9 clip, appends it to a DOM SourceBuffer
+and ends the stream after updateend. A localhost Chrome control decoded
+RGB (255, 24, 0) at 0.5 seconds and (0, 15, 255) at 1.5 seconds after
+each seeked event. The arm64 probe accepts `PROBE_CHAPTER_FRAMES` to save
+the Fresco frame for each target when running the guest comparison.
+
 A host GET of the real embed on 2026-11-23 returned HTTP 200 in both
 cases. Its preview playability status reported error 153
 (`EMBEDDER_IDENTITY_MISSING_REFERRER`) with no Referer and OK with the

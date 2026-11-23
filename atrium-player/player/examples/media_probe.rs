@@ -260,6 +260,10 @@ fn main() {
         p.flush_media();
         let colour = slot_colour(Duration::from_secs(10), expected);
         p.check(colour.is_some_and(expected), &format!("paused chapter {href} displays {colour:?}"));
+        if let (Some(dir), Some(frame)) = (std::env::var_os("PROBE_CHAPTER_FRAMES"), std::env::var_os("PROBE_CAPTURE")) {
+            let name = format!("chapter-{}.png", &href[3..]);
+            std::fs::copy(frame, PathBuf::from(dir).join(name)).expect("save chapter frame");
+        }
     }
     if let (Ok(from), Ok(to)) = (std::env::var("PROBE_CAPTURE"), std::env::var("PROBE_SAVE")) {
         // Paused: the controls are up over the picture.
