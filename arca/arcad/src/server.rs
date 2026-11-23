@@ -261,11 +261,15 @@ impl State {
     pub fn handle(&mut self, who: &Label, op: u16, body: &[u8]) -> Reply {
         let mut item: Option<ItemId> = None;
         let r = match who {
-            Label::App { user, publisher, app_id, persona } if op == op::MAIL_SMIME_UNWRAP => {
+            Label::App { user, publisher, app_id, persona } if matches!(op, op::MAIL_SMIME_UNWRAP | op::MAIL_SMIME_CERTS) => {
                 if app_id == smime::MAIL && *publisher != crate::label::UNSIGNED_PUBLISHER
                     && self.mail_sign_ins.mail_publisher.as_ref() == Some(publisher)
                 {
-                    self.smime_unwrap(user, persona.as_deref(), body, &mut item)
+                    if op == op::MAIL_SMIME_CERTS {
+                        self.smime_certs(user, persona.as_deref(), body)
+                    } else {
+                        self.smime_unwrap(user, persona.as_deref(), body, &mut item)
+                    }
                 } else {
                     reply(status::DENIED)
                 }
@@ -1545,7 +1549,7 @@ impl State {
             op::U_STORE_PRINT_LOGIN => self.store_print_login(body, item),
             op::U_SAVE_PRINT_PIN => self.saved_print_pin(body, true, item),
             op::U_USE_SAVED_PRINT_PIN => self.saved_print_pin(body, false, item),
-            op::U_SMIME_IMPORT => self.smime_import(body, item),
+            op::U_SMIME_IMPORT | op::U_SMIME_PROVISION => self.smime_import(body, item, op == op::U_SMIME_PROVISION),
             op::U_SMIME_FORGET => self.smime_forget(body, item),
             op::U_DROP => {
                 let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };

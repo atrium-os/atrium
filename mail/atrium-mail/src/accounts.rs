@@ -51,6 +51,43 @@ pub fn unwrap_smime(socket: &std::path::Path, fingerprint: &[u8; 32], wrapped: &
     }
 }
 
+/// Public certificate discovery is scoped to this Mail launch by Arca.
+pub fn smime_certificates(socket: &std::path::Path) -> Result<Vec<Vec<u8>>, String> {
+    use arcad::proto::{self, AppReply, SMIME_CERT_MAX, SMIME_CERTS_MAX};
+    use arca_store::codec::Reader;
+
+    let call = || -> std::io::Result<_> {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+        proto::write_request(&mut stream, op::MAIL_SMIME_CERTS, &[])?;
+        proto::read_app_reply(&mut stream, AppReply::SmimeCertificates)
+    };
+    let (status_code, body) = call().map_err(|_| "Arca couldn’t be reached".to_string())?;
+    match status_code {
+        status::DENIED | status::UNSUPPORTED => return Ok(Vec::new()),
+        status::LOCKED => return Err("Unlock your Atrium session to read this message".into()),
+        status::OK => {}
+        _ => return Err("Arca couldn’t list S/MIME certificates".into()),
+    }
+    let invalid = |_| "Arca returned an invalid S/MIME certificate list".to_string();
+    let mut r = Reader::new(&body);
+    let count = r.u32().map_err(invalid)? as usize;
+    if count > SMIME_CERTS_MAX {
+        return Err("Arca returned too many S/MIME certificates".into());
+    }
+    let mut certificates = Vec::with_capacity(count);
+    for _ in 0..count {
+        let cert = r.bytes(SMIME_CERT_MAX).map_err(invalid)?;
+        if cert.is_empty() {
+            return Err("Arca returned an empty S/MIME certificate".into());
+        }
+        certificates.push(cert.to_vec());
+    }
+    r.end().map_err(invalid)?;
+    Ok(certificates)
+}
+
 fn scheme(name: &str) -> std::io::Result<arca_store::Scheme> {
     arca_store::Scheme::from_name(name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown scheme"))
 }

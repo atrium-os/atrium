@@ -12,3 +12,4 @@ pub mod field;
 pub mod gate;
 pub mod keymap;
 pub mod view;
+pub mod smime;

@@ -812,9 +812,24 @@ only the bounded transport fields. Mail’s parse worker remains responsible
 for CMS and MIME.
 
 Mail’s reader calls this operation after its parse worker validates the
-supported OAEP CMS parameters and Mail derives the fingerprint from its
-known certificate. Trusted UI provisioning screens and PKCS#1 v1.5
-compatibility remain separate work.
+supported OAEP CMS parameters and Mail derives the fingerprint from a
+certificate. The trusted Arca UI identity can provision a paired DER leaf
+certificate and PKCS#8 key with `U_SMIME_PROVISION`. Arca checks that the
+certificate allows key encipherment when a key-usage extension is present
+and that its SPKI fingerprint matches the private key. Older bare keys can
+gain the matching public certificate while retaining their item ID.
+`MAIL_SMIME_CERTS` gives signed Mail at most 16 public certificates for its
+attested persona while the store is unlocked. Each certificate is at most
+4000 bytes. Mail selects those that match its account identities.
+
+For operator provisioning, run `arca-ui smime-import USER PERSONA LABEL
+CERTIFICATE.der` as the configured trusted Arca UI identity, with standard
+input redirected from the unencrypted PKCS#8 file. Use `personal` for the
+Personal persona. Both inputs must be bounded read-only regular files.
+The operator tool reads them into locked memory and prints only the public
+fingerprint. To remove the pair, use `arca-ui smime-forget USER PERSONA
+FINGERPRINT` under the same identity. The graphical import picker and
+PKCS#1 v1.5 compatibility remain separate work.
 
 ## 10. Audit
 

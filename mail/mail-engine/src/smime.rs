@@ -344,6 +344,19 @@ impl Engine {
         out
     }
 
+    /// Select provisioned public certificates for this account's identities.
+    /// These certificates are used only for receiving encrypted content.
+    pub fn my_oaep_certs(&self, account: mail_store::AccountId, provisioned: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let identities = self.identities(account).unwrap_or_default();
+        let extra: Vec<_> = provisioned.iter().filter(|der| {
+            mail_smime::cert::parse(der).ok().is_some_and(|cert| {
+                let emails = mail_smime::cert::emails(&cert);
+                identities.iter().any(|i| emails.iter().any(|e| i.addr.eq_ignore_ascii_case(e)))
+            })
+        }).cloned().collect();
+        self.my_certs(account, &extra)
+    }
+
     /// Unlock encrypted message `msg` for this session: the jail finds the
     /// key wrapped for one of `certs`, `unwrap` unwraps it, and the key is
     /// kept in memory. False when the message isn't for any of them.

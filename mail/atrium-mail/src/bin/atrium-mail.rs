@@ -449,6 +449,10 @@ fn main() {
     let view = MailView::new(engine.clone(), dirty.clone(), (win.width, win.height), now);
     let mail = view.mail.clone();
     let arca_socket = atrium_mail::accounts::arca_socket();
+    let cert_socket = arca_socket.clone();
+    *mail.oaep_certificates.borrow_mut() = Some(std::rc::Rc::new(move || {
+        atrium_mail::accounts::smime_certificates(&cert_socket)
+    }));
     *mail.oaep_unwrapper.borrow_mut() = Some(std::rc::Rc::new(move |fingerprint, wrapped| {
         atrium_mail::accounts::unwrap_smime(&arca_socket, fingerprint, wrapped)
     }));

@@ -1730,8 +1730,12 @@ Stalwart in the cloud VM, and later a real account):
    asks [Arca §9.2](arca.md#92-mail-smime-content-key-unwrap) to unwrap the
    bounded key using the caller’s launch persona. Mail checks that the
    returned key length matches the cipher before opening the content in the
-   parse worker. Existing production provisioning screens and legacy
-   PKCS#1 v1.5 messages still need separate support.
+   parse worker. The trusted Arca operator can provision a paired DER
+   certificate and key. Mail obtains only the persona’s public certificates
+   and selects those that match the receiving account’s identities. This
+   lets Mail recognize the certificate before any signed message has been
+   indexed. Graphical key provisioning and legacy PKCS#1 v1.5 messages
+   still need separate support.
    **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
    request builders, bounded readers of every answer, RFC 3339 dates) and
    `mail-sync::jmap::Client` over the caller's HTTP (the HTTP courier, which adds the

@@ -627,6 +627,7 @@ pub struct Mail {
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
     pub oaep_unwrapper: Rc<RefCell<Option<OaepUnwrapper>>>,
+    pub oaep_certificates: Rc<RefCell<Option<OaepCertificates>>>,
     /// The settings window was asked for (`,`, or the sidebar).
     settings_asked: Rc<std::cell::Cell<bool>>,
     /// "Get mail" (`g`): the sync thread looks now.
@@ -636,6 +637,7 @@ pub struct Mail {
 /// See [`Mail::unwrapper`]: (certificate, wrapped key) → content key.
 pub type Unwrapper = Rc<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, String>>;
 pub type OaepUnwrapper = Rc<dyn Fn(&[u8; 32], &[u8]) -> Result<Option<Vec<u8>>, String>>;
+pub type OaepCertificates = Rc<dyn Fn() -> Result<Vec<Vec<u8>>, String>>;
 
 /// A reader version never used before, even after the reader was empty
 /// (the laid-out lines are cached by it).
@@ -1060,11 +1062,14 @@ impl Mail {
         let mut locked_note = None;
         if let Ok(m) = self.engine.store.message(msg) {
             if m.summary.encrypted && m.full.is_some() && !self.engine.is_unlocked(msg) {
-                let certs = self.engine.my_certs(m.account, &[]);
                 let result = if let Some(unwrap) = self.oaep_unwrapper.borrow().as_ref() {
-                    self.engine.unlock_oaep(msg, &certs, &**unwrap)
+                    let provisioned = self.oaep_certificates.borrow().as_ref()
+                        .map_or_else(|| Ok(Vec::new()), |certs| certs());
+                    provisioned.map_err(mail_engine::Error::Compose).and_then(|certs| {
+                        self.engine.unlock_oaep(msg, &self.engine.my_oaep_certs(m.account, &certs), &**unwrap)
+                    })
                 } else if let Some(unwrap) = self.unwrapper.borrow().as_ref() {
-                    self.engine.unlock(msg, &certs, &**unwrap)
+                    self.engine.unlock(msg, &self.engine.my_certs(m.account, &[]), &**unwrap)
                 } else {
                     Ok(false)
                 };
@@ -3341,6 +3346,7 @@ impl MailView {
             server_ask: Rc::default(),
             unwrapper: Rc::default(),
             oaep_unwrapper: Rc::default(),
+            oaep_certificates: Rc::default(),
             settings_asked: Rc::default(),
             get_asked: Rc::default(),
         };

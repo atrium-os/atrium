@@ -212,6 +212,11 @@ fn main() -> ExitCode {
         eprintln!("arca-ui: harden: {e}");
         return ExitCode::FAILURE;
     }
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        let arcad = Arcad::new(env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock"));
+        return arca_ui::smime::run(&arcad, &args);
+    }
     let fresco = std::env::var("FRESCO_SOCKET")
         .unwrap_or_else(|_| fresco_client::default_socket_path().to_string_lossy().into_owned());
     let registry = env("ARCA_APP_REGISTRY", "/var/run/atrium/app-registry");

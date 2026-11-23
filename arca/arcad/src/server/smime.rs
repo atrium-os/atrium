@@ -2,6 +2,7 @@
 //! key by its public SPKI hash. Arca never accepts a persona from Mail.
 
 use super::*;
+use crate::proto::{SMIME_CERTS_MAX, SMIME_CERT_MAX};
 
 pub(super) const MAIL: &str = "org.atrium.mail";
 const MAX_CIPHERTEXT: usize = 512;
@@ -17,14 +18,29 @@ fn storage_persona(persona: Option<&str>) -> Option<&str> {
 impl State {
     // Trusted UI only. The supplied PKCS#8 bytes arrive in Arca's locked
     // request buffer and are sealed directly into the unlocked user's store.
-    pub(super) fn smime_import(&mut self, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+    pub(super) fn smime_import(
+        &mut self,
+        body: &[u8],
+        item: &mut Option<ItemId>,
+        paired: bool,
+    ) -> Reply {
         let mut r = Reader::new(body);
-        let (Ok(user), Ok(persona), Ok(label), Ok(der)) = (
+        let (Ok(user), Ok(persona), Ok(label)) = (
             r.str(caps::USER),
             r.str(caps::PERSONA),
             r.str(caps::ACCOUNT),
-            r.bytes(caps::VALUE),
         ) else {
+            return malformed();
+        };
+        let cert = if paired {
+            match r.bytes(SMIME_CERT_MAX) {
+                Ok(cert) if !cert.is_empty() => cert,
+                _ => return malformed(),
+            }
+        } else {
+            &[]
+        };
+        let Ok(der) = r.bytes(caps::VALUE) else {
             return malformed();
         };
         if r.end().is_err() || label.trim().is_empty() || label.chars().any(char::is_control) {
@@ -58,8 +74,27 @@ impl State {
             persona,
             recipient: &recipient,
         };
-        if tri!(key_id(store, &access, &fingerprint)).is_some() {
+        let items = tri!(store.list(&access));
+        let existing = items
+            .iter()
+            .find(|m| m.kind == Kind::SmimeRsaKey && m.scope.starts_with(&fingerprint));
+        if paired && tri!(native::certificate_fingerprint(cert)) != fingerprint {
+            return malformed();
+        }
+        if existing.is_some_and(|m| !paired || certificate(m).is_some()) {
             return reply(status::EXISTS);
+        }
+        if paired && items.iter().filter(|m| certificate(m).is_some()).count() >= SMIME_CERTS_MAX {
+            return reply(status::FULL);
+        }
+        let mut scope = fingerprint.to_vec();
+        scope.extend_from_slice(cert);
+        if let Some(m) = existing {
+            // A provisioned bare key can gain its matching certificate.
+            // The sealed key and its item ID stay the same.
+            *item = Some(m.id);
+            tri!(store.set_scope(&m.id, &access, &scope));
+            return ok(fingerprint.to_vec());
         }
         let saved = tri!(store.add(NewItem {
             persona,
@@ -68,7 +103,7 @@ impl State {
             kind: Kind::SmimeRsaKey,
             provenance: Provenance::Migrated,
             account: label,
-            scope: &fingerprint,
+            scope: &scope,
             value: der,
         }));
         *item = Some(saved.id);
@@ -109,6 +144,42 @@ impl State {
         *item = Some(id);
         tri!(store.delete(&id, &access));
         ok(Vec::new())
+    }
+
+    pub(super) fn smime_certs(&self, user: &str, persona: Option<&str>, body: &[u8]) -> Reply {
+        if !body.is_empty() {
+            return malformed();
+        }
+        let Some(persona) = storage_persona(persona) else {
+            return reply(status::DENIED);
+        };
+        let Some(store) = self
+            .stores
+            .get(user)
+            .filter(|s| s.state() == LockState::Unlocked)
+        else {
+            return reply(status::LOCKED);
+        };
+        let Some(publisher) = self.mail_sign_ins.mail_publisher else {
+            return reply(status::DENIED);
+        };
+        let recipient = Recipient::Smime { publisher };
+        let items = tri!(store.list(&Access {
+            persona,
+            recipient: &recipient
+        }));
+        let certs: Vec<_> = items
+            .iter()
+            .rev()
+            .filter_map(certificate)
+            .take(SMIME_CERTS_MAX)
+            .collect();
+        let mut w = Writer::new();
+        w.u32(certs.len() as u32);
+        for cert in certs {
+            w.bytes(cert);
+        }
+        ok(w.buf)
     }
 
     pub(super) fn smime_unwrap(
@@ -169,8 +240,15 @@ fn key_id(
     Ok(store
         .list(access)?
         .into_iter()
-        .find(|m| m.kind == Kind::SmimeRsaKey && m.scope == fingerprint)
+        .find(|m| m.kind == Kind::SmimeRsaKey && m.scope.starts_with(fingerprint))
         .map(|m| m.id))
+}
+
+// The first 32 bytes remain the public-key fingerprint even for
+// keys imported before the optional public certificate was stored.
+fn certificate(item: &arca_store::ItemMeta) -> Option<&[u8]> {
+    let der = item.scope.get(32..)?;
+    (item.kind == Kind::SmimeRsaKey && (1..=SMIME_CERT_MAX).contains(&der.len())).then_some(der)
 }
 
 #[cfg(any(target_os = "freebsd", all(test, feature = "host-openssl-tests")))]
@@ -266,6 +344,11 @@ mod native {
     #[link(name = "crypto")]
     unsafe extern "C" {
         fn CRYPTO_set_mem_functions(alloc: Allocate, resize: Resize, free: Free) -> c_int;
+        fn d2i_X509(out: *mut *mut c_void, input: *mut *const u8, len: c_long) -> *mut c_void;
+        fn X509_free(cert: *mut c_void);
+        fn X509_get_pubkey(cert: *mut c_void) -> *mut c_void;
+        fn X509_check_ca(cert: *mut c_void) -> c_int;
+        fn X509_get_key_usage(cert: *mut c_void) -> u32;
         fn d2i_PKCS8_PRIV_KEY_INFO(
             out: *mut *mut c_void,
             input: *mut *const u8,
@@ -349,6 +432,41 @@ mod native {
         fn drop(&mut self) {
             unsafe { ERR_clear_error() }
         }
+    }
+
+    struct Certificate(NonNull<c_void>);
+    impl Drop for Certificate {
+        fn drop(&mut self) {
+            // SAFETY: this owns the pointer returned by d2i_X509.
+            unsafe { X509_free(self.0.as_ptr()) }
+        }
+    }
+
+    pub(super) fn certificate_fingerprint(der: &[u8]) -> Result<[u8; 32], Error> {
+        require_locked_heap()?;
+        let _errors = ClearErrors;
+        const INVALID_CERT: Error = Error::BadInput("S/MIME certificate");
+        let mut input = der.as_ptr();
+        // SAFETY: the decoder may consume only the provided bounded input.
+        let cert = Certificate(
+            NonNull::new(unsafe { d2i_X509(ptr::null_mut(), &mut input, der.len() as c_long) })
+                .ok_or(INVALID_CERT)?,
+        );
+        const KEY_ENCIPHERMENT: u32 = 0x20;
+        if input != der.as_ptr().wrapping_add(der.len())
+            || unsafe {
+                X509_check_ca(cert.0.as_ptr()) != 0
+                    || X509_get_key_usage(cert.0.as_ptr()) & KEY_ENCIPHERMENT == 0
+            }
+        {
+            return Err(INVALID_CERT);
+        }
+        let key =
+            Key(NonNull::new(unsafe { X509_get_pubkey(cert.0.as_ptr()) }).ok_or(INVALID_CERT)?);
+        if unsafe { EVP_PKEY_is_a(key.0.as_ptr(), c"RSA".as_ptr()) } != 1 {
+            return Err(INVALID_CERT);
+        }
+        key.fingerprint()
     }
 
     impl Key {
@@ -496,6 +614,9 @@ mod native {
 #[cfg(not(any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
 mod native {
     use super::*;
+    pub(super) fn certificate_fingerprint(_: &[u8]) -> Result<[u8; 32], Error> {
+        Err(Error::BadInput("S/MIME needs the FreeBSD crypto provider"))
+    }
     pub(super) const AVAILABLE: bool = false;
     pub(super) struct Key;
     impl Key {
@@ -733,6 +854,120 @@ mod tests {
                 .handle(&personal, op::MAIL_SMIME_UNWRAP, &unwrap)
                 .status,
             status::OK
+        );
+    }
+    #[test]
+    fn paired_provisioning_lists_only_public_certificates_for_the_calling_persona() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(dir.path().into()).unwrap();
+        state.mail_sign_ins.mail_publisher = Some([7; 32]);
+        let create = body(|w| {
+            w.str("alice");
+            w.raw(&[1; 32]);
+        });
+        assert_eq!(
+            state
+                .handle(&Label::Vestibulum, op::V_CREATE, &create)
+                .status,
+            status::OK
+        );
+        let work = mail("alice", [7; 32], MAIL, Some("work"));
+        let personal = mail("alice", [7; 32], MAIL, None);
+        let leaf = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mail/mail-smime/tests/data/leaf.der"
+        ));
+        let ca = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mail/mail-smime/tests/data/ca.der"
+        ));
+        let pkcs8 = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mail/mail-smime/tests/data/leaf.p8"
+        ));
+        let provision = |cert| {
+            body(|w| {
+                w.str("alice");
+                w.str("work");
+                w.str("Mail test certificate");
+                w.bytes(cert);
+                w.bytes(pkcs8);
+            })
+        };
+        assert_eq!(
+            state
+                .handle(&work, op::U_SMIME_PROVISION, &provision(leaf))
+                .status,
+            status::DENIED
+        );
+        assert_eq!(
+            state
+                .handle(&Label::TrustedUi, op::U_SMIME_PROVISION, &provision(ca))
+                .status,
+            status::MALFORMED
+        );
+        let bare = body(|w| {
+            w.str("alice");
+            w.str("work");
+            w.str("Existing bare key");
+            w.bytes(pkcs8);
+        });
+        let bare = state.handle(&Label::TrustedUi, op::U_SMIME_IMPORT, &bare);
+        assert_eq!(bare.status, status::OK);
+        assert_eq!(
+            state.handle(&work, op::MAIL_SMIME_CERTS, &[]).body.bytes(),
+            [0; 4]
+        );
+        let added = state.handle(&Label::TrustedUi, op::U_SMIME_PROVISION, &provision(leaf));
+        assert_eq!(added.status, status::OK);
+        let hash = added.body.bytes();
+        assert_eq!(hash, bare.body.bytes());
+        let listed = state.handle(&work, op::MAIL_SMIME_CERTS, &[]);
+        assert_eq!(listed.status, status::OK);
+        assert_eq!(
+            listed.body.bytes(),
+            body(|w| {
+                w.u32(1);
+                w.bytes(leaf);
+            })
+        );
+        assert_eq!(
+            state
+                .handle(&personal, op::MAIL_SMIME_CERTS, &[])
+                .body
+                .bytes(),
+            [0, 0, 0, 0]
+        );
+        assert_eq!(
+            state
+                .handle(
+                    &mail("alice", [8; 32], MAIL, Some("work")),
+                    op::MAIL_SMIME_CERTS,
+                    &[]
+                )
+                .status,
+            status::DENIED
+        );
+        assert_eq!(
+            state
+                .handle(&work, op::MAIL_SMIME_CERTS, b"personal")
+                .status,
+            status::MALFORMED
+        );
+        let forget = body(|w| {
+            w.str("alice");
+            w.str("work");
+            w.raw(hash);
+        });
+        assert_eq!(
+            state
+                .handle(&Label::TrustedUi, op::U_SMIME_FORGET, &forget)
+                .status,
+            status::OK
+        );
+        assert_eq!(
+            state.handle(&work, op::MAIL_SMIME_CERTS, &[]).body.bytes(),
+            [0, 0, 0, 0]
         );
     }
 }

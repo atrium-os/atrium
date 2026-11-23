@@ -19,6 +19,8 @@ use arca_store::secret::LockedBuf;
 pub const MAX_FRAME: usize = 64 * 1024;
 /// The largest message SIGN accepts.
 pub const MAX_SIGN_MSG: usize = 16 * 1024;
+pub const SMIME_CERT_MAX: usize = 4000;
+pub const SMIME_CERTS_MAX: usize = 16;
 
 /// Opcodes. Apps use 0x01..; Vestibulum 0x40..; Arca's trusted UI 0x60..
 pub mod op {
@@ -102,6 +104,8 @@ pub mod op {
     /// Signed Mail: `sha256(spki)[32] | bytes ciphertext` → a CMS content key.
     /// Fixed RSA-OAEP with SHA-256, MGF1-SHA-256, and the empty label.
     pub const MAIL_SMIME_UNWRAP: u16 = 0x18;
+    /// Signed Mail: empty → `u32 count | count × bytes certificate DER`.
+    pub const MAIL_SMIME_CERTS: u16 = 0x19;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -172,6 +176,9 @@ pub mod op {
     pub const U_SMIME_IMPORT: u16 = 0x6C;
     /// Trusted UI: `str user | str persona (empty for Personal) | sha256(spki)[32]`.
     pub const U_SMIME_FORGET: u16 = 0x6D;
+    /// Trusted UI: `str user | str persona (empty for Personal) | str label |
+    /// bytes certificate DER | bytes unencrypted PKCS#8 DER` → `sha256(spki)[32]`.
+    pub const U_SMIME_PROVISION: u16 = 0x6E;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).
@@ -617,6 +624,7 @@ pub enum AppReply {
     AuthorizationUrl,
     /// The per-message key is readable by the authorized Mail client.
     SmimeContentKey,
+    SmimeCertificates,
 }
 
 pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<u8>)> {
@@ -631,6 +639,7 @@ pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<
             AppReply::Count => len == 4,
             AppReply::AuthorizationUrl => (1..=8192).contains(&len),
             AppReply::SmimeContentKey => matches!(len, 16 | 32),
+            AppReply::SmimeCertificates => (4..=4 + SMIME_CERTS_MAX * (4 + SMIME_CERT_MAX)).contains(&len),
         }
     };
     if !valid {

@@ -162,6 +162,45 @@ impl Arcad {
         self.send_secret(op::U_STORE_PRINT_LOGIN, &w.buf, value, 0).map(|_| ())
     }
 
+    pub fn provision_smime(&self, user: &str, persona: &str, label: &str, certificate: &LockedBuf, key: &LockedBuf) -> Result<[u8; 32], Error> {
+        use arca_store::model::caps;
+        if user.len() > caps::USER || persona.len() > caps::PERSONA || label.len() > caps::ACCOUNT
+            || !(1..=proto::SMIME_CERT_MAX).contains(&certificate.len()) || !(1..=caps::VALUE).contains(&key.len())
+        {
+            return Err(Error::Malformed);
+        }
+        let mut head = Writer::new();
+        head.str(user);
+        head.str(persona);
+        head.str(label);
+        let len = 2 + head.buf.len() + 4 + certificate.len() + 4 + key.len();
+        let mut frame = LockedBuf::zeroed(4 + len)?;
+        let f = frame.as_mut();
+        f[..4].copy_from_slice(&(len as u32).to_le_bytes());
+        f[4..6].copy_from_slice(&op::U_SMIME_PROVISION.to_le_bytes());
+        f[6..6 + head.buf.len()].copy_from_slice(&head.buf);
+        let mut at = 6 + head.buf.len();
+        for bytes in [certificate.as_ref(), key.as_ref()] {
+            f[at..at + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            at += 4;
+            f[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        }
+        self.send_locked_frame(frame)?.as_ref().try_into().map_err(|_| Error::Malformed)
+    }
+
+    pub fn forget_smime(&self, user: &str, persona: &str, fingerprint: &[u8; 32]) -> Result<(), Error> {
+        let mut body = Writer::new();
+        body.str(user);
+        body.str(persona);
+        body.raw(fingerprint);
+        if self.call(op::U_SMIME_FORGET, &body.buf)?.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Malformed)
+        }
+    }
+
     fn hold_value(&self, opcode: u16, head: &[u8], value: &[u8], hold: u8) -> Result<[u8; 16], Error> {
         Self::handle(&self.send_secret(opcode, head, value, hold)?)
     }
@@ -183,8 +222,13 @@ impl Arcad {
                 f[at + value.len()] = hold;
             }
         }
+        self.send_locked_frame(frame)
+    }
+
+    fn send_locked_frame(&self, frame: LockedBuf) -> Result<LockedBuf, Error> {
         let mut s = UnixStream::connect(&self.path)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.set_write_timeout(Some(Duration::from_secs(5)))?;
         s.write_all(frame.as_ref())?;
         drop(frame);
         let (st, b) = proto::read_reply(&mut s)?;

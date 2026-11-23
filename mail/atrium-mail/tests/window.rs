@@ -1046,7 +1046,7 @@ fn an_encrypted_message_is_read_with_the_person_s_key() {
 
 #[cfg(target_os = "freebsd")]
 #[test]
-fn oaep_mail_reaches_arca_in_work_and_opens_after_unlock() {
+fn provisioned_work_certificate_opens_oaep_mail_after_unlock() {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
@@ -1069,8 +1069,9 @@ fn oaep_mail_reaches_arca_in_work_and_opens_after_unlock() {
     import.str("alice");
     import.str("work");
     import.str("Synthetic S/MIME key");
+    import.bytes(include_bytes!("../../mail-smime/tests/data/leaf.der"));
     import.bytes(include_bytes!("../../mail-smime/tests/data/leaf.p8"));
-    let added = state.handle(&Label::TrustedUi, op::U_SMIME_IMPORT, &import.buf);
+    let added = state.handle(&Label::TrustedUi, op::U_SMIME_PROVISION, &import.buf);
     assert_eq!(added.status, status::OK);
     let mut lock = Writer::new();
     lock.str("alice");
@@ -1090,9 +1091,9 @@ fn oaep_mail_reaches_arca_in_work_and_opens_after_unlock() {
     let state = Arc::new(Mutex::new(state));
     let broker = state.clone();
     let server = std::thread::spawn(move || {
-        // Only the two OAEP opens should reach Arca.
+        // Locked lookup, then the successful certificate lookup and unwrap.
         let until = Instant::now() + Duration::from_secs(15);
-        for _ in 0..2 {
+        for _ in 0..3 {
             let stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -1122,24 +1123,31 @@ fn oaep_mail_reaches_arca_in_work_and_opens_after_unlock() {
             server_id: None, bytes: raw.to_vec(), full: true,
         };
         sink.messages("INBOX", vec![
-            fetched(1, include_bytes!("../../mail-smime/tests/data/signed.eml")),
             fetched(2, include_bytes!("../../mail-smime/tests/data/encrypted.eml")),
             fetched(3, include_bytes!("../../mail-smime/tests/data/oaep.eml")),
         ]).unwrap();
     }
+    assert!(engine.my_certs(account, &[]).is_empty(), "no signed mail has supplied a certificate");
+    let other = engine.store.add_account("other@example.net").unwrap();
+    let public_cert = include_bytes!("../../mail-smime/tests/data/leaf.der").to_vec();
+    assert!(engine.my_oaep_certs(other, &[public_cert]).is_empty(), "certificate must match the account");
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
     let mail = view.mail.clone();
+    let cert_socket = socket.clone();
     *mail.oaep_unwrapper.borrow_mut() = Some(Rc::new(move |fingerprint, wrapped| {
         atrium_mail::accounts::unwrap_smime(&socket, fingerprint, wrapped)
     }));
     let mut app = App::new_with_flag(view, dirty);
     app.tick();
-    let row = |subject| (0..3).find(|&i| mail.row(i).is_some_and(|r| r.subject == subject)).unwrap();
+    let row = |subject| (0..2).find(|&i| mail.row(i).is_some_and(|r| r.subject == subject)).unwrap();
     mail.open(row("Encrypted plan"));
     app.tick();
     assert!(texts(&app).iter().any(|t| t.contains("supported S/MIME envelope")));
 
+    *mail.oaep_certificates.borrow_mut() = Some(Rc::new(move || {
+        atrium_mail::accounts::smime_certificates(&cert_socket)
+    }));
     let oaep = row("OAEP encrypted plan");
     mail.open(oaep);
     app.tick();
