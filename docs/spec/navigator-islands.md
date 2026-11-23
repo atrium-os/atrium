@@ -653,6 +653,13 @@ fresh window and required confirmation before it sent one POST and
 completed the ocserv handshake. The guest fetched `crypta-ac-ok` on
 `tun9`.
 
+The follow-up kept that latest requeued window open during disconnect
+and queued Sign In for a distinct Crypta attempt. A press on the stale
+confirmation sent zero POSTs. The queued request opened a fresh window
+after teardown. Neither the tunnel handshake nor IPv4 sentinel
+response was available before fresh confirmation. One confirmed POST
+led to one redemption and `crypta-ac-ok` through ocserv on `tun9`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
