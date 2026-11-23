@@ -46,12 +46,11 @@ pub unsafe extern "C" fn navigator_fixture_get(
     out: *mut u8,
     capacity: usize,
 ) -> usize {
-    if capacity > 65536 {
-        return 0;
-    }
     let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {
         return 0;
     };
+    let limit = if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
+    if capacity > limit { return 0; }
     let Some(mut state) = CLIENT.get().and_then(|c| c.lock().ok()) else {
         return 0;
     };
@@ -62,6 +61,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
         Some(sequence) => sequence,
         None if url == URL => &[URL],
         None if url == COUNTER => &[COUNTER],
+        None if url == navigator_control::YOUTUBE_ENTRY => &[navigator_control::YOUTUBE_ENTRY],
         None if url == VIDEO[0] => &VIDEO,
         None if url == SIGN_IN[0] => &SIGN_IN,
         _ => return 0,

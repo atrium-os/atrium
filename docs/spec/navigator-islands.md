@@ -461,13 +461,32 @@ offers and fetched media from a Google Video CDN. A player script measured
 1,957,976 decoded bytes. These observations establish compatibility with
 the provider in Chrome. They do not confer a network grant on Ladybird.
 
-Installed Navigator still has a three-resource, 64 KiB-per-resource grant,
-a fixed fixture entry URL and one VP9 SourceBuffer. Its ordinary fetcher
-omits Referer. The proposed provider path would send only the broker-owned
-package identity on the initial user-started embed GET. This needs an
-explicit exception to the documented header policy. After that decision,
-test bounded provider resource loading before adding the separate audio
-track and running the installed playback and chapter gate on Tessera.
+The local playback fixture retains its three-resource, 64 KiB-per-resource
+grant and one VP9 SourceBuffer. Its ordinary fetcher
+omits Referer. For the opt-in I4 entry test, the broker admits only the exact demo URL in
+`NAVIGATORD_I4_YOUTUBE`. Start must spend a compositor press for the
+current document. The island's first typed GET launches
+`org.atrium.navigator.youtube-entry` over a private socket. The worker
+enters Capsicum and sends `Referer: https://org.atrium.navigator/` on one
+GET for the fixed embed over TLS. It accepts one HTML response up to
+512 KiB and refuses redirects. The ordinary fetch worker, subresource
+requests and the reader's page URL are outside this exception.
+Build the entry island with `I4_YOUTUBE` and install the dedicated network
+worker with `scripts/navigator-youtube-entry-bundle.sh`. The initial
+document is the only resource this stage admits. Provider JS/CSS, API and
+media requests and the separate audio track remain future gates.
+On arm64 Tessera the installed watch page and the open Start prompt made
+zero provider connections. The first run exposed an uninitialized LibWeb
+fetch executor while parsing the embed. After initializing it, two trusted
+Starts fetched 144,490 and 144,511 HTML bytes, one provider TLS connection
+each. The JIT-off worker reported the provider origin in Capsicum, UID
+50007, IPv4 and IPv6 disabled. Stop retired it. Choosing Not now caused
+zero further connections. The player area stayed black: the inline
+bootstrap reached `writeEmbed`, which was undefined with the external
+player scripts unavailable. Next, grant bounded provider JS and CSS and
+verify the script defines and executes `writeEmbed` in the installed
+island. Evidence: `~/atrium-vm/evidence/navigator-i4-youtube-entry-20261123/`.
+
 Host control scripts and observations are at
 `~/atrium-vm/evidence/navigator-i4-youtube-provider-20261123/`.
 Fingerprint verification is deferred.

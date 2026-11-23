@@ -12,14 +12,16 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO)
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #endif
 #include <LibWeb/Platform/EventLoopPlugin.h>
 
 static constexpr char fixture[] = {
-#if defined(ATRIUM_I4_VIDEO)
+#if defined(ATRIUM_I4_YOUTUBE)
+0
+#elif defined(ATRIUM_I4_VIDEO)
 #embed "local-player.html"
 #elif defined(ATRIUM_I1_COUNTER)
 #embed "counter.html"
@@ -32,6 +34,7 @@ static constexpr char fixture[] = {
 
 extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
+extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
 #ifdef ATRIUM_I4_VIDEO
 extern "C" bool navigator_video_channel(int);
 #endif
@@ -97,7 +100,7 @@ int main(int argc, char** argv)
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
-#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO)
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
     auto& agent = Web::HTML::surrounding_agent();
     agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 #endif
@@ -108,7 +111,9 @@ int main(int argc, char** argv)
     auto client = Navigator::EditorPage::create(move(palette));
 #if defined(ATRIUM_I1_COUNTER)
     if (!embedded) return 1;
-#ifdef ATRIUM_I4_VIDEO
+#ifdef ATRIUM_I4_YOUTUBE
+    constexpr auto location = "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"sv;
+#elif defined(ATRIUM_I4_VIDEO)
     constexpr auto location = "https://widget.example/navigator-i4/local-player.html"sv;
 #else
     constexpr auto location = "https://widget.example/counter.html"sv;
@@ -116,8 +121,18 @@ int main(int argc, char** argv)
     auto* scene = navigator_counter_scene_create();
     if (!scene) return 4;
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+#ifdef ATRIUM_I4_YOUTUBE
+    if (!Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(GC::Heap::the());
+    auto storage = ByteBuffer::create_uninitialized(512 * 1024);
+    if (storage.is_error()) return 4;
+    document_body = storage.release_value();
+    auto body_length = navigator_fixture_get(location.bytes().data(), location.length(), document_body.data(), document_body.size());
+    if (!body_length || body_length > document_body.size() || document_body.try_resize(body_length).is_error()) return 4;
+#else
     if (!fetch_fixture(client->page(), URL::Parser::basic_parse(location).value()))
         return 4;
+#endif
     // The broker placed this counter before delivering its granted document.
     client->page().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
     auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);

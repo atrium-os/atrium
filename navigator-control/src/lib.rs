@@ -204,6 +204,10 @@ pub enum Request {
     SeekWidgetChapter { document: Ticket, start: Press, seconds_bits: u64 },
 }
 
+/// Fixed provider document admitted by the I4 entry worker.
+pub const YOUTUBE_ENTRY: &str = "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE";
+pub const YOUTUBE_ENTRY_LIMIT: usize = 512 * 1024;
+
 /// The single whole-page fixture granted during I0.
 pub const INBOX_FIXTURE_URL: &str = "https://inbox.example/inbox";
 

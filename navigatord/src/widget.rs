@@ -1,7 +1,7 @@
 //! I1 counter qualification. Only the interpreter fixture currently accepts this URL.
 use crate::{upstream, Config, Upstream};
 use limen::{client::Parent, proto::ParentEvent};
-use navigator_control::Ticket;
+use navigator_control::{Ticket, YOUTUBE_ENTRY, YOUTUBE_ENTRY_LIMIT};
 use std::{
     os::unix::net::UnixStream,
     path::Path,
@@ -21,7 +21,7 @@ const COUNTER_RESOURCES: &[(&str, &str)] = &[(COUNTER, "text/html")];
 
 pub fn enabled_source(base: &str, src: &str) -> Option<&'static str> {
     let url = url::Url::parse(base).ok()?.join(src).ok()?;
-    [(COUNTER, "NAVIGATORD_I1_COUNTER"), (VIDEO, "NAVIGATORD_I4_VIDEO")].into_iter()
+    [(COUNTER, "NAVIGATORD_I1_COUNTER"), (VIDEO, "NAVIGATORD_I4_VIDEO"), (YOUTUBE_ENTRY, "NAVIGATORD_I4_YOUTUBE")].into_iter()
         .find(|(exact, setting)| url.as_str() == *exact && crate::settings::get(setting).as_deref() == Some(*exact))
         .map(|(exact, _)| exact)
 }
@@ -218,12 +218,11 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         .and_then(|_| socket.set_write_timeout(timeout))
         .map_err(|e| e.to_string())?;
     let (mut input, mut output) = nuntius::server::channel(socket).map_err(|e| e.to_string())?;
-    let Upstream::Fetchd(mut fetcher, _worker) = upstream(cfg, &crate::instance())? else {
-        return Err("widget requires the plain fetch worker".into());
-    };
+    let mut upstream = if source == YOUTUBE_ENTRY { None } else { Some(upstream(cfg, &crate::instance())?) };
     let resources = match source {
         COUNTER => COUNTER_RESOURCES,
         VIDEO => VIDEO_RESOURCES,
+        YOUTUBE_ENTRY => &[(YOUTUBE_ENTRY, "text/html")],
         _ => return Err("unknown widget source".into()),
     };
     for &(url, mime) in resources {
@@ -240,9 +239,16 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         {
             return Err("request outside the widget grant".into());
         }
-        let body = fetcher.widget_resource(url, mime)?;
+        let (body, limit) = if source == YOUTUBE_ENTRY {
+            (youtube_entry()?, YOUTUBE_ENTRY_LIMIT)
+        } else {
+            let Some(Upstream::Fetchd(fetcher, _)) = &mut upstream else {
+                return Err("widget requires the plain fetch worker".into());
+            };
+            (fetcher.widget_resource(url, mime)?, 65536)
+        };
         let length = body.len() as u64;
-        if length == 0 || length > open.limits.max_bytes.min(65536) {
+        if length == 0 || length > open.limits.max_bytes.min(limit as u64) {
             return Err("widget document size".into());
         }
         eprintln!("navigatord: widget GET {url} bytes={length}");
@@ -267,4 +273,26 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         send(Event::Done { id, bytes: length })?;
     }
     Ok(())
+}
+
+/// This exec-only bundle accepts no destination, headers or commands.
+fn youtube_entry() -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    let spec = crate::worker::Spec::Jail("org.atrium.navigator.youtube-entry".into());
+    let (mut reader, peer) = UnixStream::pair().map_err(|e| e.to_string())?;
+    reader.set_read_timeout(Some(Duration::from_secs(12))).map_err(|e| e.to_string())?;
+    let mut worker = crate::worker::Worker::start_on(&spec, &format!("y{}", crate::instance()), peer.into())
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        reader.write_all(&[1]).map_err(|e| e.to_string())?;
+        let mut header = [0; 4];
+        reader.read_exact(&mut header).map_err(|e| format!("entry worker: {e}"))?;
+        let len = u32::from_be_bytes(header) as usize;
+        if !(1..=YOUTUBE_ENTRY_LIMIT).contains(&len) { return Err("invalid entry length".into()); }
+        let mut body = vec![0; len];
+        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+        Ok(body)
+    })();
+    worker.kill();
+    result
 }

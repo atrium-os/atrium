@@ -39,7 +39,11 @@ own promises are built). "High" means a realistic attack with a large blast radi
 fetcher can name no file and can connect only to an address casper resolved, on ports 80
 and 443. One bounded GET, at most 5 redirects, an https→http redirect is refused, the body
 is capped at 8 MiB, and no Cookie, Referer or Authorization header is sent (§5.4.1b). The
-page network is same-origin GET (§5.4.1c).
+page network is same-origin GET (§5.4.1c). The I4 YouTube entry uses a
+separate one-shot worker reached through a trusted Start. Its hardcoded
+HTTPS request identifies Navigator's public package to the demo embed.
+It carries no page address or cookies and follows no redirect. See the
+[I4 entry grant](navigator-islands.md#youtube-provider-playback-control).
 
 **Gap — the LAN and localhost are reachable (A4).** Nothing in the fetcher refuses a
 non-global address. Three routes reach inward:
