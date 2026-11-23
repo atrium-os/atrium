@@ -622,6 +622,15 @@ blocked until fresh confirmation. Confirmation produced one POST,
 one accepted assertion, and one redemption, and the guest fetched
 `crypta-ac-ok` through ocserv on `tun7`.
 
+The overlap variant disconnected that newest requeued proposal, kept
+its jail open and queued Sign In against the next Crypta attempt. A
+press on the stale confirmation sent zero POSTs. After teardown the
+queued window opened without another Sign In request. IPv4 and the new
+proposal waited for fresh confirmation. One POST produced one accepted
+assertion, one redemption, and `crypta-ac-ok` through ocserv on `tun9`.
+The rerun restored the verified converter fixture after an installed
+binary hash mismatch caused the initial page to fail.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
