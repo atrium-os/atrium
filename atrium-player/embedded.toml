@@ -1,0 +1,24 @@
+# The embedded player receives its only Fresco connection from Limen.
+[app]
+id = "org.atrium.player.embedded"
+name = "Embedded Player"
+version = "0.1.0"
+entry = "bin/atrium-player"
+
+[roles]
+implements = ["media-player"]
+
+[capabilities]
+network = "none"
+embeds = []
+
+[[workers]]
+name = "decode"
+entry = "bin/atrium-player-decode"
+lifetime = "session"
+isolation = "capsicum"
+memory = "768M"
+
+[resources]
+memory = "1G"
+cpu = 100

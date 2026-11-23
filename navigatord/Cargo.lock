@@ -2494,6 +2494,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-media"
+version = "0.1.0"
+dependencies = [
+ "limen",
+ "navigator-fetch",
+ "navigator-render",
+]
+
+[[package]]
 name = "navigator-normalize"
 version = "0.1.0"
 dependencies = [
@@ -2571,6 +2580,7 @@ dependencies = [
  "navigator-backend",
  "navigator-control",
  "navigator-cookies",
+ "navigator-media",
  "navigator-prerender",
  "nuntius",
  "portcullis-ipc",

@@ -111,6 +111,7 @@ impl FakePlayer {
             ToChild::Pause => self.pending.push_back(ToParent::Paused),
             ToChild::Stop => {}
             ToChild::LoadDone => { if !self.loaded || self.feed { self.violation("LoadDone without a Load".into()) } }
+            ToChild::SeekTo { request, secs } => { self.time = secs; self.pending.push_back(ToParent::Seeked { request, secs }) }
             ToChild::Seek { secs } => { self.time = secs; self.pending.push_back(ToParent::Time { secs }) }
             // A page's text track goes with a source: before one, the
             // player has nothing to show it over.

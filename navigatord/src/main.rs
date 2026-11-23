@@ -58,6 +58,7 @@ mod press;
 mod settings;
 mod worker;
 mod widget;
+mod widget_video;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};

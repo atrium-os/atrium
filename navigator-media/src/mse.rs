@@ -24,7 +24,7 @@
 //! | `ms.duration = d` | `SetDuration` | `durationchange` |
 //! | `sb.buffered`, `video.buffered` | | `Buffered` (the element's: every track's intersected) |
 //! | `play()`, `pause()` | `Play`, `Pause` | `Playing` → `playing`; `Paused` → `pause` |
-//! | `currentTime = t` | `Seek` | `seeking` at once; the next `Time` → `seeked`, `timeupdate` |
+//! | `currentTime = t` | `SeekTo` | `seeking` at once; the matching decoder acknowledgement → `seeked`, `timeupdate` |
 //! | `volume`, `muted` | `SetVolume` (0 while muted) | `volumechange` at once |
 //! | `playbackRate` | `SetRate` (0.25–4; else `NotSupportedError`) | `ratechange` at once |
 //! | | | `Time` → `timeupdate`; `Waiting` → `waiting`; `Seeking` (native controls) → `seeking`; `Ended` → `pause`, `ended` |
@@ -117,6 +117,8 @@ pub struct Media {
     pub muted: bool,
     pub rate: f32,
     pub seeking: bool,
+    last_seek: u64,
+    pending_seek: Option<u64>,
     pub ended: bool,
     /// HAVE_NOTHING 0 … HAVE_ENOUGH_DATA 4.
     pub ready_state: u8,
@@ -142,7 +144,7 @@ impl Default for Media { fn default() -> Self { Self::new() } }
 impl Media {
     pub fn new() -> Self {
         Media { out: vec![], events: vec![], ms: None, can_play: HashMap::new(), asked: Default::default(), loaded: false,
-                paused: true, current_time: 0.0, duration: f64::NAN, volume: 1.0, muted: false, rate: 1.0, seeking: false,
+                paused: true, current_time: 0.0, duration: f64::NAN, volume: 1.0, muted: false, rate: 1.0, seeking: false, last_seek: 0, pending_seek: None,
                 ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0,
                 text_tracks: vec![], pending_files: vec![], shown_text: None, page_chose: false }
     }
@@ -218,7 +220,11 @@ impl Media {
         self.ended = false;
         self.seeking = true;
         self.events.push(Fire::Element("seeking"));
-        if self.loaded { self.out.push(ToChild::Seek { secs: t }) }
+        if self.loaded {
+            self.last_seek = self.last_seek.checked_add(1).ok_or(DomError::InvalidState)?;
+            self.pending_seek = Some(self.last_seek);
+            self.out.push(ToChild::SeekTo { request: self.last_seek, secs: t });
+        }
         Ok(())
     }
 
@@ -351,6 +357,7 @@ impl Media {
 
     /// `MediaSource.isTypeSupported(t)`: from the player's answers; a type
     /// it has not answered is asked now and answers `false` this time.
+    pub fn supports_cached_type(&self, mime: &str) -> bool { self.can_play.get(mime) == Some(&true) }
     pub fn is_type_supported(&mut self, t: &str) -> bool {
         match self.can_play.get(t.trim()) { Some(v) => *v, None => { self.ask(t); false } }
     }
@@ -546,6 +553,8 @@ impl Media {
     pub fn network_error(&mut self) { self.fail(2) }
 
     fn fail(&mut self, media_err: u16) {
+        self.pending_seek = None;
+        self.seeking = false;
         self.error = Some(media_err);
         self.events.push(Fire::Element("error"));
     }
@@ -597,13 +606,22 @@ impl Media {
                     Err(_) => if self.ms.is_none() { self.file_buffered = ranges; self.events.push(Fire::Element("progress")) },
                 }
             }
+            ToParent::Seeked { request, secs } => {
+                if self.pending_seek != Some(request) { return }
+                self.pending_seek = None;
+                self.current_time = secs;
+                self.seeking = false;
+                self.events.push(Fire::Element("seeked"));
+                self.events.push(Fire::Element("timeupdate"));
+            }
+            ToParent::Time { .. } if self.pending_seek.is_some() => {}
             ToParent::Time { secs } => {
                 self.current_time = secs;
                 if self.seeking { self.seeking = false; self.events.push(Fire::Element("seeked")) }
                 self.events.push(Fire::Element("timeupdate"));
             }
             ToParent::Waiting { secs } => { self.current_time = secs; self.ready_state = self.ready_state.min(2); self.events.push(Fire::Element("waiting")) }
-            ToParent::Seeking { secs } => { self.current_time = secs; self.seeking = true; self.events.push(Fire::Element("seeking")) }
+            ToParent::Seeking { secs } => { self.pending_seek = None; self.current_time = secs; self.seeking = true; self.events.push(Fire::Element("seeking")) }
             ToParent::Playing => { self.paused = false; if self.ready_state < 3 { self.ready_state = 3 } self.events.push(Fire::Element("playing")) }
             ToParent::Paused => { if !self.paused { self.paused = true; self.events.push(Fire::Element("pause")) } }
             ToParent::Ended => {

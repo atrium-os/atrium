@@ -1323,3 +1323,6 @@ pub mod host {
 
 #[cfg(feature = "editor")]
 mod fixture_fetch;
+
+#[cfg(feature = "editor")]
+mod video;

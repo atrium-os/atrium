@@ -64,6 +64,7 @@ pub enum PlayerEvent {
     VideoTrack { width: u32, height: u32, bit_depth: u8 },
     AudioTrack { rate: u32, channels: u16 },
     Duration(f64),
+    SeekAcknowledged { epoch: u32 },
     Frame { pts_ns: i64 },
     Appended { track: u8 },
     Buffered { track: u8, ranges: Vec<(i64, i64)> },
@@ -636,6 +637,10 @@ impl<S: Sink> Player<S> {
     }
 
     pub fn seek(&mut self, t_ns: i64) {
+        self.seek_with_epoch(t_ns);
+    }
+
+    pub fn seek_with_epoch(&mut self, t_ns: i64) -> u32 {
         self.drop_queued();
         // PCM still in the ring is from before the seek: none of it is
         // readable until the worker's new PCM records say what is.
@@ -662,6 +667,7 @@ impl<S: Sink> Player<S> {
         for i in held {
             self.release(i);
         }
+        epoch
     }
 
     pub fn video_format(&self) -> Option<(Format, u32, u32, u32)> {
@@ -943,6 +949,7 @@ impl<S: Sink> Player<S> {
                     self.waiting = false;
                 }
                 if epoch == self.epoch {
+                    self.events.push_back(PlayerEvent::SeekAcknowledged { epoch });
                     if let Some(a) = self.audio.as_mut() {
                         a.runs.clear();
                         a.known_until = pos;

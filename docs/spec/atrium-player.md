@@ -143,6 +143,10 @@ The policy is the one Lyra's spec settled (§12.1).
   by more than a few frames, it drops non-reference frames and then skips to the next
   keyframe, and reports the drops in its own stats, never to the parent (limen.md §10:
   frame timing is not a parent-visible channel).
+- **DOM seeks.** Navigator tags each `SeekTo` with a request ID. The player
+  associates it with the decoder's seek epoch and returns `Seeked` on that
+  epoch's acknowledgement, including while paused. A later DOM seek
+  supersedes the pending request. Frame presentation is checked separately.
 - **Rate and volume** (`SetRate`, `SetVolume`) are applied in the supervisor to the PCM it
   writes to Lyra. Rates other than 1 need time-stretching to keep pitch. v1 does this with a
   simple WSOLA stretch in the supervisor, so the worker's output never changes with rate.

@@ -142,6 +142,7 @@ pub struct App<H: Host> {
     opts: Options,
     duration: Option<f64>,
     ready_sent: bool,
+    pending_seek: Option<(u32, u64, f64)>,
     video: Option<(u32, u32)>,
     want_play: bool,
     suspended: bool,
@@ -230,6 +231,7 @@ impl<H: Host> App<H> {
             opts,
             duration: None,
             ready_sent: false,
+            pending_seek: None,
             video: None,
             want_play: false,
             suspended: false,
@@ -357,13 +359,18 @@ impl<H: Host> App<H> {
     }
 
     fn seek(&mut self, to: f64, from_controls: bool) {
+        self.seek_request(to, from_controls, None);
+    }
+
+    fn seek_request(&mut self, to: f64, from_controls: bool, request: Option<u64>) {
         let to = match self.duration {
             Some(d) if d.is_finite() => to.clamp(0.0, d),
             _ => to.max(0.0),
         };
-        if let Some(p) = self.player.as_mut() {
-            p.seek(ns(to));
-        }
+        self.pending_seek = self.player.as_mut().and_then(|p| {
+            let epoch = p.seek_with_epoch(ns(to));
+            request.map(|id| (epoch, id, to))
+        });
         if let Some(a) = self.audio.as_mut() {
             a.seek(ns(to));
         }
@@ -479,6 +486,7 @@ impl<H: Host> App<H> {
             }
             ToChild::Play => self.set_playing(true),
             ToChild::Pause | ToChild::Stop => self.set_playing(false),
+            ToChild::SeekTo { request, secs } => self.seek_request(secs, false, Some(request)),
             ToChild::Seek { secs } => self.seek(secs, false),
             ToChild::SetVolume { volume } => {
                 self.volume = volume;
@@ -616,6 +624,12 @@ impl<H: Host> App<H> {
                 self.last_frame = Instant::now();
                 self.controls.position_s = secs(pts_ns);
                 self.ready();
+            }
+            PlayerEvent::SeekAcknowledged { epoch } => {
+                if let Some((_, request, secs)) = self.pending_seek.filter(|(current, _, _)| *current == epoch) {
+                    self.pending_seek = None;
+                    self.host.emit(ToParent::Seeked { request, secs });
+                }
             }
             PlayerEvent::Appended { track } => self.host.emit(ToParent::Appended { track }),
             PlayerEvent::Buffered { track, ranges } => {

@@ -84,6 +84,8 @@ pub enum ToChild {
     RequestPip,
     /// `document.exitPictureInPicture()`.
     ExitPip,
+    /// A DOM seek whose completion must be distinguishable from periodic clock updates.
+    SeekTo { request: u64, secs: f64 },
 }
 
 /// Bits of `MediaActions` and `ToParent::Action`.
@@ -146,6 +148,8 @@ pub enum ToParent {
     /// The user asked for an action the page handles: one
     /// [`media_action`] bit it declared with `MediaActions`.
     Action { action: u16 },
+    /// The decode worker acknowledged this request's seek epoch.
+    Seeked { request: u64, secs: f64 },
 }
 
 /// Seconds representable on the native player's media clock.
@@ -178,6 +182,7 @@ impl ToChild {
             ToChild::EndOfStream { .. } => true,
             ToChild::SetDuration { secs } => finite_secs(*secs) || (secs.is_infinite() && *secs > 0.0),
             ToChild::CanPlay { mime } => clean_text(mime, MIME_MAX),
+            ToChild::SeekTo { request, secs } => *request != 0 && finite_secs(*secs),
             ToChild::Seek { secs } => finite_secs(*secs),
             ToChild::SetVolume { volume } => (0.0..=1.0).contains(volume),
             ToChild::SetRate { rate } => (0.25..=4.0).contains(rate),
@@ -210,6 +215,7 @@ impl ToParent {
                     && ranges.iter().all(|(a, b)| finite_secs(*a) && finite_secs(*b) && a <= b)
             }
             ToParent::Appended { track } => *track < TRACKS_MAX,
+            ToParent::Seeked { request, secs } => *request != 0 && finite_secs(*secs),
             ToParent::Time { secs } | ToParent::Waiting { secs } | ToParent::Seeking { secs } => finite_secs(*secs),
             ToParent::Error { track, .. } => track.is_none_or(|t| t < TRACKS_MAX),
             ToParent::Volume { volume, .. } => (0.0..=1.0).contains(volume),

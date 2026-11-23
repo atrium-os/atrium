@@ -413,11 +413,25 @@ media type and zero redirects. A loopback TLS test of the host fetch service
 compared all three bodies byte-for-byte and verified refusal of a wrong MIME
 type, a redirect and a 65,537-byte response. The counter retains its single-document grant.
 
-The DOM-to-player binding is still pending. LibWeb's local MSE attachment
-constructs a remote playback manager, and its SourceBuffer constructs a
-remote buffer through that manager. Route both to the native player before
-running the installed fixture. Verify append completion, metadata, each
-chapter press and the corresponding paused Fresco frame on Tessera.
+The local I4 build applies `patches/ladybird/native-mse.patch` to the engine
+and compiles the changed translation units with `ATRIUM_I4_VIDEO`. Build
+EditorPage and the entry point with identical definitions. A stale EditorPage
+object from the counter gate crashed before the first resource request.
+The DOM element retains its CSS box and the native player owns its pixels and
+controls. The broker clips its slot to the island. A private socket accepts
+open, one VP9 track, bounded append, end and seek. Native buffered ranges
+and decoder acknowledgements feed the DOM responses. The broker retires
+the player when the channel closes.
+
+Installed Navigator on arm64 Tessera confirmed the trusted Start press, a
+non-root Capsicum engine, and broker GETs for the HTML and external script.
+The guest's jaild mount policy refused the declared decoder-worker socket
+for `org.atrium.player.embedded`. Native placement failed before the clip
+GET. The separate native probe received correlated decoder acknowledgements
+for 0.5 and 1.5 seconds while paused and verified both Fresco frame colours.
+See `~/atrium-vm/evidence/navigator-i4-installed-chapters-20261123/`.
+The installed page still needs clip fetch, append, both chapter presses and
+corresponding frames verified before attempting YouTube.
 Fingerprint testing is
 deferred.
 

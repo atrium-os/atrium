@@ -56,6 +56,12 @@ fn main() {
             _ => files.push(a),
         }
     }
+    // Portcullis ExecInstance starts a Limen provider at its manifest
+    // entry with the private embed channel on stdin and no arguments.
+    if std::env::args_os().len() == 1 && std::os::fd::AsFd::as_fd(&std::io::stdin()).try_clone_to_owned().ok()
+        .and_then(|fd| std::os::unix::net::UnixStream::from(fd).peer_addr().ok()).is_some_and(|addr| addr.is_unnamed()) {
+        return embedded();
+    }
     if files.is_empty() && !headless {
         // Started by portcullisd for a file opened in Scrinium
         // (opening-files.md §6.2): it comes on the document channel.
@@ -169,6 +175,7 @@ fn main() {
             }
             PlayerEvent::VideoTrack { width, height, bit_depth } => println!("video-track {width}x{height} {bit_depth}-bit"),
             PlayerEvent::AudioTrack { rate, channels } => println!("audio-track {rate} Hz {channels} ch"),
+            PlayerEvent::SeekAcknowledged { epoch } => println!("seeked epoch {epoch}"),
             PlayerEvent::Duration(d) => println!("duration {d:.3}"),
             PlayerEvent::Frame { .. } => {
                 frames += 1;

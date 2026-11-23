@@ -39,6 +39,7 @@ pub struct Widget {
     pub press: navigator_control::Press,
     parent: Arc<Mutex<Option<Parent>>>,
     embed: u64,
+    video: Option<crate::widget_video::Video>,
     pub answers: std::sync::mpsc::SyncSender<limen::web_island::UnloadAnswer>,
 }
 
@@ -81,6 +82,12 @@ impl Widget {
         parent
             .place(embed, Some(rect))
             .map_err(|e| format!("place: {e:?}"))?;
+        let video = if source == VIDEO {
+            use std::os::fd::AsRawFd;
+            let (video, worker) = crate::widget_video::Video::start(socket, window, rect)?;
+            navigator_control::send_fd(&channel, worker.as_raw_fd()).map_err(|e| e.to_string())?;
+            Some(video)
+        } else { None };
         let parent = Arc::new(Mutex::new(Some(parent)));
         let watched = parent.clone();
         let (answers, received) = std::sync::mpsc::sync_channel::<limen::web_island::UnloadAnswer>(1);
@@ -176,6 +183,7 @@ impl Widget {
             press,
             parent,
             answers,
+            video,
             embed,
         })
     }
@@ -187,7 +195,9 @@ impl Widget {
 
     pub fn place(&mut self, rect: [u32; 4]) -> Result<(), String> {
         if let Some(p) = self.parent.lock().unwrap().as_mut() {
-            p.place(self.embed, Some(bounds(rect)?))
+            let rect = bounds(rect)?;
+            if let Some(video) = &self.video { video.place(rect)?; }
+            p.place(self.embed, Some(rect))
                 .map_err(|e| format!("place widget: {e:?}"))?;
         }
         Ok(())

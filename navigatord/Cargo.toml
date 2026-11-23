@@ -11,6 +11,7 @@ name = "navigatord"
 path = "src/main.rs"
 
 [dependencies]
+navigator-media = { path = "../navigator-media" }
 sigillum-webauthn = { path = "../sigillum/sigillum-webauthn" }
 sigillum-proto = { path = "../sigillum/sigillum-proto" }
 limen = { path = "../limen" }

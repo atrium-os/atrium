@@ -1,0 +1,219 @@
+--- a/Libraries/LibWeb/HTML/HTMLMediaElement.cpp
++++ b/Libraries/LibWeb/HTML/HTMLMediaElement.cpp
+@@ -74,6 +74,12 @@
+ #include <LibWeb/WebIDL/Promise.h>
+ #include <LibWebCommon/MimeSniff/MimeType.h>
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" bool navigator_video_open(u16, u16, u16, u16);
++extern "C" bool navigator_video_seek(double);
++extern "C" double navigator_video_time();
++#endif
++
+ namespace Web::HTML {
+ 
+ class HTMLMediaElement::ActiveVideoSink {
+@@ -599,6 +605,12 @@
+         time_ranges->add_range(0, m_duration);
+         return time_ranges;
+     }
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source) {
++        time_ranges->add_range(0, m_duration);
++        return time_ranges;
++    }
++#endif
+     if (auto range = m_playback_manager->seekable_time_ranges(); range.has_value())
+         time_ranges->add_range(range->start.to_seconds_f64(), range->end.to_seconds_f64());
+     return time_ranges;
+@@ -707,6 +719,10 @@
+ // https://html.spec.whatwg.org/multipage/media.html#current-playback-position
+ double HTMLMediaElement::current_playback_position() const
+ {
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source) return navigator_video_time();
++#endif
++
+     if (m_media_stream_playback)
+         return m_media_stream_playback->current_time();
+     if (!m_playback_manager)
+@@ -2038,7 +2054,17 @@
+                 media_source->set_assigned_to_media_element({}, *this);
+                 m_attached_media_source = media_source;
+                 update_pending_activity();
++#ifdef ATRIUM_I4_VIDEO
++                auto bounds = get_bounding_client_rect();
++                auto component = [](CSSPixels value) -> u16 { return clamp(value.to_int(), 0, 65535); };
++                if (!navigator_video_open(component(bounds.x()), component(bounds.y()), component(bounds.width()), component(bounds.height()))) {
++                    failure_callback->function()("Native player unavailable"_utf16);
++                    return;
++                }
++                m_playback_manager = MediaClient::RemotePlaybackManager::create_without_media_server();
++#else
+                 set_up_playback_manager_for_local(failure_callback);
++#endif
+ 
+                 // 4. Set the readyState attribute to "open".
+                 // 5. Queue a task to fire an event named sourceopen at the MediaSource.
+@@ -3466,6 +3492,20 @@
+     }));
+ 
+     // 11. Set the current playback position to the new playback position.
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source) {
++        if (!navigator_video_seek(new_playback_position)) {
++            set_seeking(false);
++            return;
++        }
++        set_official_playback_position(navigator_video_time());
++        queue_a_media_element_task(GC::create_function(GC::Heap::the(), [](HTMLMediaElement& self) {
++            self.finish_seeking_element();
++        }));
++        return;
++    }
++#endif
++
+     if (m_playback_manager) {
+         AK::Duration new_playback_position_as_duration;
+         if (new_playback_position == m_duration)
+--- a/Libraries/LibWeb/HTML/HTMLMediaElement.h
++++ b/Libraries/LibWeb/HTML/HTMLMediaElement.h
+@@ -188,6 +188,9 @@
+ 
+     GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
+ 
++#ifdef ATRIUM_I4_VIDEO
++    void native_media_ready(Badge<MediaSourceExtensions::MediaSource>) { set_ready_state(ReadyState::HaveMetadata); set_ready_state(ReadyState::HaveEnoughData); }
++#endif
+     void update_ready_state();
+ 
+     void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration, double playback_position_before_the_change) { set_duration(duration, playback_position_before_the_change); }
+--- a/Libraries/LibMediaClient/RemotePlaybackManager.cpp
++++ b/Libraries/LibMediaClient/RemotePlaybackManager.cpp
+@@ -36,6 +36,10 @@
+ NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create_without_media_server()
+ {
+     auto playback_manager = adopt_own(*new RemotePlaybackManager(nullptr, 0));
++#ifdef ATRIUM_I4_VIDEO
++    // The isolated video fixture receives state from its native player channel.
++    return playback_manager;
++#endif
+     // The owner installs its error handler after creation, so the failure reaches it from the event loop.
+     Core::deferred_invoke([playback_manager = playback_manager->make_weak_ptr()] {
+         if (playback_manager)
+--- a/Libraries/LibWeb/MediaSourceExtensions/MediaSource.cpp
++++ b/Libraries/LibWeb/MediaSourceExtensions/MediaSource.cpp
+@@ -24,6 +24,10 @@
+ #include <LibWeb/MediaSourceExtensions/SourceBufferList.h>
+ #include <LibWebCommon/MimeSniff/MimeType.h>
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" bool navigator_video_add();
++extern "C" double navigator_video_end();
++#endif
+ namespace Web::MediaSourceExtensions {
+ 
+ GC_DEFINE_ALLOCATOR(MediaSource);
+@@ -319,6 +323,10 @@
+ 
+     // 5. Let buffer be a new instance of a ManagedSourceBuffer if this is a ManagedMediaSource, or
+     //    a SourceBuffer otherwise, with their respective associated resources.
++#ifdef ATRIUM_I4_VIDEO
++    if (m_source_buffers->length() || !navigator_video_add())
++        return WebIDL::NotSupportedError::create("Native player refused this track"_utf16);
++#endif
+     auto buffer = SourceBuffer::create(
+         *this,
+         HTML::AudioTrackList::create(),
+@@ -359,7 +367,16 @@
+     }
+ 
+     // 3. Run the end of stream algorithm with the error parameter set to error.
++#ifdef ATRIUM_I4_VIDEO
++    if (error.has_value()) return WebIDL::InvalidStateError::create("Media stream failed"_utf16);
++    double native_duration = navigator_video_end();
++    if (native_duration < 0) return WebIDL::InvalidStateError::create("Native player did not become ready"_utf16);
++#endif
+     run_end_of_stream_algorithm(error);
++#ifdef ATRIUM_I4_VIDEO
++    assign_duration_change(native_duration);
++    media_element_assigned_to()->native_media_ready({});
++#endif
+ 
+     return {};
+ }
+@@ -614,6 +631,9 @@
+     if (!mime_type_is_supported_in_a_byte_stream(*mime_type))
+         return false;
+ 
++#ifdef ATRIUM_I4_VIDEO
++    return type == u"video/webm; codecs=\"vp9\""sv;
++#endif
+     auto media_client = MediaClient::Client::acquire();
+     if (media_client.is_error())
+         return false;
+--- a/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.cpp
++++ b/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.cpp
+@@ -28,6 +28,9 @@
+ #include <LibWeb/WebIDL/QuotaExceededError.h>
+ #include <LibWebCommon/MimeSniff/MimeType.h>
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" bool navigator_video_range(size_t, double*, double*);
++#endif
+ namespace Web::MediaSourceExtensions {
+ 
+ static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::NullableTrackType const& track)
+@@ -354,6 +357,12 @@
+     // NB: The remaining steps are implemented by DemuxerScanState::buffered_ranges(), which the media server also uses
+     //     to limit playback. The track buffer ranges are published after each command, so this read never observes a
+     //     partial append, and the end of the stream is tracked here, so readyState changes take effect at once.
++#ifdef ATRIUM_I4_VIDEO
++    double start, end;
++    for (size_t i = 0; navigator_video_range(i, &start, &end); ++i)
++        time_ranges->add_range(start, end);
++    return time_ranges;
++#endif
+     auto ranges = m_remote_source_buffer->scan_state().buffered_ranges();
+     for (auto const& range : ranges)
+         time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
+@@ -368,6 +377,11 @@
+ 
+ AK::Duration SourceBuffer::highest_end_time() const
+ {
++#ifdef ATRIUM_I4_VIDEO
++    double start = 0, end = 0;
++    for (size_t i = 0; navigator_video_range(i, &start, &end); ++i) { }
++    return AK::Duration::from_seconds_f64(end);
++#endif
+     return m_remote_source_buffer->published_state().highest_end_time;
+ }
+ 
+--- a/Libraries/LibMediaClient/RemoteSourceBuffer.cpp
++++ b/Libraries/LibMediaClient/RemoteSourceBuffer.cpp
+@@ -9,6 +9,9 @@
+ #include <LibMediaClient/RemotePlaybackManager.h>
+ #include <LibMediaClient/RemoteSourceBuffer.h>
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" bool navigator_video_append(u8 const*, size_t);
++#endif
+ namespace MediaClient {
+ 
+ NonnullRefPtr<RemoteSourceBuffer> RemoteSourceBuffer::create(RemotePlaybackManager& playback_manager)
+@@ -86,6 +89,15 @@
+     if (!m_pending_append.has_value())
+         return;
+     auto data = m_pending_append.release_value();
++#ifdef ATRIUM_I4_VIDEO
++    if (navigator_video_append(data.data(), data.size())) {
++        if (on_append_completed) on_append_completed(append_generation);
++    } else if (on_append_failed) {
++        on_append_failed(append_generation);
++    }
++    return;
++#endif
++
+     if (!can_send()) {
+         // The server is gone, so the append fails the way one it had started would.
+         Core::deferred_invoke([self = NonnullRefPtr(*this), append_generation] {

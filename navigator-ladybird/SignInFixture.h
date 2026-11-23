@@ -49,6 +49,12 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
 #endif
     doc->remove_all_children();
     Web::HTML::HTMLParser::create_from_byte_string(*doc, html, Web::HTML::ParserScriptingMode::Normal, "utf-8"sv)->run();
+#ifdef ATRIUM_I4_VIDEO
+    // The Limen player owns this rectangle, including its playback controls.
+    // Keep the element in layout so the native slot uses its CSS geometry.
+    if (auto video = doc->get_element_by_id(u"clip"sv))
+        video->set_attribute("style"_fly_string, u"visibility: hidden"_utf16);
+#endif
     auto field = doc->get_element_by_id(u"account"sv);
     auto label = doc->get_element_by_id(u"prompt"sv);
     if (check_fixture && (!field || !is<Web::HTML::HTMLInputElement>(*field) || !label || label->text_content() != u"Enter your account"_utf16))

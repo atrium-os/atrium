@@ -258,6 +258,10 @@ fn main() {
         let chapter = page.scene.links.iter().find(|link| link.href == href).expect("rendered chapter link");
         assert!(p.media.seek_chapter(&chapter.href));
         p.flush_media();
+        let secs = href[3..].parse::<f64>().unwrap();
+        let ack = p.wait(Duration::from_secs(5), |m| matches!(m, ToParent::Seeked { secs: at, .. } if *at == secs));
+        p.check(ack.is_some() && !p.media.seeking && p.media.current_time == secs,
+            &format!("paused chapter {href} completed its DOM seek: {ack:?}"));
         let colour = slot_colour(Duration::from_secs(10), expected);
         p.check(colour.is_some_and(expected), &format!("paused chapter {href} displays {colour:?}"));
         if let (Some(dir), Some(frame)) = (std::env::var_os("PROBE_CHAPTER_FRAMES"), std::env::var_os("PROBE_CAPTURE")) {
