@@ -1756,9 +1756,11 @@ Stalwart in the cloud VM, and later a real account):
    action. The view refreshes when sync changes an outcome. Acceptance covers
    a successful submission acknowledgment or a matching pending or final
    submission record. Recipient delivery remains a separate status. Mail
-   stores the subject for up to 24 accepted sends, newest first by outbox ID,
-   and removes the account’s acceptance history when the account is removed.
-   Earlier cancellation rows remain visible after upgrading.
+   keeps the subjects of the 24 most recently confirmed sends across app
+   restarts. A held send joins the top of the history when Mail confirms
+   acceptance, even if it was queued earlier. Removing an account clears
+   its acceptance history. The existing acceptance and cancellation
+   records carry over on upgrade.
 
    The store keeps the Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in

@@ -90,7 +90,10 @@ pub fn retry_after(tries: u32) -> i64 {
 }
 
 impl Writer<'_> {
-    pub fn record_jmap_acceptance(&mut self, id: u64, account: AccountId, subject: &str) -> Result<()> {
+    pub fn record_jmap_acceptance(&mut self, account: AccountId, subject: &str) -> Result<()> {
+        // Share the outbox sequence so an acceptance sorts after the earlier
+        // activity, including history written with the original outbox ID.
+        let id = Store::next_id(self.tx, "send")?;
         let row = AcceptedSend { account, subject: subject.chars().take(256).collect() };
         let mut table = self.tx.open_table(JMAP_ACCEPTED)?;
         table.insert(id, enc(&row).as_slice())?;

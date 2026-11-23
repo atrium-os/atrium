@@ -277,7 +277,7 @@ impl Engine {
             Ok(_) => {
                 self.store.write(|w| {
                     if let Some(sent) = w.send_done(id)? {
-                        self.note_jmap_acceptance(w, id, &sent)?;
+                        self.note_jmap_acceptance(w, &sent)?;
                     }
                     Ok(())
                 })?;
@@ -293,9 +293,9 @@ impl Engine {
         }
     }
 
-    fn note_jmap_acceptance(&self, w: &mut mail_store::Writer<'_>, id: u64, row: &Outgoing) -> mail_store::Result<()> {
+    fn note_jmap_acceptance(&self, w: &mut mail_store::Writer<'_>, row: &Outgoing) -> mail_store::Result<()> {
         let subject = self.draft_of(row).map(|draft| draft.subject).unwrap_or_default();
-        w.record_jmap_acceptance(id, row.account, &subject)?;
+        w.record_jmap_acceptance(row.account, &subject)?;
         self.note_wrote(w, row)
     }
 
@@ -355,7 +355,7 @@ impl Engine {
                 let Some(outgoing) = w.resolve_jmap_submission(*id, &evidence, status == SendStatus::Canceled)? else {
                     return Ok(false);
                 };
-                self.note_jmap_acceptance(w, *id, &outgoing)?;
+                self.note_jmap_acceptance(w, &outgoing)?;
                 Ok(true)
             })? {
                 accepted += 1;

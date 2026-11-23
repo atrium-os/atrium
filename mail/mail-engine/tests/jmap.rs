@@ -872,6 +872,62 @@ fn jmap_persists_submission_evidence_before_dispatch_and_resolves_after_restart(
 }
 
 #[test]
+fn jmap_accepted_history_keeps_the_latest_24_confirmations_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let open = || Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let engine = open();
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let server = Rc::new(RefCell::new(Server { drop_submission_reply: true, ..Default::default() }));
+    let connect = || mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut client = connect();
+
+    let queue = |engine: &Engine, subject| {
+        let draft = Draft { subject, ..submission_draft() };
+        let id = engine.send(account, &draft, When::default()).unwrap();
+        assert!(engine.send_now(id).unwrap());
+        id
+    };
+    let accepted = |engine: &Engine| {
+        engine.jmap_send_rows().unwrap().into_iter()
+            .filter(|row| row.status == JmapSendStatus::Accepted)
+            .map(|row| row.subject).collect::<Vec<_>>()
+    };
+    let newest = |from, through| (from..=through).rev().map(|n| format!("Send {n:02}")).collect::<Vec<_>>();
+
+    let held = queue(&engine, "Confirmed after the others".into());
+    assert!(matches!(engine.deliver_jmap(held, client.as_mut()).unwrap(), Delivery::Failed { transient: false, .. }));
+    for n in 1..=25 {
+        let id = queue(&engine, format!("Send {n:02}"));
+        assert!(matches!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::Sent { .. }));
+        if n == 24 {
+            assert_eq!(accepted(&engine), newest(1, 24));
+        }
+    }
+    assert_eq!(accepted(&engine), newest(2, 25));
+    drop((client, engine));
+
+    let engine = open();
+    assert_eq!(accepted(&engine), newest(2, 25));
+    assert_eq!(engine.store.outbox().unwrap()[0].0, held);
+    let mut client = connect();
+    assert_eq!(engine.reconcile_jmap_sends(account, client.as_mut()).unwrap(), 1);
+    let mut expected = vec!["Confirmed after the others".into()];
+    expected.extend(newest(3, 25));
+    assert_eq!(accepted(&engine), expected);
+    assert!(engine.store.outbox().unwrap().is_empty());
+    assert_eq!(engine.reconcile_jmap_sends(account, client.as_mut()).unwrap(), 0);
+    let s = server.borrow();
+    assert_eq!(s.submission_reads, ["EmailSubmission/query", "EmailSubmission/get"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.submitted.len()), (26, 26, 26));
+    drop((s, client, engine));
+
+    let engine = open();
+    assert_eq!(accepted(&engine), expected);
+    assert_eq!(engine.jmap_send_rows().unwrap().len(), 24);
+}
+
+#[test]
 fn jmap_read_only_reconciliation_holds_missing_conflicting_and_unanchored_sends() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });

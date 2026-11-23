@@ -1636,17 +1636,21 @@ fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
         reached: Default::default(),
     }).unwrap();
 
-    let dirty = Arc::new(AtomicBool::new(true));
-    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
-    let mail = view.mail.clone();
-    let mut app = App::new_with_flag(view, dirty);
-    app.tick();
-    assert!(texts(&app).contains(&"Send status".into()));
-    let at = Point::new(48.0, 800.0 - 8.0 - 1.5 * place_h());
-    app.handle_event(Event::PointerDown { at });
-    app.handle_event(Event::PointerUp { at });
-    app.tick();
-    assert_eq!(mail.ui.get_cloned().search.unwrap().view, Some(Lane::SendStatus));
+    let open_status = |engine| {
+        let dirty = Arc::new(AtomicBool::new(true));
+        let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+        let mail = view.mail.clone();
+        let mut app = App::new_with_flag(view, dirty);
+        app.tick();
+        assert!(texts(&app).contains(&"Send status".into()));
+        let at = Point::new(48.0, 800.0 - 8.0 - 1.5 * place_h());
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        assert_eq!(mail.ui.get_cloned().search.unwrap().view, Some(Lane::SendStatus));
+        (mail, app)
+    };
+    let (mail, mut app) = open_status(engine.clone());
     assert!(texts(&app).contains(&"No JMAP send activity".into()));
 
     let queue = |subject: &str| {
@@ -1669,7 +1673,7 @@ fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
         }
         assert!(w.resolve_jmap_submission(canceled, evidence, true)?.is_none());
         assert!(w.resolve_jmap_submission(accepted, evidence, false)?.is_some());
-        w.record_jmap_acceptance(accepted, account, "Planning")
+        w.record_jmap_acceptance(account, "Planning")
     }).unwrap();
 
     mail.refresh();
@@ -1695,13 +1699,24 @@ fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
 
     engine.store.write(|w| {
         assert!(w.resolve_jmap_submission(held, evidence, false)?.is_some());
-        w.record_jmap_acceptance(held, account, "Meeting")
+        w.record_jmap_acceptance(account, "Meeting")
     }).unwrap();
     mail.refresh();
     app.tick();
     let t = texts(&app);
     assert!(!t.contains(&"Awaiting confirmation".into()));
     assert_eq!(t.iter().filter(|line| *line == "Accepted for sending").count(), 2);
+    drop((app, mail, engine));
+
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let (mail, mut app) = open_status(engine.clone());
+    let t = texts(&app);
+    for subject in ["Meeting", "Planning"] {
+        assert!(t.windows(2).any(|pair| pair[0] == subject && pair[1] == "Accepted for sending"), "{t:?}");
+    }
+    assert_eq!(t.iter().filter(|line| *line == "Accepted for sending").count(), 2);
+    assert!(t.windows(2).any(|pair| pair[0] == "Budget" && pair[1] == "Canceled by server"), "{t:?}");
+    assert!(!t.contains(&"Awaiting confirmation".into()));
 
     engine.store.write(|w| w.remove_account(account)).unwrap();
     assert!(engine.jmap_send_rows().unwrap().is_empty());
