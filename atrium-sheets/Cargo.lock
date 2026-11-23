@@ -1359,6 +1359,7 @@ dependencies = [
  "officina-draw",
  "officina-slides",
  "officina-text",
+ "unicode-segmentation",
 ]
 
 [[package]]

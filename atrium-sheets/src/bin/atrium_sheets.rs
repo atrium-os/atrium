@@ -645,7 +645,7 @@ fn main() {
     let mut print_snap: Option<Arc<atrium_sheets::print::Snapshot>> = None;
     let mut print_pdf: Option<(std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, bool)> = None;
     let mut printing: Option<Printing> = None;
-    let mut want_print = false;
+    let mut want_print = None;
     'main: loop {
         if embeds.is_none() && Instant::now() >= next_limen_attempt {
             match Embeds::connect() {
@@ -664,7 +664,7 @@ fn main() {
         let mut close_requested = false;
         let stepped = win.step_with(&mut app, Some(Duration::from_millis(wait)), |ev| match ev {
             fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
-                want_print = true;
+                want_print = Some(false);
                 true
             }
             fresco_client::Event::Key { hid_usage: 0x1a, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
@@ -759,7 +759,8 @@ fn main() {
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::Save | Cmd::CloseSave if matches!(asking, Some(Asking::Commit | Asking::SaveAs)) && close_after_save => {}
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
-                Cmd::Print => want_print = true,
+                Cmd::Print => want_print = Some(false),
+                Cmd::Data(atrium_sheets::data::DataCmd::PrintComments) => want_print = Some(true),
                 Cmd::Save | Cmd::CloseSave if matches!(run.target, Some(Target::Picked { .. })) => {
                     close_after_save = matches!(c, Cmd::CloseSave);
                     let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if format != Format::Native)
@@ -807,13 +808,13 @@ fn main() {
                 Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose => {}
             }
         }
-        if std::mem::take(&mut want_print) {
+        if let Some(include_comments) = want_print.take() {
             if asking.is_some() || printing.is_some() || print_pdf.is_some() {
                 run.set_status("Finish what's open first, then print.");
             } else if embeds.is_none() || win.embed_token().is_none() {
                 run.set_status("Printing isn't available here.");
             } else {
-                match atrium_sheets::print::snapshot(&run.sheets.doc) {
+                match atrium_sheets::print::snapshot_with_comments(&run.sheets.doc, include_comments) {
                     Ok(snap) => {
                         run.set_status("Getting the sheet ready to print…");
                         let snap = Arc::new(snap);

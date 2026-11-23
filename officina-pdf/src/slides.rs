@@ -73,7 +73,7 @@ fn at(stops: &[(f32, u32)], t: f64) -> [f64; 3] {
 /// A gradient as bands of solid colour over the clip (every renderer,
 /// Prelum's rasteriser included, draws them; shadings it would skip).
 /// `reach` is past every corner of the shape's box.
-fn gradient(p: &Paint, reach: f64, out: &mut Vec<Op>) {
+pub(crate) fn gradient(p: &Paint, reach: f64, out: &mut Vec<Op>) {
     let n = GRADIENT_BANDS;
     match p {
         Paint::Linear { stops, from, to } => {

@@ -132,7 +132,7 @@ pub struct CellView {
 pub const INDENT_STEP: f32 = 12.0;
 
 /// The icons a cell can show (spreadsheet icon sets), drawn as vectors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellIcon {
     /// An arrow: 2 up, 1 up and right, 0 right, -1 down and right, -2 down.
     Arrow(i8),
@@ -178,10 +178,13 @@ fn poly(pts: &[(f32, f32)], c: Color, clip: Option<[f32; 4]>) -> Node {
 /// Draws `icon` in `c` in the square at (`x`, `y`), `s` wide; `off` is the
 /// colour of unlit parts.
 pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32) {
+    icon_shapes(icon, c, off, x, y, s, |node| { ctx.add(node); });
+}
+
+/// The grid icon's vector geometry, also used when printing a cell.
+pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32, mut emit: impl FnMut(Node)) {
     let (mx, my) = (x + s / 2.0, y + s / 2.0);
-    let line = |ctx: &mut Ctx, a: (f32, f32), b: (f32, f32), w: f32, col: Color| {
-        ctx.add(Node::Path { p0: a, p1: b, width: w, color: col });
-    };
+    let stroke = |a, b, w, color| Node::Path { p0: a, p1: b, width: w, color };
     let white = Color::rgba(1.0, 1.0, 1.0, 1.0);
     let w = (s * 0.16).max(1.5);
     match icon {
@@ -193,20 +196,20 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
             let r = s * 0.45;
             let tip = (mx + dx * r, my + dy * r);
             let base = (mx + dx * (r - s * 0.42), my + dy * (r - s * 0.42));
-            line(ctx, (mx - dx * r, my - dy * r), base, w * 1.4, c);
+            emit(stroke((mx - dx * r, my - dy * r), base, w * 1.4, c));
             let hw = s * 0.32;
-            ctx.add(poly(&[tip, (base.0 + nx * hw, base.1 + ny * hw), (base.0 - nx * hw, base.1 - ny * hw)], c, None));
+            emit(poly(&[tip, (base.0 + nx * hw, base.1 + ny * hw), (base.0 - nx * hw, base.1 - ny * hw)], c, None));
         }
         CellIcon::Dot => {
-            ctx.add(Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, s - 2.0, s - 2.0), fill: c, radius: (s - 2.0) / 2.0 });
+            emit(Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, s - 2.0, s - 2.0), fill: c, radius: (s - 2.0) / 2.0 });
         }
         CellIcon::Flag => {
-            line(ctx, (x + s * 0.2, y + s * 0.05), (x + s * 0.2, y + s), w, off);
-            ctx.add(poly(&[(x + s * 0.25, y + s * 0.05), (x + s * 0.95, y + s * 0.3), (x + s * 0.25, y + s * 0.6)], c, None));
+            emit(stroke((x + s * 0.2, y + s * 0.05), (x + s * 0.2, y + s), w, off));
+            emit(poly(&[(x + s * 0.25, y + s * 0.05), (x + s * 0.95, y + s * 0.3), (x + s * 0.25, y + s * 0.6)], c, None));
         }
         CellIcon::Check(ring) | CellIcon::Exclaim(ring) | CellIcon::Cross(ring) => {
             let mark = if ring {
-                ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
+                emit(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
                 white
             } else {
                 c
@@ -214,28 +217,28 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
             let k = if ring { 0.28 } else { 0.18 };
             match icon {
                 CellIcon::Check(_) => {
-                    line(ctx, (x + s * k, my), (x + s * 0.43, y + s * (1.0 - k)), w, mark);
-                    line(ctx, (x + s * 0.43, y + s * (1.0 - k)), (x + s * (1.0 - k), y + s * k), w, mark);
+                    emit(stroke((x + s * k, my), (x + s * 0.43, y + s * (1.0 - k)), w, mark));
+                    emit(stroke((x + s * 0.43, y + s * (1.0 - k)), (x + s * (1.0 - k), y + s * k), w, mark));
                 }
                 CellIcon::Exclaim(_) => {
-                    line(ctx, (mx, y + s * k), (mx, y + s * 0.6), w, mark);
-                    ctx.add(Node::Rect { rect: Rect::new(mx - w / 2.0, y + s * (0.95 - k) - w / 2.0, w, w), fill: mark, radius: w / 2.0 });
+                    emit(stroke((mx, y + s * k), (mx, y + s * 0.6), w, mark));
+                    emit(Node::Rect { rect: Rect::new(mx - w / 2.0, y + s * (0.95 - k) - w / 2.0, w, w), fill: mark, radius: w / 2.0 });
                 }
                 _ => {
-                    line(ctx, (x + s * k, y + s * k), (x + s * (1.0 - k), y + s * (1.0 - k)), w, mark);
-                    line(ctx, (x + s * (1.0 - k), y + s * k), (x + s * k, y + s * (1.0 - k)), w, mark);
+                    emit(stroke((x + s * k, y + s * k), (x + s * (1.0 - k), y + s * (1.0 - k)), w, mark));
+                    emit(stroke((x + s * (1.0 - k), y + s * k), (x + s * k, y + s * (1.0 - k)), w, mark));
                 }
             }
         }
         CellIcon::Triangle(up) => {
             let (a, b) = if up { (y + s * 0.15, y + s * 0.85) } else { (y + s * 0.85, y + s * 0.15) };
-            ctx.add(poly(&[(mx, a), (x + s * 0.95, b), (x + s * 0.05, b)], c, None));
+            emit(poly(&[(mx, a), (x + s * 0.95, b), (x + s * 0.05, b)], c, None));
         }
         CellIcon::Diamond => {
-            ctx.add(poly(&[(mx, y), (x + s, my), (mx, y + s), (x, my)], c, None));
+            emit(poly(&[(mx, y), (x + s, my), (mx, y + s), (x, my)], c, None));
         }
         CellIcon::Dash => {
-            ctx.add(Node::Rect { rect: Rect::new(x + s * 0.15, my - w / 2.0, s * 0.7, w), fill: c, radius: 0.0 });
+            emit(Node::Rect { rect: Rect::new(x + s * 0.15, my - w / 2.0, s * 0.7, w), fill: c, radius: 0.0 });
         }
         CellIcon::Star(n) => {
             let pts: Vec<(f32, f32)> = (0..10)
@@ -245,21 +248,21 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
                     (mx + r * a.cos(), my + 0.04 * s + r * a.sin())
                 })
                 .collect();
-            ctx.add(poly(&pts, if n == 2 { c } else { off }, None));
+            emit(poly(&pts, if n == 2 { c } else { off }, None));
             if n == 1 {
-                ctx.add(poly(&pts, c, Some([x - 1.0, y - 1.0, mx, y + s + 1.0])));
+                emit(poly(&pts, c, Some([x - 1.0, y - 1.0, mx, y + s + 1.0])));
             }
         }
         CellIcon::Bars(n) => {
             let bw = s / 4.0 - 1.0;
             for i in 0..4u8 {
                 let h = s * (0.25 + 0.25 * i as f32);
-                ctx.add(Node::Rect { rect: Rect::new(x + i as f32 * (bw + 1.0) + 0.5, y + s - h, bw, h), fill: if i < n { c } else { off }, radius: 0.0 });
+                emit(Node::Rect { rect: Rect::new(x + i as f32 * (bw + 1.0) + 0.5, y + s - h, bw, h), fill: if i < n { c } else { off }, radius: 0.0 });
             }
         }
         CellIcon::Quarters(n) => {
-            ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
-            ctx.add(Node::Rect { rect: Rect::new(x + w * 0.6, y + w * 0.6, s - w * 1.2, s - w * 1.2), fill: white, radius: (s - w * 1.2) / 2.0 });
+            emit(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
+            emit(Node::Rect { rect: Rect::new(x + w * 0.6, y + w * 0.6, s - w * 1.2, s - w * 1.2), fill: white, radius: (s - w * 1.2) / 2.0 });
             if n > 0 {
                 // A pie from twelve o'clock, clockwise.
                 let r = s / 2.0;
@@ -269,14 +272,14 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
                     let a = -std::f32::consts::FRAC_PI_2 + (n as f32 * std::f32::consts::FRAC_PI_2) * i as f32 / steps as f32;
                     pts.push((mx + r * a.cos(), my + r * a.sin()));
                 }
-                ctx.add(poly(&pts, c, None));
+                emit(poly(&pts, c, None));
             }
         }
         CellIcon::Boxes(n) => {
             let b = s / 2.0 - 1.0;
             for i in 0..4u8 {
                 let (bx, by) = (x + (i % 2) as f32 * (b + 2.0), y + (i / 2) as f32 * (b + 2.0));
-                ctx.add(Node::Rect { rect: Rect::new(bx, by, b, b), fill: if i < n { c } else { off }, radius: 1.0 });
+                emit(Node::Rect { rect: Rect::new(bx, by, b, b), fill: if i < n { c } else { off }, radius: 1.0 });
             }
         }
     }
@@ -2008,6 +2011,11 @@ fn draw_fill(ctx: &mut Ctx, cv: &CellView, rect: Rect) {
             opacity: 1.0, clip: Some([x, y, x+w, y+h]), verbs, points,
         })));
     }
+}
+
+/// The same fill pattern used by the grid, as an eight-pixel repeating tile.
+pub fn cell_pattern(kind: &str) -> [u8; 8] {
+    std::array::from_fn(|row| (0..8).fold(0, |bits, col| bits | (u8::from(pattern_pixel(kind, col, row as u32)) << col)))
 }
 
 fn pattern_pixel(kind: &str, x: u32, y: u32) -> bool {

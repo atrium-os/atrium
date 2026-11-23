@@ -8,6 +8,8 @@
 //! the inch).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::io::{self, Write};
 
 use officina_text::layout::{layout_para, Fonts, ParaLayout};
@@ -37,21 +39,83 @@ pub enum Align {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VAlign {
+    Top,
+    #[default]
+    Center,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pattern {
+    pub rows: [u8; 8],
+    pub ink: u32,
+    pub paper: u32,
+}
+
+/// Vector parts of a conditional icon in a 14-pixel square.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IconPart {
+    Rect { rect: [f32; 4], radius: f32, color: u32 },
+    Line { from: [f32; 2], to: [f32; 2], width: f32, color: u32 },
+    Polygon { points: Vec<[f32; 2]>, clip: Option<[f32; 4]>, color: u32 },
+}
+
 /// A cell as the grid draws it. Colours are sRGB 0xRRGGBB.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Cell {
     pub text: String,
     pub align: Align,
     pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub wrap: bool,
+    pub valign: VAlign,
+    /// Counterclockwise degrees, or 255 for vertically stacked graphemes.
+    pub rotation: i16,
+    pub shrink_to_fit: bool,
     /// A number: "###" when it doesn't fit, never cut.
     pub numeric: bool,
     pub color: Option<u32>,
     pub fill: Option<u32>,
+    pub pattern: Option<Pattern>,
+    /// Angle in millidegrees and stops at basis point offsets.
+    pub gradient: Option<(u32, Arc<[(u16, u32)]>)>,
+    pub diagonals: [Option<(f32, u32)>; 2],
     /// Left, right, top, bottom: width in px and colour.
     pub borders: [Option<(f32, u32)>; 4],
     /// A data bar: the share of the cell's width (0–1) and its colour.
     pub bar: Option<(f32, u32)>,
+    pub icon: Option<Arc<[IconPart]>>,
     pub indent: u8,
+}
+
+/// Maximum text carried into the printed comments appendix.
+pub const MAX_COMMENT_BYTES: usize = comments::MAX_COMMENT_BYTES;
+
+/// Printed notes and threads, keyed by snapshot cell.
+pub type Comments = BTreeMap<(u32, u32), Comment>;
+
+pub struct Comment {
+    pub address: String,
+    /// Each message has a heading (author) and styled text.
+    pub messages: Vec<CommentMessage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommentStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+pub struct CommentMessage {
+    pub heading: String,
+    pub text: Arc<str>,
+    pub runs: Vec<(std::ops::Range<usize>, CommentStyle)>,
 }
 
 /// What to print: the column widths and row heights of the range from A1
@@ -100,14 +164,14 @@ fn bands(sizes: &[f64], room: f64) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let (mut start, mut used) = (0, 0.0);
     for (i, &s) in sizes.iter().enumerate() {
-        if used + s > room + 0.01 && i > start {
+        if used + s > room + 0.01 && used > 0.0 {
             out.push((start, i));
             start = i;
             used = 0.0;
         }
         used += s;
     }
-    if start < sizes.len() {
+    if used > 0.0 {
         out.push((start, sizes.len()));
     }
     out
@@ -127,7 +191,7 @@ fn bands_after(sizes: &[f64], room: f64, from: usize, title: f64) -> Vec<(usize,
     };
     let mut room_now = room;
     for (i, &s) in sizes.iter().enumerate().skip(from) {
-        if used + s > room_now + 0.01 && i > start {
+        if used + s > room_now + 0.01 && used > 0.0 {
             out.push((start, i));
             start = i;
             used = 0.0;
@@ -135,7 +199,7 @@ fn bands_after(sizes: &[f64], room: f64, from: usize, title: f64) -> Vec<(usize,
         }
         used += s;
     }
-    out.push((start, sizes.len()));
+    if used > 0.0 { out.push((start, sizes.len())); }
     out
 }
 
@@ -236,6 +300,8 @@ impl Drawing {
     }
 }
 
+mod appearance;
+mod comments;
 mod drawing;
 
 /// Cells' text shaped in the screen's face at one size.
@@ -257,16 +323,19 @@ impl<'f> Shaper<'f> {
     }
 
     fn para(&self, text: &str, bold: bool, color: Option<u32>) -> Para {
-        let base = if bold { self.bold } else { self.plain };
-        let id = match color {
-            Some(c) => {
-                let mut d = self.doc.borrow_mut();
-                let mut a = d.attrs.get(base).clone();
-                a.color = Some(c);
-                d.attrs.intern(a)
-            }
-            None => base,
-        };
+        self.attributed(text, &CharAttrs { bold: Some(bold), color, ..Default::default() })
+    }
+
+    fn attributed(&self, text: &str, attrs: &CharAttrs) -> Para {
+        let base = if attrs.bold == Some(true) { self.bold } else { self.plain };
+        let mut doc = self.doc.borrow_mut();
+        let mut a = doc.attrs.get(base).clone();
+        a.color = attrs.color;
+        a.italic = attrs.italic;
+        a.underline = attrs.underline;
+        a.strike = attrs.strike;
+        a.size = attrs.size.or(a.size);
+        let id = doc.attrs.intern(a);
         let mut p = Para::new(0, text, 0);
         p.runs = vec![(0, id)];
         p
@@ -302,46 +371,48 @@ impl<'f> Shaper<'f> {
     }
 }
 
-/// The cell's text laid out to fit `room` (LU): cut with "…", or "###"
-/// for a number; None when nothing fits.
-fn fit(s: &Shaper, c: &Cell, room: i64) -> Option<(Para, ParaLayout, i64)> {
-    let whole = s.lay(&c.text, c.bold, c.color);
-    if whole.2 <= room {
-        return Some(whole);
-    }
-    if room <= 0 {
-        return None;
-    }
-    if c.numeric {
-        let one = s.width("#", c.bold).max(1);
-        return Some(s.lay(&"#".repeat((room / one).max(1) as usize), c.bold, c.color));
-    }
-    let chars: Vec<char> = c.text.chars().collect();
-    let mut n = ((room as f64 / whole.2 as f64) * chars.len() as f64) as usize;
-    loop {
-        if n == 0 {
-            return None;
+#[derive(Default)]
+struct CellPaint {
+    items: Vec<Item>,
+    clips: Vec<(usize, usize, [f64; 4])>,
+}
+
+impl CellPaint {
+    fn words(&mut self, shaper: &Shaper, cell: &Cell, rect: [f64; 4], scale: f64) {
+        let start = self.items.len();
+        appearance::words(&mut self.items, shaper, cell, rect, scale);
+        let end = self.items.len();
+        if start != end && (cell.rotation != 0 || cell.wrap || cell.text.contains(['\r', '\n']) || rect[3] < 20.0 * scale) {
+            self.clips.push((start, end, rect));
         }
-        let t: String = chars[..n.min(chars.len())].iter().collect::<String>() + "…";
-        let cut = s.lay(&t, c.bold, c.color);
-        if cut.2 <= room {
-            return Some(cut);
+    }
+
+    fn write<W: Write>(self, pdf: &mut Pdf<W>, page: &mut Page, height: f64, files: &dyn FontFiles) -> io::Result<()> {
+        use folium_content::ops::Op;
+        let mut items = self.items.into_iter();
+        let mut written = 0;
+        for (start, end, [x, y, w, h]) in self.clips {
+            pdf.items(page, items.by_ref().take(start - written), height, files, &|_| None)?;
+            page.c.extend([Op::Save, Op::Rect(x, height - y - h, w, h), Op::Clip, Op::EndPath]);
+            pdf.items(page, items.by_ref().take(end - start), height, files, &|_| None)?;
+            page.c.push(Op::Restore);
+            written = end;
         }
-        n -= 1;
+        pdf.items(page, items, height, files, &|_| None)
     }
 }
 
 /// Writes `sheet` as PDF on `setup`'s paper to `out`, calling
 /// `progress(done, total)` after each page.
 pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
-    export_drawings(sheet, &[], None, setup, fonts, files, title, out, progress)
+    export_drawings(sheet, &[], None, &Comments::new(), setup, fonts, files, title, out, progress)
 }
 
-fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
+fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, notes: &Comments, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
     let (pw, ph) = (setup.w, setup.h);
     let m = setup.margin.clamp(0.0, pw.min(ph) / 3.0);
     let (room_w, room_h) = (pw - 2.0 * m, ph - 2.0 * m);
-    if sheet.rows.len() as u64 * sheet.cols.len() as u64 > MAX_CELLS {
+    if sheet.rows.len().max(1) as u64 * sheet.cols.len().max(1) as u64 > MAX_CELLS {
         return Err(io::Error::other(format!("more than {MAX_CELLS} cells to print")));
     }
     let PrintRegion { body, explicit_rows, explicit_cols } = region.unwrap_or(PrintRegion {
@@ -352,63 +423,48 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
     if top > bottom || bottom > sheet.rows.len() || left > right || right > sheet.cols.len() {
         return Err(io::Error::other("print area is outside the snapshot"));
     }
-    let total_w: f64 = sheet.cols[left..right].iter().sum::<f64>() * PT_PER_PX;
+    let extra_title_width = if explicit_cols {
+        let (a, b) = sheet.title_cols;
+        (a as usize..(b as usize).min(sheet.cols.len())).filter(|i| !(left..right).contains(i)).map(|i| sheet.cols[i]).sum()
+    } else { 0.0 };
+    let total_w = (sheet.cols[left..right].iter().sum::<f64>() + extra_title_width) * PT_PER_PX;
     let k = if setup.fit_width && total_w > room_w { (room_w / total_w).max(1.0 / 3.0) } else { 1.0 } * PT_PER_PX;
     let cols: Vec<f64> = sheet.cols.iter().map(|w| w.max(0.0) * k).collect();
     let rows: Vec<f64> = sheet.rows.iter().map(|h| h.max(0.0) * k).collect();
     let across = axis_pages(&cols, room_w, (left, right), sheet.title_cols, explicit_cols);
     let down = axis_pages(&rows, room_h, (top, bottom), sheet.title_rows, explicit_rows);
     let shaper = Shaper::new(fonts, TEXT_PX * k);
-    let lu = |v: f64| (v * LU as f64).round() as i64;
-    let total = (across.len() * down.len()).max(1);
+    let note_pages = if notes.is_empty() {
+        Vec::new()
+    } else {
+        let mask = |len: usize, pages: &[Vec<AxisTile>]| {
+            let mut changes = vec![0i32; len + 1];
+            for tile in pages.iter().flatten() {
+                changes[tile.start] += 1;
+                changes[tile.end] -= 1;
+            }
+            changes.into_iter().take(len).scan(0, |active, change| {
+                *active += change;
+                Some(*active > 0)
+            }).collect::<Vec<_>>()
+        };
+        let (printed_rows, printed_cols) = (mask(rows.len(), &down), mask(cols.len(), &across));
+        let printable = |r: u32, c: u32| {
+            let (r, c) = (r as usize, c as usize);
+            printed_rows.get(r) == Some(&true) && printed_cols.get(c) == Some(&true)
+                && rows[r] > 0.0 && cols[c] > 0.0
+        };
+        let comments: Vec<_> = notes.iter().filter(|((r, c), _)| printable(*r, *c))
+            .map(|(_, comment)| comment).collect();
+        comments::layout(&comments, &shaper, m, room_w, room_h)?
+    };
+    let total = (across.len() * down.len()).max(1) + note_pages.len();
     let mut pdf = Pdf::new(out)?;
     let none = |_: u32| None;
     let mut done = 0;
-    // A cell's text laid in x..x + cw (pt), centred on the row y, ch.
-    let words = |items: &mut Vec<Item>, cell: &Cell, x: f64, y: f64, cw: f64, ch: f64| {
-        let lead = cell.indent as f64 * INDENT_PX * k;
-        let room = lu(cw - 2.0 * PAD_PX * k - lead);
-        if cell.text.is_empty() {
-            return;
-        }
-        if let Some((p, l, tw)) = fit(&shaper, cell, room) {
-            let left = match cell.align {
-                Align::Left => lu(x + PAD_PX * k + lead),
-                Align::Center => lu(x) + (lu(cw) - tw) / 2,
-                Align::Right => lu(x + cw - PAD_PX * k) - tw,
-            };
-            let (cy, chl) = (lu(y), lu(ch));
-            shaper.paint(items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
-        }
-    };
-    // One cell (or merged area) at x, y (pt), cw × ch: fill and bar under
-    // the text, borders over it.
-    let draw = |items: &mut Vec<Item>, cell: &Cell, x: f64, y: f64, cw: f64, ch: f64, text: bool| {
-        if let Some(f) = cell.fill {
-            items.push(Item::Rect { x: lu(x), y: lu(y), w: lu(cw), h: lu(ch), color: f });
-        }
-        if let Some((share, col)) = cell.bar {
-            let bw = ((cw - 4.0 * k).max(0.0) * share.clamp(0.0, 1.0) as f64).max(0.0);
-            items.push(Item::Rect { x: lu(x + 2.0 * k), y: lu(y + 2.0 * k), w: lu(bw), h: lu((ch - 5.0 * k).max(0.0)), color: col });
-        }
-        if text {
-            words(items, cell, x, y, cw, ch);
-        }
-        for (side, b) in cell.borders.iter().enumerate() {
-            let Some((bw, col)) = *b else { continue };
-            let bw = (bw as f64 * k).max(0.25);
-            let (bx, by, bwid, bh) = match side {
-                0 => (x, y, bw, ch),
-                1 => (x + cw - bw, y, bw, ch),
-                2 => (x, y, cw, bw),
-                _ => (x, y + ch - bw, cw, bw),
-            };
-            items.push(Item::Rect { x: lu(bx), y: lu(by), w: lu(bwid), h: lu(bh), color: col });
-        }
-    };
     // Rows r0..r1 by columns c0..c1 drawn from (ox, oy): cells, merged
     // areas cut to the block, Center Across runs.
-    let block = |items: &mut Vec<Item>, lines: &mut Vec<(f64, f64, f64, f64)>, (r0, r1): (usize, usize), (c0, c1): (usize, usize), ox: f64, oy: f64| {
+    let block = |page: &mut Page, items: &mut CellPaint, lines: &mut Vec<(f64, f64, f64, f64)>, (r0, r1): (usize, usize), (c0, c1): (usize, usize), ox: f64, oy: f64| {
         // Where each column and row starts in this block.
         let mut xs = vec![ox; c1 - c0 + 1];
         for c in c0..c1 {
@@ -448,8 +504,12 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
                 if sheet.gridlines && !run {
                     lines.push((x, y, cw, ch));
                 }
-                if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
-                    draw(items, &cell, x, y, cw, ch, !run);
+                let at = (r as u32, c as u32);
+                if let Some(cell) = (sheet.cell)(at.0, at.1) {
+                    appearance::cell(page, items, &shaper, &cell, [x, y, cw, ch], k, ph, !run);
+                }
+                if !run && notes.contains_key(&at) {
+                    appearance::note_marker(&mut items.items, [x, y, cw, ch], k);
                 }
             }
         }
@@ -465,7 +525,10 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
             if let Some(cell) = (sheet.cell)(a[0], a[1]) {
                 // The text goes on the page with the area's first cell.
                 let first = p[0] == a[0] as usize && p[1] == a[1] as usize;
-                draw(items, &cell, x, y, cw, ch, first);
+                appearance::cell(page, items, &shaper, &cell, [x, y, cw, ch], k, ph, first);
+                if first {
+                    if notes.contains_key(&(a[0], a[1])) { appearance::note_marker(&mut items.items, [x, y, cw, ch], k); }
+                }
             }
         }
         for (a, p0, p1) in &runs {
@@ -482,7 +545,8 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
             // across the part of the run on it.
             if *p0 == a[1] as usize {
                 if let Some(cell) = (sheet.cell)(a[0], a[1]) {
-                    words(items, &Cell { align: Align::Center, indent: 0, ..cell }, x, y, cw, ch);
+                    items.words(&shaper, &Cell { align: Align::Center, indent: 0, ..cell }, [x, y, cw, ch], k);
+                    if notes.contains_key(&(a[0], a[1])) { appearance::note_marker(&mut items.items, [x, y, cw, ch], k); }
                 }
             }
         }
@@ -500,14 +564,14 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
     for columns in &across {
         for rows in &down {
             let mut page = Page::default();
-            let mut items = Vec::new();
+            let mut items = CellPaint::default();
             let mut lines = Vec::new();
             let mut drawing_tiles = Vec::new();
             let mut y = m;
             for r in rows {
                 let mut x = m;
                 for c in columns {
-                    block(&mut items, &mut lines, (r.start, r.end), (c.start, c.end), x, y);
+                    block(&mut page, &mut items, &mut lines, (r.start, r.end), (c.start, c.end), x, y);
                     if c.draw_objects && r.draw_objects {
                         // Include objects that intersect the print area. On a
                         // title tile, paint only the part inside the area.
@@ -527,16 +591,21 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
                 }
                 y += r.length;
             }
-            // Gridlines first, so fills and borders cover them.
+            // Gridlines first, so fills and borders cover them. All grid
+            // content stays within the margins, including oversized rows.
+            use folium_content::ops::Op;
+            let gradients = std::mem::take(&mut page.c);
+            page.c.extend([Op::Save, Op::Rect(m, m, room_w, room_h), Op::Clip, Op::EndPath]);
             if !lines.is_empty() {
-                use folium_content::ops::Op;
                 page.c.extend([Op::Save, Op::StrokeRgb([0.85, 0.86, 0.88]), Op::LineWidth(0.25)]);
                 for (x, y, w, h) in lines {
                     page.c.push(Op::Rect(x, ph - y - h, w, h));
                 }
                 page.c.extend([Op::Stroke, Op::Restore]);
             }
-            pdf.items(&mut page, items, ph, files, &none)?;
+            page.c.extend(gradients);
+            items.write(&mut pdf, &mut page, ph, files)?;
+            page.c.push(Op::Restore);
             for tile in drawing_tiles {
                 drawing::paint(&mut pdf, &mut page, drawings, tile, fonts, files)?;
             }
@@ -548,7 +617,15 @@ fn export_drawings<W: Write>(sheet: &Sheet, drawings: &[Drawing], region: Option
     if done == 0 {
         // An empty sheet still prints a page.
         pdf.end_page(Page::default(), pw, ph)?;
-        progress(1, 1);
+        done = 1;
+        progress(done, total);
+    }
+    for items in note_pages {
+        let mut page = Page::default();
+        pdf.items(&mut page, items, ph, files, &none)?;
+        pdf.end_page(page, pw, ph)?;
+        done += 1;
+        progress(done, total);
     }
     pdf.finish(files, if title.is_empty() { sheet.name } else { title }, "Atrium Sheets")
 }
@@ -565,8 +642,12 @@ pub fn print_drawings(sheet: &Sheet, drawings: &[Drawing], setup: &Setup, title:
 }
 
 pub fn print_region(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
+    print_with_comments(sheet, drawings, region, &Comments::new(), setup, title)
+}
+
+pub fn print_with_comments(sheet: &Sheet, drawings: &[Drawing], region: Option<PrintRegion>, notes: &Comments, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
     let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
-    export_drawings(sheet, drawings, region, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
+    export_drawings(sheet, drawings, region, notes, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
 }
 
 #[cfg(test)]
@@ -590,5 +671,7 @@ mod tests {
         assert_eq!(bands(&[10.0, 10.0, 10.0], 25.0), vec![(0, 2), (2, 3)]);
         assert_eq!(bands(&[50.0, 10.0], 25.0), vec![(0, 1), (1, 2)]);
         assert_eq!(bands(&[], 25.0), vec![]);
+        assert_eq!(bands(&[0.0, 0.0, 50.0, 0.0], 25.0), vec![(0, 3)]);
+        assert!(bands(&[0.0, 0.0], 25.0).is_empty());
     }
 }

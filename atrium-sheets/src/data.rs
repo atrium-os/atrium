@@ -167,6 +167,7 @@ pub enum DataCmd {
     /// asks for the copy.
     CompareWith,
     BrowseVersions,
+    PrintComments,
     TrackChanges,
     ReviewTracked,
     MergeCopies,
@@ -433,6 +434,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Move Sheet Left").enabled(s > 0), Some(DataCmd::MoveSheetLeft)));
     v.push((MenuItem::new("Move Sheet Right").enabled(s + 1 < n), Some(DataCmd::MoveSheetRight)));
     v.push((MenuItem::new("Delete Sheet").enabled(n > 1), Some(DataCmd::DeleteSheet)));
+    v.push((MenuItem::new("Print with Comments…").separated().enabled(!wb.comments(s).is_empty()), Some(DataCmd::PrintComments)));
     v
 }
 
@@ -1052,7 +1054,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

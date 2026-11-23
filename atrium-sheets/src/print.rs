@@ -6,8 +6,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use officina_pdf::sheet::{Align, Cell, Drawing, DrawingContent, PrintRegion, Setup, Sheet, MAX_CELLS};
-use pergola::widgets::{CellAlign, CellView, GridSource};
+use officina_grid::CellAddr;
+use officina_pdf::sheet::{
+    Align, Cell, Comment, CommentMessage, Comments, Drawing, DrawingContent, IconPart,
+    Pattern, PrintRegion, Setup, Sheet, VAlign, MAX_CELLS, MAX_COMMENT_BYTES,
+};
+use pergola::widgets::{CellAlign, CellVAlign, CellView, GridSource};
 use pergola::Color;
 
 use crate::doc::Doc;
@@ -31,6 +35,7 @@ pub struct Snapshot {
     pub title_rows: (u32, u32),
     pub title_cols: (u32, u32),
     region: PrintRegion,
+    comments: Comments,
 }
 
 fn srgb(c: Color) -> u32 {
@@ -52,13 +57,50 @@ pub fn cell_of(v: CellView) -> Cell {
             CellAlign::Right => Align::Right,
         },
         bold: v.bold,
+        wrap: v.wrap,
+        shrink_to_fit: v.shrink_to_fit,
+        rotation: v.rotation,
+        valign: match v.valign {
+            CellVAlign::Top => VAlign::Top,
+            CellVAlign::Center => VAlign::Center,
+            CellVAlign::Bottom => VAlign::Bottom,
+        },
+        pattern: v.pattern.map(|(kind, ink, paper)| Pattern {
+            rows: pergola::widgets::grid_view::cell_pattern(kind), ink: srgb(ink), paper: srgb(paper),
+        }),
+        gradient: v.gradient,
+        diagonals: v.diagonals.map(|b| b.map(|(w, c)| (w, srgb(c)))),
         numeric: v.numeric,
         color: v.color.map(srgb),
         fill: v.fill.map(srgb),
         borders: v.borders.map(|b| b.map(|(w, c)| (w, srgb(c)))),
         bar: v.bar.map(|(s, c)| (s, srgb(c))),
         indent: v.indent,
+        ..Cell::default()
     }
+}
+
+fn icon_parts(icon: pergola::widgets::CellIcon, color: u32) -> std::sync::Arc<[IconPart]> {
+    use pergola::Node;
+    let mut parts = Vec::new();
+    let off = crate::source::rgb(0xD4D8DE);
+    pergola::widgets::grid_view::icon_shapes(icon, crate::source::rgb(color), off, 0.0, 0.0, 14.0, |node| {
+        match node {
+            Node::Rect { rect, fill, radius } => parts.push(IconPart::Rect {
+                rect: [rect.x(), rect.y(), rect.w(), rect.h()], radius, color: srgb(fill),
+            }),
+            Node::Path { p0, p1, width, color } => parts.push(IconPart::Line {
+                from: [p0.0, p0.1], to: [p1.0, p1.1], width, color: srgb(color),
+            }),
+            Node::Fill(fill) => {
+                if let fresco_protocol::FillPaint::Solid { r, g, b, a } = fill.paint {
+                    parts.push(IconPart::Polygon { points: fill.points.clone(), clip: fill.clip, color: srgb(Color::rgba(r, g, b, a)) });
+                }
+            }
+            _ => unreachable!("spreadsheet icon geometry"),
+        }
+    });
+    parts.into()
 }
 
 /// The imported print area, when the current sheet has one.
@@ -79,6 +121,10 @@ fn print_area(d: &Doc) -> Result<Option<[u32; 4]>, String> {
 
 /// The current sheet's print area or its used range, captured at print time.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
+    snapshot_with_comments(doc, false)
+}
+
+pub fn snapshot_with_comments(doc: &Rc<RefCell<Doc>>, include_comments: bool) -> Result<Snapshot, String> {
     let (top, left, rows, cols, name, col_px, row_px, title_rows, title_cols, explicit_rows, explicit_cols, body, merges, drawings, links, object_rows, object_cols) = {
         let d = doc.borrow();
         let area = print_area(&d)?;
@@ -95,6 +141,14 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let sh = d.wb.sheet(d.sheet);
         let rs = sh.view_row_sizes();
         let cs = &sh.col_sizes;
+        if area.is_none() && include_comments {
+            for &(r, c) in d.wb.comments(d.sheet).keys() {
+                if !d.wb.hides_value(CellAddr::new(d.sheet, r, c)) && rs.size(r) > 0.0 && cs.size(c) > 0.0 {
+                    bottom = bottom.max(r + 1);
+                    right = right.max(c + 1);
+                }
+            }
+        }
         let [area_top, area_left, _, _] = area.unwrap_or([0; 4]);
         let top = repeat_rows.map_or(area_top, |b| area_top.min(b.0));
         let left = repeat_cols.map_or(area_left, |b| area_left.min(b.0));
@@ -161,7 +215,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let bottom = repeat_rows.map_or(bottom, |b| bottom.max(b.1));
         let right = repeat_cols.map_or(right, |b| right.max(b.1));
         let (rows, cols) = (bottom - top, right - left);
-        if u64::from(rows) * u64::from(cols) > MAX_CELLS {
+        if u64::from(rows.max(1)) * u64::from(cols.max(1)) > MAX_CELLS {
             return Err(format!("the print area has more than {MAX_CELLS} cells"));
         }
         let col_px = (left..right).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect::<Vec<_>>();
@@ -183,12 +237,18 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
     let mut cells = Vec::with_capacity((rows * cols) as usize);
     let (mut last_r, mut last_c) = (object_rows, object_cols);
     let mut across = Vec::new();
+    let mut comments = Comments::new();
+    let mut icons = std::collections::HashMap::new();
+    let mut comment_bytes = 0usize;
+    let d = doc.borrow();
+    let sheet = d.sheet;
     for r in 0..rows {
         for c in 0..cols {
             let v = src.cell(top + r, left + c);
             // A run, as the grid draws it: the empty cells after this one
             // that centre across too.
-            if v.as_ref().is_some_and(|v| v.align == CellAlign::Across && !v.text.is_empty() && !v.text.contains('\n')) {
+            if v.as_ref().is_some_and(|v| v.align == CellAlign::Across && !v.text.is_empty() && !v.text.contains(['\r', '\n'])
+                && !v.wrap && !v.shrink_to_fit && v.rotation == 0 && v.icon.is_none()) {
                 let mut b = c;
                 while b + 1 < cols && b - c < pergola::widgets::grid_view::SPILL_COLS && src.merge_at(top + r, left + b + 1).is_none() && src.cell(top + r, left + b + 1).is_some_and(|w| w.text.is_empty() && w.align == CellAlign::Across) {
                     b += 1;
@@ -198,12 +258,39 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
                     last_c = last_c.max(b + 1);
                 }
             }
-            let v = v.filter(|v| !v.text.is_empty() || v.fill.is_some() || v.borders.iter().any(Option::is_some) || v.bar.is_some());
-            if v.is_some() {
+            let icon = v.as_ref().and_then(|view| view.icon).map(|(kind, color)| {
+                let color = srgb(color);
+                icons.entry((kind, color)).or_insert_with(|| icon_parts(kind, color)).clone()
+            });
+            let mut cell = v.filter(|v| !v.text.is_empty() || v.fill.is_some() || v.pattern.is_some()
+                || v.gradient.is_some() || v.borders.iter().chain(&v.diagonals).any(Option::is_some)
+                || v.bar.is_some() || icon.is_some()).map(cell_of);
+            let addr = CellAddr::new(sheet, top + r, left + c);
+            let visible = row_px[r as usize] > 0.0 && col_px[c as usize] > 0.0 && !d.wb.hides_value(addr);
+            if let Some(cell) = &mut cell {
+                cell.icon = icon;
+                let font = &d.wb.style(addr).font;
+                cell.italic = font.italic;
+                cell.underline = font.underline;
+                cell.strike = font.strike;
+                cell.underline |= visible && !cell.text.is_empty() && d.wb.link_at(addr).is_some();
+            }
+            if include_comments && visible && in_print_region(body, title_rows, title_cols, explicit_rows, explicit_cols, r, c)
+                && d.wb.merge_at(addr).is_none_or(|rect| rect.r0 == addr.row && rect.c0 == addr.col)
+            {
+                if let Some(note) = d.wb.comment(sheet, addr.row, addr.col) {
+                    let comment = comment_of(addr, note);
+                    comment_bytes += comment.address.len() + comment.messages.iter().map(|m| m.heading.len() + m.text.len()).sum::<usize>();
+                    if comment_bytes > MAX_COMMENT_BYTES { return Err("The printed comments exceed 2 MiB".into()); }
+                    comments.insert((r, c), comment);
+                    cell.get_or_insert_with(Cell::default);
+                }
+            }
+            if cell.is_some() {
                 last_r = last_r.max(r + 1);
                 last_c = last_c.max(c + 1);
             }
-            cells.push(v.map(cell_of));
+            cells.push(cell);
         }
     }
     // A merged area whose first cell shows something is printed whole.
@@ -235,7 +322,32 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, drawings, links, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (title_rows.0, title_rows.1.min(last_r)), title_cols: (title_cols.0, title_cols.1.min(last_c)), region })
+    Ok(Snapshot { name, drawings, links, comments, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (title_rows.0, title_rows.1.min(last_r)), title_cols: (title_cols.0, title_cols.1.min(last_c)), region })
+}
+
+fn in_print_region(body: Option<[u32; 4]>, rows: (u32, u32), cols: (u32, u32), explicit_rows: bool, explicit_cols: bool, r: u32, c: u32) -> bool {
+    body.is_none_or(|[r0, c0, r1, c1]| {
+        ((r0..r1).contains(&r) || explicit_rows && (rows.0..rows.1).contains(&r))
+            && ((c0..c1).contains(&c) || explicit_cols && (cols.0..cols.1).contains(&c))
+    })
+}
+
+fn comment_of(addr: CellAddr, note: &officina_grid::comments::Comment) -> Comment {
+    let address = officina_grid::addr::a1(addr.row, addr.col);
+    let messages = if note.thread().is_empty() {
+        let heading = note.author.to_string();
+        let runs = note.runs().iter().map(|run| {
+            let style = run.style;
+            (run.start..run.end, officina_pdf::sheet::CommentStyle { bold: style.bold, italic: style.italic, underline: style.underline, strike: style.strike })
+        }).collect();
+        vec![CommentMessage { heading, text: note.text.clone(), runs }]
+    } else {
+        note.thread().iter().map(|m| CommentMessage {
+            heading: if m.done { format!("{} (resolved)", m.author.name) } else { m.author.name.to_string() },
+            text: m.text.clone(), runs: Vec::new(),
+        }).collect()
+    };
+    Comment { address, messages }
 }
 
 impl Snapshot {
@@ -281,7 +393,7 @@ pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String>
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
     let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone(), title_rows: s.title_rows, title_cols: s.title_cols };
-    officina_pdf::sheet::print_region(&sheet, &s.drawings, Some(s.region), &Setup::paper(w, h), title).map_err(|e| e.to_string())
+    officina_pdf::sheet::print_with_comments(&sheet, &s.drawings, Some(s.region), &s.comments, &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -304,6 +416,36 @@ mod tests {
         assert_eq!(s.cols[0], 64.0);
         let pdf = pdf(&s, 595.0, 842.0, "Q3").unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn snapshot_prints_appearance_links_and_only_opted_in_visible_comments() {
+        use officina_grid::{comments::Comment as Note, links::Link as CellLink, style::{Style, VAlign as CellVAlign}, Rect};
+        let doc = Rc::new(RefCell::new(Doc::new("Report")));
+        {
+            let mut d = doc.borrow_mut();
+            let at = CellAddr::new(0, 2, 1);
+            d.wb.set_input(at, "A long cell\nSecond line").unwrap();
+            let mut style = Style { wrap: true, rotation: 30, v_align: CellVAlign::Top, ..Default::default() };
+            style.font.italic = true;
+            d.wb.set_style(&Rect::cell(at), style);
+            d.wb.set_links(0, vec![(2, 1, CellLink::new("#B5"))]);
+            d.wb.set_comments(0, vec![
+                (2, 1, Some(Note::new("Ana", "Printed note"))),
+                (3, 1, Some(Note::new("Ana", "Hidden note"))),
+                (8, 1, Some(Note::new("Ana", "Outside note"))),
+            ]);
+            d.wb.define_name(officina_grid::print::AREA, Some(0), "=$B$3:$D$6").unwrap();
+            d.wb.sheet_mut(0).hidden = vec![(3, 3)];
+        }
+        let plain = snapshot(&doc).unwrap();
+        let cell = plain.cells[0].as_ref().unwrap();
+        assert!(cell.wrap && cell.italic && cell.underline);
+        assert_eq!((cell.rotation, cell.valign), (30, VAlign::Top));
+        assert!(plain.comments.is_empty());
+        let with_notes = snapshot_with_comments(&doc, true).unwrap();
+        assert_eq!(with_notes.comments.len(), 1);
+        assert_eq!(with_notes.comments[&(0, 0)].messages[0].text.as_ref(), "Printed note");
     }
 
     #[test]

@@ -25,6 +25,7 @@ folium-font = { path = "../folium-font" }
 folium-content = { path = "../folium-content" }
 # Colour glyphs (emoji) drawn as pictures.
 atrium-colr = { path = "../atrium-colr" }
+unicode-segmentation = "1"
 
 [profile.release]
 debug = 1

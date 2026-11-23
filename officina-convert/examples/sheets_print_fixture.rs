@@ -220,6 +220,79 @@ fn make_comments_print(dir: &Path) {
     fs::write(dir.join("legacy.xls"), xls::sample::print_workbook(LABELS)).unwrap();
 }
 
+const STYLE_LABELS: &[(u32, u32, &str)] = &[
+    (3, 3, "JumpLink"),
+    (5, 3, "Wrap alpha beta\nTail"),
+    (5, 6, "VERT"),
+    (5, 7, "STACK"),
+    (5, 8, "ShrunkenLabel"),
+    (5, 9, "Styled"),
+    (6, 6, "DocsLink"),
+    (6, 7, "ExcludedLink"),
+    (6, 8, "UnsafeLink"),
+    (14, 3, "HiddenProof"),
+];
+
+fn make_fidelity(dir: &Path) {
+    use officina_grid::comments::{CommentRun, CommentStyle};
+    use officina_grid::links::Link;
+    use officina_grid::style::{Edge, GradientFill, HAlign, Line, PatternFill, Style, VAlign};
+    use officina_grid::Rect;
+    for format in ["xlsx", "ods"] {
+        let mut book = workbook();
+        book.define_name(print::AREA, Some(0), "=Report!$D$4:$O$90").unwrap();
+        book.define_name(print::ROWS, Some(0), "=$2:$2").unwrap();
+        book.define_name(print::COLS, Some(0), "=$B:$B").unwrap();
+        book.add_picture(picture(5)).unwrap();
+        book.add_picture(picture(92)).unwrap();
+        for &(r, c, text) in STYLE_LABELS {
+            book.set_value(at(r, c), Value::str(text));
+        }
+        let sheet = book.sheet_mut(0);
+        sheet.row_sizes.set(5, 78.0);
+        sheet.hidden = vec![(14, 14)];
+        let set = |book: &mut Workbook, c, style| book.set_style(&Rect::cell(at(5, c)), style);
+        set(&mut book, 3, Style { wrap: true, v_align: VAlign::Top, fill: Some(0xFEECC1), ..Default::default() });
+        set(&mut book, 6, Style { rotation: 90, h_align: HAlign::Center, v_align: VAlign::Center,
+            fill: Some(0xE1F3EF), ..Default::default() });
+        set(&mut book, 7, Style { rotation: 255, v_align: VAlign::Center, ..Default::default() });
+        set(&mut book, 8, Style { shrink_to_fit: true, ..Default::default() });
+        let edge = Edge { line: Line::Medium, color: Some(0x26386A) };
+        let mut styled = Style { fill: Some(0xDBE7FA), diagonals: [edge, Edge::default()],
+            borders: [Edge::default(), edge, Edge::default(), edge], ..Default::default() };
+        styled.font.bold = true;
+        styled.font.italic = true;
+        styled.font.underline = true;
+        styled.font.color = Some(0x26386A);
+        set(&mut book, 9, styled);
+        if format == "xlsx" {
+            set(&mut book, 10, Style {
+                pattern: PatternFill::new("darkDown", Some(0x174B68), Some(0xE5F6F9)), ..Default::default()
+            });
+            set(&mut book, 11, Style {
+                gradient: GradientFill::new(0.0, [(0.0, 0x9C1F8D), (1.0, 0xFFE081)]), ..Default::default()
+            });
+        }
+        book.set_links(0, vec![
+            (3, 3, Link::new("#Report!O80")),
+            (6, 6, Link::new("https://example.test/printed-report")),
+            (6, 7, Link::new("#Report!D91")),
+            (6, 8, Link::new("file:///private/excluded")),
+        ]);
+        book.set_comments(0, vec![
+            (3, 3, Some(conversation())),
+            (1, 1, Some(Comment::with_runs("Kim", "Rich title note", [
+                CommentRun { start: 0, end: 4, style: CommentStyle { bold: true, italic: true, ..Default::default() } }
+            ]))),
+            (14, 3, Some(Comment::new("HiddenAuthor", "HiddenComment"))),
+            (90, 3, Some(Comment::new("OutsideAuthor", "OutsideComment"))),
+        ]);
+        book.recalc();
+        let bytes = if format == "xlsx" { xlsx::write(&book, Vec::new()).unwrap() } else { ods::write(&book, Vec::new()).unwrap() };
+        fs::write(dir.join(format!("sales.{format}")), bytes).unwrap();
+    }
+}
+
 fn check(file: &Path, state: &str) {
     let bytes = fs::read(file).unwrap();
     let format = file.extension().unwrap().to_str().unwrap();
@@ -291,6 +364,22 @@ fn check(file: &Path, state: &str) {
         assert!(book.pictures().is_empty());
         return;
     }
+    if variant == "fidelity" {
+        assert_eq!(book.comment(0, 3, 3).unwrap(), &conversation());
+        assert_eq!(book.comment(0, 1, 1).unwrap().runs().len(), 1);
+        assert_eq!(book.link(0, 3, 3).unwrap().place(&book, 0), Some(at(79, 14)));
+        assert_eq!(book.link(0, 6, 6).unwrap().target.as_ref(), "https://example.test/printed-report");
+        assert!(book.style(at(5, 3)).wrap);
+        assert_eq!(book.style(at(5, 6)).rotation, 90);
+        assert_eq!(book.style(at(5, 7)).rotation, 255);
+        assert!(book.style(at(5, 8)).shrink_to_fit);
+        assert!(book.style(at(5, 9)).font.bold && book.style(at(5, 9)).font.italic);
+        assert!(book.sheet(0).row_hidden(14));
+        if format == "xlsx" {
+            assert!(book.style(at(5, 10)).pattern.is_some());
+            assert!(book.style(at(5, 11)).gradient.is_some());
+        }
+    }
     if variant == "threads" {
         assert_eq!(book.comment(0, 3, 3).unwrap(), &conversation());
         assert_eq!(
@@ -320,9 +409,10 @@ fn main() {
     match args.as_slice() {
         [action, dir] if action == "make" => make(Path::new(dir)),
         [action, dir] if action == "make-comments-print" => make_comments_print(Path::new(dir)),
+        [action, dir] if action == "make-fidelity" => make_fidelity(Path::new(dir)),
         [action, file, state] if action == "check" => check(Path::new(file), state),
         _ => panic!(
-            "usage: sheets_print_fixture make DIR | make-comments-print DIR | check FILE STATE"
+            "usage: sheets_print_fixture make DIR | make-comments-print DIR | make-fidelity DIR | check FILE STATE"
         ),
     }
 }

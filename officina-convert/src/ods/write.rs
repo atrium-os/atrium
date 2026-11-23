@@ -936,13 +936,14 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
         out.push('"');
     }
     match v {
-        Value::Empty if wb.comment(s, r, c).is_none() => {
+        Value::Empty if wb.comment(s, r, c).is_none() && wb.link(s, r, c).is_none() => {
             out.push_str("/>");
             return;
         }
         Value::Empty => {
             out.push('>');
             note(out, wb, s, r, c);
+            if wb.link(s, r, c).is_some() { cell_paras(out, wb, s, r, c, ""); }
         }
         Value::Num(x) => {
             let x = *x;

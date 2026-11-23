@@ -306,3 +306,32 @@ fn frozen_rows_and_columns_repeat_on_every_page() {
     let dark = (102..150).flat_map(|x| (71..83).map(move |y| (x, y))).filter(|&(x, y)| px(&pages[1], x, y)[0] < 128).count();
     assert!(dark > 5, "a body row under the title row");
 }
+
+#[test]
+fn worksheet_comments_continue_after_the_grid_pages() {
+    use sheet::{Comment, CommentMessage, CommentStyle, Comments};
+
+    let cell = |r, c| Some(Cell { text: format!("Cell {r} {c}"), ..Cell::default() });
+    let s = Sheet { name: "Report", cols: vec![100.0; 2], rows: vec![40.0; 9],
+        cell: &cell, gridlines: true, merges: Vec::new(), across: Vec::new(),
+        title_rows: (0, 1), title_cols: (0, 0) };
+    let mut setup = Setup::paper(220.0, 220.0);
+    setup.margin = 30.0;
+    let plain = sheet::print(&s, &setup, "").unwrap();
+    assert_eq!(draw(&plain).len(), 2);
+    let note = "A long worksheet comment wraps and continues onto another paper page.\n".repeat(40);
+    let note_len = note.len();
+    let mut notes = Comments::new();
+    notes.insert((0, 0), Comment {
+        address: "A1".into(),
+        messages: vec![CommentMessage { heading: "Ana".into(), text: note.into(),
+            runs: vec![(0..note_len, CommentStyle { italic: true, ..Default::default() })] }],
+    });
+    let pdf = sheet::print_with_comments(&s, &[], None, &notes, &setup, "").unwrap();
+    let pages = draw(&pdf);
+    assert!(pages.len() > 4, "the complete comment spans several pages");
+    for page in &pages[..2] {
+        assert!(reddish(px(page, 103, 31)), "the repeated commented title has a marker");
+    }
+    assert_eq!(px(&pages[2], 103, 31), [255, 255, 255], "the appendix has no worksheet grid or marker");
+}

@@ -3989,7 +3989,7 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 ### 16.79 Printing from Sheets and Slides (2026-11-18)
 
 - **Shared writer.** `officina-pdf` writes every export through one page writer (`out.rs`): faces subset once, pictures once, colour glyphs as pictures, opacity as graphics states. Write's export moved onto it unchanged.
-- **Sheets.** `officina_pdf::sheet::export` pages the used range down, then across (Excel's default), 0.75 pt to the screen's pixel, optional fit to width. Cells come from the app as the grid draws them (`atrium_sheets::print::snapshot` over `SheetSource::cell`), so number and conditional formats print as shown. Text is IBM Plex Sans at the grid's 12 px; numbers that don't fit show "###", text is cut with "…".
+- **Sheets.** `officina_pdf::sheet::export` pages the used range down, then across (Excel's default), 0.75 pt to the screen's pixel, with optional fit to width. Cells come from the grid's display values and appearance. Text uses the grid's 12 px face and preserves wrapping, line breaks, alignment, rotation, stacked graphemes and shrink-to-fit. Numbers that still exceed the cell show hashes and other single-line text can be elided. Printing also carries solid, patterned and gradient fills, edges and diagonals, font emphasis, conditional data bars and icons. Cell text and page artwork are clipped to their printable bounds. Hidden axes contribute no size.
 - **Slides.** `officina_pdf::slides::export` draws each slide from `officina_slides::draw::draw_slide` (hidden slides excluded by default), at the slide's size or fitted on the paper. Gradients are 128 bands of solid colour (Folium skips shadings, and Prelum rasterises with Folium); pictures go through the installed decoder (the apps build `officina-pdf` without `local-decode`).
 - **Apps.** Print… on the toolbar and Ctrl+P in both, through `pergola::print` (printing.md §5.1); the print sheet's Relayout gets a new layout for the paper and orientation chosen.
 - **Gates:** `officina-pdf/tests/print.rs` (pages, look and text read back and drawn by Folium); `atrium_sheets::print` tests; `scripts/prelum-r4-vm.sh` stages `sheets` and `slides`.
@@ -3999,7 +3999,8 @@ rectangle. Explicit rows and columns repeat on their respective page axes,
 including when the title lies outside the body. An explicit band takes
 precedence over the frozen pane on its axis. An axis without explicit titles
 can repeat its frozen band inside the print area. Title bands use the page's
-existing space limit, and overlapping title cells appear once per page.
+existing space limit, and overlapping title cells appear once per page. Fit
+to width accounts for repeat columns outside the body.
 
 The workbook stores these settings as sheet-local names so edits to the sheet
 structure and native saves carry them with other references. XLSX serializes
@@ -4029,6 +4030,14 @@ bands, their intersection exactly once per page, the recalculated formula and
 the picture inside the print area. The `comments_print` desktop case also checks ODS thread persistence and BIFF8 rich notes, links and print settings in a native copy, then exports both PDFs. Its PDF check verifies the same four-page layout, without expecting an image in the BIFF8 fixture. The XLSX and ODS print workbooks also retain a second picture
 outside the print area, which the PDFs omit. The converter tests cover JPEG
 bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
+
+The `print_fidelity` desktop profile opens, edits, saves and reopens matched
+XLSX and ODS workbooks, then saves each with and without comments through
+Prelum and Scrinium. The PDF gate checks text geometry and the link underline
+in the rendered output, the in-area picture, the four worksheet pages and
+both title bands. The comment mode adds an appendix and omits hidden and
+out-of-area comments. A separate Folium rendering test exercises a long note
+that runs across multiple appendix pages.
 
 ### 16.79 Merged cells (2026-11-18)
 
@@ -4060,7 +4069,7 @@ bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
 - **Mentions.** The native file and journal use comment entry marker 4 for threads containing mentions. A mention stores its ID, the referenced person and a bounded UTF-8 byte range. XLSX maps these ranges to UTF-16 indices and includes people referenced only by mentions in the workbook person directory. Copied threads keep the referenced people and receive distinct mention IDs on export. Edits before a mention move it, edits that touch its text remove the metadata, and editor undo restores the original range. [MS-XLSX CT_Mention](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-xlsx/b03ed619-e307-4d3e-9c67-b68612274128)
 - **People picker.** In a thread comment or reply, click **@ Mention** to search workbook participants by name or ID. A draft `@prefix` next to the caret starts the search and is replaced on selection. Enter an email address to mention someone new to the workbook. The picker uses the workbook’s authors and previously mentioned people. It stores the selected person and inserts the visible token as one editor undo step. Posting or saving includes the mention in the normal workbook undo step.
 - **System clipboard.** Copying a cell range between Sheets workbooks includes its comments, including styled comments on otherwise blank cells. Copying a text selection between rich comment bars carries bold, italic, underline and strikethrough. Text and styles paste together as one editor undo step. Saving the edited comment is one workbook undo step.
-- **Not yet:** printing comments.
+- **Printing.** Data ▸ Print with Comments… marks the visible comment cells and appends pages keyed by cell address. Legacy notes keep their text emphasis. Threads print the authors and replies in order, with resolved roots labelled. A note on a repeated title has one appendix entry. Hidden and protected values and the print area govern which cells contribute. Ordinary Print keeps the comment contents private.
 - **Gates:** officina-grid `comments::tests`; officina-convert `tests/comments.rs` (native and XLSX thread round trip with authors, replies and mentions, Excel's author prefix, LibreOffice both ways); atrium-sheets `comments_are_written_shown_beside_the_cell_edited_and_deleted`, `rich_comment_edits_render_and_undo_through_the_comment_bar`, `threads_can_be_posted_replied_to_edited_and_undone`, `mention_picker_inserts_in_threads_and_replies_and_round_trips`, and `imported_threads_can_be_deleted_and_undone_without_flattening`.
 
 ### 16.81 Cell hyperlinks (2026-11-18)
@@ -4076,7 +4085,7 @@ bytes and geometry, blank title bands, both XLSX axes and quoted sheet names.
   - Data ▸ Insert Link… / Edit Link… opens a bar where the tabs are. It takes `Sheet2!B4` or `B4` as a place, a bare host as `https://`, and an address as given; anything else is refused with a reason and the bar stays. An empty cell gets the target as its text, in the same undo step. An empty field removes the link, as does Data ▸ Remove Link(s) for the selection.
   - Ctrl+click (or Cmd+click) on a cell selects it and follows its link, with that click's activation. Pointer events carry no modifiers, so `pergola::input::pointer_modifiers()` keeps those of the last button event, and the grid sends `GridAction::Follow`.
   - With the cursor on a link cell and no edit open, the target shows beside the cell ("Go to Sheet2!B4" for a place) with "Ctrl+click to open". It shares the comment box when the cell has both.
-- **Not yet:** link styles in printing.
+- **Printing.** Link text uses the grid colour (or its explicit colour) and is underlined. Prelum's sanitized PDF keeps the styled label as static page content. ODS saves links even when the cell has no value or shares the cell with a comment.
 - **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`; pergola `ctrl_click_selects_and_asks_to_follow`.
 
 ### 16.82 Frozen panes (2026-11-18)
@@ -4273,7 +4282,7 @@ and the XLSM round trip with inert VBA.
 - **Rows shrink back** (2026-11-19): a row grown for typed lines is fitted again when its text changes or is cleared, back down to the default height (`Doc.grown_rows`, this session only; sizing it by hand ends that).
 - **Up and Down** in an editor holding several lines move between them at about the same place across; past the first or last line they end editing and move, as before.
 - **The editor wraps** (2026-11-19): in a cell that wraps its text, the editor breaks its lines as the cell does (after spaces, or inside a word too long for the line), and Up and Down move between them (`editor_wrap`, `editor_lines`). Gate: pergola `the_editor_wraps_as_its_cell_does`.
-- **Not yet:** wrapped text in printing (the printing thread's part).
+- **Printing:** wrapped and explicit lines follow the cell width, height and vertical alignment in the print snapshot (§16.79).
 - **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller` (with `line_top`), `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter, the second line); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it` (with alignment), `rows_nobody_sized_grow_for_typed_lines`, `records_round_trip`.
 
 The `layout` profile of `scripts/sheets-interop-vm-check.sh` verifies

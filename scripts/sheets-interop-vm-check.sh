@@ -16,6 +16,8 @@
 # and macro.xlsm. Stage the same SimpleMacro.xlsm source at /tmp/sheets-vba-source.xlsm.
 # Use SHEETS_INTEROP_CASE=print and /tmp/sheets-print-fixture for print layout.
 # Use comments_print with the same binary and its make-comments-print inputs.
+# Use print_fidelity with its make-fidelity inputs, pinned fonts in the Sheets
+# jail, and the PDF checker's fidelity mode.
 # The print profile also needs Prelum and the print sheet with no printers
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
@@ -40,7 +42,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|print_fidelity|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -90,6 +92,7 @@ checkpoint() {
         pivot_sources) /tmp/sheets-pivot-sources-fixture check "$1" "$2" "$format" ;;
         pivot_cache) /tmp/sheets-pivot-cache-fixture check "$1" "$2" "$format" ;;
         print) /tmp/sheets-print-fixture check "$1" "$2" ;;
+        print_fidelity) /tmp/sheets-print-fixture check "$1" "$2-fidelity" ;;
         comments_print) /tmp/sheets-print-fixture check "$1" "$2-$variant" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
@@ -431,20 +434,27 @@ pdf_picker_open() {
     other_window 824 458 "$print_window" && test "$window" != "$document"
 }
 
+print_fidelity() { print; }
+
 print_pdf() {
+    suffix=${1:-}
     pdf="$books/${book%.*} – Report.pdf"
     test ! -e "$pdf"
-    click 280 24
+    if test "$suffix" = -comments; then
+        data_from_bottom 1 # Print with Comments… is the final Data command.
+    else
+        click 280 24
+    fi
     wait_for other_window 829 578 "$document"
     print_window=$window
     sleep 1
-    cp selectscreen.png "$results/$format-print.png"
+    cp selectscreen.png "$results/$format$suffix-print.png"
     click 850 551 # Save as PDF is the only destination.
     wait_for pdf_picker_open
     click 824 458 # Confirm the suggested name in the system picker.
     wait_for pdf_finished "$pdf"
     wait_for same_window 824 458 "$document"
-    mv "$pdf" "$results/$format.pdf"
+    mv "$pdf" "$results/$format$suffix.pdf"
 }
 
 appearance() {
@@ -1289,6 +1299,7 @@ for format in ods xlsx; do
         layout) scroll_layout ;;
         annotations) check_reopened_validation ;;
         print) print_pdf ;;
+        print_fidelity) print_pdf; print_pdf -comments ;;
         formulas) formulas_reopened ;;
         validation) validation_reopened ;;
         condfmt) condfmt_reopened ;;

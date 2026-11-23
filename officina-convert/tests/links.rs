@@ -66,3 +66,18 @@ fn libreoffice_keeps_our_links() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn a_link_and_comment_on_a_blank_cell_survive_ods() {
+    let mut wb = book();
+    let address = CellAddr::new(0, 8, 1);
+    let link = Link::new("#Two!B4").unwrap();
+    let comment = officina_grid::comments::Comment::new("Ana", "Check the destination");
+    wb.set_links(0, vec![(8, 1, Some(link.clone()))]);
+    wb.set_comments(0, vec![(8, 1, Some(comment.clone()))]);
+    let saved = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    let (back, _) = officina_convert::ods::read(&saved).unwrap();
+    assert_eq!(back.get(address), Value::Empty);
+    assert_eq!(back.link(0, 8, 1), Some(&link));
+    assert_eq!(back.comment(0, 8, 1), Some(&comment));
+}
