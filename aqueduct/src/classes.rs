@@ -165,6 +165,9 @@ pub const CLASS_VPN:       u8 = 19;
 /// served by prelumd. Postcard payloads (the `prelum-proto` crate).
 pub const CLASS_PRINT:     u8 = 20;
 
+/// Calendar local store (Fasti), docs/spec/calendar.md §4.
+pub const CLASS_CALENDAR: u8 = 21;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -193,6 +196,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_NETCONF    => "netconf",
         CLASS_VPN        => "vpn",
         CLASS_PRINT      => "print",
+        CLASS_CALENDAR   => "calendar",
         CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",

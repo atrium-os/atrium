@@ -1,0 +1,111 @@
+//! Manual local planning. Times are floating civil minutes within the selected date.
+pub mod store;
+pub mod wire;
+
+use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Span {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl Span {
+    pub fn valid(self) -> bool {
+        self.start < self.end && self.end <= 1440
+    }
+
+    pub fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Entry {
+    pub id: Uuid,
+    pub date: NaiveDate,
+    pub title: String,
+    pub span: Span,
+    pub kind: Kind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kind {
+    Appointment,
+    Weekly,
+    AllDay,
+    Hold,
+}
+
+impl Entry {
+    pub fn appears(&self, date: NaiveDate) -> bool {
+        let days = (date - self.date).num_days();
+        days == 0 || (self.kind == Kind::Weekly && days > 0 && days % 7 == 0)
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.id.is_nil()
+            || self.title.trim().is_empty()
+            || self.title.len() > 160
+            || self.title.chars().any(|c| {
+                c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+        {
+            return Err("Enter a title of up to 160 bytes without control characters");
+        }
+        if !self.span.valid()
+            || (self.kind == Kind::AllDay
+                && self.span
+                    != (Span {
+                        start: 0,
+                        end: 1440,
+                    }))
+        {
+            return Err("Invalid event time range");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Day {
+    pub revision: u64,
+    pub entries: Vec<Entry>,
+}
+
+impl Day {
+    /// One result per qualifying gap. Adjacent meetings share a boundary.
+    pub fn openings(&self, window: Span, minutes: u16) -> Result<Vec<Span>, &'static str> {
+        if !window.valid() || minutes == 0 {
+            return Err("Invalid search range or duration");
+        }
+        let mut busy: Vec<_> = self.entries.iter().map(|e| e.span).collect();
+        busy.sort_by_key(|s| s.start);
+        let mut cursor = window.start;
+        let mut gaps = Vec::new();
+        for span in busy {
+            let start = span.start.min(window.end);
+            if start.saturating_sub(cursor) >= minutes {
+                gaps.push(Span {
+                    start: cursor,
+                    end: start,
+                });
+            }
+            cursor = cursor.max(span.end);
+            if cursor >= window.end {
+                return Ok(gaps);
+            }
+        }
+        if window.end - cursor >= minutes {
+            gaps.push(Span {
+                start: cursor,
+                end: window.end,
+            });
+        }
+        Ok(gaps)
+    }
+}

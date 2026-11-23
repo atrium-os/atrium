@@ -1,0 +1,155 @@
+use atrium_calendar::{
+    wire::{call, Request},
+    Entry, Kind, Span,
+};
+use std::{
+    fs,
+    io::{Read, Write},
+    os::unix::{fs::MetadataExt, net::UnixStream},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant},
+};
+use uuid::Uuid;
+
+struct Daemon(Child);
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn start(dir: &Path, publisher: &str) -> (Daemon, PathBuf) {
+    let socket = dir.join("calendar.sock");
+    let mut child = Daemon(
+        Command::new(
+            std::env::var_os("FASTI_TEST_BIN")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_fastid").into()),
+        )
+        .env("FASTI_SOCKET", &socket)
+        .env("FASTI_REGISTRY", dir.join("registry"))
+        .env("FASTI_USER", "mina")
+        .env("FASTI_PERSONA", "work")
+        .env("FASTI_STORE", dir)
+        .env("FASTI_PUBLISHER", publisher)
+        .spawn()
+        .unwrap(),
+    );
+    let limit = Instant::now() + Duration::from_secs(4);
+    loop {
+        if UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none() && Instant::now() < limit,
+            "Fasti failed to start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    (child, socket)
+}
+
+#[test]
+fn socket_enforces_identity_and_retains_the_accepted_revision() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let dir = temp.path();
+    let uid = fs::metadata(dir).unwrap().uid();
+    let registry = dir.join("registry");
+    let publisher = "ab".repeat(32);
+    let register = |user: &str, app: &str, signer: &str, suffix: &str| {
+        fs::write(&registry, format!("{uid} {user} {app} {signer}{suffix}\n")).unwrap();
+    };
+    register("mina", "org.atrium.calendar", &publisher, " persona=work");
+    let (daemon, socket) = start(dir, &publisher);
+    let date = "2026-11-24".parse().unwrap();
+    let query = Request::Day { date };
+    assert_eq!(call(&socket, &query).unwrap().revision, 0);
+    let event = Entry {
+        id: Uuid::new_v4(),
+        date,
+        kind: Kind::Appointment,
+        title: "Budget review".into(),
+        span: Span {
+            start: 840,
+            end: 900,
+        },
+    };
+    let saved = call(
+        &socket,
+        &Request::Add {
+            revision: 0,
+            entry: event.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(saved.entries[0].id, event.id);
+    for (user, app, signer, suffix) in [
+        ("mina", "org.atrium.calendar", publisher.as_str(), ""),
+        (
+            "mina",
+            "org.atrium.mail",
+            publisher.as_str(),
+            " persona=work",
+        ),
+        ("mina", "org.atrium.calendar", "", " persona=work"),
+        (
+            "mina",
+            "org.atrium.calendar",
+            &"cd".repeat(32),
+            " persona=work",
+        ),
+        (
+            "someone",
+            "org.atrium.calendar",
+            publisher.as_str(),
+            " persona=work",
+        ),
+        (
+            "mina",
+            "org.atrium.calendar",
+            publisher.as_str(),
+            " persona=work document=2",
+        ),
+    ] {
+        register(user, app, signer, suffix);
+        assert!(call(&socket, &query).is_err());
+        assert!(call(
+            &socket,
+            &Request::Add {
+                revision: 1,
+                entry: Entry {
+                    id: Uuid::new_v4(),
+                    ..event.clone()
+                }
+            }
+        )
+        .is_err());
+    }
+    register("mina", "org.atrium.calendar", &publisher, " persona=work");
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let big = aqueduct::Header::new(
+        aqueduct::classes::CLASS_CALENDAR,
+        1,
+        aqueduct::flag::RESPONSE_EXPECTED,
+        4097,
+    );
+    stream.write_all(&big.encode()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    let (_, bytes) = aqueduct::envelope::read_message_alloc(&mut &reply[..]).unwrap();
+    assert!(
+        serde_json::from_slice::<Result<atrium_calendar::Day, String>>(&bytes)
+            .unwrap()
+            .is_err()
+    );
+    drop(daemon);
+    let (_daemon, socket) = start(dir, &publisher);
+    let reloaded = call(&socket, &query).unwrap();
+    assert_eq!(reloaded.revision, 1);
+    assert_eq!(reloaded.entries.len(), 1);
+    assert_eq!(reloaded.entries[0].id, event.id);
+}

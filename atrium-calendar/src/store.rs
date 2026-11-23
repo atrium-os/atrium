@@ -1,0 +1,152 @@
+//! One Fasti process owns one private, supervisor-provisioned persona directory.
+use super::{Day, Entry, Kind};
+use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Read, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+use tempfile::NamedTempFile;
+
+const MAX_ENTRIES: usize = 1024;
+const MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    version: u8,
+    revision: u64,
+    entries: Vec<Entry>,
+}
+
+pub struct Store {
+    dir: PathBuf,
+    _lock: File,
+    state: Snapshot,
+}
+
+impl Store {
+    pub fn open(dir: &Path) -> io::Result<Self> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(dir.join("writer.lock"))?;
+        lock.try_lock()?;
+        let state = match File::open(dir.join("calendar.json")) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_BYTES {
+                    return Err(io::Error::other("Calendar snapshot too large"));
+                }
+                let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+                let mut ids = std::collections::HashSet::new();
+                if snapshot.version != 1
+                    || snapshot.entries.len() > MAX_ENTRIES
+                    || snapshot
+                        .entries
+                        .iter()
+                        .any(|e| e.validate().is_err() || !ids.insert(e.id))
+                {
+                    return Err(io::Error::other("Invalid calendar snapshot"));
+                }
+                snapshot
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Snapshot {
+                version: 1,
+                revision: 0,
+                entries: Vec::new(),
+            },
+            Err(e) => return Err(e),
+        };
+        Ok(Self {
+            dir: dir.into(),
+            _lock: lock,
+            state,
+        })
+    }
+
+    pub fn day(&self, date: NaiveDate) -> Day {
+        let mut entries: Vec<_> = self
+            .state
+            .entries
+            .iter()
+            .filter(|e| e.appears(date))
+            .cloned()
+            .collect();
+        entries.sort_by_key(|e| (e.span.start, e.span.end, e.id));
+        Day {
+            revision: self.state.revision,
+            entries,
+        }
+    }
+
+    pub fn add(&mut self, revision: u64, event: Entry) -> Result<(), String> {
+        event.validate()?;
+        if revision != self.state.revision {
+            return Err("Calendar changed. Refresh before saving.".into());
+        }
+        if self.state.entries.len() >= MAX_ENTRIES {
+            return Err("Calendar entry limit reached".into());
+        }
+        if self.state.entries.iter().any(|e| e.id == event.id) {
+            return Err("Entry already exists".into());
+        }
+        if event.kind == Kind::Hold
+            && self
+                .state
+                .entries
+                .iter()
+                .any(|e| e.appears(event.date) && e.span.overlaps(event.span))
+        {
+            return Err("That time is already busy".into());
+        }
+        let mut entries = self.state.entries.clone();
+        entries.push(event);
+        self.commit(revision, entries)
+    }
+
+    pub fn release(
+        &mut self,
+        revision: u64,
+        date: NaiveDate,
+        id: uuid::Uuid,
+    ) -> Result<(), String> {
+        if revision != self.state.revision {
+            return Err("Calendar changed. Refresh before saving.".into());
+        }
+        let mut entries = self.state.entries.clone();
+        let index = entries
+            .iter()
+            .position(|e| e.id == id && e.date == date && e.kind == Kind::Hold)
+            .ok_or("Hold no longer exists")?;
+        entries.remove(index);
+        self.commit(revision, entries)
+    }
+
+    fn commit(&mut self, revision: u64, entries: Vec<Entry>) -> Result<(), String> {
+        let next = Snapshot {
+            version: 1,
+            revision: revision.checked_add(1).ok_or("Revision limit reached")?,
+            entries,
+        };
+        let bytes = serde_json::to_vec(&next).map_err(|_| "Cannot encode calendar")?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err("Calendar storage limit reached".into());
+        }
+        let mut tmp = NamedTempFile::new_in(&self.dir).map_err(|_| "Cannot stage calendar")?;
+        tmp.write_all(&bytes)
+            .and_then(|_| tmp.as_file().sync_all())
+            .map_err(|_| "Cannot write calendar")?;
+        tmp.persist(self.dir.join("calendar.json"))
+            .map_err(|_| "Cannot publish calendar")?;
+        self.state = next;
+        File::open(&self.dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| "Saved, but durability is uncertain. Refresh before retrying.".to_string())
+    }
+}

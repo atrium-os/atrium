@@ -135,6 +135,18 @@ People enter events by hand in C0. Exercise the native planner with synthetic sc
 
 Full organizer scheduling, public subscriptions, live booking links and broader cross-persona availability sharing each need a later product and privacy decision.
 
+### 7.1 First native C0 increment · 2026-11-23
+
+The native day view opens on today and accepts a manually entered date. It can add a timed local appointment, a weekly appointment at the same floating wall time, or an all-day entry. Find 45 min examines 09:00–17:00 on the displayed date and shows each qualifying gap. Pressing **Hold 45 min** reserves its first 45 minutes. **Release** in the agenda removes that hold. The window keeps its own state in memory and sends changes to Fasti. [Native app and manifest](../../atrium-calendar)
+
+One Fasti instance owns a locked, versioned snapshot in its provisioned private directory. It validates each edit against the current revision, checks a hold against the latest commitments, and commits by syncing and renaming a private temporary file. The initial implementation bounds a store to 1,024 entries and a 1 MiB snapshot. A failed read of existing data surfaces an error. On each connection it asks the kernel for the peer UID and checks the configured person, persona, Calendar app ID and expected publisher against the Portcullis registry. The request carries no identity or filesystem path. [Store](../../atrium-calendar/src/store.rs) · [Fasti](../../atrium-calendar/src/bin/fastid.rs)
+
+**Verification.** Four Rust tests cover seven synthetic schedules, stale revisions, conflicting holds, single-writer exclusion, restart, release, invalid input, damaged storage and peer-identity denials. The guest check uses distinct unprivileged processes and a fixture registry in a disposable arm64 FreeBSD VM. It enters an appointment through a Pergola text field, finds a gap, holds it, releases it, and verifies the resulting on-disk records. [Host and service tests](../../atrium-calendar/tests) · [Guest check](../../scripts/calendar-guest-check.sh)
+
+Run `cargo test --locked` in `atrium-calendar/` on the host. For the guest check, cross-build with `cargo test --locked --release --target aarch64-unknown-freebsd --no-run`. Stage the two binaries, the printed `planning` and `service` integration-test executables under those names, a headless-capable `frescod`, and the guest script in a fresh guest-local directory. Run the script there as root on a disposable guest. It starts the UI and service under separate test UIDs and records the rendered frames and logs.
+
+**Next C0 increment.** Wire the signed app and a supervised Fasti instance into the installed desktop launch path. Provision the private store and socket for each persona and mount only its socket into Calendar's jail. Verify Work and Personal isolation using the live launch registry. Week and Month, saved opening views, local search, event editing and deletion, single-occurrence moves and zoned-time handling remain C0 work.
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

@@ -1,0 +1,16 @@
+[app]
+id = "org.atrium.calendar"
+name = "Calendar"
+version = "0.1.0"
+entry = "bin/atrium-calendar"
+description = "Plan the day and hold time on this device."
+icon = "calendar"
+
+[capabilities]
+graphics = "fresco"
+network = "none"
+embeds = []
+
+[supervision]
+restart = "on-crash"
+instances = "single"
