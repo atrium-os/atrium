@@ -475,8 +475,10 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
 
 /// Store uploaded message `blob` in `mailbox` (an import, mail.md §6.5),
 /// seen: it is old mail.
-pub fn import(account: &str, blob: &str, mailbox: &str) -> Vec<u8> {
-    request(vec![import_call(account, blob, mailbox)], true)
+pub fn import(account: &str, blob: &str, mailbox: &str, state: &str) -> Vec<u8> {
+    let mut call = import_call(account, blob, mailbox);
+    call[1]["ifInState"] = json!(state);
+    request(vec![call], true)
 }
 
 /// The automatic reply (RFC 8621 §8): on or off, between two times if
@@ -781,6 +783,7 @@ pub struct Changes {
     pub more: bool,
     /// Created and updated messages, as they are now.
     pub changed: Vec<Email>,
+    pub created: Vec<String>,
     pub destroyed: Vec<String>,
 }
 
@@ -818,7 +821,7 @@ pub fn changes(a: &Answers, account: &str, since: &str, max: u64) -> Result<Chan
     if changed.iter().any(|email| gone.contains(email.id.as_str())) {
         return err("Email/changes reported a fetched Email as destroyed");
     }
-    Ok(Changes { new_state, more, changed, destroyed })
+    Ok(Changes { new_state, more, changed, created, destroyed })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,10 +853,31 @@ pub fn submitted(a: &Answers, account: &str) -> Result<String> {
 
 /// The answer to [`import`]: the stored message's id, or why not.
 pub fn imported(a: &Answers, account: &str) -> Result<String> {
-    let reply = a.account_reply(IMPORT_TAG, "Email/import", account)?;
-    need_state(reply, "newState")?;
+    match import_acknowledgment(a, account, None)? {
+        ImportAck::Created(id) => Ok(id),
+        ImportAck::Refused(why) => err(why),
+    }
+}
+
+pub enum ImportAck {
+    Created(String),
+    Refused(String),
+}
+
+pub fn import_acknowledgment(a: &Answers, account: &str, state: Option<&str>) -> Result<ImportAck> {
+    let reply = match a.account_reply(IMPORT_TAG, "Email/import", account) {
+        Ok(reply) => reply,
+        Err(e) if state.is_some() && e.0 == "Email/import: stateMismatch" => {
+            return Ok(ImportAck::Refused(e.0));
+        }
+        Err(e) => return Err(e),
+    };
+    let new_state = need_state(reply, "newState")?;
     if reply.get("oldState").is_some_and(|v| !v.is_null()) {
-        need_state(reply, "oldState")?;
+        let old_state = need_state(reply, "oldState")?;
+        if state.is_some_and(|expected| expected != old_state) {
+            return err("wrong oldState in Email/import reply");
+        }
     }
     let created = import_result(reply, "created")?;
     let refused = import_result(reply, "notCreated")?;
@@ -867,12 +891,15 @@ pub fn imported(a: &Answers, account: &str) -> Result<String> {
             if email.get("size").and_then(Value::as_u64).is_none() {
                 return err("bad Email/import size");
             }
-            Ok(id)
+            if state == Some(new_state.as_str()) {
+                return err("Email/import creation did not advance state");
+            }
+            Ok(ImportAck::Created(id))
         }
         (None, Some(error)) => {
             let kind = error.as_object().and_then(|o| get_str(o, "type"))
                 .filter(|t| !t.is_empty()).ok_or(Error("bad Email/import refusal".into()))?;
-            err(format!("not stored: {}", kind.chars().filter(|c| c.is_ascii_graphic()).take(64).collect::<String>()))
+            Ok(ImportAck::Refused(format!("not stored: {}", kind.chars().filter(|c| c.is_ascii_graphic()).take(64).collect::<String>())))
         }
         _ => err("missing or conflicting Email/import creation outcome"),
     }

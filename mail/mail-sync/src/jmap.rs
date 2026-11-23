@@ -51,6 +51,10 @@ pub trait Jmap {
     fn search(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
     /// Store `message` in `folder`, seen (an import, §6.5); its id.
     fn import(&mut self, folder: &str, message: &[u8]) -> Result<String>;
+    /// Upload bytes and read the account state before the engine saves the attempt.
+    fn prepare_import(&mut self, folder: &str, message: &[u8]) -> Result<PreparedImport>;
+    /// Send the saved attempt, or reconcile it first if a previous send may have happened.
+    fn finish_import(&mut self, attempt: &PreparedImport, retry: Option<&[u8]>) -> Result<ImportResult>;
     /// The account's vacation reply, after setting it to `set` if given;
     /// `None` when the server has none (§11.6).
     fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>>;
@@ -64,6 +68,22 @@ pub trait Jmap {
     fn filters(&self) -> Filters {
         Filters::default()
     }
+}
+
+/// A validated preflight, saved before a queued import can modify the server.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedImport {
+    api_url: String,
+    account: String,
+    state: String,
+    mailbox: String,
+    blob: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ImportResult {
+    Accepted(String),
+    Refused(String),
 }
 
 /// What a JMAP server keeps (§11.6): an automatic reply of its own
@@ -108,6 +128,12 @@ impl<H: Http> Jmap for Client<H> {
     }
     fn import(&mut self, folder: &str, message: &[u8]) -> Result<String> {
         Client::import(self, folder, message)
+    }
+    fn prepare_import(&mut self, folder: &str, message: &[u8]) -> Result<PreparedImport> {
+        Client::prepare_import(self, folder, message)
+    }
+    fn finish_import(&mut self, attempt: &PreparedImport, retry: Option<&[u8]>) -> Result<ImportResult> {
+        Client::finish_import(self, attempt, retry)
     }
     fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>> {
         Client::vacation(self, set)
@@ -716,6 +742,14 @@ impl<H: Http> Client<H> {
     /// Store `message` in `folder` (a path as [`Client::folders`] names it),
     /// seen: an import (§6.5). The new message's id.
     pub fn import(&mut self, folder: &str, message: &[u8]) -> Result<String> {
+        let attempt = self.prepare_import(folder, message)?;
+        match self.finish_import(&attempt, None)? {
+            ImportResult::Accepted(id) => Ok(id),
+            ImportResult::Refused(why) => Err(Error(why)),
+        }
+    }
+
+    pub fn prepare_import(&mut self, folder: &str, message: &[u8]) -> Result<PreparedImport> {
         if self.session.max_size_upload > 0 && message.len() as u64 > self.session.max_size_upload {
             return Err(Error("the message is larger than the server takes".into()));
         }
@@ -725,8 +759,63 @@ impl<H: Http> Client<H> {
         }
         let mailbox = self.id_of(folder).ok_or_else(|| Error(format!("the server has no folder {folder}")))?;
         let blob = self.upload("message/rfc822", message)?;
-        let a = self.call(jmap::import(&self.session.account, &blob, &mailbox))?;
-        Ok(jmap::imported(&a, &self.session.account)?)
+        let answer = self.call(jmap::email_state(&self.session.account))?;
+        let state = jmap::current_state(&answer, &self.session.account)?;
+        Ok(PreparedImport { api_url: self.session.api_url.clone(), account: self.session.account.clone(), state, mailbox, blob })
+    }
+
+    pub fn finish_import(&mut self, attempt: &PreparedImport, retry: Option<&[u8]>) -> Result<ImportResult> {
+        if self.session.account != attempt.account || self.session.api_url != attempt.api_url {
+            return Err(Error("JMAP import is awaiting confirmation from its original account".into()));
+        }
+        if let Some(message) = retry {
+            let answer = self.call(jmap::email_state(&attempt.account))?;
+            let state = jmap::current_state(&answer, &attempt.account)?;
+            if state != attempt.state {
+                return self.recover_import(attempt, message);
+            }
+        }
+        // The old state remains the precondition on every send. A delayed
+        // first request and a retry therefore cannot both create a copy.
+        let answer = self.call(jmap::import(&attempt.account, &attempt.blob, &attempt.mailbox, &attempt.state))?;
+        match jmap::import_acknowledgment(&answer, &attempt.account, Some(&attempt.state))? {
+            jmap::ImportAck::Created(id) => Ok(ImportResult::Accepted(id)),
+            jmap::ImportAck::Refused(why) => Ok(ImportResult::Refused(why)),
+        }
+    }
+
+    fn recover_import(&mut self, attempt: &PreparedImport, message: &[u8]) -> Result<ImportResult> {
+        let max = self.session.max_objects_in_get.unwrap_or(32).clamp(1, 32);
+        let answer = self.call(jmap::email_changes(&attempt.account, &attempt.state, max))?;
+        let changes = jmap::changes(&answer, &attempt.account, &attempt.state, max)?;
+        if changes.more {
+            return Err(Error("JMAP import awaiting confirmation: too many intervening changes".into()));
+        }
+        let mut matched = None;
+        let mut checked = std::collections::BTreeSet::new();
+        let mut bytes_left = 8 << 20;
+        for email in changes.changed {
+            if !changes.created.contains(&email.id) || !email.mailboxes.contains(&attempt.mailbox)
+                || !checked.insert(email.id.clone()) {
+                continue;
+            }
+            let same = if email.blob == attempt.blob {
+                true
+            } else if email.size == message.len() as u64 {
+                if message.len() > bytes_left {
+                    return Err(Error("JMAP import awaiting confirmation: readback budget exceeded".into()));
+                }
+                bytes_left -= message.len();
+                let bytes = self.h.get(&self.session.download(&email.blob), message.len()).map_err(Error)?;
+                bytes == message
+            } else {
+                false
+            };
+            if same && matched.replace(email.id).is_some() {
+                return Err(Error("JMAP import awaiting confirmation: multiple matching copies".into()));
+            }
+        }
+        matched.map(ImportResult::Accepted).ok_or_else(|| Error("JMAP import awaiting confirmation: no exact server copy found".into()))
     }
 
     /// Whether the server can hold a send until `t` (seconds from now).

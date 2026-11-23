@@ -77,6 +77,8 @@ pub enum Call {
     /// the worker ends after it). Answers [`Reply::Sieved`].
     Sieve(crate::sieve::Plan),
     AppendIdentity { folder: String, flags: Vec<String>, message: Vec<u8> },
+    JmapPrepareImport { folder: String, message: Vec<u8> },
+    JmapFinishImport { attempt: crate::jmap::PreparedImport, retry: Option<Vec<u8>> },
 }
 
 /// What [`Error`] was, across the wire.
@@ -110,6 +112,8 @@ pub enum Reply {
     Found(u32),
     Failed(Kind, String),
     AppendedIdentity(Option<AppendUid>),
+    JmapPreparedImport(std::result::Result<crate::jmap::PreparedImport, String>),
+    JmapFinishedImport(std::result::Result<crate::jmap::ImportResult, String>),
 }
 
 /// A [`Sink`] call, from the worker.
@@ -534,7 +538,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_) => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_) => {
                 let reply = match (next, jmap.as_mut()) {
                     (Call::JmapWatch, Some(c)) => {
                         let mut a = RemoteSink(chan.clone());
@@ -545,6 +549,12 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
                     (Call::JmapImport { folder, message }, Some(c)) => Reply::JmapSent(c.import(&folder, &message).map_err(|e| e.0)),
+                    (Call::JmapPrepareImport { folder, message }, Some(c)) => {
+                        Reply::JmapPreparedImport(c.prepare_import(&folder, &message).map_err(|e| e.0))
+                    }
+                    (Call::JmapFinishImport { attempt, retry }, Some(c)) => {
+                        Reply::JmapFinishedImport(c.finish_import(&attempt, retry.as_deref()).map_err(|e| e.0))
+                    }
                     (Call::JmapVacation(set), Some(c)) => Reply::Vacation(c.vacation(set.as_ref()).map_err(|e| e.0)),
                     (Call::JmapSieve(plan), Some(c)) => Reply::JmapSieved(c.sieve(&plan).map_err(|e| e.0)),
                     (Call::JmapSearch { query, limit }, Some(c)) => c.search_server(&query, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
@@ -576,7 +586,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
             }
             (Call::Sieve(plan), None) => Reply::Sieved(crate::sieve::apply(Tunnel(chan.clone()), &plan)),
             (Call::Start, Some(_)) | (Call::Submit { .. } | Call::Sieve(_), Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_), _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapPrepareImport { .. } | Call::JmapFinishImport { .. } | Call::JmapVacation(_) | Call::JmapSieve(_), _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -1007,6 +1017,26 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
             Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
         }
     }
+    fn prepare_import(&mut self, folder: &str, message: &[u8]) -> crate::jmap::Result<crate::jmap::PreparedImport> {
+        let c = Call::JmapPrepareImport { folder: folder.into(), message: message.to_vec() };
+        match self.call(&c, None, QUIET) {
+            Ok(Reply::JmapPreparedImport(r)) => r.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
+    }
+
+    fn finish_import(&mut self, attempt: &crate::jmap::PreparedImport, retry: Option<&[u8]>) -> crate::jmap::Result<crate::jmap::ImportResult> {
+        let c = Call::JmapFinishImport { attempt: attempt.clone(), retry: retry.map(<[u8]>::to_vec) };
+        match self.call(&c, None, QUIET) {
+            Ok(Reply::JmapFinishedImport(r)) => r.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
+    }
+
     fn import(&mut self, folder: &str, message: &[u8]) -> crate::jmap::Result<String> {
         let c = Call::JmapImport { folder: folder.into(), message: message.to_vec() };
         match self.call(&c, None, QUIET) {

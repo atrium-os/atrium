@@ -492,9 +492,19 @@ as **making the account usable first, then filling in what's worth having, polit
   successful outcome for the expected account and creation ID before using the
   returned Email ID to retain the original Message-ID as an account-scoped import
   alias. Mail accepts a different stored blob ID if the server repairs the message.
-  Malformed acknowledgments leave the import queued and record the failure. A
-  server may already have stored the message by the time its reply is rejected,
-  so retrying can create a second server copy. Readback uses the
+  Before the first mutation, Mail saves the original JMAP account, endpoint,
+  destination mailbox, upload blob and Email state with the queue row. It
+  sends `Email/import` with that state as `ifInState`. A lost or malformed
+  acknowledgment leaves the receipt and queue row intact across restarts.
+  If the Email state is unchanged, Mail can replay the original conditional
+  request. A delayed original and a replay cannot both succeed at that state.
+  If it changed, Mail checks one complete page of at most 32 changes since the
+  saved state and accepts only one newly created Email in the destination
+  mailbox with the uploaded blob ID or byte-exact readback (at most 8 MiB
+  across candidate downloads). If proof is unavailable, Mail keeps the row
+  and never retries with a fresh state. A first-attempt explicit refusal lets
+  Mail prepare a fresh attempt. Older failed rows without a saved state are
+  held for review. Readback uses the
   message's actual headers, and a mailbox move preserves the alias. Mail
   releases it on a destruction report only after validating the changes page
   and its chained reads for the requested account and starting state. A fetched

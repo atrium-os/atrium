@@ -332,7 +332,63 @@ impl Engine {
 
     /// Upload JMAP imports and retain the returned Email IDs for deduplication.
     pub fn upload_jmap_imports(&self, account: AccountId, client: &mut dyn mail_sync::jmap::Jmap) -> Result<usize, Error> {
-        self.upload_imports_with_identity(account, |folder, bytes| client.import(folder, bytes).map(|id| Some(mail_store::imports::ImportIdentity::Jmap(id))).map_err(|err| err.0))
+        use mail_sync::jmap::{ImportResult, PreparedImport};
+
+        let _serialized = self.store.lock_jmap_imports();
+        index_legacy_imports(&self.store, &self.parser, account)?;
+        let mut done = 0;
+        for (id, row) in self.store.imports()? {
+            if done >= UPLOADS_PER_PASS {
+                break;
+            }
+            if row.tries >= mail_store::imports::TRIES_MAX {
+                continue;
+            }
+            let Ok(folder) = self.store.folder(row.folder) else {
+                self.store.write(|w| w.import_done(id))?;
+                continue;
+            };
+            if folder.account != account {
+                continue;
+            }
+            let saved = self.store.jmap_import_attempt(id)?;
+            if saved.is_none() && row.why.is_some() {
+                self.store.write(|w| w.hold_legacy_jmap_import(id))?;
+                continue;
+            }
+            let bytes = self.store.blob(&row.blob)?;
+            let retry = saved.as_deref().filter(|record| !record.is_empty());
+            let attempt: PreparedImport = if let Some(record) = retry {
+                postcard::from_bytes(record).map_err(|e| Error::Sync(format!("invalid stored JMAP attempt: {e}")))?
+            } else {
+                let attempt = match client.prepare_import(&folder.name, &bytes) {
+                    Ok(attempt) => attempt,
+                    Err(err) => {
+                        self.store.write(|w| w.jmap_import_refused(id, &err.0))?;
+                        continue;
+                    }
+                };
+                let record = postcard::to_stdvec(&attempt).map_err(|e| Error::Sync(e.to_string()))?;
+                if !self.store.write(|w| w.begin_jmap_import(id, &record))? {
+                    continue;
+                }
+                attempt
+            };
+            match client.finish_import(&attempt, retry.map(|_| bytes.as_slice())) {
+                Ok(ImportResult::Accepted(object)) => {
+                    self.store.write(|w| w.import_accepted(id, Some(mail_store::imports::ImportIdentity::Jmap(object))))?;
+                    done += 1;
+                }
+                Ok(ImportResult::Refused(why)) if retry.is_none() => {
+                    self.store.write(|w| w.jmap_import_refused(id, &why))?;
+                }
+                Ok(ImportResult::Refused(why)) => {
+                    self.store.write(|w| w.import_failed(id, &why))?;
+                }
+                Err(err) => self.store.write(|w| w.import_failed(id, &err.0))?,
+            }
+        }
+        Ok(done)
     }
 
     /// Upload IMAP imports using the complete APPENDUID when available.

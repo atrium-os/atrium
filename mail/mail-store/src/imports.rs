@@ -16,6 +16,10 @@ const IMPORT_IDENTITIES: TableDefinition<u64, (AccountId, &str)> = TableDefiniti
 const IMPORTS_BY_MESSAGE_ID: TableDefinition<(AccountId, &str, u64), ()> =
     TableDefinition::new("imports_by_message_id");
 
+// A saved precondition for an in-flight JMAP import. An empty record
+// denotes a known failure before mutation or a previously refused request.
+const JMAP_ATTEMPTS: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_import_attempts");
+
 // An accepted upload protects its Message-ID until mailbox sync indexes it.
 const ACCEPTED_IMPORTS: TableDefinition<(AccountId, &str), ()> = TableDefinition::new("accepted_imports");
 
@@ -80,6 +84,7 @@ pub(crate) fn open(tx: &WriteTransaction) -> Result<()> {
     let imports = tx.open_table(IMPORTS)?;
     let mut unindexed = tx.open_table(UNINDEXED_IMPORTS)?;
     tx.open_table(IMPORT_IDENTITIES)?;
+    tx.open_table(JMAP_ATTEMPTS)?;
     tx.open_table(IMPORTS_BY_MESSAGE_ID)?;
     tx.open_table(ACCEPTED_IMPORTS)?;
     tx.open_multimap_table(JMAP_IMPORTS_BY_ORIGINAL)?;
@@ -359,12 +364,45 @@ impl Writer<'_> {
     /// Remove a queued row and release its Message-ID.
     pub fn import_done(&mut self, id: u64) -> Result<()> {
         self.tx.open_table(IMPORTS)?.remove(id)?;
+        self.tx.open_table(JMAP_ATTEMPTS)?.remove(id)?;
         self.tx.open_table(UNINDEXED_IMPORTS)?.remove(id)?;
         let mut identities = self.tx.open_table(IMPORT_IDENTITIES)?;
         if let Some(row) = identities.remove(id)? {
             let (account, mid) = row.value();
             self.tx.open_table(IMPORTS_BY_MESSAGE_ID)?.remove((account, mid, id))?;
         }
+        Ok(())
+    }
+
+    /// Save a JMAP attempt only while the same queue row is still eligible.
+    pub fn begin_jmap_import(&mut self, id: u64, attempt: &[u8]) -> Result<bool> {
+        if self.tx.open_table(IMPORTS)?.get(id)?.is_none() {
+            return Ok(false);
+        }
+        let mut attempts = self.tx.open_table(JMAP_ATTEMPTS)?;
+        if attempts.get(id)?.is_some_and(|old| !old.value().is_empty()) {
+            return Ok(false);
+        }
+        attempts.insert(id, attempt)?;
+        Ok(true)
+    }
+
+    /// A refusal known to have had no effect lets the next pass start fresh.
+    pub fn jmap_import_refused(&mut self, id: u64, why: &str) -> Result<()> {
+        if self.tx.open_table(IMPORTS)?.get(id)?.is_some() {
+            self.tx.open_table(JMAP_ATTEMPTS)?.insert(id, &[][..])?;
+            self.import_failed(id, why)?;
+        }
+        Ok(())
+    }
+
+    /// A legacy failed import has no state precondition to reconcile against.
+    pub fn hold_legacy_jmap_import(&mut self, id: u64) -> Result<()> {
+        let mut t = self.tx.open_table(IMPORTS)?;
+        let Some(mut row) = t.get(id)?.map(|v| dec::<Import>(v.value())).transpose()? else { return Ok(()) };
+        row.tries = TRIES_MAX;
+        row.why = Some("Older JMAP import has no saved server state. Check the server before clearing it.".into());
+        t.insert(id, enc(&row).as_slice())?;
         Ok(())
     }
 
@@ -438,6 +476,18 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Keep preflight, acknowledgment and retry decisions serialized across
+    /// engines sharing the database. The durable record survives a crash.
+    pub fn lock_jmap_imports(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.jmap_imports.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn jmap_import_attempt(&self, id: u64) -> Result<Option<Vec<u8>>> {
+        let tx = self.db.begin_read()?;
+        let attempts = tx.open_table(JMAP_ATTEMPTS)?;
+        Ok(attempts.get(id)?.map(|value| value.value().to_vec()))
     }
 
     /// A bounded page of tracked JMAP objects for one account, in ID order.

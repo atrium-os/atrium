@@ -32,6 +32,7 @@ const SESSION: &str = "https://jmap.test/.well-known/jmap";
 const ACCOUNT: &str = "u1";
 
 struct Mail {
+    created: u64,
     blob: String,
     bytes: Vec<u8>,
     boxes: BTreeSet<String>,
@@ -66,6 +67,12 @@ struct Server {
     import_requests: usize,
     import_overrides: Map<String, Value>,
     repeat_import_reply: bool,
+    drop_import_before: bool,
+    delay_import: bool,
+    delayed_import: Option<Value>,
+    drop_import_after: bool,
+    refuse_import: bool,
+    import_preconditions: Vec<String>,
     presence_limit: Option<usize>,
     presence_queries: Vec<Vec<String>>,
     wrong_presence_account: bool,
@@ -88,7 +95,7 @@ impl Server {
     fn add(&mut self, bytes: Vec<u8>, boxes: &[&str], keywords: &[&str], received: i64) -> String {
         self.next += 1;
         let id = format!("M{}", self.next);
-        self.mails.insert(id.clone(), Mail { blob: format!("B{}", self.next), bytes, boxes: boxes.iter().map(|s| s.to_string()).collect(), keywords: keywords.iter().map(|s| s.to_string()).collect(), received });
+        self.mails.insert(id.clone(), Mail { created: self.state + 1, blob: format!("B{}", self.next), bytes, boxes: boxes.iter().map(|s| s.to_string()).collect(), keywords: keywords.iter().map(|s| s.to_string()).collect(), received });
         self.touch(&id, false);
         id
     }
@@ -191,13 +198,22 @@ impl Server {
                         continue;
                     }
                     let mut created = Vec::new();
+                    let mut updated = Vec::new();
                     let mut destroyed = Vec::new();
-                    for (s, id, gone) in &self.log {
-                        if *s > since {
-                            if *gone { destroyed.push(id.clone()) } else if !created.contains(id) && self.mails.contains_key(id) { created.push(id.clone()) }
+                    for (at, id, gone) in &self.log {
+                        if *at <= since {
+                            continue;
+                        }
+                        if *gone {
+                            destroyed.push(id.clone());
+                        } else if let Some(email) = self.mails.get(id) {
+                            let ids = if email.created > since { &mut created } else { &mut updated };
+                            if !ids.contains(id) {
+                                ids.push(id.clone());
+                            }
                         }
                     }
-                    json!({ "accountId": ACCOUNT, "oldState": since.to_string(), "newState": self.state.to_string(), "hasMoreChanges": false, "created": [], "updated": created, "destroyed": destroyed })
+                    json!({ "accountId": ACCOUNT, "oldState": since.to_string(), "newState": self.state.to_string(), "hasMoreChanges": false, "created": created, "updated": updated, "destroyed": destroyed })
                 }
                 "Email/set" => {
                     let old = self.state;
@@ -283,6 +299,17 @@ impl Server {
                 "Email/import" => {
                     self.import_requests += 1;
                     let old = self.state;
+                    if let Some(state) = args["ifInState"].as_str() {
+                        if state != old.to_string() {
+                            out.push(json!(["error", {"type": "stateMismatch"}, cid]));
+                            continue;
+                        }
+                    }
+                    if self.refuse_import {
+                        out.push(json!([name, {"accountId": ACCOUNT, "oldState": old.to_string(),
+                            "newState": old.to_string(), "notCreated": {"m": {"type": "overQuota"}}}, cid]));
+                        continue;
+                    }
                     assert_eq!(args["accountId"], ACCOUNT);
                     assert_eq!(args["emails"].as_object().unwrap().len(), 1);
                     let e = &args["emails"]["m"];
@@ -400,7 +427,27 @@ impl Http for Fake {
                 if s.fail_mailbox_sync && req["methodCalls"].as_array().unwrap().iter().any(|call| call[0] == "Mailbox/get") {
                     return Err("test mailbox sync outage".into());
                 }
-                Ok(serde_json::to_vec(&s.api(&req)).unwrap())
+                let import = req["methodCalls"].as_array().unwrap().iter().find(|call| call[0] == "Email/import");
+                if let Some(call) = import {
+                    if let Some(state) = call[1]["ifInState"].as_str() {
+                        s.import_preconditions.push(state.to_string());
+                    }
+                    if std::mem::take(&mut s.delay_import) {
+                        s.delayed_import = Some(req);
+                        return Err("test acknowledgment lost while the server deferred import".into());
+                    }
+                    if let Some(delayed) = s.delayed_import.take() {
+                        s.api(&delayed);
+                    }
+                    if std::mem::take(&mut s.drop_import_before) {
+                        return Err("test connection lost before import reached the server".into());
+                    }
+                }
+                let answer = s.api(&req);
+                if import.is_some() && std::mem::take(&mut s.drop_import_after) {
+                    return Err("test acknowledgment lost after the server stored the import".into());
+                }
+                Ok(serde_json::to_vec(&answer).unwrap())
             }
             "https://jmap.test/upload/u1/" => {
                 assert!(content_type == "message/rfc822" || content_type == "application/sieve", "{content_type}");
@@ -1108,6 +1155,128 @@ fn mbox_legacy_upload_is_protected_before_its_first_readback() {
     let mut mbox = Vec::new();
     mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
     assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap(), Imported { queued: 0, already: 1, refused: 0 });
+}
+
+#[test]
+fn jmap_recovers_a_stored_import_after_a_lost_reply_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let parser = jail();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser.clone() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server { drop_import_after: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let raw = message(40, "Stored before disconnect", "body");
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &raw, 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 1);
+    assert_eq!(server.borrow().mails.len(), 1);
+    assert!(engine.store.jmap_import_ids(account, "", 32).unwrap().is_empty());
+    drop((client, engine));
+
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: parser });
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    assert!(engine.store.imports().unwrap().is_empty());
+    assert_eq!(engine.store.jmap_import_ids(account, "", 32).unwrap(), ["M1"]);
+    let s = server.borrow();
+    assert_eq!(s.import_preconditions, ["0"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len(), s.downloads), (1, 1, 1, 1));
+    assert_eq!(s.mails["M1"].bytes, raw);
+}
+
+#[test]
+fn jmap_retries_an_unsent_import_with_its_original_precondition() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server { drop_import_before: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(41, "Unsent", "body"), 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert!(server.borrow().mails.is_empty());
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    let s = server.borrow();
+    assert_eq!(s.import_preconditions, ["0", "0"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (1, 1, 1));
+}
+
+#[test]
+fn jmap_delayed_first_import_and_retry_cannot_both_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server { delay_import: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(45, "Delayed commit", "body"), 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert!(server.borrow().mails.is_empty());
+    // The server applies the delayed request after the retry observes state
+    // zero but before it processes the conditional retry itself.
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert_eq!(server.borrow().mails.len(), 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    let s = server.borrow();
+    assert_eq!(s.import_preconditions, ["0", "0"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (2, 1, 1));
+    assert_eq!(engine.store.jmap_import_ids(account, "", 32).unwrap(), ["M1"]);
+}
+
+#[test]
+fn jmap_holds_an_ambiguous_import_when_the_server_copy_cannot_be_proven() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server {
+        drop_import_after: true,
+        rewrite_import_message_ids: true,
+        ..Default::default()
+    }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(42, "Server-rewritten", "body"), 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    for _ in 1..mail_store::imports::TRIES_MAX {
+        assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    }
+    assert_eq!(engine.imports_stuck(account).unwrap().0, 1);
+    assert_eq!(engine.retry_imports(account).unwrap(), 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    let s = server.borrow();
+    assert_eq!(s.import_preconditions, ["0"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (1, 1, 1));
+    assert!(engine.store.jmap_import_ids(account, "", 32).unwrap().is_empty());
+}
+
+#[test]
+fn jmap_explicit_refusal_allows_a_fresh_import_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let archive = engine.store.folder_id(account, "Archive", Role::Archive).unwrap();
+    let server = Rc::new(RefCell::new(Server { refuse_import: true, ..Default::default() }));
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    let mut mbox = Vec::new();
+    mail_engine::export::write_one(&mut mbox, &message(43, "Refused until quota cleared", "body"), 0).unwrap();
+    assert_eq!(engine.import_mbox(archive, &mbox[..]).unwrap().queued, 1);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 0);
+    assert!(server.borrow().mails.is_empty());
+    server.borrow_mut().refuse_import = false;
+    server.borrow_mut().add(message(44, "New unrelated mail", "body"), &["in"], &[], 1_800_000_000);
+    assert_eq!(engine.upload_jmap_imports(account, client.as_mut()).unwrap(), 1);
+    let s = server.borrow();
+    assert_eq!(s.import_preconditions, ["0", "1"]);
+    assert_eq!((s.import_requests, s.uploads.len(), s.mails.len()), (2, 2, 2));
 }
 
 #[test]

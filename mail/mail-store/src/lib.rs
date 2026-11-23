@@ -249,6 +249,7 @@ pub struct Row {
 pub struct Store {
     db: std::sync::Arc<Database>,
     blobs: PathBuf,
+    jmap_imports: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// Newest first: the key sorts ascending, so it is the date reversed.
@@ -322,7 +323,7 @@ impl Store {
             }
         }
         tx.commit()?;
-        Ok(Store { db: std::sync::Arc::new(db), blobs: dir.join("blobs") })
+        Ok(Store { db: std::sync::Arc::new(db), blobs: dir.join("blobs"), jmap_imports: Default::default() })
     }
 
     // ── blobs ───────────────────────────────────────────────────────

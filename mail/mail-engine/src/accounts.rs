@@ -188,6 +188,12 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn search(&mut self, query: &mail_sync::ServerQuery, sink: &mut dyn mail_sync::Sink, limit: usize) -> mail_sync::jmap::Result<usize> {
         mail_sync::jmap::Jmap::search(&mut self.remote, query, sink, limit)
     }
+    fn prepare_import(&mut self, folder: &str, message: &[u8]) -> mail_sync::jmap::Result<mail_sync::jmap::PreparedImport> {
+        mail_sync::jmap::Jmap::prepare_import(&mut self.remote, folder, message)
+    }
+    fn finish_import(&mut self, attempt: &mail_sync::jmap::PreparedImport, retry: Option<&[u8]>) -> mail_sync::jmap::Result<mail_sync::jmap::ImportResult> {
+        mail_sync::jmap::Jmap::finish_import(&mut self.remote, attempt, retry)
+    }
     fn import(&mut self, folder: &str, message: &[u8]) -> mail_sync::jmap::Result<String> {
         mail_sync::jmap::Jmap::import(&mut self.remote, folder, message)
     }
