@@ -90,7 +90,19 @@
      void set_duration(Badge<MediaSourceExtensions::MediaSource>, double duration, double playback_position_before_the_change) { set_duration(duration, playback_position_before_the_change); }
 --- a/Libraries/LibMediaClient/RemotePlaybackManager.cpp
 +++ b/Libraries/LibMediaClient/RemotePlaybackManager.cpp
-@@ -36,6 +36,10 @@
+@@ -12,6 +12,11 @@
+ #include <LibMediaClient/RemotePlaybackManager.h>
+ #include <LibMediaClient/RemoteSourceBuffer.h>
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" void navigator_video_playing(bool);
++extern "C" void navigator_video_volume(double);
++#endif
++
+ namespace MediaClient {
+ 
+ static Media::DecoderError media_server_gone_error()
+@@ -36,6 +41,10 @@
  NonnullOwnPtr<RemotePlaybackManager> RemotePlaybackManager::create_without_media_server()
  {
      auto playback_manager = adopt_own(*new RemotePlaybackManager(nullptr, 0));
@@ -101,31 +113,70 @@
      // The owner installs its error handler after creation, so the failure reaches it from the event loop.
      Core::deferred_invoke([playback_manager = playback_manager->make_weak_ptr()] {
          if (playback_manager)
+@@ -167,12 +176,24 @@
+ 
+ void RemotePlaybackManager::play()
+ {
++#ifdef ATRIUM_I4_VIDEO
++    if (!m_client) {
++        navigator_video_playing(true);
++        return;
++    }
++#endif
+     if (can_send())
+         m_client->async_play(m_session_id);
+ }
+ 
+ void RemotePlaybackManager::pause()
+ {
++#ifdef ATRIUM_I4_VIDEO
++    if (!m_client) {
++        navigator_video_playing(false);
++        return;
++    }
++#endif
+     if (can_send())
+         m_client->async_pause(m_session_id);
+ }
+@@ -195,6 +216,12 @@
+ 
+ void RemotePlaybackManager::set_volume(double volume)
+ {
++#ifdef ATRIUM_I4_VIDEO
++    if (!m_client) {
++        navigator_video_volume(volume);
++        return;
++    }
++#endif
+     if (can_send())
+         m_client->async_set_volume(m_session_id, volume);
+ }
 --- a/Libraries/LibWeb/MediaSourceExtensions/MediaSource.cpp
 +++ b/Libraries/LibWeb/MediaSourceExtensions/MediaSource.cpp
-@@ -24,6 +24,10 @@
+@@ -24,6 +24,11 @@
  #include <LibWeb/MediaSourceExtensions/SourceBufferList.h>
  #include <LibWebCommon/MimeSniff/MimeType.h>
  
 +#ifdef ATRIUM_I4_VIDEO
-+extern "C" bool navigator_video_add();
++extern "C" bool navigator_video_available();
++extern "C" bool navigator_video_add(u64, bool);
 +extern "C" double navigator_video_end();
 +#endif
  namespace Web::MediaSourceExtensions {
  
  GC_DEFINE_ALLOCATOR(MediaSource);
-@@ -319,6 +323,10 @@
- 
-     // 5. Let buffer be a new instance of a ManagedSourceBuffer if this is a ManagedMediaSource, or
-     //    a SourceBuffer otherwise, with their respective associated resources.
+@@ -324,6 +329,10 @@
+         HTML::AudioTrackList::create(),
+         HTML::VideoTrackList::create(),
+         HTML::TextTrackList::create());
 +#ifdef ATRIUM_I4_VIDEO
-+    if (m_source_buffers->length() || !navigator_video_add())
++    if (!navigator_video_add(buffer->native_buffer_id(), type == u"audio/webm; codecs=\"opus\""sv))
 +        return WebIDL::NotSupportedError::create("Native player refused this track"_utf16);
 +#endif
-     auto buffer = SourceBuffer::create(
-         *this,
-         HTML::AudioTrackList::create(),
-@@ -359,7 +367,16 @@
+     buffer->set_content_type(type.utf16_view());
+ 
+     // FIXME: 6. Set buffer's [[generate timestamps flag]] to the value in the "Generate Timestamps Flag"
+@@ -359,7 +368,16 @@
      }
  
      // 3. Run the end of stream algorithm with the error parameter set to error.
@@ -142,71 +193,98 @@
  
      return {};
  }
-@@ -614,6 +631,9 @@
+@@ -614,6 +632,9 @@
      if (!mime_type_is_supported_in_a_byte_stream(*mime_type))
          return false;
  
 +#ifdef ATRIUM_I4_VIDEO
-+    return type == u"video/webm; codecs=\"vp9\""sv;
++    return type == u"video/webm; codecs=\"vp9\""sv || (navigator_video_available() && type == u"audio/webm; codecs=\"opus\""sv);
 +#endif
      auto media_client = MediaClient::Client::acquire();
      if (media_client.is_error())
          return false;
 --- a/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.cpp
 +++ b/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.cpp
-@@ -28,6 +28,9 @@
+@@ -28,7 +28,14 @@
  #include <LibWeb/WebIDL/QuotaExceededError.h>
  #include <LibWebCommon/MimeSniff/MimeType.h>
  
 +#ifdef ATRIUM_I4_VIDEO
-+extern "C" bool navigator_video_range(size_t, double*, double*);
++extern "C" bool navigator_video_range(u64, size_t, double*, double*);
 +#endif
  namespace Web::MediaSourceExtensions {
++
++#ifdef ATRIUM_I4_VIDEO
++u64 SourceBuffer::native_buffer_id() const { return m_remote_source_buffer->id(); }
++#endif
  
  static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::NullableTrackType const& track)
-@@ -354,6 +357,12 @@
+ {
+@@ -354,6 +361,12 @@
      // NB: The remaining steps are implemented by DemuxerScanState::buffered_ranges(), which the media server also uses
      //     to limit playback. The track buffer ranges are published after each command, so this read never observes a
      //     partial append, and the end of the stream is tracked here, so readyState changes take effect at once.
 +#ifdef ATRIUM_I4_VIDEO
 +    double start, end;
-+    for (size_t i = 0; navigator_video_range(i, &start, &end); ++i)
++    for (size_t i = 0; navigator_video_range(native_buffer_id(), i, &start, &end); ++i)
 +        time_ranges->add_range(start, end);
 +    return time_ranges;
 +#endif
      auto ranges = m_remote_source_buffer->scan_state().buffered_ranges();
      for (auto const& range : ranges)
          time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
-@@ -368,6 +377,11 @@
+@@ -368,6 +381,11 @@
  
  AK::Duration SourceBuffer::highest_end_time() const
  {
 +#ifdef ATRIUM_I4_VIDEO
 +    double start = 0, end = 0;
-+    for (size_t i = 0; navigator_video_range(i, &start, &end); ++i) { }
++    for (size_t i = 0; navigator_video_range(native_buffer_id(), i, &start, &end); ++i) { }
 +    return AK::Duration::from_seconds_f64(end);
 +#endif
      return m_remote_source_buffer->published_state().highest_end_time;
  }
  
+@@ -625,6 +643,9 @@
+     if (!MediaSource::is_type_supported(type.utf16_view()))
+         return WebIDL::NotSupportedError::create("Type is not supported"_utf16);
+ 
++#ifdef ATRIUM_I4_VIDEO
++    return WebIDL::NotSupportedError::create("Native track reconfiguration is unavailable"_utf16);
++#endif
+     // 5. If the readyState attribute of the parent media source is in the "ended" state then run the following steps:
+     if (m_media_source->ready_state() == ReadyState::Ended) {
+         // 5.1. Set the readyState attribute of the parent media source to "open"
 --- a/Libraries/LibMediaClient/RemoteSourceBuffer.cpp
 +++ b/Libraries/LibMediaClient/RemoteSourceBuffer.cpp
-@@ -9,6 +9,9 @@
+@@ -9,12 +9,21 @@
  #include <LibMediaClient/RemotePlaybackManager.h>
  #include <LibMediaClient/RemoteSourceBuffer.h>
  
 +#ifdef ATRIUM_I4_VIDEO
-+extern "C" bool navigator_video_append(u8 const*, size_t);
++extern "C" bool navigator_video_append(u64, u8 const*, size_t);
 +#endif
  namespace MediaClient {
  
  NonnullRefPtr<RemoteSourceBuffer> RemoteSourceBuffer::create(RemotePlaybackManager& playback_manager)
-@@ -86,6 +89,15 @@
+ {
+     RefPtr<Client> client = playback_manager.client();
+     u64 id = client ? client->allocate_id() : 0;
++#ifdef ATRIUM_I4_VIDEO
++    // These local processors share a playback manager and need distinct registration keys.
++    static u64 next_native_id = 1;
++    if (!client)
++        id = next_native_id++;
++#endif
+     auto source_buffer = adopt_ref(*new RemoteSourceBuffer(playback_manager, client, playback_manager.session_id(), id));
+     playback_manager.register_source_buffer({}, *source_buffer);
+     if (source_buffer->can_send())
+@@ -86,6 +95,15 @@
      if (!m_pending_append.has_value())
          return;
      auto data = m_pending_append.release_value();
 +#ifdef ATRIUM_I4_VIDEO
-+    if (navigator_video_append(data.data(), data.size())) {
++    if (navigator_video_append(id(), data.data(), data.size())) {
 +        if (on_append_completed) on_append_completed(append_generation);
 +    } else if (on_append_failed) {
 +        on_append_failed(append_generation);
@@ -217,3 +295,15 @@
      if (!can_send()) {
          // The server is gone, so the append fails the way one it had started would.
          Core::deferred_invoke([self = NonnullRefPtr(*this), append_generation] {
+--- a/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.h
++++ b/Libraries/LibWeb/MediaSourceExtensions/SourceBuffer.h
+@@ -79,6 +79,9 @@
+     AK::Duration highest_presentation_timestamp() const;
+     AK::Duration highest_end_time() const;
+ 
++#ifdef ATRIUM_I4_VIDEO
++    u64 native_buffer_id() const;
++#endif
+     void set_content_type(Utf16View type);
+ 
+     // https://w3c.github.io/media-source/#addsourcebuffer-method

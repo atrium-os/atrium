@@ -15,7 +15,7 @@
  
  namespace Web {
  
-@@ -507,6 +515,47 @@
+@@ -507,6 +515,48 @@
          return nullptr;
      }
  
@@ -42,6 +42,7 @@
 +            } else {
 +                if (name == "https://widget.example/navigator-i4/local-player.js"sv) mime = "text/javascript"sv;
 +                if (name == "https://widget.example/media/red-blue.webm"sv) mime = "video/webm"sv;
++                if (name == "https://widget.example/media/tone-opus.webm"sv) mime = "audio/webm"sv;
 +                if (provider_asset == 1) mime = "text/javascript"sv;
 +                if (provider_asset == 2) mime = "text/css"sv;
 +                length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());

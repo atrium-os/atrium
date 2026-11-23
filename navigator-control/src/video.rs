@@ -4,6 +4,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 pub const MIME: &str = "video/webm; codecs=\"vp9\"";
+pub const OPUS_MIME: &str = "audio/webm; codecs=\"opus\"";
 pub const MAX_APPEND: usize = 60 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -13,6 +14,11 @@ pub enum Request {
     Append(Vec<u8>),
     End,
     Seek(f64),
+    AddOpus,
+    AppendOpus(Vec<u8>),
+    SetPlaying(bool),
+    Volume(f64),
+    Clock,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -22,6 +28,7 @@ pub enum Reply {
     Ready { duration: f64 },
     Seeked { secs: f64 },
     Failed,
+    Position { secs: f64 },
 }
 
 pub fn send<T: Serialize>(socket: &mut impl Write, message: &T) -> io::Result<()> {
@@ -60,6 +67,11 @@ mod tests {
             matches!(receive(&mut bytes.as_slice()), Ok(Request::Append(b)) if b == vec![7; MAX_APPEND])
         );
         assert!(receive::<Request>(&mut u32::MAX.to_le_bytes().as_slice()).is_err());
+        let mut audio = Vec::new();
+        send(&mut audio, &Request::AppendOpus(vec![3; MAX_APPEND])).unwrap();
+        assert!(
+            matches!(receive(&mut audio.as_slice()), Ok(Request::AppendOpus(b)) if b == vec![3; MAX_APPEND])
+        );
         let mut extra = Vec::new();
         send(&mut extra, &Request::End).unwrap();
         extra[0] += 1;

@@ -16,6 +16,7 @@ const VIDEO_RESOURCES: &[(&str, &str)] = &[
     (VIDEO, "text/html"),
     ("https://widget.example/navigator-i4/local-player.js", "text/javascript"),
     ("https://widget.example/media/red-blue.webm", "video/webm"),
+    ("https://widget.example/media/tone-opus.webm", "audio/webm"),
 ];
 const COUNTER_RESOURCES: &[(&str, &str)] = &[(COUNTER, "text/html")];
 

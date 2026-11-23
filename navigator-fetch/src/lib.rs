@@ -629,7 +629,7 @@ pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration
             if let Some(b) = url.strip_prefix("B ") { if let Ok(n) = b.trim().parse() { pf.set_budget(n) } continue }
             if url == "--gate" { let _ = out.flush(); gate(&mut out); continue }
             // Anonymous island resources have an explicit expected response type.
-            if let Some((u, mime)) = [("I ", "text/html"), ("I-js ", "text/javascript"), ("I-webm ", "video/webm")]
+            if let Some((u, mime)) = [("I ", "text/html"), ("I-js ", "text/javascript"), ("I-webm ", "video/webm"), ("I-audio-webm ", "audio/webm")]
                 .iter().find_map(|(prefix, mime)| url.strip_prefix(prefix).map(|u| (u, *mime))) {
                 match pf.widget_resource(u, mime) {
                     Ok(body) => {

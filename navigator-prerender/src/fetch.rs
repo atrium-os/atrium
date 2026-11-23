@@ -345,6 +345,7 @@ impl FetchdFetcher {
             "text/html" => "I ",
             "text/javascript" => "I-js ",
             "video/webm" => "I-webm ",
+            "audio/webm" => "I-audio-webm ",
             _ => return Err("unsupported widget resource type".into()),
         };
         match self.exchange_line(url, "", verb)? {

@@ -15,10 +15,11 @@ const SIGN_IN: [&str; 4] = [
     "https://idp.example/sign-in.html?step=callback",
 ];
 const PROVIDER: &[&str] = &[navigator_control::YOUTUBE_ENTRY];
-const VIDEO: [&str; 3] = [
+const VIDEO: [&str; 4] = [
     "https://widget.example/navigator-i4/local-player.html",
     "https://widget.example/navigator-i4/local-player.js",
     "https://widget.example/media/red-blue.webm",
+    "https://widget.example/media/tone-opus.webm",
 ];
 type Sequence = &'static [&'static str];
 static CLIENT: OnceLock<Mutex<Option<(Client, usize, Option<Sequence>)>>> = OnceLock::new();
@@ -84,7 +85,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
         if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT {return 0;}
     } else if sequence.get(step).copied() != Some(url) { return 0; }
     let expected_mime = if provider_asset { asset.unwrap() } else if url == VIDEO[1] { "text/javascript" }
-        else if url == VIDEO[2] { "video/webm" } else { "text/html" };
+        else if url == VIDEO[2] { "video/webm" } else if url == VIDEO[3] { "audio/webm" } else { "text/html" };
     let request_id = step as u32 + 1;
     let mut open = Open::get(request_id, url);
     open.limits.max_bytes = capacity as u64;

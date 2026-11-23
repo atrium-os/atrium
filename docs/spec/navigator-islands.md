@@ -461,8 +461,9 @@ offers and fetched media from a Google Video CDN. A player script measured
 1,957,976 decoded bytes. These observations establish compatibility with
 the provider in Chrome. They do not confer a network grant on Ladybird.
 
-The local playback fixture retains its three-resource, 64 KiB-per-resource
-grant and one VP9 SourceBuffer. Its ordinary fetcher
+The local playback fixture grants four GETs: the HTML, its script, the VP9
+WebM clip and the Opus WebM tone. Each resource is limited to 64 KiB.
+The private player channel accepts at most 64 KiB of append data in total. Its ordinary fetcher
 omits Referer. For the opt-in I4 entry test, the broker admits only the exact demo URL in
 `NAVIGATORD_I4_YOUTUBE`. Start must spend a compositor press for the
 current document. The island's first typed GET launches
@@ -509,8 +510,13 @@ Its player was fully intersecting the viewport, had the video title and
 duration (1,344 s), and stayed in state −1. In a diagnostic build, adding
 only the Opus answer produced the provider's own Play button in the DOM
 without an explicit cue. That probe made no audio buffer or playback
-claim. The shipping bridge still requires a real second SourceBuffer,
-track-specific append and range routing, and an installed two-track test.
+claim. The two-track bridge now associates each LibWeb SourceBuffer with its own
+native track and returns buffered ranges for that track. The fixture appends
+the audio header first and checks that the video media append leaves the
+audio range empty. After the audio media append, its shorter range must
+remain distinct. A Chrome control passed in both buffer creation orders
+and decoded both tracks after seeking to 0.5 s. Installed Ladybird playback
+and audio output after seeking still require the Tessera gate.
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter

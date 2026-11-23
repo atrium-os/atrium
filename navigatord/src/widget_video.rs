@@ -137,39 +137,81 @@ impl Session {
             if Instant::now() >= deadline {
                 return Err("player acknowledgement timed out".into());
             }
-            let (embed, ev) = {
-                let mut locked = self.slot.lock().unwrap();
-                let s = locked.as_mut().ok_or("video retired")?;
-                (
-                    s.embed,
-                    s.parent
-                        .poll(Duration::from_millis(30))
-                        .map_err(|e| format!("player poll: {e:?}"))?,
-                )
-            };
-            match ev {
-                Some(ParentEvent::Message { embed: id, bytes }) if id == embed => {
-                    let m = ToParent::decode(&bytes).ok_or("malformed player message")?;
-                    if matches!(
-                        m,
-                        ToParent::Error { .. }
-                            | ToParent::CanPlay {
-                                supported: false,
-                                ..
-                            }
-                    ) {
-                        return Err(format!("player refused video: {m:?}"));
-                    }
-                    self.media.from_player(m);
-                    self.flush()?;
-                }
-                Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. }) => {
-                    return Err("player stopped".into())
-                }
-                _ => {}
-            }
+            self.poll_player(Duration::from_millis(30))?;
         }
         Ok(())
+    }
+
+    fn poll_player(&mut self, timeout: Duration) -> Result<bool, String> {
+        let (embed, ev) = {
+            let mut locked = self.slot.lock().unwrap();
+            let s = locked.as_mut().ok_or("video retired")?;
+            (
+                s.embed,
+                s.parent
+                    .poll(timeout)
+                    .map_err(|e| format!("player poll: {e:?}"))?,
+            )
+        };
+        let received = ev.is_some();
+        match ev {
+            Some(ParentEvent::Message { embed: id, bytes }) if id == embed => {
+                let m = ToParent::decode(&bytes).ok_or("malformed player message")?;
+                if matches!(
+                    m,
+                    ToParent::Error { .. }
+                        | ToParent::CanPlay {
+                            supported: false,
+                            ..
+                        }
+                ) {
+                    return Err(format!("player refused video: {m:?}"));
+                }
+                self.media.from_player(m);
+                self.flush()?;
+            }
+            Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. }) => {
+                return Err("player stopped".into());
+            }
+            _ => {}
+        }
+        Ok(received)
+    }
+
+    fn track(&self, mime: &str) -> Option<u8> {
+        (0..2).find(|&id| self.media.source_type(id) == Some(mime))
+    }
+
+    fn add_track(&mut self, mime: &str) -> Result<Reply, String> {
+        if self.ended || self.track(mime).is_some() {
+            return Ok(Reply::Failed);
+        }
+        self.until(|media| media.supports_cached_type(mime))?;
+        self.media
+            .add_source_buffer(mime)
+            .map_err(|e| format!("add track: {e:?}"))?;
+        self.flush()?;
+        Ok(Reply::Ok)
+    }
+
+    fn append_track(&mut self, mime: &str, bytes: Vec<u8>) -> Result<Reply, String> {
+        let id = self.track(mime).ok_or("unregistered media track")?;
+        if self.ended
+            || bytes.is_empty()
+            || bytes.len() > video::MAX_APPEND
+            || self.bytes + bytes.len() > 65536
+        {
+            return Err("append outside local video grant".into());
+        }
+        self.media
+            .append_buffer(id, &bytes)
+            .map_err(|e| format!("append track: {e:?}"))?;
+        self.bytes += bytes.len();
+        self.flush()?;
+        self.until(|media| !media.updating(id))?;
+        Ok(Reply::Appended {
+            ranges: self.media.source_buffered(id),
+        })
     }
 
     fn handle(&mut self, req: Request) -> Result<Reply, String> {
@@ -183,28 +225,37 @@ impl Session {
                     s.element = Some(rect);
                     s.place()?;
                 }
-                self.media.prime(&[video::MIME]);
+                self.media.prime(&[video::MIME, video::OPUS_MIME]);
                 self.flush()?;
                 Ok(Reply::Ok)
             }
-            Request::AddVp9 if self.media.source_type(0).is_none() => {
-                self.until(|m| m.supports_cached_type(video::MIME))?;
-                self.media.add_source_buffer(video::MIME).map_err(dom)?;
+            Request::AddVp9 => self.add_track(video::MIME),
+            Request::AddOpus => self.add_track(video::OPUS_MIME),
+            Request::Append(bytes) => self.append_track(video::MIME, bytes),
+            Request::AppendOpus(bytes) => self.append_track(video::OPUS_MIME, bytes),
+            Request::SetPlaying(playing) => {
+                if playing {
+                    self.media.play().map_err(dom)?;
+                } else {
+                    self.media.pause();
+                }
                 self.flush()?;
                 Ok(Reply::Ok)
             }
-            Request::Append(bytes)
-                if !self.ended
-                    && !bytes.is_empty()
-                    && bytes.len() <= video::MAX_APPEND
-                    && self.bytes + bytes.len() <= 65536 =>
-            {
-                self.media.append_buffer(0, &bytes).map_err(dom)?;
-                self.bytes += bytes.len();
+            Request::Volume(volume) if volume.is_finite() && (0.0..=1.0).contains(&volume) => {
+                self.media.set_volume(volume).map_err(dom)?;
                 self.flush()?;
-                self.until(|m| !m.updating(0))?;
-                Ok(Reply::Appended {
-                    ranges: self.media.source_buffered(0),
+                Ok(Reply::Ok)
+            }
+            Request::Clock => {
+                // Handle queued native clock and state updates without waiting for a new tick.
+                for _ in 0..32 {
+                    if !self.poll_player(Duration::ZERO)? {
+                        break;
+                    }
+                }
+                Ok(Reply::Position {
+                    secs: self.media.current_time,
                 })
             }
             Request::End if self.bytes > 0 && !self.ended => {

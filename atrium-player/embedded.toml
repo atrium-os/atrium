@@ -10,6 +10,7 @@ implements = ["media-player"]
 
 [capabilities]
 network = "none"
+audio = true
 embeds = []
 
 [[workers]]

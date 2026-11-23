@@ -21,6 +21,8 @@ $ff $src -c:v libvpx-vp9 -b:v 200k -g 24 -c:a libopus -b:a 48k -strict -2 \
 # Colour fields for the on-screen check (atrium-player M4): 1 s red, then 1 s blue.
 $ff -f lavfi -i color=c=red:s=160x96:r=24:d=1 -f lavfi -i color=c=blue:s=160x96:r=24:d=1 \
     -filter_complex '[0][1]concat=n=2:v=1:a=0' -c:v libvpx-vp9 -b:v 100k -g 24 red-blue.webm
+# Audio-only MSE companion with a deliberately shorter buffered range.
+$ff -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1.8 -c:a libopus -b:a 32k tone-opus.webm
 # Colour descriptions (atrium-player M7): HDR10 tags in VP9/WebM, full-range BT.709 in
 # AV1/MP4 (colr box and the sequence header).
 c="-f lavfi -i testsrc2=size=64x36:rate=24:duration=0.5"
