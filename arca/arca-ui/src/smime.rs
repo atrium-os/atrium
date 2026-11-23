@@ -11,16 +11,22 @@ use arca_store::secret::LockedBuf;
 
 use crate::arca::{Arcad, Error};
 
-fn read_der(mut file: File, max: usize) -> Result<LockedBuf, Error> {
+fn read_der(file: File, max: usize) -> Result<LockedBuf, Error> {
     let mode = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if mode < 0 {
         return Err(io::Error::last_os_error().into());
     }
+    if mode & libc::O_ACCMODE != libc::O_RDONLY {
+        return Err(Error::Malformed);
+    }
+    read_checked_der(file, max)
+}
+
+/// The picker broker checks the open mode and strips F_GETFL along with
+/// the other rights. Recheck the type and length on that limited handle.
+pub(crate) fn read_checked_der(mut file: File, max: usize) -> Result<LockedBuf, Error> {
     let stat = file.metadata()?;
-    if mode & libc::O_ACCMODE != libc::O_RDONLY
-        || !stat.is_file()
-        || !(1..=max as u64).contains(&stat.len())
-    {
+    if !stat.is_file() || !(1..=max as u64).contains(&stat.len()) {
         return Err(Error::Malformed);
     }
     let mut data = LockedBuf::zeroed(stat.len() as usize)?;
@@ -98,5 +104,22 @@ pub fn run(arca: &Arcad, args: &[String]) -> ExitCode {
             eprintln!("S/MIME: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod tests {
+    use std::io::Write;
+
+    #[test]
+    fn picked_der_can_be_read_after_capsicum_strips_fcntl() {
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"synthetic DER").unwrap();
+        let read = std::fs::File::open(source.path()).unwrap();
+        let fd = read.into();
+        limen::fdpass::narrow_returned(&fd, false).unwrap();
+
+        let data = super::read_checked_der(fd.into(), 32).unwrap();
+        assert_eq!(data.as_ref(), b"synthetic DER");
     }
 }

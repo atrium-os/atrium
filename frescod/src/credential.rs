@@ -14,7 +14,8 @@
 //! be wholly on screen, nothing composed above it overlapping it, at least
 //! the minimum size and where it was last frame, for an `IDENTITY` press.
 //!
-//! Every other top-level window is watched the same way for presses that
+//! Embedded system sheets and every other top-level window are watched
+//! the same way for presses that
 //! need only the asking app's own window seen whole and still: Allow on
 //! Settings' Apps page (`APPROVE`, curia.md §13). Those count for nothing
 //! else ([`visible_for`] is for slots and sheets alone).
@@ -71,7 +72,14 @@ pub fn observe_frame_with(comp: &Mutex<Compositor>, layers: &[(u32, [i32; 4])], 
                 let fits = !w.hidden && !w.embed_pending && sw >= MIN_W && sh >= MIN_H;
                 return Some((id as u32, id as u32, None, fits, !sheet_uids.contains(&uid)));
             }
-            let s = w.slot.filter(|s| s.kind == fresco_protocol::slot::kind::CREDENTIAL)?;
+            let s = w.slot?;
+            if s.kind == fresco_protocol::slot::kind::SHEET {
+                let (sw, sh) = w.size;
+                return Some((id as u32, id as u32, None, !w.hidden && sw >= MIN_W && sh >= MIN_H, true));
+            }
+            if s.kind != fresco_protocol::slot::kind::CREDENTIAL {
+                return None;
+            }
             let p = c.windows.get(&s.parent)?;
             let [x, y, rw, rh] = s.rect;
             let inside = x >= 0.0 && y >= 0.0 && x + rw <= p.size.0 && y + rh <= p.size.1;

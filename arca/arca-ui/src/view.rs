@@ -137,9 +137,9 @@ fn rgba(c: pergola::Color) -> [f32; 4] {
 }
 
 /// Emits points as device pixels.
-struct Px<'f, 'a> {
-    fr: &'f mut FrameBuilder<'a>,
-    k: f32,
+pub(crate) struct Px<'f, 'a> {
+    pub(crate) fr: &'f mut FrameBuilder<'a>,
+    pub(crate) k: f32,
 }
 
 impl Px<'_, '_> {
@@ -148,13 +148,13 @@ impl Px<'_, '_> {
         self.fr.rect(RectParams { x, y, w: w.max(0.0), h: h.max(0.0), r: c.r, g: c.g, b: c.b, a: c.a, radius: radius * self.k }).map(drop)
     }
 
-    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: pergola::Color, radius: f32) -> io::Result<()> {
+    pub(crate) fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: pergola::Color, radius: f32) -> io::Result<()> {
         self.raw(snap_rect(x, y, w, h, self.k), c, radius)
     }
 
     /// A run with its baseline at `y` (pt), on a device pixel. The wire
     /// takes the top of the em box, one ascender above the baseline.
-    fn text(&mut self, font: Font, size: f32, x: f32, y: f32, c: pergola::Color, s: String) -> io::Result<()> {
+    pub(crate) fn text(&mut self, font: Font, size: f32, x: f32, y: f32, c: pergola::Color, s: String) -> io::Result<()> {
         let px = size * self.k;
         let top = (y * self.k).round() - font.ascent * px;
         self.fr.text_run(font.id, px, (x * self.k).round(), top, rgba(c), s).map(drop)

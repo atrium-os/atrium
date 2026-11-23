@@ -2576,6 +2576,8 @@ pub mod slot {
         /// The brokered sign-in document inside its trusted sheet. After binding,
         /// the compositor treats the document as an ordinary protected island.
         pub const SIGN_IN_PAGE: u8 = 4;
+        /// The brokered Scrinium picker inside Arca’s S/MIME provisioning sheet.
+        pub const SMIME_PICKER: u8 = 5;
     }
 
     pub mod refusal {

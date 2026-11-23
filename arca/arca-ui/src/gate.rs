@@ -43,12 +43,16 @@ impl Frescod {
     }
 }
 
-impl Gate for Frescod {
-    fn fill(&mut self, token: Token, presenter_uid: u32) -> Result<u32, Notice> {
+impl Frescod {
+    pub fn approve(&mut self, token: Token, presenter_uid: u32) -> Result<u32, Notice> {
+        self.press(token, presenter_uid, purpose::APPROVE)
+    }
+
+    fn press(&mut self, token: Token, presenter_uid: u32, purpose: u8) -> Result<u32, Notice> {
         if token == fresco_protocol::activation::NONE {
             return Err(Notice::NoPress);
         }
-        match self.ask(Consume { token, presenter_uid, purpose: purpose::FILL }) {
+        match self.ask(Consume { token, presenter_uid, purpose }) {
             Ok(ConsumeResult::Ok { window_id, .. }) => Ok(window_id),
             Ok(ConsumeResult::Refused { reason: refusal::OBSCURED }) => Err(Notice::Obscured),
             Ok(ConsumeResult::Refused { .. }) => Err(Notice::NoPress),
@@ -57,5 +61,11 @@ impl Gate for Frescod {
                 Err(Notice::NoPress)
             }
         }
+    }
+}
+
+impl Gate for Frescod {
+    fn fill(&mut self, token: Token, presenter_uid: u32) -> Result<u32, Notice> {
+        self.press(token, presenter_uid, purpose::FILL)
     }
 }

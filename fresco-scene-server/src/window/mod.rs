@@ -1653,13 +1653,21 @@ impl Compositor {
         }
         let sign_in_page = kind == k::SIGN_IN_PAGE;
         let parent_slot = self.windows[&parent].slot;
-        if sign_in_page && !parent_slot.is_some_and(|s| s.kind == k::SHEET) {
+        let smime_picker = kind == k::SMIME_PICKER;
+        let parent_is_outer_sheet = parent_slot.is_some_and(|s| {
+            s.kind == k::SHEET && self.windows.get(&s.parent).is_some_and(|w| w.slot.is_none())
+        });
+        if (sign_in_page || smime_picker) && !parent_is_outer_sheet {
             return Err(refusal::INVALID);
         }
-        let kind = if sign_in_page { k::ISLAND } else { kind };
+        let kind = match kind {
+            k::SIGN_IN_PAGE => k::ISLAND,
+            k::SMIME_PICKER => k::SHEET,
+            other => other,
+        };
         let c = &self.windows[&child];
         let ok = child != parent
-            && parent_slot.is_none_or(|s| s.kind == k::SHEET && (kind == k::CREDENTIAL || sign_in_page))
+            && (parent_slot.is_none() || (parent_is_outer_sheet && (kind == k::CREDENTIAL || sign_in_page || smime_picker)))
             && c.role != WmRole::Notification
             && c.slot.is_none_or(|s| s.parent == parent)
             && c.kept_by.is_none_or(|p| p == parent)
@@ -1748,7 +1756,11 @@ impl Compositor {
             self.windows.iter().filter_map(|(&id, w)| w.slot.map(|c| (id, c))).collect();
         /* Each goes in right above its parent, under those placed before
          * it: the topmost first. */
-        let rank = |id: WindowId, c: &Slot| (c.kind == fresco_protocol::slot::kind::SHEET, c.kind == fresco_protocol::slot::kind::CREDENTIAL, c.z, id);
+        let rank = |id: WindowId, c: &Slot| {
+            use fresco_protocol::slot::kind;
+            let outer_sheet = c.kind == kind::SHEET && self.windows.get(&c.parent).is_some_and(|w| w.slot.is_none());
+            (outer_sheet, c.kind == kind::SHEET, c.kind == kind::CREDENTIAL, c.z, id)
+        };
         slots.sort_by(|a, b| rank(b.0, &b.1).cmp(&rank(a.0, &a.1)));
         for (id, c) in slots {
             let Some((ppos, psize, pscale)) = self.windows.get(&c.parent).map(|p| (p.pos, p.size, p.scale_milli)) else {
@@ -1886,7 +1898,10 @@ impl Compositor {
     /// Where keys for `id` go: the sheet over it while one is shown, else
     /// `id` itself.
     pub fn key_target(&self, id: WindowId) -> WindowId {
-        self.sheet_of(id).unwrap_or(id)
+        match self.sheet_of(id) {
+            Some(sheet) => self.sheet_of(sheet).unwrap_or(sheet),
+            None => id,
+        }
     }
 
     /// Whether `id` is bound as a sheet slot.
@@ -2444,6 +2459,36 @@ mod notification_tests {
         assert!(c.embed_in(page, sheet));
         c.bind_slot(sheet, mail, kind::SHEET, None, 0).unwrap();
         assert!(!c.z_order.contains(&page));
+    }
+
+    #[test]
+    fn an_arca_picker_is_modal_inside_one_sheet_and_tears_down_with_it() {
+        use fresco_protocol::slot::{kind, refusal};
+        let mut c = Compositor::new();
+        let mail = c.create(1, (900, 640));
+        let picker = c.create(2, (640, 440));
+        let arca = c.create(3, (680, 520));
+        let extra = c.create(4, (100, 100));
+        let outer = Some([0., 0., 680., 520.]);
+        let inner = Some([0., 0., 640., 440.]);
+
+        assert_eq!(c.bind_slot(picker, mail, kind::SMIME_PICKER, inner, 0), Err(refusal::INVALID));
+        c.bind_slot(arca, mail, kind::SHEET, outer, 0).unwrap();
+        assert_eq!(c.bind_slot(picker, arca, kind::SHEET, inner, 0), Err(refusal::INVALID));
+        c.bind_slot(picker, arca, kind::SMIME_PICKER, inner, 0).unwrap();
+        assert_eq!(c.bind_slot(extra, picker, kind::SMIME_PICKER, inner, 0), Err(refusal::INVALID));
+        assert_eq!(c.sheet_of(mail), Some(arca));
+        assert_eq!(c.sheet_of(arca), Some(picker));
+        assert_eq!(c.key_target(mail), picker);
+        assert!(c.held(mail) && c.held(arca) && !c.held(picker));
+        assert!(c.embed_in(picker, arca));
+        let (x, y) = c.windows[&picker].pos;
+        assert_eq!(c.pointer_target(x + 4., y + 4.).0, picker);
+
+        c.bind_slot(arca, mail, kind::SHEET, None, 0).unwrap();
+        assert!(!c.z_order.contains(&picker));
+        assert!(!c.z_order.contains(&arca));
+        assert_eq!(c.key_target(mail), mail);
     }
 
     #[test]

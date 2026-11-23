@@ -210,6 +210,8 @@ pub struct Settings {
     kept: Rc<RefCell<Option<mpsc::Receiver<Result<(AccountConfig, Option<(mail_store::Server, [u8; 16])>), String>>>>>,
     microsoft: Rc<RefCell<Option<mpsc::Receiver<Result<[u8; 16], String>>>>>,
     pub microsoft_sheet_open: Rc<std::cell::Cell<bool>>,
+    smime_asked: Rc<std::cell::Cell<bool>>,
+    smime_note: Mutable<Option<&'static str>>,
     added: Rc<std::cell::Cell<bool>>,
     /// Arca's answer to removing a removed account's items.
     forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
@@ -256,16 +258,18 @@ impl Settings {
             made_for: ui.sibling(TextEdit::new("")),
             person: ui.sibling(TextEdit::new("")),
             engine,
-            ui,
             found: Rc::default(),
             kept: Rc::default(),
             renewed: Rc::default(),
             microsoft: Rc::default(),
             microsoft_sheet_open: Rc::default(),
+            smime_asked: Rc::default(),
+            smime_note: ui.sibling(None),
             added: Rc::default(),
             forgot: Rc::default(),
             arca: Rc::new(arca),
             persona: Rc::default(),
+            ui,
         };
         s.reload();
         s
@@ -542,6 +546,14 @@ impl Settings {
             Ok(ticket) => Some(ticket),
             Err(message) => { self.sign_in_note(&message); None }
         }
+    }
+
+    pub fn take_smime_ask(&self) -> bool {
+        self.smime_asked.replace(false)
+    }
+
+    pub fn smime_note(&self, message: Option<&'static str>) {
+        self.smime_note.set(message);
     }
 
     pub fn sign_in_note(&self, message: &str) {
@@ -1132,7 +1144,7 @@ impl SettingsView {
     }
 }
 
-pub const MICROSOFT_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
+pub const SYSTEM_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
 
 impl View for SettingsView {
     fn render(&self, ctx: &mut Ctx) {
@@ -1140,8 +1152,8 @@ impl View for SettingsView {
         let ui = self.s.ui.get_cloned();
         let (w, h) = self.size.get();
         let background = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
-        // Register the sheet anchor before a button press can send its ticket.
-        ctx.slot(background, MICROSOFT_SHEET_SLOT);
+        // Register the shared anchor before a button press opens a system sheet.
+        ctx.slot(background, SYSTEM_SHEET_SLOT);
         let head = em(48.0);
         ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, head), fill: t.bg_window(), radius: 0.0 });
         ctx.add(Node::Rect { rect: Rect::new(0.0, head - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
@@ -1324,9 +1336,15 @@ impl SettingsView {
 
         // S/MIME (§10.1): CAs the person trusts besides the system's, and
         // the certificates seen on signed mail.
+        y += em(16.0);
+        section(ctx, x, &mut y, "S/MIME");
+        let s = self.s.clone();
+        button(ctx, x, y + em(14.0), "Add S/MIME identity", true, true, move || s.smime_asked.set(true));
+        y += em(36.0);
+        if let Some(note) = self.s.smime_note.get() {
+            y += para(ctx, x, y, inner, note, type_size::SM, t.text_primary()) + em(8.0);
+        }
         if ui.priv_account.is_some() {
-            y += em(16.0);
-            section(ctx, x, &mut y, "S/MIME");
             let bw = measure("Paste a CA", type_size::SM, Weight::Medium) + em(24.0);
             y += para(ctx, x, y, inner - bw - em(8.0), "Signatures are checked against this system's certificate authorities. Add your company's here.", type_size::XS, t.text_tertiary());
             let s = self.s.clone();

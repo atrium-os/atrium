@@ -58,6 +58,7 @@ impl Compositor for Frescod {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
             SlotKind::SignInPage => slot::kind::SIGN_IN_PAGE,
+            SlotKind::SmimePicker => slot::kind::SMIME_PICKER,
             SlotKind::Island => slot::kind::ISLAND,
             SlotKind::Sheet { .. } => slot::kind::SHEET,
         };
@@ -66,6 +67,7 @@ impl Compositor for Frescod {
         // larger (resolution-independence.md §7.1).
         let rect = match kind_of {
             SlotKind::Sheet { w, h } => rect.map(|_| [0.0, 0.0, w as f32, h as f32]),
+            SlotKind::SmimePicker => rect.map(|_| [0.0, 0.0, 640.0, 440.0]),
             _ => rect,
         };
         match self.ask(&SlotBind { parent, child, kind, rect, z, keep_shown: false }) {

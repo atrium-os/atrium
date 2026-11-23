@@ -49,6 +49,10 @@ fn settings_window() {
     let mut app = App::new_with_flag(SettingsView::new(s.clone(), (1040.0, 720.0)), dirty);
     drawn(&mut app, &["Mail settings", "Done", "No accounts yet.", "Add an account…", "Notify about new mail", "Quiet hours"]);
 
+    // A setup with no mail accounts can still open the trusted S/MIME sheet.
+    assert!(texts(&app).iter().any(|t| t == "Add S/MIME identity"));
+    assert!(!s.take_smime_ask());
+
     // Found from the address: a known provider needs no lookups.
     s.start_adding();
     drawn(&mut app, &["Address", "Your name", "Find settings", "Cancel"]);

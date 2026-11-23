@@ -99,3 +99,5 @@ path = "/usr/local/bin/atrium-limend"
 argv = ["atrium-limend"]
 uid  = 65022   # _limen
 gid  = 65022
+# To enable Mail’s S/MIME sheet, set ARCA_MAIL_PUBLISHER here and in
+# arcad’s manifest to the verified SHA-256 publisher ID of signed Mail.

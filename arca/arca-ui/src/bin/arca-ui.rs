@@ -193,9 +193,9 @@ impl Ctx {
 }
 
 /// A window frescod keeps hidden until limend binds it, and its embed token.
-fn open_window(sock: &str) -> std::io::Result<(Connection, u32, [u8; 16])> {
+fn open_window(sock: &str, width: u32, height: u32, title: &str) -> std::io::Result<(Connection, u32, [u8; 16])> {
     let mut c = Connection::connect(sock)?;
-    let id = c.window_create(240, 36, "Arca", WindowHints { embed_pending: true, ..Default::default() })?;
+    let id = c.window_create(width, height, title, WindowHints { embed_pending: true, ..Default::default() })?;
     c.set_default_window(id as u16);
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
@@ -220,9 +220,13 @@ fn main() -> ExitCode {
     let fresco = std::env::var("FRESCO_SOCKET")
         .unwrap_or_else(|_| fresco_client::default_socket_path().to_string_lossy().into_owned());
     let registry = env("ARCA_APP_REGISTRY", "/var/run/atrium/app-registry");
+    let limen = env("LIMEN_SOCKET", limen::client::DEFAULT_SOCKET);
+    let arcad = env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock");
+    let activation = env("FRESCO_ACTIVATION", limen::fresco::DEFAULT_SOCKET);
+    arca_ui::smime_sheet::serve(limen.clone(), fresco.clone(), registry.clone(), arcad.clone(), activation.clone(), open_window);
     let prelum_uid = std::env::var("ARCA_PRELUM_UID").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(65046);
     let allow_unsigned = std::env::var_os("ARCA_ALLOW_UNSIGNED").is_some();
-    let child = match Child::provider(env("LIMEN_SOCKET", limen::client::DEFAULT_SOCKET), "credential") {
+    let child = match Child::provider(limen, "credential") {
         Ok(c) => c,
         Err(e) => {
             eprintln!("arca-ui: limend: {e:?}");
@@ -231,8 +235,8 @@ fn main() -> ExitCode {
     };
     let mut cx = Ctx {
         child,
-        arcad: Arcad::new(env("ARCA_SOCKET", "/atrium/sockets/arca/arcad.sock")),
-        gate: Frescod::new(env("FRESCO_ACTIVATION", limen::fresco::DEFAULT_SOCKET)),
+        arcad: Arcad::new(arcad),
+        gate: Frescod::new(activation),
         // SAFETY: getuid cannot fail.
         me: unsafe { libc::getuid() },
     };
@@ -247,7 +251,7 @@ fn main() -> ExitCode {
                     if role != "credential" {
                         continue;
                     }
-                    let (mut win, window_id, token) = match open_window(&fresco) {
+                    let (mut win, window_id, token) = match open_window(&fresco, 240, 36, "Arca") {
                         Ok(w) => w,
                         Err(e) => {
                             eprintln!("arca-ui: window for embed {embed}: {e}");

@@ -1734,8 +1734,12 @@ Stalwart in the cloud VM, and later a real account):
    certificate and key. Mail obtains only the persona’s public certificates
    and selects those that match the receiving account’s identities. This
    lets Mail recognize the certificate before any signed message has been
-   indexed. Graphical key provisioning and legacy PKCS#1 v1.5 messages
-   still need separate support.
+   indexed. Mail Settings opens Arca’s trusted **Add S/MIME identity**
+   sheet. It selects a DER leaf certificate and a separate unencrypted
+   RSA PKCS#8 key using Scrinium in the verified launch persona. Mail
+   receives a public outcome, and the newly registered public certificate
+   is eligible for the receiving account when its address matches. Legacy
+   PKCS#1 v1.5 messages still need separate support.
    **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
    request builders, bounded readers of every answer, RFC 3339 dates) and
    `mail-sync::jmap::Client` over the caller's HTTP (the HTTP courier, which adds the

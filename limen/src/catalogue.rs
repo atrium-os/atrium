@@ -18,6 +18,8 @@ pub enum SlotKind {
     Sheet { w: u16, h: u16 },
     /// The document of Navigator’s registered Mail sign-in sheet.
     SignInPage,
+    /// A Scrinium picker inside the trusted Arca provisioning sheet.
+    SmimePicker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

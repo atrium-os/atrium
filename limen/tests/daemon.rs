@@ -986,6 +986,7 @@ fn smime_key_picker_routes_a_single_read_only_file_to_arca() {
     let sheet = mail.request("smime-provision", W_MAIL).unwrap();
     assert!(matches!(next_c(&mut arca), ChildEvent::Attach { embed, role, parent_uid, .. }
         if embed == sheet && role == "smime-provision" && parent_uid == MAIL_UID));
+    assert_eq!(next_c(&mut arca), ChildEvent::ParentPersona { embed: sheet, persona: Some("work".into()) });
     assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_ARCA)), refusal::NOT_ATTACHED);
     assert_eq!(refused(mail.request_smime_picker(sheet, W_ARCA)), refusal::NOT_PROVIDER);
     assert_eq!(refused(mail.send(sheet, b"forged persona".to_vec())), refusal::MALFORMED);
@@ -1008,6 +1009,7 @@ fn smime_key_picker_routes_a_single_read_only_file_to_arca() {
     arca_parent.place(pick, Some([0.0, 0.0, 640.0, 440.0])).unwrap();
     picker.ready(pick, W_PICKER).unwrap();
     assert_eq!(next_p(&mut arca_parent), ParentEvent::Attached { embed: pick });
+    assert_eq!(w.fresco.binds().last().unwrap().2, SlotKind::SmimePicker);
 
     let path = std::env::temp_dir().join(format!("limen-smime-picker-{}", std::process::id()));
     let mut key = std::fs::OpenOptions::new().create_new(true).mode(0o600).read(true).write(true).open(&path).unwrap();

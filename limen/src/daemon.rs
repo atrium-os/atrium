@@ -138,6 +138,12 @@ struct Embed {
     to_parent: Rate,
 }
 
+impl Embed {
+    fn slot_kind(&self) -> SlotKind {
+        if self.smime_picker.is_some() { SlotKind::SmimePicker } else { self.role.slot }
+    }
+}
+
 struct SmimePicker {
     sheet: EmbedId,
     opened: bool,
@@ -591,7 +597,9 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
     if let Some(ticket) = audio_ticket {
         st.to_child(&e, ChildEvent::AudioTicket { embed, ticket });
     }
-    if catalogue::PERSONA_ROLES.contains(&role.name) {
+    if let Some(persona) = e.smime_scope.clone() {
+        st.to_child(&e, ChildEvent::ParentPersona { embed, persona });
+    } else if catalogue::PERSONA_ROLES.contains(&role.name) {
         let persona = shared.persona.lock().unwrap().as_ref().and_then(|f| f(uid));
         st.to_child(&e, ChildEvent::ParentPersona { embed, persona });
     }
@@ -684,7 +692,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     };
     let mut comp = shared.compositor.lock().unwrap();
     match want {
-        Some((rect, child)) => match comp.bind(e.parent_window, child, e.role.slot, Some(rect), e.z) {
+        Some((rect, child)) => match comp.bind(e.parent_window, child, e.slot_kind(), Some(rect), e.z) {
             // frescod names the owners: each window must be its side's.
             Ok((pu, cu)) if pu == e.parent_uid && cu == e.child_uid => {
                 let e = st.embeds.get_mut(&embed).unwrap();
@@ -723,7 +731,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
             }
             Ok((pu, cu)) => {
                 eprintln!("limend: embed {embed}: windows owned by {pu}/{cu}, not {}/{}", e.parent_uid, e.child_uid);
-                let _ = comp.bind(e.parent_window, child, e.role.slot, None, e.z);
+                let _ = comp.bind(e.parent_window, child, e.slot_kind(), None, e.z);
                 drop(comp);
                 let e = st.embeds.remove(&embed).unwrap();
                 st.to_parent(&e, ParentEvent::ChildLost { embed });
@@ -733,7 +741,7 @@ fn rebind(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
         },
         None if e.bound => {
             let child = e.child_window.unwrap();
-            let _ = comp.bind(e.parent_window, child, e.role.slot, None, e.z);
+            let _ = comp.bind(e.parent_window, child, e.slot_kind(), None, e.z);
             let e = st.embeds.get_mut(&embed).unwrap();
             e.bound = false;
             let e = &st.embeds[&embed];
@@ -820,8 +828,13 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
     if m.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
-    if e.smime_scope.is_some() && (!e.bound || crate::smime_provision::Outcome::decode(&m.bytes).is_none()) {
-        return Err(Reply::Refused { reason: refusal::MALFORMED });
+    if e.smime_scope.is_some() {
+        use crate::smime_provision::Outcome;
+        match Outcome::decode(&m.bytes) {
+            Some(Outcome::Failed) if !e.attached => {}
+            Some(_) if e.bound => {}
+            _ => return Err(Reply::Refused { reason: refusal::MALFORMED }),
+        }
     }
     if fd.is_some() && !e.role.returns_fd {
         return Err(Reply::Refused { reason: refusal::MALFORMED });
@@ -983,7 +996,7 @@ fn rebind_quiet(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     // Bound already as far as rebind knows, so it binds without telling.
     let Some(e) = st.embeds.get(&embed) else { return };
     let (Some(rect), Some(child)) = (e.rect, e.child_window) else { return };
-    let r = shared.compositor.lock().unwrap().bind(e.parent_window, child, e.role.slot, Some(rect), e.z);
+    let r = shared.compositor.lock().unwrap().bind(e.parent_window, child, e.slot_kind(), Some(rect), e.z);
     if !matches!(r, Ok((pu, cu)) if pu == e.parent_uid && cu == e.child_uid) {
         eprintln!("limend: embed {embed}: rebinding after PiP failed ({r:?})");
         if let Some(e) = st.embeds.get_mut(&embed) {
@@ -1063,7 +1076,7 @@ fn end(shared: &Arc<Shared>, st: &mut State, embed: EmbedId, e: Embed, tell_pare
     // PiP doesn't outlive the embed: the child's window goes with it.
     if e.bound {
         if let Some(c) = e.child_window {
-            let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.role.slot, None, e.z);
+            let _ = shared.compositor.lock().unwrap().bind(e.parent_window, c, e.slot_kind(), None, e.z);
         }
     }
     st.to_child(&e, ChildEvent::Detaching { embed });

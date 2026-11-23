@@ -65,7 +65,11 @@ can return one read-only regular file, at most 16 KiB, to Arca. The
 descriptor’s actual length must agree with the picker’s report. Limen
 narrows its rights to read, seek and fstat. Hiding or detaching the
 provisioning sheet tears down its picker. A completed pick must detach
-before Arca starts the second pick for the other input. Mail receives
+before Arca starts the second pick for the other input. Fresco accepts
+this dedicated nested slot only within an outer modal sheet, holds input
+to both ancestors while the picker is shown, and hides the picker when
+the outer sheet is released. Arca receives the attested launch persona
+through a broker event. Mail receives
 only success with a public fingerprint, cancellation, lock or failure.
 
 The broker-fetched web-island role validates child reports against the attachment and session state. Its parent may answer one outstanding unload question using the matching number. Its wire limits and message directions are in [Navigator islands §5](navigator-islands.md#i2-installed-island-reports).

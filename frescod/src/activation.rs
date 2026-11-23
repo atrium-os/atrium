@@ -389,7 +389,7 @@ pub const DEFAULT_CONSUMERS: &[(&str, &[u8])] = &[
     ("_tabula", &[purpose::COPY, purpose::PASTE, purpose::DRAG, purpose::DROP]),
     ("_share", &[purpose::SHARE]),
     ("_praeco", &[purpose::ACTION]),
-    ("_arca-ui", &[purpose::FILL]),
+    ("_arca-ui", &[purpose::FILL, purpose::APPROVE]),
     ("_sigillum-ui", &[purpose::IDENTITY]),
 ];
 

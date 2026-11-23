@@ -13,3 +13,4 @@ pub mod gate;
 pub mod keymap;
 pub mod view;
 pub mod smime;
+pub mod smime_sheet;

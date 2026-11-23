@@ -298,6 +298,7 @@ struct SettingsWin {
     /// Arca's field, while an account is being added.
     cred: Option<limen::proto::EmbedId>,
     microsoft: Option<(limen::proto::EmbedId, [u8; 16])>,
+    smime: Option<(limen::proto::EmbedId, Option<Instant>)>,
     next_ask: Instant,
 }
 
@@ -310,7 +311,7 @@ fn settings_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pe
     let s = atrium_mail::settings::Settings::new(engine.clone(), dirty.clone(), atrium_mail::accounts::arca_socket());
     let view = atrium_mail::settings::SettingsView::new(s.clone(), (win.width, win.height));
     let size = view.size.clone();
-    Ok(SettingsWin { win, app: App::new_with_flag(view, dirty), s, size, cred: None, microsoft: None, next_ask: Instant::now() })
+    Ok(SettingsWin { win, app: App::new_with_flag(view, dirty), s, size, cred: None, microsoft: None, smime: None, next_ask: Instant::now() })
 }
 
 /// The drafts whose windows were open, so a crash or a restart opens them
@@ -685,9 +686,9 @@ fn main() {
             }
             close_settings |= sw.s.closed();
             if let Some(ticket) = sw.s.take_microsoft_ticket() {
-                if let (false, None, Some(e), Some(token)) = (close_settings, sw.microsoft, &embeds, sw.win.embed_token()) {
+                if let (false, None, Some(e), Some(token)) = (close_settings || sw.smime.is_some(), sw.microsoft, &embeds, sw.win.embed_token()) {
                     let mut e = e.borrow_mut();
-                    match e.request("mail-sign-in", token, atrium_mail::settings::MICROSOFT_SHEET_SLOT) {
+                    match e.request("mail-sign-in", token, atrium_mail::settings::SYSTEM_SHEET_SLOT) {
                         Ok(id) if e.send(id, ticket.to_vec()).is_ok() => {
                             sw.microsoft = Some((id, ticket));
                             sw.s.microsoft_sheet_open.set(true);
@@ -704,6 +705,20 @@ fn main() {
                 if let (Some(e), Some((id, ticket))) = (&embeds, sw.microsoft.take()) {
                     sw.s.dismiss_microsoft(ticket, "Microsoft sign-in cancelled.");
                     let _ = e.borrow_mut().detach_embed(id);
+                }
+            }
+            if sw.s.take_smime_ask() && !close_settings && sw.smime.is_none() && sw.microsoft.is_none() {
+                let request = embeds.as_ref().zip(sw.win.embed_token()).and_then(|(e, token)| {
+                    e.borrow_mut().request("smime-provision", token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()
+                });
+                sw.smime = request.map(|id| (id, Some(Instant::now() + Duration::from_secs(12))));
+                sw.s.smime_note(request.is_none().then_some("Arca’s S/MIME sheet is unavailable."));
+            }
+            let smime_timed_out = sw.smime.is_some_and(|(_, deadline)| deadline.is_some_and(|d| Instant::now() >= d));
+            if close_settings || smime_timed_out {
+                if let (Some(e), Some((id, _))) = (&embeds, sw.smime.take()) {
+                    let _ = e.borrow_mut().detach_embed(id);
+                    sw.s.smime_note(Some("Arca’s S/MIME sheet could not open."));
                 }
             }
             // Arca's password field, while an account is being added.
@@ -1237,6 +1252,36 @@ fn main() {
                             let _ = embeds.borrow_mut().detach_embed(embed);
                         }
                     }
+                    Ok(Some(limen::proto::ParentEvent::Attached { embed }))
+                        if settings.as_ref().is_some_and(|sw| sw.smime.is_some_and(|(id, _)| id == embed)) => {
+                        if let Some(sw) = settings.as_mut() {
+                            sw.smime = Some((embed, None));
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes }))
+                        if settings.as_ref().is_some_and(|sw| sw.smime.is_some_and(|(id, _)| id == embed)) => {
+                        use limen::smime_provision::Outcome;
+                        if let (Some(sw), Some(outcome)) = (settings.as_mut(), Outcome::decode(&bytes)) {
+                            sw.smime = None;
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                            match outcome {
+                                Outcome::Provisioned { .. } => {
+                                    sw.s.smime_note(Some("S/MIME identity added to this persona."));
+                                    mail.refresh();
+                                }
+                                Outcome::Cancelled => sw.s.smime_note(None),
+                                Outcome::Locked => sw.s.smime_note(Some("Unlock Arca, then try again.")),
+                                Outcome::Failed => sw.s.smime_note(Some("Arca couldn’t add this identity. Choose a matching DER certificate and unencrypted RSA PKCS#8 key.")),
+                            }
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed } | limen::proto::ParentEvent::Detached { embed }))
+                        if settings.as_ref().is_some_and(|sw| sw.smime.is_some_and(|(id, _)| id == embed)) => {
+                        if let Some(sw) = settings.as_mut() {
+                            sw.smime = None;
+                            sw.s.smime_note(Some("Arca’s S/MIME sheet closed."));
+                        }
+                    }
                     // Arca's field in the settings window: filled, or its handle.
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if settings.as_ref().is_some_and(|s| s.cred == Some(embed)) => {
                         if let (Some(m), Some(sw)) = (limen::credential::ToParent::decode(&bytes), settings.as_ref()) {
@@ -1258,6 +1303,9 @@ fn main() {
                     Ok(None) => break,
                     Err(e) => {
                         if let Some(sw) = settings.as_mut() {
+                            if sw.smime.take().is_some() {
+                                sw.s.smime_note(Some("Lost the connection to Arca’s S/MIME sheet."));
+                            }
                             if let Some((_, ticket)) = sw.microsoft.take() {
                                 sw.s.dismiss_microsoft(ticket, "Lost the connection to the Microsoft sign-in sheet.");
                             }

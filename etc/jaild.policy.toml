@@ -473,6 +473,8 @@ allowed_keys = [
     # arcad and arca-courierd: the web broker's app id and publisher, the
     # one app that issues web tickets (arca.md §8.2).
     "ARCA_WEB_BROKER",
+    # arcad and limend: trusted signed Mail publisher for the S/MIME path.
+    "ARCA_MAIL_PUBLISHER",
     # sigillumd: the system uids that may ask VerifyUser (Arca, ostiarius)
     # and the web broker's app id and publisher, the one app that may run
     # WebAuthn for any RP ID (sigillum.md §7.1). Socket paths and the

@@ -828,10 +828,20 @@ input redirected from the unencrypted PKCS#8 file. Use `personal` for the
 Personal persona. Both inputs must be bounded read-only regular files.
 The operator tool reads them into locked memory and prints only the public
 fingerprint. To remove the pair, use `arca-ui smime-forget USER PERSONA
-FINGERPRINT` under the same identity. Limen has a restricted nested picker for the
-graphical path. It returns a selected read-only file to Arca’s trusted
-connection and gives Mail only a typed public outcome. The Arca sheet,
-Mail entry point and PKCS#1 v1.5 compatibility remain separate work.
+FINGERPRINT` under the same identity.
+
+In Mail Settings, **Add S/MIME identity** opens Arca’s own sheet.
+Arca verifies the brokered persona against the Mail launch registry
+before enabling the pickers, and revalidates the signed user and persona
+at installation. The sheet shows the destination persona and requires
+a fresh Fresco `APPROVE` press on the visible sheet. Scrinium returns
+each file separately, with rights limited to read, seek and fstat.
+Arca reads the bounded files into locked memory and clears the buffers
+on submission, suspension or dismissal. Arca uses the same pair
+validation as the operator tool. Mail receives a typed public outcome.
+Set the verified Mail publisher ID in `ARCA_MAIL_PUBLISHER` for both
+limend and arcad. Keep it unset on deployments without signed Mail.
+Legacy PKCS#1 v1.5 decryption remains separate work.
 
 ## 10. Audit
 
