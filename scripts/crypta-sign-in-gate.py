@@ -101,8 +101,19 @@ class Gate:
             stage_file("cat > /tmp/i3-net/atrium-cryptad", files / "atrium-cryptad")
             stage_file("sh -s", SUPPORT / "network.sh")
 
-        until("egress interface membership",
-              lambda: "atrium_egress" in self.guest("ifconfig vtnet0"))
+    def start_fixture(self):
+        self.guest(
+            'test "$(uname -m)" = arm64 && '
+            'test "$(mount -p | awk \'$2 == "/" {print $3}\')" = tessera && '
+            f"test -S {SOCKET} && test -S {GUEST}/input.sock && "
+            f"test -x {CTL} && test -S /tmp/i3-net/crypta.sock && "
+            f"! jls -j {JAIL} jid >/dev/null 2>&1"
+        )
+        self.guest(
+            "ifconfig vtnet0 | grep -q 'groups:.*atrium_egress' || "
+            "ifconfig vtnet0 group atrium_egress"
+        )
+        require("atrium_egress" in self.guest("ifconfig vtnet0"), "Missing fixture egress group")
         wire = "".join(json.dumps(frame) + "\n" for frame in REQUEST).encode()
         self.remote("cat > /tmp/i3-ask && chmod 644 /tmp/i3-ask", data=wire)
 
@@ -255,15 +266,17 @@ class Gate:
         require(self.counters()["launched"] == baseline["launched"] and self.jid() == old,
                 "Cancelled request opened a window or the old window closed early")
         self.no_ipv4()
-        require(all(self.stats()[key] == 0 for key in TRAFFIC_FIELDS), "Cancelled request submitted data")
+        stats = self.stats()
+        require(all(stats[key] == 0 for key in TRAFFIC_FIELDS), "Cancelled request submitted data")
 
     def run(self):
         initial = self.stats("initial")
         require(initial["init"] == initial["sso_login"] == 0, "Use a fresh gateway fixture")
         require(all(initial[key] == 0 for key in TRAFFIC_FIELDS), "Gateway already recorded a submission")
-        self.stage()
-
-        self.new_attempt()
+        if not self.args.staged:
+            self.stage()
+        self.start_fixture()
+        self.up()
         self.ask()
         self.page(initial, "initial-page")
         for number in (1, 2):
@@ -364,7 +377,15 @@ class Gate:
         self.type_fixture_text("alice-sso-pw")
         self.click(560, 131)
         self.show("assertion", r"Authentication Redirect")
-        self.click(557, 95)
+
+        def confirmation_control():
+            trace = self.guest(f"grep 'navigator-ui: trace' {LOG} | tail -1")
+            return re.search(r"live=shown .* form=\|([0-9]+),([0-9]+)$", trace)
+
+        control = until("trusted SAML confirmation control", confirmation_control)
+        self.screen("assertion-confirmation")
+        self.click(*(int(value) for value in control.groups()))
+        until("signed assertion accepted", lambda: self.stats()["acs_ok"] == 1)
 
         def tunnel():
             status = self.guest(f"{CTL} list")
@@ -383,13 +404,17 @@ class Gate:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ssh", required=True, type=Path, help="root SSH wrapper for the dedicated arm64 guest")
-    parser.add_argument("--fixtures", required=True, type=Path, help="directory of host-built fixture artifacts")
+    parser.add_argument("--fixtures", type=Path, help="directory of host-built fixture artifacts")
     parser.add_argument("--ca", required=True, type=Path, help="CA used by the local gateway and IdP")
-    parser.add_argument("--renderer", required=True, help="guest-local signed Fresco renderer bundle")
+    parser.add_argument("--renderer", help="guest-local signed Fresco renderer bundle")
     parser.add_argument("--evidence", required=True, type=Path, help="new directory for counters, screenshots and trace")
+    parser.add_argument("--staged", action="store_true",
+                        help="reuse this gate's staged private guest before its first Sign In")
     parser.add_argument("--gateway-port", type=int, default=8447)
     parser.add_argument("--ocr", default="tesseract")
     args = parser.parse_args()
+    if not args.staged and (args.fixtures is None or args.renderer is None):
+        parser.error("--fixtures and --renderer are required for a fresh guest")
     args.ssh = args.ssh.resolve()
     args.ca = args.ca.resolve()
     try:

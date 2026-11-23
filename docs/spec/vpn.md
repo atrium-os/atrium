@@ -674,6 +674,19 @@ gateway counters, Portcullis trace and screenshots from the evidence
 directory. Shut down both dedicated guests and release the shared slot
 through the fixture lifecycle wrappers.
 
+If setup needs to be resumed in the same already-staged guest before
+the first Sign In, leave the synthetic profile down, reset the gateway
+counters, and use `--staged` with a new evidence directory. The runner
+checks guest prerequisites, restores the egress group if needed, and
+starts the profile. It waits for the trusted SAML confirmation control
+before pressing it.
+
+The first coordinated run passed all seven checks. The duplicate
+request left the live attempt's original deadline in place, the
+expired request opened no window, and the gateway recorded zero
+stale POSTs. The confirmed reconnect sent one POST, redeemed one
+token, and fetched `crypta-ac-ok` through ocserv on `tun18`.
+
 ## 12. Not in v1
 
 OpenVPN (protocol needs our own implementation; on demand), IKEv2 (§8), DTLS for

@@ -30,4 +30,3 @@ EOF
 chmod 755 "$D/ctl"
 ca=$(openssl x509 -in /tmp/i3-vpn/ca.pem -outform DER | openssl base64 -A)
 "$D/ctl" create-ac name=win host=sso.crypta.test:447 ca="$ca" scoped=0
-"$D/ctl" up name=win
