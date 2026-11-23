@@ -2,6 +2,7 @@
 mod period;
 pub use period::{CalendarPage, CalendarView};
 pub mod store;
+pub use store::search::{SearchHit, SearchPage, SearchQuery, SEARCH_PAGE_SIZE};
 pub mod wire;
 
 use chrono::NaiveDate;
@@ -88,27 +89,36 @@ impl Entry {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.id.is_nil()
-            || self.title.trim().is_empty()
-            || self.title.len() > 160
-            || self.title.chars().any(|c| {
-                c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
-        {
-            return Err("Enter a title of up to 160 bytes without control characters");
-        }
-        if !self.span.valid()
-            || (self.kind == Kind::AllDay
-                && self.span
-                    != (Span {
-                        start: 0,
-                        end: 1440,
-                    }))
-        {
-            return Err("Invalid event time range");
-        }
-        Ok(())
+        validate_event_fields(self.id, &self.title, self.span, self.kind)
     }
+}
+
+fn validate_event_fields(
+    id: Uuid,
+    title: &str,
+    span: Span,
+    kind: Kind,
+) -> Result<(), &'static str> {
+    if id.is_nil()
+        || title.trim().is_empty()
+        || title.len() > 160
+        || title.chars().any(|c| {
+            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return Err("Enter a title of up to 160 bytes without control characters");
+    }
+    if !span.valid()
+        || (kind == Kind::AllDay
+            && span
+                != (Span {
+                    start: 0,
+                    end: 1440,
+                }))
+    {
+        return Err("Invalid event time range");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

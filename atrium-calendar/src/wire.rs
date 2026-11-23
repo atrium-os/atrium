@@ -1,5 +1,8 @@
 //! One bounded request and reply per connection. Version 1 uses inline JSON.
-use super::{store::Store, CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit};
+use super::{
+    store::Store, CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, SearchPage,
+    SearchQuery,
+};
 use aqueduct::{classes::CLASS_CALENDAR, envelope, flag, Header};
 use chrono::NaiveDate;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -25,6 +28,16 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    Search {
+        query: SearchQuery,
+        offset: usize,
+        revision: Option<u64>,
+    },
+    OpenSearchHit {
+        revision: u64,
+        id: uuid::Uuid,
+        date: NaiveDate,
+    },
     Browse {
         date: NaiveDate,
         view: Option<CalendarView>,
@@ -164,6 +177,25 @@ pub fn page(socket: &Path, request: &Request) -> Result<CalendarPage, String> {
     Ok(page)
 }
 
+pub fn search(
+    socket: &Path,
+    query: SearchQuery,
+    offset: usize,
+    revision: Option<u64>,
+) -> Result<SearchPage, String> {
+    let (start, end) = (query.start, query.end);
+    let result: SearchPage = exchange(
+        socket,
+        &Request::Search {
+            query,
+            offset,
+            revision,
+        },
+    )?;
+    result.validate(start, end, offset, revision)?;
+    Ok(result)
+}
+
 fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, String> {
     let mut s =
         UnixStream::connect(socket).map_err(|e| format!("Calendar service unavailable: {e}"))?;
@@ -176,6 +208,20 @@ fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, 
 pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
     let reply: Result<CalendarPage, String> = match receive(s, flag::RESPONSE_EXPECTED, 4096) {
+        Ok(Request::Search {
+            query,
+            offset,
+            revision,
+        }) => {
+            return send(
+                s,
+                flag::IS_RESPONSE,
+                &store.search(&query, offset, revision),
+            );
+        }
+        Ok(Request::OpenSearchHit { revision, id, date }) => {
+            store.open_search_hit(revision, id, date)
+        }
         Ok(Request::Browse { date, view }) => Ok(store.page(date, view)),
         Ok(Request::SetOpeningView {
             revision,

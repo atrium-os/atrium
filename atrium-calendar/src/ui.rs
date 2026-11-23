@@ -16,6 +16,8 @@ use std::{
 };
 use uuid::Uuid;
 
+mod search;
+use search::{Results, SearchForm};
 mod editor;
 use editor::{Editor, Stage};
 mod overview;
@@ -41,11 +43,21 @@ enum Action {
     Review(Stage),
     CloseEditor,
     Change(bool),
+    SearchPanel(bool),
+    Search(Option<usize>),
+    OpenHit(Uuid, NaiveDate, u64),
     Find,
     Page(usize),
 }
 
+enum Reply {
+    Calendar(CalendarPage),
+    Results(Results),
+}
+
 struct Planner {
+    search: Mutable<Option<SearchForm>>,
+    selected_row: Mutable<Option<usize>>,
     calendar_name: String,
     date: Mutable<TextEdit>,
     title: Mutable<TextEdit>,
@@ -99,6 +111,13 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<(NaiveDate, Request), String> {
+        if let Action::Search(offset) = action {
+            let form = self.search.get_cloned().ok_or("Open Search first")?;
+            return Ok((self.shown.get(), form.request(offset)?));
+        }
+        if let Action::OpenHit(id, date, revision) = action {
+            return Ok((date, Request::OpenSearchHit { revision, id, date }));
+        }
         if matches!(action, Action::Resume) {
             let date = self.shown.get();
             return Ok((
@@ -218,7 +237,15 @@ impl View for Planner {
         rect(ctx, 0., 0., 700., 600., theme.bg_canvas());
         rect(ctx, 0., 0., 700., 84., theme.bg_surface());
         rect(ctx, 0., 84., 700., 1., theme.border_default());
-        Label::new(heading).size(22.).at(18., 18.).render(ctx);
+        let search = self.search.get_cloned();
+        Label::new(if search.is_some() {
+            "Search".into()
+        } else {
+            heading
+        })
+        .size(22.)
+        .at(18., 18.)
+        .render(ctx);
         Label::new(&self.calendar_name)
             .at(350., 19.)
             .size(16.)
@@ -226,6 +253,10 @@ impl View for Planner {
         let data = self.data.get_cloned();
         if self.waiting.get() {
             Label::new("Loading calendar…").at(18., 110.).render(ctx);
+            return;
+        }
+        if let Some(form) = search {
+            form.render(self, ctx);
             return;
         }
         if let Some(edit) = self.editor.get_cloned() {
@@ -297,6 +328,7 @@ impl View for Planner {
                 Action::Browse(choice, date),
             );
         }
+        self.button(ctx, 396., 44., 121., "Search…", Action::SearchPanel(true));
         self.button(
             ctx,
             531.,
@@ -430,6 +462,9 @@ impl View for Planner {
             rows.iter().skip(page * PAGE).take(PAGE).enumerate()
         {
             let y = 254. + i as f32 * 38.;
+            if !self.finding.get() && self.selected_row.get() == Some(page * PAGE + i) {
+                rect(ctx, 8., y, 4., 31., theme.accent_fg());
+            }
             ctx.add(pergola::node::Node::Rect {
                 rect: pergola::geom::Rect::new(18., y + 31., 636., 1.),
                 fill: theme.border_default(),
@@ -472,6 +507,8 @@ pub fn run() -> io::Result<()> {
     let field = |s: &str| Mutable::with_dirty(TextEdit::new(s), dirty.clone());
     let (tx, rx) = mpsc::channel();
     let planner = Arc::new(Planner {
+        search: Mutable::with_dirty(None, dirty.clone()),
+        selected_row: Mutable::with_dirty(None, dirty.clone()),
         calendar_name,
         date: field(&today.to_string()),
         title: field(""),
@@ -521,6 +558,10 @@ pub fn run() -> io::Result<()> {
                     planner.editor.set(None);
                     let _ = tx.send(Action::Resume);
                 }
+                Action::SearchPanel(open) => {
+                    planner.search.set(open.then(|| SearchForm::new(&planner)));
+                    planner.status.set(String::new());
+                }
                 Action::Find => {
                     planner.finding.set(!planner.finding.get());
                     planner.page.set(0);
@@ -533,7 +574,27 @@ pub fn run() -> io::Result<()> {
                         let tx = done.clone();
                         let path = socket.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send((date, action, page(&path, &req)));
+                            let reply = match req {
+                                Request::Search {
+                                    query,
+                                    offset,
+                                    revision,
+                                } => atrium_calendar::wire::search(
+                                    &path,
+                                    query.clone(),
+                                    offset,
+                                    revision,
+                                )
+                                .map(|page| {
+                                    Reply::Results(Results {
+                                        query,
+                                        offset,
+                                        page,
+                                    })
+                                }),
+                                req => page(&path, &req).map(Reply::Calendar),
+                            };
+                            let _ = tx.send((date, action, reply));
                         });
                     }
                     Err(e) => planner.status.set(e),
@@ -543,11 +604,28 @@ pub fn run() -> io::Result<()> {
         while let Ok((date, action, reply)) = answers.try_recv() {
             planner.waiting.set(false);
             match reply {
-                Ok(data) => {
+                Ok(Reply::Results(results)) => {
+                    if let Some(mut form) = planner.search.get_cloned() {
+                        form.results = Some(results);
+                        planner.search.set(Some(form));
+                    }
+                    planner.status.set(String::new());
+                }
+                Ok(Reply::Calendar(data)) => {
+                    let selected = match action {
+                        Action::OpenHit(id, ..) => data.entries.iter().position(|e| e.id == id),
+                        _ => None,
+                    };
+                    planner.selected_row.set(selected);
+                    planner.search.set(None);
                     planner.view.set(Some(data.view));
                     if matches!(
                         action,
-                        Action::Resume | Action::Load | Action::Browse(..) | Action::Change(_)
+                        Action::Resume
+                            | Action::Load
+                            | Action::Browse(..)
+                            | Action::Change(_)
+                            | Action::OpenHit(..)
                     ) {
                         planner.date.set(TextEdit::new(&date.to_string()));
                         planner.finding.set(false);
@@ -556,12 +634,13 @@ pub fn run() -> io::Result<()> {
                     planner.editor.set(None);
                     planner.shown.set(date);
                     planner.data.set(Some(data));
-                    planner.page.set(0);
+                    planner.page.set(selected.unwrap_or(0) / PAGE);
                     if matches!(action, Action::Save(_)) {
                         planner.title.set(TextEdit::new(""));
                     }
                     planner.status.set(
                         match action {
+                            Action::OpenHit(..) => "Selected search result",
                             Action::Change(true) => "Deleted on this device",
                             Action::Change(false) => "Changes saved on this device",
                             Action::SetOpening(_) => "Opening view saved",
@@ -572,6 +651,13 @@ pub fn run() -> io::Result<()> {
                         }
                         .into(),
                     );
+                }
+                Err(e) if matches!(action, Action::Search(_) | Action::OpenHit(..)) => {
+                    if let Some(mut form) = planner.search.get_cloned() {
+                        form.results = None;
+                        planner.search.set(Some(form));
+                    }
+                    planner.status.set(e);
                 }
                 Err(e) => {
                     planner.data.set(None);

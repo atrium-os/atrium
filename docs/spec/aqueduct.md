@@ -233,7 +233,11 @@ day, week or month query, event creation, edit or deletion, hold release or
 opening-view preference change. A browse request can ask for the stored opening
 view. Edits name the local record, displayed date, scope and an explicit update
 or delete operation. Fasti owns series links and exceptions. All writes carry
-the current store revision. The envelope carries at most 4 KiB for a
+the current store revision. A title search includes two civil dates and returns
+one page of effective occurrences. Results and continuations use the store
+revision. Opening a search result requires its record ID, effective date and
+revision. These reads use the same instance authorization as day queries.
+The envelope carries at most 4 KiB for a
 request and 1 MiB for a reply. Only the registered Calendar
 instance for that store can use it. [Calendar](calendar.md)
 

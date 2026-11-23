@@ -1,8 +1,8 @@
 //! Guest gate only. Run at the actual app UID inside each installed UI jail.
 use aqueduct::{classes::CLASS_CALENDAR, flag, Header};
 use atrium_calendar::{
-    wire::{call, Request},
-    CalendarView, Entry, Kind, Span,
+    wire::{call, search, EventChange, Request},
+    CalendarView, EditScope, Entry, Kind, SearchQuery, Span,
 };
 use chrono::{Datelike, Days, NaiveDate};
 use std::{
@@ -128,11 +128,147 @@ fn check_review(socket: &Path, date: NaiveDate, moved: bool) -> Result<(), Strin
     Ok(())
 }
 
+fn search_fixture(socket: &Path, today: NaiveDate, mode: &str) -> Result<(), String> {
+    let first = today.with_day(1).unwrap();
+    let query = SearchQuery {
+        text: "lantern".into(),
+        start: first,
+        end: CalendarView::Month.dates(first).last().unwrap(),
+    };
+    let moved = first + Days::new(1);
+    let private = first + Days::new(2);
+    let personal = mode.ends_with("personal");
+    let change = |revision, id, shown, operation| {
+        call(
+            socket,
+            &Request::Change {
+                revision,
+                id,
+                shown,
+                scope: EditScope::ThisEvent,
+                operation,
+            },
+        )
+    };
+    if mode.starts_with("--seed-search-") {
+        let event = Entry {
+            id: Uuid::new_v4(),
+            date: if personal { private } else { first },
+            title: "Lantern".into(),
+            excluded: Vec::new(),
+            kind: if personal {
+                Kind::Appointment
+            } else {
+                Kind::Weekly
+            },
+            span: if personal {
+                Span {
+                    start: 1035,
+                    end: 1065,
+                }
+            } else {
+                Span {
+                    start: 660,
+                    end: 690,
+                }
+            },
+        };
+        let revision = call(socket, &Request::Day { date: first })?.revision;
+        let saved = call(
+            socket,
+            &Request::Add {
+                revision,
+                entry: event.clone(),
+            },
+        )?;
+        if !personal {
+            let mut fields = event.fields_on(moved);
+            fields.span = Span {
+                start: 720,
+                end: 750,
+            };
+            let edited = change(saved.revision, event.id, first, EventChange::Update(fields))?;
+            let skipped = change(
+                edited.revision,
+                event.id,
+                first + Days::new(7),
+                EventChange::Delete,
+            )?;
+            // Put Lantern beyond the first six rows in its day and exercise search pagination.
+            let mut revision = skipped.revision;
+            for n in 0..7 {
+                let desk = Entry {
+                    id: Uuid::new_v4(),
+                    title: format!("Desk prep {}", n + 1),
+                    kind: Kind::Appointment,
+                    date: moved,
+                    span: Span {
+                        start: 480 + n * 15,
+                        end: 495 + n * 15,
+                    },
+                    excluded: vec![],
+                };
+                revision = call(
+                    socket,
+                    &Request::Add {
+                        revision,
+                        entry: desk,
+                    },
+                )?
+                .revision;
+            }
+        }
+    }
+    let mut result = search(socket, query.clone(), 0, None)?;
+    if mode == "--cancel-search-hit" {
+        let hit = result.hits.first().ok_or("Missing moved meeting")?;
+        if hit.date != moved
+            || !matches!(hit.kind, Kind::Occurrence {original,..} if original == first)
+        {
+            return Err("Expected the moved meeting before cancellation".into());
+        }
+        change(result.revision, hit.id, hit.date, EventChange::Delete)?;
+        result = search(socket, query.clone(), 0, None)?;
+    }
+    let mut expected = Vec::new();
+    if personal {
+        expected.push((private, 1035));
+    } else {
+        if mode != "--cancel-search-hit" {
+            expected.push((moved, 720));
+        }
+        for day in [14, 21, 28] {
+            let date = first + Days::new(day);
+            if date <= query.end {
+                expected.push((date, 660));
+            }
+        }
+    }
+    let actual: Vec<_> = result.hits.iter().map(|h| (h.date, h.span.start)).collect();
+    if actual != expected
+        || result.total != expected.len()
+        || result.hits.iter().any(|h| h.title != "Lantern")
+    {
+        return Err("Incorrect persona search dates, times or count".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     let [socket, date, expected] = args.as_slice() else {
         return Err("expected socket, date and title (or --denied)".into());
     };
+    if matches!(
+        expected.as_str(),
+        "--seed-search-personal"
+            | "--seed-search-work"
+            | "--check-search-personal"
+            | "--cancel-search-hit"
+    ) {
+        search_fixture(Path::new(socket), date.parse()?, expected)?;
+        return Ok(());
+    }
     if matches!(expected.as_str(), "--work-schedule" | "--personal-schedule") {
         seed(
             Path::new(socket),
@@ -149,10 +285,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         return Ok(());
     }
-    let request = Request::Day {
-        date: date.parse()?,
+    let date = date.parse()?;
+    let request = if expected == "--denied-search" {
+        Request::Search {
+            query: SearchQuery {
+                text: "lantern".into(),
+                start: date,
+                end: date,
+            },
+            offset: 0,
+            revision: None,
+        }
+    } else {
+        Request::Day { date }
     };
-    if expected == "--denied" {
+    if expected.starts_with("--denied") {
         // The fixture temporarily grants connect permission. Prove that
         // Fasti itself closes the connection without returning a single byte.
         let mut stream = UnixStream::connect(socket)?;

@@ -1,4 +1,5 @@
 //! One Fasti process owns one private, supervisor-provisioned persona directory.
+pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};

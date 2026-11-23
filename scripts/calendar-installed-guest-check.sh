@@ -15,6 +15,21 @@ psock=/atrium/sockets/portcullis/portcullis.sock
 launch() {
     daemon -f -o "$D/$1.log" su -m "$person" -c "$D/forum-dock launch $app --persona $1"
 }
+close_ui() {
+    case "$1" in
+        "$work_jail") scope=work ;;
+        "$personal_jail") scope=personal ;;
+        *) return 1 ;;
+    esac
+    # Portcullis holds this advisory lock across window launch and jail teardown.
+    # Check it is held, then wait for release on the same inode before relaunch.
+    lease="/var/run/atrium/fasti/window-$scope"
+    test -f "$lease"
+    if lockf -kns -t 0 "$lease" /usr/bin/true; then return 1; fi
+    kill -TERM "$(pgrep -j "$1" -x atrium-calendar)"
+    lockf -kns -t 25 "$lease" /usr/bin/true
+    ! jls -j "$1" jid >/dev/null 2>&1
+}
 wait_ui() {
     for i in $(jot 35); do
         if pgrep -j "$1" -x atrium-calendar >/dev/null 2>&1; then return; fi
@@ -133,7 +148,9 @@ cross() {
     mount -t nullfs -o ro "$from" "$root/test-endpoint"
     chmod 666 "$from/calendar.sock"
     result=0
-    jexec -u "$(id -nu "$2")" "$1" /bin/installed-probe /test-endpoint/calendar.sock "$(date -u +%Y-%m-%d)" --denied || result=$?
+    for mode in --denied --denied-search; do
+        jexec -u "$(id -nu "$2")" "$1" /bin/installed-probe /test-endpoint/calendar.sock "$(date -u +%Y-%m-%d)" "$mode" || result=$?
+    done
     chmod 600 "$from/calendar.sock"
     umount "$root/test-endpoint"
     return "$result"
@@ -160,8 +177,7 @@ check_instance "$personal_jail" personal "$personal_store" "piano lesson"
 # A different trusted publisher may sign a manifest, but has no Fasti grant.
 # Close Work normally from the launcher's point of view and wait for its
 # jail teardown. Fasti must continue to serve its persona during the session.
-kill -TERM "$(pgrep -j "$work_jail" -x atrium-calendar)"
-for i in $(jot 20); do grep -q 'exited' work.log && break; sleep 1; done
+close_ui "$work_jail"
 grep -q 'exited' work.log
 # Capture Personal on its own. In headless mode equally sized windows
 # overlap exactly, including the edge and tag of the window behind.
@@ -186,11 +202,6 @@ check_instance "$work_jail" work "$work_store" "design review"
 click() {
     inj "MOVE $1 $2" 'BTN 1 1' 'BTN 1 0'
     sleep 1
-}
-close_ui() {
-    kill -TERM "$(pgrep -j "$1" -x atrium-calendar)"
-    for i in $(jot 25); do jls -j "$1" jid >/dev/null 2>&1 || return 0; sleep 1; done
-    return 1
 }
 today=$(date -u +%Y-%m-%d)
 cal_socket=/atrium/sockets/calendar/calendar.sock
@@ -255,6 +266,8 @@ saved "$personal_store" ride
 click 262 341
 click 273 416
 if grep -q '"title":"ride"' "$personal_store/calendar.json"; then exit 1; fi
+install -m 0555 installed_probe "$(jls -j "$personal_jail" path)/bin/installed-probe"
+jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --seed-search-personal
 close_ui "$personal_jail"
 
 open_work_week() {
@@ -298,6 +311,60 @@ cp screen.png series-review.png
 click 77 60             # Cancel without applying a series change
 check_review --moved-review
 echo "PASS: native occurrence move, changed gaps, unchanged next week, restart and confirmed local deletion"
+
+# Open identical titles in the two personas and prove which date each UI opened.
+click 54 60  # Today anchors the range even when Thursday belongs to another month.
+click 150 60 # Week
+work_search() { jexec -u "$(id -nu "$wu")" "$work_jail" /bin/installed-probe "$cal_socket" "$today" "$1"; }
+work_search --seed-search-work
+search_lantern() {
+    click 456 60
+    keys 15 4 17 23 8 21 17 40   # lantern, Return in the title field
+    sleep 1
+}
+click 456 60
+keys 7 8 22 14 40  # desk, Return
+sleep 1
+click 197 520      # Next
+cp screen.png search-page-two.png
+click 72 520       # Previous
+click 81 60        # Back to calendar
+search_lantern
+cp screen.png work-search.png
+click 613 238
+cp screen.png selected-search-hit.png
+enter 23 21 4 6 8  # trace
+saved "$work_store" trace
+target=$(date -u -v2d +%Y-%m-%d)
+grep -Fq "\"date\":\"$target\",\"title\":\"trace\"" "$work_store/calendar.json"
+sleep 1
+search_lantern
+work_search --cancel-search-hit
+click 613 238
+cp screen.png stale-search.png
+# A stale hit leaves the search fields available. Repeat the search and
+# select the new first occurrence, two weeks after the original series start.
+click 632 145
+cp screen.png refreshed-search.png
+click 613 238
+enter 21 8 23 21 28   # retry
+saved "$work_store" retry
+target=$(date -u -v15d +%Y-%m-%d)
+grep -Fq "\"date\":\"$target\",\"title\":\"retry\"" "$work_store/calendar.json"
+close_ui "$work_jail"
+launch personal
+wait_ui "$personal_jail" personal
+sleep 2
+install -m 0555 installed_probe "$(jls -j "$personal_jail" path)/bin/installed-probe"
+jexec -u "$(id -nu "$pu")" "$personal_jail" /bin/installed-probe "$cal_socket" "$today" --check-search-personal
+search_lantern
+cp screen.png personal-search.png
+click 613 238
+enter 11 18 16 8  # home
+saved "$personal_store" home
+target=$(date -u -v3d +%Y-%m-%d)
+grep -Fq "\"date\":\"$target\",\"title\":\"home\"" "$personal_store/calendar.json"
+echo "PASS: persona-local title search, moved occurrence selection, stale result refusal and refreshed dates"
 
 # Exercise the same authenticated SessionEnded message Ostiarius sends.
 printf '%s\n' '{"op":"hello","version":1}' '{"op":"session_ended","user":"calfixture"}' |

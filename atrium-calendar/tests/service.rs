@@ -93,6 +93,26 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     )
     .unwrap();
     assert_eq!(saved.entries[0].id, event.id);
+    let search = || {
+        atrium_calendar::wire::search(
+            &socket,
+            atrium_calendar::SearchQuery {
+                text: "budget".into(),
+                start: date,
+                end: date,
+            },
+            0,
+            None,
+        )
+    };
+    let result = search().unwrap();
+    assert_eq!(result.hits[0].id, event.id);
+    let open_hit = Request::OpenSearchHit {
+        revision: result.revision,
+        date,
+        id: event.id,
+    };
+    assert_eq!(page(&socket, &open_hit).unwrap().entries[0].id, event.id);
     for (user, app, signer, suffix) in [
         ("mina", "org.atrium.calendar", publisher.as_str(), ""),
         (
@@ -123,6 +143,8 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     ] {
         register(user, app, signer, suffix);
         assert!(call(&socket, &query).is_err());
+        assert!(search().is_err());
+        assert!(page(&socket, &open_hit).is_err());
         assert!(page(&socket, &resume).is_err());
         assert!(page(&socket, &set_week).is_err());
         assert!(page(

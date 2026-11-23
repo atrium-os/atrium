@@ -143,3 +143,150 @@ fn opening_views_survive_restart_and_old_snapshots_while_browsing_is_read_only()
     assert_eq!(w.entries[0].title, "Review");
     assert!(p.entries.is_empty());
 }
+
+#[test]
+fn search_uses_actual_occurrences_and_revalidates_results() {
+    use atrium_calendar::{EditScope::ThisEvent, SearchQuery};
+    let work = tempfile::tempdir().unwrap();
+    let personal = tempfile::tempdir().unwrap();
+    let mut store = Store::open(work.path()).unwrap();
+    let mut other = Store::open(personal.path()).unwrap();
+    let first = date("2026-11-02");
+    let moved = date("2026-11-09");
+    add(
+        &mut store,
+        first,
+        Kind::Weekly,
+        "Café design review",
+        840,
+        900,
+    );
+    add(
+        &mut other,
+        first,
+        Kind::AllDay,
+        "Café design review",
+        0,
+        1440,
+    );
+    let series = store.day(first).entries.remove(0);
+    let mut changed = series.fields_on(moved);
+    changed.span = Span {
+        start: 600,
+        end: 645,
+    };
+    store
+        .change(1, series.id, first, ThisEvent, Some(changed))
+        .unwrap();
+    store
+        .change(2, series.id, moved + Days::new(7), ThisEvent, None)
+        .unwrap();
+    let query = SearchQuery {
+        text: " REVIEW   CAFÉ ".into(),
+        start: first,
+        end: moved + Days::new(7),
+    };
+    let snapshot = std::fs::read(work.path().join("calendar.json")).unwrap();
+    let found = store.search(&query, 0, None).unwrap();
+    let personal_hit = other.search(&query, 0, None).unwrap();
+    assert_eq!(personal_hit.total, 1);
+    assert_eq!(personal_hit.hits[0].date, first);
+    assert_eq!(personal_hit.hits[0].kind, Kind::AllDay);
+    assert_eq!(found.total, 2);
+    let hit = &found.hits[0];
+    assert_eq!((hit.date, hit.span.start), (moved, 600));
+    assert_eq!(
+        hit.kind,
+        Kind::Occurrence {
+            series: series.id,
+            original: first
+        }
+    );
+    assert_eq!(found.hits[1].id, series.id);
+    assert_eq!(found.hits[1].date, moved);
+    let day = store
+        .open_search_hit(found.revision, hit.id, hit.date)
+        .unwrap();
+    assert_eq!(day.entries.len(), 2);
+    assert_eq!(
+        std::fs::read(work.path().join("calendar.json")).unwrap(),
+        snapshot
+    );
+    assert!(store
+        .open_search_hit(found.revision, hit.id, first)
+        .is_err());
+    store
+        .change(found.revision, hit.id, moved, ThisEvent, None)
+        .unwrap();
+    assert!(store
+        .open_search_hit(found.revision, hit.id, moved)
+        .is_err());
+    drop(store);
+    let store = Store::open(work.path()).unwrap();
+    let results = store.search(&query, 0, None).unwrap();
+    assert_eq!(results.total, 1);
+    assert_eq!(results.hits[0].id, series.id);
+}
+
+#[test]
+fn search_pages_are_ordered_bounded_and_revision_checked() {
+    use atrium_calendar::{SearchQuery, SEARCH_PAGE_SIZE};
+    let dir = tempfile::tempdir().unwrap();
+    let start = date("2028-01-01");
+    // A v1 snapshot with enough old series to exceed the annual expansion budget.
+    let entries: Vec<_> = (0..200)
+        .map(|i| Entry {
+            id: Uuid::from_u128(i + 1),
+            date: start - Days::new(7 * 400),
+            kind: Kind::Weekly,
+            span: Span {
+                start: 480,
+                end: 540,
+            },
+            title: "Weekly team".into(),
+            excluded: Vec::new(),
+        })
+        .rev()
+        .collect();
+    std::fs::write(
+        dir.path().join("calendar.json"),
+        serde_json::to_vec(&serde_json::json!({"version":1,"revision":3,"entries":entries}))
+            .unwrap(),
+    )
+    .unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let mut q = SearchQuery {
+        text: "team".into(),
+        start,
+        end: start,
+    };
+    let first = store.search(&q, 0, None).unwrap();
+    assert_eq!((first.hits.len(), first.total), (SEARCH_PAGE_SIZE, 200));
+    assert_eq!(first.hits[0].id, Uuid::from_u128(1));
+    let page = store.search(&q, SEARCH_PAGE_SIZE, Some(3)).unwrap();
+    assert_eq!(
+        page.hits[0].id,
+        Uuid::from_u128(SEARCH_PAGE_SIZE as u128 + 1)
+    );
+    assert!(store.search(&q, 200, Some(3)).is_err());
+    assert!(store.search(&q, 5, None).is_err());
+    store.set_opening_view(3, CalendarView::Week).unwrap();
+    assert!(store.search(&q, 5, Some(3)).is_err());
+    assert!(store.search(&q, 0, Some(3)).is_err());
+    q.end = start + Days::new(365);
+    assert!(store.search(&q, 0, None).unwrap_err().contains("Too many"));
+    q.text = "nothing matches".into();
+    assert_eq!(store.search(&q, 0, None).unwrap().total, 0);
+    q.end = start + Days::new(366);
+    assert!(store.search(&q, 0, None).is_err());
+    q.end = start.pred_opt().unwrap();
+    assert!(store.search(&q, 0, None).is_err());
+    q.start = NaiveDate::MAX;
+    q.end = NaiveDate::MAX;
+    q.text = "team".into();
+    assert!(store.search(&q, 0, None).is_ok());
+    for invalid in ["  ".to_owned(), "x".repeat(161), "a\nb".into()] {
+        q.text = invalid;
+        assert!(store.search(&q, 0, None).is_err());
+    }
+}
