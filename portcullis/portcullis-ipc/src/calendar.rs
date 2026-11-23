@@ -11,7 +11,18 @@ pub const REVIEW_SECONDS: u64 = 300;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Delivery {
+    pub uid: String,
+    pub organizer: String,
+    pub sequence: u32,
+    pub cancelled: bool,
+    pub scope: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Source {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
     pub account: u32,
     pub from: String,
     pub identities: Vec<String>,
@@ -58,6 +69,9 @@ impl Answer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reply {
+    /// None for an ordinary meeting, "weekly" or the original RECURRENCE-ID property.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub answer: Answer,
     pub attendee: String,
     pub uid: String,

@@ -1,8 +1,8 @@
 //! Only Mail submits an RSVP. Recheck the selected message at explicit Send.
 use crate::{Engine, Error};
-use mail_schema::{InviteMethod, PartKind, SenderCheck, Which};
+use mail_schema::{InviteMethod, PartKind, SenderCheck};
 use mail_store::MsgId;
-use portcullis_ipc::calendar::{address, Reply, Source, FILE_MAX};
+use portcullis_ipc::calendar::{address, Delivery, Reply, Source, FILE_MAX};
 
 pub struct Selected {
     pub source: Source,
@@ -59,15 +59,16 @@ impl Engine {
             .full
             .ok_or(Error::Refused("Download the full invitation first"))?;
         let summary = &m.summary;
-        if !summary
+        let invite = summary
             .invite
             .as_ref()
-            .is_some_and(|i| i.method == InviteMethod::Request && !i.cancelled)
-        {
-            return Err(Error::Refused(
-                "This message does not contain a supported meeting request",
-            ));
-        }
+            .filter(|i| {
+                (i.method == InviteMethod::Request && !i.cancelled)
+                    || i.method == InviteMethod::Cancel
+            })
+            .ok_or(Error::Refused(
+                "This message does not contain a supported scheduling request",
+            ))?;
         let mut parts = summary
             .parts
             .iter()
@@ -98,7 +99,45 @@ impl Engine {
                 .sender
                 .as_ref()
                 .is_none_or(|a| a.addr.eq_ignore_ascii_case(&from));
+        let raw = self.store.blob(&blob)?;
+        let len = raw.len() as u64;
+        let mut jail = self.parser.start()?;
+        mail_schema::write_frame(
+            &mut jail.w,
+            &mail_schema::ToJail::SchedulingPart {
+                message: mail_schema::Raw { id: 1, bytes: raw },
+                path: p.path.clone(),
+            },
+        )
+        .map_err(|e| Error::Jail(e.to_string()))?;
+        let mut frames = crate::Parser::exchange(
+            &mut jail.r,
+            &mut jail.w,
+            &|id| (id == 1).then_some(len),
+            &[],
+            &|_| None,
+        )?;
+        let Some(mail_schema::FromJail::SchedulingPart {
+            id: 1,
+            result: Ok((bytes, scope)),
+        }) = frames.pop()
+        else {
+            return Err(Error::Refused(
+                "This invitation has an unsupported recurrence pattern or scope",
+            ));
+        };
+        if !frames.is_empty() {
+            return Err(Error::Jail("Unexpected scheduling response".into()));
+        }
         let source = Source {
+            delivery: (scope.is_some() || invite.cancelled).then(|| Delivery {
+                uid: invite.uid.clone(),
+                sequence: invite.sequence,
+                organizer: invite.organizer.clone(),
+                cancelled: invite.cancelled,
+                scope,
+            }),
+
             account: m.account,
             from,
             reply_destination_matches: matches,
@@ -112,15 +151,62 @@ impl Engine {
         if !source.valid() {
             return Err(Error::Refused("Invalid Mail identity for this invitation"));
         }
-        let bytes = self.attachment(msg, &Which::Part(p.path.clone()))?.bytes;
-        if bytes.len() > FILE_MAX {
-            return Err(Error::Refused("Calendar part too large"));
-        }
         Ok(Selected {
             source,
             bytes,
             blob,
         })
+    }
+
+    /// Bind the Calendar choice to the scope in the immutable selected Mail part.
+    pub fn invitation_scope(&self, msg: MsgId, reply: &Reply) -> Result<Option<String>, Error> {
+        let selected = self.selected_invitation(msg)?;
+        let scope = selected.source.delivery.and_then(|d| d.scope);
+        if scope != reply.scope {
+            return Err(Error::Refused("The invitation scope has changed"));
+        }
+        match scope.as_deref() {
+            None => Ok(None),
+            Some("weekly") => Ok(Some("Whole weekly series".into())),
+            Some(property) => {
+                let (head, value) = property
+                    .split_once(':')
+                    .ok_or(Error::Refused("Invalid occurrence"))?;
+                let local = value.strip_suffix('Z').unwrap_or(value);
+                let date = chrono::NaiveDateTime::parse_from_str(local, "%Y%m%dT%H%M%S")
+                    .map_err(|_| Error::Refused("Invalid occurrence time"))?;
+                if local.len() != 15
+                    || local.as_bytes()[8] != b'T'
+                    || !local
+                        .bytes()
+                        .enumerate()
+                        .all(|(i, b)| i == 8 || b.is_ascii_digit())
+                {
+                    return Err(Error::Refused("Invalid occurrence time"));
+                }
+                let zone = if head == "RECURRENCE-ID" {
+                    if value.ends_with('Z') {
+                        "UTC"
+                    } else {
+                        "Floating"
+                    }
+                } else {
+                    head.strip_prefix("RECURRENCE-ID;TZID=")
+                        .filter(|z| {
+                            !z.is_empty()
+                                && z.len() <= 64
+                                && !value.ends_with('Z')
+                                && z.bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_/+-".contains(&b))
+                        })
+                        .ok_or(Error::Refused("Invalid occurrence zone"))?
+                };
+                Ok(Some(format!(
+                    "One occurrence · originally {} · {zone}",
+                    date.format("%Y-%m-%d %H:%M")
+                )))
+            }
+        }
     }
 
     pub fn send_invitation_reply(
@@ -134,7 +220,6 @@ impl Engine {
         if m.full != Some(blob)
             || i.method != InviteMethod::Request
             || i.cancelled
-            || i.repeats
             || i.uid != r.uid
             || i.sequence != r.sequence
             || !i.organizer.eq_ignore_ascii_case(&r.organizer)
@@ -160,6 +245,7 @@ impl Engine {
                 "Invitation identity or revision changed. Review it again.",
             ));
         }
+        let scope = self.invitation_scope(msg, r)?;
         let raw = self.store.blob(&blob)?;
         let received = self
             .parser
@@ -198,13 +284,16 @@ impl Engine {
         let schedule = proposed_time(&received)
             .ok_or(Error::Refused("The proposed time could not be verified"))?;
         draft.text = format!("{}\n{}\n{}", r.answer.partstat(), received.title, schedule);
+        if let Some(scope) = &scope {
+            draft.text.push_str(&format!("\n{scope}"));
+        }
         draft.in_reply_to = m.summary.message_id.clone();
         let stamp = chrono::DateTime::from_timestamp(crate::now(), 0)
             .ok_or(Error::Refused("Invalid device time"))?
             .format("%Y%m%dT%H%M%SZ");
         // Fold content lines at 75 octets. Every inserted value is bounded ASCII.
         let mut data = String::new();
-        for line in [
+        let mut lines = vec![
             "BEGIN:VCALENDAR".into(),
             "PRODID:-//Atrium//Mail//EN".into(),
             "VERSION:2.0".into(),
@@ -221,7 +310,11 @@ impl Engine {
             ),
             "END:VEVENT".into(),
             "END:VCALENDAR".into(),
-        ] {
+        ];
+        if let Some(id) = r.scope.as_ref().filter(|v| v.as_str() != "weekly") {
+            lines.insert(7, id.clone());
+        }
+        for line in lines {
             let mut rest = line.as_str();
             while rest.len() > 74 {
                 data.push_str(&rest[..74]);
@@ -236,13 +329,17 @@ impl Engine {
             mime: "text/calendar; method=REPLY".into(),
             bytes: data.into_bytes(),
         });
-        let key = format!(
+        let mut key = format!(
             "{}/{}/{}/{}",
             m.account,
             r.organizer.to_ascii_lowercase(),
             r.attendee.to_ascii_lowercase(),
             r.uid
         );
+        if let Some(id) = r.scope.as_ref().filter(|v| v.as_str() != "weekly") {
+            key.push('/');
+            key.push_str(id);
+        }
         self.queue_message(
             m.account,
             &draft,

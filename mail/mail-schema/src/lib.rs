@@ -125,6 +125,8 @@ pub enum ToJail {
     KeyFor { message: Raw, certs: Vec<Vec<u8>> },
     HtmlAttachment { message: Raw, which: Which, key: Option<Vec<u8>> },
     KeyForOaep { message: Raw, certs: Vec<Vec<u8>> },
+    /// Re-read the scope of one decoded calendar part for an RSVP.
+    SchedulingPart { message: Raw, path: String },
 }
 
 /// Most of the person's certificates sent with a [`ToJail::KeyFor`].
@@ -172,6 +174,7 @@ pub enum FromJail {
     Autocrypt { id: u64, addr: String, key: Vec<u8> },
     Done,
     KeyForOaep { id: u64, keys: Vec<OaepKey> },
+    SchedulingPart { id: u64, result: Result<(Vec<u8>, Option<String>), Refusal> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +714,12 @@ impl FromJail {
             FromJail::Autocrypt { addr, key, .. } => {
                 short(addr, c, "autocrypt address")?;
                 if !addr.contains('@') || key.is_empty() || key.len() > PGP_KEY_MAX { return Err(Lie("autocrypt key")) }
+                Ok(())
+            }
+            FromJail::SchedulingPart { result: Ok((bytes, scope)), .. } => {
+                if bytes.len() > 4 << 20 || bytes.len() as u64 > raw_len || scope.as_ref().is_some_and(|s| s.len()>128 || !s.is_ascii() || s.bytes().any(|b| b.is_ascii_control())) {
+                    return Err(Lie("invalid scheduling part"));
+                }
                 Ok(())
             }
             FromJail::Attachment { result: Ok(a), .. } => {

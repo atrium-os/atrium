@@ -31,12 +31,15 @@ struct Snapshot {
     #[serde(default)]
     device_zone: Option<Tz>,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cancelled: Vec<crate::invitation::Cancellation>,
 }
 
 struct UndoState {
     receipt: UndoReceipt,
     date: NaiveDate,
     entries: Vec<Entry>,
+    cancelled: Vec<crate::invitation::Cancellation>,
 }
 
 pub struct Store {
@@ -68,7 +71,8 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=4)
+                if !matches!(snapshot.version, 1..=5)
+                    || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
                     return Err(io::Error::other("Invalid calendar snapshot"));
@@ -82,6 +86,7 @@ impl Store {
                 revision: 0,
                 opening_view: CalendarView::Today,
                 entries: Vec::new(),
+                cancelled: Vec::new(),
             },
             Err(e) => return Err(e),
         };
@@ -144,6 +149,7 @@ impl Store {
         self.publish(
             revision,
             self.state.entries.clone(),
+            self.state.cancelled.clone(),
             self.state.opening_view,
             pinned_zone,
             device_zone,
@@ -228,6 +234,7 @@ impl Store {
         self.publish(
             revision,
             self.state.entries.clone(),
+            self.state.cancelled.clone(),
             view,
             self.state.pinned_zone,
             self.state.device_zone,
@@ -382,9 +389,20 @@ impl Store {
         entries: Vec<Entry>,
         date: NaiveDate,
     ) -> Result<UndoReceipt, String> {
+        self.commit_invitation(revision, entries, self.state.cancelled.clone(), date)
+    }
+
+    fn commit_invitation(
+        &mut self,
+        revision: u64,
+        entries: Vec<Entry>,
+        cancelled: Vec<crate::invitation::Cancellation>,
+        date: NaiveDate,
+    ) -> Result<UndoReceipt, String> {
         let previous = self.publish(
             revision,
             entries,
+            cancelled,
             self.state.opening_view,
             self.state.pinned_zone,
             self.state.device_zone,
@@ -396,7 +414,8 @@ impl Store {
         self.undo = Some(UndoState {
             receipt,
             date,
-            entries: previous,
+            entries: previous.entries,
+            cancelled: previous.cancelled,
         });
         Ok(receipt)
     }
@@ -412,6 +431,7 @@ impl Store {
         self.publish(
             receipt.revision,
             previous.entries.clone(),
+            previous.cancelled.clone(),
             self.state.opening_view,
             self.state.pinned_zone,
             self.state.device_zone,
@@ -423,14 +443,19 @@ impl Store {
         &mut self,
         revision: u64,
         entries: Vec<Entry>,
+        cancelled: Vec<crate::invitation::Cancellation>,
         opening_view: CalendarView,
         pinned_zone: Option<Tz>,
         device_zone: Option<Tz>,
-    ) -> Result<Vec<Entry>, String> {
+    ) -> Result<Snapshot, String> {
+        if cancelled.len() > MAX_ENTRIES {
+            return Err("Calendar cancellation history limit reached".into());
+        }
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 4,
+            version: 5,
+            cancelled,
             pinned_zone,
             device_zone,
             revision: revision.checked_add(1).ok_or("Revision limit reached")?,
@@ -455,7 +480,7 @@ impl Store {
             .map_err(|_| {
                 "Saved, but durability is uncertain. Refresh before retrying.".to_string()
             })?;
-        Ok(previous.entries)
+        Ok(previous)
     }
 }
 

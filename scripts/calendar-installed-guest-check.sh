@@ -77,12 +77,15 @@ calendar_paths() {
 mail_jail=org_atrium_mail__p_work
 mail_folder="$home/.atrium/persona-apps/work/org.atrium.mail/nonexistent/.local/share/atrium-mail"
 start_mail() {
-    daemon -f -p "$D/mail-launch.pid" -o "$D/mail-work.log" su -m "$person" -c "$D/forum-dock launch org.atrium.mail --persona work"
+    launcher_dir=$(mktemp -d "$D/mail-launch.XXXXXX")
+    printf '%s\n' "$launcher_dir" >"$D/current-mail-launch"
+    daemon -f -P "$launcher_dir/supervisor.pid" -p "$launcher_dir/child.pid" -o "$D/mail-work.log" su -m "$person" -c "$D/forum-dock launch org.atrium.mail --persona work"
     for i in $(jot 30); do pgrep -j "$mail_jail" -x atrium-mail >/dev/null 2>&1 && break; sleep 1; done
     pgrep -j "$mail_jail" -x atrium-mail >/dev/null
 }
 stop_mail() {
-    launcher=$(cat "$D/mail-launch.pid" 2>/dev/null || :)
+    launcher_dir=$(cat "$D/current-mail-launch")
+    launcher=$(cat "$launcher_dir/supervisor.pid" 2>/dev/null || :)
     if pid=$(pgrep -j "$mail_jail" -x atrium-mail 2>/dev/null); then kill -TERM "$pid"; fi
     # Forum returns after Portcullis has finished unmounting the previous
     # launch. The jail disappears earlier, while those mounts can still race.
@@ -126,16 +129,18 @@ case "${2-}" in
                 ;;
         esac
         exit 0 ;;
-    invitation-check-empty)
+    invitation-check-empty|series-check-empty)
         stop_mail
         ./invitation_probe empty "$mail_folder" "$D/mail-parse-jail"
-        start_mail
+        if [ "$2" = invitation-check-empty ]; then start_mail; fi
         exit 0 ;;
-    invitation-submit)
+    invitation-submit|series-submit)
         stop_mail
-        ./invitation_probe submit "$mail_folder" "$D/mail-parse-jail"
+        mode=submit; if [ "$2" = series-submit ]; then mode=submit-series; fi
+        ./invitation_probe "$mode" "$mail_folder" "$D/mail-parse-jail"
+        if [ "$2" = series-submit ]; then start_mail; fi
         exit 0 ;;
-    keyboard-setup|import-setup|invitation-setup|'') ;;
+    keyboard-setup|import-setup|invitation-setup|series-setup|'') ;;
     *) exit 2 ;;
 esac
 
@@ -158,11 +163,11 @@ mkdir -p "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 daemon -f -o "$D/portcullis.log" env RUST_LOG=info /usr/local/bin/portcullisd --socket "$psock"
 activation="$D/act.sock"
-if [ "${2-}" = import-setup ] || [ "${2-}" = invitation-setup ]; then
+if [ "${2-}" = import-setup ] || [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then
     activation=/atrium/sockets/fresco-activation/fresco-activation.sock
     if sockstat -ul | grep -Fq "$activation"; then echo "activation socket in use" >&2; exit 1; fi
 fi
-if [ "${2-}" = invitation-setup ]; then export FRESCOD_INJECT_ACTIVATION=1; fi
+if [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then export FRESCOD_INJECT_ACTIVATION=1; fi
 daemon -f -o "$D/fresco.log" env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG="$D/screen" FRESCOD_SOCK="$fsock" FRESCOD_WM_SOCK="$D/wm.sock" FRESCOD_INPUT_SOCK="$D/inject.sock" FRESCOD_ACTIVATION_SOCK="$activation" FRESCOD_DEV_CAPS=all "$D/frescod"
 for socket in "$psock" "$fsock" "$D/inject.sock"; do
     for i in $(jot 20); do test -S "$socket" && break; sleep 1; done
@@ -171,7 +176,7 @@ done
 chmod 666 "$psock" "$fsock"
 su -m "$person" -c "portcullis policy grant $app"
 su -m "$person" -c "$D/forum-dock list" | grep -F "$app"
-if [ "${2-}" = invitation-setup ]; then
+if [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then
     if [ -d /var/lib/atrium/apps/org.atrium.mail ]; then
         test -z "$(jls -n name | grep org_atrium_mail || :)"
         mv /var/lib/atrium/apps/org.atrium.mail "$D/stock-mail"
@@ -202,7 +207,8 @@ MANIFEST
     opifex install mail-app
     su -m "$person" -c 'portcullis policy grant org.atrium.mail'
     ./invitation_probe exercise "$D/standalone-store" "$D/mail-parse-jail"
-    ./invitation_probe seed "$D/seeded" "$D/mail-parse-jail"
+    mode=seed; if [ "$2" = series-setup ]; then mode=seed-series; fi
+    ./invitation_probe "$mode" "$D/seeded" "$D/mail-parse-jail"
     start_mail
     for i in $(jot 20); do test -f "$mail_folder/index.redb" && break; sleep 1; done
     uid=$(stat -f %u "$mail_folder/index.redb")

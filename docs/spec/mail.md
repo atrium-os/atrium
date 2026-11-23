@@ -1368,6 +1368,8 @@ email" kind) are Loculus's aliased-identity item (loculus.md), out of scope here
 
 Mail parses a bounded invitation summary in its parse jail. **Review in Calendar…** opens the selected calendar part in the same persona. Calendar compares a proposed move with the saved meeting. **Accept…**, **Maybe…** or **Decline…** returns a choice to the Mail message that started the review. Mail shows the sending identity, organizer, proposed time and response before **Send response**. Cancel leaves the outbox empty. Mail revalidates the original request and queues the single-recipient iTIP reply atomically with its revision receipt. The receipt survives delivery and restart. [Calendar invitation review and synthetic gate](calendar.md#711-reviewing-an-invitation-from-mail)
 
+Recurring requests show the organizer’s scope again at final Send. Mail derives the original occurrence independently from the selected part and includes that occurrence identifier in an individual reply. Duplicate detection separates each occurrence from its siblings and the whole series. An organizer cancellation opens Calendar’s removal review and has no Send action. [Calendar scopes and synthetic gate](calendar.md#712-reviewing-a-recurring-meeting-or-cancellation)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

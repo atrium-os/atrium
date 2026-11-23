@@ -54,7 +54,7 @@ enum Action {
     OpenHit(Uuid, NaiveDate, u64),
     PickImport,
     CloseImport,
-    ApplyInvitation,
+    ApplyInvitation { cancellation: bool },
     ReplyInvitation(portcullis_ipc::calendar::Answer),
     SaveImport,
     ImportPage(usize),
@@ -135,7 +135,7 @@ impl Planner {
     }
 
     fn request(&self, action: Action) -> Result<Request, String> {
-        if matches!(action, Action::ApplyInvitation) {
+        if matches!(action, Action::ApplyInvitation { .. }) {
             let Some(Screen::Invitation(sheet)) = self.import.get_cloned() else {
                 return Err("Review the invitation first".into());
             };
@@ -874,7 +874,7 @@ pub fn run() -> io::Result<()> {
                     let date = data.date;
                     if let Some(receipt) = data.undo {
                         let label = match action {
-                            Action::ApplyInvitation => "Undo invitation change",
+                            Action::ApplyInvitation { .. } => "Undo invitation change",
                             Action::SaveImport => "Undo import",
                             Action::Change(true) => "Undo deletion",
                             Action::Change(false) => "Undo edit",
@@ -901,7 +901,7 @@ pub fn run() -> io::Result<()> {
                     if matches!(
                         action,
                         Action::Undo(_)
-                            | Action::ApplyInvitation
+                            | Action::ApplyInvitation { .. }
                             | Action::SaveImport
                             | Action::Today(_)
                             | Action::SetZone(_)
@@ -925,7 +925,12 @@ pub fn run() -> io::Result<()> {
                     }
                     planner.status.set(
                         match action {
-                            Action::ApplyInvitation => "Invitation saved on this device",
+                            Action::ApplyInvitation { cancellation: true } => {
+                                "Cancellation applied on this device"
+                            }
+                            Action::ApplyInvitation {
+                                cancellation: false,
+                            } => "Invitation saved on this device",
                             Action::SaveImport => "Local copies saved",
                             Action::Undo(_) => "Change undone on this device",
                             Action::OpenHit(..) => "Selected search result",
@@ -941,7 +946,7 @@ pub fn run() -> io::Result<()> {
                         .into(),
                     );
                 }
-                Err(e) if matches!(action, Action::ApplyInvitation) => {
+                Err(e) if matches!(action, Action::ApplyInvitation { .. }) => {
                     planner.import.set(Some(Screen::InvitationProblem(e)))
                 }
                 Err(e) if matches!(action, Action::SaveImport) => {

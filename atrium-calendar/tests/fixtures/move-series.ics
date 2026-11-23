@@ -1,0 +1,18 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Atrium//Synthetic invitations//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:studio-planning@fixture.invalid
+SEQUENCE:3
+DTSTAMP:20261124T080000Z
+RRULE:FREQ=WEEKLY
+DTSTART:20261201T160000Z
+DTEND:20261201T164500Z
+SUMMARY:Studio planning
+LOCATION:Studio A
+ORGANIZER:mailto:mina@fixture.invalid
+ATTENDEE;RSVP=TRUE:mailto:dev@fixture.invalid
+ATTENDEE:mailto:guest@fixture.invalid
+END:VEVENT
+END:VCALENDAR

@@ -9,23 +9,50 @@ use std::{
     time::Duration,
 };
 const REQUEST: &str = include_str!("../../../atrium-calendar/tests/fixtures/invitation.ics");
-fn seed(e: &Engine) {
+const WEEKLY: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly.ics");
+const MOVED: &str = include_str!("../../../atrium-calendar/tests/fixtures/move-one.ics");
+const SERIES_MOVE: &str = include_str!("../../../atrium-calendar/tests/fixtures/move-series.ics");
+const CANCEL_ONE: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-one.ics");
+const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-series.ics");
+const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
+
+fn seed(e: &Engine, series: bool) {
     assert!(e.store.accounts().unwrap().is_empty());
     let account = e.store.add_account("dev@fixture.invalid").unwrap();
     let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
-    for (id, title, body) in [
-        (1, "Studio invitation", REQUEST.to_owned()),
-        (
-            2,
-            "Studio moved",
-            REQUEST
-                .replace("SEQUENCE:1", "SEQUENCE:2")
-                .replace("T140000Z", "T150000Z")
-                .replace("T144500Z", "T154500Z")
-                .replace("Studio A", "Studio B"),
-        ),
-    ] {
-        let raw=format!("From: Mina <mina@fixture.invalid>\r\nTo: dev@fixture.invalid\r\nSubject: {title}\r\nMessage-ID: <studio-{id}@fixture.invalid>\r\nDate: Tue, 24 Nov 2026 09:0{id}:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n{}",body.replace('\n',"\r\n")).into_bytes();
+    let ordinary_move = REQUEST
+        .replace("SEQUENCE:1", "SEQUENCE:2")
+        .replace("T140000Z", "T150000Z")
+        .replace("T144500Z", "T154500Z")
+        .replace("Studio A", "Studio B");
+    let messages: &[(&str, &str)] = if series {
+        &[
+            ("Weekly studio", WEEKLY),
+            ("Move Wednesday", MOVED),
+            ("Weekly time change", SERIES_MOVE),
+            ("Cancel Wednesday", CANCEL_ONE),
+            ("End weekly studio", CANCEL_ALL),
+            ("Unverified cancellation", CANCEL_ALL),
+        ]
+    } else {
+        &[
+            ("Studio invitation", REQUEST),
+            ("Studio moved", &ordinary_move),
+        ]
+    };
+    for (n, &(title, body)) in messages.iter().enumerate() {
+        let id = n as u32 + 1;
+        let method = if body.contains("METHOD:CANCEL") {
+            "CANCEL"
+        } else {
+            "REQUEST"
+        };
+        let sender = if id == 6 {
+            "intruder@fixture.invalid"
+        } else {
+            "mina@fixture.invalid"
+        };
+        let raw=format!("From: Mina <{sender}>\r\nTo: dev@fixture.invalid\r\nSubject: {title}\r\nMessage-ID: <studio-{id}@fixture.invalid>\r\nDate: Tue, 24 Nov 2026 09:0{id}:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method={method}\r\n\r\n{}",body.replace('\n',"\r\n")).into_bytes();
         let mut summary = e
             .parser
             .summarize(&[(1, &raw)], false, &[])
@@ -33,7 +60,7 @@ fn seed(e: &Engine) {
             .pop()
             .unwrap()
             .unwrap();
-        assert_eq!(summary.invite.as_ref().unwrap().sequence, id);
+        assert_eq!(summary.invite.as_ref().unwrap().sequence, id.min(5));
         // Synthetic sender evidence for the reschedule case. No DNS or live account.
         summary.sender_check = mail_schema::SenderCheck::Verified {
             domain: "fixture.invalid".into(),
@@ -59,15 +86,48 @@ fn seed(e: &Engine) {
                 )
             })
             .unwrap();
+        if series {
+            use portcullis_ipc::calendar::{Answer, Reply};
+            let scope = match id {
+                1 | 3 => Some("weekly".into()),
+                2 | 4 => Some(ORIGINAL.into()),
+                _ => None,
+            };
+            let reply = Reply {
+                scope,
+                answer: Answer::Maybe,
+                attendee: "dev@fixture.invalid".into(),
+                organizer: "mina@fixture.invalid".into(),
+                uid: "studio-planning@fixture.invalid".into(),
+                sequence: id.min(5),
+            };
+            if method == "CANCEL" {
+                assert!(e.send_invitation_reply(msg, blob, &reply).is_err());
+            } else {
+                let widened = Reply {
+                    scope: None,
+                    ..reply.clone()
+                };
+                assert!(e.send_invitation_reply(msg, blob, &widened).is_err());
+                let operation = e.send_invitation_reply(msg, blob, &reply).unwrap();
+                let draft = e.undo_send(operation).unwrap().unwrap();
+                let ics = std::str::from_utf8(&draft.attachments[0].bytes).unwrap();
+                assert_eq!(
+                    ics.lines().find(|line| line.starts_with("RECURRENCE-ID")),
+                    (id == 2).then_some(ORIGINAL)
+                );
+                assert!(ics.contains("PARTSTAT=TENTATIVE"));
+            }
+        }
         assert_eq!(
             e.selected_invitation(msg).unwrap().bytes,
             body.replace('\n', "\r\n").as_bytes()
         );
     }
-    println!("PASS two synthetic Mail deliveries, exact calendar part selected, empty outbox");
+    println!("PASS synthetic Mail deliveries, exact calendar part selected, empty outbox");
     assert!(e.store.outbox().unwrap().is_empty());
 }
-fn submit(e: &Engine) {
+fn submit(e: &Engine, series: bool) {
     let pending = e.store.outbox().unwrap();
     assert_eq!(pending.len(), 1, "one reviewed Send");
     let (id, o) = &pending[0];
@@ -146,6 +206,16 @@ fn submit(e: &Engine) {
         .unwrap();
     assert!(String::from_utf8_lossy(&part.bytes)
         .contains("ATTENDEE;PARTSTAT=ACCEPTED:mailto:dev@fixture.invalid"));
+    let ics = std::str::from_utf8(&part.bytes).unwrap();
+    let original_lines: Vec<_> = ics
+        .lines()
+        .filter(|line| line.starts_with("RECURRENCE-ID"))
+        .collect();
+    if series {
+        assert_eq!(original_lines, [ORIGINAL]);
+    } else {
+        assert!(original_lines.is_empty());
+    }
     assert!(e.store.outbox().unwrap().is_empty());
     let folder = e.store.folder_id(o.account, "INBOX", Role::Inbox).unwrap();
     let msg = e
@@ -166,6 +236,7 @@ fn submit(e: &Engine) {
         .unwrap()
         .msg;
     let r = portcullis_ipc::calendar::Reply {
+        scope: series.then(|| ORIGINAL.to_owned()),
         answer: portcullis_ipc::calendar::Answer::Accept,
         uid: invite.uid,
         attendee: "dev@fixture.invalid".into(),
@@ -187,11 +258,13 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        "seed" => seed(&e),
+        "seed" => seed(&e, false),
+        "seed-series" => seed(&e, true),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
-        "submit" => submit(&e),
+        "submit" => submit(&e, false),
+        "submit-series" => submit(&e, true),
         "exercise" => {
-            seed(&e);
+            seed(&e, false);
             let (account, _) = e.store.accounts().unwrap().remove(0);
             let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
             let msg = e
@@ -213,6 +286,7 @@ fn main() {
                 .msg;
             let blob = e.selected_invitation(msg).unwrap().blob;
             let r = portcullis_ipc::calendar::Reply {
+                scope: None,
                 answer: portcullis_ipc::calendar::Answer::Accept,
                 uid: "studio-planning@fixture.invalid".into(),
                 attendee: "dev@fixture.invalid".into(),
@@ -253,7 +327,7 @@ fn main() {
                 assert!(e.store.outbox().unwrap().is_empty());
             }
             e.send_invitation_reply(msg, blob, &r).unwrap();
-            submit(&e)
+            submit(&e, false)
         }
         _ => panic!("seed, empty, exercise or submit expected"),
     }

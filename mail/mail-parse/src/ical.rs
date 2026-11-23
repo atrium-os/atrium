@@ -217,6 +217,73 @@ pub fn invite(text: &str, me: &[String]) -> Option<Invite> {
     Some(inv)
 }
 
+/// Return the single scheduling scope. Only an unbounded weekly master or a
+/// timed original occurrence can be represented by Calendar.
+#[cfg(feature = "jail")]
+pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
+    if text.len() > 4 << 20 {
+        return None;
+    }
+    let mut stack = Vec::new();
+    let mut events = 0;
+    let mut scope = None;
+    for line in unfold(text) {
+        let (key, params, value) = split_line(&line)?;
+        if key == "BEGIN" {
+            if stack.len() >= 8 {
+                return None;
+            }
+            if value.eq_ignore_ascii_case("VEVENT") {
+                events += 1;
+            }
+            stack.push(value.to_ascii_uppercase());
+        } else if key == "END" {
+            if stack.pop()? != value.to_ascii_uppercase() {
+                return None;
+            }
+        } else if stack.last().is_some_and(|s| s == "VEVENT") {
+            match key.as_str() {
+                "RRULE"
+                    if scope.is_none()
+                        && params.is_empty()
+                        && value.eq_ignore_ascii_case("FREQ=WEEKLY") =>
+                {
+                    scope = Some("weekly".into())
+                }
+                "RECURRENCE-ID" if scope.is_none() => {
+                    let mut tz = None;
+                    for (key, v) in &params {
+                        match key.as_str() {
+                            "TZID" if tz.is_none() => tz = Some(v.as_str()),
+                            "VALUE" if v.eq_ignore_ascii_case("DATE-TIME") => (),
+                            _ => return None,
+                        }
+                    }
+                    let stamp = value.strip_suffix('Z').unwrap_or(&value);
+                    if stamp.len() != 15
+                        || stamp.as_bytes()[8] != b'T'
+                        || !stamp
+                            .bytes()
+                            .enumerate()
+                            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+                    {
+                        return None;
+                    }
+                    scope = Some(match tz {
+                        Some(_) if stamp != value => return None,
+                        Some("UTC") => format!("RECURRENCE-ID:{stamp}Z"),
+                        Some(zone) => format!("RECURRENCE-ID;TZID={zone}:{stamp}"),
+                        None => format!("RECURRENCE-ID:{value}"),
+                    });
+                }
+                "RECURRENCE-ID" | "RRULE" | "RDATE" | "EXDATE" | "EXRULE" => return None,
+                _ => (),
+            }
+        }
+    }
+    (events == 1 && stack.is_empty()).then_some(scope)
+}
+
 fn mailto(v: &str) -> String {
     let v = v.trim();
     let v = if v.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) { &v[7..] } else { v };

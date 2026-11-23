@@ -57,6 +57,7 @@ struct Confirmation {
     reply: Reply,
     title: String,
     proposed: String,
+    scope: Option<String>,
     verified: bool,
     actions: mpsc::Sender<bool>,
     height: u32,
@@ -74,7 +75,7 @@ impl View for Confirmation {
             .size(22.)
             .render(ctx);
         let mut y = 79.;
-        for line in [
+        let mut lines = vec![
             self.title.clone(),
             format!("Proposed · {}", self.proposed),
             format!("From · {}", r.attendee),
@@ -86,7 +87,11 @@ impl View for Confirmation {
                 "Mail has not verified the sender."
             }
             .into(),
-        ] {
+        ];
+        if let Some(scope) = &self.scope {
+            lines.insert(1, scope.clone());
+        }
+        for line in lines {
             let chars: Vec<_> = line.chars().collect();
             for chunk in chars.chunks(54) {
                 Label::new(chunk.iter().collect::<String>())
@@ -136,7 +141,9 @@ impl ResponseWindow {
             .invite
             .as_ref()
             .ok_or("Invitation no longer available")?;
-        if m.full != Some(blob)
+        if source.method != mail_schema::InviteMethod::Request
+            || source.cancelled
+            || m.full != Some(blob)
             || reply.uid != source.uid
             || reply.sequence != source.sequence
             || !reply.organizer.eq_ignore_ascii_case(&source.organizer)
@@ -147,6 +154,9 @@ impl ResponseWindow {
         let proposed = mail_engine::invitations::proposed_time(source)
             .ok_or("The proposed time could not be verified")?;
         let title = source.title.clone();
+        let scope = engine
+            .invitation_scope(msg, &reply)
+            .map_err(|e| e.to_string())?;
         let verified = matches!(
             m.summary.sender_check,
             mail_schema::SenderCheck::Verified { .. }
@@ -155,7 +165,11 @@ impl ResponseWindow {
             + (reply.attendee.len() + 7) / 54
             + (reply.organizer.len() + 14) / 54
             + (proposed.len() + 11) / 54) as u32;
-        let height = 365 + extra * 23;
+        let height = 365
+            + extra * 23
+            + scope.as_ref().map_or(0, |s| {
+                32 + 23 * (s.chars().count().saturating_sub(1) / 54) as u32
+            });
         let win = Window::open(&WindowDesc::new(
             "Mail · Invitation response",
             SizeSpec::Fixed(600, height),
@@ -165,6 +179,7 @@ impl ResponseWindow {
         let app = App::new(Confirmation {
             reply: reply.clone(),
             title,
+            scope,
             proposed,
             verified,
             actions,

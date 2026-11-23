@@ -31,7 +31,16 @@ def open_mail(ui, first=False):
 
 def review(ui, y):
     click(ui, 330, y)
-    click(ui, 754, 185)
+    # Mail puts first-contact information above this button for a new sender.
+    for _ in range(8):
+        frame, _ = ui.frame()
+        for top in range(165, 280):
+            red, green, blue = frame.getpixel((660, top))[:3]
+            if red < 40 and green > 95 and blue > 95:
+                click(ui, 754, top + 8)
+                return
+        time.sleep(0.15)
+    raise RuntimeError("The invitation review button did not appear")
 
 
 def run(ui):
@@ -63,12 +72,76 @@ def run(ui):
     ui.see("response-before-send", "Review your invitation response", "ACCEPTED", "15:00")
     click(ui, 487, 322)
     assert ui.store("work") == saved
+    ui.control("close", "work")
     print(guest(ui, "invitation-submit"))
     assert ui.control("fingerprint", "personal").strip() == b"empty"
     print("PASS preview, local save, reschedule comparison, Cancel, Send, SMTP receipt and replay")
 
 
+def series(ui):
+    print(guest(ui, "series-setup"))
+    open_mail(ui, first=True)
+
+    def open_item(id, name, *labels):
+        review(ui, 178 + (6 - id) * 70)
+        ui.see(name, *labels)
+
+    def apply(name, *labels):
+        click(ui, 568, 550)
+        ui.see(name, *labels)
+        ui.control("close", "work")
+
+    open_item(1, "weekly-invitation", "Whole weekly series", "14:00", "Save whole series")
+    assert ui.control("fingerprint", "work").strip() == b"empty"
+    apply("weekly-saved", "Invitation saved", "14:00")
+    master = ui.store("work")
+    open_item(2, "move-one", "One occurrence", "2026-12-08", "2026-12-09", "15:00")
+    assert ui.store("work") == master
+    click(ui, 80, 462)
+    ui.see("occurrence-response", "One occurrence", "2026-12-08", "2026-12-09", "ACCEPTED")
+    click(ui, 487, 355)
+    ui.control("close", "work")
+    print(guest(ui, "series-submit"))
+    assert ui.store("work") == master
+    open_mail(ui, first=True)
+    open_item(2, "review-move-again", "One occurrence", "15:00")
+    apply("moved", "Invitation saved", "15:00")
+    open_item(3, "change-series", "Whole weekly series", "14:00", "16:00")
+    apply("series-changed", "Invitation saved", "16:00")
+    after_change = ui.store("work")
+    rows = after_change["entries"]
+    assert len(rows) == 2
+    assert any(r["kind"] == "Weekly" and r["span"]["start"] == 960 and r["excluded"] == ["2026-12-08"] for r in rows)
+    assert any(r["date"] == "2026-12-09" and r["span"]["start"] == 900 for r in rows)
+
+    open_item(6, "spoofed-cancellation", "Review cancellation", "sender or reply address differs")
+    click(ui, 568, 550)
+    assert ui.store("work") == after_change
+    ui.control("close", "work")
+    open_item(4, "cancel-occurrence", "Review cancellation", "One occurrence", "2026-12-08", "2026-12-09", "Remove this occurrence")
+    assert ui.store("work") == after_change
+    apply("one-cancelled", "Cancellation applied", "No events")
+    remaining = ui.store("work")["entries"]
+    assert len(remaining) == 1 and remaining[0]["excluded"] == ["2026-12-08"] and remaining[0]["span"]["start"] == 960
+    open_item(5, "cancel-series", "Review cancellation", "Whole weekly series", "Remove whole series")
+    click(ui, 70, 550)
+    assert ui.store("work")["entries"] == remaining
+    ui.control("close", "work")
+    open_item(5, "cancel-series-again", "Whole weekly series", "Remove whole series")
+    apply("series-cancelled", "Cancellation applied", "No events")
+    assert ui.store("work")["entries"] == []
+    open_item(1, "stale-series", "already cancelled or superseded")
+    assert ui.store("work")["entries"] == []
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS scoped RSVP, preserved exception, single and whole cancellation, spoof, replay and empty outbox")
+
+
 if __name__ == "__main__":
+    runner = series if sys.argv[1:2] == ["--series"] else run
+    if runner == series:
+        del sys.argv[1]
     if len(sys.argv) < 6:
         sys.exit("Usage: calendar-invitation-check.py GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
-    run(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))
+    runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

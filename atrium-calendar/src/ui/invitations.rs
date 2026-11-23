@@ -52,16 +52,18 @@ fn receive(file: File) -> Result<Incoming, String> {
         .max_answer(FRAME_LIMIT + 16)
         .call("ical", &Parse { invitation: true }, Some(file))
         .map_err(|_| "Invitation worker failed")?;
-    let proposal = match serde_json::from_slice(&parsed.schedule)
-        .map_err(|_| "Invalid invitation worker response")?
-    {
-        Outcome::Invitation(p) => p,
-        Outcome::Blocked(atrium_calendar::import::Issue::Recurrence) => {
-            return Err("Recurring invitations need a later Calendar build.".into())
-        }
-        Outcome::Blocked(i) => return Err(i.message().into()),
-        _ => return Err("Expected a scheduling request".into()),
-    };
+    let proposal =
+        match serde_json::from_slice(&parsed.schedule)
+            .map_err(|_| "Invalid invitation worker response")?
+        {
+            Outcome::Invitation(p) => p,
+            Outcome::Blocked(atrium_calendar::import::Issue::Recurrence) => return Err(
+                "Calendar supports simple weekly requests and changes to one original occurrence."
+                    .into(),
+            ),
+            Outcome::Blocked(i) => return Err(i.message().into()),
+            _ => return Err("Expected a scheduling request".into()),
+        };
     Ok(Incoming {
         source,
         proposal,
@@ -151,13 +153,16 @@ impl Sheet {
                 token,
             },
         )?;
-        let origin = self.proposal.origin(&self.source)?;
+        if self.proposal.row.is_none() {
+            return Err("A cancellation has no RSVP".into());
+        }
         let reply = calendar::Reply {
             answer,
-            uid: origin.uid,
-            organizer: origin.organizer,
-            sequence: origin.sequence,
-            attendee: origin.attendee,
+            scope: self.proposal.scope(),
+            uid: self.proposal.uid.clone(),
+            organizer: self.proposal.organizer.clone(),
+            sequence: self.proposal.sequence,
+            attendee: self.review.attendee.clone(),
         };
         calendar::write(
             &mut self.stream.try_clone().map_err(|_| "Mail disconnected")?,
@@ -173,14 +178,37 @@ impl Sheet {
             ctx,
             66.,
             22.,
-            if self.review.previous.is_some() {
+            if p.row.is_none() {
+                "Review cancellation"
+            } else if self.review.previous.is_some() {
                 "Review invitation change"
             } else {
                 "Review invitation"
             }
             .into(),
         );
-        line(ctx, 105., 18., p.row.title.clone());
+        let title = p
+            .row
+            .as_ref()
+            .or(self.review.previous.as_ref())
+            .map_or("Meeting", |e| &e.title);
+        line(ctx, 98., 17., title.into());
+        let scope = if let Some(o) = p.original {
+            format!(
+                "One occurrence · originally {} {:02}:{:02} · {}",
+                o.date,
+                o.minute / 60,
+                o.minute % 60,
+                o.zone.map_or("Floating", |z| z.name())
+            )
+        } else if self.review.weekly || p.weekly_cancellation {
+            "Whole weekly series".into()
+        } else if p.row.is_none() && self.review.previous.is_none() {
+            "No matching saved meeting".into()
+        } else {
+            "One meeting".into()
+        };
+        line(ctx, 121., 16., scope);
         line(
             ctx,
             143.,
@@ -188,9 +216,12 @@ impl Sheet {
             format!("Mail sender · {}", self.source.from),
         );
         line(ctx, 170., 14., format!("Organizer · {}", p.organizer));
-        if let Ok(origin) = p.origin(&self.source) {
-            line(ctx, 197., 14., format!("Invited as · {}", origin.attendee));
-        }
+        line(
+            ctx,
+            197.,
+            14.,
+            format!("Invited as · {}", self.review.attendee),
+        );
         if let Some(old) = &self.review.previous {
             line(
                 ctx,
@@ -217,30 +248,67 @@ impl Sheet {
                 );
             }
         }
-        line(
-            ctx,
-            302.,
-            16.,
-            format!(
-                "Proposed · {}",
-                viewing_schedule(&p.row, planner.viewing_zone())
-            ),
-        );
-        line(
-            ctx,
-            333.,
-            14.,
-            format!(
-                "Proposed place · {}",
-                if p.location.is_empty() {
-                    "Unspecified"
+        if let Some(row) = &p.row {
+            line(
+                ctx,
+                302.,
+                16.,
+                format!(
+                    "Proposed · {}",
+                    viewing_schedule(row, planner.viewing_zone())
+                ),
+            );
+            line(
+                ctx,
+                333.,
+                14.,
+                format!(
+                    "Proposed place · {}",
+                    if p.location.is_empty() {
+                        "Unspecified"
+                    } else {
+                        &p.location
+                    }
+                ),
+            );
+        } else {
+            line(
+                ctx,
+                302.,
+                16.,
+                if p.original.is_some() {
+                    "Remove only this occurrence on this device."
+                } else if self.review.weekly {
+                    "Remove the weekly series and its exceptions on this device."
                 } else {
-                    &p.location
+                    "Remove this meeting on this device."
                 }
-            ),
-        );
+                .into(),
+            );
+        }
+        if let Some(base) =
+            self.review.previous.as_ref().filter(|e| {
+                e.kind == Kind::Weekly && p.original.is_none() && !e.excluded.is_empty()
+            })
+        {
+            let verb = if p.row.is_none() {
+                "removed"
+            } else {
+                "preserved"
+            };
+            line(
+                ctx,
+                356.,
+                14.,
+                format!(
+                    "Dates with saved exceptions {} · {}",
+                    verb,
+                    base.excluded.len()
+                ),
+            );
+        }
         line(ctx, 377., 14., self.review.notice.clone());
-        if self.review.token.is_some() {
+        if self.review.token.is_some() && p.row.is_some() {
             line(
                 ctx,
                 421.,
@@ -264,20 +332,34 @@ impl Sheet {
                     Action::ReplyInvitation(answer),
                 );
             }
-            if self.review.can_save {
-                planner.button(
-                    ctx,
-                    456.,
-                    535.,
-                    224.,
-                    if self.review.previous.is_some() {
-                        "Apply change on device"
+        }
+        if self.review.token.is_some() && self.review.can_save {
+            planner.button(
+                ctx,
+                456.,
+                535.,
+                224.,
+                if p.row.is_none() {
+                    if p.original.is_some() {
+                        "Remove this occurrence"
+                    } else if self.review.weekly {
+                        "Remove whole series"
                     } else {
-                        "Add to this calendar"
-                    },
-                    Action::ApplyInvitation,
-                );
-            }
+                        "Remove meeting"
+                    }
+                } else if self.review.weekly && p.original.is_none() {
+                    "Save whole series"
+                } else if p.original.is_some() {
+                    "Apply to this occurrence"
+                } else if self.review.previous.is_some() {
+                    "Apply change on device"
+                } else {
+                    "Add to this calendar"
+                },
+                Action::ApplyInvitation {
+                    cancellation: p.row.is_none(),
+                },
+            );
         }
         planner.button(
             ctx,

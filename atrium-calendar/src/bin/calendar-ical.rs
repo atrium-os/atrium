@@ -243,7 +243,8 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
     let mut sequence = None;
     let mut attendees = Vec::new();
     let mut location = None;
-    let mut request = false;
+    let mut method = None;
+    let mut cancelled_status = false;
     if bytes.len() > FILE_LIMIT {
         return Err(Issue::Limit);
     }
@@ -319,11 +320,11 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                     "PRODID" => {}
                     "METHOD"
                         if invitation
-                            && !request
                             && params.is_empty()
-                            && v.eq_ignore_ascii_case("REQUEST") =>
+                            && (v.eq_ignore_ascii_case("REQUEST")
+                                || v.eq_ignore_ascii_case("CANCEL")) =>
                     {
-                        request = true
+                        once(&mut method, v.eq_ignore_ascii_case("CANCEL"))?;
                     }
                     "METHOD" if !invitation && v.eq_ignore_ascii_case("PUBLISH") => {}
                     "METHOD" => return Err(Issue::Scheduling),
@@ -373,9 +374,10 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                             title(v)?
                         },
                     )?,
-                    "RECURRENCE-ID" | "EXDATE" | "RRULE" | "RDATE" | "EXRULE" => {
-                        return Err(Issue::Recurrence)
+                    "STATUS" if params.is_empty() && v.eq_ignore_ascii_case("CANCELLED") => {
+                        cancelled_status = true
                     }
+                    "EXDATE" | "RDATE" | "EXRULE" => return Err(Issue::Recurrence),
                     "URL" | "ATTACH" | "LOCATION" | "SEQUENCE" => return Err(Issue::Component),
                     _ => event.property(&key, &params, v, &mut omitted)?,
                 },
@@ -389,17 +391,33 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         return Err(Issue::Format);
     }
     if invitation {
-        if !request || events.len() != 1 {
+        let cancelled = method.ok_or(Issue::Scheduling)?;
+        if events.len() != 1 || (cancelled_status && !cancelled) {
             return Err(Issue::Scheduling);
         }
         let e = &events[0];
+        if e.original.is_some() && e.weekly {
+            return Err(Issue::Recurrence);
+        }
+        let original = e
+            .original
+            .map(|stamp| {
+                Ok(atrium_calendar::invitation::OccurrenceId {
+                    date: stamp.date,
+                    minute: stamp.minute.ok_or(Issue::Recurrence)?,
+                    zone: stamp.zone,
+                })
+            })
+            .transpose()?;
         return Ok(Outcome::Invitation(atrium_calendar::invitation::Proposal {
             uid: e.uid.clone().ok_or(Issue::Format)?,
             sequence: sequence.unwrap_or(0),
             organizer: organizer.ok_or(Issue::Scheduling)?,
             attendees,
             location: location.unwrap_or_default(),
-            row: e.row()?,
+            original,
+            weekly_cancellation: cancelled && e.weekly,
+            row: if cancelled { None } else { Some(e.row()?) },
         }));
     }
     let mut masters = HashMap::new();
@@ -496,6 +514,7 @@ mod tests {
         };
         let week = date("2026-12-01");
         let src = Source {
+            delivery: None,
             account: 7,
             from: "mina@fixture.invalid".into(),
             identities: vec!["dev@fixture.invalid".into()],
@@ -568,14 +587,161 @@ mod tests {
             )
             .is_err());
         for bad in [
-            file.replace("METHOD:REQUEST", "METHOD:CANCEL"),
-            file.replace("SUMMARY:", "RRULE:FREQ=WEEKLY\nSUMMARY:"),
+            file.replace("METHOD:REQUEST", "METHOD:COUNTER"),
+            file.replace("SUMMARY:", "RRULE:FREQ=MONTHLY\nSUMMARY:"),
             file.replace("END:VCALENDAR", "BEGIN:VEVENT\nEND:VEVENT\nEND:VCALENDAR"),
             file.replace("END:VEVENT", "URL:https://fixture.invalid\nEND:VEVENT"),
         ] {
             assert!(parse_mode(bad.as_bytes(), true).is_err());
         }
         assert!(parse(file.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn mail_series_scopes_survive_moves_cancellation_undo_and_restart() {
+        use portcullis_ipc::calendar::Source;
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let moved = include_str!("../../tests/fixtures/move-one.ics");
+        let changed = include_str!("../../tests/fixtures/move-series.ics");
+        let cancel_one = include_str!("../../tests/fixtures/cancel-one.ics");
+        let cancel_all = include_str!("../../tests/fixtures/cancel-series.ics");
+        let read = |file: &str| match parse_mode(file.as_bytes(), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!(),
+        };
+        let src = Source {
+            delivery: None,
+            account: 7,
+            from: "mina@fixture.invalid".into(),
+            identities: vec!["dev@fixture.invalid".into()],
+            verified: true,
+            reply_destination_matches: true,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let review =
+            |s: &mut Store, rev, source: &Source, p: atrium_calendar::invitation::Proposal| {
+                let mut source = source.clone();
+                source.delivery = Some(portcullis_ipc::calendar::Delivery {
+                    scope: p.scope(),
+                    uid: p.uid.clone(),
+                    sequence: p.sequence,
+                    organizer: p.organizer.clone(),
+                    cancelled: p.row.is_none(),
+                });
+                s.review_invitation(rev, &source, p)
+            };
+        assert!(store.review_invitation(0, &src, read(weekly)).is_err());
+        let apply = |s: &mut Store, rev, p| {
+            let r = review(s, rev, &src, p).unwrap();
+            assert!(r.can_save, "{}", r.notice);
+            s.apply_invitation(rev, r.token.unwrap()).unwrap().1
+        };
+        let starts = |s: &Store, day: &str| {
+            s.day(date(day))
+                .entries
+                .iter()
+                .map(|r| r.span.start)
+                .collect::<Vec<_>>()
+        };
+        assert!(review(&mut store, 0, &src, read(moved))
+            .unwrap()
+            .token
+            .is_none());
+        apply(&mut store, 0, read(weekly));
+        assert!(review(
+            &mut store,
+            1,
+            &src,
+            read(&moved.replace("20261208T140000Z", "20261208T120000Z"))
+        )
+        .unwrap()
+        .token
+        .is_none());
+        let r = review(&mut store, 1, &src, read(moved)).unwrap();
+        assert_eq!(r.previous.unwrap().date, date("2026-12-08"));
+        assert_eq!(starts(&store, "2026-12-08"), [840]);
+        apply(&mut store, 1, read(moved));
+        assert!(starts(&store, "2026-12-08").is_empty());
+        assert_eq!(starts(&store, "2026-12-09"), [900]);
+        assert_eq!(starts(&store, "2026-12-15"), [840]);
+        apply(&mut store, 2, read(changed));
+        assert_eq!(starts(&store, "2026-12-09"), [900]);
+        assert_eq!(starts(&store, "2026-12-15"), [960]);
+        // The regular time is now 16:00, but this moved occurrence retains
+        // its original 14:00 identity. Neither widening nor retiming is valid.
+        let retimed = read(&cancel_one.replace("20261208T140000Z", "20261208T160000Z"));
+        assert!(review(&mut store, 3, &src, retimed)
+            .unwrap()
+            .token
+            .is_none());
+        let proposed = read(cancel_one);
+        let widened = Source {
+            delivery: Some(portcullis_ipc::calendar::Delivery {
+                scope: None,
+                uid: proposed.uid.clone(),
+                sequence: proposed.sequence,
+                organizer: proposed.organizer.clone(),
+                cancelled: true,
+            }),
+            ..src.clone()
+        };
+        assert!(store.review_invitation(3, &widened, proposed).is_err());
+        for impostor in [
+            Source {
+                from: "other@fixture.invalid".into(),
+                ..src.clone()
+            },
+            Source {
+                verified: false,
+                ..src.clone()
+            },
+            Source {
+                reply_destination_matches: false,
+                ..src.clone()
+            },
+        ] {
+            assert!(review(&mut store, 3, &impostor, read(cancel_all))
+                .unwrap()
+                .token
+                .is_none());
+        }
+        assert!(review(
+            &mut store,
+            3,
+            &Source {
+                account: 8,
+                ..src.clone()
+            },
+            read(cancel_all)
+        )
+        .is_err());
+        let r = review(&mut store, 3, &src, read(cancel_one)).unwrap();
+        assert_eq!(r.previous.unwrap().date, date("2026-12-09"));
+        let undo = apply(&mut store, 3, read(cancel_one));
+        assert!(starts(&store, "2026-12-09").is_empty());
+        assert_eq!(starts(&store, "2026-12-15"), [960]);
+        store.undo(undo).unwrap();
+        assert_eq!(starts(&store, "2026-12-09"), [900]);
+        apply(&mut store, 5, read(cancel_one));
+        let undo = apply(&mut store, 6, read(cancel_all));
+        assert!(starts(&store, "2026-12-15").is_empty());
+        store.undo(undo).unwrap();
+        assert_eq!(starts(&store, "2026-12-15"), [960]);
+        apply(&mut store, 8, read(cancel_all));
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(review(&mut store, 9, &src, read(weekly))
+            .unwrap()
+            .token
+            .is_none());
+        assert!(starts(&store, "2026-12-22").is_empty());
+        for invalid in [
+            weekly.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=3"),
+            moved.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDFUTURE:"),
+        ] {
+            assert!(parse_mode(invalid.as_bytes(), true).is_err());
+        }
     }
 
     #[test]

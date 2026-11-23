@@ -85,6 +85,16 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 };
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
+            wire::ToJail::SchedulingPart { message, path } => {
+                let result = crate::parse(&message.bytes, &Limits::default()).map_err(refusal).and_then(|s| {
+                    let part = s.parts.iter().find(|p|p.path == path && p.kind == mime::PartKind::Calendar).ok_or(wire::Refusal::NotMail)?;
+                    let bytes = mime::part_bytes(&message.bytes,part);
+                    if bytes.len() > 4 << 20 { return Err(wire::Refusal::TooLarge); }
+                    let scope = std::str::from_utf8(&bytes).ok().and_then(ical::reply_scope).ok_or(wire::Refusal::NotMail)?;
+                    Ok((bytes,scope))
+                });
+                port.borrow_mut().send(&wire::FromJail::SchedulingPart { id:message.id, result })?;
+            }
             wire::ToJail::HtmlAttachment { message, which, key } => {
                 let inner = key.as_deref().map(|k| decrypted(&message.bytes, k));
                 let raw = match &inner { None => Some(message.bytes.as_slice()), Some(bytes) => bytes.as_deref() };
