@@ -96,22 +96,31 @@ pub fn length_px(s: &str) -> Option<f64> {
     px.is_finite().then_some(px)
 }
 
-/// `2026-11-14` or `2026-11-14T15:30:00.5` as a serial (Excel's 1900 system).
-pub fn date_value(s: &str) -> Option<f64> {
-    let (d, t) = s.split_once('T').unwrap_or((s, ""));
-    let mut it = d.splitn(3, '-');
-    let (y, m, dd) = (it.next()?.parse::<f64>().ok()?, it.next()?.parse::<f64>().ok()?, it.next()?.parse::<f64>().ok()?);
-    let day = dates::date_serial(y, m, dd)?;
-    let frac = if t.is_empty() {
-        0.0
-    } else {
-        let mut p = t.splitn(3, ':');
-        let h: f64 = p.next()?.parse().ok()?;
-        let mi: f64 = p.next().unwrap_or("0").parse().ok()?;
-        let se: f64 = p.next().unwrap_or("0").trim_end_matches('Z').parse().ok()?;
-        (h * 3600.0 + mi * 60.0 + se) / 86400.0
-    };
-    Some(day + frac)
+/// A typed OpenDocument date or timestamp in the workbook's epoch.
+pub fn date_value(system: dates::DateSystem, text: &str) -> Option<f64> {
+    system.iso(text).map(|(value, _)| value)
+}
+
+fn date_system(content: &[u8], rep: &mut Report) -> Result<dates::DateSystem, OdsError> {
+    use dates::DateSystem::*;
+    let mut reader = Reader::from_reader(content);
+    loop {
+        match reader.read_event()? {
+            Event::Start(tag) | Event::Empty(tag) if tag.name().as_ref() == b"table:null-date" => {
+                return Ok(match attrs(&tag).get("table:date-value").map(String::as_str) {
+                    Some("1904-01-01") => Excel1904,
+                    None | Some("1899-12-30") => Excel1900,
+                    Some(other) => {
+                        rep.note_at(Kind::Approximate, "unsupported OpenDocument null date (using the 1900 calendar)", || other.chars().take(32).collect());
+                        Excel1900
+                    }
+                });
+            }
+            Event::Start(tag) if tag.name().as_ref() == b"table:table" => return Ok(Excel1900),
+            Event::Eof => return Ok(Excel1900),
+            _ => {}
+        }
+    }
 }
 
 /// `PT12H30M15.5S` (an ISO 8601 duration, as ODF times are) as a fraction of a day.
@@ -139,7 +148,7 @@ pub fn time_value(s: &str) -> Option<f64> {
         num.clear();
     }
     let v = total / 86400.0;
-    Some(if neg { -v } else { v })
+    (v.is_finite() && num.is_empty()).then_some(if neg { -v } else { v })
 }
 
 /// An ODF border (`0.06pt solid #000000`) as an edge.
@@ -749,6 +758,7 @@ struct CellIn {
     vtype: String,
     value: Option<String>,
     formula: Option<String>,
+    live_formula: Option<String>,
     style: Option<String>,
     repeat: u32,
     text: String,
@@ -757,6 +767,14 @@ struct CellIn {
     matrix: Option<(u32, u32)>,
     /// The data validation rule it names.
     validation: Option<String>,
+}
+
+struct StoredFormula {
+    at: CellAddr,
+    source: String,
+    live: Option<String>,
+    value: Value,
+    matrix: Option<(u32, u32)>,
 }
 
 /// An ODF link target as ours: a place `#Sheet2.A1` becomes `#Sheet2!A1`
@@ -817,7 +835,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
     styles.read(&content, &mut rep);
 
-    let mut wb = Workbook::new();
+    let mut wb = Workbook::with_date_system(date_system(&content, &mut rep)?);
     let mut style_ids: HashMap<String, StyleId> = HashMap::new();
     let mut r = Reader::from_reader(&content[..]);
     r.config_mut().trim_text(false);
@@ -842,8 +860,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut pilots: Vec<super::pivot::TableIn> = Vec::new();
     let mut in_pilot_group = false;
     let mut whole_cell_filter = true;
-    // Defined names: (name, the sheet it is local to, OpenFormula, base cell).
-    let mut names: Vec<(String, Option<u16>, String, Option<String>)> = Vec::new();
+    // Defined names: name, scope, OpenFormula, base cell and optional live formula.
+    let mut names = Vec::new();
     let (mut row, mut col): (u64, u64) = (0, 0);
     let mut row_repeat = 1u32;
     let mut row_style: Option<String> = None;
@@ -854,7 +872,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut cell: Option<CellIn> = None;
     let mut in_p = false;
     let mut row_cells: Vec<(u64, u32, CellIn)> = Vec::new();
-    let mut fcells: Vec<(u16, u32, u32, String, Value, Option<(u32, u32)>)> = Vec::new();
+    let mut fcells = Vec::new();
     let mut runs: Vec<Vec<(u32, u32, StyleId)>> = Vec::new();
     let mut expanded: u64 = 0;
     let mut annotation_depth = 0u32;
@@ -1062,7 +1080,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             (None, None) => None,
                             (r, c) => Some((r.unwrap_or(1), c.unwrap_or(1))),
                         };
-                        let c = CellIn { link: None, vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix, validation: a.get("table:content-validation-name").cloned() };
+                        let formula = a.get("table:formula").cloned();
+                        let live_formula = super::formula::live_formula(&a, formula.as_deref());
+                        let c = CellIn { link: None, vtype, value, formula, live_formula, style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix, validation: a.get("table:content-validation-name").cloned() };
                         if empty {
                             row_cells.push((col, repeat, c));
                             col += repeat as u64;
@@ -1139,7 +1159,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         let src = if name == b"table:named-range" { a.get("table:cell-range-address").map(|r| format!("of:=[{r}]")) } else { a.get("table:expression").cloned() };
                         if let (Some(n), Some(src)) = (a.get("table:name"), src) {
                             if names.len() < officina_grid::names::MAX_NAMES {
-                                names.push((n.clone(), sheet, src, a.get("table:base-cell-address").cloned()));
+                                let live = super::formula::live_formula(&a, Some(&src));
+                                names.push((n.clone(), sheet, src, a.get("table:base-cell-address").cloned(), live));
                             }
                         }
                     }
@@ -1539,25 +1560,31 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                         let r0 = row.min(MAX_ROWS as u64 - 1) as u32;
                         let r1 = (row + row_repeat as u64 - 1).min(MAX_ROWS as u64 - 1) as u32;
-                        let mut id_of = |nm: &str| -> StyleId {
+                        let mut id_of = |wb: &mut Workbook, nm: &str| -> StyleId {
                             if nm == "Default" {
                                 return 0;
                             }
                             *style_ids.entry(nm.to_string()).or_insert_with(|| wb.styles.intern(styles.resolve(nm)))
                         };
                         // Column defaults that style anything, as (first, last, id).
-                        let col_ids: Vec<(u64, u64, StyleId)> = col_defaults.iter().filter_map(|(a, b, n)| n.as_deref().map(|n| (*a, *b, id_of(n)))).filter(|x| x.2 != 0).collect();
+                        let col_ids: Vec<(u64, u64, StyleId)> = col_defaults.iter().filter_map(|(a, b, n)| n.as_deref().map(|n| (*a, *b, id_of(&mut wb, n)))).filter(|x| x.2 != 0).collect();
                         for (c0, n, c) in &row_cells {
-                            let own = c.style.as_deref().or(row_style.as_deref()).map(&mut id_of);
+                            let own = c.style.as_deref().or(row_style.as_deref()).map(|name| id_of(&mut wb, name));
+                            let date_format = (c.vtype == "date").then(|| c.value.as_deref().and_then(|text| wb.date_system().iso(text)))
+                                .flatten().map(|(_, format)| format);
                             let last = (c0 + *n as u64).min(MAX_COLS as u64);
                             let col_styled = col_ids.iter().any(|(a, b, _)| *a < last && *b >= *c0);
                             // Trailing filler cells repeated to the last column carry the
                             // default style; skip runs past 1,024 columns of nothing.
-                            if own.unwrap_or(0) == 0 && !col_styled && last - c0 > 1024 {
+                            if own.unwrap_or(0) == 0 && !col_styled && date_format.is_none() && last - c0 > 1024 {
                                 continue;
                             }
                             for cc in *c0..last {
-                                let id = own.unwrap_or_else(|| col_ids.iter().find(|(a, b, _)| *a <= cc && cc <= *b).map_or(0, |x| x.2));
+                                let base = own.unwrap_or_else(|| col_ids.iter().find(|(a, b, _)| *a <= cc && cc <= *b).map_or(0, |x| x.2));
+                                let id = match date_format.filter(|_| wb.styles.format(base).is_general()) {
+                                    Some(format) => wb.styles.intern(wb.styles.get(base).clone().with_num_fmt(format)),
+                                    None => base,
+                                };
                                 if runs.len() <= cc as usize {
                                     if id == 0 {
                                         continue;
@@ -1669,7 +1696,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     }
 
     // Names, before the formulas that use them; relative parts are from the base cell.
-    for (n, scope, src, base) in names {
+    for (n, scope, src, base, live) in names {
         let at = base.and_then(|b| super::formula::from_of(&format!("of:=[{b}]"))).and_then(|a| {
             let cell = a.rsplit('!').next().unwrap_or(&a).trim_start_matches('=').replace('$', "");
             officina_grid::addr::parse_a1(&cell)
@@ -1677,7 +1704,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
         let (row, col) = at.unwrap_or((0, 0));
         // LibreOffice writes a named expression's formula without its namespace.
         let src = if src.starts_with("of:") || src.starts_with("oooc:") || src.starts_with('=') { src } else { format!("of:={src}") };
-        let ok = super::formula::from_of(&src).is_some_and(|a1| wb.define_name_at(&n, scope, &a1, row, col).is_ok());
+        let sheet = scope.unwrap_or(0);
+        let original = live.filter(|formula| {
+            wb.parse(formula, sheet, row, col).is_ok_and(|expr| super::formula::requires_fallback(&wb, sheet, &expr))
+        });
+        let ok = original.or_else(|| super::formula::from_of(&src))
+            .is_some_and(|a1| wb.define_name_at(&n, scope, &a1, row, col).is_ok());
         if !ok {
             rep.note_at(Kind::Dropped, "defined names this engine can't use", || format!("{n}: {}", src.chars().take(60).collect::<String>()));
         }
@@ -1703,33 +1735,42 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
 
     // Formulas, once every sheet exists.
     let mut cached = Vec::new();
-    for (s, rr, cc, src, v, matrix) in fcells {
-        // LibreOffice's formulas keep one value (`@` where they could spill); its
-        // matrix formulas spill, over the cells the file kept for them.
-        let text = |a1: &str| -> Option<String> {
-            let e = wb.parse(a1, s, rr, cc).ok()?;
-            let e = if matrix.is_some() { e } else { officina_grid::eval::arrays::legacy(e) };
-            Some(officina_grid::formula::to_a1(&e, rr, cc, &|i| wb.sheet_name(i)))
+    for StoredFormula { at, source, live, value, matrix } in fcells {
+        let CellAddr { sheet: s, row: rr, col: cc } = at;
+        // The foreign fallback remains authoritative when another app changes it.
+        let original = live.filter(|formula| {
+            wb.parse(formula, s, rr, cc).is_ok_and(|expr| super::formula::requires_fallback(&wb, s, &expr))
+        });
+        let formula = original.or_else(|| {
+            let a1 = super::formula::from_of(&source)?;
+            let expr = wb.parse(&a1, s, rr, cc).ok();
+            Some(expr.map_or(a1, |expr| {
+                let expr = if matrix.is_some() { expr } else { officina_grid::eval::arrays::legacy(expr) };
+                officina_grid::formula::to_a1(&expr, rr, cc, &|i| wb.sheet_name(i))
+            }))
+        });
+        let Some(formula) = formula else {
+            wb.set_value(at, value);
+            rep.note_at(Kind::Approximate, "formulas in another syntax, kept as their values", || source.chars().take(60).collect());
+            continue;
         };
-        match super::formula::from_of(&src) {
-            Some(a1) => {
-                let a1 = text(&a1).unwrap_or(a1);
-                if let Some((nr, nc)) = matrix.filter(|&(r, c)| r * c > 1) {
-                    let (r1, c1) = (rr.saturating_add(nr - 1).min(MAX_ROWS - 1), cc.saturating_add(nc - 1).min(MAX_COLS - 1));
-                    wb.claim_spill(CellAddr::new(s, rr, cc), officina_grid::Rect { sheet: s, r0: rr, c0: cc, r1, c1 });
-                }
-                if wb.set_formula(CellAddr::new(s, rr, cc), &a1).is_ok() {
-                    out.formulas += 1;
-                    cached.push((CellAddr::new(s, rr, cc), v));
-                } else {
-                    wb.set_value(CellAddr::new(s, rr, cc), v);
-                    rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || a1.chars().take(60).collect());
-                }
+        if !matches!(value, Value::Empty | Value::Err(ErrorKind::Name)) && wb.parse(&formula, s, rr, cc).is_ok_and(|expr| {
+            crate::xlsx::read::missing_top_level_function(&wb, s, &expr)
+        }) {
+            wb.set_value(at, value);
+            rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || formula.chars().take(60).collect());
+            continue;
+        }
+        if wb.set_formula(at, &formula).is_ok() {
+            if let Some((nr, nc)) = matrix.filter(|&(r, c)| r > 1 || c > 1) {
+                let (r1, c1) = (rr.saturating_add(nr - 1).min(MAX_ROWS - 1), cc.saturating_add(nc - 1).min(MAX_COLS - 1));
+                wb.claim_spill(at, officina_grid::Rect { sheet: s, r0: rr, c0: cc, r1, c1 });
             }
-            None => {
-                wb.set_value(CellAddr::new(s, rr, cc), v);
-                rep.note_at(Kind::Approximate, "formulas in another syntax, kept as their values", || src.chars().take(60).collect());
-            }
+            out.formulas += 1;
+            cached.push((at, value));
+        } else {
+            wb.set_value(at, value);
+            rep.note_at(Kind::Approximate, "formulas this engine can't calculate yet, kept as their values", || formula.chars().take(60).collect());
         }
     }
     wb.recalc();
@@ -1767,19 +1808,19 @@ fn same(a: &Value, b: &Value) -> bool {
 }
 
 fn error_of(s: &str) -> Option<ErrorKind> {
-    ErrorKind::from_text(s)
+    if s == "Err:522" { Some(ErrorKind::Circ) } else { ErrorKind::from_text(s) }
 }
 
 /// The value a cell holds (for a formula cell, its cached result).
-fn value_of(c: &CellIn, rep: &mut Report) -> Value {
+fn value_of(c: &CellIn, system: dates::DateSystem, rep: &mut Report) -> Value {
     let num = |s: &Option<String>| s.as_deref().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite());
     match c.vtype.as_str() {
         "float" | "percentage" | "currency" => num(&c.value).map(Value::Num).unwrap_or(Value::Empty),
-        "date" => match c.value.as_deref().and_then(date_value) {
+        "date" => match c.value.as_deref().and_then(|text| date_value(system, text)) {
             Some(x) => Value::Num(x),
             None => {
-                rep.note(Kind::Approximate, "dates before 1900 kept as text");
-                Value::str(&c.text)
+                rep.note(Kind::Approximate, "invalid or out-of-range OpenDocument dates kept as text");
+                Value::str(if c.text.is_empty() { c.value.as_deref().unwrap_or_default() } else { &c.text })
             }
         },
         "time" => c.value.as_deref().and_then(time_value).map(Value::Num).unwrap_or(Value::Empty),
@@ -1787,8 +1828,8 @@ fn value_of(c: &CellIn, rep: &mut Report) -> Value {
         "error" => Value::Err(error_of(c.text.trim()).unwrap_or(ErrorKind::Value)),
         "string" => {
             let t = c.value.clone().unwrap_or_else(|| c.text.clone());
-            if c.formula.is_some() {
-                if let Some(e) = error_of(&t) {
+            if c.formula.is_some() && c.value.as_deref().is_none_or(str::is_empty) {
+                if let Some(e) = error_of(if t.is_empty() { &c.text } else { &t }) {
                     return Value::Err(e);
                 }
             }
@@ -1809,11 +1850,12 @@ fn value_of(c: &CellIn, rep: &mut Report) -> Value {
     }
 }
 
-fn put_cell(wb: &mut Workbook, s: u16, r: u32, c: u32, cell: &CellIn, fcells: &mut Vec<(u16, u32, u32, String, Value, Option<(u32, u32)>)>, rep: &mut Report) {
-    let v = value_of(cell, rep);
+fn put_cell(wb: &mut Workbook, s: u16, r: u32, c: u32, cell: &CellIn, fcells: &mut Vec<StoredFormula>, rep: &mut Report) {
+    let value = value_of(cell, wb.date_system(), rep);
+    let at = CellAddr::new(s, r, c);
     match &cell.formula {
-        Some(f) => fcells.push((s, r, c, f.clone(), v, cell.matrix)),
-        None => wb.set_value(CellAddr::new(s, r, c), v),
+        Some(f) => fcells.push(StoredFormula { at, source: f.clone(), live: cell.live_formula.clone(), value, matrix: cell.matrix }),
+        None => wb.set_value(at, value),
     }
 }
 
@@ -1827,9 +1869,9 @@ mod tests {
         assert!((length_px("2.54cm").unwrap() - 96.0).abs() < 1e-9);
         assert_eq!(length_px("12pt"), Some(16.0));
         assert_eq!(length_px("x"), None);
-        assert_eq!(date_value("2026-11-14"), Some(46340.0));
-        assert_eq!(date_value("2026-11-14T12:00:00"), Some(46340.5));
-        assert_eq!(date_value("1900-02-28"), Some(59.0));
+        assert_eq!(date_value(dates::DateSystem::Excel1900, "2026-11-14"), Some(46340.0));
+        assert_eq!(date_value(dates::DateSystem::Excel1900, "2026-11-14T12:00:00"), Some(46340.5));
+        assert_eq!(date_value(dates::DateSystem::Excel1900, "1900-02-28"), Some(59.0));
         assert_eq!(time_value("PT12H00M00S"), Some(0.5));
         assert_eq!(time_value("PT36H"), Some(1.5));
         assert_eq!(time_value("P1DT6H"), Some(1.25));

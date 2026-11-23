@@ -776,18 +776,23 @@ fn num_kind(wb: &Workbook, id: StyleId) -> NumKind {
     NumKind::Float
 }
 
-pub(super) fn date_text(x: f64) -> Option<String> {
-    let (y, m, d) = dates::ymd(x)?;
-    if d == 0 || (y == 1900 && m == 2 && d == 29) {
-        return None;
+pub(super) fn date_text(system: dates::DateSystem, x: f64) -> Option<String> {
+    const DAY: i64 = 86_400_000_000_000;
+    if !system.contains(x) { return None; }
+    let day = x.floor();
+    let ticks = ((x - day) * DAY as f64).round() as i64;
+    let (y, m, d) = system.ymd(day + (ticks / DAY) as f64)?;
+    if d == 0 || (y == 1900 && m == 2 && d == 29) { return None; }
+    let secs = ticks % DAY / 1_000_000_000;
+    let nanos = ticks % 1_000_000_000;
+    let (h, mi, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let mut text = format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}");
+    if nanos > 0 {
+        let fraction = format!("{nanos:09}");
+        text.push('.');
+        text.push_str(fraction.trim_end_matches('0'));
     }
-    let ms = ((x - x.floor()) * 86_400_000.0).round() as i64;
-    let (h, mi, s, frac) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
-    let mut t = format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}");
-    if frac > 0 {
-        let _ = write!(t, ".{frac:03}");
-    }
-    Some(t)
+    Some(text)
 }
 
 fn time_text(x: f64) -> String {
@@ -831,6 +836,44 @@ fn note(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32) {
     out.push_str("</office:annotation>");
 }
 
+/// OpenFormula uses a fixed range for structured references or a spill's current extent.
+fn open_formula(wb: &Workbook, expr: &Expr, s: u16, r: u32, c: u32) -> (String, bool) {
+    // OpenFormula has no structured references: the ranges they reach.
+    let inl;
+    let e = if wb.tables().is_empty() || !Workbook::uses_tables(expr) {
+        expr
+    } else {
+        inl = wb.inline_tables(expr, s, r, c);
+        &inl
+    };
+    // No `@` or `A1#` in OpenFormula: a formula that may spill is a matrix
+    // formula over its spill, a spill reference the range it covers now.
+    let (fe, dynamic) = officina_grid::eval::arrays::for_file(e);
+    let fe = officina_grid::eval::arrays::plain(&fe, &|cr| {
+        let sheet = cr.sheet.unwrap_or(s);
+        let at = (cr.row.resolve(r, officina_grid::addr::MAX_ROWS), cr.col.resolve(c, officina_grid::addr::MAX_COLS));
+        match at {
+            (Some(rr), Some(cc)) => match wb.spill_area(officina_grid::CellAddr::new(sheet, rr, cc)) {
+                Some(a) => Expr::Range(RangeRef { sheet: cr.sheet, r0: Coord::Abs(a.r0), c0: Coord::Abs(a.c0), r1: Coord::Abs(a.r1), c1: Coord::Abs(a.c1), kind: RangeKind::Cells }),
+                None => Expr::Err(ErrorKind::Ref),
+            },
+            _ => Expr::Err(ErrorKind::Ref),
+        }
+    });
+    let a1 = formula::to_a1(&fe, r, c, &|id| wb.sheet_name(id));
+    (super::formula::to_of(&a1), dynamic)
+}
+
+fn write_live_formula(out: &mut String, a1: &str, fallback: &str) {
+    let max = officina_grid::formula::MAX_STORED_FORMULA_LEN;
+    if a1.len() > max || fallback.len() > max * 4 { return; }
+    let _ = write!(out, r#" xmlns:atrium="{}" atrium:a1-expression=""#, super::formula::ATRIUM_NS);
+    esc(out, a1);
+    out.push_str(r#"" atrium:compat-expression=""#);
+    esc(out, fallback);
+    out.push('"');
+}
+
 /// One cell's attributes and content (without the element's name).
 fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, span: Option<officina_grid::addr::Rect>, bools: &mut BTreeSet<StyleId>, val: Option<usize>) {
     out.push_str("<table:table-cell");
@@ -858,32 +901,14 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
     }
     if let Some(g) = wb.group_at(s, r, c) {
         let grp = wb.group(g);
-        // OpenFormula has no structured references: the ranges they reach.
-        let inl;
-        let e = if wb.tables().is_empty() || !Workbook::uses_tables(&grp.expr) {
-            &*grp.expr
-        } else {
-            inl = wb.inline_tables(&grp.expr, s, r, c);
-            &inl
-        };
-        // No `@` or `A1#` in OpenFormula: a formula that may spill is a matrix
-        // formula over its spill, a spill reference the range it covers now.
-        let (fe, dynamic) = officina_grid::eval::arrays::for_file(e);
-        let fe = officina_grid::eval::arrays::plain(&fe, &|cr| {
-            let sheet = cr.sheet.unwrap_or(s);
-            let at = (cr.row.resolve(r, officina_grid::addr::MAX_ROWS), cr.col.resolve(c, officina_grid::addr::MAX_COLS));
-            match at {
-                (Some(rr), Some(cc)) => match wb.spill_area(officina_grid::CellAddr::new(sheet, rr, cc)) {
-                    Some(a) => Expr::Range(RangeRef { sheet: cr.sheet, r0: Coord::Abs(a.r0), c0: Coord::Abs(a.c0), r1: Coord::Abs(a.r1), c1: Coord::Abs(a.c1), kind: RangeKind::Cells }),
-                    None => Expr::Err(ErrorKind::Ref),
-                },
-                _ => Expr::Err(ErrorKind::Ref),
-            }
-        });
-        let a1 = formula::to_a1(&fe, r, c, &|id| wb.sheet_name(id));
+        let (fallback, dynamic) = open_formula(wb, &grp.expr, s, r, c);
         out.push_str(r#" table:formula=""#);
-        esc(out, &super::formula::to_of(&a1));
+        esc(out, &fallback);
         out.push('"');
+        if super::formula::requires_fallback(wb, s, &grp.expr) {
+            let original = formula::to_a1(&grp.expr, r, c, &|id| wb.sheet_name(id));
+            write_live_formula(out, &original, &fallback);
+        }
         if dynamic {
             let area = wb.spill_area(officina_grid::CellAddr::new(s, r, c)).filter(|a| a.cells() > 1);
             let (rows, cols) = area.map_or((1, 1), |a| (a.rows(), a.cols()));
@@ -907,7 +932,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
         Value::Num(x) => {
             let x = *x;
             let kind = num_kind(wb, id);
-            let date = matches!(kind, NumKind::Date).then(|| date_text(x)).flatten();
+            let date = matches!(kind, NumKind::Date).then(|| date_text(wb.date_system(), x)).flatten();
             match (kind, date) {
                 (NumKind::Date, Some(d)) => {
                     let _ = write!(out, r#" office:value-type="date" office:date-value="{d}" calcext:value-type="date">"#);
@@ -1406,7 +1431,7 @@ fn names_xml(wb: &Workbook, scope: Option<u16>) -> String {
     for d in wb.names().iter().filter(|d| d.scope == scope
         && !officina_grid::print::is_title_name(&d.name)
         && !d.name.eq_ignore_ascii_case(officina_grid::print::AREA)) {
-        let of = super::formula::to_of(&wb.name_text(d));
+        let (of, _) = open_formula(wb, &d.expr, scope.unwrap_or(0), 0, 0);
         let range = matches!(*d.expr, Expr::Ref(_) | Expr::Range(_)).then(|| of.strip_prefix("of:=[").and_then(|r| r.strip_suffix(']'))).flatten().filter(|r| !r.contains('['));
         out.push_str(if range.is_some() { r#"<table:named-range table:name=""# } else { r#"<table:named-expression table:name=""# });
         esc(&mut out, &d.name);
@@ -1422,7 +1447,11 @@ fn names_xml(wb: &Workbook, scope: Option<u16>) -> String {
                 esc(&mut out, &of);
             }
         }
-        out.push_str(r#""/>"#);
+        out.push('"');
+        if super::formula::requires_fallback(wb, scope.unwrap_or(0), &d.expr) {
+            write_live_formula(&mut out, &wb.name_text(d), &of);
+        }
+        out.push_str("/>");
     }
     if out.is_empty() {
         return out;
@@ -1533,7 +1562,11 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     let whole_cell = !wb.filter_conditions().any(partial_regex);
-    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
+    let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false">"#);
+    if wb.date_system() == dates::DateSystem::Excel1904 {
+        content.push_str(r#"<table:null-date table:date-value="1904-01-01"/>"#);
+    }
+    content.push_str("</table:calculation-settings>");
     content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);
     content.push_str(&names_xml(wb, None));

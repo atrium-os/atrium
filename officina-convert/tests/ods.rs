@@ -242,7 +242,7 @@ fn ods_filter_round_trip() {
 }
 
 #[test]
-fn ods_tables_become_ranges_and_named_database_ranges() {
+fn ods_tables_keep_live_references_and_standard_range_fallbacks() {
     use officina_grid::tables::Table;
     let mut wb = book();
     for (c, h) in ["Item", "Qty"].iter().enumerate() {
@@ -261,8 +261,10 @@ fn ods_tables_become_ranges_and_named_database_ranges() {
     assert_eq!(back.tables(), wb.tables());
     assert_eq!(back.get(CellAddr::new(1, 20, 0)), Value::Num(10.0));
     assert_eq!(back.get(CellAddr::new(0, 3, 7)), Value::Num(6.0));
-    // As plain references: OpenFormula has no structured ones.
-    assert_eq!(back.formula_text(CellAddr::new(1, 20, 0)).unwrap(), "=SUM(Data!$G$2:$G$5)");
+    assert_eq!(back.formula_text(CellAddr::new(1, 20, 0)).unwrap(), "=SUM(Orders[Qty])");
+    let content = officina_convert::zip::Archive::open(&file).unwrap().read_name("content.xml").unwrap().unwrap();
+    let xml = std::str::from_utf8(&content).unwrap();
+    assert!(xml.contains(r#"table:formula="of:=SUM([$Data.$G$2:.$G$5])""#), "the standard formula must remain readable");
 }
 
 #[test]

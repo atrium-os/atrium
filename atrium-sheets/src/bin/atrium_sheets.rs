@@ -129,8 +129,6 @@ fn saved_status(d: &Doc, format: Format) -> String {
         status.push_str(" Excel export kept the last row visibility for filters with unsupported rules.");
     }
     if format == Format::Ods {
-        use officina_grid::formula::ast::Expr;
-
         let mut changes = Vec::new();
         if d.wb.filter_conditions().any(|cond| !officina_convert::ods::write::supports_filter(cond)) {
             changes.push("kept the last row visibility for Excel calendar and appearance filters");
@@ -148,27 +146,13 @@ fn saved_status(d: &Doc, format: Format) -> String {
         if d.wb.pivots().iter().any(|p| !officina_convert::ods::supports_pivot(p)) {
             changes.push("saved pivot tables with Excel-only calculations or groups as cell values");
         }
-        if d.wb.groups().any(|(_, group)| {
-            let mut referenced = false;
-            group.expr.walk(&mut |expr| referenced |= matches!(expr, Expr::Spill(_)));
-            referenced
-        }) {
-            changes.push("replaced spill references with fixed ranges or reference errors");
+        use officina_convert::ods::formula::requires_fallback;
+        if d.wb.groups().any(|(_, group)| requires_fallback(&d.wb, group.sheet, &group.expr))
+            || d.wb.names().iter().any(|name| requires_fallback(&d.wb, name.scope.unwrap_or(0), &name.expr))
+        {
+            changes.push("kept live references for Sheets and wrote compatibility formulas for other apps");
         }
         let tables = d.wb.tables();
-        if !tables.is_empty() && d.wb.groups().any(|(_, group)| {
-            let mut referenced = false;
-            group.expr.walk(&mut |expr| {
-                referenced |= match expr {
-                    Expr::Table(_) => true,
-                    Expr::Name(name) => d.wb.names().get(group.sheet, name).is_none() && d.wb.table(name).is_some(),
-                    _ => false,
-                };
-            });
-            referenced
-        }) {
-            changes.push("converted table references to cell ranges");
-        }
         if tables.iter().any(|table| table.style.is_some() || table.stripes) {
             changes.push("omitted table styles");
         }
@@ -1296,11 +1280,11 @@ mod document_tests {
             anchor: Anchor { sheet: 0, from: (4, 2, 0.0, 0.0), to: (12, 8, 0.0, 0.0) },
         }).unwrap();
 
-        assert!(!saved_status(&doc, Format::Ods).contains("converted table references"));
+        assert!(!saved_status(&doc, Format::Ods).contains("kept live references"));
         doc.wb.set_input(CellAddr::new(0, 0, 1), "=SUM(Sales[Units])").unwrap();
         assert_eq!(
             saved_status(&doc, Format::Ods),
-            "Saved “Sales.ods”. ODS converted table references to cell ranges, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
+            "Saved “Sales.ods”. ODS kept live references for Sheets and wrote compatibility formulas for other apps, omitted table styles, kept table totals in plain cells, omitted typed chart series names."
         );
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Sales.ods”.");
     }
@@ -1326,14 +1310,14 @@ mod document_tests {
     }
 
     #[test]
-    fn ods_save_reports_fixed_spill_references() {
+    fn ods_save_reports_live_reference_compatibility() {
         let mut doc = Doc::new("Arrays.ods");
         doc.type_into(0, 0, "=SEQUENCE(2)");
         assert_eq!(saved_status(&doc, Format::Ods), "Saved “Arrays.ods”.");
         doc.type_into(0, 1, "=SUM(A1#)");
         assert_eq!(
             saved_status(&doc, Format::Ods),
-            "Saved “Arrays.ods”. ODS replaced spill references with fixed ranges or reference errors."
+            "Saved “Arrays.ods”. ODS kept live references for Sheets and wrote compatibility formulas for other apps."
         );
         assert_eq!(saved_status(&doc, Format::Xlsx), "Saved “Arrays.ods”.");
     }

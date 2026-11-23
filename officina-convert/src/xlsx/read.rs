@@ -1615,6 +1615,16 @@ pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32,
     wb.sheet_mut(s).styles = cols;
 }
 
+/// A file can have a cached result from a function provided by another app or
+/// add-in. A direct unavailable call returns #NAME?, so keep its saved value.
+pub(crate) fn missing_top_level_function(wb: &Workbook, sheet: u16, mut expr: &Expr) -> bool {
+    use officina_grid::formula::Func;
+    while let Expr::At(inner) | Expr::Paren(inner) = expr {
+        expr = inner;
+    }
+    matches!(expr, Expr::Call(Func::Unknown(name), _) if wb.names().get(sheet, name).is_none())
+}
+
 /// Places one sheet's formula cells: each parsed at its cell (a shared formula
 /// once, at its master cell), runs of one expression down a column as one fill.
 /// Cells whose formula parses go into `cached` with the file's value.
@@ -1632,17 +1642,16 @@ pub(crate) fn place_formulas(wb: &mut Workbook, s: u16, fcells: Vec<FCell>, shar
                 .entry(*si)
                 .or_insert_with(|| shared.get(si).and_then(|(r, c, t)| wb_parse(&wb, &formula_in(t), s, *r, *c)).map(|e| Arc::new(arrays::legacy(e))))
                 .clone(),
-            Src::Array(t, area) => {
-                if let Some((r0, c0, r1, c1)) = *area {
-                    if (r0, c0) == (fc.row, fc.col) && (r1, c1) != (r0, c0) {
-                        wb.claim_spill(CellAddr::new(s, r0, c0), officina_grid::Rect { sheet: s, r0, c0, r1, c1 });
-                    }
-                }
-                wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new)
-            }
+            Src::Array(t, _) => wb_parse(&wb, &formula_in(t), s, fc.row, fc.col).map(Arc::new),
         };
+        let e = e.filter(|expr| matches!(fc.cached, Value::Empty | Value::Err(ErrorKind::Name)) || !missing_top_level_function(wb, s, expr));
         match e {
             Some(e) => {
+                if let Src::Array(_, Some((r0, c0, r1, c1))) = &fc.src {
+                    if (*r0, *c0) == (fc.row, fc.col) && (*r1, *c1) != (*r0, *c0) {
+                        wb.claim_spill(CellAddr::new(s, *r0, *c0), officina_grid::Rect { sheet: s, r0: *r0, c0: *c0, r1: *r1, c1: *c1 });
+                    }
+                }
                 cells.push((fc.col, fc.row, e));
                 cached.push((CellAddr::new(s, fc.row, fc.col), fc.cached));
             }

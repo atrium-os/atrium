@@ -313,6 +313,15 @@ a fidelity notice. Ordinary Save writes the numeric value and its number
 format. The installed `SHEETS_INTEROP_CASE=dates` gate checks XLSX, XLSM and
 native Save As from XLS. [Excel date-cell format notes](https://learn.microsoft.com/en-us/openspecs/office_standards/ms-oi29500/b9d01770-b85b-4fb2-a387-f5811719a1af)
 
+ODS preserves the 1904 null date, date serials and formula arithmetic across
+ordinary Save and in native workbooks. Timestamp offsets are normalized to UTC.
+Typed dates in General receive a date or timestamp format, while explicit
+number formats are retained. Invalid or out-of-range typed dates keep their text. Other explicit null dates
+outside the normal 1900-compatible and 1904 modes receive a fidelity notice.
+The default mode retains Sheets' Excel-compatible handling from the start of
+1900, including its historical difference from a Gregorian calendar before
+March. [ODF calculation settings](https://docs.oasis-open.org/office/OpenDocument/v1.3/os/part3-schema/OpenDocument-v1.3-os-part3-schema.html#element-table_null-date)
+
 #### Sheets fidelity triage
 
 Prioritize changes that let invalid input through or alter saved values, then
@@ -323,9 +332,9 @@ and their associated import or Save behavior.
 | Priority | Formats | Group and user impact |
 |---|---|---|
 | 1 | XLSX, XLSM | **Input validation.** Formula-backed Excel extension rules previously disappeared on open and ordinary Save. Sheets now reads them and writes direct cross-sheet rules in the extension. Extension-only list encodings and rules with missing or unparseable formulas still receive loss notices. |
-| 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel's 1904 epoch and ISO date cells are handled within the supported date range. ODS can preserve early dates as text. Unsupported formulas lose recalculation and imported cached results can differ. |
+| 2 | XLSX, XLSM, XLS, ODS | **Dates and formula results.** Excel and ODS preserve the 1904 epoch and valid typed dates within the supported range. Invalid or out-of-range dates keep their text and a notice. An unavailable direct formula call keeps a useful saved result as a static value with a notice. Supported formulas recalculate and discrepancies with the saved results remain visible in the import report. |
 | 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Sheets keeps active XLSX, XLSM and ODS sheet locks and their cell styles. Foreign passwords and custom Excel permissions have fidelity notices. XLS still drops validation rules when importing to a native copy. |
-| 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Top and bottom sheet filters by count and percentage stay live in XLSX, XLSM and ODS. The remaining static cases are grouped below. ODS Save can turn spill and table references into fixed ranges. |
+| 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Top and bottom sheet filters by count and percentage stay live in XLSX, XLSM and ODS. The remaining static cases are grouped below. ODS retains live spill and table references for Sheets and supplies fixed compatibility formulas to other apps. |
 | 5 | XLSX, XLSM, ODS, XLS | **Review and output.** ODS can flatten comment threads. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can lose content or change output. Legacy XLS also drops comments and hyperlinks. |
 | 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Rotation, shrink-to-fit, patterned or gradient fills, diagonal borders and styles on empty rows can change how a sheet looks. |
 | Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
@@ -345,7 +354,7 @@ and their associated import or Save behavior.
 | Recovered pivot caches | XLSX, XLSM | Sheets uses the workbook cache ID when a pivot cache link is broken. A damaged definition can be rebuilt when it still identifies a local source. Saved output stays visible until Refresh. |
 | Static pivot results | XLSX, XLSM, ODS | Excel calculated items, unsupported calculated formulas, automatic numeric or calendar bins, and missing or damaged caches with an unknown or external source stay as saved cells. ODS groups with missing or circular dependencies, unsupported aggregates and external or database sources also keep their saved cells and carry a fidelity notice. |
 | Pivot item order | XLSX, XLSM, ODS | Sheets preserves Excel manual order and value sorting by grand total or a selected opposite-axis member, along with ODS manual, source, label and value sorting. Previous, Next and Running Total follow the visible member order after refresh. |
-| Pivot layout | XLSX, XLSM, ODS | Some unsupported Excel aggregations are omitted. Outline layout and values down the rows can change on refresh. |
+| Pivot layout | XLSX, XLSM, ODS | Outline, per-field automatic subtotals and the innermost Values row axis stay live. Unsupported custom subtotals and a Values field before other fields retain their saved cells with a notice. |
 
 The native table record keeps the last applied row mask with the filter and
 uses table-relative coordinates. Older table records decode without a filter.
@@ -1127,7 +1136,9 @@ Gates, on the 4-core cloud machine:
   blank-width `_x`), fonts, fills, borders by width and kind, alignment, wrap; a column's
   default cell style is its column style. Reported: merged cells, comments, charts and
   images, conditional formats, validation, named ranges, hidden rows and columns,
-  rotation, other formula namespaces (kept as values).
+  rotation and other formula namespaces (kept as values). Direct unavailable
+  function calls retain their cached values when available. Explicit string
+  results keep their type even if they spell a spreadsheet error.
 - **Writer** (`officina-convert::ods::write`, in the document process): ODF 1.3 with
   `mimetype` first and stored; values typed by their cell's format (date, time,
   percentage, float), booleans with a boolean data style (LibreOffice otherwise shows 1),
@@ -2359,17 +2370,21 @@ unchanged.
   `XLDAPR` cell metadata part, `_xlfn.ANCHORARRAY` for `A1#`,
   `_xlfn.SINGLE` for an `@` Excel would keep, `_xlfn._xlws.` on `FILTER` and
   `SORT`, `_xlpm.` on `LET` and `LAMBDA` names. In `.ods` it is a matrix
-  formula over its current spill, spill references become the range they
-  cover, and Excel's newer functions get `COM.MICROSOFT.` names. An ODS Save
-  reports the conversion when a cell formula uses a spill reference. A saved
-  fixed-range formula keeps the range it received even if the spill grows
-  after reopen.
+  formula over its current spill. Excel's newer functions get
+  `COM.MICROSOFT.` names. ODS cell formulas and defined names keep their live
+  spill and table references in bounded Atrium attributes and include standard
+  OpenFormula compatibility expressions. Sheets restores the live reference
+  when the compatibility expression is unchanged. A different expression
+  written by another app takes precedence. Other apps see the fixed range or
+  a reference error when the source has no active spill. Save reports the
+  compatibility behavior.
 - **Desktop gate.** The [interoperability check](../../scripts/sheets-interop-vm-check.sh)
   with `SHEETS_INTEROP_CASE=formulas` exercises XLSX and ODS dates, times,
   named and cross-sheet references, spill anchors and errors. Each source
   contains a stale formula cache that triggers the import notice. The gate
   edits the input, saves, reopens and grows the spill again to verify the
-  XLSX dynamic reference and the ODS fixed range. It checks the repaired
+  live spill references in both formats. It also checks the 1904 epoch, a
+  defined name over the spill, a table reference, and the repaired
   cache on both saved files.
 - **Functions.** `SEQUENCE`, `RANDARRAY`, `TRANSPOSE`, `FILTER`, `SORT`,
   `SORTBY`, `UNIQUE`, `VSTACK`, `HSTACK`, `TAKE`, `DROP`, `CHOOSEROWS`,

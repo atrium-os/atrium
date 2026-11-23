@@ -6,6 +6,33 @@
 //! (operators, strings, numbers, function names) is the same text, with a few
 //! namespaced names (`COM.MICROSOFT.XLOOKUP`) for functions Excel added.
 
+pub(super) const ATRIUM_NS: &str = "urn:atrium:officina:spreadsheet:1";
+
+pub fn requires_fallback(wb: &officina_grid::Workbook, sheet: u16, expr: &officina_grid::formula::Expr) -> bool {
+    use officina_grid::formula::Expr;
+    let mut referenced = false;
+    expr.walk(&mut |expr| referenced |= match expr {
+        Expr::Spill(_) | Expr::Table(_) => true,
+        Expr::Name(name) => wb.names().get(sheet, name).is_none() && wb.table(name).is_some(),
+        _ => false,
+    });
+    referenced
+}
+
+#[cfg(feature = "read")]
+pub(super) fn live_formula(
+    attrs: &std::collections::HashMap<String, String>, fallback: Option<&str>,
+) -> Option<String> {
+    if attrs.get("xmlns:atrium").map(String::as_str) != Some(ATRIUM_NS) {
+        return None;
+    }
+    let compat = attrs.get("atrium:compat-expression")?;
+    let live = attrs.get("atrium:a1-expression")?;
+    let max = officina_grid::formula::MAX_STORED_FORMULA_LEN;
+    (Some(compat.as_str()) == fallback && compat.len() <= max * 4 && live.len() <= max && live.starts_with('='))
+        .then(|| live.clone())
+}
+
 /// `of:=SUM([.A1:.A3])` → `=SUM(A1:A3)`. `None` if it is not OpenFormula (another
 /// namespace, an unclosed bracket or string).
 pub fn from_of(f: &str) -> Option<String> {

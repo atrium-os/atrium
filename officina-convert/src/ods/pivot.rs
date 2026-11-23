@@ -100,11 +100,7 @@ fn group_xml(out: &mut String, wb: &Workbook, p: &Pivot, field: u32) {
         for (name, value) in [("start", start), ("end", end)] {
             let value = value.and_then(|value| {
                 if date {
-                    let serial = match wb.date_system() {
-                        officina_grid::eval::dates::DateSystem::Excel1900 => value,
-                        officina_grid::eval::dates::DateSystem::Excel1904 => value + 1462.0,
-                    };
-                    super::write::date_text(serial)
+                    super::write::date_text(wb.date_system(), value)
                 } else {
                     Some(value.to_string())
                 }
@@ -299,7 +295,7 @@ pub struct GroupIn {
 
 #[cfg(feature = "read")]
 impl GroupIn {
-    fn kind(&self) -> Option<GroupKind> {
+    fn kind(&self, system: officina_grid::eval::dates::DateSystem) -> Option<GroupKind> {
         if self.clipped {
             return None;
         }
@@ -313,7 +309,7 @@ impl GroupIn {
         let bound = |value: Option<&str>| match value.unwrap_or("auto") {
             "auto" => Some(None),
             value => {
-                let n = if self.dates { super::read::date_value(value)? } else { value.parse::<f64>().ok()? };
+                let n = if self.dates { super::read::date_value(system, value)? } else { value.parse::<f64>().ok()? };
                 n.is_finite().then_some(Some(n))
             }
         };
@@ -373,7 +369,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
         for field in grouped.iter().copied() {
             let group = field.group.as_ref().unwrap();
             let source_name = if group.source.is_empty() { &field.name } else { &group.source };
-            let (Some(field_id), Some(source), Some(kind)) = (index(&field.name), index(source_name), group.kind()) else {
+            let (Some(field_id), Some(source), Some(kind)) = (index(&field.name), index(source_name), group.kind(wb.date_system())) else {
                 bad = Some(format!("unsupported grouping for {}", field.name));
                 break;
             };
