@@ -705,6 +705,13 @@ tunnel handshake and IPv4 traffic waited for fresh confirmation.
 Exactly one POST led to one redemption and `crypta-ac-ok` through
 ocserv on `tun12`.
 
+The follow-up disconnected the newest requeued window with its
+proposal pending. The jail closed with zero POSTs, gateway page and
+script counts stayed unchanged, and the IPv4 sentinel was unreachable.
+The next attempt used a distinct Crypta identifier. Fresh confirmation
+sent one POST, redeemed one token, and brought up the ocserv tunnel.
+The guest fetched `crypta-ac-ok` on `tun13`.
+
 ### I3 installed passkey sign-in
 
 On 2026-11-21 Mail opened its Microsoft action in Navigator on an arm64
