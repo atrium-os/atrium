@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [features]
-editor = ["dep:navigator-control", "dep:navigator-forms", "dep:nuntius", "dep:libxml_rust", "dep:libweb_bindings_rust", "dep:libweb_rust", "dep:limen", "dep:fresco-client", "dep:fresco-protocol"]
+editor = ["dep:navigator-control", "dep:navigator-forms", "dep:nuntius", "dep:libxml_rust", "dep:libweb_bindings_rust", "dep:libweb_rust", "dep:limen", "dep:fresco-client"]
 
 [lib]
 crate-type = ["rlib", "staticlib"]
@@ -21,6 +21,6 @@ libweb_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibWeb/Rust", default-featur
 libweb_bindings_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibWeb/Bindings/Rust", default-features = false, optional = true }
 limen = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../limen", optional = true }
 fresco-client = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-client", optional = true }
-fresco-protocol = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-protocol", optional = true }
+fresco-protocol = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../fresco-protocol" }
 libxml_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibXML/Rust", default-features = false, optional = true }
 nuntius = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../nuntius", default-features = false, optional = true }

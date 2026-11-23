@@ -497,12 +497,33 @@ provider remained in state −1 and the island stayed black. Chrome with
 the same resource policy displayed a 72 px “Play video” button. Timers,
 messages and animation-frame callbacks fired in the Ladybird diagnostic.
 A separate explicit `cueVideoById` probe reached a Fresco conversion
-error on `DrawRepeatedTile` with an inline clip or transform. The cause
-of the missing initial button is still open. Compare provider readiness
-and overlay creation in the two engines, and implement scene grouping
-for the repeated tile. Real-provider playback and chapter seeks remain
-unverified. The final frame, network trace and diagnostic are at
+error on `DrawRepeatedTile` with an inline clip or transform. This run left the cause of the missing initial button open. The final frame, network trace and diagnostic are at
 `~/atrium-vm/evidence/navigator-i4-youtube-startup-20261123/`.
+
+The follow-up readiness gate ran with a 640 × 360 viewport, the same
+provider fetch policy and a signed-out page. Chrome displayed its 72 px
+Play button in state 5 when its capability probe accepted both exact WebM
+types, VP9 video and Opus audio. Either codec alone left it in state −1.
+In the JIT-off jail Ladybird reported VP9 supported and Opus unsupported.
+Its player was fully intersecting the viewport, had the video title and
+duration (1,344 s), and stayed in state −1. In a diagnostic build, adding
+only the Opus answer produced the provider's own Play button in the DOM
+without an explicit cue. That probe made no audio buffer or playback
+claim. The shipping bridge still requires a real second SourceBuffer,
+track-specific append and range routing, and an installed two-track test.
+
+The provider recorded a 1 × 180 vertical black-to-transparent gradient
+tiled across a 640 px region under two rectangular clips. The painter
+now retains same-space intersecting rectangular clips and represents a
+gapless horizontal repetition of a full-tile vertical sRGB gradient as
+one Fresco fill. A jailed control painted a 320 px wide ramp against white.
+At x=310 and 540 the five sampled channel values matched (61, 142, 186,
+234, 255), and the pixel beyond the right edge was white. The frame sent
+464 bytes for five changed nodes and the next sample sent zero. The real
+provider advanced to `DeclareMaskContent` at chunk 4, record 3. Mask
+declaration and application in Fresco remain open. End-to-end Play,
+real-provider media traffic and chapter seeking remain unverified.
+See `~/atrium-vm/evidence/navigator-i4-youtube-readiness-20261123/`.
 
 Host control scripts and observations are at
 `~/atrium-vm/evidence/navigator-i4-youtube-provider-20261123/`.

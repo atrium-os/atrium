@@ -140,7 +140,7 @@ pub fn present(
 }
 
 use libcompositing_rust::display_list::{
-    builder::{for_each_command, read_command},
+    builder::{for_each_command, inline_clips_of, read_command},
     chunks::ChunkId,
     commands::{ContextRef, DisplayListCommandType, EffectNodeIndex, FillRect, FontResourceId},
     nested_records::span_bytes,
@@ -232,6 +232,8 @@ fn scrollbar_nodes(
     nodes
 }
 
+mod gradient;
+
 pub fn recorded_leaves(
     list: &DisplayListStorage,
     snapshot: &ScrollStateSnapshot,
@@ -250,7 +252,20 @@ pub struct PaintLeaf {
     pub record_in_chunk: usize,
     pub part: usize,
     pub context: ContextRef,
+    inline_clip: Option<libgfx_rust::FloatRect>,
     pub node: Node,
+}
+
+// Clip rectangles must be in one coordinate space before taking their intersection.
+fn intersect_clip(
+    bounds: &mut Option<libgfx_rust::FloatRect>,
+    rect: libgfx_rust::FloatRect,
+) -> Result<(), &'static str> {
+    if ![rect.x, rect.y, rect.right(), rect.bottom()].into_iter().all(f32::is_finite) {
+        return Err("invalid clip coordinates");
+    }
+    *bounds = Some(bounds.map_or(rect, |old| old.intersected(rect)));
+    Ok(())
 }
 
 /// Convert an in-process recording in paint order. The caller must materialize
@@ -283,8 +298,18 @@ pub fn editor_leaves(
                     return;
                 }
                 let result = (|| {
-                    if header.inline_clip_count != 0 || header.has_inline_transform {
-                        return Err("inline clip or transform needs a scene group");
+                    if header.has_inline_transform {
+                        return Err("unsupported inline transform");
+                    }
+                    let mut inline_clip = None;
+                    for clip in inline_clips_of(header, payload) {
+                        use libcompositing_rust::{display_list::tape::InlineClipKind, visual_context::ClipMode};
+                        if clip.kind != InlineClipKind::Rect || clip.mode != ClipMode::Intersect
+                            || (clip.has_own_space && clip.space != run.context.spatial)
+                        {
+                            return Err("unsupported inline clip geometry");
+                        }
+                        intersect_clip(&mut inline_clip, clip.clip_rect_or_path_device_bounds)?;
                     }
                     let mut append = |part, node| {
                         leaves.push(PaintLeaf {
@@ -293,6 +318,7 @@ pub fn editor_leaves(
                             record_in_chunk: id,
                             part,
                             context: run.context,
+                            inline_clip,
                             node,
                         })
                     };
@@ -306,6 +332,11 @@ pub fn editor_leaves(
                         return Ok(());
                     }
                     let node = match header.command_type {
+                        DisplayListCommandType::PaintLinearGradient => gradient::direct(payload)?,
+                        DisplayListCommandType::DrawRepeatedTile => {
+                            let Some(node) = gradient::repeated(payload)? else { return Ok(()) };
+                            node
+                        }
                         DisplayListCommandType::FillRectWithRoundedCorners => {
                             let c = read_command::<libcompositing_rust::display_list::commands::FillRectWithRoundedCorners>(payload);
                             if c.background_color_animation_effect != EffectNodeIndex::NONE {
@@ -489,7 +520,7 @@ fn assemble_scene(
         }
         // A form control clips text in the stationary document coordinate space.
         // Intersect its ancestor clips in that same space.
-        let mut bounds: Option<[f32; 4]> = None;
+        let mut bounds = leaf.inline_clip;
         let mut depth = 0;
         while !clip.is_none() {
             let c = tree
@@ -508,25 +539,7 @@ fn assemble_scene(
             {
                 return Err("unsupported form clip geometry".into());
             }
-            let rect = [
-                r.rect.x,
-                r.rect.y,
-                r.rect.x + r.rect.width,
-                r.rect.y + r.rect.height,
-            ];
-            if !rect.into_iter().all(f32::is_finite) {
-                return Err("invalid form clip coordinates".into());
-            }
-            bounds = Some(if let Some(b) = bounds {
-                [
-                    b[0].max(rect[0]),
-                    b[1].max(rect[1]),
-                    b[2].min(rect[2]),
-                    b[3].min(rect[3]),
-                ]
-            } else {
-                rect
-            });
+            intersect_clip(&mut bounds, r.rect)?;
             clip = c.parent;
         }
         path.reverse();
@@ -587,15 +600,12 @@ fn assemble_scene(
             return Err("duplicate scene key".into());
         }
         let mut parent = active.last().copied();
-        if let Some([x, y, right, bottom]) = bounds {
-            if right <= x || bottom <= y {
+        if let Some(clip) = bounds {
+            if clip.is_empty() {
                 continue;
             }
             // Pergola converts document coordinates to group-local coordinates
             // when it emits placements, including children of this clip layer.
-            if !matches!(leaf.node, Node::Glyphs { .. } | Node::Rect { .. }) {
-                return Err("unsupported clipped form primitive".into());
-            }
             let mut hash = DefaultHasher::new();
             (2u8, key).hash(&mut hash);
             let clip_key = hash.finish();
@@ -607,7 +617,7 @@ fn assemble_scene(
                 parent,
                 Some(id),
                 clip_key,
-                Node::layer(Rect::new(x, y, right - x, bottom - y), 1., true),
+                Node::layer(Rect::new(clip.x, clip.y, clip.width, clip.height), 1., true),
             ));
             parent = Some(id);
         }
@@ -632,6 +642,14 @@ mod tests {
         display_list::builder::DisplayListBuilder, visual_context::VisualContextTree,
     };
     use std::sync::Arc;
+
+    // Cargo unit tests build their own visual contexts without LibGfx's C++ process counters.
+    #[unsafe(no_mangle)]
+    extern "C" fn ladybird_gfx_process_next_structural_epoch() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static EPOCH: AtomicU64 = AtomicU64::new(1);
+        EPOCH.fetch_add(1, Ordering::Relaxed)
+    }
 
     #[test]
     fn scroll_snapshot_changes_the_group_and_preserves_its_child() {
@@ -685,6 +703,7 @@ mod tests {
                 occurrence: 0,
                 record_in_chunk: 0,
                 part: 0,
+                inline_clip: None,
                 context: ContextRef {
                     spatial: index,
                     clip,
