@@ -432,23 +432,12 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
     let (mut row, mut col): (i64, i64) = (-1, -1);
     let mut vtext: Vec<u8> = Vec::new();
     let mut vbuf: Vec<u8> = Vec::new();
-    let mut fcol: Option<u32> = None;
-    let mut chose_icon = false;
-    let mut in_filter = false;
     loop {
         buf.clear();
         let ev = r.read_event_into(&mut buf)?;
         let (e, empty) = match ev {
             Event::Start(e) => (e, false),
             Event::Empty(e) => (e, true),
-            Event::End(e) if matches!(e.local_name().as_ref(), b"filterColumn" | b"autoFilter") => {
-                fcol = None;
-                chose_icon = false;
-                if e.local_name().as_ref() == b"autoFilter" {
-                    in_filter = false;
-                }
-                continue;
-            }
             Event::Eof => break,
             _ => continue,
         };
@@ -709,77 +698,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     }
                 }
             }
-            b"autoFilter" => {
-                if let Some(rf) = attr(&e, b"ref")? {
-                    seg.filter = Some((rf, Vec::new()));
-                    in_filter = !empty;
-                }
-            }
-            b"filterColumn" if in_filter => {
-                chose_icon = false;
-                fcol = if empty { None } else { attr(&e, b"colId")?.and_then(|v| v.parse().ok()) };
-                if attr(&e, b"hiddenButton")?.is_some_and(|v| v == "1") {
-                    seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
-                }
-            }
-            b"Fallback" if chose_icon && !empty => skip(&mut r, &e)?,
-            b"filters" | b"customFilters" | b"top10" | b"dynamicFilter" | b"colorFilter" | b"iconFilter" => {
-                let Some((_, conds)) = seg.filter.as_mut() else { continue };
-                let Some(c) = fcol else { continue };
-                let name = e.local_name();
-                match name.as_ref() {
-                    b"filters" => {
-                        match read_value_filter(&mut r, &e, empty)? {
-                            Some(cond) => conds.push((c, cond)),
-                            None => {
-                                seg.filter = None;
-                                seg.rep.note(Kind::Approximate, "unsupported calendar or value filters (rows stay as the file hid them)");
-                            }
-                        }
-                    }
-                    b"dynamicFilter" => {
-                        let kind = attr(&e, b"type")?;
-                        if kind.as_deref() != Some("null") {
-                            match read_dynamic_date(&e, kind.as_deref().unwrap_or_default(), system)? {
-                                Some(rule) => conds.push((c, Cond::DynamicDate(rule))),
-                                None => {
-                                    seg.filter = None;
-                                    seg.rep.note(Kind::Approximate, "unsupported dynamic filter (rows stay as the file hid them)");
-                                }
-                            }
-                        }
-                    }
-                    b"customFilters" => {
-                        match read_custom_filter(&mut r, &e, empty)? {
-                            Some(cond) => conds.push((c, cond)),
-                            None => {
-                                seg.filter = None;
-                                seg.rep.note(Kind::Approximate, "invalid custom filters (rows stay as the file hid them)");
-                            }
-                        }
-                    }
-                    b"colorFilter" | b"iconFilter" => {
-                        chose_icon = name.as_ref() == b"iconFilter" && e.name().prefix().is_some();
-                        match appearance_filter(&e, dxfs)? {
-                            Some(Some(rule)) => conds.push((c, Cond::Appearance(rule))),
-                            Some(None) => {} // The extended NoIcons sentinel is not a criterion.
-                            None => {
-                                seg.filter = None;
-                                seg.rep.note(Kind::Approximate, "unsupported color or icon filter (rows stay as the file hid them)");
-                            }
-                        }
-                    }
-                    b"top10" => {
-                        let percent = attr(&e, b"percent")?.is_some_and(|v| v == "1" || v == "true");
-                        let bottom = attr(&e, b"top")?.is_some_and(|v| v == "0" || v == "false");
-                        match attr(&e, b"val")?.and_then(|v| Rank::parse(&v, percent, bottom)) {
-                            Some(rank) => conds.push((c, Cond::Rank(rank))),
-                            None => seg.rep.note(Kind::Approximate, "invalid top/bottom filter (rows stay as the file hid them)"),
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            b"autoFilter" => seg.filter = read_auto_filter(&mut r, &e, empty, system, dxfs, &mut seg.rep)?,
             b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
@@ -1099,6 +1018,114 @@ fn read_text(r: &mut Reader<&[u8]>, end: &[u8], out: &mut String) -> Result<(), 
             _ => {}
         }
     }
+}
+
+type FilterColumns = (String, Vec<(u32, Cond)>);
+
+fn read_auto_filter(
+    r: &mut Reader<&[u8]>, tag: &BytesStart, empty: bool, system: DateSystem,
+    dxfs: &[super::condfmt::DxfIn], rep: &mut Report,
+) -> Result<Option<FilterColumns>, XlsxError> {
+    let range = attr(tag, b"ref")?;
+    let mut columns = Vec::new();
+    let mut valid = true;
+    let mut seen = std::collections::HashSet::new();
+    if !empty {
+        loop {
+            let (child, empty) = match r.read_event()? {
+                Event::Start(child) => (child, false),
+                Event::Empty(child) => (child, true),
+                Event::End(end) if end.name() == tag.name() => break,
+                Event::Eof => return Err(bad("auto-filter ended early")),
+                _ => continue,
+            };
+            match child.local_name().as_ref() {
+                b"filterColumn" => {
+                    if attr(&child, b"hiddenButton")?.is_some_and(|v| matches!(v.as_str(), "1" | "true")) {
+                        rep.note(Kind::Approximate, "hidden filter buttons shown");
+                    }
+                    let col = attr(&child, b"colId")?.and_then(|v| v.parse::<u32>().ok());
+                    let cond = if empty { Ok(None) } else { read_filter_column(r, &child, system, dxfs)? };
+                    match (col, cond) {
+                        (Some(c), Ok(cond)) if c < MAX_COLS && seen.insert(c) => {
+                            if let Some(cond) = cond { columns.push((c, cond)); }
+                        }
+                        (_, Err(reason)) => {
+                            valid = false;
+                            rep.note(Kind::Approximate, reason);
+                        }
+                        _ => {
+                            valid = false;
+                            rep.note(Kind::Approximate, "duplicate or invalid filter column (rows stay as the file hid them)");
+                        }
+                    }
+                }
+                b"sortState" => {
+                    rep.note(Kind::Approximate, "saved filter sort settings (rows stay as saved)");
+                    if !empty { skip(r, &child)?; }
+                }
+                _ if !empty => skip(r, &child)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(range.filter(|_| valid).map(|range| (range, columns)))
+}
+
+fn read_filter_column(
+    r: &mut Reader<&[u8]>, tag: &BytesStart, system: DateSystem, dxfs: &[super::condfmt::DxfIn],
+) -> Result<Result<Option<Cond>, &'static str>, XlsxError> {
+    let mut selected = Ok(None);
+    let mut chose_icon = false;
+    loop {
+        let (e, empty) = match r.read_event()? {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::End(e) if e.name() == tag.name() => break,
+            Event::Eof => return Err(bad("filter column ended early")),
+            _ => continue,
+        };
+        let cond = match e.local_name().as_ref() {
+            b"Fallback" if chose_icon && !empty => {
+                skip(r, &e)?;
+                continue;
+            }
+            b"filters" => read_value_filter(r, &e, empty)?.map(Some)
+                .ok_or("unsupported calendar or value filters (rows stay as the file hid them)"),
+            b"customFilters" => read_custom_filter(r, &e, empty)?.map(Some)
+                .ok_or("invalid custom filters (rows stay as the file hid them)"),
+            b"dynamicFilter" => {
+                match attr(&e, b"type")?.as_deref() {
+                    Some("null") => Ok(None),
+                    name => read_dynamic_date(&e, name.unwrap_or_default(), system)?.map(|rule| Some(Cond::DynamicDate(rule)))
+                        .ok_or("unsupported dynamic filter (rows stay as the file hid them)"),
+                }
+            }
+            b"colorFilter" | b"iconFilter" => {
+                chose_icon = e.local_name().as_ref() == b"iconFilter" && e.name().prefix().is_some();
+                appearance_filter(&e, dxfs)?.map(|rule| rule.map(Cond::Appearance))
+                    .ok_or("unsupported color or icon filter (rows stay as the file hid them)")
+            }
+            b"top10" => {
+                let percent = attr(&e, b"percent")?.is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+                let bottom = attr(&e, b"top")?.is_some_and(|v| matches!(v.as_str(), "0" | "false"));
+                attr(&e, b"val")?.and_then(|v| Rank::parse(&v, percent, bottom)).map(|rule| Some(Cond::Rank(rule)))
+                    .ok_or("invalid top/bottom filter (rows stay as the file hid them)")
+            }
+            b"extLst" if !empty => {
+                skip(r, &e)?;
+                continue;
+            }
+            _ => continue,
+        };
+        match (&selected, cond) {
+            (Ok(None), c) => selected = c,
+            (Ok(Some(_)), Ok(Some(_))) => selected = Err("multiple rules in one filter column (rows stay as the file hid them)"),
+            (Ok(_), Err(reason)) => selected = Err(reason),
+            _ => {}
+        }
+    }
+    Ok(selected)
 }
 
 fn appearance_filter(tag: &BytesStart, dxfs: &[super::condfmt::DxfIn]) -> Result<Option<Option<AppearanceFilter>>, XlsxError> {
@@ -1424,7 +1451,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         parts.sort();
         for p in parts {
             if let Some(data) = z.read_name(&p)? {
-                table(&mut wb, i as u16, &data, &mut rep)?;
+                table(&mut wb, i as u16, &data, &dxfs, &mut rep)?;
             }
         }
     }
@@ -1454,6 +1481,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         super::validation::read_sheet(&mut wb, *s, raw, &mut rep);
     }
     wb.recalc();
+    for sheet in 0..wb.sheet_count() as u16 {
+        wb.restore_table_visibility(sheet, None);
+    }
     // The differential: our results against the file's.
     differential(&wb, cached, &mut out, &mut rep);
     // Macros, kept inert.
@@ -1464,14 +1494,20 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
 }
 
 /// One `xl/tables/tableN.xml`.
-fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result<(), XlsxError> {
+fn table(wb: &mut Workbook, sheet: u16, data: &[u8], dxfs: &[super::condfmt::DxfIn], rep: &mut Report) -> Result<(), XlsxError> {
     let mut r = xml(data);
     let mut buf = Vec::new();
     let mut t: Option<Table> = None;
-    let mut filtered = false;
+    let mut filter = None;
+    let system = wb.date_system();
     loop {
-        match r.read_event_into(&mut buf)? {
-            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
+        let (e, empty) = match r.read_event_into(&mut buf)? {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::Eof => break,
+            _ => { buf.clear(); continue; }
+        };
+        match e.local_name().as_ref() {
                 b"table" => {
                     let name = attr(&e, b"displayName")?.or(attr(&e, b"name")?).unwrap_or_default();
                     let Some((r0, c0, r1, c1)) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) else {
@@ -1480,7 +1516,7 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result
                     };
                     let header = attr(&e, b"headerRowCount")?.map_or(true, |v| v != "0");
                     let totals = attr(&e, b"totalsRowCount")?.is_some_and(|v| v != "0");
-                    t = Some(Table { name: name.into(), rect: Rect { sheet, r0, c0, r1, c1 }, header, totals, columns: Vec::new(), style: None, stripes: false });
+                    t = Some(Table { name: name.into(), rect: Rect { sheet, r0, c0, r1, c1 }, header, totals, columns: Vec::new(), style: None, stripes: false, filter: None });
                 }
                 b"tableColumn" => {
                     if let (Some(t), Some(n)) = (t.as_mut(), attr(&e, b"name")?) {
@@ -1489,7 +1525,7 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result
                         }
                     }
                 }
-                b"filterColumn" => filtered = true,
+                b"autoFilter" => filter = read_auto_filter(&mut r, &e, empty, system, dxfs, rep)?,
                 b"sortState" => rep.note(Kind::Approximate, "a table's saved sort order (rows stay as saved)"),
                 b"tableStyleInfo" => {
                     if let Some(t) = t.as_mut() {
@@ -1498,15 +1534,20 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], rep: &mut Report) -> Result
                     }
                 }
                 _ => {}
-            },
-            Event::Eof => break,
-            _ => {}
+
         }
         buf.clear();
     }
-    let Some(t) = t else { return Ok(()) };
-    if filtered {
-        rep.note(Kind::Approximate, "filters inside tables (rows stay as the file hid them)");
+    let Some(mut t) = t else { return Ok(()) };
+    if let Some((range, conds)) = filter {
+        if t.header && t.filter_rect().is_some_and(|r| {
+            parse_ref(&range) == Some((r.r0, r.c0, r.r1, r.c1))
+                && conds.iter().all(|(c, _)| *c <= r.c1 - r.c0)
+        }) {
+            t.filter = Some(officina_grid::tables::TableFilter { conds, hidden: Vec::new() });
+        } else {
+            rep.note(Kind::Approximate, "unsupported table filter range (rows stay as the file hid them)");
+        }
     }
     if t.style.is_some() {
         rep.note(Kind::Approximate, "table styles kept but not drawn");

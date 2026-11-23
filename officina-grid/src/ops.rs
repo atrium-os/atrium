@@ -1126,7 +1126,7 @@ mod tests {
         wb.set_input(a("C1"), "=SUM(T[Qty])").unwrap();
         wb.recalc();
         assert_eq!(wb.get(a("C1")), Value::Err(ErrorKind::Ref));
-        let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true };
+        let t = Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 4, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, filter: None };
         let ch = Chart {
             kind: ChartKind::Column,
             grouping: Grouping::Standard,

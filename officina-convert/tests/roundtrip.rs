@@ -234,7 +234,7 @@ fn with_table(mut wb: Workbook) -> Workbook {
         totals: true,
         columns: vec!["Item".into(), "Qty".into(), "Line total".into()],
         style: Some("TableStyleMedium2".into()),
-        stripes: true,
+        stripes: true, filter: None,
     })
     .unwrap();
     wb.fill_formula(0, 7, 1, 4, "=[@Qty]*Data!A1").unwrap();

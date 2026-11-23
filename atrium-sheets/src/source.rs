@@ -31,7 +31,7 @@ pub struct SheetSource {
     pub note_at: std::cell::Cell<Option<(u32, u32)>>,
 }
 
-type ViewKey = (u16, usize, usize, usize, usize, u64);
+type ViewKey = (u16, usize, usize, usize, usize, usize, usize, u64);
 type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
@@ -43,11 +43,11 @@ impl SheetSource {
     fn rows_view<T>(&self, f: impl FnOnce(&officina_grid::column::Sizes) -> T) -> T {
         let d = self.doc.borrow();
         let sh = d.wb.sheet(d.sheet);
-        if sh.hidden.is_empty() {
+        if sh.hidden.is_empty() && sh.table_hidden().is_empty() {
             return f(&sh.row_sizes);
         }
         let o = sh.row_sizes.overrides();
-        let key = (d.sheet, sh.hidden.as_ptr() as usize, sh.hidden.len(), o.as_ptr() as usize, o.len(), sh.row_sizes.default.to_bits());
+        let key = (d.sheet, sh.hidden.as_ptr() as usize, sh.hidden.len(), sh.table_hidden().as_ptr() as usize, sh.table_hidden().len(), o.as_ptr() as usize, o.len(), sh.row_sizes.default.to_bits());
         let mut v = self.view.borrow_mut();
         if v.as_ref().is_none_or(|(k, _)| *k != key) {
             *v = Some((key, sh.view_row_sizes()));
@@ -368,19 +368,25 @@ impl SheetSource {
             }
             out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes), movable: false, pressable: false });
         }
-        if let Some(f) = &d.wb.sheet(s).filter {
-            let r = f.rect;
+        let sheet_filter = d.wb.sheet(s).filter.as_ref().map(|f| (f.rect, f.conds.as_slice(), None));
+        let table_filters = d.wb.tables().iter().filter(|t| t.rect.sheet == s && t.header)
+            .filter_map(|t| Some((t.filter_rect()?, t.filter.as_ref()?.conds.as_slice(), Some(t.rect.c0))));
+        for (r, conds, offset) in sheet_filter.into_iter().chain(table_filters) {
             let (y0, y1) = (self.row_top(r.r0), self.row_top(r.r0 + 1));
             if y1 > y0 && y0 <= vy1 && y1 >= vy0 {
                 let a = d.wb.sheet(s).col_sizes.index_at(vx0.max(0.0)).max(r.c0);
                 let b = d.wb.sheet(s).col_sizes.index_at(vx1.max(0.0)).min(r.c1);
                 for c in a..=b {
-                    let lit = f.conds.iter().any(|(k, _)| *k == c);
+                    // The table's button owns a shared header cell.
+                    if offset.is_none() && d.wb.table_at(s, r.r0, c).is_some_and(|t| t.rect.r0 == r.r0 && t.header && t.filter.is_some()) {
+                        continue;
+                    }
+                    let lit = conds.iter().any(|(k, _)| *k + offset.unwrap_or(0) == c);
                     let size = 14.0f32.min((y1 - y0) as f32 - 2.0).max(6.0);
                     let x = col_x(c + 1) - size as f64 - 3.0;
                     let y = y0 + ((y1 - y0) - size as f64) / 2.0;
                     // A press opens the column's value list.
-                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(drop_button(theme, size, lit)), movable: false, pressable: true });
+                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | (u64::from(r.r0) << 32) | u64::from(c), at: [x, y, size as f64, size as f64], nodes: Rc::new(drop_button(theme, size, lit)), movable: false, pressable: true });
                 }
             }
         }

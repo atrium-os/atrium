@@ -93,7 +93,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             }
         }
         let sh = d.wb.sheet(d.sheet);
-        let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
+        let rs = sh.view_row_sizes();
         let cs = &sh.col_sizes;
         let [area_top, area_left, _, _] = area.unwrap_or([0; 4]);
         let top = repeat_rows.map_or(area_top, |b| area_top.min(b.0));

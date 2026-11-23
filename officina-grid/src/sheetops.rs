@@ -178,7 +178,7 @@ mod tests {
         put(&mut wb, 2, "A2", "=Total");
         wb.define_name("Total", None, "=Calc!$A$1").unwrap();
         wb.define_name("Local", Some(2), "=Data!$A$3").unwrap();
-        let t = crate::tables::Table { name: "Q".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true };
+        let t = crate::tables::Table { name: "Q".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 0 }, header: true, totals: false, columns: vec!["Qty".into()], style: None, stripes: true, filter: None };
         GridOp::Tables(vec![t]).apply(&mut wb);
         let ch = crate::charts::Chart {
             kind: crate::charts::ChartKind::Column,

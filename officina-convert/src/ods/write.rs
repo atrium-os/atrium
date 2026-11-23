@@ -1111,14 +1111,20 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
     let fill_to = tails.iter().rposition(|&t| t != 0).map_or(0, |p| p as u32 + 1);
     // Hidden rows: "filter" inside the auto-filter's range (LibreOffice shows them
     // again when the filter is cleared), "collapse" elsewhere.
-    let frange = sh.filter.as_ref().map(|f| (f.rect.r0, f.rect.r1));
+    let frange = sh.filter.as_ref().map(|f| (f.rect.r0 + 1, f.rect.r1));
+    let hidden = sh.hidden_rows();
+    let boundary = |rows: &[(u32, u32)], r: u64, end: u64| {
+        let k = rows.partition_point(|h| u64::from(h.1) < r);
+        rows.get(k).map_or(end, |&(a, b)| if u64::from(a) <= r { u64::from(b) + 1 } else { u64::from(a) })
+    };
     let vis = |r: u32| -> &'static str {
-        if !sh.row_hidden(r) {
-            ""
-        } else if frange.is_some_and(|(a, b)| a <= r && r <= b) {
+        let manual = sh.hidden.get(sh.hidden.partition_point(|h| h.1 < r)).is_some_and(|h| h.0 <= r);
+        if manual && !frange.is_some_and(|(a, b)| a <= r && r <= b) {
+            r#" table:visibility="collapse""#
+        } else if sh.row_hidden(r) {
             r#" table:visibility="filter""#
         } else {
-            r#" table:visibility="collapse""#
+            ""
         }
     };
     // Empty rows `start .. start + n`, split where hidden ranges begin and end.
@@ -1128,12 +1134,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         while r < end {
             // The run of rows that share `r`'s visibility.
             let v = vis(r as u32);
-            let k = sh.hidden.partition_point(|h| (h.1 as u64) < r);
-            let next = match sh.hidden.get(k) {
-                Some(&(a, b)) if (a as u64) <= r => b as u64 + 1,
-                Some(&(a, _)) => a as u64,
-                None => end,
-            }
+            let next = boundary(&hidden, r, end).min(boundary(&sh.hidden, r, end))
+                .min(frange.map_or(end, |(a, b)| boundary(&[(a, b)], r, end)))
             .min(end)
             .min(u64::from(header_boundary(out, r as u32, print_rows, ROW_HEADER)));
             let m = next - r;
@@ -1207,7 +1209,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         out.push_str("</table:table-row>");
         row = r + 1;
     }
-    let hid_end = sh.hidden.last().map_or(0, |h| h.1 + 1).min(ODS_ROWS);
+    let hid_end = hidden.last().map_or(0, |h| h.1 + 1).min(ODS_ROWS);
     let end = if tails.iter().any(|&t| t != 0) {
         // LibreOffice applies a column's default style only to rows the table has.
         ODS_ROWS
@@ -1261,6 +1263,72 @@ pub fn supports_filter(cond: &Cond) -> bool {
     !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_))
 }
 
+fn filter_conditions(out: &mut String, conds: &[(u32, Cond)], start_col: u32, whole_cell: bool) {
+    if !conds.is_empty() {
+        out.push_str("<table:filter><table:filter-and>");
+        for (c, cond) in conds {
+            let field = c - start_col;
+            match cond {
+                Cond::Values(v) => {
+                    let first = v.first().cloned().unwrap_or_default();
+                    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
+                    esc(out, &first);
+                    out.push_str(r#"" table:operator="=" table:data-type="text""#);
+                    if v.len() > 1 || (!whole_cell && !v.is_empty()) {
+                        out.push('>');
+                        for x in v {
+                            out.push_str(r#"<table:filter-set-item table:value=""#);
+                            esc(out, x);
+                            out.push_str(r#""/>"#);
+                        }
+                        out.push_str("</table:filter-condition>");
+                    } else {
+                        out.push_str("/>");
+                    }
+                }
+                Cond::Compare(cs, and) => {
+                    let or = !and && cs.len() > 1;
+                    if or {
+                        out.push_str("<table:filter-or>");
+                    }
+                    for (op, x) in cs {
+                        number_condition(out, field, op, *x);
+                    }
+                    if or {
+                        out.push_str("</table:filter-or>");
+                    }
+                }
+                Cond::Custom(tests, and) => {
+                    let or = !and && tests.len() > 1;
+                    if or {
+                        out.push_str("<table:filter-or>");
+                    }
+                    for test in tests {
+                        match test {
+                            Test::Text(text) => text_condition(out, field, text, whole_cell),
+                            Test::Number(op, x) => number_condition(out, field, op, *x),
+                        }
+                    }
+                    if or {
+                        out.push_str("</table:filter-or>");
+                    }
+                }
+                Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
+                Cond::Rank(rank) => {
+                    let op = match (rank.bottom, rank.percent) {
+                        (false, false) => "top values",
+                        (false, true) => "top percent",
+                        (true, false) => "bottom values",
+                        (true, true) => "bottom percent",
+                    };
+                    let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{op}" table:data-type="number"/>"#, rank.limit());
+                }
+            }
+        }
+        out.push_str("</table:filter-and></table:filter>");
+    }
+}
+
 /// `table:database-ranges` holding each sheet's auto-filter, as LibreOffice writes
 /// them: columns joined by and; a column's values as one condition with set items.
 fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
@@ -1275,69 +1343,7 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
         let _ = write!(out, r#"<table:database-range table:name="__Anonymous_Sheet_DB__{s}" table:target-range-address=""#);
         esc(&mut out, &addr);
         out.push_str(r#"" table:display-filter-buttons="true">"#);
-        if !f.conds.is_empty() {
-            out.push_str("<table:filter><table:filter-and>");
-            for (c, cond) in &f.conds {
-                let field = c - f.rect.c0;
-                match cond {
-                    Cond::Values(v) => {
-                        let first = v.first().cloned().unwrap_or_default();
-                        let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value=""#);
-                        esc(&mut out, &first);
-                        out.push_str(r#"" table:operator="=" table:data-type="text""#);
-                        if v.len() > 1 || (!whole_cell && !v.is_empty()) {
-                            out.push('>');
-                            for x in v {
-                                out.push_str(r#"<table:filter-set-item table:value=""#);
-                                esc(&mut out, x);
-                                out.push_str(r#""/>"#);
-                            }
-                            out.push_str("</table:filter-condition>");
-                        } else {
-                            out.push_str("/>");
-                        }
-                    }
-                    Cond::Compare(cs, and) => {
-                        let or = !and && cs.len() > 1;
-                        if or {
-                            out.push_str("<table:filter-or>");
-                        }
-                        for (op, x) in cs {
-                            number_condition(&mut out, field, op, *x);
-                        }
-                        if or {
-                            out.push_str("</table:filter-or>");
-                        }
-                    }
-                    Cond::Custom(tests, and) => {
-                        let or = !and && tests.len() > 1;
-                        if or {
-                            out.push_str("<table:filter-or>");
-                        }
-                        for test in tests {
-                            match test {
-                                Test::Text(text) => text_condition(&mut out, field, text, whole_cell),
-                                Test::Number(op, x) => number_condition(&mut out, field, op, *x),
-                            }
-                        }
-                        if or {
-                            out.push_str("</table:filter-or>");
-                        }
-                    }
-                    Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
-                    Cond::Rank(rank) => {
-                        let op = match (rank.bottom, rank.percent) {
-                            (false, false) => "top values",
-                            (false, true) => "top percent",
-                            (true, false) => "bottom values",
-                            (true, true) => "bottom percent",
-                        };
-                        let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{op}" table:data-type="number"/>"#, rank.limit());
-                    }
-                }
-            }
-            out.push_str("</table:filter-and></table:filter>");
-        }
+        filter_conditions(&mut out, &f.conds, f.rect.c0, whole_cell);
         out.push_str("</table:database-range>");
     }
     // Tables as named database ranges, header and data rows (a totals row stays
@@ -1351,7 +1357,14 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
         esc(&mut out, &t.name);
         out.push_str(r#"" table:target-range-address=""#);
         esc(&mut out, &addr);
-        let _ = write!(out, r#"" table:contains-header="{}"/>"#, t.header);
+        let _ = write!(out, r#"" table:contains-header="{}""#, t.header);
+        if let Some(filter) = t.filter.as_ref().filter(|f| f.conds.iter().all(|(_, cond)| supports_filter(cond))) {
+            let _ = write!(out, r#" table:display-filter-buttons="{}">"#, t.header);
+            filter_conditions(&mut out, &filter.conds, 0, whole_cell);
+            out.push_str("</table:database-range>");
+        } else {
+            out.push_str("/>");
+        }
     }
     if out.is_empty() {
         return out;
@@ -1486,13 +1499,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         faces.push_str(r#""/>"#);
     }
     let mut content = String::with_capacity(tables.len() + auto.len() + 1024);
-    let whole_cell = !(0..wb.sheet_count() as u16).any(|sheet| {
-        wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
-            filter.conds.iter().any(|(_, cond)| matches!(cond, Cond::Custom(tests, _) if tests.iter().any(|test| {
-                matches!(test, Test::Text(t) if matches!(t.op, TextOp::PartialRegex | TextOp::NotPartialRegex))
-            })))
-        })
-    });
+    let whole_cell = !wb.filter_conditions().any(|cond| matches!(cond, Cond::Custom(tests, _) if tests.iter().any(|test| {
+        matches!(test, Test::Text(t) if matches!(t.op, TextOp::PartialRegex | TextOp::NotPartialRegex))
+    })));
     let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="{whole_cell}" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
     content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);

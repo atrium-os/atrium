@@ -826,10 +826,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Hidden rows of the sheet being read; an auto-filter being read (target range,
     // visible buttons, conditions by field) and the filters read.
     let mut hidden_rows: Vec<(u32, u32)> = Vec::new();
+    let mut filtered_rows = Vec::new();
+    let mut saved_filter_rows = HashMap::new();
     // Merged cells of the sheet being read (`table:number-*-spanned`).
     let mut merges: Vec<officina_grid::addr::Rect> = Vec::new();
-    let mut db: Option<(String, bool, Vec<(u32, Cond)>)> = None;
-    let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
+    let mut db: Option<(Option<String>, String, bool, Vec<(u32, Cond)>)> = None;
+    let mut filters: Vec<(Option<String>, String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
     let mut db_tables: Vec<(String, String, bool)> = Vec::new();
     // Conditional formats (LibreOffice's) and the one being read.
@@ -1023,7 +1025,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             }
                         }
                         if a.get("table:visibility").is_some_and(|v| v != "visible") && row < MAX_ROWS as u64 {
-                            hidden_rows.push((row as u32, (row + row_repeat as u64 - 1).min(MAX_ROWS as u64 - 1) as u32));
+                            let span = (row as u32, (row + row_repeat as u64 - 1).min(MAX_ROWS as u64 - 1) as u32);
+                            hidden_rows.push(span);
+                            if a.get("table:visibility").is_some_and(|v| v == "filter") {
+                                filtered_rows.push(span);
+                            }
                         }
                         col = 0;
                         row_cells.clear();
@@ -1320,18 +1326,19 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         let a = attrs(e);
                         db = None;
                         let named = a.get("table:name").filter(|n| !n.starts_with("__Anonymous_Sheet_DB__") && officina_grid::names::valid_name(n));
-                        if let (Some(n), Some(t)) = (named, a.get("table:target-range-address")) {
-                            // A named range with a header row: a table.
-                            if db_tables.len() < officina_grid::tables::MAX_TABLES {
-                                db_tables.push((n.clone(), t.clone(), a.get("table:contains-header").map_or(true, |v| v != "false")));
-                            }
-                        } else if let Some(t) = a.get("table:target-range-address") {
+                        if let Some(target) = a.get("table:target-range-address") {
                             let buttons = a.get("table:display-filter-buttons").is_some_and(|v| matches!(v.as_str(), "true" | "1"));
+                            if let Some(n) = named {
+                                if db_tables.len() >= officina_grid::tables::MAX_TABLES {
+                                    continue;
+                                }
+                                db_tables.push((n.clone(), target.clone(), a.get("table:contains-header").map_or(true, |v| !matches!(v.as_str(), "false" | "0"))));
+                            }
                             if !empty {
-                                db = Some((t.clone(), buttons, Vec::new()));
+                                db = Some((named.cloned(), target.clone(), buttons, Vec::new()));
                             } else if buttons {
-                                filters.push((t.clone(), Vec::new()));
-                            } else {
+                                filters.push((named.cloned(), target.clone(), Vec::new()));
+                            } else if named.is_none() {
                                 rep.note(Kind::Dropped, "database ranges");
                             }
                         } else {
@@ -1353,7 +1360,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             && !a.get("table:display-duplicates").is_some_and(|v| matches!(v.as_str(), "false" | "0"));
                         match local.then(|| super::filter::parse(inner, whole_cell_filter)).flatten() {
                             Some(conds) => {
-                                if let Some((_, _, current)) = &mut db {
+                                if let Some((_, _, _, current)) = &mut db {
                                     *current = conds;
                                 }
                             }
@@ -1433,13 +1440,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                     }
                     b"table:database-range" => {
-                        if let Some((target, buttons, conds)) = db.take() {
+                        if let Some((name, target, buttons, conds)) = db.take() {
                             if buttons || !conds.is_empty() {
                                 if !buttons {
                                     rep.note(Kind::Approximate, "filter buttons shown for a standard filter");
                                 }
-                                filters.push((target, conds));
-                            } else {
+                                filters.push((name, target, conds));
+                            } else if name.is_none() {
                                 rep.note(Kind::Dropped, "database ranges");
                             }
                         }
@@ -1585,6 +1592,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         if let Some(s) = sheet.take() {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
                             wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
+                            saved_filter_rows.insert(s, officina_grid::filter::merge(std::mem::take(&mut filtered_rows)));
                             wb.set_merges(s, std::mem::take(&mut merges));
                             wb.set_comments(s, std::mem::take(&mut comments));
                             let set = std::mem::take(&mut links).into_iter().map(|(r, c, h)| (r, c, officina_grid::links::Link::new(&from_odf_href(&h)))).filter(|x| x.2.is_some()).collect();
@@ -1611,19 +1619,6 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
         }
     }
 
-    // Auto-filters: their range names the sheet.
-    for (target, mut conds) in filters {
-        let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
-        if conds.iter().any(|(c, _)| *c > c1 - c0) {
-            rep.note(Kind::Approximate, "filter field outside its range (rows stay as the file hid them)");
-            continue;
-        }
-        for (c, _) in &mut conds {
-            *c += c0;
-        }
-        wb.sheet_mut(s).filter = Some(officina_grid::filter::AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
-    }
-
     // Tables, from named database ranges; their columns are named by the header row.
     for (name, target, header) in db_tables {
         let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
@@ -1637,10 +1632,31 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             }
             columns.push(n.as_str().into());
         }
-        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: None, stripes: false };
+        let t = officina_grid::tables::Table { name: name.as_str().into(), rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, header, totals: false, columns, style: None, stripes: false, filter: None };
         if let Err(why) = wb.add_table(t) {
             rep.note_at(Kind::Dropped, "tables this engine can't use (kept as plain cells)", || format!("{name}: {why}"));
         }
+    }
+
+    // Auto-filters: their range names the sheet.
+    for (name, target, mut conds) in filters {
+        let Some((s, r0, c0, r1, c1)) = target_rect(&wb, &target) else { continue };
+        if conds.iter().any(|(c, _)| *c > c1 - c0) {
+            rep.note(Kind::Approximate, "filter field outside its range (rows stay as the file hid them)");
+            continue;
+        }
+        if let Some(name) = name {
+            let rect = officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 };
+            if wb.table(&name).is_some_and(|t| t.filter_rect() == Some(rect)) {
+                let rule = officina_grid::tables::TableFilter { conds, hidden: Vec::new() };
+                let _ = wb.set_table_filter(&name, Some(rule));
+            }
+            continue;
+        }
+        for (c, _) in &mut conds {
+            *c += c0;
+        }
+        wb.sheet_mut(s).filter = Some(officina_grid::filter::AutoFilter { rect: officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }, conds });
     }
 
     // Names, before the formulas that use them; relative parts are from the base cell.
@@ -1708,6 +1724,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
         }
     }
     wb.recalc();
+    for (sheet, rows) in saved_filter_rows {
+        wb.restore_table_visibility(sheet, Some(&rows));
+    }
     for (a, want) in cached {
         let got = wb.get(a);
         if !same(&got, &want) {

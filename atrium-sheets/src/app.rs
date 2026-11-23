@@ -73,7 +73,7 @@ pub enum Cmd {
     /// Lets the chart go.
     ChartDone,
     /// The value list of filter column `col`, opened.
-    FilterOpen(u32),
+    FilterOpen(u32, u32),
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
@@ -195,6 +195,7 @@ impl ListPanel {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FilterPanel {
     pub open: bool,
+    row: u32,
     /// The column, of the sheet.
     pub col: u32,
     /// The header's text, for the panel's title.
@@ -359,16 +360,20 @@ impl Sheets {
 
     /// Opens the value list of filter column `col`, or says why not.
     pub fn choose_values(&self, col: u32) {
-        let got = crate::data::column_values(&self.doc.borrow(), col);
+        self.choose_values_at(self.grid.get_cloned().cursor.0, col);
+    }
+
+    fn choose_values_at(&self, row: u32, col: u32) {
+        let got = crate::data::column_values(&self.doc.borrow(), row, col);
         match got {
             Ok(v) => {
                 let d = self.doc.borrow();
-                let r0 = d.wb.sheet(d.sheet).filter.as_ref().map_or(0, |f| f.rect.r0);
+                let r0 = crate::data::filter_header(&d, row, col).unwrap_or(row);
                 let head = d.wb.formatted(officina_grid::addr::CellAddr::new(d.sheet, r0, col)).text;
                 drop(d);
                 let title = if head.trim().is_empty() { format!("Column {}", col_name(col)) } else { format!("{} · {}", col_name(col), head.trim()) };
                 let on = v.iter().map(|x| x.2).collect();
-                self.filter.set(FilterPanel { open: true, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on });
+                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on });
                 self.filter_search.set(TextEdit::new(""));
                 self.filter_scroll.set(ScrollState::default());
             }
@@ -390,7 +395,7 @@ impl Sheets {
         }
         let keep: Vec<String> = p.values.iter().zip(&p.on).filter(|(_, &o)| o).map(|(v, _)| v.0.clone()).collect();
         let every = keep.len() == p.values.len();
-        crate::data::keep_values(&mut self.doc.borrow_mut(), p.col, keep, every);
+        crate::data::keep_values(&mut self.doc.borrow_mut(), p.row, p.col, keep, every);
         self.filter.set(FilterPanel::default());
         self.changed();
     }
@@ -2011,7 +2016,7 @@ impl View for Sheets {
                 GridAction::PressFloat(crate::source::KEY_FILL) => cmds.lock().unwrap().push(Cmd::FillOptions),
                 GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
                 // A filter column's button: its value list.
-                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
+                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen(((k >> 32) & 0xF_FFFF) as u32, k as u32)),
                 // A double-click on a column's edge: as wide as its widest entry.
                 // With whole columns selected, every one of them.
                 // On the double line of hidden columns: show them.
@@ -2944,8 +2949,8 @@ impl Sheets {
                     self.changed();
                     false
                 }
-                Cmd::FilterOpen(col) => {
-                    self.choose_values(col);
+                Cmd::FilterOpen(row, col) => {
+                    self.choose_values_at(row, col);
                     self.changed();
                     false
                 }
@@ -3865,7 +3870,7 @@ mod tests {
         }
         let table = |name: &str, sheet, col, stripes| Table {
             name: name.into(), rect: Cells { sheet, r0: 0, r1: 2, c0: col, c1: col },
-            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes,
+            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes, filter: None,
         };
         let pivot = |name: &str, sales, summary, col, agg| {
             let mut p = Pivot::new(name, Cells { sheet: sales, r0: 0, r1: 2, c0: 0, c1: 1 }, CellAddr::new(summary, 0, col));

@@ -41,9 +41,10 @@ impl DxfTable {
         let rules = dxfs(wb);
         let mut colors = Vec::new();
         let mut color_ids = HashMap::new();
-        for sheet in 0..wb.sheet_count() as u16 {
-            let Some(filter) = &wb.sheet(sheet).filter else { continue };
-            for (_, cond) in &filter.conds {
+        let worksheet = (0..wb.sheet_count() as u16).filter_map(|s| wb.sheet(s).filter.as_ref()).map(|f| f.conds.as_slice());
+        let tables = wb.tables().iter().filter_map(|t| t.filter.as_ref()).map(|f| f.conds.as_slice());
+        for conds in worksheet.chain(tables) {
+            for (_, cond) in conds {
                 if let Cond::Appearance(AppearanceFilter::Color(color)) = cond {
                     color_ids.entry(*color).or_insert_with(|| {
                         let id = rules.len() + colors.len();

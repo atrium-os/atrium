@@ -122,22 +122,17 @@ fn saved_status(d: &Doc, format: Format) -> String {
     if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.pivots().iter().any(|p| !p.groups.is_empty()) {
         status.push_str(" Excel export saved grouped ODS pivot tables as cell values.");
     }
-    if matches!(format, Format::Xlsx | Format::Xlsm) && (0..d.wb.sheet_count() as u16).any(|sheet| {
-        d.wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
-            filter.conds.iter().any(|(_, cond)| !officina_convert::xlsx::write::supports_filter(cond))
-        })
-    }) {
+    if matches!(format, Format::Xlsx | Format::Xlsm)
+        && (d.wb.filter_conditions().any(|cond| !officina_convert::xlsx::write::supports_filter(cond))
+            || d.wb.tables().iter().any(|t| !t.header && t.filter.as_ref().is_some_and(|f| !f.conds.is_empty())))
+    {
         status.push_str(" Excel export kept the last row visibility for filters with unsupported rules.");
     }
     if format == Format::Ods {
         use officina_grid::formula::ast::Expr;
 
         let mut changes = Vec::new();
-        if (0..d.wb.sheet_count() as u16).any(|sheet| {
-            d.wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
-                filter.conds.iter().any(|(_, cond)| !officina_convert::ods::write::supports_filter(cond))
-            })
-        }) {
+        if d.wb.filter_conditions().any(|cond| !officina_convert::ods::write::supports_filter(cond)) {
             changes.push("kept the last row visibility for Excel calendar and appearance filters");
         }
         if d.wb.pivots().iter().any(|pivot| pivot.rows.iter().chain(&pivot.cols).any(|f| {
@@ -809,7 +804,7 @@ fn main() {
                     discard = true;
                     break 'main;
                 }
-                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(_) | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose => {}
+                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose => {}
             }
         }
         if std::mem::take(&mut want_print) {
@@ -1283,7 +1278,7 @@ mod document_tests {
         doc.wb.set_input(CellAddr::new(0, 0, 0), "Units").unwrap();
         doc.wb.add_table(Table {
             name: "Sales".into(), rect, header: true, totals: true,
-            columns: vec!["Units".into()], style: Some("TableStyleMedium2".into()), stripes: true,
+            columns: vec!["Units".into()], style: Some("TableStyleMedium2".into()), stripes: true, filter: None,
         }).unwrap();
         doc.wb.define_name("Rate", None, "=3").unwrap();
         doc.wb.set_input(CellAddr::new(0, 0, 1), "=Rate").unwrap();

@@ -374,6 +374,28 @@ pub(crate) fn shift_with_ids(
                 }
             }
         }
+        if axis == Axis::Rows && t.totals && s.map(t.rect.r1).is_none() {
+            t.totals = false;
+        }
+        if let Some(filter) = &mut t.filter {
+            match axis {
+                Axis::Cols => filter.conds = filter.conds.iter().filter_map(|(c, cond)| {
+                    s.map(t.rect.c0 + c).map(|c| (c - rect.c0, cond.clone()))
+                }).collect(),
+                Axis::Rows => {
+                    let mut runs = Vec::new();
+                    for &(a, b) in &filter.hidden {
+                        let (a, b) = (a + t.rect.r0, b + t.rect.r0);
+                        if n > 0 && a < at && at <= b {
+                            runs.extend([(a - rect.r0, at - 1 - rect.r0), (at + grow - rect.r0, b + grow - rect.r0)]);
+                        } else if let Some((a, b)) = s.map_span(a, b) {
+                            runs.push((a - rect.r0, b - rect.r0));
+                        }
+                    }
+                    filter.hidden = crate::filter::merge(runs);
+                }
+            }
+        }
         t.rect = rect;
         Some(t)
     }).collect();
@@ -664,9 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn table_filter_moves_with_its_columns_and_rows() {
+        use crate::{filter::Cond, tables::{Table, TableFilter}};
+        let mut wb = book(&[&["Item", "Status"], &["1", "Open"], &["2", "Closed"], &["3", "Closed"]]);
+        wb.add_table(Table {
+            name: "Orders".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 1 },
+            header: true, totals: false, columns: vec!["Item".into(), "Status".into()],
+            style: None, stripes: false,
+            filter: Some(TableFilter { conds: vec![(1, Cond::Values(vec!["Open".into()]))], hidden: vec![(2, 3)] }),
+        }).unwrap();
+        let before = wb.tables().to_vec();
+
+        let cols = shift_op(&wb, 0, Axis::Cols, 1, 1).unwrap();
+        let undo_cols = apply(&mut wb, cols);
+        assert_eq!(wb.tables()[0].filter.as_ref().unwrap().conds[0].0, 2);
+        let rows = shift_op(&wb, 0, Axis::Rows, 3, 1).unwrap();
+        let undo_rows = apply(&mut wb, rows);
+        assert_eq!(wb.sheet(0).table_hidden(), &[(2, 2), (4, 4)]);
+
+        apply(&mut wb, undo_rows);
+        apply(&mut wb, undo_cols);
+        assert_eq!(wb.tables(), before);
+        assert_eq!(wb.sheet(0).hidden_rows(), vec![(2, 3)]);
+    }
+
+    #[test]
     fn columns_and_the_sheets_parts_move() {
         let mut wb = book(&[&["Name", "Qty", "Price"], &["pens", "3", "2"], &["ink", "4", "5"], &["", "=SUM(B2:B3)", "=B4*C3"]]);
-        let t = crate::tables::Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 }, header: true, totals: false, columns: vec!["Name".into(), "Qty".into(), "Price".into()], style: None, stripes: true };
+        let t = crate::tables::Table { name: "T".into(), rect: Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 2 }, header: true, totals: false, columns: vec!["Name".into(), "Qty".into(), "Price".into()], style: None, stripes: true, filter: None };
         GridOp::Tables(vec![t]).apply(&mut wb);
         let before = grid(&wb, 0);
         // A column before Qty.

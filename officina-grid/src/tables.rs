@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
+use crate::filter::{AutoFilter, Cond, FilterState};
 use crate::formula::ast::{CellRef, Coord, Expr, RangeKind, RangeRef, TableArea, TableRef};
 use crate::names::valid_name;
 use officina_core::wire::{Reader, WireError, Writer};
@@ -32,9 +33,46 @@ pub struct Table {
     pub style: Option<Arc<str>>,
     /// Banded rows, kept for files.
     pub stripes: bool,
+    pub filter: Option<TableFilter>,
+}
+
+/// Predicates and last-applied row visibility, relative to the table's top left.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableFilter {
+    pub conds: Vec<(u32, Cond)>,
+    pub hidden: Vec<(u32, u32)>,
 }
 
 impl Table {
+    /// The filter's full range, excluding the totals row.
+    pub fn filter_rect(&self) -> Option<Rect> {
+        let end = self.rect.r1.checked_sub(u32::from(self.totals))?;
+        (end >= self.rect.r0).then_some(Rect { r1: end, ..self.rect })
+    }
+
+    pub fn auto_filter(&self) -> Option<AutoFilter> {
+        let rect = self.filter_rect()?;
+        Some(AutoFilter {
+            rect,
+            conds: self.filter.as_ref()?.conds.iter().map(|(col, cond)| (col + rect.c0, cond.clone())).collect(),
+        })
+    }
+
+    fn relative_filter_rect(&self) -> Option<Rect> {
+        let r = self.filter_rect()?;
+        Some(Rect { sheet: 0, r0: 0, c0: 0, r1: r.r1 - r.r0, c1: r.c1 - r.c0 })
+    }
+
+    fn valid_filter(&self) -> bool {
+        let Some(filter) = &self.filter else { return true };
+        let Some(rect) = self.relative_filter_rect() else { return false };
+        let unique: std::collections::HashSet<_> = filter.conds.iter().map(|(c, _)| *c).collect();
+        unique.len() == filter.conds.len()
+            && unique.iter().all(|c| *c <= rect.c1)
+            && filter.hidden.iter().all(|(lo, hi)| *lo >= u32::from(self.header) && lo <= hi && *hi <= rect.r1)
+            && filter.hidden.windows(2).all(|w| w[0].1 + 1 < w[1].0)
+    }
+
     /// The data rows, first and last (`None` for a table of only a header and totals).
     pub fn data_rows(&self) -> Option<(u32, u32)> {
         let a = self.rect.r0 + self.header as u32;
@@ -91,10 +129,17 @@ impl Table {
         w.var(self.rect.c0 as u64);
         w.var(self.rect.r1 as u64);
         w.var(self.rect.c1 as u64);
-        w.u8(self.header as u8 | (self.totals as u8) << 1 | (self.stripes as u8) << 2);
+        w.u8(self.header as u8 | (self.totals as u8) << 1 | (self.stripes as u8) << 2 | (self.filter.is_some() as u8) << 3);
         w.str(self.style.as_deref().unwrap_or(""));
         for c in &self.columns {
             w.str(c);
+        }
+        if let Some(filter) = &self.filter {
+            FilterState {
+                sheet: 0,
+                filter: Some(AutoFilter { rect: self.relative_filter_rect().unwrap(), conds: filter.conds.clone() }),
+                hidden: filter.hidden.clone(),
+            }.encode(w);
         }
     }
 
@@ -125,7 +170,7 @@ impl Table {
         for _ in 0..n {
             columns.push(Arc::from(r.str("column name", MAX_COL_NAME as u64)?));
         }
-        Ok(Table {
+        let mut table = Table {
             name,
             rect,
             header: flags & 1 != 0,
@@ -133,7 +178,19 @@ impl Table {
             stripes: flags & 4 != 0,
             style: (!style.is_empty()).then(|| Arc::from(style)),
             columns,
-        })
+            filter: None,
+        };
+        if flags & 8 != 0 {
+            let state = FilterState::decode(r)?;
+            let Some(filter) = state.filter.filter(|f| Some(f.rect) == table.relative_filter_rect()) else {
+                return Err(WireError::Invalid("table filter range"));
+            };
+            table.filter = Some(TableFilter { conds: filter.conds, hidden: state.hidden });
+            if !table.valid_filter() {
+                return Err(WireError::Invalid("table filter"));
+            }
+        }
+        Ok(table)
     }
 }
 
@@ -190,7 +247,15 @@ impl Workbook {
         if self.tables.iter().any(|o| overlaps(&o.rect, r)) {
             return Err("over another table");
         }
+        if !t.valid_filter() {
+            return Err("invalid table filter");
+        }
+        let sheet = t.rect.sheet;
+        let has_filter = t.filter.is_some();
         self.tables.push(t);
+        if has_filter {
+            self.rebuild_table_visibility(sheet);
+        }
         self.rebind_names();
         Ok(())
     }
@@ -201,6 +266,9 @@ impl Workbook {
     /// [`add_table`]: Workbook::add_table
     pub fn replace_tables(&mut self, ts: Vec<Table>) -> Vec<Table> {
         let old = std::mem::take(&mut self.tables);
+        for sh in &mut self.sheets {
+            sh.table_hidden.clear();
+        }
         for t in ts {
             let _ = self.add_table(t);
         }
@@ -208,9 +276,24 @@ impl Workbook {
         old
     }
 
+    pub fn set_table_filter(&mut self, name: &str, filter: Option<TableFilter>) -> Result<Option<TableFilter>, &'static str> {
+        let table = self.tables.iter_mut().find(|t| t.name.as_ref() == name).ok_or("table no longer exists")?;
+        let old = std::mem::replace(&mut table.filter, filter);
+        if !table.valid_filter() {
+            table.filter = old;
+            return Err("invalid table filter");
+        }
+        let sheet = table.rect.sheet;
+        self.rebuild_table_visibility(sheet);
+        Ok(old)
+    }
+
     pub fn remove_table(&mut self, name: &str) -> Option<Table> {
         let i = self.tables.iter().position(|t| t.name.eq_ignore_ascii_case(name))?;
         let t = self.tables.remove(i);
+        if t.filter.is_some() {
+            self.rebuild_table_visibility(t.rect.sheet);
+        }
         self.rebind_names();
         Some(t)
     }
@@ -296,7 +379,7 @@ mod tests {
             totals: true,
             columns: vec!["Region".into(), "Qty".into(), "Price".into(), "Total".into()],
             style: Some("TableStyleMedium2".into()),
-            stripes: true,
+            stripes: true, filter: None,
         })
         .unwrap();
         wb

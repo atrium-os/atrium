@@ -366,7 +366,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     for &(r, px) in sh.row_sizes.overrides() {
         meta.entry(r).or_insert((None, false)).0 = Some(px);
     }
-    for &(a, b) in &sh.hidden {
+    for (a, b) in sh.hidden_rows() {
         for r in a..=b.min(XLSX_ROWS - 1) {
             meta.entry(r).or_insert((None, false)).1 = true;
         }
@@ -525,83 +525,8 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         }
         o.extend_from_slice(b"/>");
     }
-    if let Some(f) = sh.filter.as_ref().filter(|f| f.conds.iter().all(|(_, cond)| supports_filter(cond))) {
-        if f.rect.r1 < XLSX_ROWS && f.rect.c1 < XLSX_COLS {
-            let _ = write!(o, r#"<autoFilter ref="{}:{}""#, a1(f.rect.r0, f.rect.c0), a1(f.rect.r1, f.rect.c1));
-            if f.conds.is_empty() {
-                o.extend_from_slice(b"/>");
-            } else {
-                o.push(b'>');
-                for (c, cond) in &f.conds {
-                    let _ = write!(o, r#"<filterColumn colId="{}">"#, c - f.rect.c0);
-                    match cond {
-                        Cond::Values(values) => filter_values(&mut o, values, None),
-                        Cond::Calendar(selection) => filter_values(&mut o, &selection.values, Some(selection)),
-                        Cond::DynamicDate(rule) => {
-                            let _ = write!(o, r#"<dynamicFilter type="{}""#, rule.name());
-                            let system = wb.date_system();
-                            if let Some(bounds) = rule.cached.or_else(|| rule.bounds(system, system.now())) {
-                                let (start, end) = bounds.limits();
-                                let _ = write!(o, r#" val="{start}" maxVal="{end}""#);
-                            }
-                            o.extend_from_slice(b"/>");
-                        }
-                        Cond::Compare(cs, and) => {
-                            o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
-                            for (op, x) in cs {
-                                let name = filter_comparison(op);
-                                let _ = write!(o, r#"<customFilter operator="{name}" val="{x}"/>"#);
-                            }
-                            o.extend_from_slice(b"</customFilters>");
-                        }
-                        Cond::Custom(tests, and) => {
-                            o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
-                            for test in tests {
-                                let test = match test {
-                                    Test::Number(op, x) => Some((filter_comparison(op), x.to_string())),
-                                    Test::Text(text) => excel_text_test(text),
-                                };
-                                if let Some((op, value)) = test {
-                                    let _ = write!(o, r#"<customFilter operator="{op}" val=""#);
-                                    esc(&mut o, &value);
-                                    o.extend_from_slice(b"\"/>");
-                                }
-                            }
-                            o.extend_from_slice(b"</customFilters>");
-                        }
-                        Cond::Appearance(AppearanceFilter::Color(color)) => {
-                            let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="{}"/>"#, dxfs.color_id(*color), u8::from(color.cell));
-                        }
-                        Cond::Appearance(AppearanceFilter::Icon(icon)) => {
-                            let (set, index) = icon.selection();
-                            let name = officina_grid::condfmt::ICON_SETS[set as usize].0;
-                            if let Some(index) = index.filter(|_| super::condfmt::extended_icon_set(set)) {
-                                let ns = super::condfmt::X14;
-                                let _ = write!(o, concat!(
-                                    r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:x14="{ns}">"#,
-                                    r#"<mc:Choice Requires="x14"><x14:iconFilter iconSet="{name}" iconId="{index}"/></mc:Choice>"#,
-                                    r#"<mc:Fallback/></mc:AlternateContent>"#,
-                                ), ns = ns, name = name, index = index);
-                            } else {
-                                // In the base record an absent index means no icon.
-                                let name = if super::condfmt::extended_icon_set(set) { "3Arrows" } else { name };
-                                let _ = write!(o, r#"<iconFilter iconSet="{name}""#);
-                                if let Some(index) = index {
-                                    let _ = write!(o, r#" iconId="{index}""#);
-                                }
-                                o.extend_from_slice(b"/>");
-                            }
-                        }
-                        Cond::Rank(rank) => {
-                            let _ = write!(o, r#"<top10 top="{}" percent="{}" val="{}"/>"#,
-                                u8::from(!rank.bottom), u8::from(rank.percent), rank.limit());
-                        }
-                    }
-                    o.extend_from_slice(b"</filterColumn>");
-                }
-                o.extend_from_slice(b"</autoFilter>");
-            }
-        }
+    if let Some(f) = &sh.filter {
+        write_filter(&mut o, f, wb.date_system(), dxfs);
     }
     let merges = wb.merges(s);
     if !merges.is_empty() {
@@ -655,8 +580,90 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
     Ok(o)
 }
 
+fn write_filter(
+    o: &mut Vec<u8>, f: &officina_grid::filter::AutoFilter,
+    system: officina_grid::eval::dates::DateSystem, dxfs: &super::condfmt::DxfTable,
+) {
+    if !f.conds.iter().all(|(_, cond)| supports_filter(cond)) { return; }
+    if f.rect.r1 < XLSX_ROWS && f.rect.c1 < XLSX_COLS {
+        let _ = write!(o, r#"<autoFilter ref="{}:{}""#, a1(f.rect.r0, f.rect.c0), a1(f.rect.r1, f.rect.c1));
+        if f.conds.is_empty() {
+            o.extend_from_slice(b"/>");
+        } else {
+            o.push(b'>');
+            for (c, cond) in &f.conds {
+                let _ = write!(o, r#"<filterColumn colId="{}">"#, c - f.rect.c0);
+                match cond {
+                    Cond::Values(values) => filter_values(o, values, None),
+                    Cond::Calendar(selection) => filter_values(o, &selection.values, Some(selection)),
+                    Cond::DynamicDate(rule) => {
+                        let _ = write!(o, r#"<dynamicFilter type="{}""#, rule.name());
+                                    if let Some(bounds) = rule.cached.or_else(|| rule.bounds(system, system.now())) {
+                            let (start, end) = bounds.limits();
+                            let _ = write!(o, r#" val="{start}" maxVal="{end}""#);
+                        }
+                        o.extend_from_slice(b"/>");
+                    }
+                    Cond::Compare(cs, and) => {
+                        o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
+                        for (op, x) in cs {
+                            let name = filter_comparison(op);
+                            let _ = write!(o, r#"<customFilter operator="{name}" val="{x}"/>"#);
+                        }
+                        o.extend_from_slice(b"</customFilters>");
+                    }
+                    Cond::Custom(tests, and) => {
+                        o.extend_from_slice(if *and { br#"<customFilters and="1">"# as &[u8] } else { b"<customFilters>" });
+                        for test in tests {
+                            let test = match test {
+                                Test::Number(op, x) => Some((filter_comparison(op), x.to_string())),
+                                Test::Text(text) => excel_text_test(text),
+                            };
+                            if let Some((op, value)) = test {
+                                let _ = write!(o, r#"<customFilter operator="{op}" val=""#);
+                                esc(o, &value);
+                                o.extend_from_slice(b"\"/>");
+                            }
+                        }
+                        o.extend_from_slice(b"</customFilters>");
+                    }
+                    Cond::Appearance(AppearanceFilter::Color(color)) => {
+                        let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="{}"/>"#, dxfs.color_id(*color), u8::from(color.cell));
+                    }
+                    Cond::Appearance(AppearanceFilter::Icon(icon)) => {
+                        let (set, index) = icon.selection();
+                        let name = officina_grid::condfmt::ICON_SETS[set as usize].0;
+                        if let Some(index) = index.filter(|_| super::condfmt::extended_icon_set(set)) {
+                            let ns = super::condfmt::X14;
+                            let _ = write!(o, concat!(
+                                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:x14="{ns}">"#,
+                                r#"<mc:Choice Requires="x14"><x14:iconFilter iconSet="{name}" iconId="{index}"/></mc:Choice>"#,
+                                r#"<mc:Fallback/></mc:AlternateContent>"#,
+                            ), ns = ns, name = name, index = index);
+                        } else {
+                            // In the base record an absent index means no icon.
+                            let name = if super::condfmt::extended_icon_set(set) { "3Arrows" } else { name };
+                            let _ = write!(o, r#"<iconFilter iconSet="{name}""#);
+                            if let Some(index) = index {
+                                let _ = write!(o, r#" iconId="{index}""#);
+                            }
+                            o.extend_from_slice(b"/>");
+                        }
+                    }
+                    Cond::Rank(rank) => {
+                        let _ = write!(o, r#"<top10 top="{}" percent="{}" val="{}"/>"#,
+                            u8::from(!rank.bottom), u8::from(rank.percent), rank.limit());
+                    }
+                }
+                o.extend_from_slice(b"</filterColumn>");
+            }
+            o.extend_from_slice(b"</autoFilter>");
+        }
+    }
+}
+
 /// `xl/tables/tableN.xml` for table `t`, numbered `id` (from 1).
-fn table_xml(t: &officina_grid::tables::Table, id: usize) -> Vec<u8> {
+fn table_xml(t: &officina_grid::tables::Table, id: usize, system: officina_grid::eval::dates::DateSystem, dxfs: &super::condfmt::DxfTable) -> Vec<u8> {
     let r = &t.rect;
     let mut o: Vec<u8> = Vec::new();
     let _ = write!(o, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="{id}" name=""#);
@@ -669,7 +676,9 @@ fn table_xml(t: &officina_grid::tables::Table, id: usize) -> Vec<u8> {
     }
     o.extend_from_slice(if t.totals { br#" totalsRowCount="1">"# as &[u8] } else { br#" totalsRowShown="0">"# });
     if t.header {
-        let _ = write!(o, r#"<autoFilter ref="{}:{}"/>"#, a1(r.r0, r.c0), a1(r.r1 - t.totals as u32, r.c1));
+        if let Some(filter) = t.auto_filter() {
+            write_filter(&mut o, &filter, system, dxfs);
+        }
     }
     let _ = write!(o, r#"<tableColumns count="{}">"#, t.columns.len());
     for (i, c) in t.columns.iter().enumerate() {
@@ -958,7 +967,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         }
     }
     for (i, t) in wb.tables().iter().enumerate() {
-        z.add(&format!("xl/tables/table{}.xml", i + 1), &table_xml(t, i + 1))?;
+        z.add(&format!("xl/tables/table{}.xml", i + 1), &table_xml(t, i + 1, wb.date_system(), &dxfs))?;
     }
     for (i, c) in wb.charts().iter().enumerate() {
         z.add(&format!("xl/charts/chart{}.xml", i + 1), super::chart::chart_xml(wb, c).as_bytes())?;

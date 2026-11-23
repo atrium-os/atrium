@@ -308,12 +308,12 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let (row, col) = cursor;
     let t = target(d, sel, cursor);
     let some = t.is_some();
-    let filter = wb.sheet(s).filter.as_ref();
-    let in_filter = filter.filter(|f| (f.rect.r0 + 1..=f.rect.r1).contains(&row) && (f.rect.c0..=f.rect.c1).contains(&col));
+    let filter = filter_scope(d, row, col);
+    let in_filter = filter.filter(|f| (f.first()..=f.rect().r1).contains(&row) && (f.rect().c0..=f.rect().c1).contains(&col));
     let value = short(&wb.formatted(CellAddr::new(s, row, col)).text);
     let shown = if value.is_empty() { "(empty)".to_string() } else { format!("“{value}”") };
-    let col_filtered = filter.is_some_and(|f| f.conds.iter().any(|(c, _)| *c == col));
-    let any_cond = filter.is_some_and(|f| !f.conds.is_empty());
+    let col_filtered = filter.is_some_and(|f| f.conds().iter().any(|(c, _)| *c + f.offset() == col));
+    let any_cond = filter.is_some_and(|f| !f.conds().is_empty());
     let table = wb.table_at(s, row, col);
     let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
     let plural = |n: u32, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
@@ -385,7 +385,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
         (MenuItem::new(format!("Show Only {shown}")).enabled(in_filter.is_some()), Some(DataCmd::KeepValue)),
         (MenuItem::new(format!("Hide {shown}")).enabled(in_filter.is_some()), Some(DataCmd::HideValue)),
-        (MenuItem::new(format!("Choose Values in Column {}…", officina_grid::addr::col_name(col))).enabled(filter.is_some_and(|f| (f.rect.r0..=f.rect.r1).contains(&row) && (f.rect.c0..=f.rect.c1).contains(&col))), Some(DataCmd::ChooseValues)),
+        (MenuItem::new(format!("Choose Values in Column {}…", officina_grid::addr::col_name(col))).enabled(filter.is_some_and(|f| f.rect().contains(CellAddr::new(s, row, col)))), Some(DataCmd::ChooseValues)),
         (MenuItem::new(format!("Clear Filter in Column {}", officina_grid::addr::col_name(col))).enabled(col_filtered), Some(DataCmd::ClearColumn)),
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
     ];
@@ -538,24 +538,81 @@ pub fn unhide_cols_at(d: &mut Doc, col: u32) -> bool {
     true
 }
 
-pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, String> {
-    let f = d.wb.sheet(d.sheet).filter.as_ref().ok_or("There is no filter on this sheet.")?;
-    if !(f.rect.c0..=f.rect.c1).contains(&col) {
+#[derive(Clone, Copy)]
+enum FilterScope<'a> {
+    Worksheet(&'a AutoFilter),
+    Table(&'a Table),
+}
+
+impl FilterScope<'_> {
+    fn rect(self) -> Rect {
+        match self { Self::Worksheet(f) => f.rect, Self::Table(t) => t.filter_rect().unwrap() }
+    }
+
+    fn first(self) -> u32 {
+        self.rect().r0 + match self { Self::Worksheet(_) => 1, Self::Table(t) => u32::from(t.header) }
+    }
+
+    fn offset(self) -> u32 {
+        match self { Self::Worksheet(_) => 0, Self::Table(t) => t.rect.c0 }
+    }
+
+    fn hides(self, d: &Doc, row: u32) -> bool {
+        let (rows, row) = match self {
+            Self::Worksheet(_) => (d.wb.sheet(d.sheet).hidden.as_slice(), row),
+            Self::Table(t) => (t.filter.as_ref().unwrap().hidden.as_slice(), row - t.rect.r0),
+        };
+        rows.get(rows.partition_point(|&(_, end)| end < row)).is_some_and(|&(start, _)| start <= row)
+    }
+}
+
+impl<'a> FilterScope<'a> {
+    fn conds(self) -> &'a [(u32, Cond)] {
+        match self { Self::Worksheet(f) => &f.conds, Self::Table(t) => &t.filter.as_ref().unwrap().conds }
+    }
+
+    fn auto_filter(self) -> AutoFilter {
+        match self { Self::Worksheet(f) => f.clone(), Self::Table(t) => t.auto_filter().unwrap() }
+    }
+}
+
+fn filter_scope(d: &Doc, row: u32, col: u32) -> Option<FilterScope<'_>> {
+    if let Some(table) = d.wb.table_at(d.sheet, row, col) {
+        if table.filter.is_some() {
+            return Some(FilterScope::Table(table));
+        }
+        if !d.wb.sheet(d.sheet).filter.as_ref().is_some_and(|f| f.rect.contains(CellAddr::new(d.sheet, row, col))) {
+            return None;
+        }
+    }
+    d.wb.sheet(d.sheet).filter.as_ref().map(FilterScope::Worksheet)
+}
+
+pub fn filter_header(d: &Doc, row: u32, col: u32) -> Option<u32> {
+    let scope = filter_scope(d, row, col)?;
+    Some(scope.rect().r0)
+}
+
+pub fn column_values(d: &Doc, row: u32, col: u32) -> Result<Vec<(String, u32, bool)>, String> {
+    let scope = filter_scope(d, row, col).ok_or("There is no filter here.")?;
+    let rect = scope.rect();
+    let first = scope.first();
+    if !(rect.c0..=rect.c1).contains(&col) {
         return Err("Put the cursor in a column of the filter.".into());
     }
-    let all = d.wb.filter_values(&f.rect, col, MAX_VALUES + 1);
+    let all = d.wb.filter_values_from(&rect, first, col, MAX_VALUES + 1);
     if all.len() > MAX_VALUES {
         return Err(format!("This column has more than {MAX_VALUES} different values; use Show Only or Hide."));
     }
-    let now = f.conds.iter().find(|(c, _)| *c == col).map(|(_, c)| c.clone());
+    let now = scope.conds().iter().find(|(c, _)| *c + scope.offset() == col).map(|(_, c)| c);
     let key = officina_grid::eval::funcs::text_key;
     Ok(all
         .into_iter()
         .map(|(t, n)| {
-            let on = match &now {
+            let on = match now {
                 Some(Cond::Values(v)) => v.iter().any(|x| key(x) == key(&t)),
                 // A rule: what it kept at the last application.
-                Some(_) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
+                Some(_) => (first..=rect.r1).any(|r| !scope.hides(d, r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
                 None => true,
             };
             (t, n, on)
@@ -563,12 +620,31 @@ pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, Stri
         .collect())
 }
 
-/// Keeps the rows of column `col` showing one of `keep` (every row when `keep`
-/// holds every value: the column's condition goes), one undo step.
-pub fn keep_values(d: &mut Doc, col: u32, keep: Vec<String>, every: bool) {
+fn change_filter(d: &mut Doc, row: u32, col: u32, filter: AutoFilter) -> Result<String, String> {
+    let scope = filter_scope(d, row, col).ok_or("There is no filter here.")?;
+    let (op, hidden) = match scope {
+        FilterScope::Worksheet(_) => {
+            let state = d.wb.filtered(d.sheet, Some(filter));
+            let hidden = hidden_in(&state, &scope.rect());
+            (GridOp::Filter(state), hidden)
+        }
+        FilterScope::Table(t) => {
+            let applied = d.wb.apply_table_filter(t, filter);
+            let hidden = applied.hidden.iter().map(|(a, b)| b - a + 1).sum();
+            let name = t.name.clone();
+            let mut tables = d.wb.tables().to_vec();
+            tables.iter_mut().find(|t| t.name == name).unwrap().filter = Some(applied);
+            (GridOp::Tables(tables), hidden)
+        }
+    };
+    d.run("Filter", vec![op]);
+    Ok(if hidden == 0 { "The filter shows every row.".into() } else { format!("{hidden} rows hidden by the filter.") })
+}
+
+/// Replace this column's selection within its own filter, in one undo step.
+pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bool) {
     let msg = (|| {
-        let s = d.sheet;
-        let f = d.wb.sheet(s).filter.clone().ok_or("There is no filter on this sheet.")?;
+        let mut f = filter_scope(d, row, col).ok_or("There is no filter here.")?.auto_filter();
         let mut conds = f.conds.clone();
         conds.retain(|(c, _)| *c != col);
         if !every {
@@ -578,14 +654,10 @@ pub fn keep_values(d: &mut Doc, col: u32, keep: Vec<String>, every: bool) {
         if conds == f.conds {
             return Ok::<String, String>("The filter is as it was.".into());
         }
-        let st = d.wb.filtered(s, Some(AutoFilter { rect: f.rect, conds }));
-        let hidden = hidden_in(&st, &f.rect);
-        d.run("Filter", vec![GridOp::Filter(st)]);
-        Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
+        f.conds = conds;
+        change_filter(d, row, col, f)
     })();
-    d.status = match msg {
-        Ok(m) | Err(m) => m,
-    };
+    d.status = match msg { Ok(m) | Err(m) => m };
 }
 
 fn hidden_in(st: &officina_grid::filter::FilterState, r: &Rect) -> u32 {
@@ -889,7 +961,8 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::SortAsc | DataCmd::SortDesc => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
-            if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0) {
+            if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0)
+                || d.wb.sheet(s).table_hidden().iter().any(|&(a,b)| a <= t.rect.r1 && b >= t.rect.r0) {
                 return Err("Show all rows before sorting: the filter hides some of them.".into());
             }
             let mut rect = t.rect;
@@ -913,6 +986,20 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
         }
         DataCmd::Filter => {
+            if let Some(table) = d.wb.table_at(s, row, col) {
+                if !matches!(filter_scope(d, row, col), Some(FilterScope::Worksheet(_))) {
+                    if table.filter_rect().is_none() {
+                        return Err("The table has no rows to filter.".into());
+                    }
+                    let name = table.name.clone();
+                    let mut all = d.wb.tables().to_vec();
+                    let table = all.iter_mut().find(|t| t.name == name).unwrap();
+                    let enabled = table.filter.is_none();
+                    table.filter = enabled.then(Default::default);
+                    d.run("Table Filter", vec![GridOp::Tables(all)]);
+                    return Ok(format!("Filter {} for {name}.", if enabled { "on" } else { "off" }));
+                }
+            }
             if d.wb.sheet(s).filter.is_some() {
                 let st = d.wb.filtered(s, None);
                 d.run("Remove Filter", vec![GridOp::Filter(st)]);
@@ -927,7 +1014,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(format!("Filter on {}: pick a cell and use Show Only or Hide.", range_text(&t.rect)))
         }
         DataCmd::KeepValue | DataCmd::HideValue | DataCmd::ClearColumn | DataCmd::ShowAll | DataCmd::ReapplyFilter => {
-            let f = d.wb.sheet(s).filter.clone().ok_or("There is no filter on this sheet.")?;
+            let scope = filter_scope(d, row, col).ok_or("There is no filter here.")?;
+            let first = scope.first();
+            let mut f = scope.auto_filter();
             let mut conds = f.conds.clone();
             let text = d.wb.formatted(CellAddr::new(s, row, col)).text;
             match cmd {
@@ -935,7 +1024,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 DataCmd::ShowAll => conds.clear(),
                 DataCmd::ClearColumn => conds.retain(|(c, _)| *c != col),
                 _ => {
-                    if !(f.rect.r0 + 1..=f.rect.r1).contains(&row) || !(f.rect.c0..=f.rect.c1).contains(&col) {
+                    if !(first..=f.rect.r1).contains(&row) || !(f.rect.c0..=f.rect.c1).contains(&col) {
                         return Err("Put the cursor on a value under the filter's header.".into());
                     }
                     let keep: Vec<String> = if cmd == DataCmd::KeepValue {
@@ -943,7 +1032,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                     } else {
                         // Every value the column shows now, but this one.
                         const MAX: usize = 10_000;
-                        let all = d.wb.filter_values(&f.rect, col, MAX + 1);
+                        let all = d.wb.filter_values_from(&f.rect, first, col, MAX + 1);
                         if all.len() > MAX {
                             return Err("This column has too many different values to hide one; use Show Only.".into());
                         }
@@ -959,14 +1048,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                     conds.sort_by_key(|(c, _)| *c);
                 }
             }
-            let st = d.wb.filtered(s, Some(AutoFilter { rect: f.rect, conds }));
-            let hidden = hidden_in(&st, &f.rect);
-            d.run("Filter", vec![GridOp::Filter(st)]);
-            Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
+            f.conds = conds;
+            change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
         DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
-        DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
+        DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
             if d.wb.tables().iter().any(|x| x.rect.sheet == s && x.rect.r0 <= t.rect.r1 && x.rect.r1 >= t.rect.r0 && x.rect.c0 <= t.rect.c1 && x.rect.c1 >= t.rect.c0) {
@@ -983,7 +1070,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 columns.push(n.as_str().into());
             }
             let name = (1..).map(|i| format!("Table{i}")).find(|n| d.wb.table(n).is_none() && d.wb.names().iter().all(|x| !x.name.eq_ignore_ascii_case(n))).unwrap();
-            let table = Table { name: name.as_str().into(), rect: t.rect, header: t.header, totals: false, columns, style: Some("TableStyleMedium2".into()), stripes: true };
+            let table = Table { name: name.as_str().into(), rect: t.rect, header: t.header, totals: false, columns, style: Some("TableStyleMedium2".into()), stripes: true, filter: None };
             let mut all = d.wb.tables().to_vec();
             all.push(table.clone());
             // Check it the way the engine will, so a refusal is said, not dropped.

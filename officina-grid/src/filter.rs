@@ -319,21 +319,53 @@ pub fn merge(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     out
 }
 
+fn intersect_rows(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    a.iter().flat_map(|&(lo, hi)| {
+        b[b.partition_point(|&(_, end)| end < lo)..].iter().take_while(move |&&(start, _)| start <= hi)
+            .map(move |&(start, end)| (lo.max(start), hi.min(end)))
+    }).collect()
+}
+
+fn subtract_rows(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut rows = Vec::new();
+    for &(mut lo, hi) in a {
+        for &(start, end) in &b[b.partition_point(|&(_, end)| end < lo)..] {
+            if start > hi { break; }
+            if start > lo { rows.push((lo, start - 1)); }
+            lo = lo.max(end + 1);
+            if lo > hi { break; }
+        }
+        if lo <= hi { rows.push((lo, hi)); }
+    }
+    rows
+}
+
+fn contains_row(ranges: &[(u32, u32)], row: u32) -> bool {
+    ranges.get(ranges.partition_point(|h| h.1 < row)).is_some_and(|h| h.0 <= row)
+}
+
 impl Sheet {
     /// Whether row `r` is hidden.
     pub fn row_hidden(&self, r: u32) -> bool {
-        let k = self.hidden.partition_point(|h| h.1 < r);
-        self.hidden.get(k).is_some_and(|h| h.0 <= r)
+        contains_row(&self.hidden, r) || contains_row(&self.table_hidden, r)
+    }
+
+    pub fn table_hidden(&self) -> &[(u32, u32)] {
+        &self.table_hidden
+    }
+
+    pub fn hidden_rows(&self) -> Vec<(u32, u32)> {
+        merge(self.hidden.iter().chain(&self.table_hidden).copied().collect())
     }
 
     /// Row sizes as the view lays them out: hidden rows zero high. O(overrides +
     /// hidden ranges); the app keeps it until rows or sizes change.
     pub fn view_row_sizes(&self) -> Sizes {
-        if self.hidden.is_empty() {
+        if self.hidden.is_empty() && self.table_hidden.is_empty() {
             return self.row_sizes.clone();
         }
         let mut over: Vec<(u32, f64)> = self.row_sizes.overrides().iter().copied().filter(|(r, _)| !self.row_hidden(*r)).collect();
-        for &(a, b) in &self.hidden {
+        for (a, b) in self.hidden_rows() {
             over.extend((a..=b).map(|r| (r, 0.0)));
         }
         Sizes::from_overrides(self.row_sizes.default, over)
@@ -341,6 +373,12 @@ impl Sheet {
 }
 
 impl Workbook {
+    pub fn filter_conditions(&self) -> impl Iterator<Item = &Cond> {
+        self.sheets.iter().filter_map(|sh| sh.filter.as_ref()).map(|f| f.conds.as_slice())
+            .chain(self.tables.iter().filter_map(|t| t.filter.as_ref()).map(|f| f.conds.as_slice()))
+            .flatten().map(|(_, cond)| cond)
+    }
+
     /// The sheet's filter and hidden rows now.
     pub fn filter_state(&self, sheet: u16) -> FilterState {
         let sh = self.sheet(sheet);
@@ -361,12 +399,12 @@ impl Workbook {
 
     /// The cutoff over the numeric data rows before intersecting other column
     /// conditions. All values tied at the cutoff are kept.
-    fn rank_cutoff(&self, rect: Rect, col: u32, rank: Rank) -> Option<f64> {
-        if rect.r0 >= rect.r1 {
+    fn rank_cutoff(&self, rect: Rect, first: u32, col: u32, rank: Rank) -> Option<f64> {
+        if first > rect.r1 {
             return None;
         }
         let mut numbers = Vec::new();
-        let column = Rect { r0: rect.r0 + 1, c0: col, c1: col, ..rect };
+        let column = Rect { r0: first, c0: col, c1: col, ..rect };
         self.each(&column, &mut |_, _, value| {
             if let Value::Num(x) = value {
                 if x.is_finite() {
@@ -405,47 +443,117 @@ impl Workbook {
             }
         }
         if let Some(f) = &mut filter {
-            if f.conds.iter().any(|(_, cond)| matches!(cond, Cond::DynamicDate(_))) {
-                let system = self.date_system();
-                let today = system.now();
-                for (_, cond) in &mut f.conds {
-                    if let Cond::DynamicDate(rule) = cond {
-                        rule.cached = rule.bounds(system, today);
-                    }
-                }
-            }
-            let prepared: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
-                Cond::Rank(rank) => Prepared::Rank(self.rank_cutoff(f.rect, *col, *rank)),
-                Cond::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
-                Cond::Calendar(selection) => Prepared::Calendar(selection.prepare()),
-                _ => Prepared::Other,
-            }).collect();
-            let mut run: Option<(u32, u32)> = None;
-            for r in f.rect.r0 + 1..=f.rect.r1 {
-                let keep = f.conds.iter().zip(&prepared).all(|((c, cond), prepared)| {
-                    cond.keeps(self, CellAddr::new(sheet, r, *c), prepared)
-                });
-                if !keep {
-                    run = match run {
-                        Some((a, b)) if b + 1 == r => Some((a, r)),
-                        Some(x) => {
-                            hidden.push(x);
-                            Some((r, r))
-                        }
-                        None => Some((r, r)),
-                    };
-                }
-            }
-            hidden.extend(run);
+            hidden.extend(self.filter_rows(f, f.rect.r0 + 1, true));
         }
         FilterState { sheet, filter, hidden: merge(hidden) }
+    }
+
+    fn filter_rows(&self, f: &mut AutoFilter, first: u32, reapply: bool) -> Vec<(u32, u32)> {
+        if f.conds.is_empty() || first > f.rect.r1 {
+            return Vec::new();
+        }
+        let mut hidden = Vec::new();
+        if reapply && f.conds.iter().any(|(_, cond)| matches!(cond, Cond::DynamicDate(_))) {
+            let system = self.date_system();
+            let today = system.now();
+            for (_, cond) in &mut f.conds {
+                if let Cond::DynamicDate(rule) = cond {
+                    rule.cached = rule.bounds(system, today);
+                }
+            }
+        }
+        let prepared: Vec<_> = f.conds.iter().map(|(col, cond)| match cond {
+            Cond::Rank(rank) => Prepared::Rank(self.rank_cutoff(f.rect, first, *col, *rank)),
+            Cond::Custom(tests, _) => Prepared::Custom(tests.iter().map(Test::prepare).collect()),
+            Cond::Calendar(selection) => Prepared::Calendar(selection.prepare()),
+            _ => Prepared::Other,
+        }).collect();
+        let mut run: Option<(u32, u32)> = None;
+        for r in first..=f.rect.r1 {
+            let keep = f.conds.iter().zip(&prepared).all(|((c, cond), prepared)| {
+                cond.keeps(self, CellAddr::new(f.rect.sheet, r, *c), prepared)
+            });
+            if !keep {
+                run = match run {
+                    Some((a, b)) if b + 1 == r => Some((a, r)),
+                    Some(x) => {
+                        hidden.push(x);
+                        Some((r, r))
+                    }
+                    None => Some((r, r)),
+                };
+            }
+        }
+        hidden.extend(run);
+        hidden
+    }
+
+    pub fn apply_table_filter(&self, table: &crate::tables::Table, mut filter: AutoFilter) -> crate::tables::TableFilter {
+        let rect = filter.rect;
+        let hidden = self.filter_rows(&mut filter, rect.r0 + u32::from(table.header), true);
+        crate::tables::TableFilter {
+            conds: filter.conds.into_iter().map(|(col, cond)| (col - rect.c0, cond)).collect(),
+            hidden: hidden.into_iter().map(|(lo, hi)| (lo - rect.r0, hi - rect.r0)).collect(),
+        }
+    }
+
+    pub(crate) fn rebuild_table_visibility(&mut self, sheet: u16) {
+        self.sheets[sheet as usize].table_hidden = merge(self.tables.iter()
+            .filter(|t| t.rect.sheet == sheet)
+            .filter_map(|t| t.filter.as_ref().map(|f| (t.rect.r0, f)))
+            .flat_map(|(base, f)| f.hidden.iter().map(move |(a, b)| (a + base, b + base)))
+            .collect());
+    }
+
+    /// Foreign row visibility is sheet-wide. Attribute saved hidden rows to the
+    /// table rules the cells currently fail, without changing the saved union.
+    /// ODS may additionally supply the rows it explicitly marks as filtered.
+    pub fn restore_table_visibility(&mut self, sheet: u16, filtered: Option<&[(u32, u32)]>) {
+        let sh = self.sheet(sheet);
+        let saved = sh.hidden.as_slice();
+        if saved.is_empty() {
+            return;
+        }
+        let owned: Vec<_> = self.tables.iter().enumerate().filter(|(_, t)| t.rect.sheet == sheet)
+            .filter_map(|(i, t)| {
+                let mut filter = t.auto_filter()?;
+                if filter.conds.is_empty() {
+                    return None;
+                }
+                let first = t.rect.r0 + u32::from(t.header);
+                let rows = intersect_rows(saved, &self.filter_rows(&mut filter, first, false));
+                Some((i, t.rect.r0, rows))
+            }).collect();
+        if owned.is_empty() {
+            return;
+        }
+        let worksheet = sh.filter.clone().map_or_else(Vec::new, |mut f| {
+            let first = f.rect.r0 + 1;
+            self.filter_rows(&mut f, first, false)
+        });
+        let mut taken = Vec::new();
+        for (i, base, rows) in owned {
+            self.tables[i].filter.as_mut().unwrap().hidden = rows.iter().map(|(a, b)| (a - base, b - base)).collect();
+            taken.extend(rows);
+        }
+        let mut remove = subtract_rows(&merge(taken), &worksheet);
+        if let Some(filtered) = filtered {
+            let manual = subtract_rows(&self.sheet(sheet).hidden, filtered);
+            remove = subtract_rows(&remove, &manual);
+        }
+        self.sheets[sheet as usize].hidden = subtract_rows(&self.sheet(sheet).hidden, &remove);
+        self.rebuild_table_visibility(sheet);
     }
 
     /// The values a filter column offers to pick from: distinct shown texts below the
     /// header, sorted, with how many rows show each (at most `max`).
     pub fn filter_values(&self, rect: &Rect, col: u32, max: usize) -> Vec<(String, u32)> {
+        self.filter_values_from(rect, rect.r0 + 1, col, max)
+    }
+
+    pub fn filter_values_from(&self, rect: &Rect, first: u32, col: u32, max: usize) -> Vec<(String, u32)> {
         let mut m: std::collections::BTreeMap<String, (String, u32)> = std::collections::BTreeMap::new();
-        for r in rect.r0 + 1..=rect.r1 {
+        for r in first..=rect.r1 {
             let t = self.formatted(CellAddr::new(rect.sheet, r, col)).text;
             let e = m.entry(text_key(&t)).or_insert((t, 0));
             e.1 += 1;

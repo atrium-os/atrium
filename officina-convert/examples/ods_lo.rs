@@ -159,7 +159,7 @@ fn fixture(cases: &[(String, String)], st: &[(Style, Value)]) -> Workbook {
         totals: false,
         columns: vec!["Item".into(), "Qty".into(), "Double".into()],
         style: Some("TableStyleMedium2".into()),
-        stripes: true,
+        stripes: true, filter: None,
     })
     .unwrap();
     wb.fill_formula(1, 2, 41, 43, "=[@Qty]*2").unwrap();

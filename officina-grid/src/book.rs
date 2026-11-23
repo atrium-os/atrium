@@ -36,6 +36,8 @@ pub struct Sheet {
     pub styles: Vec<StyleRuns>,
     /// Hidden rows, as sorted, disjoint ranges (a filter's and by hand).
     pub hidden: Vec<(u32, u32)>,
+    /// Union of the tables’ last applied row masks, rebuilt when tables change.
+    pub(crate) table_hidden: Vec<(u32, u32)>,
     /// The auto-filter, if the sheet has one.
     pub filter: Option<crate::filter::AutoFilter>,
     /// The colour of its tab, 0xRRGGBB.
@@ -62,7 +64,7 @@ pub struct Sheet {
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
+        Sheet { protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -260,7 +262,7 @@ impl Workbook {
             }
             n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
             n += sh.axis_ids.iter().map(|ids| ids.bytes()).sum::<u64>();
-            n += sh.hidden.len() as u64 * 8;
+            n += (sh.hidden.len() + sh.table_hidden.len()) as u64 * 8;
             n += sh.merges.len() as u64 * 20;
             n += sh.comments.values().map(crate::comments::Comment::estimated_bytes).sum::<u64>();
             n += sh.links.values().map(|k| 48 + k.target.len() as u64).sum::<u64>();
