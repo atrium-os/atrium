@@ -361,6 +361,7 @@ pub enum Lane {
     ScreenedOut,
     /// Every attachment across mail (§8.1).
     Files,
+    SendStatus,
 }
 
 impl Lane {
@@ -374,6 +375,7 @@ impl Lane {
             Lane::NewSenders => "New senders",
             Lane::ScreenedOut => "Screened out",
             Lane::Files => "Files",
+            Lane::SendStatus => "Send status",
         }
     }
 }
@@ -393,6 +395,8 @@ pub struct Ui {
     pub saved: Vec<SavedPlace>,
     /// The views shown under the folders, with a count where it matters.
     pub views: Vec<(Lane, usize)>,
+    send_status_visible: bool,
+    send_rows: Vec<mail_engine::send::JmapSendRow>,
     /// The Files view's files and their total size (§8.1).
     pub files_total: (usize, u64),
     /// Later items past their time (the sidebar marks them).
@@ -912,6 +916,13 @@ impl Mail {
                 return;
             }
         };
+        ui.send_status_visible = accounts.iter().any(|(id, _)| {
+            store.account_config(*id).ok().flatten()
+                .is_some_and(|config| matches!(config.protocol, mail_store::Protocol::Jmap { .. }))
+        });
+        if ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::SendStatus)) {
+            self.refresh_send_status(&mut ui);
+        }
         let many = accounts.len() > 1;
         let mut places = Vec::new();
         for (aid, a) in &accounts {
@@ -1776,10 +1787,13 @@ impl Mail {
         if lane == Lane::Files {
             return e.search(&mail_engine::search::parse("has:attachment", false)).unwrap_or_default();
         }
+        if lane == Lane::SendStatus {
+            return Vec::new();
+        }
         let mut ids = Vec::new();
         for (a, _) in e.store.accounts().unwrap_or_default() {
             match lane {
-                Lane::Later | Lane::Dropped | Lane::Files => {}
+                Lane::Later | Lane::Dropped | Lane::Files | Lane::SendStatus => {}
                 Lane::People => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::People, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Updates => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Updates, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Newsletters => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Newsletters, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
@@ -2014,7 +2028,17 @@ impl Mail {
         self.find.borrow_mut().set_text("");
         ui.search = Some(Search { view: Some(lane), ..Search::default() });
         self.run_search(&mut ui);
+        if lane == Lane::SendStatus {
+            self.refresh_send_status(&mut ui);
+        }
         self.ui.set(ui);
+    }
+
+    fn refresh_send_status(&self, ui: &mut Ui) {
+        match self.engine.jmap_send_rows() {
+            Ok(rows) => ui.send_rows = rows,
+            Err(e) => eprintln!("atrium-mail: Send status: {e}"),
+        }
     }
 
     /// Unsubscribe from message `k`'s list (§11.3): one press does it where
@@ -3388,24 +3412,29 @@ impl View for MailView {
         ctx.min_size(pergola::geom::Size::new(em(320.0), head_h() + 4.0 * row_h()));
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_canvas());
         let typing = ui.search.as_ref().is_some_and(|s| s.typing);
+        let send_status = ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::SendStatus));
         match layout_for(w) {
             Layout::Wide => {
                 // The places and the list keep their widths; the reader
                 // takes the rest.
                 let side = side_w().min(w * 0.22);
-                let list = list_width(w);
+                let list = if send_status { w - side } else { list_width(w) };
                 self.places(ctx, &ui, side, h);
                 self.list(ctx, &ui, side, list, h, false);
                 self.toast(ctx, &ui, side, list, h);
-                self.reader(ctx, &ui, side + list, w - side - list, h, false);
+                if !send_status {
+                    self.reader(ctx, &ui, side + list, w - side - list, h, false);
+                }
             }
             Layout::Medium => {
                 let rail = rail_w();
-                let list = list_width(w);
+                let list = if send_status { w - rail } else { list_width(w) };
                 self.rail(ctx, &ui, rail, h);
                 self.list(ctx, &ui, rail, list, h, false);
                 self.toast(ctx, &ui, rail, list, h);
-                self.reader(ctx, &ui, rail + list, w - rail - list, h, false);
+                if !send_status {
+                    self.reader(ctx, &ui, rail + list, w - rail - list, h, false);
+                }
                 if ui.side_open || typing {
                     self.places(ctx, &ui, side_w(), h);
                 }
@@ -3606,7 +3635,20 @@ impl MailView {
         // Settings (,), kept at the foot of the sidebar.
         {
             let fy = h - place_h() - 8.0;
-            rect(ctx, Rect::new(0.0, fy - 8.0, w - 1.0, place_h() + 16.0), t.bg_surface());
+            let foot_top = if ui.send_status_visible { fy - place_h() } else { fy };
+            rect(ctx, Rect::new(0.0, foot_top - 8.0, w - 1.0, h - foot_top + 8.0), t.bg_surface());
+            if ui.send_status_visible {
+                let lane = Lane::SendStatus;
+                let selected = ui.search.as_ref().is_some_and(|s| s.view == Some(lane));
+                let fill = if selected { t.selection_bg() } else { Color::TRANSPARENT };
+                let m = self.mail.clone();
+                area(ctx, Rect::new(8.0, foot_top, w - 16.0, place_h()), fill, move || {
+                    m.close_side();
+                    m.show_view(lane);
+                });
+                text(ctx, 20.0, foot_top + place_h() / 2.0, lane.label(), type_size::SM, Weight::Medium, t.text_primary());
+                ctx.pop();
+            }
             let m = self.mail.clone();
             area(ctx, Rect::new(8.0, fy, w - 16.0, place_h()), Color::TRANSPARENT, move || m.ask_settings());
             text(ctx, 20.0, fy + place_h() / 2.0, "Settings", type_size::SM, Weight::Regular, t.text_secondary());
@@ -3808,6 +3850,10 @@ impl MailView {
             text(ctx, x0 + 16.0, top + em(20.0), &fit(e, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.danger_fg());
             return;
         }
+        if ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::SendStatus)) && !ui.send_rows.is_empty() {
+            self.send_status(ctx, ui, Rect::new(x0, top, w - 1.0, h - top));
+            return;
+        }
         if ui.count == 0 {
             match &ui.search {
                 Some(Search { view: Some(v), .. }) => {
@@ -3820,6 +3866,7 @@ impl MailView {
                         Lane::NewSenders => "No one new is waiting",
                         Lane::ScreenedOut => "Nothing screened out",
                         Lane::Files => "No files in your mail",
+                        Lane::SendStatus => "No JMAP send activity",
                     };
                     text(ctx, x0 + 16.0, top + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
                 }
@@ -3902,6 +3949,33 @@ impl MailView {
         .key(100)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+    }
+
+    fn send_status(&self, ctx: &mut Ctx, ui: &Ui, bounds: Rect) {
+        use mail_engine::send::JmapSendStatus;
+
+        let rows = ui.send_rows.clone();
+        let height = em(76.0);
+        let w = bounds.w();
+        VirtualList::new(self.mail.list.clone(), bounds, rows.len(), height, move |i, ctx| {
+            let t = ctx.theme;
+            let item = &rows[i];
+            let subject = if item.subject.trim().is_empty() { "(No subject)" } else { &item.subject };
+            let label = match item.status {
+                JmapSendStatus::Held => "Awaiting confirmation",
+                JmapSendStatus::Canceled => "Canceled by server",
+                JmapSendStatus::Accepted => "Accepted for sending",
+            };
+            row(ctx, w, height);
+            text(ctx, 16.0, em(19.0), &fit(subject, type_size::SM, Weight::Semibold, w - 32.0), type_size::SM, Weight::Semibold, t.text_primary());
+            text(ctx, 16.0, em(38.0), label, type_size::SM, Weight::Medium, t.text_primary());
+            if item.status == JmapSendStatus::Held {
+                let note = "This message may already have been sent.";
+                text(ctx, 16.0, em(57.0), &fit(note, type_size::XS, Weight::Regular, w - 32.0), type_size::XS, Weight::Regular, t.text_secondary());
+            }
+            rect(ctx, Rect::new(12.0, height - 1.0, w - 24.0, 1.0), t.border_default());
+            ctx.pop();
+        }).key(104).backdrop(ctx.theme.bg_canvas()).emit(ctx);
     }
 
     /// One tile per attachment. Opening a tile selects its source message,

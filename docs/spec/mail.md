@@ -1748,8 +1748,19 @@ Stalwart in the cloud VM, and later a real account):
    cancellation reason. Per-recipient delivery uses separate optional
    status. Missing, pruned, ambiguous or mismatched records, and older rows
    without a verified Email ID, stay held. Reconciliation never uploads,
-   imports or resubmits. The store keeps the
-   Email state per account. Test: the
+   imports or resubmits.
+
+   The sidebar’s **Send status** view shows JMAP send subjects with
+   **Awaiting confirmation**, **Canceled by server**, or **Accepted for sending**.
+   A held row says the message may already have been sent and has no Retry
+   action. The view refreshes when sync changes an outcome. Acceptance covers
+   a successful submission acknowledgment or a matching pending or final
+   submission record. Recipient delivery remains a separate status. Mail
+   stores the subject for up to 24 accepted sends, newest first by outbox ID,
+   and removes the account’s acceptance history when the account is removed.
+   Earlier cancellation rows remain visible after upgrading.
+
+   The store keeps the Email state per account. Test: the
    engine with real jails against an in-process JMAP server (first sync, one message in
    two mailboxes, a large one by headers only, archive + read made on the server, changes
    from elsewhere, a too-old state, send with Bcc only in the envelope, refused sender).

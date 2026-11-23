@@ -10,7 +10,7 @@ use std::process::Command;
 use std::rc::Rc;
 
 use mail_compose::{Draft, Mailbox};
-use mail_engine::send::{Delivery, When};
+use mail_engine::send::{Delivery, JmapSendRow, JmapSendStatus, When};
 use mail_engine::{Action, Engine, Parser};
 use mail_schema::SenderCheck;
 use mail_store::flag;
@@ -836,6 +836,9 @@ fn jmap_persists_submission_evidence_before_dispatch_and_resolves_after_restart(
         assert!(matches!(delivery, Delivery::Failed { transient: false, .. }));
         assert!(matches!(engine.store.outbox().unwrap()[0].1.state, SendState::Uncertain { .. }));
         assert!(engine.store.jmap_submission(id).unwrap().is_some());
+        assert_eq!(engine.jmap_send_rows().unwrap(), [JmapSendRow {
+            subject: draft.subject.clone(), status: JmapSendStatus::Held,
+        }]);
         assert_eq!(server.borrow().submitted.len(), 1);
         {
             let mut s = server.borrow_mut();
@@ -849,12 +852,17 @@ fn jmap_persists_submission_evidence_before_dispatch_and_resolves_after_restart(
         assert_eq!(engine.reconcile_jmap_sends(account, client.as_mut()).unwrap(), usize::from(status != "canceled"));
         assert!(engine.store.jmap_submission(id).unwrap().is_none());
         let outbox = engine.store.outbox().unwrap();
-        if status == "canceled" {
-            assert!(matches!(&outbox[0].1.state, SendState::Stopped { why } if why.contains("canceled")));
+        let expected = if status == "canceled" {
+            assert_eq!(outbox[0].1.state, SendState::JmapCanceled);
+            JmapSendStatus::Canceled
         } else {
             assert!(outbox.is_empty());
             assert_eq!(engine.complete("sam", 5).unwrap().len(), 1, "count the accepted Bcc recipient");
-        }
+            JmapSendStatus::Accepted
+        };
+        assert_eq!(engine.jmap_send_rows().unwrap(), [JmapSendRow {
+            subject: draft.subject, status: expected,
+        }]);
         assert_eq!(engine.reconcile_jmap_sends(account, client.as_mut()).unwrap(), 0);
         assert_eq!(engine.deliver_jmap(id, client.as_mut()).unwrap(), Delivery::NotDue);
         let s = server.borrow();
@@ -1151,6 +1159,9 @@ fn jmap_sync_changes_and_send() {
     let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert_eq!(d, Delivery::Sent { copy: None, rejected: vec![], held: false });
     assert!(engine.store.outbox().unwrap().is_empty());
+    assert_eq!(engine.jmap_send_rows().unwrap(), [JmapSendRow {
+        subject: draft.subject.clone(), status: JmapSendStatus::Accepted,
+    }]);
     {
         let s = server.borrow();
         let sub = &s.submitted[0];

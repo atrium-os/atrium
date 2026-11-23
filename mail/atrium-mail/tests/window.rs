@@ -989,11 +989,10 @@ fn a_read_item_closes_when_read_to_the_end() {
 fn a_signed_message_says_who_signed_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
-    let data = |f: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
-    engine.set_roots(vec![data("ca.der")]);
+    engine.set_roots(vec![include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()]);
     let engine = Rc::new(engine);
     let account = engine.store.add_account("priya@example.org").unwrap();
-    let raw = data("signed.eml");
+    let raw = include_bytes!("../../mail-smime/tests/data/signed.eml").to_vec();
     {
         let mut sink = engine.sink(account);
         sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
@@ -1017,15 +1016,14 @@ fn an_encrypted_message_is_read_with_the_person_s_key() {
     use rsa::pkcs8::DecodePrivateKey;
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
-    let data = |f: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
-    engine.set_roots(vec![data("ca.der")]);
+    engine.set_roots(vec![include_bytes!("../../mail-smime/tests/data/ca.der").to_vec()]);
     let engine = Rc::new(engine);
     let account = engine.store.add_account("grace@example.net").unwrap();
     {
         let mut sink = engine.sink(account);
         sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
         let f = |uid, bytes: Vec<u8>| Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW), server_id: None, bytes, full: true };
-        sink.messages("INBOX", vec![f(1, data("signed.eml")), f(2, data("encrypted.eml"))]).unwrap();
+        sink.messages("INBOX", vec![f(1, include_bytes!("../../mail-smime/tests/data/signed.eml").to_vec()), f(2, include_bytes!("../../mail-smime/tests/data/encrypted.eml").to_vec())]).unwrap();
     }
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
@@ -1038,7 +1036,7 @@ fn an_encrypted_message_is_read_with_the_person_s_key() {
     assert!(texts(&app).iter().any(|x| x.contains("This message is encrypted.")), "{:?}", texts(&app));
     assert!(texts(&app).iter().any(|x| x == "Encrypted with S/MIME"));
     // With a key (the token's, here in software): read.
-    let key = rsa::RsaPrivateKey::from_pkcs8_der(&data("leaf.p8")).unwrap();
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(include_bytes!("../../mail-smime/tests/data/leaf.p8")).unwrap();
     *mail.unwrapper.borrow_mut() = Some(Rc::new(move |_: &[u8], w: &[u8]| key.decrypt(rsa::Pkcs1v15Encrypt, w).map_err(|e| e.to_string())));
     mail.open(row);
     app.tick();
@@ -1616,4 +1614,98 @@ fn files_across_mail() {
     let total = 20 + s.hits[1].files[0].size;
     assert_eq!(mail.ui.get_cloned().files_total, (2, total));
     assert!(texts(&app).contains(&format!("2 files, {total} bytes")), "{:?}", texts(&app));
+}
+
+#[test]
+fn jmap_send_status_words_stay_distinct_and_held_has_no_retry() {
+    use atrium_mail::view::{place_h, Lane};
+    use mail_compose::{Draft, Mailbox};
+    use mail_engine::send::When;
+    use mail_store::{AccountConfig, Protocol};
+    use pergola::theme::Semantic;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_configured(&AccountConfig {
+        address: "ada@example.org".into(),
+        name: "Ada".into(),
+        protocol: Protocol::Jmap { session: "https://jmap.test/.well-known/jmap".into() },
+        incoming_item: None,
+        outgoing_item: None,
+        oauth: None,
+        reached: Default::default(),
+    }).unwrap();
+
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    assert!(texts(&app).contains(&"Send status".into()));
+    let at = Point::new(48.0, 800.0 - 8.0 - 1.5 * place_h());
+    app.handle_event(Event::PointerDown { at });
+    app.handle_event(Event::PointerUp { at });
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().search.unwrap().view, Some(Lane::SendStatus));
+    assert!(texts(&app).contains(&"No JMAP send activity".into()));
+
+    let queue = |subject: &str| {
+        let draft = Draft {
+            from: Mailbox::new("Ada", "ada@example.org"),
+            to: vec![Mailbox::new("Grace", "grace@example.net")],
+            subject: subject.into(),
+            text: "One copy, please.".into(),
+            ..Default::default()
+        };
+        engine.send(account, &draft, When::default()).unwrap()
+    };
+    let (accepted, canceled, held) = (queue("Planning"), queue("Budget"), queue("Meeting"));
+    let evidence = b"synthetic submission evidence";
+    engine.store.write(|w| {
+        for id in [accepted, canceled, held] {
+            assert!(w.claim_jmap_send(id, i64::MAX)?);
+            assert!(w.save_jmap_submission(id, evidence)?);
+            w.send_uncertain(id, "Reply lost")?;
+        }
+        assert!(w.resolve_jmap_submission(canceled, evidence, true)?.is_none());
+        assert!(w.resolve_jmap_submission(accepted, evidence, false)?.is_some());
+        w.record_jmap_acceptance(accepted, account, "Planning")
+    }).unwrap();
+
+    mail.refresh();
+    for theme in [Semantic::LIGHT, Semantic::DARK] {
+        app.set_theme(theme);
+        app.tick();
+        let t = texts(&app);
+        let index = |label| t.iter().position(|line| line == label).unwrap_or_else(|| panic!("Missing {label:?}: {t:?}"));
+        for (subject, label) in [
+            ("Meeting", "Awaiting confirmation"),
+            ("Budget", "Canceled by server"),
+            ("Planning", "Accepted for sending"),
+        ] {
+            assert_eq!(index(subject) + 1, index(label));
+            assert!(app.tree().iter().any(|(_, node)| matches!(
+                node, Node::Text { content, style, .. }
+                if content == label && style.color == theme.text_primary()
+            )));
+        }
+        assert_eq!(index("Awaiting confirmation") + 1, index("This message may already have been sent."));
+        assert!(t.iter().all(|line| !line.contains("Retry") && !line.contains("Send again")), "{t:?}");
+    }
+
+    engine.store.write(|w| {
+        assert!(w.resolve_jmap_submission(held, evidence, false)?.is_some());
+        w.record_jmap_acceptance(held, account, "Meeting")
+    }).unwrap();
+    mail.refresh();
+    app.tick();
+    let t = texts(&app);
+    assert!(!t.contains(&"Awaiting confirmation".into()));
+    assert_eq!(t.iter().filter(|line| *line == "Accepted for sending").count(), 2);
+
+    engine.store.write(|w| w.remove_account(account)).unwrap();
+    assert!(engine.jmap_send_rows().unwrap().is_empty());
+    mail.refresh();
+    app.tick();
+    assert!(texts(&app).contains(&"No JMAP send activity".into()));
 }

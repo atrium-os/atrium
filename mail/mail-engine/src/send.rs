@@ -61,6 +61,19 @@ pub enum Delivery {
     NotDue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JmapSendStatus {
+    Held,
+    Canceled,
+    Accepted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JmapSendRow {
+    pub subject: String,
+    pub status: JmapSendStatus,
+}
+
 pub(crate) fn random16() -> [u8; 16] {
     let mut r = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -263,8 +276,10 @@ impl Engine {
         match result {
             Ok(_) => {
                 self.store.write(|w| {
-                    w.send_done(id)?;
-                    self.note_wrote(w, &o)
+                    if let Some(sent) = w.send_done(id)? {
+                        self.note_jmap_acceptance(w, id, &sent)?;
+                    }
+                    Ok(())
                 })?;
                 Ok(Delivery::Sent { copy: None, rejected: Vec::new(), held: send_at.is_some() })
             }
@@ -276,6 +291,31 @@ impl Engine {
                 Ok(Delivery::Failed { why, transient: false })
             }
         }
+    }
+
+    fn note_jmap_acceptance(&self, w: &mut mail_store::Writer<'_>, id: u64, row: &Outgoing) -> mail_store::Result<()> {
+        let subject = self.draft_of(row).map(|draft| draft.subject).unwrap_or_default();
+        w.record_jmap_acceptance(id, row.account, &subject)?;
+        self.note_wrote(w, row)
+    }
+
+    pub fn jmap_send_rows(&self) -> Result<Vec<JmapSendRow>, Error> {
+        let mut rows = Vec::new();
+        let activity = self.store.jmap_send_activity()?;
+        for (id, row) in activity.outstanding {
+            let status = if row.state.canceled_by_jmap() {
+                JmapSendStatus::Canceled
+            } else {
+                JmapSendStatus::Held
+            };
+            let subject = self.draft_of(&row).map(|draft| draft.subject).unwrap_or_default();
+            rows.push((id, JmapSendRow { subject, status }));
+        }
+        for (id, subject) in activity.accepted {
+            rows.push((id, JmapSendRow { subject, status: JmapSendStatus::Accepted }));
+        }
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        Ok(rows.into_iter().map(|(_, row)| row).collect())
     }
 
     /// Resolve held sends from verified submission status. This path only reads
@@ -315,7 +355,7 @@ impl Engine {
                 let Some(outgoing) = w.resolve_jmap_submission(*id, &evidence, status == SendStatus::Canceled)? else {
                     return Ok(false);
                 };
-                self.note_wrote(w, &outgoing)?;
+                self.note_jmap_acceptance(w, *id, &outgoing)?;
                 Ok(true)
             })? {
                 accepted += 1;

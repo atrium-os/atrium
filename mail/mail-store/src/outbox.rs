@@ -6,14 +6,29 @@
 //! The store keeps the written message and the draft it came from as blobs;
 //! it doesn't know what's in either.
 
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::{dec, enc, AccountId, Error, Hash, Result, Store, Writer};
+use crate::{dec, enc, AccountId, Error, Hash, Result, Store, Writer, ACCOUNTS};
 
 pub(crate) const OUTBOX: TableDefinition<u64, &[u8]> = TableDefinition::new("outbox");
 /// The server identity and envelope saved before dispatch.
 pub(crate) const JMAP_SUBMISSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_submissions");
+pub(crate) const JMAP_ACCEPTED: TableDefinition<u64, &[u8]> = TableDefinition::new("jmap_accepted_sends");
+
+const RECENT_ACCEPTED: u64 = 24;
+const CANCELED_BY_SERVER: &str = "The JMAP server canceled this submission.";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AcceptedSend {
+    account: AccountId,
+    subject: String,
+}
+
+pub struct JmapSendActivity {
+    pub outstanding: Vec<(u64, Outgoing)>,
+    pub accepted: Vec<(u64, String)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SendState {
@@ -30,11 +45,18 @@ pub enum SendState {
     JmapSending,
     /// Submission may have succeeded. Neither sync nor Send again resends it.
     Uncertain { why: String },
+    JmapCanceled,
 }
 
 impl SendState {
     fn waiting(&self) -> bool {
         matches!(self, Self::Waiting | Self::JmapRetry)
+    }
+
+    /// Recognize the cancellation reason stored before JmapCanceled existed.
+    pub fn canceled_by_jmap(&self) -> bool {
+        matches!(self, Self::JmapCanceled)
+            || matches!(self, Self::Stopped { why } if why == CANCELED_BY_SERVER)
     }
 }
 
@@ -68,6 +90,31 @@ pub fn retry_after(tries: u32) -> i64 {
 }
 
 impl Writer<'_> {
+    pub fn record_jmap_acceptance(&mut self, id: u64, account: AccountId, subject: &str) -> Result<()> {
+        let row = AcceptedSend { account, subject: subject.chars().take(256).collect() };
+        let mut table = self.tx.open_table(JMAP_ACCEPTED)?;
+        table.insert(id, enc(&row).as_slice())?;
+        while table.len()? > RECENT_ACCEPTED {
+            table.pop_first()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_jmap_acceptances(&mut self, account: AccountId) -> Result<()> {
+        let mut table = self.tx.open_table(JMAP_ACCEPTED)?;
+        let mut ids = Vec::new();
+        for row in table.iter()? {
+            let (id, send) = row?;
+            if dec::<AcceptedSend>(send.value())?.account == account {
+                ids.push(id.value());
+            }
+        }
+        for id in ids {
+            table.remove(id)?;
+        }
+        Ok(())
+    }
+
     /// Put `o` in the outbox; its id.
     pub fn queue_send(&mut self, o: &Outgoing) -> Result<u64> {
         let id = Store::next_id(self.tx, "send")?;
@@ -160,22 +207,24 @@ impl Writer<'_> {
     /// Apply a read-only finding only while the original held row and its
     /// evidence still exist. Return an accepted send for address bookkeeping.
     pub fn resolve_jmap_submission(&mut self, id: u64, evidence: &[u8], canceled: bool) -> Result<Option<Outgoing>> {
-        {
-            let outbox = self.tx.open_table(OUTBOX)?;
-            let row = outbox.get(id)?.map(|value| dec::<Outgoing>(value.value())).transpose()?;
-            if !row.is_some_and(|row| matches!(row.state, SendState::Uncertain { .. })) {
-                return Ok(None);
-            }
-            let saved = self.tx.open_table(JMAP_SUBMISSIONS)?;
-            if !saved.get(id)?.is_some_and(|value| value.value() == evidence) {
-                return Ok(None);
-            }
-        }
-        if canceled {
-            self.send_failed(id, "The JMAP server canceled this submission.", false, 0)?;
+        let mut outbox = self.tx.open_table(OUTBOX)?;
+        let row = outbox.get(id)?.map(|value| dec::<Outgoing>(value.value())).transpose()?;
+        let Some(mut row) = row.filter(|row| matches!(row.state, SendState::Uncertain { .. })) else {
+            return Ok(None);
+        };
+        let mut saved = self.tx.open_table(JMAP_SUBMISSIONS)?;
+        if !saved.get(id)?.is_some_and(|value| value.value() == evidence) {
             return Ok(None);
         }
-        self.send_done(id)
+        saved.remove(id)?;
+        if canceled {
+            row.state = SendState::JmapCanceled;
+            row.last_error = Some(CANCELED_BY_SERVER.into());
+            outbox.insert(id, enc(&row).as_slice())?;
+            return Ok(None);
+        }
+        outbox.remove(id)?;
+        Ok(Some(row))
     }
 
     pub fn send_uncertain(&mut self, id: u64, why: &str) -> Result<()> {
@@ -216,7 +265,7 @@ impl Writer<'_> {
     pub fn send_again(&mut self, id: u64, now: i64) -> Result<bool> {
         let mut t = self.tx.open_table(OUTBOX)?;
         let Some(mut o) = t.get(id)?.map(|v| dec::<Outgoing>(v.value())).transpose()? else { return Ok(false) };
-        if !matches!(o.state, SendState::Stopped { .. }) {
+        if !matches!(o.state, SendState::Stopped { .. } | SendState::JmapCanceled) {
             return Ok(false);
         }
         o.state = if self.jmap_account(o.account)? { SendState::JmapRetry } else { SendState::Waiting };
@@ -265,6 +314,28 @@ fn uncertain(why: &str) -> SendState {
 }
 
 impl Store {
+    /// One snapshot: a send that just resolved appears in only one state.
+    pub fn jmap_send_activity(&self) -> Result<JmapSendActivity> {
+        let tx = self.db.begin_read()?;
+        let accounts = tx.open_table(ACCOUNTS)?;
+        let mut outstanding = Vec::new();
+        for entry in tx.open_table(OUTBOX)?.iter()? {
+            let (id, value) = entry?;
+            let row: Outgoing = dec(value.value())?;
+            if (matches!(row.state, SendState::Uncertain { .. }) || row.state.canceled_by_jmap())
+                && accounts.get(row.account)?.is_some()
+            {
+                outstanding.push((id.value(), row));
+            }
+        }
+        let accepted = tx.open_table(JMAP_ACCEPTED)?.iter()?.map(|entry| {
+            let (id, value) = entry?;
+            let row: AcceptedSend = dec(value.value())?;
+            Ok((id.value(), row.subject))
+        }).collect::<Result<_>>()?;
+        Ok(JmapSendActivity { outstanding, accepted })
+    }
+
     pub fn jmap_submission(&self, id: u64) -> Result<Option<Vec<u8>>> {
         let tx = self.db.begin_read()?;
         let saved = tx.open_table(JMAP_SUBMISSIONS)?;

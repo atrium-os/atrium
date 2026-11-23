@@ -28,7 +28,7 @@ pub use ops::{Op, OpKind, LEAVING};
 mod drafts;
 pub use drafts::LocalDraft;
 mod outbox;
-pub use outbox::{retry_after, Outgoing, SendState};
+pub use outbox::{retry_after, JmapSendActivity, Outgoing, SendState};
 pub mod search;
 pub mod senders;
 pub mod certs;
@@ -277,6 +277,7 @@ impl Store {
             tx.open_table(ops::OPS)?;
             tx.open_table(outbox::OUTBOX)?;
             tx.open_table(outbox::JMAP_SUBMISSIONS)?;
+            tx.open_table(outbox::JMAP_ACCEPTED)?;
             tx.open_table(drafts::DRAFTS)?;
             tx.open_table(thread::THREADS)?;
             tx.open_table(thread::MSGID_THREADS)?;
