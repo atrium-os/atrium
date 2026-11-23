@@ -14,7 +14,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use officina_grid::numfmt::{self, PALETTE};
-use officina_grid::style::{Edge, Font, HAlign, Line, PatternFill, Style, VAlign};
+use officina_grid::style::{Edge, Font, GradientFill, HAlign, Line, PatternFill, Style, VAlign};
 use officina_grid::Workbook;
 
 use crate::report::{Kind, Report};
@@ -202,7 +202,7 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
     let mut buf = Vec::new();
     let mut fmts: HashMap<u32, String> = HashMap::new();
     let mut fonts: Vec<FontIn> = Vec::new();
-    let mut borders: Vec<[Edge; 4]> = Vec::new();
+    let mut borders: Vec<[Edge; 6]> = Vec::new();
     let mut indexed = PALETTE;
     let mut custom_indexed: Vec<u32> = Vec::new();
     // A cell XF can inherit lock flags from a named style XF.
@@ -233,17 +233,21 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
     let mut sect = In::None;
     let mut font = FontIn::default();
     let mut fill_kind = String::new();
-    let mut border = [Edge::default(); 4];
+    let mut linear_angle = None;
+    let mut gradient_stops = Vec::new();
+    let mut stop = None;
+    let mut border = [Edge::default(); 6];
+    let mut diagonal = (false, false);
     let mut edge: Option<usize> = None;
     let mut in_xf = false;
     // Colours are resolved after the custom palette is known; keep raw attrs meanwhile.
     let mut font_colors: Vec<Option<HashMap<Vec<u8>, String>>> = Vec::new();
     let mut fill_colors = Vec::new();
-    let mut border_colors: Vec<[Option<HashMap<Vec<u8>, String>>; 4]> = Vec::new();
+    let mut border_colors: Vec<[Option<HashMap<Vec<u8>, String>>; 6]> = Vec::new();
     let mut fcol: Option<HashMap<Vec<u8>, String>> = None;
     let mut fillcol: Option<HashMap<Vec<u8>, String>> = None;
     let mut fill_bg = None;
-    let mut bcol: [Option<HashMap<Vec<u8>, String>>; 4] = Default::default();
+    let mut bcol: [Option<HashMap<Vec<u8>, String>>; 6] = Default::default();
     loop {
         buf.clear();
         let ev = match r.read_event_into(&mut buf) {
@@ -264,13 +268,23 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                         font_colors.push(fcol.take());
                     }
                     b"fill" if sect == In::Fills => {
-                        fill_colors.push((std::mem::take(&mut fill_kind), fillcol.take(), fill_bg.take()));
+                        fill_colors.push((std::mem::take(&mut fill_kind), fillcol.take(), fill_bg.take(), linear_angle.take(), std::mem::take(&mut gradient_stops)));
                     }
                     b"border" if sect == In::Borders => {
+                        if diagonal.1 {
+                            border[5] = border[4];
+                            bcol[5] = bcol[4].clone();
+                        }
+                        if !diagonal.0 {
+                            border[4] = Edge::default();
+                            bcol[4] = None;
+                        }
                         borders.push(std::mem::take(&mut border));
+                        diagonal = (false, false);
                         border_colors.push(std::mem::take(&mut bcol));
                     }
-                    b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom" => edge = None,
+                    b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom" | b"diagonal" => edge = None,
+                    b"stop" => stop = None,
                     b"xf" => in_xf = false,
                     _ => {}
                 }
@@ -319,24 +333,41 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                 }
             }
             (In::Fills, b"fill") if empty => {
-                fill_colors.push((String::new(), None, None));
+                fill_colors.push((String::new(), None, None, None, Vec::new()));
             }
             (In::Fills, b"patternFill") => {
                 fill_kind = attrs(&e).get(b"patternType".as_slice()).cloned().unwrap_or_else(|| "none".into());
-                if fill_kind != "none" && fill_kind != "solid" && fill_kind != "gray125" {
-                    rep.note(Kind::Approximate, "patterned fills shown solid");
-                }
+
             }
             (In::Fills, b"fgColor") if fill_kind != "none" => fillcol = Some(attrs(&e)),
             (In::Fills, b"bgColor") if fill_kind != "none" && fill_kind != "solid" => fill_bg = Some(attrs(&e)),
             (In::Fills, b"gradientFill") => {
-                rep.note(Kind::Approximate, "gradient fills shown in their first colour");
+                let a = attrs(&e);
+                if a.get(b"type".as_slice()).is_none_or(|value| value == "linear") {
+                    linear_angle = a.get(b"degree".as_slice()).map_or(Some(0.0), |v| v.parse::<f64>().ok());
+                }
                 fill_kind = "gradient".into();
             }
-            (In::Fills, b"color") if fill_kind == "gradient" && fillcol.is_none() => fillcol = Some(attrs(&e)),
-            (In::Borders, b"border") if empty => {
-                borders.push([Edge::default(); 4]);
-                border_colors.push(Default::default());
+            (In::Fills, b"stop") if fill_kind == "gradient" && !empty => {
+                stop = attrs(&e).get(b"position".as_slice()).and_then(|v| v.parse::<f64>().ok());
+            }
+            (In::Fills, b"color") if fill_kind == "gradient" => {
+                let a = attrs(&e);
+                if fillcol.is_none() {
+                    fillcol = Some(a.clone());
+                }
+                if gradient_stops.len() <= GradientFill::MAX_STOPS {
+                    gradient_stops.push((stop.take().unwrap_or(f64::NAN), a));
+                }
+            }
+            (In::Borders, b"border") => {
+                if empty {
+                    borders.push([Edge::default(); 6]);
+                    border_colors.push(Default::default());
+                } else {
+                    let a = attrs(&e);
+                    diagonal = (truthy(a.get(b"diagonalDown".as_slice())), truthy(a.get(b"diagonalUp".as_slice())));
+                }
             }
             (In::Borders, b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom") => {
                 let i = match n {
@@ -349,9 +380,8 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                 edge = if empty { None } else { Some(i) };
             }
             (In::Borders, b"diagonal") => {
-                if attrs(&e).get(b"style".as_slice()).is_some_and(|s| s != "none") {
-                    rep.note(Kind::Dropped, "diagonal borders");
-                }
+                border[4].line = attrs(&e).get(b"style".as_slice()).and_then(|s| Line::from_name(s)).unwrap_or(Line::None);
+                edge = (!empty).then_some(4);
             }
             (In::Borders, b"color") => {
                 if let Some(i) = edge {
@@ -416,22 +446,29 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
         f.color = col(c);
         f
     }).collect();
-    let fills: Vec<_> = fill_colors.iter().map(|(name, fg, bg)| {
+    let fills: Vec<_> = fill_colors.iter().map(|(name, fg, bg, angle, stops)| {
         let (fg, bg) = (col(fg), col(bg));
-        (fg.or(bg), PatternFill::new(name, fg, bg))
+        let pattern = PatternFill::new(name, fg, bg);
+        let gradient = angle.and_then(|angle| {
+            let resolved: Option<Vec<_>> = stops.iter().map(|(pos, a)| Some((*pos, colors.of(a)?))).collect();
+            GradientFill::new(angle, resolved?)
+        });
+        if name == "gradient" && gradient.is_none() {
+            rep.note(Kind::Approximate, "unsupported gradient fills shown in their first colour");
+        }
+        if !matches!(name.as_str(), "" | "none" | "solid" | "gradient") && pattern.is_none() {
+            rep.note(Kind::Approximate, "unsupported patterned fills shown solid");
+        }
+        (fg.or(bg), pattern, gradient)
     }).collect();
-    let borders: Vec<[Edge; 4]> = borders
-        .into_iter()
-        .zip(border_colors.iter())
-        .map(|(mut b, c)| {
-            for i in 0..4 {
-                if b[i].line != Line::None {
-                    b[i].color = col(&c[i]);
-                }
+    let borders: Vec<[Edge; 6]> = borders.into_iter().zip(border_colors.iter()).map(|(mut b, c)| {
+        for (edge, color) in b.iter_mut().zip(c) {
+            if edge.line != Line::None {
+                edge.color = col(color);
             }
-            b
-        })
-        .collect();
+        }
+        b
+    }).collect();
     let base = fonts.first().cloned().unwrap_or_default();
     let mut out = Vec::with_capacity(xfs.len());
     for xf in xfs {
@@ -461,9 +498,10 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
                     || (fo != 0 && font_colors.get(fo) != font_colors.first())),
             };
         }
-        (s.fill, s.pattern) = fills.get(fi).copied().unwrap_or_default();
+        (s.fill, s.pattern, s.gradient) = fills.get(fi).cloned().unwrap_or_default();
         if let Some(b) = borders.get(bo) {
-            s.borders = *b;
+            s.borders.copy_from_slice(&b[..4]);
+            s.diagonals.copy_from_slice(&b[4..]);
         }
         if let Some(h) = al.get(b"horizontal".as_slice()) {
             s.h_align = match h.as_str() {
@@ -494,12 +532,7 @@ pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> 
             255 => 255,
             _ => 0,
         });
-        if s.rotation != 0 {
-            rep.note(Kind::Approximate, "rotated text shown level");
-        }
-        if truthy(al.get(b"shrinkToFit".as_slice())) {
-            rep.note(Kind::Approximate, "shrink-to-fit text shown at its size");
-        }
+        s.shrink_to_fit = truthy(al.get(b"shrinkToFit".as_slice()));
         out.push(s);
     }
     if out.is_empty() {
@@ -535,8 +568,8 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
 pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) -> Vec<u8> {
     let mut fmts: Vec<(u32, String)> = Vec::new();
     let mut fonts: Vec<Font> = vec![Font::default()];
-    let mut fills = vec![(None, None), (None, PatternFill::new("gray125", None, None))];
-    let mut borders: Vec<[Edge; 4]> = vec![[Edge::default(); 4]];
+    let mut fills = vec![(None, None, None), (None, PatternFill::new("gray125", None, None), None)];
+    let mut borders = vec![([Edge::default(); 4], [Edge::default(); 2])];
     let mut xfs = String::new();
     let n = wb.styles.len();
     for (_, s) in wb.styles.iter() {
@@ -558,19 +591,20 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
                 fonts.len() - 1
             }
         };
-        let fill = (s.fill, s.pattern);
+        let fill = (s.fill, s.pattern, s.gradient.as_ref());
         let fi = fills.iter().position(|f| *f == fill).unwrap_or_else(|| {
             fills.push(fill);
             fills.len() - 1
         });
-        let bo = match borders.iter().position(|b| *b == s.borders) {
+        let border = (s.borders, s.diagonals);
+        let bo = match borders.iter().position(|b| *b == border) {
             Some(i) => i,
             None => {
-                borders.push(s.borders);
+                borders.push(border);
                 borders.len() - 1
             }
         };
-        let align = s.h_align != HAlign::General || s.v_align != VAlign::Bottom || s.wrap || s.indent > 0 || s.rotation != 0;
+        let align = s.h_align != HAlign::General || s.v_align != VAlign::Bottom || s.wrap || s.shrink_to_fit || s.indent > 0 || s.rotation != 0;
         let _ = write!(xfs, r#"<xf numFmtId="{nf}" fontId="{fo}" fillId="{fi}" borderId="{bo}" xfId="0""#);
         if nf != 0 {
             xfs.push_str(r#" applyNumberFormat="1""#);
@@ -623,6 +657,9 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
             }
             if s.wrap {
                 xfs.push_str(r#" wrapText="1""#);
+            }
+            if s.shrink_to_fit {
+                xfs.push_str(r#" shrinkToFit="1""#);
             }
             if s.indent > 0 {
                 let _ = write!(xfs, r#" indent="{}""#, s.indent);
@@ -689,7 +726,15 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
     }
     o.push_str("</fonts>");
     let _ = write!(o, r#"<fills count="{}"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>"#, fills.len());
-    for (f, pattern) in fills.into_iter().skip(2) {
+    for (f, pattern, gradient) in fills.into_iter().skip(2) {
+        if let Some(g) = gradient {
+            let _ = write!(o, r#"<fill><gradientFill degree="{}">"#, f64::from(g.angle) / 1000.0);
+            for &(pos, color) in g.stops.iter() {
+                let _ = write!(o, r#"<stop position="{}"><color rgb="{}"/></stop>"#, f64::from(pos) / 10000.0, hex(color));
+            }
+            o.push_str("</gradientFill></fill>");
+            continue;
+        }
         if let Some(pattern) = pattern {
             write_pattern(&mut o, pattern);
             continue;
@@ -698,10 +743,16 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
     }
     o.push_str("</fills>");
     let _ = write!(o, r#"<borders count="{}">"#, borders.len());
-    for b in &borders {
-        o.push_str("<border>");
-        for (i, tag) in ["left", "right", "top", "bottom"].iter().enumerate() {
-            let e = b[i];
+    for (sides, diagonal) in &borders {
+        o.push_str("<border");
+        for (tag, edge) in ["diagonalDown", "diagonalUp"].into_iter().zip(diagonal) {
+            if edge.line != Line::None {
+                let _ = write!(o, r#" {tag}="1""#);
+            }
+        }
+        o.push('>');
+        let edge = if diagonal[0].line != Line::None { diagonal[0] } else { diagonal[1] };
+        for (tag, e) in ["left", "right", "top", "bottom", "diagonal"].into_iter().zip(sides.iter().copied().chain([edge])) {
             if e.line == Line::None {
                 let _ = write!(o, "<{tag}/>");
             } else {
@@ -715,7 +766,7 @@ pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) ->
                 let _ = write!(o, "</{tag}>");
             }
         }
-        o.push_str("<diagonal/></border>");
+        o.push_str("</border>");
     }
     o.push_str("</borders>");
     o.push_str(r#"<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#);

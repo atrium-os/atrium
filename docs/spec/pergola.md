@@ -507,6 +507,13 @@ stays frescod's, drawn outside any app.
 
 ### §10.6 Grid cell overflow
 
+A styled grid cell can draw a patterned background or a bounded linear fill
+and a stroke on either diagonal. Rotated text is shaped and emitted as a
+turned glyph run, and stacked text uses upright graphemes. A single-line
+shrink-to-fit cell reduces its display size in its own width. Wrapped, turned,
+stacked and shrink-to-fit cells keep their text in their own bounds.
+
+
 In `GridView`, ordinary cell text overflows only from visible columns. The 32-column
 search counts visible neighbours and skips zero-width columns in both directions,
 including when finding text that reaches the viewport from outside it.

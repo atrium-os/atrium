@@ -165,6 +165,36 @@ impl PatternFill {
     }
 }
 
+/// Bounded linear Excel fill. Angles are thousandths of a degree and
+/// positions are hundredths of a percent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GradientFill {
+    pub angle: u32,
+    pub stops: Arc<[(u16, u32)]>,
+}
+
+impl GradientFill {
+    pub const MAX_STOPS: usize = 16;
+
+    pub fn new(degrees: f64, stops: impl IntoIterator<Item = (f64, u32)>) -> Option<Self> {
+        if !degrees.is_finite() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (position, color) in stops.into_iter().take(Self::MAX_STOPS + 1) {
+            if !(0.0..=1.0).contains(&position) || out.len() == Self::MAX_STOPS {
+                return None;
+            }
+            out.push(((position * 10000.0).round() as u16, color & 0xFF_FFFF));
+        }
+        if out.len() < 2 {
+            return None;
+        }
+        out.sort_by_key(|s| s.0);
+        Some(Self { angle: (degrees.rem_euclid(360.0) * 1000.0).round() as u32 % 360_000, stops: out.into() })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Style {
     /// The number format code ("General" by default).
@@ -173,9 +203,11 @@ pub struct Style {
     /// Solid background, 0xRRGGBB.
     pub fill: Option<u32>,
     pub pattern: Option<PatternFill>,
+    pub gradient: Option<GradientFill>,
     pub h_align: HAlign,
     pub v_align: VAlign,
     pub wrap: bool,
+    pub shrink_to_fit: bool,
     /// These settings take effect when the sheet is protected.
     pub unlocked: bool,
     pub hide_formula: bool,
@@ -185,6 +217,8 @@ pub struct Style {
     pub rotation: i16,
     /// Left, right, top, bottom.
     pub borders: [Edge; 4],
+    /// Diagonals from top left down, then from bottom left up.
+    pub diagonals: [Edge; 2],
 }
 
 impl Default for Style {
@@ -194,15 +228,18 @@ impl Default for Style {
             font: Font::default(),
             fill: None,
             pattern: None,
+            gradient: None,
             h_align: HAlign::General,
             v_align: VAlign::Bottom,
             wrap: false,
+            shrink_to_fit: false,
             unlocked: false,
             hide_formula: false,
             hide_value: false,
             indent: 0,
             rotation: 0,
             borders: [Edge::default(); 4],
+            diagonals: [Edge::default(); 2],
         }
     }
 }
@@ -221,12 +258,29 @@ impl Style {
         w.u8(f.bold as u8 | (f.italic as u8) << 1 | (f.underline as u8) << 2 | (f.strike as u8) << 3 | (self.wrap as u8) << 4
             | (self.unlocked as u8) << 5 | (self.hide_formula as u8) << 6 | (self.hide_value as u8) << 7);
         color_out(w, f.color);
+        let extended = self.shrink_to_fit || self.gradient.is_some() || self.diagonals.iter().any(|e| e.line != Line::None);
+        if extended {
+            w.u8(3);
+        }
         if let Some(pattern) = self.pattern {
             w.u8(2);
             pattern.encode(w);
-            color_out(w, self.fill);
-        } else {
-            color_out(w, self.fill);
+        }
+        color_out(w, self.fill);
+        if extended {
+            w.u8(u8::from(self.shrink_to_fit) | (u8::from(self.gradient.is_some()) << 1));
+            for edge in self.diagonals {
+                w.u8(edge.line as u8);
+                color_out(w, edge.color);
+            }
+            if let Some(gradient) = &self.gradient {
+                w.u32(gradient.angle);
+                w.u8(gradient.stops.len() as u8);
+                for &(pos, color) in gradient.stops.iter() {
+                    w.u16(pos);
+                    w.u32(color);
+                }
+            }
         }
         w.u8(self.h_align as u8);
         w.u8(self.v_align as u8);
@@ -244,13 +298,45 @@ impl Style {
         let size = r.len("font size", 409 * 20)? as u16;
         let flags = r.u8()?;
         let color = color_in(r)?;
-        let fill_tag = r.u8()?;
+        let tag = r.u8()?;
+        let fill_tag = if tag == 3 { r.u8()? } else { tag };
         let (fill, pattern) = if fill_tag == 2 {
             let pattern = PatternFill::decode(r)?;
             (color_in(r)?, Some(pattern))
         } else {
             (color_with_tag(r, fill_tag)?, None)
         };
+        let mut diagonals = [Edge::default(); 2];
+        let mut gradient = None;
+        let mut shrink_to_fit = false;
+        if tag == 3 {
+            let extra = r.u8()?;
+            if extra > 3 {
+                return Err(WireError::Invalid("extra style flags"));
+            }
+            shrink_to_fit = extra & 1 != 0;
+            for edge in &mut diagonals {
+                edge.line = *Line::ALL.get(r.u8()? as usize).ok_or(WireError::Invalid("diagonal border"))?;
+                edge.color = color_in(r)?;
+            }
+            if extra & 2 != 0 {
+                let angle = r.u32()?;
+                let count = r.u8()? as usize;
+                if angle >= 360_000 || !(2..=GradientFill::MAX_STOPS).contains(&count) {
+                    return Err(WireError::Invalid("gradient fill"));
+                }
+                let mut stops = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let pos = r.u16()?;
+                    let color = r.u32()? & 0xFF_FFFF;
+                    if pos > 10000 || stops.last().is_some_and(|&(previous, _)| pos < previous) {
+                        return Err(WireError::Invalid("gradient stop"));
+                    }
+                    stops.push((pos, color));
+                }
+                gradient = Some(GradientFill { angle, stops: stops.into() });
+            }
+        }
         const H: [HAlign; 8] = [HAlign::General, HAlign::Left, HAlign::Center, HAlign::Right, HAlign::Fill, HAlign::Justify, HAlign::CenterAcross, HAlign::Distributed];
         const V: [VAlign; 5] = [VAlign::Top, VAlign::Center, VAlign::Bottom, VAlign::Justify, VAlign::Distributed];
         let h_align = *H.get(r.u8()? as usize).ok_or(WireError::Invalid("alignment"))?;
@@ -278,15 +364,18 @@ impl Style {
             },
             fill,
             pattern,
+            gradient,
             h_align,
             v_align,
             wrap: flags & 16 != 0,
+            shrink_to_fit,
             unlocked: flags & 32 != 0,
             hide_formula: flags & 64 != 0,
             hide_value: flags & 128 != 0,
             indent,
             rotation: rotation as i16,
             borders,
+            diagonals,
         })
     }
 }

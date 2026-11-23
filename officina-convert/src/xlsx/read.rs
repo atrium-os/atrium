@@ -391,7 +391,7 @@ struct Seg {
     sruns: Vec<Vec<(u32, u32, u32)>>,
     /// `<col style>`: (first column, last column, xf), 0-based.
     col_styles: Vec<(u32, u32, u32)>,
-    row_styled: u64,
+    row_styles: Vec<(u32, u32)>,
     cells: u64,
     rep: Report,
     first_row: Option<u32>,
@@ -429,6 +429,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
     let mut buf = Vec::new();
     let mut tbuf = Vec::new();
     let mut pend = Pending { runs: Vec::new() };
+    let mut row_xf = 0;
     let (mut row, mut col): (i64, i64) = (-1, -1);
     let mut vtext: Vec<u8> = Vec::new();
     let mut vbuf: Vec<u8> = Vec::new();
@@ -496,8 +497,13 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                 col = -1;
                 seg.first_row.get_or_insert(rr as u32);
                 seg.last_row = Some(rr as u32);
-                if attr(&e, b"customFormat")?.is_some_and(|v| v == "1" || v == "true") && attr(&e, b"s")?.is_some_and(|v| v != "0") {
-                    seg.row_styled += 1;
+                row_xf = if attr(&e, b"customFormat")?.is_some_and(|v| v == "1" || v == "true") {
+                    attr(&e, b"s")?.and_then(|v| v.parse().ok()).unwrap_or(0)
+                } else {
+                    0
+                };
+                if row_xf != 0 {
+                    seg.row_styles.push((row as u32, row_xf));
                 }
                 if attr(&e, b"customHeight")?.is_some_and(|v| v == "1" || v == "true") {
                     if let Some(h) = attr(&e, b"ht")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v < 410.0) {
@@ -511,7 +517,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
             }
             b"c" => {
                 // One pass over the attributes, no allocation unless escaped.
-                let (mut r_at, mut t_at, mut xf) = (None::<std::borrow::Cow<[u8]>>, None::<std::borrow::Cow<[u8]>>, 0u32);
+                let (mut r_at, mut t_at, mut xf) = (None::<std::borrow::Cow<[u8]>>, None::<std::borrow::Cow<[u8]>>, row_xf);
                 for a in e.attributes().with_checks(false) {
                     let a = a?;
                     match a.key.local_name().as_ref() {
@@ -814,6 +820,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
         let mut iso_dates = Vec::new();
         let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
+        let mut row_styles = Vec::new();
         let (mut dw, mut dh) = (None, None);
         let mut failed = None;
         for (i, seg) in seg_rx {
@@ -874,9 +881,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
                 out.cells += seg.cells;
-                if seg.row_styled > 0 {
-                    out.report.note_n(Kind::Approximate, "row formats on empty cells not kept (cells keep their own)", seg.row_styled);
-                }
+                row_styles.extend(seg.row_styles);
                 if sruns.len() < seg.sruns.len() {
                     sruns.resize_with(seg.sruns.len(), Vec::new);
                 }
@@ -961,7 +966,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             }
         }
         // Styles: a column's own style under its cells' runs.
-        apply_styles(wb, s, col_styles, &sruns, xf_ids, rep);
+        apply_styles(wb, s, col_styles, row_styles, MAX_COLS, &sruns, xf_ids, rep);
         for (row, col, format) in iso_dates {
             let address = CellAddr::new(s, row, col);
             if wb.styles.format(wb.style_id(address)).is_general() {
@@ -1562,7 +1567,19 @@ fn wb_parse(wb: &Workbook, src: &str, s: u16, row: u32, col: u32) -> Option<Expr
 /// A sheet's cell styles: per column, the column's own style (`col_styles`:
 /// first column, last column, xf) under its cells' runs (`sruns`: per column,
 /// first row, last row, xf), xfs mapped through `xf_ids`.
-pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32, u32)>, sruns: &[Vec<(u32, u32, u32)>], xf_ids: &[StyleId], rep: &mut Report) {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32, u32)>, row_styles: Vec<(u32, u32)>, format_cols: u32, sruns: &[Vec<(u32, u32, u32)>], xf_ids: &[StyleId], rep: &mut Report) {
+    // Sparse rows otherwise expand to tens of thousands of column runs per
+    // source record. Keep a visible prefix and the used extent when it fits.
+    const ROW_STYLE_CELLS: usize = 262_144;
+    let extent = sruns.len().max(col_styles.iter().map(|p| p.1 as usize + 1).max().unwrap_or(0));
+    let row_width = if row_styles.is_empty() { 0 } else {
+        let width = extent.max(256).min(format_cols as usize).min(ROW_STYLE_CELLS / row_styles.len());
+        if width < format_cols as usize {
+            rep.note(Kind::Approximate, "row formats on distant blank cells were limited");
+        }
+        width
+    };
     let mut id = |xf: u32| -> StyleId {
         match xf_ids.get(xf as usize) {
             Some(&i) => i,
@@ -1584,7 +1601,17 @@ pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32,
             }
         }
     }
-    let ncols = sruns.len().max(base.len());
+    let mut row_styles: Vec<_> = row_styles.into_iter().map(|(row, xf)| (row, id(xf))).collect();
+    row_styles.sort_by_key(|&(row, _)| row);
+    row_styles.dedup_by(|later, earlier| {
+        if later.0 == earlier.0 {
+            earlier.1 = later.1;
+            true
+        } else {
+            false
+        }
+    });
+    let ncols = sruns.len().max(base.len()).max(row_width);
     let mut cols: Vec<StyleRuns> = Vec::with_capacity(ncols);
     for c in 0..ncols {
         let b = base.get(c).copied().unwrap_or(0);
@@ -1593,8 +1620,9 @@ pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32,
         if b != 0 {
             v.push((0, b));
         }
-        for &(r0, r1, xf) in sruns.get(c).map(Vec::as_slice).unwrap_or(&[]) {
-            if r0 > at && b != 0 {
+        let explicit = sruns.get(c).map(Vec::as_slice).unwrap_or(&[]);
+        for &(r0, r1, xf) in explicit {
+            if r0 > at && at != 0 {
                 v.push((at, b));
             }
             v.push((r0, id(xf)));
@@ -1603,6 +1631,30 @@ pub(crate) fn apply_styles(wb: &mut Workbook, s: u16, col_styles: Vec<(u32, u32,
         if (at as u64) < MAX_ROWS as u64 && at > 0 {
             v.push((at, b));
         }
+        if c < row_width && !row_styles.is_empty() {
+            let mut overlay = Vec::new();
+            for &(row, style) in &row_styles {
+                let k = explicit.partition_point(|r| r.0 <= row);
+                if k > 0 && explicit[k - 1].1 >= row {
+                    continue;
+                }
+                overlay.push((row, style));
+                if row + 1 < MAX_ROWS {
+                    let next = v.partition_point(|r| r.0 <= row + 1);
+                    overlay.push((row + 1, next.checked_sub(1).map_or(0, |i| v[i].1)));
+                }
+            }
+            v.extend(overlay);
+            v.sort_by_key(|r| r.0);
+        }
+        v.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                earlier.1 = later.1;
+                true
+            } else {
+                false
+            }
+        });
         cols.push(StyleRuns::from_runs(v));
     }
     while cols.last().is_some_and(|c| c.is_empty()) {

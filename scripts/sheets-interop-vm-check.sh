@@ -30,6 +30,7 @@
 # Use SHEETS_INTEROP_CASE=native_copy and /tmp/sheets-native-copy-fixture for Save As.
 # Use SHEETS_INTEROP_CASE=table_filters and /tmp/sheets-table-filter-fixture for table-local filters.
 # Use SHEETS_INTEROP_CASE=advanced_filters and /tmp/sheets-advanced-filter-fixture for nested ODS and advanced Excel filters.
+# Use SHEETS_INTEROP_CASE=appearance and /tmp/sheets-appearance-fixture with /tmp/sheets-vba-source.xlsm.
 # Use SHEETS_INTEROP_CASE=appearance_filters and /tmp/sheets-appearance-filter-fixture for Excel color and icon filters.
 # Use SHEETS_INTEROP_CASE=date_filters and /tmp/sheets-date-filter-fixture for Excel date filters.
 # Use SHEETS_INTEROP_CASE=dates and /tmp/sheets-date-fixture with the same VBA source as legacy.
@@ -38,7 +39,7 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
@@ -49,6 +50,7 @@ case "$profile" in
     protection) test "$(ls "$books")" = "$(printf 'macro.xlsm\nopen.ods\nplain.xlsx')" ;;
     table_filters) test "$(ls "$books")" = "$(printf 'tables.ods\ntables.xlsm\ntables.xlsx')" ;;
     advanced_filters) test "$(ls "$books")" = "$(printf 'sales.ods\nsales.xlsx')" ;;
+    appearance) test "$(ls "$books")" = "$(printf 'legacy.xls\nmacro.xlsm\nsales.ods\nsales.xlsx')" ;;
     appearance_filters) test "$(ls "$books")" = "$(printf '01-base.xlsx\n02-extended.xlsx')" ;;
     date_filters) test "$(ls "$books")" = "$(printf 'dates-1900.xlsx\ndates-1904.xlsx')" ;;
     dates) test "$(ls "$books")" = "$(printf 'dates.xlsx\nlegacy.xls\nmacro.xlsm')" ;;
@@ -99,6 +101,7 @@ checkpoint() {
         protection) /tmp/sheets-protection-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
         table_filters) /tmp/sheets-table-filter-fixture check "$1" "$2" "$format" ;;
         advanced_filters) /tmp/sheets-advanced-filter-fixture check "$1" "$2" "$format" ;;
+        appearance) SHEETS_APPEARANCE_VBA=/tmp/sheets-vba-source.xlsm /tmp/sheets-appearance-fixture check "$1" "$2" "$format" ;;
         appearance_filters) /tmp/sheets-appearance-filter-fixture check "$1" "$2" "$kind" ;;
         date_filters) /tmp/sheets-date-filter-fixture check "$1" "$2" "$format" ;;
         dates) /tmp/sheets-date-fixture check "$1" "$2" "$format" /tmp/sheets-vba-source.xlsm ;;
@@ -441,6 +444,45 @@ print_pdf() {
     wait_for pdf_finished "$pdf"
     wait_for same_window 824 458 "$document"
     mv "$pdf" "$results/$format.pdf"
+}
+
+appearance() {
+    for format in xlsx xlsm ods xls; do
+        case "$format" in
+            xlsx) book=sales.xlsx; row=273 ;;
+            xlsm) book=macro.xlsm; row=213 ;;
+            ods) book=sales.ods; row=243 ;;
+            xls) book=legacy.xls; row=183; checksum=$(sha256 -q "$books/$book") ;;
+        esac
+        checkpoint "$books/$book" initial
+        open_book "$row" "$book" initial
+        sleep 1.6
+        cp selectscreen.png "$results/$format-appearance-initial.png"
+        click 62 112
+        key 0x25
+        key 0x28
+        if test "$format" = xls; then
+            sleep .45
+            click 205 24
+            wait_for other_window 824 458 "$document"
+            click 824 458
+            book=legacy.osheet
+            wait_for checkpoint "$books/$book" edited
+            wait_for same_window 824 458 "$document"
+            close_book
+            test "$(sha256 -q "$books/legacy.xls")" = "$checksum"
+            open_book "$row" "$book" edited native
+        else
+            save "$book" edited
+            close_book
+            open_book "$row" "$book" edited
+        fi
+        sleep 1.6
+        cp selectscreen.png "$results/$format-appearance-reopened.png"
+        cp "$books/$book" "$results/reopened.${book##*.}"
+        close_book
+        echo "PASS $format cell appearance after desktop Save and picker reopen"
+    done
 }
 
 comments_print() {
@@ -1198,6 +1240,7 @@ case "$profile" in
     pivot_scope) pivot_scope; exit ;;
     legacy) legacy; exit ;;
     comments_print) comments_print; exit ;;
+    appearance) appearance; exit ;;
     validation_legacy) validation_legacy; exit ;;
     delimited) delimited; exit ;;
     native_copy) native_copy; exit ;;

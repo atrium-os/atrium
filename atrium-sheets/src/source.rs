@@ -86,10 +86,19 @@ pub fn rgb(c: u32) -> Color {
 
 /// How a value shows in a cell with a style: through its number format, in its
 /// font's colour and weight, its fill and borders, aligned as it says.
+fn rotation_face() -> pergola::glyphs::Face {
+    use std::sync::OnceLock;
+    static FACE: OnceLock<pergola::glyphs::Face> = OnceLock::new();
+    FACE.get_or_init(|| {
+        pergola::glyphs::Face::from_static(include_bytes!("../../fonts/ibm-plex/IBMPlexSans.ttf"), 0)
+    }).clone()
+}
+
 fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Option<CellView> {
     let st = t.get(id);
     // An empty cell centring across shows, so the run can reach over it.
-    let has_look = st.fill.is_some() || st.borders.iter().any(|b| b.line != Line::None) || st.h_align == HAlign::CenterAcross;
+    let has_look = st.fill.is_some() || st.pattern.is_some() || st.gradient.is_some()
+        || st.borders.iter().chain(&st.diagonals).any(|b| b.line != Line::None) || st.h_align == HAlign::CenterAcross;
     let mut cv = match v {
         Value::Empty if !has_look => return None,
         Value::Empty => CellView::text(""),
@@ -109,6 +118,18 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     }
     cv.bold = st.font.bold;
     cv.fill = st.fill.map(rgb);
+    cv.pattern = st.pattern.map(|p| (p.name(), rgb(p.foreground.unwrap_or(0)), rgb(p.background.unwrap_or(0xFFFFFF))));
+    cv.gradient = st.gradient.as_ref().map(|g| (g.angle, g.stops.clone()));
+    cv.rotation = st.rotation;
+    cv.shrink_to_fit = st.shrink_to_fit;
+    if matches!(st.rotation, -90..=-1 | 1..=90) && !cv.text.is_empty() {
+        cv.rotation_face = Some(rotation_face());
+    }
+    for (target, edge) in cv.diagonals.iter_mut().zip(st.diagonals) {
+        if edge.line != Line::None {
+            *target = Some((edge.line.width(), rgb(edge.color.unwrap_or(0))));
+        }
+    }
     for (k, e) in st.borders.iter().enumerate() {
         if e.line != Line::None {
             cv.borders[k] = Some((e.line.width(), rgb(e.color.unwrap_or(0))));
@@ -170,6 +191,8 @@ fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Valu
     }
     if let Some(c) = look.scale.or(d.fill) {
         cv.fill = Some(rgb(c));
+        cv.pattern = None;
+        cv.gradient = None;
     }
     if let Some(c) = d.color {
         cv.color = Some(rgb(c));

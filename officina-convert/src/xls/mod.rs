@@ -28,7 +28,7 @@ use std::sync::Arc;
 use officina_grid::addr::{a1, CellAddr};
 use officina_grid::column::Sizes;
 use officina_grid::numfmt::{self, PALETTE};
-use officina_grid::style::{Edge, Font, HAlign, Line, Style, StyleId, VAlign};
+use officina_grid::style::{Edge, Font, HAlign, Line, PatternFill, Style, StyleId, VAlign};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::cfb::{self, Cfb};
@@ -322,13 +322,8 @@ fn styles(g: &Globals, rep: &mut Report) -> Vec<Style> {
             255 => 255,
             _ => 0,
         };
-        if s.rotation != 0 {
-            rep.note(Kind::Approximate, "rotated text shown level");
-        }
         s.indent = x[8] & 0x0F;
-        if x[8] & 0x10 != 0 {
-            rep.note(Kind::Approximate, "shrink-to-fit text shown at its size");
-        }
+        s.shrink_to_fit = x[8] & 0x10 != 0;
         let (b1, b2, cols) = (u32_at(10), u32_at(14), u16_at(18));
         let line = |d: u32| Line::ALL.get(d as usize).copied().unwrap_or(Line::None);
         let edge = |d: u32, icv: u32| {
@@ -336,16 +331,30 @@ fn styles(g: &Globals, rep: &mut Report) -> Vec<Style> {
             Edge { line: l, color: if l == Line::None || icv >= 64 { None } else { color(g, icv as u16) } }
         };
         s.borders = [edge(b1 & 0xF, (b1 >> 16) & 0x7F), edge((b1 >> 4) & 0xF, (b1 >> 23) & 0x7F), edge((b1 >> 8) & 0xF, b2 & 0x7F), edge((b1 >> 12) & 0xF, (b2 >> 7) & 0x7F)];
-        if (b1 >> 30) != 0 && (b2 >> 21) & 0xF != 0 {
-            rep.note(Kind::Dropped, "diagonal borders");
+        let diagonal = edge((b2 >> 21) & 0xF, (b2 >> 14) & 0x7F);
+        if b1 & (1 << 30) != 0 {
+            s.diagonals[0] = diagonal;
+        }
+        if b1 & (1 << 31) != 0 {
+            s.diagonals[1] = diagonal;
         }
         let fls = b2 >> 26;
         if fls != 0 {
-            let fore = cols & 0x7F;
+            let resolve = |index: u16| (index < 64).then(|| color(g, index)).flatten();
+            let fore = resolve(cols & 0x7F);
+            let back = resolve((cols >> 7) & 0x7F);
+            s.fill = fore;
             if fls != 1 {
-                rep.note(Kind::Approximate, "patterned fills shown solid");
+                const PATTERNS: [&str; 17] = [
+                    "mediumGray", "darkGray", "lightGray", "darkHorizontal", "darkVertical",
+                    "darkDown", "darkUp", "darkGrid", "darkTrellis", "lightHorizontal",
+                    "lightVertical", "lightDown", "lightUp", "lightGrid", "lightTrellis", "gray125", "gray0625",
+                ];
+                s.pattern = PATTERNS.get(fls as usize - 2).and_then(|name| PatternFill::new(name, fore, back));
+                if s.pattern.is_none() {
+                    rep.note(Kind::Approximate, "unsupported patterned fills shown solid");
+                }
             }
-            s.fill = if fore >= 64 { None } else { color(g, fore) };
         }
         out.push(s);
     }
@@ -418,7 +427,7 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
     // The formula whose string result the next STRING record holds.
     let mut want_string: Option<usize> = None;
     let mut depth = 0u32;
-    let mut row_styled = 0u64;
+    let mut row_styles = Vec::new();
     let mut nested_note = false;
     let mut note_object = None;
     let mut note_text = HashMap::new();
@@ -562,7 +571,7 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
                 c.skip(4)?;
                 let miy = c.u16()?;
                 c.skip(4)?;
-                let grbit = c.u16()?;
+                let grbit = c.u32()?;
                 if row >= formula::ROWS {
                     continue;
                 }
@@ -573,7 +582,7 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
                     hidden.push(row);
                 }
                 if grbit & 0x80 != 0 {
-                    row_styled += 1;
+                    row_styles.push((row, (grbit >> 16) & 0xFFF));
                 }
             }
             0x007D => {
@@ -698,9 +707,6 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
         }
     }
     wb.set_comments(s, comments);
-    if row_styled > 0 {
-        out.report.note_n(Kind::Approximate, "row formats on empty cells not kept (cells keep their own)", row_styled);
-    }
     // Numbers, a run down a column at a time.
     so.nums.sort_by_key(|n| (n.0, n.1));
     so.nums.dedup_by(|b, a| {
@@ -759,7 +765,7 @@ fn sheet(wb: &mut Workbook, s: u16, recs: &[Record], g: &Globals, ctx: &Ctx, xf_
             _ => runs.push((row, row, xf)),
         }
     }
-    apply_styles(wb, s, col_styles, &sruns, xf_ids, rep);
+    apply_styles(wb, s, col_styles, row_styles, formula::COLS, &sruns, xf_ids, rep);
     Ok(so)
 }
 

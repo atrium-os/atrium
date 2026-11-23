@@ -100,6 +100,16 @@ pub struct CellView {
     pub numeric: bool,
     /// Background over the grid lines.
     pub fill: Option<Color>,
+    /// Pattern name and its foreground/background colors.
+    pub pattern: Option<(&'static str, Color, Color)>,
+    /// Angle in millidegrees and stops (basis points, packed sRGB).
+    pub gradient: Option<(u32, std::sync::Arc<[(u16, u32)]>)>,
+    /// Diagonal down and up edges.
+    pub diagonals: [Option<(f32, Color)>; 2],
+    /// Degrees counterclockwise, or 255 for stacked characters.
+    pub rotation: i16,
+    pub rotation_face: Option<crate::glyphs::Face>,
+    pub shrink_to_fit: bool,
     /// Left, right, top, bottom: width in points and colour.
     pub borders: [Option<(f32, Color)>; 4],
     /// A data bar: the share of the cell's width it fills (0–1) and its colour.
@@ -274,7 +284,7 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -1815,7 +1825,7 @@ fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
 /// alignment points (both, centred), up to [`SPILL_COLS`]. None when it fits,
 /// is a number, or has no empty neighbour.
 fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u32)> {
-    if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap {
+    if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap || cv.shrink_to_fit || cv.rotation != 0 {
         return None;
     }
     let cols = src.cols();
@@ -1946,9 +1956,151 @@ fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, 
 
 /// One cell's ground, bar, borders, icon and text in the box (`cx`, `cy`,
 /// `cw`, `ch`), window px.
+fn draw_fill(ctx: &mut Ctx, cv: &CellView, rect: Rect) {
+    use fresco_protocol::{FillPaint, FillParams, GradientStop, fill_verb::{CLOSE, LINE, MOVE}};
+    let (x, y, w, h) = (rect.x(), rect.y(), rect.w(), rect.h());
+    let mut verbs = Vec::new();
+    let mut points = Vec::new();
+    let mut quad = |x: f32, y: f32, w: f32, h: f32| {
+        verbs.extend([MOVE, LINE, LINE, LINE, CLOSE]);
+        points.extend([[x,y], [x+w,y], [x+w,y+h], [x,y+h]]);
+    };
+    let paint = if let Some((angle, stops)) = &cv.gradient {
+        let (dy, dx) = (*angle as f32 / 1000.0).to_radians().sin_cos();
+        let length = (w * dx.abs() + h * dy.abs()) / 2.0;
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        let component = |color: u32, shift| ((color >> shift) & 255u32) as f32 / 255.0;
+        quad(x, y, w, h);
+        FillPaint::Linear { x0: cx-dx*length, y0: cy-dy*length, x1: cx+dx*length, y1: cy+dy*length,
+            stops: stops.iter().map(|&(p,c)| GradientStop { offset: f32::from(p)/10000.0,
+                r: component(c,16), g: component(c,8), b: component(c,0), a: 1.0 }).collect() }
+    } else if let Some((kind, ink, paper)) = cv.pattern {
+        ctx.add(Node::Rect { rect, fill: paper, radius: 0.0 });
+        // Bound geometry even for unusually wide cells and merged ranges.
+        let step = (w.max(h) / 48.0).ceil().max(1.0);
+        let count = |extent: f32| (extent / step).ceil() as u32;
+        for row in 0..count(h) {
+            let mut col = 0;
+            while col < count(w) {
+                if !pattern_pixel(kind, col, row) {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                col += 1;
+                while col < count(w) && pattern_pixel(kind, col, row) {
+                    col += 1;
+                }
+                let (left, top) = (start as f32 * step, row as f32 * step);
+                quad(x + left, y + top, (col as f32 * step).min(w) - left, step.min(h - top));
+            }
+        }
+        FillPaint::Solid { r: ink.r, g: ink.g, b: ink.b, a: ink.a }
+    } else {
+        if let Some(fill) = cv.fill {
+            ctx.add(Node::Rect { rect, fill, radius: 0.0 });
+        }
+        return;
+    };
+    if !points.is_empty() {
+        ctx.add(Node::Fill(std::sync::Arc::new(FillParams {
+            rule: 0, transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], paint,
+            opacity: 1.0, clip: Some([x, y, x+w, y+h]), verbs, points,
+        })));
+    }
+}
+
+fn pattern_pixel(kind: &str, x: u32, y: u32) -> bool {
+    let (x,y) = (x % 8, y % 8);
+    let (down, up) = ((x+8-y)%4, (x+y)%4);
+    match kind {
+        "darkGray" => x%2 == 0 || y%2 == 0,
+        "mediumGray" => (x+y)%2 == 0,
+        "lightGray" => x%2 == 0 && y%2 == 0,
+        "darkHorizontal" => y%4 < 2,
+        "darkVertical" => x%4 < 2,
+        "darkDown" => down < 2,
+        "darkUp" => up < 2,
+        "darkGrid" => x%4 < 2 || y%4 < 2,
+        "darkTrellis" => up < 2 || down < 2,
+        "lightHorizontal" => y%4 == 0,
+        "lightVertical" => x%4 == 0,
+        "lightDown" => down == 0,
+        "lightUp" => up == 0,
+        "lightGrid" => x%4 == 0 || y%4 == 0,
+        "lightTrellis" => up == 0 || down == 0,
+        "gray125" => x % 4 == 2 * (y % 2) && y % 2 == (x / 4 + y / 2) % 2,
+        "gray0625" => x % 4 == 0 && y % 4 == 0,
+        _ => false,
+    }
+}
+
+fn draw_rotated(ctx: &mut Ctx, cv: &CellView, style: &TextStyle, rect: Rect) -> bool {
+    use crate::geom::Point;
+    let (x, y, w, h) = (rect.x(), rect.y(), rect.w(), rect.h());
+    if cv.rotation == 255 {
+        use unicode_segmentation::UnicodeSegmentation;
+        let line_h = style.em() * 1.1;
+        let lines = cv.text.graphemes(true).take(((h / line_h).floor() as usize).min(MAX_LINES)).collect::<Vec<_>>();
+        let top = y + line_top(cv.valign, h, lines.len() as f32 * line_h);
+        for (i, line) in lines.into_iter().enumerate() {
+            if line != "\n" {
+                let advance = crate::text::measure_chars(line, style).min(w);
+                ctx.add(Node::Text { rect: Rect::new(x+(w-advance)/2.0, top+i as f32*line_h, advance, line_h),
+                    content: line.to_string(), style: style.clone() });
+            }
+        }
+        return true;
+    }
+    let Some(face) = &cv.rotation_face else { return false };
+    let Some(font) = swash::FontRef::from_index(face.bytes(), face.index() as usize) else { return false };
+    let angle = -f32::from(cv.rotation).to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let (s, c) = (sin.abs(), cos.abs());
+    let cap = style.em() * 0.85;
+    let fit = ((w-s*cap) / c.max(0.0001)).min((h-c*cap) / s.max(0.0001));
+    if fit <= 0.0 {
+        return true;
+    }
+    let text = cv.text.replace(['\r', '\n'], " ");
+    let (shown, _) = fit_text(&CellView { text, ..cv.clone() }, fit, style);
+    let mut glyphs = Vec::new();
+    let mut advance = 0.0;
+    thread_local! { static SHAPER: std::cell::RefCell<swash::shape::ShapeContext> = Default::default(); }
+    SHAPER.with_borrow_mut(|context| {
+        let mut shape = context.builder(font).size(style.em()).build();
+        shape.add_str(&shown);
+        shape.shape_with(|cluster| {
+            for g in cluster.glyphs {
+                glyphs.push(crate::glyphs::Glyph { id: g.id, dx: advance + g.x, dy: -g.y });
+                advance += g.advance;
+            }
+        });
+    });
+    let (box_w, box_h) = (advance*c+cap*s, advance*s+cap*c);
+    let left = x + match cv.align {
+        CellAlign::Left => 0.0,
+        CellAlign::Right => (w-box_w).max(0.0),
+        _ => ((w-box_w)/2.0).max(0.0),
+    };
+    let top = y + line_top(cv.valign, h, box_h);
+    // Rotate about the middle of the upright ink box, then align its bounds.
+    let ox = left + box_w/2.0 - cos*advance/2.0 - sin*cap/2.0;
+    let oy = top + box_h/2.0 - sin*advance/2.0 + cos*cap/2.0;
+    ctx.add(Node::Glyphs { origin: Point::new(ox, oy), face: face.clone(), size: style.em(), color: style.color,
+        glyphs: glyphs.into(), turn: Some(crate::node::turn_by(angle)) });
+    true
+}
+
 fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, cy: f32, cw: f32, ch: f32) {
-    if let Some(f) = cv.fill {
-        ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: f, radius: 0.0 });
+    draw_fill(ctx, cv, Rect::new(cx, cy, cw, ch));
+    for (k, edge) in cv.diagonals.iter().enumerate() {
+        if let Some((width, color)) = *edge {
+            let pad = width.min(cw / 2.0).min(ch / 2.0);
+            let (top, bottom) = (cy+pad, cy+ch-pad);
+            let (y0,y1) = if k == 0 { (top,bottom) } else { (bottom,top) };
+            ctx.add(Node::Path { p0: (cx+pad,y0), p1: (cx+cw-pad,y1), width, color });
+        }
     }
     if let Some((share, c)) = cv.bar {
         let w = ((cw - 4.0) * share.clamp(0.0, 1.0)).max(0.0);
@@ -1980,8 +2132,18 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
     if cv.text.is_empty() {
         return;
     }
-    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
-    let lh = TEXT_SIZE * 1.3;
+    let mut style = cell_style(cv, t);
+    let avail = (cw - 2.0 * PAD - lead).max(0.0);
+    if cv.shrink_to_fit && !cv.wrap && !cv.text.contains('\n') && cv.rotation == 0 {
+        let width = crate::text::measure_chars(&cv.text, &style);
+        if width > avail {
+            style.size = (style.size * avail / width * 0.98).max(3.0);
+        }
+    }
+    let lh = style.size * 1.3;
+    if cv.rotation != 0 && draw_rotated(ctx, cv, &style, Rect::new(cx+PAD+lead, cy, avail, ch)) {
+        return;
+    }
     if !cv.numeric && (cv.wrap || cv.text.contains('\n')) {
         // Several lines: centred down the cell when they fit, else from
         // the top, as many as fit whole (at least one).

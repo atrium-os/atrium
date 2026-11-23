@@ -683,8 +683,21 @@ fn cell_style(out: &mut String, name: &str, st: &Style, data: Option<&str>) {
     if st.wrap {
         tc.push_str(r#" fo:wrap-option="wrap""#);
     }
-    if st.rotation != 0 {
-        let _ = write!(tc, r#" style:rotation-angle="{}""#, st.rotation);
+    if st.shrink_to_fit {
+        tc.push_str(r#" style:shrink-to-fit="true""#);
+    }
+    if st.rotation == 255 {
+        tc.push_str(r#" style:direction="ttb""#);
+    } else if st.rotation != 0 {
+        let _ = write!(tc, r#" style:rotation-angle="{}""#, st.rotation.rem_euclid(360));
+    }
+    for (key, edge) in ["style:diagonal-tl-br", "style:diagonal-bl-tr"].into_iter().zip(st.diagonals) {
+        if edge.line != Line::None {
+            let _ = write!(tc, r#" {key}="{}""#, border(edge.line, edge.color));
+            if edge.line == Line::Double {
+                let _ = write!(tc, r#" {key}-widths="0.0071in 0.0102in 0.0071in""#);
+            }
+        }
     }
     let protection = match (st.unlocked, st.hide_formula, st.hide_value) {
         (_, _, true) => Some("hidden-and-protected"),

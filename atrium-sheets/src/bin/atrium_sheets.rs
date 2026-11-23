@@ -128,8 +128,17 @@ fn saved_status(d: &Doc, format: Format) -> String {
     {
         status.push_str(" Excel export kept the last row visibility for filters with unsupported rules.");
     }
+    if matches!(format, Format::Xlsx | Format::Xlsm) && d.wb.styles.iter().any(|(_, s)| {
+        use officina_grid::style::Line;
+        s.diagonals.iter().all(|edge| edge.line != Line::None) && s.diagonals[0] != s.diagonals[1]
+    }) {
+        status.push_str(" Excel export used one shared style for both diagonals.");
+    }
     if format == Format::Ods {
         let mut changes = Vec::new();
+        if d.wb.styles.iter().any(|(_, s)| s.pattern.is_some() || s.gradient.is_some()) {
+            changes.push("saved patterned and gradient cell backgrounds as solid colours");
+        }
         if d.wb.filter_conditions().any(|cond| !officina_convert::ods::write::supports_filter(cond)) {
             changes.push("kept the last row visibility for Excel calendar and appearance filters");
         }

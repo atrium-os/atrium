@@ -336,7 +336,7 @@ and their associated import or Save behavior.
 | 3 | XLSX, XLSM, ODS, XLS | **Other editing constraints.** Sheets keeps active XLSX, XLSM and ODS sheet locks and their cell styles. Foreign passwords and custom Excel permissions have fidelity notices. |
 | 4 | XLSX, XLSM, ODS, XLS | **Editable analysis.** Top and bottom sheet filters by count and percentage stay live in XLSX, XLSM and ODS. The remaining static cases are grouped below. ODS retains live spill and table references for Sheets and supplies fixed compatibility formulas to other apps. |
 | 5 | XLSX, XLSM, ODS, XLS | **Review and output.** Sheets restores intact ODS comment threads from a bounded extension and gives other apps a standard note. Legacy XLS keeps cell notes, supported links, rectangular print areas and both print-title axes on native Save As. Unsupported drawings, chart types, chart series, conditional formatting variants and print settings can still lose content or change output. |
-| 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Rotation, shrink-to-fit, patterned or gradient fills, diagonal borders and styles on empty rows can change how a sheet looks. |
+| 6 | XLSX, XLSM, ODS, XLS | **Appearance.** Sheets draws turned or stacked text, shrink-to-fit, diagonal borders, patterns and supported linear gradients. Native files and applicable foreign formats retain these settings. XLSX and ODS import bound the width of style defaults on empty rows. Unsupported gradients and conversion to formats with fewer fill or border options receive fidelity notices. |
 | Format boundary | CSV, TSV, XLS, macro-enabled formats | Delimited files carry values and may report encoding conversion or clipped long fields. XLS opens for import and can be saved as a native copy. Supported macro payloads stay inert and external workbook values stay cached. |
 
 #### Advanced filters and pivot fidelity
@@ -1094,23 +1094,35 @@ Gates, on the 4-core cloud machine:
   `\x`, `_x` padding, `*x` fill (shown once), `[$€-407]` currency, and the built-in ids
   0–49. A code never fails to parse; unknown parts show as literals and the fidelity
   report says so. `TEXT(value, format)` uses it.
-- **Styles** (`officina-grid::style`): a style is a number format, font (name, size,
-  bold, italic, underline, strike, colour), solid fill, horizontal and vertical
-  alignment, wrap, indent, rotation and four borders. Styles are interned per workbook;
-  each column keeps runs of style ids, so a formatted column is one run at any height.
-  Restyling is an undoable op carrying styles by value (`GridOp::Restyle`); the native
-  file has `STYLES` and `STYLE_RUNS` chunks.
-- **`.xlsx` styles**: read from `styles.xml` (custom and built-in number formats,
-  fonts, solid, patterned and gradient fills, borders, alignment, the custom indexed
-  palette, theme colours with Excel's tint) and written back (one `cellXfs` entry per
-  style; a style reaching the last row becomes the column's style). Reported: patterned
-  and gradient fills shown solid, diagonal borders, rotated and shrink-to-fit text,
-  unlocked or hidden cells, row formats on empty cells, locale-specific built-in formats.
+- **Styles** (`officina-grid::style`): a style includes number format, font, fill,
+  alignment, wrap, indent, rotation, shrink-to-fit, four outer borders and two
+  diagonal borders. Each column keeps runs of interned styles. Restyling uses
+  `GridOp::Restyle`; native `STYLES` and `STYLE_RUNS` also keep these settings.
+  Styles with a new field use style marker 3 alongside the older encodings.
+- **Excel styles:** XLSX and XLSM keep both diagonal flags and their shared
+  stroke, rotated and stacked text, shrink-to-fit, patterns and linear
+  gradients with up to 16 stops. Unsupported gradients use the first colour
+  and appear in the fidelity report. BIFF8 imports rotation, shrink-to-fit,
+  patterns and diagonals through native Save As. Excel row defaults are
+  materialized as compressed style runs within 262,144 styled cells per sheet.
+  The import normally covers the first 256 columns and extends through the
+  used columns when the budget allows. Cell styles take precedence.
+  [SpreadsheetML diagonal borders](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.diagonalborder)
+  [BIFF8 cell formatting](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-xls/671c8577-901f-4215-9ebf-6f5890e5896d)
+- **OpenDocument styles:** the cell properties keep signed turns through the
+  normalized angle, stacked direction, shrink-to-fit and independent diagonals.
+  Row defaults also style trailing blanks in a bounded prefix. Plain ODS
+  cell backgrounds provide a solid fallback for Excel patterns and gradients.
+  [OpenDocument 1.4 schema](https://docs.oasis-open.org/office/OpenDocument/v1.4/OpenDocument-v1.4-part3-schema.pdf)
 - **Sheets** shows values through their format (with the format's colour, `#` for a date
-  out of range), bold, font colour, fills over the grid lines, borders by width, and
-  alignment. Not yet shown: italic, underline, strike, font names and sizes, wrap and
-  vertical alignment; no style editing UI yet (the inspector comes with the toolbar
-  work).
+  out of range), bold, font colour, fills over the grid lines, outer and diagonal
+  strokes, wrap, vertical alignment, rotated and stacked labels, and shrink-to-fit.
+  Rotated labels use the bundled UI face. Dashed and double diagonals use a
+  single stroke in the grid. The installed `appearance` gate opens, edits and
+  reopens XLSX, XLSM and ODS and performs native Save As from BIFF8. It checks
+  saved styles and captures the grid before and after each operation. The
+  [appearance checker](../../scripts/sheets-appearance-png-check.py) tests
+  visible formatting and compares the styled cells pixel for pixel.
 
 Gates, on the 4-core cloud machine:
 

@@ -238,6 +238,10 @@ struct CellStyle {
     font: Option<String>,
     fill: Option<Option<u32>>,
     borders: [Option<Edge>; 4],
+    diagonals: [Option<Edge>; 2],
+    shrink_to_fit: Option<bool>,
+    rotation: Option<i16>,
+    stacked: Option<bool>,
     h: Option<HAlign>,
     v: Option<VAlign>,
     wrap: Option<bool>,
@@ -407,8 +411,26 @@ impl Styles {
                                 if let Some(w) = a.get("fo:wrap-option") {
                                     c.wrap = Some(w == "wrap");
                                 }
-                                if a.get("style:rotation-angle").is_some_and(|v| v != "0") {
-                                    rep.note(Kind::Approximate, "rotated text shown level");
+                                if let Some(value) = a.get("style:shrink-to-fit") {
+                                    c.shrink_to_fit = Some(matches!(value.as_str(), "true" | "1"));
+                                }
+                                if let Some(value) = a.get("style:direction") {
+                                    c.stacked = Some(value == "ttb");
+                                }
+                                if let Some(value) = a.get("style:rotation-angle") {
+                                    c.rotation = value.parse::<i32>().ok().and_then(|angle| match angle.rem_euclid(360) {
+                                        n @ 0..=90 => Some(n as i16),
+                                        n @ 270..=359 => Some((n - 360) as i16),
+                                        _ => {
+                                            rep.note(Kind::Approximate, "ODS rotation outside the supported range");
+                                            None
+                                        }
+                                    });
+                                }
+                                for (i, key) in ["style:diagonal-tl-br", "style:diagonal-bl-tr"].into_iter().enumerate() {
+                                    if let Some(value) = a.get(key) {
+                                        c.diagonals[i] = Some(border(value));
+                                    }
                                 }
                             }
                         }
@@ -739,6 +761,24 @@ impl Styles {
             if let Some(w) = c.wrap {
                 s.wrap = w;
             }
+            if let Some(rotation) = c.rotation {
+                s.rotation = rotation;
+            }
+            if let Some(stacked) = c.stacked {
+                if stacked {
+                    s.rotation = 255;
+                } else if s.rotation == 255 {
+                    s.rotation = 0;
+                }
+            }
+            if let Some(shrink) = c.shrink_to_fit {
+                s.shrink_to_fit = shrink;
+            }
+            for (target, edge) in s.diagonals.iter_mut().zip(c.diagonals) {
+                if let Some(edge) = edge {
+                    *target = edge;
+                }
+            }
             if let Some(flags) = c.protection {
                 (s.unlocked, s.hide_formula, s.hide_value) = flags;
             }
@@ -817,6 +857,33 @@ impl Annotation {
     }
 }
 
+// A row default can reach every column even when its row has no cells in
+// content.xml. Keep the visible prefix without expanding the entire sheet.
+fn trailing_row_style(
+    runs: &mut Vec<Vec<(u32, u32, StyleId)>>,
+    rows: (u32, u32),
+    col: usize,
+    id: StyleId,
+    budget: &mut usize,
+    rep: &mut Report,
+) {
+    if id == 0 || col >= 256 {
+        return;
+    }
+    let width = (256 - col).min(*budget);
+    *budget -= width;
+    if runs.len() < col + width {
+        runs.resize_with(col + width, Vec::new);
+    }
+    for spans in &mut runs[col..col + width] {
+        match spans.last_mut() {
+            Some(last) if last.2 == id && last.1 + 1 == rows.0 => last.1 = rows.1,
+            _ => spans.push((rows.0, rows.1, id)),
+        }
+    }
+    rep.note(Kind::Approximate, "ODS row formats on distant blank cells were limited");
+}
+
 /// Reads an `.ods` package into a workbook.
 
 pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
@@ -866,6 +933,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let (mut row, mut col): (u64, u64) = (0, 0);
     let mut row_repeat = 1u32;
     let mut row_style: Option<String> = None;
+    let mut row_style_budget = 262_144;
     let mut col_defaults: Vec<(u64, u64, Option<String>)> = Vec::new();
     let mut col_x: u64 = 0;
     let mut widths: Vec<(u32, f64)> = Vec::new();
@@ -1053,6 +1121,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         col = 0;
                         row_cells.clear();
                         if empty {
+                            if let Some(nm) = row_style.as_deref().filter(|&nm| nm != "Default" && row < u64::from(MAX_ROWS)) {
+                                let id = *style_ids.entry(nm.to_string()).or_insert_with(|| wb.styles.intern(styles.resolve(nm)));
+                                let end = (row + u64::from(row_repeat) - 1).min(u64::from(MAX_ROWS) - 1);
+                                trailing_row_style(&mut runs, (row as u32, end as u32), 0, id, &mut row_style_budget, &mut rep);
+                            }
                             row += row_repeat as u64;
                         }
                     }
@@ -1621,6 +1694,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 }
                             }
                         }
+                        if let Some(nm) = row_style.as_deref().filter(|_| row < u64::from(MAX_ROWS)) {
+                            let id = id_of(&mut wb, nm);
+                            trailing_row_style(&mut runs, (r0, r1), col.min(u64::from(MAX_COLS)) as usize, id, &mut row_style_budget, &mut rep);
+                        }
                         row += row_repeat as u64;
                         row_cells.clear();
                     }
@@ -1646,6 +1723,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:table" => {
                         if let Some(s) = sheet.take() {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
+                            row_style_budget = 262_144;
                             wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
                             saved_filter_rows.insert(s, officina_grid::filter::merge(std::mem::take(&mut filtered_rows)));
                             wb.set_merges(s, std::mem::take(&mut merges));
