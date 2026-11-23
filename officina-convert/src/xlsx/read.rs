@@ -20,7 +20,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
 use officina_grid::eval::dates::DateSystem;
-use officina_grid::filter::{gregorian_calendar, AutoFilter, CalendarSelection, Cond, DateBounds, DateGroup,
+use officina_grid::filter::{gregorian_calendar, AppearanceFilter, AutoFilter, CalendarSelection, Cond, DateBounds, DateGroup, IconFilter,
     DynamicDate, Rank, Test, TextOp, TextTest, GROUP_FIELDS, MAX_SELECTIONS};
 use officina_grid::tables::Table;
 use officina_grid::addr::{a1, parse_a1, CellAddr, Rect, MAX_COLS, MAX_ROWS};
@@ -421,7 +421,7 @@ struct Seg {
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
-fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: DateSystem) -> Result<Seg, XlsxError> {
+fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: DateSystem, dxfs: &[super::condfmt::DxfIn]) -> Result<Seg, XlsxError> {
     let mut seg = Seg::default();
     let mut r = xml(data);
     r.config_mut().check_end_names = false;
@@ -433,12 +433,22 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
     let mut vtext: Vec<u8> = Vec::new();
     let mut vbuf: Vec<u8> = Vec::new();
     let mut fcol: Option<u32> = None;
+    let mut chose_icon = false;
+    let mut in_filter = false;
     loop {
         buf.clear();
         let ev = r.read_event_into(&mut buf)?;
         let (e, empty) = match ev {
             Event::Start(e) => (e, false),
             Event::Empty(e) => (e, true),
+            Event::End(e) if matches!(e.local_name().as_ref(), b"filterColumn" | b"autoFilter") => {
+                fcol = None;
+                chose_icon = false;
+                if e.local_name().as_ref() == b"autoFilter" {
+                    in_filter = false;
+                }
+                continue;
+            }
             Event::Eof => break,
             _ => continue,
         };
@@ -668,8 +678,13 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                 let span = r.read_to_end(quick_xml::name::QName(&end))?;
                 let inner = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
                 if seg.cond.len() < 1 << 16 {
-                    seg.cond.push(super::condfmt::Raw { sqref, inner });
+                    seg.cond.push(super::condfmt::Raw { sqref, inner, extended: false });
                 }
+            }
+            b"ext" if !empty && attr(&e, b"uri")?.is_some_and(|uri| uri.eq_ignore_ascii_case(super::condfmt::EXT_URI)) => {
+                let span = r.read_to_end(e.name())?;
+                let inner = data.get(span.start as usize..span.end as usize).unwrap_or_default();
+                super::condfmt::read_extension(inner, &mut seg.cond)?;
             }
             b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
             b"dataValidations" if !empty && e.name().as_ref() == b"dataValidations" => {
@@ -697,15 +712,18 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
             b"autoFilter" => {
                 if let Some(rf) = attr(&e, b"ref")? {
                     seg.filter = Some((rf, Vec::new()));
+                    in_filter = !empty;
                 }
             }
-            b"filterColumn" => {
-                fcol = attr(&e, b"colId")?.and_then(|v| v.parse::<u32>().ok());
+            b"filterColumn" if in_filter => {
+                chose_icon = false;
+                fcol = if empty { None } else { attr(&e, b"colId")?.and_then(|v| v.parse().ok()) };
                 if attr(&e, b"hiddenButton")?.is_some_and(|v| v == "1") {
                     seg.rep.note(Kind::Approximate, "hidden filter buttons shown");
                 }
             }
-            b"filters" | b"customFilters" | b"top10" | b"dynamicFilter" => {
+            b"Fallback" if chose_icon && !empty => skip(&mut r, &e)?,
+            b"filters" | b"customFilters" | b"top10" | b"dynamicFilter" | b"colorFilter" | b"iconFilter" => {
                 let Some((_, conds)) = seg.filter.as_mut() else { continue };
                 let Some(c) = fcol else { continue };
                 let name = e.local_name();
@@ -740,6 +758,17 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                             }
                         }
                     }
+                    b"colorFilter" | b"iconFilter" => {
+                        chose_icon = name.as_ref() == b"iconFilter" && e.name().prefix().is_some();
+                        match appearance_filter(&e, dxfs)? {
+                            Some(Some(rule)) => conds.push((c, Cond::Appearance(rule))),
+                            Some(None) => {} // The extended NoIcons sentinel is not a criterion.
+                            None => {
+                                seg.filter = None;
+                                seg.rep.note(Kind::Approximate, "unsupported color or icon filter (rows stay as the file hid them)");
+                            }
+                        }
+                    }
                     b"top10" => {
                         let percent = attr(&e, b"percent")?.is_some_and(|v| v == "1" || v == "true");
                         let bottom = attr(&e, b"top")?.is_some_and(|v| v == "0" || v == "false");
@@ -751,7 +780,6 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     _ => {}
                 }
             }
-            b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "colour and icon filters (rows stay as the file hid them)"),
             b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
                 // xSplit and ySplit count the frozen columns and rows, from
@@ -780,7 +808,7 @@ const PIECE: usize = 8 << 20;
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>, valid: &mut super::validation::Raw) -> Result<(), XlsxError> {
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], dxfs: &[super::condfmt::DxfIn], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>, valid: &mut super::validation::Raw) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -837,7 +865,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             sc.spawn(move || loop {
                 let next = piece_rx.lock().unwrap().recv();
                 let Ok((i, data)) = next else { return };
-                if seg_tx.send((i, segment(&data, sst, theme, i == 0, system))).is_err() {
+                if seg_tx.send((i, segment(&data, sst, theme, i == 0, system, dxfs))).is_err() {
                     return;
                 }
             });
@@ -1073,6 +1101,34 @@ fn read_text(r: &mut Reader<&[u8]>, end: &[u8], out: &mut String) -> Result<(), 
     }
 }
 
+fn appearance_filter(tag: &BytesStart, dxfs: &[super::condfmt::DxfIn]) -> Result<Option<Option<AppearanceFilter>>, XlsxError> {
+    if tag.local_name().as_ref() == b"colorFilter" {
+        let cell = match attr(tag, b"cellColor")?.as_deref() {
+            None | Some("1" | "true") => true,
+            Some("0" | "false") => false,
+            _ => return Ok(None),
+        };
+        let color = attr(tag, b"dxfId")?.and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| dxfs.get(i)).and_then(|dxf| dxf.filter_color(cell));
+        return Ok(color.map(|color| Some(AppearanceFilter::Color(color))));
+    }
+    let name = attr(tag, b"iconSet")?;
+    let index = attr(tag, b"iconId")?;
+    if name.as_deref() == Some("NoIcons") && index.as_deref() == Some("0") {
+        return Ok(Some(None));
+    }
+    let index = match index {
+        None => None,
+        Some(i) => match i.parse::<u8>() {
+            Ok(i) => Some(i),
+            Err(_) => return Ok(None),
+        },
+    };
+    let rule = name.as_deref().and_then(officina_grid::condfmt::icon_set)
+        .and_then(|set| IconFilter::new(set, index));
+    Ok(rule.map(|rule| Some(AppearanceFilter::Icon(rule))))
+}
+
 fn date_group(tag: &BytesStart) -> Result<Option<DateGroup>, XlsxError> {
     let kind = attr(tag, b"dateTimeGrouping")?;
     let Some(precision) = GROUP_FIELDS.iter().position(|&field| Some(field) == kind.as_deref()) else {
@@ -1301,11 +1357,14 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         None => super::styles::theme_colors(b""),
     };
     let mut dxfs = Vec::new();
+    let mut indexed = officina_grid::numfmt::PALETTE;
     let xf_ids: Vec<StyleId> = match wb_rels.values().find(|(t, _)| t.ends_with("/styles")).map(|(_, p)| p.clone()) {
         Some(p) => match z.read_name(&p)? {
             Some(x) => {
-                dxfs = super::condfmt::read_dxfs(&x, &theme);
-                super::styles::read(&x, &theme, &mut rep).into_iter().map(|st| wb.styles.intern(st)).collect()
+                let (styles, palette) = super::styles::read_with_palette(&x, &theme, &mut rep);
+                indexed = palette;
+                dxfs = super::condfmt::read_dxfs(&x, &super::styles::Colors { theme: &theme, indexed: &indexed });
+                styles.into_iter().map(|st| wb.styles.intern(st)).collect()
             }
             None => vec![0],
         },
@@ -1353,7 +1412,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         let mut shared = HashMap::new();
         let mut cond = Vec::new();
         let mut valid = super::validation::Raw::default();
-        sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond, &mut valid)?;
+        sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &dxfs, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond, &mut valid)?;
         all_f.push((i as u16, fcells, shared));
         conds.push((i as u16, cond));
         valids.push((i as u16, valid));
@@ -1389,7 +1448,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     super::pivot::read_all(&mut wb, &z, &parts, &wb_part, &pivot_caches, &mut rep)?;
     // Conditional formats, once formulas (and the names they use) can be read.
     for (s, raws) in &conds {
-        super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);
+        super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &super::styles::Colors { theme: &theme, indexed: &indexed }, &mut rep);
     }
     for (s, raw) in &valids {
         super::validation::read_sheet(&mut wb, *s, raw, &mut rep);

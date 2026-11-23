@@ -456,6 +456,9 @@ impl Workbook {
                 }
             }
             RuleKind::ColorScale(points) => {
+                if out.scale.is_some() || out.dxf.fill.is_some() {
+                    return false;
+                }
                 let Value::Num(x) = v else { return false };
                 let st = self.stats(fi, ri, f);
                 let ps: Vec<(f64, u32)> = points.iter().map(|(p, c)| (self.cfvo(p, &st, f, a), *c)).collect();
@@ -475,6 +478,9 @@ impl Workbook {
                 false
             }
             RuleKind::IconSet { set, points, reverse, show_value } => {
+                if out.icon.is_some() {
+                    return false;
+                }
                 let Value::Num(x) = v else { return false };
                 let n = ICON_SETS.get(*set as usize).map_or(0, |s| s.1) as usize;
                 if n == 0 || points.len() != n {

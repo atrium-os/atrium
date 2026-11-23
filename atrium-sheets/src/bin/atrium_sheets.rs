@@ -135,10 +135,10 @@ fn saved_status(d: &Doc, format: Format) -> String {
         let mut changes = Vec::new();
         if (0..d.wb.sheet_count() as u16).any(|sheet| {
             d.wb.sheet(sheet).filter.as_ref().is_some_and(|filter| {
-                filter.conds.iter().any(|(_, cond)| cond.is_excel_date())
+                filter.conds.iter().any(|(_, cond)| !officina_convert::ods::write::supports_filter(cond))
             })
         }) {
-            changes.push("kept the last row visibility for Excel calendar filters");
+            changes.push("kept the last row visibility for Excel calendar and appearance filters");
         }
         if d.wb.pivots().iter().any(|pivot| pivot.rows.iter().chain(&pivot.cols).any(|f| {
             matches!(&f.sort, officina_grid::pivot::AxisSort::Scoped { members, .. } if !members.is_empty())

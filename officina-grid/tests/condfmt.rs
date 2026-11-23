@@ -189,3 +189,30 @@ fn changing_formats_is_one_undoable_journaled_op() {
     assert_eq!(wb.cond_formats().len(), 1);
     assert!(GridOp::decode(&[8, 200]).is_err());
 }
+
+#[test]
+fn appearance_filters_follow_the_displayed_priority() {
+    use officina_grid::condfmt::{icon_points, icon_set};
+    use officina_grid::filter::{AppearanceFilter, AutoFilter, ColorFilter, Cond, IconFilter};
+
+    let mut wb = book();
+    let range = col(0, 10);
+    let arrows = icon_set("3Arrows").unwrap();
+    let stars = icon_set("3Stars").unwrap();
+    let formula = wb.cond_formula("A1>=5", 0, (0, 0)).unwrap();
+    let rules = vec![
+        Rule { kind: RuleKind::Expression(formula), dxf: fill(), stop: false },
+        Rule { kind: RuleKind::ColorScale(vec![(Cfvo::Min, 0x008000), (Cfvo::Max, 0xFFFF00)]), dxf: Dxf::default(), stop: false },
+        Rule { kind: RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true }, dxf: Dxf::default(), stop: false },
+        Rule { kind: RuleKind::IconSet { set: stars, points: icon_points(3), reverse: true, show_value: false }, dxf: Dxf::default(), stop: false },
+    ];
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![range], rules }).unwrap();
+    let top = wb.look(CellAddr::new(0, 9, 0));
+    assert_eq!(top.scale.or(top.dxf.fill), Some(RED));
+    assert_eq!(top.icon, Some((arrows, 2)));
+    assert!(!top.hide_value);
+
+    let hidden = |rule| wb.filtered(0, Some(AutoFilter { rect: range, conds: vec![(0, Cond::Appearance(rule))] })).hidden;
+    assert_eq!(hidden(AppearanceFilter::Color(ColorFilter { cell: true, rgb: Some(RED) })), vec![(1, 3)]);
+    assert_eq!(hidden(AppearanceFilter::Icon(IconFilter::new(arrows, Some(2)).unwrap())), vec![(1, 6)]);
+}

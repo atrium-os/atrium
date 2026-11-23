@@ -12,6 +12,8 @@ use crate::column::Sizes;
 use crate::eval::funcs::text_key;
 use crate::value::Value;
 
+mod appearance;
+pub use appearance::{AppearanceFilter, ColorFilter, IconFilter};
 mod calendar;
 pub use calendar::{gregorian_calendar, CalendarSelection, DateBounds, DateGroup, DynamicDate, GROUP_FIELDS, MAX_SELECTIONS};
 mod text;
@@ -29,6 +31,7 @@ pub enum Cond {
     Rank(Rank),
     Calendar(CalendarSelection),
     DynamicDate(DynamicDate),
+    Appearance(AppearanceFilter),
     /// Custom numeric and text tests joined by AND (true) or OR.
     Custom(Vec<Test>, bool),
 }
@@ -126,6 +129,10 @@ impl FilterState {
                             w.u8(7);
                             rule.encode(w);
                         }
+                        Cond::Appearance(rule) => {
+                            w.u8(8);
+                            rule.encode(w);
+                        }
                         Cond::Rank(rank) => {
                             w.u8(3);
                             w.u8(u8::from(rank.percent) | (u8::from(rank.bottom) << 1));
@@ -212,6 +219,7 @@ impl FilterState {
                         }
                         6 => Cond::Calendar(CalendarSelection::decode(r)?),
                         7 => Cond::DynamicDate(DynamicDate::decode(r)?),
+                        8 => Cond::Appearance(AppearanceFilter::decode(r)?),
                         _ => return Err(WireError::Invalid("filter kind")),
                     };
                     conds.push((c, cond));
@@ -276,6 +284,7 @@ impl Cond {
                 calendar_serial(wb, addr).is_some_and(|serial| selection.matches_date(wb.date_system(), serial))
                     || (!selection.values.is_empty() && selection.values.contains(&text_key(&wb.formatted(addr).text)))
             }
+            Cond::Appearance(rule) => rule.keeps(wb, addr),
             Cond::DynamicDate(rule) => calendar_serial(wb, addr).is_some_and(|serial| rule.keeps(wb.date_system(), serial)),
             Cond::Rank(rank) => {
                 let (Value::Num(x), Prepared::Rank(Some(y))) = (wb.get(addr), prepared) else { return false };

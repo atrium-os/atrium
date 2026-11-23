@@ -146,15 +146,15 @@ pub fn tint(rgb: u32, t: f64) -> u32 {
 }
 
 #[cfg(feature = "read")]
-struct Colors<'a> {
-    theme: &'a [u32],
-    indexed: &'a [u32],
+pub(super) struct Colors<'a> {
+    pub theme: &'a [u32],
+    pub indexed: &'a [u32],
 }
 
 #[cfg(feature = "read")]
 impl Colors<'_> {
     /// A `<color>`-like element's colour; `None` for automatic.
-    fn of(&self, a: &HashMap<Vec<u8>, String>) -> Option<u32> {
+    pub(super) fn of(&self, a: &HashMap<Vec<u8>, String>) -> Option<u32> {
         let t = a.get(b"tint".as_slice()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         if truthy(a.get(b"auto".as_slice())) {
             return None;
@@ -193,13 +193,18 @@ struct FontIn {
 /// One [`Style`] per `cellXfs` entry. Never fails: what it cannot read is the default,
 /// with a note.
 pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
+    read_with_palette(xml, theme, rep).0
+}
+
+#[cfg(feature = "read")]
+pub(super) fn read_with_palette(xml: &[u8], theme: &[u32], rep: &mut Report) -> (Vec<Style>, [u32; 64]) {
     let mut r = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut fmts: HashMap<u32, String> = HashMap::new();
     let mut fonts: Vec<FontIn> = Vec::new();
     let mut fills: Vec<Option<u32>> = Vec::new();
     let mut borders: Vec<[Edge; 4]> = Vec::new();
-    let mut indexed: Vec<u32> = PALETTE.to_vec();
+    let mut indexed = PALETTE;
     let mut custom_indexed: Vec<u32> = Vec::new();
     // A cell XF can inherit lock flags from a named style XF.
     #[derive(Default)]
@@ -453,7 +458,8 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
                 italic: f.italic,
                 underline: f.underline,
                 strike: f.strike,
-                color: f.color.filter(|c| Some(*c) != base.color),
+                color: f.color.filter(|c| Some(*c) != base.color
+                    || (fo != 0 && font_colors.get(fo) != font_colors.first())),
             };
         }
         s.fill = fills.get(fi).copied().flatten();
@@ -500,7 +506,7 @@ pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {
     if out.is_empty() {
         out.push(Style::default());
     }
-    out
+    (out, indexed)
 }
 
 fn hex(c: u32) -> String {
@@ -524,6 +530,10 @@ fn esc_attr(s: &str) -> String {
 
 /// `xl/styles.xml` for the workbook: `cellXfs` entry `i` is style id `i`.
 pub fn write(wb: &Workbook) -> Vec<u8> {
+    write_with_dxfs(wb, &super::condfmt::DxfTable::new(wb))
+}
+
+pub(super) fn write_with_dxfs(wb: &Workbook, dxfs: &super::condfmt::DxfTable) -> Vec<u8> {
     let mut fmts: Vec<(u32, String)> = Vec::new();
     let mut fonts: Vec<Font> = vec![Font::default()];
     let mut fills: Vec<Option<u32>> = vec![None, None]; // none, gray125 (required)
@@ -635,7 +645,7 @@ pub fn write(wb: &Workbook) -> Vec<u8> {
         xfs.push_str("</xf>");
     }
     // Conditional formats' formats; their number formats join the list.
-    let dxfs = super::condfmt::dxfs_xml(&super::condfmt::dxfs(wb), &mut |code| match numfmt::builtin_id(code) {
+    let dxfs = super::condfmt::dxfs_xml(dxfs, &mut |code| match numfmt::builtin_id(code) {
         Some(id) => id,
         None => match fmts.iter().find(|(_, c)| c == code) {
             Some((id, _)) => *id,

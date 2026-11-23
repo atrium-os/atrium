@@ -45,7 +45,7 @@ fn write_rules(wb: &Workbook, s: u16, o: &mut Vec<u8>, extended: bool) {
     let prefix = if extended { "x14:" } else { "" };
     if extended {
         let _ = write!(x, concat!(
-            r#"<extLst><ext uri="{}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main""#,
+            r#"<ext uri="{}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main""#,
             r#" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">"#
         ), EXT_URI);
     }
@@ -107,7 +107,7 @@ fn write_rules(wb: &Workbook, s: u16, o: &mut Vec<u8>, extended: bool) {
     }
     let _ = write!(x, "</{prefix}dataValidations>");
     if extended {
-        x.push_str("</ext></extLst>");
+        x.push_str("</ext>");
     }
     o.extend_from_slice(x.as_bytes());
 }

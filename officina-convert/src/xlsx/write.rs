@@ -12,7 +12,7 @@ use std::sync::Arc;
 use officina_grid::addr::{a1, Rect};
 use officina_grid::eval::arrays;
 use officina_grid::formula;
-use officina_grid::filter::{Cond, Test, TextOp, TextTest, GROUP_FIELDS};
+use officina_grid::filter::{AppearanceFilter, Cond, Test, TextOp, TextTest, GROUP_FIELDS};
 use officina_grid::{ErrorKind, Value, Workbook};
 
 use crate::xlsx::MDW;
@@ -246,7 +246,7 @@ impl Strings {
 
 const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
 
-fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -> io::Result<Vec<u8>> {
+fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, dxfs: &super::condfmt::DxfTable) -> io::Result<Vec<u8>> {
     let (rows, cols) = wb.extent(s);
     let name = wb.sheet_name(s);
     if rows > XLSX_ROWS || cols > XLSX_COLS {
@@ -569,6 +569,29 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
                             }
                             o.extend_from_slice(b"</customFilters>");
                         }
+                        Cond::Appearance(AppearanceFilter::Color(color)) => {
+                            let _ = write!(o, r#"<colorFilter dxfId="{}" cellColor="{}"/>"#, dxfs.color_id(*color), u8::from(color.cell));
+                        }
+                        Cond::Appearance(AppearanceFilter::Icon(icon)) => {
+                            let (set, index) = icon.selection();
+                            let name = officina_grid::condfmt::ICON_SETS[set as usize].0;
+                            if let Some(index) = index.filter(|_| super::condfmt::extended_icon_set(set)) {
+                                let ns = super::condfmt::X14;
+                                let _ = write!(o, concat!(
+                                    r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:x14="{ns}">"#,
+                                    r#"<mc:Choice Requires="x14"><x14:iconFilter iconSet="{name}" iconId="{index}"/></mc:Choice>"#,
+                                    r#"<mc:Fallback/></mc:AlternateContent>"#,
+                                ), ns = ns, name = name, index = index);
+                            } else {
+                                // In the base record an absent index means no icon.
+                                let name = if super::condfmt::extended_icon_set(set) { "3Arrows" } else { name };
+                                let _ = write!(o, r#"<iconFilter iconSet="{name}""#);
+                                if let Some(index) = index {
+                                    let _ = write!(o, r#" iconId="{index}""#);
+                                }
+                                o.extend_from_slice(b"/>");
+                            }
+                        }
                         Cond::Rank(rank) => {
                             let _ = write!(o, r#"<top10 top="{}" percent="{}" val="{}"/>"#,
                                 u8::from(!rank.bottom), u8::from(rank.percent), rank.limit());
@@ -588,7 +611,8 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         }
         o.extend_from_slice(b"</mergeCells>");
     }
-    super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb), &mut o);
+    let mut extensions = Vec::new();
+    super::condfmt::sheet_xml(wb, s, &dxfs.rules, &mut o, &mut extensions);
     super::validation::sheet_xml(wb, s, &mut o);
     let links = wb.links(s);
     if !links.is_empty() {
@@ -621,7 +645,12 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         }
         o.extend_from_slice(b"</tableParts>");
     }
-    super::validation::extension_xml(wb, s, &mut o);
+    super::validation::extension_xml(wb, s, &mut extensions);
+    if !extensions.is_empty() {
+        o.extend_from_slice(b"<extLst>");
+        o.extend(extensions);
+        o.extend_from_slice(b"</extLst>");
+    }
     o.extend_from_slice(b"</worksheet>");
     Ok(o)
 }
@@ -711,8 +740,9 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     let threads = super::threaded::Export::new(wb);
     let mut strings = Strings { ids: HashMap::new(), list: Vec::new(), uses: 0 };
     let mut parts = Vec::with_capacity(n);
+    let dxfs = super::condfmt::DxfTable::new(wb);
     for s in 0..n {
-        parts.push(sheet_xml(wb, s as u16, &mut strings, code_of(s))?);
+        parts.push(sheet_xml(wb, s as u16, &mut strings, code_of(s), &dxfs)?);
     }
     let main = if macros.is_some() { super::macros::MAIN_MACRO } else { "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" };
     let mut ct = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="{MAIN}"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#).replace("{MAIN}", main);
@@ -858,7 +888,7 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     if let Some(m) = macros {
         super::macros::write_parts(&mut z, m)?;
     }
-    z.add("xl/styles.xml", &super::styles::write(wb))?;
+    z.add("xl/styles.xml", &super::styles::write_with_dxfs(wb, &dxfs))?;
     let mut sst: Vec<u8> = Vec::new();
     let _ = write!(sst, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{}" uniqueCount="{}">"#, strings.uses, strings.list.len());
     for s in &strings.list {

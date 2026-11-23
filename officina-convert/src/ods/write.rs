@@ -1257,13 +1257,17 @@ fn number_condition(out: &mut String, field: u32, op: &str, x: f64) {
     let _ = write!(out, r#"<table:filter-condition table:field-number="{field}" table:value="{}" table:operator="{}"{ty}/>"#, num(x), esc_attr(op));
 }
 
+pub fn supports_filter(cond: &Cond) -> bool {
+    !cond.is_excel_date() && !matches!(cond, Cond::Appearance(_))
+}
+
 /// `table:database-ranges` holding each sheet's auto-filter, as LibreOffice writes
 /// them: columns joined by and; a column's values as one condition with set items.
 fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
     let mut out = String::new();
     for s in 0..wb.sheet_count() as u16 {
         let Some(f) = &wb.sheet(s).filter else { continue };
-        if f.conds.iter().any(|(_, cond)| cond.is_excel_date()) {
+        if f.conds.iter().any(|(_, cond)| !supports_filter(cond)) {
             continue;
         }
         let sh = super::formula::sheet_a1(&wb.sheet_name(s));
@@ -1320,7 +1324,7 @@ fn filters_xml(wb: &Workbook, whole_cell: bool) -> String {
                             out.push_str("</table:filter-or>");
                         }
                     }
-                    Cond::Calendar(_) | Cond::DynamicDate(_) => unreachable!(),
+                    Cond::Calendar(_) | Cond::DynamicDate(_) | Cond::Appearance(_) => unreachable!(),
                     Cond::Rank(rank) => {
                         let op = match (rank.bottom, rank.percent) {
                             (false, false) => "top values",
