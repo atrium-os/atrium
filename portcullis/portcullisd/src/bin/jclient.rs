@@ -82,6 +82,8 @@ fn main() -> ExitCode {
         "create" => {
             if rest.len() < 2 { return usage(); }
             Request::CreateJail(CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name:          rest[0].clone(),
                 path:          rest[1].clone(),
@@ -118,6 +120,8 @@ fn main() -> ExitCode {
             let argv: Vec<String> = rest[2..].to_vec();
             let (uid, gid) = env_ids();
             Request::CreateJail(CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name,
                 path,
@@ -126,6 +130,7 @@ fn main() -> ExitCode {
                 devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec: Some(ExecSpec {
+                    groups: vec![],
                     path: bin,
                     argv,
                     env:  vec![EnvPair {

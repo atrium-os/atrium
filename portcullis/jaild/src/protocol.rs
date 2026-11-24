@@ -116,6 +116,87 @@ pub enum Request {
 
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
+
+    /// Where a jaild-created jail is: [`Response::JailInfo`], answered from
+    /// jaild's state and the kernel. A name jaild did not create is
+    /// `PolicyDenied`, as for [`Request::ExecInJail`].
+    JailInfo { name: String },
+
+    /// A TCP socket listening on `127.0.0.1:port` inside a jaild-created
+    /// jail's own network stack (0: any port), handed back as one descriptor
+    /// with `Response::Ok`. For a workspace's egress proxy: the socket is
+    /// bound in the jail, served from the host.
+    ListenInJail { name: String, port: u16 },
+}
+
+/// What kind of jail a [`CreateJailRequest`] is, when it is one portcullisd
+/// makes for a person (app-jails-via-jaild.md §3). jaild records it and
+/// holds the request, and every later [`ExecInJailRequest`] into the jail,
+/// to the class's rules.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum JailClass {
+    /// An app's jail: its exec uid must be bound to `app_id` and `owner` in
+    /// the launch registry, and its groups are the owner's files groups.
+    App {
+        owner: String,
+        app_id: String,
+        /// Started under the debugger: the jail may debug its own processes.
+        #[serde(default)]
+        debug: bool,
+    },
+    /// A workspace: `allow.unprivileged_proc_debug` for this jail only, no
+    /// children; processes run as the owner's accounts or the jail's root.
+    Develop { owner: String },
+    /// A console beside an app, or an empty console: no children; processes
+    /// run as the owner's accounts or the jail's root.
+    Terminal { owner: String },
+}
+
+impl JailClass {
+    pub fn owner(&self) -> &str {
+        match self {
+            JailClass::App { owner, .. } | JailClass::Develop { owner } | JailClass::Terminal { owner } => owner,
+        }
+    }
+}
+
+/// A device set an app capability shows in the app's own devfs mount
+/// (app-jails-via-jaild.md §3 item 3). Typed, so no rule text crosses the
+/// socket; jaild owns the node patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClass {
+    /// `graphics`: the Fresco cdev.
+    Fresco,
+    /// `usb_hid`: input event devices.
+    Input,
+    /// `camera`: video capture devices.
+    Camera,
+}
+
+impl DeviceClass {
+    /// The devfs path pattern this class unhides.
+    pub fn pattern(self) -> &'static str {
+        match self {
+            DeviceClass::Fresco => "fresco0",
+            DeviceClass::Input => "input/event*",
+            DeviceClass::Camera => "video*",
+        }
+    }
+}
+
+/// Most supplementary groups an exec may carry past its gid.
+pub const MAX_EXEC_GROUPS: usize = 16;
+
+/// Who an [`ExecInJailRequest`] runs as, when not the jail's recorded uid.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ExecIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    /// Supplementary groups past `gid`, at most [`MAX_EXEC_GROUPS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<u32>,
 }
 
 /// Request body for [`Request::ExecInJail`].
@@ -142,6 +223,22 @@ pub struct ExecInJailRequest {
     /// Initial pty window size.
     pub cols: u16,
     pub rows: u16,
+    /// Run as this account instead (a classed jail only, checked against
+    /// its class; not with `want_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ExecIdentity>,
+    /// Directory to start in, inside the jail, entered after the drop.
+    /// Absolute; `/` when it cannot be entered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The process's umask (at most 0o777). Unset: 0o022.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub umask: Option<u32>,
+    /// The caller's stdin, stdout and stderr ride the request (three
+    /// descriptors) instead of a pty; the response carries the procdesc
+    /// alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdio: bool,
 }
 
 /// Runtime-mount attachment. See `docs/spec/storage.md` §6.2.
@@ -355,6 +452,17 @@ pub struct CreateJailRequest {
     /// `fuse_mount_prefix`; the mount goes when the jail is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse: Option<FuseServe>,
+
+    /// The kind of person-owned jail this is (app, workspace, console).
+    /// `None`: a service, component or one-shot, held to the rules those
+    /// already have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<JailClass>,
+
+    /// Device sets shown in this jail's devfs mount (an `app` class jail
+    /// with a devfs ruleset only; each at most once).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<DeviceClass>,
 }
 
 /// See [`CreateJailRequest::fuse`].
@@ -468,6 +576,10 @@ pub struct ExecSpec {
     /// pipe open for writing. Services only, never with `stdio` or FUSE.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ready: bool,
+    /// Supplementary groups past `gid` (at most [`MAX_EXEC_GROUPS`]): for
+    /// an `app` class jail, the owner's files groups. Empty: exactly `{gid}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<u32>,
 }
 
 /// The highest routing table a jail's epair may be put in: atrium-net's
@@ -578,9 +690,13 @@ pub enum Response {
 
     /// ExecInJail succeeded; the process is running inside the jail on a
     /// pty. Two fds ride SCM_RIGHTS alongside this body, in order:
-    /// `[procdesc, pty_master]`. `uid` is what it actually runs as inside
-    /// the jail (the jail's app-uid, or 0 if `want_root`).
+    /// `[procdesc, pty_master]` (only `[procdesc]` with `stdio`). `uid` is
+    /// what it actually runs as inside the jail.
     JailExecStarted { pid: i32, uid: u32 },
+
+    /// [`Request::JailInfo`]: `jid` is `None` when the jail is recorded but
+    /// not running.
+    JailInfo { jid: Option<i32>, path: String, persist: bool },
 
     /// Request was structurally valid but rejected by jaild's
     /// policy (mount source not allowed, name pattern bad, …).
@@ -745,6 +861,8 @@ mod tests {
     #[test]
     fn create_jail_request_serde() {
         let req = Request::CreateJail(CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name: "atrium-test".into(),
             path: "/usr/local/share/atrium".into(),

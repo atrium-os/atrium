@@ -312,6 +312,7 @@ fn main() -> ExitCode {
                 continue 'manifest;
             };
             let init_exec = ExecSpec {
+                groups: vec![],
                 path: init_exec_m.path.clone(),
                 argv: init_exec_m.argv.clone(),
                 uid:  init_exec_m.uid,

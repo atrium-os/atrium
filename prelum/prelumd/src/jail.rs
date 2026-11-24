@@ -217,13 +217,15 @@ impl Jailed {
         }
         let id = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(format!("host identity: {e}")))?;
         let req = Request::CreateJail(CreateJailRequest {
+            class: None,
+            devices: vec![],
             name: name(uid),
             path: root.to_string_lossy().into_owned(),
             children_max: 0,
             mounts,
             devfs_ruleset: DEVFS_RULESET,
             network,
-            exec: Some(ExecSpec { path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
+            exec: Some(ExecSpec { groups: vec![], path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
             rctl,
             hostname: Some(name(uid)),
             hostid: Some(id.hostid),

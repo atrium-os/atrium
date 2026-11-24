@@ -513,6 +513,8 @@ impl ServiceManifest {
     /// Translate to the wire-protocol type.
     pub fn to_create_request(&self) -> CreateJailRequest {
         CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name:          self.name.clone(),
             path:          self.path.clone(),
@@ -527,6 +529,7 @@ impl ServiceManifest {
                 owner: None,
             }).collect(),
             exec: self.exec.as_ref().map(|e| ExecSpec {
+                groups: vec![],
                 path: e.path.clone(),
                 argv: e.argv.clone(),
                 uid:  e.uid,

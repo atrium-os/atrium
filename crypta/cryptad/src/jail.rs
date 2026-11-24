@@ -76,6 +76,8 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
         tag: Some(TAG.into()),
     };
     let req = Request::CreateJail(CreateJailRequest {
+        class: None,
+        devices: vec![],
         name: name(uid),
         path: root.to_string_lossy().into_owned(),
         children_max: 0,
@@ -83,6 +85,7 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
         devfs_ruleset: DEVFS_RULESET,
         network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
         exec: Some(ExecSpec {
+            groups: vec![],
             path: if ac { EXEC_AC } else { EXEC_PATH }.into(),
             argv: vec![if ac { EXEC_AC } else { EXEC_PATH }.into()],
             env: vec![],

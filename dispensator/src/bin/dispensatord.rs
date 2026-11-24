@@ -1218,13 +1218,15 @@ mod run {
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {
+            class: None,
+            devices: vec![],
             name: name.clone(),
             path: root,
             children_max: 0,
             mounts,
             devfs_ruleset: 22,
             network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
-            exec: Some(ExecSpec { path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio, listen: Vec::new(), ready: false }),
+            exec: Some(ExecSpec { groups: vec![], path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio, listen: Vec::new(), ready: false }),
             rctl: None,
             hostname: Some(name),
             hostid: Some(id.hostid),
@@ -2297,6 +2299,8 @@ mod run {
                 owner: None,
             };
             CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name: p.name.clone(),
                 path: p.path.clone(),
@@ -2304,7 +2308,7 @@ mod run {
                 devfs_ruleset: p.devfs_ruleset,
                 network: NetworkConfig::Disable,
                 mounts: p.mounts_ro.iter().map(|m| ro(m)).collect(),
-                exec: Some(ExecSpec { path: p.exec.clone(), argv: p.argv.clone(), env: vec![], uid: p.uid, gid: p.gid, stdio: false, listen: Vec::new(), ready: false }),
+                exec: Some(ExecSpec { groups: vec![], path: p.exec.clone(), argv: p.argv.clone(), env: vec![], uid: p.uid, gid: p.gid, stdio: false, listen: Vec::new(), ready: false }),
                 hostname: None,
                 hostid: None,
                 hostuuid: None,
@@ -2497,13 +2501,15 @@ mod run {
                 argv.push("--ro".into());
             }
             let req = CreateJailRequest {
+                class: None,
+                devices: vec![],
                 name: name.clone(),
                 path: root,
                 children_max: 0,
                 mounts: STICK_MOUNTS.iter().map(|m| ro(m)).collect(),
                 devfs_ruleset: 22,
                 network: NetworkConfig::Disable,
-                exec: Some(ExecSpec { path: STICK_EXEC.into(), argv, env: vec![], uid, gid, stdio: false, listen: Vec::new(), ready: false }),
+                exec: Some(ExecSpec { groups: vec![], path: STICK_EXEC.into(), argv, env: vec![], uid, gid, stdio: false, listen: Vec::new(), ready: false }),
                 rctl: None,
                 hostname: None,
                 hostid: None,

@@ -3757,6 +3757,10 @@ fn handle_exec_in_jail(uid: u32, req: Request, writer: &mut UnixStream) -> std::
 
     // 2. forward to jaild (the sole jail_attach caller).
     let jreq = jaild::protocol::Request::ExecInJail(jaild::protocol::ExecInJailRequest {
+        identity: None,
+        cwd: None,
+        umask: None,
+        stdio: false,
         name: jail_name.clone(),
         path,
         argv,

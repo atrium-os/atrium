@@ -25,7 +25,7 @@ use log::{error, info, warn};
 use crate::ffi::{self, JailCreateSpec};
 use crate::protocol::{
     self, AttachMountRequest, CreateJailRequest, CreateJailResponse,
-    DetachMountRequest, ExecSpec, MountKind, NetworkConfig, ReapRequest, Request,
+    DetachMountRequest, ExecSpec, JailClass, MountKind, NetworkConfig, ReapRequest, Request,
     Response, SetRctlRequest,
 };
 use crate::state::PersistentState;
@@ -218,6 +218,18 @@ fn dispatch(
      * closed: a caller that sent a pipe is waiting on it. */
     let wants_stdio = matches!(&req,
         Request::CreateJail(r) if r.exec.as_ref().is_some_and(|e| e.stdio));
+    /* ExecInJail with the caller's stdio takes exactly the three. */
+    if matches!(&req, Request::ExecInJail(r) if r.stdio) {
+        let n = fds.len();
+        let Ok(std) = <[OwnedFd; 3]>::try_from(fds) else {
+            return (Response::PolicyDenied {
+                rule:   "exec_in_jail.stdio.fd_count".into(),
+                detail: format!("exec stdio needs exactly 3 descriptors; got {n}"),
+            }, Vec::new());
+        };
+        let Request::ExecInJail(r) = &req else { unreachable!("matched above") };
+        return exec_in_jail_response(handle_exec_in_jail(r, Some(std), dry_run, state));
+    }
     /* ★ And a FUSE server's control socket (FuseServe::control, device-
      * assignment.md §4.8): exactly one descriptor, and it must be a socket,
      * which the server gets after its FUSE descriptors: fd 5 behind a
@@ -309,6 +321,10 @@ fn dispatch(
         Request::CreateJail(spec) => {
             match handle_create(&spec, stdio, control, listen, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
+                    if !dry_run {
+                        state.set_class(&spec.name, spec.class.clone(), spec.exec.is_none());
+                        if let Err(e) = state.save(state_path) { warn!("jaild: state save after class: {e}"); }
+                    }
                     (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
                 }
                 Err(JaildError::PolicyViolation { rule, detail }) => {
@@ -321,16 +337,13 @@ fn dispatch(
             }
         }
 
-        Request::ExecInJail(req) => match handle_exec_in_jail(&req, dry_run, state) {
-            Ok((resp, fds)) => (resp, fds),
-            Err(JaildError::PolicyViolation { rule, detail }) => {
-                (Response::PolicyDenied { rule: rule.into(), detail }, Vec::new())
-            }
-            Err(JaildError::Syscall { name, errno, msg }) => {
-                (Response::SyscallFailed { name: name.into(), errno, msg }, Vec::new())
-            }
-            Err(other) => (Response::Error { detail: format!("{other}") }, Vec::new()),
-        },
+        Request::ExecInJail(req) => exec_in_jail_response(handle_exec_in_jail(&req, None, dry_run, state)),
+
+        Request::JailInfo { name } => handle_jail_info(&name, state),
+
+        Request::ListenInJail { name, port } => {
+            exec_in_jail_response(handle_listen_in_jail(&name, port, dry_run, state))
+        }
 
         Request::RemoveJail { jid, name } => {
             let (resp, fd) = handle_remove(jid, name, dry_run, state, state_path);
@@ -864,6 +877,7 @@ fn handle_create(
     let engine = req.name.contains("navigator-engine");
     if engine { start_trace("jaild", "create-begin", &req.name) }
     validator::validate_create(req, policy)?;
+    validator::validate_class_identity(req, &crate::identity::HostIdentity)?;
     if let Some(exec) = &req.exec {
         let n = exec.listen.len().min(listen.len());
         check_listen(req, &exec.listen, &listen[..n])?;
@@ -1052,6 +1066,22 @@ fn handle_create(
             info!("jaild: granted {node} to uid {uid} in {devdir}");
         }
 
+        /* An app's device classes (camera, input, ...): shown in this mount
+         * by a fixed pattern per class, never by text from the request. */
+        for d in &req.devices {
+            if let Err(e) = ffi::devfs_unhide(&devdir, *d) {
+                if let Some(addr) = &lo0_alias {
+                    let _ = ffi::ifconfig_lo0_alias_del(addr);
+                }
+                ffi::unmount_quiet(&devdir);
+                return Err(JaildError::Syscall {
+                    name:  "devfs rule apply",
+                    errno: e.raw_os_error().unwrap_or(-1),
+                    msg:   format!("show {} in {devdir}: {e}", d.pattern()),
+                });
+            }
+        }
+
         /* A pinned ruleset's device leases (the display lease): name this jail
          * and uid as the only opener BEFORE the service runs, so it never sees
          * EPERM at startup and nothing else can open the device meanwhile. The
@@ -1120,6 +1150,8 @@ fn handle_create(
         hostuuid:       req.hostuuid.as_deref(),
         allow_mlock:    req.allow_mlock,
         allow_tessera_keys: req.allow_tessera_keys,
+        classed: req.class.is_some(),
+        allow_proc_debug: may_debug(req),
         sysfil,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
@@ -1276,6 +1308,12 @@ fn isolated_needs_vnet(n: &NetworkConfig) -> bool {
     matches!(n, NetworkConfig::Isolated) && !ffi::netblind_supported()
 }
 
+/// A workspace jail, or an app started under the debugger, may debug its own
+/// processes (`allow.unprivileged_proc_debug`); no other jail gets it.
+fn may_debug(req: &CreateJailRequest) -> bool {
+    matches!(req.class, Some(JailClass::Develop { .. }) | Some(JailClass::App { debug: true, .. }))
+}
+
 /// The persistent vnet=new jail both pre-networked modes start from.
 fn isolated_spec<'a>(req: &'a CreateJailRequest, sysfil: Option<&'a SysfilParams>) -> JailCreateSpec<'a> {
     JailCreateSpec {
@@ -1292,6 +1330,8 @@ fn isolated_spec<'a>(req: &'a CreateJailRequest, sysfil: Option<&'a SysfilParams
         hostuuid:      req.hostuuid.as_deref(),
         allow_mlock:   req.allow_mlock,
         allow_tessera_keys: req.allow_tessera_keys,
+        classed: req.class.is_some(),
+        allow_proc_debug: may_debug(req),
         sysfil,
     }
 }
@@ -1616,6 +1656,8 @@ fn handle_create_with_exec(
             hostuuid:       req.hostuuid.as_deref(),
             allow_mlock:    req.allow_mlock,
             allow_tessera_keys: req.allow_tessera_keys,
+            classed: req.class.is_some(),
+        allow_proc_debug: may_debug(req),
             sysfil,
         };
         // No core dumps from a filtered jail: three of the advisories the
@@ -1653,7 +1695,7 @@ fn handle_create_with_exec(
                 ffi::child_exit(105);
             }
         }
-        if let Err(e) = ffi::drop_privileges(exec.uid, exec.gid) {
+        if let Err(e) = ffi::drop_privileges_groups(exec.uid, exec.gid, &exec.groups) {
             eprintln!("jaild-child: drop_privileges({}, {}): {e}",
                 exec.uid, exec.gid);
             ffi::child_exit(103);
@@ -1740,6 +1782,97 @@ fn handle_create_with_exec(
     })
 }
 
+fn exec_in_jail_response(r: Result<(Response, Vec<i32>), JaildError>) -> (Response, Vec<i32>) {
+    match r {
+        Ok(ok) => ok,
+        Err(JaildError::PolicyViolation { rule, detail }) => {
+            (Response::PolicyDenied { rule: rule.into(), detail }, Vec::new())
+        }
+        Err(JaildError::Syscall { name, errno, msg }) => {
+            (Response::SyscallFailed { name: name.into(), errno, msg }, Vec::new())
+        }
+        Err(other) => (Response::Error { detail: format!("{other}") }, Vec::new()),
+    }
+}
+
+/// A jail jaild made, by name: its live jid (`None` when nothing runs in an
+/// exec'd jail any more), root and whether it persists. Jails jaild did not
+/// make are refused, as for every other request that names one.
+fn handle_jail_info(name: &str, state: &PersistentState) -> (Response, Vec<i32>) {
+    let Some(r) = state.jails.iter().rev().find(|j| j.name == name) else {
+        return (Response::PolicyDenied {
+            rule:   "jail_info.unknown_jail".into(),
+            detail: format!("no jail named {name:?} in jaild state"),
+        }, Vec::new());
+    };
+    (Response::JailInfo { jid: ffi::jail_id_by_name(name), path: r.path.clone(), persist: r.persistent }, Vec::new())
+}
+
+/// A TCP socket listening on 127.0.0.1:`port` (0: any) in the network stack
+/// of a workspace, or of an app started under the debugger: a child
+/// attaches to the jail, binds, listens and hands the socket back. The
+/// socket is the caller's; nothing runs in the jail afterwards.
+fn handle_listen_in_jail(
+    name:    &str,
+    port:    u16,
+    dry_run: bool,
+    state:   &PersistentState,
+) -> Result<(Response, Vec<i32>), JaildError> {
+    let Some(jail) = state.jails.iter().rev().find(|j| j.name == name) else {
+        return Err(JaildError::PolicyViolation {
+            rule:   "listen_in_jail.unknown_jail",
+            detail: format!("no jail named {name:?} in jaild state"),
+        });
+    };
+    if !matches!(jail.class, Some(JailClass::Develop { .. }) | Some(JailClass::App { debug: true, .. })) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "listen_in_jail.class",
+            detail: "a listening socket only in a workspace, or an app under the debugger".into(),
+        });
+    }
+    let Some(jid) = ffi::jail_id_by_name(name) else {
+        return Err(JaildError::Syscall { name: "jail_id_by_name", errno: 0, msg: format!("jail {name:?} is not running") });
+    };
+    if dry_run {
+        return Ok((Response::Ok, Vec::new()));
+    }
+    let sys = |name: &'static str| move |e: std::io::Error| JaildError::Syscall {
+        name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
+    };
+    let (ours, theirs) = UnixStream::pair().map_err(sys("socketpair"))?;
+    let pdf = ffi::pdfork().map_err(sys("pdfork"))?;
+    if pdf.pid == 0 {
+        /* ====== child ====== */
+        drop(ours);
+        if let Err(e) = ffi::jail_attach(jid) {
+            eprintln!("jaild-child: jail_attach({jid}): {e}");
+            ffi::child_exit(102);
+        }
+        match ffi::listen_loopback(port) {
+            Ok(fd) => {
+                if let Err(e) = atrium_fdpass::send_fd(theirs.as_raw_fd(), fd.as_raw_fd()) {
+                    eprintln!("jaild-child: send listener: {e}");
+                    ffi::child_exit(104);
+                }
+                ffi::child_exit(0);
+            }
+            Err(e) => {
+                eprintln!("jaild-child: listen 127.0.0.1:{port} in {name}: {e}");
+                ffi::child_exit(103);
+            }
+        }
+    }
+    /* ====== parent ====== */
+    drop(theirs);
+    // pdfork's descriptor is ours alone; dropping it reaps the child.
+    let procdesc = ffi::owned_fd(pdf.procdesc_fd);
+    ours.set_read_timeout(Some(std::time::Duration::from_secs(5))).map_err(sys("setsockopt"))?;
+    let got = atrium_fdpass::recv_fd(ours.as_raw_fd()).map_err(sys("recv listener"))?;
+    drop(procdesc);
+    info!("jaild: listening socket on 127.0.0.1:{port} in {name}");
+    Ok((Response::Ok, vec![ffi::into_raw(got)]))
+}
+
 /// Exec a process inside an EXISTING jaild-created jail on a pty (the
 /// `ExecInJail` primitive; stoa.md §4.5). jaild allocates the pty in the
 /// parent (keeping the master), then pdforks a child that `login_tty`s the
@@ -1748,28 +1881,36 @@ fn handle_create_with_exec(
 /// `[procdesc, pty_master]` for the caller to drive + reap.
 fn handle_exec_in_jail(
     req:     &protocol::ExecInJailRequest,
+    stdio:   Option<[OwnedFd; 3]>,
     dry_run: bool,
     state:   &PersistentState,
 ) -> Result<(Response, Vec<i32>), JaildError> {
     /* jaild-created-only gate (same protection as Reap/SetRctl): the
      * target name MUST be in jaild's own state, so an exec can never
      * attach into the TCB or a jail jaild did not create. */
-    let jail = match state.jails.iter().find(|j| j.name == req.name) {
-        Some(j) => j.clone(),
-        None => {
-            return Ok((
-                Response::PolicyDenied {
-                    rule: "exec.unknown_jail".into(),
-                    detail: format!(
-                        "no jail named {:?} in jaild state — refusing to attach \
-                         into a jail jaild did not create",
-                        req.name
-                    ),
-                },
-                Vec::new(),
-            ))
-        }
+    let Some(jail) = state.jails.iter().rev().find(|j| j.name == req.name).cloned() else {
+        return Ok((
+            Response::PolicyDenied {
+                rule: "exec.unknown_jail".into(),
+                detail: format!(
+                    "no jail named {:?} in jaild state — refusing to attach \
+                     into a jail jaild did not create",
+                    req.name
+                ),
+            },
+            Vec::new(),
+        ));
     };
+    if req.stdio != stdio.is_some() {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec_in_jail.stdio",
+            detail: "stdio needs its three descriptors, and they need stdio".into(),
+        });
+    }
+    /* A classed jail's rules on who may run in it; checked before anything
+     * else so a refused identity never reaches a lookup of the live jail. */
+    validator::validate_exec_in_jail(jail.class.as_ref(), req, &crate::identity::HostIdentity)?;
+
     /* Resolve the LIVE jid (exec'd jails carry sentinel 0 in state). */
     let jid = match ffi::jail_id_by_name(&jail.name) {
         Some(j) => j,
@@ -1785,10 +1926,15 @@ fn handle_exec_in_jail(
         }
     };
 
-    /* uid/gid: the jail's own app-uid (non-root) by default, or root iff
-     * the caller (portcullisd, post-jail_exec_root) asked. NOT from the
-     * request's uid — there isn't one. */
-    let (uid, gid) = if req.want_root { (0, 0) } else { (jail.uid, jail.gid) };
+    /* Who runs: the identity the validator accepted, else the jail's root
+     * when asked for, else the jail's own recorded uid. */
+    let (uid, gid, groups) = match (&req.identity, req.want_root) {
+        (Some(id), _) => (id.uid, id.gid, id.groups.clone()),
+        (None, true) => (0, 0, Vec::new()),
+        (None, false) => (jail.uid, jail.gid, Vec::new()),
+    };
+    let cwd = req.cwd.clone().unwrap_or_else(|| "/".into());
+    let umask = req.umask.unwrap_or(0o022);
 
     if dry_run {
         info!(
@@ -1798,19 +1944,24 @@ fn handle_exec_in_jail(
         return Ok((Response::JailExecStarted { pid: 0, uid }, Vec::new()));
     }
 
-    /* Allocate the pty in the PARENT: we keep `master` to hand back over
-     * SCM_RIGHTS; the child turns `slave` into its controlling tty. */
-    let (master, slave) = ffi::openpty_pair(req.cols, req.rows).map_err(|e| {
-        JaildError::Syscall {
+    /* A pty unless the caller brought its own stdio: allocated in the
+     * PARENT, which keeps `master` to hand back; the child makes `slave`
+     * its controlling tty. */
+    let pty = if stdio.is_none() {
+        Some(ffi::openpty_pair(req.cols, req.rows).map_err(|e| JaildError::Syscall {
             name: "openpty",
             errno: e.raw_os_error().unwrap_or(-1),
             msg: format!("{e}"),
-        }
-    })?;
+        })?)
+    } else {
+        None
+    };
 
     let pdf = ffi::pdfork().map_err(|e| {
-        let _ = ffi::close_fd(master);
-        let _ = ffi::close_fd(slave);
+        if let Some((m, s)) = pty {
+            let _ = ffi::close_fd(m);
+            let _ = ffi::close_fd(s);
+        }
         JaildError::Syscall {
             name: "pdfork",
             errno: e.raw_os_error().unwrap_or(-1),
@@ -1820,20 +1971,32 @@ fn handle_exec_in_jail(
 
     if pdf.pid == 0 {
         /* ====== child ====== */
-        let _ = ffi::close_fd(master);
-        /* login_tty sets fd 0/1/2 to a valid tty BEFORE jail_attach, so
-         * the child has working stdio inside the jail. */
-        if let Err(e) = ffi::login_tty(slave) {
-            eprintln!("jaild-child: login_tty: {e}");
+        /* Valid stdio BEFORE jail_attach, so the child's own diagnostics
+         * land somewhere: the pty's slave, or the caller's three. */
+        let set = match (&pty, &stdio) {
+            (Some((m, s)), _) => {
+                let _ = ffi::close_fd(*m);
+                ffi::login_tty(*s)
+            }
+            (None, Some(std)) => ffi::install_child_stdio(std.each_ref().map(|f| f.as_raw_fd())).map(|()| ffi::setsid()),
+            (None, None) => unreachable!("one of the two, checked above"),
+        };
+        if let Err(e) = set {
+            eprintln!("jaild-child: stdio: {e}");
             ffi::child_exit(101);
         }
         if let Err(e) = ffi::jail_attach(jid) {
             eprintln!("jaild-child: jail_attach({jid}): {e}");
             ffi::child_exit(102);
         }
-        if let Err(e) = ffi::drop_privileges(uid, gid) {
+        if let Err(e) = ffi::drop_privileges_groups(uid, gid, &groups) {
             eprintln!("jaild-child: drop_privileges({uid}, {gid}): {e}");
             ffi::child_exit(103);
+        }
+        /* After the drop: a folder the identity cannot enter is not entered. */
+        if let Err(e) = ffi::child_cwd_umask(&cwd, umask) {
+            eprintln!("jaild-child: chdir {cwd}: {e}");
+            ffi::child_exit(105);
         }
         let env_pairs: Vec<(String, String)> =
             req.env.iter().map(|p| (p.key.clone(), p.value.clone())).collect();
@@ -1847,12 +2010,15 @@ fn handle_exec_in_jail(
     }
 
     /* ====== parent ====== */
-    let _ = ffi::close_fd(slave); // the child owns it now
-    info!(
-        "jaild: exec-in-jail {} (jid {}) pid={} pdfd={} master={}",
-        jail.name, jid, pdf.pid, pdf.procdesc_fd, master
-    );
-    Ok((Response::JailExecStarted { pid: pdf.pid, uid }, vec![pdf.procdesc_fd, master]))
+    drop(stdio); // the child has its copies
+    let mut out = vec![pdf.procdesc_fd];
+    if let Some((master, slave)) = pty {
+        let _ = ffi::close_fd(slave); // the child owns it now
+        out.push(master);
+    }
+    info!("jaild: exec-in-jail {} (jid {}) pid={} uid={uid} pdfd={} stdio={}",
+        jail.name, jid, pdf.pid, pdf.procdesc_fd, req.stdio);
+    Ok((Response::JailExecStarted { pid: pdf.pid, uid }, out))
 }
 
 fn send_response(

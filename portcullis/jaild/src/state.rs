@@ -108,6 +108,14 @@ pub struct JailRecord {
     /// force-unmounted at RemoveJail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fuse_mount: Option<String>,
+    /// The person-owned class the jail was created with
+    /// (`CreateJailRequest::class`): what later ExecInJail requests into it
+    /// are held to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<crate::protocol::JailClass>,
+    /// Created without an exec: it stays until RemoveJail.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -214,8 +222,19 @@ impl PersistentState {
             gid,
             memory_ceiling_mb: None,
             fuse_mount: None,
+            class: None,
+            persistent: false,
         });
         self.written_at_unix = now_unix();
+    }
+
+    /// Record the class, and whether it persists, of the most recent record
+    /// named `name`.
+    pub fn set_class(&mut self, name: &str, class: Option<crate::protocol::JailClass>, persistent: bool) {
+        if let Some(r) = self.jails.iter_mut().rev().find(|r| r.name == name) {
+            r.class = class;
+            r.persistent = persistent;
+        }
     }
 
     /// Record the static memory ceiling of the most recent record named `name`.

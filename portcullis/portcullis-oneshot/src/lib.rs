@@ -473,6 +473,8 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     };
     let entry = format!("/{}", manifest.entry());
     let req = jaild::protocol::Request::CreateJail(jaild::protocol::CreateJailRequest {
+        class: None,
+        devices: vec![],
         name:          jail_name.clone(),
         path:          jail_path.to_string_lossy().into_owned(),
         children_max:  0,
@@ -482,6 +484,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
         // list the host's interfaces or read its real MAC (§9.1c).
         network,
         exec: Some(jaild::protocol::ExecSpec {
+            groups: vec![],
             path:  entry.clone(),
             argv:  vec![entry],
             env:   clean_env(&pw).into_iter().chain(spec.extra_env.iter()

@@ -75,6 +75,8 @@ fn main() {
     // 4. EXEC the app jailed at that uid (jaild jails + drops to it).
     let name = format!("app-{}", app_id.replace(['.', '/'], "-"));
     let req = Request::CreateJail(CreateJailRequest {
+        class: None,
+        devices: vec![],
         rctl: None,
         name,
         path: jail_path.clone(),
@@ -83,6 +85,7 @@ fn main() {
         devfs_ruleset: 0,
         network: NetworkConfig::Disable,
         exec: Some(ExecSpec {
+            groups: vec![],
             path: bin.clone(),
             argv,
             env: vec![EnvPair { key: "PATH".into(), value: "/bin:/usr/bin".into() }],
