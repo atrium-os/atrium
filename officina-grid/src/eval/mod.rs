@@ -12,6 +12,7 @@ pub mod criteria;
 pub mod dates;
 pub mod funcs;
 pub mod ifcache;
+mod textafter;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
@@ -240,18 +241,18 @@ impl<'a> Ctx<'a> {
                 None => Ev::err(ErrorKind::Ref),
             },
             Expr::Paren(a) | Expr::Plus(a) => self.eval(a),
-            Expr::Neg(a) => self.map1(self.eval(a), |v| match to_num(&v) {
+            Expr::Neg(a) => self.map1(self.eval(a), |v| match self.number(&v) {
                 Ok(x) => Value::num(-x),
                 Err(e) => Value::Err(e),
             }),
-            Expr::Pct(a) => self.map1(self.eval(a), |v| match to_num(&v) {
+            Expr::Pct(a) => self.map1(self.eval(a), |v| match self.number(&v) {
                 Ok(x) => Value::num(x / 100.0),
                 Err(e) => Value::Err(e),
             }),
             Expr::Bin(op, a, b) => {
                 let x = self.eval(a);
                 let y = self.eval(b);
-                self.map2(x, y, |p, q| binop(*op, &p, &q))
+                self.map2(x, y, |p, q| binop_with(*op, &p, &q, |v| self.number(v)))
             }
             Expr::Call(Func::Known(id), args) => match arrays::lifted(*id, args) {
                 Some(mask) => self.lift(*id, mask, args),
@@ -312,6 +313,17 @@ impl<'a> Ctx<'a> {
     /// One value from an expression in a place that wants one.
     pub fn scalar(&self, e: &Expr) -> Value {
         self.to_scalar(self.eval(e))
+    }
+
+    pub(crate) fn numeric_text(&self, s: &str) -> Option<f64> {
+        parse_number(s).or_else(|| self.wb.date_system().formula_text(s))
+    }
+
+    pub(crate) fn number(&self, v: &Value) -> Result<f64, ErrorKind> {
+        match v {
+            Value::Str(s) => self.numeric_text(s).ok_or(ErrorKind::Value),
+            v => to_num(v),
+        }
     }
 
     pub fn to_scalar(&self, ev: Ev) -> Value {
@@ -424,7 +436,7 @@ fn fix(v: Value) -> Value {
     }
 }
 
-/// Excel's number coercion of a single value.
+/// Numeric coercion where no workbook calendar is available.
 pub fn to_num(v: &Value) -> Result<f64, ErrorKind> {
     match v {
         Value::Empty => Ok(0.0),
@@ -436,7 +448,7 @@ pub fn to_num(v: &Value) -> Result<f64, ErrorKind> {
 }
 
 /// Text as a number: optional spaces, sign, digits with an optional exponent, an
-/// optional trailing `%`. (Dates and currency in text come with locale support.)
+/// optional trailing `%`. Calendar dates are handled separately in formulas.
 pub fn parse_number(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
@@ -485,6 +497,10 @@ pub fn to_bool(v: &Value) -> Result<bool, ErrorKind> {
 }
 
 pub fn binop(op: BinOp, a: &Value, b: &Value) -> Value {
+    binop_with(op, a, b, to_num)
+}
+
+fn binop_with(op: BinOp, a: &Value, b: &Value, number: impl Fn(&Value) -> Result<f64, ErrorKind>) -> Value {
     if let Value::Err(e) = a {
         return Value::Err(*e);
     }
@@ -513,7 +529,7 @@ pub fn binop(op: BinOp, a: &Value, b: &Value) -> Value {
             })
         }
         _ => {
-            let (x, y) = match (to_num(a), to_num(b)) {
+            let (x, y) = match (number(a), number(b)) {
                 (Ok(x), Ok(y)) => (x, y),
                 (Err(e), _) | (_, Err(e)) => return Value::Err(e),
             };

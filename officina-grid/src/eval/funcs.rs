@@ -5,7 +5,7 @@
 use super::criteria::{Criterion, Key};
 use super::ifcache;
 use super::arrays::*;
-use super::{to_bool, to_num, to_text, Array, Ctx, Ev};
+use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
 use crate::value::{cmp_text, compare, ErrorKind, Value};
@@ -122,6 +122,7 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("VALUE", 1, 1, value),
     f!("TEXT", 2, 2, text_fn),
     f!("EXACT", 2, 2, exact),
+    f!("TEXTAFTER", 2, 6, textafter),
     // lookup
     f!("CHOOSE", 2, N, choose),
     f!("INDEX", 2, 3, index),
@@ -198,7 +199,7 @@ macro_rules! tri {
 }
 
 fn num(c: &Ctx, a: &Expr) -> Result<f64, ErrorKind> {
-    to_num(&c.scalar(a))
+    c.number(&c.scalar(a))
 }
 fn text(c: &Ctx, a: &Expr) -> Result<Arc<str>, ErrorKind> {
     to_text(&c.scalar(a))
@@ -231,7 +232,7 @@ fn each_num_slices(c: &Ctx, args: &[Expr], f: &mut dyn FnMut(&[f64])) -> Result<
         match c.eval(a) {
             Ev::F(_) => return Err(ErrorKind::Calc),
             Ev::V(Value::Empty) => {}
-            Ev::V(x) => f(&[to_num(&x)?]),
+            Ev::V(x) => f(&[c.number(&x)?]),
             Ev::R(r) => {
                 let mut err = None;
                 if let Some(cl) = c.clip(&r) {
@@ -326,7 +327,7 @@ fn count(c: &Ctx, a: &[Expr]) -> Ev {
         match c.eval(x) {
             Ev::F(_) => {}
             Ev::V(val) => {
-                if matches!(val, Value::Num(_) | Value::Bool(_)) || matches!(&val, Value::Str(s) if super::parse_number(s).is_some()) {
+                if matches!(val, Value::Num(_) | Value::Bool(_)) || matches!(&val, Value::Str(s) if c.numeric_text(s).is_some()) {
                     k += 1
                 }
             }
@@ -1187,11 +1188,30 @@ fn substitute(c: &Ctx, a: &[Expr]) -> Ev {
     }
     s(out)
 }
+fn textafter(c: &Ctx, a: &[Expr]) -> Ev {
+    let haystack = tri!(text(c, &a[0]));
+    let delim = tri!(super::textafter::delimiters(c, c.eval(&a[1])));
+    let instance = tri!(opt_num(c, a, 2, 1.0)).floor();
+    let mode = tri!(opt_num(c, a, 3, 0.0));
+    let match_end = tri!(opt_num(c, a, 4, 0.0));
+    let explicit_instance = a.get(2).is_some_and(|arg| !missing(arg));
+    match super::textafter::after(&haystack, &delim, instance, mode, match_end, explicit_instance) {
+        Ok(Some(suffix)) => v(Value::str(suffix)),
+        Ok(None) => match a.get(5).filter(|arg| !missing(arg)) {
+            Some(fallback) => match c.scalar(fallback) {
+                Value::Empty => v(Value::str("")),
+                value => v(value),
+            },
+            None => e(ErrorKind::NA),
+        },
+        Err(err) => e(err),
+    }
+}
 fn value(c: &Ctx, a: &[Expr]) -> Ev {
     match c.scalar(&a[0]) {
         Value::Num(x) => n(x),
         Value::Empty => n(0.0),
-        Value::Str(t) => match super::parse_number(&t) {
+        Value::Str(t) => match c.numeric_text(&t) {
             Some(x) => n(x),
             None => e(ErrorKind::Value),
         },
@@ -1205,7 +1225,7 @@ fn text_fn(c: &Ctx, a: &[Expr]) -> Ev {
     let x = match c.scalar(&a[0]) {
         Value::Empty => Value::Num(0.0),
         Value::Err(k) => return e(k),
-        Value::Str(t) => match super::parse_number(&t) {
+        Value::Str(t) => match c.numeric_text(&t) {
             Some(x) => Value::Num(x),
             None => Value::Str(t),
         },

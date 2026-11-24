@@ -103,9 +103,7 @@ impl DateSystem {
         if date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
             return None;
         }
-        let digits = |s: &str| -> Option<u32> {
-            (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
-        };
+        let digits = |s: &str| date_digits(s, 1, 9);
         let year = digits(date.get(..4)?)?;
         let month = digits(date.get(5..7)?)?;
         let day = digits(date.get(8..10)?)?;
@@ -187,6 +185,42 @@ impl DateSystem {
         Some((serial, format))
     }
 
+    /// Explicit dates in the formula engine's English input formats. Ambiguous
+    /// numeric dates use month/day/year. Date text stays text outside coercion.
+    pub(super) fn formula_text(self, text: &str) -> Option<f64> {
+        if let Some((serial, _)) = self.iso(text) {
+            return Some(serial);
+        }
+        let text = text.trim();
+        let (year, month, day) = if text.contains('/') {
+            numeric_date(text, '/')?
+        } else if text.bytes().any(|b| b.is_ascii_alphabetic()) {
+            let mut fields = text.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '-' | ','))
+                .filter(|field| !field.is_empty());
+            let first = fields.next()?;
+            let second = fields.next()?;
+            let third = fields.next()?;
+            if fields.next().is_some() || !text.starts_with(first) || !text.ends_with(third) {
+                return None;
+            }
+            if let Some(month) = english_month(first) {
+                (text_year(third)?, month, date_digits(second, 1, 2)?)
+            } else {
+                (text_year(third)?, english_month(second)?, date_digits(first, 1, 2)?)
+            }
+        } else {
+            numeric_date(text, '-')?
+        };
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        if (year, month, day) == (1900, 2, 29) {
+            return self.from_1900(60.0);
+        }
+        let serial = self.date(year.into(), month.into(), day.into())?;
+        (self.ymd(serial) == Some((year.into(), month.into(), day.into()))).then_some(serial)
+    }
+
     pub fn contains(self, serial: f64) -> bool {
         let end = match self {
             Self::Excel1900 => 2958466.0,
@@ -225,6 +259,46 @@ impl DateSystem {
             Self::Excel1904 => serial - Self::OFFSET_1904,
         }
     }
+}
+
+fn numeric_date(text: &str, separator: char) -> Option<(u32, u32, u32)> {
+    let mut fields = text.split(separator).map(str::trim);
+    let first = fields.next()?;
+    let second = fields.next()?;
+    let third = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    if separator == '-' && first.len() == 4 {
+        Some((text_year(first)?, date_digits(second, 1, 2)?, date_digits(third, 1, 2)?))
+    } else {
+        Some((text_year(third)?, date_digits(first, 1, 2)?, date_digits(second, 1, 2)?))
+    }
+}
+
+fn date_digits(text: &str, min: usize, max: usize) -> Option<u32> {
+    if !(min..=max).contains(&text.len()) || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn text_year(text: &str) -> Option<u32> {
+    match date_digits(text, 2, 4)? {
+        year if text.len() == 2 => Some(year + if year < 30 { 2000 } else { 1900 }),
+        year if year >= 1900 && text.len() == 4 => Some(year),
+        _ => None,
+    }
+}
+
+fn english_month(text: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    ];
+    MONTHS.iter().position(|month| {
+        text.eq_ignore_ascii_case(month) || text.eq_ignore_ascii_case(&month[..3])
+    }).map(|i| i as u32 + 1)
 }
 
 #[cfg(test)]

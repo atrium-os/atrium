@@ -40,6 +40,8 @@ const CASES: &[(&str, &str)] = &[
     ("=SUM(A4:A7*2)", "18"),
     ("=IFERROR(A1:A3/{1;0},99)", "1;99;99"),
     (r#"=IFERROR(E10:E12,"fallback")"#, ";;"),
+    (r#"=TEXTAFTER({"a-x";"b:y";"missing"},{"-",":"},1,,,7)"#, "x;y;7"),
+    (r#"=--TEXTAFTER({"Sun, 1 January 2023";"Mon, 2 January 2023"},", ")"#, "44927;44928"),
     // making arrays
     ("=SEQUENCE(3)", "1;2;3"),
     ("=SEQUENCE(2,3)", "1,2,3;4,5,6"),
@@ -270,6 +272,8 @@ fn implicit_intersection_keeps_one_value() {
     assert_eq!(legacy("=ABS(A1:A5)"), "=ABS(@A1:A5)");
     assert_eq!(legacy("=SUM(A1:A5)"), "=SUM(A1:A5)");
     assert_eq!(legacy("=A1+1"), "=A1+1");
+    assert_eq!(legacy(r#"=TEXTAFTER("a:b",A1:A5)"#), r#"=TEXTAFTER("a:b",@A1:A5)"#);
+    assert_eq!(legacy(r#"=TEXTAFTER("a:b",{":","-"})"#), r#"=TEXTAFTER("a:b",{":","-"})"#);
 }
 
 #[test]

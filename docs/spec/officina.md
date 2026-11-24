@@ -643,6 +643,18 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   [Microsoft AVERAGEIF](https://support.microsoft.com/en-us/excel/functions/averageif-function)
   [Microsoft AVERAGEIFS](https://support.microsoft.com/en-us/excel/functions/averageifs-function)
   [Microsoft COUNTIFS](https://support.microsoft.com/en-us/excel/functions/countifs-function)
+- **TEXTAFTER and date text.** TEXTAFTER matches literal delimiters and supports
+  an array of alternative delimiters, forward and backward instances,
+  case-insensitive matching, boundary matching, and a fallback value. Array
+  arguments other than delimiters broadcast over the result. XLSX writes
+  the Excel future-function prefix `_xlfn.TEXTAFTER`.
+  Arithmetic and scalar numeric coercion, including VALUE and date functions,
+  recognize explicit ISO dates, US month/day/year dates, and English
+  dates such as `1 January 2023` in the workbook's 1900 or 1904 system.
+  Two-digit years use Excel's 2029 cutoff. Invalid dates give `#VALUE!` in
+  arithmetic. Date strings remain text in comparisons and in cells.
+  [Microsoft TEXTAFTER](https://support.microsoft.com/en-us/excel/functions/textafter-function)
+  [Microsoft date interpretation](https://support.microsoft.com/en-us/excel/change-the-date-system-format-or-two-digit-year-interpretation)
 - **Array coercion.** Explicit ranges retain trailing blank cells when converted
   to arrays. Whole-axis references still use the used extent on that axis.
   Binary operators broadcast singleton axes and pad unmatched positions with
@@ -4097,10 +4109,37 @@ its value matches:
 | Ranking (59932), with external workbook links | 142 | 15,808 | 20,394 |
 
 Sheets reported the differences when opening the three affected workbooks.
-The formula follow-up is to cover `TEXTAFTER` and Excel's date-text coercion
-together, then reproduce the external-link results against the caches in
-the workbook. Keep these fixtures in the repeatable test. The outputs and
-trial logs are under `/private/tmp/atrium-sheets-excel`.
+These original timings used a release probe with a development converter.
+The outputs and trial logs are under `/private/tmp/atrium-sheets-excel`.
+
+**TEXTAFTER and date-text rerun (2026-11-24).** With the §8.2 changes,
+all 42,042 live formulas in the shared-fill case now match Excel's original
+cached results after each of three XLSX saves and reopens. The source uses
+`--TEXTAFTER(A2,", ")` to convert labels such as `Sunday, 1 January 2023`
+to date serials. The other three workbooks retained the same cache results.
+All twelve trials kept the Sheets-computed results on reopen. Installed
+Sheets also saved all four via Scrinium and reopened them in new document
+jails with the same 76,052 live formula results. Both date
+systems passed a separate XLSX regression that also changes the input after
+reopening and checks the dependent formulas. All 124 TEXTAFTER formula
+cells from three independent Excel-recalculated reference files also
+matched Excel's caches, including fractional reverse instances, an empty
+fallback cell and implicit intersection of a legacy delimiter range.
+[Excel-recalculated TEXTAFTER fixtures](https://github.com/GRID-is/spreadsheet-benchmark/tree/7b6278e39e38453a0420d5c0b3786ca860f3064d/suites)
+
+With the release converter and release probe, median timings on the same
+four-vCPU Tessera configuration were:
+
+| Case | Open | Recalculate | Save | Reopen |
+|---|---:|---:|---:|---:|
+| Lookup | 75 ms | 1 ms | 49 ms | 96 ms |
+| Schedules | 579 ms | 406 ms | 85 ms | 552 ms |
+| Shared formulas | 109 ms | 9 ms | 47 ms | 101 ms |
+| Ranking | 1,147 ms | 340 ms | 494 ms | 761 ms |
+
+The next formula follow-up is to reproduce external workbook references
+against the cached link values in the source files. Evidence for this run
+is under `/private/tmp/atrium-sheets-textafter`.
 
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 

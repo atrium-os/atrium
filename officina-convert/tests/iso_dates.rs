@@ -68,3 +68,33 @@ fn typed_dates_use_the_workbook_epoch_and_keep_explicit_formats() {
         );
     }
 }
+
+#[test]
+fn textafter_date_formulas_reopen_with_their_epoch_and_recalculate_after_edits() {
+    let cell = |col| CellAddr::new(0, 0, col);
+    for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+        let mut wb = Workbook::with_date_system(system);
+        wb.add_sheet("Dates").unwrap();
+        wb.set_value(cell(0), Value::str("Sunday, 1 January 2023"));
+        wb.set_input(cell(1), r#"=--TEXTAFTER(A1,", ")"#).unwrap();
+        wb.set_input(cell(2), r#"=VALUE(TEXTAFTER(A1,", "))"#).unwrap();
+        wb.recalc();
+        let bytes = xlsx::write(&wb, Vec::new()).unwrap();
+        let xml = Archive::open(&bytes).unwrap().read_name("xl/worksheets/sheet1.xml").unwrap().unwrap();
+        assert!(String::from_utf8(xml).unwrap().contains("_xlfn.TEXTAFTER("));
+
+        let (mut reopened, _) = xlsx::read(&bytes).unwrap();
+        assert_eq!(reopened.date_system(), system);
+        assert_eq!(reopened.get(cell(0)), wb.get(cell(0)));
+        let initial = system.from_1900(44927.0).unwrap();
+        for col in [1, 2] {
+            assert!(reopened.group_at(0, 0, col).is_some());
+            assert_eq!(reopened.get(cell(col)), Value::Num(initial));
+        }
+        reopened.set_value(cell(0), Value::str("Monday, 2 January 2023"));
+        assert_eq!(reopened.recalc().cells, 2);
+        for col in [1, 2] {
+            assert_eq!(reopened.get(cell(col)), Value::Num(initial + 1.0));
+        }
+    }
+}

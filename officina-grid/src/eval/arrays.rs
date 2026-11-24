@@ -52,6 +52,7 @@ const LIFT: &[(&str, u32)] = &[
     ("FIND", ALL),
     ("SEARCH", ALL),
     ("SUBSTITUTE", ALL),
+    ("TEXTAFTER", 0b11_1101), // the delimiter argument is a set, not lifted
     ("VALUE", ALL),
     ("TEXT", ALL),
     ("EXACT", ALL),
@@ -107,6 +108,11 @@ fn on(mask: u32, i: usize) -> bool {
     mask == ALL || (i < 32 && mask & (1 << i) != 0)
 }
 
+fn legacy_arg(id: usize, position: usize, arg: &Expr) -> bool {
+    on(shapes().lift[id], position)
+        || (position == 1 && FUNCS[id].name == "TEXTAFTER" && !matches!(arg, Expr::Array(_)))
+}
+
 fn missing(a: &Expr) -> bool {
     matches!(a, Expr::Name(n) if n.is_empty())
 }
@@ -121,7 +127,7 @@ pub fn can_array(e: &Expr) -> bool {
         Expr::Call(Func::Known(id), args) => {
             let s = shapes();
             let id = *id as usize;
-            s.array[id] || (s.pass[id] && args.iter().any(can_array)) || (s.lift[id] != 0 && args.iter().enumerate().any(|(i, a)| on(s.lift[id], i) && can_array(a)))
+            s.array[id] || (s.pass[id] && args.iter().any(can_array)) || (s.lift[id] != 0 && args.iter().enumerate().any(|(i, a)| legacy_arg(id, i, a) && can_array(a)))
         }
         Expr::Neg(a) | Expr::Plus(a) | Expr::Pct(a) | Expr::Paren(a) => can_array(a),
         Expr::Bin(_, a, b) => can_array(a) || can_array(b),
@@ -144,8 +150,7 @@ pub fn legacy(e: Expr) -> Expr {
         Expr::Paren(x) => Expr::Paren(b(x)),
         Expr::Bin(op, x, y) => Expr::Bin(op, b(x), b(y)),
         Expr::Call(Func::Known(id), args) if !shapes().array[id as usize] && shapes().lift[id as usize] != 0 => {
-            let m = shapes().lift[id as usize];
-            Expr::Call(Func::Known(id), args.into_iter().enumerate().map(|(i, a)| if on(m, i) { legacy(a) } else { a }).collect())
+            Expr::Call(Func::Known(id), args.into_iter().enumerate().map(|(i, a)| if legacy_arg(id as usize, i, &a) { legacy(a) } else { a }).collect())
         }
         e => Expr::At(Box::new(e)),
     }
@@ -162,8 +167,7 @@ pub fn unlegacy(e: &Expr) -> Expr {
         Expr::Paren(x) => Expr::Paren(b(x)),
         Expr::Bin(op, x, y) => Expr::Bin(*op, b(x), b(y)),
         Expr::Call(Func::Known(id), args) if !shapes().array[*id as usize] && shapes().lift[*id as usize] != 0 => {
-            let m = shapes().lift[*id as usize];
-            Expr::Call(Func::Known(*id), args.iter().enumerate().map(|(i, a)| if on(m, i) { unlegacy(a) } else { a.clone() }).collect())
+            Expr::Call(Func::Known(*id), args.iter().enumerate().map(|(i, a)| if legacy_arg(*id as usize, i, a) { unlegacy(a) } else { a.clone() }).collect())
         }
         e => e.clone(),
     }
@@ -291,7 +295,7 @@ impl Ctx<'_> {
     fn int(&self, args: &[Expr], i: usize, default: i64) -> Result<i64, ErrorKind> {
         match args.get(i) {
             Some(a) if !missing(a) => {
-                let x = to_num(&self.scalar(a))?.trunc();
+                let x = self.number(&self.scalar(a))?.trunc();
                 if x.abs() > 1e15 {
                     return Err(ErrorKind::Num);
                 }
@@ -303,7 +307,7 @@ impl Ctx<'_> {
 
     fn num_or(&self, args: &[Expr], i: usize, default: f64) -> Result<f64, ErrorKind> {
         match args.get(i) {
-            Some(a) if !missing(a) => to_num(&self.scalar(a)),
+            Some(a) if !missing(a) => self.number(&self.scalar(a)),
             _ => Ok(default),
         }
     }
