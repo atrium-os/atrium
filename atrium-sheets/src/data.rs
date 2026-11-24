@@ -203,6 +203,8 @@ pub enum DataCmd {
     DuplicateSheet,
     /// The bar naming the selection; the window runs it.
     DefineName,
+    /// The Name Manager panel: every defined name; the window runs it.
+    NameManager,
     /// Rename the sheet on screen; the window runs it (a bar under the grid).
     RenameSheet,
     /// Delete the sheet on screen, or move it a place; the window runs them.
@@ -468,6 +470,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let sel_rect = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
     let validated = wb.validations().iter().any(|v| v.ranges.iter().any(|r| r.sheet == s && r.r0 <= sel_rect.r1 && sel_rect.r0 <= r.r1 && r.c0 <= sel_rect.c1 && sel_rect.c0 <= r.c1));
     v.push((MenuItem::new("Define Name…").separated(), Some(DataCmd::DefineName)));
+    v.push((MenuItem::new("Name Manager…"), Some(DataCmd::NameManager)));
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
@@ -609,11 +612,82 @@ pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
     if !merges.is_empty() {
         ops.push(GridOp::Merges { sheet: t, list: merges });
     }
+    // The sheet's conditional formats, validations and own names, on the copy.
+    let mut cfs = d.wb.cond_formats().to_vec();
+    let more: Vec<_> = cfs.iter().filter(|f| f.sheet == s).map(|f| officina_grid::condfmt::CondFormat { sheet: t, ranges: f.ranges.iter().map(|r| Rect { sheet: t, ..*r }).collect(), ..f.clone() }).collect();
+    if !more.is_empty() {
+        cfs.extend(more);
+        ops.push(GridOp::cond_formats(&d.wb, &cfs));
+    }
+    let mut vs = d.wb.validations().to_vec();
+    let more: Vec<_> = vs.iter().filter(|v| v.sheet == s).map(|v| officina_grid::validation::Validation { sheet: t, ranges: v.ranges.iter().map(|r| Rect { sheet: t, ..*r }).collect(), ..v.clone() }).collect();
+    if !more.is_empty() {
+        vs.extend(more);
+        ops.push(GridOp::validations(&d.wb, &vs));
+    }
+    let mut names: Vec<_> = d.wb.names().iter().cloned().collect();
+    let more: Vec<_> = names.iter().filter(|n| n.scope == Some(s)).map(|n| officina_grid::names::NameDef { scope: Some(t), ..n.clone() }).collect();
+    if !more.is_empty() {
+        names.extend(more);
+        ops.push(GridOp::names(&d.wb, &names));
+    }
+    // Moved last: everything above names the copy by its place at the end.
     if s + 1 < t {
         ops.push(GridOp::MoveSheet { from: t, to: s + 1 });
     }
     d.extend(ops);
     Ok(s + 1)
+}
+
+/// A Name Manager row: the name, its sheet when it belongs to one, and
+/// what it refers to, written out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NameRow {
+    pub name: String,
+    pub scope: Option<u16>,
+    pub refers: String,
+}
+
+/// The Name Manager's rows: every defined name, workbook ones first, then
+/// by sheet, each by name. Excel's own names show without `_xlnm.`.
+pub fn name_rows(wb: &Workbook) -> Vec<NameRow> {
+    let mut v: Vec<NameRow> = wb.names().iter().map(|n| NameRow {
+        name: n.name.to_string(),
+        scope: n.scope,
+        refers: officina_grid::formula::to_a1(&n.expr, 0, 0, &|id| wb.sheet_name(id)),
+    }).collect();
+    v.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    v
+}
+
+/// How a name shows in the Name Manager.
+pub fn shown_name(name: &str) -> &str {
+    name.strip_prefix("_xlnm.").unwrap_or(name)
+}
+
+/// The place row `i` of the Name Manager refers to, if it is a place.
+pub fn name_place(wb: &Workbook, own: u16, i: usize) -> Result<(u16, Rect), String> {
+    let row = name_rows(wb).into_iter().nth(i).ok_or("That name is gone.")?;
+    go_to_place(wb, row.scope.unwrap_or(own), &row.refers).map_err(|_| format!("{} is {}, not a place to go to.", shown_name(&row.name), row.refers))
+}
+
+/// Deletes row `i` of the Name Manager, as one step. Formulas using it
+/// then show `#NAME?`, as in Excel.
+pub fn delete_name(d: &mut Doc, i: usize) -> Result<String, String> {
+    let row = name_rows(&d.wb).into_iter().nth(i).ok_or("That name is gone.")?;
+    let keep: Vec<_> = d.wb.names().iter().filter(|n| !(n.scope == row.scope && *n.name == *row.name)).cloned().collect();
+    let op = GridOp::names(&d.wb, &keep);
+    d.run("Delete Name", vec![op]);
+    Ok(format!("{} deleted.", shown_name(&row.name)))
+}
+
+/// The Name Manager panel's commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamesCmd {
+    /// Go to what row `.0` refers to.
+    Go(usize),
+    Delete(usize),
+    Close,
 }
 
 /// Define Name: `name` given to the selection, for the whole workbook, as
@@ -1647,7 +1721,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

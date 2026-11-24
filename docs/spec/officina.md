@@ -4778,11 +4778,18 @@ Gates: atrium-sheets `insert_and_delete_cells_shift_their_neighbours_and_formula
 
 ### 16.99 Duplicate Sheet, Define Name, indent (2026-11-24)
 
-- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: the sheet's tables, charts, pictures, pivots, conditional formats, validations and sheet-scoped names stay with the original.
-- **Define Name…** (Data menu) opens a bar that names the selection for the whole workbook as one step (`data::define_name`), for example `Sheet1!$A$1:$B$2`. A name already in use now means the new place. Names that look like cells, or that break Excel's rules, are refused and the bar stays open. Formulas and Go To use the names at once. Not yet: a Name Manager to list, rename or delete names.
+- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: the sheet's tables, charts, pictures and pivots stay with the original. (Conditional formats, validations and sheet-scoped names are copied since §16.100.)
+- **Define Name…** (Data menu) opens a bar that names the selection for the whole workbook as one step (`data::define_name`), for example `Sheet1!$A$1:$B$2`. A name already in use now means the new place. Names that look like cells, or that break Excel's rules, are refused and the bar stays open. Formulas and Go To use the names at once. A Name Manager came in §16.100.
 - **Increase Indent / Decrease Indent** (Format menu) step text in from the left by up to 15 steps. Indenting General or centred text moves it to the left, as Excel does. The grid now draws a cell style's indent for left-aligned and General cells, which also covers indents that files bring in.
 
 Gates: atrium-sheets `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`, `define_name_names_the_selection_and_formulas_and_go_to_use_it` and `indent_steps_text_in_and_the_grid_draws_it`; all 126 Sheets lib tests pass.
+
+### 16.100 Name Manager, and a fuller Duplicate Sheet (2026-11-24)
+
+- **Name Manager…** (Data menu) opens a panel at the right of the grid. It lists every defined name: workbook names first, then sheet names with their sheet, each with what it refers to. Excel's own names show without `_xlnm.`, for example Print_Area. **Go** selects what a name covers, on its sheet; a name for a constant or a formula says it isn't a place. **Delete** removes a name as one undo step, and formulas that used it show `#NAME?` (`data::name_rows`, `name_place`, `delete_name`). Not yet: renaming a name or editing what it refers to in the panel. Define Name with the same spelling moves a name.
+- **Duplicate Sheet** now also copies the sheet's conditional formats, data validations and sheet-scoped names (such as its print area) onto the copy. The sheet move comes last so that these follow the copy to its place.
+
+Gates: atrium-sheets `the_name_manager_lists_goes_to_and_deletes_names` and the extended `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`; all 127 Sheets lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 
