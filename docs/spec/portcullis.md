@@ -52,6 +52,12 @@ jails, devfs.rules, nullfs, rctl, and the Atrium substrate
 
 ## 0.5 Architecture (privsep — post-V7 revision)
 
+> **As built (2026-11-25):** portcullisd still creates app, workspace and
+> console jails itself with `jail -c`, as host root and without Capsicum;
+> only services, components and the one-shot lane go through jaild.
+> [app-jails-via-jaild.md](app-jails-via-jaild.md) is the plan to close
+> that gap (codebase review H3).
+
 Originally this spec described a single `portcullisd` that did
 both policy interpretation and `jail_set(2)`. Validation work in
 2026-05-07 (`scratch/jail-smoke/`) showed two relevant facts:

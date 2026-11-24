@@ -7322,4 +7322,61 @@ mod tests {
         let items = crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection());
         assert!(items.iter().any(|(m, c)| *c == Some(FormatCmd::Angle) && m.label == "Rotation Angle…"));
     }
+
+    #[test]
+    fn duplicate_sheet_brings_charts_and_tables_under_fresh_names() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"Item,Qty\nA,1\nB,2\n");
+        select(&s, (0, 0), (2, 1));
+        data(&s, DataCmd::FormatAsTable);
+        data(&s, DataCmd::Chart(officina_grid::charts::ChartKind::Column));
+        let (tables0, charts0) = { let d = s.doc.borrow(); (d.wb.tables().len(), d.wb.charts().len()) };
+        assert_eq!((tables0, charts0), (1, 1));
+        let tname = s.doc.borrow().wb.tables()[0].name.to_string();
+        s.doc.borrow_mut().type_into(5, 0, &format!("=SUM({tname}[Qty])"));
+        data(&s, DataCmd::DuplicateSheet);
+        // The copy's formula names the copied table; the original's doesn't change.
+        let ft = |sh: u16| s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(sh, 5, 0));
+        assert_eq!(ft(1), Some(format!("=SUM({tname}_2[Qty])")));
+        assert_eq!(ft(0), Some(format!("=SUM({tname}[Qty])")));
+        s.doc.borrow_mut().wb.recalc();
+        assert_eq!(s.doc.borrow().wb.value(1, 5, 0), officina_grid::Value::Num(3.0));
+        let d = s.doc.borrow();
+        assert_eq!(d.wb.tables().len(), 2);
+        let copy = &d.wb.tables()[1];
+        assert_eq!((copy.name.to_string(), copy.rect.sheet), (format!("{tname}_2"), 1));
+        assert_eq!(d.wb.charts().len(), 2);
+        let ch = &d.wb.charts()[1];
+        assert_eq!(ch.anchor.sheet, 1);
+        assert!(ch.series.iter().all(|se| se.vals.sheet == 1));
+        assert_eq!(d.wb.charts()[0].anchor.sheet, 0);
+    }
+
+    #[test]
+    fn renaming_a_name_reaches_conditional_formats_and_validations() {
+        use crate::data::NamesCmd;
+        let s = sheets_of(b"1\n5\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            d.wb.define_name("Limit", None, "=3").unwrap();
+            let r = officina_grid::Rect { sheet: 0, r0: 0, c0: 0, r1: 1, c1: 0 };
+            let e = d.wb.cond_formula("A1>Limit", 0, (0, 0)).unwrap();
+            let cf = officina_grid::condfmt::CondFormat { sheet: 0, ranges: vec![r], rules: vec![officina_grid::condfmt::Rule { kind: officina_grid::condfmt::RuleKind::Expression(e), dxf: Default::default(), stop: false }] };
+            let f1 = Some(d.wb.validation_formula("Limit", 0, (0, 0)).unwrap());
+            let v = officina_grid::validation::Validation::new(0, vec![r], officina_grid::validation::Allow::Whole, officina_grid::condfmt::CmpOp::LessOrEqual, f1, None);
+            let ops = vec![officina_grid::ops::GridOp::cond_formats(&d.wb, &[cf]), officina_grid::ops::GridOp::validations(&d.wb, &[v])];
+            d.run("Set up", ops);
+        }
+        let i = crate::data::name_rows(&s.doc.borrow().wb).iter().position(|r| r.name == "Limit").unwrap();
+        s.cmds.lock().unwrap().push(Cmd::Names(NamesCmd::Rename(i)));
+        s.take_cmds();
+        s.name_text.set(TextEdit::new("Cap"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::NameDone));
+        s.take_cmds();
+        let d = s.doc.borrow();
+        let officina_grid::condfmt::RuleKind::Expression(e) = &d.wb.cond_formats()[0].rules[0].kind else { panic!() };
+        assert_eq!(d.wb.cond_formula_text(e, (0, 0)), "A1>Cap");
+        let f1 = d.wb.validations()[0].f1.clone().unwrap();
+        assert_eq!(officina_grid::formula::to_a1(&f1, 0, 0, &|id| d.wb.sheet_name(id)), "=Cap");
+    }
 }

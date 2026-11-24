@@ -259,6 +259,33 @@ pub fn rename_ops(wb: &crate::book::Workbook, scope: Option<u16>, old: &str, new
         n
     }).collect();
     ops.push(GridOp::names(wb, &defs));
+    // Conditional formats and validations on the sheets where the spelling means it.
+    let fs = wb.cond_formats();
+    if fs.iter().any(|f| means(f.sheet) && f.rules.iter().any(|r| { let hit = std::cell::Cell::new(false); r.kind.map_exprs(&|e| { if uses(e) { hit.set(true); } e.clone() }); hit.get() })) {
+        let fs: Vec<_> = fs.iter().map(|f| {
+            if !means(f.sheet) {
+                return f.clone();
+            }
+            let mut f = f.clone();
+            for r in &mut f.rules {
+                r.kind = r.kind.map_exprs(&|e| if binds(e) { e.clone() } else { swap_name(e, old, &to) });
+            }
+            f
+        }).collect();
+        ops.push(GridOp::cond_formats(wb, &fs));
+    }
+    let vs = wb.validations();
+    let in_rule = |v: &crate::validation::Validation| v.f1.iter().chain(&v.f2).any(|e| uses(e));
+    if vs.iter().any(|v| means(v.sheet) && in_rule(v)) {
+        let swap = |e: &Arc<Expr>| if binds(e) { e.clone() } else { Arc::new(swap_name(e, old, &to)) };
+        let vs: Vec<_> = vs.iter().map(|v| {
+            if !means(v.sheet) || !in_rule(v) {
+                return v.clone();
+            }
+            crate::validation::Validation { f1: v.f1.as_ref().map(swap), f2: v.f2.as_ref().map(swap), ..v.clone() }
+        }).collect();
+        ops.push(GridOp::validations(wb, &vs));
+    }
     let mut kept = 0;
     for (_, g) in wb.groups() {
         if !means(g.sheet) || !uses(&g.expr) {

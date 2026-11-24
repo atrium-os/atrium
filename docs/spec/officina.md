@@ -4778,7 +4778,7 @@ Gates: atrium-sheets `insert_and_delete_cells_shift_their_neighbours_and_formula
 
 ### 16.99 Duplicate Sheet, Define Name, indent (2026-11-24)
 
-- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: the sheet's tables, charts, pictures and pivots stay with the original. (Conditional formats, validations and sheet-scoped names are copied since §16.100.)
+- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: pivots stay with the original. (Conditional formats, validations and sheet-scoped names are copied since §16.100; charts, pictures and tables since §16.106.)
 - **Define Name…** (Data menu) opens a bar that names the selection for the whole workbook as one step (`data::define_name`), for example `Sheet1!$A$1:$B$2`. A name already in use now means the new place. Names that look like cells, or that break Excel's rules, are refused and the bar stays open. Formulas and Go To use the names at once. A Name Manager came in §16.100.
 - **Increase Indent / Decrease Indent** (Format menu) step text in from the left by up to 15 steps. Indenting General or centred text moves it to the left, as Excel does. The grid now draws a cell style's indent for left-aligned and General cells, which also covers indents that files bring in.
 
@@ -4819,7 +4819,7 @@ Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all
 ### 16.104 Border pens, and renaming names (2026-11-24)
 
 - **Border pen** (Format menu): Border Line: Thin, Medium, Dashed, Dotted or Hair, and Border Colour: Automatic or one of the eight tab colours. Both are radio items and stay set for the session (`Doc::border_pen`). All, Outside, Bottom, and Top and Bottom draw with the pen. Thick and Double keep their own line and take the pen's colour.
-- **Rename** in the Name Manager opens the name bar filled with the name. `officina_grid::names::rename_ops` renames the definition and rewrites every formula and other name that uses it, as one step. A workbook name isn't rewritten on a sheet whose own name of that spelling hides it, and a sheet name is rewritten only on its sheet. A formula that binds the spelling itself with LET or LAMBDA is left unchanged and counted in the status. Clashing and invalid names are refused, and the bar stays open. Not yet: names used in conditional formats, validations and charts aren't rewritten.
+- **Rename** in the Name Manager opens the name bar filled with the name. `officina_grid::names::rename_ops` renames the definition and rewrites every formula and other name that uses it, as one step. A workbook name isn't rewritten on a sheet whose own name of that spelling hides it, and a sheet name is rewritten only on its sheet. A formula that binds the spelling itself with LET or LAMBDA is left unchanged and counted in the status. Clashing and invalid names are refused, and the bar stays open. Conditional formats and validations follow since §16.106.
 
 Gates: atrium-sheets `border_pens_draw_their_line_and_colour` and `renaming_a_name_rewrites_the_formulas_and_names_using_it`; all 132 Sheets lib and 121 officina-grid lib tests pass.
 
@@ -4830,6 +4830,20 @@ Gates: atrium-sheets `border_pens_draw_their_line_and_colour` and `renaming_a_na
 - Opening a bar now closes the others through one helper (`Sheets::close_bars`).
 
 Gates: atrium-sheets `custom_sort_orders_by_several_columns_named_by_letter_or_header` and `a_typed_rotation_angle_turns_the_text`; all 134 Sheets lib tests pass.
+
+### 16.106 Duplicate Sheet brings charts and tables; renames reach rules (2026-11-24)
+
+- **Duplicate Sheet** now copies the sheet's charts and pictures onto the copy. A chart's series ranges, and its title or series names taken from cells, follow to the copy when they were on the original sheet; ranges on other sheets stay. Tables are copied too, each under a fresh workbook-wide name `Name_2` (or the next free number, clashing with neither tables nor defined names). Formulas in the copy that name a copied table name the copy instead (since §16.107), as Excel's do. Pivots stay with the original.
+- **Renaming a name** also rewrites conditional-format rule formulas and data-validation formulas, on the sheets where the spelling means that name, with the same LET and LAMBDA exception as cell formulas (`names::rename_ops`).
+
+Gates: atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` and `renaming_a_name_reaches_conditional_formats_and_validations`. Both fail on the code before. All 136 Sheets lib and 121 officina-grid lib tests pass.
+
+### 16.107 Copied formulas follow copied tables; Freeze First Column (2026-11-24)
+
+- After Duplicate Sheet, formulas on the copy whose structured references name a table that was copied (`Sales[Qty]`) are rewritten to name the copy (`Sales_2[Qty]`), as part of the same step (`data::retable`). Formulas on other sheets keep naming the original.
+- **Freeze First Column** (Data menu, beside Freeze Top Row) keeps the view's first column in view, as Freeze Top Row does for the top row.
+
+Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` (the copy's `=SUM(Table[Qty])` names the copy and sums to 3) and `panes_freeze_at_the_cursor_and_unfreeze`; all 136 Sheets lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 
