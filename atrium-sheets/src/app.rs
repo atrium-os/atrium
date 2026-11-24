@@ -1694,7 +1694,9 @@ impl Sheets {
         for (s, x, tw) in crate::tabs::visible(&d.wb, first, (w - TABS_X - 8.0).max(0.0)) {
             let on = s == d.sheet;
             let r = Rect::new(TABS_X + x, y + 1.0, tw - 2.0, TABS_H - 2.0);
-            let hit = ctx.add(Node::Rect { rect: r, fill: if on { t.bg_canvas() } else { Color::TRANSPARENT }, radius: 0.0 });
+            // The tab holds its label and bars, so a press on any of them
+            // reaches the tab (a sibling label took the press and dropped it).
+            let hit = ctx.push(Node::Rect { rect: r, fill: if on { t.bg_canvas() } else { Color::TRANSPARENT }, radius: 0.0 });
             // Its colour as a bar along the bottom (thicker on screen), or
             // the accent under the tab on screen.
             match d.wb.sheet(s).tab_color {
@@ -1710,6 +1712,7 @@ impl Sheets {
             let st = crate::tabs::style(if on { t.text_primary() } else { t.text_secondary() }, on);
             let name = d.wb.sheet_name(s);
             ctx.add(Node::Text { rect: Rect::new(TABS_X + x + 12.0, y + 6.0, tw - 24.0, 18.0), content: name, style: st });
+            ctx.pop();
             let cmds = self.cmds.clone();
             ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Tab(TabCmd::Go(s))));
         }
@@ -5719,6 +5722,44 @@ mod tests {
         assert!(sheets.doc.borrow().wb.comment(0, 0, 0).is_none());
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(sheets.doc.borrow().wb.comment(0, 0, 0), Some(&note));
+    }
+
+    #[test]
+    fn a_press_on_a_tab_label_edge_or_colour_bar_shows_that_sheet() {
+        let (mut d, _) = Doc::from_csv("t.csv", b"a,1\n").unwrap();
+        d.wb.recalc();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AddSheet));
+        s.take_cmds();
+        s.doc.borrow_mut().wb.sheet_mut(0).tab_color = Some(0x2E7D32);
+        let mut app = App::new(s.clone());
+        let label = |app: &App<Sheets>, name: &str| app.tree().iter().find_map(|(_, n)| match n {
+            Node::Text { rect, content, .. } if content == name => Some(*rect),
+            _ => None,
+        }).unwrap();
+        let press = |app: &mut App<Sheets>, at: pergola::geom::Point| {
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            app.tick();
+            s.take_cmds();
+        };
+        let tab_y = 800.0 - STATUS_H - crate::tabs::TABS_H;
+        for (what, at) in [
+            ("label", (|r: Rect| pergola::geom::Point::new(r.x() + 6.0, r.y() + r.h() / 2.0)) as fn(Rect) -> pergola::geom::Point),
+            ("edge", (|r: Rect| pergola::geom::Point::new(r.x() - 8.0, r.y() - 3.0)) as fn(Rect) -> pergola::geom::Point),
+            ("colour bar", (|r: Rect| pergola::geom::Point::new(r.x() + 6.0, r.y() + r.h() + 1.0)) as fn(Rect) -> pergola::geom::Point),
+        ] {
+            app.tick();
+            s.doc.borrow_mut().sheet = 1;
+            app.tick();
+            let r = label(&app, "Sheet1");
+            assert!(r.y() >= tab_y - 1.0, "{r:?}");
+            press(&mut app, at(r));
+            assert_eq!(s.doc.borrow().sheet, 0, "a press on Sheet1's {what} at {:?}", at(r));
+            let r = label(&app, "Sheet2");
+            press(&mut app, at(r));
+            assert_eq!(s.doc.borrow().sheet, 1, "a press on Sheet2's {what}");
+        }
     }
 
     #[test]

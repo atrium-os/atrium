@@ -4280,6 +4280,8 @@ Three new undoable ops, journaled like the rest: `GridOp::AddSheet(name)` (tag 1
 
 Gates: `officina-grid` `ops::tests::sheets_are_added_renamed_and_undone`; `atrium-sheets` `sheets_are_added_switched_renamed_and_tabbed`, `tabs::tests::only_the_tabs_that_fit_are_laid_out`.
 
+Fix (2026-11-24): a press on a tab's name or colour bar now shows that sheet. The name and bars were drawn as siblings on top of the tab, so they took the press and dropped it; only the margin around the name worked. They are now drawn inside the tab, and a press on any of them reaches it. Gate: `a_press_on_a_tab_label_edge_or_colour_bar_shows_that_sheet` (fails on the old drawing).
+
 ### 16.72 Deleting and moving sheets (2026-11-18)
 
 - **Moving.** `Workbook::move_sheet(from, to)` renumbers in place: formula groups come out and go back on their sheets' new places with their references renumbered (`remap_sheets`), and tables, charts, pivot tables, conditional formats, names (read back from their text, which names sheets), spills, macro code names and pending recalculation follow. Cells don't move or recalculate, so the cost is the workbook's groups and objects, not its cells. Journaled as `GridOp::MoveSheet { from, to }` (tag 14), its inverse moving it back.
