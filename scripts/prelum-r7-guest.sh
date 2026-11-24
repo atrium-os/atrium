@@ -107,6 +107,18 @@ entry = "bin/scrinium"
 [capabilities]
 embeds = ["print", "doc-viewer", "pdf-viewer", "picker"]
 TOML
+# The Mail fixture prints too; write its manifest rather than rely on one left in the image.
+M=/var/lib/atrium/apps/org.test.prelum.mailprint
+mkdir -p "$M"
+cat >"$M/atrium.toml" <<'TOML'
+[app]
+id = "org.test.prelum.mailprint"
+name = "Prelum Mail print fixture"
+version = "1"
+entry = "bin/prelum-print-fixture"
+[capabilities]
+embeds = ["print"]
+TOML
 
 daemon -f -p "$P/scrinium.pid" -o "$P/app.log" -u prelusheets env HOME="$P/home" LIMEN_SOCKET="$P/limen/limend.sock" FRESCO_SOCKET="$P/fresco.sock" SCRINIUM_TRACE=1 SCRINIUM_PLACES="Proof=$P/files" "$P/scrinium" --no-picker
 for i in $(seq 20); do grep -q 'entries=\[quicklook.html\]' app.log 2>/dev/null && break; sleep 1; done
