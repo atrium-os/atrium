@@ -8,7 +8,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use arca_store::{RootKey, Store};
-use arcad::server::integration::{self, Prepared, Selection, FAILURE, FIXTURE_ACCOUNT};
+use arcad::server::integration::{
+    self, received_selection, Prepared, Selection, FAILURE, FIXTURE_ACCOUNT,
+};
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 use limen::client::Child;
@@ -41,13 +43,13 @@ fn closed() -> io::Error {
     io::Error::other(FAILURE)
 }
 
-fn reserve_via_arcad(uid: u32, selection: Selection) -> io::Result<UnixStream> {
+fn reserve_via_arcad(uid: u32, snapshot: &[u8]) -> io::Result<UnixStream> {
     use arcad::proto;
     let mut stream = UnixStream::connect("/atrium/sockets/arca/arcad.sock")?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut request = uid.to_le_bytes().to_vec();
-    request.extend_from_slice(&selection.encode());
+    request.extend_from_slice(snapshot);
     proto::write_request(&mut stream, proto::op::U_SMIME_SYNTHETIC_RESERVE, &request)?;
     let (status, body) = proto::read_reply(&mut stream)?;
     if status != proto::status::OK || !body.as_ref().is_empty() {
@@ -199,7 +201,7 @@ impl Sheet<'_> {
         }
         let mut reservation = if store.is_none() {
             let until = Instant::now() + Duration::from_secs(5);
-            let selection = loop {
+            let snapshot = loop {
                 if Instant::now() >= until {
                     return Err(closed());
                 }
@@ -209,9 +211,7 @@ impl Sheet<'_> {
                     .map_err(|_| closed())?
                 {
                     Some(ChildEvent::Message { embed, bytes }) if embed == self.embed => {
-                        break Selection::decode(&bytes)
-                            .filter(|s| *s == Selection::fixture())
-                            .ok_or_else(closed)?;
+                        break bytes;
                     }
                     Some(ChildEvent::Detaching { embed } | ChildEvent::Suspended { embed })
                         if embed == self.embed =>
@@ -221,7 +221,10 @@ impl Sheet<'_> {
                     _ => {}
                 }
             };
-            Some((reserve_via_arcad(self.uid, selection)?, selection))
+            let (selection, _) = received_selection(&snapshot).ok_or_else(closed)?;
+            let stream = reserve_via_arcad(self.uid, &snapshot)?;
+            println!("LEGACY_FIXTURE_SELECTED_MESSAGE={}", selection.message);
+            Some((stream, selection))
         } else {
             None
         };

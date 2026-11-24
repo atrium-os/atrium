@@ -897,18 +897,21 @@ only a typed outcome. The isolated provider gate uses a fixed test
 message, a synthetic launch registry and a private persistent Arca
 store. The signed gate instead launches Mail from a content-signed
 bundle and Arca from its normal service manifest with a gate-only
-override. Mail snapshots the local account ID, message ID and SHA-256
-of the complete stored RFC 5322 bytes. Limen forwards one selection
-before the sheet attaches. The fixture UI reserves that tuple with
-Arca on a dedicated trusted-UI connection before drawing the sheet.
-Arca cross-checks it against the built-in account and message, and
+override. Mail snapshots the account ID, message ID and SHA-256
+of the exact RFC 5322 bytes read from the selected local message's
+complete blob. Limen forwards one bounded message and its selection
+before the sheet attaches. The trusted UI reserves both with Arca
+before drawing the sheet. Arca rehashes the bytes, accepts the
+disposable account and two specifically allowed synthetic messages, and
 resolves the publisher, disposable user and persona through Portcullis’s
 live launch registry. The approved Fresco press redeems the exact tuple
 on that same connection. A changed tuple, an unexpected frame, a
 disconnect or expiry ends the reservation. Arca accepts no second
-redemption on that socket. The operation accepts only the built-in test
-certificate and ciphertext, and the private candidate goes directly
-from Arca to the worker. The daemon retains the launch socket until
+redemption on that socket. After approval, Arca passes the reserved
+bytes and fixture certificate to the Capsicum worker in a networkless
+jail. The worker uses Mail's MIME parser to extract the top-level CMS
+and returns a digest of the bytes it processed. Arca checks that digest
+before any private-key use. The candidate goes directly to that worker. The daemon retains the launch socket until
 Portcullis reports the worker’s exit, including when the worker reads
 EOF before receiving a candidate. The fixture checks the exit
 acknowledgment and returns only the public sheet outcome to Mail.
@@ -925,14 +928,14 @@ dismissal, key-purpose separation, and one user-visible failure outcome.
 It must also verify that unsupported envelopes and failed OAEP opens
 cannot dispatch legacy RSA, and that legacy reads have no background
 or network effects. The signed fixture gate verifies the process
-boundaries and the three sheet outcomes for a fixed input. Whole-path
-timing and the production path for received messages remain unverified.
+boundaries and the three sheet outcomes for the fixture. The production
+path for arbitrary received messages remains disabled.
 
 ##### Failure observability review
 
 - **Remote sender and mailbox provider.** The current legacy operation
-  has no path from received mail to key use. The signed gate starts in
-  Settings and accepts a built-in certificate and ciphertext under a
+  has no path from live mail to key use. The signed gate starts in
+  Settings and accepts the two synthetic stored messages under a
   disposable identity. Its Capsicum reader has no network and returns
   bounded text to Arca on a private socket. A future local preview must
   also avoid indirect effects from Mail, including sync writes, receipts,
@@ -955,8 +958,8 @@ timing and the production path for received messages remain unverified.
   while the sheet and launch remain valid. Arca watches that connection,
   the launch registry and the deadline while the worker runs. It closes
   the worker's channels when approval ends and rechecks approval before
-  handing off a result. This fixture flow still uses a fixed message
-  and key.
+  handing off a result. This flow uses only the allowed synthetic
+  messages and fixture enrollment.
 - **Private crypto and content.** OpenSSL's default provider is pinned
   and implicit rejection is required and checked. Arca selects a
   fixed-width candidate without returning the provider status or
@@ -966,16 +969,17 @@ timing and the production path for received messages remain unverified.
   across the composed key lookup, worker, content parser, and reply.
   CBC encryption also provides no sender authenticity.
 
-Keep legacy receiving disabled. Before enablement, bind the real
-immutable received message, selected account and signed launch to a
-one-use approval and extend the fixture's revocation checks to that
-path. The staged timing check repeats two fixed synthetic cases and
-reports the minimum, median and maximum at the trusted Arca transport
-boundary. It compares an admission refusal with a Personal key lookup
-refusal after a simulated worker handshake. These samples do not cover
-the Fresco gesture, Portcullis startup, or cryptographic failure timing.
-Whole-path verification still needs consistent replies, local timing and
-contention checks, and zero outcome-dependent network and mailbox effects.
+Keep legacy receiving disabled. The staged signed gate compares
+unsupported top-level MIME with a missing Personal enrollment, using
+equal-length synthetic messages in the same account and persona.
+It records three samples per case, alternating the cases. The driver
+measures selection to attached sheet and approval press to dismissal,
+excluding the deliberate pause between them. The samples cover signed
+Mail, Limen, Fresco, Arca, and actual Portcullis worker startup and
+teardown. Both failures have the same public outcome and preserve unread
+state. The fixture records no cryptographic failure timing. Checks for
+arbitrary received mail, account enrollment, and externally observable
+behavior remain before enablement.
 
 See [OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
 and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).

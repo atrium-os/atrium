@@ -24,7 +24,7 @@ use crate::label::Label;
 use crate::proto::{self, op, status};
 use crate::server::{reply, Body, Reply, State};
 
-pub use wire::{Selection, FAILURE, FIXTURE_ACCOUNT};
+pub use wire::{received_selection, Selection, FAILURE, FIXTURE_ACCOUNT};
 type Fingerprint = [u8; 32];
 
 fn closed() -> io::Error {
@@ -36,6 +36,7 @@ pub const SYNTHETIC_USER: &str = "maillegacyfixture";
 pub const SYNTHETIC_PREVIEW: &str = "From OpenSSL.\r\n";
 const CERT: &[u8] = include_bytes!("../../../../../mail/mail-smime/tests/data/leaf.der");
 const KEY: &[u8] = include_bytes!("../../../../../mail/mail-smime/tests/data/leaf.p8");
+#[cfg(test)]
 const CMS: &[u8] = include_bytes!("../../../../../mail/mail-smime/tests/data/env.der");
 
 fn launch() -> io::Result<(UnixStream, UnixStream)> {
@@ -117,6 +118,7 @@ struct Approval {
     publisher: [u8; 32],
     persona: Option<String>,
     selection: Selection,
+    received: Vec<u8>,
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
 }
@@ -171,10 +173,7 @@ fn watch_worker<T>(
 fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
     let (uid, selected) = body.split_at_checked(4)?;
     let uid = u32::from_le_bytes(uid.try_into().ok()?);
-    let selection = Selection::decode(selected)?;
-    if selection != Selection::fixture() {
-        return None;
-    }
+    let (selection, received) = received_selection(selected)?;
     let registry = state.legacy_smime_registry.clone()?;
     let publisher = state.mail_sign_ins.mail_publisher?;
     if state.legacy_smime_pending.is_some() {
@@ -189,6 +188,7 @@ fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
         publisher,
         persona,
         selection,
+        received: received.to_vec(),
         cancelled,
         deadline: Instant::now() + Duration::from_secs(32),
     })
@@ -211,8 +211,8 @@ fn synthetic_open(
         valid,
         |control, mut lifetime, close_control| {
             let result = (|| {
-                let prepared = Prepared::start(control, CERT, CMS)?;
-                if !valid() || prepared.message_digest != <[u8; 32]>::from(Sha256::digest(CMS)) {
+                let prepared = Prepared::start_received(control, CERT, &approval.received)?;
+                if !valid() || prepared.message_digest != approval.selection.digest {
                     return Err(closed());
                 }
                 let persona = approval.persona.as_deref();
@@ -323,7 +323,27 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    pub fn start(mut worker: UnixStream, cert: &[u8], cms: &[u8]) -> io::Result<Self> {
+    pub fn start(worker: UnixStream, cert: &[u8], cms: &[u8]) -> io::Result<Self> {
+        Self::start_input(worker, cert, cms, wire::INPUT_CMS, wire::MAX_CMS)
+    }
+
+    fn start_received(worker: UnixStream, cert: &[u8], received: &[u8]) -> io::Result<Self> {
+        Self::start_input(
+            worker,
+            cert,
+            received,
+            wire::INPUT_RECEIVED,
+            wire::MAX_RECEIVED,
+        )
+    }
+
+    fn start_input(
+        mut worker: UnixStream,
+        cert: &[u8],
+        input: &[u8],
+        mode: u8,
+        limit: usize,
+    ) -> io::Result<Self> {
         worker
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|_| closed())?;
@@ -335,8 +355,9 @@ impl Prepared {
         if ready != wire::WORKER_READY {
             return Err(closed());
         }
+        worker.write_all(&[mode]).map_err(|_| closed())?;
         wire::write(&mut worker, cert, wire::MAX_CERT).map_err(|_| closed())?;
-        wire::write(&mut worker, cms, wire::MAX_CMS).map_err(|_| closed())?;
+        wire::write(&mut worker, input, limit).map_err(|_| closed())?;
         let mut header = [0u8; 2];
         worker.read_exact(&mut header[..1]).map_err(|_| closed())?;
         if header[0] != 1 {
@@ -349,13 +370,21 @@ impl Prepared {
         let mut fingerprint = [0u8; 32];
         worker.read_exact(&mut fingerprint).map_err(|_| closed())?;
         let wrapped = wire::read(&mut worker, 512).map_err(|_| closed())?;
+        let message_digest = wire::digest(input);
+        if mode == wire::INPUT_RECEIVED {
+            let mut consumed = [0; 32];
+            worker.read_exact(&mut consumed).map_err(|_| closed())?;
+            if consumed != message_digest {
+                return Err(closed());
+            }
+        }
         Ok(Self {
             worker,
             fingerprint,
             wrapped,
             key_bytes: header[1] as usize,
             cert_digest: Sha256::digest(cert).into(),
-            message_digest: Sha256::digest(cms).into(),
+            message_digest,
         })
     }
 
@@ -580,7 +609,12 @@ mod tests {
     }
 
     fn reservation(uid: u32, selection: Selection) -> Vec<u8> {
-        [uid.to_le_bytes().as_slice(), selection.encode().as_slice()].concat()
+        [
+            uid.to_le_bytes().as_slice(),
+            selection.encode().as_slice(),
+            &wire::fixture_message(),
+        ]
+        .concat()
     }
 
     fn read_reply(client: &mut UnixStream) -> (u8, Vec<u8>) {
@@ -622,14 +656,19 @@ mod tests {
 
     fn worker_header(worker: &mut UnixStream) -> usize {
         worker.write_all(wire::WORKER_READY).unwrap();
+        let mut mode = [0];
+        worker.read_exact(&mut mode).unwrap();
+        assert_eq!(mode, [wire::INPUT_RECEIVED]);
         assert_eq!(wire::read(worker, wire::MAX_CERT).unwrap(), CERT);
-        assert_eq!(wire::read(worker, wire::MAX_CMS).unwrap(), CMS);
+        let raw = wire::read(worker, wire::MAX_RECEIVED).unwrap();
+        assert_eq!(raw, wire::fixture_message());
         let env = mail_smime::envelope::enveloped_data(CMS).unwrap();
         let (fingerprint, size, wrapped) =
             mail_smime::envelope::legacy_recipient(&env, CERT).unwrap();
         worker.write_all(&[1, size as u8]).unwrap();
         worker.write_all(&fingerprint).unwrap();
         wire::write(worker, &wrapped, 512).unwrap();
+        worker.write_all(&wire::digest(&raw)).unwrap();
         size
     }
 
@@ -698,6 +737,26 @@ mod tests {
             });
             assert!(state.lock().unwrap().legacy_smime_pending.is_none());
         }
+    }
+
+    #[test]
+    fn legacy_reservation_refuses_changed_received_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Mutex::new(configured_fixture(dir.path()));
+        let (ui, mut client) = socket_pair();
+        let mut changed = wire::fixture_message();
+        changed[0] = b'f';
+        for selection in [Selection::fixture(), Selection::for_message(1, 1, &changed)] {
+            let mut request = 51000u32.to_le_bytes().to_vec();
+            request.extend_from_slice(&selection.encode());
+            request.extend_from_slice(&changed);
+            serve_open(&state, &ui, &request, || {
+                panic!("changed bytes started worker")
+            })
+            .unwrap();
+            assert_eq!(read_reply(&mut client), (status::DENIED, vec![]));
+        }
+        assert!(state.lock().unwrap().legacy_smime_pending.is_none());
     }
 
     #[test]

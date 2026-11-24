@@ -51,14 +51,34 @@ mod freebsd {
 
     fn execute(socket: &mut UnixStream) -> io::Result<()> {
         let invalid = || io::Error::other(wire::FAILURE);
+        let mut mode = [0; 1];
+        socket.read_exact(&mut mode)?;
         let cert = wire::read(socket, wire::MAX_CERT)?;
-        let input = wire::read(socket, wire::MAX_CMS)?;
-        let cms = envelope::enveloped_data(&input).map_err(|_| invalid())?;
+        let (cms, received_digest) = match mode[0] {
+            wire::INPUT_CMS => {
+                let input = wire::read(socket, wire::MAX_CMS)?;
+                (
+                    envelope::enveloped_data(&input).map_err(|_| invalid())?,
+                    None,
+                )
+            }
+            wire::INPUT_RECEIVED => {
+                let input = wire::read(socket, wire::MAX_RECEIVED)?;
+                (
+                    mail_parse::smime_envelope(&input).ok_or_else(invalid)?,
+                    Some(wire::digest(&input)),
+                )
+            }
+            _ => return Err(invalid()),
+        };
         let (fingerprint, key_bytes, wrapped) =
             envelope::legacy_recipient(&cms, &cert).ok_or_else(invalid)?;
         socket.write_all(&[1, key_bytes as u8])?;
         socket.write_all(&fingerprint)?;
         wire::write(socket, &wrapped, 512)?;
+        if let Some(digest) = received_digest {
+            socket.write_all(&digest)?;
+        }
 
         let mut key = Zeroizing::new([0u8; 32]);
         match socket.read_exact(&mut key[..key_bytes]) {

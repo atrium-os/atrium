@@ -4,6 +4,7 @@
 //! DMARC records — it asks the engine for with `Query`, and the engine has
 //! mail-sync look them up; the jail itself has no network and no files.
 
+use crate::smime_envelope as envelope_of;
 use crate::{dkim, html, ical, mime, tnef, Limits, Refused};
 use mail_schema as wire;
 use std::cell::RefCell;
@@ -142,14 +143,6 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
         }
         port.borrow_mut().send(&wire::FromJail::Done)?;
     }
-}
-
-/// The S/MIME envelope of an encrypted message (its top-level body).
-fn envelope_of(raw: &[u8]) -> Option<mail_smime::envelope::EnvelopedData> {
-    let s = crate::parse(raw, &Limits::default()).ok()?;
-    if !s.encrypted { return None }
-    let p = s.parts.iter().find(|p| p.path.is_empty())?;
-    mail_smime::envelope::enveloped_data(&mime::part_bytes(raw, p)).ok()
 }
 
 /// The message inside an encrypted one: its outer header lines (but the

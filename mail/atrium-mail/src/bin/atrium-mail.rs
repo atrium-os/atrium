@@ -753,9 +753,10 @@ fn main() {
                     let _ = e.borrow_mut().detach_embed(id);
                 }
             }
-            if sw.s.take_smime_ask() && !close_settings && sw.smime.is_none() && sw.microsoft.is_none() {
+            if let Some(ask) = sw.s.take_smime_ask().filter(|_| !close_settings && sw.smime.is_none() && sw.microsoft.is_none()) {
                 let request = embeds.as_ref().zip(sw.win.embed_token()).and_then(|(e, token)| {
-                    let role = if atrium_mail::settings::synthetic_legacy_sheet() {
+                    use atrium_mail::settings::SmimeAsk;
+                    let role = if ask != SmimeAsk::Provision {
                         "smime-legacy-read"
                     } else {
                         "smime-provision"
@@ -763,9 +764,9 @@ fn main() {
                     let mut e = e.borrow_mut();
                     #[cfg(feature = "legacy-smime-integration")]
                     if let Some(preview) = &legacy_preview {
-                        let selection = preview.selection()?;
+                        let snapshot = preview.snapshot(ask == SmimeAsk::LegacyUnsupported)?;
                         let id = e.request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()?;
-                        if e.send(id, selection.encode().to_vec()).is_err() {
+                        if e.send(id, snapshot).is_err() {
                             let _ = e.detach_embed(id);
                             return None;
                         }

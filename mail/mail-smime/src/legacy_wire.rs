@@ -4,9 +4,12 @@
 use std::io::{self, Read, Write};
 
 pub const MAX_CERT: usize = 4000;
+pub const MAX_RECEIVED: usize = 48 << 10;
+pub const INPUT_CMS: u8 = 0;
+pub const INPUT_RECEIVED: u8 = 1;
 pub const MAX_CMS: usize = 128 << 10;
 pub const MAX_TEXT: usize = 64 << 10;
-pub const WORKER_READY: &[u8] = b"legacy-jail-capmode-1";
+pub const WORKER_READY: &[u8] = b"legacy-jail-capmode-2";
 pub const FAILURE: &str = "Couldn’t open this legacy S/MIME message.";
 
 pub const FIXTURE_ACCOUNT: &str = "legacy-preview@fixture.invalid";
@@ -16,6 +19,32 @@ pub fn fixture_message() -> Vec<u8> {
     include_str!("../tests/data/legacy-preview.eml")
         .replace('\n', "\r\n")
         .into_bytes()
+}
+
+/// Same shape as the valid fixture with an unsupported top-level media type.
+pub fn unsupported_fixture_message() -> Vec<u8> {
+    include_str!("../tests/data/legacy-preview.eml")
+        .replace("application/pkcs7-mime", "application/other-cmsx")
+        .replace('\n', "\r\n")
+        .into_bytes()
+}
+
+pub fn received_selection(bytes: &[u8]) -> Option<(Selection, &[u8])> {
+    let (header, raw) = bytes.split_at_checked(Selection::SIZE)?;
+    let selection = Selection::decode(header)?;
+    if raw.is_empty()
+        || raw.len() > MAX_RECEIVED
+        || selection != Selection::for_message(selection.account, selection.message, raw)
+    {
+        return None;
+    }
+    let fixture = match selection.message {
+        1 => fixture_message(),
+        2 => unsupported_fixture_message(),
+        _ => return None,
+    };
+    // Enforce the disabled gate's fixed account and uploaded fixtures.
+    (selection.account == 1 && raw == fixture).then_some((selection, raw))
 }
 
 /// Snapshot of the selected local account and fully downloaded message.
@@ -33,10 +62,7 @@ impl Selection {
         Self {
             account,
             message,
-            digest: ring::digest::digest(&ring::digest::SHA256, bytes)
-                .as_ref()
-                .try_into()
-                .expect("SHA-256 digest length"),
+            digest: digest(bytes),
         }
     }
 
@@ -66,6 +92,13 @@ impl Selection {
             digest: bytes[12..].try_into().ok()?,
         })
     }
+}
+
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 digest length")
 }
 
 pub fn write(out: &mut impl Write, bytes: &[u8], limit: usize) -> io::Result<()> {

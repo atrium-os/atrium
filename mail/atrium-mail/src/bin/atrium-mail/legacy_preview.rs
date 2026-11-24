@@ -27,37 +27,47 @@ impl PreviewFixture {
             store: store.clone(),
             inbox,
         };
-        if store.count(inbox)? != 0 {
-            return Ok(fixture);
-        }
-        let raw = legacy_wire::fixture_message();
-        let blob = store.put_blob(&raw)?;
-        store.write(|w| {
-            w.put(
-                inbox,
-                account,
-                1,
-                Incoming {
-                    server_id: None,
-                    size: raw.len() as u64,
-                    internal_date: None,
-                    flags: 0,
-                    blob,
-                    full: true,
-                    summary: mail_schema::Summary {
-                        subject: SUBJECT.into(),
-                        encrypted: true,
-                        ..Default::default()
+        let present = store.list(inbox, 0, 3)?;
+        for (uid, raw) in [
+            (1, legacy_wire::fixture_message()),
+            (2, legacy_wire::unsupported_fixture_message()),
+        ] {
+            if present.iter().any(|row| row.uid == uid) {
+                continue;
+            }
+            let blob = store.put_blob(&raw)?;
+            store.write(|w| {
+                w.put(
+                    inbox,
+                    account,
+                    uid,
+                    Incoming {
+                        server_id: None,
+                        size: raw.len() as u64,
+                        internal_date: None,
+                        flags: 0,
+                        blob,
+                        full: true,
+                        summary: mail_schema::Summary {
+                            subject: SUBJECT.into(),
+                            encrypted: uid == 1,
+                            ..Default::default()
+                        },
                     },
-                },
-            )
-        })?;
+                )
+            })?;
+        }
         Ok(fixture)
     }
 
-    pub(super) fn selection(&self) -> Option<Selection> {
-        let rows = self.store.list(self.inbox, 0, 2).ok()?;
-        let [row] = rows.as_slice() else { return None };
+    pub(super) fn snapshot(&self, unsupported: bool) -> Option<Vec<u8>> {
+        let uid = if unsupported { 2 } else { 1 };
+        let row = self
+            .store
+            .list(self.inbox, 0, 3)
+            .ok()?
+            .into_iter()
+            .find(|row| row.uid == uid)?;
         let message = self.store.message(row.msg).ok()?;
         if !self
             .store
@@ -69,16 +79,21 @@ impl PreviewFixture {
             return None;
         }
         let raw = self.store.blob(&message.full?).ok()?;
-        let selection = Selection::for_message(message.account, row.msg, &raw);
-        (selection == Selection::fixture()).then_some(selection)
+        let mut snapshot = Selection::for_message(message.account, row.msg, &raw)
+            .encode()
+            .to_vec();
+        snapshot.extend_from_slice(&raw);
+        legacy_wire::received_selection(&snapshot)?;
+        Some(snapshot)
     }
 
     pub(super) fn still_unread(&self) -> Result<bool, mail_store::Error> {
-        let rows = self.store.list(self.inbox, 0, 2)?;
-        Ok(
-            matches!(rows.as_slice(), [row] if row.subject == SUBJECT && row.flags & flag::SEEN == 0)
-                && self.store.ops_pending()? == 0,
-        )
+        let rows = self.store.list(self.inbox, 0, 3)?;
+        Ok(rows.len() == 2
+            && rows
+                .iter()
+                .all(|row| row.subject == SUBJECT && row.flags & flag::SEEN == 0)
+            && self.store.ops_pending()? == 0)
     }
 }
 
@@ -91,12 +106,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let fixture = PreviewFixture::seed(&store).unwrap();
-        assert_eq!(fixture.selection(), Some(Selection::fixture()));
+        for (unsupported, expected) in [
+            (false, legacy_wire::fixture_message()),
+            (true, legacy_wire::unsupported_fixture_message()),
+        ] {
+            let snapshot = fixture.snapshot(unsupported).unwrap();
+            let (selected, bytes) = legacy_wire::received_selection(&snapshot).unwrap();
+            assert_eq!(selected.account, 1);
+            assert_eq!(selected.message, if unsupported { 2 } else { 1 });
+            assert_eq!(bytes, expected);
+        }
         store.write(|w| w.remove(fixture.inbox, 1)).unwrap();
-        assert!(fixture.selection().is_none());
+        assert!(fixture.snapshot(false).is_none());
         let replacement = PreviewFixture::seed(&store).unwrap();
         assert!(replacement.still_unread().unwrap());
-        assert!(replacement.selection().is_none());
+        assert!(replacement.snapshot(false).is_none());
     }
 
     #[test]

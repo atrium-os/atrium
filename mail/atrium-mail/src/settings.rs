@@ -210,7 +210,7 @@ pub struct Settings {
     kept: Rc<RefCell<Option<mpsc::Receiver<Result<(AccountConfig, Option<(mail_store::Server, [u8; 16])>), String>>>>>,
     microsoft: Rc<RefCell<Option<mpsc::Receiver<Result<[u8; 16], String>>>>>,
     pub microsoft_sheet_open: Rc<std::cell::Cell<bool>>,
-    smime_asked: Rc<std::cell::Cell<bool>>,
+    smime_asked: Rc<std::cell::Cell<Option<SmimeAsk>>>,
     smime_note: Mutable<Option<&'static str>>,
     added: Rc<std::cell::Cell<bool>>,
     /// Arca's answer to removing a removed account's items.
@@ -548,8 +548,8 @@ impl Settings {
         }
     }
 
-    pub fn take_smime_ask(&self) -> bool {
-        self.smime_asked.replace(false)
+    pub fn take_smime_ask(&self) -> Option<SmimeAsk> {
+        self.smime_asked.take()
     }
 
     pub fn smime_note(&self, message: Option<&'static str>) {
@@ -1144,6 +1144,13 @@ impl SettingsView {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SmimeAsk {
+    Provision,
+    LegacyPreview,
+    LegacyUnsupported,
+}
+
 pub const SYSTEM_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
 
 /// Staged into the signed synthetic bundle only. The feature is off by default.
@@ -1353,12 +1360,13 @@ impl SettingsView {
         y += em(16.0);
         section(ctx, x, &mut y, "S/MIME");
         let s = self.s.clone();
-        let label = if synthetic_legacy_sheet() {
-            "Open synthetic legacy S/MIME message"
+        if synthetic_legacy_sheet() {
+            button(ctx, x, y + em(14.0), "Open synthetic legacy S/MIME message", true, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyPreview)));
+            let s = self.s.clone();
+            button(ctx, x + em(315.0), y + em(14.0), "Open synthetic unsupported message", false, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyUnsupported)));
         } else {
-            "Add S/MIME identity"
-        };
-        button(ctx, x, y + em(14.0), label, true, true, move || s.smime_asked.set(true));
+            button(ctx, x, y + em(14.0), "Add S/MIME identity", true, true, move || s.smime_asked.set(Some(SmimeAsk::Provision)));
+        }
         y += em(36.0);
         if let Some(note) = self.s.smime_note.get() {
             y += para(ctx, x, y, inner, note, type_size::SM, t.text_primary()) + em(8.0);

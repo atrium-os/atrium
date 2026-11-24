@@ -769,8 +769,8 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
     if e.role.name == "smime-legacy-read" {
-        // One account, message and SHA-256 digest per sheet. Arca validates the binding.
-        if e.bound || e.legacy_selection_sent || fd.is_some() || s.bytes.len() != 44 {
+        // One bounded selection and message copy per sheet. Arca validates the binding.
+        if e.bound || e.legacy_selection_sent || fd.is_some() || s.bytes.len() <= 44 || s.bytes.len() > 44 + (48 << 10) {
             return Err(Reply::Refused { reason: refusal::MALFORMED });
         }
         e.legacy_selection_sent = true;

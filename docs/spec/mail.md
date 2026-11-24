@@ -1113,19 +1113,21 @@ receive-only path and its verification gate.
   indicator.
 
 The disposable verification bundle adds an explicit synthetic open in Mail
-Settings. It uses the signed Mail launch’s persona, a fixed test message,
-and the jailed Arca daemon’s trusted-UI dispatch. The ordinary bundle
+Settings. It uses the signed Mail launch’s persona, two synthetic
+received messages, and the jailed Arca daemon’s trusted-UI dispatch. The ordinary bundle
 omits that action and role grant. The signed gate checks Work
 cancellation, approved Work opening, and approved Personal refusal in
 one private overlay, with clean worker exit for both approved scenarios.
 
 The synthetic Settings action selects the local fixture account and
 message and hashes the complete stored bytes before requesting the
-sheet. Arca shows the account and binds the press to this one
-snapshot. The action resolves its outcomes locally, without selecting
+sheet. Arca reserves those bytes and the selected account and message
+IDs. The sheet shows the account and binds the press to this snapshot.
+The jailed reader extracts MIME from the reserved bytes. The action resolves its outcomes locally, without selecting
 or refreshing the regular reader. The signed gate seeds an
-unread copy of the fixture in each persona and checks its flag and the
-mailbox-operation queue after each sheet outcome. In the regular
+unread copy of each fixture in each persona and checks the flags and
+mailbox-operation queue after each outcome, including the repeated
+timing runs. In the regular
 reader, opening an unread conversation queues a Seen update
 independently of whether the message decrypts. A legacy preview must
 keep its request and outcome outside that update, HTML rendering and

@@ -975,14 +975,14 @@ fn legacy_sheet_accepts_one_selection_before_attach() {
     assert!(matches!(next_c(&mut arca), ChildEvent::Attach { embed, .. } if embed == sheet));
     assert_eq!(next_c(&mut arca), ChildEvent::ParentPersona { embed: sheet, persona: Some("work".into()) });
     assert_eq!(refused(mail.send(sheet, vec![0; 43])), refusal::MALFORMED);
-    let selected = vec![1; 44];
+    let selected = vec![1; 45];
     mail.send(sheet, selected.clone()).unwrap();
     assert_eq!(next_c(&mut arca), ChildEvent::Message { embed: sheet, bytes: selected });
-    assert_eq!(refused(mail.send(sheet, vec![2; 44])), refusal::MALFORMED);
+    assert_eq!(refused(mail.send(sheet, vec![2; 45])), refusal::MALFORMED);
     mail.place(sheet, Some([0.0, 0.0, 620.0, 350.0])).unwrap();
     arca.ready(sheet, W_ARCA).unwrap();
     assert_eq!(next_p(&mut mail), ParentEvent::Attached { embed: sheet });
-    assert_eq!(refused(mail.send(sheet, vec![3; 44])), refusal::MALFORMED);
+    assert_eq!(refused(mail.send(sheet, vec![3; 45])), refusal::MALFORMED);
 }
 
 #[test]

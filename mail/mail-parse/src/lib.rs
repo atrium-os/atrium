@@ -28,6 +28,32 @@ pub(crate) mod mime;
 pub use address::Address;
 pub use mime::{parse_date, part_bytes, sanitize_filename, Part, PartKind};
 
+/// Extract the top-level encrypted MIME body inside the parser jail.
+#[cfg(any(feature = "jail", feature = "legacy-receive-worker"))]
+pub fn smime_envelope(raw: &[u8]) -> Option<mail_smime::envelope::EnvelopedData> {
+    let summary = parse(raw, &Limits::default()).ok()?;
+    if !summary.encrypted {
+        return None;
+    }
+    let part = summary.parts.iter().find(|part| part.path.is_empty())?;
+    mail_smime::envelope::enveloped_data(&mime::part_bytes(raw, part)).ok()
+}
+
+#[cfg(all(test, feature = "legacy-receive-worker"))]
+#[test]
+fn legacy_received_envelope_uses_the_top_level_mime_body() {
+    use mail_smime::legacy_wire as wire;
+    let valid = wire::fixture_message();
+    let unsupported = wire::unsupported_fixture_message();
+    assert_eq!(valid.len(), unsupported.len());
+    assert!(smime_envelope(&unsupported).is_none());
+    let actual = smime_envelope(&valid).expect("received fixture envelope");
+    let expected = mail_smime::envelope::enveloped_data(include_bytes!(
+        "../../mail-smime/tests/data/env.der"
+    )).unwrap();
+    assert_eq!(actual, expected);
+}
+
 /// Hard limits refuse the message; soft ones cut what is kept.
 #[derive(Debug, Clone)]
 pub struct Limits {

@@ -1398,6 +1398,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "encoding_rs",
+ "libc",
  "mail-pgp",
  "mail-schema",
  "mail-smime",
@@ -1413,6 +1414,7 @@ dependencies = [
  "ring",
  "rsa",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

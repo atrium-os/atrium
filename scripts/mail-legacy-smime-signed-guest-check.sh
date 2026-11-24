@@ -29,9 +29,10 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 15 server::smime
+run_suite arcad-unit 16 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
+run_suite mail-received-unit 1 legacy_received_envelope
 run_suite mail-preview-unit 2 legacy_preview
 run_suite limen-binding-test 1 legacy_sheet_accepts_one_selection_before_attach
 
@@ -258,23 +259,36 @@ scenario() {
     login=$3
     uid=$4
     workers=$5
+    scenario_log=${6:-$outcome}
     marker=$(printf '%s' "$outcome" | tr '[:lower:]' '[:upper:]')
-    start "$outcome" env FRESCO_SOCKET="$fresco" FRESCO_ACTIVATION="$activation" \
+    prior_lines=$(wc -l <"$d/$login.log")
+    start "$scenario_log" env FRESCO_SOCKET="$fresco" FRESCO_ACTIVATION="$activation" \
         LIMEN_SOCKET="$limen" ARCA_APP_REGISTRY="$registry" \
         su -m _arca-ui -c "exec $d/arca-legacy-smime-fixture signed $d $publisher $nonce"
-    wait_marker "$d/$outcome.log" LEGACY_FIXTURE_PROVIDER_READY
+    wait_marker "$d/$scenario_log.log" LEGACY_FIXTURE_PROVIDER_READY
     timeout 52 "$d/smime_installed_probe" drive-legacy "$d/wm.sock" "$d/input.sock" "$uid" "$action"
-    wait_marker "$d/$outcome.log" "LEGACY_FIXTURE_$marker"
-    wait_marker "$d/$login.log" "MAIL_SIGNED_LEGACY_$marker"
-    wait_marker "$d/$login.log" "MAIL_SIGNED_LEGACY_${marker}_UNREAD_NO_WRITES"
+    wait_marker "$d/$scenario_log.log" "LEGACY_FIXTURE_$marker"
+    expected_message=1
+    if [ "$action" = unsupported ]; then expected_message=2; fi
+    wait_marker "$d/$scenario_log.log" "LEGACY_FIXTURE_SELECTED_MESSAGE=$expected_message"
+    for _ in $(jot 40); do
+        tail -n "+$((prior_lines + 1))" "$d/$login.log" >"$d/$scenario_log.mail"
+        if grep -qx "MAIL_SIGNED_LEGACY_$marker" "$d/$scenario_log.mail"; then break; fi
+        sleep .25
+    done
+    grep -qx "MAIL_SIGNED_LEGACY_$marker" "$d/$scenario_log.mail"
+    grep -qx "MAIL_SIGNED_LEGACY_${marker}_UNREAD_NO_WRITES" "$d/$scenario_log.mail"
     echo "MAIL_SIGNED_LEGACY_${marker}_UNREAD_NO_WRITES"
     test "$(worker_count)" = "$workers"
-    jls -q name >"$d/$outcome.jails"
-    if grep -F 'app-org-atrium-smime-legacy-reader' "$d/$outcome.jails"; then
+    jls -q name >"$d/$scenario_log.jails"
+    if grep -F 'app-org-atrium-smime-legacy-reader' "$d/$scenario_log.jails"; then
         echo "Legacy reader jail remained after $outcome" >&2
         exit 1
     fi
     echo "MAIL_SIGNED_LEGACY_$marker"
+    if [ "$outcome" != cancelled ]; then
+        test "$(grep -xc 'LEGACY_JAILED_WORKER_EXIT=0' "$d/$scenario_log.log")" = 1
+    fi
     # The trusted fixture keeps its connection briefly to deliver the outcome.
     sleep 1
 }
@@ -295,16 +309,21 @@ test "$personaluid" != "$workuid"
 echo "MAIL_SIGNED_PERSONAL_UID=$personaluid"
 scenario closed approve personal "$personaluid" 2
 
+worker_total=2
+for sample in 1 2 3; do
+    for profile in missing-key unsupported; do
+        worker_total=$((worker_total + 1))
+        scenario closed "$profile" personal "$personaluid" "$worker_total" "$profile-$sample"
+    done
+done
+
 awk '$2 == "ui" && $3 == "op=0x0067" && $5 == "status=1" { abandoned++ }
 $2 == "ui" && $3 == "op=0x006f" {
     if ($5 == "status=0") opened++
     else if ($5 == "status=1") closed++
     else unexpected++
-} END { exit !(abandoned == 1 && opened == 1 && closed == 1 && !unexpected) }' /var/db/arca/audit.log
+} END { exit !(abandoned == 1 && opened == 1 && closed == 7 && !unexpected) }' /var/db/arca/audit.log
 echo MAIL_LEGACY_ARCA_DISPATCH_OK
-for outcome in opened closed; do
-    test "$(grep -xc 'LEGACY_JAILED_WORKER_EXIT=0' "$d/$outcome.log")" = 1
-done
 if grep -Ei 'broken pipe|caller hung up; removing worker jail' "$d/portcullisd.log"; then
     echo "Portcullis detected a premature disconnect" >&2
     exit 1
