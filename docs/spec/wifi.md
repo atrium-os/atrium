@@ -292,7 +292,7 @@ in FreeBSD and that hardware is going away.
 | W4 | `aura_mt79` station: BSS/STA records, TX/RX, HW crypto, firmware rate control, BA sessions, PS, country/regulatory; then the PCIe (WFDMA) bus layer and MT7925 on the AI X1 Pro | real AP joined at HE/EHT rates, iperf target met on the AI X1 Pro |
 | W5 | suspend/resume, rfkill, firmware crash recovery (reload + rejoin), 24 h soak | soak green |
 | W6 | second family: `aura_intel` (BE200 swapped into the AI X1 Pro, or AX210) | same gates |
-| W7 | Enterprise: EAP-TLS, PEAP-MSCHAPv2, EAP-TTLS; certificates through Arca | interop with hostapd's EAP server |
+| W7 | Enterprise: EAP-TLS, PEAP-MSCHAPv2, EAP-TTLS; certificates through Arca | interop with hostapd's EAP server. Proposed in §7.4 (2026-11-24) |
 
 W0–W2 need no Wi-Fi hardware at all.
 
@@ -389,6 +389,82 @@ W0–W2 need no Wi-Fi hardware at all.
   hunting-and-pecking; transition mode with Transition Disable; a WPA2-only AP under a
   WPA3-only name refused; roaming from channel 1 to 6 as `aura/sim-ap/air-hwsim.py`
   lowers the first AP's signal; no secret in the aura-mlme log.
+
+### 7.4 W7 Enterprise (proposed 2026-11-24)
+
+Work, campus and eduroam networks: WPA2/WPA3-Enterprise, where the network checks a
+username and password (or a certificate) through a RADIUS server instead of one shared
+passphrase. Today Atrium cannot join them at all.
+
+**What joins.** AKM 1 (802.1X, SHA-1) and AKM 5 (802.1X, SHA-256; PMF as the AP asks,
+required for WPA3-Enterprise). Not in v1: AKM 3/4 (FT), 12/13 (192-bit Suite B), PMK
+caching across roams (each roam runs EAP again: slower, correct).
+
+**Methods.** PEAPv0 with EAP-MSCHAPv2 inside; EAP-TTLS with PAP or MSCHAPv2 inside;
+EAP-TLS with a client certificate. These cover eduroam and nearly every company
+network. Never: LEAP, EAP-MD5, EAP-FAST, plain MSCHAPv2 outside a tunnel. The server
+proposes a method; we answer with a Nak naming the one the network is set for, so a
+server cannot talk the machine into a weaker one.
+
+**The server certificate is always checked.** A captured password is the usual way
+enterprise Wi-Fi is attacked (an evil twin with the same name and any certificate). So
+there is no "don't validate" switch: a network is joined only when the RADIUS server's
+chain ends in the trust it was set up with (the system roots, or a CA certificate
+imported for that network) and the certificate names the server's domain (a dNSName in
+its subjectAltName equal to, or under, the domain set for the network). On a first join
+with no CA set, the join stops before any password is sent and Settings shows the
+server's certificate (its name, issuer, validity and fingerprint) with "Trust this
+server": that pins the chain's root and the server's name for this network only
+(the "trust on first use" phones do for eduroam). A later change of root is refused
+and shown, never accepted silently.
+
+**Where it runs (§8.3's `aura-eap`).** A new process, `aura-eap`, one per join, uid
+`_aura-eap` (65056), started by aura-keys over a socket pair from a spawner forked
+before capability mode, chroot `/var/empty`, no network, no files, capability mode
+before the first EAP byte. It parses EAP, the TLS records and the server's certificate
+chain (the large hostile parsers) and holds the password only for that join. aura-keys
+keeps EAPOL and the controlled port: it passes EAP packets (EAPOL type 0) both ways,
+gives aura-eap the network's settings and credential for that join, and takes back the
+MSK at the end; the PMK is its first 32 bytes, and the 4-way handshake runs as for a
+passphrase. aura-mlme sees neither the password nor the MSK. A client certificate's key
+stays in Arca: aura-eap asks Arca, through aura-keys, to sign the TLS CertificateVerify
+(the key never leaves Arca).
+
+**TLS.** rustls 0.23 (Apache-2.0/MIT/ISC, already in the tree), TLS 1.2 and 1.3,
+driven without sockets; keys from its RFC 5705 exporter ("client EAP encryption" for
+PEAP and EAP-TLS, "ttls keying material" for TTLS; RFC 9190 for EAP-TLS 1.3). A server
+that speaks only TLS 1.0 or 1.1 is refused with that reason. MSCHAPv2 needs MD4 and DES
+(RustCrypto `md4`, `des`: MIT/Apache-2.0).
+
+**Identity privacy.** The outer, unencrypted identity is `anonymous@<realm>` (the realm
+from the username) unless the network says otherwise; the real username goes only
+inside the tunnel.
+
+**Settings.** A secured network nearby that advertises 802.1X opens an "Enterprise"
+sheet: username, password (typed into Arca's field, as for a passphrase), method
+(Automatic: PEAP, then TTLS), CA (System or a file), domain, and, under More,
+anonymous identity and a client certificate. Saved networks show "Enterprise (802.1X)"
+and the pinned server.
+
+**Build steps.**
+
+| Step | What | Done when |
+|---|---|---|
+| E1 | `aura-eap` crate: EAP state machine, PEAP/TTLS/EAP-TLS, MSCHAPv2 (RFC 2759 vectors), server checks; fuzz targets for EAP and the inner methods | host tests against hostapd's EAP server (`eapol_test`-style harness on the Linux host) for each method, wrong password, wrong CA, wrong domain, TLS 1.0-only server |
+| E2 | aura-keys: AKM 1/5, the `aura-eap` process and jail, MSK to PMK; atrium-net and Arca: enterprise profile and credential | `aura-sim-gate.sh w7`: the VM joins hostapd WPA2- and WPA3-Enterprise on hwsim with PEAP and TTLS, gets an address; an evil-twin AP with another certificate is refused before any password leaves |
+| E3 | EAP-TLS with the client key in Arca | same gate, certificate login |
+| E4 | Settings sheet, first-join trust, bar menu | joined from Settings in the VM, shown in frames |
+
+**Decisions for Shankar**
+- Q1. Methods in v1: PEAP-MSCHAPv2, TTLS (PAP, MSCHAPv2), EAP-TLS; nothing weaker. *Recommend yes.*
+- Q2. The server certificate always checked (CA plus domain); no "don't validate". *Recommend yes.*
+- Q3. First join without a CA: show the server's certificate and "Trust this server",
+  pinning its root and name for that network. *Recommend yes.* (Alternative: require a
+  CA file or the system roots up front; safer, but most eduroam setups would need one.)
+- Q4. rustls, TLS 1.2/1.3 only; TLS 1.0/1.1 servers refused with a clear reason. *Recommend yes.*
+- Q5. `aura-eap` as its own sandboxed process per join, password from aura-keys for
+  that join only, client keys signing inside Arca. *Recommend yes.*
+- Q6. Wired 802.1X (the same `aura-eap` on Ethernet) later, not in W7. *Recommend later.*
 
 ## 8. Threat model and what runs where
 
