@@ -289,10 +289,19 @@ fn probe(path: &str, uid: u32, allow: bool) -> io::Result<()> {
         let mut body = uid.to_le_bytes().to_vec();
         body.push(mode as u8);
         proto::write_request(&mut stream, op::U_SMIME_SYNTHETIC_JMAP, &body)?;
-        let (status, witness) = proto::read_reply(&mut stream)?;
-        if allow && status == status::OK && witness.as_ref() == [mode as u8] {
+        // This lab opcode has a public result. The unprivileged Mail probe
+        // must be able to read a denial without allocating locked memory.
+        let mut header = [0; 5];
+        stream.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[..4].try_into().map_err(io::Error::other)?);
+        if allow && header[4] == status::OK && length == 2 {
+            let mut witness = [0];
+            stream.read_exact(&mut witness)?;
+            if witness != [mode as u8] {
+                return Err(invalid());
+            }
             println!("MAIL_JMAP_PROOF_{label}");
-        } else if !allow && status == status::DENIED && witness.as_ref().is_empty() {
+        } else if !allow && header[4] == status::DENIED && length == 1 {
             println!("MAIL_JMAP_PROOF_DIRECT_DENIED");
             return Ok(());
         } else {
