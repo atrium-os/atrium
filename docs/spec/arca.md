@@ -1075,9 +1075,13 @@ request deletes every fenced row before it loads or enrolls. A
 receipt issued before an arcad restart still authorizes the same
 bytes after it. Revoked receipts never authorize again, even after
 the same mailbox is enrolled again, because that enrollment gets a
-new instance and key. `PERSONA_DESTROY` does not yet fence
-synthetic persona instances; the signed fixture has one fixed
-persona.
+new instance and key. `PERSONA_DESTROY` fences every synthetic account
+row of the persona for the current Mail publisher before it erases the
+persona's groups, and refuses the erasure if that fails, so a retry
+fences first again. The signed fixture has one fixed persona instance,
+so it fences accounts rather than the persona instance. A recreated
+persona with the same name enrolls afresh, and other personas keep
+their accounts.
 
 The optional `legacy-jmap-worker` fixture adds a trusted-UI probe for the
 signed synthetic Work launch. It launches a separate signed Portcullis
@@ -1101,8 +1105,7 @@ signed Mail requests and trusted-UI requests for Personal. No live
 account, credential store lookup or provider authorization is involved.
 This proves a transport path for the disposable fixture. A separately
 deployed service, a trusted-sheet enrollment press for this account,
-revocation from Mail's account removal and persona destruction remain
-later work. The six whole-path timing
+and revocation from Mail's account removal remain later work. The six whole-path timing
 trials cover two operational failures only.
 
 ##### Failure observability review

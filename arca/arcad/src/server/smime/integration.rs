@@ -1288,3 +1288,5 @@ mod jmap_account_gate;
 
 #[cfg(all(target_os = "freebsd", feature = "legacy-jmap-worker"))]
 pub use jmap_account_gate::serve_jmap_proof;
+#[cfg(any(test, all(target_os = "freebsd", feature = "legacy-jmap-worker")))]
+pub(crate) use jmap_account_gate::fence_persona;

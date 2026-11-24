@@ -317,6 +317,34 @@ impl Fences {
 }
 
 const RECORD: &str = "Atrium synthetic JMAP account v1";
+/// The revocation ledger, beside the stores in Arca's private directory.
+const LEDGER: &str = "legacy-jmap-fences";
+
+/// Persona destruction: durably fence every synthetic account the persona
+/// holds for this publisher before its groups are erased. A store without
+/// legacy groups for the persona needs no ledger. Any error must stop the
+/// erasure, so a retry fences first again.
+pub(crate) fn fence_persona(
+    store: &mut Store,
+    dir: &Path,
+    persona: &str,
+    publisher: [u8; 32],
+) -> io::Result<usize> {
+    let accounts = Accounts::new(persona, publisher);
+    if !store
+        .personas_for(&accounts.recipient)
+        .iter()
+        .any(|held| held == persona)
+    {
+        return Ok(0);
+    }
+    let fences = accounts.fences(store, &dir.join(LEDGER))?;
+    let rows = accounts.rows(store)?;
+    for row in &rows {
+        accounts.revoke_account(store, &fences, row.instance)?;
+    }
+    Ok(rows.len())
+}
 const SESSION_MAX: usize = 4096;
 
 impl Enrollment {
@@ -600,9 +628,9 @@ impl<'a> Accounts<'a> {
     }
 
     /// Fence a persona instance, then delete every account row it holds.
-    /// `PERSONA_DESTROY` does not call this yet; the signed fixture has one
-    /// fixed persona instance.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The signed fixture has one fixed persona instance, so persona
+    /// destruction fences each account instead (`fence_persona`).
+    #[cfg(test)]
     fn revoke_persona(&self, store: &mut Store, fences: &Fences, persona: Instance) -> io::Result<()> {
         fences.revoke("persona", persona, || {
             for row in self.rows(store)? {
@@ -1081,6 +1109,58 @@ fn jmap_legacy_sealed_account_refuses_without_its_revocation_ledger() {
     assert!(accounts.fences(&store, &ledger).is_err());
 }
 
+#[test]
+fn jmap_legacy_persona_destroy_fences_sealed_accounts_before_erasing() {
+    use crate::{label::Label, proto::{op, status, volume_op}, server::State};
+    let root = tempfile::tempdir().unwrap();
+    let mut state = State::new(root.path().into()).unwrap();
+    state.mail_sign_ins.mail_publisher = Some([7; 32]);
+    let body = |write: &dyn Fn(&mut Writer)| {
+        let mut w = Writer::new();
+        write(&mut w);
+        w.buf
+    };
+    let create = body(&|w| {
+        w.str("alice");
+        w.raw(&[9; 32]);
+    });
+    assert_eq!(state.handle(&Label::Vestibulum, op::V_CREATE, &create).status, status::OK);
+    let ledger = root.path().join(LEDGER);
+    let work = Accounts::new("work", [7; 32]);
+    let school = Accounts::new("school", [7; 32]);
+    let bytes = wire::fixture_message();
+    let (old, receipt, kept) = {
+        let store = state.stores.get_mut("alice").unwrap();
+        let fences = work.fences(store, &ledger).unwrap();
+        let (approval, json) = approved(binding(1, 1), "a1");
+        let old = work.enroll(store, &fences, approval, json.as_bytes()).unwrap();
+        let receipt = download(&old, &fences, &bytes).unwrap();
+        let (approval, json) = approved(binding(5, 1), "a1");
+        let kept = school.enroll(store, &fences, approval, json.as_bytes()).unwrap();
+        (old, receipt, kept)
+    };
+    let destroy = body(&|w| {
+        w.str("alice");
+        w.str("work");
+    });
+    let service = Label::Service("atrium-volumes".into());
+    assert_eq!(state.handle(&service, volume_op::PERSONA_DESTROY, &destroy).status, status::OK);
+    let fences = Fences::open(&ledger).unwrap();
+    assert!(fences.fenced(old.enrollment.instance, [0; 16]).unwrap());
+    assert!(old.authorize(&binding(1, 1), "message", &bytes, &receipt, &fences).is_err());
+    let store = state.stores.get_mut("alice").unwrap();
+    assert!(work.rows(store).unwrap().is_empty());
+    // A recreated persona with the same name enrolls afresh; others stay.
+    let (approval, json) = approved(binding(1, 1), "a1");
+    let new = work.enroll(store, &fences, approval, json.as_bytes()).unwrap();
+    assert_ne!(new.tag(), old.tag());
+    let loaded = school
+        .load(store, &fences, &binding(5, 1), "login@fixture.invalid", "a1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.tag(), kept.tag());
+}
+
 /// Witness codes for the public synthetic result.
 #[cfg(all(target_os = "freebsd", feature = "legacy-jmap-worker"))]
 mod witness {
@@ -1100,7 +1180,6 @@ pub fn serve_jmap_proof(
     use super::{launch_worker, op, proto, signed_persona, status, Label, SYNTHETIC_USER};
     use portcullis_ipc::Response;
 
-    const LEDGER: &str = "legacy-jmap-fences";
     let run = || -> io::Result<Vec<u8>> {
         let [a, b, c, d, mode @ (0..=3)] = *body else {
             return Err(closed());

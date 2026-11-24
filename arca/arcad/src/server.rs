@@ -972,6 +972,23 @@ impl State {
                 if let Some(ids) = self.group_keys.get_mut(&user) {
                     ids.retain(|k| !keys.contains(k));
                 }
+                // Synthetic JMAP accounts are fenced before their sealed
+                // rows go with the persona's groups (arca.md, sealed
+                // synthetic account).
+                #[cfg(all(
+                    feature = "legacy-smime-integration",
+                    any(all(test, feature = "host-openssl-tests"), all(target_os = "freebsd", feature = "legacy-jmap-worker"))
+                ))]
+                if let Some(publisher) = self.mail_sign_ins.mail_publisher {
+                    let dir = self.dir.clone();
+                    let store = match self.volume_store(&user, &persona, false) {
+                        Ok(s) => s,
+                        Err(r) => return r,
+                    };
+                    if integration::fence_persona(store, &dir, &persona, publisher).is_err() {
+                        return reply(status::INTERNAL);
+                    }
+                }
                 let store = match self.volume_store(&user, &persona, false) {
                     Ok(s) => s,
                     Err(r) => return r,
