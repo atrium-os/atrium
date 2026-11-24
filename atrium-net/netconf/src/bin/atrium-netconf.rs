@@ -398,12 +398,17 @@ fn listen(dir: &Path, g: Grant) -> UnixListener {
     // print-discovery (prelumd) and network-portal (the portal launcher)
     // are root's alone: no jail gets them either.
     let root_only = g.root_only();
-    let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if root_only { 0o700 } else { 0o755 }));
+    /* For a root-only grant the mode is the access control: fail loudly
+     * rather than serve with whatever mode the directory had (review
+     * 2026-11-24, M2). */
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if root_only { 0o700 } else { 0o755 }))
+        .unwrap_or_else(|e| die(&format!("chmod {}: {e}", d.display())));
     let p: PathBuf = d.join(format!("{}.sock", g.name()));
     let _ = std::fs::remove_file(&p);
     let l = UnixListener::bind(&p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
     // Who reaches the socket is decided by which jails get its directory.
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if root_only { 0o600 } else { 0o666 }));
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if root_only { 0o600 } else { 0o666 }))
+        .unwrap_or_else(|e| die(&format!("chmod {}: {e}", p.display())));
     l
 }
 
