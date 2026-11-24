@@ -162,13 +162,13 @@ case "${2-}" in
                 test ! -f "$personal_store/meeting-changes.json" ;;
         esac
         exit 0 ;;
-    response-window|range-window|occurrence-window|response-deliver|response-result)
+    response-window|range-window|group-window|occurrence-window|response-deliver|response-result)
         root=$(jls -j "$mail_jail" path)
         uid=$(stat -f %u "$mail_folder/index.redb")
         fixture=/tmp/rsvp-fixture
         case "$2" in
-            response-window|range-window|occurrence-window)
-                case "$2" in occurrence-window) mode=during-occurrence ;; range-window) mode=during-range-cancellation ;; *) mode=during-confirmation ;; esac
+            response-window|range-window|group-window|occurrence-window)
+                case "$2" in group-window) mode=during-group-cancellation ;; occurrence-window) mode=during-occurrence ;; range-window) mode=during-range-cancellation ;; *) mode=during-confirmation ;; esac
                 install -d -o "$uid" -g "$uid" "$root$fixture"
                 install -m 0555 invitation_probe "$root/bin/invitation-probe"
                 daemon -f -o "$D/response-probe.log" jexec -u "$(id -nu "$uid")" "$mail_jail" /bin/invitation-probe "$mode" "$fixture" /bin/mail-parse-jail ;;
@@ -193,7 +193,7 @@ case "${2-}" in
         ./invitation_probe "$mode" "$mail_folder" "$D/mail-parse-jail"
         if [ "$2" = series-submit ] || [ "$2" = occurrence-submit ]; then start_mail; fi
         exit 0 ;;
-    keyboard-setup|import-setup|invitation-setup|occurrence-setup|range-response-setup|series-setup|bounded-setup|cancel-dates-setup|exdates-setup|future-setup|cancel-future-setup|reinstate-setup|restart-setup|restore-one-setup|reissue-setup|long-range-setup|'') ;;
+    keyboard-setup|import-setup|invitation-setup|occurrence-setup|range-response-setup|group-response-setup|series-setup|bounded-setup|cancel-dates-setup|exdates-setup|future-setup|cancel-future-setup|reinstate-setup|restart-setup|restore-one-setup|reissue-setup|long-range-setup|'') ;;
     *) exit 2 ;;
 esac
 
@@ -216,7 +216,7 @@ mkdir -p "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 daemon -f -o "$D/portcullis.log" env RUST_LOG=info /usr/local/bin/portcullisd --socket "$psock"
 activation="$D/act.sock"
-case "${2-}" in invitation-setup|occurrence-setup|range-response-setup|series-setup|bounded-setup|cancel-dates-setup|exdates-setup|future-setup|cancel-future-setup|reinstate-setup|restart-setup|restore-one-setup|reissue-setup|long-range-setup) mail_setup=yes ;; *) mail_setup=no ;; esac
+case "${2-}" in invitation-setup|occurrence-setup|range-response-setup|group-response-setup|series-setup|bounded-setup|cancel-dates-setup|exdates-setup|future-setup|cancel-future-setup|reinstate-setup|restart-setup|restore-one-setup|reissue-setup|long-range-setup) mail_setup=yes ;; *) mail_setup=no ;; esac
 if [ "${2-}" = import-setup ] || [ "$mail_setup" = yes ]; then
     activation=/atrium/sockets/fresco-activation/fresco-activation.sock
     if sockstat -ul | grep -Fq "$activation"; then echo "activation socket in use" >&2; exit 1; fi
@@ -262,7 +262,7 @@ MANIFEST
     opifex install mail-app
     su -m "$person" -c 'portcullis policy grant org.atrium.mail'
     ./invitation_probe exercise "$D/standalone-store" "$D/mail-parse-jail"
-    case "$2" in range-response-setup) mode=seed-range-response ;; occurrence-setup) mode=seed-occurrences ;; series-setup) mode=seed-series ;; bounded-setup) mode=seed-bounded ;; cancel-dates-setup) mode=seed-cancel-dates ;; reissue-setup) mode=seed-reissue ;; restore-one-setup) mode=seed-restore-one ;; restart-setup) mode=seed-restart ;; reinstate-setup) mode=seed-reinstate ;; cancel-future-setup) mode=seed-cancel-future ;; long-range-setup) mode=seed-long-range ;; future-setup) mode=seed-future ;; exdates-setup) mode=seed-exdates ;; *) mode=seed ;; esac
+    case "$2" in group-response-setup) mode=seed-group-response ;; range-response-setup) mode=seed-range-response ;; occurrence-setup) mode=seed-occurrences ;; series-setup) mode=seed-series ;; bounded-setup) mode=seed-bounded ;; cancel-dates-setup) mode=seed-cancel-dates ;; reissue-setup) mode=seed-reissue ;; restore-one-setup) mode=seed-restore-one ;; restart-setup) mode=seed-restart ;; reinstate-setup) mode=seed-reinstate ;; cancel-future-setup) mode=seed-cancel-future ;; long-range-setup) mode=seed-long-range ;; future-setup) mode=seed-future ;; exdates-setup) mode=seed-exdates ;; *) mode=seed ;; esac
     ./invitation_probe "$mode" "$D/seeded" "$D/mail-parse-jail"
     start_mail
     for i in $(jot 20); do test -f "$mail_folder/index.redb" && break; sleep 1; done

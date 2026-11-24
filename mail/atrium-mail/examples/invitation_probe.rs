@@ -42,6 +42,10 @@ const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
+    let group_response = mode == "seed-group-response";
+    let group_target = MOVED
+        .replace(ORIGINAL, AFTER_CUTOFF)
+        .replace("SEQUENCE:2", "SEQUENCE:3");
     let range_response = mode == "seed-range-response";
     let earlier = MOVED.replace("20261209T15", "20261218T15");
     let after = MOVED.replace(ORIGINAL, AFTER_CUTOFF);
@@ -148,6 +152,13 @@ fn seed(e: &Engine, mode: &str) {
                 ("Extend to December 29", UNTIL)
             },
         ]
+    } else if group_response {
+        &[
+            ("Weekly studio", WEEKLY),
+            ("December 15 moved to December 9", &sibling),
+            ("December 22 moved to December 9", &group_target),
+            ("Cancel December 8 and 22", CANCEL_DATES),
+        ]
     } else if range_response {
         &[
             ("Weekly studio", WEEKLY),
@@ -197,7 +208,9 @@ fn seed(e: &Engine, mode: &str) {
             .pop()
             .unwrap()
             .unwrap();
-        let sequence = if range_response {
+        let sequence = if group_response {
+            [1, 2, 3, 2][n]
+        } else if range_response {
             [1, 2, 2, 3][n]
         } else if occurrences && id == 4 {
             2
@@ -759,6 +772,90 @@ fn during_range_cancellation(e: &Engine, dir: &Path) {
     println!("PASS live confirmation, inclusive cancellation cutoff, later original moved earlier blocked, earlier original moved later delivered exactly once");
 }
 
+fn during_group_cancellation(e: &Engine, dir: &Path) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    let account = e.store.add_account("dev@fixture.invalid").unwrap();
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let put = |id, body: &str, verified| put_revision(e, account, inbox, id, body, verified);
+    let request = MOVED.replace("SEQUENCE:2", "SEQUENCE:3");
+    let target = put(1, &request.replace(ORIGINAL, AFTER_CUTOFF), true);
+    let sibling = put(2, &MOVED.replace(ORIGINAL, SIBLING), true);
+    let first = put(3, &request, true);
+    let blob = |id| e.store.message(id).unwrap().full.unwrap();
+    let reply = Reply {
+        scope: Some(AFTER_CUTOFF.into()),
+        sequence: 3,
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        uid: "studio-planning@fixture.invalid".into(),
+        answer: Answer::Accept,
+    };
+    let latest = check_open_window(e, dir, target, blob(target), &reply, || {
+        // A same-revision conflict inspected before the group must yield to
+        // the higher revision on the group's second date.
+        put(
+            4,
+            &request
+                .replace(ORIGINAL, AFTER_CUTOFF)
+                .replace("Studio B", "Studio C"),
+            true,
+        );
+        put(
+            5,
+            &CANCEL_DATES
+                .replace(AFTER_CUTOFF, SIBLING)
+                .replace("SEQUENCE:4", "SEQUENCE:9"),
+            false,
+        );
+        put(
+            6,
+            &CANCEL_DATES
+                .replace("SEQUENCE:2", "SEQUENCE:0\nLOCATION:Sibling venue")
+                .replace(
+                    AFTER_CUTOFF,
+                    "RECURRENCE-ID;TZID=America/New_York:20261222T090000",
+                ),
+            true,
+        )
+    });
+    assert!(
+        matches!(e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update {msg, sequence:4, when, location}))
+        if msg == latest && location.is_empty() && when == "This meeting is one of 2 cancelled dates")
+    );
+    // A high revision on the first date cannot cancel a newer reply on the second.
+    let stale = CANCEL_DATES
+        .replace("SEQUENCE:2", "SEQUENCE:8")
+        .replace("SEQUENCE:4", "SEQUENCE:1");
+    put(7, &stale, true);
+    assert!(
+        matches!(e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update { msg, sequence:4, .. })) if msg == latest)
+    );
+    let first_reply = Reply {
+        scope: Some(ORIGINAL.into()),
+        ..reply.clone()
+    };
+    assert!(matches!(
+        e.send_invitation_reply(first, blob(first), &first_reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update {
+            sequence: 8,
+            ..
+        }))
+    ));
+    assert!(e.store.outbox().unwrap().is_empty());
+    let untouched = Reply {
+        sequence: 2,
+        scope: Some(SIBLING.into()),
+        ..reply
+    };
+    e.send_invitation_reply(sibling, blob(sibling), &untouched)
+        .unwrap();
+    submit(e, 2, Some(SIBLING));
+    println!("PASS live confirmation, per-date revisions in both orders, unlisted meeting delivered once");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -770,6 +867,7 @@ fn main() {
     match args[1].as_str() {
         mode @ ("seed"
         | "seed-range-response"
+        | "seed-group-response"
         | "seed-occurrences"
         | "seed-series"
         | "seed-bounded"
@@ -782,6 +880,7 @@ fn main() {
         | "seed-restart"
         | "seed-restore-one"
         | "seed-reissue") => seed(&e, mode),
+        "during-group-cancellation" => during_group_cancellation(&e, Path::new(&args[2])),
         "during-range-cancellation" => during_range_cancellation(&e, Path::new(&args[2])),
         "during-occurrence" => during_occurrence(&e, Path::new(&args[2])),
         "submit-occurrence" => submit(&e, 3, Some(NEW_YORK_ORIGINAL)),

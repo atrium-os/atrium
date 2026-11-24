@@ -559,12 +559,13 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
     let Outcome::Invitation(mut p) = parse_mode(bytes, true).ok()? else {
         return None;
     };
-    if p.sequence == 0
+    let grouped = !p.cancelled_dates.is_empty();
+    if (p.sequence == 0 && !grouped)
         || (p.this_and_future && p.row.is_some())
         || p.scope().as_deref() != scope
-        || p.original.is_some() != scope.is_some()
+        || (p.original.is_some() || grouped) != scope.is_some()
         || p.weekly_cancellation
-        || !p.cancelled_dates.is_empty()
+        || (grouped && p.row.is_some())
     {
         return None;
     }
@@ -580,6 +581,18 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
 #[cfg(test)]
 mod background_tests {
     use super::individual_update;
+    #[test]
+    fn grouped_cancellation_requires_every_slot_revision_and_the_same_attendee() {
+        let group = include_str!("../../../atrium-calendar/tests/fixtures/cancel-dates.ics");
+        let scope = "cancel-dates|2/RECURRENCE-ID:20261208T140000Z|4/RECURRENCE-ID:20261222T140000Z";
+        let me = vec!["dev@fixture.invalid".into()];
+        assert!(individual_update(group.as_bytes(), &me, Some(scope)).is_some());
+        assert!(individual_update(group.as_bytes(), &me, None).is_none());
+        assert!(individual_update(group.as_bytes(), &me, Some(&scope.replace("|4/", "|2/"))).is_none());
+        let other = group.replacen("END:VEVENT", "ATTENDEE:mailto:other@fixture.invalid\nEND:VEVENT", 1);
+        assert!(individual_update(other.as_bytes(), &me, Some(scope)).is_none());
+    }
+
     #[test]
     fn only_a_matching_range_cancellation_can_pause_an_occurrence() {
         let cancel = include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics");

@@ -1,7 +1,7 @@
 //! Only Mail submits an RSVP. Recheck the selected message at explicit Send.
 use crate::{Engine, Error};
 use mail_schema::{InviteMethod, PartKind, SenderCheck};
-use mail_store::MsgId;
+use mail_store::{MsgId, OccurrenceSlot};
 use portcullis_ipc::calendar::{address, Delivery, Reply, Source, FILE_MAX};
 
 #[derive(serde::Deserialize)]
@@ -68,6 +68,55 @@ fn occurrence_label(property: &str) -> Result<(bool, String), Error> {
         range.is_some(),
         format!("{} · {zone}", date.format("%Y-%m-%d %H:%M")),
     ))
+}
+
+enum CancellationScope {
+    Individual,
+    Range(OccurrenceSlot, String),
+    Group(usize),
+}
+
+impl CancellationScope {
+    fn same_effect(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Range(a, _), Self::Range(b, _)) => a == b,
+            (Self::Group(_), Self::Group(_)) | (Self::Individual, Self::Individual) => true,
+            _ => false,
+        }
+    }
+}
+
+// The two parser workers have agreed on every component of this scope. A
+// sibling's SEQUENCE has no bearing on whether this reply is still current.
+fn grouped_revision(scope: &str, wanted: OccurrenceSlot) -> Option<(u32, CancellationScope)> {
+    let listed = scope.strip_prefix("cancel-dates|")?.split('|');
+    let count = listed.clone().count();
+    if !(2..=8).contains(&count) {
+        return None;
+    }
+    let mut matched = None;
+    for component in listed {
+        let (seq, property) = component.split_once('/')?;
+        if wanted.matches(OccurrenceSlot::parse(property)?) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(seq.parse().ok()?);
+        }
+    }
+    Some((matched?, CancellationScope::Group(count)))
+}
+
+struct ResponseRevision {
+    msg: MsgId,
+    sequence: u32,
+    invite: mail_schema::Invite,
+    scope: CancellationScope,
+    conflict: bool,
+}
+
+fn same_schedule(a: &mail_schema::Invite, b: &mail_schema::Invite) -> bool {
+    a.cancelled == b.cancelled && a.start == b.start && a.end == b.end && a.location == b.location
 }
 
 pub struct Selected {
@@ -262,12 +311,9 @@ impl Engine {
         slot: Option<mail_store::OccurrenceSlot>,
     ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
         use mail_schema::{FromJail, Raw, ToJail};
-        let Some(i) = m
-            .summary
-            .invite
-            .as_ref()
-            .filter(|i| i.sequence > 0 && !i.repeats)
-        else {
+        let Some(i) = m.summary.invite.as_ref().filter(|i| {
+            !i.repeats && (i.sequence > 0 || slot.is_some() && i.method == InviteMethod::Cancel)
+        }) else {
             return Ok(None);
         };
         let selected = match self.extract_invitation(m, crate::Parser::installed_worker) {
@@ -283,8 +329,9 @@ impl Engine {
                 if mail_store::OccurrenceSlot::parse(raw)
                     .is_some_and(|found| wanted.matches(found))
                     || (i.method == InviteMethod::Cancel
-                        && mail_store::OccurrenceSlot::range_cutoff(raw)
-                            .is_some_and(|cutoff| wanted.on_or_after(cutoff))) =>
+                        && (raw.starts_with("cancel-dates|")
+                            || OccurrenceSlot::range_cutoff(raw)
+                                .is_some_and(|cutoff| wanted.on_or_after(cutoff)))) =>
             {
                 ()
             }
@@ -412,7 +459,7 @@ impl Engine {
         }
     }
 
-    /// Check the newest eligible part first. A conflicting pair at the highest
+    /// Compare the revision for the reviewed occurrence. A conflict at the highest
     /// verified sequence needs a later organizer revision to disambiguate it.
     fn check_individual_response(
         &self,
@@ -424,14 +471,14 @@ impl Engine {
     ) -> Result<mail_store::CalendarRevisions, Error> {
         // Old stores may still be backfilling when the first RSVP is sent.
         self.store.index_calendar_before_send()?;
+        // The index stores the first component's sequence. A later component
+        // in the same cancellation can have a higher revision for this date.
+        let floor = if slot.is_some() { 0 } else { r.sequence };
         let revisions = self
             .store
-            .write(|w| w.calendar_revisions(account, &r.uid, r.sequence, &r.organizer))?;
-        let mut latest: Option<(MsgId, mail_schema::Invite, Option<String>)> = None;
+            .write(|w| w.calendar_revisions(account, &r.uid, floor, &r.organizer))?;
+        let mut latest: Option<ResponseRevision> = None;
         for &(seq, id, hash) in &revisions.messages {
-            if latest.as_ref().is_some_and(|(_, i, _)| seq < i.sequence) {
-                break;
-            }
             if id == msg {
                 continue;
             }
@@ -447,6 +494,15 @@ impl Engine {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if seq < latest.as_ref().map_or(r.sequence, |v| v.sequence)
+                && !(slot.is_some()
+                    && m.summary
+                        .invite
+                        .as_ref()
+                        .is_some_and(|i| i.method == InviteMethod::Cancel))
+            {
+                continue;
+            }
             let Some(update) = self.individual_update(&m, Some(&r.attendee), slot)? else {
                 continue;
             };
@@ -468,59 +524,91 @@ impl Engine {
             {
                 continue;
             }
-            let Some(i) = m.summary.invite else {
+            let Some(mut i) = m.summary.invite else {
                 return Err(mail_store::Error::CalendarChanged.into());
             };
-            let cutoff = delivery
-                .scope
-                .filter(|s| mail_store::OccurrenceSlot::range_cutoff(s).is_some());
-            let same_schedule = |other: &mail_schema::Invite| {
-                other.cancelled == i.cancelled
-                    && other.start == i.start
-                    && other.end == i.end
-                    && other.location == i.location
+            let (sequence, scope) = match delivery.scope.as_deref() {
+                Some(raw) if raw.starts_with("cancel-dates|") => {
+                    let Some(found) = slot.and_then(|wanted| grouped_revision(raw, wanted)) else {
+                        continue;
+                    };
+                    // The summary fields describe the first component. Only the
+                    // original slot and revision identify the date being answered.
+                    i.start = None;
+                    i.end = None;
+                    i.location.clear();
+                    found
+                }
+                Some(raw) => (
+                    seq,
+                    OccurrenceSlot::range_cutoff(raw)
+                        .map_or(CancellationScope::Individual, |start| {
+                            CancellationScope::Range(start, raw.to_owned())
+                        }),
+                ),
+                None => (seq, CancellationScope::Individual),
             };
-            // The reviewed request can be replayed alongside a range cancellation
-            // at its sequence. Only the cancellation changes the pending response.
-            if seq == original.sequence && cutoff.is_none() {
-                if same_schedule(original) {
+            if sequence == 0 || sequence < latest.as_ref().map_or(r.sequence, |v| v.sequence) {
+                continue;
+            }
+            let clashes_with_review =
+                sequence == r.sequence && matches!(scope, CancellationScope::Individual);
+            if clashes_with_review && same_schedule(&i, original) {
+                continue;
+            }
+            if let Some(previous) = latest.as_mut().filter(|v| v.sequence == sequence) {
+                previous.conflict |= clashes_with_review
+                    || !same_schedule(&previous.invite, &i)
+                    || !previous.scope.same_effect(&scope);
+                if previous.msg > id {
                     continue;
                 }
-                return Err(Error::InvitationChanged(LatestInvitation::Conflict {
-                    sequence: seq,
-                }));
-            }
-            if let Some((_, previous, previous_cutoff)) = &latest {
-                let boundary = |scope: &Option<String>| {
-                    scope
-                        .as_deref()
-                        .and_then(mail_store::OccurrenceSlot::range_cutoff)
-                };
-                if !same_schedule(previous) || boundary(previous_cutoff) != boundary(&cutoff) {
-                    return Err(Error::InvitationChanged(LatestInvitation::Conflict {
-                        sequence: seq,
-                    }));
-                }
+                previous.msg = id;
+                previous.scope = scope;
+                previous.invite = i;
             } else {
-                latest = Some((id, i, cutoff));
+                latest = Some(ResponseRevision {
+                    msg: id,
+                    sequence,
+                    invite: i,
+                    scope,
+                    conflict: clashes_with_review,
+                });
             }
         }
-        if let Some((msg, i, cutoff)) = latest {
-            let when = if let Some(property) = cutoff {
-                let (_, stamp) = occurrence_label(&property)?;
-                format!("Cancelled from {stamp} onward")
-            } else if i.cancelled {
-                "Cancelled by the organizer".into()
-            } else {
-                proposed_time(&i).ok_or(Error::Refused(
+        if let Some(ResponseRevision {
+            msg,
+            sequence,
+            invite,
+            scope,
+            conflict,
+        }) = latest
+        {
+            if conflict {
+                return Err(Error::InvitationChanged(LatestInvitation::Conflict {
+                    sequence,
+                }));
+            }
+            let when = match scope {
+                CancellationScope::Range(_, property) => {
+                    let (_, stamp) = occurrence_label(&property)?;
+                    format!("Cancelled from {stamp} onward")
+                }
+                CancellationScope::Group(count) => {
+                    format!("This meeting is one of {count} cancelled dates")
+                }
+                CancellationScope::Individual if invite.cancelled => {
+                    "Cancelled by the organizer".into()
+                }
+                CancellationScope::Individual => proposed_time(&invite).ok_or(Error::Refused(
                     "Open the latest invitation to review its time.",
-                ))?
+                ))?,
             };
             return Err(Error::InvitationChanged(LatestInvitation::Update {
                 msg,
-                sequence: i.sequence,
+                sequence,
                 when,
-                location: i.location,
+                location: invite.location,
             }));
         }
         Ok(revisions)

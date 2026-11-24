@@ -395,6 +395,12 @@ At **Send response**, Mail checks the original occurrence against the verified o
 
 For a cutoff of **15 December 2026 at 14:00 UTC**, the meeting originally at that time and the following Tuesdays are covered. A 22 December meeting moved to 9 December is still covered. An 8 December meeting moved to 18 December can still be answered. Its reply identifies the original 8 December occurrence. The check uses the receiving account, invited identity, organizer, UID and revision rules from §7.25. Floating cutoffs use the recurrence’s civil clock. Zoned cutoffs compare instants, including across midnight. [Synthetic range-cancellation check](../../scripts/calendar-invitation-check.py)
 
+### 7.28 A grouped cancellation arrives while an occurrence RSVP is open
+
+When the organizer cancels several dates in one Mail message, **Send response** checks the original slot of the occurrence being answered. If that date is listed with a current cancellation revision, Mail pauses the response and shows the original slot, the proposed time, the number of cancelled dates and the organizer’s revision for this date. **Review latest invitation** opens the complete cancellation in Calendar. The recipient can inspect each date before deciding whether to apply the batch (§7.14).
+
+Each date carries its own revision. A newer cancellation for December 22 can pause its RSVP even if the first date listed carries an older revision. A recipient can still answer an unlisted December 15 occurrence, including when both occurrences moved to December 9 at 15:00. Its reply names December 15. Dismissing the cancellation review preserves the saved series. Run the installed synthetic check with `--group-cancel-response`. [Synthetic invitations](../../mail/atrium-mail/examples/invitation_probe.rs) · [Installed check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |
