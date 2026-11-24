@@ -1977,6 +1977,28 @@ on the jail that had hosted the probes took 3,745 ms, with the first fetch
 alone taking 1 s; it is left out of the medians. Evidence is in
 `~/atrium-vm/evidence/navigator-i5-trace-frame-20261124/`.
 
+#### Follow-up: the 20 ms input poll, not the clip scan
+
+The clip split is not the cost: the first Cluster starts at byte 468 of
+`red-blue.webm` and byte 497 of `tone-opus.webm`, so `findIndex` calls its
+callback fewer than 500 times per clip. The gaps between the page's steps
+are each about 200 ms, which matches about ten turns of `drive_page`
+(`SignInFixture.h`). Each turn pumped the Core event loop once, without
+waiting, and then `navigator_page_pointer` waited up to 20 ms on frescod
+for input. A resolved fetch, a promise reaction or a media event that
+queued the next task therefore waited out a 20 ms poll at every hop.
+`drive_page` now pumps until nothing is ready, up to 256 times, before it
+polls for input.
+
+This is a hypothesis until it is measured: the engine is not built in the
+cloud. The change assumes `Core::EventLoop::pump` returns the number of
+events it handled. Next on the Mac: rebuild the engine with this change,
+re-audit it, rerun the three arms, and compare `served` step 1 to
+`video-open`, step 2 served to step 3's `request`, and step 3 served to
+`add-vp9` against the table above. If the gaps stay, add `start-trace`
+stages inside the engine (painter `navigator_video_ready`, the fixture
+loader's completion) before changing anything else.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a

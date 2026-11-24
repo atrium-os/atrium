@@ -102,7 +102,13 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #else
     for (unsigned tick = 0; tick < 15000; ++tick) {
 #endif
-        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        // Run everything that is ready before navigator_page_pointer waits
+        // up to 20 ms on frescod for input. One pump per tick made every
+        // task hop (a resolved fetch, a promise reaction, a media event)
+        // wait out that input poll, the likely cause of the ~200 ms gaps
+        // between the I5 page's steps (navigator-islands.md, I5 trace).
+        // Bounded, so a page that keeps posting tasks still reads input.
+        for (int drained = 0; drained < 256 && loop.pump(Core::EventLoop::WaitMode::PollForEvents) > 0; ++drained) { }
 #ifdef ATRIUM_I1_COUNTER
         if (client.closed) break;
 #endif
