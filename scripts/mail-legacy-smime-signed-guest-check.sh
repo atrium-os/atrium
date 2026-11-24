@@ -4,8 +4,14 @@
 set -eu
 umask 022
 test "$#" = 1
-test -n "$1"
 nonce=$1
+if [ "${#nonce}" -ne 48 ]; then
+    echo "Expected a 48-character hexadecimal synthetic run nonce" >&2
+    exit 1
+fi
+case "$nonce" in
+    *[!a-f0-9]*) echo "Invalid synthetic run nonce" >&2; exit 1 ;;
+esac
 test "$(cat .isolated-gate)" = "$nonce"
 test "$(uname -s)/$(uname -m)" = FreeBSD/arm64
 test "$(mount -p | awk '$2 == "/" {print $3}')" = tessera
