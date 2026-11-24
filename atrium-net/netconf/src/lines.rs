@@ -72,6 +72,8 @@ pub fn iface(l: &Line) -> Option<Iface> {
         metered: l.get("metered") == Some("1"),
         egress: l.get("egress") == Some("1"),
         manual: manual(l),
+        dot1x: l.get("dot1x").map(String::from),
+        dot1x_why: l.get("dot1x_why").map(String::from),
     })
 }
 

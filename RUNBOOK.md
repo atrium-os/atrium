@@ -5554,6 +5554,10 @@ sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens
                                     # atrium-net auto-join, tunnel and long-drop scenarios
 sh scripts/aura-sim-gate.sh w7      # WPA2/WPA3-Enterprise: hostapd's EAP server, PEAP, TTLS, wrong password,
                                     # first-join trust, an evil twin refused, EAP-TLS with the key in Arca
+sh scripts/aura-sim-gate.sh w8      # wired 802.1X over a VM-to-VM cable (vtnet2), hostapd driver=wired as
+                                    # the switch: PEAP, TTLS, EAP-TLS, replug, refusals (wifi.md §7.5)
+sh scripts/aura-sim-gate.sh bar-wired # the cable's switch asking, atrium-net on Wi-Fi and vtnet2, the bar;
+                                    # then curia-vm.sh arca: Network > Wired network > Sign in…
 sh scripts/aura-sim-gate.sh bar-eap # the w7 APs, atrium-net/netconf and the bar, nothing joined; then
 sh scripts/curia-vm.sh arca         # Settings with Arca's field: click a work network, `type` the
                                     # username (@ works), the password into Arca's field, Join, then

@@ -1,5 +1,6 @@
 //! atrium-net's logic, kept free of system calls so it runs in host tests.
 
+pub mod dot1x;
 pub mod egress;
 pub mod plan;
 pub mod spawn;

@@ -52,6 +52,18 @@ pub mod op {
     /// network, made and kept in Arca, and a certificate request for it
     /// (DER) to give the network's IT team.
     pub const WIFI_CERT_REQUEST: u16 = 0x28;
+    /// Wired 802.1X (wifi.md §7.5), the machine's one wired profile, used
+    /// on whichever Ethernet port asks (network-configure):
+    /// [`Enterprise`] with an empty SSID: set it up (or change it); the
+    /// port signs in again. Progress shows in [`Iface::dot1x`].
+    pub const WIRED_SIGN_IN: u16 = 0x29;
+    /// → [`ServerSeen`]: the certificate a wired sign-in stopped at.
+    pub const WIRED_SERVER_SEEN: u16 = 0x2a;
+    /// "Trust this server" for the wired profile, then sign in again.
+    pub const WIRED_TRUST_SERVER: u16 = 0x2b;
+    /// Name → [`KeyRequest`]: a new EAP-TLS key for the wired profile.
+    pub const WIRED_CERT_REQUEST: u16 = 0x2c;
+    pub const WIRED_FORGET: u16 = 0x2d;
     pub const WIFI_NEARBY: u16 = 0x30;
     pub const SET_COUNTRY: u16 = 0x40;
     pub const SET_STATIC: u16 = 0x41;
@@ -134,7 +146,7 @@ impl Grant {
             INTERFACES | ROUTES => self == Grant::Details,
             WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE | WIFI_JOIN_ENTERPRISE | WIFI_SERVER_SEEN | WIFI_TRUST_SERVER | WIFI_CERT_REQUEST => self == Grant::Wifi,
             WIFI_NEARBY => self == Grant::Nearby,
-            SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS => self == Grant::Configure,
+            SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS | WIRED_SIGN_IN | WIRED_SERVER_SEEN | WIRED_TRUST_SERVER | WIRED_CERT_REQUEST | WIRED_FORGET => self == Grant::Configure,
             PRINT_DISCOVERY => self == Grant::PrintDiscovery,
             PORTAL_INFO | PORTAL_WATCH => self == Grant::Portal,
             _ => false,
@@ -213,6 +225,11 @@ pub struct Iface {
     /// A fixed IPv4 setting in use instead of DHCP (a wired port's own,
     /// or the Wi-Fi network's).
     pub manual: Option<Manual>,
+    /// Wired 802.1X on this port: `needed` (the switch asks, nothing set
+    /// up), `running`, `authorized`, `failed`; None: not asked.
+    pub dot1x: Option<String>,
+    /// Why it failed (`eap-trust`: waiting for "Trust this server").
+    pub dot1x_why: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,6 +652,21 @@ pub mod server {
         fn cert_request(&self, _r: CertRequest) -> Res<KeyRequest> {
             Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
         }
+        fn wired_sign_in(&self, _e: Enterprise) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no wired 802.1X here"))
+        }
+        fn wired_server_seen(&self) -> Res<ServerSeen> {
+            Err(Fail::new(status::UNSUPPORTED, "no wired 802.1X here"))
+        }
+        fn wired_trust_server(&self) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no wired 802.1X here"))
+        }
+        fn wired_cert_request(&self, _name: String) -> Res<KeyRequest> {
+            Err(Fail::new(status::UNSUPPORTED, "no wired 802.1X here"))
+        }
+        fn wired_forget(&self) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no wired 802.1X here"))
+        }
         fn leave(&self) -> Res<()>;
         fn forget(&self, ssid: Vec<u8>) -> Res<()>;
         fn set_profile(&self, p: Profile) -> Res<()>;
@@ -659,6 +691,11 @@ pub mod server {
 
     fn arg<T: for<'a> Deserialize<'a>>(p: &[u8]) -> Res<T> {
         postcard::from_bytes(p).map_err(|_| Fail::new(status::MALFORMED, "request does not parse"))
+    }
+
+    /// The name a certificate request carries.
+    fn cert_name_ok(n: &str) -> bool {
+        !n.is_empty() && n.len() <= 64 && !n.chars().any(|c| c.is_control())
     }
 
     fn valid_ssid(s: &[u8]) -> Res<()> {
@@ -735,11 +772,27 @@ pub mod server {
                 })),
                 op::WIFI_CERT_REQUEST => enc(&arg::<CertRequest>(p).and_then(|r| {
                     valid_ssid(&r.ssid)?;
-                    if r.name.is_empty() || r.name.len() > 64 || r.name.chars().any(|c| c.is_control()) {
+                    if !cert_name_ok(&r.name) {
                         return Err(Fail::new(status::MALFORMED, "a name is 1 to 64 characters"));
                     }
                     b.cert_request(r)
                 })),
+                op::WIRED_SIGN_IN => enc(&arg::<Enterprise>(p).and_then(|e| {
+                    if !e.ssid.is_empty() {
+                        return Err(Fail::new(status::MALFORMED, "the wired profile has no SSID"));
+                    }
+                    e.check()?;
+                    b.wired_sign_in(e)
+                })),
+                op::WIRED_SERVER_SEEN => enc(&b.wired_server_seen()),
+                op::WIRED_TRUST_SERVER => enc(&b.wired_trust_server()),
+                op::WIRED_CERT_REQUEST => enc(&arg::<String>(p).and_then(|name| {
+                    if !cert_name_ok(&name) {
+                        return Err(Fail::new(status::MALFORMED, "a name is 1 to 64 characters"));
+                    }
+                    b.wired_cert_request(name)
+                })),
+                op::WIRED_FORGET => enc(&b.wired_forget()),
                 op::WIFI_LEAVE => enc(&b.leave()),
                 op::WIFI_FORGET => enc(&arg::<Vec<u8>>(p).and_then(|s| {
                     valid_ssid(&s)?;
@@ -891,6 +944,21 @@ pub mod client {
         }
         pub fn cert_request(&mut self, r: &CertRequest) -> Res<KeyRequest> {
             self.call(op::WIFI_CERT_REQUEST, r)
+        }
+        pub fn wired_sign_in(&mut self, e: &Enterprise) -> Res<()> {
+            self.call(op::WIRED_SIGN_IN, e)
+        }
+        pub fn wired_server_seen(&mut self) -> Res<ServerSeen> {
+            self.call(op::WIRED_SERVER_SEEN, &())
+        }
+        pub fn wired_trust_server(&mut self) -> Res<()> {
+            self.call(op::WIRED_TRUST_SERVER, &())
+        }
+        pub fn wired_cert_request(&mut self, name: &str) -> Res<KeyRequest> {
+            self.call(op::WIRED_CERT_REQUEST, &name.to_string())
+        }
+        pub fn wired_forget(&mut self) -> Res<()> {
+            self.call(op::WIRED_FORGET, &())
         }
         pub fn leave(&mut self) -> Res<()> {
             self.call(op::WIFI_LEAVE, &())

@@ -40,6 +40,8 @@ pub enum Want {
     /// Open the network's sign-in page (atrium-net.md §8.1): portcullisd's
     /// `PortalWindow`, with the press so an open window comes forward.
     SignIn { activation: Option<[u8; 16]> },
+    /// The machine's wired 802.1X sign-in is no longer wanted.
+    WiredForget,
 }
 
 impl std::fmt::Debug for Want {
@@ -62,6 +64,7 @@ impl std::fmt::Debug for Want {
             Want::SetDns(v) => write!(f, "SetDns({v:?})"),
             Want::SetDnsTls(t) => write!(f, "SetDnsTls({:?}, {})", t.servers, t.name),
             Want::SignIn { .. } => write!(f, "SignIn"),
+            Want::WiredForget => write!(f, "WiredForget"),
         }
     }
 }
@@ -148,6 +151,11 @@ pub struct NetPage {
     pub scanned: bool,
     pub profiles: Vec<Profile>,
     pub ifaces: Vec<Iface>,
+    /// When the interfaces were last asked for (kept fresh while a wired
+    /// port signs in).
+    pub details_at: Option<std::time::Instant>,
+    /// The wired sign-in that stopped at the server was already shown.
+    pub wired_seen_asked: bool,
     pub show_details: bool,
     /// The network whose passphrase row is open.
     pub asking: Option<Vec<u8>>,
@@ -250,8 +258,35 @@ pub fn parse_dns_row(servers: &str, tls: &str) -> Result<Want, String> {
 /// How long a press on Join waits for Arca's handle.
 pub const ARMED_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The wired 802.1X profile (wifi.md §7.5) where the sheet, the trust
+/// prompt and the requests otherwise carry a Wi-Fi network's SSID: no SSID
+/// is empty, so an empty one stands for the wired network.
+pub const WIRED: &[u8] = &[];
+const SIGNING_IN_WIRED: &str = "Signing in on the wired network";
+
 pub fn name(s: &[u8]) -> String {
+    if s == WIRED {
+        return "the wired network".into();
+    }
     String::from_utf8_lossy(s).into_owned()
+}
+
+/// What the wired port's 802.1X state says, for its row.
+pub fn wired_label(i: &Iface) -> Option<String> {
+    let why = |w: &str| match w {
+        "eap-trust" => "check its server first".to_string(),
+        "eap-rejected" => "the username or password is wrong".to_string(),
+        "eap-untrusted" => "its server is not the one expected".to_string(),
+        "eap-method" | "eap-refused" => "it does not accept this sign-in method".to_string(),
+        w => w.replace('-', " "),
+    };
+    Some(match (i.dot1x.as_deref()?, i.dot1x_why.as_deref()) {
+        ("needed", _) => "This port asks you to sign in".into(),
+        ("running", _) => "Signing in…".into(),
+        ("authorized", _) => "Signed in".into(),
+        ("failed", w) => format!("Could not sign in: {}", why(w.unwrap_or("unknown"))),
+        (s, _) => s.to_string(),
+    })
 }
 
 /// "Wi-Fi: home", "Ethernet", "Not connected", and what is wrong.
@@ -480,6 +515,40 @@ impl NetPage {
         }
     }
 
+    /// The Ethernet port whose switch speaks 802.1X, if any.
+    pub fn wired_port(&self) -> Option<&Iface> {
+        self.ifaces.iter().find(|i| !i.wifi && i.dot1x.is_some())
+    }
+
+    /// "Sign in…" on the wired port's row: the work-network sheet for it.
+    pub fn sign_in_wired(&mut self) {
+        if self.asking.as_deref() == Some(WIRED) {
+            return self.cancel_ask();
+        }
+        self.notice = None;
+        self.asking = Some(WIRED.to_vec());
+        self.ent = Some(EntForm::default());
+        self.handle = None;
+        self.armed = None;
+    }
+
+    pub fn forget_wired(&mut self) {
+        self.wants.push(Want::WiredForget);
+    }
+
+    /// Keeps the interfaces fresh: a switch may ask to sign in at any time,
+    /// and a wired port signing in changes every few seconds.
+    pub fn refresh(&mut self, now: std::time::Instant) {
+        let every = match self.wired_port().and_then(|i| i.dot1x.as_deref()) {
+            Some("running") => std::time::Duration::from_secs(2),
+            _ => std::time::Duration::from_secs(10),
+        };
+        if self.reachable && self.details_at.is_none_or(|t| now.duration_since(t) >= every) && !self.wants.contains(&Want::Details) {
+            self.details_at = Some(now);
+            self.wants.push(Want::Details);
+        }
+    }
+
     /// No handle came after a press on Join: the field was empty.
     pub fn tick(&mut self, now: std::time::Instant) -> bool {
         match self.armed {
@@ -647,7 +716,24 @@ impl NetPage {
             Got::Nearby(Err(_)) => self.scanned = true,
             Got::Profiles(Ok(v)) => self.profiles = v,
             Got::Profiles(Err(_)) => {}
-            Got::Details(Ok(v)) => self.ifaces = v,
+            Got::Details(Ok(v)) => {
+                self.ifaces = v;
+                // A wired sign-in stopped at the server's certificate: show
+                // it once (it stays stopped until trusted or set up again).
+                let stopped = self.wired_port().is_some_and(|i| i.dot1x_why.as_deref() == Some("eap-trust"));
+                if stopped && !self.wired_seen_asked && self.trusting.is_none() {
+                    self.wired_seen_asked = true;
+                    self.wants.push(Want::Seen(WIRED.to_vec()));
+                }
+                if !stopped {
+                    self.wired_seen_asked = false;
+                }
+                // "Signing in" lasts while the port runs; the row says how it ended.
+                let running = self.wired_port().is_some_and(|i| i.dot1x.as_deref() == Some("running"));
+                if !running && self.notice.as_ref().is_some_and(|n| n.text == SIGNING_IN_WIRED) {
+                    self.notice = None;
+                }
+            }
             Got::Details(Err(_)) => {}
             Got::OwnDns(Ok((v, tls))) => {
                 self.own_dns = v;
@@ -688,6 +774,19 @@ impl NetPage {
             Got::Seen(ssid, Err(e)) => self.notice = Some(Notice { text: format!("Could not show the server of {}: {}", name(&ssid), e.replace('-', " ")), error: true }),
             Got::Done { what, result } => {
                 match (&what, &result) {
+                    // The wired profile is saved at once; the port's row
+                    // follows the sign-in itself.
+                    (Want::JoinEnterprise(Enterprise { ssid, .. }) | Want::Trust(ssid), Ok(())) if ssid.as_slice() == WIRED => {
+                        self.joining = None;
+                        self.asking = None;
+                        self.ent = None;
+                        self.notice = Some(Notice { text: SIGNING_IN_WIRED.into(), error: false });
+                        self.wants.push(Want::Details);
+                    }
+                    (Want::WiredForget, Ok(())) => {
+                        self.notice = Some(Notice { text: "The wired network's sign-in is forgotten".into(), error: false });
+                        self.wants.push(Want::Details);
+                    }
                     (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. } | Want::JoinEnterprise(Enterprise { ssid, .. }) | Want::Trust(ssid), Ok(())) => {
                         self.joining = None;
                         self.asking = None;
@@ -1005,6 +1104,45 @@ mod tests {
         let [Want::JoinEnterprise(e)] = w.as_slice() else { panic!("{w:?}") };
         assert_eq!((e.method.as_str(), e.key, e.cert.as_deref(), e.handle, e.ca.as_deref(), e.anonymous.as_deref()), ("tls", Some([7; 16]), Some(&[0x30, 2, 5, 5][..]), None, Some(&[0x30, 1, 9][..]), None));
         assert!(e.check().is_ok(), "{:?}", e.check());
+    }
+
+    #[test]
+    fn a_wired_port_that_asks_to_sign_in() {
+        let mut p = page();
+        p.reachable = true;
+        let port = |state: &str, why: Option<&str>| Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: None, router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::No, metered: false, egress: false, manual: None, dot1x: Some(state.into()), dot1x_why: why.map(String::from) };
+        p.apply(Got::Details(Ok(vec![port("needed", None)])));
+        assert_eq!(wired_label(p.wired_port().unwrap()).as_deref(), Some("This port asks you to sign in"));
+        p.sign_in_wired();
+        assert_eq!(p.asking.as_deref(), Some(WIRED));
+        p.next_method();
+        p.ent_join_pressed("alice@corp.example", "", "", std::time::Instant::now());
+        p.field(Some([3; 16]), std::time::Instant::now());
+        let w = p.take_wants();
+        let Some(Want::JoinEnterprise(e)) = w.iter().find(|w| matches!(w, Want::JoinEnterprise(_))) else { panic!("{w:?}") };
+        assert!(e.ssid.is_empty() && e.method == "ttls-mschapv2" && e.handle == Some([3; 16]), "{e:?}");
+        assert!(e.check().is_ok());
+        p.apply(Got::Done { what: Want::JoinEnterprise(e.clone()), result: Ok(()) });
+        assert!(p.asking.is_none() && p.notice.as_ref().is_some_and(|n| n.text == "Signing in on the wired network"));
+        p.apply(Got::Details(Ok(vec![port("running", None)])));
+        assert!(p.notice.is_some(), "kept while the port signs in");
+        // It stops at the server: shown once, trusted through Configure.
+        p.take_wants();
+        p.apply(Got::Details(Ok(vec![port("failed", Some("eap-trust"))])));
+        assert_eq!(p.take_wants(), vec![Want::Seen(vec![])]);
+        p.apply(Got::Details(Ok(vec![port("failed", Some("eap-trust"))])));
+        assert!(p.take_wants().is_empty(), "asked once");
+        assert!(p.notice.is_none(), "the row says how it ended");
+        // Kept fresh: every 2 s while signing in.
+        let t = std::time::Instant::now();
+        p.apply(Got::Details(Ok(vec![port("running", None)])));
+        p.refresh(t);
+        assert_eq!(p.take_wants(), vec![Want::Details]);
+        p.refresh(t + std::time::Duration::from_secs(1));
+        assert!(p.take_wants().is_empty());
+        p.refresh(t + std::time::Duration::from_secs(2));
+        assert_eq!(p.take_wants(), vec![Want::Details]);
+        assert_eq!(name(WIRED), "the wired network");
     }
 
     #[test]

@@ -17,6 +17,7 @@ const fn ioc(dir: u64, g: u8, n: u8, len: usize) -> u64 {
 }
 const IFREQ: usize = 32;
 const SIOCSIFFLAGS: u64 = ioc(IOC_IN, b'i', 16, IFREQ);
+const SIOCADDMULTI: u64 = ioc(IOC_IN, b'i', 49, IFREQ);
 const SIOCGIFFLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 17, IFREQ);
 const SIOCDIFADDR: u64 = ioc(IOC_IN, b'i', 25, IFREQ);
 const SIOCAIFADDR: u64 = ioc(IOC_IN, b'i', 43, 68);
@@ -209,6 +210,21 @@ impl Ifc {
         r[24..40].copy_from_slice(&a.octets());
         if unsafe { ioctl(self.s6.as_raw_fd(), SIOCDIFADDR_IN6, r.as_mut_ptr()) } != 0 {
             return err("SIOCDIFADDR_IN6");
+        }
+        Ok(())
+    }
+
+    /// Receive frames sent to link-layer multicast address `mac` (wired
+    /// 802.1X: the PAE group address switches send EAPOL to).
+    pub fn add_multi(&self, name: &str, mac: &[u8; 6]) -> io::Result<()> {
+        let mut r = ifreq(name);
+        // A sockaddr_dl in ifr_addr: length, AF_LINK, no index, type, name
+        // or selector; the address right after the header.
+        r[16..24].copy_from_slice(&[16, libc::AF_LINK as u8, 0, 0, 0, 0, 6, 0]);
+        r[24..30].copy_from_slice(mac);
+        // SAFETY: r is a whole ifreq, the size SIOCADDMULTI reads, on our own socket.
+        if unsafe { ioctl(self.s.as_raw_fd(), SIOCADDMULTI, r.as_mut_ptr()) } != 0 {
+            return err("SIOCADDMULTI");
         }
         Ok(())
     }

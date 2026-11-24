@@ -47,9 +47,35 @@ pub fn account(ssid: &[u8]) -> String {
     format!("wifi {}", aura_ipc::hex(ssid))
 }
 
-/// The account of an EAP-TLS network's client key.
-pub fn tls_account(ssid: &[u8]) -> String {
-    format!("{} tls", account(ssid))
+/// Whose 802.1X profile: a Wi-Fi network, or the machine's one wired
+/// profile (wifi.md §7.5), used on whichever Ethernet port asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Net {
+    Wifi(Vec<u8>),
+    Wired,
+}
+
+impl Net {
+    /// From a ctl line: `wired=1`, or `ssid=..` (1 to 32 bytes); never both.
+    pub fn from_line(l: &aura_ipc::Line) -> Option<Net> {
+        match (l.get("wired"), l.get("ssid")) {
+            (Some("1"), None) => Some(Net::Wired),
+            (None, Some(_)) => l.hex("ssid").filter(|s| !s.is_empty() && s.len() <= 32).map(Net::Wifi),
+            _ => None,
+        }
+    }
+
+    pub fn account(&self) -> String {
+        match self {
+            Net::Wifi(ssid) => account(ssid),
+            Net::Wired => "wired".into(),
+        }
+    }
+
+    /// The account of an EAP-TLS profile's client key.
+    pub fn tls_account(&self) -> String {
+        format!("{} tls", self.account())
+    }
 }
 
 pub const MAC_KEY: &str = "aura mac-key";
@@ -238,5 +264,23 @@ impl Store for Arca {
             return Err(io::Error::other("bad arcad signature"));
         }
         Ok(r.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_ipc::Line;
+
+    #[test]
+    fn wired_and_wifi_accounts_differ() {
+        let w = Net::from_line(&Line::new("x").with("wired", 1)).unwrap();
+        assert_eq!((w.account(), w.tls_account()), ("wired".to_string(), "wired tls".to_string()));
+        let n = Net::from_line(&Line::new("x").with_hex("ssid", b"corp")).unwrap();
+        assert_eq!(n.account(), "wifi 636f7270");
+        assert!(Net::from_line(&Line::new("x").with("wired", 1).with_hex("ssid", b"corp")).is_none(), "one or the other");
+        assert!(Net::from_line(&Line::new("x").with("wired", 0)).is_none());
+        assert!(Net::from_line(&Line::new("x").with("ssid", "-")).is_none(), "an empty SSID");
+        assert!(Net::from_line(&Line::new("x").with_hex("ssid", &[1; 33])).is_none());
     }
 }

@@ -80,6 +80,11 @@ fn grants() {
     assert!(Grant::Nearby.allows(WIFI_NEARBY) && !Grant::Nearby.allows(WIFI_JOIN));
     assert!(!Grant::Wifi.allows(SET_COUNTRY) && Grant::Configure.allows(SET_COUNTRY));
     assert!(!Grant::Configure.allows(WIFI_JOIN));
+    for o in [WIRED_SIGN_IN, WIRED_SERVER_SEEN, WIRED_TRUST_SERVER, WIRED_CERT_REQUEST, WIRED_FORGET] {
+        for g in Grant::ALL {
+            assert_eq!(g.allows(o), g == Grant::Configure, "wired sign-in is a network-configure grant: {g:?} {o:#x}");
+        }
+    }
     for g in Grant::ALL {
         assert_eq!(g.allows(PORTAL_INFO) || g.allows(PORTAL_WATCH), g == Grant::Portal, "{g:?}");
         assert_eq!(g.root_only(), matches!(g, Grant::Portal | Grant::PrintDiscovery));

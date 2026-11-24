@@ -9,6 +9,9 @@
 //!   atrium-netctl forget SSID | list
 //!   atrium-netctl join SSID [--open | --wpa3] [--mac P] [--wait SECS] [--dhcp IFACE]
 //!   atrium-netctl leave | wifi-status | country CC | watch SECS
+//!   atrium-netctl send VERB [KEY=VALUE ...] [--secret-stdin]
+//!                                 (any control line, e.g. wired-remember-eap;
+//!                                 --secret-stdin adds secret=<stdin as hex>)
 //!
 //! Global: --sock PATH (/atrium/sockets/atrium-net/ctl.sock).
 //!
@@ -186,6 +189,21 @@ fn main() {
             ok_or_exit(&p.call(&l, true));
         }
         "forget" => ok_or_exit(&p.call(&Line::new("wifi-forget").with_hex("ssid", &ssid()), true)),
+        "send" => {
+            let Some(verb) = args.get(1) else { die("send VERB [KEY=VALUE ...]") };
+            let mut l = Line::new(verb);
+            for a in &args[2..] {
+                if a == "--secret-stdin" {
+                    let mut v = String::new();
+                    std::io::stdin().lock().read_line(&mut v).unwrap_or_else(|e| die(&e.to_string()));
+                    l = l.with_hex("secret", v.trim_end_matches('\n').as_bytes());
+                    continue;
+                }
+                let Some((k, v)) = a.split_once('=') else { die(&format!("not KEY=VALUE: {a}")) };
+                l = l.with(k, v);
+            }
+            ok_or_exit(&p.call(&l, true))
+        }
         "country" => {
             let cc = args.get(1).cloned().unwrap_or_default().to_ascii_uppercase();
             p.subscribe();

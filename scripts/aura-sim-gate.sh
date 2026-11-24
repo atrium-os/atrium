@@ -31,6 +31,11 @@
 #                                     hostapd's EAP server: PEAP, TTLS,
 #                                     wrong password, first-join trust, an
 #                                     evil twin refused (wifi.md §7.4)
+#   sh scripts/aura-sim-gate.sh w8    wired 802.1X (wifi.md §7.5): vtnet2 is a
+#                                     cable to the AP VM's hostapd (driver=wired);
+#                                     PEAP after "Trust this server", TTLS,
+#                                     EAP-TLS with the key in Arca, cable out and
+#                                     in, wrong password and another CA refused
 #
 # AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
 # memory store. The FreeBSD VM must have been started with
@@ -1063,11 +1068,85 @@ wifi6() {
     [ -z "$(v6)" ] && ok "left the network: its IPv6 addresses removed" || fail "after leave: $(v6)"
 }
 
+# Wired 802.1X (wifi.md §7.5): vtnet2 is a cable to the AP VM, where
+# hostapd (driver=wired) is the switch port and DHCP answers only while
+# signed in. atrium-net relays the port's EAPOL to aura-keys.
+w8() {
+    W="/tmp/aura/atrium-netctl --sock /tmp/aura/net.sock"
+    st() { "$V" "$W status" | grep 'name=vtnet2' || true; }
+    wait_st() { i=0; while [ $i -lt "$2" ]; do st | grep -Eq "$1" && return 0; sleep 3; i=$((i + 3)); done; return 1; }
+    H='h() { printf %s "$1" | od -An -tx1 | tr -d " \n"; }; hf() { od -An -tx1 "$1" | tr -d " \n"; }'
+    # send VERB ARGS...: a control line (values built in the guest by h/hf).
+    send() { "$V" "$H; $W send $*" 2>&1; }
+    plog() { sh "$AP" ssh "cat /tmp/wired-port.log" 2>/dev/null; }
+
+    wait_st 'dot1x=needed' 150 && ok "the switch asks for a sign-in and the port says so ($(st | grep -o 'dot1x=[a-z]*'))" || fail "no dot1x=needed: $(st)"
+    st | grep -q 'state=none' && ok "no address while not signed in" || fail "an address before the sign-in: $(st)"
+
+    # First sign-in with nothing to check the server against: it stops at
+    # the certificate; "Trust this server" pins it and signs in.
+    r=$("$V" "$H; echo s3cret | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) --secret-stdin" 2>&1) || fail "remember: $r"
+    wait_st 'dot1x_why=eap-trust' 180 && ok "a first sign-in stops at the server's certificate, before the password" || fail "no eap-trust: $(st)"
+    r=$(send wired-eap-seen) || fail "seen: $r"
+    echo "$r" | grep -q 'names=radius.corp.example' && ok "the server's certificate is shown (radius.corp.example)" || fail "seen: $r"
+    r=$(send wired-eap-trust) || fail "trust: $r"
+    wait_st 'dot1x=authorized' 180 && ok "Trust this server: PEAP-MSCHAPv2 over the cable, the port authorized" || fail "not authorized: $(st)"
+    wait_st 'state=bound addr=10\.79\.0\.' 150 && ok "an address from the port once signed in ($(st | grep -o 'addr=[0-9./]*'))" || fail "no lease: $(st)"
+    "$V" "ping -c 2 -t 20 10.79.0.1" >/dev/null 2>&1 && ok "pings the switch's network" || fail "ping 10.79.0.1"
+    k=$("$V" "cat $KLOG")
+    echo "$k" | grep -q 'EAP (peap) on vtnet2' && echo "$k" | grep -q 'EAP succeeded on vtnet2' && ok "aura-keys ran EAP for the port in its helper" || fail "keys log: no wired EAP"
+    plog | grep -q open && ok "the switch opened the port ($(plog | grep -c open) time)" || fail "port never opened"
+
+    # TTLS-PAP, with the corp CA and its domain.
+    r=$("$V" "$H; echo pap-pass | $W send wired-remember-eap method=ttls-pap identity=\$(h bob@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/eap-ca.der) --secret-stdin" 2>&1) || fail "remember 2: $r"
+    sleep 5
+    wait_st 'dot1x=authorized' 180 && ok "TTLS-PAP with the CA: authorized again" || fail "TTLS-PAP: $(st)"
+    "$V" "grep -c 'EAP (ttls-pap) on vtnet2' $KLOG" | grep -q '[1-9]' && ok "that sign-in was TTLS-PAP" || fail "no TTLS-PAP run"
+
+    # EAP-TLS: the key minted in Arca, the request signed by the corp CA.
+    r=$(send wired-eap-key 'cn=$(h tls-user@corp.example)') || fail "eap-key: $r"
+    kid=$(echo "$r" | sed -n 's/.*id=\([0-9a-f]\{32\}\).*/\1/p')
+    csr=$(echo "$r" | sed -n 's/.*csr=\([0-9a-f]*\).*/\1/p')
+    [ -n "$kid" ] && [ -n "$csr" ] || fail "eap-key gave no key: $r"
+    python3 -I -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))" "$csr" > "$W7C/wired.csr"
+    printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$W7C/cext"
+    openssl x509 -req -in "$W7C/wired.csr" -inform DER -CA "$W7C/corp-ca.pem" -CAkey "$W7C/corp-ca.key" -CAcreateserial -days 30 -outform DER -out "$W7C/wired.der" -extfile "$W7C/cext" >/dev/null 2>&1 || fail "signing the request"
+    "$V" 'cat > /tmp/aura/wired-cert.der' < "$W7C/wired.der"
+    r=$("$V" "$H; $W send wired-remember-eap method=tls identity=\$(h tls-user@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/eap-ca.der) key=$kid cert=\$(hf /tmp/aura/wired-cert.der)" 2>&1) || fail "remember tls: $r"
+    sleep 5
+    wait_st 'dot1x=authorized' 180 && ok "EAP-TLS with the key in Arca: authorized" || fail "EAP-TLS: $(st)"
+    "$V" "grep -c 'EAP (tls) on vtnet2' $KLOG" | grep -q '[1-9]' && ok "that sign-in was EAP-TLS" || fail "no EAP-TLS run"
+
+    # Cable out and in: the port signs in again by itself.
+    cablex off
+    wait_st 'link=down' 30 && ok "cable pulled: link down" || fail "link still up: $(st)"
+    cablex on
+    wait_st 'dot1x=authorized' 240 && wait_st 'state=bound addr=10\.79\.0\.' 150 && ok "cable back: signed in again and an address, with no one asked" || fail "after the cable: $(st)"
+
+    # A wrong password and another CA are refused; the port stays closed.
+    r=$("$V" "$H; echo wrong | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/eap-ca.der) --secret-stdin" 2>&1) || fail "remember 3: $r"
+    wait_st 'dot1x=failed' 180 && ok "a wrong password: refused ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "wrong password: $(st)"
+    plog | tail -n 1 | grep -q closed && ok "the switch closed the port" || fail "port: $(plog | tail -n 2)"
+    r=$("$V" "$H; echo s3cret | $W send wired-remember-eap method=peap identity=\$(h alice@corp.example) domain=\$(h corp.example) ca=\$(hf /tmp/aura/evil-ca.der) --secret-stdin" 2>&1) || fail "remember 4: $r"
+    # The switch's quiet period after the wrong password (60 s) first.
+    wait_st 'dot1x_why=eap-' 240 && sleep 20 && st | grep -q 'dot1x=failed' && ok "a server outside the network's CA: refused before the password ($(st | grep -o 'dot1x_why=[a-z-]*'))" || fail "evil CA: $(st)"
+
+    r=$(send wired-forget) || fail "forget: $r"
+    sleep 5
+    if ! st | grep -q 'dot1x=' || wait_st 'dot1x=needed' 120; then ok "forgotten: the port no longer signs in ($(st | grep -o 'dot1x=[a-z]*' || echo 'no dot1x'))"; else fail "after forget: $(st)"; fi
+}
+
+cablex() {
+    python3 -I -c "import socket,sys,time;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.sendall(b'set_link cable '+sys.argv[2].encode()+b'\n');time.sleep(0.5)" "$HOME/atrium-vm/mon.sock" "$1"
+}
+
 case "${1:-}" in
 vms)
     sh "$AP" up
     if ! VSSH_CONNECT_TIMEOUT=5 "$V" true 2>/dev/null; then
-        QEMU_EXTRA="-netdev socket,id=lan,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802 -device virtio-net-pci,netdev=lan,mac=02:4e:00:00:00:01" NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
+        # vtnet1: the fake LAN (atrium-net/sim/lan.py); vtnet2: a cable to
+        # the AP VM's wired 802.1X port (w8).
+        QEMU_EXTRA="-netdev socket,id=lan,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802 -device virtio-net-pci,netdev=lan,mac=02:4e:00:00:00:01 -netdev socket,id=cable,udp=127.0.0.1:7811,localaddr=127.0.0.1:7812 -device virtio-net-pci,netdev=cable,mac=02:4e:00:00:02:02" NETDEV_EXTRA="hostfwd=udp:127.0.0.1:7701-:7701" sh "$ROOT/scripts/cloud-vm.sh" up
     fi
     ARCH=aarch64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-vm-check.sh" kernel ;;
 w1 | test)
@@ -1110,6 +1189,26 @@ bar-eap)
     rm -rf "$W7C"
     BAR_JOIN=0 bar
     echo "bar: frames in scratch/ (VMs left running; teardown with w1's end or reboot)" ;;
+bar-wired)
+    # Settings' Ethernet sign-in (wifi.md §7.5, D2): bar-eap's stack with
+    # atrium-net on Wi-Fi and the cable, the AP VM's wired port asking.
+    "$V" true >/dev/null 2>&1 || { echo "FreeBSD VM down: run the vms step"; exit 1; }
+    "$V" 'ifconfig vtnet2' >/dev/null 2>&1 || { echo "no vtnet2: reboot the VM with the vms step"; exit 1; }
+    pass=0
+    ok() { echo "ok   $1"; pass=$((pass + 1)); }
+    fail() { echo "FAIL $1"; exit 1; }
+    w7_certs
+    export HOSTAPD_ARGS=-dd
+    setup hostapd-eap.conf
+    "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
+    mkdir -p "$ROOT/scratch/w7-ca"
+    cp "$W7C/corp-ca.pem" "$W7C/corp-ca.key" "$ROOT/scratch/w7-ca/"
+    rm -rf "$W7C"
+    sh "$AP" wired || fail "the wired port in the AP VM"
+    "$V" 'rm -f /tmp/aura/net-state/settings'
+    NET_ARGS="--wifi wlan0 --iface vtnet2 --no-probe" start_net
+    BAR_JOIN=0 bar
+    echo "bar: frames in scratch/ (VMs left running; then curia-vm.sh arca)" ;;
 n4)
     setup hostapd-wpa2.conf
     n4
@@ -1135,6 +1234,32 @@ wifi6)
     trap - EXIT
     teardown
     echo "IPv6 over Wi-Fi: $pass checks passed" ;;
+w8)
+    "$V" true >/dev/null 2>&1 || { echo "FreeBSD VM down: run the vms step"; exit 1; }
+    "$V" 'ifconfig vtnet2' >/dev/null 2>&1 || { echo "no vtnet2: the VM was booted before the cable; reboot it with the vms step"; exit 1; }
+    pass=0
+    ok() { echo "ok   $1"; pass=$((pass + 1)); }
+    fail() { echo "FAIL $1"; exit 1; }
+    w7_certs
+    export HOSTAPD_ARGS=-dd
+    setup hostapd-eap.conf
+    "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
+    "$V" 'cat > /tmp/aura/evil-ca.der' < "$W7C/evil-ca.der"
+    sh "$AP" wired || fail "the wired port in the AP VM"
+    fail() {
+        echo "FAIL $1"
+        "$V" "for f in $KLOG /tmp/aura/net.log; do echo \"--- \$f\"; tail -n 40 \$f; done" || true
+        sh "$AP" wired-log || true
+        exit 1
+    }
+    # atrium-net for the cable only (no Wi-Fi, no probe).
+    "$V" 'rm -f /tmp/aura/net-state/settings'
+    NET_ARGS="--iface vtnet2 --no-probe" start_net
+    w8
+    cablex on
+    rm -rf "$W7C"
+    teardown
+    echo "W8 gate (wired 802.1X): $pass checks passed" ;;
 w7)
     "$V" true >/dev/null 2>&1 || { echo "FreeBSD VM down: run the vms step"; exit 1; }
     pass=0

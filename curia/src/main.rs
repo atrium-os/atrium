@@ -288,6 +288,13 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
                 let j = Join { ssid: ssid.clone(), passphrase: None, handle: Some(*handle), open: false };
                 Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join(&j).map_err(e)) }
             }
+            // The wired 802.1X profile (an empty SSID in the sheet) is
+            // machine configuration: network-configure.
+            Want::JoinEnterprise(x) if x.ssid.as_slice() == curia::network::WIRED => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.wired_sign_in(x).map_err(e)) },
+            Want::Seen(s) if s.as_slice() == curia::network::WIRED => Got::Seen(s.clone(), connect(Grant::Configure).and_then(|mut c| c.wired_server_seen().map_err(e))),
+            Want::Trust(s) if s.as_slice() == curia::network::WIRED => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.wired_trust_server().map_err(e)) },
+            Want::CertRequest(r) if r.ssid.as_slice() == curia::network::WIRED => Got::KeyRequest(r.ssid.clone(), connect(Grant::Configure).and_then(|mut c| c.wired_cert_request(&r.name).map_err(e))),
+            Want::WiredForget => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.wired_forget().map_err(e)) },
             Want::JoinEnterprise(x) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join_enterprise(x).map_err(e)) },
             Want::Seen(s) => Got::Seen(s.clone(), connect(Grant::Wifi).and_then(|mut c| c.server_seen(s).map_err(e))),
             Want::CertRequest(r) => Got::KeyRequest(r.ssid.clone(), connect(Grant::Wifi).and_then(|mut c| c.cert_request(r).map_err(e))),
@@ -1098,6 +1105,7 @@ fn main() {
         if p.tick(Instant::now()) {
             changed = true;
         }
+        p.refresh(Instant::now());
         if Instant::now() >= next_scan {
             next_scan = Instant::now() + Duration::from_secs(15);
             if p.reachable && p.joining.is_none() {

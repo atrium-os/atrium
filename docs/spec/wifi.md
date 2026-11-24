@@ -476,6 +476,84 @@ and the pinned server.
   that join only, client keys signing inside Arca. *Recommend yes.*
 - Q6. Wired 802.1X (the same `aura-eap` on Ethernet) later, not in W7. *Recommend later.*
 
+### 7.5 Wired 802.1X (built 2026-11-24, Q6 of §7.4)
+
+Office and campus Ethernet ports that ask the machine to sign in before they carry
+traffic (802.1X on the switch port, the same EAP methods as §7.4). Today such a port
+gives no address, or a guest VLAN.
+
+**What runs where.** The same pieces as Wi-Fi, so the methods, the server checks, "Trust
+this server" and EAP-TLS with the key in Arca come unchanged. atrium-net (root) already
+holds a bpf descriptor per Ethernet port: it adds EAPOL (ethertype 0x888E) to that
+port's filter, joins the PAE group address 01:80:c2:00:00:03, and relays the frames to
+aura-keys over a connection kept open for the port. It parses nothing in them: it checks
+the ethertype and the length, and forwards. aura-keys runs the supplicant side (EAPOL
+start, EAP through `atrium-aura-eap` per authentication, logoff after a failure) and
+answers `authorized` or `failed why=..`; atrium-net sends the logoff itself when it
+stops the port's session (cable out, profile forgotten). There is no 4-way handshake on a wire: the switch opens
+the port when EAP succeeds, and the MSK is dropped (MACsec, 802.1AE, is not in v1).
+
+**Lines on keys.sock** (atrium-net's ctl uid only): `wired-start port=NAME`,
+`wired-rx body=HEX` (an EAPOL PDU, at most 1500 bytes), `wired-stop`; back on the same connection
+`wired-tx body=HEX` (atrium-net sends it to the PAE group address), `authorized`,
+`failed why=..` (`no-credential` when nothing is set up). The profile verbs take
+`wired=1` instead of `ssid=..`: `remember-eap`, `eap-seen`, `eap-trust`, `eap-key`,
+`forget`. The profile is kept in Arca under the account `wired` (the EAP-TLS key under
+`wired tls`). aura-keys runs with `--dev none` on a machine without Wi-Fi.
+
+**Settings and atrium-netconf.** Ops `WIRED_SIGN_IN` (an `Enterprise` with no SSID),
+`WIRED_SERVER_SEEN`, `WIRED_TRUST_SERVER`, `WIRED_CERT_REQUEST`, `WIRED_FORGET`, under
+network-configure (Settings only); each port's `Iface` carries `dot1x` (needed, running,
+authorized, failed) and `dot1x_why`. atrium-net's control lines are `wired-remember-eap`,
+`wired-eap-seen`, `wired-eap-trust`, `wired-eap-key`, `wired-forget`; it keeps only
+that a wired profile exists (`dot1x` in its settings file). Settings shows a "Wired
+network" row for a port whose switch speaks 802.1X ("This port asks you to sign in",
+"Signing in…", "Signed in", or why it failed) with "Sign in…" opening the §7.4 sheet,
+and shows the server's certificate when a first sign-in stops at it.
+
+**Policy.**
+- One wired profile for the machine, used on whichever Ethernet port asks (a laptop
+  meets one office network through different docks and adapters). Per-switch profiles
+  later, if anyone needs them.
+- A port that never sends EAPOL works as today. DHCP starts at link up as before; when
+  the port is authorized, atrium-net restarts that port's lease, because the switch
+  often moves an authorized port to another VLAN. A switch that asks again
+  (re-authentication) gets a fresh EAP run without the link dropping.
+- A port asking for a sign-in with nothing set up is reported (`dot1x=needed` in the
+  port's status, an event for Settings). After a failure, atrium-net waits 60 s (the
+  switch's quiet period) before it starts again, at most three times until the profile
+  changes or the cable is plugged in again.
+- One port at a time runs 802.1X in v1.
+
+**Testing without a network.** The FreeBSD VM gets one more NIC, a QEMU socket netdev
+whose other end is a NIC of the Ubuntu AP VM: a cable between the two VMs only. There
+hostapd runs with `driver=wired` and its own EAP server (the certificates and users of
+the w7 gate), playing the switch, and udhcpd serves the cable. A link between two VMs
+passes the PAE group address that a real bridge drops.
+
+| Step | What | Done when |
+|---|---|---|
+| D1 | aura-keys wired sessions; atrium-net EAPOL relay, `wired-*` ctl lines, lease restart; the VM cable | `aura-sim-gate.sh w8`: PEAP, TTLS and EAP-TLS over the cable, then an address from the authorized port; a wrong password and another CA refused; first join stops at the certificate; a port without 802.1X unchanged |
+| D2 | Settings: the Ethernet row says when the port asks to sign in and opens the §7.4 sheet for it; netconf ops for the wired profile | signed in from Settings in the VM, shown in frames |
+
+**As built (2026-11-24).** D1 and D2 done. The policy is `atrium-net/src/dot1x.rs`
+(host-tested, no system calls); the port's bpf filter passes EAPOL (`wrap.rs`), and
+the port joins the PAE group with `SIOCADDMULTI`. aura-keys keeps one wired session
+(`Wired` in `main.rs`), starting the helper on the switch's first EAP Request; the
+account names are `creds::Net`. The rig: `aura-sim-gate.sh vms` boots both VMs with the
+cable (FreeBSD vtnet2, QEMU udp 7811/7812), `aura-ap-vm.sh wired` starts hostapd
+`driver=wired` with `aura/sim-ap/hostapd-wired.conf`, and `wired-port.sh` (hostapd_cli
+action script) runs udhcpd only while the port is authorized, so an address proves the
+switch opened it. `aura-sim-gate.sh w8` 22/22: needed with no address; PEAP stopping at
+the certificate, then trusted, an address and a ping; TTLS-PAP with the CA; EAP-TLS with
+the key in Arca; cable out and in signs in again with no one asked; a wrong password
+and another CA refused (the switch closes the port); forget. `aura-sim-gate.sh
+bar-wired` then `curia-vm.sh arca`: signed in from Settings with "Trust this server".
+A port without 802.1X: `atrium-net-gate.sh n0` 72/72 unchanged.
+Open: a forgotten profile or a failure leaves the old lease until it expires (the
+switch has already closed the port); re-authentication is only as tested by hostapd's
+defaults (`eap_reauth_period=0` in the rig).
+
 ## 8. Threat model and what runs where
 
 ### 8.1 What we protect
