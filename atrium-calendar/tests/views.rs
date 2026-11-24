@@ -524,7 +524,7 @@ fn zoned_write_preserves_version_two_floating_and_all_day_entries() {
     drop(store);
     let snapshot: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(snapshot["version"], 12);
+    assert_eq!(snapshot["version"], 13);
     let page = Store::open(dir.path()).unwrap().page(day, None);
     assert_eq!((page.revision, page.view), (9, CalendarView::Week));
     let rows: Vec<_> = page

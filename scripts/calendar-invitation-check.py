@@ -582,10 +582,68 @@ def restart_range(ui):
     print("PASS partial restart, cancelled original date, two private copies, prefix, Undo and empty outbox")
 
 
+def restore_one(ui):
+    print(guest(ui, "restore-one-setup"))
+    open_mail(ui, first=True)
+    review(ui, 388)
+    ui.see("one-weekly", "Whole weekly series")
+    click(ui, 568, 550)
+    ui.see("one-original-saved", "Invitation saved")
+    move_meeting(ui, "2026-12-15", "2026-12-24", "16:30", "17:15")
+    ui.control("close", "work")
+    review(ui, 318)
+    ui.see("one-cancellation", "Review 3 dates")
+    click(ui, 355, 412)
+    ui.see("one-cut", "2026-12-08")
+    click(ui, 355, 412)
+    ui.see("one-move", "2026-12-24", "Keep private copy")
+    click(ui, 105, 300)
+    click(ui, 355, 412)
+    ui.see("one-confirm-cut", "Apply range cancellation")
+    click(ui, 568, 550)
+    ui.see("one-cancelled", "Cancellation applied")
+    ui.control("close", "work")
+    review(ui, 248)
+    ui.see("one-restart", "Restore from 2026-12-29")
+    for date in ("2026-12-08", "2026-12-15", "2026-12-22", "2026-12-29", "2027-01-05"):
+        click(ui, 355, 412)
+        ui.see("one-interval-" + date, date)
+    click(ui, 568, 550)
+    ui.see("one-restarted", "Invitation saved")
+    baseline = ui.store("work")
+    private = next(e for e in baseline["entries"] if e["kind"] == "Appointment")
+    for keep in (True, False):
+        ui.control("close", "work")
+        review(ui, 178)
+        ui.see("one-overview", "Review one returning meeting", "Restore only 2026-12-15")
+        click(ui, 355, 412)
+        ui.see("one-copy", "Your private copy", "2026-12-24", "Returns", "2026-12-17", "10:00")
+        click(ui, 105 if keep else 290, 300)
+        ui.see("one-choice", "Restore this meeting")
+        assert ui.store("work") == baseline
+        click(ui, 568, 550)
+        ui.see("one-applied", "Invitation saved", "10:00")
+        saved = ui.store("work")
+        assert (private in saved["entries"]) == keep
+        for date in ("2026-12-08", "2026-12-22"):
+            ui.open_date(date)
+            ui.see("one-still-cancelled-" + date, "No events on this day")
+        ui.open_date("2026-12-30")
+        ui.see("one-resumed-series", "Studio planning", "16:00")
+        click(ui, 590, 562)
+        ui.see("one-undone", "Change undone")
+        assert ui.store("work") == dict(baseline, revision=saved["revision"] + 1)
+        baseline = ui.store("work")
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS one restored date, both private-copy choices, cancelled neighbors, Undo and empty outbox")
+
+
 if __name__ == "__main__":
-    runner = {"--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

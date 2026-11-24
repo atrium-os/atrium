@@ -86,6 +86,10 @@ pub struct RangeRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CancelledInterval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub copies: std::collections::BTreeMap<NaiveDate, uuid::Uuid>,
     pub first: NaiveDate,
     pub restart: NaiveDate,
 }

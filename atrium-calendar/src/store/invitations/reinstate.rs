@@ -101,17 +101,29 @@ impl Store {
         rule.occurrence(&base, restart)?;
         let origin = base.invitation.as_mut().unwrap();
         if restart > cut {
-            let gap = CancelledInterval {
+            let mut gap = CancelledInterval {
+                sequence: Some(p.sequence),
+                copies: BTreeMap::new(),
                 first: cut,
                 restart,
             };
             review.cancelled_before_restart = Some(gap.clone());
             // Fold intersecting or adjacent gaps together; storage is independent of their length.
+            gap.copies.extend(
+                tail.copies
+                    .iter()
+                    .copied()
+                    .filter(|(d, _)| *d >= cut && *d < restart),
+            );
             let mut merged = gap;
             origin.cancelled_intervals.retain(|g| {
                 if g.restart < merged.first || g.first > merged.restart {
                     return true;
                 }
+                merged
+                    .copies
+                    .extend(g.copies.iter().map(|(&d, &id)| (d, id)));
+                merged.sequence = merged.sequence.max(g.sequence);
                 merged.first = merged.first.min(g.first);
                 merged.restart = merged.restart.max(g.restart);
                 false

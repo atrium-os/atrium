@@ -73,7 +73,7 @@ impl Store {
                 }
                 let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=12)
+                if !matches!(snapshot.version, 1..=13)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -476,7 +476,7 @@ impl Store {
     fn publish(
         &mut self,
         revision: u64,
-        entries: Vec<Entry>,
+        mut entries: Vec<Entry>,
         mut cancelled: Vec<crate::invitation::Cancellation>,
         opening_view: CalendarView,
         pinned_zone: Option<Tz>,
@@ -495,9 +495,20 @@ impl Store {
         for tail in cancelled.iter_mut().filter_map(|c| c.tail.as_mut()) {
             tail.copies.retain(|(_, id)| appointments.contains(id));
         }
+        for entry in entries.iter_mut().chain(
+            cancelled
+                .iter_mut()
+                .filter_map(|c| Some(&mut c.tail.as_mut()?.master)),
+        ) {
+            if let Some(origin) = &mut entry.invitation {
+                for gap in &mut origin.cancelled_intervals {
+                    gap.copies.retain(|_, id| appointments.contains(id));
+                }
+            }
+        }
         let next = Snapshot {
             opening_view,
-            version: 12,
+            version: 13,
             cancelled,
             pinned_zone,
             device_zone,
@@ -544,6 +555,9 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
             if origin.cancelled_intervals.iter().any(|g| {
                 e.kind != Kind::Weekly
                     || g.first < e.date
+                    || g.copies
+                        .keys()
+                        .any(|d| !g.contains(*d) || (*d - g.first).num_days() % 7 != 0)
                     || g.first >= g.restart
                     || (g.first - e.date).num_days() % 7 != 0
                     || (g.restart - e.date).num_days() % 7 != 0

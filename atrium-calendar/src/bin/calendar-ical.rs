@@ -1536,6 +1536,193 @@ mod tests {
 
     const RESTART: &str = include_str!("../../tests/fixtures/restart-future.ics");
 
+    const RESTORE_ONE: &str = include_str!("../../tests/fixtures/restore-one.ics");
+
+    fn seed_cancelled_interval(s: &mut Store) {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(s, 0, weekly).token.unwrap();
+        s.apply_invitation(0, t).unwrap();
+        for (rev, original) in [(1, "2026-12-15"), (2, "2026-12-22")] {
+            let day = date(original);
+            let row = s.day(day).entries.pop().unwrap();
+            let mut edit = row.fields_on(day);
+            edit.date = date("2026-12-24");
+            edit.title = format!("Private copy of {original}");
+            s.change(rev, row.id, day, EditScope::ThisEvent, Some(edit))
+                .unwrap();
+        }
+        let cut = CANCEL_FUTURE.replace("20261215", "20261208");
+        let t = review_range(s, 3, &cut).token.unwrap();
+        let choices = ["2026-12-15", "2026-12-22"].map(|d| SkipDecision {
+            original: date(d),
+            keep: true,
+        });
+        s.apply_reviewed_invitation(3, t, &choices).unwrap();
+        let restart = RESTART
+            .replace("20261222", "20261229")
+            .replace("20261223", "20261230");
+        let t = review_range(s, 4, &restart).token.unwrap();
+        s.apply_invitation(4, t).unwrap();
+    }
+
+    #[test]
+    fn one_verified_request_splits_the_interval_and_reviews_only_its_copy() {
+        use atrium_calendar::invitation::SkipDecision;
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        seed_cancelled_interval(&mut s);
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        let p = range_proposal(RESTORE_ONE);
+        let mut source = range_source(&p);
+        source.verified = false;
+        assert!(s
+            .review_invitation(5, &source, p.clone())
+            .unwrap()
+            .token
+            .is_none());
+        source = range_source(&p);
+        source.delivery.as_mut().unwrap().scope = range_proposal(REINSTATE).scope();
+        assert!(s.review_invitation(5, &source, p).is_err());
+        for bad in [
+            RESTORE_ONE.replace("SEQUENCE:4", "SEQUENCE:3"),
+            RESTORE_ONE.replace("20261215T140000Z", "20261215T130000Z"),
+            RESTORE_ONE.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDFUTURE:"),
+        ] {
+            assert!(review_range(&mut s, 5, &bad).token.is_none());
+        }
+        let bundle = RANGE_MASTER.replace("SEQUENCE:1", "SEQUENCE:4");
+        let blocked = review_range(&mut s, 5, &bundle);
+        assert!(blocked.token.is_none() && blocked.notice.contains("cancelled interval"));
+        let snapshot = || std::fs::read(dir.path().join("calendar.json")).unwrap();
+        let baseline = snapshot();
+        let copies_on = date("2026-12-24");
+        let first = s.day(date("2026-12-01")).entries[0].id;
+        let resumed = s.day(date("2026-12-30")).entries[0].id;
+        let original = date("2026-12-15");
+        let sibling = date("2026-12-22");
+        let zoned = RESTORE_ONE.replace(
+            "RECURRENCE-ID:20261215T140000Z",
+            "RECURRENCE-ID;TZID=Pacific/Kiritimati:20261216T040000",
+        );
+        for (rev, keep, request) in [(5, true, RESTORE_ONE), (7, false, zoned.as_str())] {
+            let review = review_range(&mut s, rev, request);
+            assert!(review.reinstating && review.can_save);
+            assert_eq!(review.range_dates.len(), 1);
+            let detail = &review.range_dates[0];
+            assert_eq!(detail.original, original);
+            assert_eq!(
+                detail.private_copy.as_ref().unwrap().title,
+                "Private copy of 2026-12-15"
+            );
+            assert_eq!(detail.after.as_ref().unwrap().date, date("2026-12-17"));
+            let token = review.token.unwrap();
+            assert!(s.apply_invitation(rev, token).is_err());
+            assert!(s
+                .apply_reviewed_invitation(
+                    rev,
+                    token,
+                    &[SkipDecision {
+                        original: sibling,
+                        keep: false
+                    }]
+                )
+                .is_err());
+            assert_eq!(s.day(copies_on).entries.len(), 2);
+            let (_, undo) = s
+                .apply_reviewed_invitation(rev, token, &[SkipDecision { original, keep }])
+                .unwrap();
+            assert_eq!(s.day(copies_on).entries.len(), if keep { 2 } else { 1 });
+            assert!(s
+                .day(copies_on)
+                .entries
+                .iter()
+                .any(|r| r.title == "Private copy of 2026-12-22"));
+            assert_eq!(s.day(date("2026-12-17")).entries[0].span.start, 600);
+            for absent in [date("2026-12-08"), original, sibling] {
+                assert!(s.day(absent).entries.is_empty());
+            }
+            assert_eq!(s.day(date("2026-12-01")).entries[0].id, first);
+            assert_eq!(s.day(date("2026-12-30")).entries[0].id, resumed);
+            let replay = review_range(&mut s, rev + 1, request);
+            assert!(!replay.can_save && replay.notice.contains("Already saved"));
+            let next = RESTORE_ONE.replace("20261215T140000", "20261222T140000");
+            let preview = review_range(&mut s, rev + 1, &next);
+            assert_eq!(
+                preview.range_dates[0].private_copy.as_ref().unwrap().title,
+                "Private copy of 2026-12-22"
+            );
+            if keep {
+                s.undo(undo).unwrap();
+                let mut restored: serde_json::Value = serde_json::from_slice(&snapshot()).unwrap();
+                restored["revision"] = 5.into();
+                assert_eq!(
+                    restored,
+                    serde_json::from_slice::<serde_json::Value>(&baseline).unwrap()
+                );
+            }
+        }
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.day(date("2026-12-17")).entries.len(), 1);
+        assert!(s.day(date("2026-12-08")).entries.is_empty() && s.day(sibling).entries.is_empty());
+    }
+
+    #[test]
+    fn restoring_a_date_leaves_unlinked_or_deleted_private_copies_alone() {
+        use atrium_calendar::EditScope;
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut s = Store::open(dir.path()).unwrap();
+            seed_cancelled_interval(&mut s);
+            let private_day = date("2026-12-24");
+            let mut replacement = s
+                .day(private_day)
+                .entries
+                .into_iter()
+                .find(|e| e.title.ends_with("12-15"))
+                .unwrap();
+            let rev = if legacy {
+                drop(s);
+                let path = dir.path().join("calendar.json");
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                json["version"] = 12.into();
+                let master = json["entries"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|r| r["kind"] == "Weekly")
+                    .unwrap();
+                let gap = master["invitation"]["cancelled_intervals"][0]
+                    .as_object_mut()
+                    .unwrap();
+                gap.remove("copies");
+                gap.remove("sequence");
+                std::fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+                s = Store::open(dir.path()).unwrap();
+                5
+            } else {
+                s.change(5, replacement.id, private_day, EditScope::ThisEvent, None)
+                    .unwrap();
+                replacement.title = "Independent appointment".into();
+                replacement.source = None;
+                s.add(6, replacement.clone()).unwrap();
+                7
+            };
+            let preview = review_range(&mut s, rev, RESTORE_ONE);
+            assert!(preview.range_dates[0].private_copy.is_none());
+            assert_eq!(preview.notice.contains("Older calendar"), legacy);
+            s.apply_invitation(rev, preview.token.unwrap()).unwrap();
+            assert!(s
+                .day(private_day)
+                .entries
+                .iter()
+                .any(|r| r.id == replacement.id && r.title == replacement.title));
+        }
+    }
+
     #[test]
     fn partial_restart_uses_original_dates_for_both_private_copies() {
         use atrium_calendar::{invitation::SkipDecision, EditScope};
@@ -1647,13 +1834,8 @@ mod tests {
         assert!(s.day(date("2026-12-30")).entries.is_empty());
         assert!(!review_range(&mut s, 7, RESTART).can_save);
         let gap_update = REINSTATE.replace("SEQUENCE:3", "SEQUENCE:5");
-        for request in [
-            gap_update.clone(),
-            gap_update.replace(";RANGE=THISANDFUTURE", ""),
-        ] {
-            let blocked = review_range(&mut s, 7, &request);
-            assert!(blocked.token.is_none() && blocked.notice.contains("cancelled interval"));
-        }
+        let blocked = review_range(&mut s, 7, &gap_update);
+        assert!(blocked.token.is_none() && blocked.notice.contains("cancelled interval"));
         let extension = weekly
             .replace("COUNT=6", "COUNT=8")
             .replace("SEQUENCE:1", "SEQUENCE:4");

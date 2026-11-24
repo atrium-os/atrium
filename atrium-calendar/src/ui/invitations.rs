@@ -245,7 +245,9 @@ impl Sheet {
             ctx,
             66.,
             22.,
-            if self.review.reinstating {
+            if self.review.reinstating && !p.this_and_future {
+                "Review one returning meeting"
+            } else if self.review.reinstating {
                 "Review reinstatement"
             } else if p.row.is_none() {
                 "Review cancellation"
@@ -902,6 +904,8 @@ impl Sheet {
                     } else {
                         "Remove meeting"
                     }
+                } else if self.review.reinstating && !p.this_and_future {
+                    "Restore this meeting"
                 } else if self.review.reinstating {
                     "Restore reviewed dates"
                 } else if p.this_and_future {

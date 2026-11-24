@@ -1,6 +1,7 @@
 mod cancel_future;
 mod future;
 mod reinstate;
+mod restore_one;
 use super::*;
 use crate::invitation::{Cancellation, MeetingKey, Origin, Proposal, Review};
 use portcullis_ipc::calendar::{Source, REVIEW_SECONDS};
@@ -198,7 +199,7 @@ impl Store {
         view: Tz,
         revision: u64,
         source: &Source,
-        p: Proposal,
+        mut p: Proposal,
         prior_occurrence: Option<&Entry>,
         range_from: Option<NaiveDate>,
         pending: &mut Option<Pending>,
@@ -237,7 +238,7 @@ impl Store {
             !matches!(e.kind, Kind::Occurrence { .. })
                 && e.invitation.as_ref().is_some_and(|o| o.key == key)
         });
-        let original_date = p.original.map(|o| o.date);
+        let wire_date = p.original.map(|o| o.date);
         let mut review = Review {
             reinstating: false,
             cancelled_before_restart: None,
@@ -274,7 +275,7 @@ impl Store {
                             o.date == cut
                                 || o.in_series(&tail.master).is_ok_and(|slot| slot.date >= cut)
                         }),
-                        None => original_date.is_some_and(|date| date >= cut),
+                        None => wire_date.is_some_and(|date| date >= cut),
                     }
                 })
                 .max_by_key(|c| c.original)
@@ -284,11 +285,43 @@ impl Store {
                 );
             }
         }
+        let mut restoring = None;
         if let Some(base) = master {
-            if p.original.is_some_and(|o| {
-                base.remains_cancelled(o.in_series(base).map_or(o.date, |slot| slot.date))
-            }) || p
-                .exceptions
+            let saved = base.invitation.as_ref().ok_or("Missing weekly identity")?;
+            if let Some(original) = p.original {
+                let canonical = original.in_series(base).ok();
+                let date = canonical.map_or(original.date, |slot| slot.date);
+                if let Some(gap) = saved.cancelled_intervals.iter().find(|g| g.contains(date)) {
+                    let Some(slot) = canonical else {
+                        return Ok(review.blocked(
+                            "The original slot differs from the cancelled weekly schedule.",
+                        ));
+                    };
+                    restoring = match restore_one::SingleDate::review(gap, saved, &p, source) {
+                        Ok(one) => Some(one),
+                        Err(reason) => return Ok(review.blocked(reason)),
+                    };
+                    p.original = Some(slot);
+                } else if let Some(slot) =
+                    canonical.filter(|s| !p.this_and_future && *s != original)
+                {
+                    // A single restoration records its source-clock slot. Match the same
+                    // occurrence on replay if Mail used an equivalent clock representation.
+                    if rows.iter().any(|r| {
+                        r.kind
+                            == Kind::Occurrence {
+                                series: base.id,
+                                original: slot.date,
+                            }
+                            && r.invitation
+                                .as_ref()
+                                .is_some_and(|o| o.original == Some(slot))
+                    }) {
+                        p.original = Some(slot);
+                    }
+                }
+            }
+            if p.exceptions
                 .iter()
                 .any(|m| base.remains_cancelled(m.original.date))
                 || p.skips.iter().any(|o| base.remains_cancelled(o.date))
@@ -296,6 +329,7 @@ impl Store {
                 return Ok(review.blocked("These original dates remain in a cancelled interval."));
             }
         }
+        let original_date = p.original.map(|o| o.date);
         if p.this_and_future && cancelled {
             return Self::prepare_range_cancellation(
                 rows, history, view, revision, source, &p, key, master, review, pending,
@@ -393,7 +427,7 @@ impl Store {
                 }
             }
             if let Some(date) = original_date {
-                if base.excluded.contains(&date) && explicit.is_none() {
+                if restoring.is_none() && base.excluded.contains(&date) && explicit.is_none() {
                     let organizer_skip = origin.owned_skips.contains(&date);
                     if organizer_skip && (cancelled || p.sequence <= origin.sequence) {
                         return Ok(review.blocked("This date is already skipped by the organizer."));
@@ -568,6 +602,9 @@ impl Store {
             let parent = next.iter_mut().find(|e| e.id == base.id).unwrap();
             if let Some(o) = &mut parent.invitation {
                 o.owned_skips.retain(|d| *d != original);
+                if let Some(one) = restoring {
+                    local_moves.extend(one.prepare(o, original, rows, &p, &mut review)?);
+                }
             }
             let exclusions = &mut parent.excluded;
             if let Err(at) = exclusions.binary_search(&original) {

@@ -1396,6 +1396,8 @@ A directly delivered range cancellation carries the organizer’s cancellation m
 
 A newer verified request at the original cutoff or a later original slot can reopen the remaining weekly meetings for review. Mail binds the response to the requested restart slot. Saving is local. If the person chooses to respond, Mail receives the original range scope and RSVP. Calendar keeps the private appointment choices. [Reinstating a cancelled range](calendar.md#719-reinstating-a-cancelled-range) · [Restarting partway through a cancelled range](calendar.md#720-restarting-partway-through-a-cancelled-range)
 
+A separately delivered request for one occurrence can bring back that date inside a cancelled interval. Mail verifies the exact recurrence ID on the response. Calendar retains the decision about any private copy. [Bringing back one meeting](calendar.md#721-bringing-back-one-meeting-inside-a-cancelled-interval)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

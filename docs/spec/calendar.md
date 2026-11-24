@@ -335,6 +335,16 @@ Fasti stores the cancelled interval on the weekly series using the first cancell
 
 The synthetic desktop gate runs with `--restart`. It cancels from December 15 and restarts from December 22. The December 15 private copy on December 24 stays put. The December 22 copy on December 11 exercises both choices alongside the organizer’s returning meeting on December 23. [Synthetic Mail request](../../atrium-calendar/tests/fixtures/restart-future.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
+### 7.21 Bringing back one meeting inside a cancelled interval
+
+A verified organizer can send a newer Mail request for one original weekly slot inside the interval left by a partial restart. **Review one returning meeting** identifies the original date, the proposed date and time, and any private copy still linked to that slot. With a linked copy, choose **Keep private copy** or **Remove private copy**. The choice starts empty. An appointment moved or renamed since cancellation is shown at its current time. Deleting the copy severs the link.
+
+**Restore this meeting** saves one occurrence and the copy choice together. The dates on either side stay cancelled and the restarted weekly schedule keeps its timing. One Undo restores the prior interval and appointments. A response reviewed in Mail carries the single recurrence ID. Saving the meeting and resolving its private copy are local to the selected persona.
+
+The request must identify the original series clock slot and carry a revision newer than the saved series and restart. A whole-series invitation, an included move, or a range request cannot silently reopen a date in this interval. For intervals written by version 12, Fasti can verify the restart against its saved weekly rule. Existing standalone appointments remain independent because that version did not record which private copy belonged to the slot. If the restart revision is unavailable, Calendar leaves the interval closed.
+
+The installed synthetic gate runs with `--restore-one`. The series restarts on December 29. The organizer then offers the December 15 occurrence for Thursday, December 17 at 10:00. The test exercises both choices for the private copy on December 24 and checks the cancelled December 8 and 22 slots, the resumed schedule, Undo and the Mail outbox. [Synthetic request](../../atrium-calendar/tests/fixtures/restore-one.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |
