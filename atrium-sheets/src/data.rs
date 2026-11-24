@@ -735,6 +735,51 @@ pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
         names.extend(more);
         ops.push(GridOp::names(&d.wb, &names));
     }
+    // Charts and pictures: those on the sheet, and the cells they read
+    // there, onto the copy.
+    let on = |r: Rect| if r.sheet == s { Rect { sheet: t, ..r } } else { r };
+    let mut charts = d.wb.charts().to_vec();
+    let more: Vec<_> = charts.iter().filter(|c| c.anchor.sheet == s).map(|c| {
+        let mut c = c.clone();
+        c.anchor.sheet = t;
+        for se in &mut c.series {
+            se.vals = on(se.vals);
+            se.cats = se.cats.map(on);
+            if let Some(officina_grid::charts::ChartText::Cell(a)) = &mut se.name {
+                if a.sheet == s {
+                    a.sheet = t;
+                }
+            }
+        }
+        if let Some(officina_grid::charts::ChartText::Cell(a)) = &mut c.title {
+            if a.sheet == s {
+                a.sheet = t;
+            }
+        }
+        c
+    }).collect();
+    if !more.is_empty() {
+        charts.extend(more);
+        ops.push(GridOp::Charts(charts));
+    }
+    let mut pictures = d.wb.pictures().to_vec();
+    let more: Vec<_> = pictures.iter().filter(|p| p.anchor.sheet == s).map(|p| { let mut p = p.clone(); p.anchor.sheet = t; p }).collect();
+    if !more.is_empty() {
+        pictures.extend(more);
+        ops.push(GridOp::Pictures(pictures));
+    }
+    // Tables, each under a fresh name (table names are workbook-wide).
+    let mut tables = d.wb.tables().to_vec();
+    let mut more = Vec::new();
+    for tb in tables.iter().filter(|tb| tb.rect.sheet == s) {
+        let taken = |n: &str| tables.iter().chain(&more).any(|x: &officina_grid::tables::Table| x.name.eq_ignore_ascii_case(n)) || d.wb.names().iter().any(|x| x.name.eq_ignore_ascii_case(n));
+        let Some(name) = (2..).map(|k| format!("{}_{k}", tb.name)).take(10_000).find(|n| !taken(n)) else { continue };
+        more.push(officina_grid::tables::Table { name: name.into(), rect: Rect { sheet: t, ..tb.rect }, ..tb.clone() });
+    }
+    if !more.is_empty() {
+        tables.extend(more);
+        ops.push(GridOp::Tables(tables));
+    }
     // Moved last: everything above names the copy by its place at the end.
     if s + 1 < t {
         ops.push(GridOp::MoveSheet { from: t, to: s + 1 });
