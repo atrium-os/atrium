@@ -20,6 +20,7 @@ pub enum Request {
     SetPlaying(bool),
     Volume(f64),
     Clock,
+    FrameCounts,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub enum Reply {
     Failed,
     Position { secs: f64 },
     EndedPosition { secs: f64 },
+    FrameCounts { presented: u32, dropped: u32 },
 }
 
 pub fn send<T: Serialize>(socket: &mut impl Write, message: &T) -> io::Result<()> {

@@ -833,6 +833,16 @@ Physical display cadence and the DOM's zero decoded-frame count remain open.
 Guest captures, the progress log and the focused end-event observations
 are in `~/atrium-vm/evidence/navigator-i4-fullclip-20261124/`.
 
+#### Native playback quality
+
+For the attached native MediaSource, Ladybird reads the player’s latest
+presentation counts through the existing private element channel.
+`totalVideoFrames` is the sum of frames Fresco presented and frames it
+reported dropping. `droppedVideoFrames` is the latter count. A decoded
+frame can still be waiting for presentation or belong to a previous seek.
+Each new player starts at zero, and a chapter seek keeps the same counters.
+The ordinary LibWeb sink supplies the counts for other video elements.
+
 ## 6a. Sign-in: SSO and WebAuthn
 
 An identity provider's page is a whole page of script: a redirect chain, a password step,

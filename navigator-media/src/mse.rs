@@ -125,6 +125,7 @@ pub struct Media {
     /// `MediaError.code`.
     pub error: Option<u16>,
     pub size: (u32, u32),
+    pub frame_counts: (u32, u32),
     file_buffered: Vec<(f64, f64)>,
     /// In picture-in-picture: set only by limend's `Pip` event ([`Media::pip`]).
     pub in_pip: bool,
@@ -145,7 +146,7 @@ impl Media {
     pub fn new() -> Self {
         Media { out: vec![], events: vec![], ms: None, can_play: HashMap::new(), asked: Default::default(), loaded: false,
                 paused: true, current_time: 0.0, duration: f64::NAN, volume: 1.0, muted: false, rate: 1.0, seeking: false, last_seek: 0, pending_seek: None,
-                ended: false, ready_state: 0, error: None, size: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0,
+                ended: false, ready_state: 0, error: None, size: (0, 0), frame_counts: (0, 0), file_buffered: vec![], in_pip: false, session_actions: 0,
                 text_tracks: vec![], pending_files: vec![], shown_text: None, page_chose: false }
     }
 
@@ -646,6 +647,11 @@ impl Media {
                 if let Some(ms) = self.ms.as_mut() { for b in &mut ms.bufs { b.quota = true } }
             }
             // The user turned it up, down or off in the player itself.
+            ToParent::FrameCounts { presented, dropped } => {
+                if presented >= self.frame_counts.0 && dropped >= self.frame_counts.1 {
+                    self.frame_counts = (presented, dropped);
+                }
+            }
             ToParent::Volume { volume, muted } => {
                 if (self.volume, self.muted) != (volume, muted) {
                     self.volume = volume;

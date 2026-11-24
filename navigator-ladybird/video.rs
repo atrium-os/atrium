@@ -14,6 +14,7 @@ struct Player {
     playing: bool,
     ended: bool,
     end_event: bool,
+    frame_counts: (u32, u32),
 }
 
 struct Buffer {
@@ -52,6 +53,7 @@ pub unsafe extern "C" fn navigator_video_channel(fd: i32) -> bool {
             playing: false,
             ended: false,
             end_event: false,
+            frame_counts: (0, 0),
         }))
         .is_ok()
 }
@@ -214,6 +216,15 @@ pub extern "C" fn navigator_video_take_end_event() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn navigator_video_ended() -> bool {
     player().is_some_and(|p| p.ended)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_video_frame_counts(presented: &mut u32, dropped: &mut u32) {
+    let Some(mut p) = player() else { return };
+    if let Some(Reply::FrameCounts { presented, dropped }) = p.call(Request::FrameCounts) {
+        p.frame_counts = (presented, dropped);
+    }
+    (*presented, *dropped) = p.frame_counts;
 }
 
 #[unsafe(no_mangle)]

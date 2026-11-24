@@ -288,3 +288,16 @@ fn local_chapter_link_seeks_an_attached_source_and_waits_for_decoder_acknowledge
         assert!(!media.seeking);
     }
 }
+
+#[test]
+fn frame_counts_are_per_element_and_survive_a_stale_report() {
+    let mut media = Media::new();
+    for (presented, dropped) in [(30, 2), (31, 1), (29, 3)] {
+        let bytes = ToParent::FrameCounts { presented, dropped }.encode();
+        media.from_player(ToParent::decode(&bytes).unwrap());
+    }
+    assert_eq!(media.frame_counts, (30, 2));
+    media.from_player(ToParent::FrameCounts { presented: 34, dropped: 3 });
+    assert_eq!(media.frame_counts, (34, 3));
+    assert_eq!(Media::new().frame_counts, (0, 0));
+}

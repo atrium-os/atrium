@@ -150,6 +150,8 @@ pub enum ToParent {
     Action { action: u16 },
     /// The decode worker acknowledged this request's seek epoch.
     Seeked { request: u64, secs: f64 },
+    /// Cumulative Fresco presentation outcomes for this player.
+    FrameCounts { presented: u32, dropped: u32 },
 }
 
 /// Seconds representable on the native player's media clock.
@@ -220,7 +222,7 @@ impl ToParent {
             ToParent::Error { track, .. } => track.is_none_or(|t| t < TRACKS_MAX),
             ToParent::Volume { volume, .. } => (0.0..=1.0).contains(volume),
             ToParent::Action { action } => action.count_ones() == 1 && action & !media_action::ALL == 0,
-            ToParent::Playing | ToParent::Paused | ToParent::Ended => true,
+            ToParent::FrameCounts { .. } | ToParent::Playing | ToParent::Paused | ToParent::Ended => true,
         };
         ok.then_some(m)
     }

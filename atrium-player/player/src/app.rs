@@ -157,6 +157,8 @@ pub struct App<H: Host> {
     ended_at: Option<Instant>,
     pcm: Vec<f32>,
     pub frames: u32,
+    reported_counts: (u32, u32),
+    last_counts: Instant,
     pub done: bool,
     /// Buffered ranges of the first track the feed reported, in seconds.
     shown_track: Option<u8>,
@@ -244,6 +246,8 @@ impl<H: Host> App<H> {
             ended_at: None,
             pcm: vec![0f32; 48_000 * 2],
             frames: 0,
+            reported_counts: (0, 0),
+            last_counts: Instant::now(),
             done: false,
             shown_track: None,
             audio: None,
@@ -696,6 +700,15 @@ impl<H: Host> App<H> {
         }
         if self.sink().closed {
             self.done = true;
+        }
+        if self.last_counts.elapsed() >= Duration::from_millis(250) {
+            let stats = &self.sink().stats;
+            let counts = (stats.presented, stats.dropped);
+            if counts != self.reported_counts {
+                self.host.emit(ToParent::FrameCounts { presented: counts.0, dropped: counts.1 });
+                self.reported_counts = counts;
+            }
+            self.last_counts = Instant::now();
         }
         // The end: everything decoded, and the last frame's had its time.
         if let Some(t) = self.ended_at {

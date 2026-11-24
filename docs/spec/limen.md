@@ -242,6 +242,7 @@ There are two ways to feed it.
 | child → parent | `Buffered` | `track`, `ranges: Vec<(f64, f64)>` (at most 64), after each append or remove |
 | child → parent | `Appended` | `track`: the append is parsed, so the next may go (`updateend`) |
 | child → parent | `Time` | `secs: f64`, at most 4 a second |
+| child → parent | `FrameCounts` | Cumulative `presented` and `dropped` counts (u32) from Fresco for this player. Sent on change, at most four times per second, including the final presentation while paused. |
 | child → parent | `Waiting` | `secs: f64`: playback reached the end of what is buffered |
 | child → parent | `Seeking` | `secs: f64`: the user seeked in the native controls; the parent fetches from there |
 | child → parent | `Ended` | none |

@@ -503,3 +503,32 @@
      void set_content_type(Utf16View type);
  
      // https://w3c.github.io/media-source/#addsourcebuffer-method
+--- a/Libraries/LibWeb/HTML/HTMLVideoElement.cpp
++++ b/Libraries/LibWeb/HTML/HTMLVideoElement.cpp
+@@ -677,10 +677,25 @@
+         document().page().client().request_frame();
+ }
+ 
++#ifdef ATRIUM_I4_VIDEO
++extern "C" void navigator_video_frame_counts(u32*, u32*);
++#endif
++
+ // https://w3c.github.io/media-playback-quality/#dom-htmlvideoelement-getvideoplaybackquality
+ GC::Ref<VideoPlaybackQuality> HTMLVideoElement::get_video_playback_quality()
+ {
+-    auto frame_counts = video_frame_counts_since_last_load();
++    VideoFrameCounts frame_counts;
++#ifdef ATRIUM_I4_VIDEO
++    if (attached_media_source()) {
++        u32 presented = 0;
++        u32 dropped = 0;
++        navigator_video_frame_counts(&presented, &dropped);
++        frame_counts = { presented, dropped };
++    } else
++#endif
++    {
++        frame_counts = video_frame_counts_since_last_load();
++    }
+     auto clamp_count = [](u64 count) { return static_cast<WebIDL::UnsignedLong>(min(count, NumericLimits<WebIDL::UnsignedLong>::max())); };
+ 
+     // 1. Let playbackQuality be a new instance of VideoPlaybackQuality.

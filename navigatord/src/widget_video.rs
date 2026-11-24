@@ -264,12 +264,16 @@ impl Session {
                 self.flush()?;
                 Ok(Reply::Ok)
             }
-            Request::Clock => {
+            Request::Clock | Request::FrameCounts => {
                 // Handle queued native clock and state updates without waiting for a new tick.
                 for _ in 0..32 {
                     if !self.poll_player(Duration::ZERO)? {
                         break;
                     }
+                }
+                if matches!(req, Request::FrameCounts) {
+                    let (presented, dropped) = self.media.frame_counts;
+                    return Ok(Reply::FrameCounts { presented, dropped });
                 }
                 let secs = self.media.current_time;
                 if self.media.ended {

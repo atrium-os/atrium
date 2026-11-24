@@ -102,8 +102,8 @@ impl FrescoSink {
             match ev {
                 Event::VideoReleased { layer, buffer, .. } if Some(layer) == self.layer => self.released.push(buffer),
                 Event::VideoPresented { layer, seq, vblank_ns, dropped, .. } if Some(layer) == self.layer => {
-                    self.stats.presented += 1;
-                    self.stats.dropped += dropped;
+                    self.stats.presented = self.stats.presented.saturating_add(1);
+                    self.stats.dropped = self.stats.dropped.saturating_add(dropped);
                     if let Some(asked) = self.asked.remove(&seq) {
                         let skew = (vblank_ns as i64 - asked).abs();
                         self.stats.skew_sum += skew;
