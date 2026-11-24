@@ -35,6 +35,9 @@ use pergola::{App, SizeSpec, Window, WindowDesc};
 mod invitation;
 mod thumbnails;
 mod sanitized;
+#[cfg(feature = "legacy-smime-integration")]
+#[path = "atrium-mail/legacy_preview.rs"]
+mod legacy_preview;
 
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -379,6 +382,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+    #[cfg(feature = "legacy-smime-integration")]
+    let legacy_preview = atrium_mail::settings::synthetic_legacy_sheet().then(|| {
+        let fixture = legacy_preview::PreviewFixture::seed(&store).expect("seed synthetic preview");
+        assert!(fixture.still_unread().expect("check seeded preview"));
+        fixture
+    });
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
     let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
@@ -1303,7 +1312,7 @@ fn main() {
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes }))
                         if settings.as_ref().is_some_and(|sw| sw.smime.is_some_and(|(id, _)| id == embed)) => {
                         #[cfg(feature = "legacy-smime-integration")]
-                        if atrium_mail::settings::synthetic_legacy_sheet() {
+                        if let Some(preview) = &legacy_preview {
                             let outcome = match bytes.as_slice() {
                                 b"opened" => Some(("OPENED", "Opened the synthetic legacy S/MIME message.")),
                                 b"closed" => Some(("CLOSED", "Couldn’t open this legacy S/MIME message.")),
@@ -1314,6 +1323,11 @@ fn main() {
                                 sw.smime = None;
                                 let _ = embeds.borrow_mut().detach_embed(embed);
                                 sw.s.smime_note(Some(note));
+                                // Preview outcomes belong to Settings only.
+                                // Do not select a message, refresh the reader,
+                                // or write flags while resolving the sheet.
+                                assert!(preview.still_unread().expect("check synthetic preview"));
+                                println!("MAIL_SIGNED_LEGACY_{marker}_UNREAD_NO_WRITES");
                                 println!("MAIL_SIGNED_LEGACY_{marker}");
                             }
                             continue;

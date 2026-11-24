@@ -52,6 +52,11 @@ pub fn serve_conn_with(stream: UnixStream, label: &label::Label, state: &Mutex<s
         let b = frame.as_ref();
         let op = u16::from_le_bytes([b[0], b[1]]);
         let lock = || state.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+        if op == proto::op::U_SMIME_SYNTHETIC_OPEN && *label == label::Label::TrustedUi {
+            let r = server::integration::serve_synthetic_open(state, &rd, &b[2..]);
+            return proto::write_reply(&mut wr, r.status, r.body.bytes());
+        }
         let mut r = lock().handle(label, op, &b[2..]);
         if r.status == proto::status::NEEDS_VERIFICATION {
             let prompt = verifier.and_then(|v| Some((v, lock().verify_prompt(label, op, &b[2..])?)));

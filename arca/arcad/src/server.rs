@@ -41,6 +41,8 @@ pub struct State {
     pub mail_sign_ins: crate::oauth::Sessions,
     #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
     pub legacy_smime_registry: Option<PathBuf>,
+    #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+    legacy_smime_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The machine store (arca.md §6.4): open from boot, for services.
     machine: Option<Store>,
     /// Unrecorded trails' cookie jars: in memory only (`crate::jar`).
@@ -162,6 +164,8 @@ impl State {
             mail_sign_ins: Default::default(),
             #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
             legacy_smime_registry: None,
+        #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+            legacy_smime_pending: None,
             dir,
             kdf_default: KdfParams::NO_TPM,
             stores: HashMap::new(),
@@ -1436,6 +1440,12 @@ impl State {
                 if r.end().is_err() {
                     return malformed();
                 }
+        #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+                if user == integration::SYNTHETIC_USER {
+                    if let Some(pending) = &self.legacy_smime_pending {
+                        pending.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
                 if let Some(s) = self.stores.get_mut(&user) {
                     s.lock();
                 }
@@ -1568,24 +1578,6 @@ impl State {
             op::U_STORE_PRINT_LOGIN => self.store_print_login(body, item),
             op::U_SAVE_PRINT_PIN => self.saved_print_pin(body, true, item),
             op::U_USE_SAVED_PRINT_PIN => self.saved_print_pin(body, false, item),
-            #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
-            op::U_SMIME_SYNTHETIC_OPEN => {
-                let (Some(registry), Some(publisher), Ok(uid)) = (
-                    &self.legacy_smime_registry, self.mail_sign_ins.mail_publisher, body.try_into(),
-                ) else { return reply(status::DENIED) };
-                let Some(store) = self.stores.get_mut(integration::SYNTHETIC_USER) else {
-                    return reply(status::DENIED);
-                };
-                match integration::synthetic_open(store, registry, u32::from_le_bytes(uid), publisher) {
-                    Ok(opened) => Reply {
-                        status: if opened { status::OK } else { status::DENIED },
-                        // The fixture-only UI can attest clean worker exit.
-                        // Limen forwards only the public sheet outcome.
-                        body: Body::Plain(vec![0]),
-                    },
-                    Err(_) => reply(status::DENIED),
-                }
-            }
             op::U_SMIME_IMPORT | op::U_SMIME_PROVISION => self.smime_import(body, item, op == op::U_SMIME_PROVISION),
             op::U_SMIME_FORGET => self.smime_forget(body, item),
             op::U_DROP => {

@@ -941,12 +941,16 @@ timing and the production path for received messages remain unverified.
   reply marker. The daemon audit records the operation and coarse
   status. Worker lifecycle diagnostics can distinguish operational
   failures. No reviewed public field names an RSA or content-padding
-  failure. The worker and store are still handled under Arca's shared
-  state mutex, making contention observable in principle. The
-  signed fixture checks the live launch registry before key use, while
-  a lock request handled by Arca can wait on that mutex. The fixture
-  does not attest a real account and message selection or continued
-  sheet and session liveness throughout the operation.
+  failure. The signed fixture takes Arca's shared state lock to
+  reserve an approval, locate the separate key and commit the outcome.
+  Worker I/O and the private-key operation run outside that lock. A
+  session lock permanently revokes a pending approval, even after
+  unlock. The trusted UI keeps its own request connection open only
+  while the sheet and launch remain valid. Arca watches that connection,
+  the launch registry and the deadline while the worker runs. It closes
+  the worker's channels when approval ends and rechecks approval before
+  handing off a result. This fixture flow still uses a fixed message
+  and key.
 - **Private crypto and content.** OpenSSL's default provider is pinned
   and implicit rejection is required and checked. Arca selects a
   fixed-width candidate without returning the provider status or
@@ -957,12 +961,12 @@ timing and the production path for received messages remain unverified.
   CBC encryption also provides no sender authenticity.
 
 Keep legacy receiving disabled. Before enablement, bind the real
-immutable message, selected account and signed launch to a one-use
-approval, make revocation effective during worker I/O, and keep worker
-I/O off the shared Arca state lock. Verify consistent failure replies,
-local timing and contention, and zero legacy-outcome-dependent network
-and mailbox effects on the whole message path. Use a synthetic gate
-with controlled comparisons across failure stages.
+immutable received message, selected account and signed launch to a
+one-use approval and extend the fixture's revocation checks to that
+path. Verify consistent failure replies, local timing and contention,
+and zero legacy-outcome-dependent network and mailbox effects on the
+whole message path. Use a synthetic gate with controlled comparisons
+across failure stages.
 
 See [OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
 and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).

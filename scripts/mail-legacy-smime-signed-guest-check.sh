@@ -29,9 +29,10 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 9 server::smime
+run_suite arcad-unit 12 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
+run_suite mail-preview-unit 1 legacy_preview
 
 app=org.atrium.mail
 person=maillegacyfixture
@@ -264,6 +265,8 @@ scenario() {
     timeout 52 "$d/smime_installed_probe" drive-legacy "$d/wm.sock" "$d/input.sock" "$uid" "$action"
     wait_marker "$d/$outcome.log" "LEGACY_FIXTURE_$marker"
     wait_marker "$d/$login.log" "MAIL_SIGNED_LEGACY_$marker"
+    wait_marker "$d/$login.log" "MAIL_SIGNED_LEGACY_${marker}_UNREAD_NO_WRITES"
+    echo "MAIL_SIGNED_LEGACY_${marker}_UNREAD_NO_WRITES"
     test "$(worker_count)" = "$workers"
     jls -q name >"$d/$outcome.jails"
     if grep -F 'app-org-atrium-smime-legacy-reader' "$d/$outcome.jails"; then

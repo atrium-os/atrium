@@ -2,6 +2,7 @@
 //! and a real Portcullis reader. Regular arca-ui does not start this provider.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -40,7 +41,7 @@ fn closed() -> io::Error {
     io::Error::other(FAILURE)
 }
 
-fn open_via_arcad(uid: u32) -> io::Result<bool> {
+fn open_via_arcad(uid: u32, mut still_approved: impl FnMut() -> bool) -> io::Result<bool> {
     use arcad::proto;
     let mut stream = UnixStream::connect("/atrium/sockets/arca/arcad.sock")?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -50,12 +51,31 @@ fn open_via_arcad(uid: u32) -> io::Result<bool> {
         proto::op::U_SMIME_SYNTHETIC_OPEN,
         &uid.to_le_bytes(),
     )?;
-    let (status, body) = proto::read_reply(&mut stream)?;
-    if body.as_ref() != [0] {
-        return Err(closed());
-    }
-    println!("LEGACY_JAILED_WORKER_EXIT=0");
-    Ok(status == proto::status::OK)
+    let mut reply = stream.try_clone()?;
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let _reader = std::thread::Builder::new().spawn_scoped(scope, move || {
+            let _ = send.send(proto::read_reply(&mut reply));
+        })?;
+        loop {
+            if !still_approved() {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Err(closed());
+            }
+            match receive.recv_timeout(Duration::from_millis(20)) {
+                Ok(result) => {
+                    let (status, body) = result?;
+                    if !still_approved() || body.as_ref() != [0] {
+                        return Err(closed());
+                    }
+                    println!("LEGACY_JAILED_WORKER_EXIT=0");
+                    return Ok(status == proto::status::OK);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err(closed()),
+            }
+        }
+    })
 }
 
 fn valid_parent(registry: &str, uid: u32, publisher: [u8; 32], persona: Option<&str>) -> bool {
@@ -258,7 +278,18 @@ impl Sheet<'_> {
                     })?
                     .map(|text| text.as_str() == integration::SYNTHETIC_PREVIEW)
                 } else if still_approved() {
-                    open_via_arcad(self.uid)
+                    open_via_arcad(self.uid, || {
+                        still_approved()
+                            && matches!(
+                                win.wait_event(Some(Duration::ZERO)),
+                                Ok(event) if !matches!(
+                                    event,
+                                    Some(Event::CloseRequested { .. } | Event::Key {
+                                        hid_usage: 0x29, pressed: true, ..
+                                    })
+                                )
+                            )
+                    })
                 } else {
                     Err(closed())
                 }
