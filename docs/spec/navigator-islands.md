@@ -754,6 +754,56 @@ Host control scripts and observations are at
 `~/atrium-vm/evidence/navigator-i4-youtube-provider-20261123/`.
 Fingerprint verification is deferred.
 
+#### Bounded delivery renewal and frame presentation
+
+The initial media grant covers 12 POSTs. The broker can renew that count
+three times on the same private channel. At each boundary it consumes a
+fresh indication from the native player that playback time advanced in the
+last five seconds. A pause, seek or end clears that indication. The TLS
+worker accepts the renewal opcode only on requests 13, 25 and 37. Both
+layers continue to validate each destination against the current player
+response. Each session retains its original 120-second deadline and shared
+10 MiB budget across renewals.
+
+Fresco imports a video buffer before its scheduled display time and can
+release the buffer immediately. The supervisor now holds early decoded
+frames in the existing decoder buffer queue until they are within the
+sink’s 60 ms submission lead. Polling still services worker records and
+audio while video waits. The headless compositor schedules queued video at
+its frame cadence and samples diagnostic PNGs separately.
+
+Installed Navigator on arm64 Tessera played the same signed-out embed in
+JIT-off Ladybird. The engine reported Capsicum mode, and both the engine
+and player jails had IPv4 disabled. The final broker trace recorded 18
+successful media responses on the issued destination, including six
+after the first renewal. Both chapter presses landed (5 s and 60 s).
+A guest Lyra capture after renewal peaked at 22,172 in signed 16-bit stereo.
+
+Three trials per configuration used the same 1280 × 840 headless display,
+player fixture, sound device and sampling schedule. A test build recorded
+native frame submissions, their Lyra-mapped deadlines and Fresco's landed
+events; matching sequence numbers gave the signed landing error. The
+player-only and original builds were alternated before the compositor change.
+
+| Configuration | Frames landed per trial | Median submission lead per trial | Median landing minus Lyra target per trial |
+|---|---|---|---|
+| Original player and compositor | 1, 1, 0 | 42.8, 26.3, 76.1 s | No matched audio-clock landings |
+| Paced player and original compositor | 146, 152, 152 | 58.0, 58.4, 56.6 ms | +42.7, +30.3, +42.0 ms |
+| Paced player and updated compositor | 515, 521, 527 | 57.6, 57.7, 58.6 ms | +1.6, +2.3, +1.4 ms |
+
+The final trials reported 1, 6 and 9 dropped frames. Their 95th-percentile
+absolute landing errors were 18.0, 39.0 and 20.3 ms over 39, 39 and 37
+sampled matches. The guest's dummy device produced 25,237 stereo frames
+per elapsed guest second during a 12-second observation at a nominal
+48 kHz. Median landed intervals were about 62 ms, consistent with the
+guest audio mapping. A hardware-display refresh measurement is still open.
+
+The provider reports a duration of 1,344 seconds. Full-clip playback
+requires a policy for continuing after the session-wide byte or time
+limit. The renewal gate exercised request-count renewal only. Raw timing
+events, the guest mix and frame evidence are in
+`~/atrium-vm/evidence/navigator-i4-renewal-cadence-20261124/`.
+
 ## 6a. Sign-in: SSO and WebAuthn
 
 An identity provider's page is a whole page of script: a redirect chain, a password step,

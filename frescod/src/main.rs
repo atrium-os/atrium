@@ -1412,14 +1412,24 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let mut last_render = Instant::now()
         .checked_sub(HEADLESS_HEARTBEAT)
         .unwrap_or_else(Instant::now);
+    let mut last_capture = last_render;
+    let mut last_video = None;
+    let mut capture_pending = false;
     let island_idle = island_idle_timeout();
     loop {
         let next_island = socket_server::retire_idle_islands(&comp, island_idle);
         let cur = redraw2.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
         let (now_ns, video_at) = (video::monotonic_ns(), video::VIDEOS.next_due());
-        if cur == last_gen && !heartbeat_due && !video_at.is_some_and(|t| t <= now_ns) {
+        if video_at.is_some() { last_video = Some(Instant::now()); }
+        // Between two incoming frames the queue can be empty. A scene update
+        // in that gap must not put the video compositor to sleep for 200 ms.
+        let video_active = last_video.is_some_and(|t| t.elapsed() < HEADLESS_MIN_INTERVAL);
+        let capture_wait = HEADLESS_MIN_INTERVAL.saturating_sub(last_capture.elapsed());
+        if cur == last_gen && !heartbeat_due && !video_at.is_some_and(|t| t <= now_ns)
+            && !(capture_pending && capture_wait.is_zero()) {
             let mut until_beat = heartbeat.saturating_sub(last_render.elapsed());
+            if capture_pending { until_beat = until_beat.min(capture_wait); }
             if let Some(t) = video_at {
                 until_beat = until_beat.min(Duration::from_nanos(t.saturating_sub(now_ns)));
             }
@@ -1429,7 +1439,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         }
         /* Coalesce bursts: floor the interval between captures (a frame
          * period while animating). */
-        let floor = if was_animating { frame_period } else { HEADLESS_MIN_INTERVAL };
+        let floor = if was_animating || video_active { frame_period } else { HEADLESS_MIN_INTERVAL };
         let since = last_render.elapsed();
         if since < floor {
             std::thread::sleep(floor - since);
@@ -1445,7 +1455,10 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         if now_animating {
             redraw2.wake();
         }
-        let saving = !now_animating || every_frame;
+        // A video landing is clocked like a display frame. PNG captures keep
+        // their own slower cadence. Wake once for a final skipped capture.
+        let saving = every_frame || (!now_animating && (!video_active || last_capture.elapsed() >= HEADLESS_MIN_INTERVAL));
+        capture_pending = !now_animating && !saving;
         was_animating = now_animating;
         if !saving {
             last_render = Instant::now();
@@ -1461,6 +1474,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
                 let _ = std::fs::rename(&tmp, &out);
             }
         }
+        last_capture = Instant::now();
         heartbeat = HEADLESS_HEARTBEAT.max(t_render.elapsed() * 8);
         last_render = Instant::now();
     }

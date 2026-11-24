@@ -138,6 +138,7 @@ The policy is the one Lyra's spec settled (§12.1).
   heard, subtracts the display pipeline's reported latency, and queues it with that
   `present_ns`. With VRR on, frescod shows it at that instant. On a fixed refresh it snaps
   to the nearest vblank, which holds sync within half a refresh.
+- **Submission timing.** The player holds early decoded frames in their existing worker buffers until the Fresco sink reaches its submission lead. Other sinks can release frames immediately.
 - **Feedback.** `EV_VIDEO_PRESENTED` gives the vblank each frame really showed at. The
   supervisor tracks the error and corrects later `present_ns` values. If decode falls behind
   by more than a few frames, it drops non-reference frames and then skips to the next

@@ -79,6 +79,11 @@ Only a window that is shown gets refresh timing. A layer whose window is off scr
 released from its slot, gets no `PRESENTED` and every queued buffer back as `RELEASED`, so
 the player can pause decoding. That is the same signal Limen's `Suspended` gives.
 
+In the headless compositor, the configured headless refresh period governs
+active video. The 200 ms diagnostic PNG interval applies to captures.
+Between incoming frames the compositor keeps the shorter scheduling
+interval briefly and wakes for the last pending capture.
+
 ## 5. Colour
 
 frescod composes in the desktop's space.

@@ -83,6 +83,7 @@ impl Widget {
         parent
             .place(embed, Some(rect))
             .map_err(|e| format!("place: {e:?}"))?;
+        let playback = Arc::new(Mutex::new(None));
         let video = if matches!(source, VIDEO | YOUTUBE_ENTRY) {
             use std::os::fd::AsRawFd;
             let append_budget = if source == YOUTUBE_ENTRY {
@@ -90,7 +91,7 @@ impl Widget {
             } else {
                 65536
             };
-            let (video, worker) = crate::widget_video::Video::start(socket, window, rect, append_budget)?;
+            let (video, worker) = crate::widget_video::Video::start(socket, window, rect, append_budget, playback.clone())?;
             navigator_control::send_fd(&channel, worker.as_raw_fd()).map_err(|e| e.to_string())?;
             Some(video)
         } else { None };
@@ -100,7 +101,7 @@ impl Widget {
         // A slow document GET must not delay Stop or placement retirement.
         let (done, fetched) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = fetch(channel, &cfg, source);
+            let result = fetch(channel, &cfg, source, playback);
             if let Err(e) = &result { eprintln!("navigatord: widget fetch: {e}"); }
             let _ = done.send(result);
         });
@@ -216,7 +217,7 @@ impl Drop for Widget {
     }
 }
 
-fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
+fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Option<Instant>>>) -> Result<(), String> {
     use nuntius::{Deliver, Event, Method, Request};
     let timeout = Some(if source == YOUTUBE_ENTRY {
         navigator_control::youtube::PLAYER_WINDOW
@@ -243,7 +244,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
     let mut posts = 0;
     let mut remaining = navigator_control::youtube::ASSET_BUDGET;
     let requests = if source == YOUTUBE_ENTRY {
-        1 + navigator_control::youtube::ASSET_COUNT + media::REQUESTS
+        1 + navigator_control::youtube::ASSET_COUNT + media::MAX_REQUESTS
     } else {
         resources.len()
     };
@@ -271,6 +272,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         if source == YOUTUBE_ENTRY && !stream && step - media_posts > navigator_control::youtube::ASSET_COUNT {
             return Err("startup request count exhausted".into());
         }
+        let mut media_kind = None;
         let payload = if player {
             let body = open.body.as_ref().ok_or("missing player request")?;
             if body.content_type != "application/json" || posts >= navigator_control::youtube::PLAYER_REQUESTS { return Err("outside player grant".into()); }
@@ -278,13 +280,23 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             Some(navigator_control::youtube::player_body(&body.bytes)?)
         } else if stream {
             let body = open.body.as_ref().ok_or("missing delivery request")?;
-            if media_posts >= media::REQUESTS
-                || body.bytes.is_empty()
+            if body.bytes.is_empty()
                 || body.bytes.len() > media::BODY
                 || body.content_type != "application/octet-stream"
             {
                 return Err("outside delivery grant".into());
             }
+            let kind = media::request_kind(media_posts).ok_or("delivery session exhausted")?;
+            if kind == 5 {
+                let recent = playback.lock().unwrap().take();
+                if !recent.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+                    output.send(Event::Error { id: open.id, code: nuntius::ErrorCode::Policy })
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+                eprintln!("navigatord: renewed delivery after {media_posts} media requests");
+            }
+            media_kind = Some(kind);
             media_posts += 1;
             Some(body.bytes.clone())
         } else {None};
@@ -319,7 +331,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             if step > 0 && remaining == 0 { return Err("provider startup budget exhausted".into()); }
             if provider.is_none() { provider = Some(youtube_worker()?); }
             let (socket, _worker) = provider.as_mut().ok_or("provider worker missing")?;
-            let body = youtube_resource(socket, url, payload.as_deref(), if step == 0 {limit} else {limit.min(remaining)})?;
+            let body = youtube_resource(socket, url, payload.as_deref(), media_kind, if step == 0 {limit} else {limit.min(remaining)})?;
             if step > 0 { remaining -= body.len(); }
             (body, limit)
         } else {
@@ -386,13 +398,14 @@ fn youtube_resource(
     reader: &mut UnixStream,
     url: &str,
     post: Option<&[u8]>,
+    media_kind: Option<u8>,
     limit: usize,
 ) -> Result<Vec<u8>, String> {
     use std::io::{Read, Write};
 
     if let Some(body) = post {
-        if navigator_control::youtube_media::endpoint(url).is_some() {
-            reader.write_all(&[4])
+        if let Some(kind) = media_kind {
+            reader.write_all(&[kind])
                 .and_then(|_| reader.write_all(&(url.len() as u16).to_be_bytes()))
                 .and_then(|_| reader.write_all(url.as_bytes()))
                 .map_err(|e| e.to_string())?;

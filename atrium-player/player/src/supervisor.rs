@@ -47,6 +47,8 @@ pub enum Subtitles {
 pub trait Sink {
     /// Buffers for a video layer of this format and (even) size.
     fn layer(&mut self, format: Format, width: u32, height: u32, count: u32) -> io::Result<Vec<OwnedFd>>;
+    /// How long this sink wants the decoder buffer held before submission.
+    fn submission_delay(&mut self, _pts_ns: i64) -> Duration { Duration::ZERO }
     /// Buffer `index` holds the frame for media time `pts_ns`. Return true if
     /// the sink is done with it at once; otherwise it hands the buffer back
     /// later through [`Player::release`].
@@ -606,9 +608,7 @@ impl<S: Sink> Player<S> {
         self.show_one = false;
         if !paused {
             self.sink.discontinuity();
-            while let Some((i, pts)) = self.queued.pop_front() {
-                self.present(i, pts);
-            }
+            self.submit_ready();
         }
     }
 
@@ -628,6 +628,18 @@ impl<S: Sink> Player<S> {
             self.release(index);
         }
         self.events.push_back(PlayerEvent::Frame { pts_ns });
+    }
+
+    fn submit_ready(&mut self) -> Duration {
+        if !self.paused {
+            while let Some(&(i, pts)) = self.queued.front() {
+                let wait = self.sink.submission_delay(pts);
+                if !wait.is_zero() { return wait; }
+                self.queued.pop_front();
+                self.present(i, pts);
+            }
+        }
+        Duration::MAX
     }
 
     fn drop_queued(&mut self) {
@@ -788,7 +800,8 @@ impl<S: Sink> Player<S> {
                 return None;
             }
             // The CDM's news first; while a licence exchange runs, look again soon.
-            let mut timeout = timeout;
+            let mut timeout = timeout.min(self.submit_ready());
+            if !self.events.is_empty() { continue; }
             if let Some(c) = self.w.as_mut().and_then(|w| w.cdm.as_mut()) {
                 let events = c.poll();
                 if c.busy() {
@@ -900,10 +913,11 @@ impl<S: Sink> Player<S> {
                 }
                 self.show_from = None;
                 self.waiting = false;
-                if self.paused && !std::mem::take(&mut self.show_one) {
-                    self.queued.push_back((index, pts_ns));
-                } else {
+                if self.paused && std::mem::take(&mut self.show_one) {
                     self.present(index, pts_ns);
+                } else {
+                    self.queued.push_back((index, pts_ns));
+                    self.submit_ready();
                 }
             }
             Record::Pcm { epoch, pts_ns, frames, pos } => {

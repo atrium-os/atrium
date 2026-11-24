@@ -157,6 +157,14 @@ impl Sink for FrescoSink {
         Ok(fds)
     }
 
+    fn submission_delay(&mut self, pts_ns: i64) -> Duration {
+        // Fresco releases the shared buffer after importing its pixels. Keep
+        // decoder back-pressure until the compositor needs the frame.
+        let lead = self.clock.lead_ns;
+        let wait = self.clock.present_at(pts_ns).saturating_sub(monotonic_ns()).saturating_sub(lead);
+        Duration::from_nanos(wait.max(0) as u64)
+    }
+
     fn frame(&mut self, index: u32, pts_ns: i64) -> bool {
         let Some(layer) = self.layer else { return true };
         let at = self.clock.present_at(pts_ns);

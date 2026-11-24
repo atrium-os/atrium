@@ -45,6 +45,7 @@ impl Video {
         window: [u8; 16],
         island: [f32; 4],
         append_budget: usize,
+        playback: Arc<Mutex<Option<Instant>>>,
     ) -> Result<(Self, UnixStream), String> {
         let mut parent = Parent::at(path).map_err(|e| format!("player connection: {e:?}"))?;
         let embed = parent
@@ -59,6 +60,7 @@ impl Video {
         let (server, worker) = UnixStream::pair().map_err(|e| e.to_string())?;
         let socket = server.try_clone().map_err(|e| e.to_string())?;
         let session = Session {
+            playback,
             slot: slot.clone(),
             media: Media::new(),
             bytes: 0,
@@ -89,6 +91,7 @@ impl Drop for Video {
 }
 
 struct Session {
+    playback: Arc<Mutex<Option<Instant>>>,
     slot: Arc<Mutex<Option<Slot>>>,
     media: Media,
     bytes: usize,
@@ -118,6 +121,7 @@ impl Session {
                 Err(e) => break Err(e.to_string()),
             }
         };
+        self.playback.lock().unwrap().take();
         self.slot.lock().unwrap().take();
         result
     }
@@ -169,6 +173,15 @@ impl Session {
                         }
                 ) {
                     return Err(format!("player refused video: {m:?}"));
+                }
+                match m {
+                    ToParent::Time { secs } if !self.media.paused && !self.media.seeking && secs > self.media.current_time => {
+                        *self.playback.lock().unwrap() = Some(Instant::now());
+                    }
+                    ToParent::Seeking { .. } | ToParent::Paused | ToParent::Ended => {
+                        self.playback.lock().unwrap().take();
+                    }
+                    _ => {}
                 }
                 self.media.from_player(m);
                 self.flush()?;
@@ -240,6 +253,7 @@ impl Session {
                 if playing {
                     self.media.play().map_err(dom)?;
                 } else {
+                    self.playback.lock().unwrap().take();
                     self.media.pause();
                 }
                 self.flush()?;
@@ -271,6 +285,7 @@ impl Session {
                 })
             }
             Request::Seek(t) if self.media.ready_state >= 1 && limen::media_player::finite_secs(t) => {
+                self.playback.lock().unwrap().take();
                 self.media.seek(t).map_err(dom)?;
                 self.flush()?;
                 self.until(|m| !m.seeking)?;

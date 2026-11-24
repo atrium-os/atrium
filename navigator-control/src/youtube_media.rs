@@ -6,6 +6,26 @@ pub const MIME: &str = "application/vnd.yt-ump";
 pub const BODY: usize = 8192;
 pub const REPLY: usize = 2 * 1024 * 1024;
 pub const REQUESTS: usize = 12;
+// One initial window and at most three playback-backed renewals. The byte
+// budget, expiry and provider-issued URL belong to the original session.
+pub const MAX_REQUESTS: usize = 4 * REQUESTS;
+
+/// Kind 5 is a broker-authorized renewal carried on the next media POST.
+/// Both ends enforce the boundary and the absolute session ceiling.
+pub fn request_kind(previous: usize) -> Option<u8> {
+    if previous >= MAX_REQUESTS { return None; }
+    Some(if previous > 0 && previous % REQUESTS == 0 { 5 } else { 4 })
+}
+
+#[cfg(test)]
+#[test]
+fn renewal_boundaries() {
+    assert_eq!(request_kind(0), Some(4));
+    assert_eq!(request_kind(11), Some(4));
+    for n in [12, 24, 36] { assert_eq!(request_kind(n), Some(5)); }
+    assert_eq!(request_kind(47), Some(4));
+    assert_eq!(request_kind(48), None);
+}
 
 pub fn endpoint(url: &str) -> Option<(&str, &str)> {
     if url.len() > 8192

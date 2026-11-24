@@ -57,13 +57,13 @@ fn run() -> Result<(), String> {
         let mut media_posts = 0;
         let until = std::time::Instant::now() + navigator_control::youtube::PLAYER_WINDOW;
         let mut posts = 0;
-        for step in 0..=navigator_control::youtube::ASSET_COUNT + media::REQUESTS {
+        for step in 0..=navigator_control::youtube::ASSET_COUNT + media::MAX_REQUESTS {
             let mut kind = [0];
             if out.read(&mut kind).map_err(|e| e.to_string())? == 0 {
                 break;
             }
-            if kind[0] == 4 {
-                if media_posts >= media::REQUESTS || std::time::Instant::now() >= until {
+            if matches!(kind[0], 4 | 5) {
+                if media::request_kind(media_posts) != Some(kind[0]) || std::time::Instant::now() >= until {
                     return Err("delivery window exhausted".into());
                 }
                 let mut read_part = |max: usize| -> Result<Vec<u8>, String> {

@@ -140,7 +140,7 @@ unsafe fn fixture_request(
     };
     let provider_asset = sequence == PROVIDER && step > 0;
     if provider_asset {
-        if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT + navigator_control::youtube_media::REQUESTS {return 0;}
+        if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT + navigator_control::youtube_media::MAX_REQUESTS {return 0;}
     } else if sequence.get(step).copied() != Some(url) { return 0; }
     let expected_mime = if provider_asset { asset.unwrap() } else if url == VIDEO[1] { "text/javascript" }
         else if url == VIDEO[2] { "video/webm" } else if url == VIDEO[3] { "audio/webm" } else { "text/html" };
