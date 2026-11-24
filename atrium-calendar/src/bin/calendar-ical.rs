@@ -1534,6 +1534,183 @@ mod tests {
 
     const REINSTATE: &str = include_str!("../../tests/fixtures/reinstate-future.ics");
 
+    const RESTART: &str = include_str!("../../tests/fixtures/restart-future.ics");
+
+    #[test]
+    fn partial_restart_uses_original_dates_for_both_private_copies() {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics").replace(
+            "FREQ=WEEKLY",
+            "FREQ=WEEKLY;COUNT=6\nEXDATE:20261229T140000Z",
+        );
+        let t = review_range(&mut s, 0, &weekly).token.unwrap();
+        s.apply_invitation(0, t).unwrap();
+        let cut = date("2026-12-15");
+        let restart = date("2026-12-22");
+        let stay = date("2026-12-24");
+        let choice_day = date("2026-12-11");
+        for (rev, from, to) in [(1, cut, stay), (2, restart, choice_day)] {
+            let row = s.day(from).entries.pop().unwrap();
+            let mut edit = row.fields_on(from);
+            edit.date = to;
+            s.change(rev, row.id, from, EditScope::ThisEvent, Some(edit))
+                .unwrap();
+        }
+        let earlier = s.day(date("2026-12-08")).entries.pop().unwrap();
+        let t = review_range(&mut s, 3, CANCEL_FUTURE).token.unwrap();
+        let choices = [
+            SkipDecision {
+                original: cut,
+                keep: true,
+            },
+            SkipDecision {
+                original: restart,
+                keep: true,
+            },
+        ];
+        s.apply_reviewed_invitation(3, t, &choices).unwrap();
+        let snapshot = || std::fs::read(dir.path().join("calendar.json")).unwrap();
+        let before = snapshot();
+        let p = range_proposal(RESTART);
+        let mut wrong = range_source(&p);
+        wrong.delivery.as_mut().unwrap().scope = range_proposal(REINSTATE).scope();
+        assert!(s.review_invitation(4, &wrong, p.clone()).is_err());
+        let mut unverified = range_source(&p);
+        unverified.verified = false;
+        assert!(s
+            .review_invitation(4, &unverified, p)
+            .unwrap()
+            .token
+            .is_none());
+        assert!(
+            review_range(&mut s, 4, &RESTART.replace("SEQUENCE:3", "SEQUENCE:2"))
+                .token
+                .is_none()
+        );
+        let after_end = RESTART.replace("20261222T140000", "20270112T140000");
+        assert!(review_range(&mut s, 4, &after_end).token.is_none());
+        let inspect = |s: &mut Store, rev| {
+            let r = review_range(s, rev, RESTART);
+            let gap = r.cancelled_before_restart.unwrap();
+            assert_eq!((gap.first, gap.restart), (cut, restart));
+            assert_eq!(
+                r.range_dates
+                    .iter()
+                    .map(|d| (
+                        d.original,
+                        d.after.as_ref().map(|e| e.date),
+                        d.private_copy.as_ref().map(|e| e.date)
+                    ))
+                    .collect::<Vec<_>>(),
+                [
+                    (cut, None, Some(stay)),
+                    (restart, Some(date("2026-12-23")), Some(choice_day)),
+                    (date("2026-12-29"), None, None),
+                    (date("2027-01-05"), Some(date("2027-01-06")), None)
+                ]
+            );
+            r.token.unwrap()
+        };
+        let t = inspect(&mut s, 4);
+        assert!(s.apply_invitation(4, t).is_err());
+        assert!(s.apply_reviewed_invitation(4, t, &choices).is_err());
+        assert!(s.apply_reviewed_invitation(4, t, &choices[..1]).is_err());
+        assert_eq!(before, snapshot());
+        let (_, undo) = s.apply_reviewed_invitation(4, t, &choices[1..]).unwrap();
+        assert!(s.day(cut).entries.is_empty());
+        assert_eq!(s.day(choice_day).entries.len(), 1);
+        s.undo(undo).unwrap();
+        let mut undone: serde_json::Value = serde_json::from_slice(&snapshot()).unwrap();
+        undone["revision"] = 4.into();
+        assert_eq!(
+            undone,
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap()
+        );
+        let t = inspect(&mut s, 6);
+        s.apply_reviewed_invitation(
+            6,
+            t,
+            &[SkipDecision {
+                original: restart,
+                keep: false,
+            }],
+        )
+        .unwrap();
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        assert!(s.day(cut).entries.is_empty() && s.day(choice_day).entries.is_empty());
+        assert_eq!(s.day(stay).entries[0].kind, Kind::Appointment);
+        assert_eq!(s.day(date("2026-12-08")).entries[0].id, earlier.id);
+        assert_eq!(s.day(date("2026-12-23")).entries[0].span.start, 960);
+        assert!(s.day(date("2026-12-30")).entries.is_empty());
+        assert!(!review_range(&mut s, 7, RESTART).can_save);
+        let gap_update = REINSTATE.replace("SEQUENCE:3", "SEQUENCE:5");
+        for request in [
+            gap_update.clone(),
+            gap_update.replace(";RANGE=THISANDFUTURE", ""),
+        ] {
+            let blocked = review_range(&mut s, 7, &request);
+            assert!(blocked.token.is_none() && blocked.notice.contains("cancelled interval"));
+        }
+        let extension = weekly
+            .replace("COUNT=6", "COUNT=8")
+            .replace("SEQUENCE:1", "SEQUENCE:4");
+        let t = review_range(&mut s, 7, &extension).token.unwrap();
+        s.apply_invitation(7, t).unwrap();
+        assert!(s.day(cut).entries.is_empty() && s.day(date("2026-12-30")).entries.is_empty());
+        assert_eq!(s.day(date("2027-01-20")).entries[0].span.start, 960);
+    }
+
+    #[test]
+    fn distant_restart_after_first_slot_cancellation_keeps_a_compact_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(&mut s, 0, weekly).token.unwrap();
+        s.apply_invitation(0, t).unwrap();
+        let t = review_range(&mut s, 1, &CANCEL_FUTURE.replace("20261215", "20261201"))
+            .token
+            .unwrap();
+        s.apply_invitation(1, t).unwrap();
+        let first = date("2026-12-01");
+        let restart = first + chrono::Days::new(7 * 2500);
+        let resumed = restart.succ_opt().unwrap();
+        let req = RESTART
+            .replace("20261222", &restart.format("%Y%m%d").to_string())
+            .replace("20261223", &resumed.format("%Y%m%d").to_string());
+        let r = review_range(&mut s, 2, &req);
+        assert_eq!(r.range_dates.len(), 4);
+        s.apply_invitation(2, r.token.unwrap()).unwrap();
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        for d in [
+            first,
+            first + chrono::Days::new(7 * 1200),
+            restart - chrono::Days::new(7),
+        ] {
+            assert!(s.day(d).entries.is_empty());
+        }
+        assert_eq!(
+            s.day(resumed + chrono::Days::new(7 * 25)).entries[0]
+                .span
+                .start,
+            960
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("calendar.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["entries"][0]["invitation"]["cancelled_intervals"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn deleting_a_private_copy_severs_its_link_and_legacy_cuts_stay_closed() {
         use atrium_calendar::{invitation::SkipDecision, EditScope};

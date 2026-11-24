@@ -85,7 +85,21 @@ pub struct RangeRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelledInterval {
+    pub first: NaiveDate,
+    pub restart: NaiveDate,
+}
+
+impl CancelledInterval {
+    pub fn contains(&self, original: NaiveDate) -> bool {
+        self.first <= original && original < self.restart
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_intervals: Vec<CancelledInterval>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranges: Vec<RangeRule>,
     /// The range update that generated this detached occurrence.
@@ -376,6 +390,8 @@ pub struct RangeDate {
 pub struct Review {
     #[serde(default)]
     pub reinstating: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_before_restart: Option<CancelledInterval>,
     #[serde(default)]
     pub range_summary: Option<String>,
     #[serde(default)]

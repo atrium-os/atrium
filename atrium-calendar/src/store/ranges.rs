@@ -51,6 +51,7 @@ impl RangeRule {
         let accepted = row.fields_on(row.date);
         let origin = row.invitation.as_mut().ok_or("Missing weekly invitation")?;
         origin.ranges.clear();
+        origin.cancelled_intervals.clear();
         origin.range_sequence = None;
         origin.range_from = Some(self.anchor);
         origin.original = Some(OccurrenceId {

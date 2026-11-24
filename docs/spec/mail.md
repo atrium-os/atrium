@@ -1394,7 +1394,7 @@ For a weekly range update, Mail binds the original slot and `RANGE=THISANDFUTURE
 
 A directly delivered range cancellation carries the organizer’s cancellation method and original cutoff to Calendar. Calendar reviews the affected dates and offers one local Undo. Mail sends no response for a cancellation. [Cancelling this and future occurrences](calendar.md#718-cancelling-this-and-future-occurrences)
 
-A newer verified request at the original cutoff can reopen the cancelled range for review. Saving is local. If the person chooses to respond, Mail receives the original range scope and RSVP. Calendar keeps the private appointment choices. [Reinstating a cancelled range](calendar.md#719-reinstating-a-cancelled-range)
+A newer verified request at the original cutoff or a later original slot can reopen the remaining weekly meetings for review. Mail binds the response to the requested restart slot. Saving is local. If the person chooses to respond, Mail receives the original range scope and RSVP. Calendar keeps the private appointment choices. [Reinstating a cancelled range](calendar.md#719-reinstating-a-cancelled-range) · [Restarting partway through a cancelled range](calendar.md#720-restarting-partway-through-a-cancelled-range)
 
 ### 14.2 People
 

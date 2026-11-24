@@ -317,13 +317,23 @@ The synthetic installed check cancels a Tuesday series from December 15. The Dec
 
 ### 7.19 Reinstating a cancelled range
 
-A verified organizer can send a newer Mail request for the same weekly series and the same original cutoff. **Review reinstatement** shows which original dates return, their new times, and which dates stay absent. A short range shows each date. A long or open-ended range shows its end condition, examples and all recorded exceptions and surviving private copies. Dates before the cutoff keep their current times, including moves made after cancellation. Separately skipped dates stay skipped. Later individual organizer moves and separately scheduled ranges keep their accepted times.
+A verified organizer can send a newer Mail request for the same weekly series and the same original cutoff. A later restart is covered in §7.20. **Review reinstatement** shows which original dates return, their new times, and which dates stay absent. A short range shows each date. A long or open-ended range shows its end condition, examples and all recorded exceptions and surviving private copies. Dates before the cutoff keep their current times, including moves made after cancellation. Separately skipped dates stay skipped. Later individual organizer moves and separately scheduled ranges keep their accepted times.
 
 For each private copy kept during cancellation, the review shows its current date and time alongside the returning meeting. Choose **Keep private copy** to keep both appointments independently, even at the same time. **Remove private copy** removes that appointment when the reviewed range is saved. Each choice starts empty. Deleting a private copy severs its link to the invitation. A similar appointment at the same time is independent.
 
 **Restore reviewed dates** saves the range and all copy choices together. One **Undo invitation change** returns the calendar to its state immediately before saving. Saving sends nothing to Mail. A separately reviewed RSVP names only the invitation, invited identity, response and original range. Private appointments and choices stay in the selected persona. Cancellations saved by older builds lack the recovery record. Calendar explains this when reviewing a reinstatement and leaves those appointments in place.
 
 The installed synthetic gate runs with `--reinstate` using the §7.11 driver. It exercises both private-copy choices, a meeting moved across the cutoff, one Undo and an empty Mail outbox. [Synthetic reinstatement](../../atrium-calendar/tests/fixtures/reinstate-future.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
+
+### 7.20 Restarting partway through a cancelled range
+
+Mail can deliver a newer verified weekly request whose original recurrence slot falls inside a previously cancelled range. The review names the restart date and the interval that stays cancelled. Short intervals show each original date. Long intervals show the first and last cancelled slots, saved exceptions and surviving private copies. Returning dates show the proposed time, including a move onto a different day. The existing series end and separately skipped dates still apply.
+
+A private copy belongs to its **original meeting date**. A copy from before the restart stays at its current saved time, even if it was moved past the restart. Its review page explains this and offers no removal action. For a copy from a returning date, the person sees both times and chooses **Keep private copy** or **Remove private copy** before saving. The whole change uses one local save and one Undo. Mail receives only the scoped RSVP if the person separately chooses to respond.
+
+Fasti stores the cancelled interval on the weekly series using the first cancelled date and the first returning date. The interval survives reopening Calendar, later extensions and ordinary invitation updates. An open-ended series can restart thousands of weeks later without storing a record per cancelled week. Earlier builds did not save recovery details when cancelling a range. Those cancellations remain in place.
+
+The synthetic desktop gate runs with `--restart`. It cancels from December 15 and restarts from December 22. The December 15 private copy on December 24 stays put. The December 22 copy on December 11 exercises both choices alongside the organizer’s returning meeting on December 23. [Synthetic Mail request](../../atrium-calendar/tests/fixtures/restart-future.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
 ## 8. Accepted decisions
 

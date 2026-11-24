@@ -130,8 +130,18 @@ impl Entry {
                     .is_none_or(|last| date <= last))
     }
 
+    pub(crate) fn remains_cancelled(&self, date: NaiveDate) -> bool {
+        self.kind == Kind::Weekly
+            && self
+                .invitation
+                .as_ref()
+                .is_some_and(|o| o.cancelled_intervals.iter().any(|gap| gap.contains(date)))
+    }
+
     pub fn appears(&self, date: NaiveDate) -> bool {
-        self.scheduled_on(date) && self.excluded.binary_search(&date).is_err()
+        self.scheduled_on(date)
+            && !self.remains_cancelled(date)
+            && self.excluded.binary_search(&date).is_err()
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {

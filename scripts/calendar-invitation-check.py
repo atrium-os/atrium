@@ -25,7 +25,16 @@ def guest(ui, action):
 
 def open_mail(ui, first=False):
     if first:
-        click(ui, 996, 23)  # Done in the unconfigured synthetic account's Settings.
+        # The launcher can report the process before its settings window accepts input.
+        ui.see("mail-settings-ready", "ACCOUNTS", "NOTIFICATIONS")
+        for _ in range(8):
+            click(ui, 996, 23)
+            frame, _ = ui.frame()
+            red, green, blue = frame.getpixel((975, 22))[:3]
+            if not (red > green > blue):  # The brown Done button has disappeared.
+                break
+        else:
+            raise RuntimeError("Mail did not dismiss its startup settings")
     click(ui, 900, 415)  # Bring Mail forward if Calendar is over part of its window.
 
 
@@ -414,6 +423,16 @@ def long_range(ui):
     print("PASS long and open-ended range review, inherited extension, distant agenda and both private moves")
 
 
+def move_meeting(ui, day, dest, start, end):
+    ui.open_date(day)
+    click(ui, 450, 268)
+    ui.field(80, 256, dest)
+    ui.field(225, 256, start)
+    ui.field(330, 256, end)
+    click(ui, 92, 506)
+    ui.see("cut-move-" + dest, dest, start)
+
+
 def cancel_future(ui, reinstate=False):
     print(guest(ui, "reinstate-setup" if reinstate else "cancel-future-setup"))
     open_mail(ui, first=True)
@@ -422,17 +441,8 @@ def cancel_future(ui, reinstate=False):
     click(ui, 568, 550)
     ui.see("cut-saved", "Invitation saved")
 
-    def move(day, dest, start, end):
-        ui.open_date(day)
-        click(ui, 450, 268)
-        ui.field(80, 256, dest)
-        ui.field(225, 256, start)
-        ui.field(330, 256, end)
-        click(ui, 92, 506)
-        ui.see("cut-move-" + dest, dest, start)
-
-    move("2026-12-08", "2026-12-18", "10:00", "10:45")
-    move("2026-12-22", "2026-12-11", "16:30", "17:15")
+    move_meeting(ui, "2026-12-08", "2026-12-18", "10:00", "10:45")
+    move_meeting(ui, "2026-12-22", "2026-12-11", "16:30", "17:15")
     baseline = ui.store("work")
     earlier = next(r for r in baseline["entries"] if r["date"] == "2026-12-18")
     local = next(r for r in baseline["entries"] if r["date"] == "2026-12-11")
@@ -517,10 +527,65 @@ def cancel_future(ui, reinstate=False):
     print("PASS both boundary crossings, private copy and removal, untouched prefix, one Undo and empty outbox")
 
 
+def restart_range(ui):
+    print(guest(ui, "restart-setup"))
+    open_mail(ui, first=True)
+    review(ui, 318)
+    ui.see("restart-master", "Whole weekly series")
+    click(ui, 568, 550)
+    ui.see("restart-original", "Invitation saved")
+    move_meeting(ui, "2026-12-15", "2026-12-24", "10:00", "10:45")
+    move_meeting(ui, "2026-12-22", "2026-12-11", "16:30", "17:15")
+    ui.control("close", "work")
+    review(ui, 248)
+    ui.see("restart-cancel", "Review cancellation", "Review 3 dates")
+    for original in ("2026-12-15", "2026-12-22"):
+        click(ui, 355, 412)
+        ui.see("restart-keep-" + original, original, "Keep private copy")
+        click(ui, 105, 300)
+    click(ui, 355, 412)
+    ui.see("restart-cancel-last", "Apply range cancellation")
+    click(ui, 568, 550)
+    ui.see("restart-cancelled", "Cancellation applied")
+    baseline = ui.store("work")
+    private = {r["date"]: r for r in baseline["entries"] if r["kind"] == "Appointment"}
+    for keep in (True, False):
+        ui.control("close", "work")
+        review(ui, 178)
+        ui.see("restart-overview", "Restore from 2026-12-22", "2026-12-15", "stay cancelled")
+        click(ui, 355, 412)
+        ui.see("restart-gap-copy", "2026-12-15", "2026-12-24", "stays cancelled", "stays at its saved time")
+        click(ui, 355, 412)
+        ui.see("restart-returning-copy", "2026-12-22", "2026-12-11", "Returns", "2026-12-23", "Remove private copy")
+        click(ui, 105 if keep else 290, 300)
+        click(ui, 355, 412)
+        ui.see("restart-following", "2026-12-30", "Restore reviewed dates")
+        assert ui.store("work") == baseline
+        click(ui, 568, 550)
+        ui.see("restart-saved", "Invitation saved")
+        saved = ui.store("work")
+        assert private["2026-12-24"] in saved["entries"]
+        assert (private["2026-12-11"] in saved["entries"]) == keep
+        ui.open_date("2026-12-15")
+        ui.see("restart-still-cancelled", "No events on this day")
+        ui.open_date("2026-12-08")
+        ui.see("restart-prefix", "Studio planning", "14:00")
+        ui.open_date("2026-12-23")
+        ui.see("restart-returned", "Studio planning", "16:00")
+        click(ui, 590, 562)
+        ui.see("restart-undo", "Change undone")
+        assert ui.store("work") == dict(baseline, revision=saved["revision"] + 1)
+        baseline = ui.store("work")
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS partial restart, cancelled original date, two private copies, prefix, Undo and empty outbox")
+
+
 if __name__ == "__main__":
-    runner = {"--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

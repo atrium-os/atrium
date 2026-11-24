@@ -73,7 +73,7 @@ impl Store {
                 }
                 let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=11)
+                if !matches!(snapshot.version, 1..=12)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -391,6 +391,7 @@ impl Store {
                 occurrence.excluded.clear();
                 if let Some(origin) = &mut occurrence.invitation {
                     origin.ranges.clear();
+                    origin.cancelled_intervals.clear();
                     origin.range_sequence = None;
                 }
                 index = entries.len();
@@ -496,7 +497,7 @@ impl Store {
         }
         let next = Snapshot {
             opening_view,
-            version: 11,
+            version: 12,
             cancelled,
             pinned_zone,
             device_zone,
@@ -540,6 +541,19 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
         }
         e.validate()?;
         if let Some(origin) = &e.invitation {
+            if origin.cancelled_intervals.iter().any(|g| {
+                e.kind != Kind::Weekly
+                    || g.first < e.date
+                    || g.first >= g.restart
+                    || (g.first - e.date).num_days() % 7 != 0
+                    || (g.restart - e.date).num_days() % 7 != 0
+            }) || origin
+                .cancelled_intervals
+                .windows(2)
+                .any(|w| w[0].restart >= w[1].first)
+            {
+                return Err("Invalid cancelled weekly interval");
+            }
             if !origin
                 .ranges
                 .windows(2)
@@ -547,6 +561,7 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
                 || origin.ranges.iter().any(|r| {
                     e.kind != Kind::Weekly
                         || !e.scheduled_on(r.anchor)
+                        || e.remains_cancelled(r.anchor)
                         || !r.schedule.span.valid()
                         || r.schedule.zone.is_some() != e.zone.is_some()
                         || r.occurrence(e, r.anchor).is_err()
@@ -570,7 +585,8 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
     for e in entries {
         if let Kind::Occurrence { series, original } = e.kind {
             let parent = by_id.get(&series).ok_or("Missing weekly series")?;
-            if parent.excluded.binary_search(&original).is_err()
+            if parent.remains_cancelled(original)
+                || parent.excluded.binary_search(&original).is_err()
                 || !overrides.insert((series, original))
             {
                 return Err("Invalid weekly occurrence");

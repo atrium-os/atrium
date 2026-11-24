@@ -28,7 +28,8 @@ fn seed(e: &Engine, mode: &str) {
     let grouped = mode == "seed-cancel-dates";
     let skipped = mode == "seed-exdates";
     let long = mode == "seed-long-range";
-    let reinstate = mode == "seed-reinstate";
+    let restart = mode == "seed-restart";
+    let reinstate = mode == "seed-reinstate" || restart;
     let cancel_future = mode == "seed-cancel-future" || reinstate;
     let future = mode == "seed-future" || long;
     let bounded = mode == "seed-bounded" || grouped || skipped || future || cancel_future;
@@ -55,10 +56,17 @@ fn seed(e: &Engine, mode: &str) {
                 "Cancel December 15 onward",
                 include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics"),
             ),
-            (
-                "Return December 15 onward",
-                include_str!("../../../atrium-calendar/tests/fixtures/reinstate-future.ics"),
-            ),
+            if restart {
+                (
+                    "Restart December 22 onward",
+                    include_str!("../../../atrium-calendar/tests/fixtures/restart-future.ics"),
+                )
+            } else {
+                (
+                    "Return December 15 onward",
+                    include_str!("../../../atrium-calendar/tests/fixtures/reinstate-future.ics"),
+                )
+            },
         ]
     } else if cancel_future {
         &[
@@ -153,6 +161,7 @@ fn seed(e: &Engine, mode: &str) {
             use portcullis_ipc::calendar::{Answer, Reply};
             let scope = match (bounded, id) {
                 (true, 1) if cancel_future => Some("weekly".into()),
+                (true, 3) if restart => Some(FUTURE_SCOPE.replace("20261208", "20261222")),
                 (true, 2 | 3) if cancel_future => {
                     Some(FUTURE_SCOPE.replace("20261208", "20261215"))
                 }
@@ -372,9 +381,8 @@ fn main() {
     );
     match args[1].as_str() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
-        | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate") => {
-            seed(&e, mode)
-        }
+        | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate"
+        | "seed-restart") => seed(&e, mode),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),

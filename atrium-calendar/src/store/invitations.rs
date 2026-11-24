@@ -240,6 +240,7 @@ impl Store {
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
             reinstating: false,
+            cancelled_before_restart: None,
             range_summary: None,
             range_dates: vec![],
             previous_dates: vec![],
@@ -259,20 +260,40 @@ impl Store {
         }
 
         if p.this_and_future && !cancelled {
-            if let Some(mark) = history.iter().find(|c| {
-                c.this_and_future
-                    && c.key == key
-                    && (c.original == original_date
-                        || c.tail.as_ref().is_some_and(|t| {
-                            p.original
-                                .and_then(|o| o.in_series(&t.master).ok())
-                                .map(|o| o.date)
-                                == c.original
-                        }))
-            }) {
+            if let Some(mark) = history
+                .iter()
+                .filter(|c| {
+                    if !c.this_and_future || c.key != key {
+                        return false;
+                    }
+                    let Some(cut) = c.original else {
+                        return false;
+                    };
+                    match &c.tail {
+                        Some(tail) => p.original.is_some_and(|o| {
+                            o.date == cut
+                                || o.in_series(&tail.master).is_ok_and(|slot| slot.date >= cut)
+                        }),
+                        None => original_date.is_some_and(|date| date >= cut),
+                    }
+                })
+                .max_by_key(|c| c.original)
+            {
                 return Self::prepare_reinstatement(
                     rows, history, view, revision, source, &p, mark, master, review, pending,
                 );
+            }
+        }
+        if let Some(base) = master {
+            if p.original.is_some_and(|o| {
+                base.remains_cancelled(o.in_series(base).map_or(o.date, |slot| slot.date))
+            }) || p
+                .exceptions
+                .iter()
+                .any(|m| base.remains_cancelled(m.original.date))
+                || p.skips.iter().any(|o| base.remains_cancelled(o.date))
+            {
+                return Ok(review.blocked("These original dates remain in a cancelled interval."));
             }
         }
         if p.this_and_future && cancelled {
@@ -363,7 +384,7 @@ impl Store {
                 }
                 if base.kind == Kind::Weekly
                     && p.original.is_none()
-                    && !base.excluded.is_empty()
+                    && (!base.excluded.is_empty() || !origin.cancelled_intervals.is_empty())
                     && row.date != base.date
                 {
                     return Ok(
@@ -564,6 +585,10 @@ impl Store {
                 row.excluded.clone_from(&base.excluded);
             }
             row.invitation = Some(Origin {
+                cancelled_intervals: master
+                    .filter(|_| row.kind == Kind::Weekly)
+                    .and_then(|m| m.invitation.as_ref())
+                    .map_or_else(Vec::new, |o| o.cancelled_intervals.clone()),
                 ranges: if row.kind == Kind::Weekly {
                     master.map_or_else(Vec::new, |m| m.ranges().to_vec())
                 } else {

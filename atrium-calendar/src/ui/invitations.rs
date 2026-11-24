@@ -162,6 +162,14 @@ impl Sheet {
     fn choice_date(&self) -> Option<chrono::NaiveDate> {
         if self.review.reinstating {
             let day = self.review.range_dates.get(self.page.checked_sub(1)?)?;
+            if self
+                .review
+                .cancelled_before_restart
+                .as_ref()
+                .is_some_and(|g| g.contains(day.original))
+            {
+                return None;
+            }
             return day.private_copy.as_ref().map(|_| day.original);
         }
         self.skip_page()
@@ -413,6 +421,17 @@ impl Sheet {
                     .into(),
                 );
             }
+            if let Some(gap) = &self.review.cancelled_before_restart {
+                line(
+                    ctx,
+                    377.,
+                    14.,
+                    format!(
+                        "Original dates from {} until {} stay cancelled.",
+                        gap.first, gap.restart
+                    ),
+                );
+            }
             if let Some(summary) = &self.review.range_summary {
                 line(ctx, 356., 14., summary.clone());
             }
@@ -481,6 +500,11 @@ impl Sheet {
                     e.zone.map_or("Floating", |z| z.name.name())
                 )
             };
+            let stays_cancelled = self
+                .review
+                .cancelled_before_restart
+                .as_ref()
+                .is_some_and(|gap| gap.contains(date.original));
             if let Some(copy) = &date.private_copy {
                 line(
                     ctx,
@@ -512,7 +536,9 @@ impl Sheet {
                     ctx,
                     242.,
                     16.,
-                    if date.before.is_some() {
+                    if stays_cancelled {
+                        "This original meeting stays cancelled."
+                    } else if date.before.is_some() {
                         "Keep the separately edited meeting."
                     } else {
                         "This date stays absent."
@@ -520,7 +546,14 @@ impl Sheet {
                     .into(),
                 );
             }
-            if date.private_copy.is_some() {
+            if stays_cancelled && date.private_copy.is_some() {
+                line(
+                    ctx,
+                    266.,
+                    14.,
+                    "Your private copy stays at its saved time.".into(),
+                );
+            } else if date.private_copy.is_some() {
                 line(ctx, 266., 14., "Only you see this choice.".into());
                 planner.button(
                     ctx,
