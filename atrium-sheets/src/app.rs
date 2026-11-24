@@ -6784,10 +6784,10 @@ mod tests {
         s.cmds.lock().unwrap().push(Cmd::Undo);
         s.take_cmds();
         assert_eq!((shown(&s, 2, 0), shown(&s, 2, 1)), ("c".into(), "3".into()));
-        // Merged cells crossing what would move are refused.
+        // Merged cells among what would move are refused.
         s.doc.borrow_mut().run("Merge", vec![officina_grid::ops::GridOp::Merges { sheet: 0, list: vec![officina_grid::Rect { sheet: 0, r0: 1, c0: 0, r1: 1, c1: 1 }] }]);
         select(&s, (0, 1), (0, 1));
-        assert!(data(&s, DataCmd::DeleteCellsUp).starts_with("Merged cells cross"));
+        assert!(data(&s, DataCmd::DeleteCellsUp).starts_with("Merged cells are among"));
     }
 
     #[test]
@@ -6998,5 +6998,37 @@ mod tests {
         d.wb.sheet_mut(0).sheet_hidden = true;
         let t = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         assert_eq!(t.doc.borrow().sheet, 1);
+    }
+
+    #[test]
+    fn deleted_cells_turn_formulas_reading_them_into_ref_errors() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"1,x\n2,y\n3,z\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            d.type_into(0, 3, "=A2");
+            d.type_into(1, 3, "=A3*10");
+            d.type_into(2, 3, "=SUM(A2:A2)");
+            d.type_into(3, 3, "=B2");
+        }
+        // A2 deleted, shift up: =A2 is #REF!, =A3 follows 3 up to A2.
+        select(&s, (1, 0), (1, 0));
+        data(&s, DataCmd::DeleteCellsUp);
+        let f = |r: u32| s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, r, 3));
+        assert_eq!(f(0).as_deref(), Some("=#REF!"));
+        assert_eq!(f(1).as_deref(), Some("=A2*10"));
+        assert_eq!(f(2).as_deref(), Some("=SUM(#REF!)"));
+        assert_eq!(f(3).as_deref(), Some("=B2"));
+        assert_eq!((shown(&s, 1, 3), shown(&s, 0, 3)), ("30".into(), "#REF!".into()));
+        // One undo puts both halves back.
+        s.cmds.lock().unwrap().push(Cmd::Undo);
+        s.take_cmds();
+        assert_eq!((f(0).as_deref(), f(1).as_deref()), (Some("=A2"), Some("=A3*10")));
+        assert_eq!(shown(&s, 1, 0), "2");
+        // With nothing past it to move, a deleted cell still breaks what read it.
+        s.doc.borrow_mut().type_into(5, 1, "=D4");
+        select(&s, (3, 3), (3, 3));
+        data(&s, DataCmd::DeleteCellsLeft);
+        assert_eq!(s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, 5, 1)).as_deref(), Some("=#REF!"));
     }
 }

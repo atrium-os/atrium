@@ -583,6 +583,37 @@ struct Mover {
     dead: Option<Rect>,
 }
 
+/// The edits that turn references to the cells of `dead` (a cell inside,
+/// or a range wholly inside) into `#REF!` in formulas outside it, as Excel
+/// does when cells are deleted. Other references stay as they are.
+pub fn kill_refs(wb: &Workbook, dead: Rect) -> Vec<GridOp> {
+    // Nothing moves: `from` is on no sheet, so every reference is outside it.
+    let nowhere = Rect { sheet: u16::MAX, r0: 0, c0: 0, r1: 0, c1: 0 };
+    let m = Mover { from: nowhere, sheet: dead.sheet, dr: 0, dc: 0, transpose: false, keep_outside: true, dead: Some(dead) };
+    let mut ops = Vec::new();
+    for (_, g) in wb.groups() {
+        if !reads(&g.expr, g.sheet, dead) {
+            continue;
+        }
+        let mut cells = Vec::new();
+        for r in g.r0..=g.r1 {
+            if dead.contains(CellAddr::new(g.sheet, r, g.col)) {
+                continue;
+            }
+            let e = m.expr(&g.expr, r, g.col, g.sheet, r, g.col, g.sheet);
+            if e != *g.expr {
+                cells.push((r, g.col, Arc::new(e)));
+            }
+        }
+        let mut fills = Vec::new();
+        crate::shift::fills_of(wb, cells, &mut fills);
+        for f in fills {
+            ops.push(GridOp::Replace(Region { rect: Rect { sheet: g.sheet, r0: f.r0, c0: f.col, r1: f.r1, c1: f.col }, values: Vec::new(), fills: vec![f] }));
+        }
+    }
+    ops
+}
+
 /// Where `a` and `b` (on one sheet) overlap.
 fn meet(a: Rect, b: Rect) -> Option<Rect> {
     let r = Rect { sheet: a.sheet, r0: a.r0.max(b.r0), c0: a.c0.max(b.c0), r1: a.r1.min(b.r1), c1: a.c1.min(b.c1) };

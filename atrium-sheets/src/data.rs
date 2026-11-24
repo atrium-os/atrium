@@ -765,17 +765,28 @@ fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, Stri
     } else {
         Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: officina_grid::addr::MAX_COLS - 1 }
     };
-    if d.wb.merges(s).iter().any(|m| m.intersects(&strip) && !(m.r0 >= strip.r0 && m.r1 <= strip.r1 && m.c0 >= strip.c0 && m.c1 <= strip.c1)) {
-        return Err("Merged cells cross the cells that would move; unmerge them first.".into());
+    // A move doesn't carry merged cells along, so none may be in the way.
+    if d.wb.merges(s).iter().any(|m| m.intersects(&strip)) {
+        return Err("Merged cells are among the cells that would move; unmerge them first.".into());
     }
     if block.is_some_and(|b| b.cells() > MAX_SHIFT_CELLS) {
         return Err(format!("That would move more than {MAX_SHIFT_CELLS} cells; insert or delete whole rows or columns instead."));
     }
     let (n_r, n_c) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
+    let label = if insert { "Insert Cells" } else { "Delete Cells" };
     let mut ops = Vec::new();
+    let mut started = false;
     if !insert {
-        ops.push(GridOp::clear(sel_rect));
-        ops.push(GridOp::Restyle(officina_grid::ops::StyleRegion { rect: sel_rect, spans: Vec::new() }));
+        // References to the deleted cells become #REF!; they go, and then
+        // what is past them moves in, read from the workbook as it is now.
+        let mut first = officina_grid::clip::kill_refs(&d.wb, sel_rect);
+        first.push(GridOp::clear(sel_rect));
+        first.push(GridOp::Restyle(officina_grid::ops::StyleRegion { rect: sel_rect, spans: Vec::new() }));
+        d.run(label, first);
+        if d.status == crate::sheet_protection::REFUSED {
+            return Err(d.status.clone());
+        }
+        started = true;
     }
     if let Some(b) = block {
         let clip = officina_grid::clip::Clip::take(&d.wb, b, true);
@@ -785,17 +796,26 @@ fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, Stri
             (false, true) => (b.r0, b.c0 + n_c),
             (false, false) => (b.r0, sel.c0),
         };
-        let (moved, _) = clip.paste(&d.wb, s, row, col).map_err(|e| if e.contains("fit") { "There is no room to move those cells along.".to_string() } else { e })?;
+        let (moved, _) = match clip.paste(&d.wb, s, row, col) {
+            Ok(p) => p,
+            Err(e) => {
+                // Take back the half already done.
+                if started {
+                    d.undo();
+                }
+                return Err(if e.contains("fit") { "There is no room to move those cells along.".to_string() } else { e });
+            }
+        };
         ops.extend(moved);
     }
-    if ops.is_empty() {
+    if ops.is_empty() && !started {
         return Ok("Nothing to move there.".into());
     }
-    let label = match cmd {
-        DataCmd::InsertCellsDown | DataCmd::InsertCellsRight => "Insert Cells",
-        _ => "Delete Cells",
-    };
-    d.run(label, ops);
+    if started {
+        d.extend(ops);
+    } else {
+        d.run(label, ops);
+    }
     let way = match cmd {
         DataCmd::InsertCellsDown => "inserted; the cells below moved down",
         DataCmd::InsertCellsRight => "inserted; the cells to the right moved right",

@@ -4770,7 +4770,7 @@ Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it
 
 ### 16.98 Insert and delete cells, custom number formats, rows that follow text size (2026-11-24)
 
-- **Insert and delete cells** (Data menu): Insert Cells, Shift Down or Shift Right, and Delete Cells, Shift Up or Shift Left, as Excel's Insert and Delete dialogs offer them. The cells from the selection (inserting) or past it (deleting) to the end of what is used, across the selection's columns or rows, are cut and pasted along by the selection's height or width as one undo step (`data::shift_cells`). Formulas elsewhere that read the moved cells follow them, as a cut does. Merged cells crossing the moving block are refused; at most 2,000,000 cells move. Not yet: formulas that read deleted cells don't turn into `#REF!`; they read whatever moves into place.
+- **Insert and delete cells** (Data menu): Insert Cells, Shift Down or Shift Right, and Delete Cells, Shift Up or Shift Left, as Excel's Insert and Delete dialogs offer them. The cells from the selection (inserting) or past it (deleting) to the end of what is used, across the selection's columns or rows, are cut and pasted along by the selection's height or width as one undo step (`data::shift_cells`). Formulas elsewhere that read the moved cells follow them, as a cut does. Merged cells crossing the moving block are refused; at most 2,000,000 cells move. Deleting first turns references to the deleted cells (a cell, or a range wholly inside them) into `#REF!` in formulas outside them (`officina_grid::clip::kill_refs`), then moves the rest in, all as one step (§16.102). Merged cells anywhere in the cells that would move are refused, since a move doesn't carry merges.
 - **Custom Format…** (Format menu) opens a bar with the cursor cell's format code. Apply sets the code on the selection as one step, and the status shows how the first cell now reads. A code with a part the formatter doesn't understand (`NumFmt::is_exact`) is refused and the bar stays open. Codes are at most 255 characters.
 - **Row heights:** Larger Text and Smaller Text refit rows nobody sized (the first 1,000 selected rows that hold something), as part of the same step. Rows a person sized keep their height.
 
@@ -4800,6 +4800,12 @@ Before this, a hidden sheet in an .xlsx file opened shown, with a "hidden sheets
 - **Sheets:** Data ▸ Hide Sheet hides the shown sheet and opens the next one that shows. Data ▸ Unhide *Name* lists up to 32 hidden sheets by name; choosing one shows it and opens it. Tabs leave hidden sheets out. Go To refuses a hidden sheet and says how to unhide it. A file that opens on a hidden sheet opens on the first that shows.
 
 Gates: officina-grid `sheets_are_hidden_shown_undone_and_saved_but_one_always_shows`; officina-convert `hidden_sheets_stay_hidden_through_xlsx_and_ods`; atrium-sheets `hide_sheet_takes_its_tab_away_and_unhide_brings_it_back`. All 121 officina-grid lib, all officina-convert and all 128 Sheets lib tests pass.
+
+### 16.102 Delete Cells breaks references to the deleted cells (2026-11-24)
+
+Delete Cells (shift up or left) now turns references to the deleted cells into `#REF!`, as Excel does, even when nothing moves in to replace them. `officina_grid::clip::kill_refs(wb, rect)` rewrites every formula outside `rect` that names a cell inside it, or a range wholly inside it. It uses the cut mover with nothing moving. Ranges that only overlap the deleted cells keep their ends. Excel would shrink them; that is not done yet. The rewrite and the clearing run first, then the cells past the deletion are cut and pasted in from the workbook as it now is, so the mover never sees a stale formula. The two halves are one undo step, and if the paste is refused the first half is undone.
+
+Gates: atrium-sheets `deleted_cells_turn_formulas_reading_them_into_ref_errors`. It fails on the code before (`=D4` stayed `=D4` after D4 was deleted with nothing to its right). All 129 Sheets lib and 121 officina-grid lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 
