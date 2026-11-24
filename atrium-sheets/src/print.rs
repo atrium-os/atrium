@@ -11,6 +11,7 @@ use officina_pdf::sheet::{
     Align, Cell, Comment, CommentMessage, Comments, Drawing, DrawingContent, IconPart,
     Pattern, PrintRegion, Setup, Sheet, VAlign, MAX_CELLS, MAX_COMMENT_BYTES,
 };
+use pergola::inline::Emphasis;
 use pergola::widgets::{CellAlign, CellVAlign, CellView, GridSource};
 use pergola::Color;
 
@@ -57,6 +58,10 @@ pub fn cell_of(v: CellView) -> Cell {
             CellAlign::Right => Align::Right,
         },
         bold: v.bold,
+        italic: v.marks & Emphasis::Italic as u8 != 0,
+        underline: v.marks & Emphasis::Underline as u8 != 0,
+        strike: v.marks & Emphasis::Strike as u8 != 0,
+        size: v.size,
         wrap: v.wrap,
         shrink_to_fit: v.shrink_to_fit,
         rotation: v.rotation,
@@ -588,6 +593,13 @@ mod tests {
         }
         let s = snapshot(&doc).unwrap();
         assert_eq!((s.title_rows, s.title_cols), ((0, 2), (0, 1)));
+    }
+
+    #[test]
+    fn italic_underline_strike_and_size_reach_the_page() {
+        let v = CellView { marks: Emphasis::Italic as u8 | Emphasis::Strike as u8, size: Some(20.0), ..CellView::text("x") };
+        let c = cell_of(v);
+        assert_eq!((c.italic, c.underline, c.strike, c.size), (true, false, true, Some(20.0)));
     }
 
     #[test]

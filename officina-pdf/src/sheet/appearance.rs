@@ -33,8 +33,14 @@ fn left(align: Align, available: i64, width: i64) -> i64 {
     }
 }
 
-fn attrs(c: &Cell) -> CharAttrs {
+/// The cell's text size, px: its own or the grid's.
+fn text_px(c: &Cell) -> f64 {
+    c.size.map_or(TEXT_PX, |px| f64::from(px).clamp(1.0, 409.0))
+}
+
+fn attrs(c: &Cell, k: f64) -> CharAttrs {
     CharAttrs {
+        size: c.size.map(|_| (text_px(c) * k * 2.0).round().clamp(2.0, 3200.0) as u16),
         bold: Some(c.bold),
         italic: Some(c.italic),
         underline: Some(c.underline),
@@ -118,7 +124,7 @@ pub(super) fn words(
     let x = lu(x + icon_lead) + inset;
     let y = lu(y);
     let pad = lu(2.0 * k);
-    let mut attrs = attrs(c);
+    let mut attrs = attrs(c, k);
     let align = |line_width| match c.align {
         Align::Left => indent,
         other => left(other, inner, line_width),
@@ -181,7 +187,7 @@ pub(super) fn words(
     }
 
     if c.rotation == 255 || (!c.numeric && (c.wrap || c.text.contains(['\r', '\n']))) {
-        let line_height = lu(TEXT_PX * k * if c.rotation == 255 { 1.1 } else { 1.3 }).max(1);
+        let line_height = lu(text_px(c) * k * if c.rotation == 255 { 1.1 } else { 1.3 }).max(1);
         let slots = ((height / line_height) as usize).clamp(1, MAX_LINES);
         let (lines, clipped): (Vec<_>, bool) = if c.rotation == 255 {
             let mut lines = c.text.graphemes(true);
@@ -237,7 +243,7 @@ pub(super) fn words(
         if natural > room {
             let minimum = (3.0 * k * 2.0).ceil().max(2.0);
             attrs.size = Some(
-                (TEXT_PX * k * 2.0 * room as f64 / natural as f64 * 0.98)
+                (text_px(c) * k * 2.0 * room as f64 / natural as f64 * 0.98)
                     .floor()
                     .max(minimum) as u16,
             );

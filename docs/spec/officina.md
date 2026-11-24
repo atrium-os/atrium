@@ -4766,7 +4766,7 @@ Before this, Sheets showed the formatting a file brought in but had no way to se
 - **Borders:** All Borders, Outside Borders (built from disjoint corners and strips, so a corner gets both of its edges), Bottom Border, and No Borders. All are thin and automatic in colour.
 - **Grid:** cells now show italic, underline, strikethrough and font size. pergola's `CellView` gains `marks` (the `inline::Emphasis` bits) and `size`. Fitting a column or row measures with them. pergola sends `GridAction::Format(char)` for the keys.
 
-Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it` and `format::tests::decimals_are_added_and_taken_in_every_section`; pergola `italic_and_size_reach_the_cell_style` and the grid key test. Not yet: a font name picker, custom colours, other border styles and colours, a format code box (Format Cells), Format Painter, rows growing for larger text by themselves, and italic, underline and size in printed sheets (print.rs belongs to the printing thread).
+Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it` and `format::tests::decimals_are_added_and_taken_in_every_section`; pergola `italic_and_size_reach_the_cell_style` and the grid key test. Not yet: a font name picker, custom colours, other border styles and colours, a format code box (Format Cells), Format Painter and rows growing for larger text by themselves. Printing draws italic, underline, strike and sizes as the grid does (officina-pdf `a_cell_prints_in_its_own_size_and_italic`).
 
 ## 17. Decisions (accepted 2026-11-14)
 

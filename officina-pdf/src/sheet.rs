@@ -71,6 +71,8 @@ pub struct Cell {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+    /// Text size, px, when not the grid's own ([`TEXT_PX`]).
+    pub size: Option<f32>,
     pub wrap: bool,
     pub valign: VAlign,
     /// Counterclockwise degrees, or 255 for vertically stacked graphemes.

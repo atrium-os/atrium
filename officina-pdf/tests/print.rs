@@ -335,3 +335,23 @@ fn worksheet_comments_continue_after_the_grid_pages() {
     }
     assert_eq!(px(&pages[2], 103, 31), [255, 255, 255], "the appendix has no worksheet grid or marker");
 }
+
+#[test]
+fn a_cell_prints_in_its_own_size_and_italic() {
+    let fonts = PinnedFonts::new().unwrap();
+    // Two cells with "H": A1 at the grid's size, B1 at 24 px, italic and underlined.
+    let big = |_: u32, c: u32| {
+        Some(match c {
+            0 => Cell { text: "H".into(), ..Default::default() },
+            _ => Cell { text: "H".into(), size: Some(24.0), italic: true, underline: true, ..Default::default() },
+        })
+    };
+    let s = Sheet { name: "", cols: vec![64.0; 2], rows: vec![48.0], cell: &big, gridlines: false, merges: Vec::new(), across: Vec::new(), title_rows: (0, 0), title_cols: (0, 0) };
+    let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+    assert_eq!(stats.fonts, 2, "the regular face and the italic one");
+    let pages = draw(&pdf);
+    // Rows of the cell (54..90 pt) with ink, in each column.
+    let ink_rows = |x0: u32, x1: u32| (54..90).filter(|&y| (x0..x1).any(|x| px(&pages[0], x, y)[0] < 128)).count();
+    let (small, large) = (ink_rows(54, 102), ink_rows(102, 150));
+    assert!(small >= 5 && large >= 2 * small - 2, "24 px is twice 12 px: {small} vs {large} rows");
+}
