@@ -3782,6 +3782,7 @@ static int tessera_gc_trace = 0;   /* DEBUG: printf publish/begin/free events */
 static int tessera_inode_enoent_trace = 1; /* DIAG: one line per ungated inode read that failed and was retried under the gate (rare) */
 static unsigned long tessera_stat_gc_walk_leaf_skips = 0;
 static unsigned long tessera_stat_gc_walk_leaf_lies  = 0;
+static unsigned long tessera_stat_gc_manifest_stack_grows = 0;
 
 /* THE ONE WAY to point an inode record at a manifest. Sets or clears
  * TESSERA_INODE_FLAG_MFT_LEAF from the manifest kind, so the flag can never
@@ -22371,11 +22372,13 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	uint32_t seen_cap = 256;                 /* power of two, >= 2*live_cap */
 	uint32_t *seen = malloc(seen_cap * sizeof(*seen), M_TESSERA,
 	    M_WAITOK | M_ZERO);
-	/* ★ T2: the manifest walk's work stack (64 hashes, 2 KiB) used to be a
-	 * local in _GC_WALK_RECORD, which made this the largest frame in the
-	 * module (2.8 KiB). One heap buffer serves every walk. */
-	tessera_hash_t *gc_walk_stack = malloc(64 * sizeof(tessera_hash_t),
-	    M_TESSERA, M_WAITOK);
+	/* Reuse a heap work stack across manifests. A wide tree can enqueue
+	 * more than 63 children. Dropping any of them makes live packs look
+	 * dead, so grow the stack and abort reclamation if it cannot fit. */
+	uint32_t gc_walk_stack_cap = 63; /* old walk's effective capacity */
+	const uint32_t gc_walk_stack_limit = 65536;
+	tessera_hash_t *gc_walk_stack = malloc(
+	    gc_walk_stack_cap * sizeof(*gc_walk_stack), M_TESSERA, M_WAITOK);
 	int _gc_push_dup = 0;
 
 #define _GC_SEEN_REHASH() do {                                            \
@@ -22437,12 +22440,26 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * leaf manifests, a DIRECTORY_2L outer's bucket manifests, or
 	 * a CHUNK_TREE file's inner-tier manifests would be reclaimed
 	 * as orphans on the next GC pass — the inode.manifest_hash
-	 * keeps only the ROOT alive. depth caps recursion so a corrupt
-	 * cycle can't loop forever. Inline lambda via nested macro for
-	 * conciseness — pure C function follows. */
+	 * keeps only the root alive. The visited set avoids rewalking
+	 * shared subtrees. */
+#define _GC_QUEUE_MANIFEST(_child) do {                                  \
+		if (_sp == gc_walk_stack_cap) {                          \
+			if (gc_walk_stack_cap == gc_walk_stack_limit) {  \
+				_GC_ABORT("manifest-work-stack", E2BIG);  \
+				break;                                    \
+			}                                                 \
+			gc_walk_stack_cap = MIN(gc_walk_stack_cap * 2,    \
+			    gc_walk_stack_limit);                         \
+			gc_walk_stack = realloc(gc_walk_stack,           \
+			    gc_walk_stack_cap * sizeof(*gc_walk_stack),  \
+			    M_TESSERA, M_WAITOK);                         \
+			atomic_add_long(                                  \
+			    &tessera_stat_gc_manifest_stack_grows, 1);    \
+		}                                                         \
+		memcpy(gc_walk_stack[_sp++], (_child), TESSERA_HASH_SIZE); \
+} while (0)
 #define _GC_WALK_RECORD(_ino) do {                                       \
-		tessera_hash_t *_stack = gc_walk_stack;                   \
-		int _sp = 0;                                              \
+		uint32_t _sp = 0;                                        \
 		int _gw = 1;                                              \
 		uint64_t _wg = tessera_fs_gc_record_group(tmp_, &(_ino),  \
 		    gc_groups, &_gw);                                     \
@@ -22458,17 +22475,15 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				_GC_PUSH_HASH(_lh);                       \
 				tessera_stat_gc_walk_leaf_skips++;        \
 			} else {                                          \
-				memcpy(_stack[_sp++], _ino.manifest_hash, \
-				    TESSERA_HASH_SIZE);                   \
+				_GC_QUEUE_MANIFEST(_ino.manifest_hash);  \
 			}                                                 \
 		}                                                         \
 		if (!tessera_hash_is_null(_ino.xattr_hash)) {             \
-			memcpy(_stack[_sp++], _ino.xattr_hash,            \
-			    TESSERA_HASH_SIZE);                           \
+			_GC_QUEUE_MANIFEST(_ino.xattr_hash);             \
 		}                                                         \
-		while (_sp > 0 && _sp < 64) {                             \
+		while (_sp > 0 && !gc_walk_abort) {                    \
 			tessera_hash_t _h;                                \
-			memcpy(_h, _stack[--_sp], TESSERA_HASH_SIZE);     \
+			memcpy(_h, gc_walk_stack[--_sp], TESSERA_HASH_SIZE); \
 			_GC_PUSH_HASH(_h);                                \
 			/* #134: already walked — same hash, same bytes,  \
 			 * same children, so its subtree is already in    \
@@ -22574,23 +22589,19 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				}                                         \
 			} else if (_k2 == TESSERA_MFT_CHUNK_TREE) {       \
 				for (uint32_t _i = 0;                     \
-				    _i < _cnt && _sp < 63; _i++) {        \
+				    _i < _cnt && !gc_walk_abort; _i++) { \
 					tessera_tree_record_t _tr;        \
 					if (tessera_manifest_tree_at(_p,  \
 					    _i, &_tr) == TESSERA_OK)      \
-						memcpy(_stack[_sp++],     \
-						    _tr.child_manifest_hash, \
-						    TESSERA_HASH_SIZE);   \
+						_GC_QUEUE_MANIFEST(_tr.child_manifest_hash); \
 				}                                         \
 			} else if (_k2 == TESSERA_MFT_DIRECTORY_2L) {     \
 				for (uint32_t _i = 0;                     \
-				    _i < _cnt && _sp < 63; _i++) {        \
+				    _i < _cnt && !gc_walk_abort; _i++) { \
 					tessera_dir_bucket_record_t _br;  \
 					if (tessera_manifest_dir_bucket_at(\
 					    _p, _i, &_br) == TESSERA_OK)  \
-						memcpy(_stack[_sp++],     \
-						    _br.bucket_manifest_hash, \
-						    TESSERA_HASH_SIZE);   \
+						_GC_QUEUE_MANIFEST(_br.bucket_manifest_hash); \
 				}                                         \
 			} else if (_k2 == TESSERA_MFT_DIRECTORY_BTREE) {  \
 				int _lf;                                  \
@@ -22602,14 +22613,12 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				    == 0 && !_lf) {                       \
 					size_t _off = 0;                  \
 					for (uint32_t _i = 0;             \
-					    _i < _bcnt && _sp < 63;       \
+					    _i < _bcnt && !gc_walk_abort; \
 					    _i++) {                       \
 						if (_off + 8 +            \
 						    TESSERA_HASH_SIZE >   \
 						    _bblen) break;        \
-						memcpy(_stack[_sp++],     \
-						    _body + _off + 8,     \
-						    TESSERA_HASH_SIZE);   \
+						_GC_QUEUE_MANIFEST(_body + _off + 8); \
 						_off += 8 +               \
 						    TESSERA_HASH_SIZE;    \
 					}                                 \
@@ -23243,6 +23252,7 @@ snap_next:
 
 #undef _GC_WALK_INODE_TREE
 #undef _GC_WALK_RECORD
+#undef _GC_QUEUE_MANIFEST
 #undef _GC_PUSH_HASH
 #undef _GC_ABORT
 
@@ -31869,6 +31879,9 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_walk_trust_leaf, CTLFLAG_RW,
     "AND verify the flag, counting lies in gc_walk_leaf_lies");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_skips, CTLFLAG_RD,
     &tessera_stat_gc_walk_leaf_skips, 0, "pass-1 manifest fetches skipped via MFT_LEAF");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_manifest_stack_grows, CTLFLAG_RD,
+    &tessera_stat_gc_manifest_stack_grows, 0,
+    "manifest work stack expansions while marking live blobs");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_lies, CTLFLAG_RD,
     &tessera_stat_gc_walk_leaf_lies, 0,
     "MFT_LEAF-flagged inodes whose manifest was NOT a leaf (verify mode). "

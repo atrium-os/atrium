@@ -597,6 +597,32 @@ A blob hash is *reachable* if:
 
 GC computes this set by scanning live inodes and the GC-root list, then transitively walking manifests.
 
+The data-zone collector keeps pending manifest hashes on a heap stack shared
+by all inode and snapshot walks in one pass. It starts at 63 hashes and doubles
+when full, up to the safety bound. Chunk-tree children, two-level directory
+buckets and internal directory B-tree children use the same push. If another push
+would exceed 65,536 pending hashes (2 MiB), the collector records
+`manifest-work-stack` and aborts the pass before reclaiming packs.
+`kern.tessera.gc_manifest_stack_grows` counts stack expansions.
+
+The arm64 regression in `scripts/tessera-workbook-gc-check.sh` uses a
+disposable Tessera root with 16 MiB append windows. The data zone must be
+below 50% free when the gate raises the GC pressure threshold. Cross-build the
+`native_memory` example in `atrium-sheets` and the `workbook_replace_check`
+example in `scrinium` on the host. Copy both binaries and the script to the
+guest's local disk. With the examples on `PATH`, run as root:
+
+```sh
+sh tessera-workbook-gc-check.sh /var/tmp/workbook-gc
+```
+
+Use a fresh directory for each run. The check alternates equal-length dense
+revisions through direct staged replacement and Scrinium grant/commit, then
+waits for scan, stack-growth and reclaimed-pack counters to advance. It
+compares the SHA-256 of both published files with the expected revision six
+times and reopens each workbook to check its edited cell and samples from
+every column.
+
 ### 11.2 GC algorithm (pseudocode)
 
 ```

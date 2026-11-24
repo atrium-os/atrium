@@ -4301,12 +4301,27 @@ and the reference values sampled in all 125 columns. An earlier Save with
 both a full encoded buffer and a memory file exhausted the 4 GiB guest.
 The plain native snapshot now streams into the sealed memory file (§4.2).
 
-A later picker attempt on the first published revision reported an I/O
-error. The guest's `sha256` and a sequential `dd` failed on the same file.
-The sequential read completed 1,056,964,608 bytes of the 1,065,968,177-byte
-file before failing. After the file moved within the same volume, both
-published revisions passed three delayed checksums. The intermittent read
-failure still needs a filesystem-level reproduction and a delayed read gate.
+The later picker read error reproduced on the stock Nov 18 arm64
+Tessera-root guest. Both a direct fsync/rename replacement and Scrinium's
+`workbook::grant` and `commit` passed three immediate and delayed digest
+checks per path under ordinary metadata activity. Raising the data-zone GC
+pressure threshold from 12% to 50% advanced the scan count from 1 to 9.
+All six subsequent reads of each file failed after 1,056,964,608 bytes
+(1,008 MiB). GC had queued only the first 63 child manifests. Each child
+covered a 16 MiB append window in this file, so GC could reclaim the tail
+while the workbook was still live.
+
+On a fresh clone with the corrected Tessera module (tessera-fs.md §11.1),
+three alternating replacements per path passed both immediate and delayed
+full-file BLAKE3 comparisons. After the pressure change, `gc_scans` and
+`gc_manifest_stack_grows` each advanced from 11 to 12 and `gc_reclaimed`
+from 4,993 to 4,999. All six SHA-256 reads per path matched the edited
+1,065,968,177-byte revision. Both workbooks reopened with A1 equal to 8 and
+the sampled values intact in all 125 columns. Both SHA-256 digests and
+workbook checks passed again after a clean reboot. The reproducer is
+`scripts/tessera-workbook-gc-check.sh`. Baseline logs are under
+`/private/tmp/atrium-sheets-delayed-read/guest/` and the final run is under
+`/private/tmp/atrium-sheets-delayed-read/final/`.
 
 The dense desktop trial confirmed that the 128 MiB workbook recovery volume
 cannot hold the 1,065,968,177-byte native base. Sheets shows the autosave

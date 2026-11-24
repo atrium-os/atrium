@@ -22,7 +22,7 @@ fn points_per_column() -> u64 {
     u64::from(MAX_ROWS.div_ceil(CHUNK_ROWS)) * std::mem::size_of::<usize>() as u64
 }
 
-fn make(case: &str, path: &Path) -> io::Result<()> {
+fn make(case: &str, path: &Path, a1: f64) -> io::Result<()> {
     let mut workbook = Workbook::new();
     workbook.add_sheet("Memory boundary").unwrap();
     let budget = match case {
@@ -31,13 +31,14 @@ fn make(case: &str, path: &Path) -> io::Result<()> {
             for col in 0..DENSE_COLS {
                 workbook.set_numbers(0, col, 0, &values);
             }
+            workbook.set_value(CellAddr::new(0, 0, 0), Value::Num(a1));
             MAKE_LIMIT
         }
         "sparse" | "oversized" => {
             let budget = default_memory_budget();
             let below = ((budget - points_per_column()) / (points_per_column() + 1024)) as u32;
             let columns = if case == "sparse" { below } else { below + 8 };
-            workbook.set_value(CellAddr::new(0, 0, 0), Value::Num(INITIAL));
+            workbook.set_value(CellAddr::new(0, 0, 0), Value::Num(a1));
             for col in 0..columns {
                 workbook.set_value(
                     CellAddr::new(0, SPARSE_ROW, col),
@@ -135,17 +136,24 @@ fn check(case: &str, path: &Path, expected: f64) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [command, case, path] if command == "make" => make(case, Path::new(path)),
-        [command, case, path] if command == "check" => {
+        [command, case, path] | [command, case, path, _] => {
             let initial = if case == "dense" { 0.0 } else { INITIAL };
-            check(case, Path::new(path), initial)
+            let a1 = args
+                .get(3)
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(io::Error::other)?
+                .unwrap_or(initial);
+            match command.as_str() {
+                "make" => make(case, Path::new(path), a1),
+                "check" => check(case, Path::new(path), a1),
+                _ => Err(usage()),
+            }
         }
-        [command, case, path, value] if command == "check" => {
-            let value = value.parse().map_err(io::Error::other)?;
-            check(case, Path::new(path), value)
-        }
-        _ => Err(io::Error::other(
-            "usage: native_memory make|check dense|sparse|oversized FILE [EXPECTED_A1]",
-        )),
+        _ => Err(usage()),
     }
+}
+
+fn usage() -> io::Error {
+    io::Error::other("usage: native_memory make|check dense|sparse|oversized FILE [A1]")
 }
