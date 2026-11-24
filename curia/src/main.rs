@@ -288,6 +288,9 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
                 let j = Join { ssid: ssid.clone(), passphrase: None, handle: Some(*handle), open: false };
                 Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join(&j).map_err(e)) }
             }
+            Want::JoinEnterprise(x) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join_enterprise(x).map_err(e)) },
+            Want::Seen(s) => Got::Seen(s.clone(), connect(Grant::Wifi).and_then(|mut c| c.server_seen(s).map_err(e))),
+            Want::Trust(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.trust_server(s).map_err(e)) },
             Want::Leave => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.leave().map_err(e)) },
             Want::Forget(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.forget(s).map_err(e)) },
             Want::Save(p) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.set_profile(p).map_err(e)) },

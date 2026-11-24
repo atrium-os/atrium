@@ -3,7 +3,7 @@
 //! the requests the page wants made. `main.rs` makes them on a thread and
 //! feeds the answers back with [`NetPage::apply`].
 
-use atrium_netconf::{check_dns, tls_name_ok, DnsTls, Iface, Link, Manual, Nearby, Online, Profile, SetStatic, Status, Target};
+use atrium_netconf::{check_dns, tls_name_ok, DnsTls, Enterprise, Iface, Link, Manual, Nearby, Online, Profile, ServerSeen, SetStatic, Status, Target};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// A request to atrium-netconf.
@@ -17,6 +17,13 @@ pub enum Want {
     /// Remember with what was typed into Arca's field, then join: the
     /// handle Arca gave us (curia.md §4). Curia never has the passphrase.
     JoinWith { ssid: Vec<u8>, handle: [u8; 16] },
+    /// Remember a work or campus (802.1X) network and join it; the
+    /// password is Arca's handle, as for a passphrase.
+    JoinEnterprise(Enterprise),
+    /// The certificate a first 802.1X join stopped at.
+    Seen(Vec<u8>),
+    /// "Trust this server", then join.
+    Trust(Vec<u8>),
     Leave,
     Forget(Vec<u8>),
     Save(Profile),
@@ -38,6 +45,9 @@ impl std::fmt::Debug for Want {
         match self {
             Want::JoinWith { ssid, .. } => write!(f, "JoinWith({:?}, ..)", String::from_utf8_lossy(ssid)),
             Want::Join { ssid, open } => write!(f, "Join({:?}, open={open})", String::from_utf8_lossy(ssid)),
+            Want::JoinEnterprise(e) => write!(f, "JoinEnterprise({:?}, {})", String::from_utf8_lossy(&e.ssid), e.method),
+            Want::Seen(s) => write!(f, "Seen({:?})", String::from_utf8_lossy(s)),
+            Want::Trust(s) => write!(f, "Trust({:?})", String::from_utf8_lossy(s)),
             Want::Forget(s) => write!(f, "Forget({:?})", String::from_utf8_lossy(s)),
             Want::Save(p) => write!(f, "Save({:?})", String::from_utf8_lossy(&p.ssid)),
             Want::Scan => write!(f, "Scan"),
@@ -65,6 +75,23 @@ pub enum Got {
     OwnDns(Result<(Vec<String>, Option<String>), String>),
     /// A join, leave, forget or save finished.
     Done { what: Want, result: Result<(), String> },
+    Seen(Vec<u8>, Result<ServerSeen, String>),
+}
+
+/// The sign-in methods offered for a work or campus network, as named to
+/// the network service and to the user.
+pub const EAP_METHODS: [(&str, &str); 3] = [("peap", "PEAP"), ("ttls-mschapv2", "TTLS (MSCHAPv2)"), ("ttls-pap", "TTLS (PAP)")];
+
+/// What the work-network sheet holds besides the typed fields.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EntForm {
+    /// Index into `EAP_METHODS`.
+    pub method: usize,
+    /// Check the server against the system's certificates (needs its
+    /// domain); otherwise the first join shows its certificate.
+    pub system_roots: bool,
+    /// Username and server domain, from the sheet's fields at the press.
+    pub typed: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -97,6 +124,11 @@ pub struct NetPage {
     pub reset_field: bool,
     /// Arca's field is on the passphrase row (limend and arca-ui answer).
     pub field_up: bool,
+    /// The passphrase row is a work-network sheet (802.1X).
+    pub ent: Option<EntForm>,
+    /// A first join stopped at this server's certificate: "Trust this
+    /// server" or not.
+    pub trusting: Option<(Vec<u8>, ServerSeen)>,
     /// The network whose Forget waits for a second press.
     pub confirm_forget: Option<Vec<u8>>,
     pub notice: Option<Notice>,
@@ -213,6 +245,8 @@ pub fn security_label(s: &str) -> &'static str {
         "wpa2" => "WPA2",
         "wpa3" => "WPA3",
         "wpa2/wpa3" => "WPA2/WPA3",
+        "wpa2-enterprise" => "WPA2 Enterprise",
+        "wpa3-enterprise" => "WPA3 Enterprise",
         _ => "Not supported",
     }
 }
@@ -262,8 +296,55 @@ impl NetPage {
             self.wants.push(Want::Join { ssid: ssid.to_vec(), open });
         } else {
             self.asking = if self.asking.as_deref() == Some(ssid) { None } else { Some(ssid.to_vec()) };
+            self.ent = (self.asking.is_some() && n.security.ends_with("-enterprise")).then(EntForm::default);
             self.handle = None;
             self.armed = None;
+        }
+    }
+
+    /// The work-network sheet's method button: the next method.
+    pub fn next_method(&mut self) {
+        if let Some(f) = &mut self.ent {
+            f.method = (f.method + 1) % EAP_METHODS.len();
+        }
+    }
+
+    pub fn set_system_roots(&mut self, on: bool) {
+        if let Some(f) = &mut self.ent {
+            f.system_roots = on;
+        }
+    }
+
+    /// Join pressed on the work-network sheet, with what its fields hold.
+    pub fn ent_join_pressed(&mut self, user: &str, domain: &str, now: std::time::Instant) {
+        let (user, domain) = (user.trim(), domain.trim().trim_end_matches('.').to_ascii_lowercase());
+        let Some(f) = &mut self.ent else { return };
+        let err = if user.is_empty() {
+            Some("Type your username first")
+        } else if f.system_roots && domain.is_empty() {
+            Some("Checking with the system's certificates needs the server's domain")
+        } else {
+            None
+        };
+        if let Some(e) = err {
+            self.notice = Some(Notice { text: e.into(), error: true });
+            return;
+        }
+        f.typed = Some((user.to_string(), domain));
+        self.join_pressed(now);
+    }
+
+    /// "Trust this server" on the certificate a first join stopped at.
+    pub fn trust(&mut self) {
+        let Some((ssid, _)) = self.trusting.take() else { return };
+        self.notice = None;
+        self.joining = Some(ssid.clone());
+        self.wants.push(Want::Trust(ssid));
+    }
+
+    pub fn dont_trust(&mut self) {
+        if let Some((ssid, _)) = self.trusting.take() {
+            self.notice = Some(Notice { text: format!("Did not join {}: its server was not trusted", name(&ssid)), error: false });
         }
     }
 
@@ -275,7 +356,20 @@ impl NetPage {
             Some(handle) => {
                 self.armed = None;
                 self.joining = Some(ssid.clone());
-                self.wants.push(Want::JoinWith { ssid, handle });
+                match self.ent.as_ref().map(|f| (f.method, f.system_roots, f.typed.clone())) {
+                    Some((m, system_roots, Some((identity, domain)))) => self.wants.push(Want::JoinEnterprise(Enterprise {
+                        ssid,
+                        method: EAP_METHODS[m].0.into(),
+                        identity,
+                        anonymous: None,
+                        domain,
+                        ca: None,
+                        system_roots,
+                        handle,
+                    })),
+                    Some(_) => self.joining = None,
+                    None => self.wants.push(Want::JoinWith { ssid, handle }),
+                }
             }
             None => self.armed = Some(now),
         }
@@ -304,6 +398,7 @@ impl NetPage {
 
     pub fn cancel_ask(&mut self) {
         self.asking = None;
+        self.ent = None;
         self.armed = None;
         self.handle = None;
         self.notice = None;
@@ -462,21 +557,39 @@ impl NetPage {
                 self.dns_tls = tls;
             }
             Got::OwnDns(Err(_)) => {}
+            Got::Seen(ssid, Ok(seen)) => self.trusting = Some((ssid, seen)),
+            Got::Seen(ssid, Err(e)) => self.notice = Some(Notice { text: format!("Could not show the server of {}: {}", name(&ssid), e.replace('-', " ")), error: true }),
             Got::Done { what, result } => {
                 match (&what, &result) {
-                    (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. }, Ok(())) => {
+                    (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. } | Want::JoinEnterprise(Enterprise { ssid, .. }) | Want::Trust(ssid), Ok(())) => {
                         self.joining = None;
                         self.asking = None;
+                        self.ent = None;
                         self.notice = Some(Notice { text: format!("Connected to {}", name(ssid)), error: false });
                     }
-                    (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. }, Err(e)) => {
+                    // A first join with nothing to check the server with
+                    // stopped at its certificate: show it.
+                    (Want::Join { ssid, .. } | Want::JoinEnterprise(Enterprise { ssid, .. }), Err(e)) if e == "eap-trust" => {
                         self.joining = None;
-                        if matches!(what, Want::JoinWith { .. }) {
+                        self.asking = None;
+                        self.ent = None;
+                        self.handle = None;
+                        self.reset_field = true;
+                        self.wants.push(Want::Seen(ssid.clone()));
+                        self.notice = Some(Notice { text: format!("Check the server of {} before your password goes to it", name(ssid)), error: false });
+                    }
+                    (Want::Join { ssid, .. } | Want::JoinWith { ssid, .. } | Want::JoinEnterprise(Enterprise { ssid, .. }) | Want::Trust(ssid), Err(e)) => {
+                        self.joining = None;
+                        if matches!(what, Want::JoinWith { .. } | Want::JoinEnterprise(_)) {
                             self.handle = None;
                             self.reset_field = true;
                         }
                         let why = match e.as_str() {
                             "wrong-passphrase" => "the passphrase is wrong".to_string(),
+                            "eap-rejected" => "the username or password is wrong".to_string(),
+                            "eap-untrusted" => "its server is not the one expected (a wrong certificate)".to_string(),
+                            "eap-no-system-roots" => "the system has no certificates to check the server with".to_string(),
+                            "eap-method" | "eap-refused" => "the network does not accept this sign-in method".to_string(),
                             "timed out" => "no answer in time: out of range, or the network is busy".to_string(),
                             "bad-secret" => "a Wi-Fi passphrase is 8 to 63 letters, digits or symbols".to_string(),
                             w => w.replace('-', " "),
@@ -540,7 +653,7 @@ mod tests {
     }
 
     fn prof(s: &str) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None, enterprise: false }
     }
 
     fn page() -> NetPage {
@@ -685,6 +798,46 @@ mod tests {
             p.save_dns(servers, name);
             assert!(p.edit_error.is_some() && p.take_wants().is_empty(), "{servers} {name}");
         }
+    }
+
+    #[test]
+    fn work_network_sheet_then_trust_this_server() {
+        let mut p = page();
+        p.apply(Got::Nearby(Ok(vec![near("corp", "wpa3-enterprise", false)])));
+        p.take_wants();
+        p.pick(b"corp");
+        assert!(p.ent.is_some(), "an 802.1X network opens the work-network sheet");
+        let now = std::time::Instant::now();
+        p.ent_join_pressed("  ", "", now);
+        assert!(p.notice.as_ref().is_some_and(|n| n.error), "no username: said so");
+        assert!(p.take_wants().is_empty());
+        p.set_system_roots(true);
+        p.ent_join_pressed("alice@corp.example", "", now);
+        assert!(p.take_wants().is_empty(), "system certificates need the domain");
+        p.set_system_roots(false);
+        p.next_method();
+        p.ent_join_pressed("alice@corp.example", "Corp.Example.", now);
+        assert!(p.take_wants().is_empty(), "waits for Arca's handle");
+        p.field(Some([3; 16]), now);
+        let w = p.take_wants();
+        let [Want::JoinEnterprise(e)] = w.as_slice() else { panic!("{w:?}") };
+        assert_eq!((e.ssid.as_slice(), e.method.as_str(), e.identity.as_str(), e.domain.as_str(), e.handle, e.system_roots), (&b"corp"[..], "ttls-mschapv2", "alice@corp.example", "corp.example", [3; 16], false));
+        assert!(e.check().is_ok());
+        assert_eq!(format!("{:?}", w[0]), "JoinEnterprise(\"corp\", ttls-mschapv2)", "no handle in logs");
+
+        // The first join stopped at the server's certificate.
+        p.apply(Got::Done { what: w[0].clone(), result: Err("eap-trust".into()) });
+        assert!(p.take_wants().contains(&Want::Seen(b"corp".to_vec())));
+        assert!(p.reset_field, "the spent handle is dropped");
+        let seen = ServerSeen { names: vec!["radius.corp.example".into()], subject: "radius.corp.example".into(), issuer: "corp CA".into(), not_after: "2027-01-01".into(), sha256: vec![0xab; 32] };
+        p.apply(Got::Seen(b"corp".to_vec(), Ok(seen)));
+        assert!(p.trusting.is_some());
+        p.take_wants();
+        p.trust();
+        assert_eq!(p.take_wants(), vec![Want::Trust(b"corp".to_vec())]);
+        assert_eq!(p.joining.as_deref(), Some(&b"corp"[..]));
+        p.apply(Got::Done { what: Want::Trust(b"corp".to_vec()), result: Err("eap-rejected".into()) });
+        assert!(p.notice.as_ref().unwrap().text.contains("username or password is wrong"));
     }
 
     #[test]

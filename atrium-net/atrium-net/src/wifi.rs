@@ -48,6 +48,8 @@ pub struct Profile {
     pub metered: bool,
     /// A fixed IPv4 setting used instead of DHCP on this network.
     pub manual: Option<Manual>,
+    /// 802.1X (wifi.md §7.4): its profile and credential are in aura-keys.
+    pub enterprise: bool,
 }
 
 impl Profile {
@@ -59,7 +61,8 @@ impl Profile {
             .with("mac", &self.mac)
             .with("auto", self.auto as u8)
             .with("prio", self.prio)
-            .with("metered", self.metered as u8);
+            .with("metered", self.metered as u8)
+            .with("eap", self.enterprise as u8);
         match &self.manual {
             Some(m) => lines::with_manual(l, m),
             None => l,
@@ -79,6 +82,7 @@ impl Profile {
             prio: l.num("prio").unwrap_or(0).clamp(-1000, 1000),
             metered: l.get("metered") == Some("1"),
             manual: lines::manual(l),
+            enterprise: l.get("eap") == Some("1"),
         })
     }
 
@@ -86,6 +90,8 @@ impl Profile {
     pub fn security(&self, wanted: Option<&str>) -> &'static str {
         if self.open {
             "open"
+        } else if self.enterprise {
+            "eap"
         } else if self.wpa3_only || wanted == Some("sae") {
             "sae"
         } else {
@@ -407,6 +413,12 @@ impl Wifi {
         vec![Act::Save]
     }
 
+    /// The user trusted the network's server: its failed joins so far
+    /// were waiting on that, not broken.
+    pub fn failures_clear(&mut self, ssid: &[u8]) {
+        self.failures.retain(|(s, _, _)| *s != ssid);
+    }
+
     /// A fixed address for a saved network (None: DHCP again). False if
     /// the network is not saved.
     pub fn set_manual(&mut self, ssid: &[u8], m: Option<Manual>) -> bool {
@@ -523,15 +535,19 @@ impl Wifi {
                         self.trial = None;
                     }
                     a.push(Act::LeaseDown);
+                    // A server waiting for the user to trust it (802.1X, no
+                    // CA set): asking again won't change that; held until
+                    // they do (`failures_clear`) or the hold ends.
+                    let step = if l.get("why") == Some("eap-trust") { MAX_FAILURES } else { 1 };
                     let n = match self.failures.iter_mut().find(|(s, _, _)| *s == ssid) {
                         Some(f) => {
-                            f.1 += 1;
+                            f.1 = if step == MAX_FAILURES { f.1.max(MAX_FAILURES) } else { f.1 + 1 };
                             f.2 = now + FAILING_HOLD_MS;
                             f.1
                         }
                         None => {
-                            self.failures.push((ssid.clone(), 1, now + FAILING_HOLD_MS));
-                            1
+                            self.failures.push((ssid.clone(), step, now + FAILING_HOLD_MS));
+                            step
                         }
                     };
                     if n == MAX_FAILURES {
@@ -583,7 +599,7 @@ mod tests {
     use super::*;
 
     fn prof(s: &str, prio: i32) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None, enterprise: false }
     }
 
     fn line(s: &str) -> Line {
@@ -694,7 +710,7 @@ mod dropout_tests {
     use super::*;
 
     fn prof(s: &str) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None, enterprise: false }
     }
 
     fn line(s: &str) -> Line {
@@ -774,6 +790,23 @@ mod dropout_tests {
     }
 
     #[test]
+    fn a_server_waiting_for_trust_is_not_asked_again_until_trusted() {
+        let mut w = Wifi::new(Saved { profiles: vec![Profile { enterprise: true, ..prof("corp") }], country: None });
+        w.mlme_up(0);
+        w.tick(0);
+        w.mlme_line(&Line::new("bss").with_hex("ssid", b"corp").with("rssi", -50), 0);
+        let a = w.mlme_line(&line("scan-done status=0 count=1"), 0);
+        assert!(a.iter().any(|x| matches!(x, Act::Join { security: "eap", .. })), "{a:?}");
+        w.mlme_line(&line("state state=failed why=eap-trust"), 1);
+        let t = w.deadline().unwrap();
+        w.tick(t);
+        w.mlme_line(&Line::new("bss").with_hex("ssid", b"corp").with("rssi", -50), t);
+        assert!(!w.mlme_line(&line("scan-done status=0 count=1"), t).iter().any(|x| matches!(x, Act::Join { .. })), "held after one stop");
+        w.failures_clear(b"corp");
+        assert!(w.join(b"corp".to_vec(), None, None).iter().any(|x| matches!(x, Act::Join { .. })), "joined once trusted");
+    }
+
+    #[test]
     fn user_leave_drops_address_now() {
         let mut w = Wifi::new(Saved { profiles: vec![prof("home")], country: None });
         w.mlme_up(0);
@@ -791,7 +824,7 @@ mod weak_signal_tests {
     use super::*;
 
     fn prof(s: &str, prio: i32) -> Profile {
-        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None }
+        Profile { ssid: s.as_bytes().to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio, metered: false, manual: None, enterprise: false }
     }
 
     fn line(s: &str) -> Line {

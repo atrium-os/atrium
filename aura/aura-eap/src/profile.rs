@@ -50,6 +50,8 @@ pub struct Profile {
     pub domain: String,
     /// CA certificates (DER) the server must chain to.
     pub ca: Vec<Vec<u8>>,
+    /// Or the system's root certificates (with `domain`; no `ca`).
+    pub system_roots: bool,
     /// The top certificate (DER) pinned by "Trust this server".
     pub pin: Option<Vec<u8>>,
     pub password: Zeroizing<String>,
@@ -106,6 +108,9 @@ impl Profile {
         for c in &self.ca {
             put("ca", c);
         }
+        if self.system_roots {
+            put("roots", b"system");
+        }
         if let Some(p) = &self.pin {
             put("pin", p);
         }
@@ -134,6 +139,7 @@ impl Profile {
             anonymous: None,
             domain: String::new(),
             ca: Vec::new(),
+            system_roots: false,
             pin: None,
             password: Zeroizing::new(String::new()),
             cert: Vec::new(),
@@ -150,6 +156,7 @@ impl Profile {
                 b"anonymous" => p.anonymous = Some(text()?),
                 b"domain" => p.domain = text()?,
                 b"ca" if p.ca.len() < 8 => p.ca.push(v.to_vec()),
+                b"roots" if v.as_slice() == b"system" => p.system_roots = true,
                 b"pin" => p.pin = Some(v.to_vec()),
                 b"password" => p.password = Zeroizing::new(text()?),
                 b"cert" if p.cert.len() < 8 => p.cert.push(v.to_vec()),
@@ -177,6 +184,7 @@ mod tests {
             anonymous: None,
             domain: "corp.example".into(),
             ca: vec![vec![0x30, 1, 2]],
+            system_roots: true,
             pin: None,
             password: Zeroizing::new("s3cret=\n".into()),
             cert: vec![vec![0x30, 9]],

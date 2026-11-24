@@ -7,7 +7,7 @@
 //!   aura-ctl forget SSID
 //!   aura-ctl remember-eap SSID --method peap|ttls-pap|ttls-mschapv2|tls
 //!                --identity NAME [--anonymous NAME] [--domain DOMAIN]
-//!                [--ca FILE.der]   (password on stdin; an 802.1X network)
+//!                [--ca FILE.der | --roots system]   (password on stdin; an 802.1X network)
 //!                [--key ID --cert FILE.der]   (EAP-TLS: the key from eap-key)
 //!   aura-ctl eap-key SSID --cn NAME --out FILE.der
 //!                (EAP-TLS: a key made in Arca; its certificate request)
@@ -141,6 +141,7 @@ fn main() {
                     "--anonymous" => l.with_hex("anonymous", v.as_bytes()),
                     "--domain" => l.with_hex("domain", v.as_bytes()),
                     "--ca" => l.with_hex("ca", &std::fs::read(v).unwrap_or_else(|e| die(&format!("{v}: {e}")))),
+                    "--roots" if v == "system" => l.with("roots", "system"),
                     "--key" => l.with("key", v),
                     "--cert" => l.with_hex("cert", &std::fs::read(v).unwrap_or_else(|e| die(&format!("{v}: {e}")))),
                     _ => die("remember-eap SSID --method M --identity NAME [--anonymous NAME] [--domain D] [--ca FILE.der] [--key ID --cert FILE.der]"),

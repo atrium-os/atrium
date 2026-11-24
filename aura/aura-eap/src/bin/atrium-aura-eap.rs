@@ -6,6 +6,10 @@
 //! and writes back responses and, at the end, the MSK, a failure, or the
 //! certificate the user has to decide about (aura_eap::helper). For
 //! EAP-TLS it asks aura-keys to sign with the key Arca keeps.
+//!
+//! usage: atrium-aura-eap [--roots PATH]   (the system's root certificates,
+//! PEM, default /etc/ssl/cert.pem; opened before capability mode, read only
+//! for a profile that uses them)
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -69,7 +73,32 @@ impl Pipe {
     }
 }
 
+/// The most of the roots bundle read (FreeBSD's is about 180 KB).
+const MAX_ROOTS: u64 = 1 << 20;
+
+fn system_roots(f: Option<std::fs::File>) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    let mut pem = Vec::new();
+    if let Some(f) = f {
+        if f.take(MAX_ROOTS).read_to_end(&mut pem).is_err() {
+            return Vec::new();
+        }
+    }
+    rustls::pki_types::CertificateDer::pem_slice_iter(&pem).filter_map(Result::ok).collect()
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let roots_path = match args.get(1..) {
+        Some([flag, path]) if flag == "--roots" => path.clone(),
+        Some([]) | None => "/etc/ssl/cert.pem".into(),
+        _ => {
+            eprintln!("usage: atrium-aura-eap [--roots PATH]");
+            std::process::exit(2);
+        }
+    };
+    // Opened now: after cap_enter no path can be.
+    let mut roots_file = std::fs::File::open(&roots_path).ok();
     #[cfg(target_os = "freebsd")]
     {
         // SAFETY: cap_enter takes no arguments and only changes this process.
@@ -92,7 +121,12 @@ fn main() {
                     send(helper::FAILED, b"bad-profile");
                     return;
                 };
-                let mut cfg = Config::from_profile(&p);
+                let system = if p.system_roots { system_roots(roots_file.take()) } else { Vec::new() };
+                if p.system_roots && system.is_empty() {
+                    send(helper::FAILED, b"no-system-roots");
+                    return;
+                }
+                let mut cfg = Config::from_profile(&p, &system);
                 if p.method == Method::Tls {
                     let (Some(_), false) = (p.key, p.cert.is_empty()) else {
                         send(helper::FAILED, b"no-client-certificate");

@@ -39,6 +39,15 @@ pub mod op {
     pub const WIFI_LEAVE: u16 = 0x22;
     pub const WIFI_FORGET: u16 = 0x23;
     pub const WIFI_SET_PROFILE: u16 = 0x24;
+    /// [`Enterprise`]: remember an 802.1X network (wifi.md §7.4) and join
+    /// it. `FAILED` "eap-trust" when a first join with no CA stopped at
+    /// the server's certificate: `WIFI_SERVER_SEEN` shows it.
+    pub const WIFI_JOIN_ENTERPRISE: u16 = 0x25;
+    /// SSID → [`ServerSeen`]: the certificate that first join stopped at.
+    pub const WIFI_SERVER_SEEN: u16 = 0x26;
+    /// SSID: "Trust this server" (pin what was seen, for that network
+    /// only), then join; answers like `WIFI_JOIN`.
+    pub const WIFI_TRUST_SERVER: u16 = 0x27;
     pub const WIFI_NEARBY: u16 = 0x30;
     pub const SET_COUNTRY: u16 = 0x40;
     pub const SET_STATIC: u16 = 0x41;
@@ -119,7 +128,7 @@ impl Grant {
         match o {
             STATUS | SUBSCRIBE => true,
             INTERFACES | ROUTES => self == Grant::Details,
-            WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE => self == Grant::Wifi,
+            WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE | WIFI_JOIN_ENTERPRISE | WIFI_SERVER_SEEN | WIFI_TRUST_SERVER => self == Grant::Wifi,
             WIFI_NEARBY => self == Grant::Nearby,
             SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS => self == Grant::Configure,
             PRINT_DISCOVERY => self == Grant::PrintDiscovery,
@@ -358,6 +367,79 @@ pub struct Profile {
     /// A fixed IPv4 setting for this network (`SET_STATIC`); None: DHCP.
     /// Not changed by `WIFI_SET_PROFILE`.
     pub manual: Option<Manual>,
+    /// An 802.1X network (work, campus): a username and password, not a
+    /// passphrase. Not changed by `WIFI_SET_PROFILE`.
+    pub enterprise: bool,
+}
+
+/// An 802.1X network to remember and join (wifi.md §7.4). The password is
+/// what the user typed into Arca's field: only its handle passes here.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enterprise {
+    pub ssid: Vec<u8>,
+    /// `peap`, `ttls-pap` or `ttls-mschapv2`.
+    pub method: String,
+    pub identity: String,
+    /// The name sent before the tunnel; None: `anonymous@<realm>`.
+    pub anonymous: Option<String>,
+    /// The server must be this domain or a name under it. Empty: the
+    /// first join stops at the server's certificate for the user to trust.
+    pub domain: String,
+    /// The network's CA certificate (DER), or the system's roots.
+    pub ca: Option<Vec<u8>>,
+    pub system_roots: bool,
+    pub handle: [u8; 16],
+}
+
+impl std::fmt::Debug for Enterprise {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Enterprise").field("ssid", &self.ssid).field("method", &self.method).field("identity", &self.identity).field("domain", &self.domain).finish_non_exhaustive()
+    }
+}
+
+pub const ENTERPRISE_METHODS: [&str; 3] = ["peap", "ttls-pap", "ttls-mschapv2"];
+
+fn dns_name_ok(n: &str) -> bool {
+    n.len() <= 253 && n.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+}
+
+impl Enterprise {
+    pub fn check(&self) -> Res<()> {
+        let text = |s: &str| !s.is_empty() && s.len() <= 253 && s.chars().all(|c| !c.is_control());
+        if !ENTERPRISE_METHODS.contains(&self.method.as_str()) {
+            return Err(Fail::new(status::MALFORMED, "method is peap, ttls-pap or ttls-mschapv2"));
+        }
+        if !text(&self.identity) || self.anonymous.as_deref().is_some_and(|a| !text(a)) {
+            return Err(Fail::new(status::MALFORMED, "a username is 1 to 253 characters"));
+        }
+        if !self.domain.is_empty() && !dns_name_ok(&self.domain) {
+            return Err(Fail::new(status::MALFORMED, "the server's domain is a DNS name"));
+        }
+        if (self.ca.is_some() || self.system_roots) && self.domain.is_empty() {
+            return Err(Fail::new(status::MALFORMED, "a CA needs the server's domain"));
+        }
+        if self.ca.is_some() && self.system_roots {
+            return Err(Fail::new(status::MALFORMED, "a CA or the system's roots, not both"));
+        }
+        if self.ca.as_ref().is_some_and(|c| c.is_empty() || c.len() > 1500 || c[0] != 0x30) {
+            return Err(Fail::new(status::MALFORMED, "the CA certificate is DER, at most 1500 bytes"));
+        }
+        Ok(())
+    }
+}
+
+/// The certificate an 802.1X server showed on a first join, for "Trust
+/// this server".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSeen {
+    /// The DNS names the certificate is for.
+    pub names: Vec<String>,
+    pub subject: String,
+    pub issuer: String,
+    /// "YYYY-MM-DD".
+    pub not_after: String,
+    /// SHA-256 of the certificate that would be pinned (the chain's top).
+    pub sha256: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,6 +536,15 @@ pub mod server {
         fn routes(&self) -> Res<Routes>;
         fn profiles(&self) -> Res<Vec<Profile>>;
         fn join(&self, j: Join) -> Res<()>;
+        fn join_enterprise(&self, _e: Enterprise) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
+        }
+        fn server_seen(&self, _ssid: Vec<u8>) -> Res<ServerSeen> {
+            Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
+        }
+        fn trust_server(&self, _ssid: Vec<u8>) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
+        }
         fn leave(&self) -> Res<()>;
         fn forget(&self, ssid: Vec<u8>) -> Res<()>;
         fn set_profile(&self, p: Profile) -> Res<()>;
@@ -538,6 +629,19 @@ pub mod server {
                         }
                     }
                     b.join(j)
+                })),
+                op::WIFI_JOIN_ENTERPRISE => enc(&arg::<Enterprise>(p).and_then(|e| {
+                    valid_ssid(&e.ssid)?;
+                    e.check()?;
+                    b.join_enterprise(e)
+                })),
+                op::WIFI_SERVER_SEEN => enc(&arg::<Vec<u8>>(p).and_then(|s| {
+                    valid_ssid(&s)?;
+                    b.server_seen(s)
+                })),
+                op::WIFI_TRUST_SERVER => enc(&arg::<Vec<u8>>(p).and_then(|s| {
+                    valid_ssid(&s)?;
+                    b.trust_server(s)
                 })),
                 op::WIFI_LEAVE => enc(&b.leave()),
                 op::WIFI_FORGET => enc(&arg::<Vec<u8>>(p).and_then(|s| {
@@ -625,6 +729,9 @@ pub mod client {
         pub fn limit(o: u16) -> std::time::Duration {
             std::time::Duration::from_secs(match o {
                 op::WIFI_JOIN => 90,
+                // 802.1X: a TLS handshake and an exchange with the
+                // network's RADIUS server before the 4-way handshake.
+                op::WIFI_JOIN_ENTERPRISE | op::WIFI_TRUST_SERVER => 150,
                 op::WIFI_NEARBY => 30,
                 _ => 10,
             })
@@ -675,6 +782,15 @@ pub mod client {
         }
         pub fn join(&mut self, j: &Join) -> Res<()> {
             self.call(op::WIFI_JOIN, j)
+        }
+        pub fn join_enterprise(&mut self, e: &Enterprise) -> Res<()> {
+            self.call(op::WIFI_JOIN_ENTERPRISE, e)
+        }
+        pub fn server_seen(&mut self, ssid: &[u8]) -> Res<ServerSeen> {
+            self.call(op::WIFI_SERVER_SEEN, &ssid.to_vec())
+        }
+        pub fn trust_server(&mut self, ssid: &[u8]) -> Res<()> {
+            self.call(op::WIFI_TRUST_SERVER, &ssid.to_vec())
         }
         pub fn leave(&mut self) -> Res<()> {
             self.call(op::WIFI_LEAVE, &())

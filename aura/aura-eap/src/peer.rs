@@ -34,16 +34,20 @@ pub struct Config {
 
 impl Config {
     /// The settings for a join from the stored profile.
-    pub fn from_profile(p: &crate::profile::Profile) -> Config {
+    /// `system`: the system's root certificates, used when the profile
+    /// asks for them (with a domain, so not any server they ever signed).
+    pub fn from_profile(p: &crate::profile::Profile, system: &[rustls::pki_types::CertificateDer<'static>]) -> Config {
+        let roots = |certs: &mut dyn Iterator<Item = rustls::pki_types::CertificateDer<'static>>| {
+            let mut roots = rustls::RootCertStore::empty();
+            for c in certs {
+                let _ = roots.add(c);
+            }
+            Trust::Roots { roots: Arc::new(roots), domain: p.domain.clone() }
+        };
         let trust = match (&p.pin, p.ca.is_empty()) {
             (Some(top), _) => Trust::Pinned { top: top.clone().into(), domain: p.domain.clone() },
-            (None, false) => {
-                let mut roots = rustls::RootCertStore::empty();
-                for c in &p.ca {
-                    let _ = roots.add(c.clone().into());
-                }
-                Trust::Roots { roots: Arc::new(roots), domain: p.domain.clone() }
-            }
+            (None, false) => roots(&mut p.ca.iter().map(|c| c.clone().into())),
+            (None, true) if p.system_roots && !p.domain.is_empty() => roots(&mut system.iter().cloned()),
             (None, true) => Trust::Unset,
         };
         Config {

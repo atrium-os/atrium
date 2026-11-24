@@ -231,6 +231,9 @@ impl Station {
         let wrong = matches!(self.st, State::Keys { m2: true, .. })
             && reason == REASON_4WAY_TIMEOUT
             && matches!(why, "deauth" | "disassoc" | "handshake-timeout");
+        // 802.1X ended before the keys (a refused password, an untrusted
+        // server, a server waiting to be trusted): the join failed.
+        let eap_failed = matches!(self.st, State::Keys { .. }) && why.starts_with("eap-");
         if tell_ap {
             let protect = matches!(self.st, State::Up { .. }) && t.pmf;
             let s = self.seq();
@@ -249,6 +252,8 @@ impl Station {
         self.unnarrow(out);
         if wrong {
             out.push(Out::Ctl(state_line("failed").with("why", "wrong-passphrase").with("reason", reason)));
+        } else if eap_failed {
+            out.push(Out::Ctl(state_line("failed").with("why", why)));
         } else {
             out.push(Out::Ctl(state_line("disconnected").with("reason", reason).with("why", why)));
         }

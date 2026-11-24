@@ -131,6 +131,7 @@ pub fn profile(l: &Line) -> Option<Profile> {
         prio: l.num("prio").unwrap_or(0),
         metered: l.get("metered") == Some("1"),
         manual: manual(l),
+        enterprise: l.get("eap") == Some("1"),
     })
 }
 
@@ -153,6 +154,8 @@ pub fn security(s: &str) -> &'static str {
         "psk" | "psk-sha256" => "wpa2",
         "sae" => "wpa3",
         "sae-transition" => "wpa2/wpa3",
+        "eap" => "wpa2-enterprise",
+        "eap-sha256" => "wpa3-enterprise",
         _ => "unsupported",
     }
 }

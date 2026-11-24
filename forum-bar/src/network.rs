@@ -117,6 +117,12 @@ pub fn menu(n: &NetShown) -> (Vec<MenuItem>, Vec<Option<NetAction>>) {
             (name(&x.ssid), Some(NetAction::Join { ssid: x.ssid.clone(), open }))
         } else if open {
             (format!("{} (open)", name(&x.ssid)), Some(NetAction::Join { ssid: x.ssid.clone(), open: true }))
+        } else if x.security.ends_with("-enterprise") {
+            // A work or campus network: username, password and how its
+            // server is checked are set in Settings (wifi.md §7.4).
+            (format!("{} — work network, sign in from Settings", name(&x.ssid)), None)
+        } else if x.security == "unsupported" {
+            (format!("{} — not supported", name(&x.ssid)), None)
         } else {
             (format!("{} — passphrase in Settings", name(&x.ssid)), None)
         };
@@ -221,7 +227,7 @@ mod tests {
         let near = |s: &str, sec: &str, known| Nearby { ssid: s.as_bytes().to_vec(), security: sec.into(), bars: 3, known };
         let n = NetShown {
             status: Some(st(Link::Wifi, Online::Unknown, Some(3), Some("home"))),
-            nearby: vec![near("home", "wpa2", true), near("cafe", "open", false), near("office", "wpa3", true), near("neighbour", "wpa2", false)],
+            nearby: vec![near("home", "wpa2", true), near("cafe", "open", false), near("office", "wpa3", true), near("neighbour", "wpa2", false), near("corp", "wpa3-enterprise", false), near("uni", "wpa2-enterprise", true)],
             scanning: false,
             note: None,
         };
@@ -233,7 +239,10 @@ mod tests {
         assert_eq!(acts[3], Some(NetAction::Join { ssid: b"cafe".to_vec(), open: true }));
         assert_eq!(acts[4], Some(NetAction::Join { ssid: b"office".to_vec(), open: false }));
         assert_eq!(acts[5], None, "a new secured network needs Settings");
-        assert_eq!(acts.len(), 6, "the current network is not offered again");
+        assert_eq!(acts[6], None, "so does a new work network");
+        assert!(items[6].label.contains("work network"), "{:?}", items[6].label);
+        assert_eq!(acts[7], Some(NetAction::Join { ssid: b"uni".to_vec(), open: false }), "a saved work network joins from the bar");
+        assert_eq!(acts.len(), 8, "the current network is not offered again");
     }
 
     #[test]

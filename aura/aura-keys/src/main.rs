@@ -18,7 +18,8 @@
 //!
 //!
 //! 802.1X networks (wifi.md §7.4): `remember-eap ssid=.. method=..
-//! identity=.. [anonymous=..] [domain=..] [ca=<DER hex>] secret=..|handle=..`
+//! identity=.. [anonymous=..] [domain=..] [ca=<DER hex> | roots=system]
+//! secret=..|handle=..`
 //! stores the network's profile; an `assoc` with AKM 1 or 5 runs EAP in
 //! `atrium-aura-eap` (eap.rs) and the 4-way handshake on its MSK. A first
 //! join with no CA stops at the server's certificate: `eap-seen ssid=..`
@@ -566,10 +567,15 @@ impl Keys {
                 Some(seen) if seen.ssid == ssid => {
                     use sha2::Digest;
                     let top = seen.chain.last().expect("a chain");
-                    Line::new("seen")
+                    let leaf = seen.chain.first().and_then(|c| aura_eap::cert::summary(c));
+                    let mut r = Line::new("seen")
                         .with("names", if seen.names.is_empty() { "-".to_string() } else { seen.names.join(",") })
                         .with("certs", seen.chain.len())
-                        .with_hex("top_sha256", &sha2::Sha256::digest(top))
+                        .with_hex("top_sha256", &sha2::Sha256::digest(top));
+                    if let Some(s) = leaf {
+                        r = r.with_hex("subject", s.subject.as_bytes()).with_hex("issuer", s.issuer.as_bytes()).with("not_after", s.not_after);
+                    }
+                    r
                 }
                 _ => err("nothing-seen"),
             },
@@ -630,9 +636,13 @@ impl Keys {
         let Ok(password) = String::from_utf8(password.to_vec()).map(zeroize::Zeroizing::new) else { return err("bad-secret") };
         let domain = text("domain").unwrap_or_default();
         let ca: Vec<Vec<u8>> = l.hex("ca").into_iter().collect();
-        if !ca.is_empty() && domain.is_empty() {
+        let system_roots = l.get("roots") == Some("system");
+        if (!ca.is_empty() || system_roots) && domain.is_empty() {
             // A CA without a name trusts every server that CA ever signed.
             return err("ca-needs-domain");
+        }
+        if system_roots && !ca.is_empty() {
+            return err("ca-or-system-roots");
         }
         let (mut cert, mut key) = (Vec::new(), None);
         if method == Method::Tls {
@@ -651,7 +661,7 @@ impl Keys {
             }
             (cert, key) = (vec![c], Some(id));
         }
-        let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, pin: None, password, cert, key };
+        let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, system_roots, pin: None, password, cert, key };
         match self.store.remember(&creds::account(&ssid), &p.encode()) {
             Ok(()) => Line::new("ok"),
             Err(e) => err(&store_err(&e)),
@@ -691,7 +701,7 @@ impl Keys {
             Ok(None) => return err("no-credential"),
             Err(e) => return err(&store_err(&e)),
         };
-        if p.pin.is_some() || !p.ca.is_empty() {
+        if p.pin.is_some() || !p.ca.is_empty() || p.system_roots {
             // A changed server is never trusted by a press: forget the
             // network and set it up again.
             return err("already-trusted");
