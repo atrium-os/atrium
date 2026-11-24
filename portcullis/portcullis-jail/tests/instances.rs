@@ -144,3 +144,19 @@ fn an_overlong_jaild_instance_name_is_refused() {
     let long = "org.".to_string() + &"x".repeat(70);
     assert!(portcullis_jail::jaild_instance_name(&long, Some("1")).is_none());
 }
+
+/// `decoders = ["image"]` (app-composition.md C6) is what brings the
+/// worker-call socket into a jail that has no `[[workers]]`; a bad decoder
+/// name is a manifest error.
+#[test]
+fn decoders_bring_the_worker_call_socket() {
+    let m = portcullis_toml::parse_and_validate(
+        "[app]\nid = \"org.atrium.pics\"\nname = \"T\"\nversion = \"1\"\nentry = \"bin/t\"\n\n[capabilities]\ndecoders = [\"image\"]\n"
+    ).expect("valid manifest").0;
+    let jc = build(&m, &opts(None)).expect("builds");
+    assert!(jc.mounts.iter().any(|mt| format!("{mt:?}").contains("workers")), "no worker-call socket: {:?}", jc.mounts);
+    let (_, r) = portcullis_toml::parse_and_validate(
+        "[app]\nid = \"org.atrium.pics\"\nname = \"T\"\nversion = \"1\"\nentry = \"bin/t\"\n\n[capabilities]\ndecoders = [\"../x\"]\n"
+    ).expect("parses");
+    assert!(r.errors.iter().any(|e| e.contains("decoders")), "{:?}", r.errors);
+}

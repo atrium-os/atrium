@@ -529,6 +529,11 @@ pub struct Capabilities {
     /// Limen roles the app may ask to embed (app-composition.md §3, C7):
     /// `embeds = ["picker", "doc-viewer"]`. Each is a consent line.
     pub embeds: Option<Vec<String>>,
+    /// The system's decoders the app calls (app-composition.md C6,
+    /// dev-tools.md §3.5): `decoders = ["image"]`. Each runs in a jail of
+    /// its own with no capability, as the system's uid, never the app's
+    /// (portcullisd's `SystemWorker`), so it asks no consent.
+    pub decoders: Option<Vec<String>>,
     /// Arca's API for the app's own items (app-composition.md §3, C8): it
     /// keeps secrets in Arca and reads back only its own. Asks consent.
     pub arca: Option<bool>,
@@ -798,6 +803,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         protected_media:  ovr.protected_media.or(base.protected_media),
         network_portal:   ovr.network_portal.or(base.network_portal),
         embeds:           ovr.embeds.clone().or_else(|| base.embeds.clone()),
+        decoders:         ovr.decoders.clone().or_else(|| base.decoders.clone()),
         arca:             ovr.arca.or(base.arca),
         arca_courier:     ovr.arca_courier.or(base.arca_courier),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),

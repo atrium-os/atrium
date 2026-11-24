@@ -503,6 +503,9 @@ min_user_uid        = 1000
 max_user_uid        = 65000
 allowed_system_uids = [
     65055,   # _fasti: Calendar store service
+    65056,   # _imagedec: the system's image decoder, started per call by
+             # portcullisd (SystemWorker) under the system worker rule
+             # (image-decode-bundle.sh; app-composition.md C6)
     # Atrium's system uids sit above the user range and below nobody
     # (65534), clear of base and ports: 65 and 66, reserved here at first,
     # are FreeBSD's _dhcp and uucp.
@@ -567,6 +570,7 @@ allowed_system_uids = [
 [gid]
 allowed_system_gids = [
     65055,   # _fasti
+    65056,   # _imagedec
     # mirrors uid table
     65010,   # _frescod
     65011,   # _fresco-render

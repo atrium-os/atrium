@@ -18,6 +18,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-assets"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "atrium-worker",
+]
+
+[[package]]
 name = "atrium-links"
 version = "0.1.0"
 dependencies = [

@@ -229,10 +229,11 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
 
     /* Apply each declared capability. */
     capabilities::apply_all(&manifest.capabilities, &mut jc, opts)?;
-    /* An app with `[[workers]]` reaches portcullisd's worker-call socket,
-     * which takes WorkerCall and nothing else. (A worker's own jail is
-     * built from a manifest with no workers, so it does not.) */
-    if !manifest.workers.is_empty() {
+    /* An app with `[[workers]]` or `decoders` reaches portcullisd's
+     * worker-call socket, which takes WorkerCall (its own workers) and
+     * SystemWorker (the decoders it names) and nothing else. (A worker's
+     * own jail is built from a manifest with neither, so it does not.) */
+    if !manifest.workers.is_empty() || manifest.capabilities.decoders.as_ref().is_some_and(|d| !d.is_empty()) {
         capabilities::apply_socket("workers", &mut jc, opts);
     }
     /* `embeds` (app-composition.md §5.1): limend's socket. limend checks

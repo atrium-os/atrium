@@ -272,6 +272,19 @@ workers with their fuzz state, and the check's findings. The trace prints
 `view=`, and `vm-artifex-check.sh` drives the Fuzz view's buttons and opens
 the Composition view.
 
+As built (step 3): the image decoder is `org.atrium.image-decode`
+(`atrium-image-decode/`, installed by `scripts/image-decode-bundle.sh`),
+started per session by portcullisd's `SystemWorker` for an app naming
+`decoders = ["image"]` (app-composition.md §3, C6). It speaks the
+`atrium-worker` wire: `atrium_assets::Decode { max_width, max_height }` plus
+the open file, answered by `Picture { width, height, rgba }`. A raster
+picture is fitted into the box and never enlarged; an SVG is drawn at the
+largest size of its own shape that fits. The SDK's `atrium-assets` crate
+opens `assets/<name>` in the bundle (names of `A-Z a-z 0-9 . _ -` parts,
+no `..`), checks the answer's size and length, and with
+`ATRIUM_WORKERS=local` runs the decoder as a plain child for development
+off Atrium. `scripts/vm-image-decode-check.sh` is its VM check.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today

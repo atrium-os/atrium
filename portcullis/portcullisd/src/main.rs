@@ -469,7 +469,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &response)?;
             continue;
         }
-        if workers_only && !matches!(req, Request::WorkerCall { .. }) {
+        if workers_only && !matches!(req, Request::WorkerCall { .. } | Request::SystemWorker { .. }) {
             write_response(&mut writer, &Response::Error {
                 message: "request is unavailable on the worker-call socket".into() })?;
             return Ok(());
@@ -653,6 +653,50 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
                                  &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
                                  Some((person.clone(), persona.clone())), false)?;
+            continue;
+        }
+        /* ★ SystemWorker (app-composition.md C6, dev-tools.md §3.5): one of
+         * the system's decoders (portcullis_ipc::SYSTEM_WORKERS), for a
+         * launched app that names it in `decoders`, never a worker. Its bundle is the system's
+         * installed one for that name; it runs as the system worker rule's
+         * uid (never the caller's) in a one-shot jail with no capability,
+         * on the rule's own concurrency budget. Without a rule it is
+         * refused: it never runs as its caller. */
+        if let Request::SystemWorker { name } = &req {
+            let refuse = |why: String| Response::LaunchFailed { stage: "system-worker".into(), message: why };
+            let Some(bundle) = portcullis_ipc::system_worker_app(name) else {
+                write_response(&mut writer, &refuse("no such system worker".into()))?;
+                continue;
+            };
+            let reg = load_registry();
+            let Some((person, app)) = reg.resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+                eprintln!("portcullisd: system worker {bundle} DENIED to uid {uid}: not a launched app");
+                write_response(&mut writer, &refuse("only an app calls a system worker: uid is not a launched app".into()))?;
+                continue;
+            };
+            if app.starts_with("worker:") {
+                write_response(&mut writer, &refuse("a worker calls no workers".into()))?;
+                continue;
+            }
+            // Named in the caller's INSTALLED manifest, else refused (an
+            // unreadable manifest refuses too).
+            let named = launch::installed_manifest(&app)
+                .is_some_and(|m| m.capabilities.decoders.as_ref().is_some_and(|d| d.iter().any(|n| n == name)));
+            if !named {
+                eprintln!("portcullisd: system worker {bundle} DENIED to {app}: not in its decoders");
+                write_response(&mut writer, &refuse(format!("{app}'s manifest does not name {name:?} in decoders")))?;
+                continue;
+            }
+            let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.workers.get(bundle).cloned()) else {
+                eprintln!("portcullisd: system worker {bundle} for {app} REFUSED: no system worker rule");
+                write_response(&mut writer, &refuse(format!("no system worker rule for {bundle}: it never runs as its caller")))?;
+                continue;
+            };
+            let instance = fetcher_instance(uid);
+            eprintln!("portcullisd: system worker {bundle} {instance} for {app} ({person}) runs as {}", rule.run_as);
+            handle_exec_instance(bundle.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -4222,6 +4266,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::OpenCdm { .. } => Response::Error {
             message: "OpenCdm must be routed through the peer-uid, fd-passing path".into(),
+        },
+        Request::SystemWorker { .. } => Response::Error {
+            message: "SystemWorker must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::WorkerCall { .. } => Response::Error {
             message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),
