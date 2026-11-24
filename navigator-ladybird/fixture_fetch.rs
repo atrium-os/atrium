@@ -58,16 +58,66 @@ pub unsafe extern "C" fn navigator_fixture_get(
     out: *mut u8,
     capacity: usize,
 ) -> usize {
+    unsafe { fixture_request(url, len, out, capacity, None) }
+}
+
+/// # Safety
+/// The caller supplies readable URL and body bytes and writable reply storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_player_post(
+    url: *const u8,
+    len: usize,
+    body: *const u8,
+    size: usize,
+    out: *mut u8,
+    capacity: usize,
+) -> usize {
+    if size == 0 || size > navigator_control::youtube::PLAYER_BODY_LIMIT {
+        return 0;
+    }
+    let body = unsafe { std::slice::from_raw_parts(body, size) };
+    unsafe { fixture_request(url, len, out, capacity, Some(body)) }
+}
+
+unsafe fn fixture_request(
+    url: *const u8,
+    len: usize,
+    out: *mut u8,
+    capacity: usize,
+    post: Option<&[u8]>,
+) -> usize {
     let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {
         return 0;
     };
-    let asset = navigator_control::youtube::asset_mime(url);
-    let limit = if asset.is_some() { navigator_control::youtube::asset_limit(url) } else if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
+    if post.is_some() && !navigator_control::youtube::player_url(url) {
+        return 0;
+    }
+    let asset = if post.is_some() {
+        Some("application/json")
+    } else {
+        navigator_control::youtube::asset_mime(url)
+    };
+    let limit = if post.is_some() {
+        navigator_control::youtube::PLAYER_RESPONSE_LIMIT
+    } else if asset.is_some() {
+        navigator_control::youtube::asset_limit(url)
+    } else if url == navigator_control::YOUTUBE_ENTRY {
+        navigator_control::YOUTUBE_ENTRY_LIMIT
+    } else {
+        65536
+    };
     if capacity > limit { return 0; }
     let Some(mut state) = CLIENT.get().and_then(|c| c.lock().ok()) else {
         return 0;
     };
     if state.as_ref().is_some_and(|(_,step,seq)| *seq == Some(PROVIDER) && *step > 0 && asset.is_none()) {return 0;}
+    if post.is_some()
+        && !state
+            .as_ref()
+            .is_some_and(|(_, step, seq)| *seq == Some(PROVIDER) && *step > 0)
+    {
+        return 0;
+    }
     let Some((mut client, step, sequence)) = state.take() else {
         return 0;
     };
@@ -87,7 +137,10 @@ pub unsafe extern "C" fn navigator_fixture_get(
     let expected_mime = if provider_asset { asset.unwrap() } else if url == VIDEO[1] { "text/javascript" }
         else if url == VIDEO[2] { "video/webm" } else if url == VIDEO[3] { "audio/webm" } else { "text/html" };
     let request_id = step as u32 + 1;
-    let mut open = Open::get(request_id, url);
+    let mut open = match post {
+        Some(bytes) => Open::post(request_id, url, "application/json", bytes.to_vec()),
+        None => Open::get(request_id, url),
+    };
     open.limits.max_bytes = capacity as u64;
     open.retry.max_attempts = 0;
     if client.open(open).is_err() {

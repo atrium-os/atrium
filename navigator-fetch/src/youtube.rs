@@ -1,6 +1,6 @@
 //! Bounded HTTPS GETs for the installed I4 embed. Only its fixed entry sends
 //! the app ID. Its versioned bootstrap resources use anonymous requests.
-use crate::{Conn, Conversation, http};
+use crate::{http, Conn, Conversation};
 use std::io::{Read, Write};
 
 pub const HOST: &str = "www.youtube-nocookie.com";
@@ -38,6 +38,25 @@ pub fn resource(url: &str, conv: &mut Conversation<'_>) -> Result<Vec<u8>, Strin
     } else {
         exchange(&mut *stream)
     }
+}
+
+pub fn player(input: &[u8], conv: &mut Conversation<'_>) -> Result<Vec<u8>, String> {
+    use navigator_control::youtube::player_body;
+    let body = player_body(input)?;
+    conv.site_check(HOST).map_err(|e| e.to_string())?;
+    let Conn::Tls(mut stream) = conv
+        .connect(HOST, 443, true, HOST)
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("player requires TLS".into());
+    };
+    exchange_player(&mut *stream, &body)
+}
+
+fn exchange_player(stream: &mut (impl Read + Write), body: &[u8]) -> Result<Vec<u8>, String> {
+    use navigator_control::youtube::{ORIGIN, PLAYER_RESPONSE_LIMIT};
+    write!(stream, "POST /youtubei/v1/player?prettyPrint=false HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nReferer: {ORIGIN}/embed/M7lc1UVf-VE\r\nContent-Type: application/json\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).and_then(|_|stream.write_all(body)).and_then(|_|stream.flush()).map_err(|e|e.to_string())?;
+    response(stream, "application/json", PLAYER_RESPONSE_LIMIT)
 }
 
 fn exchange(stream: &mut (impl Read + Write)) -> Result<Vec<u8>, String> {
@@ -105,6 +124,31 @@ mod tests {
     }
 
     #[test]
+    fn player_post_uses_fixed_headers_and_refuses_redirects() {
+        let mut wire = Wire {
+            sent: Vec::new(),
+            reply: Cursor::new(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+                    .to_vec(),
+            ),
+        };
+        assert_eq!(exchange_player(&mut wire, b"{}").unwrap(), b"{}");
+        let request = std::str::from_utf8(&wire.sent).unwrap();
+        assert!(request.starts_with("POST /youtubei/v1/player?prettyPrint=false HTTP/1.1\r\nHost: www.youtube-nocookie.com\r\n"));
+        assert!(request.contains("Content-Length: 2\r\n"));
+        assert!(request.ends_with("\r\n\r\n{}"));
+        assert!(!request.to_ascii_lowercase().contains("cookie:"));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        wire.reply = Cursor::new(
+            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        );
+        assert!(exchange_player(&mut wire, b"{}")
+            .unwrap_err()
+            .contains("307"));
+    }
+
+    #[test]
     fn icon_requires_cross_origin_permission_and_svg_mime() {
         for (origin, mime, ok) in [
             ("", "image/svg+xml", false),
@@ -144,12 +188,10 @@ mod tests {
         );
         let mut ordinary = Vec::new();
         http::write_request(&mut ordinary, HOST, "/embed/M7lc1UVf-VE").unwrap();
-        assert!(
-            !String::from_utf8(ordinary)
-                .unwrap()
-                .to_lowercase()
-                .contains("referer:")
-        );
+        assert!(!String::from_utf8(ordinary)
+            .unwrap()
+            .to_lowercase()
+            .contains("referer:"));
 
         entry.reply = Cursor::new(
             b"HTTP/1.1 302 Found\r\nLocation: /another\r\nContent-Length: 0\r\n\r\n".to_vec(),

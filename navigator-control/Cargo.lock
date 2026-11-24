@@ -325,6 +325,7 @@ dependencies = [
  "portcullis-ipc",
  "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

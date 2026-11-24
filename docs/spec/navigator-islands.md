@@ -598,10 +598,37 @@ unused z-axis scale differs from one by floating-point roundoff.
 The provider moved from cued (5) to buffering (3). The spinner continued
 painting at the 11-second capture. The restricted loader refused the
 `POST /youtubei/v1/player` request. No media delivery was verified.
-The next gate needs a bounded player-request contract before it can test
-the returned media URLs. The private guest exited cleanly.
+The subsequent player POST gate below exercises that boundary. The private guest exited cleanly.
 
 Evidence is in `~/atrium-vm/evidence/navigator-i4-play-icon-20261124/`.
+
+#### Bounded player POST on Tessera
+
+A trusted Start opens the fixed demo embed. Its private Nuntius channel
+accepts at most two player POSTs in the first 120 seconds, within the existing
+resource count and byte budget. The destination is the exact same-origin
+`/youtubei/v1/player` with an optional `?prettyPrint=false`. LibWeb accepts
+JSON with identity or gzip encoding. Both compressed input and inflated output
+are capped at 32 KiB. The renderer inflates a single gzip stream before IPC.
+The broker and TLS worker validate the video ID and embedded client, and
+rebuild the body using the app embed identity and bounded playback fields,
+including the provider's own visitor and integrity values when present.
+No page-supplied headers, cookies or authorization are forwarded.
+The courier accepts HTTP 200 JSON up to 512 KiB and does not follow redirects
+or retry the POST.
+
+On the installed arm64 Tessera gate, the first attempt exposed the startup
+socket closing before Play. The interactive timeout fixed that. The next
+attempt established that the provider sent gzip-compressed JSON. With both
+fixes, the minimal player body received 4,136 bytes. The body including
+embed identity, playback context and provider values received 4,103 bytes.
+Both responses reported a playability error and no adaptive formats. The page’s player API reported
+“This video is unavailable”.
+Time, decoded frames and buffered ranges remained zero. Native VP9 and Opus
+buffer creation and append probes recorded no calls. The error UI attempted
+`PaintOuterBoxShadow` after the response, which stopped scene submission.
+The guest exited cleanly. Evidence is in
+`~/atrium-vm/evidence/navigator-i4-player-post-20261124/`.
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter

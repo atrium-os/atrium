@@ -20,7 +20,7 @@ fn run() -> Result<(), String> {
         let channel = UnixStream::from(fd);
         let timeout = Some(std::time::Duration::from_secs(10));
         channel
-            .set_read_timeout(timeout)
+            .set_read_timeout(Some(navigator_control::youtube::PLAYER_WINDOW))
             .and_then(|_| channel.set_write_timeout(timeout))
             .map_err(|e| e.to_string())?;
         channel
@@ -52,10 +52,32 @@ fn run() -> Result<(), String> {
     {
         use std::io::Read;
         let mut remaining = navigator_control::youtube::ASSET_BUDGET;
+        let mut posts = 0;
         for step in 0..=navigator_control::youtube::ASSET_COUNT {
             let mut kind = [0];
             if out.read(&mut kind).map_err(|e| e.to_string())? == 0 {
                 break;
+            }
+            if step > 0 && kind[0] == 3 {
+                use navigator_control::youtube::{PLAYER_BODY_LIMIT, PLAYER_REQUESTS};
+                if posts >= PLAYER_REQUESTS || remaining == 0 {
+                    return Err("player budget exhausted".into());
+                }
+                let mut header = [0; 2];
+                out.read_exact(&mut header).map_err(|e| e.to_string())?;
+                let len = usize::from(u16::from_be_bytes(header));
+                if !(1..=PLAYER_BODY_LIMIT).contains(&len) {
+                    return Err("invalid player request size".into());
+                }
+                let mut bytes = vec![0; len];
+                out.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+                let reply = youtube::player(&bytes, &mut conversation)?;
+                remaining = remaining
+                    .checked_sub(reply.len())
+                    .ok_or("startup byte budget")?;
+                posts += 1;
+                send(&mut out, &reply)?;
+                continue;
             }
             let url = match (step, kind[0]) {
                 (0, 1) => navigator_control::YOUTUBE_ENTRY.to_owned(),
