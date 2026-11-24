@@ -29,5 +29,6 @@ portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 libc            = "0.2"
 
 [dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tempfile = "3"

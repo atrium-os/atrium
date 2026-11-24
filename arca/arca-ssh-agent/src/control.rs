@@ -5,7 +5,8 @@
 //!   WORKSPACE`, `forget OWNER WORKSPACE PERSONA` (deleted: its grants go),
 //!   `list OWNER PERSONA` and `grant|revoke OWNER PERSONA ID WORKSPACE`;
 //! - a person (a uid with a passwd entry that is not a launched app's):
-//!   `new|new-touch PERSONA COMMENT...`, `list PERSONA`, `grant|revoke PERSONA ID
+//!   `new|new-touch|new-p256|new-p256-touch PERSONA COMMENT...` (P-256: an
+//!   `ecdsa-sha2-nistp256` key, which also signs bundles), `list PERSONA`, `grant|revoke PERSONA ID
 //!   WORKSPACE`, `delete PERSONA ID`, `token PERSONA HOST USERNAME` (the
 //!   token on the next line), acting on their own keys only.
 
@@ -24,7 +25,7 @@ pub enum Admin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Person {
-    New { persona: String, comment: String, touch: bool },
+    New { persona: String, comment: String, touch: bool, p256: bool },
     List { persona: String },
     Grant { persona: String, id: [u8; 16], ws: String, on: bool },
     Delete { persona: String, id: [u8; 16] },
@@ -68,11 +69,11 @@ pub fn parse_person(line: &str) -> Option<Person> {
     let f: Vec<&str> = rest.split_ascii_whitespace().collect();
     let p = |s: &&str| valid_persona(s).then(|| s.to_string());
     match (verb, f.as_slice()) {
-        ("new" | "new-touch", [persona, ..]) => {
+        ("new" | "new-touch" | "new-p256" | "new-p256-touch", [persona, ..]) => {
             let comment = rest.trim_start().strip_prefix(*persona)?.trim().to_string();
             (!comment.is_empty() && comment.len() <= arcad::proto::ssh_op::COMMENT_MAX && !comment.chars().any(char::is_control))
                 .then_some(())?;
-            Some(Person::New { persona: p(persona)?, comment, touch: verb == "new-touch" })
+            Some(Person::New { persona: p(persona)?, comment, touch: verb.ends_with("-touch"), p256: verb.starts_with("new-p256") })
         }
         ("list", [persona]) => Some(Person::List { persona: p(persona)? }),
         ("grant" | "revoke", [persona, id, ws]) if ws_ok(ws) => {
@@ -100,7 +101,10 @@ mod tests {
         assert_eq!(parse_admin("close alice web"), Some(Admin::Close { owner: "alice".into(), ws: "web".into() }));
         assert!(matches!(parse_admin("forget alice web work"), Some(Admin::Forget { .. })));
         assert_eq!(parse_person("new personal alice@laptop key"),
-                   Some(Person::New { persona: "personal".into(), comment: "alice@laptop key".into(), touch: false }));
+                   Some(Person::New { persona: "personal".into(), comment: "alice@laptop key".into(), touch: false, p256: false }));
+        assert_eq!(parse_person("new-p256-touch work publisher"),
+                   Some(Person::New { persona: "work".into(), comment: "publisher".into(), touch: true, p256: true }));
+        assert_eq!(parse_person("new-p256x work publisher"), None);
         assert_eq!(parse_person("new personal"), None);
         assert_eq!(parse_person("new Bad x"), None);
         let id = "00112233445566778899aabbccddeeff";

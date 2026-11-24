@@ -63,9 +63,11 @@ pub fn base64(b: &[u8]) -> String {
     o
 }
 
-/// `ssh-ed25519 AAAA... comment`, for `authorized_keys` or a forge.
-pub fn public_line(pk: &[u8; 32], comment: &str) -> String {
-    format!("ssh-ed25519 {} {comment}", base64(&wire::key_blob(pk)))
+/// `ssh-ed25519 AAAA... comment` (or `ecdsa-sha2-nistp256 ...`), for
+/// `authorized_keys` or a forge.
+pub fn public_line(k: &wire::Key) -> String {
+    let algo = if k.p256 { "ecdsa-sha2-nistp256" } else { "ssh-ed25519" };
+    format!("{algo} {} {}", base64(&wire::key_blob(k)), k.comment)
 }
 
 pub fn hex(b: &[u8]) -> String {
@@ -95,7 +97,10 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // The blob of an all-zero key, as ssh-keygen would print it.
-        assert!(public_line(&[0; 32], "c").starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI"));
+        let k = wire::Key { id: [0; 16], p256: false, pk: vec![0; 32], comment: "c".into() };
+        assert!(public_line(&k).starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI"));
+        let k = wire::Key { p256: true, pk: vec![4; 65], ..k };
+        assert!(public_line(&k).starts_with("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABB"));
         assert_eq!(unhex16(&hex(&[7; 16])), Some([7; 16]));
         assert_eq!(arca_persona("personal"), "main");
         assert_eq!(arca_persona("work"), "work");

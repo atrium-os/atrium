@@ -254,7 +254,7 @@ impl State {
                 let store = self.stores.get(user).filter(|s| s.state() == LockState::Unlocked)?;
                 let recipient = Recipient::Service(name.clone());
                 let meta = store.meta(&id, &Access { persona, recipient: &recipient }).ok()?;
-                return (meta.kind == Kind::Ed25519 && meta.class == Class::VerifyEachUse
+                return (crate::ssh::is_key(meta.kind) && meta.class == Class::VerifyEachUse
                     && crate::ssh::granted(&meta.scope, workspace))
                     .then(|| (user.into(), format!("workspace {workspace}: {}", meta.account)));
             }
@@ -2854,35 +2854,54 @@ impl State {
         let Some(store) = self.stores.get_mut(&user).filter(|s| s.state() == LockState::Unlocked) else {
             return reply(status::LOCKED);
         };
-        let pubkey = |store: &Store, m: &arca_store::model::ItemMeta| -> Result<[u8; 32], Error> {
+        let pubkey = |store: &Store, m: &arca_store::model::ItemMeta| -> Result<Vec<u8>, Error> {
             if m.class == Class::VerifyEachUse {
-                return crate::ssh::scope_public_key(&m.scope).ok_or(Error::BadInput("SSH public key metadata"));
+                return crate::ssh::scope_public_key(m.kind, &m.scope).ok_or(Error::BadInput("SSH public key metadata"));
             }
             let (_, seed) = store.release(&m.id, &who, None)?;
-            Ok(signing_key(&seed).verifying_key().to_bytes())
+            agent_public(m.kind, &seed)
         };
         match op {
             ssh_op::SA_MINT => {
                 let comment = field!(r.str(ssh_op::COMMENT_MAX));
                 let class = if r.remaining() == 0 {
                     Class::WhileUnlocked
-                } else if field!(r.u8()) == Class::VerifyEachUse as u8 {
-                    Class::VerifyEachUse
                 } else {
-                    return malformed();
+                    match field!(r.u8()) {
+                        c if c == Class::VerifyEachUse as u8 => Class::VerifyEachUse,
+                        c if c == Class::WhileUnlocked as u8 => Class::WhileUnlocked,
+                        _ => return malformed(),
+                    }
+                };
+                let kind = if r.remaining() == 0 {
+                    Kind::Ed25519
+                } else {
+                    match field!(r.u16()) {
+                        k if k == Kind::Ed25519 as u16 => Kind::Ed25519,
+                        k if k == Kind::P256 as u16 => Kind::P256,
+                        _ => return malformed(),
+                    }
                 };
                 field!(r.end());
                 if comment.chars().any(|c| c.is_control()) {
                     return malformed();
                 }
-                let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
-                let pk = signing_key(&seed).verifying_key().to_bytes();
-                let scope = if class == Class::VerifyEachUse { crate::ssh::public_scope(&pk) } else { Vec::new() };
+                // A P-256 scalar must be below the order: a draw that isn't
+                // (about 2^-32) is drawn again.
+                let mut seed = tri!(LockedBuf::random(32).map_err(Error::Io));
+                for _ in 0..8 {
+                    if agent_public(kind, &seed).is_ok() {
+                        break;
+                    }
+                    seed = tri!(LockedBuf::random(32).map_err(Error::Io));
+                }
+                let pk = tri!(agent_public(kind, &seed));
+                let scope = if class == Class::VerifyEachUse { crate::ssh::public_scope(kind, &pk) } else { Vec::new() };
                 let m = tri!(store.add(NewItem {
                     persona: &persona,
                     recipient: me.clone(),
                     class,
-                    kind: Kind::Ed25519,
+                    kind,
                     provenance: Provenance::ArcaGenerated,
                     account: comment,
                     scope: &scope,
@@ -2909,20 +2928,18 @@ impl State {
                 let mut w = Writer::new();
                 for m in tri!(store.list(&who)) {
                     let listed = match ws {
-                        Some(ws) => m.kind == Kind::Ed25519 && granted(&m.scope, ws),
-                        None => matches!(m.kind, Kind::Ed25519 | Kind::ApiKey),
+                        Some(ws) => crate::ssh::is_key(m.kind) && granted(&m.scope, ws),
+                        None => crate::ssh::is_key(m.kind) || m.kind == Kind::ApiKey,
                     };
                     if !listed {
                         continue;
                     }
                     w.raw(&m.id.0);
-                    if ws.is_none() {
-                        w.u16(m.kind as u16);
-                    }
-                    if m.kind == Kind::Ed25519 {
-                        w.raw(&tri!(pubkey(store, &m)));
+                    w.u16(m.kind as u16);
+                    if crate::ssh::is_key(m.kind) {
+                        w.bytes(&tri!(pubkey(store, &m)));
                     } else {
-                        w.raw(&[0; 32]);
+                        w.bytes(&[]);
                     }
                     w.str(&m.account);
                     if ws.is_none() {
@@ -3031,11 +3048,20 @@ impl State {
                 *item = Some(id);
                 let m = tri!(store.meta(&id, &who));
                 // Not granted reads as not there: DENIED either way.
-                if m.kind != Kind::Ed25519 || !granted(&m.scope, ws) {
+                if !crate::ssh::is_key(m.kind) || !granted(&m.scope, ws) {
                     return reply(status::DENIED);
                 }
                 let verified = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
                 let (_, seed) = tri!(store.release(&id, &who, verified));
+                if m.kind == Kind::P256 {
+                    // ECDSA with the SHA-256 prehash: what ecdsa-sha2-nistp256
+                    // and a bundle's atrium.toml.sig both are.
+                    use p256::ecdsa::signature::Signer as _;
+                    let Ok(sk) = p256::ecdsa::SigningKey::from_slice(seed.as_ref()) else { return reply(status::INTERNAL) };
+                    drop(seed);
+                    let sig: p256::ecdsa::Signature = sk.sign(msg);
+                    return ok(sig.to_bytes().to_vec());
+                }
                 let sk = signing_key(&seed);
                 drop(seed);
                 ok(sk.sign(msg).to_bytes().to_vec())
@@ -3196,6 +3222,17 @@ fn x25519(secret: &LockedBuf, point: &[u8; 32]) -> Option<zeroize::Zeroizing<[u8
     zeroize_array(&mut b);
     let shared = s.diffie_hellman(&x25519_dalek::PublicKey::from(*point));
     shared.was_contributory().then(|| zeroize::Zeroizing::new(shared.to_bytes()))
+}
+
+/// The public half of an agent key: Ed25519's 32 bytes, or P-256's
+/// uncompressed SEC1 point (65 bytes). An error for a P-256 scalar that is
+/// zero or not below the order.
+fn agent_public(kind: Kind, seed: &LockedBuf) -> Result<Vec<u8>, Error> {
+    if kind == Kind::P256 {
+        let sk = p256::ecdsa::SigningKey::from_slice(seed.as_ref()).map_err(|_| Error::BadInput("P-256 scalar"))?;
+        return Ok(sk.verifying_key().to_encoded_point(false).as_bytes().to_vec());
+    }
+    Ok(signing_key(seed).verifying_key().to_bytes().to_vec())
 }
 
 fn signing_key(seed: &LockedBuf) -> SigningKey {

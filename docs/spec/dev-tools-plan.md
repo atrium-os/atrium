@@ -317,7 +317,12 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   carried by both Run and `cargo atrium bundle`, and `make bundle` in
   `atrium.app.mk` (runs `cargo-atrium bundle`, so the workspace needs the Rust
   toolchain; `BUNDLE_FLAGS` passes `--sign` and the rest). `vm-run-closure-check.sh`
-  covers both, 24/24. Not done: the Arca-held key.
+  covers both, 24/24. The publisher key in Arca (2026-11-24): `arca-ssh new --p256
+  publisher` makes a P-256 key that the workspace's agent offers as
+  `ecdsa-sha2-nistp256` once granted; `opifex token agent --out pub.key --pub pub.pem`
+  names it, and `--sign pub.key` signs through the agent (arca.md §9.1).
+  `scripts/vm-ssh-agent-check.sh` signs a manifest in the granted workspace (openssl
+  verifies it with the PEM), and another workspace and a revoked grant sign nothing.
 - **M8 (M).** `registries` mode: a jailed `nuntius-egress` CONNECT proxy reusing
   `navigator-fetch`'s address policy; the workspace gets no route out, only the
   proxy; per-workspace host list in its record and the Workspaces app. Gate: cargo

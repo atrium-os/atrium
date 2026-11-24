@@ -6,7 +6,12 @@
 //! opifex token list --module <pkcs11 lib>
 //! opifex token ref --module <pkcs11 lib> --serial <s> --id <hex> --out <file> [--pub <file>]
 //! opifex token pub <key file>
+//! opifex token agent [--comment <c>] --out <file> [--pub <file>]
 //! ```
+//!
+//! `agent` writes a key file for a P-256 key in Arca, reached through the
+//! SSH agent (a workspace's `SSH_AUTH_SOCK`): `arca-ssh new --p256 COMMENT`
+//! makes one and `arca-ssh grant ID WORKSPACE` lets that workspace sign.
 
 use portcullis_token::KeyRef;
 
@@ -51,6 +56,26 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
             print!("{}", portcullis_sig::public_pem(&t).map_err(|e| format!("{f}: {e:?}"))?);
             Ok(())
         }
-        _ => Err("token: list --module <lib> | ref --module <lib> --serial <s> --id <hex> --out <file> [--pub <file>] | pub <key file>".into()),
+        Some("agent") => {
+            let want = flag(args, "--comment");
+            let keys: Vec<_> = portcullis_token::agent::keys()?.into_iter()
+                .filter(|k| want.as_ref().is_none_or(|c| &k.comment == c)).collect();
+            let k = match keys.as_slice() {
+                [k] => k,
+                [] => return Err(format!("the SSH agent offers no P-256 key{} (arca-ssh new --p256 COMMENT, then arca-ssh grant ID WORKSPACE)",
+                                         want.map(|c| format!(" named {c:?}")).unwrap_or_default())),
+                many => return Err(format!("the SSH agent offers {} P-256 keys ({}): pick one with --comment",
+                                           many.len(), many.iter().map(|k| format!("{:?}", k.comment)).collect::<Vec<_>>().join(", "))),
+            };
+            let pem = k.pem()?;
+            let out = need("--out")?;
+            std::fs::write(&out, k.text()).map_err(|e| format!("{out}: {e}"))?;
+            if let Some(p) = flag(args, "--pub") {
+                std::fs::write(&p, &pem).map_err(|e| format!("{p}: {e}"))?;
+            }
+            println!("opifex: {out} names Arca key {:?} (key id {})", k.comment, &opifex_catalog::key_id(&pem)?[..16]);
+            Ok(())
+        }
+        _ => Err("token: list --module <lib> | ref --module <lib> --serial <s> --id <hex> --out <file> [--pub <file>] | pub <key file> | agent [--comment <c>] --out <file> [--pub <file>]".into()),
     }
 }

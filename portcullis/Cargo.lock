@@ -1332,6 +1332,7 @@ dependencies = [
 name = "portcullis-token"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cryptoki",
  "opifex-catalog",
  "p256",

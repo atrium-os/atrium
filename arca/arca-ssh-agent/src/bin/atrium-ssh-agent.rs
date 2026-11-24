@@ -295,17 +295,17 @@ fn person(a: &Agent, user: &str, line: &str, token: &str) -> Result<Vec<String>,
 fn person_request(a: &Agent, user: &str, req: Person, token: &str) -> Result<Vec<String>, String> {
     let e = |e: arca_ssh_agent::arca::Error| e.to_string();
     match req {
-        Person::New { persona, comment, touch } => {
-            let k = a.arca.mint(user, &persona, &comment, touch).map_err(e)?;
-            eprintln!("ssh-agent: {user} made key {} in {persona}", &hex(&k.id)[..8]);
-            Ok(vec![format!("{} {}", hex(&k.id), public_line(&k.pk, &k.comment))])
+        Person::New { persona, comment, touch, p256 } => {
+            let k = a.arca.mint(user, &persona, &comment, touch, p256).map_err(e)?;
+            eprintln!("ssh-agent: {user} made {} key {} in {persona}", if p256 { "P-256" } else { "Ed25519" }, &hex(&k.id)[..8]);
+            Ok(vec![format!("{} {}", hex(&k.id), public_line(&k))])
         }
         Person::List { persona } => Ok(a.arca.list(user, &persona).map_err(e)?
             .into_iter()
             .map(|l| if l.token {
                 format!("{} token {} granted={}", hex(&l.key.id), l.key.comment, l.grants.join(","))
             } else {
-                format!("{} {} granted={}", hex(&l.key.id), public_line(&l.key.pk, &l.key.comment), l.grants.join(","))
+                format!("{} {} granted={}", hex(&l.key.id), public_line(&l.key), l.grants.join(","))
             })
             .collect()),
         Person::Grant { persona, id, ws, on } => {

@@ -788,6 +788,18 @@ For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
   Each invocation accepts only a fresh Sigillum reply for an enrolled
   security key with user verification and presence. Refusal, an unavailable
   verifier, or a passcode reply returns no signature.
+- **Publisher keys (bundle signing, dev-tools-plan M7).** `arca-ssh new --p256 COMMENT`
+  makes a P-256 item instead (`SA_MINT` with a trailing `u16 kind`; Ed25519 stays the
+  default). The agent offers it as `ecdsa-sha2-nistp256`, under the same grants and
+  verify-each-use option as any key, and arcad signs ECDSA over SHA-256 of the data, which is
+  exactly a bundle's `atrium.toml.sig`. In a workspace `opifex token agent [--comment C]
+  --out FILE [--pub PEM]` writes a key file naming that key by its public line
+  (`atrium-agent-key = 1`, `public = "ecdsa-sha2-nistp256 ..."`), and every opifex `--key`/
+  `--sign` takes it, so `cargo atrium bundle --sign FILE` and `make bundle` sign with a key
+  whose private half stays in Arca. opifex checks the agent's signature against the key
+  before writing it; the PEM goes in `/etc/atrium/publishers/`. `SA_KEYS` and `SA_LIST`
+  carry `u16 kind | bytes pubkey` for each key. Portcullisd copies the host's opifex into
+  each workspace's tool folder, beside git-credential-arca.
 - Gate: `scripts/vm-ssh-agent-check.sh`.
 
 ### 9.2 Mail S/MIME content-key unwrap

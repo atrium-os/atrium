@@ -37,12 +37,22 @@ fn grant(s: &mut State, persona: &str, id: [u8; 16], ws: &str, on: bool) -> u8 {
     s.handle(&agent(), o, &body(|w| { w.str("alice"); w.str(persona); w.raw(&id); w.str(ws); })).status
 }
 
-fn keys(s: &mut State, persona: &str, ws: &str) -> Vec<([u8; 16], [u8; 32], String)> {
+fn keys_of(s: &mut State, persona: &str, ws: &str) -> Vec<([u8; 16], u16, Vec<u8>, String)> {
     let r = s.handle(&agent(), ssh_op::SA_KEYS, &body(|w| { w.str("alice"); w.str(persona); w.str(ws); }));
     assert_eq!(r.status, status::OK);
     let mut rd = Reader::new(r.body.bytes());
     let n = rd.u32().unwrap();
-    (0..n).map(|_| (rd.array().unwrap(), rd.array().unwrap(), rd.str(256).unwrap().to_string())).collect()
+    let v = (0..n).map(|_| (rd.array().unwrap(), rd.u16().unwrap(), rd.bytes(65).unwrap().to_vec(), rd.str(256).unwrap().to_string())).collect();
+    rd.end().unwrap();
+    v
+}
+
+/// The Ed25519 keys granted to `ws`.
+fn keys(s: &mut State, persona: &str, ws: &str) -> Vec<([u8; 16], [u8; 32], String)> {
+    keys_of(s, persona, ws).into_iter().map(|(id, kind, pk, c)| {
+        assert_eq!(kind, arca_store::Kind::Ed25519 as u16);
+        (id, pk.try_into().unwrap(), c)
+    }).collect()
 }
 
 fn sign(s: &mut State, who: &Label, persona: &str, ws: &str, id: [u8; 16], msg: &[u8]) -> (u8, Vec<u8>) {
@@ -143,7 +153,7 @@ fn a_workspace_gets_only_its_granted_https_token() {
     assert_eq!(rd.u32().unwrap(), 1);
     let _id: [u8; 16] = rd.array().unwrap();
     assert_eq!(rd.u16().unwrap(), 4, "ApiKey");
-    assert_eq!(rd.array::<32>().unwrap(), [0; 32]);
+    assert_eq!(rd.bytes(65).unwrap(), b"", "a token has no public key");
     assert_eq!(rd.str(512).unwrap(), "github.com alice");
     assert_eq!(rd.str(4096).unwrap(), "web");
 
@@ -238,4 +248,37 @@ fn touch_keys_list_publicly_and_require_a_new_security_key_reply_for_each_signat
     verifier.join().unwrap();
     drop(client);
     arcad.join().unwrap();
+}
+
+#[test]
+fn a_p256_publisher_key_signs_for_its_workspace_only() {
+    use p256::ecdsa::{signature::Verifier as _, Signature as EcSig, VerifyingKey as EcKey};
+    let (_d, mut s) = setup();
+    let r = s.handle(&agent(), ssh_op::SA_MINT, &body(|w| {
+        w.str("alice"); w.str("main"); w.str("publisher");
+        w.u8(arca_store::Class::WhileUnlocked as u8);
+        w.u16(arca_store::Kind::P256 as u16);
+    }));
+    assert_eq!(r.status, status::OK);
+    let id: [u8; 16] = r.body.bytes()[..16].try_into().unwrap();
+    let pk = r.body.bytes()[16..].to_vec();
+    assert_eq!((pk.len(), pk[0]), (65, 4), "an uncompressed point");
+    assert_eq!(sign(&mut s, &agent(), "main", "web", id, b"m").0, status::DENIED, "not granted yet");
+    assert_eq!(grant(&mut s, "main", id, "web", true), status::OK);
+    assert_eq!(keys_of(&mut s, "main", "web"), vec![(id, arca_store::Kind::P256 as u16, pk.clone(), "publisher".into())]);
+    let manifest = b"[app]\nid = \"org.example.app\"\n";
+    let (st, sig) = sign(&mut s, &agent(), "main", "web", id, manifest);
+    assert_eq!(st, status::OK);
+    let vk = EcKey::from_sec1_bytes(&pk).unwrap();
+    vk.verify(manifest, &EcSig::from_slice(&sig).unwrap()).unwrap();
+    assert!(vk.verify(b"other", &EcSig::from_slice(&sig).unwrap()).is_err());
+    assert_eq!(sign(&mut s, &agent(), "main", "lib", id, manifest).0, status::DENIED);
+    assert_eq!(sign(&mut s, &agent(), "work", "web", id, manifest).0, status::DENIED);
+    // Only Ed25519 and P-256 can be minted.
+    let r = s.handle(&agent(), ssh_op::SA_MINT, &body(|w| {
+        w.str("alice"); w.str("main"); w.str("x");
+        w.u8(arca_store::Class::WhileUnlocked as u8);
+        w.u16(arca_store::Kind::Symmetric as u16);
+    }));
+    assert_eq!(r.status, status::MALFORMED);
 }

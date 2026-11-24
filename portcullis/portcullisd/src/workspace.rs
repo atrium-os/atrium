@@ -271,27 +271,33 @@ fn ensure_ws_bin() -> Result<PathBuf, String> {
             fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
         }
     }
-    // git's credential helper for Arca's HTTPS tokens (M9), from the host's
-    // install; none installed, none offered.
-    let src = Path::new(GIT_CREDENTIAL_ARCA);
-    let f = dir.join("git-credential-arca");
-    match fs::read(src) {
-        Ok(b) if fs::read(&f).ok().as_deref() != Some(&b[..]) => {
-            let tmp = dir.join(".git-credential-arca.new");
-            fs::write(&tmp, &b).map_err(|e| format!("{}: {e}", tmp.display()))?;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
-            fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
-        }
-        Ok(_) => {}
-        Err(_) => {
-            let _ = fs::remove_file(&f);
+    // Host tools a workspace uses as they are, from the host's install;
+    // none installed, none offered.
+    for src in HOST_TOOLS {
+        let src = Path::new(src);
+        let Some(name) = src.file_name() else { continue };
+        let f = dir.join(name);
+        match fs::read(src) {
+            Ok(b) if fs::read(&f).ok().as_deref() != Some(&b[..]) => {
+                let tmp = dir.join(format!(".{}.new", name.to_string_lossy()));
+                fs::write(&tmp, &b).map_err(|e| format!("{}: {e}", tmp.display()))?;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
+                fs::rename(&tmp, &f).map_err(|e| e.to_string())?;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let _ = fs::remove_file(&f);
+            }
         }
     }
     Ok(dir)
 }
 
-/// Where the host has git-credential-arca (scripts/ssh-agent-service.sh).
-const GIT_CREDENTIAL_ARCA: &str = "/usr/local/bin/git-credential-arca";
+/// Host tools copied into every workspace's tool folder: git's credential
+/// helper for Arca's HTTPS tokens (M9, scripts/ssh-agent-service.sh), and
+/// opifex, which `cargo atrium bundle` and `make bundle` pack and sign with
+/// (a publisher key in Arca signs through the workspace's agent).
+const HOST_TOOLS: &[&str] = &["/usr/local/bin/git-credential-arca", "/usr/local/bin/opifex"];
 
 /// Files the jail's `/etc` starts with, from the host's.
 const ETC: &[&str] = &[
@@ -950,7 +956,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     if agent.is_some() && (running_jid(owner, name).is_none() || mounted) {
         env.push(crate::ssh_agent::AUTH_SOCK.into());
         // git asks the agent for HTTPS tokens too (git-credential-arca).
-        if Path::new(GIT_CREDENTIAL_ARCA).exists() {
+        if Path::new(HOST_TOOLS[0]).exists() {
             env.extend(["GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=credential.helper", "GIT_CONFIG_VALUE_0=arca"].map(String::from));
         }
     }

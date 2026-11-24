@@ -26,6 +26,10 @@
 #     workspace: git there has credential.helper=arca, and
 #     git-credential-arca hands it over for that host only, not to the
 #     other workspace;
+#   - a P-256 publisher key (`arca-ssh new --p256`) granted to a workspace
+#     signs a package manifest there with `opifex token agent` and `opifex
+#     sign` (what `cargo atrium bundle --sign` runs); openssl verifies it
+#     outside; another workspace gets no key file and no signature;
 #   - revoke ends it; stopping a workspace closes its socket; a locked
 #     store lists nothing. (Deleting a workspace needs a person's gesture,
 #     so its grants ending is arcad's test, tests/ssh.rs.)
@@ -61,7 +65,7 @@ hasnt() { case "$3" in *"$2"*) bad "$1: [$2] in [$3]" ;; *) ok "$1" ;; esac; }
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
-    -p jaild -p portcullisd -p portcullis-cli --example sigillum_stand_in --bin atrium-jaild --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap) || { echo "ssh-agent: 1 failed"; exit 1; }
+    -p jaild -p portcullisd -p portcullis-cli -p opifex --example sigillum_stand_in --bin atrium-jaild --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap --bin opifex) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arca-ssh-agent" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 
@@ -87,7 +91,7 @@ V "test ! -s $G/arcad.pid || kill \$(cat $G/arcad.pid) 2>/dev/null || true"
 V "pkill -x portcullisd; pkill -f $B/; sleep 1; rm -rf $B $G; mkdir -p $B $G; chmod 755 $B"
 for b in portcullis/target/$TARGET/release/atrium-jaild \
          portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
-         portcullis/target/$TARGET/release/atrium-portcullisd-bootstrap \
+         portcullis/target/$TARGET/release/atrium-portcullisd-bootstrap portcullis/target/$TARGET/release/opifex \
          portcullis/target/$TARGET/release/examples/sigillum_stand_in \
          arca/arcad/target/$TARGET/release/arcad arca/arcad/target/$TARGET/release/arca-probe \
          arca/arca-ssh-agent/target/$TARGET/release/atrium-ssh-agent arca/arca-ssh-agent/target/$TARGET/release/arca-ssh \
@@ -102,7 +106,7 @@ LOG=$B/portcullisd.log
 V 'sh -s' <<EOS
 set -e
 mkdir -p /usr/local/bin /usr/local/etc/rc.d
-for b in portcullisd portcullis arca-ssh git-credential-arca; do install -m 0755 $B/\$b /usr/local/bin/\$b; done
+for b in portcullisd portcullis opifex arca-ssh git-credential-arca; do install -m 0755 $B/\$b /usr/local/bin/\$b; done
 mkdir -p /etc/atrium; cp $B/jaild.policy.toml /etc/atrium/jaild.policy.toml
 grep -q '^allow_rctl' /etc/atrium/jaild.policy.toml || printf '\n[resource_control]\nallow_rctl = true\n' >> /etc/atrium/jaild.policy.toml
 id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
@@ -290,6 +294,33 @@ for use in 1 2; do
 done
 check "every protected signing attempt asked Sigillum" 4 "$(prompts)"
 SSHA revoke "$protected_id" keys >/dev/null
+
+echo "=== a publisher key signs bundles (opifex through the agent)"
+PNEW=$(SSHA new --p256 publisher)
+PID=$(echo "$PNEW" | awk '{print $1}')
+check "arca-ssh new --p256: an id" 32 "${#PID}"
+has "an ecdsa-sha2-nistp256 public line" "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY" "$PNEW"
+SSHA grant "$PID" keys >/dev/null
+PUBSIGN='rm -rf pkg pub.key pub.pem; mkdir pkg
+printf "[app]\nid = \"org.example.signed\"\nversion = \"1.0\"\n\n[bundle]\ncontent = \"sha256:%064d\"\n" 0 > pkg/atrium.toml
+opifex token agent --comment publisher --out pub.key --pub pub.pem 2>&1 && opifex sign pkg --key pub.key 2>&1
+grep -c PRIVATE pub.key; test -s pkg/atrium.toml.sig && echo signed'
+out=$(run keys "$PUBSIGN")
+has "opifex token agent names the Arca key" "names Arca key \"publisher\"" "$out"
+has "opifex sign signs through the agent" "signed org.example.signed" "$out"
+has "the key file holds no private key" "0
+signed" "$out"
+r=$(V "cd $W/keys/work && b64decode -r < pkg/atrium.toml.sig > /tmp/pub.sig.der && openssl dgst -sha256 -verify pub.pem -signature /tmp/pub.sig.der pkg/atrium.toml 2>&1")
+has "openssl verifies it with the key's public PEM" "Verified OK" "$r"
+r=$(V "cp $W/keys/work/pub.pem /tmp/pub.pem && ssh-keygen -i -m PKCS8 -f /tmp/pub.pem 2>&1 | cut -d' ' -f2")
+check "the PEM is the key arca-ssh made" "$(echo "$PNEW" | awk '{print $3}')" "$r"
+out=$(run other "$PUBSIGN")
+has "another workspace has no publisher key" "offers no P-256 key" "$out"
+hasnt "and signs nothing" "signed org.example" "$out"
+SSHA revoke "$PID" keys >/dev/null
+out=$(run keys 'rm -f pkg/atrium.toml.sig; opifex sign pkg --key pub.key 2>&1; test -s pkg/atrium.toml.sig && echo signed')
+has "revoked: the agent refuses" "refused to sign" "$out"
+hasnt "and nothing is signed" "signed org.example" "$out"
 
 echo "=== revoke, lock, delete"
 check "broker revokes the key" "ok" "$(agent_admin revoke alice personal "$ID" keys)"
