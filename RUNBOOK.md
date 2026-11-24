@@ -5558,6 +5558,9 @@ sh scripts/aura-sim-gate.sh bar-eap # the w7 APs, atrium-net/netconf and the bar
 sh scripts/curia-vm.sh arca         # Settings with Arca's field: click a work network, `type` the
                                     # username (@ works), the password into Arca's field, Join, then
                                     # "Trust this server" (wifi.md §7.4 E4)
+sh scripts/curia-vm.sh picker       # then Scrinium as the picker over /tmp/aura/certs (the corp CA);
+sh scripts/curia-vm.sh sign         # after "Make a certificate request": the test CA signs it into
+                                    # /tmp/aura/certs/tls-user.pem for "Import the signed certificate…"
 sh scripts/aura-ap-vm.sh ap CONF... # AP configs from aura/sim-ap (two at most: one radio each, bridged)
 sh scripts/aura-ap-vm.sh signal 2412 -85 2437 -40   # what the FreeBSD side hears per channel
 sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there

@@ -10,7 +10,7 @@
 #                                               # arca-ui; then Curia, one frame
 #   sh scripts/curia-vm.sh shot                 # start Curia, one frame
 #   sh scripts/curia-vm.sh click X Y [name]     # a click, then a frame
-#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, 0-9, @ . / , space, Enter as |, Backspace as <), then a frame
+#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, 0-9, @ . / , - space, Enter as |, Backspace as <), then a frame
 #   sh scripts/curia-vm.sh frame [name]
 #   sh scripts/curia-vm.sh status               # atrium-netctl status + list
 #   sh scripts/curia-vm.sh away                 # after `arca`: each service Settings talks to
@@ -21,6 +21,12 @@
 #                                               # lyra-vm-check.sh qemu-args): lyrad, choragusd
 #                                               # with the control socket, frescod, forum-wm,
 #                                               # a tone as org.test.a, Curia's Sound page
+#   sh scripts/curia-vm.sh picker               # after `arca`: Scrinium as the system picker,
+#                                               # its one place /tmp/aura/certs holding the
+#                                               # corp CA that aura-sim-gate.sh bar-eap kept
+#   sh scripts/curia-vm.sh sign                 # the corp CA signs the newest certificate
+#                                               # request aura-keys answered (EAP-TLS, as IT
+#                                               # would) into /tmp/aura/certs/tls-user.pem
 #   sh scripts/curia-vm.sh core [TEXT]          # Curia's core: TEXT (default the gate's
 #                                               # passphrase) must not be in it
 set -eu
@@ -172,11 +178,12 @@ type)
             .) u=55 ;;
             /) u=56 ;;
             ,) u=54 ;;
+            -) u=45 ;;
             " ") u=44 ;;
             "|") u=40 ;;   # Enter
             @) out="${out}KEY 31 1 2\nKEY 31 0 2\n"; continue ;;   # Shift-2 (modifier byte 2: left Shift)
             "<") u=42 ;;   # Backspace
-            *) echo "type: only a-z, 0-9, @ . / , space, | (Enter) and < (Backspace)"; exit 2 ;;
+            *) echo "type: only a-z, 0-9, @ . / , -, space, | (Enter) and < (Backspace)"; exit 2 ;;
         esac
         out="${out}KEY $u 1\nKEY $u 0\n"
     done
@@ -184,8 +191,38 @@ type)
     frame "${3:-typed}" ;;
 frame)
     GAP=${GAP:-2} frame "${2:-now}" ;;
+picker)
+    W="$ROOT/scratch/w7-ca"
+    test -f "$W/corp-ca.pem" || { echo "no $W/corp-ca.pem: run aura-sim-gate.sh bar-eap"; exit 1; }
+    (cd "$ROOT/scrinium" && RUSTFLAGS="$X" cargo build -q --release --target "$T" --bin scrinium) || exit 1
+    "$V" "pkill -x scrinium; sleep 1; true"
+    scp $K -P 2222 -q "$ROOT/scrinium/target/$T/release/scrinium" "root@localhost:$D/"
+    "$V" 'mkdir -p /tmp/aura/certs && cat > /tmp/aura/certs/corp-ca.pem' < "$W/corp-ca.pem"
+    # Scrinium (sg-files) is alice's picker in the registry; limend lets
+    # Curia embed it from Curia's installed manifest.
+    "$V" "set -e
+        id sg-files >/dev/null 2>&1 || pw useradd sg-files -u 50097 -d /nonexistent -s /usr/sbin/nologin
+        sed -i '' '/^50097 /d' /tmp/aura/launch-registry
+        printf '50097 alice org.atrium.scrinium $PUB\n' >> /tmp/aura/launch-registry
+        mkdir -p /var/lib/atrium/apps/org.atrium.curia
+        chmod 755 /tmp/aura/certs; chmod 644 /tmp/aura/certs/*"
+    "$V" 'cat > /var/lib/atrium/apps/org.atrium.curia/atrium.toml' < "$ROOT/curia/atrium.toml"
+    "$V" "cd $Sx && env HOME=/nonexistent SCRINIUM_HOME=/nonexistent SCRINIUM_WORKSPACES=/nonexistent LIMEN_SOCKET=$Sx/limend.sock FRESCO_SOCKET=$Sx/fresco.sock \
+            SCRINIUM_PLACES='Certificates=/tmp/aura/certs' daemon -f -u sg-files -o $Sx/picker.log $D/scrinium --no-window </dev/null
+        i=0; until grep -q 'providing picker' $Sx/picker.log; do i=\$((i+1)); [ \$i -lt 30 ] || { tail -5 $Sx/picker.log; exit 1; }; sleep 1; done
+        echo 'picker: Scrinium provides it'" ;;
+sign)
+    W="$ROOT/scratch/w7-ca"
+    csr=$("$V" 'cat /var/log/atrium/atrium-aura-keys.log /tmp/aura/keys.log 2>/dev/null' | sed -n 's/.*-> key id=[0-9a-f]* csr=\([0-9a-f]*\).*/\1/p' | tail -1)
+    [ -n "$csr" ] || { echo "no certificate request in aura-keys' log"; exit 1; }
+    python3 -c "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))" "$csr" > "$W/tls.csr.der"
+    printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$W/ext"
+    openssl req -in "$W/tls.csr.der" -inform DER -verify -noout -subject || exit 1
+    openssl x509 -req -in "$W/tls.csr.der" -inform DER -CA "$W/corp-ca.pem" -CAkey "$W/corp-ca.key" -CAcreateserial -days 30 -out "$W/tls-user.pem" -extfile "$W/ext" || exit 1
+    "$V" 'cat > /tmp/aura/certs/tls-user.pem && chmod 644 /tmp/aura/certs/tls-user.pem' < "$W/tls-user.pem"
+    echo "signed: /tmp/aura/certs/tls-user.pem" ;;
 status)
     "$V" "/tmp/aura/atrium-netctl --sock /tmp/aura/net.sock status; /tmp/aura/atrium-netctl --sock /tmp/aura/net.sock list; tail -n 5 $Sx/curia.log" ;;
 *)
-    sed -n 2,19p "$0"; exit 2 ;;
+    sed -n 2,31p "$0"; exit 2 ;;
 esac

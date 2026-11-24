@@ -3,7 +3,7 @@
 //! the requests the page wants made. `main.rs` makes them on a thread and
 //! feeds the answers back with [`NetPage::apply`].
 
-use atrium_netconf::{check_dns, tls_name_ok, DnsTls, Enterprise, Iface, Link, Manual, Nearby, Online, Profile, ServerSeen, SetStatic, Status, Target};
+use atrium_netconf::{check_dns, der_to_pem, pem_to_der, tls_name_ok, CertRequest, DnsTls, Enterprise, KeyRequest, Iface, Link, Manual, Nearby, Online, Profile, ServerSeen, SetStatic, Status, Target};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// A request to atrium-netconf.
@@ -24,6 +24,8 @@ pub enum Want {
     Seen(Vec<u8>),
     /// "Trust this server", then join.
     Trust(Vec<u8>),
+    /// A certificate login's key, made in Arca, and its request.
+    CertRequest(CertRequest),
     Leave,
     Forget(Vec<u8>),
     Save(Profile),
@@ -48,6 +50,7 @@ impl std::fmt::Debug for Want {
             Want::JoinEnterprise(e) => write!(f, "JoinEnterprise({:?}, {})", String::from_utf8_lossy(&e.ssid), e.method),
             Want::Seen(s) => write!(f, "Seen({:?})", String::from_utf8_lossy(s)),
             Want::Trust(s) => write!(f, "Trust({:?})", String::from_utf8_lossy(s)),
+            Want::CertRequest(r) => write!(f, "CertRequest({:?})", String::from_utf8_lossy(&r.ssid)),
             Want::Forget(s) => write!(f, "Forget({:?})", String::from_utf8_lossy(s)),
             Want::Save(p) => write!(f, "Save({:?})", String::from_utf8_lossy(&p.ssid)),
             Want::Scan => write!(f, "Scan"),
@@ -76,22 +79,58 @@ pub enum Got {
     /// A join, leave, forget or save finished.
     Done { what: Want, result: Result<(), String> },
     Seen(Vec<u8>, Result<ServerSeen, String>),
+    KeyRequest(Vec<u8>, Result<KeyRequest, String>),
+    /// A file picked for the sheet (name, bytes); Err("") when cancelled.
+    Picked(Result<(String, Vec<u8>), String>),
+}
+
+/// What the system picker is open for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetPick {
+    /// The network's CA certificate.
+    Ca,
+    /// Our certificate, signed by the network's IT team.
+    Cert,
+}
+
+/// How the work network's server is checked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Check {
+    /// Its certificate is shown on the first join, for "Trust this server".
+    #[default]
+    FirstJoin,
+    /// The system's root certificates, with its domain.
+    System,
+    /// A CA certificate from a file, with its domain.
+    CaFile,
 }
 
 /// The sign-in methods offered for a work or campus network, as named to
 /// the network service and to the user.
-pub const EAP_METHODS: [(&str, &str); 3] = [("peap", "PEAP"), ("ttls-mschapv2", "TTLS (MSCHAPv2)"), ("ttls-pap", "TTLS (PAP)")];
+pub const EAP_METHODS: [(&str, &str); 4] = [("peap", "PEAP"), ("ttls-mschapv2", "TTLS (MSCHAPv2)"), ("ttls-pap", "TTLS (PAP)"), ("tls", "Certificate (EAP-TLS)")];
 
 /// What the work-network sheet holds besides the typed fields.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EntForm {
     /// Index into `EAP_METHODS`.
     pub method: usize,
-    /// Check the server against the system's certificates (needs its
-    /// domain); otherwise the first join shows its certificate.
-    pub system_roots: bool,
-    /// Username and server domain, from the sheet's fields at the press.
-    pub typed: Option<(String, String)>,
+    pub check: Check,
+    /// The CA certificate picked (file name, DER).
+    pub ca: Option<(String, Vec<u8>)>,
+    /// Username, server domain and anonymous identity, from the sheet's
+    /// fields at the press.
+    pub typed: Option<(String, String, String)>,
+    /// A certificate login: the key Arca made, and its request (PEM) to
+    /// give the network's IT team.
+    pub request: Option<([u8; 16], String)>,
+    /// The certificate they signed (file name, DER).
+    pub cert: Option<(String, Vec<u8>)>,
+}
+
+impl EntForm {
+    pub fn tls(&self) -> bool {
+        EAP_METHODS[self.method].0 == "tls"
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -126,6 +165,8 @@ pub struct NetPage {
     pub field_up: bool,
     /// The passphrase row is a work-network sheet (802.1X).
     pub ent: Option<EntForm>,
+    /// The system picker is wanted (or open) for the sheet.
+    pub pick: Option<NetPick>,
     /// A first join stopped at this server's certificate: "Trust this
     /// server" or not.
     pub trusting: Option<(Vec<u8>, ServerSeen)>,
@@ -309,20 +350,55 @@ impl NetPage {
         }
     }
 
-    pub fn set_system_roots(&mut self, on: bool) {
-        if let Some(f) = &mut self.ent {
-            f.system_roots = on;
+    /// The check button: first join, system certificates, a CA file (the
+    /// picker opens for it), and round again.
+    pub fn next_check(&mut self) {
+        let Some(f) = &mut self.ent else { return };
+        f.check = match f.check {
+            Check::FirstJoin => Check::System,
+            Check::System => {
+                if f.ca.is_none() {
+                    self.pick = Some(NetPick::Ca);
+                }
+                Check::CaFile
+            }
+            Check::CaFile => Check::FirstJoin,
+        };
+    }
+
+    /// A certificate login: make the key in Arca and its request, named
+    /// for the username typed.
+    pub fn request_certificate(&mut self, user: &str) {
+        let (Some(ssid), Some(f)) = (self.asking.clone(), &mut self.ent) else { return };
+        let user = user.trim();
+        if user.is_empty() || user.len() > 64 {
+            self.notice = Some(Notice { text: "Type your username first: the request carries it".into(), error: true });
+            return;
+        }
+        f.request = None;
+        f.cert = None;
+        self.notice = None;
+        self.wants.push(Want::CertRequest(CertRequest { ssid, name: user.to_string() }));
+    }
+
+    pub fn import_certificate(&mut self) {
+        if self.ent.as_ref().is_some_and(|f| f.request.is_some()) {
+            self.pick = Some(NetPick::Cert);
         }
     }
 
     /// Join pressed on the work-network sheet, with what its fields hold.
-    pub fn ent_join_pressed(&mut self, user: &str, domain: &str, now: std::time::Instant) {
-        let (user, domain) = (user.trim(), domain.trim().trim_end_matches('.').to_ascii_lowercase());
+    pub fn ent_join_pressed(&mut self, user: &str, domain: &str, anonymous: &str, now: std::time::Instant) {
+        let (user, domain, anonymous) = (user.trim(), domain.trim().trim_end_matches('.').to_ascii_lowercase(), anonymous.trim());
         let Some(f) = &mut self.ent else { return };
         let err = if user.is_empty() {
             Some("Type your username first")
-        } else if f.system_roots && domain.is_empty() {
-            Some("Checking with the system's certificates needs the server's domain")
+        } else if f.check != Check::FirstJoin && domain.is_empty() {
+            Some("Checking the server with certificates needs its domain")
+        } else if f.check == Check::CaFile && f.ca.is_none() {
+            Some("Pick the network's CA certificate first")
+        } else if f.tls() && f.cert.is_none() {
+            Some("Import the certificate your IT team signed first")
         } else {
             None
         };
@@ -330,8 +406,36 @@ impl NetPage {
             self.notice = Some(Notice { text: e.into(), error: true });
             return;
         }
-        f.typed = Some((user.to_string(), domain));
+        f.typed = Some((user.to_string(), domain, anonymous.to_string()));
+        if f.tls() {
+            // No password: the key in Arca signs.
+            let Some(ssid) = self.asking.clone() else { return };
+            let e = self.enterprise(ssid, None);
+            self.wants.extend(e.map(Want::JoinEnterprise));
+            return;
+        }
         self.join_pressed(now);
+    }
+
+    /// The request for the sheet as it stands.
+    fn enterprise(&mut self, ssid: Vec<u8>, handle: Option<[u8; 16]>) -> Option<Enterprise> {
+        let f = self.ent.as_ref()?;
+        let (identity, domain, anonymous) = f.typed.clone()?;
+        self.joining = Some(ssid.clone());
+        Some(Enterprise {
+            ssid,
+            method: EAP_METHODS[f.method].0.into(),
+            identity,
+            // EAP-TLS has no tunnel: its outer identity is the username the
+            // certificate names, so an anonymous one would only be refused.
+            anonymous: (!anonymous.is_empty() && !f.tls()).then_some(anonymous),
+            domain,
+            ca: f.ca.as_ref().filter(|_| f.check == Check::CaFile).map(|c| c.1.clone()),
+            system_roots: f.check == Check::System,
+            handle,
+            key: f.request.as_ref().filter(|_| f.tls()).map(|r| r.0),
+            cert: f.cert.as_ref().filter(|_| f.tls()).map(|c| c.1.clone()),
+        })
     }
 
     /// "Trust this server" on the certificate a first join stopped at.
@@ -355,20 +459,12 @@ impl NetPage {
         match self.handle.take() {
             Some(handle) => {
                 self.armed = None;
-                self.joining = Some(ssid.clone());
-                match self.ent.as_ref().map(|f| (f.method, f.system_roots, f.typed.clone())) {
-                    Some((m, system_roots, Some((identity, domain)))) => self.wants.push(Want::JoinEnterprise(Enterprise {
-                        ssid,
-                        method: EAP_METHODS[m].0.into(),
-                        identity,
-                        anonymous: None,
-                        domain,
-                        ca: None,
-                        system_roots,
-                        handle,
-                    })),
-                    Some(_) => self.joining = None,
-                    None => self.wants.push(Want::JoinWith { ssid, handle }),
+                if self.ent.is_some() {
+                    let e = self.enterprise(ssid, Some(handle));
+                    self.wants.extend(e.map(Want::JoinEnterprise));
+                } else {
+                    self.joining = Some(ssid.clone());
+                    self.wants.push(Want::JoinWith { ssid, handle });
                 }
             }
             None => self.armed = Some(now),
@@ -399,6 +495,7 @@ impl NetPage {
     pub fn cancel_ask(&mut self) {
         self.asking = None;
         self.ent = None;
+        self.pick = None;
         self.armed = None;
         self.handle = None;
         self.notice = None;
@@ -557,6 +654,36 @@ impl NetPage {
                 self.dns_tls = tls;
             }
             Got::OwnDns(Err(_)) => {}
+            Got::KeyRequest(ssid, r) => match (r, &mut self.ent) {
+                (Ok(k), Some(f)) if self.asking.as_deref() == Some(ssid.as_slice()) => {
+                    f.request = Some((k.key, der_to_pem(&k.csr, "CERTIFICATE REQUEST")));
+                    self.notice = Some(Notice { text: "Give your IT team this certificate request, then import what they sign".into(), error: false });
+                }
+                (Ok(_), _) => {}
+                (Err(e), _) => self.notice = Some(Notice { text: format!("No certificate request: {}", e.replace('-', " ")), error: true }),
+            },
+            Got::Picked(r) => {
+                let what = self.pick.take();
+                match (r, what, &mut self.ent) {
+                    (Ok((file, bytes)), Some(w), Some(f)) => match pem_to_der(&bytes).filter(|d| d.len() <= atrium_netconf::MAX_CERT) {
+                        Some(der) if w == NetPick::Ca => f.ca = Some((file, der)),
+                        Some(der) => {
+                            f.cert = Some((file, der));
+                            self.notice = None;
+                        }
+                        None => self.notice = Some(Notice { text: format!("{file} is not a certificate (PEM or DER)"), error: true }),
+                    },
+                    (Err(e), _, Some(f)) => {
+                        if what == Some(NetPick::Ca) && f.ca.is_none() {
+                            f.check = Check::FirstJoin;
+                        }
+                        if !e.is_empty() {
+                            self.notice = Some(Notice { text: e, error: true });
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Got::Seen(ssid, Ok(seen)) => self.trusting = Some((ssid, seen)),
             Got::Seen(ssid, Err(e)) => self.notice = Some(Notice { text: format!("Could not show the server of {}: {}", name(&ssid), e.replace('-', " ")), error: true }),
             Got::Done { what, result } => {
@@ -808,20 +935,23 @@ mod tests {
         p.pick(b"corp");
         assert!(p.ent.is_some(), "an 802.1X network opens the work-network sheet");
         let now = std::time::Instant::now();
-        p.ent_join_pressed("  ", "", now);
+        p.ent_join_pressed("  ", "", "", now);
         assert!(p.notice.as_ref().is_some_and(|n| n.error), "no username: said so");
         assert!(p.take_wants().is_empty());
-        p.set_system_roots(true);
-        p.ent_join_pressed("alice@corp.example", "", now);
+        p.next_check();
+        p.ent_join_pressed("alice@corp.example", "", "", now);
         assert!(p.take_wants().is_empty(), "system certificates need the domain");
-        p.set_system_roots(false);
+        p.next_check();
+        assert_eq!(p.pick, Some(NetPick::Ca), "a CA file opens the picker");
+        p.apply(Got::Picked(Err(String::new())));
+        assert_eq!(p.ent.as_ref().unwrap().check, Check::FirstJoin, "cancelled: back to asking on the first join");
         p.next_method();
-        p.ent_join_pressed("alice@corp.example", "Corp.Example.", now);
+        p.ent_join_pressed("alice@corp.example", "Corp.Example.", "", now);
         assert!(p.take_wants().is_empty(), "waits for Arca's handle");
         p.field(Some([3; 16]), now);
         let w = p.take_wants();
         let [Want::JoinEnterprise(e)] = w.as_slice() else { panic!("{w:?}") };
-        assert_eq!((e.ssid.as_slice(), e.method.as_str(), e.identity.as_str(), e.domain.as_str(), e.handle, e.system_roots), (&b"corp"[..], "ttls-mschapv2", "alice@corp.example", "corp.example", [3; 16], false));
+        assert_eq!((e.ssid.as_slice(), e.method.as_str(), e.identity.as_str(), e.domain.as_str(), e.handle, e.system_roots), (&b"corp"[..], "ttls-mschapv2", "alice@corp.example", "corp.example", Some([3; 16]), false));
         assert!(e.check().is_ok());
         assert_eq!(format!("{:?}", w[0]), "JoinEnterprise(\"corp\", ttls-mschapv2)", "no handle in logs");
 
@@ -838,6 +968,43 @@ mod tests {
         assert_eq!(p.joining.as_deref(), Some(&b"corp"[..]));
         p.apply(Got::Done { what: Want::Trust(b"corp".to_vec()), result: Err("eap-rejected".into()) });
         assert!(p.notice.as_ref().unwrap().text.contains("username or password is wrong"));
+    }
+
+    #[test]
+    fn certificate_login_and_a_ca_file() {
+        let mut p = page();
+        p.apply(Got::Nearby(Ok(vec![near("corp", "wpa2-enterprise", false)])));
+        p.pick(b"corp");
+        p.take_wants();
+        let now = std::time::Instant::now();
+        for _ in 0..3 {
+            p.next_method();
+        }
+        assert!(p.ent.as_ref().unwrap().tls());
+        p.request_certificate("");
+        assert!(p.take_wants().is_empty(), "the request carries the username");
+        p.request_certificate("tls-user@corp.example");
+        assert_eq!(p.take_wants(), vec![Want::CertRequest(CertRequest { ssid: b"corp".to_vec(), name: "tls-user@corp.example".into() })]);
+        p.ent_join_pressed("tls-user@corp.example", "", "", now);
+        assert!(p.take_wants().is_empty(), "no certificate yet");
+        p.apply(Got::KeyRequest(b"corp".to_vec(), Ok(KeyRequest { key: [7; 16], csr: vec![0x30, 1, 0] })));
+        assert!(p.ent.as_ref().unwrap().request.as_ref().unwrap().1.starts_with("-----BEGIN CERTIFICATE REQUEST-----"));
+        p.import_certificate();
+        assert_eq!(p.pick, Some(NetPick::Cert));
+        p.apply(Got::Picked(Ok(("me.txt".into(), b"hello".to_vec()))));
+        assert!(p.notice.as_ref().is_some_and(|n| n.error), "not a certificate: said so");
+        p.import_certificate();
+        p.apply(Got::Picked(Ok(("me.pem".into(), der_to_pem(&[0x30, 2, 5, 5], "CERTIFICATE").into_bytes()))));
+        // A CA from a file, with its domain.
+        p.next_check();
+        p.next_check();
+        assert_eq!(p.pick, Some(NetPick::Ca));
+        p.apply(Got::Picked(Ok(("ca.der".into(), vec![0x30, 1, 9]))));
+        p.ent_join_pressed("tls-user@corp.example", "corp.example", "anon@corp.example", now);
+        let w = p.take_wants();
+        let [Want::JoinEnterprise(e)] = w.as_slice() else { panic!("{w:?}") };
+        assert_eq!((e.method.as_str(), e.key, e.cert.as_deref(), e.handle, e.ca.as_deref(), e.anonymous.as_deref()), ("tls", Some([7; 16]), Some(&[0x30, 2, 5, 5][..]), None, Some(&[0x30, 1, 9][..]), None));
+        assert!(e.check().is_ok(), "{:?}", e.check());
     }
 
     #[test]

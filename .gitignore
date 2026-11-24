@@ -135,3 +135,5 @@ atrium-tessera/core/fuzz/artifacts/
 kmod-rust-spike/out/
 atrium-tessera/kmod/out/
 atrium-gpu-amd/out/
+# The corp test CA (key included) the Wi-Fi bar-eap step keeps.
+scratch/w7-ca/

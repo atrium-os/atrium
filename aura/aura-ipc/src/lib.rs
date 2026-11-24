@@ -16,7 +16,8 @@ pub mod sock;
 use std::io::{self, Read, Write};
 use zeroize::Zeroize;
 
-pub const MAX_LINE: usize = 4096;
+/// Room for an 802.1X profile with a CA and a client certificate (hex).
+pub const MAX_LINE: usize = 16 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Line {
@@ -229,8 +230,11 @@ mod tests {
         assert!(matches!(&got[2], Got::Bad));
         let long = vec![b'x'; MAX_LINE + 10];
         let mut r = Reader::default();
-        assert!(r.fill(&mut &long[..2048]).is_ok());
-        assert!(r.fill(&mut &long[2048..4096]).is_ok());
-        assert!(r.fill(&mut &long[4096..]).is_err());
+        let mut fed = 0;
+        while r.fill(&mut &long[fed..]).is_ok() {
+            fed += 2048.min(long.len() - fed);
+            assert!(fed <= MAX_LINE, "a line past MAX_LINE is refused");
+        }
+        assert!(fed + 2048 > MAX_LINE, "refused only past MAX_LINE: {fed}");
     }
 }

@@ -1103,6 +1103,10 @@ bar-eap)
     export HOSTAPD_ARGS=-dd
     setup hostapd-eap.conf hostapd-eap-wpa2.conf
     "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
+    # Kept for curia-vm.sh picker and sign: the CA file Settings picks and
+    # the key IT signs a certificate request with.
+    mkdir -p "$ROOT/scratch/w7-ca"
+    cp "$W7C/corp-ca.pem" "$W7C/corp-ca.key" "$ROOT/scratch/w7-ca/"
     rm -rf "$W7C"
     BAR_JOIN=0 bar
     echo "bar: frames in scratch/ (VMs left running; teardown with w1's end or reboot)" ;;

@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atrium_netconf::server::{serve, Backend};
-use atrium_netconf::{lines, status, Fail, Grant, Enterprise, Iface, Join, Nearby, Profile, Res, Routes, ServerSeen, SetStatic, Status, Target};
+use atrium_netconf::{lines, status, Fail, Grant, CertRequest, Enterprise, Iface, Join, KeyRequest, Nearby, Profile, Res, Routes, ServerSeen, SetStatic, Status, Target};
 use aura_ipc::{Got, Line, Reader};
 
 fn die(s: &str) -> ! {
@@ -300,8 +300,16 @@ impl Backend for Front {
             .with_hex("ssid", &e.ssid)
             .with("method", &e.method)
             .with_hex("identity", e.identity.as_bytes())
-            .with_hex("domain", e.domain.as_bytes())
-            .with_hex("handle", &e.handle);
+            .with_hex("domain", e.domain.as_bytes());
+        if let Some(h) = &e.handle {
+            r = r.with_hex("handle", h);
+        }
+        if let Some(k) = &e.key {
+            r = r.with_hex("key", k);
+        }
+        if let Some(c) = &e.cert {
+            r = r.with_hex("cert", c);
+        }
         if let Some(a) = &e.anonymous {
             r = r.with_hex("anonymous", a.as_bytes());
         }
@@ -328,6 +336,15 @@ impl Backend for Front {
             not_after: l.get("not_after").unwrap_or("").to_string(),
             sha256: l.hex("top_sha256").filter(|h| h.len() == 32).ok_or_else(|| Fail::new(status::FAILED, "bad-seen"))?,
         })
+    }
+
+    fn cert_request(&self, r: CertRequest) -> Res<KeyRequest> {
+        let v = self.call(&Line::new("wifi-eap-key").with_hex("ssid", &r.ssid).with_hex("cn", r.name.as_bytes()))?;
+        let bad = || Fail::new(status::FAILED, "bad-key-answer");
+        let l = v.iter().find(|l| l.verb == "key").ok_or_else(bad)?;
+        let key = l.hex("id").and_then(|k| <[u8; 16]>::try_from(k.as_slice()).ok()).ok_or_else(bad)?;
+        let csr = l.hex("csr").filter(|c| c.first() == Some(&0x30) && c.len() <= 1024).ok_or_else(bad)?;
+        Ok(KeyRequest { key, csr })
     }
 
     fn trust_server(&self, ssid: Vec<u8>) -> Res<()> {
