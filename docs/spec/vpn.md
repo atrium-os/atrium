@@ -1273,7 +1273,13 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   fingerprint or Windows Hello passkey in Sigillum's own sheet. The answer
   goes back as `Event::Credential` and on to the page. A page that goes, or
   a window that closes, retires the ceremony.
-- *Checks.* `scripts/crypta-v4-gate.sh run` now 76 checks on the amd64
+- *unbound restarts.* A tunnel's forward zones are unbound's runtime
+  state, so a restart of local-unbound (seen once when rc started it late
+  in a slow boot, during the gate) drops them, and the tunnel's names go to
+  the network's servers until atrium-net's check puts them back. That check
+  ran every 10 s; it now runs every 2 s while any tunnel has zones. The
+  gate restarts unbound under a tunnel and times it: back within 1 s.
+- *Checks.* `scripts/crypta-v4-gate.sh run` now 78 checks on the amd64
   VM: the V4 ones plus GlobalProtect SAML through the window against
   Keycloak (the stand-in serves a GlobalProtect portal front: prelogin
   REDIRECT, ACS checked with xmlsec1, a token checked once with an empty
@@ -1284,7 +1290,9 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   start is the form, navigatord posts it to Keycloak). `scripts/crypta-gp-packet-check.py --saml` (host,
   or `--vm`) checks the engine half against the GlobalProtect peer, and
   `--saml-portal` a SAML portal whose cookie signs in to its gateway: one
-  sign-on, no password, an echo through the tunnel. Host
+  sign-on, no password, an echo through the tunnel; with
+  `--refuse-portal-cookie` the gateway refuses that cookie and a second
+  sign-on signs in. Host
   tests for the parser, arcad's filing, the courier's capture, navigatord's
   origin rule, navigator-control and navigator-ui pass. The security-key
   path in the installed window (Ladybird page, Sigillum's sheet) needs the

@@ -116,6 +116,7 @@ mod imp {
     /// A dead probe process is started again after this long.
     const PROBE_AGAIN_MS: u64 = 10_000;
     const UNBOUND_CHECK_MS: u64 = 10_000;
+    const UNBOUND_CHECK_ZONES_MS: u64 = 2_000;
     /// While a portal sign-in window is open (§8.1).
     const PORTAL_PROBE_MS: u64 = 5_000;
     const PORTAL_WATCH_MS: u64 = 10 * 60_000;
@@ -628,7 +629,7 @@ mod imp {
             }
         }
 
-        /// Every 10 s: does unbound still forward to our servers? A restart
+        /// Every 10 s (2 s with tunnel zones): does unbound still forward to our servers? A restart
         /// of local-unbound (or one that was down when we set them) falls
         /// back to forward.conf; set them again.
         fn unbound_tick(&mut self) {
@@ -636,7 +637,11 @@ mod imp {
             if now < self.unbound_check_at || self.forwarders.is_empty() {
                 return;
             }
-            self.unbound_check_at = now + UNBOUND_CHECK_MS;
+            // A tunnel's zones are unbound's runtime state: while one is
+            // up, a restart sends its names to the network's servers until
+            // the zones are back, so look more often (vpn.md §5.5).
+            let zones = self.tunnels.iter().any(|t| !t.zones.is_empty());
+            self.unbound_check_at = now + if zones { UNBOUND_CHECK_ZONES_MS } else { UNBOUND_CHECK_MS };
             let Some(u) = &self.unbound else { return };
             let have = match u.cmd("list_forwards") {
                 Ok(s) => root_forwards(&s),

@@ -317,7 +317,30 @@ run)
     "$V" "ps -axo command | grep -q '^/usr/local/bin/atrium-crypta-ac'" && ok "the engine is atrium-crypta-ac" || fail "engine binary"
     r=$("$V" 'fetch -T 10 -qo - http://10.98.0.1/' 2>&1) && [ "$r" = crypta-ac-ok ] && ok "HTTP to 10.98.0.1 through the tunnel" || fail "HTTP 10.98.0.1: $r"
     r=$("$V" 'fetch -T 10 -qo - http://203.0.113.80/' 2>&1) && [ "$r" = crypta-ac-ok ] && ok "HTTP to 203.0.113.80 (a pushed route)" || fail "HTTP 203.0.113.80: $r"
-    "$V" 'local-unbound-control list_forwards' | grep -q corp.crypta.test && ok "the pushed domain forwards to the pushed DNS" || fail "no corp.crypta.test forward"
+    if "$V" 'local-unbound-control list_forwards' | grep -q corp.crypta.test; then
+        ok "the pushed domain forwards to the pushed DNS"
+    else
+        # Seen once after a fresh boot: what unbound and atrium-net did,
+        # and whether atrium-net's 10 s check put the zone back.
+        "$V" "local-unbound-control status | grep -i uptime; local-unbound-control list_forwards; grep -i unbound /var/log/messages | tail -8; sleep 12
+            echo after 12 s:; local-unbound-control list_forwards; tail -8 $G/net.log" 2>&1 | sed 's/^/     /'
+        fail "no corp.crypta.test forward"
+    fi
+    # unbound restarted under a tunnel (rc late in a slow boot did this
+    # once): its zones are runtime state, so they go; atrium-net's check
+    # puts them back. How long the tunnel's names go to the LAN's servers.
+    # Timed in the guest: gone right after the restart, then back.
+    r=$("$V" "service local_unbound restart >/dev/null 2>&1
+        local-unbound-control list_forwards | grep -q corp.crypta.test && echo still-there
+        t0=\$(date +%s); n=0
+        until local-unbound-control list_forwards 2>/dev/null | grep -q corp.crypta.test; do
+            n=\$((n + 1)); [ \$n -lt 60 ] || { echo never; exit 0; }; sleep 0.5; done
+        echo back \$((\$(date +%s) - t0))")
+    case "$r" in
+        "back "*) ok "unbound restarted under the tunnel: its zones went with it, and atrium-net put the pushed domain back after ${r#back } s" ;;
+        *) fail "unbound restarted under the tunnel: $r" ;;
+    esac
+    "$V" "grep -q 'unbound forwards .* (restarted), not ours' $G/net.log" && ok "atrium-net noticed the restart" || fail "no restart in atrium-net's log: $("$V" "tail -5 $G/net.log")"
     l=$(acleaks); [ -z "$l" ] && ok "nothing for the tunnel's networks on the LAN, only the gateway's TCP ($(stat ac_out) bytes out)" || fail "leaked: $l"
     "$V" "grep -rq alice-pw $G/state $G/cryptad.log" && fail "the password is in cryptad's state or log" || ok "the password is not in cryptad's state or log"
     [ "$(tl corp user)" = "$(hexof alice)" ] && ok "the profile remembers the username" || fail "user: $(tl corp user)"

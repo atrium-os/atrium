@@ -13,7 +13,8 @@
 //! attaches and drops privileges before starting the engine. `--sso
 //! KIND:USER:TOKEN` stands in for the sign-in window and Arca's courier: a
 //! single sign-on ends at once with that token (GlobalProtect's form,
-//! `<kind>\n<user>\n<token>`), handed out once.
+//! `<kind>\n<user>\n<token>`), handed out once; `--sso` again queues
+//! the next sign-on's token.
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -78,7 +79,7 @@ fn main() {
     let mut key_pem: Option<String> = None;
     let mut gp = false;
     let mut portal = false;
-    let mut sso: Option<String> = None;
+    let mut sso: std::collections::VecDeque<String> = Default::default();
     let mut native_tun = None;
     let mut jid = None;
     let mut i = 5;
@@ -86,7 +87,7 @@ fn main() {
         match a[i].as_str() {
             "--gp" => gp = true,
             "--sso" => {
-                sso = Some(a[i + 1].replacen(':', "\n", 2));
+                sso.push_back(a[i + 1].replacen(':', "\n", 2));
                 i += 1;
             }
             "--gp-portal" => { gp = true; portal = true; },
@@ -185,7 +186,7 @@ fn main() {
                 let Some(r) = Line::parse(&l) else { return };
                 let ans = match r.verb.as_str() {
                     // Used once, as Crypta's helper hands it out.
-                    "sso" => match sso.take() {
+                    "sso" => match sso.pop_front() {
                         Some(v) => {
                             println!("secrets: sign-on token taken");
                             Line::new("ok").with_hex("value", v.as_bytes())
