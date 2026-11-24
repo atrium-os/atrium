@@ -1916,6 +1916,67 @@ the three arms with the player's and navigatord's stderr in the trace
 inputs, and read where the 1.4 s after `engine-started` goes before tuning
 anything else.
 
+#### Results on arm64 Tessera, 2026-11-24 (trace to the first frame)
+
+Main `fe34b869c`: navigatord, limend and the embedded player rebuilt, the
+engine unchanged (`6b2b35bb…5092eb`, the installed digest), on a disposable
+guest. limend's log carries the player's stderr, so the four daemon logs
+give every stage. Medians in milliseconds since `widget-start`, three cold
+presses per arm and four warm (presses 2 to 5):
+
+| Stage | No choragusd | choragusd | Warm |
+| --- | ---: | ---: | ---: |
+| `first-request` | 70 | 70 | 100 (42 to 155) |
+| player `ready` | 264 | 247 | 164 |
+| `served` step 0 (document) | 234 | 233 | 232 |
+| `engine-started` | 354 | 354 | 336 |
+| `served` step 1 (script) | 391 | 358 | 367 |
+| `video-open` | 665 | 602 | 607 |
+| `served` step 2 (VP9 clip) | 761 | 695 | 713 |
+| `served` step 3 (Opus clip) | 1,027 | 963 | 987 |
+| `add-vp9` | 1,222 | 1,158 | 1,181 |
+| `appended-vp9` | 1,331 | 1,270 | 1,301 |
+| player `first-frame` | 1,398 | 1,330 | 1,363 |
+| `player-ready` | 1,462 | 1,375 | 1,425 |
+| Press to red pixel | 1,744 | 1,724 | 1,740 |
+
+Where the time goes, in the median cold press:
+
+- **The engine's own work between fetches, about 700 ms.** From the
+  script served to `video-open` takes 210 to 275 ms, from the VP9 clip
+  served to the Opus request about 220 ms, and from the Opus clip served
+  to `add-vp9` about 195 ms. In those spans the JIT-off engine runs the
+  page script, which splits each clip by scanning its bytes with
+  `findIndex`, and sets up MediaSource. Which of these dominates is not yet
+  traced inside the engine.
+- **The first fetch, about 160 ms** from `first-request` to served; the
+  later three take 40 to 55 ms each, so about 300 ms of fetching in all.
+- **Appends and the first frame, about 240 ms** from `add-vp9` to
+  `player-ready`, of which the decode of the first frame is about 65 ms
+  after the VP9 append is acknowledged.
+- **Composition and capture, about 280 ms** from `player-ready` to the
+  observed red pixel, which includes the headless PNG and the SSH poll.
+
+The player now launches beside the engine and is ready at 160 to 260 ms,
+long before the first append, so it is off the press's path. The next
+standby forks 3.0 s after the island and no longer overlaps the Start.
+The standby still saves nothing visible: the island's first request comes
+40 to 155 ms after `standby-assigned` and the rest of the path is the
+same engine and media work, so warm and cold reach red at about 1.74 s.
+
+A standby fed one data byte without a descriptor ended 101 ms later with
+"a standby expects exactly its fetch socket" (exit 1), and one whose
+channel was closed ended with "peer closed before sending fds". As the
+control, a standby sent one descriptor went on as an island and exited
+8 s later when its stand-in fetch socket never answered. The probe
+(`standby-probe.c`) ran the installed engine as uid 50007 in an engine
+jail, on a socketpair with `/dev/null` as stdout, after a 3 s warm-up.
+`navigator-i5-worker-check.sh` passed again on an assigned standby (PID
+9109, jail 77), and a waiting standby held 69,720 to 69,728 KB. One press
+on the jail that had hosted the probes took 3,745 ms, with the first fetch
+alone taking 1 s; it is left out of the medians. Evidence is in
+`~/atrium-vm/evidence/navigator-i5-trace-frame-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
