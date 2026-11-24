@@ -528,7 +528,7 @@ impl ServiceManifest {
                 size_mb: None,
                 owner: None,
             }).collect(),
-            exec: self.exec.as_ref().map(|e| ExecSpec {
+            exec: self.exec.as_ref().map(|e| ExecSpec { cwd: None,
                 groups: vec![],
                 path: e.path.clone(),
                 argv: e.argv.clone(),

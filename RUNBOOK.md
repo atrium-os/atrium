@@ -2603,90 +2603,11 @@ end-to-end.
 
 ### Deploy Portcullis end-to-end in a fresh VM
 
-After `Re-do first-boot setup from scratch` above, get from "fresh
-qcow2 with sshd" to "user logs in and lands in a session jail with
-working app launches" in ~5 minutes.
-
-```sh
-VSSH=~/src/bsd/scripts/vssh
-PORT=~/src/bsd/portcullis
-
-# 1. Cross-compile the Portcullis binaries (host; ~7s clean, ~2s incremental).
-cd $PORT
-cargo build --target aarch64-unknown-freebsd --release \
-    -p portcullis-cli -p portcullisd -p atrium-session
-
-# 2. Install zsh in the guest (atrium-login execs into zsh).
-$VSSH 'ASSUME_ALWAYS_YES=yes pkg install -y zsh'
-
-# 3. Install binaries (atrium-session MUST be setuid root — login(1)
-#    runs the user's shell as the user, so atrium-login has no privs;
-#    atrium-session escalates to do the mount + jail -c work).
-$VSSH "install -m 0755  /mnt/portcullis/target/aarch64-unknown-freebsd/release/portcullis      /usr/local/bin/portcullis &&
-       install -m 0755  /mnt/portcullis/target/aarch64-unknown-freebsd/release/portcullisd     /usr/local/bin/portcullisd &&
-       install -m 04755 /mnt/portcullis/target/aarch64-unknown-freebsd/release/atrium-session  /usr/local/bin/atrium-session &&
-       install -m 0755  /mnt/portcullis/atrium-session/install/atrium-login                    /usr/local/bin/atrium-login &&
-       install -m 0755  /mnt/portcullis/portcullisd/install/portcullisd                        /usr/local/etc/rc.d/portcullisd"
-
-# 4. Add a test user with atrium-login as their shell.
-$VSSH "pw useradd atrium -m -G wheel -s /usr/local/bin/atrium-login -w no
-       mkdir -p /home/atrium/.ssh
-       cp /root/.ssh/authorized_keys /home/atrium/.ssh/authorized_keys
-       chown -R atrium:atrium /home/atrium/.ssh
-       chmod 700 /home/atrium/.ssh"
-
-# 5. Enable + start portcullisd. Pre-creates /atrium/sockets/ and
-#    /var/lib/atrium/{apps,overlays,jails,sessions} on first start.
-#    Daemon is multi-tenant: socket world-connectable (mode 0666),
-#    per-user authorization happens inside via getpeereid(2).
-$VSSH 'sysrc portcullisd_enable=YES
-       service portcullisd start
-       ls -la /atrium/sockets/portcullis.sock'
-
-# 6. Verify: ssh in as atrium, run a smoke command.
-ssh -i ~/.ssh/fresco_bsd_ed25519 -p 2222 atrium@localhost <<'EOF'
-hostname    # should print "atrium-session" (the session jail's hostname)
-id          # uid=1001(atrium) — matches the host uid (atrium-session
-            # composes its in-jail passwd to mirror host uids so the
-            # daemon's getpeereid lookup resolves correctly)
-ls /apps    # the apps registry
-exit
-EOF
-
-# 7. Install a test app + launch via session jail to verify the
-#    SCM_RIGHTS pty handoff path:
-$VSSH 'mkdir -p /var/lib/atrium/apps/test.hello
-       cp /rescue/sh /var/lib/atrium/apps/test.hello/sh
-       cat > /var/lib/atrium/apps/test.hello/atrium.toml <<MANIFEST
-[app]
-id = "test.hello"
-name = "Hello"
-version = "0.1.0"
-entry = "runme"
-
-[capabilities]
-network = "none"
-MANIFEST
-       cat > /var/lib/atrium/apps/test.hello/runme <<RUNME
-#!/sh
-echo "hello from app jail!"
-echo "pid=\$\$"
-RUNME
-       chmod +x /var/lib/atrium/apps/test.hello/runme
-       /usr/local/bin/portcullis link-apps'
-
-# Then ssh in as atrium and run:
-#     /apps/test.hello/test.hello
-# Expected output:
-#     hello from app jail!
-#     pid=<small number>
-```
-
-Known papered-over issues (see commits 4e52f9d, plus
-multi-tenancy fixes in the next commit):
-- /usr/local/etc/zshrc isn't installed yet; default zsh prompt fine.
-- App jails inherit no /etc, no /sbin — apps must bring their own
-  binaries (or a curated etc); intentional sealed-app behaviour.
+`scripts/bootstrap-atrium.sh` builds and installs portcullisd, jaild and
+the rest of the stack (§0). The old per-user session jail
+(`atrium-session`, a setuid-root `jail -c` wrapper behind `atrium-login`)
+is gone: every app, workspace and console jail is made by jaild
+(docs/spec/app-jails-via-jaild.md).
 
 ### jaild — the privileged jail broker (bring-up, first run 2026-06-14)
 

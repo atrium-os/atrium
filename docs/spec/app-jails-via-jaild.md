@@ -159,6 +159,38 @@ and maps each jail.conf parameter or refuses the request:
 Its tests run every shipped app manifest through `build` and the mapping
 and then through jaild's validator with the shipped policy.
 
+### 4.2 As built (J2)
+
+- **Apps** (`launch.rs` `run_one_jail`): the setup phase and the app run in
+  a jail of class `App{owner, app_id, debug}` with the entry exec'd by
+  jaild as the app uid, its groups from `getgrouplist`, its home as the
+  working directory and a clean environment (HOME, SHELL, USER, PATH,
+  TERM). The `--persona`, `--document` and debugger arguments are an
+  argument list. portcullisd waits on the returned process descriptor
+  (kqueue `EVFILT_PROCDESC`), then has jaild remove the jail.
+- **Workspaces** (`Develop{owner}`), **app consoles** (`con-<app>`,
+  `Terminal{owner}`) and **the empty console** (`Terminal{owner}`) are
+  empty persistent jails (`create_persistent`); shells, IDE commands and
+  `pkg` go in with `ExecInJail` (a pty, or the caller's pipes), as the
+  person's account with its files group, or as the jail's root for `pkg`.
+- **The registries proxy and the debugger's way in** take a socket from
+  `ListenInJail`; jaild brings the jail's `lo0` up first. The re-exec'd
+  `--bind-in-jail` helper is gone.
+- **Deleted:** `render_jail_conf`, `write_jail_conf`, `render_devfs_rules`,
+  `attach_routed_net`, `ensure_devfs_isolation`, `ensure_network_ready`,
+  the CLI's local launch fallback (an app tree given by path is now only
+  `--dry-run`), and the `atrium-session` crate, which created session jails
+  with `jail -c` from a setuid-root binary and was installed nowhere.
+- **Still `jls`:** read-only lookups (`reclaim_abandoned_workbook`,
+  `remove_jails_at`, `workbook_jail_active`); jid lookups by name use
+  `jail_get(2)` (`jaild::ffi::jail_id_by_name`).
+- **Left for later:** jaild's `AllocateNet`/`ReleaseNet` (a network for a
+  jail jaild did not make) is now used only by `jclient` and
+  `crypta-v2-gate.sh`; the service daemons (arca-courierd, cryptad,
+  prelumd) still follow their `RemoveJail` with a `jail -r`. The
+  `sysfil.*` parameters `build` still sets only tell the mapping that a
+  class is needed.
+
 ## 5. Order of work
 
 One path only (Shankar, 2026-11-25): there is no flag and no fallback. Each

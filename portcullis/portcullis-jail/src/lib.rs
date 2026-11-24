@@ -9,7 +9,6 @@
 
 pub mod capabilities;
 pub mod config;
-pub mod render;
 
 use std::path::PathBuf;
 
@@ -18,7 +17,6 @@ use thiserror::Error;
 use portcullis_toml::Manifest;
 
 pub use config::{JailConfig, MountSpec, Value};
-pub use render::RenderError;
 
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -246,7 +244,7 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
      *
      * Capabilities have always recorded devfs actions (audio unhides dsp*,
      * input unhides input/event*, …) and nothing ever applied them: the
-     * per-jail rules were rendered by render_devfs_rules and never loaded, and
+     * per-jail rules were rendered as devfs.rules text and never loaded, and
      * the ruleset the jail was mounted with (99) did not exist. Apps got their
      * devices only because nothing was hidden at all. With a real baseline
      * ruleset those grants must actually happen, per jail.

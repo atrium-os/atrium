@@ -69,33 +69,6 @@ fn opened() -> io::Result<Option<UnixStream>> {
     Ok(Some(s))
 }
 
-/// Returns `Some(true)` if the daemon authorized the launch,
-/// `Some(false)` (with `delta_lines` populated) if it needs approval,
-/// `None` if the daemon is not running.
-pub fn authorize(
-    app_id: &str,
-    manifest_hash: &str,
-    requested: &Capabilities,
-) -> DaemonResult<AuthorizeOutcome> {
-    let Some(mut s) = opened()? else { return Ok(None) };
-    let resp = round_trip(&mut s, &Request::Authorize {
-        app_id:        app_id.into(),
-        manifest_hash: manifest_hash.into(),
-        requested:     requested.clone(),
-    })?;
-    match resp {
-        Response::Authorized           => Ok(Some(AuthorizeOutcome::Authorized)),
-        Response::NeedsApproval{delta} => Ok(Some(AuthorizeOutcome::NeedsApproval(delta))),
-        Response::Error{message}       => Err(io::Error::other(message)),
-        other => Err(io::Error::other(format!("unexpected authorize reply: {other:?}"))),
-    }
-}
-
-pub enum AuthorizeOutcome {
-    Authorized,
-    NeedsApproval(Vec<String>),
-}
-
 /// Persist a grant via the daemon. `Ok(Some(()))` on success;
 /// `Ok(None)` if daemon offline (caller should fall back).
 pub fn grant(

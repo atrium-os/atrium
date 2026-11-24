@@ -772,6 +772,14 @@ max_simultaneous_per_user = 32
 # §3.1) may be given read-write: <sockets_dir>/<name>, one directory per
 # service an app capability reaches (portcullis-jail apply_socket). A
 # portcullisd test checks every name it mounts is listed here.
+# Where a classed jail's root may be: an app's (and the console beside
+# it) under jails/, a workspace under its owner's, an empty console its
+# owner's own. {owner} is the request's class owner.
+class_roots = [
+    "/var/lib/atrium/jails/*",
+    "/var/lib/atrium/workspaces/{owner}/*",
+    "/var/lib/atrium/empty/{owner}",
+]
 sockets_dir = "/atrium/sockets"
 sockets = [
     "aqueduct-gpu", "arca", "arca-courier", "audio", "audio-capture",

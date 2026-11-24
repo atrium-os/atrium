@@ -25,9 +25,8 @@ pub use fdpass::{recv_fds, send_fds, send_fds_with};
 
 /// Default socket path. Created by portcullisd at startup mode 0666
 /// (world-connectable); per-user authorization happens inside the
-/// daemon via getpeereid(2). Lives under /atrium/sockets/ so
-/// atrium-session's bind-mount of that directory exposes it to
-/// processes inside session jails without an extra mount entry.
+/// daemon via getpeereid(2). Lives under /atrium/sockets/, where
+/// jails reach it through their socket mounts.
 pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 
 /// The same socket under the per-service DIRECTORY convention:

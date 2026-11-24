@@ -9,9 +9,8 @@
 //! console needs, and mounted read-only at `/atrium/console` in the jail,
 //! first (and only) on `PATH`. An app's root usually has no shell of its own.
 
-use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -135,16 +134,13 @@ pub fn console_jail_name(app_id: &str) -> String {
 }
 
 fn jid_of(name: &str) -> Option<i32> {
-    let out = Command::new("jls").args(["-j", name, "jid"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    jaild::ffi::jail_id_by_name(name)
 }
 
-/// The console jail for `app_id` on `jail_path`: joined if it runs, made if
-/// not. The toolbox must already be mounted there ([`mount_toolbox`]).
-pub fn console_jail(app_id: &str, jail_path: &Path) -> Result<i32, String> {
+/// The console jail for `app_id` on `jail_path`, `owner`'s instance:
+/// joined if it runs, made if not. The toolbox must already be mounted
+/// there ([`mount_toolbox`]).
+pub fn console_jail(app_id: &str, owner: &str, jail_path: &Path) -> Result<i32, String> {
     use crate::launch;
     let name = console_jail_name(app_id);
     if let Some(jid) = jid_of(&name) {
@@ -173,8 +169,8 @@ pub fn console_jail(app_id: &str, jail_path: &Path) -> Result<i32, String> {
     jc.devfs_actions.clear();
     jc.params.retain(|(k, _)| k != "exec.prestart");
     jc.set("mount.devfs", portcullis_jail::Value::Bool(false));
-    jc.set("exec.jail_user", portcullis_jail::Value::String("root".into()));
-    launch::create_persistent(&jc, jail_path).map_err(|e| format!("{e:?}"))?;
+    launch::create_persistent(&jc, jail_path, jaild::protocol::JailClass::Terminal { owner: owner.into() }, launch::TERMINAL_CLASS)
+        .map_err(|e| format!("{e:?}"))?;
     let jid = jid_of(&name).ok_or_else(|| format!("{name} did not start"))?;
     eprintln!("portcullisd: console jail {name} on {} (jid {jid}, class terminal)", jail_path.display());
     Ok(jid)
@@ -206,7 +202,8 @@ pub fn live(owner: &str, app_id: &str) -> bool {
 pub struct Spec<'a> {
     /// The person it runs for.
     pub owner: &'a str,
-    pub jid: i32,
+    /// The jail's name: jaild starts the shell there.
+    pub jail: &'a str,
     pub uid: u32,
     pub gid: u32,
     /// `$HOME` in the jail, also where it starts.
@@ -264,79 +261,59 @@ pub fn spawn(s: &Spec) -> io::Result<OwnedFd> {
 }
 
 /// Start the shell: (pty master, process descriptor, pid). Whoever holds
-/// the descriptor reaps it (stoad, for a Stoa console).
+/// the descriptor reaps it (stoad, for a Stoa console). jaild starts it, as
+/// the identity in `s`, on a new pty.
 pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
-    let c = |v: &str| CString::new(v).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a NUL"));
-    // Everything the child needs, made before the fork.
     let ws = s.kind == Kind::Workspace;
-    let path = if ws { c("/bin/sh")? } else { c(&format!("/{IN_JAIL}/sh"))? };
-    let argv = [c("sh")?, c("-i")?];
+    let path = if ws { "/bin/sh".to_string() } else { format!("/{IN_JAIL}/sh") };
     let mut env = vec![
-        c(&format!("HOME={}", s.home))?,
-        c(&format!("TERM={TERM_NAME}"))?,
-        c("ENV=")?,
+        format!("HOME={}", s.home),
+        format!("TERM={TERM_NAME}"),
+        "ENV=".to_string(),
     ];
     if ws {
         // The workspace's own PATH (its toolchain layers first) when it has one.
         if !s.env.iter().any(|e| e.starts_with("PATH=")) {
-            env.push(c("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")?);
+            env.push("PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin".into());
         }
-        env.push(c(&format!("PS1={} $ ", s.app_id.strip_prefix(WORKSPACE_PREFIX).unwrap_or(s.app_id)))?);
-        env.push(c(&format!("USER={}", s.owner))?);
-        for e in s.env {
-            env.push(c(e)?);
-        }
+        env.push(format!("PS1={} $ ", s.app_id.strip_prefix(WORKSPACE_PREFIX).unwrap_or(s.app_id)));
+        env.push(format!("USER={}", s.owner));
+        env.extend(s.env.iter().cloned());
     } else {
-        env.push(c(&format!("PATH=/{IN_JAIL}"))?);
+        env.push(format!("PATH=/{IN_JAIL}"));
         // The jail has no terminal database: the toolbox carries the one
         // entry, so the shell's line editing works and doesn't complain.
-        env.push(c(&format!("TERMCAP=/{IN_JAIL}/termcap"))?);
-        env.push(c(&format!("TERMINFO=/{IN_JAIL}/terminfo"))?);
-        env.push(c(&format!("PS1={} $ ", s.app_id))?);
+        env.push(format!("TERMCAP=/{IN_JAIL}/termcap"));
+        env.push(format!("TERMINFO=/{IN_JAIL}/terminfo"));
+        env.push(format!("PS1={} $ ", s.app_id));
         // App jails have /tmp but no /var/tmp: without a recovery folder the
         // toolbox's vi opens on an error that eats the first key.
-        env.push(c("NEXINIT=set recdir=/tmp/vi.recover")?);
+        env.push("NEXINIT=set recdir=/tmp/vi.recover".into());
     }
-    // A workspace's shell starts in ~/work.
-    let home = if ws { c(&format!("{}/work", s.home))? } else { c(s.home)? };
-    let root = c("/")?;
-    let mut argp: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-    argp.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
-    envp.push(std::ptr::null());
-
-    let mut groups: Vec<libc::gid_t> = vec![s.gid as libc::gid_t];
-    groups.extend(s.groups.iter().map(|g| *g as libc::gid_t));
-    let (master, slave) = jaild::ffi::openpty_pair(s.cols, s.rows)?;
-    // SAFETY: both fds are fresh from openpty and owned here alone.
-    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let pd = jaild::ffi::pdfork()?;
-    if pd.pid == 0 {
-        // ====== child: nothing that allocates or locks from here on ======
-        // SAFETY: async-signal-safe calls only, on what was made above.
-        unsafe {
-            libc::close(master.as_raw_fd());
-            if libc::login_tty(slave.as_raw_fd()) != 0 { libc::_exit(101) }
-            if libc::jail_attach(s.jid) != 0 { libc::_exit(102) }
-            if libc::chdir(home.as_ptr()) != 0 && libc::chdir(root.as_ptr()) != 0 { libc::_exit(103) }
-            if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 || libc::setgid(s.gid) != 0 || libc::setuid(s.uid) != 0 {
-                libc::_exit(104)
-            }
-            // A drop that didn't happen is fatal (jaild::ffi::verify_dropped).
-            if libc::getuid() != s.uid || libc::geteuid() != s.uid || libc::getgid() != s.gid || libc::setuid(0) == 0 {
-                libc::_exit(105)
-            }
-            if ws {
-                libc::umask(0o002);
-            }
-            libc::execve(path.as_ptr(), argp.as_ptr(), envp.as_ptr());
-            libc::_exit(106)
-        }
-    }
-    drop(slave);
-    // SAFETY: pdfork's descriptor, ours alone.
-    let procdesc = unsafe { OwnedFd::from_raw_fd(pd.procdesc_fd) };
-    Ok((master, procdesc, pd.pid))
+    let env = env.into_iter().map(|e| {
+        let (k, v) = e.split_once('=').unwrap_or((e.as_str(), ""));
+        jaild::protocol::EnvPair { key: k.into(), value: v.into() }
+    }).collect();
+    // A workspace's shell starts in ~/work; an app's uid has no home.
+    let cwd = if ws { format!("{}/work", s.home) } else if s.home.starts_with("/nonexistent") { "/".into() } else { s.home.to_string() };
+    let req = jaild::protocol::ExecInJailRequest {
+        name: s.jail.into(),
+        path,
+        argv: vec!["sh".into(), "-i".into()],
+        env,
+        want_root: false,
+        cols: s.cols,
+        rows: s.rows,
+        identity: Some(jaild::protocol::ExecIdentity { uid: s.uid, gid: s.gid, groups: s.groups.to_vec() }),
+        cwd: Some(cwd),
+        // What the file manager hands in stays shareable in a workspace.
+        umask: ws.then_some(0o002),
+        stdio: false,
+    };
+    let (run, master) = portcullisd::jaild_jail::exec_in(req, None).map_err(io::Error::other)?;
+    let master = master.ok_or_else(|| io::Error::other("jaild sent no pty"))?;
+    let pid = run.pid;
+    Ok((master, run.into_procdesc(), pid))
 }
 
 // ── Stoa (docs/spec/stoa.md; homes.md §4) ──────────────────────────────

@@ -311,7 +311,7 @@ fn main() -> ExitCode {
                 launch_failures += 1;
                 continue 'manifest;
             };
-            let init_exec = ExecSpec {
+            let init_exec = ExecSpec { cwd: None,
                 groups: vec![],
                 path: init_exec_m.path.clone(),
                 argv: init_exec_m.argv.clone(),

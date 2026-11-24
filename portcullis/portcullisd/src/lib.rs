@@ -17,6 +17,7 @@ pub mod host_mount;
 pub mod init_phase;
 pub mod jaild_client;
 pub mod jail_request;
+pub mod jaild_jail;
 /// Settings' Apps page (curia.md §13).
 pub mod access;
 pub mod crossing;

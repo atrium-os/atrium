@@ -1740,6 +1740,14 @@ fn handle_create_with_exec(
                 exec.uid, exec.gid);
             ffi::child_exit(103);
         }
+        /* After the drop: a directory the entry's identity cannot enter is
+         * not entered. */
+        if let Some(dir) = &exec.cwd {
+            if let Err(e) = ffi::child_chdir(dir) {
+                eprintln!("jaild-child: chdir {dir}: {e}");
+                ffi::child_exit(106);
+            }
+        }
         let mut env_pairs: Vec<(String, String)> = exec.env.iter()
             .filter(|p| !p.key.starts_with("ATRIUM_LISTEN_") && p.key != "ATRIUM_READY_FD")
             .map(|p| (p.key.clone(), p.value.clone()))
@@ -1879,6 +1887,11 @@ fn handle_listen_in_jail(
     let sys = |name: &'static str| move |e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
+    /* A workspace with no network has its own lo0, down: the listener needs
+     * it up. Nothing leaves the jail by it. */
+    if let Err(e) = crate::routed::configure_loopback(name) {
+        warn!("jaild: lo0 in {name}: {e}");
+    }
     let (ours, theirs) = UnixStream::pair().map_err(sys("socketpair"))?;
     let pdf = ffi::pdfork().map_err(sys("pdfork"))?;
     if pdf.pid == 0 {

@@ -2074,3 +2074,13 @@ pub struct MountFlags {
     pub nosuid: bool,
     pub noexec: bool,
 }
+
+/// Enter `dir` in the post-drop child.
+pub fn child_chdir(dir: &str) -> io::Result<()> {
+    let c = c_string(dir)?;
+    // SAFETY: chdir reads a NUL-terminated path we own.
+    if unsafe { libc::chdir(c.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

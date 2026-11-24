@@ -84,11 +84,6 @@ usage:
 fn main() -> ExitCode {
     let mut socket_path: Option<PathBuf> = None;
     let args: Vec<String> = std::env::args().collect();
-    // The registries proxy's helper (egress.rs): bind in a workspace's
-    // jail and hand the socket back; never the daemon.
-    if args.get(1).map(String::as_str) == Some(egress::BIND_ARG) {
-        egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""), args.get(3).map(String::as_str));
-    }
     // A debug run doesn't outlive portcullisd: no stale "debugging" tag.
     dev::clear_debugging();
     let mut i = 1;
@@ -1381,8 +1376,8 @@ fn handle_exec_instance(
         memory_mb: limits.0,
         cpu_pct: limits.1,
         require_memory_limit: limits.2,
-        // The home jail(8) chdirs into is resolved from this user's passwd
-        // inside portcullis_oneshot — see Spec::user_name.
+        // The worker's account; portcullis_oneshot resolves its uid and
+        // home from passwd (Spec::user_name).
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
         extra_env,
         worker,
@@ -1484,12 +1479,13 @@ fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time:
             if hung_up {
                 if expired { eprintln!("portcullisd: worker jail {name} reached its time limit; removing it") }
                 else { eprintln!("portcullisd: caller hung up; removing worker jail {name}") }
-                // SIGKILL first: `jail -r` alone sends SIGTERM and waits ten
-                // seconds for a worker that may be ignoring it (or stopped).
+                // SIGKILL first: removing the jail alone sends SIGTERM and
+                // waits for a worker that may be ignoring it (or stopped).
                 let _ = std::process::Command::new("pkill").args(["-9", "-j", &name])
                     .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
-                let _ = std::process::Command::new("jail").arg("-r").arg(&name)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                if let Err(e) = portcullisd::jaild_jail::remove(&name) {
+                    eprintln!("portcullisd: remove {name}: {e}");
+                }
                 return;
             }
             // The caller wrote something it should not have; do not spin on it.
@@ -1521,11 +1517,9 @@ fn handle_launch(
      *
      * This is checked FIRST, ahead of the policy gate and long before any
      * mount, so a duplicate launch cannot disturb the instance that is already
-     * up. Previously the request went all the way to jail(8), which failed with
-     *     jail: "org_atrium_forum-bar" already exists
-     * and a generic non-zero exit — indistinguishable, to a launcher, from a
-     * broken app. Clicking a dock icon twice reported an error instead of
-     * raising the window that was already there.
+     * up, and a launcher gets "already running" rather than a generic
+     * failure it cannot tell from a broken app: a second click on a dock
+     * icon raises the window that is already there.
      *
      * The uid goes back with the reply because surfaces carry `owner_uid`: it
      * is what lets a jailed launcher find the live window and focus it without
@@ -1650,9 +1644,8 @@ fn handle_launch(
     let mut iter = fds.into_iter();
     let stdio = [iter.next().unwrap(), iter.next().unwrap(), iter.next().unwrap()];
 
-    /* 4. launch as the connecting user. launch_with_stdio sets
-     *    BuildOpts.user_name = user, which becomes exec.jail_user
-     *    in the rendered jail.conf. */
+    /* 4. launch for the connecting user (the entry runs as that
+     *    person's uid for the app). */
     let resp = match launch::launch_instance(&app_id, persona, user, Some(stdio)) {
         Ok(o) => Response::LaunchExit { code: o.exit_code },
         Err(e) => Response::LaunchFailed {
@@ -3232,11 +3225,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     /* The debugger's way in: a socket listening on the workspace's own
      * loopback, so only what runs in the workspace reaches it. */
     let listener = if debug {
-        let jid = match workspace::start(owner, ws) {
-            Ok(r) => r.jid,
-            Err(why) => return refuse(why),
-        };
-        match egress::bind_in(jid, 0) {
+        if let Err(why) = workspace::start(owner, ws) {
+            return refuse(why);
+        }
+        match egress::bind_in(&workspace::jail_name(owner, ws), 0) {
             Ok(l) => Some(l),
             Err(why) => return refuse(why),
         }
@@ -3583,7 +3575,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
     // A workspace (homes.md §5) or an app (§4): where the shell goes.
     let ws_groups: Vec<u32>;
     let mut ws_env: Vec<String> = Vec::new();
-    let (jid, app_uid, gid, home, kind, title) = if to_empty {
+    let (jid, jail, app_uid, gid, home, kind, title) = if to_empty {
         // Nothing to reach, so no press: a new tab or window of it is free.
         if let Err(why) = may_run_unasked(console::TERMINAL, owner, shared) {
             return refuse(format!("the terminal: {why}"));
@@ -3593,7 +3585,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
             Err(why) => return refuse(why),
         };
         ws_groups = Vec::new();
-        (jid, uid, gid, "/tmp".to_string(), console::Kind::App, "Terminal".to_string())
+        (jid, empty::jail_name(owner), uid, gid, "/tmp".to_string(), console::Kind::App, "Terminal".to_string())
     } else if let Some(ws) = app_id.strip_prefix(console::WORKSPACE_PREFIX) {
         if !workspace::valid_name(ws) {
             return refuse(format!("{ws:?} is not a workspace name"));
@@ -3614,7 +3606,7 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         };
         ws_groups = vec![r.files];
         ws_env = r.env.clone();
-        (r.jid, r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
+        (r.jid, workspace::jail_name(owner, ws), r.uid, r.gid, r.home, console::Kind::Workspace, format!("Workspace: {ws}"))
     } else {
         let Some(m) = launch::installed_manifest(app_id) else {
             return refuse(format!("{app_id} is not installed"));
@@ -3662,14 +3654,14 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         }
         // The shell goes in the console jail beside the app's, never in the
         // app's own (dev-tools-plan.md M0, P1): the app keeps its class.
-        let jid = match console::console_jail(app_id, &app_root) {
+        let jid = match console::console_jail(app_id, owner, &app_root) {
             Ok(j) => j,
             Err(why) => return refuse(format!("the console's jail: {why}")),
         };
         ws_groups = Vec::new();
-        (jid, app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
+        (jid, console::console_jail_name(app_id), app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
     };
-    let spec = console::Spec { owner, jid, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind, env: &ws_env };
+    let spec = console::Spec { owner, jail: &jail, uid: app_uid, gid, home: &home, app_id, cols: 80, rows: 24, groups: &ws_groups, kind, env: &ws_env };
     let hub = Hub::global();
     if let Err(e) = hub.listen(console::TERMINAL) {
         return refuse(format!("the terminal's channel: {e}"));

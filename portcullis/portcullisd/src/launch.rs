@@ -21,7 +21,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,18 +51,8 @@ impl LaunchError {
 }
 
 pub struct LaunchOutcome {
-    /// Exit code from the runtime jail (the wrapped app's exit code
-    /// by way of jail(8) propagation). `None` if the jail terminated
-    /// by signal — Unix has no numeric exit code in that case.
+    /// The entry's exit code; `None` if a signal ended it.
     pub exit_code: Option<i32>,
-}
-
-pub fn launch_with_stdio(
-    app_id: &str,
-    user:   &str,
-    stdio:  Option<[OwnedFd; 3]>,
-) -> Result<LaunchOutcome, LaunchError> {
-    launch_instance(app_id, None, user, stdio)
 }
 
 // Files has one jail across all personas. Its launch thread owns both the
@@ -156,11 +146,10 @@ pub fn launch_debug(app_id: &str, user: &str, conn: OwnedFd) -> Result<LaunchOut
 /// environment, so the app lldb-server starts loads its own as ever.
 const DEBUG_TREE: &str = "/var/lib/atrium/debug";
 const DEBUG_IN_JAIL: &str = "atrium/debug";
-/* ★ jail(8) closes every descriptor above 2, so the connection arrives as
- * stdin; the script moves it to 3 and gives the program /dev/null. And
- * jail(8) runs exec.start without a shell when it has no shell characters,
- * as here. */
-const DEBUG_LD: &str = "/libexec/ld-elf.so.1 -o LIBRARY_PATH=/atrium/debug/lib:/atrium/debug/usr-lib";
+/* ★ The connection arrives as the entry's stdin; the script moves it to 3
+ * and gives the program /dev/null. */
+const DEBUG_LD: &str = "/libexec/ld-elf.so.1";
+const DEBUG_LD_ARGS: [&str; 2] = ["-o", "LIBRARY_PATH=/atrium/debug/lib:/atrium/debug/usr-lib"];
 const DEBUG_START: &str = "exec 3<&0 0</dev/null\nexec /libexec/ld-elf.so.1 -o LIBRARY_PATH=/atrium/debug/lib:/atrium/debug/usr-lib /atrium/debug/bin/lldb-server gdbserver --fd 3 -- \"$@\"\n";
 
 fn debug_tree() -> Result<PathBuf, String> {
@@ -182,28 +171,6 @@ fn debug_tree() -> Result<PathBuf, String> {
         fs::create_dir_all(t.join(d)).map_err(|e| e.to_string())?;
     }
     Ok(t.to_path_buf())
-}
-
-/// The app's filter with the `develop` class's added (ptrace, fork and
-/// what lldb-server does), for a debug run only.
-fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_policy::SysfilParams>, LaunchError> {
-    let (Some(a), Some(d)) = (app, sysfil_for_class(DEVELOP_CLASS)?) else { return Ok(None) };
-    let join = |x: &Option<String>, y: &Option<String>| match (x, y) {
-        (None, _) | (_, None) => None,
-        (Some(x), Some(y)) => {
-            let mut v: Vec<&str> = x.split(',').chain(y.split(',')).filter(|s| !s.is_empty()).collect();
-            v.sort();
-            v.dedup();
-            Some(v.join(","))
-        }
-    };
-    Ok(Some(jaild_policy::SysfilParams {
-        mode: a.mode,
-        syscalls: join(&a.syscalls, &d.syscalls),
-        ioctls: join(&a.ioctls, &d.ioctls),
-        sockopts: join(&a.sockopts, &d.sockopts),
-        families: join(&a.families, &d.families),
-    }))
 }
 
 use portcullis_ipc::PendingWorkbook;
@@ -626,7 +593,13 @@ fn launch_inner(
      * app will: a licence registered during setup must still match at run. */
     let host_identity = portcullis_identity::for_app(&instance_key(&manifest.app.id, persona))
         .map_err(|e| LaunchError::Failed("identity", e.to_string()))?;
-    let sysfil = if debug.is_some() { with_develop(app_sysfil(&manifest)?)? } else { app_sysfil(&manifest)? };
+    /* jaild resolves the class again, and adds `develop` for a debug run. */
+    let sysfil = app_sysfil(&manifest)?;
+    let mut app_run = AppRun {
+        owner: user.to_string(), app_id: app_id.to_string(), debug: debug.is_some(),
+        uid: app_uid, user: run_as_user.clone(), home: user_home.clone(), args: Vec::new(),
+        syscall_class: portcullis_jail::sysfil_class(&manifest.capabilities),
+    };
     let debug_tree = match &debug {
         Some(_) => Some(debug_tree().map_err(|e| LaunchError::Failed("debug", e))?),
         None => None,
@@ -737,8 +710,8 @@ fn launch_inner(
         return Err(LaunchError::Failed("mount", format!("unionfs: {e}")));
     }
 
-    /* mount.devfs (set in jail.conf) needs the /dev mountpoint to
-     * exist inside jail.path. App trees don't ship /dev/, so create
+    /* jaild mounts the jail's devfs on /dev, which must
+     * exist inside the root. App trees don't ship /dev/, so create
      * it now via the unionfs upper layer (writes land in overlay/dev). */
     if let Err(e) = fs::create_dir_all(jail_path.join("dev")) {
         let _ = umount(&jail_path);
@@ -747,10 +720,9 @@ fn launch_inner(
             format!("mkdir jail/dev: {e}")));
     }
 
-    /* jail(8) with exec.jail_user does an implicit chdir to the
-     * user's home (looked up via host passwd because of
-     * exec.system_jail_user=true). App trees don't ship that
-     * dir, so create it inside the jail (writes land in overlay).
+    /* The entry starts in its account's home (the request's cwd,
+     * entered after the drop). App trees don't ship that dir, so
+     * create it inside the jail (writes land in overlay).
      * Empty dir is fine — apps that need real $HOME contents
      * declare a `filesystem` capability that bind-mounts them.
      * Path varies by user: /home/<user>, /root, etc. */
@@ -789,11 +761,11 @@ fn launch_inner(
                 })?;
             ensure_mountpoints(&setup_jc)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
-            let setup_exit = run_one_jail(&setup_jc, &jail_path, /* stdio
-                         inherits daemon intentionally — Phase 4.5
-                         step-1 simplification. Step-2 will pipe setup
-                         output through the same tty as the runtime
-                         app. */ None, None, None)
+            let setup_run = AppRun {
+                debug: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), ..app_run.clone()
+            };
+            /* The setup's output goes to the daemon's. */
+            let setup_exit = run_one_jail(&setup_jc, &jail_path, None, &setup_run, None, None)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             if setup_exit != Some(0) {
                 full_teardown(&jail_path, None);
@@ -851,8 +823,7 @@ fn launch_inner(
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("fasti", e.to_string()) })?;
         jc.add_mount(&dir, &mountpoint, "nullfs", &["ro", "nosuid", "noexec"]);
         // Presentation only. Fasti authorizes commands from kernel credentials.
-        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} --persona {}",
-            manifest.entry(), persona.unwrap_or("personal"))));
+        app_run.args = vec!["--persona".into(), persona.unwrap_or("personal").into()];
     }
     let mut recovery_mount = None;
     if let Some(doc) = &mut document {
@@ -860,7 +831,7 @@ fn launch_inner(
         let recovery_id = u128::from_be_bytes(mount.id);
         recovery_mount = Some(mount);
         let option = if doc.recover { "--recover-document" } else if doc.blank { "--blank-document" } else { "--document" };
-        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} {option} {recovery_id}", manifest.entry())));
+        app_run.args = vec![option.into(), recovery_id.to_string()];
     } else if calendar_window.is_some() || (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
         || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))
@@ -936,8 +907,11 @@ fn launch_inner(
         jc.add_mount(Path::new("/lib"), &at.join("lib"), "nullfs", &["ro"]);
         jc.add_mount(Path::new("/usr/lib"), &at.join("usr-lib"), "nullfs", &["ro"]);
         jc.set("allow.unprivileged_proc_debug", portcullis_jail::Value::Bool(true));
-        jc.set("exec.start", portcullis_jail::Value::String(format!(
-            "{DEBUG_LD} /{DEBUG_IN_JAIL}/bin/sh /{DEBUG_IN_JAIL}/start {entry_at}")));
+        jc.set("exec.start", portcullis_jail::Value::String(DEBUG_LD.into()));
+        let mut args: Vec<String> = DEBUG_LD_ARGS.iter().map(|a| a.to_string()).collect();
+        args.extend([format!("/{DEBUG_IN_JAIL}/bin/sh"), format!("/{DEBUG_IN_JAIL}/start"), entry_at.clone()]);
+        args.append(&mut app_run.args);
+        app_run.args = args;
         let err = |e: std::io::Error| { full_teardown(&jail_path, None); LaunchError::Failed("debug", e.to_string()) };
         let out = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned().map_err(err)?;
         let out2 = out.try_clone().map_err(err)?;
@@ -953,7 +927,7 @@ fn launch_inner(
         ready.send(result).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
         Some(RecoveryStart { uid: app_uid, started, slot: doc.slot.0, pending: doc.pending.clone() })
     } else { None };
-    let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid), recovery_start);
+    let outcome = run_one_jail(&jc, &jail_path, stdio, &app_run, refresh_groups.then_some(app_uid), recovery_start);
 
     let clean = full_teardown(&jail_path, Some(&jc.name));
     if refresh_groups && !clean {
@@ -1050,13 +1024,14 @@ fn workbook_store(dir: &Path, index: usize) -> portcullis_overlay::Place {
     }
 }
 
-/// A previous broker may have left a persistent jail after a clean close.
+/// A previous broker may have left a jail after a clean close: an empty one
+/// on this workbook's root, with nothing saved, is ended here.
 fn workbook_jail_active(name: &str, instance: &str, dir: &Path, index: usize, occupied: bool) -> std::io::Result<bool> {
-    let jail = Command::new("jls").args(["-j", name, "jid", "path", "persist"]).output()?;
+    let jail = Command::new("jls").args(["-j", name, "jid", "path"]).output()?;
     if !jail.status.success() { return Ok(false); }
     let row = String::from_utf8_lossy(&jail.stdout);
     let fields: Vec<_> = row.split_whitespace().collect();
-    let [jid, path, "true"] = fields.as_slice() else { return Ok(true); };
+    let [jid, path] = fields.as_slice() else { return Ok(true); };
     if !occupied || Path::new(path) != Path::new(JAILS_DIR).join(instance) {
         return Ok(true);
     }
@@ -1073,13 +1048,8 @@ fn workbook_jail_active(name: &str, instance: &str, dir: &Path, index: usize, oc
         Some(1) => {}
         _ => return Err(std::io::Error::other("cannot verify empty workbook jail")),
     }
-    // Drop the persistence flag. Any remaining process still holds its jail.
-    let result = Command::new("jail").args(["-m", &format!("jid={jid}"), "nopersist"]).output()?;
-    let active = Command::new("jls").args(["-j", name, "jid"]).output()?.status.success();
-    if active && !result.status.success() {
-        return Err(std::io::Error::other(String::from_utf8_lossy(&result.stderr).into_owned()));
-    }
-    Ok(active)
+    portcullisd::jaild_jail::remove(name).map_err(std::io::Error::other)?;
+    Ok(!portcullis_mounts::wait_jail_gone(name, portcullis_mounts::JAIL_GONE_TIMEOUT))
 }
 
 fn require_workbook_image(store: &portcullis_overlay::Place) -> std::io::Result<()> {
@@ -1239,8 +1209,8 @@ fn clone_manifest_with(
     }
 }
 
-/// Create every capability mount's destination (the mountpoint) before jail(8)
-/// runs. jail(8) does not create mountpoints, and the read-only app tree can't
+/// Create every capability mount's destination (the mountpoint) before jaild
+/// makes the jail. jaild does not create mountpoints, and the read-only app tree can't
 /// carry them, so without this each `mount +=` (fresco.sock, forum-ctl.sock,
 /// clipboard.sock, a filesystem dir, …) fails and the jail never starts. We stat
 /// the source to pick the mountpoint type: a directory source → a directory
@@ -1251,111 +1221,174 @@ pub fn ensure_mountpoints(jc: &JailConfig) -> Result<(), LaunchError> {
     portcullis_mounts::ensure_mountpoints(jc).map_err(|e| LaunchError::Failed("mount", e))
 }
 
-/// Run one jail-c against `jail_path`, capture exit, jail -r before
-/// returning. Caller owns the over-arching mount lifecycle.
+/// Who an app's entry runs as, and how (app-jails-via-jaild.md §4): what a
+/// [`JailConfig`] cannot say and jaild checks.
+#[derive(Clone)]
+pub struct AppRun {
+    /// The person the instance is for; the launch registry binds `uid` to
+    /// them and `app_id`.
+    pub owner:  String,
+    pub app_id: String,
+    /// Started under lldb-server (M10).
+    pub debug:  bool,
+    pub uid:    u32,
+    /// The uid's account name, for its supplementary groups.
+    pub user:   String,
+    /// The account's home, which the entry starts in.
+    pub home:   PathBuf,
+    /// Arguments after the entry's name.
+    pub args:   Vec<String>,
+    /// The manifest's system call class; jaild resolves it again.
+    pub syscall_class: String,
+}
+
+/// The entry's whole environment: the account's HOME, SHELL and USER, a
+/// PATH, and the caller's TERM.
+fn clean_env(run: &AppRun) -> Vec<jaild::protocol::EnvPair> {
+    let pair = |k: &str, v: String| jaild::protocol::EnvPair { key: k.into(), value: v };
+    let shell = account_shell(&run.user).unwrap_or_else(|| "/bin/sh".into());
+    let mut env = vec![
+        pair("HOME", run.home.display().to_string()),
+        pair("SHELL", shell),
+        pair("USER", run.user.clone()),
+        pair("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin".into()),
+    ];
+    if let Ok(t) = std::env::var("TERM") {
+        env.push(pair("TERM", t));
+    }
+    env
+}
+
+fn account_shell(user: &str) -> Option<String> {
+    let cuser = std::ffi::CString::new(user).ok()?;
+    // SAFETY: getpwnam_r writes `pwd` and points its strings into `buf`,
+    // which outlives the reads below.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe { libc::getpwnam_r(cuser.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if r != 0 || result.is_null() || pwd.pw_shell.is_null() {
+        return None;
+    }
+    // SAFETY: a NUL-terminated string in `buf`, per getpwnam_r's success.
+    Some(unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }.to_string_lossy().into_owned())
+}
+
+/// The supplementary groups `user` is a member of past `gid` (the owner's
+/// files groups, which home::grant_group adds). jaild refuses any that is
+/// not one.
+fn account_groups(user: &str, gid: u32) -> Result<Vec<u32>, String> {
+    let cuser = std::ffi::CString::new(user).map_err(|_| format!("account name {user:?}"))?;
+    let mut groups = vec![0 as libc::gid_t; jaild::protocol::MAX_EXEC_GROUPS + 2];
+    let mut n = groups.len() as libc::c_int;
+    // SAFETY: `groups` holds `n` entries; getgrouplist writes at most that
+    // many and sets `n` to how many there are.
+    let rc = unsafe { libc::getgrouplist(cuser.as_ptr(), gid as libc::gid_t, groups.as_mut_ptr(), &mut n) };
+    if rc != 0 {
+        return Err(format!("{user} is in more than {} groups", jaild::protocol::MAX_EXEC_GROUPS));
+    }
+    let mut out: Vec<u32> = groups[..n.max(0) as usize].iter().map(|&g| g as u32).filter(|&g| g != gid).collect();
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Run `jc`'s entry in a jail jaild makes on `jail_path`, wait for it, and
+/// drop the jail's record. The caller owns the root's mounts.
 fn run_one_jail(
     jc:        &JailConfig,
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
+    run:       &AppRun,
     refresh_uid: Option<u32>,
     recovery_start: Option<RecoveryStart>,
 ) -> Result<Option<i32>, LaunchError> {
-    /* ★★ A `full` network comes from jaild, the one allocator (network.md §0):
-     * a point-to-point epair with the app's derived MAC — never the host's
-     * stack. Allocated for THIS jail and released when it is gone, on every
-     * path out of here. */
-    let mut jc = jc.clone();
-    let networked = jc.needs_routed_net.clone();
-    if let Some(mac) = &networked {
-        /* The app's finer grants (network.md §0.1), hostnames resolved now. */
-        let grants = match &jc.routed_net_spec {
-            Some((id, spec)) => portcullis_oneshot::net_grants(spec, id)
-                .map_err(|e| LaunchError::Failed("network", e))?,
-            None => None,
-        };
-        let (b, app, host) = jaild::client::allocate_net_in(Path::new(JAILD_SOCK), &jc.name, mac, grants, jc.route_fib)
-            .map_err(|e| LaunchError::Failed("network", e))?;
-        jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
-        /* Names resolve through the host's resolvers, over NAT. Written into the
-         * overlay, never the signed tree. */
+    let fail = |stage: &'static str| move |e: String| LaunchError::Failed(stage, e);
+    /* ★★ A `full` network is jaild's (network.md §0): it builds the epair
+     * with the app's derived MAC from the request, and releases it with the
+     * jail. The app's finer grants (network.md §0.1), hostnames resolved now. */
+    let grants = match &jc.routed_net_spec {
+        Some((id, spec)) => portcullis_oneshot::net_grants(spec, id).map_err(fail("network"))?,
+        None => None,
+    };
+    if jc.needs_routed_net.is_some() {
+        /* Names resolve through the host's resolvers, over NAT. Written into
+         * the overlay, never the signed tree. */
         let etc = jail_path.join("etc");
         let _ = fs::create_dir_all(&etc);
         let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
-    let outcome = run_one_jail_inner(&jc, jail_path, stdio, refresh_uid, recovery_start);
-    if networked.is_some() {
-        jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
+    let groups = account_groups(&run.user, run.uid).map_err(fail("groups"))?;
+    let parts = portcullisd::jail_request::RequestParts {
+        class: jaild::protocol::JailClass::App { owner: run.owner.clone(), app_id: run.app_id.clone(), debug: run.debug },
+        run: Some(portcullisd::jail_request::RunAs {
+            uid: run.uid, gid: run.uid, groups, args: run.args.clone(), env: clean_env(run),
+            stdio: true, cwd: Some(run.home.display().to_string()),
+        }),
+        grants,
+        syscall_profile: Some(run.syscall_class.clone()),
+    };
+    let req = portcullisd::jail_request::to_create_request(jc, parts).map_err(fail("jail"))?;
+    /* jaild mounts this jail's devfs; one left from a run that died would
+     * be stacked under it. */
+    let _ = umount_silent(&jail_path.join("dev"));
+    let running = portcullisd::jaild_jail::create(req, stdio).map_err(fail("jail"))?
+        .ok_or_else(|| LaunchError::Failed("jail", "jaild started no entry".into()))?;
+    let status = match (recovery_start, refresh_uid) {
+        (Some(start), _) => wait_for_recovery(&running, &jc.name, start),
+        (_, Some(uid)) => wait_for_files(&running, &jc.name, uid),
+        _ => running.wait(),
+    };
+    drop(running);
+    /* The jail ended with its entry; this drops jaild's record and, for a
+     * networked jail, its epair. */
+    if let Err(e) = portcullisd::jaild_jail::remove(&jc.name) {
+        eprintln!("portcullisd: {}: {e}", jc.name);
     }
-    outcome
+    /* ★★ A dying jail pins its root; unmount only once it is gone. */
+    portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
+    let _ = umount(&jail_path.join("dev"));
+    /* A non-zero exit is the caller's to read: the setup phase fails on it,
+     * the runtime phase passes it through. */
+    status.map(portcullisd::jaild_jail::exit_code)
+        .map_err(|e| LaunchError::Failed("jail", format!("wait for the entry: {e}")))
 }
 
-/// Create a jail that stays (`persist`, an entry that returns at once):
-/// a workspace (homes.md §5), which lives until stopped, not until a
-/// process exits. Its network, if any, is jaild's as for an app, and is
-/// released by [`remove_persistent`].
-pub fn create_persistent(jc: &JailConfig, jail_path: &Path) -> Result<(), LaunchError> {
-    let mut jc = jc.clone();
-    if let Some(mac) = jc.needs_routed_net.clone() {
-        /* The jail isn't running, so a network jaild still holds for its name
-         * is left from one that ended without a stop (a crash, a reboot of
-         * portcullisd): released, or the allocation is refused. */
-        jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
-        let (b, app, host) = jaild::client::allocate_net_in(Path::new(JAILD_SOCK), &jc.name, &mac, None, jc.route_fib)
-            .map_err(|e| LaunchError::Failed("network", e))?;
-        jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
+/// Create a jail that stays, with nothing running in it: a workspace
+/// (homes.md §5) or a console, which lives until stopped. Its network, if
+/// any, is jaild's as for an app, and goes with [`remove_persistent`].
+pub fn create_persistent(jc: &JailConfig, jail_path: &Path, class: jaild::protocol::JailClass, syscall_class: &str) -> Result<(), LaunchError> {
+    let fail = |stage: &'static str| move |e: String| LaunchError::Failed(stage, e);
+    /* A record jaild still holds for this name is left from one that ended
+     * without a stop (a crash, a reboot of portcullisd). */
+    let _ = portcullisd::jaild_jail::remove(&jc.name);
+    if jc.needs_routed_net.is_some() {
         let etc = jail_path.join("etc");
         let _ = fs::create_dir_all(&etc);
         let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
-    let release = |jc: &JailConfig| if jc.needs_routed_net.is_some() {
-        jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
+    let parts = portcullisd::jail_request::RequestParts {
+        class, run: None, grants: None, syscall_profile: Some(syscall_class.into()),
     };
-    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc).map_err(|e| LaunchError::Failed("devfs", e))
-        .and_then(|_| portcullis_mounts::ensure_network_ready(&jc).map_err(|e| LaunchError::Failed("network", e)))
-    {
-        release(&jc);
-        return Err(e);
-    }
-    let conf_path = match jc.write_jail_conf(&format!("portcullisd-{}", jc.name)) {
-        Ok(p) => p,
-        Err(e) => {
-            release(&jc);
-            return Err(LaunchError::Failed("jail-c", e));
-        }
-    };
-    let out = Command::new("jail").arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
-        .stdin(Stdio::null()).output();
-    let _ = fs::remove_file(&conf_path);
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            release(&jc);
-            Err(LaunchError::Failed("jail-c", String::from_utf8_lossy(&o.stderr).trim().to_string()))
-        }
-        Err(e) => {
-            release(&jc);
-            Err(LaunchError::Failed("jail-c", format!("could not invoke jail(8): {e}")))
-        }
-    }
+    let req = portcullisd::jail_request::to_create_request(jc, parts).map_err(fail("jail"))?;
+    portcullisd::jaild_jail::create(req, None).map(|_| ()).map_err(fail("jail"))
 }
 
 /// End a jail made by [`create_persistent`] and take down its mounts.
-pub fn remove_persistent(name: &str, jail_path: &Path, networked: bool) {
-    let _ = Command::new("jail").arg("-q").arg("-r").arg(name).stderr(Stdio::null()).status();
-    portcullis_mounts::wait_jail_gone(name, portcullis_mounts::JAIL_GONE_TIMEOUT);
-    if networked {
-        jaild::client::release_net(Path::new(JAILD_SOCK), name);
+pub fn remove_persistent(name: &str, jail_path: &Path) {
+    if let Err(e) = portcullisd::jaild_jail::remove(name) {
+        eprintln!("portcullisd: remove {name}: {e}");
     }
+    portcullis_mounts::wait_jail_gone(name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     let _ = umount(&jail_path.join("dev"));
     full_teardown(jail_path, None);
 }
 
-const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
 const JAILD_POLICY: &str = "/etc/atrium/jaild.policy.toml";
 
 /// The app jail's system call filter (docs/spec/jail-sysfil.md §5.2): the
-/// manifest's class, resolved from jaild's policy, so a jail(8) launch and a
-/// jaild launch of the same app get the same lists. `None` on a kernel
+/// manifest's class, resolved from jaild's policy, as jaild resolves it
+/// again from the request's class name. `None` on a kernel
 /// without sysfil, which would refuse the parameters, unless the policy
 /// says a filter is required.
 pub fn app_sysfil(manifest: &Manifest) -> Result<Option<jaild_policy::SysfilParams>, LaunchError> {
@@ -1399,67 +1432,6 @@ pub fn sysfil_for_class(class: &str) -> Result<Option<jaild_policy::SysfilParams
     policy.sysfil.resolve(class).map(Some).map_err(|e| fail(format!("class {class:?}: {e}")))
 }
 
-fn run_one_jail_inner(
-    jc:        &JailConfig,
-    jail_path: &Path,
-    stdio:     Option<[OwnedFd; 3]>,
-    refresh_uid: Option<u32>,
-    recovery_start: Option<RecoveryStart>,
-) -> Result<Option<i32>, LaunchError> {
-    /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
-    portcullis_mounts::ensure_devfs_isolation(jc)
-        .map_err(|e| LaunchError::Failed("devfs", e))?;
-    /* ★★ And a networked config whose network was never attached. */
-    portcullis_mounts::ensure_network_ready(jc)
-        .map_err(|e| LaunchError::Failed("network", e))?;
-    let conf_path = jc.write_jail_conf(&format!("portcullisd-{}", jc.name))
-        .map_err(|e| LaunchError::Failed("jail-c", e))?;
-    let mut cmd = Command::new("jail");
-    /* ★★ `-q`: jail(8) prints "<name>: created" on STDOUT, and stdout here is
-     * the CALLER's (received over SCM_RIGHTS) — the app's own output stream.
-     * Measured 2026-09-22: a daemon launch's output began with
-     * "test_e2e_nettest: created". The one-shot lane hit the same corruption
-     * and fixed it the same way. */
-    cmd.arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name);
-    if let Some([sin, sout, serr]) = stdio {
-        cmd.stdin (Stdio::from(sin));
-        cmd.stdout(Stdio::from(sout));
-        cmd.stderr(Stdio::from(serr));
-    }
-    let status = match (recovery_start, refresh_uid) {
-        (Some(start), _) => wait_for_recovery(&mut cmd, &jc.name, start),
-        (_, Some(uid)) => wait_for_files(&mut cmd, &jc.name, uid),
-        _ => cmd.status(),
-    };
-    let _ = fs::remove_file(&conf_path);
-    /* Per-jail teardown: jail -r releases the jail's specific mounts
-     * (mount.devfs, capability mounts) without touching the
-     * overarching overlay union. */
-    /* The jail usually removed itself when its last process exited, so this
-     * is a safety net; its "not found" is expected, not news for the log. */
-    let _ = Command::new("jail").arg("-q").arg("-r").arg(&jc.name)
-        .stderr(Stdio::null()).status();
-    /* ★★ A dying jail pins its root; unmount only once it is gone. */
-    portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
-    let _ = umount(&jail_path.join("dev"));
-
-    let code = match status {
-        Ok(s) => s.code(),
-        Err(e) => return Err(LaunchError::Failed("jail-c",
-                  format!("could not invoke jail(8): {e}"))),
-    };
-    /* Setup phase: a non-zero exit aborts the launch (sentinel
-     * stays absent so next launch retries). For the runtime phase
-     * the caller passes the code through verbatim — non-zero is
-     * just "the app exited non-zero", not a failure. So this fn
-     * returns Ok always for now and the caller distinguishes by
-     * looking at jc.name (or by passing an "is_setup" flag).
-     *
-     * Today setup failures are detected at the call site by
-     * checking `code != Some(0)` after this returns. */
-    Ok(code)
-}
-
 struct RecoveryStart {
     uid: u32,
     started: mpsc::Sender<()>,
@@ -1472,18 +1444,16 @@ fn recovery_process_running(jail: &str, uid: u32) -> bool {
         .output().is_ok_and(|out| out.status.success())
 }
 
-// jail(8) stays alive while exec.start runs. Confirm Sheets in this specific
-// document jail before replying, then let the launch thread supervise its exit.
-fn wait_for_recovery(cmd: &mut Command, jail: &str, start: RecoveryStart) -> std::io::Result<ExitStatus> {
-    let mut child = cmd.spawn()?;
+/// Confirm Sheets is running in this document's jail before replying, then
+/// let the launch thread supervise its exit.
+fn wait_for_recovery(running: &portcullisd::jaild_jail::Running, jail: &str, start: RecoveryStart) -> std::io::Result<i32> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? { return Ok(status); }
+        if let Some(status) = running.wait_for(Some(Duration::from_millis(25)))? { return Ok(status); }
         if recovery_process_running(jail, start.uid) {
             let _ = start.started.send(());
-            return child.wait();
+            return running.wait();
         }
-        std::thread::sleep(Duration::from_millis(25));
     }
     // Wake a repeated Recover already waiting on this reservation. After the
     // deadline, probe again only on demand while the original launch continues.
@@ -1491,7 +1461,7 @@ fn wait_for_recovery(cmd: &mut Command, jail: &str, start: RecoveryStart) -> std
         pending: start.pending, uid: start.uid, jail: jail.to_owned(),
     };
     SLOT_RELEASED.notify_all();
-    let status = child.wait();
+    let status = running.wait();
     ACTIVE_WORKBOOKS.lock().unwrap()[start.slot] = SlotState::Active;
     status
 }
@@ -1500,8 +1470,7 @@ fn files_should_stop() -> bool {
     FILES_RUN.lock().unwrap().as_ref().is_some_and(|run| run.refresh || run.logging_out)
 }
 
-fn wait_for_files(cmd: &mut Command, jail: &str, uid: u32) -> std::io::Result<ExitStatus> {
-    let mut child = cmd.spawn()?;
+fn wait_for_files(running: &portcullisd::jaild_jail::Running, jail: &str, uid: u32) -> std::io::Result<i32> {
     let uid = uid.to_string();
     let signal = |sig: &str| {
         Command::new("pkill").args([sig, "-j", jail, "-U", &uid])
@@ -1509,27 +1478,27 @@ fn wait_for_files(cmd: &mut Command, jail: &str, uid: u32) -> std::io::Result<Ex
     };
     let mut term_at: Option<Instant> = None;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = running.wait_for(Some(Duration::from_millis(100)))? {
             return Ok(status);
         }
         if let Some(at) = term_at {
             if at.elapsed() >= Duration::from_secs(3) {
-                if !signal("-KILL") && child.try_wait()?.is_none() {
+                if !signal("-KILL") && running.wait_for(Some(Duration::ZERO))?.is_none() {
                     eprintln!("portcullisd: could not signal Files in {jail} after TERM");
                 }
-                return child.wait();
+                return running.wait();
             }
         } else if files_should_stop() && signal("-TERM") {
             // A refresh during startup stays pending until the app is
             // actually in the jail and can receive the signal.
             term_at = Some(Instant::now());
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// Final teardown: optional jail -r (idempotent if already removed), then
-/// unmount everything the launch mounted — deepest first, convergently.
+/// Final teardown: end the jail through jaild if it is named (a jail
+/// already gone is fine), then unmount everything the launch mounted,
+/// deepest first, convergently.
 ///
 /// The mechanics moved to `portcullis-mounts` when the one-shot lane turned
 /// out to have a near-copy of them and the CLI's fallback a worse one. The
@@ -1540,8 +1509,8 @@ fn wait_for_files(cmd: &mut Command, jail: &str, uid: u32) -> std::io::Result<Ex
 ///
 ///     umount: unmount of /var/lib/atrium/jails/<app> failed: Device busy
 ///
-/// `jail -r` is documented to drop a jail's own mounts and demonstrably does
-/// not always. Each relaunch then stacked a fresh set on top of the
+/// Removing a jail is documented to drop its own mounts and demonstrably
+/// does not always. Each relaunch then stacked a fresh set on top of the
 /// survivors: 12 mounts with no jail running, no process, no open file.
 ///
 /// ★ And a stacked pile cannot be cleaned up afterwards by path: a path
@@ -1554,8 +1523,7 @@ fn wait_for_files(cmd: &mut Command, jail: &str, uid: u32) -> std::io::Result<Ex
 /// still using it. This path reports survivors instead.
 pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) -> bool {
     if let Some(n) = jail_name {
-        let _ = Command::new("jail").arg("-q").arg("-r").arg(n)
-            .stderr(Stdio::null()).status();
+        let _ = portcullisd::jaild_jail::remove(n);
     }
     // ★ A console jail on the same root (M0/P1) holds its mounts busy and
     // would outlive them: it goes first.
@@ -1622,9 +1590,9 @@ fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, p
     Ok((uid, run_as))
 }
 
-/// Ensure a host passwd entry exists for a dedicated 50000+ uid (jail(8)
-/// resolves exec.jail_user via it, and portcullisd refuses a peer whose uid
-/// isn't in passwd). Returns the username. Used for apps and session components.
+/// Ensure a host passwd entry exists for a dedicated 50000+ uid (its
+/// groups and home are read from it, and portcullisd refuses a peer whose
+/// uid isn't in passwd). Returns the username. Used for apps and session components.
 pub fn ensure_passwd(uid: u32) -> Result<String, String> {
     match portcullis_peer::username(uid) {
         Some(name) => Ok(name),
@@ -2045,16 +2013,10 @@ pub fn fetch_sites_of(list: Option<&[String]>) -> Result<Option<String>, String>
 
 /// The jid of a running jail for `app_id`, or `None`.
 ///
-/// Asks jls(8) rather than tracking state in-process: portcullisd can be
-/// restarted while jails keep running, so the kernel's view is the only one
-/// that is always right.
+/// Asks the kernel rather than tracking state in-process: portcullisd can
+/// be restarted while jails keep running.
 pub fn running_jid(app_id: &str) -> Option<i32> {
-    let name = jail_name_from_app_id(app_id);
-    let out = Command::new("jls").args(["-j", &name, "jid"]).output().ok()?;
-    if !out.status.success() {
-        return None;   /* jls exits non-zero when the jail does not exist */
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    jaild::ffi::jail_id_by_name(&jail_name_from_app_id(app_id))
 }
 
 /// The key of an instance: `<id>` for Personal, `<id>@<persona>` for a named
@@ -2069,11 +2031,7 @@ pub fn instance_key(app_id: &str, persona: Option<&str>) -> String {
 /// As [`running_jid`], for the instance in `persona`.
 pub fn running_jid_instance(app_id: &str, persona: Option<&str>) -> Option<i32> {
     let name = portcullis_jail::jail_name_for_instance(app_id, persona.map(|p| format!("p-{p}")).as_deref());
-    let out = Command::new("jls").args(["-j", &name, "jid"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    jaild::ffi::jail_id_by_name(&name)
 }
 
 /// The apps of `user`'s persona `persona` with a process running now (any
@@ -2269,7 +2227,7 @@ pub fn remove_jails_at(path: &Path) {
         let mut f = line.split_whitespace();
         if let (Some(name), Some(p)) = (f.next(), f.next()) {
             if p == want && name.starts_with(CONSOLE_JAIL_PREFIX) {
-                let _ = Command::new("jail").arg("-q").arg("-r").arg(name).stderr(Stdio::null()).status();
+                let _ = portcullisd::jaild_jail::remove(name);
                 removed.push(name.to_string());
             }
         }

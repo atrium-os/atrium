@@ -33,7 +33,4 @@ fn the_jail_reports_the_apps_synthetic_identity() {
     assert!(matches!(get("host.hostid"), Some(Value::Number(n)) if n == id.hostid as i64));
     assert!(matches!(get("host.hostuuid"), Some(Value::String(ref u)) if *u == id.hostuuid));
     assert!(matches!(get("host.hostname"), Some(Value::String(ref h)) if h == "org.x.cad"));
-    let conf = jc.render_jail_conf().unwrap();
-    assert!(conf.contains(&format!("host.hostid = {};", id.hostid)), "{conf}");
-    assert!(conf.contains(&format!("host.hostuuid = \"{}\";", id.hostuuid)), "{conf}");
 }

@@ -84,7 +84,7 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
         mounts,
         devfs_ruleset: DEVFS_RULESET,
         network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
-        exec: Some(ExecSpec {
+        exec: Some(ExecSpec { cwd: None,
             groups: vec![],
             path: if ac { EXEC_AC } else { EXEC_PATH }.into(),
             argv: vec![if ac { EXEC_AC } else { EXEC_PATH }.into()],
