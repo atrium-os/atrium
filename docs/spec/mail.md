@@ -1139,11 +1139,25 @@ remote-picture loading. A mailbox provider can observe ordinary read
 activity. The production gate must verify that the legacy action itself
 adds no outcome-dependent mailbox changes or external activity.
 
-The selected local message supplies the account association. Mail's
-numeric account ID indexes its own database. The private-key request
-must also carry the enrolled account instance that Arca can validate
-and revoke. Removing the account or changing its receiving identity
-invalidates the old enrollment, including any open approval.
+The selected local message supplies the account association for the
+sheet. The proposed JMAP path also requires an Arca-authenticated
+receipt binding the exact downloaded bytes to an authenticated account
+instance and generation. The trusted sheet shows the verified sign-in
+and service. Mail's address and database ID remain local labels. Mail
+must persist a removal intent, stop offering the preview, and obtain
+Arca's revocation acknowledgment before deleting local account data.
+A pending removal survives restart and retries against the same
+instance. A newly added account gets a fresh instance.
+
+The next disabled synthetic batch should exercise the JMAP proof and
+receive receipt, then inject failures between the revocation fence,
+worker cancellation and local cleanup. Include a real signed Work
+launch, a second account in Work, and a Personal control. Verify refusal
+for a substituted account or message, a shared account, a stale
+challenge, an imported copy, a restarted removal and a recreated
+persona. Verify the approved account still previews its own received
+fixture while unrelated accounts retain their own access. No live
+provider or mailbox writes are needed for this batch.
 
 See [Arca §9.2.1](arca.md#921-proposed-legacy-smime-receive-operation),
 [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),

@@ -933,51 +933,94 @@ path for arbitrary received messages remains disabled.
 
 ##### Account enrollment and received-message review
 
-The signed fixture reserves the selected account, local message ID and
-exact RFC 5322 bytes. It authenticates the launch through Portcullis and
-checks the digest returned by the jailed parser. These checks bind the
-approval to a snapshot. Portcullis attests the user, signed Mail
-publisher and persona. Its registry carries no mail account identity.
-The legacy key lookup scopes by user, persona, publisher, certificate
-digest and key fingerprint. The old one-account fixture used its first approved open to install the
-built-in key. The current signed gate stores the fixed Work enrollment
-with an account scope and uses a separate trusted approval to add or
-forget it. An open can only look up the enrollment. The existing
-provisioning, discovery and forget operations apply to the separate OAEP
-recipient. Mail account
-removal cleans up the account's credential items and local data.
+Portcullis attests the local user, signed Mail publisher and launch
+persona. Its registry carries no receiving account identity. Mail's
+account number and configured address are local data. Arca's existing
+credential item records an endpoint and a sign-in label. Microsoft
+grant completion records the requested address. Neither an item ID nor
+a successful token exchange proves which mailbox the server made
+available. The normal OAEP provisioning and forget operations have
+their own recipient and scope.
 
-A production enrollment needs a stable instance binding that Arca can
-validate independently of a Mail store ID. An Arca-issued opaque handle
-can identify the enrolled account and its generation. The trusted
-enrollment must associate that handle with the authenticated receiving
-account, local user, launch persona and Mail publisher. The trusted
-sheet should identify the account and obtain explicit approval before
-storing a matching certificate and dedicated legacy key. The enrolled
-identity may include explicitly confirmed receiving aliases. Envelope
-and message headers and provider authentication results convey no
-enrollment authority. Opening the first received message must never
-create or repair an enrollment. Keep the existing key-purpose exclusion
-across a user's accounts, personas and publishers.
+**First supported account proof.** Start with a synthetic JMAP service.
+Use a fixed, signed network worker with an Arca-authorized grant for
+one receiving credential and HTTPS Session origin. The worker validates
+TLS and fetches a fresh authenticated JMAP Session. It reports the
+effective origin, authenticated Session username, and exact primary
+Mail account ID. Require the matching account entry to advertise the
+Mail capability and belong to the authenticated principal
+(`isPersonal` in [RFC 8620 §2](https://www.rfc-editor.org/rfc/rfc8620.html#section-2)).
+Refuse shared accounts, ambiguous IDs, missing fields and origin changes.
+The server's account ID is scoped to that service. The account name is
+for display. The trusted sheet displays the verified service and
+principal, the local persona and the proposed certificate fingerprint.
+It binds the press to the worker result, one local launch and a
+short-lived Arca challenge. Only the worker launched for that challenge
+can deliver the result on its private channel. Mail supplies the
+requested account selection. Arca checks the exact credential item's
+ownership, recipient, endpoint and generation before accepting the
+worker result and again before sealing the dedicated key.
 
-Reserve the account handle and generation with the signed launch and
-message snapshot. Mail must resolve the account from the selected
-stored message or its mailbox location. Arca must check the active
-enrollment and generation before private-key use and before publishing
-the result. The jailed worker receives bounded complete stored bytes,
-validates the top-level profile, and returns a witness for the actual
-bytes and the unique enrolled recipient. Keep routing explicit for
-legacy and OAEP. The preview remains local and bypasses the ordinary
-reader's Seen path, external content and mailbox operations.
+Seal the user, persona, publisher, receiving credential binding,
+service, principal, remote Mail account ID and key metadata under an
+Arca-issued account instance and generation. Allow at most one active
+legacy enrollment for that authenticated receiving account within the
+same user, publisher and persona. Revalidate changes to the receiving
+credential before continuing to use an enrollment. An account, service
+or publisher change requires revocation and a new explicit enrollment.
+The user can review the confirmed account regardless of Mail's local
+address label. IMAP login and a successful INBOX selection do not by
+themselves supply the same stable mailbox identity. Defer IMAP until
+there is a suitable account proof. Defer alias enrollment until the
+service can attest the aliases and the user can confirm them on the
+trusted sheet. DKIM, DMARC, Authentication-Results and message headers
+convey no enrollment authority. Preserve key-purpose separation.
 
-Give the user a dedicated forget action. Account removal and persona
-erasure must also invalidate the enrollment and revoke outstanding
-reservations, worker calls and previews. Invalidate the account binding
-before reporting revocation complete. If deletion of the sealed item
-needs a retry, the old binding must stay unusable and the cleanup must
-be idempotent. Re-adding the same address produces a new account
-instance. A changed account identity or publisher requires a new
-explicit enrollment.
+**Proof of message origin.** The first production candidate requires an
+account-scoped receipt from the trusted receive worker during normal
+sync. Bind it to the enrolled account instance and generation, the
+server Email ID and the digest of the exact fetched RFC 5322 bytes.
+Validate the response's account and Email IDs before issuing a receipt.
+Use a proof Arca can authenticate and Mail can store with the message.
+Copying a database row or relabeling imported mail cannot mint a receipt.
+The first profile covers messages fetched after enrollment and omits
+local imports and cross-account copies. Reserve the verified receipt
+and selected snapshot at the trusted sheet. Recheck the active account
+and receipt before releasing the key and before publishing the result.
+Preview uses local bytes and the existing networkless jailed reader.
+Opening a message never authenticates to the provider, enrolls a key,
+or falls back to OAEP.
+
+**Revocation and recovery.** Today Mail removes the local account first
+and then asks Arca to delete endpoint credentials asynchronously.
+`DELETE_FOR` reaches those endpoint items. `PERSONA_DESTROY`, invoked by
+atrium-volumes, enumerates and removes the persona's Arca groups. Group
+removal can fail partway and does not itself cancel an in-flight reader.
+
+Give the trusted sheet a separate forget action bound to the exact
+account instance. Account removal must first persist a Mail removal
+intent that survives restart. It must then get an authenticated Arca
+acknowledgment of revocation before deleting the account rows and
+requesting existing credential cleanup. While Arca is unavailable,
+show the removal as pending and suppress the local preview. Retain
+the instance in the pending record so a retry never targets a newly
+added account. Ordinary credential deletion or invalidation must
+also invalidate any dependent legacy enrollment.
+
+Arca must durably fence the account generation before deleting any
+sealed key material or acknowledging revocation. Use the same
+authorization state to invalidate outstanding reservations, stop
+active reader work, and prevent publication after the fence. Clear
+any already displayed local sheet through its revocation channel,
+and dismiss it on channel loss. Retries resume cleanup for the exact
+revoked generation. A restart, partial deletion, duplicate request
+or re-addition of the same mailbox cannot restore that generation.
+Persona destruction must first persist a fence for the affected
+persona instance and cancel its legacy approvals, then erase its
+groups. Other personas stay available. A new persona with the same
+name gets a fresh instance. Refuse key use if revocation state cannot
+be established. Keep removal and storage failures outside the one
+generic legacy message-open outcome.
 
 The native synthetic account gate exercises four backend cases. It
 opens distinct fixed messages for two accounts in one persona, checks
@@ -1001,9 +1044,9 @@ Arca rechecks the signed launch and the reserved sealed item ID. A
 preview checks that ID again before key release and result publication.
 Forgetting the active enrollment revokes pending preview approval.
 Neither account management action launches the reader. Personal stays
-isolated. Production account provisioning and account deletion still
-need an independently authenticated account binding. The six
-whole-path timing trials cover two operational failures only.
+isolated. JMAP account proof, receive receipts and durable account and
+persona revocation still need a synthetic gate. The six whole-path timing
+trials cover two operational failures only.
 
 ##### Failure observability review
 
