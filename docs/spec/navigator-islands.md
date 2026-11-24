@@ -2067,6 +2067,47 @@ there, it is the measurement and not the Start; the product figure is then
 `FRESCOD_START_TRACE=1`, repeat the three arms, and pass frescod's stderr
 to `navigator-i5-start-trace.sh` with the other logs.
 
+#### Results on arm64 Tessera, 2026-11-24 (frescod traced)
+
+frescod from main `f0682dae8` with `FRESCOD_START_TRACE=1`; the engine
+(`1000beb6…`), daemons and player were byte-identical to the drained-loop
+run, so frescod was the only change. Times in milliseconds since
+`widget-start`; "frame" is the first frescod frame after the player's
+`first-frame`.
+
+| Press | `player-ready` | frame `frame-begin` (slept) | `composited` | `png-saved` | Red observed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| No choragusd 2 | 623 | 794 (199) | 846 | 849 | 942 |
+| No choragusd 3 | 692 | 838 (199) | 892 | 896 | 1,062 |
+| choragusd 1 | 642 | 782 (199) | 835 | 838 | 959 |
+| choragusd 2 | 694 | 837 (199) | 889 | 892 | 992 |
+| choragusd 3 | 705 | 819 (199) | 872 | 875 | 1,015 |
+| Warm 2 | 680 | 797 (199) | 850 | 854 | 994 |
+| Warm 3 | 714 | 801 (199) | 855 | 858 | 988 |
+| Warm 4 | 695 | 824 (199) | 875 | 878 | 977 |
+
+The 330 ms is the measurement, as the follow-up expected. After
+`player-ready`, the next frame waits 89 to 175 ms for the 200 ms headless
+capture floor (every such frame slept 199 ms), composition takes 52 to
+55 ms, the PNG 3 ms, and the SSH poll finds the red pixel 94 to 170 ms
+after the PNG is written. The gate therefore now ends at frescod's
+`composited` for the first frame after the player's `first-frame`, not at
+the pixel poll. On that end the median press to `composited` is 869 ms
+without choragusd (two presses), 872 ms with it and 855 ms warm. Without
+the headless floor, which a real display does not have, composition would
+follow the first decoded frame by about 55 ms, about 730 to 770 ms after
+the press.
+
+Two of the eleven presses took about 1.6 s to red, both before the engine
+work: the first press after boot made its first request at 452 ms, and
+warm press 5's first fetch took 765 ms upstream. They are left out above.
+
+The same guest then took main `afdae0373`'s portcullisd (with the launch
+registry check from `2bd8429`), frescod and navigatord. Three cold Starts
+reached red at 1,050, 881 and 893 ms, and portcullisd logged no registry
+error with `/var/run/atrium/app-registry` present. Evidence for both is in
+`~/atrium-vm/evidence/navigator-i5-frescod-trace-20261124/`.
+
 ### I6 plan: whole pages live on a press (proposed)
 
 Shankar asked for this plan on 2026-11-24 while the I5 timing waited on the
