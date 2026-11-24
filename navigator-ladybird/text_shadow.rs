@@ -9,6 +9,16 @@ pub(super) fn shadow_image(
     sigma: f32,
     color: Color,
 ) -> pergola::node::Image {
+    pergola::node::Image::new(w as u32, h as u32, shadow_pixels(alpha, w, h, sigma, color))
+}
+
+pub(super) fn shadow_pixels(
+    alpha: &[f32],
+    w: usize,
+    h: usize,
+    sigma: f32,
+    color: Color,
+) -> Vec<u8> {
     let radius = (3. * sigma).ceil() as i32;
     let mut temp = vec![0.; alpha.len()];
     let weights: Vec<_> = (-radius..=radius)
@@ -49,7 +59,7 @@ pub(super) fn shadow_image(
             ]);
         }
     }
-    pergola::node::Image::new(w as u32, h as u32, rgba)
+    rgba
 }
 
 pub(super) fn nodes(

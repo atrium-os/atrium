@@ -49,6 +49,21 @@ pub fn player_body(input: &[u8]) -> Result<Vec<u8>, &'static str> {
     {
         body["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"] = ts.into();
     }
+    // Preserve the configuration issued by the embed for this player request.
+    // Its value is opaque to Navigator and is only returned to the fixed provider.
+    if let Some(flags) =
+        request.pointer("/playbackContext/contentPlaybackContext/encryptedHostFlags")
+    {
+        let flags = flags.as_str().ok_or("invalid embed configuration")?;
+        if flags.len() > 2048
+            || !flags
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_+/=.%".contains(&c))
+        {
+            return Err("invalid embed configuration");
+        }
+        body["playbackContext"]["contentPlaybackContext"]["encryptedHostFlags"] = flags.into();
+    }
     // The embed can return its own opaque values only to the same player endpoint.
     for (object, key, max_len) in [
         ("/context/client", "visitorData", 2048),
@@ -185,8 +200,20 @@ fn player_grant_checks_url_and_emits_only_granted_fields() {
     request["context"]["client"]["visitorData"] = "from_this_embed".into();
     request["serviceIntegrityDimensions"]["poToken"] = "fixture-token".into();
     request["playbackContext"]["contentPlaybackContext"]["signatureTimestamp"] = 12345.into();
+    request["playbackContext"]["contentPlaybackContext"]["encryptedHostFlags"] =
+        "fixture-data=".into();
     let courier = player_body(&serde_json::to_vec(&request).unwrap()).unwrap();
     assert_eq!(player_body(&courier).unwrap(), courier);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&courier).unwrap()["playbackContext"]
+            ["contentPlaybackContext"]["encryptedHostFlags"],
+        "fixture-data="
+    );
+    request["playbackContext"]["contentPlaybackContext"]["encryptedHostFlags"] =
+        "x".repeat(2049).into();
+    assert!(player_body(&serde_json::to_vec(&request).unwrap()).is_err());
+    request["playbackContext"]["contentPlaybackContext"]["encryptedHostFlags"] =
+        "fixture-data=".into();
     let parsed: serde_json::Value = serde_json::from_slice(&courier).unwrap();
     assert_eq!(
         parsed["serviceIntegrityDimensions"]["poToken"],

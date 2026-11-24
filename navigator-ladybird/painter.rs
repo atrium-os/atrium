@@ -232,6 +232,7 @@ fn scrollbar_nodes(
     nodes
 }
 
+mod box_shadow;
 mod text_shadow;
 use text_shadow::shadow_image;
 mod gradient;
@@ -358,7 +359,9 @@ pub fn editor_leaves(
                         return Ok(());
                     }
                     let node = match header.command_type {
+                        DisplayListCommandType::PaintOuterBoxShadow => box_shadow::paint(read_command(payload))?,
                         DisplayListCommandType::FillPath => mask::vector_path(payload)?,
+                        DisplayListCommandType::PaintRadialGradient => gradient::radial(payload)?,
                         DisplayListCommandType::PaintLinearGradient => gradient::direct(payload)?,
                         DisplayListCommandType::DrawRepeatedTile => {
                             let Some(node) = gradient::repeated(payload)? else { return Ok(()) };

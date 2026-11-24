@@ -630,6 +630,35 @@ buffer creation and append probes recorded no calls. The error UI attempted
 The guest exited cleanly. Evidence is in
 `~/atrium-vm/evidence/navigator-i4-player-post-20261124/`.
 
+#### Signed-out player comparison and error-screen shadow
+
+Fresh signed-out Chrome and installed JIT-off Ladybird used the same demo
+(`M7lc1UVf-VE`) and Atrium app referrer. Normal Chrome received 23 adaptive
+formats and decoded 329 frames and 139,328 audio bytes. Re-encoding the
+complete request and narrowing its page-controlled headers separately
+preserved playback. Substituting Navigator’s bounded body reproduced the
+provider error in Chrome. Keeping only the embed’s `encryptedHostFlags` in
+the tested content-playback context restored playback in three fresh
+profiles (319–328 frames). Omitting that one field from the complete
+content-playback context returned zero formats, frames and audio bytes
+in all three controls.
+
+The broker and worker now preserve that optional field on the existing
+fixed player POST, subject to a 2,048-byte token limit. The installed
+Ladybird gate received 39,008 bytes, playability OK and 23 adaptive formats
+in the arm64 Capsicum jail. Playback time, buffered ranges and decoded
+frames remained zero. The next media gate should identify the first
+format-selection or delivery failure before extending any network grant.
+
+The native painter now blurs the offset rounded shadow and removes the
+original rounded box interior. The pixel test also checks texture reuse.
+The real provider error control advanced past the shadow and an elliptical
+radial gradient. Its next failure was applying the mask to multiple leaves
+that require isolated composition. The complete error frame remains open.
+The painter suite passed 11 tests and the player request suite passed three.
+Evidence, including both guest controls and the Chrome comparison, is in
+`~/atrium-vm/evidence/navigator-i4-shadow-compare-20261124/`.
+
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
 now retains same-space intersecting rectangular clips and represents a

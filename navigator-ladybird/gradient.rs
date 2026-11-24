@@ -1,7 +1,8 @@
 //! CSS gradients that can be expressed as a single retained Fresco fill.
 use super::{Node, Point, Rect, color, for_each_command, read_command, span_bytes};
 use libcompositing_rust::display_list::commands::{
-    DisplayListCommandType, DrawRepeatedTile, PaintLinearGradient,
+    DisplayListCommandType, DisplayListGradientColorStops, DrawRepeatedTile, PaintLinearGradient,
+    PaintRadialGradient,
 };
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, FloatRect, GradientInterpolationType, IntRect,
@@ -25,22 +26,7 @@ fn linear(
     {
         return Err("unsupported gradient interpolation, extent or blend");
     }
-    let colors = span_bytes(payload, command.color_stops.colors);
-    let positions = span_bytes(payload, command.color_stops.positions);
-    if colors.len() != positions.len()
-        || colors.len() % 4 != 0
-        || !(1..=fresco_protocol::FILL_MAX_STOPS).contains(&(colors.len() / 4))
-    {
-        return Err("unsupported gradient stop count");
-    }
-    let mut stops = Vec::with_capacity(colors.len() / 4);
-    for (rgba, offset) in colors.chunks_exact(4).zip(positions.chunks_exact(4)) {
-        let offset = read_command::<f32>(offset);
-        if !(0.0..=1.0).contains(&offset) || stops.last().is_some_and(|&(last, _)| offset < last) {
-            return Err("invalid gradient stop position");
-        }
-        stops.push((offset, color(read_command::<Color>(rgba))));
-    }
+    let stops = gradient_stops(payload, command.color_stops)?;
 
     // CSS zero points up in device coordinates. Project the rectangle onto
     // that axis to get the length of the CSS gradient line.
@@ -61,6 +47,69 @@ fn linear(
         .into_iter()
         .next()
         .ok_or("empty gradient")?;
+    Ok(Node::Fill(fill.into()))
+}
+
+fn gradient_stops(
+    payload: &[u8],
+    raw: DisplayListGradientColorStops,
+) -> Result<Vec<(f32, pergola::Color)>, &'static str> {
+    let colors = span_bytes(payload, raw.colors);
+    let positions = span_bytes(payload, raw.positions);
+    if colors.len() != positions.len()
+        || colors.len() % 4 != 0
+        || !(1..=fresco_protocol::FILL_MAX_STOPS).contains(&(colors.len() / 4))
+    {
+        return Err("unsupported gradient stop count");
+    }
+    let mut stops = Vec::with_capacity(colors.len() / 4);
+    for (rgba, offset) in colors.chunks_exact(4).zip(positions.chunks_exact(4)) {
+        let offset = read_command::<f32>(offset);
+        if !(0.0..=1.0).contains(&offset) || stops.last().is_some_and(|&(last, _)| offset < last) {
+            return Err("invalid gradient stop position");
+        }
+        stops.push((offset, color(read_command::<Color>(rgba))));
+    }
+
+    Ok(stops)
+}
+
+pub(super) fn radial(payload: &[u8]) -> Result<Node, &'static str> {
+    let command: PaintRadialGradient = read_command(payload);
+    if command.compositing_and_blending_operator != CompositingAndBlendingOperator::Normal
+        || command.interpolation_method.interpolation_type != GradientInterpolationType::Rectangular
+        || command.interpolation_method.rectangular_color_space != RectangularColorSpace::Srgb
+        || command.color_stops.repeating
+        || command.size.width <= 0
+        || command.size.height <= 0
+    {
+        return Err("unsupported radial gradient interpolation, size or blend");
+    }
+    let rect = command.rect.to_float();
+    // Use a unit circle in fill space. The same transform scales the rectangle
+    // and gradient to the two CSS radii and places the center in scene space.
+    let rx = command.size.width as f32;
+    let ry = command.size.height as f32;
+    let dx = command.center.x as f32;
+    let dy = command.center.y as f32;
+    let shape = Shape::new(PathData::rect(Rect::new(
+        -dx / rx,
+        -dy / ry,
+        rect.width / rx,
+        rect.height / ry,
+    )))
+    .fill(Paint::Radial {
+        center: Point::new(0., 0.),
+        radius: 1.,
+        stops: gradient_stops(payload, command.color_stops)?,
+    });
+    let mut fill = shape
+        .fills()
+        .into_iter()
+        .next()
+        .ok_or("empty radial gradient")?;
+    fill.transform = [rx, 0., 0., ry, rect.x + dx, rect.y + dy];
+    fill.validate()?;
     Ok(Node::Fill(fill.into()))
 }
 

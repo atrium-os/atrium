@@ -210,8 +210,9 @@ fn records(bytes: &[u8], depth: usize) -> Result<Option<Node>, &'static str> {
                 }
             }
             T::FillPath => vector_path(data).map(Some),
+            T::PaintRadialGradient => gradient::radial(data).map(Some),
             T::PaintLinearGradient => gradient::direct(data).map(Some),
-            _ => Err("unsupported mask paint"),
+            _ => Err(header.command_type.name()),
         };
         mask = shape.and_then(|node| {
             let Some(mut node) = node else {
@@ -349,7 +350,7 @@ pub(super) fn apply(
                     *a = source.a * coverage(kind, *r, *g, *b, *a);
                     (*r, *g, *b) = (source.r, source.g, source.b);
                 }
-                FillPaint::Linear { stops, .. } if kind == MaskKind::Alpha => {
+                FillPaint::Linear { stops, .. } | FillPaint::Radial { stops, .. } if kind == MaskKind::Alpha => {
                     for stop in stops {
                         stop.a *= source.a;
                         (stop.r, stop.g, stop.b) = (source.r, source.g, source.b);
