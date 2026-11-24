@@ -4852,6 +4852,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Duplicate Sheet** now copies pivot tables whose output is on the sheet, each under a fresh name `Name_2` (or the next free number). A pivot reading data on the same sheet reads the copy's data; one reading another sheet keeps its source.
 - Tests: `paste_link_points_at_the_copied_cells_and_merge_across_merges_each_row`, `duplicate_sheet_copies_a_pivot_table_reading_the_copy`. All 138 Sheets lib tests pass.
 
+### 16.109 Goal Seek, Show Formulas, AutoFit from the menu (2026-11-25)
+
+- **Goal Seek…** (cell menu after Go To, enabled on a formula) opens a bar "Set B2 to [goal, cell]" prefilled with the formula's value and the first cell on the sheet it reads that holds a number (`data::goal_seek_start`). Seek changes that cell by Newton steps on a measured slope until the formula is within 0.001 of the goal (Excel's default), at most 100 steps and 3 s, then prefers a round number that does as well (20 rather than 20.0000000003). The answer goes in as one undo step; with no answer the cell is left as it was and the bar says the closest value. It refuses a cursor without a formula, an input cell holding a formula or text, and a goal that isn't a number. `goal, cell` may also be typed `goal by changing cell`.
+- **Show Formulas** (checked item, not saved) shows each formula as typed in its cell instead of its value; hidden formulas stay hidden.
+- **AutoFit Row Height** and **AutoFit Column Width** (after Row Height… and Column Width…) fit every selected row or column in the used area to its contents, as one undo step, like a double-click on the header edge. Hidden rows and columns stay hidden; at most 1,000 at a time.
+- Tests: `goal_seek_finds_roots_and_leaves_the_cell_alone_without_one`, `goal_seek_show_formulas_and_autofit_from_the_menu`. All 140 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

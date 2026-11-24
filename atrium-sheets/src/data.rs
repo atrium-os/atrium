@@ -145,6 +145,14 @@ pub enum DataCmd {
     Merge,
     /// Each row of the selection merged on its own, keeping its left value.
     MergeAcross,
+    /// Formulas shown as typed in their cells instead of their values (not saved).
+    ShowFormulas,
+    /// The selected rows as tall as their tallest cell.
+    AutoFitRows,
+    /// The selected columns as wide as their widest entry.
+    AutoFitCols,
+    /// The cursor's formula brought to a value by changing one input cell.
+    GoalSeek,
     /// Formulas at the cursor reading the cells last copied, one for each.
     PasteLink,
     /// The selection's text centred across its columns without merging
@@ -403,7 +411,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Unhide Rows").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
         (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
         (MenuItem::new("Row Height…"), Some(DataCmd::RowHeight)),
+        (MenuItem::new("AutoFit Row Height"), Some(DataCmd::AutoFitRows)),
         (MenuItem::new("Column Width…"), Some(DataCmd::ColWidth)),
+        (MenuItem::new("AutoFit Column Width"), Some(DataCmd::AutoFitCols)),
         (MenuItem::new("Unhide Columns").enabled(wb.sheet(s).col_sizes.overrides().iter().any(|&(c, w)| w <= 0.0 && (sel.c0..=sel.c1).contains(&c))), Some(DataCmd::UnhideCols)),
         (MenuItem::new(match wb.comment(s, row, col) {
             Some(comment) if !comment.thread().is_empty() => "Open Comment Thread…",
@@ -449,6 +459,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
         (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
+        (MenuItem::new("Show Formulas").checked(d.show_formulas), Some(DataCmd::ShowFormulas)),
+        (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
         v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
@@ -673,6 +685,140 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
             Ok(format!("Sorted {} rows by {}{}.", rect.r1 - rect.r0 + 1, names.join(", then "), if t.header { " (the first row is kept as the header)" } else { "" }))
         }
         None => Ok("Already in that order.".into()),
+    }
+}
+
+/// The most steps Goal Seek takes.
+pub const SEEK_STEPS: u32 = 100;
+/// How close Goal Seek must come to the goal, as Excel's default.
+pub const SEEK_TOLERANCE: f64 = 0.001;
+/// The longest Goal Seek runs.
+pub const SEEK_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Goal Seek's starting text, `goal, cell`: the cursor formula's value and
+/// the first cell on this sheet it reads that holds a number.
+pub fn goal_seek_start(d: &Doc, cursor: (u32, u32)) -> String {
+    let s = d.sheet;
+    let at = CellAddr::new(s, cursor.0, cursor.1);
+    let Some(f) = d.wb.formula_text(at) else { return String::new() };
+    let goal = match d.wb.get(at) {
+        Value::Num(n) => show_num(n),
+        _ => "0".into(),
+    };
+    let mut cell = None;
+    for tok in f.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '$' || ch == '!' || ch == '\'' || ch == '.' || ch == '_')) {
+        if tok.contains(['!', '.', '_', '\'']) {
+            continue;
+        }
+        if let Some((r, c)) = officina_grid::addr::parse_a1(&tok.replace('$', "").to_uppercase()) {
+            let x = CellAddr::new(s, r, c);
+            if x != at && d.wb.formula_text(x).is_none() && matches!(d.wb.get(x), Value::Num(_)) {
+                cell = Some(officina_grid::addr::a1(r, c));
+                break;
+            }
+        }
+    }
+    format!("{goal}, {}", cell.unwrap_or_default())
+}
+
+fn show_num(n: f64) -> String {
+    let t = format!("{n:.6}");
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    if t == "-0" { "0".into() } else { t.to_string() }
+}
+
+/// Goal Seek: changes the cell named in `spec` (`goal, cell`) until the
+/// formula at the cursor shows the goal, as one undo step. Every step is a
+/// recalculation, at most [`SEEK_STEPS`] of them and [`SEEK_TIME`]; the cell
+/// is left as it was when no value reaches the goal.
+pub fn goal_seek(d: &mut Doc, cursor: (u32, u32), spec: &str) -> Result<String, String> {
+    let s = d.sheet;
+    let at = CellAddr::new(s, cursor.0, cursor.1);
+    let here = officina_grid::addr::a1(at.row, at.col);
+    if d.wb.formula_text(at).is_none() {
+        return Err(format!("{here} has no formula: Goal Seek sets a formula's cell."));
+    }
+    let spec = spec.replace(" by changing ", ",");
+    let (goal, cell) = spec.split_once(',').ok_or("Type the value to reach and the cell to change, such as: 100, B2")?;
+    let goal: f64 = goal.trim().parse().ok().filter(|g: &f64| g.is_finite()).ok_or_else(|| format!("{:?} isn't a number.", goal.trim()))?;
+    let name = cell.trim().replace('$', "").to_uppercase();
+    let (r, c) = officina_grid::addr::parse_a1(&name).ok_or_else(|| format!("{:?} isn't a cell on this sheet, such as B2.", cell.trim()))?;
+    let x = CellAddr::new(s, r, c);
+    if x == at {
+        return Err("The cell to change must be another cell than the formula's.".into());
+    }
+    if d.wb.formula_text(x).is_some() {
+        return Err(format!("{name} holds a formula; Goal Seek changes a cell that holds a number."));
+    }
+    let old = d.wb.get(x);
+    let start = match old {
+        Value::Num(n) => n,
+        Value::Empty => 0.0,
+        _ => return Err(format!("{name} holds text; Goal Seek changes a cell that holds a number.")),
+    };
+    if d.wb.recalc_pending() {
+        d.wb.recalc();
+    }
+    let deadline = std::time::Instant::now() + SEEK_TIME;
+    let gap = |wb: &mut Workbook, v: f64| -> Option<f64> {
+        wb.set_value(x, Value::Num(v));
+        wb.recalc();
+        match wb.get(at) {
+            Value::Num(y) if y.is_finite() => Some(y - goal),
+            _ => None,
+        }
+    };
+    let mut v = start;
+    let mut best: Option<(f64, f64)> = None;
+    let mut fv = gap(&mut d.wb, v);
+    for _ in 0..SEEK_STEPS {
+        let Some(f) = fv else { break };
+        if best.is_none_or(|(b, _)| f.abs() < b) {
+            best = Some((f.abs(), v));
+        }
+        if f.abs() <= SEEK_TOLERANCE || std::time::Instant::now() > deadline {
+            break;
+        }
+        // A Newton step on the slope measured just beside v.
+        let h = (v.abs() * 1e-6).max(1e-6);
+        let Some(fh) = gap(&mut d.wb, v + h) else { break };
+        let slope = (fh - f) / h;
+        let next = v - f / slope;
+        if !slope.is_finite() || slope == 0.0 || !next.is_finite() {
+            break;
+        }
+        v = next;
+        fv = gap(&mut d.wb, v);
+    }
+    // A round number that does as well, as 20 for 20.0000000003.
+    if let Some((miss, v)) = best.filter(|&(m, _)| m <= SEEK_TOLERANCE) {
+        let fine = miss.max(1e-9 * goal.abs().max(1.0));
+        for k in 0..=12 {
+            let p = 10f64.powi(k);
+            let r = (v * p).round() / p;
+            if r == v {
+                break;
+            }
+            if gap(&mut d.wb, r).is_some_and(|f| f.abs() <= fine) {
+                best = Some((miss, r));
+                break;
+            }
+        }
+    }
+    // The workbook as it was; the answer goes in as one undo step.
+    d.wb.set_value(x, old);
+    d.wb.recalc();
+    match best {
+        Some((miss, v)) if miss <= SEEK_TOLERANCE => {
+            d.run("Goal Seek", vec![GridOp::set(x, officina_grid::book::Input::Value(Value::Num(v)))]);
+            if d.status == crate::sheet_protection::REFUSED {
+                return Err(d.status.clone());
+            }
+            d.wb.recalc();
+            Ok(format!("Goal Seek set {name} to {}, so {here} is {}.", show_num(v), show_num(goal)))
+        }
+        Some((_, v)) => Err(format!("Goal Seek found no value of {name} that makes {here} {}; the closest was {}.", show_num(goal), show_num(v))),
+        None => Err(format!("{here} doesn't give a number as {name} changes, so Goal Seek can't reach {}.", show_num(goal))),
     }
 }
 
@@ -1972,7 +2118,11 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
         }
         DataCmd::InsertCellsDown | DataCmd::InsertCellsRight | DataCmd::DeleteCellsUp | DataCmd::DeleteCellsLeft => shift_cells(d, sel, cmd),
-        DataCmd::CustomSort => Ok(String::new()),
+        DataCmd::CustomSort | DataCmd::GoalSeek | DataCmd::AutoFitRows | DataCmd::AutoFitCols => Ok(String::new()),
+        DataCmd::ShowFormulas => {
+            d.show_formulas = !d.show_formulas;
+            Ok(if d.show_formulas { "Formulas are shown in their cells.".into() } else { "Values are shown in their cells.".into() })
+        }
         DataCmd::SortAsc | DataCmd::SortDesc => {
             let (rect, t) = sort_rect(d, sel, cursor)?;
             let key = col.clamp(rect.c0, rect.c1);
@@ -2332,6 +2482,30 @@ mod tests {
         assert_eq!((cell(&d, 1, 0), cell(&d, 2, 0), cell(&d, 1, 1)), ("pear".into(), "apple".into(), "".into()));
         assert!(d.undo());
         assert!(d.wb.merges(0).is_empty());
+    }
+
+    #[test]
+    fn goal_seek_finds_roots_and_leaves_the_cell_alone_without_one() {
+        let mut d = Doc::from_csv("g.csv", b"1,=A1^2\nword,=A2&\"!\"\n").unwrap().0;
+        d.type_into(0, 1, "=A1^2");
+        d.type_into(1, 1, "=A2&\"!\"");
+        d.wb.recalc();
+        assert_eq!(goal_seek_start(&d, (0, 1)), "1, A1");
+        let m = goal_seek(&mut d, (0, 1), "2 by changing $A$1").unwrap();
+        assert!(m.starts_with("Goal Seek set A1 to 1.41421"), "{m}");
+        let Value::Num(y) = d.wb.get(CellAddr::new(0, 0, 1)) else { panic!() };
+        assert!((y - 2.0).abs() <= SEEK_TOLERANCE);
+        // No real root: an error, and A1 as it was.
+        let Value::Num(a1) = d.wb.get(CellAddr::new(0, 0, 0)) else { panic!() };
+        let e = goal_seek(&mut d, (0, 1), "-1, A1").unwrap_err();
+        assert!(e.contains("found no value"), "{e}");
+        assert_eq!(d.wb.get(CellAddr::new(0, 0, 0)), Value::Num(a1));
+        // Refusals: no formula, a text input, a formula input, a bad goal.
+        assert!(goal_seek(&mut d, (0, 0), "1, A1").unwrap_err().contains("no formula"));
+        assert!(goal_seek(&mut d, (0, 1), "1, A2").unwrap_err().contains("holds text"));
+        assert!(goal_seek(&mut d, (0, 1), "1, B2").unwrap_err().contains("holds a formula"));
+        assert!(goal_seek(&mut d, (0, 1), "lots, A1").unwrap_err().contains("isn't a number"));
+        assert!(goal_seek(&mut d, (1, 1), "1, A2").unwrap_err().contains("holds text"));
     }
 
     #[test]
