@@ -8,6 +8,8 @@ pub const MDW: f64 = 7.0;
 pub mod chart;
 pub mod comments;
 pub mod condfmt;
+#[cfg(feature = "read")]
+mod external;
 pub mod macros;
 pub mod pivot;
 #[cfg(feature = "read")]

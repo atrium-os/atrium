@@ -633,6 +633,16 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
 - **External** functions (`WEBSERVICE`, stock and currency data, links to other workbooks)
   are off until the user allows them for this document (§11.2).
 
+- **Closed workbook references in XLSX and XLSM.** The converter keeps a
+  formula that directly refers to another workbook as its last saved result,
+  including shared fills and array results. A direct single-cell reference
+  can use the package's embedded cell value when its formula result is absent.
+  An absolute single-cell defined name becomes a constant in its original
+  scope, so local formulas using the name stay live. References without a
+  usable cached result show `#REF!` and a fidelity note. Archive reads are
+  bounded and use only internal relationships. Saving writes the inert
+  values and names.
+  [SpreadsheetML external cell cache](https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.spreadsheet.externalcell)
 - **Conditional totals.** SUMIF and AVERAGEIF take the shape of their criteria
   range and begin at the top-left cell of the optional value range. SUMIFS and
   AVERAGEIFS require matching shapes. Errors in matched values propagate through
@@ -4137,9 +4147,34 @@ four-vCPU Tessera configuration were:
 | Shared formulas | 109 ms | 9 ms | 47 ms | 101 ms |
 | Ranking | 1,147 ms | 340 ms | 494 ms | 761 ms |
 
-The next formula follow-up is to reproduce external workbook references
-against the cached link values in the source files. Evidence for this run
-is under `/private/tmp/atrium-sheets-textafter`.
+Evidence for the TEXTAFTER run is under `/private/tmp/atrium-sheets-textafter`.
+
+**Closed-workbook cache check (2026-11-24).** In the ranking workbook, 6,793
+direct formula anchors agreed with their embedded source cell. Twelve more
+had a consuming formula result and no corresponding cached source cell.
+After preserving the consuming results on import, all 36,344 Excel results
+survived XLSX Save and reopen. That includes 7,582 live local formulas,
+25,363 linked formulas converted to their saved values, and 3,399 unsupported
+LARGE formulas already imported as saved values.
+
+In the schedules workbook, 13 linked names now use their embedded cell
+values. A name that points to a range without usable cached cells remains
+a reference error. Excel's additional table accessibility metadata had
+also been interpreted as a second table declaration, discarding the actual
+table. Sheets now keeps all three tables and the structured references
+resolve. The schedules workbook had 527 differing results, down from
+6,663. Remaining examples include the current year versus the saved year
+and empty text versus saved zero. Its 27 SUBTOTAL results still import as
+static values.
+
+Three trials per workbook on the private Tessera guest covered Open, full
+recalculation, XLSX Save and reopen. Lookup and shared formulas matched
+Excel in every trial. Installed Sheets saved all four via Scrinium and
+reopened the same 67,684 live formula results in fresh document jails.
+The focused converter tests exercise a missing
+consuming cache, quoted names, direct and shared links, array values,
+a missing link, and local recalculation after an edit and a reopen.
+Evidence is under `/private/tmp/atrium-sheets-external`.
 
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 

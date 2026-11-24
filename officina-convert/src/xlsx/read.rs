@@ -13,7 +13,7 @@
 //! drawings, defined names, tables, conditional formats, data validation,
 //! Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use quick_xml::events::{BytesStart, Event};
@@ -1325,6 +1325,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Sheets in order.
     let mut sheets: Vec<(String, String)> = Vec::new();
     let mut pivot_caches: HashMap<u32, Option<String>> = HashMap::new();
+    let mut external_ids = Vec::new();
     // Defined names: (name, sheet index it is local to, formula text).
     let mut names: Vec<(String, Option<u32>, String)> = Vec::new();
     {
@@ -1345,6 +1346,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                             Some(_) => out.report.note_at(Kind::Dropped, "chart sheets and dialog sheets", || name.clone()),
                             None => return Err(bad("a sheet without its part")),
                         }
+                    }
+                    b"externalReference" if external_ids.len() < super::external::MAX_LINKS => {
+                        external_ids.push(attr(&e, b"id")?);
                     }
                     b"pivotCache" => {
                         if let (Some(cache), Some(rel)) = (attr(&e, b"cacheId")?.and_then(|id| id.parse::<u32>().ok()), attr(&e, b"id")?) {
@@ -1414,6 +1418,16 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         },
         None => vec![0],
     };
+    let external_cache = if external_ids.is_empty() {
+        super::external::Cache::default()
+    } else {
+        let internal = internal_rels(&z, &wb_part)?;
+        let paths = external_ids.iter().enumerate().filter_map(|(index, id)| {
+            let (kind, part) = internal.get(id.as_ref()?)?;
+            kind.ends_with("/externalLink").then(|| (index + 1, part.clone()))
+        });
+        super::external::Cache::read(&z, paths)
+    };
     // Names, before the formulas that use them.
     for (name, local, text) in &names {
         let scope = match local {
@@ -1424,6 +1438,25 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         if name.eq_ignore_ascii_case(officina_grid::print::TITLES) {
             if !scope.is_some_and(|sheet| define_print_titles(&mut wb, sheet, text)) {
                 rep.note(Kind::Dropped, "unsupported print titles");
+            }
+            continue;
+        }
+        if super::external::has_reference(text) {
+            let cached = external_cache.cell(text, true);
+            let value = match cached.as_ref() {
+                Some(Value::Num(x)) => format!("={x}"),
+                Some(Value::Bool(true)) => "=TRUE".into(),
+                Some(Value::Bool(false)) => "=FALSE".into(),
+                Some(Value::Str(text)) => format!("=\"{}\"", text.replace('"', "\"\"")),
+                Some(Value::Err(error)) => format!("={}", error.text()),
+                _ => "=#REF!".into(),
+            };
+            if wb.define_name(name, scope, &value).is_ok() && cached.is_some() {
+                rep.note_at(Kind::Inert, "linked workbook names kept as cached constants", || name.clone());
+            } else {
+                // Keep scope shadowing and give dependents a reference error.
+                let _ = wb.define_name(name, scope, "=#REF!");
+                rep.note_at(Kind::Approximate, "linked workbook names without a usable cached cell", || name.clone());
             }
             continue;
         }
@@ -1468,7 +1501,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
 
     // Formulas, once every sheet exists (they name each other).
     let mut cached: Vec<(CellAddr, Value)> = Vec::new();
-    for (s, fcells, shared) in all_f {
+    for (s, mut fcells, shared) in all_f {
+        preserve_external_results(&mut wb, s, &mut fcells, &shared, &external_cache, &mut rep);
         place_formulas(&mut wb, s, fcells, &shared, &mut rep, &mut out, &mut cached);
     }
     // Pivot tables, over the cells they wrote.
@@ -1509,6 +1543,8 @@ fn table(wb: &mut Workbook, sheet: u16, data: &[u8], dxfs: &[super::condfmt::Dxf
             _ => { buf.clear(); continue; }
         };
         match e.local_name().as_ref() {
+                // Excel puts x14:table accessibility metadata inside extLst.
+                b"extLst" if !empty => skip(&mut r, &e)?,
                 b"table" => {
                     let name = attr(&e, b"displayName")?.or(attr(&e, b"name")?).unwrap_or_default();
                     let Some((r0, c0, r1, c1)) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) else {
@@ -1689,6 +1725,44 @@ pub(crate) fn define_print_titles(wb: &mut Workbook, sheet: u16, text: &str) -> 
         axes.push((axis, src));
     }
     axes.into_iter().all(|(axis, src)| wb.define_name(axis, Some(sheet), &src).is_ok())
+}
+
+/// A link is inert in Sheets. Keep Excel's consuming formula result before
+/// recalculation can replace it with #REF!, including shared or array anchors.
+fn preserve_external_results(
+    wb: &mut Workbook,
+    sheet: u16,
+    cells: &mut Vec<FCell>,
+    shared: &HashMap<u32, (u32, u32, String)>,
+    cache: &super::external::Cache,
+    report: &mut Report,
+) {
+    let external_shared: HashSet<_> = shared.iter()
+        .filter(|(_, (_, _, text))| super::external::has_reference(text))
+        .map(|(id, _)| *id)
+        .collect();
+    cells.retain(|cell| {
+        let (text, absolute) = match &cell.src {
+            Src::Text(text) | Src::Array(text, _) if super::external::has_reference(text) => (text, false),
+            Src::Shared(id) if external_shared.contains(id) => {
+                let (row, col, text) = &shared[id];
+                (text, (*row, *col) != (cell.row, cell.col))
+            }
+            _ => return true,
+        };
+        if cell.cached.is_empty() {
+            let address = CellAddr::new(sheet, cell.row, cell.col);
+            if let Some(value) = cache.cell(text, absolute) {
+                wb.set_value(address, value);
+            } else {
+                wb.set_value(address, Value::Err(ErrorKind::Ref));
+                report.note_at(Kind::Approximate, "linked workbook formulas without a usable cached result", || a1(cell.row, cell.col));
+                return false;
+            }
+        }
+        report.note_at(Kind::Inert, "linked workbook formulas kept as cached values", || a1(cell.row, cell.col));
+        false
+    });
 }
 
 /// Places one sheet's formula cells: each parsed at its cell (a shared formula

@@ -259,6 +259,38 @@ fn table_round_trip() {
     assert_eq!(back.formula_text(CellAddr::new(0, 3, 7)).unwrap(), "=[@Qty]*Data!A3");
 }
 
+#[test]
+fn xlsx_table_extensions_keep_the_table_and_its_formulas() {
+    use officina_convert::zip::{Archive, ZipWriter};
+
+    let wb = with_table(book());
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let archive = Archive::open(&file).unwrap();
+    let mut patched = ZipWriter::new(Vec::new());
+    for part in &archive.entries {
+        let data = archive.read(part).unwrap();
+        if part.name == "xl/tables/table1.xml" {
+            let table = String::from_utf8(data).unwrap();
+            let table = table.replace("</table>", concat!(
+                r#"<extLst><ext uri="fixture" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">"#,
+                r#"<x14:table altTextSummary="Budget inputs"/></ext></extLst></table>"#,
+            ));
+            patched.add(&part.name, table.as_bytes()).unwrap();
+        } else {
+            patched.add(&part.name, &data).unwrap();
+        }
+    }
+
+    let (back, report) = xlsx::read(&patched.finish().unwrap()).unwrap();
+    assert_eq!(back.tables(), wb.tables());
+    assert_eq!(report.differ, 0);
+    let formula = CellAddr::new(1, 20, 0);
+    assert_eq!(back.get(formula), wb.get(formula));
+    let (reopened, _) = xlsx::read(&xlsx::write(&back, Vec::new()).unwrap()).unwrap();
+    assert_eq!(reopened.tables(), wb.tables());
+    assert_eq!(reopened.get(formula), wb.get(formula));
+}
+
 fn charted(mut wb: Workbook) -> Workbook {
     use officina_grid::addr::Rect;
     use officina_grid::charts::*;
