@@ -286,3 +286,38 @@ fn cryptad_signs_with_a_tls_client_key_and_keeps_a_session() {
     // A cookie is no other service's to keep.
     assert_ne!(store(&mut s, &vinculum(), COOKIE, AFTER_BOOT, "x", b"c").0, status::OK);
 }
+
+/// Wi-Fi E3 (wifi.md §7.4): aura-keys keeps an 802.1X EAP-TLS key it can
+/// sign with and never read; TLS client keys only, and only its own.
+#[test]
+fn aura_keys_signs_with_an_eap_tls_key() {
+    const TLS_KEY: u16 = 0x105;
+    use p256::ecdsa::signature::Verifier;
+    use sha2::Digest;
+    let wifi = Label::Service(op::WIFI_SERVICE.into());
+    let crypta = Label::Service(op::CRYPTA_SERVICE.into());
+    let d = tempfile::tempdir().unwrap();
+    let mut s = machine(&d);
+    let r = s.handle(&wifi, op::MINT, &body(|w| { w.u16(TLS_KEY); w.u8(AFTER_BOOT); w.str("eap corp"); }));
+    assert_eq!(r.status, status::OK);
+    let (id, point) = (r.body.bytes()[..16].to_vec(), r.body.bytes()[16..].to_vec());
+    assert_eq!(s.handle(&wifi, op::PUBKEY, &id).body.bytes(), &point[..]);
+    let mut b = id.clone();
+    b.extend_from_slice(&sha2::Sha256::digest(b"certificate verify"));
+    let r = s.handle(&wifi, op::SIGN_DIGEST, &b);
+    assert_eq!(r.status, status::OK);
+    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
+    assert!(vk.verify(b"certificate verify", &p256::ecdsa::Signature::from_der(r.body.bytes()).unwrap()).is_ok());
+    assert_eq!(release(&mut s, &wifi, &id).0, status::NOT_RELEASABLE);
+    // No WireGuard keys for it, no X25519, and neither service signs with
+    // the other's key.
+    assert_eq!(s.handle(&wifi, op::MINT, &body(|w| { w.u16(0x104); w.u8(AFTER_BOOT); w.str("wg"); })).status, status::DENIED);
+    let mut x = id.clone();
+    x.extend_from_slice(&[9u8; 32]);
+    assert_ne!(s.handle(&wifi, op::DH_X25519, &x).status, status::OK);
+    assert_ne!(s.handle(&crypta, op::SIGN_DIGEST, &b).status, status::OK);
+    let r = s.handle(&crypta, op::MINT, &body(|w| { w.u16(TLS_KEY); w.u8(AFTER_BOOT); w.str("vpn"); }));
+    let mut c = r.body.bytes()[..16].to_vec();
+    c.extend_from_slice(&[1u8; 32]);
+    assert_ne!(s.handle(&wifi, op::SIGN_DIGEST, &c).status, status::OK);
+}

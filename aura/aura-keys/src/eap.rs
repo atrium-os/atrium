@@ -31,6 +31,8 @@ pub enum Event {
     Failed(String),
     /// The server's DNS names and chain, for "Trust this server".
     Trust(Vec<String>, Vec<Vec<u8>>),
+    /// EAP-TLS: sign this SHA-256 digest with the network's key in Arca.
+    Sign([u8; 32]),
     Log(String),
 }
 
@@ -57,6 +59,14 @@ impl Run {
     pub fn packet(&mut self, eap: &[u8]) -> io::Result<()> {
         self.sock.set_nonblocking(false)?;
         let r = helper::write(&mut self.sock, helper::PACKET, eap);
+        self.sock.set_nonblocking(true)?;
+        r
+    }
+
+    /// The signature asked for with `Event::Sign`; empty when Arca refused.
+    pub fn signed(&mut self, sig: &[u8]) -> io::Result<()> {
+        self.sock.set_nonblocking(false)?;
+        let r = helper::write(&mut self.sock, helper::SIGNED, sig);
         self.sock.set_nonblocking(true)?;
         r
     }
@@ -93,6 +103,10 @@ impl Run {
                         None => Event::Failed("bad-certificate-report".into()),
                     },
                     helper::DROPPED => Event::Log(word(&d)),
+                    helper::SIGN => match <[u8; 32]>::try_from(&d[..]) {
+                        Ok(digest) => Event::Sign(digest),
+                        Err(_) => Event::Failed("bad-helper-frame".into()),
+                    },
                     _ => Event::Failed("bad-helper-frame".into()),
                 }),
                 Ok(None) => break,

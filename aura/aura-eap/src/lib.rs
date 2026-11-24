@@ -1,5 +1,6 @@
 //! Aura's EAP peer for WPA2/WPA3-Enterprise (docs/spec/wifi.md §7.4).
 
+pub mod csr;
 pub mod eap;
 pub mod helper;
 pub mod profile;
@@ -10,6 +11,8 @@ pub mod mschapv2;
 pub mod peap;
 #[cfg(feature = "peer")]
 pub mod peer;
+#[cfg(feature = "peer")]
+pub mod remote;
 #[cfg(feature = "peer")]
 pub mod tls;
 #[cfg(feature = "peer")]

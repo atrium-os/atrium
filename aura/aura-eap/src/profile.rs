@@ -53,6 +53,10 @@ pub struct Profile {
     /// The top certificate (DER) pinned by "Trust this server".
     pub pin: Option<Vec<u8>>,
     pub password: Zeroizing<String>,
+    /// EAP-TLS: our certificate chain (DER, ours first) and the Arca item
+    /// that holds its key (aura-keys signs with it; nobody reads it).
+    pub cert: Vec<Vec<u8>>,
+    pub key: Option<[u8; 16]>,
 }
 
 const MAGIC: &[u8] = b"eap1\n";
@@ -106,6 +110,12 @@ impl Profile {
             put("pin", p);
         }
         put("password", self.password.as_bytes());
+        for c in &self.cert {
+            put("cert", c);
+        }
+        if let Some(k) = &self.key {
+            put("key", k);
+        }
         out
     }
 
@@ -126,6 +136,8 @@ impl Profile {
             ca: Vec::new(),
             pin: None,
             password: Zeroizing::new(String::new()),
+            cert: Vec::new(),
+            key: None,
         };
         let mut method = None;
         for line in b[MAGIC.len()..].split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
@@ -140,6 +152,8 @@ impl Profile {
                 b"ca" if p.ca.len() < 8 => p.ca.push(v.to_vec()),
                 b"pin" => p.pin = Some(v.to_vec()),
                 b"password" => p.password = Zeroizing::new(text()?),
+                b"cert" if p.cert.len() < 8 => p.cert.push(v.to_vec()),
+                b"key" => p.key = Some(<[u8; 16]>::try_from(v.as_slice()).ok()?),
                 _ => return None,
             }
         }
@@ -165,6 +179,8 @@ mod tests {
             ca: vec![vec![0x30, 1, 2]],
             pin: None,
             password: Zeroizing::new("s3cret=\n".into()),
+            cert: vec![vec![0x30, 9]],
+            key: Some([5; 16]),
         };
         let e = p.encode();
         assert!(Profile::is_profile(&e));

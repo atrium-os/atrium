@@ -8,6 +8,9 @@
 //!   aura-ctl remember-eap SSID --method peap|ttls-pap|ttls-mschapv2|tls
 //!                --identity NAME [--anonymous NAME] [--domain DOMAIN]
 //!                [--ca FILE.der]   (password on stdin; an 802.1X network)
+//!                [--key ID --cert FILE.der]   (EAP-TLS: the key from eap-key)
+//!   aura-ctl eap-key SSID --cn NAME --out FILE.der
+//!                (EAP-TLS: a key made in Arca; its certificate request)
 //!   aura-ctl eap-seen SSID   (the certificate a first join stopped at)
 //!   aura-ctl eap-trust SSID  (pin it: "Trust this server")
 //!   aura-ctl join SSID [--open | --wpa3 | --eap] [--mac network|random|device]
@@ -138,7 +141,9 @@ fn main() {
                     "--anonymous" => l.with_hex("anonymous", v.as_bytes()),
                     "--domain" => l.with_hex("domain", v.as_bytes()),
                     "--ca" => l.with_hex("ca", &std::fs::read(v).unwrap_or_else(|e| die(&format!("{v}: {e}")))),
-                    _ => die("remember-eap SSID --method M --identity NAME [--anonymous NAME] [--domain D] [--ca FILE.der]"),
+                    "--key" => l.with("key", v),
+                    "--cert" => l.with_hex("cert", &std::fs::read(v).unwrap_or_else(|e| die(&format!("{v}: {e}")))),
+                    _ => die("remember-eap SSID --method M --identity NAME [--anonymous NAME] [--domain D] [--ca FILE.der] [--key ID --cert FILE.der]"),
                 };
             }
             if method != "tls" {
@@ -149,6 +154,28 @@ fn main() {
             let r = Peer::connect(&keys).call(&l);
             println!("{}", show(&r));
             exit((r.verb != "ok") as i32);
+        }
+        "eap-key" => {
+            let ssid = ssid_arg();
+            let usage = || -> ! { die("eap-key SSID --cn NAME --out FILE.der") };
+            let (mut cn, mut out) = (None, None);
+            let mut a = args[2..].iter();
+            while let Some(x) = a.next() {
+                let v = a.next().unwrap_or_else(|| usage());
+                match x.as_str() {
+                    "--cn" => cn = Some(v.clone()),
+                    "--out" => out = Some(v.clone()),
+                    _ => usage(),
+                }
+            }
+            let (Some(cn), Some(out)) = (cn, out) else { usage() };
+            let r = Peer::connect(&keys).call(&Line::new("eap-key").with_hex("ssid", &ssid).with_hex("cn", cn.as_bytes()));
+            let (Some(id), Some(csr)) = (r.get("id"), r.hex("csr")) else {
+                println!("{}", show(&r));
+                exit(1);
+            };
+            std::fs::write(&out, &csr).unwrap_or_else(|e| die(&format!("{out}: {e}")));
+            println!("key id={id} csr={out}");
         }
         "eap-seen" | "eap-trust" => {
             let r = Peer::connect(&keys).call(&Line::new(&args[0]).with_hex("ssid", &ssid_arg()));

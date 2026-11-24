@@ -71,7 +71,8 @@ pub mod op {
     pub const DH_X25519: u16 = 0x0D;
     // The crypta service also (V4): `MINT` a `TlsClientKey` (P-256; the
     // answer's public part is the 65-byte SEC1 point), `PUBKEY` of it, and
-    // `SIGN_DIGEST` with it; `STORE` a
+    // `SIGN_DIGEST` with it (the Wi-Fi key service too, for 802.1X
+    // EAP-TLS: wifi.md §7.4 E3, `TlsClientKey` only); `STORE` a
     // `Password` (a saved VPN password) or a `Cookie` (the gateway's
     // session, for a reconnect), `RELEASE` and `DELETE` them.
     /// The crypta service only (vpn.md §9.3): `handle[16]` → `bytes value`,

@@ -1223,11 +1223,17 @@ impl State {
             };
         }
         let crypta = name == op::CRYPTA_SERVICE;
+        // The Wi-Fi key service mints, signs with and shows TLS client
+        // keys only: 802.1X EAP-TLS certificates (wifi.md §7.4 E3).
+        let tls_keys = crypta || name == op::WIFI_SERVICE;
         match op {
             // Crypta's WireGuard keys (vpn.md §4.3): minted here, or stored
             // once from an imported file; then only used.
-            op::MINT if crypta => {
+            op::MINT if tls_keys => {
                 let kind = field!(r.u16());
+                if !crypta && kind != Kind::TlsClientKey as u16 {
+                    return reply(status::DENIED);
+                }
                 let class = field!(r.u8());
                 let account = field!(r.str(caps::ACCOUNT));
                 field!(r.end());
@@ -1279,7 +1285,7 @@ impl State {
                 w.raw(&pk);
                 ok(w.buf)
             }
-            op::SIGN_DIGEST if crypta => {
+            op::SIGN_DIGEST if tls_keys => {
                 let id = ItemId(field!(r.array::<16>()));
                 let digest = field!(r.array::<32>());
                 field!(r.end());
@@ -1294,12 +1300,15 @@ impl State {
                 let Ok(sig) = PrehashSigner::<p256::ecdsa::Signature>::sign_prehash(&k, &digest) else { return reply(status::INTERNAL) };
                 ok(sig.to_der().as_bytes().to_vec())
             }
-            op::PUBKEY | op::DH_X25519 if crypta => {
+            op::PUBKEY | op::DH_X25519 if tls_keys => {
                 let id = ItemId(field!(r.array::<16>()));
                 let point = if op == op::DH_X25519 { Some(field!(r.array::<32>())) } else { None };
                 field!(r.end());
                 *item = Some(id);
                 let (m, secret) = tri!(store.release(&id, &who, None));
+                if !crypta && (point.is_some() || m.kind != Kind::TlsClientKey) {
+                    return reply(status::DENIED);
+                }
                 if m.kind == Kind::TlsClientKey && point.is_none() {
                     let Ok(k) = p256::ecdsa::SigningKey::from_slice(secret.as_ref()) else { return reply(status::INTERNAL) };
                     return ok(k.verifying_key().to_encoded_point(false).as_bytes().to_vec());

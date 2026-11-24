@@ -23,6 +23,7 @@ md4 = { version = "0.10", optional = true }
 des = { version = "0.8", optional = true }
 sha1 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
+sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
@@ -30,3 +31,4 @@ libc = "0.2"
 
 [dev-dependencies]
 md-5 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
