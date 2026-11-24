@@ -281,7 +281,7 @@ impl Sheet<'_> {
                     open_via_arcad(self.uid, || {
                         still_approved()
                             && matches!(
-                                win.wait_event(Some(Duration::ZERO)),
+                                win.poll_event(),
                                 Ok(event) if !matches!(
                                     event,
                                     Some(Event::CloseRequested { .. } | Event::Key {
