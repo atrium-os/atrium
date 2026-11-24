@@ -2288,6 +2288,69 @@ What the run is expected to show, so a surprise is visible:
 - Public apps that load their code from a CDN host on another site render
   little; the refused hosts list says which.
 
+#### Results on arm64 Tessera, 2026-11-25 (I6.0)
+
+The vehicle was the VPN sign-in window, asked of portcullisd as the Crypta
+Sign In runner does, on a disposable overlay of
+`~/atrium-vm/navigator-signin-base` with QEMU user networking unrestricted
+for this run only. navigatord came from main `659476f56`; the JIT-off
+`mail-page` engine and the other binaries were the VPN passkey run's set
+(`mail-page` `0f917aff…`). A stand-in for cryptad's socket reported one
+live attempt for profile `win`, so the window stayed open; the fixture
+names were forwarded to `navigator-i6-fixture.py` on the host. Each page
+was opened cold three times (the window's jail ended between runs). The
+start is the press of Sign In (the portcullisd request) to the first
+headless frame that differs from the empty desktop; "drawn" is the first
+frame with page content. Peak RSS is the engine's (`mail-page`) largest
+`ps` sample, once a second.
+
+| Page | Window | Drawn | Engine peak RSS | What it drew |
+| --- | ---: | ---: | ---: | --- |
+| Fixture app | 576–617 ms | 1,023–1,046 ms | 88 to 91 MiB | the app and its checks |
+| Khan Academy exercise | 546–556 ms | 11.6–12.0 s | 96 MiB | Fastly's "cookies are disabled" challenge |
+| OpenStreetMap | 536–558 ms | nothing in 60 s | 130 MiB | an empty page; still loading at 60 s |
+| MapLibre demo | 547–576 ms | nothing in 60 s | 106 to 112 MiB | an empty page; still loading at 60 s |
+| Notion public page | 543–578 ms | blank after 5 to 9 s | 119 to 185 MiB | an empty page |
+| Figma (once) | 542 ms | none | none | "figma.com could not be opened: the site answered 403" |
+
+The fixture's checks: `module` pass, `third-party` refused,
+`indexeddb` pass, `notifications` pass (default); `session` failed
+("Resource unavailable from the VPN sign-in window"), `same-site-api`
+failed (CORS tainting), and `local-storage` failed ("Unable to store more
+than 5242880 bytes"). `push-state`, `wasm`, `webgl` and `frame` printed no
+line within the run. Pressing Sign In raised the window's Continue bar;
+pressing Continue sent nothing to the server, and Add, the file chooser and
+the four links changed nothing and sent no request. One deviation from the
+expected shape: `/api/me` reached the server on every load even though the
+page was refused it, so a refused request can still appear in the
+server's log.
+
+Refused resources, from the engine's `VPN page: no <url>` lines:
+
+| Page | Refused per run | Same origin | Same site, other host | Third party |
+| --- | ---: | ---: | ---: | ---: |
+| Fixture app | 3 | 1 | 1 (`api.app.example`) | 1 (`cdn.thirdparty.example`) |
+| Khan Academy | 17 to 19 | all | 0 | 0 |
+| OpenStreetMap | 59 to 105 | all | 0 | 0 |
+| MapLibre demo | 99 to 124 | 74 to 93 | 0 | 25 to 31 (`fonts.googleapis.com`) |
+| Notion | 1 to 2 | all | 0 | 0 |
+
+On these public pages almost every refusal was the page's own origin,
+for being neither a script nor a stylesheet (images, fonts, JSON and
+fetches), not for its host: the window's script-and-stylesheet rule, not
+D12's same-site question, is what stops them. The only cross-site
+refusals were Google Fonts stylesheets on the MapLibre page. navigatord
+logs a host and site only for the origin refusal, so the engine's lines
+are the complete list. Khan Academy's edge served a cookie challenge
+because the window gives the page no `document.cookie`
+(`arcad: Operation not permitted`).
+
+Two setup notes for the next run: the Crypta stand's atrium-net
+(`--no-unbound`) empties `/etc/resolv.conf`, so couriers cannot resolve
+real hosts until it is put back; and a stand-in on cryptad's socket must
+read a whole line, because portcullisd writes the request in two writes.
+Evidence is in `~/atrium-vm/evidence/navigator-i6-0-20261125/`.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
