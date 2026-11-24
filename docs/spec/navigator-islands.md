@@ -1733,7 +1733,7 @@ limend, portcullisd and jaild, then run three Starts without choragusd and
 three with it. Both arms should now reach `first-request` in tens of
 milliseconds; record press to red pixel as in the I5 gate.
 
-### I5 warm start: how a warmed engine gets its own jail (proposed, D7)
+### I5 warm start: how a warmed engine gets its own jail (D7, accepted)
 
 What the measurements say. On arm64 Tessera the daemons take 16 to 29 ms
 from the press to a forked worker, and with the audio wait gone the engine
@@ -1785,6 +1785,48 @@ a standby, the cold path unchanged without one, the I5 worker checks on an
 assigned standby, a standby that receives anything but `Assign` exits, and
 idle memory recorded per standby. Revisit the fork zygote only if standby
 memory proves too high.
+
+Shankar chose option 3 on 2026-11-24.
+
+#### As built
+
+- **limend** keeps at most one standby per Navigator uid (that is, per
+  persona instance). After each island it asks for one, it starts the next
+  standby on a thread of its own through `Launcher::launch_island_standby`:
+  the same `ExecInstance` as a cold island (`serves` = the Navigator's uid,
+  so the persona's island uid, jail and limits), with `/dev/null` where the
+  fetch socket goes and no frescod connection yet. On the next
+  `REQUEST_ISLAND` it takes the standby, sends the fetch socket first on the
+  island channel, then the frescod embed connection and `Attach` as for a
+  cold island; the island keeps the standby's embed id, so ending it ends
+  the standby's jail. A standby that is older than `STANDBY_MAX_AGE`
+  (10 minutes), or whose engine has gone (the send fails), is ended and the
+  island starts cold. An unused standby is ended when it ages out. The first
+  island of each Navigator is still cold.
+- **The engine** (`navigator-ladybird/editor-check.cpp`) takes a `/dev/null`
+  stdout as the sign of a standby. It enters Capsicum, installs the pinned
+  faces, builds the event loop, the JS agent and the page client, then
+  blocks in `navigator_standby_fetch` (`limen::client::Child::standby_fetch`)
+  for exactly one descriptor. Anything else, or limend hanging up, ends it.
+  It then continues as a cold island would.
+- **Off by default.** limend starts standbys only with
+  `LIMEN_ISLAND_STANDBY=1`, because an engine built before this change
+  exits at once when it has no fetch socket. Turn it on with an engine
+  rebuilt from main.
+- **Tests.** `limen/tests/daemon.rs`: the second island takes the standby
+  (same embed id, no new launch, fetch socket then frescod then `Attach`,
+  the fetch socket reaches navigatord), a standby gets nothing before a
+  press, the next standby follows, and a dead standby falls back to a cold
+  start and is ended. The engine side is not built in the cloud.
+- **Trace.** `limend standby-assigned` marks a warm Start, and
+  `scripts/navigator-i5-start-trace.sh` then expects it in place of the
+  portcullisd, one-shot and jaild stages.
+
+Gate on the Mac VM, with the rebuilt engine and `LIMEN_ISLAND_STANDBY=1`:
+three warm Starts (the second and later presses), press to `first-request`
+and to the red pixel against the cold first press; `navigator-i5-worker-check.sh`
+on an assigned standby; the standby's resident memory while it waits; and
+a standby whose channel receives a data byte without a descriptor exits.
 
 ## 8. Costs and risks, stated
 
@@ -2629,7 +2671,7 @@ alongside I0.
 | **D4** ✓ | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
 | **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
-| **D7** | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
+| **D7** ✓ | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Decided (Shankar, 2026-11-24): warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
 
 ### Local Mail callback and account storage
 

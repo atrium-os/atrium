@@ -23,6 +23,9 @@
 //! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
 //! - `LIMEN_CHORAGUS`: choragusd's attribution socket, for embedded players'
 //!   audio tickets (default /atrium/sockets/audio-attribution/audio-attribution.sock).
+//! - `LIMEN_ISLAND_STANDBY=1`: keep one warmed Navigator engine per Navigator
+//!   uid for its next island (navigator-islands.md D7). Off by default until
+//!   the installed engine knows the standby phase.
 //!
 //! User-role children start through portcullisd's `ExecInstance`
 //! ([`limen::launch`]). Slots are bound with frescod's slot op on its

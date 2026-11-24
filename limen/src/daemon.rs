@@ -78,6 +78,15 @@ pub trait Launcher: Send {
     fn launch_island(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32, _fetch: UnixStream) -> Result<u32, String> {
         Err("this launcher does not support an island fetch channel".into())
     }
+    /// Start the engine as a standby for `parent_uid`'s next island
+    /// (navigator-islands.md D7): the same jail, uid and limits as
+    /// [`Launcher::launch_island`], but with no fetch socket yet. The engine
+    /// warms up and then waits on `channel` for the fetch socket, which
+    /// limend sends when an island is asked for. Without one (the default),
+    /// every island starts cold.
+    fn launch_island_standby(&mut self, _embed: EmbedId, _channel: UnixStream, _parent_uid: u32) -> Result<u32, String> {
+        Err("this launcher keeps no standby engines".into())
+    }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
 }
@@ -192,7 +201,26 @@ struct State {
     /// When each window last opened a print sheet, within the last minute
     /// (printing.md §5.2).
     print_opens: HashMap<WindowToken, Vec<Instant>>,
+    /// Navigator uid → its one warmed engine, waiting for an island
+    /// (navigator-islands.md D7).
+    standbys: HashMap<u32, Standby>,
+    /// Navigator uids whose standby is being launched.
+    standby_starting: std::collections::HashSet<u32>,
 }
+
+/// An engine started ahead of a press, in its own jail as the Navigator's
+/// island uid, that has had no page, fetch socket or frescod connection.
+struct Standby {
+    embed: EmbedId,
+    child_uid: u32,
+    /// limend's end of the island channel the engine got as its stdin.
+    ours: UnixStream,
+    at: Instant,
+}
+
+/// A standby nobody used is ended after this, so an idle Navigator does not
+/// keep an engine's memory forever.
+pub const STANDBY_MAX_AGE: Duration = Duration::from_secs(600);
 
 impl State {
     fn push<T: Serialize>(&self, conn: ConnId, op: u16, ev: &T) {
@@ -284,6 +312,11 @@ impl Shared {
     /// embedded player gets no ticket and so plays nothing.
     pub fn set_attribution(&self, a: Box<dyn Attribution>) {
         *self.attribution.lock().unwrap() = Some(a);
+    }
+
+    /// Whether a warmed engine is waiting for `uid`'s next island.
+    pub fn standby_ready(&self, uid: u32) -> bool {
+        self.state.lock().unwrap().standbys.contains_key(&uid)
     }
 
     /// Who may embed what: limend's is the installed manifests' `embeds`
@@ -515,7 +548,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         }
     }
     st.next_embed = st.next_embed.wrapping_add(1);
-    let embed = st.next_embed;
+    let mut embed = st.next_embed;
     let mut broker_fetch = None;
     let (child, child_uid, spawned) = match role.provider {
         Provider::System(_) if role.name == "mail-sign-in" => {
@@ -540,17 +573,34 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
                 _ => (shared.defaults)(&user, role.name).map(|a| (a, None)),
             };
             let Some((provider, persona)) = provider else { return refuse(refusal::NO_PROVIDER) };
-            let (ours, theirs) = UnixStream::pair().map_err(|_| Reply::Refused { reason: refusal::LAUNCH_FAILED })?;
+            // A warmed engine for this Navigator takes the island if it is
+            // still there; otherwise it starts cold, as before.
+            let warm = if with_fetch { take_standby(shared, &mut st, uid) } else { None };
+            let (ours, theirs, warm_uid) = match warm {
+                Some((standby, broker)) => {
+                    embed = standby.embed;
+                    broker_fetch = Some(broker);
+                    (standby.ours, None, Some(standby.child_uid))
+                }
+                None => {
+                    let (a, b) = UnixStream::pair().map_err(|_| Reply::Refused { reason: refusal::LAUNCH_FAILED })?;
+                    (a, Some(b), None)
+                }
+            };
             let (tx, rx) = mpsc::channel();
             st.next_conn += 1;
             let id = st.next_conn;
             st.conns.insert(id, tx);
-            let launched = if with_fetch {
+            let launched = if let Some(u) = warm_uid {
+                Ok(u)
+            } else if with_fetch {
+                let theirs = theirs.expect("a cold launch has a channel");
                 UnixStream::pair().map_err(|e| e.to_string()).and_then(|(broker, worker)| {
                     broker_fetch = Some(broker);
                     shared.launcher.lock().unwrap().launch_island(embed, theirs, uid, worker)
                 })
             } else {
+                let theirs = theirs.expect("a cold launch has a channel");
                 match &persona {
                     Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
                     None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
@@ -612,11 +662,77 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         st.to_parent_fd(&e, ParentEvent::IslandFetch { embed }, socket.into());
     }
     st.embeds.insert(embed, e);
+    if with_fetch {
+        refill_standby(shared, &mut st, uid);
+    }
     if wants_ticket {
         let sh = shared.clone();
         std::thread::spawn(move || issue_audio_ticket(&sh, embed, child_uid, uid));
     }
     Ok(Reply::Embed { embed })
+}
+
+/// Take `uid`'s standby, if one is warm and young enough, and hand it its
+/// fetch socket: the first thing on its channel, before the frescod
+/// connection. Returns the standby and the broker's end of the socket.
+fn take_standby(shared: &Arc<Shared>, st: &mut State, uid: u32) -> Option<(Standby, UnixStream)> {
+    let standby = st.standbys.remove(&uid)?;
+    let fail = |why: String| {
+        eprintln!("limend: standby engine {:016x} for uid {uid}: {why}; starting cold", standby.embed);
+        shared.launcher.lock().unwrap().end(standby.embed);
+    };
+    if standby.at.elapsed() >= STANDBY_MAX_AGE {
+        fail("too old".into());
+        return None;
+    }
+    let (broker, worker) = match UnixStream::pair() {
+        Ok(p) => p,
+        Err(e) => { fail(e.to_string()); return None; }
+    };
+    use std::os::fd::AsRawFd;
+    if let Err(e) = portcullis_ipc::send_fds(&standby.ours, &[worker.as_raw_fd()]) {
+        // The engine is gone (it crashed or was ended while waiting).
+        fail(format!("handing over its fetch socket: {e}"));
+        return None;
+    }
+    crate::start_trace("limend", "standby-assigned", &format!("{:016x}", standby.embed));
+    Some((standby, broker))
+}
+
+/// Start the next standby for `uid` in the background, unless one is there
+/// or on its way. Off the state lock: the launch is a portcullisd round trip.
+fn refill_standby(shared: &Arc<Shared>, st: &mut State, uid: u32) {
+    if st.standbys.contains_key(&uid) || !st.standby_starting.insert(uid) {
+        return;
+    }
+    st.next_embed = st.next_embed.wrapping_add(1);
+    let embed = st.next_embed;
+    let sh = shared.clone();
+    std::thread::spawn(move || {
+        let launched = UnixStream::pair().map_err(|e| e.to_string()).and_then(|(ours, theirs)| {
+            sh.launcher.lock().unwrap().launch_island_standby(embed, theirs, uid).map(|child_uid| (ours, child_uid))
+        });
+        let mut st = sh.state.lock().unwrap();
+        st.standby_starting.remove(&uid);
+        match launched {
+            Ok((ours, child_uid)) => {
+                st.standbys.insert(uid, Standby { embed, child_uid, ours, at: Instant::now() });
+            }
+            Err(e) => {
+                eprintln!("limend: no standby engine for uid {uid}: {e}");
+                return;
+            }
+        }
+        drop(st);
+        // Ended if still unused when it ages out.
+        std::thread::sleep(STANDBY_MAX_AGE);
+        let mut st = sh.state.lock().unwrap();
+        if st.standbys.get(&uid).is_some_and(|s| s.embed == embed) {
+            st.standbys.remove(&uid);
+            drop(st);
+            sh.launcher.lock().unwrap().end(embed);
+        }
+    });
 }
 
 /// Ask choragusd for a player's ticket and hand it over, if the embed is

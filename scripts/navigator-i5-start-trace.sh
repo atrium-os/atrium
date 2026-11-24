@@ -36,10 +36,18 @@ echo "$lines" | awk '
         prev = $1; n++
     }
     END { printf "%d stages, %.3f ms first to last\n", n, (prev - first) / 1000 }'
-# Every hop must have printed, or the trace is not the installed path.
-for want in "navigatord widget-start" "limend request-island" "portcullisd exec-begin" \
-            "oneshot jaild-call" "jaild create-begin" "jaild pdfork-done" \
-            "limend embed-handed" "navigatord island-fetch" "navigatord attached"; do
+# Every hop must have printed, or the trace is not the installed path. A
+# warm Start (a standby took the island, navigator-islands.md D7) launches
+# nothing on the press, so it must show the assignment instead.
+if echo "$lines" | awk '($3 " " $4) == "limend standby-assigned" { f = 1 } END { exit !f }'; then
+    echo "warm start: a standby engine took the island"
+    required="limend:standby-assigned"
+else
+    required="portcullisd:exec-begin oneshot:jaild-call jaild:create-begin jaild:pdfork-done"
+fi
+for want in navigatord:widget-start limend:request-island $required \
+            limend:embed-handed navigatord:island-fetch navigatord:attached; do
+    want=$(echo "$want" | tr : ' ')
     echo "$lines" | awk -v w="$want" '($3 " " $4) == w { f = 1 } END { exit !f }' \
         || { echo "MISSING stage: $want" >&2; missing=1; }
 done

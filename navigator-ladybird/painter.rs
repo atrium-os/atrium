@@ -925,6 +925,20 @@ pub mod host {
         Box::into_raw(Box::new(state))
     }
 
+    /// A standby engine's wait (navigator-islands.md D7): the fetch socket
+    /// limend sends when an island is asked for, or -1 on anything else.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_standby_fetch() -> i32 {
+        use std::os::fd::IntoRawFd;
+        match limen::client::Child::standby_fetch() {
+            Ok(f) => f.into_raw_fd(),
+            Err(e) => {
+                eprintln!("navigator: standby ended: {e}");
+                -1
+            }
+        }
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_counter_scene_create() -> *mut SceneState {
         let Ok((child, id, surface, _)) = attach("web-island") else { return std::ptr::null_mut() };

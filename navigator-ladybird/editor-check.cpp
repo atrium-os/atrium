@@ -34,6 +34,7 @@ static constexpr char fixture[] = {
 
 extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
+extern "C" int navigator_standby_fetch();
 extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
 #if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 extern "C" bool navigator_video_channel(int);
@@ -83,13 +84,26 @@ int main(int argc, char** argv)
 #endif
     if (argc != 1 && !embedded && !mail_probe)
         return 1;
+    // A standby (navigator-islands.md D7) is started with /dev/null in
+    // place of its fetch socket: it warms up first, then waits on its Limen
+    // channel for the socket, which comes only when an island is asked for.
+    [[maybe_unused]] bool standby = false;
+#ifndef ATRIUM_MAIL_PAGE
+    auto attach_fetch = [](int channel) {
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
+        if (channel < 0 || !navigator_video_channel(channel)) return false;
+#endif
+        return channel >= 0 && navigator_fixture_channel(channel);
+    };
+#endif
     if (embedded) {
 #ifndef ATRIUM_MAIL_PAGE
-        int channel = dup(STDOUT_FILENO);
-#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
-        if (channel < 0 || !navigator_video_channel(channel)) return 1;
-#endif
-        if (channel < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0 || !navigator_fixture_channel(channel))
+        struct stat out {};
+        standby = fstat(STDOUT_FILENO, &out) == 0 && S_ISCHR(out.st_mode);
+        int channel = standby ? -1 : dup(STDOUT_FILENO);
+        if ((!standby && channel < 0) || dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
+            return 1;
+        if (!standby && !attach_fetch(channel))
             return 1;
 #endif
     }
@@ -109,6 +123,12 @@ int main(int argc, char** argv)
         return 3;
     auto palette = Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value()));
     auto client = Navigator::EditorPage::create(move(palette));
+    // Warm: fonts, event loop, JS agent and page client exist, and no site
+    // input has been seen. Wait here for the island.
+#ifndef ATRIUM_MAIL_PAGE
+    if (standby && !attach_fetch(navigator_standby_fetch()))
+        return 1;
+#endif
 #if defined(ATRIUM_I1_COUNTER)
     if (!embedded) return 1;
 #ifdef ATRIUM_I4_YOUTUBE

@@ -230,6 +230,24 @@ impl Child {
         Self::embedded_on(s)
     }
 
+    /// A standby engine's wait (navigator-islands.md D7): block on the limend
+    /// channel until an island is asked for, and return the fetch socket
+    /// limend sends first. Anything else, or limend hanging up, is an error,
+    /// and the engine exits. Call before [`Child::embedded`], which then
+    /// reads the frescod connection that follows.
+    pub fn standby_fetch() -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::BorrowedFd;
+        let fd: i32 = std::env::var("LIMEN_FD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // SAFETY: the limend channel stays open for the process's life; this
+        // only borrows it for one receive.
+        let channel = unsafe { BorrowedFd::borrow_raw(fd) };
+        let mut fds = portcullis_ipc::recv_fds(&channel, 1)?;
+        match (fds.pop(), fds.is_empty()) {
+            (Some(f), true) => Ok(f),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "a standby expects exactly its fetch socket")),
+        }
+    }
+
     /// [`Child::embedded`] on a given channel.
     pub fn embedded_on(s: std::os::unix::net::UnixStream) -> Result<(Self, std::os::unix::net::UnixStream), Error> {
         // The frescod descriptor comes first, before any aqueduct frame,

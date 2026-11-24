@@ -65,7 +65,7 @@ impl Fresco {
 
 /// portcullisd: hands the child's channel to the test.
 #[derive(Clone)]
-struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
+struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>, Arc<std::sync::atomic::AtomicBool>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
         assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes", "org.atrium.navigator.mail-page", catalogue::NAVIGATOR_ENGINE].contains(&app), "{app}");
@@ -75,6 +75,10 @@ impl Launcher for Launch {
     fn launch_island(&mut self, embed: EmbedId, ch: UnixStream, _: u32, mut fetch: UnixStream) -> Result<u32, String> {
         use std::io::Write;
         fetch.write_all(&embed.to_le_bytes()).unwrap();
+        self.launch(catalogue::NAVIGATOR_ENGINE, embed, ch)
+    }
+    fn launch_island_standby(&mut self, embed: EmbedId, ch: UnixStream, _: u32) -> Result<u32, String> {
+        if !self.2.load(std::sync::atomic::Ordering::SeqCst) { return Err("off".into()) }
         self.launch(catalogue::NAVIGATOR_ENGINE, embed, ch)
     }
 
@@ -94,6 +98,7 @@ struct World {
     fresco: Fresco,
     launched: mpsc::Receiver<(EmbedId, UnixStream)>,
     ended: Arc<Mutex<Vec<EmbedId>>>,
+    standby: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl World {
@@ -130,10 +135,11 @@ impl World {
             "map" => Some("org.example.map".to_string()),
             _ => None,
         });
-        let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone())), resolve, defaults);
+        let standby = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone(), standby.clone())), resolve, defaults);
         // The mail app runs in Work (personas.md §3), everyone else in Personal.
         shared.set_persona_lookup(Box::new(|uid: u32| (uid == APP).then(|| "work".to_string())));
-        World { shared, fresco, launched: rx, ended }
+        World { shared, fresco, launched: rx, ended, standby }
     }
 
     fn connect(&self, uid: u32) -> aqueduct::Connection {
@@ -1132,3 +1138,72 @@ fn smime_key_picker_routes_a_single_read_only_file_to_arca() {
     assert_eq!(refused(arca_parent.request_smime_picker(sheet, W_ARCA)), refusal::NOT_ATTACHED);
     assert!(mail.take_fd().is_none());
 }
+
+#[test]
+fn a_navigators_next_island_takes_its_warmed_standby_engine() {
+    use std::io::{Read, Write};
+    let w = World::new();
+    w.standby.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    let mut navigator = w.parent(4101);
+
+    // The first island starts cold, and a standby is started behind it.
+    let first = navigator.request_island(W_APP, 1).unwrap();
+    let (instance, mut cold) = w.spawned();
+    assert_eq!(instance, first);
+    assert!(matches!(next_c(&mut cold), ChildEvent::Attach { role, .. } if role == "web-island"));
+    let (standby, standby_channel) = w.launched.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_ne!(standby, first);
+    eventually("the standby is registered", || w.shared.standby_ready(4101));
+    // Before a press the standby has nothing: no fetch socket, no frescod
+    // connection, no event.
+    standby_channel.set_nonblocking(true).unwrap();
+    let mut probe = [0u8; 1];
+    assert!(matches!((&standby_channel).read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    standby_channel.set_nonblocking(false).unwrap();
+
+    // The second island is the standby: same embed id, no new launch.
+    let second = navigator.request_island(W_APP, 1).unwrap();
+    assert_eq!(second, standby);
+    // The engine's side: the fetch socket first, then frescod, then Attach.
+    let mut fds = portcullis_ipc::recv_fds(&standby_channel, 1).unwrap();
+    let mut fetch = UnixStream::from(fds.pop().unwrap());
+    let (mut warm, _fresco) = Child::embedded_on(standby_channel).unwrap();
+    assert!(matches!(next_c(&mut warm), ChildEvent::Attach { embed, role, .. } if embed == second && role == "web-island"));
+    // The fetch socket reaches the navigator as this island's.
+    for id in [first, second] {
+        assert_eq!(next_p(&mut navigator), ParentEvent::IslandFetch { embed: id });
+    }
+    let mut broker = navigator.take_island_fetch(second).unwrap();
+    fetch.write_all(b"warm").unwrap();
+    let mut got = [0u8; 4];
+    broker.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"warm");
+
+    // And the next standby is on its way.
+    let (third, _) = w.launched.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(![first, second].contains(&third));
+    navigator.detach(second).unwrap();
+    eventually("the warm island's jail ends", || w.ended.lock().unwrap().contains(&second));
+}
+
+#[test]
+fn a_dead_standby_falls_back_to_a_cold_start() {
+    let w = World::new();
+    w.standby.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    let mut navigator = w.parent(4101);
+    let first = navigator.request_island(W_APP, 1).unwrap();
+    let (_, _cold) = w.spawned();
+    // The standby's engine dies before any press.
+    let (standby, channel) = w.launched.recv_timeout(Duration::from_secs(2)).unwrap();
+    eventually("the standby is registered", || w.shared.standby_ready(4101));
+    drop(channel);
+    let second = navigator.request_island(W_APP, 1).unwrap();
+    assert!(![first, standby].contains(&second), "a fresh cold island");
+    let (instance, mut child) = w.spawned();
+    assert_eq!(instance, second);
+    assert!(matches!(next_c(&mut child), ChildEvent::Attach { .. }));
+    eventually("the dead standby is ended", || w.ended.lock().unwrap().contains(&standby));
+}
+

@@ -31,11 +31,20 @@ pub struct Portcullis {
     caller: String,
     policy: PathBuf,
     jails: HashMap<EmbedId, UnixStream>,
+    /// Keep a warmed engine per Navigator (navigator-islands.md D7). Off
+    /// unless `LIMEN_ISLAND_STANDBY=1`, until the installed engine knows the
+    /// standby phase: an older engine given no fetch socket exits at once.
+    standby: bool,
 }
 
 impl Portcullis {
     pub fn new(caller: impl Into<String>) -> Self {
-        Self { caller: caller.into(), policy: portcullis_policy::SYSTEM_PATH.into(), jails: HashMap::new() }
+        Self {
+            caller: caller.into(),
+            policy: portcullis_policy::SYSTEM_PATH.into(),
+            jails: HashMap::new(),
+            standby: std::env::var("LIMEN_ISLAND_STANDBY").is_ok_and(|v| v == "1"),
+        }
     }
 
     fn run_as(&self, app: &str) -> Result<u32, String> {
@@ -97,6 +106,13 @@ impl Launcher for Portcullis {
 
     fn launch_island(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32, fetch: UnixStream) -> Result<u32, String> {
         self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, Some(fetch))
+    }
+
+    fn launch_island_standby(&mut self, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+        if !self.standby { return Err("standby engines are off (LIMEN_ISLAND_STANDBY)".into()); }
+        // No fetch socket: stdout is /dev/null, which is how the engine
+        // knows to warm up and then wait for one on its channel.
+        self.start(crate::catalogue::NAVIGATOR_ENGINE, embed, channel, Some(parent_uid), None, None)
     }
 
     fn end(&mut self, embed: EmbedId) {
