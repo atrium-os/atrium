@@ -1318,11 +1318,13 @@ fn run_one_jail(
         let _ = fs::create_dir_all(&etc);
         let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
-    let groups = account_groups(&run.user, run.uid).map_err(fail("groups"))?;
+    let gid = jaild::ffi::account(run.uid).map(|(_, g)| g)
+        .ok_or_else(|| LaunchError::Failed("account", format!("uid {} has no account", run.uid)))?;
+    let groups = account_groups(&run.user, gid).map_err(fail("groups"))?;
     let parts = portcullisd::jail_request::RequestParts {
         class: jaild::protocol::JailClass::App { owner: run.owner.clone(), app_id: run.app_id.clone(), debug: run.debug },
         run: Some(portcullisd::jail_request::RunAs {
-            uid: run.uid, gid: run.uid, groups, args: run.args.clone(), env: clean_env(run),
+            uid: run.uid, gid, groups, args: run.args.clone(), env: clean_env(run),
             stdio: true, cwd: Some(run.home.display().to_string()),
         }),
         grants,

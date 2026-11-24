@@ -42,19 +42,27 @@ pub struct Running {
     pub pid:  i32,
     procdesc: OwnedFd,
     kq:       OwnedFd,
+    /// The exit, once seen: the kqueue reports it once (`EV_ONESHOT`).
+    exited:   std::cell::Cell<Option<i32>>,
 }
 
 impl Running {
     fn new(pid: i32, procdesc: OwnedFd) -> io::Result<Running> {
         let kq = kqueue()?;
         watch_exit(&kq, &procdesc)?;
-        Ok(Running { pid, procdesc, kq })
+        Ok(Running { pid, procdesc, kq, exited: std::cell::Cell::new(None) })
     }
 
     /// Wait up to `timeout` (forever with `None`) for the exit; its wait(2)
-    /// status, or `None` if it still runs.
+    /// status, or `None` if it still runs. Asked again after the exit, the
+    /// same status.
     pub fn wait_for(&self, timeout: Option<Duration>) -> io::Result<Option<i32>> {
-        next_exit(&self.kq, timeout)
+        if let Some(s) = self.exited.get() {
+            return Ok(Some(s));
+        }
+        let s = next_exit(&self.kq, timeout)?;
+        self.exited.set(s);
+        Ok(s)
     }
 
     pub fn wait(&self) -> io::Result<i32> {
