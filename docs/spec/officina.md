@@ -4879,6 +4879,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - Sheets passes the fill through for cell styles and for conditional-format number formats.
 - Tests: `a_star_fill_is_shown_once_and_its_place_kept` (officina-grid), `a_star_fill_puts_the_sign_left_and_the_number_right` (pergola), and the Sheets format-menu test. Results: officina-grid 122, pergola 230 and Sheets 141 lib tests pass.
 
+### 16.113 F4 anchors references; Ctrl+T, Ctrl+Shift+L, Ctrl+K (2026-11-25)
+
+- **F4** while editing a formula cycles the reference at the caret through A1 → $A$1 → A$1 → $A1 → A1, as Excel does. Both ends of a range change together. A reference after a sheet name (`Sheet2!A1`) counts. Function names (`LOG10(`), defined names (`Tax_A1`) and text outside a formula are left alone (`pergola::widgets::grid_view::cycle_ref`, so every grid editor gets it).
+- **Ctrl+T** (or Ctrl+L) is Format as Table, **Ctrl+Shift+L** turns Filter on or off, and **Ctrl+K** opens Insert/Edit Link. The menu shows these keys (`data::key_cmd`).
+- Tests: `f4_cycles_the_reference_at_the_caret`, the grid editor's F2/F4 key test, the grid key test, and `excel_row_and_column_keys_pick_the_command_for_the_selection`. Results: pergola 231 and Sheets 141 lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
