@@ -980,7 +980,7 @@ impl RecoveryMount {
             Some(mount) => mount,
             None => {
                 let store = workbook_store(doc.pending.parent().unwrap(), doc.slot.0);
-                portcullis_overlay::mount_recovery(&store, 128 << 20).map_err(fail)?;
+                portcullis_overlay::mount_recovery(&store, portcullis_overlay::WORKBOOK_RECOVERY_BYTES).map_err(fail)?;
                 Self { store, pending: doc.pending.clone(), clean: false, id: [0; 16] }
             }
         };
@@ -991,6 +991,9 @@ impl RecoveryMount {
         if !doc.recover && fs::read_dir(&data).map_err(|e| fail(e.to_string()))?.next().is_some() {
             fs::File::create(&doc.pending).map_err(|e| fail(e.to_string()))?;
             return Err(fail("slot contains a previous recovery".into()));
+        }
+        if !doc.recover {
+            portcullis_overlay::resize_empty_recovery(&mount.store).map_err(fail)?;
         }
         // Across boots the registry may assign this slot a different UID.
         // The detached private volume has no external hard links. Walk it
@@ -1088,7 +1091,7 @@ fn require_workbook_image(store: &portcullis_overlay::Place) -> std::io::Result<
 
 fn mount_existing_workbook(store: &portcullis_overlay::Place) -> std::io::Result<()> {
     require_workbook_image(store)?;
-    portcullis_overlay::mount_recovery(store, 128 << 20).map_err(std::io::Error::other)
+    portcullis_overlay::mount_recovery(store, portcullis_overlay::WORKBOOK_RECOVERY_BYTES).map_err(std::io::Error::other)
 }
 
 /// After reboot the old jail and mounts are gone. Occupancy-only markers

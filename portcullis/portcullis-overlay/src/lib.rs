@@ -802,6 +802,10 @@ pub fn parse_size(s: &str) -> Option<u64> {
     digits.trim().parse::<u64>().ok()?.checked_mul(mult)
 }
 
+/// Two dense 1 GiB native bases coexist during a checkpoint switch. Leave
+/// another GiB for the journal, filesystem overhead and a sealed base.
+pub const WORKBOOK_RECOVERY_BYTES: u64 = 3 << 30;
+
 /// Workbook journals always get a size-limited volume. Minimal guests without
 /// the Tessera formatter can still put a bounded UFS vnode image in app data.
 pub fn mount_recovery(pl: &Place, bytes: u64) -> Result<(), String> {
@@ -810,6 +814,10 @@ pub fn mount_recovery(pl: &Place, bytes: u64) -> Result<(), String> {
     if fresh && matches!(ensure_mounted(pl, "Sheets recovery", bytes)?, Backing::Volume { .. }) {
         return Ok(());
     }
+    mount_ufs_recovery(pl, &ufs, fresh, bytes)
+}
+
+fn mount_ufs_recovery(pl: &Place, ufs: &Path, fresh: bool, bytes: u64) -> Result<(), String> {
     if let Some((kind, _)) = mount_at(&pl.dir) {
         return if kind == "ufs" { Ok(()) } else { Err("unexpected recovery mount".into()) };
     }
@@ -834,6 +842,36 @@ pub fn mount_recovery(pl: &Place, bytes: u64) -> Result<(), String> {
         detach(&unit);
         Err(format!("could not mount recovery volume {}", ufs.display()))
     }
+}
+
+/// Called only for a reserved new document slot, before exposing its autosave
+/// directory. Old pending images stay in their original format and size.
+pub fn resize_empty_recovery(pl: &Place) -> Result<(), String> {
+    let bytes = WORKBOOK_RECOVERY_BYTES;
+    let (kind, _) = mount_at(&pl.dir).ok_or("missing recovery mount")?;
+    let (image, needed) = match kind.as_str() {
+        "ufs" => (pl.img.with_extension("ufs"), bytes),
+        "tessera" => (pl.img.clone(), image_mib_for_quota(bytes) << 20),
+        _ => return Err("unexpected recovery filesystem".into()),
+    };
+    if fs::metadata(&image).map_err(|e| e.to_string())?.len() >= needed {
+        return Ok(());
+    }
+    let data = pl.dir.join("autosave");
+    if fs::read_dir(&data).map_err(|e| e.to_string())?.next().is_some() {
+        return Err("cannot resize an occupied workbook recovery image".into());
+    }
+    if image.parent().and_then(store_bytes).is_some_and(|size| size < needed) {
+        return Err(format!("workbook recovery image needs {} MiB on the backing volume", needed >> 20));
+    }
+    unmount_recovery(pl)?;
+    fs::remove_file(&image).map_err(|e| e.to_string())?;
+    if kind == "ufs" {
+        mount_ufs_recovery(pl, &image, true, bytes)?;
+    } else {
+        mount_recovery(pl, bytes)?;
+    }
+    fs::create_dir_all(data).map_err(|e| e.to_string())
 }
 
 pub fn unmount_recovery(pl: &Place) -> Result<(), String> {

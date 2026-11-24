@@ -1220,11 +1220,25 @@ launch carries no file descriptor.
 Each slot has a private recovery image under the owner's persona app data,
 scoped to the verified Sheets publisher. Portcullis mounts only its autosave
 directory read-write in the document jail. It uses the quota-limited Tessera
-volume machinery (128 MiB), with a bounded UFS vnode image for guests where
-a new Tessera volume cannot be provisioned. An existing image keeps its
-format. The broker records the occupied slot before launch. Clean teardown
+volume machinery. A new slot has a 3 GiB Tessera quota on a sparse
+3,840 MiB image, or a fixed 3 GiB UFS vnode image when a new Tessera
+volume cannot be provisioned. Two 1 GiB native checkpoint generations can
+coexist with the journal during a switch. The UFS filesystem also uses
+part of its image for metadata and reserved space.
+
+Recover and detached-slot inspection mount existing images at their
+original capacity. New and Open may rebuild an undersized image once
+they hold the slot reservation and verify its mounted autosave directory
+is empty. A previous edit, a failed directory read or a failed unmount
+prevents replacement. An empty legacy UFS slot is rebuilt as UFS. The broker records the occupied slot before launch. Clean teardown
 unmounts the image; an empty autosave directory clears the pending marker.
 New and Open skip occupied slots.
+The FreeBSD integration test `portcullis-overlay/tests/workbook_recovery.rs`
+exercised both formats in a disposable arm64 guest. Each kept a nonempty
+legacy image readable after detach and remount. After the test emptied the
+slot, the replacement held two 1,065,968,177-byte bases and the journal
+together. Both bases compared byte-for-byte after another remount.
+
 
 A launcher press authorizes `RecoverWorkbook` for inactive pending slots of
 that owner, persona and publisher. One candidate opens directly. For several,

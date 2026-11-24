@@ -4329,8 +4329,15 @@ quota error and still opens the file. A failed base write removes the
 incomplete temporary file. If this was the first base, Sheets removes the
 failed autosave directory so closing the workbook frees its slot. A fresh
 dense trial reused that slot in a new jail and confirmed a second saved A1
-edit. Dense crash recovery still needs a larger or more compact private
-recovery base.
+edit. Portcullis now gives new workbook slots a bounded 3 GiB recovery volume
+(Portcullis §6.5). On the private arm64 Tessera-root desktop an empty legacy
+slot upgraded from 128 MiB. Its first native checkpoint held all
+1,065,968,177 bytes. After an unsaved A1 edit from 1 to 8 reached the
+journal, the document process was killed. Recover opened a new jail.
+Save As published the replayed 8 through Scrinium, ordinary Save published
+a subsequent 9, and picker Open in a third jail produced a new checkpoint
+containing 9. Each revision retained the sampled values in all 125 columns.
+The desktop check is `scripts/sheets-dense-recovery-vm-check.sh`.
 
 The FreeBSD gate passed all six Portcullis Open tests, including the bounded
 grant transfer, and all six runnable Sheets app tests. The Sheets library
