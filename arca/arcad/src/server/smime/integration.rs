@@ -21,10 +21,10 @@ use zeroize::Zeroizing;
 
 use super::{native, storage_persona};
 use crate::label::Label;
-use crate::proto::{op, status};
+use crate::proto::{self, op, status};
 use crate::server::{reply, Body, Reply, State};
 
-pub use wire::FAILURE;
+pub use wire::{Selection, FAILURE, FIXTURE_ACCOUNT};
 type Fingerprint = [u8; 32];
 
 fn closed() -> io::Error {
@@ -116,6 +116,7 @@ struct Approval {
     uid: u32,
     publisher: [u8; 32],
     persona: Option<String>,
+    selection: Selection,
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
 }
@@ -168,7 +169,12 @@ fn watch_worker<T>(
 }
 
 fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
-    let uid = u32::from_le_bytes(body.try_into().ok()?);
+    let (uid, selected) = body.split_at_checked(4)?;
+    let uid = u32::from_le_bytes(uid.try_into().ok()?);
+    let selection = Selection::decode(selected)?;
+    if selection != Selection::fixture() {
+        return None;
+    }
     let registry = state.legacy_smime_registry.clone()?;
     let publisher = state.mail_sign_ins.mail_publisher?;
     if state.legacy_smime_pending.is_some() {
@@ -182,8 +188,9 @@ fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
         uid,
         publisher,
         persona,
+        selection,
         cancelled,
-        deadline: Instant::now() + Duration::from_secs(24),
+        deadline: Instant::now() + Duration::from_secs(32),
     })
 }
 
@@ -238,16 +245,20 @@ fn synthetic_open(
     )
 }
 
-pub fn serve_synthetic_open(state: &Mutex<State>, client: &UnixStream, body: &[u8]) -> Reply {
+pub fn serve_synthetic_open(
+    state: &Mutex<State>,
+    client: &UnixStream,
+    body: &[u8],
+) -> io::Result<()> {
     serve_open(state, client, body, launch)
 }
 
 fn serve_open(
     state: &Mutex<State>,
-    client: &UnixStream,
+    mut client: &UnixStream,
     body: &[u8],
     start: impl FnOnce() -> io::Result<(UnixStream, UnixStream)>,
-) -> Reply {
+) -> io::Result<()> {
     let lock = || state.lock().unwrap_or_else(|p| p.into_inner());
     let pending = {
         let mut state = lock();
@@ -256,31 +267,48 @@ fn serve_open(
     let Some(approval) = pending else {
         lock().audit(
             &Label::TrustedUi,
-            op::U_SMIME_SYNTHETIC_OPEN,
+            op::U_SMIME_SYNTHETIC_RESERVE,
             None,
             status::DENIED,
         );
-        return reply(status::DENIED);
+        return proto::write_reply(&mut client, status::DENIED, &[]);
     };
-    let result = synthetic_open(state, client, &approval, start);
-    let mut state = lock();
-    state.legacy_smime_pending = None;
-    let result = match result {
-        // The test UI can attest the worker exited cleanly. Limen forwards
-        // only the generic sheet outcome to Mail.
-        Ok(opened) if approval.valid(client) => Reply {
-            status: if opened { status::OK } else { status::DENIED },
-            body: Body::Plain(vec![0]),
-        },
-        _ => reply(status::DENIED),
+    // The socket is the one-use reservation. Exactly one next frame may
+    // redeem it. A mismatched frame, disconnect or timeout spends it too.
+    let mut attempted = false;
+    let result = (|| {
+        client.set_read_timeout(Some(
+            approval.deadline.saturating_duration_since(Instant::now()),
+        ))?;
+        proto::write_reply(&mut client, status::OK, &[])?;
+        let frame = proto::read_frame(&mut client)?.ok_or_else(closed)?;
+        let bytes = frame.as_ref();
+        attempted = bytes[..2] == op::U_SMIME_SYNTHETIC_OPEN.to_le_bytes();
+        if !attempted || Selection::decode(&bytes[2..]) != Some(approval.selection) {
+            return Err(closed());
+        }
+        synthetic_open(state, client, &approval, start)
+    })();
+    let final_reply = {
+        let mut state = lock();
+        state.legacy_smime_pending = None;
+        let result = match result {
+            // Only the fixture UI sees the synthetic clean-exit marker.
+            Ok(opened) if approval.valid(client) => Reply {
+                status: if opened { status::OK } else { status::DENIED },
+                body: Body::Plain(vec![0]),
+            },
+            _ => reply(status::DENIED),
+        };
+        let operation = if attempted {
+            op::U_SMIME_SYNTHETIC_OPEN
+        } else {
+            op::U_SMIME_SYNTHETIC_RESERVE
+        };
+        state.audit(&Label::TrustedUi, operation, None, result.status);
+        result
     };
-    state.audit(
-        &Label::TrustedUi,
-        op::U_SMIME_SYNTHETIC_OPEN,
-        None,
-        result.status,
-    );
-    result
+    proto::write_reply(&mut client, final_reply.status, final_reply.body.bytes())
 }
 
 /// Owns the private channel and the binding of one immutable request.
@@ -551,20 +579,72 @@ mod tests {
         assert_eq!(signed_persona(&registry, 51000, PUB), None);
     }
 
+    fn reservation(uid: u32, selection: Selection) -> Vec<u8> {
+        [uid.to_le_bytes().as_slice(), selection.encode().as_slice()].concat()
+    }
+
+    fn read_reply(client: &mut UnixStream) -> (u8, Vec<u8>) {
+        let (status, body) = proto::read_reply(client).unwrap();
+        (status, body.as_ref().to_vec())
+    }
+
+    fn socket_pair() -> (UnixStream, UnixStream) {
+        let (server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (server, client)
+    }
+
+    fn configured_fixture(dir: &Path) -> State {
+        let mut state = unlocked(dir);
+        let registry = dir.join("app-registry");
+        let pub_hex = "08".repeat(32);
+        std::fs::write(
+            &registry,
+            format!(
+                "51000 {SYNTHETIC_USER} org.atrium.mail {pub_hex} persona=work\n\
+             51001 {SYNTHETIC_USER} org.atrium.mail {pub_hex}\n"
+            ),
+        )
+        .unwrap();
+        state.legacy_smime_registry = Some(registry);
+        let root = body(|w| {
+            w.str(SYNTHETIC_USER);
+            w.raw(&ROOT);
+        });
+        assert_eq!(
+            state.handle(&Label::Vestibulum, op::V_CREATE, &root).status,
+            status::OK
+        );
+        state
+    }
+
+    fn worker_header(worker: &mut UnixStream) -> usize {
+        worker.write_all(wire::WORKER_READY).unwrap();
+        assert_eq!(wire::read(worker, wire::MAX_CERT).unwrap(), CERT);
+        assert_eq!(wire::read(worker, wire::MAX_CMS).unwrap(), CMS);
+        let env = mail_smime::envelope::enveloped_data(CMS).unwrap();
+        let (fingerprint, size, wrapped) =
+            mail_smime::envelope::legacy_recipient(&env, CERT).unwrap();
+        worker.write_all(&[1, size as u8]).unwrap();
+        worker.write_all(&fingerprint).unwrap();
+        wire::write(worker, &wrapped, 512).unwrap();
+        size
+    }
+
     #[test]
     fn synthetic_dispatch_is_disabled_by_default_and_unavailable_to_mail() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = unlocked(dir.path());
-        let uid = 51000u32.to_le_bytes();
-        let (ui, _client) = UnixStream::pair().unwrap();
+        let request = reservation(51000, Selection::fixture());
+        let (ui, mut client) = socket_pair();
         let state_mutex = Mutex::new(state);
-        assert_eq!(
-            serve_open(&state_mutex, &ui, &uid, || panic!(
-                "disabled gate launched a worker"
-            ))
-            .status,
-            status::DENIED
-        );
+        serve_open(&state_mutex, &ui, &request, || {
+            panic!("disabled gate launched")
+        })
+        .unwrap();
+        assert_eq!(read_reply(&mut client), (status::DENIED, vec![]));
         state = state_mutex.into_inner().unwrap();
         let mail = Label::App {
             user: SYNTHETIC_USER.into(),
@@ -573,17 +653,163 @@ mod tests {
             persona: Some("work".into()),
         };
         state.legacy_smime_registry = Some(dir.path().join("app-registry"));
-        assert_ne!(
-            state.handle(&mail, op::U_SMIME_SYNTHETIC_OPEN, &uid).status,
-            status::OK
-        );
-        assert_eq!(
-            serve_open(&Mutex::new(state), &ui, &uid[..3], || panic!(
-                "malformed request launched a worker"
-            ))
-            .status,
-            status::DENIED
-        );
+        for operation in [op::U_SMIME_SYNTHETIC_RESERVE, op::U_SMIME_SYNTHETIC_OPEN] {
+            assert_ne!(state.handle(&mail, operation, &request).status, status::OK);
+        }
+        serve_open(&Mutex::new(state), &ui, &request[..3], || {
+            panic!("malformed gate launched")
+        })
+        .unwrap();
+        assert_eq!(read_reply(&mut client), (status::DENIED, vec![]));
+    }
+
+    #[test]
+    fn legacy_approval_refuses_account_message_and_digest_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Mutex::new(configured_fixture(dir.path()));
+        let selection = Selection::fixture();
+        for changed in [
+            Selection {
+                account: 2,
+                ..selection
+            },
+            Selection {
+                message: 2,
+                ..selection
+            },
+            Selection::for_message(
+                selection.account,
+                selection.message,
+                b"changed synthetic bytes",
+            ),
+        ] {
+            let (ui, mut client) = socket_pair();
+            std::thread::scope(|scope| {
+                let serve = scope.spawn(|| {
+                    serve_open(&state, &ui, &reservation(51000, selection), || {
+                        panic!("changed selection launched")
+                    })
+                });
+                assert_eq!(read_reply(&mut client), (status::OK, vec![]));
+                proto::write_request(&mut client, op::U_SMIME_SYNTHETIC_OPEN, &changed.encode())
+                    .unwrap();
+                assert_eq!(read_reply(&mut client), (status::DENIED, vec![]));
+                serve.join().unwrap().unwrap();
+            });
+            assert!(state.lock().unwrap().legacy_smime_pending.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_approval_cannot_move_to_another_connection_or_be_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Mutex::new(configured_fixture(dir.path()));
+        let selection = Selection::fixture().encode();
+        let (first_server, mut first) = socket_pair();
+        let (second_server, mut second) = socket_pair();
+        std::thread::scope(|scope| {
+            let original =
+                scope.spawn(|| crate::serve_conn(first_server, &Label::TrustedUi, &state));
+            proto::write_request(
+                &mut first,
+                op::U_SMIME_SYNTHETIC_RESERVE,
+                &reservation(51000, Selection::fixture()),
+            )
+            .unwrap();
+            assert_eq!(read_reply(&mut first), (status::OK, vec![]));
+            let foreign =
+                scope.spawn(|| crate::serve_conn(second_server, &Label::TrustedUi, &state));
+            proto::write_request(&mut second, op::U_SMIME_SYNTHETIC_OPEN, &selection).unwrap();
+            assert_eq!(read_reply(&mut second), (status::DENIED, vec![]));
+            drop(second);
+            foreign.join().unwrap().unwrap();
+
+            // An invalid second frame spends the reservation.
+            proto::write_request(&mut first, op::U_SMIME_SYNTHETIC_OPEN, &selection[..12]).unwrap();
+            assert_eq!(read_reply(&mut first), (status::DENIED, vec![]));
+            original.join().unwrap().unwrap();
+            assert!(proto::read_frame(&mut first).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn synthetic_failure_timing_samples_include_admission_and_worker_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Mutex::new(configured_fixture(dir.path()));
+        let selection = Selection::fixture();
+        let refused = Selection {
+            account: 2,
+            ..selection
+        };
+        let mut samples = [Vec::new(), Vec::new()];
+        for _ in 0..5 {
+            for (index, requested) in [refused, selection].into_iter().enumerate() {
+                let (mut ui, mut client) = socket_pair();
+                let (control, mut worker) = socket_pair();
+                let (lifetime, mut launcher) = socket_pair();
+                lifetime
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                std::thread::scope(|scope| {
+                    let serve = scope.spawn(|| {
+                        let frame = proto::read_frame(&mut ui).unwrap().unwrap();
+                        assert_eq!(
+                            frame.as_ref()[..2],
+                            op::U_SMIME_SYNTHETIC_RESERVE.to_le_bytes()
+                        );
+                        serve_open(&state, &ui, &frame.as_ref()[2..], || {
+                            assert_eq!(requested, selection);
+                            Ok((control, lifetime))
+                        })
+                        .unwrap();
+                    });
+                    let simulated_worker = (requested == selection).then(|| {
+                        scope.spawn(|| {
+                            worker_header(&mut worker);
+                            assert_eq!(worker.read(&mut [0]).unwrap(), 0);
+                            portcullis_ipc::write_response(
+                                &mut launcher,
+                                &Response::LaunchExit { code: Some(0) },
+                            )
+                            .unwrap();
+                        })
+                    });
+
+                    let started = Instant::now();
+                    proto::write_request(
+                        &mut client,
+                        op::U_SMIME_SYNTHETIC_RESERVE,
+                        &reservation(51001, requested),
+                    )
+                    .unwrap();
+                    let first = read_reply(&mut client);
+                    if let Some(worker) = simulated_worker {
+                        assert_eq!(first, (status::OK, vec![]));
+                        proto::write_request(
+                            &mut client,
+                            op::U_SMIME_SYNTHETIC_OPEN,
+                            &selection.encode(),
+                        )
+                        .unwrap();
+                        let refused = read_reply(&mut client);
+                        samples[index].push(started.elapsed().as_micros());
+                        assert_eq!(refused, (status::DENIED, vec![0]));
+                        worker.join().unwrap();
+                    } else {
+                        samples[index].push(started.elapsed().as_micros());
+                        assert_eq!(first, (status::DENIED, vec![]));
+                    }
+                    serve.join().unwrap();
+                });
+            }
+        }
+        for (kind, mut readings) in ["admission", "worker-refusal"].into_iter().zip(samples) {
+            readings.sort_unstable();
+            println!(
+                "LEGACY_FAILURE_TIMING class={kind} samples=5 min_us={} median_us={} max_us={}",
+                readings[0], readings[2], readings[4]
+            );
+        }
     }
 
     enum Revoke {
@@ -594,29 +820,15 @@ mod tests {
 
     fn revoke_during_worker_read(revoke: Revoke) {
         let dir = tempfile::tempdir().unwrap();
-        let mut state = unlocked(dir.path());
-        let registry = dir.path().join("app-registry");
-        std::fs::write(
-            &registry,
-            format!(
-                "51000 {SYNTHETIC_USER} org.atrium.mail {} persona=work\n",
-                "08".repeat(32)
-            ),
-        )
-        .unwrap();
-        state.legacy_smime_registry = Some(registry.clone());
+        let fixture = configured_fixture(dir.path());
+        let registry = fixture.legacy_smime_registry.clone().unwrap();
+        let state = Mutex::new(fixture);
         let user = body(|w| w.str(SYNTHETIC_USER));
         let root = body(|w| {
             w.str(SYNTHETIC_USER);
             w.raw(&ROOT);
         });
-        assert_eq!(
-            state.handle(&Label::Vestibulum, op::V_CREATE, &root).status,
-            status::OK
-        );
-        let state = Mutex::new(state);
-
-        let (ui, client) = UnixStream::pair().unwrap();
+        let (ui, mut client) = socket_pair();
         let (control, mut worker) = UnixStream::pair().unwrap();
         let (lifetime, mut launcher) = UnixStream::pair().unwrap();
         let bound = Some(Duration::from_secs(5));
@@ -626,19 +838,21 @@ mod tests {
 
         std::thread::scope(|scope| {
             let read = scope.spawn(|| {
-                serve_open(&state, &ui, &51000u32.to_le_bytes(), || {
-                    Ok((control, lifetime))
-                })
+                serve_open(
+                    &state,
+                    &ui,
+                    &reservation(51000, Selection::fixture()),
+                    || Ok((control, lifetime)),
+                )
             });
-            worker.write_all(wire::WORKER_READY).unwrap();
-            assert_eq!(wire::read(&mut worker, wire::MAX_CERT).unwrap(), CERT);
-            assert_eq!(wire::read(&mut worker, wire::MAX_CMS).unwrap(), CMS);
-            let env = mail_smime::envelope::enveloped_data(CMS).unwrap();
-            let (fingerprint, size, wrapped) =
-                mail_smime::envelope::legacy_recipient(&env, CERT).unwrap();
-            worker.write_all(&[1, size as u8]).unwrap();
-            worker.write_all(&fingerprint).unwrap();
-            wire::write(&mut worker, &wrapped, 512).unwrap();
+            assert_eq!(read_reply(&mut client), (status::OK, vec![]));
+            proto::write_request(
+                &mut client,
+                op::U_SMIME_SYNTHETIC_OPEN,
+                &Selection::fixture().encode(),
+            )
+            .unwrap();
+            let size = worker_header(&mut worker);
             let mut candidate = Zeroizing::new(vec![0; size]);
             worker.read_exact(&mut candidate).unwrap();
             assert!(
@@ -661,14 +875,16 @@ mod tests {
                         status::OK
                     );
                 }
-                Revoke::Disconnect => drop(client),
+                Revoke::Disconnect => client.shutdown(Shutdown::Both).unwrap(),
                 Revoke::Registry => std::fs::write(&registry, "").unwrap(),
             }
             assert_eq!(worker.read(&mut [0]).unwrap(), 0);
             assert_eq!(launcher.read(&mut [0]).unwrap(), 0);
-            let reply = read.join().unwrap();
-            assert_eq!(reply.status, status::DENIED);
-            assert!(reply.body.bytes().is_empty());
+            let result = read.join().unwrap();
+            if !matches!(revoke, Revoke::Disconnect) {
+                result.unwrap();
+                assert_eq!(read_reply(&mut client), (status::DENIED, vec![]));
+            }
             assert!(state.lock().unwrap().legacy_smime_pending.is_none());
         });
     }

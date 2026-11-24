@@ -1119,8 +1119,11 @@ omits that action and role grant. The signed gate checks Work
 cancellation, approved Work opening, and approved Personal refusal in
 one private overlay, with clean worker exit for both approved scenarios.
 
-The synthetic Settings action resolves its outcomes locally, without
-selecting or refreshing the regular reader. The signed gate seeds an
+The synthetic Settings action selects the local fixture account and
+message and hashes the complete stored bytes before requesting the
+sheet. Arca shows the account and binds the press to this one
+snapshot. The action resolves its outcomes locally, without selecting
+or refreshing the regular reader. The signed gate seeds an
 unread copy of the fixture in each persona and checks its flag and the
 mailbox-operation queue after each sheet outcome. In the regular
 reader, opening an unread conversation queues a Seen update

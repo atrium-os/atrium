@@ -132,6 +132,7 @@ struct Embed {
     attached: bool,
     /// In picture-in-picture: out of the slot, in Forum's `pip` layer.
     pip: bool,
+    legacy_selection_sent: bool,
     smime_scope: Option<Option<String>>,
     smime_picker: Option<SmimePicker>,
     to_child: Rate,
@@ -590,7 +591,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
     let e = Embed {
         role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
         child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, island: with_fetch.then(Default::default), media_ready: false, attached: false, pip: false,
-        smime_scope, smime_picker: None,
+        legacy_selection_sent: false, smime_scope, smime_picker: None,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
@@ -643,7 +644,7 @@ fn request_smime_picker(shared: &Arc<Shared>, conn: ConnId, uid: u32, sheet: Emb
         role, parent: conn, parent_uid: uid, parent_window: window, z: 0, child, child_uid,
         spawned: false, audio_ticket: None, child_window: None, rect: None, visible: true,
         bound: false, binding_generation: 0, island: None, media_ready: false, attached: false, pip: false,
-        smime_scope: None,
+        legacy_selection_sent: false, smime_scope: None,
         smime_picker: Some(SmimePicker { sheet, opened: false, delivered: false, finished: false }),
         to_child: Rate::default(), to_parent: Rate::default(),
     };
@@ -766,6 +767,16 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
     };
     if s.bytes.len() > catalogue::MAX_MESSAGE {
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
+    }
+    if e.role.name == "smime-legacy-read" {
+        // One account, message and SHA-256 digest per sheet. Arca validates the binding.
+        if e.bound || e.legacy_selection_sent || fd.is_some() || s.bytes.len() != 44 {
+            return Err(Reply::Refused { reason: refusal::MALFORMED });
+        }
+        e.legacy_selection_sent = true;
+        let e = &st.embeds[&s.embed];
+        st.to_child(e, ChildEvent::Message { embed: s.embed, bytes: s.bytes });
+        return Ok(Reply::Ok);
     }
     if e.smime_scope.is_some() {
         return Err(Reply::Refused { reason: refusal::MALFORMED });

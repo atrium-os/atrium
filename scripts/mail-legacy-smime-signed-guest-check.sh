@@ -21,7 +21,7 @@ run_suite() {
     shift 2
     timeout 30 "./$bin" --list "$@" | awk '/: test$/ { sub(/: test$/, ""); print }' | sort >"$bin.expected"
     test "$(wc -l <"$bin.expected" | tr -d ' ')" = "$count"
-    if ! timeout 90 "./$bin" "$@" --test-threads=1 >"$bin.out" 2>&1; then
+    if ! timeout 90 "./$bin" "$@" --test-threads=1 --show-output >"$bin.out" 2>&1; then
         cat "$bin.out"
         return 1
     fi
@@ -29,10 +29,11 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 12 server::smime
+run_suite arcad-unit 15 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
-run_suite mail-preview-unit 1 legacy_preview
+run_suite mail-preview-unit 2 legacy_preview
+run_suite limen-binding-test 1 legacy_sheet_accepts_one_selection_before_attach
 
 app=org.atrium.mail
 person=maillegacyfixture
@@ -294,11 +295,12 @@ test "$personaluid" != "$workuid"
 echo "MAIL_SIGNED_PERSONAL_UID=$personaluid"
 scenario closed approve personal "$personaluid" 2
 
-awk '$2 == "ui" && $3 == "op=0x006f" {
+awk '$2 == "ui" && $3 == "op=0x0067" && $5 == "status=1" { abandoned++ }
+$2 == "ui" && $3 == "op=0x006f" {
     if ($5 == "status=0") opened++
     else if ($5 == "status=1") closed++
     else unexpected++
-} END { exit !(opened == 1 && closed == 1 && !unexpected) }' /var/db/arca/audit.log
+} END { exit !(abandoned == 1 && opened == 1 && closed == 1 && !unexpected) }' /var/db/arca/audit.log
 echo MAIL_LEGACY_ARCA_DISPATCH_OK
 for outcome in opened closed; do
     test "$(grep -xc 'LEGACY_JAILED_WORKER_EXIT=0' "$d/$outcome.log")" = 1

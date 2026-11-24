@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use arca_store::{RootKey, Store};
-use arcad::server::integration::{self, Prepared, FAILURE};
+use arcad::server::integration::{self, Prepared, Selection, FAILURE, FIXTURE_ACCOUNT};
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
 use limen::client::Child;
@@ -41,15 +41,32 @@ fn closed() -> io::Error {
     io::Error::other(FAILURE)
 }
 
-fn open_via_arcad(uid: u32, mut still_approved: impl FnMut() -> bool) -> io::Result<bool> {
+fn reserve_via_arcad(uid: u32, selection: Selection) -> io::Result<UnixStream> {
     use arcad::proto;
     let mut stream = UnixStream::connect("/atrium/sockets/arca/arcad.sock")?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = uid.to_le_bytes().to_vec();
+    request.extend_from_slice(&selection.encode());
+    proto::write_request(&mut stream, proto::op::U_SMIME_SYNTHETIC_RESERVE, &request)?;
+    let (status, body) = proto::read_reply(&mut stream)?;
+    if status != proto::status::OK || !body.as_ref().is_empty() {
+        return Err(closed());
+    }
+    Ok(stream)
+}
+
+fn open_via_arcad(
+    mut stream: UnixStream,
+    selection: Selection,
+    mut still_approved: impl FnMut() -> bool,
+) -> io::Result<bool> {
+    use arcad::proto;
     stream.set_read_timeout(Some(Duration::from_secs(24)))?;
     proto::write_request(
         &mut stream,
         proto::op::U_SMIME_SYNTHETIC_OPEN,
-        &uid.to_le_bytes(),
+        &selection.encode(),
     )?;
     let mut reply = stream.try_clone()?;
     std::thread::scope(|scope| {
@@ -93,6 +110,7 @@ fn draw(
     scale: f32,
     persona: &str,
     content: Option<&str>,
+    selected: bool,
 ) -> io::Result<()> {
     let t = if win
         .appearance()
@@ -122,7 +140,11 @@ fn draw(
         24.,
         88.,
         t.text_secondary(),
-        format!("Local message in {persona}"),
+        if selected {
+            format!("{FIXTURE_ACCOUNT} · {persona}")
+        } else {
+            format!("Local message in {persona}")
+        },
     )?;
     match content {
         Some(text) => {
@@ -175,6 +197,35 @@ impl Sheet<'_> {
         if !valid_parent(self.registry, self.uid, self.publisher, persona) {
             return Err(closed());
         }
+        let mut reservation = if store.is_none() {
+            let until = Instant::now() + Duration::from_secs(5);
+            let selection = loop {
+                if Instant::now() >= until {
+                    return Err(closed());
+                }
+                match self
+                    .child
+                    .poll(Duration::from_millis(50))
+                    .map_err(|_| closed())?
+                {
+                    Some(ChildEvent::Message { embed, bytes }) if embed == self.embed => {
+                        break Selection::decode(&bytes)
+                            .filter(|s| *s == Selection::fixture())
+                            .ok_or_else(closed)?;
+                    }
+                    Some(ChildEvent::Detaching { embed } | ChildEvent::Suspended { embed })
+                        if embed == self.embed =>
+                    {
+                        return Err(closed())
+                    }
+                    _ => {}
+                }
+            };
+            Some((reserve_via_arcad(self.uid, selection)?, selection))
+        } else {
+            None
+        };
+        let selected = reservation.is_some();
         let mut win = Connection::connect(fresco)?;
         let id = win.window_create(
             620,
@@ -189,7 +240,7 @@ impl Sheet<'_> {
         let font = Font::open(&mut win);
         let scale = win.window_scale(id);
         let shown_persona = persona.unwrap_or("Personal");
-        draw(&mut win, font, scale, shown_persona, None)?;
+        draw(&mut win, font, scale, shown_persona, None, selected)?;
         let until = Instant::now() + Duration::from_secs(5);
         let token = loop {
             if Instant::now() >= until {
@@ -278,7 +329,8 @@ impl Sheet<'_> {
                     })?
                     .map(|text| text.as_str() == integration::SYNTHETIC_PREVIEW)
                 } else if still_approved() {
-                    open_via_arcad(self.uid, || {
+                    let (stream, selection) = reservation.take().ok_or_else(closed)?;
+                    open_via_arcad(stream, selection, || {
                         still_approved()
                             && matches!(
                                 win.poll_event(),
@@ -302,11 +354,19 @@ impl Sheet<'_> {
                         scale,
                         shown_persona,
                         Some(integration::SYNTHETIC_PREVIEW),
+                        selected,
                     )?;
                     b"opened"
                 }
                 _ => {
-                    draw(&mut win, font, scale, shown_persona, Some(FAILURE))?;
+                    draw(
+                        &mut win,
+                        font,
+                        scale,
+                        shown_persona,
+                        Some(FAILURE),
+                        selected,
+                    )?;
                     b"closed"
                 }
             };

@@ -897,10 +897,16 @@ only a typed outcome. The isolated provider gate uses a fixed test
 message, a synthetic launch registry and a private persistent Arca
 store. The signed gate instead launches Mail from a content-signed
 bundle and Arca from its normal service manifest with a gate-only
-override. The fixture UI spends the Fresco press and sends the parent
-UID through Arca’s trusted-UI socket dispatch. Arca resolves the
-expected publisher, disposable user and persona through Portcullis’s
-live launch registry. Its operation accepts only the built-in test
+override. Mail snapshots the local account ID, message ID and SHA-256
+of the complete stored RFC 5322 bytes. Limen forwards one selection
+before the sheet attaches. The fixture UI reserves that tuple with
+Arca on a dedicated trusted-UI connection before drawing the sheet.
+Arca cross-checks it against the built-in account and message, and
+resolves the publisher, disposable user and persona through Portcullis’s
+live launch registry. The approved Fresco press redeems the exact tuple
+on that same connection. A changed tuple, an unexpected frame, a
+disconnect or expiry ends the reservation. Arca accepts no second
+redemption on that socket. The operation accepts only the built-in test
 certificate and ciphertext, and the private candidate goes directly
 from Arca to the worker. The daemon retains the launch socket until
 Portcullis reports the worker’s exit, including when the worker reads
@@ -963,10 +969,13 @@ timing and the production path for received messages remain unverified.
 Keep legacy receiving disabled. Before enablement, bind the real
 immutable received message, selected account and signed launch to a
 one-use approval and extend the fixture's revocation checks to that
-path. Verify consistent failure replies, local timing and contention,
-and zero legacy-outcome-dependent network and mailbox effects on the
-whole message path. Use a synthetic gate with controlled comparisons
-across failure stages.
+path. The staged timing check repeats two fixed synthetic cases and
+reports the minimum, median and maximum at the trusted Arca transport
+boundary. It compares an admission refusal with a Personal key lookup
+refusal after a simulated worker handshake. These samples do not cover
+the Fresco gesture, Portcullis startup, or cryptographic failure timing.
+Whole-path verification still needs consistent replies, local timing and
+contention checks, and zero outcome-dependent network and mailbox effects.
 
 See [OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
 and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).

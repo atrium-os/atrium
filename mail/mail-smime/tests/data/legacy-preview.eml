@@ -1,0 +1,17 @@
+From: test@fixture.invalid
+To: legacy-preview@fixture.invalid
+Subject: Synthetic legacy S/MIME message
+MIME-Version: 1.0
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="smime.p7m"
+
+MIAGCSqGSIb3DQEHA6CAMIACAQAxggFiMIIBXgIBADBGMC4xGjAYBgNVBAMMEU9wZW5TU0wgVGVz
+dCBSb290MRAwDgYDVQQKDAdGaXh0dXJlAhQgoy4Y7BO26q2ePmsNxlvBP8Xy8zANBgkqhkiG9w0B
+AQEFAASCAQCzAku46UziEeS83BMCYCByl0y0eD/kzJT1uSWYRtmo3SMr6AxuW3W5BxwzdKk7dDHE
+AWmqD92ieHx3VtBqVPj6+2Rcgb/nrCqVXd+YIeItjc2nLFelbr/HuQdXSxLbu/7LrLV8BUVfaLcu
+oF8PE2NGQLYjEV4XD3t/fzuXySkHMZrRh7NbzbF3Y/6BHlWpxoJl3ZvT7IkhUJ4R7jStZ8LS9hvc
+NyPT7PqZRXQ7AUs5VX4/oiTrX1/+0tA02oNK88MrvZ4xYKKcEy1Lg9HdjyREa1+1YlSt7FCv4FWF
+1wqmLmnlWY1NW+2CzZYabfD6A6+VJQW+fS7x5jI6mThzkWHWMIAGCSqGSIb3DQEHATAdBglghkgB
+ZQMEASoEEFqANLiySgy2pgY43icvRbeggAQgyEEAQ8JUS6Cys2QJ5tfWmloKdjd0LFXC/kiGGzNE
+HTcEEOLQZocKIxkNxIt1bXuG0LYAAAAAAAAAAAAA

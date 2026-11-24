@@ -22,7 +22,7 @@ path = "src/bin/atrium-mail.rs"
 
 [features]
 # Signed disposable bundle only. The installed production manifest omits the role.
-legacy-smime-integration = []
+legacy-smime-integration = ["mail-smime/legacy-receive-prototype"]
 
 [dependencies]
 mail-office-copy = { path = "../mail-office-copy", default-features = false }

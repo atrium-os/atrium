@@ -1,9 +1,10 @@
 //! Regression witness used only by the signed, disposable legacy sheet gate.
 //! A legacy preview never opens Mail's normal reader or queues a mailbox action.
 
+use mail_smime::legacy_wire::{self, Selection};
 use mail_store::{flag, FolderId, Incoming, Role, Store};
 
-const ACCOUNT: &str = "legacy-preview@fixture.invalid";
+const ACCOUNT: &str = legacy_wire::FIXTURE_ACCOUNT;
 const SUBJECT: &str = "Synthetic legacy S/MIME message";
 
 pub(super) struct PreviewFixture {
@@ -29,10 +30,7 @@ impl PreviewFixture {
         if store.count(inbox)? != 0 {
             return Ok(fixture);
         }
-        let raw = mail_compose::smime::enveloped(
-            b"From: test@fixture.invalid\r\nTo: legacy-preview@fixture.invalid\r\nSubject: Synthetic legacy S/MIME message\r\nMIME-Version: 1.0\r\n",
-            include_bytes!("../../../../mail-smime/tests/data/env.der"),
-        );
+        let raw = legacy_wire::fixture_message();
         let blob = store.put_blob(&raw)?;
         store.write(|w| {
             w.put(
@@ -57,6 +55,24 @@ impl PreviewFixture {
         Ok(fixture)
     }
 
+    pub(super) fn selection(&self) -> Option<Selection> {
+        let rows = self.store.list(self.inbox, 0, 2).ok()?;
+        let [row] = rows.as_slice() else { return None };
+        let message = self.store.message(row.msg).ok()?;
+        if !self
+            .store
+            .accounts()
+            .ok()?
+            .into_iter()
+            .any(|(id, account)| id == message.account && account.name == ACCOUNT)
+        {
+            return None;
+        }
+        let raw = self.store.blob(&message.full?).ok()?;
+        let selection = Selection::for_message(message.account, row.msg, &raw);
+        (selection == Selection::fixture()).then_some(selection)
+    }
+
     pub(super) fn still_unread(&self) -> Result<bool, mail_store::Error> {
         let rows = self.store.list(self.inbox, 0, 2)?;
         Ok(
@@ -69,6 +85,19 @@ impl PreviewFixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_selection_uses_the_stored_account_and_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let fixture = PreviewFixture::seed(&store).unwrap();
+        assert_eq!(fixture.selection(), Some(Selection::fixture()));
+        store.write(|w| w.remove(fixture.inbox, 1)).unwrap();
+        assert!(fixture.selection().is_none());
+        let replacement = PreviewFixture::seed(&store).unwrap();
+        assert!(replacement.still_unread().unwrap());
+        assert!(replacement.selection().is_none());
+    }
 
     #[test]
     fn preview_fixture_detects_a_seen_change() {

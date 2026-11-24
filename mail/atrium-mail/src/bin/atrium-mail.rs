@@ -760,7 +760,18 @@ fn main() {
                     } else {
                         "smime-provision"
                     };
-                    e.borrow_mut().request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()
+                    let mut e = e.borrow_mut();
+                    #[cfg(feature = "legacy-smime-integration")]
+                    if let Some(preview) = &legacy_preview {
+                        let selection = preview.selection()?;
+                        let id = e.request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()?;
+                        if e.send(id, selection.encode().to_vec()).is_err() {
+                            let _ = e.detach_embed(id);
+                            return None;
+                        }
+                        return Some(id);
+                    }
+                    e.request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()
                 });
                 sw.smime = request.map(|id| (id, Some(Instant::now() + Duration::from_secs(12))));
                 sw.s.smime_note(request.is_none().then_some("Arca’s S/MIME sheet is unavailable."));

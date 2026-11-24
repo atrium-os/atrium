@@ -960,6 +960,31 @@ fn fetched_island_reports_follow_attachment_direction_and_lifecycle() {
     assert_eq!(refused(child.emit(id, title)), refusal::MALFORMED);
 }
 
+#[cfg(feature = "legacy-smime-integration")]
+#[test]
+fn legacy_sheet_accepts_one_selection_before_attach() {
+    let w = World::new();
+    const MAIL_UID: u32 = 4111;
+    const W_MAIL: WindowToken = [25; 16];
+    w.fresco.0.lock().unwrap().0.insert(W_MAIL, MAIL_UID);
+    w.shared.set_system_uid(catalogue::ARCA, ARCA_UID);
+    w.shared.set_smime_mail(Box::new(|uid| (uid == MAIL_UID).then(|| Some("work".into()))));
+    let mut arca = provider(w.connect(ARCA_UID), "smime-legacy-read").unwrap();
+    let mut mail = w.parent(MAIL_UID);
+    let sheet = mail.request("smime-legacy-read", W_MAIL).unwrap();
+    assert!(matches!(next_c(&mut arca), ChildEvent::Attach { embed, .. } if embed == sheet));
+    assert_eq!(next_c(&mut arca), ChildEvent::ParentPersona { embed: sheet, persona: Some("work".into()) });
+    assert_eq!(refused(mail.send(sheet, vec![0; 43])), refusal::MALFORMED);
+    let selected = vec![1; 44];
+    mail.send(sheet, selected.clone()).unwrap();
+    assert_eq!(next_c(&mut arca), ChildEvent::Message { embed: sheet, bytes: selected });
+    assert_eq!(refused(mail.send(sheet, vec![2; 44])), refusal::MALFORMED);
+    mail.place(sheet, Some([0.0, 0.0, 620.0, 350.0])).unwrap();
+    arca.ready(sheet, W_ARCA).unwrap();
+    assert_eq!(next_p(&mut mail), ParentEvent::Attached { embed: sheet });
+    assert_eq!(refused(mail.send(sheet, vec![3; 44])), refusal::MALFORMED);
+}
+
 #[test]
 fn smime_key_picker_routes_a_single_read_only_file_to_arca() {
     use std::io::{Read, Write};
