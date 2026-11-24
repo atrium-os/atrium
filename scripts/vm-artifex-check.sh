@@ -10,7 +10,11 @@
 # Runs on the HOST after cloud-vm.sh up (QEMU fork, TCG_CPU=Haswell-noTSX).
 # CDEV=<c-dev layer tree> installs it first (build-c-dev-layer.sh's output);
 # RUST=<Rust layer tree> installs that too, makes proj a Rust workspace and
-# checks rust-analyzer on rs/main.rs.
+# checks rust-analyzer on rs/main.rs. Its bin/cargo-atrium must be main's
+# (cross-build sdk/cargo-atrium; FRESH_LAYERS=1 reinstalls the layer).
+# FUZZ_VENDOR=<dir with vendor/> (default ~/work/fuzz-vendor: libfuzzer-sys
+# and what it needs, from `cargo vendor`) adds a photos project: fuzzing its
+# core finds a crash, and Move it moves the parser into a worker.
 # BUNDLE=1 installs Artifex and the Terminal the platform-SDK way instead:
 # `cargo atrium bundle --sign` on the host makes each .insula (programs,
 # library closure, loader), and the VM unarchives and installs it through
@@ -42,7 +46,7 @@ export CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd --sysroot=
 export CXXFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd --sysroot=$S"
 xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2) || { echo "build of $1 failed"; echo "artifex: 1 failed"; exit 1; }; }
 xb frescod "--bin frescod"
-xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bin portcullis --bin opifex"
+xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-volumes --bin portcullisd --bin portcullis --bin opifex --bin atrium-jaild --bin atrium-volumes"
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex --bin artifex"
@@ -57,7 +61,8 @@ for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
 done
 V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
-         portcullis/target/$TARGET/release/opifex atrium-term-socket/target/$TARGET/release/atrium-term-socket \
+         portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/atrium-jaild portcullis/target/$TARGET/release/atrium-volumes \
+         atrium-term-socket/target/$TARGET/release/atrium-term-socket \
          stoa/target/$TARGET/release/stoad artifex/target/$TARGET/release/artifex; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "artifex: 1 failed"; exit 1; }
 done
@@ -86,6 +91,10 @@ set -e
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
 install -m 0755 $B/portcullis /usr/local/bin/portcullis
 install -m 0755 $B/opifex /usr/local/bin/opifex
+# portcullisd speaks to jaild and atrium-volumes: main's go with main's portcullisd.
+for d in atrium-jaild atrium-volumes; do
+  cmp -s $B/\$d /usr/local/bin/\$d || { install -m 0755 $B/\$d /usr/local/bin/\$d; service \$d restart >/dev/null 2>&1 || true; }
+done
 test -f /root/of-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/of-key.pem
 mkdir -p /etc/atrium/publishers; openssl ec -in /root/of-key.pem -pubout -out /etc/atrium/publishers/of-gate.pem 2>/dev/null
 sign() { openssl dgst -sha256 -sign /root/of-key.pem -out \$1/atrium.toml.sig \$1/atrium.toml; }
@@ -210,6 +219,12 @@ fi
 [ -z "${KEEP_RUST:-}" ] || RUST=kept
 
 echo "=== the workspace"
+# The fuzz harness's crates (libfuzzer-sys and what it needs), vendored on
+# the host: the workspace has no network. FUZZ_VENDOR=<dir with vendor/>.
+FUZZ_VENDOR=${FUZZ_VENDOR:-$HOME/work/fuzz-vendor}
+if [ -d "$FUZZ_VENDOR/vendor" ]; then
+    (cd "$FUZZ_VENDOR" && tar -czf /tmp/artifex-vendor.tgz vendor) && scp -q $K -P 2222 /tmp/artifex-vendor.tgz root@localhost:$B/vendor.tgz
+fi
 V "rm -rf $B/c-app; mkdir -p $B/c-app" && scp -q $K -P 2222 "$ROOT"/sdk/templates/c-app/*.tmpl root@localhost:$B/c-app/
 V "service atrium-jaild status >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1; sleep 1; test -S /var/run/atrium/jaild.sock" && ok "jaild is up" || bad "no jaild"
 W=/home/alice/.atrium/workspaces
@@ -243,6 +258,17 @@ if [ -f /usr/share/mk/atrium.app.mk ]; then
     sed 's/{{name}}/app/g' \$T/Makefile.tmpl > $W/proj/work/app/Makefile
     sed 's/{{name}}/app/g; s/{{title}}/App/g; s/{{id}}/org.example.app/g' \$T/atrium.toml.tmpl > $W/proj/work/app/atrium.toml
     sed 's/{{name}}/app/g; s/{{title}}/App/g' \$T/main.c.tmpl > $W/proj/work/app/app.c
+fi
+# A Rust app whose core reads album bytes itself (a parser in the core):
+# the fuzz panel's core crash, and Move into a worker.
+if [ -f $B/vendor.tgz ]; then
+    P=$W/proj/work/photos
+    mkdir -p \$P/src \$P/.cargo
+    tar -xzf $B/vendor.tgz -C \$P
+    printf '[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = "vendor"\n' > \$P/.cargo/config.toml
+    printf '[package]\nname = "photos"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n\n[package.metadata.atrium.fuzz."core:album"]\nfunction = "photos::read_album"\nabout = "album bytes"\n' > \$P/Cargo.toml
+    printf '[app]\nid = "org.example.photos"\nentry = "bin/photos"\n' > \$P/atrium.toml
+    printf 'pub fn read_album(b: &[u8]) {\n    if b.len() > 3 && b[0] == 0x41 {\n        let n = b[1] as usize;\n        let _ = b[n];\n    }\n}\n' > \$P/src/lib.rs
 fi
 chown -R alice:files-alice $W/proj/work; chmod -R g+rwX $W/proj/work
 EOS
@@ -325,6 +351,16 @@ if V "test -f $W/proj/work/app/Makefile"; then
     # The question's Run button (ui.rs: over the output, right-aligned).
     GAP=8 press 980 520
     DEV=dev.alice.proj.org.example.app
+    # Under TCG a busy guest (rust-analyzer still indexing) can take more
+    # than the press's 1 s lifetime to reach frescod: ask once more then.
+    n=0
+    while [ $n -lt 3 ] && ! waitstate "note=Some(\"Running $DEV\")" 120 \
+        && [ "$(V "grep -c 'proj/app for alice REFUSED: the press was too long ago' $LOG")" -gt $n ]; do
+        n=$((n + 1)); echo "  (the press expired on the way: again, $n)"
+        waitstate 'running=None' 120
+        ctrl 0x15
+        waitstate 'ask=Some("app")' 300 && GAP=8 press 980 520
+    done
     waitstate "note=Some(\"Running $DEV\")" 120 && ok "a press on Run starts it as a dev app ($DEV)" || bad "run: $(state) $(V "grep -i 'Run\|REFUSED' $LOG | tail -3")"
     waitstate 'running=None' 60 && ok "and make run ends" || bad "make run still running: $(state)"
     sleep 15
@@ -378,11 +414,11 @@ fi
 echo "=== New project"
 if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
     press 962 52               # the bar's New project (ui.rs)
-    waitstate 'templates=[2-9]' 300 && ok "New project lists the SDK's templates ($(state | sed 's/.*templates=//'))" || bad "templates: $(state)"
+    waitstate 'templates=[2-9]' 300 && ok "New project lists the SDK's templates ($(state | sed 's/.*templates=\([0-9]*\).*/\1/'))" || bad "templates: $(state)"
     shot artifex-11-new-project
     # The form (ui.rs: 460 wide, centred; rows 40 apart from 72 down): c-app,
     # the name field, Create.
-    N=$(state | sed 's/.*templates=//')
+    N=$(state | sed 's/.*templates=\([0-9]*\).*/\1/')
     CY=$(( (660 - 220 - 40 * N) / 2 + 30 ))
     press 590 $((CY + 72 + 40 + 18))
     press 590 $((CY + 72 + 40 * N + 12 + 14 + 16))
@@ -392,6 +428,39 @@ if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; the
     check "with its Makefile and made.c" "1" "$(V "test -f $W/proj/work/made/Makefile -a -f $W/proj/work/made/made.c && echo 1")"
 else
     echo "  (no cargo-atrium in proj: skipped)"
+fi
+
+echo "=== fuzz and Move into a worker"
+if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/toolchains/rust/bin/cargo-atrium atrium 2>&1 | grep -q 'worker add'"; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    for r in photos photos/src photos/src/lib.rs; do
+        ROW=$(rows | grep -n "^$r\$" | cut -d: -f1)
+        [ -n "$ROW" ] || { bad "no row $r: $(state)"; break; }
+        press 100 $((89 + 22 * (ROW - 1)))
+    done
+    waitstate 'tabs=\[[^]]*photos/src/lib.rs' 20 && ok "photos/src/lib.rs opens" || bad "lib.rs: $(state)"
+    waitstate 'fuzz=Some((false, "core:album", 0' 300 && ok "the fuzz panel lists core:album" || bad "fuzz list: $(state)"
+    # Fuzz tab, then Start fuzzing (ui.rs: tabs from the panel's left, the
+    # button 220 from the right).
+    press 622 485
+    press 985 485
+    # libFuzzer and the harness build in the workspace under TCG: slow.
+    waitstate 'fuzz=Some((true, "core:album", [1-9][0-9]*, true' 3600 && ok "fuzzing finds the crash in the core" || bad "fuzz: $(state) $(V "tail -5 $B/artifex.log")"
+    shot artifex-12-fuzz-crash
+    press 985 485              # Stop fuzzing
+    # The fix line's Move it button (row 2 of the panel, right-aligned).
+    press 1072 544
+    waitstate 'moving=true' 300 && ok "Move it previews cargo atrium worker add" || bad "preview: $(state)"
+    shot artifex-13-move-preview
+    check "the preview writes nothing" "0" "$(V "grep -c 'workers' $W/proj/work/photos/atrium.toml")"
+    press 980 520              # the preview's Move
+    waitstate 'note=Some("Moved crate::read_album into the worker read-album")' 300 && ok "Move makes the worker" || bad "move: $(state)"
+    check "atrium.toml has it" "1" "$(V "grep -c '^\[\[workers\]\]' $W/proj/work/photos/atrium.toml")"
+    waitstate 'comp=Some(("org.example.photos", 1,' 60 && ok "the composition panel shows the worker" || bad "composition: $(state)"
+    waitstate 'fuzz=Some((false, "[^"]*worker:read-album' 300 && ok "and the fuzz panel has worker:read-album" || bad "fuzz targets: $(state)"
+    shot artifex-14-moved
+else
+    echo "  (no vendored fuzz crates (FUZZ_VENDOR), or no cargo-atrium with worker add in the Rust layer: skipped)"
 fi
 
 echo "=== terminal"

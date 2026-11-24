@@ -428,6 +428,12 @@ impl Engine {
     }
 
     fn set_project(&mut self, p: &str, s: &mut State) {
+        if s.project != p {
+            // Another project's targets and crashes aren't this one's.
+            self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. } | Job::FuzzList { .. }));
+            s.fuzz = None;
+            s.moving = None;
+        }
         s.project = p.to_string();
         let dir = if p.is_empty() { self.root.clone() } else { self.root.join(p) };
         s.tasks = tasks::detect(&dir, p);
