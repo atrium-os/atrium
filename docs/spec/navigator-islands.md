@@ -696,8 +696,46 @@ zero. With the headless test seat set to `mailgate`, Choragus attributed a
 peaked at 21,087 (signed 16-bit PCM). The same capture with no active seat
 was silent. Evidence is in
 `~/atrium-vm/evidence/navigator-i4-media-selection-20261124/`.
-Next test sustained delivery beyond the initial buffered interval and a
-chapter seek on the provider video.
+
+#### Sustained YouTube playback and chapter seeking
+
+On the same signed-out embed the first buffer ended at 20.0145 s. LibWeb
+kept reporting enough data even after the native clock passed that point.
+The clientless playback manager never started LibWeb’s playback-position
+timer. The attached native MediaSource now starts and stops that timer with
+playback, so LibWeb updates readiness and runs its normal media event
+algorithm. The engine allows 15 s for a bounded CDN reply. At 5 s the
+engine could close the channel while the broker was writing a successful
+response. The provider grant, byte limits and exact delivery origin still
+apply.
+
+The installed demo links to Opening (5 s) and One minute (60 s). After
+metadata arrives, the provider island reports media readiness and forwards
+each typed chapter seek to its video element. The broker accepts seeks
+during an open stream. Starting a decoder epoch clears the old clock
+sample. Sequential decoding waits at a gap until more samples arrive,
+including after seeking back into the first of two buffered ranges.
+
+Three observations from the final JIT-off arm64 Capsicum runs on Tessera:
+
+- Without a chapter press, the video reached 58.633 s with 60.0145 s
+  buffered. The native counter reached frame 1,024 at PTS 34.100 s. The
+  12-second guest Lyra capture peaked at 21,945 in signed 16-bit stereo.
+- The 60 s link was pressed at 2.4 s with 3.200 s buffered. The new
+  range started at 56.733 s. The player acknowledged 60 s and decoded
+  frames at 60.633 s and 64.900 s. Guest PCM peaked at 21,271.
+- The 5 s link returned to the first range. The player decoded a frame
+  at 8.600 s and continued past 24 s as the opening range refilled.
+  Guest PCM peaked at 21,087. Before the gap fix playback jumped from
+  the opening section into the previously fetched one-minute section.
+
+The run used the existing 12-POST grant and reached its limit. Full-video
+completion and continuous frame presentation remain unverified. The
+next playback gate should exercise bounded grant renewal and measure
+presentation cadence against Lyra’s clock. The redacted event sequences,
+guest WAVs and frames are in
+`~/atrium-vm/evidence/navigator-i4-sustained-20261124/`.
+
 
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter

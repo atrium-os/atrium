@@ -647,7 +647,7 @@ impl Worker {
                         feed.video = Some(t.index);
                         // The track is announced once its first picture says
                         // its bit depth (see `probe_video`).
-                        self.video = Some(Video { track: t.clone(), dec, cdm_decodes, store: Store::default(), feed: fi, buffers: Vec::new(), free: VecDeque::new(), format: Format::Nv12, dims: (width, height), drained: false, probed: false, drain_tries: 0 });
+                        self.video = Some(Video { track: t.clone(), dec, cdm_decodes, store: Store::new(self.mode == Some(Mode::Feed)), feed: fi, buffers: Vec::new(), free: VecDeque::new(), format: Format::Nv12, dims: (width, height), drained: false, probed: false, drain_tries: 0 });
                     }
                     Err(decode::Error::TooBig) => return self.fail(err::TOO_BIG),
                     Err(_) => return self.fail(err::UNSUPPORTED),
@@ -665,7 +665,7 @@ impl Worker {
                 if let Ok(dec) = decode::audio(t) {
                     feed.audio = Some(t.index);
                     let (rate, channels) = (dec.rate(), dec.channels());
-                    self.audio = Some(Audio { dec, store: Store::default(), feed: fi, ring: None, pcm: Vec::new(), pcm_pts: 0, drop_before: self.pending_drop.take() });
+                    self.audio = Some(Audio { dec, store: Store::new(self.mode == Some(Mode::Feed)), feed: fi, ring: None, pcm: Vec::new(), pcm_pts: 0, drop_before: self.pending_drop.take() });
                     let _ = self.send(Record::AudioTrack { track: self.feeds[fi].0, codec: codec_id(t.codec), rate, channels });
                 } else if self.video.is_none() {
                     return self.fail(err::UNSUPPORTED);

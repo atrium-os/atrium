@@ -265,6 +265,7 @@ fn a_feed_seek_waits_for_its_segment() {
     assert!(!frames.borrow().is_empty(), "plays what it has");
     // Seek ahead of it; the next segment takes longer than the watchdog.
     p.seek(1_500_000_000);
+    assert!(p.position_ns().is_none(), "old frames cannot move the new seek clock");
     let n0 = frames.borrow().len();
     pump(&mut p, crate_watchdog() + Duration::from_millis(1500));
     assert_eq!(frames.borrow().len(), n0, "nothing shown while the target isn't there");

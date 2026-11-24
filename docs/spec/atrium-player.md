@@ -146,7 +146,7 @@ The policy is the one Lyra's spec settled (§12.1).
 - **DOM seeks.** Navigator tags each `SeekTo` with a request ID. The player
   associates it with the decoder's seek epoch and returns `Seeked` on that
   epoch's acknowledgement, including while paused. A later DOM seek
-  supersedes the pending request. Frame presentation is checked separately.
+  supersedes the pending request. Starting a new epoch clears the last frame timestamp so it cannot overwrite the acknowledged position while the player waits for data. Frame presentation is checked separately.
 - **Rate and volume** (`SetRate`, `SetVolume`) are applied in the supervisor to the PCM it
   writes to Lyra. Rates other than 1 need time-stretching to keep pitch. v1 does this with a
   simple WSOLA stretch in the supervisor, so the worker's output never changes with rate.
@@ -170,7 +170,7 @@ The policy is the one Lyra's spec settled (§12.1).
   OpenH264 gets.
 - **Seeking** within buffered data goes to the keyframe at or before the target and decodes
   forward silently. A seek outside it sends `Seeking` (from native controls) or `Waiting`, and
-  the parent fetches.
+  the parent fetches. During sequential playback a segment feed waits at a gap in decode time. An explicit seek can select a different buffered range.
 
 ## 7. The window and controls
 

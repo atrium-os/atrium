@@ -113,7 +113,21 @@
  
                  // 4. Set the readyState attribute to "open".
                  // 5. Queue a task to fire an event named sourceopen at the MediaSource.
-@@ -3121,8 +3184,18 @@
+@@ -2395,7 +2458,12 @@
+ {
+     static constexpr int playback_position_update_interval_ms = 20;
+ 
+-    if (!m_playback_manager || !m_playback_manager->is_playing()) {
++    bool playing = m_playback_manager && m_playback_manager->is_playing();
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source)
++        playing = m_has_started_playback && !paused();
++#endif
++    if (!playing) {
+         if (m_playback_position_update_timer)
+             m_playback_position_update_timer->stop();
+         return;
+@@ -3121,8 +3189,18 @@
      // -> If HTMLMediaElement's buffered does not contain a TimeRanges for the current playback position:
      auto current_time = m_playback_manager->current_time();
      auto ranges = m_playback_manager->buffered_time_ranges().time_ranges;
@@ -133,7 +147,7 @@
  
      if (available_data == Media::AvailableData::None
          || (available_data == Media::AvailableData::Current && !current_range.has_value())) {
-@@ -3466,6 +3539,20 @@
+@@ -3466,6 +3544,20 @@
      }));
  
      // 11. Set the current playback position to the new playback position.
@@ -154,6 +168,28 @@
      if (m_playback_manager) {
          AK::Duration new_playback_position_as_duration;
          if (new_playback_position == m_duration)
+@@ -3550,6 +3642,10 @@
+         m_media_stream_playback->play();
+ 
+     m_has_started_playback = true;
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source)
++        start_or_stop_playback_position_update_timer();
++#endif
+     update_audio_play_state();
+ 
+     update_screen_wake_lock();
+@@ -3594,6 +3690,10 @@
+ 
+     if (m_paused) {
+         m_has_started_playback = false;
++#ifdef ATRIUM_I4_VIDEO
++        if (m_attached_media_source)
++            start_or_stop_playback_position_update_timer();
++#endif
+ 
+         if (m_playback_manager)
+             m_playback_manager->pause();
 --- a/Libraries/LibWeb/HTML/HTMLMediaElement.h
 +++ b/Libraries/LibWeb/HTML/HTMLMediaElement.h
 @@ -188,6 +188,15 @@

@@ -154,7 +154,9 @@ unsafe fn fixture_request(
     if client.open(open).is_err() {
         return 0;
     }
-    let until = Instant::now() + Duration::from_secs(5);
+    // A CDN response can outlast the local fixture timeout while the TLS
+    // worker and broker are still delivering the bounded body.
+    let until = Instant::now() + Duration::from_secs(if media { 15 } else { 5 });
     let mut total = None;
     let mut used = 0;
     let output = unsafe { std::slice::from_raw_parts_mut(out, capacity) };

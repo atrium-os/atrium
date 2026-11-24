@@ -270,7 +270,7 @@ impl Session {
                     duration: self.media.duration,
                 })
             }
-            Request::Seek(t) if self.ended && limen::media_player::finite_secs(t) => {
+            Request::Seek(t) if self.media.ready_state >= 1 && limen::media_player::finite_secs(t) => {
                 self.media.seek(t).map_err(dom)?;
                 self.flush()?;
                 self.until(|m| !m.seeking)?;

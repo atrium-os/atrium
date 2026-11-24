@@ -654,6 +654,8 @@ impl<S: Sink> Player<S> {
         self.show_one = self.paused;
         self.epoch += 1;
         self.ended = false;
+        // Clock reports after the acknowledgement must belong to this seek.
+        self.last_pts = None;
         self.show_from = Some(t_ns);
         // The worker owes `Seeked` at once; frames too for a whole resource.
         // A feed's frames wait on the parent's appends, however slow the

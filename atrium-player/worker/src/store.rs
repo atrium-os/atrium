@@ -14,6 +14,8 @@ const DEFAULT_DUR_NS: i64 = 40_000_000;
 pub struct Store {
     s: VecDeque<Sample>,
     cursor: usize,
+    segment_feed: bool,
+    decoded_end: Option<i64>,
     bytes: u64,
     /// A seek to a time not yet buffered (a segment feed): nothing is
     /// decoded until appends cover it, then the cursor goes there.
@@ -21,6 +23,16 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn new(segment_feed: bool) -> Self {
+        Self { segment_feed, ..Self::default() }
+    }
+
+    fn waiting_for_data(&self) -> bool {
+        self.pending.is_some() || self.decoded_end.zip(self.s.get(self.cursor)).is_some_and(|(end, next)| {
+            next.dts_ns > end.saturating_add(GAP_NS)
+        })
+    }
+
     pub fn push(&mut self, s: Sample) {
         self.bytes += s.data.len() as u64;
         match self.s.back() {
@@ -46,7 +58,7 @@ impl Store {
     }
 
     pub fn next(&self) -> Option<&Sample> {
-        if self.pending.is_some() {
+        if self.waiting_for_data() {
             return None;
         }
         self.s.get(self.cursor)
@@ -54,23 +66,30 @@ impl Store {
 
 
     pub fn next_mut(&mut self) -> Option<&mut Sample> {
-        if self.pending.is_some() {
+        if self.waiting_for_data() {
             return None;
         }
         self.s.get_mut(self.cursor)
     }
 
     pub fn advance(&mut self) {
+        if self.segment_feed {
+            if let Some(s) = self.s.get(self.cursor) {
+                let duration = s.duration_ns.map_or(DEFAULT_DUR_NS, |d| d.min(10_000_000_000) as i64);
+                self.decoded_end = Some(s.dts_ns.saturating_add(duration));
+            }
+        }
         self.cursor = (self.cursor + 1).min(self.s.len());
     }
 
     pub fn rewind(&mut self) {
+        self.decoded_end = None;
         self.cursor = 0;
     }
 
     /// Samples not yet decoded.
     pub fn ahead(&self) -> usize {
-        if self.pending.is_some() {
+        if self.waiting_for_data() {
             return 0;
         }
         self.s.len() - self.cursor
@@ -90,6 +109,7 @@ impl Store {
 
     pub fn clear(&mut self) {
         self.s.clear();
+        self.decoded_end = None;
         self.cursor = 0;
         self.bytes = 0;
         self.pending = None;
@@ -122,6 +142,7 @@ impl Store {
         let Some(k) = self.s.iter().enumerate().filter(|(_, x)| x.key && x.pts_ns <= t_ns).map(|(i, _)| i).next_back() else {
             return false;
         };
+        self.decoded_end = None;
         self.cursor = k;
         true
     }
@@ -184,6 +205,25 @@ mod tests {
 
     fn s(pts_ms: i64, key: bool) -> Sample {
         Sample { track: 0, pts_ns: pts_ms * 1_000_000, dts_ns: pts_ms * 1_000_000, duration_ns: Some(40_000_000), key, data: vec![0; 10], crypto: None }
+    }
+
+    #[test]
+    fn feed_waits_at_a_gap_after_seeking_back() {
+        let mut st = Store::new(true);
+        for t in [0, 40, 240, 280] { st.push(s(t, true)); }
+        assert!(st.seek(240_000_000));
+        st.advance();
+        assert!(st.seek(0));
+        st.advance();
+        st.advance();
+        assert!(st.next().is_none());
+        assert!(st.next_mut().is_none());
+        assert_eq!(st.ahead(), 0);
+        for t in [80, 120, 160, 200, 240] {
+            st.push(s(t, true));
+            assert_eq!(st.next().unwrap().pts_ns, t * 1_000_000);
+            st.advance();
+        }
     }
 
     #[test]

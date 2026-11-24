@@ -20,7 +20,7 @@
 #include <LibWeb/Layout/RenderDocument.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <sys/resource.h>
-#ifdef ATRIUM_I4_VIDEO
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 #include <LibWeb/HTML/HTMLMediaElement.h>
 #endif
 
@@ -90,7 +90,7 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
     auto doc = client.page().local_traversable()->active_document();
     auto tree = doc->dom_tree_version();
     auto text = doc->character_data_version();
-#ifdef ATRIUM_I4_VIDEO
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
     bool video_reported = false;
 #endif
 #ifdef ATRIUM_I1_COUNTER
@@ -103,9 +103,13 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #endif
         float x = 0, y = 0;
         auto action = navigator_page_pointer(scene, &x, &y);
-#ifdef ATRIUM_I4_VIDEO
+#if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
         if (!video_reported || action == 4) {
+#ifdef ATRIUM_I4_YOUTUBE
+            auto element = doc->query_selector(u"#movie_player video"_utf16).release_value_but_fixme_should_propagate_errors();
+#else
             auto element = doc->get_element_by_id(u"clip"sv);
+#endif
             if (element && is<Web::HTML::HTMLMediaElement>(*element)) {
                 auto& video = as<Web::HTML::HTMLMediaElement>(*element);
                 if (video.ready_state() >= Web::HTML::HTMLMediaElement::ReadyState::HaveMetadata) {
