@@ -383,6 +383,29 @@ pub fn app_label(uid: u32) -> String {
     }
 }
 
+/// Whether the dev build `app` (as [`app_label`] gives it) runs under the
+/// debugger: portcullisd keeps a file named for it in [`DEBUGGING_DIR`] while
+/// it does (dev-tools.md §7.3). Read again at most every second.
+pub fn debugging(app: &str) -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static SEEN: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+    let mut g = SEEN.lock().unwrap();
+    if g.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(1)) {
+        let dir = std::env::var("FRESCOD_DEBUGGING_DIR").unwrap_or_else(|_| DEBUGGING_DIR.into());
+        let names = std::fs::read_dir(dir).map(|d| d.flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .map(|n| n.to_ascii_lowercase().bytes().filter(|&c| fresco_split::chrome::origin_char(c)).map(char::from).collect())
+            .collect()).unwrap_or_default();
+        *g = Some((Instant::now(), names));
+    }
+    g.as_ref().is_some_and(|(_, n)| n.iter().any(|x| x == app))
+}
+
+/// portcullisd's marks for dev builds under the debugger (in the
+/// read-only /var/db/atrium frescod already has).
+pub const DEBUGGING_DIR: &str = "/var/db/atrium/debugging";
+
 /// `f` on the launch registry, read again every 5 s, and sooner (at most
 /// every 200 ms) for a uid it doesn't know: a window composed once, just
 /// after its app was registered, must not keep the stale answer.
@@ -456,6 +479,9 @@ pub struct Sheet {
     /// Not a sheet: a window of a dev build (homes.md §5.3, W5), framed
     /// the same way in amber so it is never taken for the real app.
     pub dev: bool,
+    /// A dev build started under the debugger (dev-tools.md §7.3, M10):
+    /// its tag says so.
+    pub debugging: bool,
     /// Not a sheet: a window of a named persona (personas.md §7), framed
     /// in that persona's colour and tagged with its name (`app` holds the
     /// name). No app draws it: the persona is the launch registry's.
@@ -470,9 +496,10 @@ impl Sheet {
         } else if self.dev {
             // dev.<person>.<workspace>.<id>
             let rest = self.app.strip_prefix("dev.").unwrap_or(&self.app);
+            let what = if self.debugging { "dev build, debugging" } else { "dev build" };
             match rest.splitn(3, '.').collect::<Vec<_>>()[..] {
-                [_, ws, id] => format!("dev build: {id} from {ws}"),
-                _ => format!("dev build: {rest}"),
+                [_, ws, id] => format!("{what}: {id} from {ws}"),
+                _ => format!("{what}: {rest}"),
             }
         } else {
             format!("system: {}", self.app)
@@ -606,8 +633,10 @@ mod tests {
 
     #[test]
     fn a_dev_build_is_tagged_with_its_workspace() {
-        let d = Sheet { rect: [0, 40, 100, 100], app: "dev.alice.scratch.org.example.hello".into(), dev: true, persona: None };
+        let d = Sheet { rect: [0, 40, 100, 100], app: "dev.alice.scratch.org.example.hello".into(), dev: true, debugging: false, persona: None };
         assert_eq!(d.tag(), "dev build: org.example.hello from scratch");
+        let d = Sheet { debugging: true, ..d };
+        assert_eq!(d.tag(), "dev build, debugging: org.example.hello from scratch");
         assert_eq!(d.color(), ISLAND_COLOR);
     }
 
@@ -741,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_sheet_is_framed_and_tagged_above_and_its_parent_dimmed() {
-        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false, persona: None };
+        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false, debugging: false, persona: None };
         assert_eq!(sh.tag(), "system: org.atrium.scrinium");
         let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
         let before = c.rects.len();
@@ -768,7 +797,7 @@ mod tests {
     #[test]
     fn a_persona_window_is_framed_in_its_colour_and_the_strip_names_it() {
         let blue = [0x25, 0x63, 0xeb];
-        let w = Sheet { rect: [100, 200, 700, 600], app: "work".into(), dev: false, persona: Some(blue) };
+        let w = Sheet { rect: [100, 200, 700, 600], app: "work".into(), dev: false, debugging: false, persona: Some(blue) };
         assert_eq!(w.tag(), "work");
         let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
         let before = c.rects.len();

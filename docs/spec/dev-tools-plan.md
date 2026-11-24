@@ -410,8 +410,13 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   an installed app can't be seen or attached; a core read there). The gate's
   crashing app gets a tmpfs overlay: FreeBSD 16-CURRENT fails every core on ZFS
   with EFAULT, GENERIC too. Not done: Run under debugger from the Terminal's
-  `atrium-run` and Artifex's DAP launch (both can send `WorkspaceDebug`), the frame
-  tag ("dev build, debugging").
+  `atrium-run` and Artifex's DAP launch (both can send `WorkspaceDebug`).
+  The frame tag (2026-11-24): while a dev build runs under lldb-server, portcullisd keeps
+  an empty file named for it in `/var/db/atrium/debugging` (removed when it exits and
+  at portcullisd's start); frescod, which already mounts `/var/db/atrium` read-only,
+  tags that build's amber frame "dev build, debugging: <id> from <workspace>".
+  `scripts/vm-debug-check.sh` checks the mark appears and goes (27/27; it sets lldb's
+  gdb-remote packet timeout to 60 s for TCG).
 - **M11 (L+).** Artifex v0 as a new app `artifex/` (org.atrium.artifex,
   `workspace-exec`, `embeds = ["terminal"]`): a code-grid text widget in Pergola
   (rope buffer, monospace fast path, multi-cursor) (P4); tree-sitter grammars in a

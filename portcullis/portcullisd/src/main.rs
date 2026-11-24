@@ -89,6 +89,8 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some(egress::BIND_ARG) {
         egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""), args.get(3).map(String::as_str));
     }
+    // A debug run doesn't outlive portcullisd: no stale "debugging" tag.
+    dev::clear_debugging();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -3157,10 +3159,13 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
         };
         drop(listener);
         eprintln!("portcullisd: debug of {id}: a debugger connected");
+        // Its windows say so while it runs (frescod reads the mark).
+        dev::mark_debugging(&id, true);
         match launch::launch_debug(&id, &o, conn) {
             Ok(out) => eprintln!("portcullisd: {id} (debug) exited {:?}", out.exit_code),
             Err(e) => eprintln!("portcullisd: {id} (debug) failed at {}: {}", e.stage(), e.message()),
         }
+        dev::mark_debugging(&id, false);
     });
     let address = format!("127.0.0.1:{port}");
     let program = format!("{}/{}/{}", dev::APPS_DIR, p.id, m.entry());

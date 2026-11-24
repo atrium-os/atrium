@@ -15,6 +15,9 @@
 #   - lldb in Scratch connects (gdb-remote), a breakpoint on a function
 #     stops there with its argument visible, and continuing runs the app
 #     to its end; it ran in its own jail, as its own uid, under lldb-server;
+#   - while it runs under lldb-server portcullisd marks it in
+#     /var/db/atrium/debugging (frescod tags its windows "dev build,
+#     debugging" from that), and the mark goes when it exits;
 #   - the address is gone once used, and isn't reachable from the host;
 #   - an installed app can't be debugged: lldb in Scratch can't attach to
 #     it, nor see it;
@@ -127,9 +130,12 @@ check "the app hasn't started" "" "$(V "grep debug-before $LOG")"
 check "Scratch sees the bundle where the host has it" "1" "$(V "jexec $J test -x /var/lib/atrium/apps/$ID/dbg && echo 1")"
 check "and only its own bundles" "" "$(V "jexec $J ls /var/lib/atrium/apps" | grep -v '^dev\.alice\.scratch\.')"
 check "not reachable from the host" "refused" "$(V "nc -z -w 2 127.0.0.1 ${ADDR#*:} && echo open || echo refused")"
+DM=/var/db/atrium/debugging
+V "i=0; while [ \$i -lt 240 ]; do test -e $DM/$ID && { echo seen; break; }; sleep 0.5; i=\$((i+1)); done" > /tmp/debug-mark.$$ 2>&1 &
+MARKW=$!
 out=$(ws_sh scratch <<SH
 cd ~/work/dbg
-lldb -b -o 'target create $PROG' -o 'gdb-remote $ADDR' -o 'breakpoint set -n marker' -o 'continue' \
+lldb -b -o 'settings set plugin.process.gdb-remote.packet-timeout 60' -o 'target create $PROG' -o 'gdb-remote $ADDR' -o 'breakpoint set -n marker' -o 'continue' \
      -o 'frame variable answer' -o 'bt 2' -o 'continue' 2>&1
 SH
 )
@@ -143,6 +149,9 @@ case "$out" in *"debug-after 42"*) ok "its output reached lldb: debug-after 42" 
 case "$(V "grep -E '$ID (\\(debug\\) )?exited|starts under lldb-server' $LOG | head -2 | tr '\n' ' '")" in
     *"starts under lldb-server"*) ok "it ran under lldb-server, in its own jail" ;; *) bad "log: $(V "grep -i debug $LOG | tail -5")" ;; esac
 case "$(V "grep 'launching $ID as uid' $LOG | tail -1")" in *"as uid 5"*) ok "as its own uid: $(V "grep 'launching $ID as uid' $LOG | tail -1 | sed 's/.*as uid \([0-9]*\).*/\1/'")" ;; *) bad "uid line" ;; esac
+wait $MARKW
+check "marked as debugging while it ran" "seen" "$(cat /tmp/debug-mark.$$)"; rm -f /tmp/debug-mark.$$
+check "and unmarked once it exited" "" "$(V "i=0; while [ \$i -lt 20 ] && [ -n \"\$(ls $DM 2>/dev/null)\" ]; do sleep 1; i=\$((i+1)); done; ls $DM 2>/dev/null")"
 check "the address is gone once used" "refused" "$(V "jexec $J nc -z -w 2 127.0.0.1 ${ADDR#*:} && echo open || echo refused")"
 
 echo "=== an installed app can't be debugged"

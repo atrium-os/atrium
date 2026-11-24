@@ -39,6 +39,38 @@ use std::path::{Path, PathBuf};
 use crate::workspace;
 
 pub const APPS_DIR: &str = "/var/lib/atrium/apps";
+
+/// While a dev build runs under the debugger, an empty file named for it
+/// here; frescod reads the folder (read-only) and tags the build's windows
+/// "dev build, debugging" (dev-tools.md §7.3, M10). Cleared at start.
+pub const DEBUGGING_DIR: &str = "/var/db/atrium/debugging";
+
+/// Mark `id` (a dev build's, checked) as under the debugger, or not.
+pub fn mark_debugging(id: &str, on: bool) {
+    if !id.starts_with("dev.") || id.contains('/') || id.starts_with("dev..") {
+        return;
+    }
+    let f = Path::new(DEBUGGING_DIR).join(id);
+    let r = if on {
+        fs::create_dir_all(DEBUGGING_DIR)
+            .and_then(|_| fs::set_permissions(DEBUGGING_DIR, fs::Permissions::from_mode(0o755)))
+            .and_then(|_| fs::write(&f, b""))
+    } else {
+        fs::remove_file(&f)
+    };
+    if let Err(e) = r {
+        eprintln!("portcullisd: debugging mark for {id}: {e}");
+    }
+}
+
+/// No debug run survives a restart: drop every mark.
+pub fn clear_debugging() {
+    if let Ok(d) = fs::read_dir(DEBUGGING_DIR) {
+        for e in d.flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
 const MANIFEST_MAX: u64 = 64 * 1024;
 const ENTRY_MAX: u64 = 512 * 1024 * 1024;
 

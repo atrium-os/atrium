@@ -1635,7 +1635,7 @@ fn render_one_frame(
             if let Some(at) = windows.iter().position(|w| w.id == sheet) {
                 windows.insert(at, chrome::dim_layer(chrome::dim_id(sheet), pr));
             }
-            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid), dev: false, persona: None });
+            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid), dev: false, debugging: false, persona: None });
         }
         /* Dev builds (homes.md §5.3): every window of one framed in amber
          * and tagged with the workspace it came from. */
@@ -1647,7 +1647,8 @@ fn render_one_frame(
             let app = chrome::app_label(uid);
             let Some(&(_, r)) = rects.iter().find(|(l, _)| *l == id) else { continue };
             if app.starts_with("dev.") {
-                out.push(chrome::Sheet { rect: r, app, dev: true, persona: None });
+                let debugging = chrome::debugging(&app);
+                out.push(chrome::Sheet { rect: r, app, dev: true, debugging, persona: None });
             } else if let Some((name, colour)) = chrome::persona_of(uid) {
                 /* A named persona's window (personas.md §7): framed in its
                  * colour and tagged with its name, from the registry; with
@@ -1656,7 +1657,7 @@ fn render_one_frame(
                     Some(r) => (r.label(&name), if r.warns() { route::DOWN_COLOUR } else { colour }),
                     None => (name, colour),
                 };
-                out.push(chrome::Sheet { rect: r, app: tag, dev: false, persona: Some(colour) });
+                out.push(chrome::Sheet { rect: r, app: tag, dev: false, debugging: false, persona: Some(colour) });
             }
         }
         out
