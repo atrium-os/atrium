@@ -1,6 +1,6 @@
 # App, workspace and console jails through jaild
 
-**Status: PROPOSED 2026-11-25** (codebase review H3, option (a), chosen by
+**Status: ACCEPTED 2026-11-25, J0 in progress** (codebase review H3, option (a), chosen by
 Shankar 2026-11-24). Nothing here is built yet.
 
 ## 1. Why
@@ -93,29 +93,24 @@ anything the validator does not know is refused.
 
 ## 5. Order of work
 
-Each step lands on its own and passes its gate before the next one starts.
+One path only (Shankar, 2026-11-25): there is no flag and no fallback. Each
+kind of jail moves to jaild in the commit that deletes its jail(8) code.
 
 | Step | What | Gate |
 |---|---|---|
-| J0 | jaild: `groups`, `JailInfo`, stdio `ExecInJail`, named device grants, `develop`/`terminal`/`app` classes; validator tests for each refusal | jaild validator tests on the host; the existing service gates still pass in a VM |
-| J1 | `to_create_request` with the comparison test; no caller yet | host tests |
-| J2 | consoles and empty consoles through jaild (`terminal` class) | `vm-console-check.sh` |
-| J3 | workspaces through jaild (`develop` class) | `vm-workspace-check.sh`, `vm-artifex-check.sh` |
-| J4 | apps through jaild, behind `PORTCULLIS_JAILD_LAUNCH=1` for a side-by-side week | Sheets, Navigator, Mail cloud gates (`cloud-vm.sh test`), `vm-personas-check.sh`, `lyra-vm-check.sh` |
-| J5 | default on; delete the jail(8) lane, `render_jail_conf` and the `jls`/`jail -r` calls; update portcullis.md §2 and §3.3 | all of J2–J4 again |
+| J0 | jaild: `groups`, `JailInfo`, stdio `ExecInJail`, typed device classes, `develop`/`terminal`/`app` classes; validator tests for each refusal | jaild validator tests on the host; the existing service gates still pass in a VM |
+| J1 | `to_create_request`, refusing anything it cannot map | host tests over every sample manifest |
+| J2 | consoles, workspaces and apps through jaild in one sweep; `render_jail_conf`, `write_jail_conf` and the `jls`/`jail -r`/`jail_attach` code deleted; portcullis.md §2 and §3.3 updated | `vm-console-check.sh`, `vm-workspace-check.sh`, `vm-artifex-check.sh`, the Sheets, Navigator and Mail cloud gates (`cloud-vm.sh test`), `vm-personas-check.sh`, `lyra-vm-check.sh` |
 
-J4 touches the launch path that the Sheets, Navigator and VPN threads use
-every day, so it starts only when the coordinator says those threads are at
-a pause. The flag lets either lane run without a revert.
+J2 changes the launch path that the Sheets, Navigator and VPN threads use
+every day, so it lands in one push that the coordinator announces.
 
-## 6. Open questions
+## 6. Decisions (2026-11-25)
 
-1. **The registry check (§3 item 1).** Should jaild refuse an app uid
-   that the launch registry does not bind to that app? Recommended: yes.
-   It costs one read-only file in jaild's jail.
-2. **Root inside workspace and console jails.** Today these run as the
-   jail's uid 0 (with no mounts, raw sockets or children). jaild would
-   keep allowing that only for `develop` and `terminal`. Recommended: yes
-   for now. Running them as the person's uid is a separate change.
-3. **The side-by-side flag in J4.** Recommended: one week, then delete
-   the old lane in J5.
+1. jaild refuses an app uid that the launch registry does not bind to that
+   app and owner (§3 item 1).
+2. Workspace and console jails keep running as the jail's uid 0 for now,
+   with no mounts, raw sockets or children; jaild allows that only for the
+   `develop` and `terminal` classes. Running them as the person's uid is a
+   separate change.
+3. One path only: no side-by-side flag (§5).
