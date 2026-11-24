@@ -336,6 +336,34 @@ pub fn render_zones(tunnels: &[(&[String], &[Ipv4Addr], bool)]) -> String {
     out
 }
 
+/// unbound's forward.conf: the root's forwarders as atrium-net set them
+/// live, so a restart of unbound starts with them (vpn.md §5.5). `off` (a
+/// full tunnel without DNS servers) leaves no root zone: unbound resolves
+/// from the roots, through the tunnel. Entries with `@853#name` are DNS over
+/// TLS, and then only TLS. Anything that isn't an address is skipped.
+pub fn render_forward(forwarders: &[String]) -> String {
+    let mut out = String::from("# Written by atrium-net: the root's DNS forwarders (vpn.md §5.5). Do not edit.\n");
+    let ok = |x: &&String| {
+        let (addr, rest) = x.split_once('@').map_or((x.as_str(), None), |(a, r)| (a, Some(r)));
+        let host = addr.split('%').next().unwrap_or("");
+        let scope = addr.split_once('%').map_or(true, |(_, i)| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit()));
+        let tls = rest.map_or(true, |r| r.split_once('#').is_some_and(|(p, n)| p == "853" && valid_domain(n)));
+        host.parse::<std::net::IpAddr>().is_ok() && scope && tls
+    };
+    let list: Vec<&String> = forwarders.iter().filter(ok).collect();
+    if list.is_empty() {
+        return out;
+    }
+    out.push_str("forward-zone:\n    name: \".\"\n");
+    if list.iter().any(|x| x.contains('@')) {
+        out.push_str("    forward-tls-upstream: yes\n");
+    }
+    for a in list {
+        out.push_str(&format!("    forward-addr: {a}\n"));
+    }
+    out
+}
+
 pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
     let out = phys.unwrap_or("atrium_egress");
     let mut r = String::new();
@@ -404,6 +432,16 @@ mod zone_tests {
         assert!(t.contains("server:\n    domain-insecure: \"corp.example.\"\n    domain-insecure: \"lab.corp.example.\"\n"), "{t}");
         assert!(!t.contains("include") && !t.contains("10.99.0.1") && !t.contains("\"local."), "{t}");
         assert_eq!(render_zones(&[]).lines().count(), 1, "only the header");
+    }
+
+    #[test]
+    fn the_roots_forwarders_are_written_as_set() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let t = render_forward(&v(&["10.98.0.1", "fe80::1%2", "bad\ninclude: /etc", "fe80::2%vtnet0"]));
+        assert!(t.ends_with("forward-zone:\n    name: \".\"\n    forward-addr: 10.98.0.1\n    forward-addr: fe80::1%2\n"), "{t}");
+        let t = render_forward(&v(&["1.1.1.1@853#one.one.one.one", "9.9.9.9@853#x\"y"]));
+        assert!(t.contains("    forward-tls-upstream: yes\n    forward-addr: 1.1.1.1@853#one.one.one.one\n") && !t.contains("9.9.9.9"), "{t}");
+        assert_eq!(render_forward(&v(&["off"])).lines().count(), 1, "only the header");
     }
 }
 

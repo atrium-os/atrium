@@ -912,6 +912,7 @@ g "set -e
     cp /tmp/atrium-net/unbound-atrium-local.conf /var/unbound/conf.d/atrium-local.conf
     service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
     cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
+    [ -f /tmp/atrium-net/forward.conf.saved ] || cp /var/unbound/forward.conf /tmp/atrium-net/forward.conf.saved
     printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
     route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > /tmp/atrium-net/default.saved
     pkill -f 'atrium-net -v' 2>/dev/null || true; sleep 1
@@ -924,6 +925,7 @@ lanback() {
         for a in \$(ifconfig vtnet1 inet6 | awk '/inet6 fd77:/{print \$2}'); do ifconfig vtnet1 inet6 \$a -alias; done
         g=\$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n \"\$g\" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default \$g; }
         [ -f /tmp/atrium-net/resolv.conf.saved ] && cp /tmp/atrium-net/resolv.conf.saved /etc/resolv.conf
+        [ -f /tmp/atrium-net/forward.conf.saved ] && cp /tmp/atrium-net/forward.conf.saved /var/unbound/forward.conf
         true"
 }
 stl() { g "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep 'name=vtnet1'; }

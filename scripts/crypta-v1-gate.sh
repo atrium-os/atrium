@@ -56,6 +56,7 @@ cleanup() {
         g=\$(cat $G/default.saved 2>/dev/null); [ -n \"\$g\" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default \$g; }
         ifconfig vtnet0 group atrium_egress; ifconfig vtnet1 -group atrium_egress 2>/dev/null
         [ -f $G/resolv.conf.saved ] && cp $G/resolv.conf.saved /etc/resolv.conf
+        [ -f $G/forward.conf.saved ] && cp $G/forward.conf.saved /var/unbound/forward.conf
         true" || true
 }
 
@@ -153,6 +154,7 @@ setup() {
         sysrc local_unbound_enable=YES >/dev/null
         service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
         cp /etc/resolv.conf $G/resolv.conf.saved
+        [ -f $G/forward.conf.saved ] || cp /var/unbound/forward.conf $G/forward.conf.saved
         printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
         route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > $G/default.saved
         pkill -f 'atrium-net -v' 2>/dev/null || true
@@ -268,11 +270,26 @@ run)
     "$V" "$CTL set name=full block=0" >/dev/null || fail "set block=0"
     "$V" "$CTL up name=full" >/dev/null || fail "up full (no block)"
     i=0; until [ "$(tunnel handshake | sed -n 1p)" = 1 ]; do i=$((i + 1)); [ $i -lt 30 ] || fail "no handshake"; sleep 1; done
+    # Without the block nothing stops a lookup to the LAN's DNS, so a
+    # restarted unbound must start with the tunnel's servers: atrium-net
+    # keeps them in forward.conf as well as live (vpn.md §5.5).
+    i=0; until "$V" 'grep -q "forward-addr: 10.99.0.1" /var/unbound/forward.conf'; do i=$((i + 1)); [ $i -lt 10 ] || fail "forward.conf: $("$V" 'cat /var/unbound/forward.conf')"; sleep 1; done
+    "$V" 'grep -q 10.88.0.53 /var/unbound/forward.conf' && fail "the LAN's DNS still in forward.conf" || ok "forward.conf holds only the tunnel's DNS"
+    lanctl seen-reset >/dev/null
+    r=$("$V" "service local_unbound restart >/dev/null 2>&1
+        local-unbound-control list_forwards | awk '\$1 == \".\"' | grep -q 10.99.0.1 && echo at-once || echo missing
+        drill restarted.example.test @127.0.0.1 | awk '/^restarted.example.test/{print \$5}'")
+    [ "$(echo "$r" | sed -n 1p)" = at-once ] && ok "unbound restarted under the full tunnel: the root goes to the tunnel's DNS at once" || fail "restart under the full tunnel: $r"
+    [ "$(echo "$r" | sed -n 2p)" = 203.0.113.80 ] && ok "the first lookup after the restart went through the tunnel" || fail "lookup after the restart: $r"
+    l=$(leaks)
+    case " $l " in *":53="*|*"10.88.0.53"*) fail "DNS to the LAN across the restart: $l" ;; *) ok "no DNS to the LAN across the restart ($l)" ;; esac
     lanctl seen-reset >/dev/null
     "$V" 'ping6 -c 2 -t 3 fd77:0:0:88::1; ping6 -c 1 -t 3 fd77:0:0:88::53' >/dev/null 2>&1 || true
     l=$(leaks)
     case " $l " in *" ip6/"*) fail "IPv6 around the full tunnel: $l" ;; *) ok "no IPv6 out the LAN with a v4-only full tunnel ($l)" ;; esac
     "$V" "$CTL down name=full" >/dev/null || fail "down full (no block)"
+    i=0; until "$V" 'grep -q "forward-addr: 10.88.0.53" /var/unbound/forward.conf'; do i=$((i + 1)); [ $i -lt 10 ] || fail "forward.conf after down: $("$V" 'cat /var/unbound/forward.conf')"; sleep 1; done
+    ok "down: forward.conf back to the LAN's DNS"
     lanctl seen-reset >/dev/null
     "$V" 'ping6 -c 1 -t 3 fd77:0:0:88::1' >/dev/null 2>&1 || true
     case " $(leaks) " in *" ip6/58 fd77:0:0:88::1="*) ok "IPv6 flows again once it is down (control)" ;; *) fail "v6 control: $(leaks)" ;; esac

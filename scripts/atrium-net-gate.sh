@@ -29,6 +29,8 @@ cleanup() {
         ifconfig vtnet1 inet6 ifdisabled
         g=$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n "$g" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default $g; }
         [ -f /tmp/atrium-net/resolv.conf.saved ] && cp /tmp/atrium-net/resolv.conf.saved /etc/resolv.conf
+        # atrium-net keeps the root forwarders in forward.conf: put the setup one back.
+        [ -f /tmp/atrium-net/forward.conf.saved ] && cp /tmp/atrium-net/forward.conf.saved /var/unbound/forward.conf
         true' || true
 }
 fail() {
@@ -92,6 +94,7 @@ n0)
         sysrc local_unbound_enable=YES >/dev/null
         service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
         cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
+        [ -f /tmp/atrium-net/forward.conf.saved ] || cp /var/unbound/forward.conf /tmp/atrium-net/forward.conf.saved
         printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
         route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > /tmp/atrium-net/default.saved
         daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock
