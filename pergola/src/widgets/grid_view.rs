@@ -131,6 +131,10 @@ pub struct CellView {
     pub marks: u8,
     /// Text size, px, when not the grid's own.
     pub size: Option<f32>,
+    /// A number format's `*` fill: the byte offset in `text` of the character
+    /// repeated to the cell's width. What comes before it sits at the left
+    /// edge, what comes after at the right (Accounting's sign and number).
+    pub fill_at: Option<usize>,
 }
 
 /// One step of a cell's indent, px.
@@ -292,7 +296,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None, fill_at: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -2308,6 +2312,27 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         }
         return;
     }
+    if let Some((left, fill, right)) = cv.fill_at.and_then(|at| split_fill(&cv.text, at)) {
+        let avail = cw - 2.0 * PAD - lead;
+        let (wl, wr) = (crate::text::measure_chars(left, &style), crate::text::measure_chars(right, &style));
+        let wf = crate::text::measure_chars(fill, &style);
+        if wl + wf + wr <= avail {
+            let y = cy + line_top(cv.valign, ch, lh);
+            let x0 = cx + PAD + lead;
+            let x1 = cx + q((cw - PAD - wr) as f64);
+            // The fill character as many times as fit between the two.
+            let n = if fill.trim().is_empty() || wf <= 0.0 { 0 } else { (((x1 - x0 - wl) / wf).floor().max(1.0) as usize).min(MAX_FILL_REPEAT) };
+            let mid = fill.repeat(n);
+            if !left.is_empty() {
+                cell_text(ctx, Rect::new(x0, y, wl, lh), left.to_string(), style.clone(), cv.marks);
+            }
+            if n > 0 {
+                cell_text(ctx, Rect::new(x0 + wl, y, wf * n as f32, lh), mid, style.clone(), cv.marks);
+            }
+            cell_text(ctx, Rect::new(x1, y, wr, lh), right.to_string(), style, cv.marks);
+            return;
+        }
+    }
     let (shown, w) = fit_text(cv, cw - 2.0 * PAD - lead, &style);
     let tx0 = match cv.align {
         CellAlign::Left => cx + PAD + lead,
@@ -2315,6 +2340,17 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
     cell_text(ctx, Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), shown, style, cv.marks);
+}
+
+/// The most times a `*` fill's character is repeated in one cell.
+const MAX_FILL_REPEAT: usize = 512;
+
+/// `text` around its fill character at byte `at`: before, the character, after.
+/// `None` when `at` is not a character in `text`.
+fn split_fill(text: &str, at: usize) -> Option<(&str, &str, &str)> {
+    let rest = text.get(at..)?;
+    let n = rest.chars().next()?.len_utf8();
+    Some((&text[..at], &rest[..n], &rest[n..]))
 }
 
 /// The formatting a Ctrl (Ctrl+Shift) key asks for: see [`GridAction::Format`].
@@ -2955,6 +2991,43 @@ mod tests {
 
     fn texts(d: &[NodeDelta]) -> usize {
         d.iter().filter(|d| matches!(d, NodeDelta::Added { node: Node::Text { .. }, .. })).count()
+    }
+
+    #[test]
+    fn a_star_fill_puts_the_sign_left_and_the_number_right() {
+        struct One(CellView, f32);
+        impl View for One {
+            fn render(&self, ctx: &mut Ctx) {
+                draw_cell(ctx, &crate::theme::Semantic::LIGHT, &self.0, 0.0, 0.0, self.1, 20.0);
+            }
+        }
+        let nodes = |cv: CellView, w: f32| {
+            let mut app = App::new(One(cv, w));
+            app.tick();
+            let mut v: Vec<(String, f32, f32)> = app.tree().iter().filter_map(|(_, n)| match n {
+                Node::Text { content, rect, .. } => Some((content.to_string(), rect.x(), rect.x() + rect.w())),
+                _ => None,
+            }).collect();
+            v.sort_by(|a, b| a.1.total_cmp(&b.1));
+            v
+        };
+        let acc = CellView { fill_at: Some(2), ..CellView::number(" $ 1,234.50 ") };
+        let v = nodes(acc.clone(), 200.0);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert_eq!(v[0].0, " $");
+        assert!(v[0].1 < 10.0, "{v:?}");
+        assert_eq!(v[1].0, "1,234.50 ");
+        assert!(v[1].2 > 190.0 && v[1].1 > 100.0, "{v:?}");
+        // A visible fill character repeats between them.
+        let dash = CellView { fill_at: Some(1), ..CellView::number("7-") };
+        let v = nodes(dash, 120.0);
+        assert!(v.iter().any(|(t, ..)| t.len() > 5 && t.chars().all(|c| c == '-')), "{v:?}");
+        // Too narrow: hashes, as any number that doesn't fit.
+        let v = nodes(acc, 30.0);
+        assert!(v.iter().all(|(t, ..)| t.chars().all(|c| c == '#')), "{v:?}");
+        // An offset off a character boundary is ignored.
+        let v = nodes(CellView { fill_at: Some(2), ..CellView::number("€5") }, 200.0);
+        assert_eq!(v.len(), 1);
     }
 
     #[test]

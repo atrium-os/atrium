@@ -136,8 +136,10 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
         Value::Empty => CellView::text(""),
         Value::Num(_) | Value::Str(_) => {
             let f = t.format(id).format_in(v, system);
+            let fill_at = f.fill.filter(|_| !f.hashes);
             let text = if f.hashes { "#".repeat(8) } else { f.text };
             let mut cv = if matches!(v, Value::Num(_)) { CellView::number(text) } else { CellView::text(text) };
+            cv.fill_at = fill_at;
             if let Some(c) = f.color {
                 cv.color = Some(rgb(c.rgb()));
             }
@@ -221,6 +223,7 @@ fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Valu
     let mut cv = cv.unwrap_or_else(|| CellView::text(""));
     if let (Some(code), Value::Num(_)) = (&d.num_fmt, v) {
         let f = officina_grid::numfmt::NumFmt::parse(code).format_in(v, system);
+        cv.fill_at = f.fill.filter(|_| !f.hashes);
         cv.text = if f.hashes { "#".repeat(8) } else { f.text };
         if let Some(c) = f.color {
             cv.color = Some(rgb(c.rgb()));

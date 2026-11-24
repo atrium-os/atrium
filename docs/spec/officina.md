@@ -4862,7 +4862,7 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 ### 16.110 Excel's formatting keys, Accounting and Comma Style (2026-11-25)
 
 - Keys as in Excel: **Ctrl+`** turns Show Formulas on and off, **Ctrl+1** opens the Custom Format bar, **Ctrl+Shift+&** draws outside borders and **Ctrl+Shift+_** takes borders away. The menus show them. The keys are mapped in pergola's grid (`format_key`) and in `format::for_key`.
-- The Format menu's number formats gain **Accounting** (`_($* #,##0.00_);…`), **Comma Style** (the same without the currency sign: negatives in brackets, zero as a dash), **Long Date** (`dddd, mmmm d, yyyy`) and **Fraction** (`# ?/?`), after Text. The `*` fill is not stretched to the column width yet, so the sign isn't pushed to the left edge as in Excel.
+- The Format menu's number formats gain **Accounting** (`_($* #,##0.00_);…`), **Comma Style** (the same without the currency sign: negatives in brackets, zero as a dash), **Long Date** (`dddd, mmmm d, yyyy`) and **Fraction** (`# ?/?`), after Text. The `*` fill is drawn to the column width since §16.112.
 - Tests: the format-menu test checks the new keys and that each new format shows a value as Excel does; pergola's grid key test checks the four keys. All 140 Sheets lib tests pass.
 
 ### 16.111 Excel's row, column and selection keys (2026-11-25)
@@ -4871,6 +4871,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Ctrl+9** / **Ctrl+0** hide the selected rows / columns; **Ctrl+Shift+(** / **Ctrl+Shift+)** unhide them.
 - **Ctrl+-** deletes and **Ctrl++** (or Ctrl+Shift+=) inserts: whole rows or columns when those are selected, otherwise cells, shifting them up or down. Excel asks in a dialog; Sheets takes the dialog's first choice, and the menu offers the others (`data::key_cmd`).
 - The menu shows these keys. Tests: `excel_row_and_column_keys_pick_the_command_for_the_selection`, and pergola's grid key test. All 141 Sheets lib tests and 229 pergola lib tests pass.
+
+### 16.112 Number formats' `*` fill drawn to the cell's width (2026-11-25)
+
+- A number format's `*x` fill (Accounting, Comma Style, `0*-`, …) now does what Excel's does. The parser marks where the fill goes, and `numfmt::Formatted::fill` gives the byte offset of the fill character in the text. The text still holds that character once, so copies, CSV and print are unchanged.
+- The grid (`CellView::fill_at`) draws the text before the fill at the cell's left edge and the text after it at the right edge. A visible fill character is repeated between them, at most 512 times. Accounting's `$` therefore sits at the left and the number at the right. A cell too narrow for both shows `#`s like any number. An offset that isn't on a character boundary is ignored.
+- Sheets passes the fill through for cell styles and for conditional-format number formats.
+- Tests: `a_star_fill_is_shown_once_and_its_place_kept` (officina-grid), `a_star_fill_puts_the_sign_left_and_the_number_right` (pergola), and the Sheets format-menu test. Results: officina-grid 122, pergola 230 and Sheets 141 lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 

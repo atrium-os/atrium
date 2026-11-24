@@ -6714,6 +6714,12 @@ mod tests {
         assert_eq!((shown(&s, 5, 0), shown(&s, 6, 0), shown(&s, 7, 0).trim().to_string()), ("  1,234.50 ".into(), "  (1,234.50)".into(), "-".into()));
         fmt(&s, FormatCmd::Number(named("Accounting")));
         assert_eq!(shown(&s, 5, 0), " $ 1,234.50 ");
+        // The grid puts the sign at the left edge and the number at the right.
+        {
+            use pergola::widgets::GridSource;
+            let cv = s.source.cell(5, 0).unwrap();
+            assert_eq!((cv.text.as_str(), cv.fill_at), (" $ 1,234.50 ", Some(2)));
+        }
         fmt(&s, FormatCmd::Number(named("Fraction")));
         assert_eq!(shown(&s, 5, 0), "1234 1/2");
         select(&s, (5, 0), (5, 0));
