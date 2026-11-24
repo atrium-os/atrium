@@ -214,6 +214,51 @@ hostile input and the previewers run as Limen embeds.
 editor (notes, config files, one file at a time, no workspace). Artifex is for
 projects. They share the buffer and text code.
 
+### 3.5 Artifex's UI and assets (Shankar, 2026-11-24)
+
+Accepted from the [design canvas](https://claude.ai/artifact/P1DtV5MRskZPA22pp1UcBc)
+(editor window, composition, fuzz and Move, assets, toolbar states and icon
+map). Built from Atrium's tokens, IBM Plex and the Phosphor font the base
+already ships, so every icon exists.
+
+- **Toolbar** (Pergola `Toolbar`): workspace and project pickers; Run as the
+  one accent-filled button (it becomes Stop while the app runs, and holds the
+  Run question); Build, Test, Debug as icon-and-label buttons; "Go to file or
+  command" (Ctrl K); Terminal. Narrow windows drop labels first, then move
+  Debug and Terminal into More; Run, the workspace and search stay.
+- **View strip** down the left: Files, Search, Composition, Fuzz (with a
+  crash count), Debug, Assets. Files get type icons (`code` for source,
+  `file-text` for config and docs, folders in the accent mark colour); tabs
+  show an unsaved dot; a path line sits above the editor; a status bar shows
+  the workspace, `cargo atrium check`, the language server and the caret.
+- **Composition** is a diagram: grants, the core (the only part with them),
+  workers, each with its fuzz state. **Fuzz** shows the crash, its input as
+  hex, and the Move into a worker preview (name, input kind, files changed,
+  calls to change by hand, Move and Cancel).
+- **Assets** (`icons/`, `images/` in the project): pictures with their scales,
+  icons previewed at 16 to 48 px in light and dark, and where each is used.
+  - **Import SVG** checks a file with the dock's own checker (navigator-svg's
+    strict profile, forum.md §6.1). It converts what it can (text to outlines,
+    strokes to fills, hidden layers dropped) and names what it can't keep
+    (masks, patterns, scripts, outside references), offering to import the
+    rest. What imports in Artifex shows in the dock.
+  - **The icon editor** is an icon editor, not a vector app: lines, shapes and
+    a pen on a 24-unit grid, fills and strokes, linear and radial gradients,
+    Atrium's palette plus up to 8 colours of the project's own, a flat list of
+    shapes to reorder. No masks, boolean operations, text, filters or effects.
+    A counter shows the dock's 64-shape limit, and the editor refuses to save
+    an icon the dock would refuse. Anything bigger is drawn in another tool
+    and imported.
+- **Pictures in apps**: the SDK's `assets::image("name")` asks the system
+  image service (app-composition.md C6: navigator-image in its own jail) to
+  decode a picture from the app's bundle and gets pixels back. The core never
+  parses image bytes, and a developer needs no worker of their own for their
+  own pictures.
+
+Order: (1) toolbar, view strip, file icons; (2) Fuzz and Composition views;
+(3) the image service and `assets::image`; (4) Assets with Import SVG; (5) the
+icon editor.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today
@@ -624,3 +669,7 @@ decided. T2 and T3 together already give a usable terminal development setup.
 | D12 | `atrium-edit` vs Artifex | both: `atrium-edit` stays the plain text editor, Artifex is for projects |
 | D13 | Default terminal editor in layers | Helix in `c-dev`, `vi` everywhere, others by `pkg` |
 | D14 | Order | T1, T2, T3, T4, T5, then T6–T10 |
+| D15 | Artifex's UI (2026-11-24) | ACCEPTED: toolbar, view strip, diagram composition, assets view (§3.5) |
+| D16 | Icons drawn in Artifex | ACCEPTED: filled, multi-colour icons, capped at what the dock draws (64 shapes; no masks, booleans, text, filters) |
+| D17 | Pictures from an app's bundle | ACCEPTED: `assets::image` through the system image service (C6), never decoded in the core |
+| D18 | Importing SVG from other tools | ACCEPTED: the dock's checker; convert what it can, name what it can't keep |
