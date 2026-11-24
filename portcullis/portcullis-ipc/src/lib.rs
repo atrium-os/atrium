@@ -1138,13 +1138,24 @@ pub fn write_response<W: Write>(w: &mut W, resp: &Response) -> io::Result<()> {
     w.flush()
 }
 
+/// The longest request line portcullisd reads. No request carries bulk
+/// data; the largest (argv lists, workspace layouts) are a few KiB.
+pub const MAX_REQUEST_LINE: usize = 1 << 20;
+
+/// Read one request line. The daemon reads from any local uid, jailed apps
+/// included, so the line is bounded: past [`MAX_REQUEST_LINE`] without a
+/// newline is an error, not more memory (review 2026-11-24, H2).
 pub fn read_request<R: BufRead>(r: &mut R) -> io::Result<Request> {
-    let mut line = String::new();
-    let n = r.read_line(&mut line)?;
+    let mut line = Vec::new();
+    let n = r.take(MAX_REQUEST_LINE as u64 + 1).read_until(b'\n', &mut line)?;
     if n == 0 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed"));
     }
-    serde_json::from_str(line.trim_end())
+    if line.last() != Some(&b'\n') {
+        let why = if n > MAX_REQUEST_LINE { "request frame too long" } else { "request frame cut off by close" };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, why));
+    }
+    serde_json::from_slice(line.trim_ascii_end())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                  format!("bad request frame: {e}")))
 }
@@ -1297,5 +1308,20 @@ mod tests {
         let r2 = read_request(&mut br).unwrap();
         matches!(r1, Request::Ping);
         matches!(r2, Request::Reload);
+    }
+
+    /// Review 2026-11-24 (H2): a client that never sends a newline used to
+    /// grow the root broker's buffer without bound.
+    #[test]
+    fn request_lines_are_bounded() {
+        let ok = format!("{}\n", serde_json::to_string(&Request::Hello { version: 1 }).unwrap());
+        assert!(matches!(read_request(&mut ok.as_bytes()).unwrap(), Request::Hello { version: 1 }));
+        let endless = vec![b' '; MAX_REQUEST_LINE + 4096];
+        let mut r = io::BufReader::new(&endless[..]);
+        let e = read_request(&mut r).unwrap_err();
+        assert!(e.to_string().contains("too long"), "{e}");
+        let cut = &ok.as_bytes()[..ok.len() - 1];
+        assert!(read_request(&mut &cut[..]).unwrap_err().to_string().contains("cut off"));
+        assert_eq!(read_request(&mut &b""[..]).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 }

@@ -176,8 +176,10 @@ fn main() -> ExitCode {
                 let shared = Arc::clone(&shared);
                 thread::spawn(move || {
                     for conn in l.incoming().flatten() {
+                        let Some(slot) = ConnSlot::take(&conn) else { continue };
                         let s = Arc::clone(&shared);
                         thread::spawn(move || {
+                            let _slot = slot;
                             if let Err(e) = serve(conn, s, true) {
                                 eprintln!("portcullisd: worker connection: {e}");
                             }
@@ -193,8 +195,10 @@ fn main() -> ExitCode {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                let Some(slot) = ConnSlot::take(&stream) else { continue };
                 let s = Arc::clone(&shared);
                 thread::spawn(move || {
+                    let _slot = slot;
                     if let Err(e) = serve(stream, s, false) {
                         eprintln!("portcullisd: connection: {e}");
                     }
@@ -206,6 +210,44 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Connections one non-root uid may hold open at once, across both
+/// sockets. Each is a thread here; without a cap any local process, a jailed
+/// app included, could open connections until the broker runs out of
+/// threads (review 2026-11-24, H2). Long-lived holders (the dock, the
+/// session bootstrap) use a handful.
+const MAX_CONNS_PER_UID: usize = 64;
+
+static CONNS_PER_UID: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
+
+/// One counted connection; dropping it gives the slot back.
+struct ConnSlot(u32);
+
+impl ConnSlot {
+    /// A slot for this connection's peer, or `None` (connection dropped,
+    /// logged) when the peer is unknown or already holds the maximum. Root
+    /// is not counted.
+    fn take(stream: &UnixStream) -> Option<ConnSlot> {
+        let Ok((uid, _)) = peer_eid(stream) else { return None };
+        let mut g = CONNS_PER_UID.lock().unwrap_or_else(|p| p.into_inner());
+        let n = g.get_or_insert_with(HashMap::new).entry(uid).or_insert(0);
+        if uid != 0 && *n >= MAX_CONNS_PER_UID {
+            eprintln!("portcullisd: uid {uid} already holds {MAX_CONNS_PER_UID} connections; refusing another");
+            return None;
+        }
+        *n += 1;
+        Some(ConnSlot(uid))
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        let mut g = CONNS_PER_UID.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = g.as_mut().and_then(|m| m.get_mut(&self.0)) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 // ── per-tenant policy cache ──────────────────────────────────────
