@@ -239,6 +239,13 @@ pub enum Region {
     Page,
 }
 
+/// `https://host[:port]` of a plain HTTPS address.
+fn origin_of(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    (end > 0).then(|| &url[..8 + end])
+}
+
 /// A whole page running live (I6.1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveRun {
@@ -246,6 +253,8 @@ pub struct LiveRun {
     pub url: String,
     /// `None` until navigatord reports the engine started.
     pub origin: Option<String>,
+    /// The trail entry the live page went to (I6.2), until it runs there.
+    pub next: Option<(u64, PageId)>,
 }
 
 /// The live page's state, as navigatord and the page child reported it.
@@ -285,6 +294,8 @@ pub enum Out {
     RunPageLive { url: String, press: navigator_control::Press },
     /// Stop the page running live: back to the document lane.
     StopLive { url: String },
+    /// Run `url` live too (I6.2): the live page went there, same origin.
+    ContinueLive { url: String },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
@@ -750,6 +761,44 @@ impl Shell {
         self.outbox.push(Out::StopLive { url: run.url });
     }
 
+    /// The live page asked to go to `url` (I6.2; navigatord checked it):
+    /// a new trail entry, like a followed link. It runs live too once
+    /// navigatord shows it, if it is the same origin ([`Self::live_follow`]).
+    pub fn live_navigated(&mut self, from: &str, url: &str) -> bool {
+        let shown = self.shown_key();
+        let Some(run) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some() && r.next.is_none()) else { return false };
+        if self.history.is_some() || shown != Some(run.key) { return false; }
+        self.follow_link(url, false);
+        let next = self.shown_key();
+        if let Some(run) = self.live_run.as_mut() { run.next = next; }
+        true
+    }
+
+    /// The page on screen changed while a page runs live: the page the
+    /// live page went to runs live too once navigatord shows it at the same
+    /// origin; anything else (Back, another tab, another origin, a failed
+    /// open) stops it. Returns whether anything changed.
+    pub fn live_follow(&mut self) -> bool {
+        let Some(run) = self.live_run.clone() else { return false };
+        let shown = self.shown_key();
+        if self.history.is_none() && shown == Some(run.key) { return false; }
+        if self.history.is_none() && run.next.is_some() && shown == run.next {
+            match &self.live {
+                Some(LivePage::Loading(_)) => return false,
+                Some(LivePage::Shown(u)) if origin_of(u).is_some() && origin_of(u) == run.origin.as_deref().and_then(origin_of) => {
+                    let url = u.clone();
+                    self.set_live_whole(run.key, false);
+                    self.live_run = Some(LiveRun { key: run.next.unwrap_or(run.key), url: url.clone(), origin: run.origin, next: None });
+                    self.outbox.push(Out::ContinueLive { url });
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        self.stop_live();
+        true
+    }
+
     /// navigatord said the page runs live (`origin`), or ended it (`None`).
     pub fn live_reported(&mut self, url: &str, origin: Option<String>, why: Option<String>) {
         let Some(run) = self.live_run.as_mut().filter(|r| r.url == url) else { return };
@@ -939,7 +988,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, next: None });
                     self.outbox.push(Out::RunPageLive { url, press });
                 }
             }
@@ -2627,6 +2676,58 @@ mod tests {
         assert!(s.live_run.is_none());
         assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
         assert!(s.last_note.as_deref().is_some_and(|n| n.contains("engine failed")));
+    }
+
+    #[test]
+    fn a_live_page_link_is_a_trail_entry_that_runs_live_at_the_same_origin() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        s.outbox.clear();
+        let first = s.shown_key().unwrap();
+        // Before the engine started, a proposal is not followed.
+        assert!(!s.live_navigated(url, "https://app.example/second.html"));
+        s.live_reported(url, Some("https://app.example".into()), None);
+        // Only the page that runs live can propose.
+        assert!(!s.live_navigated("https://app.example/other.html", "https://app.example/second.html"));
+        assert!(s.live_navigated(url, "https://app.example/second.html"));
+        let second = s.shown_key().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(s.shown_url().as_deref(), Some("https://app.example/second.html"));
+        // While navigatord opens it, nothing is sent.
+        s.live = Some(LivePage::Loading("https://app.example/second.html".into()));
+        assert!(!s.live_follow());
+        assert!(s.outbox.is_empty());
+        // Shown (after a redirect within the origin): it runs live there.
+        s.live = Some(LivePage::Shown("https://app.example/second.html?r=1".into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/second.html?r=1".into() }));
+        let run = s.live_run.clone().unwrap();
+        assert_eq!((run.key, run.next), (second, None));
+        s.live_reported("https://app.example/second.html?r=1", Some("https://app.example".into()), None);
+        assert_eq!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        // A page of another origin opens in the document lane: live stops.
+        assert!(s.live_navigated("https://app.example/second.html?r=1", "https://other.example/"));
+        s.live = Some(LivePage::Shown("https://other.example/".into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::StopLive { url: "https://app.example/second.html?r=1".into() }));
+        assert!(s.live_run.is_none());
+        // The person goes elsewhere before the proposed page is shown: stop.
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        assert!(s.offer_live(5000.0));
+        assert!(s.answer_pressed(1, 5600.0, Some([3; 16])));
+        s.live_reported(url, Some("https://app.example".into()), None);
+        s.outbox.clear();
+        assert!(s.live_navigated(url, "https://app.example/third.html"));
+        s.enter("https://app.example/typed.html");
+        s.live = Some(LivePage::Shown("https://app.example/typed.html".into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::StopLive { url: url.into() }));
     }
 
     #[test]

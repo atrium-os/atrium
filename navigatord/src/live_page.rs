@@ -176,12 +176,33 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, start
     }
 }
 
+/// Where a live page's proposed navigation may go (I6.2): a plain HTTPS
+/// address in its normal spelling, without credentials, of any origin
+/// (another origin opens in the document lane). `None` refuses it.
+pub fn navigation(page: Option<&str>, to: &str) -> Option<String> {
+    page?;
+    if !navigator_control::clean(to, navigator_control::URL_MAX) { return None; }
+    let u = url::Url::parse(to).ok()?;
+    (u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.as_str() == to).then(|| to.to_string())
+}
+
 /// One running live page: its island, placed over the page area.
 pub struct Live {
     pub url: String,
     pub press: navigator_control::Press,
     parent: Arc<Mutex<Option<Parent>>>,
     embed: u64,
+    /// Whether the engine started, and the latest placement: the engine
+    /// lays the page out at its size (I6.2), told once it runs.
+    placed: Arc<Mutex<(bool, [u32; 4])>>,
+}
+
+/// Tell the engine its page area's size; a refusal is logged, not fatal.
+fn tell_size(parent: &mut Parent, embed: u64, rect: [u32; 4]) {
+    let Some(size) = limen::web_island::PageSize::new(rect[2], rect[3]) else { return };
+    if let Err(e) = parent.send(embed, size.encode()) {
+        eprintln!("navigatord: live page size {}x{} not sent: {e:?}", rect[2], rect[3]);
+    }
 }
 
 impl Live {
@@ -197,9 +218,11 @@ impl Live {
         rect: [u32; 4],
         cfg: Arc<crate::Config>,
         started: impl FnOnce(String) + Send + 'static,
+        navigate: impl Fn(String) + Send + 'static,
         finished: impl FnOnce(Option<String>) + Send + 'static,
     ) -> Result<Self, String> {
         scope(&url, &url).map_err(|why| format!("this page can't run live: {why}"))?;
+        let placed = Arc::new(Mutex::new((false, rect)));
         let rect = crate::widget::bounds(rect)?;
         limen::start_trace("navigatord", "live-start", &url);
         let mut parent = Parent::at(socket).map_err(|e| format!("Limen: {e:?}"))?;
@@ -233,6 +256,7 @@ impl Live {
             let _ = done.send(result.map(|_| ()));
         });
         let watched = parent.clone();
+        let size = placed.clone();
         std::thread::spawn(move || {
             use limen::web_island::{EndReason, Lifecycle, Report};
             let mut reports = Lifecycle::default();
@@ -256,8 +280,26 @@ impl Live {
                             }
                             limen::start_trace("navigatord", "live-started", origin);
                             if let Some(s) = started.take() { s(origin.to_string()); }
+                            let rect = { let mut p = size.lock().unwrap(); p.0 = true; p.1 };
+                            tell_size(connection, embed, rect);
                         }
                         Some(Report::Title(_) | Report::Resize { .. } | Report::MediaReady) => {}
+                        // The page asked to go somewhere (I6.2): never followed in
+                        // the engine. navigatord hands it to the UI, which opens
+                        // it as a trail entry: live again if it is this origin's
+                        // (`ContinueLive`), in the document lane if not.
+                        Some(Report::Navigate(to)) => match navigation(page.as_deref(), to) {
+                            Some(to) => navigate(to),
+                            None => eprintln!("navigatord: a live page's navigation refused ({})", crate::refused_target(to)),
+                        },
+                        Some(Report::UrlChanged(to)) => {
+                            // The address bar follows in a later step; the
+                            // engine must not claim another origin's address.
+                            if page.as_deref().and_then(crate::origin) != crate::origin(to) {
+                                break Some("the engine claimed another origin's address".into());
+                            }
+                            eprintln!("navigatord: a live page changed its address in place");
+                        }
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
                         // A live page has no unload question in I6.1: Stop is the person's.
@@ -282,16 +324,23 @@ impl Live {
                 finished(why);
             }
         });
-        Ok(Live { url, press, parent, embed })
+        Ok(Live { url, press, parent, embed, placed })
     }
 
     /// Move the island with the page area (the window resized).
     pub fn place(&self, rect: [u32; 4]) -> Result<(), String> {
-        let rect = crate::widget::bounds(rect)?;
-        match self.parent.lock().unwrap().as_mut() {
-            Some(p) => p.place(self.embed, Some(rect)).map_err(|e| format!("place: {e:?}")),
-            None => Err("the live page has ended".into()),
-        }
+        let bounds = crate::widget::bounds(rect)?;
+        let mut parent = self.parent.lock().unwrap();
+        let Some(p) = parent.as_mut() else { return Err("the live page has ended".into()) };
+        p.place(self.embed, Some(bounds)).map_err(|e| format!("place: {e:?}"))?;
+        let running = {
+            let mut placed = self.placed.lock().unwrap();
+            let resized = placed.1[2..] != rect[2..];
+            placed.1 = rect;
+            placed.0 && resized
+        };
+        if running { tell_size(p, self.embed, rect); }
+        Ok(())
     }
 
     /// End it: the island goes, and `finished` is not called.
@@ -309,6 +358,17 @@ impl Drop for Live {
 mod tests {
     use super::*;
     use nuntius::{Open};
+
+    #[test]
+    fn a_proposed_navigation_is_one_plain_https_address() {
+        let page = Some("https://app.example/app.html");
+        assert_eq!(navigation(page, "https://app.example/second.html").as_deref(), Some("https://app.example/second.html"));
+        assert_eq!(navigation(page, "https://elsewhere.example/").as_deref(), Some("https://elsewhere.example/"), "another origin opens in the document lane");
+        assert_eq!(navigation(None, "https://app.example/second.html"), None, "not before the page was delivered");
+        for bad in ["http://app.example/", "https://u:p@app.example/", "https://APP.example/", "file:///etc/passwd", "https://a.example/\u{7f}"] {
+            assert_eq!(navigation(page, bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn a_live_page_reaches_its_own_site_and_nothing_else() {

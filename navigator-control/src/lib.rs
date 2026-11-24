@@ -226,6 +226,11 @@ pub enum Request {
     /// The page area moved (`Some`), or Stop / leaving the page (`None`:
     /// the engine ends and no `LiveEnded` follows).
     PlaceLive { url: String, rect: Option<[u32; 4]> },
+    /// The trail moved to another page of the origin running live (a link
+    /// the live page proposed, Back, Forward; I6.2): run it live too,
+    /// without a press. navigatord refuses unless the person ran this
+    /// origin live in this window and has not stopped it.
+    ContinueLive { url: String, rect: [u32; 4] },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
@@ -414,6 +419,9 @@ pub enum Event {
     /// The live page ended by itself or failed (`why`), or never started:
     /// the trail shows the document lane again.
     LiveEnded { url: String, why: Option<String> },
+    /// The live page at `from` proposed going to `url` (I6.2): the UI opens
+    /// it as a trail entry, live again if it is the same origin.
+    LiveNavigate { from: String, url: String },
 }
 
 /// What a VPN page's resource is, from its content type.

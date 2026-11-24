@@ -1168,6 +1168,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // The page running live (I6.1), and the page on screen: (the address
     // the UI showed, the page's own address as delivered).
     let mut live: Option<live_page::Live> = None;
+    // The origin the person ran live in this window (I6.2): pages of it the
+    // trail moves to run live without another press, until Stop.
+    let mut live_origin: Option<String> = None;
     let mut shown: Option<(String, String)> = None;
     // The page the UI opened last, in the foreground: a first open never
     // sends Show, so Run live must accept it too (I6.1 gate, 2026-11-25).
@@ -1309,6 +1312,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             Request::Blank => {
                 widget = None;
                 live = None;
+                live_origin = None;
                 shown = None;
                 opened = None;
                 let mut st = strip.lock().unwrap();
@@ -1941,14 +1945,13 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if let Err(why) = spend(press) { return Err(format!("\0{why}")); }
                     live = None;
                     widget = None;
-                    let (on_start, on_end) = (w.clone(), w.clone());
-                    let (start_url, end_url) = (page.clone(), page.clone());
-                    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(),
-                        move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
-                        move |why| send(&on_end, &Event::LiveEnded { url: end_url, why }))
+                    start_live(&cfg, &w, window, page, press, rect)
                 })();
                 match result {
-                    Ok(l) => live = Some(l),
+                    Ok(l) => {
+                        live_origin = origin(&l.url);
+                        live = Some(l);
+                    }
                     Err(why) => match why.strip_prefix('\0') {
                         Some(why) => send(&w, &Event::PressRefused { why: why.into() }),
                         None => {
@@ -1958,7 +1961,31 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     },
                 }
             }
+            Request::ContinueLive { url, rect } => {
+                let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone())
+                    .or_else(|| opened.as_ref().filter(|o| **o == url).map(|o| o.clone()));
+                let window = strip.lock().unwrap().window_token;
+                let result = (|| {
+                    if !cfg.live_pages_enabled() { return Err("running a page live is off".to_string()); }
+                    let page = page.ok_or("that page is no longer on screen")?;
+                    if live_origin.is_none() || origin(&page) != live_origin {
+                        return Err("this origin was not run live here".into());
+                    }
+                    let window = window.ok_or("no window to run it in")?;
+                    live = None;
+                    widget = None;
+                    start_live(&cfg, &w, window, page, [0; 16], rect)
+                })();
+                match result {
+                    Ok(l) => live = Some(l),
+                    Err(why) => {
+                        eprintln!("navigatord: continue live: {why}");
+                        send(&w, &Event::LiveEnded { url, why: Some(why) });
+                    }
+                }
+            }
             Request::PlaceLive { url, rect } => {
+                if rect.is_none() { live_origin = None; }
                 if let Some(active) = live.as_ref().filter(|l| l.url == url) {
                     match rect {
                         None => live = None,
@@ -2856,4 +2883,15 @@ mod island_metadata_tests {
         let over = serde_json::json!({"url": base, "island_sources": vec!["/frame"; 17]});
         assert!(island_sources(over.to_string().as_bytes(), base).is_empty());
     }
+}
+
+/// Start the whole-page engine for `page` in the UI's window (I6.1, I6.2),
+/// telling the UI when it started, where it asked to go, and when it ended.
+fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4]) -> Result<live_page::Live, String> {
+    let (on_start, on_nav, on_end) = (w.clone(), w.clone(), w.clone());
+    let (start_url, nav_url, end_url) = (page.clone(), page.clone(), page.clone());
+    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(),
+        move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
+        move |url| send(&on_nav, &Event::LiveNavigate { from: nav_url.clone(), url }),
+        move |why| send(&on_end, &Event::LiveEnded { url: end_url, why }))
 }

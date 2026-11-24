@@ -51,9 +51,8 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     nav->set_viewport_size(navigator_is_vpn_page(scene) ? Web::CSSPixelSize { 1024, 600 } : Web::CSSPixelSize { 640, 360 });
 #elif defined(ATRIUM_I6_PAGE)
     // A live page (I6.1) covers the window's page area, not an island's
-    // 640 x 360; content below 360 px was never laid out or painted. The
-    // engine does not learn the placed size yet, so this is the page area of
-    // a 1280 x 840 window (an open gap: PlaceLive resizes the island only).
+    // 640 x 360. Until navigatord tells the engine the placed size (I6.2,
+    // just after it reports its start), this is a 1280 x 840 window's.
     nav->set_viewport_size({ 1024, 768 });
 #else
     nav->set_viewport_size({ 640, 360 });
@@ -108,6 +107,9 @@ extern "C" bool navigator_take_chapter(NavigatorScene*, double*);
 extern "C" bool navigator_video_ready(NavigatorScene*);
 extern "C" bool navigator_counter_resize(NavigatorScene*, u16, u16);
 #endif
+#ifdef ATRIUM_I6_PAGE
+extern "C" bool navigator_take_page_size(NavigatorScene*, u16*, u16*);
+#endif
 
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
 {
@@ -159,6 +161,12 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         }
 #endif
         if (action < 0) break;
+#ifdef ATRIUM_I6_PAGE
+        // navigatord placed the page in a page area of this size (I6.2).
+        u16 width = 0, height = 0;
+        if (action == 5 && navigator_take_page_size(scene, &width, &height))
+            client.page().local_traversable()->set_viewport_size({ static_cast<int>(width), static_cast<int>(height) });
+#endif
         Web::DevicePixelPoint point { static_cast<int>(x), static_cast<int>(y) };
         if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);
         if (action == 2) client.page().handle_mouseup(point, point, Web::UIEvents::MouseButton::Primary, 0, 0);

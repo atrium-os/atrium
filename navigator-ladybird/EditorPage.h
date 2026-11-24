@@ -7,6 +7,9 @@
 #endif
 
 struct NavigatorScene;
+#ifdef ATRIUM_I6_PAGE
+extern "C" bool navigator_live_propose(NavigatorScene*, u8 const*, size_t);
+#endif
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" bool navigator_vpn_script_submit(u8 const*, size_t);
 extern "C" bool navigator_vpn_script_post(u8 const*, size_t, u8 const*, size_t);
@@ -67,13 +70,23 @@ public:
     }
 #endif
 #if defined(ATRIUM_I6_PAGE) && !defined(ATRIUM_I0_SIGN_IN)
-    // A live page (I6.1) runs its one document: a navigation it starts (a
-    // link, a form, a frame's document) is refused, loudly, until links
-    // become trail entries (I6.2) and frames run (I6.5). The base
-    // PageClient's VERIFY_NOT_REACHED would end the engine.
-    void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget target, URL::URL const& url, Utf16String, Optional<Web::HTML::NavigationStartRequest>) override
+    // A live page runs its one document. A top-level GET it starts (a link,
+    // a GET form, `location`) is proposed to navigatord, which makes it a
+    // trail entry (I6.2); the engine never follows it. Anything else (a
+    // POST, a frame's document, a jump within this document) is refused,
+    // loudly. The base PageClient's VERIFY_NOT_REACHED would end the engine.
+    void request_navigation_start(Web::HTML::LocalNavigable& navigable, Web::NavigationTarget target, URL::URL const& url, Utf16String, Optional<Web::HTML::NavigationStartRequest> request) override
     {
-        warnln("live page: navigation to {} refused (top-level={})", url.serialize(), target == Web::NavigationTarget::TopLevel);
+        bool get = target == Web::NavigationTarget::TopLevel && request.has_value() && request->document_resource.has<Empty>();
+        auto document = navigable.active_document();
+        bool same_document = document && url.equals(document->url(), URL::ExcludeFragment::Yes);
+        if (get && !same_document && island_scene) {
+            auto address = url.serialize();
+            if (navigator_live_propose(island_scene, address.bytes().data(), address.bytes().size()))
+                return;
+        }
+        warnln("live page: navigation to {} refused (top-level={} get={} same-document={})", url.serialize(),
+            target == Web::NavigationTarget::TopLevel, get, same_document);
     }
 #endif
 #ifdef ATRIUM_MAIL_PAGE

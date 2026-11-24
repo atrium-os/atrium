@@ -958,6 +958,8 @@ pub mod host {
         vpn_page: bool,
         unload_query: u32,
         chapter_seconds: Option<f64>,
+        /// The page area navigatord placed a whole live page in (I6.2).
+        page_size: Option<(u16, u16)>,
         mail_document: Option<(String, Vec<u8>)>,
         embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
@@ -1063,10 +1065,34 @@ pub mod host {
         true
     }
 
+    /// A whole live page's link, GET form or `location` (I6.2): reported
+    /// to navigatord, never followed here. False when the address is not
+    /// one an engine may report (plain HTTPS, printable, bounded).
+    ///
+    /// # Safety
+    /// LibWeb owns the UTF-8 buffer for the duration of this call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_propose(state: &SceneState, url: *const u8, url_len: usize) -> bool {
+        use limen::web_island::{Report, URL_MAX};
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if url.is_null() || url_len == 0 || url_len > URL_MAX { return false; }
+        // SAFETY: the caller passes LibWeb's live buffer of `url_len` bytes.
+        let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, url_len) }) else { return false };
+        let Some(bytes) = Report::Navigate(url).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_take_chapter(state: &mut SceneState, seconds: &mut f64) -> bool {
         let Some(value) = state.chapter_seconds.take() else { return false };
         *seconds = value;
+        true
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_take_page_size(state: &mut SceneState, width: &mut u16, height: &mut u16) -> bool {
+        let Some((w, h)) = state.page_size.take() else { return false };
+        (*width, *height) = (w, h);
         true
     }
 
@@ -1460,6 +1486,10 @@ pub mod host {
                     if let Some(seek) = limen::web_island::ChapterSeek::decode(&bytes) {
                         state.chapter_seconds = Some(seek.seconds());
                         return 4;
+                    }
+                    if let Some(size) = limen::web_island::PageSize::decode(&bytes) {
+                        state.page_size = Some((size.width(), size.height()));
+                        return 5;
                     }
                 }
                 Err(_) => return -1,

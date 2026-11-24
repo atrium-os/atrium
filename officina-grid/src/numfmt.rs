@@ -143,6 +143,24 @@ pub struct Formatted {
     pub text: String,
     pub color: Option<FmtColor>,
     pub hashes: bool,
+    /// Where a `*` fill's character is in `text` (a byte offset): the grid
+    /// repeats it there to the cell's width, as Accounting's `_($* #,##0.00_)`
+    /// puts the sign at the left edge and the number at the right.
+    pub fill: Option<usize>,
+}
+
+/// Marks a `*` fill in a section's literals until the text is built.
+const FILL_MARK: char = '\u{E000}';
+
+impl Formatted {
+    /// The fill's mark taken out of the text and its place kept.
+    fn placed(mut self) -> Self {
+        if let Some(off) = self.text.find(FILL_MARK) {
+            self.text = self.text.replace(FILL_MARK, "");
+            self.fill = self.text.get(off..).and_then(|t| t.chars().next()).map(|_| off);
+        }
+        self
+    }
 }
 
 /// The built-in format codes Excel uses for `numFmtId` 0..=49 (en-US), or `None` for
@@ -244,7 +262,11 @@ impl NumFmt {
 
     /// Formats a number using its workbook's date system.
     pub fn format_in(&self, v: &Value, system: dates::DateSystem) -> Formatted {
-        let plain = |text: String| Formatted { text, color: None, hashes: false };
+        self.format_marked(v, system).placed()
+    }
+
+    fn format_marked(&self, v: &Value, system: dates::DateSystem) -> Formatted {
+        let plain = |text: String| Formatted { text, color: None, hashes: false, fill: None };
         match v {
             Value::Empty => plain(String::new()),
             Value::Bool(_) | Value::Err(_) => plain(v.display()),
@@ -255,7 +277,7 @@ impl NumFmt {
                     _ => self.sections.iter().find(|s| s.has_text()),
                 };
                 match sec {
-                    Some(sec) => Formatted { text: text_section(sec, s), color: sec.color, hashes: false },
+                    Some(sec) => Formatted { text: text_section(sec, s), color: sec.color, hashes: false, fill: None },
                     None => plain(s.to_string()),
                 }
             }
@@ -266,7 +288,7 @@ impl NumFmt {
     fn format_num(&self, x: f64, system: dates::DateSystem) -> Formatted {
         let (sec, neg_sign) = self.pick(x);
         let Some(sec) = sec else {
-            return Formatted { text: format_general(x), color: None, hashes: false };
+            return Formatted { text: format_general(x), color: None, hashes: false, fill: None };
         };
         // A section for negatives shows the magnitude; its own literals say "negative".
         let v = if neg_sign { x } else { x.abs() };
@@ -284,7 +306,7 @@ impl NumFmt {
         } else {
             (format_number(sec, v), false)
         };
-        Formatted { text, color: sec.color, hashes }
+        Formatted { text, color: sec.color, hashes, fill: None }
     }
 
     /// The section for `x`, and whether the number keeps its own minus sign.
@@ -430,10 +452,11 @@ fn parse_section(src: &str) -> (Section, bool) {
                 lit(&mut toks, " ");
                 i += 2;
             }
-            // Fill: Excel repeats it across the cell; the grid shows it once.
+            // Fill: Excel repeats it across the cell; the text holds it once
+            // and `Formatted::fill` says where.
             '*' => {
                 if let Some(&d) = ch.get(i + 1) {
-                    lit(&mut toks, &d.to_string());
+                    lit(&mut toks, &format!("{FILL_MARK}{d}"));
                 }
                 i += 2;
             }
@@ -1074,6 +1097,21 @@ mod tests {
 
     fn f(code: &str, x: f64) -> String {
         NumFmt::parse(code).format(&Value::Num(x)).text
+    }
+
+    #[test]
+    fn a_star_fill_is_shown_once_and_its_place_kept() {
+        let acc = NumFmt::parse(r#"_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)"#);
+        let f = acc.format(&Value::num(1234.5));
+        assert_eq!(f.text, " $ 1,234.50 ");
+        assert_eq!(f.fill, Some(2));
+        assert_eq!(&f.text[2..3], " ");
+        let f = NumFmt::parse("0*-").format(&Value::num(7.0));
+        assert_eq!((f.text.as_str(), f.fill), ("7-", Some(1)));
+        // No fill: none recorded; a star at the very end fills with nothing.
+        assert_eq!(NumFmt::parse("0.00").format(&Value::num(1.0)).fill, None);
+        assert_eq!(NumFmt::parse("0*").format(&Value::num(1.0)).fill, None);
+        assert!(!NumFmt::parse("0*").format(&Value::num(1.0)).text.contains(FILL_MARK));
     }
 
     #[test]
