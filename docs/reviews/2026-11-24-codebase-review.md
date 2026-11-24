@@ -86,8 +86,8 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | L1 | Low | everywhere | 2,304 "★" war-story comments, dangling ticket numbers, misplaced doc comments | ongoing | Open |
 | L2 | Low | portcullis-peer | A four-level wrapper chain for one function | S | Open |
 | L3 | Low | repo | Dead crates, a dead CI workflow, fake tests, tracked `scratch/` | S | **Fixed `ee1552e`** (Shankar's OK): atrium-pt-demo and the Insula CI removed; 4 of the 5 listed crates are in use and stay; `scratch/` still tracked |
-| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | **Started `L4HASH`**: `scripts/lib/gate.sh`; 18 gates that always exited 0 now fail on a failure |
-| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | README fixed `L4HASH`; AGENTS.md row-size rule; the five long rows go back to their owners |
+| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | **Started `5078c65`**: `scripts/lib/gate.sh`; 18 gates that always exited 0 now fail on a failure |
+| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | README fixed `5078c65`; AGENTS.md row-size rule; the five long rows go back to their owners |
 | L6 | Low | several | Compiler warnings, silent parse drops, a personal path in tests | S | **Mostly fixed `ee1552e`**: bridge tests, 27 stale lockfiles, home path, imports |
 
 ### C1. A manifest entry could inject jail.conf parameters (fixed)
@@ -437,7 +437,7 @@ under-used.
 access, deploy of main's build), adopted when a script is next touched. No
 mass rewrite.
 
-**Status (`L4HASH`):** `scripts/lib/gate.sh` has the bookkeeping: `gate_end`
+**Status (`5078c65`):** `scripts/lib/gate.sh` has the bookkeeping: `gate_end`
 exits non-zero on a failure, and fails when no checks or fewer than the
 declared count ran; `scripts/lib/gate-selftest.sh` checks each case and fails
 when `gate_end` is made to always pass. `opifex-token-check.sh` uses it (18
