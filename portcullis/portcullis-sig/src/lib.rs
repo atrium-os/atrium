@@ -189,7 +189,7 @@ mod tests {
 ///
 /// A key file that is not a PEM goes to the installed [`ExternalSigner`].
 pub fn sign(manifest: &[u8], key_pem: &str) -> Result<Vec<u8>, SigError> {
-    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::ecdsa::signature::Signer;
     if !is_pem(key_pem) {
         return match EXTERNAL.get().and_then(|x| (x.sign)(manifest, key_pem)) {
             Some(r) => r.map_err(SigError::External),

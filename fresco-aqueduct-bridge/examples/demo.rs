@@ -76,15 +76,15 @@ fn main() -> std::io::Result<()> {
     // - a thin green stripe
     // - "aqueduct-gpu" rendered via real fresco-text shaping +
     //   rasterization, composited via glyph_run
-    let scene_bg = fp::RectParams {
+    let scene_bg = fp::RectParams { radius: 0.0,
         x: 0.0, y: 0.0, w: W as f32, h: H as f32,
         r: 0.07, g: 0.10, b: 0.22, a: 1.0,
     };
-    let scene_card = fp::RectParams {
+    let scene_card = fp::RectParams { radius: 0.0,
         x: 60.0, y: 50.0, w: 200.0, h: 100.0,
         r: 0.85, g: 0.20, b: 0.20, a: 1.0,
     };
-    let scene_stripe = fp::RectParams {
+    let scene_stripe = fp::RectParams { radius: 0.0,
         x: 0.0, y: (H - 8) as f32, w: W as f32, h: 6.0,
         r: 0.20, g: 0.80, b: 0.40, a: 1.0,
     };
@@ -105,6 +105,7 @@ fn main() -> std::io::Result<()> {
         &font_bytes,
         "aqueduct-gpu",
         20.0, // pixel size
+        400.0, // weight: regular
     ).map_err(|e| io_other(format!("shape: {e}")))?;
     eprintln!(
         "aqueduct-gpu-demo: shaped {} glyphs into {}×{} atlas",

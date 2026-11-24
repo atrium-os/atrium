@@ -1004,7 +1004,7 @@ mod tests {
         let p = load_sample_policy();
         validate_path("/usr/local/lib", &p).unwrap();         // ro
         validate_path("/var/run/aqueduct", &p).unwrap();      // rw
-        validate_path("/usr/home/girivs", &p).unwrap();       // rw_pattern
+        validate_path("/usr/home/alice", &p).unwrap();       // rw_pattern
         validate_path("/var/lib/atrium/jails/atrium-test", &p).unwrap(); // per-jail root
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
     fn path_rejects_unlisted() {
         let p = load_sample_policy();
         validate_path("/etc/master.passwd.bak", &p).unwrap_err();
-        validate_path("/usr/home/girivs/.ssh", &p).unwrap_err();   // sub-of-glob
+        validate_path("/usr/home/alice/.ssh", &p).unwrap_err();   // sub-of-glob
         validate_path("/tmp", &p).unwrap_err();
     }
 
@@ -1754,8 +1754,8 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.mounts.push(MountSpec {
-            source: "/usr/home/girivs".into(),
-            dest:   "home/girivs".into(),
+            source: "/usr/home/alice".into(),
+            dest:   "home/alice".into(),
             kind:   MountKind::RwNullfs,
             size_mb: None,
             owner: None,

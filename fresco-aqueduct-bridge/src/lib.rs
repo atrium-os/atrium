@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn rect_emits_three_records() {
         let mut fb = FrameBuilder::new(4096);
-        let p = fp::RectParams {
+        let p = fp::RectParams { radius: 0.0,
             x: 10.0, y: 20.0, w: 30.0, h: 40.0,
             r: 1.0, g: 0.0, b: 1.0, a: 1.0,
         };

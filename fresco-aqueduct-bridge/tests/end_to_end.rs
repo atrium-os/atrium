@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aqueduct::Connection;
 use aqueduct_gpu::{
-    ids::{IdNamespace, ResourceId},
+    ids::ResourceId,
     payloads::{ClientKind, MemoryUsage},
 };
 use aqueduct_gpu_client::GpuClient;
@@ -51,7 +51,7 @@ fn rect_through_bridge_renders_pixels() {
     let fence = client.create_fence().unwrap();
     let mut fb = client.frame_builder();
     fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [0, 0, 0, 255]).unwrap();
-    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
         x: 16.0, y: 16.0, w: 32.0, h: 32.0,
         r: 1.0, g: 0.5, b: 0.0, a: 1.0, // orange
     }).unwrap();
@@ -165,7 +165,7 @@ fn multi_node_scene_composites_through_bridge() {
     fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [10, 10, 30, 255]).unwrap();
 
     // Background rect.
-    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
         x: 0.0, y: 0.0, w: 64.0, h: 64.0,
         r: 0.1, g: 0.1, b: 0.2, a: 1.0,
     }).unwrap();
@@ -233,7 +233,7 @@ fn partial_redraw_via_bridge_helpers() {
 
     // Pass 1: full clear-and-fill cyan.
     fresco_aqueduct_bridge::begin_renderpass(&mut fb, target, [0, 0, 0, 255]).unwrap();
-    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
         x: 0.0, y: 0.0, w: 64.0, h: 64.0,
         r: 0.0, g: 1.0, b: 1.0, a: 1.0,
     }).unwrap();
@@ -243,7 +243,7 @@ fn partial_redraw_via_bridge_helpers() {
     // whole image. Only the scissor region should change colour.
     fresco_aqueduct_bridge::begin_renderpass_no_clear(&mut fb, target).unwrap();
     fresco_aqueduct_bridge::set_scissor(&mut fb, 0, 0, 16, 16).unwrap();
-    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+    fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
         x: 0.0, y: 0.0, w: 64.0, h: 64.0,
         r: 1.0, g: 0.0, b: 1.0, a: 1.0,
     }).unwrap();
@@ -268,12 +268,6 @@ fn partial_redraw_via_bridge_helpers() {
     drop(client);
     let _ = server_thread;
     let _ = std::fs::remove_file(&sock);
-}
-
-#[test]
-fn _unused_idnamespace_warning_suppressor() {
-    // Imports referenced by docs only.
-    let _ = IdNamespace::Builtin;
 }
 
 /// Proves the correctness invariant behind frescod's level-3 damage-rect
@@ -322,11 +316,11 @@ fn offscreen_node_in_partial_pass_contributes_nothing() {
         let mut fb = client.frame_builder();
         fresco_aqueduct_bridge::begin_renderpass_no_clear(&mut fb, target).unwrap();
         fresco_aqueduct_bridge::set_scissor(&mut fb, 8, 8, 16, 16).unwrap();
-        fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+        fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
             x: 8.0, y: 8.0, w: 16.0, h: 16.0, r: 1.0, g: 0.0, b: 0.0, a: 1.0,
         }).unwrap();
         if emit_b {
-            fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams {
+            fresco_aqueduct_bridge::translate_rect(&mut fb, &fp::RectParams { radius: 0.0,
                 x: 40.0, y: 40.0, w: 16.0, h: 16.0, r: 0.0, g: 1.0, b: 0.0, a: 1.0,
             }).unwrap();
         }

@@ -954,9 +954,11 @@ name = "praeco"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "fresco-protocol",
  "portcullis-peer",
  "postcard",
  "serde",
+ "tabula",
 ]
 
 [[package]]
@@ -1221,6 +1223,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tabula"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "fresco-protocol",
+ "portcullis-peer",
+ "portcullis-policy",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
