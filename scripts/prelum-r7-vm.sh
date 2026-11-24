@@ -15,6 +15,13 @@ qemu=${QEMU:-qemu-system-aarch64}
 ssh_port=${PRELUM_R7_SSH_PORT:-6329}
 ipps_port=${PRELUM_R7_IPPS_PORT:-19329}
 keep_vm=${PRELUM_R7_KEEP_VM:-0}
+# SSH attempts (one a second or slower) while the guest boots, and seconds to wait
+# for its power-down; raise both under TCG.
+boot_wait=${PRELUM_R7_BOOT_WAIT:-80}
+shutdown_wait=${PRELUM_R7_SHUTDOWN_WAIT:-30}
+case "$boot_wait$shutdown_wait" in
+    *[!0-9]*) echo "PRELUM_R7_BOOT_WAIT and PRELUM_R7_SHUTDOWN_WAIT are whole numbers" >&2; exit 2 ;;
+esac
 case "$keep_vm" in
     0|1) ;;
     *) echo "PRELUM_R7_KEEP_VM must be 0 or 1" >&2; exit 2 ;;
@@ -81,7 +88,7 @@ cleanup() {
             remote "test \$(cat '$guest/.isolated-gate') = '$marker' && shutdown -p now" \
                 >"$D/shutdown.log" 2>&1 || status=1
         fi
-        for i in $(seq 30); do
+        for i in $(seq "$shutdown_wait"); do
             kill -0 "$qemu_pid" 2>/dev/null || break
             sleep 1
         done
@@ -153,7 +160,7 @@ cp "$vars" "$D/vars.fd"
     -netdev "user,id=n,net=1.2.3.0/24,host=1.2.3.2,hostfwd=tcp:127.0.0.1:$ssh_port-:22" \
     -device virtio-net-pci,netdev=n >"$D/qemu.log" 2>&1 &
 qemu_pid=$!
-for i in $(seq 80); do
+for i in $(seq "$boot_wait"); do
     kill -0 "$qemu_pid"
     if remote 'test "$(uname -s)" = FreeBSD' >"$D/ssh.log" 2>&1; then break; fi
     sleep 1

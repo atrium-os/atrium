@@ -6048,7 +6048,9 @@ The gate checks the staged hashes before starting the desktop tests.
 
 The host needs QEMU, Python 3, OpenSSL and Poppler. The default QEMU
 settings are HVF and `-cpu host`. Set `PRELUM_R7_ACCEL` and `PRELUM_R7_CPU`
-for another arm64 host. `PRELUM_R7_SSH_PORT` and `PRELUM_R7_IPPS_PORT` default
+for another arm64 host. Under TCG (a cloud host) use `PRELUM_R7_ACCEL=tcg,thread=multi`,
+`PRELUM_R7_CPU=neoverse-n2`, `PRELUM_R7_BOOT_WAIT=600` (SSH attempts while it
+boots, 80 by default) and `PRELUM_R7_SHUTDOWN_WAIT=180` (seconds, 30 by default). `PRELUM_R7_SSH_PORT` and `PRELUM_R7_IPPS_PORT` default
 to 6329 and 19329. The gate starts and powers down its own guest and uses
 a fresh loopback TLS simulator. It keeps the simulator PDFs, guest job
 log, build hashes and verdicts under the printed artifact directory. Before
