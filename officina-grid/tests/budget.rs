@@ -80,3 +80,31 @@ fn a_workbook_past_the_budget_is_refused_while_loading() {
     let back = officina_grid::native::load_within(&file, full + (1 << 20)).unwrap();
     assert_eq!(back.value(0, 8191, 299), Value::Num(1.0));
 }
+
+#[test]
+fn sliced_groups_preserve_disjoint_dirty_runs_and_count_completed_cells() {
+    const ROWS: u32 = 131_072;
+    const STARTS: [u32; 3] = [1, 40_000, 105_000];
+    const WRITES: u32 = 20_000;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sheet1").unwrap();
+    wb.threads = 4;
+    wb.set_numbers(0, 0, 0, &vec![1.0; ROWS as usize]);
+    wb.fill_formula(0, 1, 0, ROWS - 1, "=ROUND(A1/3,2)").unwrap();
+    wb.recalc();
+    for start in STARTS {
+        wb.set_numbers(0, 0, start, &vec![6.0; WRITES as usize]);
+    }
+
+    let mut computed = 0;
+    for _ in 0..10_000 {
+        if !wb.recalc_pending() { break; }
+        computed += wb.recalc_for(Duration::from_millis(2)).0.cells;
+    }
+    assert!(!wb.recalc_pending());
+    assert_eq!(computed, u64::from(WRITES) * STARTS.len() as u64);
+    for row in 0..ROWS {
+        let changed = STARTS.iter().any(|&start| (start..start + WRITES).contains(&row));
+        assert_eq!(wb.value(0, row, 1), Value::Num(if changed { 2.0 } else { 0.33 }), "row {row}");
+    }
+}

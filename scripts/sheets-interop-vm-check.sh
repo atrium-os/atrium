@@ -21,6 +21,8 @@
 # The print profile also needs Prelum and the print sheet with no printers
 # configured. Run sheets-interop-pdf-check.py on the exported PDFs on the host.
 # Use SHEETS_INTEROP_CASE=formulas and /tmp/sheets-formula-fixture for formulas.
+# Use SHEETS_INTEROP_CASE=responsiveness and /tmp/recalc-responsiveness for the
+# large native workbook from recalc_responsiveness make. Run measure separately.
 # Use SHEETS_INTEROP_CASE=delimited and /tmp/sheets-delimited-fixture for CSV and TSV.
 # Use SHEETS_INTEROP_CASE=text_filter and /tmp/sheets-text-filter-fixture for text filters.
 # Use SHEETS_INTEROP_CASE=rank_filter and /tmp/sheets-rank-filter-fixture for rank filters.
@@ -42,10 +44,11 @@ set -eu
 cd /var/tmp/sheets-desktop
 books=${1:-/var/tmp/sheets-format-input}
 profile=${SHEETS_INTEROP_CASE:-pivots}
-case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|print_fidelity|formulas|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
+case "$profile" in pivots|pivot_display|pivot_order|pivot_scope|pivot_cache|pivot_sources|pivot_layout|tables|layout|annotations|legacy|print|comments_print|print_fidelity|formulas|responsiveness|delimited|sort_filter|rank_filter|text_filter|validation|validation_legacy|condfmt|native_copy|dates|date_filters|appearance|appearance_filters|advanced_filters|table_filters|protection) ;; *) exit 2 ;; esac
 results=$(mktemp -d /var/tmp/sheets-interop-results.XXXXXX)
 echo "Sheets interoperability evidence: $results"
 case "$profile" in
+    responsiveness) test "$(ls "$books")" = responsive.osheet ;;
     pivot_cache) test "$(ls "$books")" = "$(printf 'missing.xlsx\nunusable.xlsx')" ;;
     pivot_scope) test "$(ls "$books")" = "$(printf 'grand.xlsx\nmember.xlsx')" ;;
     comments_print) test "$(ls "$books")" = "$(printf 'legacy.xls\nsales.ods')" ;;
@@ -95,6 +98,7 @@ checkpoint() {
         print_fidelity) /tmp/sheets-print-fixture check "$1" "$2-fidelity" ;;
         comments_print) /tmp/sheets-print-fixture check "$1" "$2-$variant" ;;
         formulas) /tmp/sheets-formula-fixture check "$1" "$2" "$format" ;;
+        responsiveness) /tmp/recalc-responsiveness check "$1" "$2" ;;
         sort_filter) /tmp/sheets-sort-filter-fixture check "$1" "$2" ;;
         text_filter) /tmp/sheets-text-filter-fixture check "$1" "$2" "$format" ;;
         rank_filter) /tmp/sheets-rank-filter-fixture check "$1" "$2" "$format" ;;
@@ -582,6 +586,38 @@ formulas_reopened() {
     open_book "$row" "$book" resized
     sleep .4
     cp selectscreen.png "$results/$format-formulas-reopened.png"
+}
+
+responsiveness() {
+    book=responsive.osheet
+    checkpoint "$books/$book" 1
+    open_book 183 "$book" 1 native
+    cp selectscreen.png "$results/responsiveness-initial.png"
+
+    # Both edits go through the in-cell editor. Scroll between them and use
+    # Ctrl+Home to put the same input cell back in view.
+    initial_inode=$(stat -f '%i' "$books/$book")
+    click 60 111
+    key 0x1f                             # 2
+    key 0x28                             # Enter
+    input 'MOVE 350 300' 'SCROLL 360'
+    sleep .12
+    key 0x4a 1                           # Ctrl+Home
+    key 0x24                             # 7
+    key 0x28
+    click 128 24                         # ordinary Save through Scrinium
+
+    file_replaced() { test "$(stat -f '%i' "$books/$book")" != "$initial_inode"; }
+    wait_for file_replaced
+    checkpoint "$books/$book" 7
+    sleep .4
+    cp selectscreen.png "$results/responsiveness-saved.png"
+    close_book
+    open_book 183 "$book" 7 native
+    sleep .4
+    cp selectscreen.png "$results/responsiveness-reopened.png"
+    close_book
+    echo "PASS responsiveness desktop Save and picker reopen kept the latest edit and all formula results"
 }
 
 condfmt_screen() {
@@ -1275,6 +1311,7 @@ case "$profile" in
     native_copy) native_copy; exit ;;
     dates) dates; exit ;;
     protection) protection; exit ;;
+    responsiveness) responsiveness; exit ;;
 esac
 for format in ods xlsx; do
     case "$format" in ods) row=183 ;; xlsx) row=213 ;; esac

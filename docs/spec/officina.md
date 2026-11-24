@@ -3999,6 +3999,40 @@ Shankar asked whether each sheet has a memory budget or only the workbook, and t
 
 Gates: `officina-grid` `tests/ifcache.rs`, `tests/budget.rs`; `atrium-sheets` `a_slow_edit_hands_the_window_back_and_greys_what_is_not_done`, `a_change_past_the_memory_budget_is_not_made`.
 
+**Large-workbook check (2026-11-24).** The live
+`atrium-sheets/examples/recalc_responsiveness.rs` fixture has 1,048,576 rows and
+2,097,152 formula results in an approximately 24.4 MiB native file. Every trial
+begins from the same saved copy. It enters 2, scrolls while a dependent result
+is stale, then enters 7 before the old work completes. Every cached result is
+checked against 7 once recalculation settles. The installed
+`scripts/sheets-interop-vm-check.sh` responsiveness profile uses Scrinium to
+open, edit, save and reopen the same fixture. It checks the file's stored values
+without recalculating them and checks the new document jail's recovery baseline.
+
+Building the entire group's partitions before every slice cost more than the
+slice budget on this workbook. The scheduler now partitions only the current
+wave and carries the unvisited row runs into the next slice. The full calculation
+path still partitions the group once. `tests/budget.rs` verifies disjoint dirty
+runs and that the slice counters add up to the rows actually evaluated.
+
+Three baseline and three updated trials ran consecutively with optimized
+FreeBSD/arm64 binaries on the same four-vCPU HVF Tessera-root VM. Typing and
+scrolling timings begin at event dispatch and end when the app submits its
+scene update. Commit timing also includes the first calculation slice.
+
+| Measurement | Baseline median / max | Updated median / max |
+|---|---|---|
+| Idle typing | 5.65 / 6.16 ms | 5.67 / 5.86 ms |
+| Typing with calculation pending | 5.90 / 6.26 ms | 5.79 / 5.90 ms |
+| Idle scrolling | 5.83 / 6.32 ms | 5.94 / 6.30 ms |
+| Scrolling with calculation pending | 6.51 / 7.65 ms | 6.06 / 7.01 ms |
+| Commit | 36.58 / 38.61 ms | 20.54 / 24.27 ms |
+| Background calculation slice | 26.16 / 33.62 ms | 14.51 / 25.17 ms |
+| Second edit to settled | 762.71 / 868.41 ms | 434.74 / 499.53 ms |
+
+The measured slices can still exceed the 12 ms target. Timing covers app scene
+submission in the VM, while the installed check covers input and file lifecycle.
+
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 
 Sheets showed only a workbook's first sheet. A tab strip now sits under the grid: a press on a tab shows that sheet (at its top left; the filter and conditional-format panels about the last sheet close), **+** adds a sheet at the end and shows it, and ‹ › move the strip a tab at a time. Only the tabs that fit are measured and drawn (`atrium-sheets::tabs::visible`, `reveal`), so 3,000 sheets render as a few do. The Data menu gains Add Sheet and Rename Sheet…, which opens a bar in the strip's place; a taken name (case aside) or one with `[ ] : * ? / \` is refused with the reason, and formulas follow a rename because they name sheets by number.

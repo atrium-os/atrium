@@ -45,6 +45,37 @@ const WAVE_QUICK: std::time::Duration = std::time::Duration::from_millis(4);
 /// Cell-graph edges one on-demand evaluation may walk (cycles among large fills).
 pub const MAX_DEMAND_EDGES: u64 = 64 << 20;
 
+/// Walk dirty runs without allocating partitions for work after this wave.
+struct RowCursor<'a> {
+    tail: Option<(u32, u32)>,
+    rest: std::slice::Iter<'a, (u32, u32)>,
+}
+
+impl<'a> RowCursor<'a> {
+    fn new(rows: &'a RowSet) -> Self {
+        let mut rest = rows.0.iter();
+        Self { tail: rest.next().copied(), rest }
+    }
+
+    fn take(&mut self, mut capacity: u64) -> Vec<(u32, u32)> {
+        let mut part = Vec::new();
+        while capacity > 0 {
+            let Some((first, last)) = self.tail else { break };
+            let size = u64::from(last - first) + 1;
+            let taken = capacity.min(size);
+            let end = first + (taken - 1) as u32;
+            part.push((first, end));
+            capacity -= taken;
+            self.tail = if end == last { self.rest.next().copied() } else { Some((end + 1, last)) };
+        }
+        part
+    }
+
+    fn remaining(self) -> RowSet {
+        RowSet(self.tail.into_iter().chain(self.rest.copied()).collect())
+    }
+}
+
 impl Workbook {
     /// Recalculates everything affected by changes since the last call: rounds of
     /// [`Workbook::recalc_pass`] while dynamic arrays spill into cells others read.
@@ -269,43 +300,18 @@ impl Workbook {
             return true;
         }
         stats.groups += 1;
-        stats.cells += total;
         let (sheet, col) = (self.group(g).sheet, self.group(g).col);
-        // Partition the runs into about 4 parts per thread.
         let threads = self.threads.max(1);
-        // With a deadline: small slices, handed out in waves that grow while
-        // they are quick, so a slow formula stops near the deadline.
-        let parts: Vec<Vec<(u32, u32)>> = if deadline.is_none() && (total < PAR_MIN || threads == 1) {
-            vec![rows.0.clone()]
+        // Full recalculation keeps roughly four parts per thread. With a
+        // deadline each worker gets one part in the current wave.
+        let per = if total < PAR_MIN || threads == 1 {
+            total
         } else {
-            let per = if deadline.is_some() { SLICE } else { total.div_ceil(threads as u64 * 4).max(PAR_MIN / 2) };
-            let mut parts = vec![];
-            let mut cur = vec![];
-            let mut n = 0u64;
-            for &(a, b) in &rows.0 {
-                let mut s = a;
-                loop {
-                    let room = per - n;
-                    let e = if (b - s) as u64 + 1 > room { s + room as u32 - 1 } else { b };
-                    cur.push((s, e));
-                    n += (e - s) as u64 + 1;
-                    if n == per {
-                        parts.push(std::mem::take(&mut cur));
-                        n = 0;
-                    }
-                    if e == b {
-                        break;
-                    }
-                    s = e + 1;
-                }
-            }
-            if !cur.is_empty() {
-                parts.push(cur);
-            }
-            parts
+            total.div_ceil(threads as u64 * 4).max(PAR_MIN / 2)
         };
+        let mut rows = RowCursor::new(rows);
         let shared = std::sync::Arc::new(crate::eval::ifcache::Shared::default());
-        let compute = |this: &Workbook, part: &Vec<(u32, u32)>| -> (Vec<Value>, u64) {
+        let compute = |this: &Workbook, part: &[(u32, u32)]| -> (Vec<Value>, u64) {
             // What the group reads can't change until every part is done (it
             // doesn't read its own column).
             let _frozen = crate::eval::ifcache::Frozen::new(&shared);
@@ -322,33 +328,36 @@ impl Workbook {
             }
             (out, fast)
         };
-        // Without a deadline, one wave of a thread a part; with one, waves of a
-        // run of parts per thread, the runs growing while waves are quick.
-        let mut per_thread = 1usize;
-        let mut i = 0;
-        while i < parts.len() {
-            if i > 0 && deadline.is_some_and(|d| Instant::now() >= d) {
-                let p = self.pending.entry(g).or_default();
-                for part in &parts[i..] {
-                    for &(a, b) in part {
-                        p.add(a, b);
-                    }
-                }
+        let mut per_thread = 1u64;
+        let mut first = true;
+        while rows.tail.is_some() {
+            if !first && deadline.is_some_and(|d| Instant::now() >= d) {
+                self.pending.insert(g, rows.remaining());
                 return false;
             }
-            let n = if deadline.is_some() { (threads * per_thread).min(parts.len() - i) } else { parts.len() };
-            let these = &parts[i..i + n];
-            i += n;
-            let runs: Vec<&[Vec<(u32, u32)>]> = if deadline.is_some() { these.chunks(per_thread).collect() } else { these.chunks(1).collect() };
+            first = false;
+            let (workers, capacity) = if deadline.is_some() {
+                (threads, SLICE * per_thread)
+            } else {
+                (total.div_ceil(per) as usize, per)
+            };
+            let mut parts = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                if rows.tail.is_none() { break; }
+                parts.push(rows.take(capacity));
+            }
             let t = Instant::now();
             let this: &Workbook = self;
-            let run = |r: &[Vec<(u32, u32)>]| -> Vec<(Vec<Value>, u64)> { r.iter().map(|p| compute(this, p)).collect() };
-            let results: Vec<(Vec<Value>, u64)> = if runs.len() == 1 {
-                run(runs[0])
+            let results: Vec<(Vec<Value>, u64)> = if parts.len() == 1 {
+                vec![compute(this, &parts[0])]
             } else {
                 std::thread::scope(|s| {
-                    let hs: Vec<_> = runs.iter().map(|r| std::thread::Builder::new().stack_size(16 << 20).spawn_scoped(s, || run(r)).unwrap()).collect();
-                    hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+                    let workers: Vec<_> = parts.iter().map(|part| {
+                        let compute = &compute;
+                        std::thread::Builder::new().stack_size(16 << 20)
+                            .spawn_scoped(s, move || compute(this, part)).unwrap()
+                    }).collect();
+                    workers.into_iter().map(|h| h.join().unwrap()).collect()
                 })
             };
             if t.elapsed() < WAVE_QUICK {
@@ -356,10 +365,11 @@ impl Workbook {
             } else if t.elapsed() > WAVE_QUICK * 4 {
                 per_thread = (per_thread / 2).max(1);
             }
-            for (part, (vals, fast)) in these.iter().zip(results) {
+            for (part, (vals, fast)) in parts.into_iter().zip(results) {
                 stats.fast_cells += fast;
+                stats.cells += vals.len() as u64;
                 let mut it = vals.into_iter();
-                for &(a, b) in part {
+                for (a, b) in part {
                     for r in a..=b {
                         let v = it.next().unwrap();
                         self.store(sheet, r, col, &v);
