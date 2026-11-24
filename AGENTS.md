@@ -143,6 +143,33 @@ on:
 - Never commit secrets, build outputs (`target/`, `.ko`, images, tarballs) or
   anything under `scratch/` unless asked.
 
+## Review checklist for new code
+
+Before pushing, check your diff against these. An adversarial reviewer
+thread checks them too.
+
+- Every value from a less-trusted party is bounded before it is buffered:
+  frame and line lengths, counts of pending items, declared sizes.
+- No `unwrap`, `expect`, slicing or `as` casts on bytes a peer controls.
+  Return an error and drop that peer.
+- An error on an authority check denies. Never `unwrap_or_default()` a
+  file or answer that grants access; never ignore the result of a
+  `set_permissions`/`chown` that is the access control.
+- Text handed to another parser (jail.conf, fstab, shell, pf, TOML,
+  registry lines) is built from validated tokens, and the renderer refuses
+  rather than escapes anything else.
+- Root never writes a predictable path in a shared directory: `O_EXCL`,
+  0600, fresh name, or a root-only directory.
+- Reuse the shared helper (fd passing, peer uid, framing, hex) instead of
+  writing a new one.
+- Every `unsafe` block has a `SAFETY:` comment saying why it holds.
+- A comment states the invariant, not the history; history goes in the
+  commit message.
+- A test asserts something, and fails on the code before the fix.
+- No new code in portcullisd for one app's feature: ask whether the
+  owning service can do it with a generic primitive.
+  See [docs/reviews/2026-11-24-codebase-review.md](docs/reviews/2026-11-24-codebase-review.md).
+
 ## How to verify (lessons that cost real time)
 
 - A green suite can hide a hang: reconcile the test names that printed

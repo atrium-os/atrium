@@ -72,7 +72,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | C1 | Critical | portcullis-jail, portcullis-toml | An app manifest's entry could add jail.conf parameters (host root) | S | **Fixed `5bf45cf`** |
 | H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | Open |
 | H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | Open |
-| H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: needs a decision |
+| H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
 | H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | Open |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | Open |
 | M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | Open |
@@ -479,10 +479,10 @@ Proposal:
    main that touch a trust boundary (`portcullis/`, `jaild`, `arca/`,
    `aqueduct/`, `frescod/`, `sockmux`, `atrium-tessera/kmod`, `crypta/`,
    `sigillum/`). Post only when there is a finding.
-3. **A checklist in AGENTS.md** (draft below; not applied, pending
-   Shankar's OK).
+3. **A checklist in AGENTS.md**, added 2026-11-24 with Shankar's OK
+   (text below).
 
-Draft AGENTS.md section:
+The AGENTS.md section:
 
 ```markdown
 ## Review checklist for new code
