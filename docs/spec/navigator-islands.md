@@ -1529,7 +1529,8 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 6. **I5. Hardening and the zygote.** JIT-off verified in the binary, rctl limits, crash
    handling (an island that dies leaves its box and a note), and fork-before-taint start-up.
    Then measure the time to first frame.
-7. **I6. Whole-page live code** for fat clients in everyday browsing, if §9 D5 says so.
+7. **I6. Whole-page live code** for fat clients in everyday browsing, on a press
+   (§9 D5). Planned in [I6 plan](#i6-plan-whole-pages-live-on-a-press-proposed).
 
 ### I5 installed-worker hardening on Tessera
 
@@ -2065,6 +2066,134 @@ there, it is the measurement and not the Start; the product figure is then
 `composited` rather than the pixel poll. Next on the Mac: run frescod with
 `FRESCOD_START_TRACE=1`, repeat the three arms, and pass frescod's stderr
 to `navigator-i5-start-trace.sh` with the other logs.
+
+### I6 plan: whole pages live on a press (proposed)
+
+Shankar asked for this plan on 2026-11-24 while the I5 timing waited on the
+Mac. D5 settled the shape: everyday trails stay in the document lane with
+islands, and a whole page goes live only when the person asks, for the few
+fat clients that need it (legacy-web §11.8.3: Figma, WhatsApp Web, Notion's
+editor, Khan Academy's exercises, map-heavy pages, banking, checkout).
+
+**What is already built.** Sign-in windows (I3) run whole pages live: the
+JIT-off Ladybird engine in its own jail, a page fetched through Arca's
+couriers in the window's own jar, forms the page's script submits turned
+into a trusted Continue, WebAuthn through Sigillum, and module scripts. I5
+gives a hardened, audited worker with a standby per persona and a Start of
+about one second. I6 is mostly the sign-in window's machinery offered in an
+ordinary trail, with the sign-in window's strictness loosened where an
+everyday app needs it and kept where it protects the person.
+
+#### What the person sees
+
+- In the document lane the tier chip's popover offers **Run this page live**
+  when the converter saw scripts that did not replay (tier 1 or 2 with
+  losses). Nothing goes live by itself.
+- After the press the chip reads **Live code** (navigator-ui §6.5, already
+  drawn) and frescod frames the whole content area in amber with the
+  origin's tag. The Where field stays navigatord's: the engine never draws
+  the address, the chip or the frame.
+- **Stop** in the popover returns the trail to its document-lane rendering
+  and ends the engine. Leaving the origin ends it too.
+- Whether the choice is remembered per origin is D8.
+
+#### Where it runs
+
+- One engine jail per (persona, origin), from the same
+  `org.atrium.navigator.engine` bundle, as the persona's island uid, with
+  the I5 limits, Capsicum after start-up and JIT off. A standby (D7) takes
+  it when one is waiting.
+- The engine gets a whole-window `Island` slot in the trail instead of a
+  box. Input, clipping and the obscured rule are the island's.
+- The engine is told its origin and fetches only through its own Nuntius
+  (§3). What it may reach beyond its origin is D12.
+- Session recycling (§11.9.1) applies: a memory or idle limit ends the
+  engine and the trail falls back to the document lane until the next
+  press (or the remembered choice) restarts it from the same address.
+
+#### Navigation
+
+The engine never navigates the trail on its own authority.
+
+- A same-origin navigation (link, form, `location`, history API) stays in
+  the engine and is reported on the typed channel, so navigatord adds a
+  trail entry and the Where field follows. Back and Forward drive the
+  engine's history for entries it made.
+- A navigation to another origin is proposed on the channel and refused in
+  the engine. navigatord opens it in the document lane, in the same trail
+  (a link) or a new one (`window.open`, `target=_blank`). It never starts a
+  second live engine for the other origin without its own press.
+- Downloads go to Scrinium's save sheet, as in the document lane. Printing
+  uses the existing Navigator print path (the page child writes the PDF in
+  its jail).
+
+#### What the page can reach
+
+| need | I6 answer | later |
+| --- | --- | --- |
+| Cookies and sign-in | D9 | |
+| `localStorage`, IndexedDB, Cache API | D10 | |
+| Cross-origin `<iframe>` | D11 | |
+| Network beyond the origin | D12 | |
+| File inputs | Scrinium's picker through Limen, one read-only file per press | drag and drop |
+| Clipboard | Tabula: copy any time, paste only on the person's Ctrl-V in that window | |
+| Notifications, geolocation, camera, microphone, MIDI, USB, Bluetooth | refused, and the refusal shown in the chip's popover | per-origin grants through Curia |
+| WebGL, WebGPU, `OffscreenCanvas` on a GPU | not available (no GPU descriptor, §2) | D13 |
+| WebAssembly | the interpreter only (JIT off) | |
+| Service workers, background sync, push | refused: nothing runs after the trail stops showing the page | |
+
+#### Script-made requests
+
+A sign-in window turns a form the script submits into a trusted Continue
+because credentials are at stake. An everyday app sends requests all the
+time, so I6 does not confirm them: the person chose to run the page live,
+and the chip's words already say the page can send what is typed to its
+own site. The protections that stay are the network scope (D12), Nuntius's
+address rules (no private or loopback addresses), the jar's partition
+(D9), and the obscured-input rule. A live page's script can read whatever
+is typed or filled into its own fields, which is what the chip says, so
+Arca fills a saved password only on the person's press and only for the
+origin that saved it.
+
+#### Build steps
+
+1. **I6.0 Qualify.** Without accounts: Khan Academy's public exercises,
+   an OpenStreetMap or MapLibre page, a public Notion page, and local
+   fixtures for a fat client (a single-page app with IndexedDB, a login
+   against the local Keycloak, a cross-origin frame, a file input and a
+   download). Record what renders, what each refused request was, Start and
+   memory. Figma is expected to fail without WebGL and is recorded, not
+   chased.
+2. **I6.1 Whole-window island and the press.** The chip's Run this page
+   live, the whole-window slot, Stop, fallback to the document lane, the
+   amber frame and tag. Gate: the fixture app runs live on a press, never
+   without one, and Stop returns the document-lane rendering.
+3. **I6.2 Navigation contract.** Same-origin navigations as trail entries,
+   cross-origin proposals opened in the document lane, `window.open`,
+   Back and Forward. Gate: a fixture with each kind of navigation, and an
+   engine that tries to navigate cross-origin without proposing.
+4. **I6.3 Jar and storage** (D9, D10). Gate: sign in to the fixture app,
+   Stop, run live again and stay signed in; another persona and another
+   origin see neither the cookie nor the stored data; removing the persona
+   destroys both (Tessera E5).
+5. **I6.4 Brokers.** File input through Scrinium, downloads, clipboard,
+   printing, and the refusals listed above shown in the popover. Gate: each
+   broker on the fixture, and each refused API reported, not silently
+   dropped.
+6. **I6.5 Frames and network scope** (D11, D12). Gate: a fixture page with a
+   same-site API, a third-party script and a cross-origin payment frame.
+7. **I6.6 Hardening.** The remembered choice (D8) in Curia with revoke,
+   recycling under memory pressure, the worker audit and check on a
+   whole-page engine, and the fuzzed channel's new navigation messages.
+
+#### Costs
+
+- A live whole page is a large attack surface in a JIT-off engine: the jail,
+  Capsicum, the origin-scoped fetcher and the persona's separate uid bound
+  the harm, as for islands, but do not remove it (§8).
+- JIT off makes script-heavy apps slow. I6.0 records how slow; making them
+  fast is not in I6.
+- Without WebGL some fat clients (Figma) will not run at all.
 
 ## 8. Costs and risks, stated
 
@@ -2910,6 +3039,12 @@ alongside I0.
 | **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
 | **D7** ✓ | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Decided (Shankar, 2026-11-24): warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
+| **D8** | Is "run this page live" remembered (I6) | ask on every visit · remember per (persona, origin) until revoked · remember for the session only | **Remember per (persona, origin), revocable in Curia and from the chip.** A fat client used daily should not need a press every visit, and a choice that is per persona and visible in the chip keeps it the person's. Never automatic for an origin not chosen |
+| **D9** | Whose jar a live page uses (I6) | a jar per (persona, origin) kept by Nuntius through Arca couriers · a throwaway jar per run | **Kept per (persona, origin) through Arca's couriers**, as sign-in windows do (D6). Apps people run live are the ones they sign in to; a throwaway jar would sign them out at every Stop. The engine still never holds a cookie |
+| **D10** | Where a live page's storage lives (I6) | a per-(persona, origin) directory on the persona's encrypted volume, mounted into the engine jail · in memory for the run only | **On the persona's encrypted volume, one directory per origin**, mounted read-write into that origin's engine jail only. Offline-capable apps (Notion, WhatsApp) need it; persona removal destroys it with the rest (Tessera E5) |
+| **D11** | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
+| **D12** | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
+| **D13** | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |
 
 ### Local Mail callback and account storage
 
