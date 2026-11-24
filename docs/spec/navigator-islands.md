@@ -1599,6 +1599,63 @@ arm64 binary in a signed offline bundle and run
 `scripts/navigator-i5-fork-check.sh INSTALLED_BUNDLE` inside Tessera.
 Evidence is in `~/atrium-vm/evidence/navigator-i5-fork-20261124/`.
 
+### I5 Start trace
+
+The 3,176 ms installed Start covers every hop from the press to the first
+presented frame, and the fork gate covers only the engine's own part. Before
+choosing how a warmed child gets its own jail, the installed path is traced
+hop by hop. Each process on the path prints one line on stderr per stage,
+and only for an engine launch:
+
+```
+start-trace WHO STAGE mono_us=N pid=P TAG
+```
+
+`mono_us` is `CLOCK_MONOTONIC` in microseconds, which is one clock for every
+process and every jail on the machine, so the lines line up without any
+clock exchange. A launch counts as an engine launch when the app is
+`org.atrium.navigator.engine` (Limen, portcullisd, the one-shot lane) or the
+jail name contains `navigator-engine` (jaild). Other launches print nothing.
+
+| Who | Stage | Where |
+| --- | --- | --- |
+| navigatord | `widget-start` | `Widget::start`, before connecting to Limen |
+| limend | `request-island` | `REQUEST_ISLAND` received |
+| limend | `exec-instance` | `ExecInstance` sent to portcullisd |
+| portcullisd | `exec-begin` | `handle_exec_instance` entry |
+| portcullisd | `ready-for-fds` | policy, limits and route domain passed |
+| limend | `ready-for-fds` | portcullisd's answer read |
+| limend | `fds-sent` | island channel, fetch socket and stderr sent |
+| portcullisd | `fds-received` | descriptors received |
+| oneshot | `run-begin` | `run_inner` entry (manifest, signature, root) |
+| oneshot | `jaild-call` | instance root built, `run_via_jaild` called |
+| jaild | `create-begin` | `handle_create`, before validation |
+| jaild | `exec-begin` | jail created, before the exec path |
+| jaild | `pdfork-done` | the worker forked (its pid in the tag) |
+| limend | `embed-handed` | frescod embed connection sent on the channel |
+| navigatord | `island-granted` | `request_island` answered |
+| navigatord | `island-fetch` | the fetch channel arrived |
+| navigatord | `placed` | the island placed in the window |
+| navigatord | `first-request` | the engine's first document GET |
+| navigatord | `engine-started` | the engine reported its start for the origin |
+| navigatord | `attached` | frescod attached the island's scene |
+| oneshot | `jaild-returned` | the worker's jail ended (after the run) |
+
+`scripts/navigator-i5-start-trace.sh [--last] LOG...` merges the logs of
+navigatord, limend, portcullisd and jaild, orders the lines by `mono_us`,
+prints each stage's time since the first and since the previous stage, and
+fails when a hop that must appear is missing. `--last` keeps only the most
+recent press. The engine's own work and frescod's first presentation are not
+instrumented: the gap from `first-request` to `attached` is the engine
+(execve, dynamic link, LibWeb start, layout, first scene), and the gap from
+`attached` to the observed red pixel is composition and the headless
+capture, which the existing I5 observation measures.
+
+To run it, deploy main's navigatord, limend, portcullisd and jaild to the
+arm64 Tessera VM, press Start three times as in the I5 gate, and pass the
+daemons' logs to the script once per press. Record the three per-stage
+tables beside the I5 evidence.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a

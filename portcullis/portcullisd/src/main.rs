@@ -1087,6 +1087,8 @@ fn handle_exec_instance(
      * not delegate a uid): `user` may start this app as a worker that runs
      * as the rule's `run_as`, on the rule's own budget. Without one, the
      * worker runs as the caller, as it always has. */
+    let engine = app_id == "org.atrium.navigator.engine";
+    if engine { portcullis_oneshot::start_trace("portcullisd", "exec-begin", &app_id) }
     if let Some(r) = &rule {
         eprintln!("portcullisd: {user} starts {app_id} as {} (system worker rule)", r.run_as);
     }
@@ -1185,6 +1187,7 @@ fn handle_exec_instance(
     } else {
         None
     };
+    if engine { portcullis_oneshot::start_trace("portcullisd", "ready-for-fds", &app_id) }
     write_response(writer, &match as_uid {
         Some(uid) => Response::ReadyForFdsAs { uid },
         None => Response::ReadyForFds,
@@ -1213,6 +1216,7 @@ fn handle_exec_instance(
                      else { format!("expected 3 fds, got {}", fds.len()) },
         });
     }
+    if engine { portcullis_oneshot::start_trace("portcullisd", "fds-received", &app_id) }
     let mut it = fds.into_iter();
     let stdio = [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()];
     let mut extra_fds: Vec<OwnedFd> = it.collect();

@@ -271,6 +271,12 @@ pub fn run_with_fds_detached(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3
     run_inner(spec, stdio, extra, true)
 }
 
+/// One `start-trace` line for the island Start trace (navigator-islands.md
+/// "I5 Start trace"): CLOCK_MONOTONIC so lines from every process line up.
+pub fn start_trace(who: &str, stage: &str, tag: &str) {
+    eprintln!("start-trace {who} {stage} mono_us={} pid={} {tag}", jaild::ffi::monotonic_us(), std::process::id());
+}
+
 fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<std::os::fd::OwnedFd>, detached: bool) -> OneShot {
     if !extra.is_empty() && (stdio.is_none() || extra.len() > jaild::protocol::MAX_EXTRA_FDS) {
         return OneShot::Refused(format!("{} extra descriptors: at most {}, and only with the caller's stdio",
@@ -291,6 +297,8 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     }
     let mut tm = Phases::new();
     let target = spec.target.as_str();
+    let engine = target == "org.atrium.navigator.engine";
+    if engine { start_trace("oneshot", "run-begin", target) }
     let instance = spec.instance.clone();
     let tmpfs_mb = spec.tmpfs_mb;
     let tree = resolve_tree(target);
@@ -496,7 +504,9 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
         fuse: None,
     });
     tm.mark("prepare");
+    if engine { start_trace("oneshot", "jaild-call", &jail_name) }
     let outcome = run_via_jaild(&req, stdio, extra);
+    if engine { start_trace("oneshot", "jaild-returned", &jail_name) }
     tm.mark("jaild-run");
 
     jaild_remove(&jail_name);

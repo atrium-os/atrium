@@ -118,6 +118,7 @@ impl Portcullis {
             Err(e) => return Err(e),
         };
         no_app_socket(app)?;
+        let engine = app == "org.atrium.navigator.engine";
         let go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;
@@ -127,6 +128,7 @@ impl Portcullis {
                 Response::Hello { .. } => {}
                 other => return Err(io::Error::other(format!("hello: {other:?}"))),
             }
+            if engine { crate::start_trace("limend", "exec-instance", app) }
             write_request(&mut s, &Request::ExecInstance {
                 app_id: app.to_string(),
                 instance: Some(format!("limen-{embed:016x}")),
@@ -150,7 +152,9 @@ impl Portcullis {
                 Some(socket) => socket.into(),
                 None => std::fs::OpenOptions::new().write(true).open("/dev/null")?.into(),
             };
+            if engine { crate::start_trace("limend", "ready-for-fds", app) }
             send_fds(&s, &[channel.as_raw_fd(), stdout.as_raw_fd(), 2])?;
+            if engine { crate::start_trace("limend", "fds-sent", app) }
             s.set_read_timeout(None)?;
             Ok(s)
         };

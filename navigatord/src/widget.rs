@@ -59,10 +59,12 @@ impl Widget {
         finished: impl FnOnce(Option<navigator_control::WidgetFailure>) + Send + 'static,
     ) -> Result<Self, String> {
         let rect = bounds(rect)?;
+        limen::start_trace("navigatord", "widget-start", source);
         let mut parent = Parent::at(socket).map_err(|e| format!("Limen: {e:?}"))?;
         let embed = parent
             .request_island(window, 1)
             .map_err(|e| format!("engine launch: {e:?}"))?;
+        limen::start_trace("navigatord", "island-granted", &format!("embed={embed:?}"));
         let until = Instant::now() + Duration::from_secs(5);
         loop {
             let left = until.saturating_duration_since(Instant::now());
@@ -77,12 +79,14 @@ impl Widget {
                 _ => {}
             }
         }
+        limen::start_trace("navigatord", "island-fetch", source);
         let channel = parent
             .take_island_fetch(embed)
             .ok_or("missing widget fetch socket")?;
         parent
             .place(embed, Some(rect))
             .map_err(|e| format!("place: {e:?}"))?;
+        limen::start_trace("navigatord", "placed", source);
         let playback = Arc::new(Mutex::new(None));
         let video = if matches!(source, VIDEO | YOUTUBE_ENTRY) {
             use std::os::fd::AsRawFd;
@@ -135,11 +139,13 @@ impl Widget {
                 }
                 match connection.poll(Duration::from_millis(40)) {
                     Ok(Some(ParentEvent::Attached { embed: id })) if id == embed => {
+                        limen::start_trace("navigatord", "attached", granted_origin.as_deref().unwrap_or("-"));
                         if let Some(report) = attached.take() { report(); }
                     }
                     Ok(Some(ParentEvent::Message { embed: id, bytes })) if id == embed => {
                         match reports.receive(&bytes) {
                             Some(Report::Started { origin }) if granted_origin.as_deref() == Some(origin) => {
+                                limen::start_trace("navigatord", "engine-started", origin);
                                 eprintln!("navigatord: widget reported start for {origin}");
                             }
                             Some(Report::MediaReady) => {
@@ -259,6 +265,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
         let Some(Request::Open(open)) = request else {
             return Err("expected a document GET".into());
         };
+        if step == 0 { limen::start_trace("navigatord", "first-request", source) }
         let player = source == YOUTUBE_ENTRY && step > 0 && open.method == Method::Post
             && navigator_control::youtube::player_url(&open.url);
         let stream = source == YOUTUBE_ENTRY

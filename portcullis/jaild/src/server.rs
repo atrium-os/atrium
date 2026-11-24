@@ -844,6 +844,13 @@ struct CallerFds {
     extra: Vec<OwnedFd>,
 }
 
+/// One line per island Start stage for scripts/navigator-i5-start-trace.sh
+/// (navigator-islands.md §I5): CLOCK_MONOTONIC is one clock for every
+/// process and jail on the machine, so the stages line up across daemons.
+fn start_trace(who: &str, stage: &str, tag: &str) {
+    eprintln!("start-trace {who} {stage} mono_us={} pid={} {tag}", ffi::monotonic_us(), std::process::id());
+}
+
 fn handle_create(
     req:        &CreateJailRequest,
     stdio:      Option<CallerFds>,
@@ -854,6 +861,8 @@ fn handle_create(
     state:      &mut PersistentState,
     state_path: &Path,
 ) -> Result<CreateOutcome, JaildError> {
+    let engine = req.name.contains("navigator-engine");
+    if engine { start_trace("jaild", "create-begin", &req.name) }
     validator::validate_create(req, policy)?;
     if let Some(exec) = &req.exec {
         let n = exec.listen.len().min(listen.len());
@@ -1073,6 +1082,7 @@ fn handle_create(
     };
 
     if let Some(exec) = &req.exec {
+        if engine { start_trace("jaild", "exec-begin", &req.name) }
         let r = handle_create_with_exec(
             req, exec, stdio, control, listen, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
             policy.mount_sources.max_tmpfs_mb, pre_created, sysfil,
@@ -1701,6 +1711,7 @@ fn handle_create_with_exec(
             warn!("jaild: clear persist on jid {jid}: {e} — jail will outlive its process");
         }
     }
+    if req.name.contains("navigator-engine") { start_trace("jaild", "pdfork-done", &format!("{} child={}", req.name, pdf.pid)) }
     info!("jaild: pdfork ok pid={} pdfd={} lo0_alias={:?}",
         pdf.pid, pdf.procdesc_fd, lo0_alias);
 

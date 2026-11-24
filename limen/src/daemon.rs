@@ -385,6 +385,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
             }
             op::REQUEST_ISLAND => {
                 let (window, z) = de(payload)?;
+                crate::start_trace("limend", "request-island", &format!("uid={uid}"));
                 request(shared, conn, uid, proto::Request { role: "web-island".into(), window, z }, true)
             }
             op::PLACE => {
@@ -571,6 +572,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
                     use std::os::fd::AsRawFd;
                     portcullis_ipc::send_fds(&ours, &[f.as_raw_fd()]).map_err(|e| e.to_string())
                 });
+            if with_fetch && handed.is_ok() { crate::start_trace("limend", "embed-handed", &provider) }
             if let Err(e) = handed {
                 eprintln!("limend: {provider} for {}: {e}", role.name);
                 shared.launcher.lock().unwrap().end(embed);
