@@ -1656,6 +1656,56 @@ arm64 Tessera VM, press Start three times as in the I5 gate, and pass the
 daemons' logs to the script once per press. Record the three per-stage
 tables beside the I5 evidence.
 
+#### Results on arm64 Tessera, 2026-11-24
+
+The daemons came from main `e4dc55230`, and the engine was the audited I5
+worker (digest `036711b4…5a95f7`), on a disposable guest running the I5
+local chapter fixture. All 21 stages printed on every press. The medians
+below are milliseconds since `widget-start`, over three presses per arm.
+
+| Stage | No audio service (as in the I5 gate) | choragusd answering |
+| --- | ---: | ---: |
+| limend `request-island` | 0.261 | 0.266 |
+| portcullisd `exec-begin` | 1.523 | 1.558 |
+| limend `fds-sent` | 1.837 | 1.869 |
+| limend `embed-handed` | 2.136 | 2.158 |
+| navigatord `placed` | 2.325 | 2.358 |
+| oneshot `jaild-call` | 10.910 | 11.320 |
+| jaild `create-begin` | 13.682 | 11.938 |
+| jaild `exec-begin` | 23.119 | 16.867 |
+| jaild `pdfork-done` | 23.456 | 17.156 |
+| navigatord `first-request` | 2,025.432 | 62.587 |
+| navigatord `attached` | 2,035.679 | 66.401 |
+| navigatord `engine-started` | 2,270.950 | 366.227 |
+| oneshot `jaild-returned` | 2,690.142 | 817.506 |
+
+The daemon path from the press to a forked worker takes 16 to 29 ms. Of
+that, about 2.4 ms covers Limen, portcullisd's policy step and the
+descriptor handoff. The one-shot lane's manifest and root preparation
+takes 6 to 21 ms, and jaild's jail creation takes 3 to 14 ms.
+
+In the arm without an audio service, the engine's first request arrived
+2.0 s after its fork, on every press. The I5 gate guest ran no choragusd.
+While it starts the embedded player, limend waits up to 2 s for the absent
+audio-attribution socket (`atrium_listen::connect` in `limen/src/audio.rs`).
+With lyrad on `snd_dummy` and choragusd answering, the gap fell to 40 to
+56 ms. choragusd still refused the ticket, because the Navigator grant has
+no `audio`. A listener that accepts and never answers kept the 2.0 s gap,
+which acts as the positive control (1 s read timeout, then one retry).
+The 3,176 ms installed baseline was therefore measured with this wait
+included. With the wait removed, the engine accounts for most of the
+remaining Start time: about 45 ms from fork to its first request, and
+about 300 ms from that request to its start report.
+
+In every press the island then failed with "The live widget could not load
+its page". Main's navigatord grant for the local video expects a fourth
+fetch (`tone-opus.webm`, since `88704300b`), but the I5 fixture and worker
+make three. No red frame was observed, so this run does not repeat the
+press-to-pixel time. The press-to-failure note took about 2.9 s without the
+audio service and about 0.95 s with it. Before the next Start measurement,
+pair main's navigatord with a worker and fixture that make the Opus fetch.
+Evidence is in `~/atrium-vm/evidence/navigator-i5-start-trace-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
