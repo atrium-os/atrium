@@ -4833,10 +4833,17 @@ Gates: atrium-sheets `custom_sort_orders_by_several_columns_named_by_letter_or_h
 
 ### 16.106 Duplicate Sheet brings charts and tables; renames reach rules (2026-11-24)
 
-- **Duplicate Sheet** now copies the sheet's charts and pictures onto the copy. A chart's series ranges, and its title or series names taken from cells, follow to the copy when they were on the original sheet; ranges on other sheets stay. Tables are copied too, each under a fresh workbook-wide name `Name_2` (or the next free number, clashing with neither tables nor defined names). Not yet: structured references in the copied cells still name the original table, where Excel points them at the copy. Pivots stay with the original.
+- **Duplicate Sheet** now copies the sheet's charts and pictures onto the copy. A chart's series ranges, and its title or series names taken from cells, follow to the copy when they were on the original sheet; ranges on other sheets stay. Tables are copied too, each under a fresh workbook-wide name `Name_2` (or the next free number, clashing with neither tables nor defined names). Formulas in the copy that name a copied table name the copy instead (since §16.107), as Excel's do. Pivots stay with the original.
 - **Renaming a name** also rewrites conditional-format rule formulas and data-validation formulas, on the sheets where the spelling means that name, with the same LET and LAMBDA exception as cell formulas (`names::rename_ops`).
 
 Gates: atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` and `renaming_a_name_reaches_conditional_formats_and_validations`. Both fail on the code before. All 136 Sheets lib and 121 officina-grid lib tests pass.
+
+### 16.107 Copied formulas follow copied tables; Freeze First Column (2026-11-24)
+
+- After Duplicate Sheet, formulas on the copy whose structured references name a table that was copied (`Sales[Qty]`) are rewritten to name the copy (`Sales_2[Qty]`), as part of the same step (`data::retable`). Formulas on other sheets keep naming the original.
+- **Freeze First Column** (Data menu, beside Freeze Top Row) keeps the view's first column in view, as Freeze Top Row does for the top row.
+
+Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` (the copy's `=SUM(Table[Qty])` names the copy and sums to 3) and `panes_freeze_at_the_cursor_and_unfreeze`; all 136 Sheets lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 

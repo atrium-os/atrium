@@ -189,6 +189,8 @@ pub enum DataCmd {
     FreezePanes,
     /// Keep the first row in view.
     FreezeTopRow,
+    /// The first column of the view kept in view.
+    FreezeFirstColumn,
     /// Let every row and column scroll again.
     Unfreeze,
     /// Compare this workbook with another copy ([`crate::review`]); the window
@@ -444,6 +446,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
         v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
+        v.insert(i + 2, (MenuItem::new("Freeze First Column"), Some(DataCmd::FreezeFirstColumn)));
     }
     match table {
         Some(t) => {
@@ -771,9 +774,11 @@ pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
     // Tables, each under a fresh name (table names are workbook-wide).
     let mut tables = d.wb.tables().to_vec();
     let mut more = Vec::new();
+    let mut renamed: Vec<(Arc<str>, Arc<str>)> = Vec::new();
     for tb in tables.iter().filter(|tb| tb.rect.sheet == s) {
         let taken = |n: &str| tables.iter().chain(&more).any(|x: &officina_grid::tables::Table| x.name.eq_ignore_ascii_case(n)) || d.wb.names().iter().any(|x| x.name.eq_ignore_ascii_case(n));
         let Some(name) = (2..).map(|k| format!("{}_{k}", tb.name)).take(10_000).find(|n| !taken(n)) else { continue };
+        renamed.push((tb.name.clone(), Arc::<str>::from(name.as_str())));
         more.push(officina_grid::tables::Table { name: name.into(), rect: Rect { sheet: t, ..tb.rect }, ..tb.clone() });
     }
     if !more.is_empty() {
@@ -785,6 +790,21 @@ pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
         ops.push(GridOp::MoveSheet { from: t, to: s + 1 });
     }
     d.extend(ops);
+    // Formulas in the copy naming a table that was copied name the copy,
+    // as Excel's do.
+    if !renamed.is_empty() {
+        let at = s + 1;
+        let mut fix = Vec::new();
+        for (_, g) in d.wb.groups().filter(|(_, g)| g.sheet == at) {
+            if let Some(e) = retable(&g.expr, &renamed) {
+                let src = officina_grid::formula::to_a1(&e, g.r0, g.col, &|id| d.wb.sheet_name(id));
+                fix.push(GridOp::Replace(officina_grid::ops::Region { rect: Rect { sheet: at, r0: g.r0, c0: g.col, r1: g.r1, c1: g.col }, values: Vec::new(), fills: vec![officina_grid::ops::Fill { col: g.col, r0: g.r0, r1: g.r1, src }] }));
+            }
+        }
+        if !fix.is_empty() {
+            d.extend(fix);
+        }
+    }
     Ok(s + 1)
 }
 
@@ -857,6 +877,39 @@ pub enum NamesCmd {
     Rename(usize),
     Delete(usize),
     Close,
+}
+
+/// `e` with its structured references to the tables `renamed` lists (old,
+/// new) naming the new ones; `None` when it names none of them.
+fn retable(e: &officina_grid::formula::ast::Expr, renamed: &[(Arc<str>, Arc<str>)]) -> Option<officina_grid::formula::ast::Expr> {
+    use officina_grid::formula::ast::Expr;
+    let new_name = |t: &str| renamed.iter().find(|(o, _)| o.eq_ignore_ascii_case(t)).map(|(_, n)| n.clone());
+    let mut any = false;
+    e.walk(&mut |x| if let Expr::Table(r) = x { any |= new_name(&r.table).is_some() });
+    if !any {
+        return None;
+    }
+    fn go(e: &Expr, f: &dyn Fn(&str) -> Option<Arc<str>>) -> Expr {
+        let b = |x: &Expr| Box::new(go(x, f));
+        let all = |xs: &[Expr]| xs.iter().map(|a| go(a, f)).collect::<Vec<_>>();
+        match e {
+            Expr::Table(r) => match f(&r.table) {
+                Some(n) => Expr::Table(Arc::new(officina_grid::formula::ast::TableRef { table: n, ..(**r).clone() })),
+                None => e.clone(),
+            },
+            Expr::Neg(x) => Expr::Neg(b(x)),
+            Expr::Plus(x) => Expr::Plus(b(x)),
+            Expr::Pct(x) => Expr::Pct(b(x)),
+            Expr::Paren(x) => Expr::Paren(b(x)),
+            Expr::At(x) => Expr::At(b(x)),
+            Expr::Bin(op, x, y) => Expr::Bin(*op, b(x), b(y)),
+            Expr::Call(fun, args) => Expr::Call(fun.clone(), all(args)),
+            Expr::Invoke(g, args) => Expr::Invoke(b(g), all(args)),
+            Expr::Array(rows) => Expr::Array(rows.iter().map(|r| all(r)).collect()),
+            other => other.clone(),
+        }
+    }
+    Some(go(e, &new_name))
 }
 
 /// Define Name: `name` given to the selection, for the whole workbook, as
@@ -1683,13 +1736,14 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run(if n == 1 { "Delete Comment" } else { "Delete Comments" }, vec![GridOp::Comments { sheet: s, set }]);
             Ok(if n == 1 { "Comment deleted.".into() } else { format!("{n} comments deleted.") })
         }
-        DataCmd::FreezePanes | DataCmd::FreezeTopRow | DataCmd::Unfreeze => {
+        DataCmd::FreezePanes | DataCmd::FreezeTopRow | DataCmd::FreezeFirstColumn | DataCmd::Unfreeze => {
             // Frozen from the row and column at the top left of the view, as
             // in Excel: what is above and left of them is out of reach.
             let top = d.view_top;
             let (rows, cols) = match cmd {
                 DataCmd::FreezePanes => cursor,
                 DataCmd::FreezeTopRow => (top.0.saturating_add(1).min(officina_grid::addr::MAX_ROWS - 1), 0),
+                DataCmd::FreezeFirstColumn => (0, top.1.saturating_add(1).min(officina_grid::addr::MAX_COLS - 1)),
                 _ => (0, 0),
             };
             let from = (if top.0 < rows { top.0 } else { 0 }, if top.1 < cols { top.1 } else { 0 });
@@ -2140,6 +2194,12 @@ mod tests {
         d.undo();
         run(&mut d, one(5, 0), (5, 0), DataCmd::FreezePanes);
         assert_eq!((d.wb.sheet(0).freeze, d.wb.sheet(0).freeze_from), ((5, 0), (0, 0)));
+        // Freeze First Column keeps the view's first column.
+        d.view_top = (0, 0);
+        run(&mut d, one(5, 0), (5, 0), DataCmd::Unfreeze);
+        assert!(titles(&d).iter().any(|t| t == "Freeze First Column"));
+        run(&mut d, one(5, 3), (5, 3), DataCmd::FreezeFirstColumn);
+        assert_eq!((d.wb.sheet(0).freeze, d.status.as_str()), ((0, 1), "The first column stays in view."));
     }
 
     #[test]

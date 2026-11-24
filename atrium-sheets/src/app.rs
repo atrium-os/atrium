@@ -7333,7 +7333,14 @@ mod tests {
         let (tables0, charts0) = { let d = s.doc.borrow(); (d.wb.tables().len(), d.wb.charts().len()) };
         assert_eq!((tables0, charts0), (1, 1));
         let tname = s.doc.borrow().wb.tables()[0].name.to_string();
+        s.doc.borrow_mut().type_into(5, 0, &format!("=SUM({tname}[Qty])"));
         data(&s, DataCmd::DuplicateSheet);
+        // The copy's formula names the copied table; the original's doesn't change.
+        let ft = |sh: u16| s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(sh, 5, 0));
+        assert_eq!(ft(1), Some(format!("=SUM({tname}_2[Qty])")));
+        assert_eq!(ft(0), Some(format!("=SUM({tname}[Qty])")));
+        s.doc.borrow_mut().wb.recalc();
+        assert_eq!(s.doc.borrow().wb.value(1, 5, 0), officina_grid::Value::Num(3.0));
         let d = s.doc.borrow();
         assert_eq!(d.wb.tables().len(), 2);
         let copy = &d.wb.tables()[1];
