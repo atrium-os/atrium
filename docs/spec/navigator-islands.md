@@ -2575,6 +2575,35 @@ Same flag as I6.1.
 4. Resize the window while live: the page lays out at the new size (the
    navigatord log shows no "size not sent" line).
 
+#### I6.2 first part: gate results on arm64 Tessera, 2026-11-25
+
+Main `87785725f`, set up as for the I6.1 gate: the `I6_PAGE` engine
+(`d7526241…6452`, audit passed), navigatord, navigator-ui and limend from
+main. The engine needed one compile fix: `EditorPage.h` includes
+`LibWeb/DOM/Document.h` and `LibWeb/HTML/LocalNavigable.h` for
+`ATRIUM_I6_PAGE`.
+
+1. Run live, press **Same origin page**: a new trail entry
+   `https://app.example/second.html`, navigatord logged `live-start` and
+   `live-started` for it with no prompt, the island and "live code" tag
+   showed it, and the fixture server logged `/second.html` twice (the
+   document lane's fetch and the engine's through navigatord). Passed.
+2. Back: `app.html` in the document lane, no engine process. Passed.
+3. Run live, press **Another site**: the trail shows `https://elsewhere.example/`,
+   and the engine ended. Passed, but the first time the page area stayed
+   blank white although the document lane had laid the page out: the slot
+   hidden for the live page was not shown again for the new page. Nine
+   later tries (the same sequence from a fresh Navigator, and from Back)
+   drew the page. navigator-ui now shows a newly attached child in a hidden
+   slot unless its own page runs live; three repeats with it drew the page.
+4. Resizing the page area while live (the rail's collapse button, since the
+   headless injector cannot resize the window): the island followed the new
+   page area and navigatord logged no "size not sent" line. Passed.
+
+c6de813e7 (the document lane hidden while live) is confirmed: `second.html`,
+which has a clear background, no longer shows doubled text. Evidence is in
+`~/atrium-vm/evidence/navigator-i6-2a-20261125/`.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

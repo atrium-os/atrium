@@ -999,6 +999,17 @@ impl Live {
                 ParentEvent::Attached { .. } => {
                     eprintln!("navigator-ui: page child attached");
                     self.children[i].attached = true;
+                    // A page opened while the slot was hidden for a live page
+                    // (a live page's link to another site) must show: the
+                    // slot stays hidden only while its own page runs live.
+                    let live_here = s.live_run.as_ref().is_some_and(|r| r.origin.is_some() && Some(r.key) == self.shown);
+                    if on_screen && !live_here {
+                        if let Some(e) = &self.embeds {
+                            if let Err(err) = e.borrow_mut().show(PAGE_SLOT, self.children[i].embed) {
+                                eprintln!("navigator-ui: limend: {err:?}");
+                            }
+                        }
+                    }
                     if let Some(t) = self.children[i].pending.take() {
                         self.give(i, t);
                     }
