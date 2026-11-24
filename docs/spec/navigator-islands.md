@@ -1883,6 +1883,39 @@ standby that receives a data byte without a descriptor was not tested on
 the guest. Evidence is in
 `~/atrium-vm/evidence/navigator-i5-rerun-20261124/`.
 
+#### Follow-up: tracing past the engine's start, and two overlaps
+
+The trace now continues to the first decoded frame. New stages, all
+printed once per island:
+
+| Who | Stage | Where |
+| --- | --- | --- |
+| navigatord | `player-request`, `player-granted` | the embedded player asked of Limen, and granted |
+| navigatord | `request`, `fetched`, `served` | each of the first eight fetches: arrived, answered upstream (tag `step=N bytes=N url`), delivered to the engine |
+| navigatord | `video-open`, `add-vp9`, `add-opus` | the engine's media element and source buffers |
+| navigatord | `append-vp9`, `appended-vp9`, `append-opus`, `appended-opus` | the first append of each track, and its acknowledgement |
+| navigatord | `player-canplay`, `player-ready`, `set-playing`, `playing` | the player's answers, Play, and the first advancing time |
+| player | `main`, `ready` | the embedded player's process start and its embed token, for a Navigator embed only |
+| player | `first-frame` | the first decoded frame |
+
+Two changes take work off the press's path:
+
+- **The player launches beside the engine.** `Video::start` used to ask
+  Limen for the player and wait for it before handing the engine its video
+  socket, and the engine could not make its first request until it had that
+  socket. The socket is now handed over at once and the player is asked
+  for on the session's own thread; the engine's media requests wait on the
+  socket until the player is there, and a placement that arrives meanwhile
+  is kept for it.
+- **The next standby waits.** limend launches it `STANDBY_REFILL_DELAY`
+  (3 s) after the island, so its jail, fork and warm-up do not compete with
+  the island's start, its player and its first frame.
+
+Next on the Mac VM: rebuild the player and navigatord from main, repeat
+the three arms with the player's and navigatord's stderr in the trace
+inputs, and read where the 1.4 s after `engine-started` goes before tuning
+anything else.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a

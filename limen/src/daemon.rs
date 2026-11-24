@@ -222,6 +222,12 @@ struct Standby {
 /// keep an engine's memory forever.
 pub const STANDBY_MAX_AGE: Duration = Duration::from_secs(600);
 
+/// The next standby waits this long after an island is asked for, so its
+/// jail, fork and warm-up don't compete with the island's own start, its
+/// player and its first frame (on the Mac VM a standby launched at the
+/// press delayed a cold island's fork to 141 ms).
+pub const STANDBY_REFILL_DELAY: Duration = Duration::from_secs(3);
+
 impl State {
     fn push<T: Serialize>(&self, conn: ConnId, op: u16, ev: &T) {
         if let Some(tx) = self.conns.get(&conn) {
@@ -259,6 +265,8 @@ pub struct Shared {
     mail_sheet_provider: Mutex<Option<Box<dyn Fn(u32) -> bool + Send + Sync>>>,
     smime_mail: Mutex<Option<SmimeMail>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
+    /// How long after an island the next standby is launched.
+    standby_delay: Mutex<Duration>,
     /// Without one (tests), any app may embed any role.
     embed_check: Mutex<Option<EmbedCheck>>,
     /// Without one (tests), the share sheet may choose any app.
@@ -282,6 +290,7 @@ impl Shared {
             mail_sheet_provider: Mutex::new(None),
             smime_mail: Mutex::new(None),
             attribution: Mutex::new(None),
+            standby_delay: Mutex::new(STANDBY_REFILL_DELAY),
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
         })
@@ -312,6 +321,12 @@ impl Shared {
     /// embedded player gets no ticket and so plays nothing.
     pub fn set_attribution(&self, a: Box<dyn Attribution>) {
         *self.attribution.lock().unwrap() = Some(a);
+    }
+
+    /// How long after an island its Navigator's next standby is launched
+    /// (default [`STANDBY_REFILL_DELAY`]).
+    pub fn set_standby_delay(&self, d: Duration) {
+        *self.standby_delay.lock().unwrap() = d;
     }
 
     /// Whether a warmed engine is waiting for `uid`'s next island.
@@ -708,7 +723,9 @@ fn refill_standby(shared: &Arc<Shared>, st: &mut State, uid: u32) {
     st.next_embed = st.next_embed.wrapping_add(1);
     let embed = st.next_embed;
     let sh = shared.clone();
+    let delay = *shared.standby_delay.lock().unwrap();
     std::thread::spawn(move || {
+        std::thread::sleep(delay);
         let launched = UnixStream::pair().map_err(|e| e.to_string()).and_then(|(ours, theirs)| {
             sh.launcher.lock().unwrap().launch_island_standby(embed, theirs, uid).map(|child_uid| (ours, child_uid))
         });

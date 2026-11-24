@@ -1144,6 +1144,7 @@ fn a_navigators_next_island_takes_its_warmed_standby_engine() {
     use std::io::{Read, Write};
     let w = World::new();
     w.standby.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.shared.set_standby_delay(Duration::ZERO);
     w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
     let mut navigator = w.parent(4101);
 
@@ -1191,6 +1192,7 @@ fn a_navigators_next_island_takes_its_warmed_standby_engine() {
 fn a_dead_standby_falls_back_to_a_cold_start() {
     let w = World::new();
     w.standby.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.shared.set_standby_delay(Duration::ZERO);
     w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
     let mut navigator = w.parent(4101);
     let first = navigator.request_island(W_APP, 1).unwrap();
@@ -1207,3 +1209,19 @@ fn a_dead_standby_falls_back_to_a_cold_start() {
     eventually("the dead standby is ended", || w.ended.lock().unwrap().contains(&standby));
 }
 
+
+#[test]
+fn the_next_standby_waits_until_the_island_has_started() {
+    let w = World::new();
+    w.standby.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.shared.set_standby_delay(Duration::from_millis(400));
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    let mut navigator = w.parent(4101);
+    let _ = navigator.request_island(W_APP, 1).unwrap();
+    let (_, _cold) = w.spawned();
+    // Nothing competes with the island's own start...
+    assert!(w.launched.recv_timeout(Duration::from_millis(200)).is_err());
+    // ...and then the standby comes.
+    assert!(w.launched.recv_timeout(Duration::from_secs(2)).is_ok());
+    eventually("the standby is registered", || w.shared.standby_ready(4101));
+}

@@ -349,13 +349,18 @@ fn start_fetcher(url: &str) -> Fetcher {
 /// channel on stdin and an embed-only frescod connection on it.
 fn embedded() {
     use limen::proto::ChildEvent;
+    let started = limen::monotonic_us();
     let (mut child, fresco) = limen::client::Child::embedded().unwrap_or_else(|e| {
         eprintln!("atrium-player: no limend channel: {e:?}");
         std::process::exit(1)
     });
-    let embed = loop {
+    let (embed, trace) = loop {
         match child.poll(Duration::from_secs(30)) {
-            Ok(Some(ChildEvent::Attach { embed, role, .. })) if role == "media-player" => break embed,
+            // The island Start trace (navigator-islands.md "I5 Start trace"):
+            // only for a player the Navigator embeds.
+            Ok(Some(ChildEvent::Attach { embed, role, parent_app, .. })) if role == "media-player" => {
+                break (embed, parent_app == "org.atrium.navigator")
+            }
             Ok(Some(ChildEvent::Attach { role, .. })) => {
                 eprintln!("atrium-player: asked to be {role}");
                 std::process::exit(1)
@@ -398,7 +403,12 @@ fn embedded() {
     if child.ready(embed, token).is_err() {
         std::process::exit(1);
     }
+    if trace {
+        limen::start_trace_at("player", "main", started, "");
+        limen::start_trace("player", "ready", "");
+    }
     let mut app = App::new(LimenHost { child, embed, dropped: 0, ticket: None }, conn, win, size, Options::default());
+    app.trace_start = trace;
     run(&mut app);
     if app.host.dropped > 0 {
         eprintln!("atrium-player: dropped {} malformed messages", app.host.dropped);

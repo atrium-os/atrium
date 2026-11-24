@@ -36,9 +36,18 @@ pub mod sign_in;
 /// "I5 Start trace"): CLOCK_MONOTONIC microseconds, so lines from limend,
 /// portcullisd, jaild and navigatord line up on one clock.
 pub fn start_trace(who: &str, stage: &str, tag: &str) {
+    start_trace_at(who, stage, monotonic_us(), tag)
+}
+
+/// [`start_trace`] for a moment taken earlier with [`monotonic_us`].
+pub fn start_trace_at(who: &str, stage: &str, us: u64, tag: &str) {
+    eprintln!("start-trace {who} {stage} mono_us={us} pid={} {tag}", std::process::id());
+}
+
+/// CLOCK_MONOTONIC in microseconds: one clock for every process and jail.
+pub fn monotonic_us() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: clock_gettime writes the one timespec it is given.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let us = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000;
-    eprintln!("start-trace {who} {stage} mono_us={us} pid={} {tag}", std::process::id());
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
 }

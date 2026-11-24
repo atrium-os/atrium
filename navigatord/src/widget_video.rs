@@ -8,7 +8,7 @@ use std::{
     net::Shutdown,
     os::unix::net::UnixStream,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,12 @@ impl Slot {
 
 pub struct Video {
     socket: UnixStream,
+    /// None while the player is still being launched, and again once
+    /// retired (`retired` tells the two apart).
     slot: Arc<Mutex<Option<Slot>>>,
+    /// The island's latest rectangle, for a player still being launched.
+    island: Arc<Mutex<[f32; 4]>>,
+    retired: Arc<AtomicBool>,
 }
 
 impl Video {
@@ -47,18 +52,16 @@ impl Video {
         append_budget: usize,
         playback: Arc<Mutex<Option<Instant>>>,
     ) -> Result<(Self, UnixStream), String> {
-        let mut parent = Parent::at(path).map_err(|e| format!("player connection: {e:?}"))?;
-        let embed = parent
-            .request_at("media-player", window, 2)
-            .map_err(|e| format!("player launch: {e:?}"))?;
-        let slot = Arc::new(Mutex::new(Some(Slot {
-            parent,
-            embed,
-            island,
-            element: None,
-        })));
+        // The engine's video socket is handed over at once, and the player
+        // is launched beside the engine's own start rather than before it
+        // (navigator-islands.md "I5 Start trace": the document fetch waited
+        // for the player's jail). The engine's media requests queue on the
+        // socket until the player is there.
         let (server, worker) = UnixStream::pair().map_err(|e| e.to_string())?;
         let socket = server.try_clone().map_err(|e| e.to_string())?;
+        let slot = Arc::new(Mutex::new(None));
+        let shared_island = Arc::new(Mutex::new(island));
+        let retired = Arc::new(AtomicBool::new(false));
         let session = Session {
             playback,
             slot: slot.clone(),
@@ -66,25 +69,64 @@ impl Video {
             bytes: 0,
             append_budget,
             ended: false,
+            traced: Default::default(),
         };
+        let path = path.to_owned();
+        let (launch_slot, launch_island, launch_retired) = (slot.clone(), shared_island.clone(), retired.clone());
         std::thread::spawn(move || {
+            limen::start_trace("navigatord", "player-request", "");
+            let launched = Parent::at(&path)
+                .map_err(|e| format!("player connection: {e:?}"))
+                .and_then(|mut parent| {
+                    parent
+                        .request_at("media-player", window, 2)
+                        .map(|embed| (parent, embed))
+                        .map_err(|e| format!("player launch: {e:?}"))
+                });
+            let (parent, embed) = match launched {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("navigatord: video: {e}");
+                    launch_retired.store(true, Ordering::SeqCst);
+                    let _ = server.shutdown(Shutdown::Both);
+                    return;
+                }
+            };
+            limen::start_trace("navigatord", "player-granted", &format!("embed={embed:016x}"));
+            {
+                let mut locked = launch_slot.lock().unwrap();
+                if launch_retired.load(Ordering::SeqCst) {
+                    return;
+                }
+                let island = *launch_island.lock().unwrap();
+                *locked = Some(Slot { parent, embed, island, element: None });
+            }
             if let Err(e) = session.serve(server) {
                 eprintln!("navigatord: video: {e}");
             }
+            launch_retired.store(true, Ordering::SeqCst);
         });
-        Ok((Self { socket, slot }, worker))
+        Ok((Self { socket, slot, island: shared_island, retired }, worker))
     }
 
     pub fn place(&self, rect: [f32; 4]) -> Result<(), String> {
+        *self.island.lock().unwrap() = rect;
         let mut locked = self.slot.lock().unwrap();
-        let slot = locked.as_mut().ok_or("video retired")?;
-        slot.island = rect;
-        slot.place()
+        match locked.as_mut() {
+            Some(slot) => {
+                slot.island = rect;
+                slot.place()
+            }
+            None if self.retired.load(Ordering::SeqCst) => Err("video retired".into()),
+            // Still launching: the player takes the latest rectangle.
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for Video {
     fn drop(&mut self) {
+        self.retired.store(true, Ordering::SeqCst);
         let _ = self.socket.shutdown(Shutdown::Both);
         self.slot.lock().unwrap().take();
     }
@@ -97,9 +139,18 @@ struct Session {
     bytes: usize,
     append_budget: usize,
     ended: bool,
+    /// Start-trace stages already printed (each prints once).
+    traced: std::collections::HashSet<&'static str>,
 }
 
 impl Session {
+    /// One `start-trace` line per stage, the first time it happens.
+    fn trace(&mut self, stage: &'static str) {
+        if self.traced.insert(stage) {
+            limen::start_trace("navigatord", stage, "");
+        }
+    }
+
     fn serve(mut self, mut socket: UnixStream) -> Result<(), String> {
         socket
             .set_write_timeout(Some(Duration::from_secs(3)))
@@ -174,9 +225,15 @@ impl Session {
                 ) {
                     return Err(format!("player refused video: {m:?}"));
                 }
+                match &m {
+                    ToParent::Ready { .. } => self.trace("player-ready"),
+                    ToParent::CanPlay { .. } => self.trace("player-canplay"),
+                    _ => {}
+                }
                 match m {
                     ToParent::Time { secs } if !self.media.paused && !self.media.seeking && secs > self.media.current_time => {
                         *self.playback.lock().unwrap() = Some(Instant::now());
+                        self.trace("playing");
                     }
                     ToParent::Seeking { .. } | ToParent::Paused | ToParent::Ended => {
                         self.playback.lock().unwrap().take();
@@ -234,6 +291,7 @@ impl Session {
         let dom = |e| format!("media operation refused: {e:?}");
         match req {
             Request::Open { rect } if rect[2] > 0 && rect[3] > 0 => {
+                self.trace("video-open");
                 self.media.attach_source().map_err(dom)?;
                 {
                     let mut locked = self.slot.lock().unwrap();
@@ -245,11 +303,22 @@ impl Session {
                 self.flush()?;
                 Ok(Reply::Ok)
             }
-            Request::AddVp9 => self.add_track(video::MIME),
-            Request::AddOpus => self.add_track(video::OPUS_MIME),
-            Request::Append(bytes) => self.append_track(video::MIME, bytes),
-            Request::AppendOpus(bytes) => self.append_track(video::OPUS_MIME, bytes),
+            Request::AddVp9 => { self.trace("add-vp9"); self.add_track(video::MIME) }
+            Request::AddOpus => { self.trace("add-opus"); self.add_track(video::OPUS_MIME) }
+            Request::Append(bytes) => {
+                self.trace("append-vp9");
+                let r = self.append_track(video::MIME, bytes);
+                self.trace("appended-vp9");
+                r
+            }
+            Request::AppendOpus(bytes) => {
+                self.trace("append-opus");
+                let r = self.append_track(video::OPUS_MIME, bytes);
+                self.trace("appended-opus");
+                r
+            }
             Request::SetPlaying(playing) => {
+                if playing { self.trace("set-playing"); }
                 if playing {
                     self.media.play().map_err(dom)?;
                 } else {

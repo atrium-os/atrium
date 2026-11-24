@@ -170,6 +170,9 @@ pub struct App<H: Host> {
     /// Buffered ranges of the first track the feed reported, in seconds.
     shown_track: Option<u8>,
     pub audio: Option<AudioOut>,
+    /// Print `start-trace` lines for the island Start trace (an embed of
+    /// the Navigator's): the first media message, the first frame.
+    pub trace_start: bool,
     /// The audio track's rate and channels, once the media reported one.
     audio_format: Option<(u32, u16)>,
     /// choragusd's socket.
@@ -260,6 +263,7 @@ impl<H: Host> App<H> {
             done: false,
             shown_track: None,
             audio: None,
+            trace_start: false,
             audio_format: None,
             audio_socket: std::env::var("ATRIUM_AUDIO_SOCKET").unwrap_or_else(|_| crate::audio_out::DEFAULT_SOCKET.into()),
             volume: 1.0,
@@ -647,6 +651,9 @@ impl<H: Host> App<H> {
             }
             PlayerEvent::Frame { pts_ns } => {
                 self.frames += 1;
+                if self.trace_start && self.frames == 1 {
+                    limen::start_trace("player", "first-frame", &format!("pts_ns={pts_ns}"));
+                }
                 self.last_frame = Instant::now();
                 self.controls.position_s = secs(pts_ns);
                 self.ready();

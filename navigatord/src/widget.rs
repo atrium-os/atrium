@@ -266,6 +266,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             return Err("expected a document GET".into());
         };
         if step == 0 { limen::start_trace("navigatord", "first-request", source) }
+        else if step < 8 { limen::start_trace("navigatord", "request", &format!("step={step}")) }
         let player = source == YOUTUBE_ENTRY && step > 0 && open.method == Method::Post
             && navigator_control::youtube::player_url(&open.url);
         let stream = source == YOUTUBE_ENTRY
@@ -352,6 +353,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             (fetcher.widget_resource(url, mime)?, 65536)
         };
         let length = body.len() as u64;
+        if step < 8 { limen::start_trace("navigatord", "fetched", &format!("step={step} bytes={length} {url}")) }
         if length == 0 || length > open.limits.max_bytes.min(limit as u64) {
             return Err("widget document size".into());
         }
@@ -392,6 +394,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             })?;
         }
         send(Event::Done { id, bytes: length })?;
+        if step < 8 { limen::start_trace("navigatord", "served", &format!("step={step}")) }
     }
     Ok(())
 }
