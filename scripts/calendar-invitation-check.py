@@ -127,6 +127,52 @@ def stale_response(ui):
     print("PASS reviewed replacement from the paused confirmation and sent its revision exactly once")
 
 
+def occurrence_response(ui):
+    print(guest(ui, "occurrence-setup"))
+    open_mail(ui, first=True)
+    print(guest(ui, "occurrence-window"))
+    ui.see("before-occurrence-delivery", "One occurrence", "2026-12-08", "15:00", "TENTATIVE")
+    print(guest(ui, "response-deliver"))
+    click(ui, 485, 355)
+    ui.see("late-occurrence", "Invitation changed before sending", "2026-12-08", "2026-12-09", "15:00", "2026-12-10", "17:00")
+    click(ui, 485, 355)
+    print(guest(ui, "response-result"))
+
+    open_mail(ui)
+    review(ui, 388)
+    ui.see("occurrence-master", "Whole weekly series", "14:00")
+    click(ui, 568, 550)
+    ui.see("master-saved", "Invitation saved")
+    move_meeting(ui, "2026-12-08", "2026-12-11", "11:30", "12:15")
+    saved = ui.store("work")
+    ui.control("close", "work")
+    review(ui, 318)
+    ui.see("private-and-offered", "One occurrence", "2026-12-08", "2026-12-11", "11:30", "15:00")
+    click(ui, 80, 462)
+    ui.see("occurrence-confirm", "Review your invitation response", "15:00")
+    click(ui, 485, 355)
+    ui.see("occurrence-paused", "Invitation changed before sending", "One occurrence", "2026-12-08", "15:00", "17:00", "Studio C")
+    click(ui, 485, 355)
+    ui.see("fresh-occurrence-review", "One occurrence", "2026-12-08", "17:00")
+    click(ui, 80, 462)
+    ui.see("fresh-occurrence-confirm", "One occurrence", "2026-12-08", "2026-12-10", "17:00", "ACCEPTED")
+    click(ui, 485, 378)
+    ui.control("close", "work")
+    print(guest(ui, "occurrence-submit"))
+    assert ui.store("work") == saved
+    open_mail(ui, first=True)
+    review(ui, 178)
+    ui.see("sibling-review", "One occurrence", "2026-12-15", "15:00")
+    click(ui, 80, 462)
+    ui.see("sibling-confirm", "One occurrence", "2026-12-15", "ACCEPTED")
+    click(ui, 485, 355)
+    ui.control("close", "work")
+    print(guest(ui, "sibling-submit"))
+    assert ui.store("work") == saved
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    print("PASS both occurrence replies delivered once, private move and other meetings preserved")
+
+
 def background(ui):
     print(guest(ui, "invitation-setup"))
     open_mail(ui, first=True)
@@ -176,8 +222,10 @@ def series(ui):
     click(ui, 80, 462)
     ui.see("occurrence-response", "One occurrence", "2026-12-08", "2026-12-09", "ACCEPTED")
     click(ui, 487, 355)
+    ui.see("occurrence-cancelled-before-send", "Invitation changed before sending", "One occurrence", "2026-12-08", "Cancelled by the organizer")
+    click(ui, 68, 355)
     ui.control("close", "work")
-    print(guest(ui, "series-submit"))
+    print(guest(ui, "invitation-check-empty"))
     assert ui.store("work") == master
     open_mail(ui, first=True)
     open_item(2, "review-move-again", "One occurrence", "15:00")
@@ -211,7 +259,7 @@ def series(ui):
     assert ui.control("fingerprint", "personal").strip() == b"empty"
     ui.control("close", "work")
     print(guest(ui, "series-check-empty"))
-    print("PASS scoped RSVP, preserved exception, single and whole cancellation, spoof, replay and empty outbox")
+    print("PASS stale occurrence RSVP paused, preserved exception, single and whole cancellation, spoof, replay and empty outbox")
 
 
 def inspect_moves(ui):
@@ -759,9 +807,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

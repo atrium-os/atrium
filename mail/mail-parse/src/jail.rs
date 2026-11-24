@@ -87,8 +87,12 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
             wire::ToJail::OneOffUpdate { part, identities } => {
-                let proposal = one_off_update(&part.bytes, &identities);
-                port.borrow_mut().send(&wire::FromJail::OneOffUpdate { id: part.id, proposal })?;
+                let proposal = individual_update(&part.bytes, &identities, None);
+                port.borrow_mut().send(&wire::FromJail::IndividualUpdate { id: part.id, proposal })?;
+            }
+            wire::ToJail::OccurrenceUpdate { part, identities, scope } => {
+                let proposal = individual_update(&part.bytes, &identities, Some(&scope));
+                port.borrow_mut().send(&wire::FromJail::IndividualUpdate { id: part.id, proposal })?;
             }
             wire::ToJail::SchedulingPart { message, path } => {
                 let result = crate::parse(&message.bytes, &Limits::default()).map_err(refusal).and_then(|s| {
@@ -547,7 +551,7 @@ fn text_of(bytes: &[u8], charset: Option<&str>) -> Option<String> {
 
 /// Use the same strict calendar decoder as an explicit review. Only the recipient's
 /// own matching address may leave Mail in a background update.
-fn one_off_update(bytes: &[u8], identities: &[String]) -> Option<String> {
+fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -> Option<String> {
     use atrium_calendar::{ical_format::parse_mode, import::Outcome};
     if identities.len() > 32 || identities.iter().any(|addr| addr.len() > 254) {
         return None;
@@ -555,7 +559,13 @@ fn one_off_update(bytes: &[u8], identities: &[String]) -> Option<String> {
     let Outcome::Invitation(mut p) = parse_mode(bytes, true).ok()? else {
         return None;
     };
-    if p.scope().is_some() || p.sequence == 0 {
+    if p.sequence == 0
+        || p.this_and_future
+        || p.scope().as_deref() != scope
+        || p.original.is_some() != scope.is_some()
+        || p.weekly_cancellation
+        || !p.cancelled_dates.is_empty()
+    {
         return None;
     }
     let omit_attendees = p.row.is_none() && p.attendees.is_empty();
@@ -569,12 +579,34 @@ fn one_off_update(bytes: &[u8], identities: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod background_tests {
-    use super::one_off_update;
+    use super::individual_update;
+    #[test]
+    fn detached_occurrence_requires_the_original_slot_and_individual_scope() {
+        let moved = include_str!("../../../atrium-calendar/tests/fixtures/move-one.ics");
+        let cancel = include_str!("../../../atrium-calendar/tests/fixtures/cancel-one.ics");
+        let range = include_str!("../../../atrium-calendar/tests/fixtures/future.ics");
+        let me = vec!["dev@fixture.invalid".to_owned()];
+        let slot = Some("RECURRENCE-ID:20261208T140000Z");
+        assert!(individual_update(moved.as_bytes(), &me, slot).is_some());
+        assert!(individual_update(cancel.as_bytes(), &me, slot).is_some());
+        assert!(individual_update(range.as_bytes(), &me, slot).is_none());
+        assert!(individual_update(
+            moved.as_bytes(),
+            &me,
+            Some("RECURRENCE-ID:20261209T150000Z")
+        )
+        .is_none());
+        assert!(
+            individual_update(moved.as_bytes(), &["other@fixture.invalid".into()], slot).is_none()
+        );
+        assert!(individual_update(moved.as_bytes(), &me, None).is_none());
+    }
+
     #[test]
     fn unopened_update_exposes_only_the_matching_attendee_and_rejects_series() {
         let fixture = include_str!("../../../atrium-calendar/tests/fixtures/invitation.ics");
         let me = vec!["dev@fixture.invalid".into()];
-        let part = one_off_update(fixture.as_bytes(), &me).unwrap();
+        let part = individual_update(fixture.as_bytes(), &me, None).unwrap();
         assert!(part.contains("dev@fixture.invalid") && !part.contains("guest@fixture.invalid"));
         for wrong in [
             fixture.replace("dev@fixture.invalid", "other@fixture.invalid"),
@@ -582,7 +614,7 @@ mod background_tests {
             fixture.replace("END:VEVENT", "RECURRENCE-ID:20261201T140000Z\nEND:VEVENT"),
             fixture.replace("SEQUENCE:1", "SEQUENCE:0"),
         ] {
-            assert!(one_off_update(wrong.as_bytes(), &me).is_none());
+            assert!(individual_update(wrong.as_bytes(), &me, None).is_none());
         }
     }
 }

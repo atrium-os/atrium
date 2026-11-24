@@ -815,6 +815,50 @@ mod tests {
         s.review_invitation(rev, &range_source(&p), p).unwrap()
     }
     #[test]
+    fn a_verified_occurrence_rsvp_keeps_a_private_move_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let master = include_str!("../../tests/fixtures/weekly.ics");
+        let token = review_range(&mut store, 0, master).token.unwrap();
+        store.apply_invitation(0, token).unwrap();
+        let original = date("2026-12-08");
+        let row = store.day(original).entries.pop().unwrap();
+        let mut private = row.fields_on(original);
+        private.date = date("2026-12-11");
+        store
+            .change(
+                1,
+                row.id,
+                original,
+                atrium_calendar::EditScope::ThisEvent,
+                Some(private),
+            )
+            .unwrap();
+        let moved = include_str!("../../tests/fixtures/move-one.ics").replace(
+            "RECURRENCE-ID:20261208T140000Z",
+            "RECURRENCE-ID;TZID=America/New_York:20261208T090000",
+        );
+        let snapshot = || std::fs::read(dir.path().join("calendar.json")).unwrap();
+        let before = snapshot();
+        let p = range_proposal(&moved);
+        let mut unverified = range_source(&p);
+        unverified.verified = false;
+        assert!(store
+            .review_invitation(2, &unverified, p)
+            .unwrap()
+            .token
+            .is_none());
+        let review = review_range(&mut store, 2, &moved);
+        assert_eq!(review.previous.unwrap().date, date("2026-12-11"));
+        assert!(!review.can_save);
+        let token = review.token.unwrap();
+        store.check_invitation(2, token).unwrap();
+        assert!(store.apply_invitation(2, token).is_err());
+        assert_eq!(before, snapshot());
+        assert_eq!(store.day(date("2026-12-15")).entries.len(), 1);
+    }
+
+    #[test]
     fn organizer_changes_coalesce_across_restarts_without_changing_the_schedule() {
         let base = include_str!("../../tests/fixtures/invitation.ics");
         let day = date("2026-12-01");

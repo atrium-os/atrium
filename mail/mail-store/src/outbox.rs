@@ -132,12 +132,46 @@ impl Writer<'_> {
 
     /// Atomically record the RSVP and the outgoing message.
     pub fn queue_invitation(&mut self, key: &str, sequence: u32, o: &Outgoing) -> Result<u64> {
-        if self.tx.open_table(INVITE_REPLIES)?
-            .range((key, sequence)..=(key, u32::MAX))?.next().transpose()?.is_some() {
-            return Err(Error::Db("A response is already queued or sent for this or a newer revision".into()));
+        if self
+            .tx
+            .open_table(INVITE_REPLIES)?
+            .range((key, sequence)..=(key, u32::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        {
+            return Err(Error::Db(
+                "A response is already queued or sent for this or a newer revision".into(),
+            ));
+        }
+        // Older receipts retain the organizer's original TZID spelling. Scan
+        // only this meeting's occurrence receipts, inside the enqueue transaction.
+        if let Some((meeting, property)) = key.rsplit_once("/RECURRENCE-ID") {
+            if let Some(slot) = crate::OccurrenceSlot::parse(&format!("RECURRENCE-ID{property}")) {
+                let prefix = format!("{meeting}/RECURRENCE-ID");
+                let table = self.tx.open_table(INVITE_REPLIES)?;
+                for row in table.range((prefix.as_str(), 0)..)? {
+                    let (saved, _) = row?;
+                    let (saved, seq) = saved.value();
+                    let Some(tail) = saved.strip_prefix(&prefix) else {
+                        break;
+                    };
+                    if seq >= sequence
+                        && crate::OccurrenceSlot::parse(&format!("RECURRENCE-ID{tail}"))
+                            .is_some_and(|other| slot.matches(other))
+                    {
+                        return Err(Error::Db(
+                            "A response is already queued or sent for this or a newer revision"
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
         let id = self.queue_send(o)?;
-        self.tx.open_table(INVITE_REPLIES)?.insert((key, sequence), id)?;
+        self.tx
+            .open_table(INVITE_REPLIES)?
+            .insert((key, sequence), id)?;
         Ok(id)
     }
 

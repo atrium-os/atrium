@@ -381,6 +381,14 @@ Mail binds the check to the receiving account, organizer, invited identity and m
 
 The synthetic guest check opens a 15:00 confirmation, waits until the window is visible, and delivers a verified move to 17:00, a delayed older revision, a replay and an unverified higher revision. A second check follows the replacement from the installed Mail confirmation into Calendar and back to Mail, then inspects the one reply delivered to the synthetic SMTP organizer. [Installed scenarios](../../scripts/calendar-invitation-check.py) · [Synthetic deliveries](../../mail/atrium-mail/examples/invitation_probe.rs)
 
+### 7.26 A single occurrence changes before Send
+
+A Tuesday meeting might move to Wednesday, then Thursday. Both invitations still identify the original Tuesday. When the recipient presses **Send response**, Mail checks for verified updates to that occurrence in the receiving persona’s inbox. The paused confirmation shows the original slot, the previously reviewed proposal and the new time, venue or cancellation. **Review latest invitation** opens the exact replacement in Calendar. Another Tuesday in the same series can be reviewed and answered independently, even when both proposals use the same new time.
+
+If the recipient has already moved the occurrence privately, Calendar shows its saved time beside the organizer’s proposal. A newer, verified request for that date can be answered while keeping the private move. The review authorizes an RSVP only. The organizer receives the reviewed proposal’s recurrence ID and attendee response. The private schedule stays in Calendar.
+
+Mail recognizes equivalent zoned recurrence IDs on incoming revisions and previous response receipts. A floating recurrence ID is compared on its own civil clock. The RSVP preserves the organizer’s original recurrence property. Conflicting changes at the same revision require clarification. This check covers individually delivered occurrences. Whole-series, grouped and future-range changes still use their existing explicit review flows. [Installed two-Tuesday check](../../scripts/calendar-invitation-check.py) · [Synthetic receipts and cancellations](../../mail/atrium-mail/examples/invitation_probe.rs)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

@@ -221,6 +221,9 @@ impl View for Confirmation {
                 self.title.clone(),
                 format!("You reviewed · {}", self.proposed),
             ];
+            if let Some(scope) = &self.scope {
+                lines.insert(1, scope.clone());
+            }
             match change {
                 LatestInvitation::Update {
                     sequence,

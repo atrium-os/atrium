@@ -128,6 +128,8 @@ pub enum ToJail {
     /// Re-read the scope of one decoded calendar part for an RSVP.
     SchedulingPart { message: Raw, path: String },
     OneOffUpdate { part: Raw, identities: Vec<String> },
+    /// Check one detached occurrence against the scope read from the MIME part.
+    OccurrenceUpdate { part: Raw, identities: Vec<String>, scope: String },
 }
 
 /// Most of the person's certificates sent with a [`ToJail::KeyFor`].
@@ -176,7 +178,7 @@ pub enum FromJail {
     Done,
     KeyForOaep { id: u64, keys: Vec<OaepKey> },
     SchedulingPart { id: u64, result: Result<(Vec<u8>, Option<String>), Refusal> },
-    OneOffUpdate { id: u64, proposal: Option<String> },
+    IndividualUpdate { id: u64, proposal: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -718,7 +720,7 @@ impl FromJail {
                 if !addr.contains('@') || key.is_empty() || key.len() > PGP_KEY_MAX { return Err(Lie("autocrypt key")) }
                 Ok(())
             }
-            FromJail::OneOffUpdate { proposal: Some(p), .. } if p.len() > 4096 => Err(Lie("oversized meeting update")),
+            FromJail::IndividualUpdate { proposal: Some(p), .. } if p.len() > 4096 => Err(Lie("oversized meeting update")),
             FromJail::SchedulingPart { result: Ok((bytes, scope)), .. } => {
                 if bytes.len() > 4 << 20 || bytes.len() as u64 > raw_len || scope.as_ref().is_some_and(|s| s.len()>1024 || !s.is_ascii() || s.bytes().any(|b| b.is_ascii_control())) {
                     return Err(Lie("invalid scheduling part"));

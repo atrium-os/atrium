@@ -31,7 +31,7 @@ mod outbox;
 pub use outbox::{retry_after, JmapSendActivity, Outgoing, SendState};
 pub mod search;
 mod calendar;
-pub use calendar::CalendarRevisions;
+pub use calendar::{CalendarRevisions, OccurrenceSlot};
 pub mod senders;
 pub mod certs;
 pub mod dns;

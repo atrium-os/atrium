@@ -20,6 +20,17 @@ const CANCEL_ONE: &str = include_str!("../../../atrium-calendar/tests/fixtures/c
 const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-series.ics");
 const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
 
+const NEW_YORK_ORIGINAL: &str = "RECURRENCE-ID;TZID=America/New_York:20261208T090000";
+const SIBLING: &str = "RECURRENCE-ID:20261215T140000Z";
+
+fn later_occurrence() -> String {
+    MOVED
+        .replace(ORIGINAL, NEW_YORK_ORIGINAL)
+        .replace("SEQUENCE:2", "SEQUENCE:3")
+        .replace("20261209T15", "20261210T17")
+        .replace("Studio B", "Studio C")
+}
+
 const BOUNDED: &str = include_str!("../../../atrium-calendar/tests/fixtures/bounded-moves.ics");
 const FUTURE: &str = include_str!("../../../atrium-calendar/tests/fixtures/future.ics");
 const FUTURE_SCOPE: &str = "RECURRENCE-ID;RANGE=THISANDFUTURE:20261208T140000Z";
@@ -29,6 +40,9 @@ const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
+    let occurrences = mode == "seed-occurrences";
+    let later = later_occurrence();
+    let sibling = MOVED.replace(ORIGINAL, SIBLING);
     let grouped = mode == "seed-cancel-dates";
     let skipped = mode == "seed-exdates";
     let long = mode == "seed-long-range";
@@ -128,6 +142,13 @@ fn seed(e: &Engine, mode: &str) {
                 ("Extend to December 29", UNTIL)
             },
         ]
+    } else if occurrences {
+        &[
+            ("Weekly studio", WEEKLY),
+            ("Move December 8", MOVED),
+            ("Move December 8 again", &later),
+            ("Move December 15", &sibling),
+        ]
     } else if series {
         &[
             ("Weekly studio", WEEKLY),
@@ -163,7 +184,13 @@ fn seed(e: &Engine, mode: &str) {
             .pop()
             .unwrap()
             .unwrap();
-        let sequence = if series { id.min(5) } else { id };
+        let sequence = if occurrences && id == 4 {
+            2
+        } else if series {
+            id.min(5)
+        } else {
+            id
+        };
         assert_eq!(summary.invite.as_ref().unwrap().sequence, sequence);
         // Synthetic sender evidence for the reschedule case. No DNS or live account.
         summary.sender_check = mail_schema::SenderCheck::Verified {
@@ -289,7 +316,7 @@ fn seed(e: &Engine, mode: &str) {
     println!("PASS synthetic Mail deliveries, exact calendar part selected, empty outbox");
     assert!(e.store.outbox().unwrap().is_empty());
 }
-fn submit(e: &Engine, series: bool) {
+fn submit(e: &Engine, sequence: u32, scope: Option<&str>) {
     let pending = e.store.outbox().unwrap();
     assert_eq!(pending.len(), 1, "one reviewed Send");
     let (id, o) = &pending[0];
@@ -345,9 +372,13 @@ fn submit(e: &Engine, series: bool) {
         .pop()
         .unwrap()
         .unwrap();
+    if scope == Some(NEW_YORK_ORIGINAL) {
+        let text = summary.text.as_deref().unwrap();
+        assert!(text.contains("17:00") && !text.contains("2026-12-11") && !text.contains("11:30"));
+    }
     let invite = summary.invite.unwrap();
     assert_eq!(invite.method, mail_schema::InviteMethod::Reply);
-    assert_eq!(invite.sequence, 2);
+    assert_eq!(invite.sequence, sequence);
     assert_eq!(invite.uid, "studio-planning@fixture.invalid");
     assert_eq!(invite.attendees, 1);
     assert_eq!(summary.from[0].addr, "dev@fixture.invalid");
@@ -373,11 +404,7 @@ fn submit(e: &Engine, series: bool) {
         .lines()
         .filter(|line| line.starts_with("RECURRENCE-ID"))
         .collect();
-    if series {
-        assert_eq!(original_lines, [ORIGINAL]);
-    } else {
-        assert!(original_lines.is_empty());
-    }
+    assert_eq!(original_lines, scope.into_iter().collect::<Vec<_>>());
     assert!(e.store.outbox().unwrap().is_empty());
     let folder = e.store.folder_id(o.account, "INBOX", Role::Inbox).unwrap();
     let msg = e
@@ -386,30 +413,31 @@ fn submit(e: &Engine, series: bool) {
         .unwrap()
         .into_iter()
         .find(|x| {
-            e.store
-                .message(x.msg)
-                .unwrap()
-                .summary
-                .invite
-                .unwrap()
-                .sequence
-                == 2
+            let m = e.store.message(x.msg).unwrap();
+            m.summary.invite.is_some_and(|i| i.sequence == sequence)
+                && e.selected_invitation(x.msg)
+                    .unwrap()
+                    .source
+                    .delivery
+                    .and_then(|d| d.scope)
+                    .as_deref()
+                    == scope
         })
         .unwrap()
         .msg;
     let r = portcullis_ipc::calendar::Reply {
-        scope: series.then(|| ORIGINAL.to_owned()),
+        scope: scope.map(str::to_owned),
         answer: portcullis_ipc::calendar::Answer::Accept,
         uid: invite.uid,
         attendee: "dev@fixture.invalid".into(),
         organizer: invite.organizer,
-        sequence: 2,
+        sequence,
     };
     assert!(e
         .send_invitation_reply(msg, e.store.message(msg).unwrap().full.unwrap(), &r)
         .is_err());
     assert!(e.store.outbox().unwrap().is_empty());
-    println!("PASS SMTP received one ACCEPTED for revision 2, organizer only. Replay queued zero additional messages.");
+    println!("PASS SMTP received one ACCEPTED for revision {sequence}, organizer only. Replay queued zero additional messages.");
 }
 // The guest fixture supplies sender evidence explicitly and never contacts a provider.
 fn background_batch(e: &Engine) {
@@ -510,29 +538,10 @@ fn during_confirmation(e: &Engine, dir: &Path) {
         organizer: "mina@fixture.invalid".into(),
         sequence: 2,
     };
-    let mut window = invitation::ResponseWindow::new(e, msg, blob, reply.clone()).unwrap();
-    let until = std::time::Instant::now() + Duration::from_secs(120);
-    let mut delivered = false;
-    let mut latest = 0;
-    loop {
-        assert!(
-            std::time::Instant::now() < until,
-            "timed out waiting for fixture input"
-        );
-        if !delivered && dir.join("deliver").exists() {
-            background_batch(e);
-            latest = e.store.at(inbox, 5).unwrap().unwrap().0;
-            delivered = true;
-        }
-        if let Some(done) = window.tick(e) {
-            assert!(
-                matches!(done, invitation::Finished::Review(id, _) if delivered && id == latest)
-            );
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    assert!(e.store.outbox().unwrap().is_empty());
+    let latest = check_open_window(e, dir, msg, blob, &reply, || {
+        background_batch(e);
+        e.store.at(inbox, 5).unwrap().unwrap().0
+    });
     let latest_reply = Reply {
         sequence: 5,
         ..reply
@@ -573,6 +582,105 @@ fn during_confirmation(e: &Engine, dir: &Path) {
     println!("PASS live confirmation, late verified move, duplicate, identity isolation, conflict and cancellation");
 }
 
+fn check_open_window(
+    e: &Engine,
+    dir: &Path,
+    msg: u64,
+    blob: mail_store::Hash,
+    reply: &portcullis_ipc::calendar::Reply,
+    deliver: impl FnOnce() -> u64,
+) -> u64 {
+    let mut window = invitation::ResponseWindow::new(e, msg, blob, reply.clone()).unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(120);
+    let mut deliver = Some(deliver);
+    let mut latest = None;
+    loop {
+        assert!(
+            std::time::Instant::now() < until,
+            "timed out waiting for fixture input"
+        );
+        if dir.join("deliver").exists() {
+            if let Some(send) = deliver.take() {
+                latest = Some(send());
+            }
+        }
+        if let Some(done) = window.tick(e) {
+            assert!(matches!(done, invitation::Finished::Review(id, _) if Some(id) == latest));
+            assert!(e.store.outbox().unwrap().is_empty());
+            return latest.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+fn during_occurrence(e: &Engine, dir: &Path) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    let account = e.store.add_account("dev@fixture.invalid").unwrap();
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let put = |id, body: &str, verified| put_revision(e, account, inbox, id, body, verified);
+    let first = put(1, MOVED, true);
+    let sibling = put(2, &MOVED.replace(ORIGINAL, SIBLING), true);
+    let blob = |id| e.store.message(id).unwrap().full.unwrap();
+    let reply = Reply {
+        scope: Some(ORIGINAL.into()),
+        sequence: 2,
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        uid: "studio-planning@fixture.invalid".into(),
+        answer: Answer::Maybe,
+    };
+    let later = later_occurrence();
+    let latest = check_open_window(e, dir, first, blob(first), &reply, || {
+        put(3, &later.replace("SEQUENCE:3", "SEQUENCE:9"), false);
+        put(4, &later, true)
+    });
+    let sibling_reply = Reply {
+        scope: Some(SIBLING.into()),
+        ..reply.clone()
+    };
+    let op = e
+        .send_invitation_reply(sibling, blob(sibling), &sibling_reply)
+        .unwrap();
+    let draft = e.undo_send(op).unwrap().unwrap();
+    let ics = std::str::from_utf8(&draft.attachments[0].bytes).unwrap();
+    assert!(ics.lines().any(|s| s == SIBLING));
+    let fresh = Reply {
+        scope: Some(NEW_YORK_ORIGINAL.into()),
+        sequence: 3,
+        ..reply.clone()
+    };
+    let op = e
+        .send_invitation_reply(latest, blob(latest), &fresh)
+        .unwrap();
+    let alias = put(5, &later.replace(NEW_YORK_ORIGINAL, ORIGINAL), true);
+    let utc_reply = Reply {
+        sequence: 3,
+        ..reply
+    };
+    assert!(e
+        .send_invitation_reply(alias, blob(alias), &utc_reply)
+        .unwrap_err()
+        .to_string()
+        .contains("already queued"));
+    assert_eq!(e.store.outbox().unwrap().len(), 1);
+    e.undo_send(op).unwrap().unwrap();
+    put(6, &later.replace("Studio C", "Studio D"), true);
+    assert!(matches!(
+        e.send_invitation_reply(latest, blob(latest), &fresh),
+        Err(Error::InvitationChanged(LatestInvitation::Conflict {
+            sequence: 3
+        }))
+    ));
+    let cancel = put(7, CANCEL_ONE, true);
+    assert!(
+        matches!(e.send_invitation_reply(latest,blob(latest),&fresh),
+        Err(Error::InvitationChanged(LatestInvitation::Update {msg, when, ..})) if msg == cancel && when.contains("Cancelled"))
+    );
+    assert!(e.store.outbox().unwrap().is_empty());
+    println!("PASS live confirmation for a moved occurrence, sibling RSVP, zoned replay receipt, conflict and cancellation");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -582,15 +690,19 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
-        | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate"
-        | "seed-restart" | "seed-restore-one" | "seed-reissue") => seed(&e, mode),
+        mode @ ("seed" | "seed-occurrences" | "seed-series" | "seed-bounded"
+        | "seed-cancel-dates" | "seed-exdates" | "seed-future" | "seed-long-range"
+        | "seed-cancel-future" | "seed-reinstate" | "seed-restart" | "seed-restore-one"
+        | "seed-reissue") => seed(&e, mode),
+        "during-occurrence" => during_occurrence(&e, Path::new(&args[2])),
+        "submit-occurrence" => submit(&e, 3, Some(NEW_YORK_ORIGINAL)),
+        "submit-sibling" => submit(&e, 2, Some(SIBLING)),
         "during-confirmation" => during_confirmation(&e, Path::new(&args[2])),
         "background-batch" => background_batch(&e),
         "background-check" => check_background(&e),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
-        "submit" => submit(&e, false),
-        "submit-series" => submit(&e, true),
+        "submit" => submit(&e, 2, None),
+        "submit-series" => submit(&e, 2, Some(ORIGINAL)),
         "exercise" => {
             seed(&e, "seed");
             let (account, _) = e.store.accounts().unwrap().remove(0);
@@ -655,7 +767,7 @@ fn main() {
                 assert!(e.store.outbox().unwrap().is_empty());
             }
             e.send_invitation_reply(msg, blob, &r).unwrap();
-            submit(&e, false)
+            submit(&e, 2, None)
         }
         _ => panic!("seed, empty, exercise or submit expected"),
     }

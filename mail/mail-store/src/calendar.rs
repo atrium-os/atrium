@@ -18,7 +18,46 @@ fn candidate(m: &Message) -> bool {
         })
 }
 
-/// Eligible immutable parts at the moment Mail checks a one-off response.
+/// Compare parser-normalized single-occurrence properties. Floating slots keep
+/// their civil clock. Without a saved fold choice, either instant of a repeated
+/// local hour can refer to that occurrence.
+#[derive(Clone, Copy, Debug)]
+pub enum OccurrenceSlot {
+    Floating(chrono::NaiveDateTime),
+    Zoned { first: i64, last: i64 },
+}
+
+impl OccurrenceSlot {
+    pub fn parse(scope: &str) -> Option<Self> {
+        use chrono::{NaiveDateTime, TimeZone};
+        let (property, value) = scope.split_once(':')?;
+        let stamp = value.strip_suffix('Z').unwrap_or(value);
+        let wall = NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S").ok()?;
+        let zone = match property {
+            "RECURRENCE-ID" if stamp == value => return Some(Self::Floating(wall)),
+            "RECURRENCE-ID" => chrono_tz::UTC,
+            name if stamp == value => name.strip_prefix("RECURRENCE-ID;TZID=")?.parse().ok()?,
+            _ => return None,
+        };
+        let times = zone.from_local_datetime(&wall);
+        Some(Self::Zoned {
+            first: times.earliest()?.timestamp(),
+            last: times.latest()?.timestamp(),
+        })
+    }
+
+    pub fn matches(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Floating(a), Self::Floating(b)) => a == b,
+            (Self::Zoned { first: a, last: b }, Self::Zoned { first: c, last: d }) => {
+                a == c || a == d || b == c || b == d
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Eligible immutable parts at the moment Mail checks an individual response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CalendarRevisions {
     account: AccountId,
@@ -194,5 +233,28 @@ impl Store {
                 Ok((id.value(), generation.value()))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OccurrenceSlot;
+
+    #[test]
+    fn original_slots_cross_midnight_and_distinguish_floating_times_and_folds() {
+        let slot = |s| OccurrenceSlot::parse(s).unwrap();
+        let utc = slot("RECURRENCE-ID:20261208T220000Z");
+        assert!(utc.matches(slot("RECURRENCE-ID;TZID=Asia/Kolkata:20261209T033000")));
+        assert!(!utc.matches(slot("RECURRENCE-ID:20261208T220000")));
+        let fold = slot("RECURRENCE-ID;TZID=America/New_York:20261101T013000");
+        let early = slot("RECURRENCE-ID:20261101T053000Z");
+        let late = slot("RECURRENCE-ID:20261101T063000Z");
+        assert!(fold.matches(early) && fold.matches(late) && !early.matches(late));
+        assert!(
+            OccurrenceSlot::parse("RECURRENCE-ID;TZID=America/New_York:20260308T023000").is_none()
+        );
+        assert!(
+            OccurrenceSlot::parse("RECURRENCE-ID;RANGE=THISANDFUTURE:20261208T220000Z").is_none()
+        );
     }
 }

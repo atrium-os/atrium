@@ -400,7 +400,8 @@ impl Store {
                 {
                     // Both saved occurrences and cancellation records identify the original
                     // source-clock date, even if this delivery uses another zone.
-                    if history.iter().any(|c| is_single_cancellation(c, slot.date))
+                    if single_delivery && source.verified
+                        || history.iter().any(|c| is_single_cancellation(c, slot.date))
                         || rows.iter().any(|r| {
                             r.kind
                                 == Kind::Occurrence {
@@ -455,8 +456,11 @@ impl Store {
                 occurrence.date = original.date;
                 Some(occurrence)
             });
-            let original_matches = match explicit.and_then(|e| e.invitation.as_ref()) {
-                Some(saved) => saved.original == Some(original),
+            let original_matches = match explicit
+                .and_then(|e| e.invitation.as_ref())
+                .and_then(|o| o.original)
+            {
+                Some(saved_slot) => saved_slot == original,
                 None => std::iter::once(base).chain(prior_occurrence).any(|row| {
                     row.span.start == original.minute
                         && row.zone.map(|z| z.name) == original.zone
@@ -659,6 +663,47 @@ impl Store {
         let included: Vec<_> = p.exceptions.iter().map(|m| m.original).collect();
         let mut replay = false;
         if let Some(saved) = explicit {
+            // A direct organizer request can be answered without replacing the
+            // recipient's private move. This token has no schedule mutations.
+            if single_delivery && source.verified && !cancelled && restoring.is_none() {
+                let slot = p.original.unwrap();
+                let local_move = matches!(saved.kind, Kind::Occurrence { .. })
+                    && saved
+                        .invitation
+                        .as_ref()
+                        .is_none_or(|o| o.accepted != saved.fields_on(saved.date));
+                let latest_saved = master
+                    .and_then(|m| m.invitation.as_ref())
+                    .map(|o| o.sequence)
+                    .into_iter()
+                    .chain(
+                        master
+                            .and_then(|m| m.range_at(slot.date))
+                            .map(|r| r.sequence),
+                    )
+                    .chain(saved.invitation.as_ref().map(|o| o.sequence))
+                    .max();
+                if local_move
+                    && latest_saved.is_some_and(|seq| p.sequence > seq)
+                    && master.is_some_and(|m| !m.remains_cancelled(slot.date))
+                {
+                    let token = Uuid::new_v4();
+                    *pending = Some(Pending {
+                        one_off: None,
+                        token,
+                        revision,
+                        created: Instant::now(),
+                        date: saved.date,
+                        local_moves: vec![],
+                        changes: None,
+                    });
+                    review.token = Some(token);
+                    review.notice =
+                        "Your local move stays saved. An RSVP uses the organizer’s proposed time."
+                            .into();
+                    return Ok(review);
+                }
+            }
             let Some(o) = saved
                 .invitation
                 .as_ref()
@@ -864,7 +909,7 @@ impl Store {
         let (mut rows, marks) = pending
             .changes
             .clone()
-            .ok_or("This revision is already saved")?;
+            .ok_or("This review has no calendar changes to save")?;
         super::invitation_skips::resolve(&mut rows, &pending.local_moves, choices)?;
         self.commit_invitation(revision, rows, marks, date)
             .map(|receipt| (date, receipt))

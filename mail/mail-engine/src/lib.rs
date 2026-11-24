@@ -184,7 +184,7 @@ impl Parser {
         loop {
             let f: FromJail = wire::read_frame(reader).map_err(|e| Error::Jail(e.to_string()))?.ok_or_else(|| Error::Jail("closed".into()))?;
             let raw_len = match &f {
-                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } | FromJail::SchedulingPart { id, .. } | FromJail::OneOffUpdate { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
+                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } | FromJail::SchedulingPart { id, .. } | FromJail::IndividualUpdate { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
                 _ => 0,
             };
             f.check(&caps, raw_len).map_err(|e| Error::Jail(e.to_string()))?;

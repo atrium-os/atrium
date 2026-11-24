@@ -7,6 +7,8 @@ publish = false
 description = "Mail's store (docs/spec/mail.md §6.2): raw messages as files by content hash, and the engine's index (redb): folders, messages, flags, the list newest first. Holds parsed summaries only; parses nothing."
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10.4"
 mail-schema = { path = "../mail-schema" }
 postcard = { version = "1.1.3", features = ["use-std"] }
 redb = "2"

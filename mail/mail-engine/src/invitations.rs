@@ -5,7 +5,7 @@ use mail_store::MsgId;
 use portcullis_ipc::calendar::{address, Delivery, Reply, Source, FILE_MAX};
 
 #[derive(serde::Deserialize)]
-struct OneOffIdentity {
+struct IndividualIdentity {
     uid: String,
     sequence: u32,
     organizer: String,
@@ -208,13 +208,14 @@ impl Engine {
         {
             return Ok(None);
         }
-        self.one_off_update(&m, None)
+        self.individual_update(&m, None, None)
     }
 
-    fn one_off_update(
+    fn individual_update(
         &self,
         m: &mail_store::Message,
         attendee: Option<&str>,
+        slot: Option<mail_store::OccurrenceSlot>,
     ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
         use mail_schema::{FromJail, Raw, ToJail};
         let Some(i) = m
@@ -231,10 +232,20 @@ impl Engine {
             Err(e) => return Err(e),
         };
         let mut source = selected.source;
+        let scope = source.delivery.as_ref().and_then(|d| d.scope.clone());
+        match (slot, scope.as_deref()) {
+            (None, None) => (),
+            (Some(wanted), Some(raw))
+                if mail_store::OccurrenceSlot::parse(raw)
+                    .is_some_and(|found| wanted.matches(found)) =>
+            {
+                ()
+            }
+            _ => return Ok(None),
+        }
         if !source.verified
             || !source.reply_destination_matches
             || !i.organizer.eq_ignore_ascii_case(&source.from)
-            || source.delivery.as_ref().is_some_and(|d| d.scope.is_some())
         {
             return Ok(None);
         }
@@ -243,7 +254,7 @@ impl Engine {
             sequence: i.sequence,
             organizer: i.organizer.clone(),
             cancelled: i.cancelled,
-            scope: None,
+            scope: scope.clone(),
         });
         if let Some(attendee) = attendee {
             source
@@ -255,17 +266,20 @@ impl Engine {
         }
         let mut jail = crate::Parser::installed_worker()?;
         let len = selected.bytes.len() as u64;
-        mail_schema::write_frame(
-            &mut jail.w,
-            &ToJail::OneOffUpdate {
-                part: Raw {
-                    id: 1,
-                    bytes: selected.bytes,
-                },
-                identities: source.identities.clone(),
+        let part = Raw {
+            id: 1,
+            bytes: selected.bytes,
+        };
+        let identities = source.identities.clone();
+        let check = match scope {
+            Some(scope) => ToJail::OccurrenceUpdate {
+                part,
+                identities,
+                scope,
             },
-        )
-        .map_err(|e| Error::Jail(e.to_string()))?;
+            None => ToJail::OneOffUpdate { part, identities },
+        };
+        mail_schema::write_frame(&mut jail.w, &check).map_err(|e| Error::Jail(e.to_string()))?;
         let frames = crate::Parser::exchange(
             &mut jail.r,
             &mut jail.w,
@@ -273,7 +287,7 @@ impl Engine {
             &[],
             &|_| None,
         )?;
-        let [FromJail::OneOffUpdate { id: 1, proposal }] = frames.as_slice() else {
+        let [FromJail::IndividualUpdate { id: 1, proposal }] = frames.as_slice() else {
             return Err(Error::Jail("Invalid meeting update response".into()));
         };
         Ok(proposal
@@ -392,10 +406,11 @@ impl Engine {
 
     /// Check the newest eligible part first. A conflicting pair at the highest
     /// verified sequence needs a later organizer revision to disambiguate it.
-    fn check_one_off_response(
+    fn check_individual_response(
         &self,
         msg: MsgId,
         account: u32,
+        slot: Option<mail_store::OccurrenceSlot>,
         original: &mail_schema::Invite,
         r: &Reply,
     ) -> Result<mail_store::CalendarRevisions, Error> {
@@ -424,14 +439,14 @@ impl Engine {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let Some(update) = self.one_off_update(&m, Some(&r.attendee))? else {
+            let Some(update) = self.individual_update(&m, Some(&r.attendee), slot)? else {
                 continue;
             };
             let Some(delivery) = update.source.delivery else {
                 continue;
             };
-            let proof: OneOffIdentity = serde_json::from_str(&update.proposal)
-                .map_err(|_| Error::Jail("Invalid one-off scheduling proof".into()))?;
+            let proof: IndividualIdentity = serde_json::from_str(&update.proposal)
+                .map_err(|_| Error::Jail("Invalid individual scheduling proof".into()))?;
             if delivery.uid != r.uid
                 || delivery.sequence != seq
                 || !delivery.organizer.eq_ignore_ascii_case(&r.organizer)
@@ -614,9 +629,22 @@ impl Engine {
         }
         // Recheck inside the outbox transaction. If sync committed between
         // parsing these parts and enqueueing, review the new set before sending.
+        let slot = r
+            .scope
+            .as_deref()
+            .and_then(mail_store::OccurrenceSlot::parse);
+        if slot.is_none()
+            && r.scope.as_deref().is_some_and(|s| {
+                s.starts_with("RECURRENCE-ID:") || s.starts_with("RECURRENCE-ID;TZID=")
+            })
+        {
+            return Err(Error::Refused(
+                "The original occurrence time could not be verified.",
+            ));
+        }
         for _ in 0..3 {
-            let checked = if r.scope.is_none() {
-                match self.check_one_off_response(msg, m.account, i, r) {
+            let checked = if r.scope.is_none() || slot.is_some() {
+                match self.check_individual_response(msg, m.account, slot, i, r) {
                     Ok(checked) => Some(checked),
                     Err(Error::Store(mail_store::Error::CalendarChanged)) => continue,
                     Err(e) => return Err(e),
