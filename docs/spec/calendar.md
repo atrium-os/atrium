@@ -345,6 +345,16 @@ The request must identify the original series clock slot and carry a revision ne
 
 The installed synthetic gate runs with `--restore-one`. The series restarts on December 29. The organizer then offers the December 15 occurrence for Thursday, December 17 at 10:00. The test exercises both choices for the private copy on December 24 and checks the cancelled December 8 and 22 slots, the resumed schedule, Undo and the Mail outbox. [Synthetic request](../../atrium-calendar/tests/fixtures/restore-one.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
+### 7.22 Cancelling and reissuing a restored meeting
+
+If the organizer cancels a meeting that previously returned inside a cancelled interval, Mail identifies it by its original recurrence ID. Calendar shows that original slot and the organizer meeting’s current saved time. Applying the cancellation removes the organizer meeting. Any private copy kept during the earlier restoration is now an independent appointment and keeps its current title, date and time.
+
+A verified invitation for that single slot opens **Review one returning meeting** when its revision is newer than the cancellation and any saved range update covering the slot. The overview identifies the previous cancellation. The date review shows the original slot and the newly offered time. **Restore this meeting** saves just the organizer meeting. Even if a private appointment coincides with the proposed time, Calendar leaves it in place. Each save has its own Undo, and neither sends an RSVP. The person can separately review a response for the one original occurrence in Mail.
+
+Fasti matches the selected Mail delivery to the cancelled occurrence, including equivalent recurrence IDs expressed in another time zone. A stale revision, unverified change or broader invitation cannot reissue the cancelled slot. On save the new occurrence revision supersedes the cancellation record. If the person later deletes the meeting locally, Calendar preserves that decision on subsequent organizer updates.
+
+The synthetic desktop gate runs with `--reissue` using the §7.11 driver. The December 15 slot first returns on December 17 at 10:00, is cancelled, and is offered again for December 18 at 11:30. The retained copy is moved independently to December 23. The gate checks the two adjacent cancelled weeks, the resumed weekly time, both Undo operations and the Mail outbox. [Cancellation](../../atrium-calendar/tests/fixtures/cancel-restored.ics) · [Reissue](../../atrium-calendar/tests/fixtures/reissue-one.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

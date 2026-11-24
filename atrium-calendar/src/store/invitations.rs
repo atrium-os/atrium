@@ -239,6 +239,15 @@ impl Store {
                 && e.invitation.as_ref().is_some_and(|o| o.key == key)
         });
         let wire_date = p.original.map(|o| o.date);
+        // Match the delivered recurrence ID before converting it to the series clock.
+        let single_delivery = !p.this_and_future
+            && p.original.is_some()
+            && source
+                .delivery
+                .as_ref()
+                .is_some_and(|d| d.scope == p.scope());
+        let is_single_cancellation =
+            |c: &Cancellation, date| c.key == key && !c.this_and_future && c.original == Some(date);
         let mut review = Review {
             reinstating: false,
             cancelled_before_restart: None,
@@ -305,18 +314,20 @@ impl Store {
                 } else if let Some(slot) =
                     canonical.filter(|s| !p.this_and_future && *s != original)
                 {
-                    // A single restoration records its source-clock slot. Match the same
-                    // occurrence on replay if Mail used an equivalent clock representation.
-                    if rows.iter().any(|r| {
-                        r.kind
-                            == Kind::Occurrence {
-                                series: base.id,
-                                original: slot.date,
-                            }
-                            && r.invitation
-                                .as_ref()
-                                .is_some_and(|o| o.original == Some(slot))
-                    }) {
+                    // Both saved occurrences and cancellation records identify the original
+                    // source-clock date, even if this delivery uses another zone.
+                    if history.iter().any(|c| is_single_cancellation(c, slot.date))
+                        || rows.iter().any(|r| {
+                            r.kind
+                                == Kind::Occurrence {
+                                    series: base.id,
+                                    original: slot.date,
+                                }
+                                && r.invitation
+                                    .as_ref()
+                                    .is_some_and(|o| o.original == Some(slot))
+                        })
+                    {
                         p.original = Some(slot);
                     }
                 }
@@ -375,6 +386,15 @@ impl Store {
                     review.blocked("The original time or zone differs from the saved series.")
                 );
             }
+        }
+        let cancelled_slot = original_date.filter(|&date| {
+            restoring.is_none()
+                && explicit.is_none()
+                && master.is_some_and(|m| m.excluded.contains(&date))
+                && history.iter().any(|c| is_single_cancellation(c, date))
+        });
+        if cancelled_slot.is_some() {
+            review.previous = None;
         }
         let relevant = |c: &&Cancellation| {
             c.key == key
@@ -589,6 +609,24 @@ impl Store {
         {
             return Ok(review.blocked("Mail could not verify the sender of this change."));
         }
+        if let (Some(date), Some(proposed)) = (cancelled_slot, p.row.as_ref()) {
+            if !single_delivery {
+                return Ok(
+                    review.blocked("Review a separate invitation for this cancelled occurrence.")
+                );
+            }
+            if master
+                .and_then(|m| m.range_at(date))
+                .is_some_and(|rule| rule.sequence >= p.sequence)
+            {
+                return Ok(review.blocked("A saved range update supersedes this reissue."));
+            }
+            review.returning_date(date, proposed, None);
+            review.range_summary = Some(format!(
+                "Previously cancelled · only the {date} occurrence returns."
+            ));
+            review.notice = "Standalone private copies keep their saved times.".into();
+        }
         let date = p
             .row
             .as_ref()
@@ -610,6 +648,11 @@ impl Store {
             if let Err(at) = exclusions.binary_search(&original) {
                 exclusions.insert(at, original);
             }
+        }
+        // Once a reissue is saved, the event's revision supersedes its cancellation.
+        // A later local deletion must not look like another organizer cancellation.
+        if let Some(date) = cancelled_slot.filter(|_| p.row.is_some()) {
+            marks.retain(|c| !is_single_cancellation(c, date));
         }
         if let Some(mut row) = p.row {
             row.id = explicit.map_or_else(Uuid::new_v4, |e| e.id);

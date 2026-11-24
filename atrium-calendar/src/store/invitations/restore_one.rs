@@ -67,8 +67,8 @@ impl<'a> SingleDate<'a> {
             rows.iter()
                 .find(|r| r.id == *id && r.kind == Kind::Appointment && r.invitation.is_none())
         });
-        review.previous = None;
-        review.reinstating = true;
+        let proposed = p.row.as_ref().ok_or("Missing returning occurrence")?;
+        review.returning_date(original, proposed, private);
         review.range_summary = Some(format!(
             "Restore only {original}. Other cancelled dates stay absent."
         ));
@@ -76,13 +76,25 @@ impl<'a> SingleDate<'a> {
             review.notice =
                 "Older calendar data · existing private appointments stay in place.".into();
         }
-        review.range_dates.push(RangeDate {
+        Ok(private.map(|r| LocalMove::private_copy(original, r.id)))
+    }
+}
+
+impl Review {
+    pub(super) fn returning_date(
+        &mut self,
+        original: NaiveDate,
+        proposed: &Entry,
+        private: Option<&Entry>,
+    ) {
+        self.previous = None;
+        self.reinstating = true;
+        self.range_dates.push(RangeDate {
             original,
             before: None,
-            after: p.row.as_ref().map(|r| r.fields_on(r.date)),
+            after: Some(proposed.fields_on(proposed.date)),
             private_copy: private.map(|r| r.fields_on(r.date)),
         });
-        Ok(private.map(|r| LocalMove::private_copy(original, r.id)))
     }
 }
 

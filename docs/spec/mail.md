@@ -1404,6 +1404,8 @@ A newer verified request at the original cutoff or a later original slot can reo
 
 A separately delivered request for one occurrence can bring back that date inside a cancelled interval. Mail verifies the exact recurrence ID on the response. Calendar retains the decision about any private copy. [Bringing back one meeting](calendar.md#721-bringing-back-one-meeting-inside-a-cancelled-interval)
 
+A cancellation and later reissue of that meeting use the same original recurrence ID. A response to the reissue uses its new sequence and single-occurrence scope. Standalone appointments stay in Calendar. [Cancelling and reissuing a restored meeting](calendar.md#722-cancelling-and-reissuing-a-restored-meeting)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

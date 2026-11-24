@@ -423,9 +423,9 @@ def long_range(ui):
     print("PASS long and open-ended range review, inherited extension, distant agenda and both private moves")
 
 
-def move_meeting(ui, day, dest, start, end):
+def move_meeting(ui, day, dest, start, end, *, standalone=False):
     ui.open_date(day)
-    click(ui, 450, 268)
+    click(ui, 590 if standalone else 450, 268)
     ui.field(80, 256, dest)
     ui.field(225, 256, start)
     ui.field(330, 256, end)
@@ -582,16 +582,17 @@ def restart_range(ui):
     print("PASS partial restart, cancelled original date, two private copies, prefix, Undo and empty outbox")
 
 
-def restore_one(ui):
-    print(guest(ui, "restore-one-setup"))
+def restore_one(ui, reissue=False):
+    offset = 140 if reissue else 0
+    print(guest(ui, "reissue-setup" if reissue else "restore-one-setup"))
     open_mail(ui, first=True)
-    review(ui, 388)
+    review(ui, 388 + offset)
     ui.see("one-weekly", "Whole weekly series")
     click(ui, 568, 550)
     ui.see("one-original-saved", "Invitation saved")
     move_meeting(ui, "2026-12-15", "2026-12-24", "16:30", "17:15")
     ui.control("close", "work")
-    review(ui, 318)
+    review(ui, 318 + offset)
     ui.see("one-cancellation", "Review 3 dates")
     click(ui, 355, 412)
     ui.see("one-cut", "2026-12-08")
@@ -603,7 +604,7 @@ def restore_one(ui):
     click(ui, 568, 550)
     ui.see("one-cancelled", "Cancellation applied")
     ui.control("close", "work")
-    review(ui, 248)
+    review(ui, 248 + offset)
     ui.see("one-restart", "Restore from 2026-12-29")
     for date in ("2026-12-08", "2026-12-15", "2026-12-22", "2026-12-29", "2027-01-05"):
         click(ui, 355, 412)
@@ -614,7 +615,7 @@ def restore_one(ui):
     private = next(e for e in baseline["entries"] if e["kind"] == "Appointment")
     for keep in (True, False):
         ui.control("close", "work")
-        review(ui, 178)
+        review(ui, 178 + offset)
         ui.see("one-overview", "Review one returning meeting", "Restore only 2026-12-15")
         click(ui, 355, 412)
         ui.see("one-copy", "Your private copy", "2026-12-24", "Returns", "2026-12-17", "10:00")
@@ -625,6 +626,9 @@ def restore_one(ui):
         ui.see("one-applied", "Invitation saved", "10:00")
         saved = ui.store("work")
         assert (private in saved["entries"]) == keep
+        if reissue:
+            check_reissue(ui, private)
+            break
         for date in ("2026-12-08", "2026-12-22"):
             ui.open_date(date)
             ui.see("one-still-cancelled-" + date, "No events on this day")
@@ -637,13 +641,60 @@ def restore_one(ui):
     assert ui.control("fingerprint", "personal").strip() == b"empty"
     ui.control("close", "work")
     print(guest(ui, "series-check-empty"))
-    print("PASS one restored date, both private-copy choices, cancelled neighbors, Undo and empty outbox")
+    if reissue:
+        print("PASS cancellation and reissue, independent private copy, cancelled neighbors, Undo and empty outbox")
+    else:
+        print("PASS one restored date, both private-copy choices, cancelled neighbors, Undo and empty outbox")
+
+
+def check_reissue(ui, private):
+    move_meeting(ui, "2026-12-24", "2026-12-23", "09:15", "10:00", standalone=True)
+    before = ui.store("work")
+    kept = next(r for r in before["entries"] if r["id"] == private["id"])
+    assert kept["date"] == "2026-12-23"
+
+    def cancel():
+        ui.control("close", "work")
+        review(ui, 248)
+        ui.see("recancel-review", "Review cancellation", "2026-12-15", "Current", "2026-12-17", "10:00", "Standalone private copies")
+        assert ui.store("work") == before
+        click(ui, 568, 550)
+        ui.see("recancel-saved", "Cancellation applied")
+
+    cancel()
+    assert kept in ui.store("work")["entries"]
+    click(ui, 590, 562)
+    ui.see("recancel-undone", "Change undone")
+    assert ui.store("work") == dict(before, revision=before["revision"] + 2)
+    before = ui.store("work")
+    cancel()
+    cancelled = ui.store("work")
+    ui.open_date("2026-12-17")
+    ui.see("recancel-absent", "No events on this day")
+    ui.control("close", "work")
+    review(ui, 178)
+    ui.see("reissue-overview", "Previously cancelled", "2026-12-18", "11:30", "Standalone private copies")
+    click(ui, 355, 412)
+    ui.see("reissue-date", "Original occurrence", "2026-12-15", "Returns", "2026-12-18", "11:30", "Restore this meeting")
+    assert ui.store("work") == cancelled
+    click(ui, 568, 550)
+    ui.see("reissue-saved", "Invitation saved", "11:30")
+    saved = ui.store("work")
+    assert kept in saved["entries"]
+    for day in ("2026-12-08", "2026-12-15", "2026-12-17", "2026-12-22"):
+        ui.open_date(day)
+        ui.see("reissue-absent-" + day, "No events on this day")
+    ui.open_date("2026-12-30")
+    ui.see("reissue-series", "Studio planning", "16:00")
+    click(ui, 590, 562)
+    ui.see("reissue-undone", "Change undone")
+    assert ui.store("work") == dict(cancelled, revision=saved["revision"] + 1)
 
 
 if __name__ == "__main__":
-    runner = {"--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

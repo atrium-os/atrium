@@ -28,7 +28,8 @@ fn seed(e: &Engine, mode: &str) {
     let grouped = mode == "seed-cancel-dates";
     let skipped = mode == "seed-exdates";
     let long = mode == "seed-long-range";
-    let one = mode == "seed-restore-one";
+    let reissue = mode == "seed-reissue";
+    let one = mode == "seed-restore-one" || reissue;
     let restart = mode == "seed-restart" || one;
     let reinstate = mode == "seed-reinstate" || restart;
     let cancel_future = mode == "seed-cancel-future" || reinstate;
@@ -55,16 +56,27 @@ fn seed(e: &Engine, mode: &str) {
     let resume = include_str!("../../../atrium-calendar/tests/fixtures/restart-future.ics")
         .replace("20261222", "20261229")
         .replace("20261223", "20261230");
-    let messages: &[(&str, &str)] = if one {
-        &[
-            ("Weekly studio meetings", WEEKLY),
-            ("Cancel December 8 onward", &cut),
-            ("Restart December 29 onward", &resume),
-            (
-                "Bring back December 15 only",
-                include_str!("../../../atrium-calendar/tests/fixtures/restore-one.ics"),
-            ),
-        ]
+    let restored_series = [
+        ("Weekly studio meetings", WEEKLY),
+        ("Cancel December 8 onward", &cut),
+        ("Restart December 29 onward", &resume),
+        (
+            "Bring back December 15 only",
+            include_str!("../../../atrium-calendar/tests/fixtures/restore-one.ics"),
+        ),
+        (
+            "Cancel the restored meeting",
+            include_str!("../../../atrium-calendar/tests/fixtures/cancel-restored.ics"),
+        ),
+        (
+            "Reissue the December 15 meeting",
+            include_str!("../../../atrium-calendar/tests/fixtures/reissue-one.ics"),
+        ),
+    ];
+    let messages: &[(&str, &str)] = if reissue {
+        &restored_series
+    } else if one {
+        &restored_series[..4]
     } else if reinstate {
         &[
             ("Weekly studio meetings", WEEKLY),
@@ -134,7 +146,7 @@ fn seed(e: &Engine, mode: &str) {
         } else {
             "REQUEST"
         };
-        let sender = if id == 6 {
+        let sender = if series && id == 6 {
             "intruder@fixture.invalid"
         } else {
             "mina@fixture.invalid"
@@ -147,7 +159,8 @@ fn seed(e: &Engine, mode: &str) {
             .pop()
             .unwrap()
             .unwrap();
-        assert_eq!(summary.invite.as_ref().unwrap().sequence, id.min(5));
+        let sequence = if series { id.min(5) } else { id };
+        assert_eq!(summary.invite.as_ref().unwrap().sequence, sequence);
         // Synthetic sender evidence for the reschedule case. No DNS or live account.
         summary.sender_check = mail_schema::SenderCheck::Verified {
             domain: "fixture.invalid".into(),
@@ -179,7 +192,7 @@ fn seed(e: &Engine, mode: &str) {
                 (true, 1) if cancel_future => Some("weekly".into()),
                 (true, 2) if one => Some(FUTURE_SCOPE.into()),
                 (true, 3) if one => Some(FUTURE_SCOPE.replace("20261208", "20261229")),
-                (true, 4) if one => Some("RECURRENCE-ID:20261215T140000Z".into()),
+                (true, 4..=6) if one => Some("RECURRENCE-ID:20261215T140000Z".into()),
                 (true, 3) if restart => Some(FUTURE_SCOPE.replace("20261208", "20261222")),
                 (true, 2 | 3) if cancel_future => {
                     Some(FUTURE_SCOPE.replace("20261208", "20261215"))
@@ -219,7 +232,7 @@ fn seed(e: &Engine, mode: &str) {
                 attendee: "dev@fixture.invalid".into(),
                 organizer: "mina@fixture.invalid".into(),
                 uid: "studio-planning@fixture.invalid".into(),
-                sequence: id.min(5),
+                sequence,
             };
             if method == "CANCEL" {
                 assert!(e.send_invitation_reply(msg, blob, &reply).is_err());
@@ -243,7 +256,7 @@ fn seed(e: &Engine, mode: &str) {
                 let ics = std::str::from_utf8(&draft.attachments[0].bytes).unwrap();
                 assert_eq!(
                     ics.lines().find(|line| line.starts_with("RECURRENCE-ID")),
-                    if (reinstate && id == 3) || (one && id == 4) {
+                    if (reinstate && id == 3) || (one && id >= 4) {
                         reply.scope.as_deref()
                     } else if long && id == 4 {
                         Some(spring_scope.as_str())
@@ -253,6 +266,10 @@ fn seed(e: &Engine, mode: &str) {
                         (!bounded && id == 2).then_some(ORIGINAL)
                     }
                 );
+                if reissue && id == 6 {
+                    assert!(ics.lines().any(|line| line == "SEQUENCE:6"));
+                    assert!(!ics.contains("RANGE="));
+                }
                 assert!(ics.contains("PARTSTAT=TENTATIVE"));
                 if skipped && id == 2 {
                     assert!(draft.text.contains("2 skipped dates"));
@@ -401,7 +418,7 @@ fn main() {
     match args[1].as_str() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
         | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate"
-        | "seed-restart" | "seed-restore-one") => seed(&e, mode),
+        | "seed-restart" | "seed-restore-one" | "seed-reissue") => seed(&e, mode),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),

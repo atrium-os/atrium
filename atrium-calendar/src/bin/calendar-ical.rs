@@ -1567,6 +1567,194 @@ mod tests {
     }
 
     #[test]
+    fn reissue_must_follow_the_revision_of_a_range_covering_the_cancelled_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let cancel = include_str!("../../tests/fixtures/cancel-restored.ics");
+        let range = RANGE_REQUEST.replace("SEQUENCE:2", "SEQUENCE:7");
+        for (rev, text) in [
+            (0, include_str!("../../tests/fixtures/weekly.ics")),
+            (1, cancel),
+            (2, range.as_str()),
+        ] {
+            let token = review_range(&mut store, rev, text).token.unwrap();
+            store.apply_invitation(rev, token).unwrap();
+        }
+        let reissue = include_str!("../../tests/fixtures/reissue-one.ics");
+        let blocked = review_range(&mut store, 3, reissue);
+        assert!(blocked.token.is_none() && blocked.notice.contains("supersedes"));
+        assert!(store.day(date("2026-12-16")).entries.is_empty());
+        let newer = reissue.replace("SEQUENCE:6", "SEQUENCE:8");
+        let review = review_range(&mut store, 3, &newer);
+        assert!(review.reinstating);
+        store.apply_invitation(3, review.token.unwrap()).unwrap();
+        assert_eq!(store.day(date("2026-12-18")).entries[0].span.start, 690);
+        assert_eq!(store.day(date("2026-12-23")).entries[0].span.start, 960);
+    }
+
+    #[test]
+    fn cancellation_and_reissue_of_a_restored_slot_leave_private_copies_independent() {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        seed_cancelled_interval(&mut s);
+        let original = date("2026-12-15");
+        let t = review_range(&mut s, 5, RESTORE_ONE).token.unwrap();
+        s.apply_reviewed_invitation(
+            5,
+            t,
+            &[SkipDecision {
+                original,
+                keep: true,
+            }],
+        )
+        .unwrap();
+        let old_day = date("2026-12-17");
+        let old_id = s.day(old_day).entries[0].id;
+        let private_day = date("2026-12-24");
+        let private = s
+            .day(private_day)
+            .entries
+            .into_iter()
+            .find(|r| r.title.ends_with("12-15"))
+            .unwrap();
+        let mut moved = private.fields_on(private_day);
+        // Even an exact collision with the new organizer time is an independent appointment.
+        moved.date = date("2026-12-18");
+        moved.span = Span {
+            start: 690,
+            end: 735,
+        };
+        moved.title = "Independent appointment".into();
+        s.change(
+            6,
+            private.id,
+            private_day,
+            EditScope::ThisEvent,
+            Some(moved.clone()),
+        )
+        .unwrap();
+        let cancel = include_str!("../../tests/fixtures/cancel-restored.ics");
+        let reissue = include_str!("../../tests/fixtures/reissue-one.ics");
+        let snapshot = || {
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(dir.path().join("calendar.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        let with_revision = |value: &serde_json::Value, rev: u64| {
+            let mut v = value.clone();
+            v["revision"] = rev.into();
+            v
+        };
+        let before = snapshot();
+        let p = range_proposal(cancel);
+        let mut source = range_source(&p);
+        source.verified = false;
+        assert!(s.review_invitation(7, &source, p).unwrap().token.is_none());
+        assert!(
+            review_range(&mut s, 7, &cancel.replace("SEQUENCE:5", "SEQUENCE:4"))
+                .token
+                .is_none()
+        );
+        let r = review_range(&mut s, 7, cancel);
+        assert_eq!(r.previous.as_ref().unwrap().id, old_id);
+        assert_eq!(r.previous.as_ref().unwrap().date, old_day);
+        assert_eq!(snapshot(), before);
+        let (_, undo) = s.apply_invitation(7, r.token.unwrap()).unwrap();
+        assert!(s.day(old_day).entries.is_empty());
+        assert_eq!(s.day(moved.date).entries[0].fields_on(moved.date), moved);
+        s.undo(undo).unwrap();
+        assert_eq!(snapshot(), with_revision(&before, 9));
+        let t = review_range(&mut s, 9, cancel).token.unwrap();
+        s.apply_invitation(9, t).unwrap();
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        let cancelled = snapshot();
+        assert!(review_range(&mut s, 10, cancel).token.is_none());
+        for stale in [
+            RESTORE_ONE.to_owned(),
+            reissue.replace("SEQUENCE:6", "SEQUENCE:5"),
+        ] {
+            let r = review_range(&mut s, 10, &stale);
+            assert!(r.token.is_none() && r.previous.is_none());
+        }
+        let widened = reissue.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDFUTURE:");
+        assert!(review_range(&mut s, 10, &widened).token.is_none());
+        let master =
+            include_str!("../../tests/fixtures/weekly.ics").replace("SEQUENCE:1", "SEQUENCE:6");
+        let (_, event) = reissue.split_once("BEGIN:VEVENT").unwrap();
+        let bundle = master.replace("END:VCALENDAR", &format!("BEGIN:VEVENT{event}"));
+        assert!(review_range(&mut s, 10, &bundle).token.is_none());
+        let proposal = range_proposal(reissue);
+        let mut unverified = range_source(&proposal);
+        unverified.verified = false;
+        assert!(s
+            .review_invitation(10, &unverified, proposal.clone())
+            .unwrap()
+            .token
+            .is_none());
+        let mut substituted = range_source(&proposal);
+        substituted.delivery.as_mut().unwrap().scope = range_proposal(&widened).scope();
+        assert!(s.review_invitation(10, &substituted, proposal).is_err());
+        let equivalent = reissue.replace(
+            "RECURRENCE-ID:20261215T140000Z",
+            "RECURRENCE-ID;TZID=Pacific/Kiritimati:20261216T040000",
+        );
+        for (rev, request) in [(10, equivalent.as_str()), (12, reissue)] {
+            let r = review_range(&mut s, rev, request);
+            assert!(r.reinstating && r.can_save && r.previous.is_none());
+            assert_eq!(r.range_dates.len(), 1);
+            let d = &r.range_dates[0];
+            assert_eq!(d.original, original);
+            assert!(d.private_copy.is_none() && d.before.is_none());
+            assert_eq!(d.after.as_ref().unwrap().date, moved.date);
+            let t = r.token.unwrap();
+            assert!(s
+                .apply_reviewed_invitation(
+                    rev,
+                    t,
+                    &[SkipDecision {
+                        original,
+                        keep: false
+                    }]
+                )
+                .is_err());
+            assert_eq!(snapshot(), with_revision(&cancelled, rev));
+            let (_, undo) = s.apply_invitation(rev, t).unwrap();
+            let day = s.day(moved.date).entries;
+            assert_eq!(day.len(), 2);
+            assert!(day
+                .iter()
+                .any(|e| e.id == private.id && e.fields_on(moved.date) == moved));
+            let returned = day.iter().find(|e| e.invitation.is_some()).unwrap();
+            assert_eq!(returned.invitation.as_ref().unwrap().sequence, 6);
+            for day in ["2026-12-08", "2026-12-15", "2026-12-17", "2026-12-22"] {
+                assert!(s.day(date(day)).entries.is_empty());
+            }
+            assert_eq!(s.day(date("2026-12-30")).entries[0].span.start, 960);
+            assert!(!review_range(&mut s, rev + 1, request).can_save);
+            assert!(review_range(&mut s, rev + 1, cancel).token.is_none());
+            if rev == 10 {
+                s.undo(undo).unwrap();
+                assert_eq!(snapshot(), with_revision(&cancelled, 12));
+            }
+        }
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        let returned = s
+            .day(moved.date)
+            .entries
+            .into_iter()
+            .find(|r| r.invitation.is_some())
+            .unwrap();
+        s.change(13, returned.id, moved.date, EditScope::ThisEvent, None)
+            .unwrap();
+        let blocked = review_range(&mut s, 14, &reissue.replace("SEQUENCE:6", "SEQUENCE:7"));
+        assert!(blocked.token.is_none() && blocked.notice.contains("removed locally"));
+    }
+
+    #[test]
     fn one_verified_request_splits_the_interval_and_reviews_only_its_copy() {
         use atrium_calendar::invitation::SkipDecision;
         let dir = tempfile::tempdir().unwrap();

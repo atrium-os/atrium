@@ -423,6 +423,19 @@ impl Sheet {
                     .into(),
                 );
             }
+            if p.row.is_none()
+                && p.original.is_some()
+                && !cancel_range
+                && !grouped
+                && self.review.can_save
+            {
+                line(
+                    ctx,
+                    333.,
+                    14.,
+                    "Standalone private copies keep their saved times.".into(),
+                );
+            }
             if let Some(gap) = &self.review.cancelled_before_restart {
                 line(
                     ctx,
@@ -486,12 +499,16 @@ impl Sheet {
                 ctx,
                 160.,
                 19.,
-                format!(
-                    "Range date {} of {} · {}",
-                    self.page,
-                    self.detail_count(),
-                    date.original
-                ),
+                if self.review.reinstating && !p.this_and_future {
+                    format!("Original occurrence · {}", date.original)
+                } else {
+                    format!(
+                        "Range date {} of {} · {}",
+                        self.page,
+                        self.detail_count(),
+                        date.original
+                    )
+                },
             );
             let display = |e: &atrium_calendar::EventEdit| {
                 format!(
