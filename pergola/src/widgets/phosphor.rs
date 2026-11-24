@@ -68,3 +68,16 @@ pub const CARET_DOWN: char = '\u{e136}';
 pub const CARET_RIGHT: char = '\u{e13a}';
 /// Personas (Settings' Personas page).
 pub const USERS: char = '\u{e4d6}';
+// Developer tools (Artifex, dev-tools.md §3.5).
+pub const FILE: char = '\u{e230}';
+pub const FILE_TEXT: char = '\u{e23a}';
+pub const FLASK: char = '\u{e79e}';
+pub const BUG: char = '\u{e5f4}';
+pub const LIGHTNING: char = '\u{e2de}';
+pub const GIT_BRANCH: char = '\u{e278}';
+pub const PUZZLE_PIECE: char = '\u{e596}';
+pub const SHIELD_CHECK: char = '\u{e40c}';
+pub const WARNING: char = '\u{e4e0}';
+pub const WARNING_OCTAGON: char = '\u{e4e4}';
+pub const GEAR: char = '\u{e270}';
+pub const ARROW_CLOCKWISE: char = '\u{e036}';

@@ -264,8 +264,39 @@ fn fit(s: &str, width: f32, size: f32) -> String {
     }
 }
 
+/// A task's button label: its verb ("Build (cargo)" -> "Build").
+fn task_short(label: &str) -> String {
+    label.split(" (").next().unwrap_or(label).to_string()
+}
+
+fn task_icon(label: &str) -> char {
+    match task_short(label).as_str() {
+        "Build" => phosphor::HAMMER,
+        "Test" => phosphor::FLASK,
+        "Check" | "Clippy" | "Lint" => phosphor::SHIELD_CHECK,
+        _ => phosphor::CODE,
+    }
+}
+
+/// The tree's and the tabs' icon for a file.
+pub fn file_icon(name: &str) -> char {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "py" | "sh" | "js" | "ts" | "go" | "zig" | "s" => phosphor::CODE,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => phosphor::IMAGE,
+        "pdf" => phosphor::FILE_PDF,
+        "toml" | "md" | "txt" | "json" | "yaml" | "yml" | "mk" | "lock" | "ini" | "conf" => phosphor::FILE_TEXT,
+        _ if name == "Makefile" || name.starts_with("README") => phosphor::FILE_TEXT,
+        _ => phosphor::FILE,
+    }
+}
+
 pub fn bar_h() -> f32 { em(44.0) }
+/// The view strip down the left edge.
+pub fn strip_w() -> f32 { em(48.0) }
 pub fn side_w() -> f32 { em(240.0) }
+/// Where the editor, its tabs and the panel start: right of the strip and the tree.
+pub fn left() -> f32 { strip_w() + side_w() }
 pub fn tabs_h() -> f32 { em(32.0) }
 pub fn status_h() -> f32 { em(24.0) }
 pub fn panel_h() -> f32 { em(200.0) }
@@ -275,7 +306,7 @@ pub fn row_h() -> f32 { em(22.0) }
 pub fn editor_rect(w: f32, h: f32, panel: bool) -> Rect {
     let top = bar_h() + tabs_h();
     let bottom = h - status_h() - if panel { panel_h() } else { 0.0 };
-    Rect::new(side_w(), top, (w - side_w()).max(em(100.0)), (bottom - top).max(em(60.0)))
+    Rect::new(left(), top, (w - left()).max(em(100.0)), (bottom - top).max(em(60.0)))
 }
 
 impl View for ArtifexView {
@@ -286,81 +317,89 @@ impl View for ArtifexView {
         let q = &self.queue;
         ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
 
-        // The bar: workspace, tasks, terminal, branch.
+        // The toolbar (dev-tools.md §3.5): the workspace, Run as the one
+        // accent button, the other tasks and Debug as icon-and-label
+        // buttons; New project and Terminal on the right.
         ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, bar_h()), fill: t.bg_surface(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(0.0, bar_h() - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         let mid = bar_h() / 2.0;
+        let by = mid - em(16.0);
         let ws_label = s.ws.as_deref().map(crate::title).unwrap_or_else(|| "Choose a workspace".into());
         ctx.key(10);
-        Button::ghost(ws_label).at(em(8.0), mid - em(16.0)).width(side_w() - em(16.0)).on_click(plain(q, Act::Choose)).render(ctx);
-        let mut x = side_w() + em(8.0);
-        for (i, task) in s.tasks.iter().enumerate() {
+        Button::secondary(fit(&ws_label, em(150.0), type_size::MD)).lead(phosphor::STACK_SIMPLE).at(em(8.0), by).width(em(180.0))
+            .tooltip("Workspace").on_click(plain(q, Act::Choose)).render(ctx);
+        let mut x = em(200.0);
+        ctx.add(Node::Rect { rect: Rect::new(x, mid - em(12.0), 1.0, em(24.0)), fill: t.border_strong(), radius: 0.0 });
+        x += em(10.0);
+        // Run first, then the rest in the order the project gives them.
+        let mut order: Vec<usize> = (0..s.tasks.len()).collect();
+        order.sort_by_key(|&i| !s.tasks[i].label.starts_with("Run"));
+        for (k, &i) in order.iter().enumerate() {
+            let task = &s.tasks[i];
             ctx.key(20 + i as u64);
-            let bw = em(14.0 + 8.0 * task.label.len() as f32);
-            if s.running.is_some() {
-                Button::secondary(task.label.clone()).at(x, mid - em(16.0)).width(bw).render(ctx);
-            } else {
-                Button::secondary(task.label.clone()).at(x, mid - em(16.0)).width(bw).on_click(plain(q, Act::Task(i))).render(ctx);
+            let run = task.label.starts_with("Run");
+            let short = task_short(&task.label);
+            let bw = em(if run { 70.0 } else { 40.0 } + 8.0 * short.len() as f32);
+            let mut b = if run { Button::primary(short).lead(phosphor::PLAY) } else { Button::ghost(short).lead(task_icon(&task.label)) };
+            b = b.tooltip(task.label.clone()).at(x, by).width(bw);
+            if s.running.is_none() {
+                b = b.on_click(plain(q, Act::Task(i)));
             }
-            x += bw + em(8.0);
+            b.render(ctx);
+            x += bw + em(if k == 0 { 8.0 } else { 2.0 });
         }
         if s.ws.is_some() && s.running.is_none() {
             let live = s.debug.as_ref().is_some_and(|d| d.live);
             let stopped = s.debug.as_ref().is_some_and(|d| d.stopped);
-            let mut buttons: Vec<(&str, Act)> = Vec::new();
+            let mut buttons: Vec<(&str, Option<char>, Act)> = Vec::new();
             if !live {
                 if !s.tasks.is_empty() {
-                    buttons.push(("Debug", Act::Debug));
+                    buttons.push(("Debug", Some(phosphor::BUG), Act::Debug));
                 }
             } else {
                 if stopped {
-                    buttons.extend([("Continue", Act::Debug), ("Over", Act::StepOver), ("Into", Act::StepIn), ("Out", Act::StepOut)]);
+                    buttons.extend([("Continue", Some(phosphor::PLAY), Act::Debug), ("Over", None, Act::StepOver), ("Into", None, Act::StepIn), ("Out", None, Act::StepOut)]);
                 }
-                buttons.push(("Stop", Act::StopDebug));
+                buttons.push(("Stop", Some(phosphor::X), Act::StopDebug));
             }
-            for (i, (label, a)) in buttons.into_iter().enumerate() {
+            for (i, (label, icon, a)) in buttons.into_iter().enumerate() {
                 ctx.key(30 + i as u64);
-                let bw = em(18.0 + 8.0 * label.len() as f32);
-                Button::ghost(label).at(x, mid - em(16.0)).width(bw).on_click(plain(q, a)).render(ctx);
-                x += bw + em(4.0);
+                let bw = em(if icon.is_some() { 40.0 } else { 18.0 } + 8.0 * label.len() as f32);
+                let mut b = Button::ghost(label);
+                if let Some(ch) = icon {
+                    b = b.lead(ch);
+                }
+                b.at(x, by).width(bw).on_click(plain(q, a)).render(ctx);
+                x += bw + em(2.0);
             }
         }
         if let Some(r) = &s.running {
             ctx.key(40);
-            Button::primary("Stop").at(x, mid - em(16.0)).width(em(70.0)).on_click(plain(q, Act::Stop)).render(ctx);
-            x += em(78.0);
+            Button::destructive("Stop").lead(phosphor::X).at(x, by).width(em(80.0)).on_click(plain(q, Act::Stop)).render(ctx);
+            x += em(88.0);
             text(ctx, x, mid, &format!("{r}…"), type_size::SM, Weight::Regular, t.text_secondary());
         }
         if s.ws.is_some() {
             ctx.key(41);
-            Button::ghost("Terminal").at(w - em(110.0), mid - em(16.0)).width(em(100.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
+            Button::ghost("Terminal").lead(phosphor::TERMINAL_WINDOW).at(w - em(110.0), by).width(em(100.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
             ctx.key(42);
-            Button::ghost("New project").at(w - em(240.0), mid - em(16.0)).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
-            if let Some(g) = &s.git {
-                if let Some(b) = &g.branch {
-                    let mut label = format!("⎇ {b}");
-                    if g.ahead > 0 {
-                        label.push_str(&format!(" ↑{}", g.ahead));
-                    }
-                    if g.behind > 0 {
-                        label.push_str(&format!(" ↓{}", g.behind));
-                    }
-                    text(ctx, w - em(250.0) - em(8.0 * label.chars().count() as f32), mid, &label, type_size::SM, Weight::Medium, t.text_secondary());
-                }
-            }
+            Button::ghost("New project").lead(phosphor::PACKAGE).at(w - em(240.0), by).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
         }
 
         // The tree.
         let tree_top = bar_h();
         let tree_bottom = h - status_h();
-        ctx.add(Node::Rect { rect: Rect::new(0.0, tree_top, side_w(), tree_bottom - tree_top), fill: t.bg_surface(), radius: 0.0 });
+        let sx = strip_w();
+        ctx.add(Node::Rect { rect: Rect::new(sx, tree_top, side_w(), tree_bottom - tree_top), fill: t.bg_surface(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(left() - 1.0, tree_top, 1.0, tree_bottom - tree_top), fill: t.border_default(), radius: 0.0 });
         let fit_rows = ((tree_bottom - tree_top - em(8.0)) / row_h()).floor().max(1.0) as usize;
         let top = s.tree_top.min(s.rows.len().saturating_sub(fit_rows));
         ctx.key(50);
-        let area = ctx.push(Node::Rect { rect: Rect::new(0.0, tree_top, side_w(), tree_bottom - tree_top), fill: Color::TRANSPARENT, radius: 0.0 });
+        let area = ctx.push(Node::Rect { rect: Rect::new(sx, tree_top, side_w(), tree_bottom - tree_top), fill: Color::TRANSPARENT, radius: 0.0 });
         let active_rel = s.active.and_then(|i| s.tabs.get(i)).map(|t| t.rel.clone());
         for (i, row) in s.rows.iter().enumerate().skip(top).take(fit_rows) {
             let y = tree_top + em(4.0) + (i - top) as f32 * row_h();
-            let r = Rect::new(em(4.0), y, side_w() - em(8.0), row_h());
+            let r = Rect::new(sx + em(4.0), y, side_w() - em(8.0), row_h());
             ctx.key(1000 + i as u64);
             let id = ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: radius::SM });
             let fill = if active_rel.as_deref() == Some(row.rel.as_str()) { t.selection_idle() } else if ctx.is_hovered(id) { t.state_hover() } else { Color::TRANSPARENT };
@@ -392,9 +431,22 @@ impl View for ArtifexView {
                 Some(_) => t.warning_fg(),
                 None => t.text_primary(),
             };
-            text(ctx, r.x() + indent + em(4.0), y + row_h() / 2.0, &fit(&row.name, side_w() - indent - em(36.0), type_size::SM), type_size::SM, Weight::Regular, color);
+            let (icon, icon_color) = if row.dir {
+                (if row.open { phosphor::FOLDER_OPEN } else { phosphor::FOLDER }, t.accent_mark())
+            } else if active_rel.as_deref() == Some(row.rel.as_str()) {
+                (file_icon(&row.name), t.accent_fg())
+            } else {
+                (file_icon(&row.name), t.text_secondary())
+            };
+            let ih = em(type_size::MD) * 1.2;
+            ctx.add(Node::Text {
+                rect: Rect::new(r.x() + indent + em(2.0), y + (row_h() - ih) / 2.0, 0.0, ih),
+                content: icon.to_string(),
+                style: style(font::ICONS, type_size::MD, Weight::Regular, icon_color),
+            });
+            text(ctx, r.x() + indent + em(24.0), y + row_h() / 2.0, &fit(&row.name, side_w() - indent - em(56.0), type_size::SM), type_size::SM, Weight::Regular, color);
             if let Some(c) = change {
-                text(ctx, side_w() - em(22.0), y + row_h() / 2.0, &c.to_string(), type_size::XS, Weight::Medium, color);
+                text(ctx, sx + side_w() - em(22.0), y + row_h() / 2.0, &c.to_string(), type_size::XS, Weight::Medium, color);
             }
             ctx.pop();
         }
@@ -408,30 +460,90 @@ impl View for ArtifexView {
         });
         ctx.pop();
         if s.ws.is_some() && s.rows.is_empty() {
-            text(ctx, em(16.0), tree_top + em(20.0), "work is empty", type_size::SM, Weight::Regular, t.text_tertiary());
+            text(ctx, sx + em(16.0), tree_top + em(20.0), "work is empty", type_size::SM, Weight::Regular, t.text_tertiary());
+        }
+
+        // The view strip: Files, then the views the project has.
+        let st_top = bar_h();
+        ctx.add(Node::Rect { rect: Rect::new(0.0, st_top, strip_w(), h - st_top - status_h()), fill: t.bg_surface(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(strip_w() - 1.0, st_top, 1.0, h - st_top - status_h()), fill: t.border_default(), radius: 0.0 });
+        if s.ws.is_some() {
+            let mut views: Vec<(&str, char, Option<Panel>, usize)> = vec![("Files", phosphor::FILES, None, 0)];
+            let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
+            views.push(("Problems", phosphor::WARNING, Some(Panel::Problems), errors));
+            if s.composition.is_some() {
+                views.push(("Composition", phosphor::GRAPH, Some(Panel::Composition), 0));
+            }
+            if let Some(f) = &s.fuzz {
+                views.push(("Fuzz", phosphor::LIGHTNING, Some(Panel::Fuzz), f.crashes.len()));
+            }
+            if s.debug.is_some() {
+                views.push(("Debug", phosphor::BUG, Some(Panel::Debug), 0));
+            }
+            for (i, (label, icon, panel, count)) in views.into_iter().enumerate() {
+                let y = st_top + em(8.0) + i as f32 * em(42.0);
+                let on = match panel { None => true, Some(p) => s.panel_open && s.panel == p };
+                if on {
+                    ctx.add(Node::Rect { rect: Rect::new(em(6.0), y, em(36.0), em(36.0)), fill: t.accent_bg(), radius: radius::MD });
+                }
+                ctx.key(8000 + i as u64);
+                let mut b = Button::ghost(label).icon(icon).at(em(6.0), y).width(em(36.0));
+                b.rect.size.h = em(36.0);
+                if let Some(p) = panel {
+                    b = b.on_click(plain(q, Act::Panel(p)));
+                }
+                b.render(ctx);
+                if count > 0 {
+                    let label = if count > 9 { "9+".to_string() } else { count.to_string() };
+                    ctx.add(Node::Rect { rect: Rect::new(em(26.0), y + em(2.0), em(15.0), em(15.0)), fill: t.danger_fg(), radius: em(7.5) });
+                    let ts = style(font::SANS, type_size::XXS, Weight::Semibold, t.text_on_accent());
+                    let sz = Node::measure_text(&label, &ts);
+                    ctx.add(Node::Text { rect: Rect::new(em(33.5) - sz.w / 2.0, y + em(9.5) - sz.h / 2.0, sz.w, sz.h), content: label, style: ts });
+                }
+            }
         }
 
         // Tabs.
         let ty = bar_h();
-        let mut tx = side_w();
+        let mut tx = left();
+        ctx.add(Node::Rect { rect: Rect::new(left(), ty, w - left(), tabs_h()), fill: t.bg_surface(), radius: 0.0 });
         for (i, tab) in s.tabs.iter().enumerate() {
-            let label = format!("{}{}", tab.title, if tab.dirty { " •" } else { "" });
-            let tw = em(36.0) + em(7.5 * label.chars().count() as f32);
+            let tw = em(64.0) + em(7.5 * tab.title.chars().count() as f32);
             ctx.key(2000 + i as u64);
             let selected = s.active == Some(i);
             let id = ctx.push(Node::Rect { rect: Rect::new(tx, ty, tw, tabs_h()), fill: if selected { t.bg_canvas() } else { t.bg_surface() }, radius: 0.0 });
             ctx.on_click(id, plain(q, Act::Tab(i)));
-            text(ctx, tx + em(10.0), ty + tabs_h() / 2.0, &label, type_size::SM, if selected { Weight::Medium } else { Weight::Regular },
+            if selected {
+                ctx.add(Node::Rect { rect: Rect::new(tx, ty, tw, em(2.0)), fill: t.accent_mark(), radius: 0.0 });
+            }
+            let ih = em(type_size::SM) * 1.2;
+            ctx.add(Node::Text {
+                rect: Rect::new(tx + em(10.0), ty + (tabs_h() - ih) / 2.0, 0.0, ih),
+                content: file_icon(&tab.title).to_string(),
+                style: style(font::ICONS, type_size::SM, Weight::Regular, if selected { t.accent_fg() } else { t.text_tertiary() }),
+            });
+            text(ctx, tx + em(30.0), ty + tabs_h() / 2.0, &tab.title, type_size::SM, if selected { Weight::Medium } else { Weight::Regular },
                 if selected { t.text_primary() } else { t.text_secondary() });
             ctx.key(1);
-            let x_id = ctx.push(Node::Rect { rect: Rect::new(tx + tw - em(22.0), ty + em(7.0), em(18.0), em(18.0)), fill: Color::TRANSPARENT, radius: radius::SM });
-            if ctx.is_hovered(x_id) {
+            let x_id = ctx.push(Node::Rect { rect: Rect::new(tx + tw - em(24.0), ty + em(7.0), em(18.0), em(18.0)), fill: Color::TRANSPARENT, radius: radius::SM });
+            let hovered = ctx.is_hovered(x_id);
+            if hovered {
                 if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(x_id) {
                     *fill = t.state_hover();
                 }
             }
             ctx.on_click(x_id, plain(q, Act::CloseTab(i)));
-            text(ctx, tx + tw - em(17.0), ty + tabs_h() / 2.0, "×", type_size::SM, Weight::Regular, t.text_tertiary());
+            if tab.dirty && !hovered {
+                // Unsaved: a dot where the close mark goes, until it's pointed at.
+                ctx.add(Node::Rect { rect: Rect::new(tx + tw - em(18.5), ty + tabs_h() / 2.0 - em(3.5), em(7.0), em(7.0)), fill: t.accent_mark(), radius: em(3.5) });
+            } else {
+                let xh = em(type_size::XS) * 1.2;
+                ctx.add(Node::Text {
+                    rect: Rect::new(tx + tw - em(20.0), ty + (tabs_h() - xh) / 2.0, 0.0, xh),
+                    content: phosphor::X.to_string(),
+                    style: style(font::ICONS, type_size::XS, Weight::Regular, t.text_tertiary()),
+                });
+            }
             ctx.pop();
             ctx.pop();
             tx += tw + 1.0;
@@ -479,42 +591,42 @@ impl View for ArtifexView {
         // The panel: output or problems.
         if s.panel_open {
             let py = er.y() + er.h();
-            ctx.add(Node::Rect { rect: Rect::new(side_w(), py, w - side_w(), panel_h()), fill: t.bg_surface(), radius: 0.0 });
-            ctx.add(Node::Rect { rect: Rect::new(side_w(), py, w - side_w(), 1.0), fill: t.border_default(), radius: 0.0 });
-            let mut px = side_w() + em(8.0);
-            let mut tabs = vec![(Panel::Output, "Output".to_string()), (Panel::Problems, format!("Problems ({})", s.problems.len()))];
+            ctx.add(Node::Rect { rect: Rect::new(left(), py, w - left(), panel_h()), fill: t.bg_surface(), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(left(), py, w - left(), 1.0), fill: t.border_default(), radius: 0.0 });
+            let mut px = left() + em(8.0);
+            let mut tabs = vec![(Panel::Output, phosphor::CODE, "Output".to_string()), (Panel::Problems, phosphor::WARNING, format!("Problems ({})", s.problems.len()))];
             if s.composition.is_some() {
-                tabs.push((Panel::Composition, "Composition".to_string()));
+                tabs.push((Panel::Composition, phosphor::GRAPH, "Composition".to_string()));
             }
             if s.debug.is_some() {
-                tabs.push((Panel::Debug, "Debug".to_string()));
+                tabs.push((Panel::Debug, phosphor::BUG, "Debug".to_string()));
             }
             if let Some(f) = &s.fuzz {
-                tabs.push((Panel::Fuzz, if f.crashes.is_empty() { "Fuzz".to_string() } else { format!("Fuzz ({})", f.crashes.len()) }));
+                tabs.push((Panel::Fuzz, phosphor::LIGHTNING, if f.crashes.is_empty() { "Fuzz".to_string() } else { format!("Fuzz ({})", f.crashes.len()) }));
             }
-            for (i, (p, label)) in tabs.into_iter().enumerate() {
+            for (i, (p, icon, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
-                let bw = em(24.0 + 7.5 * label.len() as f32);
+                let bw = em(46.0 + 7.5 * label.len() as f32);
                 if s.panel == p {
-                    Button::secondary(label).at(px, py + em(4.0)).width(bw).on_click(plain(q, Act::Panel(p))).render(ctx);
+                    Button::secondary(label).lead(icon).at(px, py + em(4.0)).width(bw).on_click(plain(q, Act::Panel(p))).render(ctx);
                 } else {
-                    Button::ghost(label).at(px, py + em(4.0)).width(bw).on_click(plain(q, Act::Panel(p))).render(ctx);
+                    Button::ghost(label).lead(icon).at(px, py + em(4.0)).width(bw).on_click(plain(q, Act::Panel(p))).render(ctx);
                 }
                 px += bw + em(6.0);
             }
             ctx.key(4010);
-            Button::ghost("Hide").at(w - em(80.0), py + em(4.0)).width(em(70.0)).on_click(plain(q, Act::HidePanel)).render(ctx);
+            Button::ghost("Hide panel").icon(phosphor::X).at(w - em(44.0), py + em(4.0)).width(em(32.0)).on_click(plain(q, Act::HidePanel)).render(ctx);
             let body_y = py + em(42.0);
             let lines_fit = ((panel_h() - em(46.0)) / em(18.0)).floor().max(1.0) as usize;
-            let width = w - side_w() - em(24.0);
+            let width = w - left() - em(24.0);
             match s.panel {
                 Panel::Output => {
                     let mut body_y = body_y;
                     let mut lines_fit = lines_fit;
                     if let Some(m) = s.moving.as_ref().filter(|m| m.dry_run) {
                         let y = body_y + em(10.0);
-                        ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
-                        text(ctx, side_w() + em(16.0), y, &fit(&format!("Move {} into a worker, {}", m.from, m.worker), width - em(220.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
+                        ctx.add(Node::Rect { rect: Rect::new(left() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        text(ctx, left() + em(16.0), y, &fit(&format!("Move {} into a worker, {}", m.from, m.worker), width - em(220.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
                         ctx.key(4032);
                         Button::primary("Move").at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(plain(q, Act::ConfirmMove(true))).render(ctx);
                         ctx.key(4033);
@@ -524,9 +636,9 @@ impl View for ArtifexView {
                     } else if let (Some(folder), Some(ws)) = (&s.ask, &s.ws) {
                         // What atrium-run asks, as the Terminal asks it.
                         let y = body_y + em(10.0);
-                        ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        ctx.add(Node::Rect { rect: Rect::new(left() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
                         let (verb, yes) = if s.ask_debug { ("Debug", "Debug") } else { ("Run", "Run") };
-                        text(ctx, side_w() + em(16.0), y, &format!("{ws} asks to {verb} {folder}"), type_size::SM, Weight::Medium, t.text_primary());
+                        text(ctx, left() + em(16.0), y, &format!("{ws} asks to {verb} {folder}"), type_size::SM, Weight::Medium, t.text_primary());
                         ctx.key(4030);
                         Button::primary(yes).at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(pressed(q, |t| Act::AnswerRun(Some(t)))).render(ctx);
                         ctx.key(4031);
@@ -536,7 +648,7 @@ impl View for ArtifexView {
                     }
                     let all: Vec<&str> = s.output.lines().collect();
                     for (i, l) in all.iter().skip(all.len().saturating_sub(lines_fit)).enumerate() {
-                        mono(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());
+                        mono(ctx, left() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());
                     }
                 }
                 Panel::Composition => {
@@ -550,17 +662,17 @@ impl View for ArtifexView {
                             Some(crate::composition::Level::Note) => t.info_fg(),
                             None => t.text_primary(),
                         };
-                        text(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                        text(ctx, left() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), type_size::SM, Weight::Regular, color);
                     }
                 }
                 Panel::Debug => {
                     let Some(d) = &s.debug else { return };
-                    text(ctx, side_w() + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
-                    let half = (w - side_w()) / 2.0;
+                    text(ctx, left() + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
+                    let half = (w - left()) / 2.0;
                     for (i, (name, file, line)) in d.frames.iter().take(lines_fit.saturating_sub(1)).enumerate() {
                         let y = body_y + (i + 1) as f32 * em(18.0);
                         ctx.key(5500 + i as u64);
-                        let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
                         if ctx.is_hovered(id) {
                             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
                                 *fill = t.state_hover();
@@ -568,13 +680,13 @@ impl View for ArtifexView {
                         }
                         ctx.on_click(id, plain(q, Act::Frame(i)));
                         let place = match file { Some(f) => format!("{name}  {f}:{line}"), None => name.clone() };
-                        mono(ctx, side_w() + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
+                        mono(ctx, left() + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
                             if file.is_some() { t.text_primary() } else { t.text_tertiary() });
                         ctx.pop();
                     }
                     for (i, (name, value)) in d.locals.iter().take(lines_fit.saturating_sub(1)).enumerate() {
                         let y = body_y + (i + 1) as f32 * em(18.0);
-                        mono(ctx, side_w() + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
+                        mono(ctx, left() + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
                     }
                 }
                 Panel::Fuzz => {
@@ -589,38 +701,38 @@ impl View for ArtifexView {
                         let color = match core { Some(true) => t.danger_fg(), Some(false) => t.warning_fg(), None => t.text_primary() };
                         if let Some(c) = crash {
                             ctx.key(5800 + i as u64);
-                            let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                            let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
                             if ctx.is_hovered(id) {
                                 if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
                                     *fill = t.state_hover();
                                 }
                             }
                             ctx.on_click(id, plain(q, Act::Crash(c)));
-                            text(ctx, side_w() + em(12.0), y, &fit(&l, width - em(90.0), type_size::SM), type_size::SM, Weight::Regular, color);
+                            text(ctx, left() + em(12.0), y, &fit(&l, width - em(90.0), type_size::SM), type_size::SM, Weight::Regular, color);
                             if core.is_some() {
                                 ctx.key(1);
-                                Button::ghost("Debug it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
+                                Button::ghost("Debug it").at(left() + width - em(86.0), y - em(14.0)).width(em(84.0))
                                     .on_click(plain(q, Act::ReplayCrash(c))).render(ctx);
                             } else if f.crashes.get(c).is_some_and(|x| x.in_core && x.frame.is_some()) {
                                 // The fix line under a core crash.
                                 ctx.key(2);
-                                Button::ghost("Move it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
+                                Button::ghost("Move it").at(left() + width - em(86.0), y - em(14.0)).width(em(84.0))
                                     .on_click(plain(q, Act::MoveToWorker(c))).render(ctx);
                             }
                             ctx.pop();
                         } else {
-                            text(ctx, side_w() + em(12.0), y, &fit(&l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                            text(ctx, left() + em(12.0), y, &fit(&l, width, type_size::SM), type_size::SM, Weight::Regular, color);
                         }
                     }
                 }
                 Panel::Problems => {
                     if s.problems.is_empty() {
-                        text(ctx, side_w() + em(12.0), body_y, "No problems from the last task.", type_size::SM, Weight::Regular, t.text_tertiary());
+                        text(ctx, left() + em(12.0), body_y, "No problems from the last task.", type_size::SM, Weight::Regular, t.text_tertiary());
                     }
                     for (i, p) in s.problems.iter().take(lines_fit).enumerate() {
                         let y = body_y + i as f32 * em(18.0);
                         ctx.key(5000 + i as u64);
-                        let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
                         if ctx.is_hovered(id) {
                             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
                                 *fill = t.state_hover();
@@ -629,9 +741,9 @@ impl View for ArtifexView {
                         ctx.on_click(id, plain(q, Act::Problem(i)));
                         let c = match p.severity { Severity::Error => t.danger_fg(), Severity::Warning => t.warning_fg(), Severity::Note => t.info_fg() };
                         let place = format!("{}:{}:{}", p.file, p.line, p.col);
-                        mono(ctx, side_w() + em(12.0), y, &place, c);
+                        mono(ctx, left() + em(12.0), y, &place, c);
                         let off = em(8.0) * place.chars().count() as f32 + em(24.0);
-                        text(ctx, side_w() + off, y, &fit(&p.message, width - off, type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
+                        text(ctx, left() + off, y, &fit(&p.message, width - off, type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
                         ctx.pop();
                     }
                 }
@@ -643,29 +755,58 @@ impl View for ArtifexView {
         ctx.add(Node::Rect { rect: Rect::new(0.0, sy, w, status_h()), fill: t.bg_surface(), radius: 0.0 });
         ctx.add(Node::Rect { rect: Rect::new(0.0, sy, w, 1.0), fill: t.border_default(), radius: 0.0 });
         let smid = sy + status_h() / 2.0;
-        let mut left = String::new();
+        let mut right = String::new();
+        // The workspace and its branch, each after its icon.
+        let mut nx = em(10.0);
+        let icon_at = |ctx: &mut Ctx, x: f32, ch: char, color: Color| {
+            let ih = em(type_size::XS) * 1.2;
+            ctx.add(Node::Text { rect: Rect::new(x, smid - ih / 2.0, 0.0, ih), content: ch.to_string(), style: style(font::ICONS, type_size::XS, Weight::Regular, color) });
+        };
+        if let Some(ws) = &s.ws {
+            icon_at(ctx, nx, phosphor::STACK_SIMPLE, t.accent_mark());
+            let label = crate::title(ws);
+            text(ctx, nx + em(16.0), smid, &label, type_size::XS, Weight::Medium, t.text_secondary());
+            nx += em(28.0) + em(6.5) * label.chars().count() as f32;
+        }
+        if let Some(b) = s.git.as_ref().and_then(|g| g.branch.clone().map(|b| (b, g.ahead, g.behind))) {
+            let (b, ahead, behind) = b;
+            let mut label = b;
+            if ahead > 0 {
+                label.push_str(&format!(" ↑{ahead}"));
+            }
+            if behind > 0 {
+                label.push_str(&format!(" ↓{behind}"));
+            }
+            icon_at(ctx, nx, phosphor::GIT_BRANCH, t.text_secondary());
+            text(ctx, nx + em(16.0), smid, &label, type_size::XS, Weight::Regular, t.text_secondary());
+            nx += em(28.0) + em(6.5) * label.chars().count() as f32;
+        }
         if let Some((note, err)) = &s.note {
-            text(ctx, em(10.0), smid, &fit(note, w * 0.5, type_size::XS), type_size::XS, Weight::Regular, if *err { t.danger_fg() } else { t.text_secondary() });
+            text(ctx, nx, smid, &fit(note, w * 0.5, type_size::XS), type_size::XS, Weight::Regular, if *err { t.danger_fg() } else { t.text_secondary() });
         } else if let Some(d) = s.diags.iter().find(|d| d.0 + 1 == s.caret.0) {
             let c = if d.1 == Severity::Error { t.danger_fg() } else { t.warning_fg() };
-            text(ctx, em(10.0), smid, &fit(&d.2, w * 0.5, type_size::XS), type_size::XS, Weight::Regular, c);
+            icon_at(ctx, nx, if d.1 == Severity::Error { phosphor::WARNING_OCTAGON } else { phosphor::WARNING }, c);
+            text(ctx, nx + em(16.0), smid, &fit(&d.2, w * 0.5, type_size::XS), type_size::XS, Weight::Regular, c);
         }
         if s.active.is_some() {
             let errors = s.diags.iter().filter(|d| d.1 == Severity::Error).count();
             let warnings = s.diags.len() - errors;
-            left.push_str(&format!("Ln {}, Col {}", s.caret.0, s.caret.1));
+            right.push_str(&format!("Ln {}, Col {}", s.caret.0, s.caret.1));
             if let Some(l) = s.lang {
-                left.push_str(&format!("  ·  {l}"));
+                right.push_str(&format!("  ·  {l}"));
             }
             if errors + warnings > 0 {
-                left.push_str(&format!("  ·  {errors} errors, {warnings} warnings"));
+                right.push_str(&format!("  ·  {errors} errors, {warnings} warnings"));
             }
         }
+        let lw = em(6.5) * right.chars().count() as f32;
+        text(ctx, w - lw - em(12.0), smid, &right, type_size::XS, Weight::Regular, t.text_secondary());
         if let Some(l) = &s.lsp {
-            left.push_str(&format!("  ·  {l}"));
+            // The language server, with a pulse, left of the caret.
+            let x = w - lw - em(36.0) - em(6.5) * l.chars().count() as f32;
+            icon_at(ctx, x, phosphor::PULSE, t.success_fg());
+            text(ctx, x + em(16.0), smid, l, type_size::XS, Weight::Regular, t.text_secondary());
         }
-        let lw = em(6.5) * left.chars().count() as f32;
-        text(ctx, w - lw - em(12.0), smid, &left, type_size::XS, Weight::Regular, t.text_secondary());
 
         // New project.
         if s.creating {
@@ -737,7 +878,7 @@ impl View for ArtifexView {
             }
             ctx.pop();
         } else if !s.listed {
-            text(ctx, side_w() + em(24.0), bar_h() + em(48.0), "Asking for your workspaces…", type_size::SM, Weight::Regular, t.text_secondary());
+            text(ctx, left() + em(24.0), bar_h() + em(48.0), "Asking for your workspaces…", type_size::SM, Weight::Regular, t.text_secondary());
         }
     }
 }

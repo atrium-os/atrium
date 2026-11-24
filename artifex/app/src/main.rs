@@ -106,7 +106,7 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -115,7 +115,7 @@ fn main() {
                 s.debug.as_ref().map(|d| (&d.run, d.stopped, d.frames.iter().find(|f| f.1.is_some()).map(|f| format!("{}:{}", f.1.as_deref().unwrap_or(""), f.2)))),
                 s.breakpoints,
                 s.fuzz.as_ref().map(|f| (f.on, f.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("+"), f.crashes.len(), f.crashes.iter().any(|c| c.in_core))),
-                s.moving.is_some());
+                s.moving.is_some(), s.panel_open.then_some(s.panel));
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;
