@@ -437,8 +437,8 @@ pub mod control {
     /// `lock`) only `lock`; anyone else nothing.
     fn peer_access(stream: &UnixStream) -> Option<Access> {
         use std::os::fd::AsRawFd;
-        let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-            .unwrap_or_default();
+        // An unreadable registry grants nothing (review 2026-11-24, H4).
+        let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok()?;
         let p = portcullis_peer::resolve(stream.as_raw_fd(), &reg).ok()?;
         // SAFETY: geteuid has no preconditions.
         if p.uid == unsafe { libc::geteuid() } {

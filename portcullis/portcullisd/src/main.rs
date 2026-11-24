@@ -212,6 +212,26 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The launch registry, re-read for a decision made mid-connection.
+///
+/// `serve` refuses a connection whose registry cannot be read, so this
+/// failing means the file became unreadable while portcullisd runs. Every
+/// identity decision would then be made blind, and many of them treat "not
+/// an app" as "a person" (workspace exec, link and window requests), so
+/// portcullisd stops rather than answer with an empty registry (review
+/// 2026-11-24, H4). The file is root's and local: this does not happen in
+/// normal operation.
+fn load_registry() -> portcullis_peer::AppRegistry {
+    match portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("portcullisd: FATAL: launch registry {} unreadable: {e}; stopping rather than decide without it",
+                portcullis_peer::DEFAULT_REGISTRY);
+            std::process::exit(70);
+        }
+    }
+}
+
 /// Connections one non-root uid may hold open at once, across both
 /// sockets. Each is a thread here; without a cap any local process, a jailed
 /// app included, could open connections until the broker runs out of
@@ -377,8 +397,11 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
      * capabilities into the HUMAN's policy and approve itself. Requesting a
      * launch on the owner's behalf is delegation; editing the owner's policy
      * is escalation. */
+    /* Who the peer is: an app or a person. An unreadable registry would
+     * make every app look like a person, so refuse the connection instead
+     * (review 2026-11-24, H4). */
     let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-        .unwrap_or_default();
+        .map_err(|e| std::io::Error::other(format!("launch registry unreadable, refusing uid {uid}: {e}")))?;
     if let Some((reg_owner, app)) = registry.resolve(uid) {
         eprintln!("portcullisd: uid={uid} is app {app}; launches inherit owner={reg_owner}");
     }
@@ -527,7 +550,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                     Some(s) if r.callers.iter().any(|c| c == &owner) => s,
                     _ => uid,
                 };
-                let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+                let reg = load_registry();
                 let inst = reg.resolve(served).map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(served).flatten().map(String::from)));
                 let Some((person, served_app, mut persona)) = inst else {
                     write_response(&mut writer, &Response::LaunchFailed { stage: "worker".into(),
@@ -585,7 +608,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * its own per (person, app, worker, persona): never the caller's,
          * so a parser that is taken over holds nothing of the core's. */
         if let Request::WorkerCall { worker } = &req {
-            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let reg = load_registry();
             let refuse = |why: String| Response::LaunchFailed { stage: "worker".into(), message: why };
             let Some((person, app, persona)) = reg.resolve(uid)
                 .map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(uid).flatten().map(String::from))) else {
@@ -937,7 +960,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         /* ★ The caller's own persona (personas.md §3): from the launch
          * registry by the PEER UID, its colour from the owner's policy. */
         if matches!(req, Request::Persona) {
-            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let reg = load_registry();
             let resp = match (reg.persona(uid), reg.resolve(uid)) {
                 (Some(here), Some((user, _))) => {
                     let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1091,7 +1114,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
 /// A launched app's (person, persona), by its uid, for its helpers' route
 /// domain; None for anything else (a person's own CLI).
 fn caller_domain(uid: u32) -> Option<(String, Option<String>)> {
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let (person, _) = reg.resolve(uid)?;
     Some((person.to_string(), reg.persona(uid).flatten().map(String::from)))
 }
@@ -1700,7 +1723,7 @@ fn handle_open(
             app, mime, name, write, activation, always, workbook_picker,
             workbook_commit, prepare_workbook_commit,
         } => {
-            let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let registry = load_registry();
             if (workbook_commit.is_some() || prepare_workbook_commit)
                 && (!write || app != portcullis_policy::opens::SHEETS || caller.as_deref() != Some("org.atrium.scrinium"))
             {
@@ -1814,7 +1837,7 @@ fn handle_save_download(
         eprintln!("portcullisd: download REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     if !caller.as_deref().is_some_and(launch::app_is_navigator) {
         return refuse(writer, format!("cap.navigator_broker.denied: {} may not save downloads",
@@ -1879,7 +1902,7 @@ fn handle_open_download(
         eprintln!("portcullisd: download open REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     if !caller.as_deref().is_some_and(launch::app_is_navigator) {
         return refuse(writer, format!("cap.navigator_broker.denied: {} may not open downloads",
@@ -2110,7 +2133,7 @@ fn handle_open_attachment(
         eprintln!("portcullisd: attachment REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let registry = load_registry();
     let persona = registry.persona(uid).flatten();
     let caller = registry.resolve(uid).map(|(_, a)| a.to_string());
     if !caller.as_deref().is_some_and(launch::app_opens_attachments) {
@@ -2184,7 +2207,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let grants = Grants::global();
     match req {
         Request::LinkGrant { asker_uid, activation, scheme, app } => {
-            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let reg = load_registry();
             let Some((person, asker_app)) = reg.resolve(asker_uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
                 return refuse(format!("uid {asker_uid} is not a launched app"));
             };
@@ -2379,7 +2402,7 @@ fn start_for_instance(app: &str, persona: Option<&str>, owner: &str, why: &'stat
 
 /// Whether `uid` is an instance in the reserved sign-in persona.
 fn is_portal_instance(uid: u32) -> bool {
-    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+    load_registry()
         .persona(uid).flatten() == Some(portcullis_peer::PORTAL_PERSONA)
 }
 
@@ -2491,7 +2514,7 @@ fn vpn_sign_in_attempt(profile: &str) -> Option<String> {
 
 /// Whether `uid` is an instance in the reserved VPN sign-in persona.
 fn is_vpn_instance(uid: u32) -> bool {
-    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+    load_registry()
         .persona(uid).flatten() == Some(portcullis_peer::VPN_PERSONA)
 }
 
@@ -2593,7 +2616,7 @@ fn handle_vpn_sign_in_status(uid: u32) -> Response {
         eprintln!("portcullisd: VPN sign-in status REFUSED to uid {uid}: not a VPN sign-in window");
         return Response::Error { message: "only a VPN sign-in window's instance".into() };
     }
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let Some(owner) = reg.resolve(uid).map(|(u, _)| u.to_string()) else {
         return Response::Error { message: "not a launched app".into() };
     };
@@ -2637,7 +2660,7 @@ fn handle_new_window_in(uid: u32, persona: &str, activation: [u8; 16], shared: &
         eprintln!("portcullisd: new window REFUSED to uid {uid}: {why}");
         Response::Error { message: why }
     };
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let (Some((owner, app)), Some(here)) = (reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string())), reg.persona(uid).map(|p| p.map(String::from))) else {
         return refuse("not a launched app".into());
     };
@@ -3229,7 +3252,7 @@ fn local_port(s: &OwnedFd) -> Result<u16, String> {
 
 /// The IDE asking (by its uid), if it is one.
 fn ide_of(uid: u32) -> Result<String, String> {
-    match portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().resolve(uid) {
+    match load_registry().resolve(uid) {
         Some((_, a)) if launch::app_execs_in_workspaces(a) => Ok(a.to_string()),
         Some((_, a)) => Err(format!("cap.workspace_exec.denied: {a} has no workspace-exec")),
         None => Err("cap.workspace_exec.denied: not an app".into()),
@@ -3266,7 +3289,7 @@ fn handle_ws_exec(uid: u32, owner: &str, name: &str, argv: &[String], cwd: &str,
         eprintln!("portcullisd: exec in workspace {name} of {owner} REFUSED: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let in_app = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().resolve(uid).is_some();
+    let in_app = load_registry().resolve(uid).is_some();
     let app = if in_app {
         let app = match ide_of(uid) {
             Ok(a) => a,
@@ -3297,7 +3320,7 @@ fn handle_ws_admin(uid: u32, owner: &str, name: &str, argv: &[String], activatio
         eprintln!("portcullisd: pkg in workspace {name} of {owner} REFUSED: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+    let caller = load_registry()
         .resolve(uid).map(|(_, a)| a.to_string());
     let who = match &caller {
         Some(a) if launch::app_shows_consoles(a) || launch::app_manages_workspaces(a) => a.clone(),
@@ -3364,7 +3387,7 @@ fn handle_workspace_credentials(uid: u32, req: Request) -> Response {
 }
 
 fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = load_registry();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
     let allowed = match &caller {
         // The terminal lists them for its switcher, and Settings for
@@ -4007,7 +4030,10 @@ fn launch_session_component(component_id: &str, owner_name: &str,
         match portcullis_peer::uid_for_session(reg, owner_name, &app_id) {
             Some(uid) => uid,
             None => {
-                let uid = portcullis_peer::allocate(reg);
+                let uid = match portcullis_peer::allocate(reg) {
+                    Ok(uid) => uid,
+                    Err(e) => return Response::Error { message: format!("allocate session uid: {e}") },
+                };
                 if let Err(e) = portcullis_peer::register_session(reg, uid, owner_name, &app_id) {
                     return Response::Error { message: format!("register session uid: {e}") };
                 }

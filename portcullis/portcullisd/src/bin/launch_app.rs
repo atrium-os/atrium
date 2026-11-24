@@ -64,7 +64,8 @@ fn main() {
     // 2. ALLOCATE a dedicated uid; 3. REGISTER the binding.
     let guard = portcullis_peer::lock_registry(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_else(|e| { eprintln!("launch: lock registry: {e}"); exit(1) });
-    let uid = portcullis_peer::allocate(portcullis_peer::DEFAULT_REGISTRY);
+    let uid = portcullis_peer::allocate(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_else(|e| { eprintln!("launch: allocate uid: {e}"); exit(1) });
     if let Err(e) = portcullis_peer::register_with_publisher(portcullis_peer::DEFAULT_REGISTRY, uid, owner, app_id, publisher.as_ref()) {
         eprintln!("launch: register uid {uid}: {e}"); exit(1);
     }
