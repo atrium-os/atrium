@@ -828,7 +828,7 @@ intervals produced 47,637, 47,328 and 44,352 frames/s. Of the first 4,096
 landed-event records, 4,095 were parseable. Their median interval was
 34.28 ms. The 280 matches with sampled audio deadlines had a median signed
 landing error of +8.73 ms. The intervals measure one virtual-device run.
-Physical display cadence and the DOM's zero decoded-frame count remain open.
+Physical display cadence remains open. The following gate addresses the DOM frame count.
 
 Guest captures, the progress log and the focused end-event observations
 are in `~/atrium-vm/evidence/navigator-i4-fullclip-20261124/`.
@@ -842,6 +842,16 @@ reported dropping. `droppedVideoFrames` is the latter count. A decoded
 frame can still be waiting for presentation or belong to a previous seek.
 Each new player starts at zero, and a chapter seek keeps the same counters.
 The ordinary LibWeb sink supplies the counts for other video elements.
+
+Installed JIT-off Ladybird on arm64 Tessera started at zero and reported
+407 total, four dropped at 13.5 s. The 1,325 s chapter seek preserved the
+counters. At the end the DOM reported 983 total and four dropped. The native
+trace recorded 1,011 decoder outputs, 983 submissions, 979 Fresco presentation
+acknowledgements and four compositor drops. Of the 28 decoder outputs that
+never reached submission, eight belonged to the old seek epoch and 20 preceded
+the target in the new epoch. The element ended once at 1,343.567 s. A fresh
+engine process reported zero for both counters before Play. Evidence is in
+`~/atrium-vm/evidence/navigator-i4-frame-counts-20261124/`.
 
 ## 6a. Sign-in: SSO and WebAuthn
 
