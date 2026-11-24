@@ -418,6 +418,9 @@ pub enum Request {
         workbook_picker: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workbook_commit: Option<[u8; 16]>,
+        /// Scrinium will send the save grant after the Open press is spent.
+        #[serde(default)]
+        prepare_workbook_commit: bool,
     },
 
     /// Start an empty workbook in a fresh Sheets jail on a Sheets press.
@@ -979,6 +982,9 @@ pub enum Response {
     /// drains the daemon's BufReader so the cmsg's 1-byte payload
     /// can't be silently swallowed by a buffered read.
     ReadyForFds,
+    /// The Open press was spent. Send the 16 raw grant bytes, then the
+    /// same workbook's descriptor via SCM_RIGHTS on this connection.
+    ReadyForWorkbookCommit,
     /// `ReadyForFds`, for an `ExecInstance` that named `serves`: the
     /// worker will run as `uid`.
     ReadyForFdsAs { uid: u32 },

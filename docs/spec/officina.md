@@ -201,9 +201,11 @@ wraps the full prompt above the field and its Open and Cancel buttons.
 ### 4.2 Save and Save As
 
 For a workbook opened through Scrinium, Sheets encodes the current revision and
-sends a sealed snapshot and its session save grant through Limen. Scrinium
-stages the bytes in the selected directory, syncs the file, checks the original
-entry and revision, atomically replaces it and syncs the directory. Sheets
+sends a sealed snapshot and its session save grant through Limen. Plain
+native saves stream directly into the sealed memory file, avoiding a second
+workbook-sized buffer. Scrinium stages the bytes in the selected directory,
+syncs the file, checks the original entry and revision, atomically replaces
+it and syncs the directory. Sheets
 keeps the grid interactive while waiting for confirmation and marks only the
 acknowledged revision saved. Later edits stay pending. Closing the window or
 pressing Ctrl+W during Save waits for the active request. Sheets closes only
@@ -4288,15 +4290,43 @@ are timings for the guest. The installed Sheets app refused the oversized
 workbook through Scrinium. From that same window, the picker opened the
 near-limit sparse workbook in a fresh jail. Ordinary Save and picker reopen
 preserved the A1 edit and all 507 far-row cells. The oversized file's hash
-stayed the same. The dense workbook passed the engine boundary check. Its
-installed picker attempt expired before Sheets started. Scrinium computes
-the writable grant's content verification before Portcullis claims the Open
-press. The large-file picker path needs a separate fix and desktop retest.
+stayed the same. The dense workbook passed the engine boundary check.
+The original desktop attempt failed because grant verification outlasted the
+Open press. Portcullis now spends the press before Scrinium verifies the
+grant and bounds the rest of the handoff on that connection
+(opening-files.md §6.2). On the same Tessera desktop fixture, Sheets opened
+the dense file, edited A1 to 7, saved via the original Scrinium grant and
+reopened it through the picker in a fresh jail. The saved file retained A1
+and the reference values sampled in all 125 columns. An earlier Save with
+both a full encoded buffer and a memory file exhausted the 4 GiB guest.
+The plain native snapshot now streams into the sealed memory file (§4.2).
+
+A later picker attempt on the first published revision reported an I/O
+error. The guest's `sha256` and a sequential `dd` failed on the same file.
+The sequential read completed 1,056,964,608 bytes of the 1,065,968,177-byte
+file before failing. After the file moved within the same volume, both
+published revisions passed three delayed checksums. The intermittent read
+failure still needs a filesystem-level reproduction and a delayed read gate.
+
+The dense desktop trial confirmed that the 128 MiB workbook recovery volume
+cannot hold the 1,065,968,177-byte native base. Sheets shows the autosave
+quota error and still opens the file. A failed base write removes the
+incomplete temporary file. If this was the first base, Sheets removes the
+failed autosave directory so closing the workbook frees its slot. A fresh
+dense trial reused that slot in a new jail and confirmed a second saved A1
+edit. Dense crash recovery still needs a larger or more compact private
+recovery base.
+
+The FreeBSD gate passed all six Portcullis Open tests, including the bounded
+grant transfer, and all six runnable Sheets app tests. The Sheets library
+suite passed 107 of 109 tests. The two timing failures also occurred in
+alternating runs of the unchanged baseline on the same VM.
 
 `officina-grid/tests/budget.rs` covers exact-budget sparse acceptance,
 early refusal and retry, and a compact million-row formula fill. Guest logs,
 screenshots, and small workbook snapshots are under
-`/private/tmp/atrium-sheets-memory/guest/`.
+`/private/tmp/atrium-sheets-memory/guest/`. The dense desktop retry and
+Save evidence are under `/private/tmp/atrium-sheets-large-open/guest/`.
 
 ### 16.77 -IF criteria such as ">"&A1 from a sorted index (2026-11-18)
 

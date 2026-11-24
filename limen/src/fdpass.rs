@@ -62,7 +62,17 @@ pub fn sealed(fd: &OwnedFd) -> bool {
 /// [`check`] takes as read-only. `name` shows only in debugging.
 #[cfg(any(target_os = "freebsd", target_os = "linux"))]
 pub fn sealed_file(name: &str, bytes: &[u8]) -> io::Result<OwnedFd> {
-    use std::io::{Seek, Write};
+    use std::io::Write;
+    sealed_file_with(name, |file| file.write_all(bytes))
+}
+
+/// Write directly into a memory file, then rewind and seal it for handoff.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+pub fn sealed_file_with(
+    name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<OwnedFd> {
+    use std::io::Seek;
     use std::os::fd::FromRawFd;
     let c = std::ffi::CString::new(name).map_err(|_| io::Error::other("name"))?;
     // SAFETY: a valid C string; the flags are memfd_create's.
@@ -73,7 +83,7 @@ pub fn sealed_file(name: &str, bytes: &[u8]) -> io::Result<OwnedFd> {
     // SAFETY: memfd_create returned a new descriptor that nothing else owns.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut f = std::fs::File::from(fd);
-    f.write_all(bytes)?;
+    write(&mut f)?;
     f.rewind()?;
     // SAFETY: fcntl(F_ADD_SEALS) on a descriptor we own; no memory.
     if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, SEALED | libc::F_SEAL_SEAL) } != 0 {

@@ -3,6 +3,7 @@
 //! (`OpenFile`, the press's token, then the descriptor). Called off the
 //! window's thread.
 
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -48,9 +49,9 @@ pub fn open_workbook(parent: u32, mime: &str, name: &str, write: bool, token: [u
 pub fn reopen_workbook(parent: u32, name: &str, activation: [u8; 16], pick: &crate::bookmarks::Pick) -> Result<String, String> {
     let mime = workbook_mime(name, &pick.file)?;
     let write = pick.write && mime != "application/vnd.ms-excel";
-    let commit = if write {
-        Some(crate::workbook::grant_at(pick.folder.try_clone().map_err(|err| err.to_string())?, pick.name.clone(), &pick.file, Some(pick.scope.clone())).map_err(|err| err.to_string())?)
-    } else { None };
+    let commit = write.then(|| || crate::workbook::grant_at(
+        pick.folder.try_clone()?, pick.name.clone(), &pick.file, Some(pick.scope.clone()),
+    ));
     launch_file("org.atrium.sheets", mime, name, write, false, activation, &pick.file, Some(parent), commit)
 }
 
@@ -64,7 +65,12 @@ pub fn workbook_mime(name: &str, file: &std::fs::File) -> Result<&'static str, S
 }
 
 fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, path: Option<&std::path::Path>) -> Result<String, String> {
-    let workbook_commit = if write && app == "org.atrium.sheets" { Some(crate::workbook::grant(path.ok_or("Missing workbook path")?, file).map_err(|e| e.to_string())?) } else { None };
+    let workbook_commit = if write && app == "org.atrium.sheets" {
+        let path = path.ok_or("Missing workbook path")?;
+        Some(|| crate::workbook::grant(path, file))
+    } else {
+        None
+    };
     let result = launch_file(app, mime, name, write, always, token, file, workbook_picker, workbook_commit)?;
     if app == "org.atrium.sheets" {
         if let Some(path) = path {
@@ -76,13 +82,25 @@ fn open_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token
     Ok(result)
 }
 
-fn launch_file(app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16], file: &std::fs::File, workbook_picker: Option<u32>, workbook_commit: Option<[u8; 16]>) -> Result<String, String> {
+fn launch_file(
+    app: &str, mime: &str, name: &str, write: bool, always: bool, token: [u8; 16],
+    file: &std::fs::File, workbook_picker: Option<u32>,
+    prepare_commit: Option<impl FnOnce() -> std::io::Result<[u8; 16]>>,
+) -> Result<String, String> {
     let mut s = connect()?;
-    let req = Request::OpenFile { app: app.into(), mime: mime.into(), name: name.into(), write, activation: token, always, workbook_picker, workbook_commit };
-    match round_trip(&mut s, &req).map_err(|e| e.to_string())? {
-        Response::ReadyForFds => {}
-        Response::Error { message } => return Err(message),
-        r => return Err(format!("an odd answer: {r:?}")),
+    let req = Request::OpenFile {
+        app: app.into(), mime: mime.into(), name: name.into(), write, activation: token,
+        always, workbook_picker, workbook_commit: None, prepare_workbook_commit: prepare_commit.is_some(),
+    };
+    let ready = round_trip(&mut s, &req).map_err(|e| e.to_string())?;
+    match (ready, prepare_commit) {
+        (Response::ReadyForFds, None) => {}
+        (Response::ReadyForWorkbookCommit, Some(prepare)) => {
+            let grant = prepare().map_err(|err| err.to_string())?;
+            s.write_all(&grant).map_err(|err| err.to_string())?;
+        }
+        (Response::Error { message }, _) => return Err(message),
+        (r, _) => return Err(format!("the app launcher cannot complete this Open ({r:?})")),
     }
     send_fds(&s, &[file.as_raw_fd()]).map_err(|e| e.to_string())?;
     match portcullis_ipc::read_response(&mut s).map_err(|e| e.to_string())? {

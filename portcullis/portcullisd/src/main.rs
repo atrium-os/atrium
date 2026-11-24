@@ -1623,10 +1623,18 @@ fn handle_open(
             list.sort_by_key(|c| !c.default);
             write_response(writer, &Response::OpenApps { apps: list })
         }
-        Request::OpenFile { app, mime, name, write, activation, always, workbook_picker, workbook_commit } => {
+        Request::OpenFile {
+            app, mime, name, write, activation, always, workbook_picker,
+            workbook_commit, prepare_workbook_commit,
+        } => {
             let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
-            if workbook_commit.is_some() && (!write || app != portcullis_policy::opens::SHEETS) {
-                return refuse(writer, "save grant requires a writable Sheets workbook".into());
+            if (workbook_commit.is_some() || prepare_workbook_commit)
+                && (!write || app != portcullis_policy::opens::SHEETS || caller.as_deref() != Some("org.atrium.scrinium"))
+            {
+                return refuse(writer, "save grant requires a writable Sheets workbook from Scrinium".into());
+            }
+            if workbook_commit.is_some() && prepare_workbook_commit {
+                return refuse(writer, "expected one workbook save grant".into());
             }
             let persona = match workbook_picker {
                 Some(parent) if app == portcullis_policy::opens::SHEETS && !always
@@ -1653,11 +1661,22 @@ fn handle_open(
             if let Err(why) = opens::spend_press(&opens::activation_socket(), activation, uid) {
                 return refuse(writer, why);
             }
-            write_response(writer, &Response::ReadyForFds)?;
             if !reader.buffer().is_empty() {
                 return refuse(writer, "protocol violation: data buffered before the descriptor".into());
             }
-            let mut fds = match portcullis_ipc::recv_fds(reader.get_ref(), 1) {
+            let stream = reader.get_ref();
+            let workbook_commit = if prepare_workbook_commit {
+                write_response(writer, &Response::ReadyForWorkbookCommit)?;
+                Some(opens::receive_workbook_commit(stream, std::time::Duration::from_secs(60))?)
+            } else {
+                write_response(writer, &Response::ReadyForFds)?;
+                workbook_commit
+            };
+            let received = portcullis_ipc::recv_fds(stream, 1);
+            if prepare_workbook_commit {
+                stream.set_read_timeout(None)?;
+            }
+            let mut fds = match received {
                 Ok(v) if v.len() == 1 => v,
                 Ok(v) => return refuse(writer, format!("expected one descriptor, got {}", v.len())),
                 Err(e) => return refuse(writer, format!("recv_fds: {e}")),

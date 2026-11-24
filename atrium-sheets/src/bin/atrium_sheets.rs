@@ -105,6 +105,21 @@ fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Stage a sealed revision without an extra workbook-sized buffer for native saves.
+fn stage_save(d: &Doc, format: Format) -> io::Result<(std::os::fd::OwnedFd, u64)> {
+    let snapshot = limen::fdpass::sealed_file_with("workbook.osheet", |file| {
+        if format == Format::Native && d.protection.is_none() {
+            let mut out = d.write_native(io::BufWriter::with_capacity(64 * 1024, file))?;
+            out.flush()
+        } else {
+            file.write_all(&encode(d, format)?)
+        }
+    })?;
+    let file = File::from(snapshot);
+    let size = file.metadata()?.len();
+    Ok((file.into(), size))
+}
+
 fn saved_status(d: &Doc, format: Format) -> String {
     let lost = format == Format::Csv && d.wb.groups().next().is_some();
     // Macros go back only into their own kind of file (§5.3).
@@ -295,7 +310,14 @@ impl Run {
     fn show(&mut self, mut d: Doc, target: Option<Target>) {
         let target = keep_target(&mut d, target);
         if d.autosave().is_none() {
-            if let Err(e) = d.autosave_to(&new_autosave_dir(&self.root)) {
+            let dir = new_autosave_dir(&self.root);
+            if let Err(e) = d.autosave_to(&dir) {
+                // This new directory has no prior recovery generation to keep.
+                if let Err(cleanup) = fs::remove_dir_all(&dir) {
+                    if cleanup.kind() != io::ErrorKind::NotFound {
+                        eprintln!("atrium-sheets: could not clean up failed autosave: {cleanup}");
+                    }
+                }
                 d.status = format!("{} Autosave is off: {e}.", d.status);
             }
         }
@@ -923,10 +945,7 @@ fn main() {
                     let source = if matches!(what, Asking::SaveAs | Asking::Commit) {
                         let mut d = run.sheets.doc.borrow_mut();
                         if d.wb.recalc_pending() { d.wb.recalc(); }
-                        match encode(&d, commit_target.map_or(Format::Native, |(_, format)| format)).and_then(|bytes| {
-                            let file = limen::fdpass::sealed_file("workbook.osheet", &bytes)?;
-                            Ok((file, bytes.len() as u64))
-                        }) {
+                        match stage_save(&d, commit_target.map_or(Format::Native, |(_, format)| format)) {
                             Ok((file, size)) => { staged_save = Some((d.edits, size)); Some(file) }
                             Err(err) => { drop(d); close_after_save = false; run.set_status(format!("Couldn't stage the workbook: {err}")); continue; }
                         }

@@ -20,6 +20,30 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Read the grant and leave only the rest of the same deadline for its fd.
+pub fn receive_workbook_commit(mut stream: &UnixStream, wait: Duration) -> io::Result<[u8; 16]> {
+    let deadline = Instant::now() + wait;
+    let set_remaining = || {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "workbook open handoff expired"));
+        }
+        stream.set_read_timeout(Some(remaining))
+    };
+    let mut grant = [0; 16];
+    let mut bytes = grant.as_mut_slice();
+    while !bytes.is_empty() {
+        set_remaining()?;
+        let n = stream.read(bytes)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing workbook save grant"));
+        }
+        bytes = &mut bytes[n..];
+    }
+    set_remaining()?;
+    Ok(grant)
+}
+
 /// Where the channels' directories are on the host.
 pub const ROOT: &str = "/atrium/sockets/opens";
 /// Overrides [`ROOT`] (a gate that runs its own portcullisd).
@@ -406,6 +430,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn workbook_commit_leaves_the_following_descriptor_for_recvmsg() {
+        use std::io::Write;
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let file = File::open("/dev/null").unwrap();
+        let grant = [7; 16];
+        sender.write_all(&grant).unwrap();
+        portcullis_ipc::send_fds(&sender, &[file.as_raw_fd()]).unwrap();
+        assert_eq!(receive_workbook_commit(&receiver, Duration::from_secs(1)).unwrap(), grant);
+        assert_eq!(portcullis_ipc::recv_fds(&receiver, 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incomplete_workbook_commit_cannot_hold_the_handoff_open() {
+        use std::io::Write;
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        sender.write_all(&[7]).unwrap();
+        let err = receive_workbook_commit(&receiver, Duration::from_millis(40)).unwrap_err();
+        assert!(matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
     }
 
     #[test]

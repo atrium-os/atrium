@@ -100,7 +100,12 @@ fn check(case: &str, path: &Path, expected: f64) -> io::Result<()> {
                 assert_eq!(workbook.extent(0), (DENSE_ROWS, DENSE_COLS));
                 for col in 0..DENSE_COLS {
                     for row in [0, 65_535, DENSE_ROWS - 1] {
-                        assert_eq!(workbook.value(0, row, col), Value::Num(f64::from(row)));
+                        let value = if row == 0 && col == 0 {
+                            expected
+                        } else {
+                            f64::from(row)
+                        };
+                        assert_eq!(workbook.value(0, row, col), Value::Num(value));
                     }
                 }
             } else {
@@ -131,7 +136,10 @@ fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [command, case, path] if command == "make" => make(case, Path::new(path)),
-        [command, case, path] if command == "check" => check(case, Path::new(path), INITIAL),
+        [command, case, path] if command == "check" => {
+            let initial = if case == "dense" { 0.0 } else { INITIAL };
+            check(case, Path::new(path), initial)
+        }
         [command, case, path, value] if command == "check" => {
             let value = value.parse().map_err(io::Error::other)?;
             check(case, Path::new(path), value)

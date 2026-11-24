@@ -319,17 +319,19 @@ impl Autosave {
     fn begin(dir: &Path, l: File, g: u64, wb: &Workbook, name: &str, sealer: Option<&Sealer>) -> io::Result<Self> {
         let old = generation(dir).ok();
         let tmp = dir.join(".base.tmp");
-        let f = File::create(&tmp)?;
-        let f = match sealer {
-            Some(s) => {
-                let mut f = f;
-                f.write_all(&s.seal(&native::save_to_vec(wb)))?;
-                f
+        let write_base = || -> io::Result<()> {
+            let mut file = File::create(&tmp)?;
+            match sealer {
+                Some(s) => file.write_all(&s.seal(&native::save_to_vec(wb)))?,
+                None => native::save(wb, io::BufWriter::new(&mut file))?.flush()?,
             }
-            None => native::save(wb, io::BufWriter::new(f))?.into_inner().map_err(|e| e.into_error())?,
+            file.sync_all()?;
+            fs::rename(&tmp, base_path(dir, g))
         };
-        f.sync_all()?;
-        fs::rename(&tmp, base_path(dir, g))?;
+        if let Err(err) = write_base() {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
         let j = OpenOptions::new().create(true).write(true).truncate(true).open(dir.join(format!("journal.{g}")))?;
         j.sync_all()?;
         fs::write(dir.join(META), name.as_bytes())?;

@@ -171,12 +171,11 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
   only when the app's mode is `edit`, the file is writable and the place
   isn't read-only), and sends it with the press's token. The **name** is
   the file's own name only, for the app's title bar.
-- portcullisd takes `OpenFile` only from Scrinium (the session's file
-  manager, as dispensatord's `CONNECT`), spends the token (new purpose
-  `OPEN`, a `BUTTON` or `KEY` press in Scrinium's window within 1 s),
-  checks that the app declares the type in that mode and that the user's
-  policy lets it launch, and checks the descriptor itself (`fstat`:
-  regular file; access mode as claimed).
+- Portcullis takes `OpenFile` from the session's file manager. It checks
+  the installed app's type and access mode and the user's launch policy.
+  It then spends the token for `OPEN`, a button or key press in the file
+  manager's window within one second. It checks the supplied descriptor
+  with `fstat` for a regular file and verifies the access mode.
 - It narrows the descriptor with `cap_rights_limit`: read, seek, fstat,
   and for `edit` write, ftruncate, fsync. No `fchmod`, `fchown`,
   `fexecve`, `mmap` with exec.
@@ -202,6 +201,15 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
   picker's press and the parent UID supplied by Limen. Portcullis verifies
   the parent is Sheets for the same owner and starts the new jail in its
   persona. The picker sends the old window a completion message.
+- On writable Sheets opens, including Recent Workbooks, Portcullis checks
+  the launch request and consumes the Open press before asking Scrinium
+  for the save grant. Scrinium verifies the file's revision, then sends
+  the 16-byte grant and descriptor on that same connection. The handoff
+  has a 60-second deadline and uses the app, name, access mode, owner and
+  picker persona from the validated request. A dropped connection or
+  missing descriptor ends the handoff. Fresco's press lifetime and
+  single-use check still apply
+  when Portcullis consumes the press.
 - The app never learns the path, the folder, or the place. Save As goes
   through the picker (officina.md §4.2).
 
