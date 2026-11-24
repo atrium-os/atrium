@@ -98,6 +98,8 @@ pub enum DataCmd {
     /// and links too.
     ClearFormats,
     ClearAll,
+    /// The selection's comments taken off.
+    ClearComments,
     /// Ask for a cell, range, sheet or name to go to; the window runs it (a bar
     /// under the grid).
     GoTo,
@@ -434,6 +436,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("AutoSum").shortcut("Alt+="), Some(DataCmd::AutoSum)),
         (MenuItem::new("Clear Formats").separated(), Some(DataCmd::ClearFormats)),
         (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
+        (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
@@ -1621,6 +1624,15 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
             d.run(if all { "Clear All" } else { "Clear Formats" }, ops);
             Ok(if all { "Cleared: contents, formats, comments and links.".into() } else { "Formats cleared.".into() })
+        }
+        DataCmd::ClearComments => {
+            let set: Vec<_> = comments_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+            if set.is_empty() {
+                return Ok("No comments there.".into());
+            }
+            let n = set.len();
+            d.run(if n == 1 { "Clear Comment" } else { "Clear Comments" }, vec![GridOp::Comments { sheet: s, set }]);
+            Ok(if n == 1 { "Comment cleared.".into() } else { format!("{n} comments cleared.") })
         }
         // The window opens its bar.
         DataCmd::GoTo => Ok(String::new()),

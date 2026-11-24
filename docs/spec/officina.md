@@ -4807,6 +4807,15 @@ Delete Cells (shift up or left) now turns references to the deleted cells into `
 
 Gates: atrium-sheets `deleted_cells_turn_formulas_reading_them_into_ref_errors`. It fails on the code before (`=D4` stayed `=D4` after D4 was deleted with nothing to its right). All 129 Sheets lib and 121 officina-grid lib tests pass.
 
+### 16.103 Text rotation, more border styles, typed colours, Clear Comments (2026-11-24)
+
+- **Rotation** (Format menu): No Rotation, Angle Counterclockwise (45°), Angle Clockwise (−45°), Vertical Text (stacked, 255), Rotate Text Up (90°) and Rotate Text Down (−90°), as Excel's Orientation button offers them. The grid already draws `Style::rotation`.
+- **Borders:** Top and Bottom Border (thin), Thick Outside Borders, Thick Bottom Border and Double Bottom Border join All, Outside, Bottom and None. Thick outside uses the same disjoint corner and strip rectangles as Outside, so the inside cells keep their own edges.
+- **Typed colours:** the text and fill colour bar has a `#RRGGBB` field (`#RGB` and a bare `RRGGBB` also work, via `format::parse_hex`). Set applies the colour as one step and closes the bar. A colour the field can't read keeps the bar open and says how to write one.
+- **Clear Comments** (Data menu) takes the selection's comments off as one step, leaving contents and formats.
+
+Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Not yet: border colours and dashed or dotted styles, a rotation angle typed by hand.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

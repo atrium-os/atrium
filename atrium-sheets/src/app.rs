@@ -85,6 +85,8 @@ pub enum Cmd {
     Format(crate::format::FormatCmd),
     /// The text or fill colour bar closed.
     ColorBarClose,
+    /// The colour bar's hex field submitted.
+    ColorHex,
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
@@ -349,6 +351,8 @@ pub struct Sheets {
     /// The Custom Format bar is open, with its code field.
     pub coding: Mutable<bool>,
     pub code_text: Mutable<TextEdit>,
+    /// The colour bar's field for a colour typed as #RRGGBB.
+    pub hex_text: Mutable<TextEdit>,
     /// The Define Name bar is open, with its name field.
     pub naming: Mutable<bool>,
     pub name_text: Mutable<TextEdit>,
@@ -380,7 +384,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1847,7 +1851,11 @@ impl Sheets {
             let cmds = self.cmds.clone();
             Button::secondary(if fill { "No Fill" } else { "Automatic" }).at(x + 8.0, y + 2.0).width(88.0).on_click(move || cmds.lock().unwrap().push(Cmd::Format(FormatCmd::Color(fill, None)))).render(ctx);
             let cmds = self.cmds.clone();
-            Button::secondary("Cancel").at(x + 104.0, y + 2.0).width(72.0).on_click(move || cmds.lock().unwrap().push(Cmd::ColorBarClose)).render(ctx);
+            TextField::new(self.hex_text.clone()).key(0x5348_4858).placeholder("#RRGGBB").at(x + 104.0, y + 2.0).width(92.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ColorHex)).render(ctx);
+            let cmds = self.cmds.clone();
+            Button::secondary("Set").at(x + 202.0, y + 2.0).width(52.0).on_click(move || cmds.lock().unwrap().push(Cmd::ColorHex)).render(ctx);
+            let cmds = self.cmds.clone();
+            Button::secondary("Cancel").at(x + 260.0, y + 2.0).width(72.0).on_click(move || cmds.lock().unwrap().push(Cmd::ColorBarClose)).render(ctx);
             return;
         }
         if self.coloring.get() {
@@ -3513,6 +3521,22 @@ impl Sheets {
                         }
                     }
                     self.rev.set(self.rev.get().wrapping_add(1));
+                    self.changed();
+                    false
+                }
+                Cmd::ColorHex => {
+                    let Some(fill) = self.color_bar.get() else { return false };
+                    let typed = self.hex_text.get_cloned().text().to_string();
+                    match crate::format::parse_hex(&typed) {
+                        Some(rgb) => {
+                            self.hex_text.set(TextEdit::new(""));
+                            self.color_bar.set(None);
+                            let sel = self.grid.get_cloned().selection();
+                            crate::format::run(&mut self.doc.borrow_mut(), sel, crate::format::FormatCmd::Color(fill, Some(rgb)));
+                            self.rev.set(self.rev.get().wrapping_add(1));
+                        }
+                        None => self.set_status(format!("Type a colour as #RRGGBB, such as #1F77B4; {:?} isn't one.", typed.trim())),
+                    }
                     self.changed();
                     false
                 }
@@ -7030,5 +7054,51 @@ mod tests {
         select(&s, (3, 3), (3, 3));
         data(&s, DataCmd::DeleteCellsLeft);
         assert_eq!(s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, 5, 1)).as_deref(), Some("=#REF!"));
+    }
+
+    #[test]
+    fn rotation_border_styles_hex_colours_and_clear_comments() {
+        use crate::data::DataCmd;
+        use crate::format::{BorderKind, FormatCmd};
+        use officina_grid::style::Line;
+        use pergola::widgets::GridSource as _;
+        let s = sheets_of(b"a,b\nc,d\ne,f\n");
+        let st = |r: u32, c: u32| s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, r, c)).clone();
+        select(&s, (0, 0), (2, 1));
+        assert_eq!(fmt(&s, FormatCmd::Rotate(90)), "Rotate Text Up.");
+        assert_eq!(st(2, 1).rotation, 90);
+        assert_eq!(s.source.cell(0, 0).map(|c| c.rotation), Some(90));
+        fmt(&s, FormatCmd::Rotate(0));
+        assert_eq!(st(0, 0).rotation, 0);
+        // Thick outside: edges only; the middle row keeps none.
+        fmt(&s, FormatCmd::Borders(BorderKind::ThickOutside));
+        assert_eq!((st(0, 0).borders[2].line, st(0, 0).borders[0].line, st(2, 1).borders[3].line), (Line::Thick, Line::Thick, Line::Thick));
+        assert_eq!(st(1, 0).borders[2].line, Line::None);
+        fmt(&s, FormatCmd::Borders(BorderKind::DoubleBottom));
+        assert_eq!((st(2, 0).borders[3].line, st(1, 0).borders[3].line), (Line::Double, Line::None));
+        fmt(&s, FormatCmd::Borders(BorderKind::None));
+        fmt(&s, FormatCmd::Borders(BorderKind::TopAndBottom));
+        assert_eq!((st(0, 1).borders[2].line, st(2, 1).borders[3].line, st(1, 1).borders[2].line), (Line::Thin, Line::Thin, Line::None));
+        // A typed colour; a bad one says how to write it.
+        assert_eq!(crate::format::parse_hex("#abc"), Some(0xAABBCC));
+        assert_eq!(crate::format::parse_hex("1f77b4"), Some(0x1F77B4));
+        assert_eq!(crate::format::parse_hex("#12345g"), None);
+        fmt(&s, FormatCmd::Colors(true));
+        s.hex_text.set(TextEdit::new("teal"));
+        s.cmds.lock().unwrap().push(Cmd::ColorHex);
+        s.take_cmds();
+        assert!(s.doc.borrow().status.starts_with("Type a colour") && s.color_bar.get() == Some(true));
+        s.hex_text.set(TextEdit::new("#1F77B4"));
+        s.cmds.lock().unwrap().push(Cmd::ColorHex);
+        s.take_cmds();
+        assert_eq!(st(1, 1).fill, Some(0x1F77B4));
+        assert!(s.color_bar.get().is_none());
+        // Clear Comments takes only the comments.
+        s.doc.borrow_mut().run("Note", vec![officina_grid::ops::GridOp::Comments { sheet: 0, set: vec![(0, 0, Some(officina_grid::comments::Comment::new("me", "hi")))] }]);
+        let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (0, 0));
+        assert!(items.iter().any(|(m, c)| *c == Some(DataCmd::ClearComments) && m.enabled));
+        assert_eq!(data(&s, DataCmd::ClearComments), "Comment cleared.");
+        assert!(s.doc.borrow().wb.comment(0, 0, 0).is_none());
+        assert_eq!(shown(&s, 0, 0), "a");
     }
 }

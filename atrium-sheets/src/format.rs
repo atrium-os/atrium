@@ -33,6 +33,8 @@ pub enum FormatCmd {
     Custom,
     /// The text moved one step in (true) or out from the left.
     Indent(bool),
+    /// Text turned by degrees (-90..=90, counter-clockwise), or stacked (255).
+    Rotate(i16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,13 @@ pub enum BorderKind {
     Outside,
     Bottom,
     None,
+    /// Thick lines around the selection.
+    ThickOutside,
+    ThickBottom,
+    /// A double line under the selection (totals).
+    DoubleBottom,
+    /// Thin lines over the first row and under the last.
+    TopAndBottom,
 }
 
 /// The number formats the menu offers: name and format code.
@@ -105,7 +114,18 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
     v.push((MenuItem::new("All Borders").separated(), Some(FormatCmd::Borders(BorderKind::All))));
     v.push((MenuItem::new("Outside Borders"), Some(FormatCmd::Borders(BorderKind::Outside))));
     v.push((MenuItem::new("Bottom Border"), Some(FormatCmd::Borders(BorderKind::Bottom))));
+    v.push((MenuItem::new("Top and Bottom Border"), Some(FormatCmd::Borders(BorderKind::TopAndBottom))));
+    v.push((MenuItem::new("Thick Outside Borders"), Some(FormatCmd::Borders(BorderKind::ThickOutside))));
+    v.push((MenuItem::new("Thick Bottom Border"), Some(FormatCmd::Borders(BorderKind::ThickBottom))));
+    v.push((MenuItem::new("Double Bottom Border"), Some(FormatCmd::Borders(BorderKind::DoubleBottom))));
     v.push((MenuItem::new("No Borders"), Some(FormatCmd::Borders(BorderKind::None))));
+    for (i, (name, deg)) in ROTATIONS.iter().enumerate() {
+        let mut item = MenuItem::new(*name).radio(st.rotation == *deg);
+        if i == 0 {
+            item = item.separated();
+        }
+        v.push((item, Some(FormatCmd::Rotate(*deg))));
+    }
     v
 }
 
@@ -156,6 +176,11 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
     }
     match cmd {
         FormatCmd::Custom => Ok(String::new()),
+        FormatCmd::Rotate(deg) => {
+            let (name, _) = ROTATIONS.iter().find(|r| r.1 == deg).ok_or("Unknown rotation.")?;
+            one(d, "Text Rotation", &|st| Style { rotation: deg, ..st.clone() });
+            Ok(if deg == 0 { "Rotation taken off.".into() } else { format!("{name}.") })
+        }
         FormatCmd::Indent(more) => {
             if !more && first.indent == 0 {
                 return Err("The text isn't indented.".into());
@@ -223,7 +248,12 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             const R: usize = 1;
             const T: usize = 2;
             const B: usize = 3;
-            let thin = Edge { line: Line::Thin, color: None };
+            let line = match kind {
+                BorderKind::ThickOutside | BorderKind::ThickBottom => Line::Thick,
+                BorderKind::DoubleBottom => Line::Double,
+                _ => Line::Thin,
+            };
+            let thin = Edge { line, color: None };
             let set = |edges: &'static [usize]| move |st: &Style| {
                 let mut st = st.clone();
                 for &e in edges {
@@ -234,8 +264,10 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             let ops = match kind {
                 BorderKind::All => vec![GridOp::restyle(&d.wb, r, set(&[L, R, T, B]))],
                 BorderKind::None => vec![GridOp::restyle(&d.wb, r, |st| Style { borders: [Edge::default(); 4], ..st.clone() })],
-                BorderKind::Bottom => vec![GridOp::restyle(&d.wb, Rect { r0: r.r1, ..r }, set(&[B]))],
-                BorderKind::Outside => {
+                BorderKind::Bottom | BorderKind::ThickBottom | BorderKind::DoubleBottom => vec![GridOp::restyle(&d.wb, Rect { r0: r.r1, ..r }, set(&[B]))],
+                BorderKind::TopAndBottom if r.r0 == r.r1 => vec![GridOp::restyle(&d.wb, r, set(&[T, B]))],
+                BorderKind::TopAndBottom => vec![GridOp::restyle(&d.wb, Rect { r1: r.r0, ..r }, set(&[T])), GridOp::restyle(&d.wb, Rect { r0: r.r1, ..r }, set(&[B]))],
+                BorderKind::Outside | BorderKind::ThickOutside => {
                     // Disjoint parts, each built against the same styles:
                     // corners, edge strips (the inside keeps its own).
                     let mut ops = Vec::new();
@@ -273,6 +305,10 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
                 BorderKind::Outside => "Border around the selection.",
                 BorderKind::Bottom => "Bottom border.",
                 BorderKind::None => "Borders taken off.",
+                BorderKind::ThickOutside => "Thick border around the selection.",
+                BorderKind::ThickBottom => "Thick bottom border.",
+                BorderKind::DoubleBottom => "Double bottom border.",
+                BorderKind::TopAndBottom => "Top and bottom borders.",
             }.into())
         }
     }
@@ -344,6 +380,17 @@ mod tests {
     }
 }
 
+/// The Format menu's text rotations, as Excel's Orientation button offers
+/// them: degrees counter-clockwise, 255 for stacked letters.
+pub const ROTATIONS: [(&str, i16); 6] = [
+    ("No Rotation", 0),
+    ("Angle Counterclockwise", 45),
+    ("Angle Clockwise", -45),
+    ("Vertical Text", 255),
+    ("Rotate Text Up", 90),
+    ("Rotate Text Down", -90),
+];
+
 /// The most indent steps a cell takes (Excel's indent buttons stop at 15).
 pub const MAX_INDENT: u8 = 15;
 
@@ -380,4 +427,22 @@ pub fn set_code(d: &mut Doc, sel: CellRange, code: &str) -> Result<String, Strin
     } else {
         format!("Format is {code}: {} shows {shown}.", officina_grid::addr::a1(sel.r0, sel.c0))
     })
+}
+
+/// A colour typed as `#RRGGBB`, `RRGGBB` or `#RGB`.
+pub fn parse_hex(text: &str) -> Option<u32> {
+    let t = text.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    if !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match t.len() {
+        6 => u32::from_str_radix(t, 16).ok(),
+        3 => {
+            let v = u32::from_str_radix(t, 16).ok()?;
+            let (r, g, b) = ((v >> 8) & 0xF, (v >> 4) & 0xF, v & 0xF);
+            Some((r * 17) << 16 | (g * 17) << 8 | (b * 17))
+        }
+        _ => None,
+    }
 }

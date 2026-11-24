@@ -860,7 +860,7 @@ fn main() {
                     discard = true;
                     break 'main;
                 }
-                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Author(_) | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::FilterCond(_) | Cmd::Format(_) | Cmd::ColorBarClose | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose | Cmd::Names(_) => {}
+                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Author(_) | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::ListPick(_) | Cmd::ListCancel | Cmd::Valid(_) | Cmd::UseSelection | Cmd::FilterOpen(..) | Cmd::FilterCond(_) | Cmd::Format(_) | Cmd::ColorBarClose | Cmd::ColorHex | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) | Cmd::FillOptions | Cmd::ListsForget(_) | Cmd::ListsClose | Cmd::Names(_) => {}
             }
         }
         if let Some(include_comments) = want_print.take() {
