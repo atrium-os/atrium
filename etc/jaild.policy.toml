@@ -780,6 +780,27 @@ class_roots = [
     "/var/lib/atrium/workspaces/{owner}/*",
     "/var/lib/atrium/empty/{owner}",
 ]
+# What portcullisd mounts into a classed jail beside its capabilities:
+# the owner's own files (folders, personas, workspaces' work, object cache,
+# Sheets recovery), document channels, and a workspace's or console's
+# tools and base system. Subtrees; `{owner}` is the class's owner.
+class_rw_subtrees = [
+    "/home/{owner}",
+    "/usr/home/{owner}",
+    "/atrium/sockets/opens",
+]
+class_ro_subtrees = [
+    "/var/run/atrium/fasti",
+    "/var/run/atrium/ide/{owner}",
+    "/atrium/sockets/ssh-agent",
+    "/var/lib/atrium/apps",
+    "/var/lib/atrium/debug",
+    "/var/lib/atrium/layers",
+    "/var/db/atrium/console",
+    "/var/db/atrium/workspace-bin",
+    "/bin", "/sbin", "/libexec",
+    "/usr/bin", "/usr/sbin", "/usr/include", "/usr/lib32", "/usr/libdata", "/usr/libexec", "/usr/share",
+]
 sockets_dir = "/atrium/sockets"
 sockets = [
     "aqueduct-gpu", "arca", "arca-courier", "audio", "audio-capture",

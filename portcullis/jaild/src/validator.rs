@@ -42,7 +42,7 @@ pub fn validate_create(
     validate_mlock(req, policy)?;
     validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
-        if !is_app_socket_mount(req, m, policy) {
+        if !is_app_socket_mount(req, m, policy) && !is_class_mount(req, m, policy) {
             validate_mount(m, policy)?;
         }
         validate_tmpfs_owner(m, req.exec.as_ref())?;
@@ -749,6 +749,31 @@ pub fn validate_mount_for_runtime(policy: &Policy, m: &MountSpec) -> Result<(), 
 
 /// An app jail's capability socket: `<apps.sockets_dir>/<name>` read-write
 /// for a name the policy lists, at a destination with no `..`.
+/// A mount of a classed jail from one of the class subtrees: what
+/// portcullisd hands an app, a workspace or a console of the owner's (their
+/// files, the document channel, the workspace's tools and base system).
+fn is_class_mount(req: &CreateJailRequest, m: &MountSpec, policy: &Policy) -> bool {
+    let Some(class) = &req.class else { return false };
+    let owner = class.owner();
+    let plain = !owner.is_empty() && owner != "." && owner != ".."
+        && owner.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+    let under = |bases: &[String]| bases.iter().any(|b| {
+        let b = b.replace("{owner}", owner);
+        let b = b.trim_end_matches('/');
+        !b.is_empty() && (m.source == b || m.source.strip_prefix(b).is_some_and(|r| r.starts_with('/')))
+    });
+    plain
+        && m.source.starts_with('/')
+        && !m.source.split('/').any(|s| s == ".." || s == ".")
+        && !m.dest.is_empty()
+        && !m.dest.split('/').any(|seg| seg == "..")
+        && match m.kind {
+            MountKind::RoNullfs => under(&policy.apps.class_ro_subtrees) || under(&policy.apps.class_rw_subtrees),
+            MountKind::RwNullfs => under(&policy.apps.class_rw_subtrees),
+            _ => false,
+        }
+}
+
 fn is_app_socket_mount(req: &CreateJailRequest, m: &MountSpec, policy: &Policy) -> bool {
     let dir = policy.apps.sockets_dir.trim_end_matches('/');
     matches!(req.class, Some(crate::protocol::JailClass::App { .. }))
@@ -2966,6 +2991,35 @@ mod tests {
         }
         r.mounts = vec![MountSpec { kind: MountKind::RoNullfs, ..sock("/atrium/sockets/workers", "x") }];
         assert_eq!(rule_of(validate_create(&r, &p)), "mount.source.not_in_ro");
+    }
+
+    #[test]
+    fn a_classed_jail_mounts_its_owners_files_and_no_one_elses() {
+        let p = load_sample_policy();
+        let mut ws = req_default();
+        ws.class = Some(JailClass::Develop { owner: "alice".into() });
+        ws.name = "ws_alice_tools".into();
+        ws.path = "/var/lib/atrium/workspaces/alice/tools".into();
+        let m = |src: &str, kind: MountKind| MountSpec {
+            source: src.into(), dest: "/x".into(), kind, size_mb: None, owner: None, noexec: false,
+        };
+        for (src, kind) in [("/home/alice/Documents", MountKind::RwNullfs), ("/usr/home/alice/.atrium/workspaces/tools/work", MountKind::RwNullfs),
+                            ("/usr/bin", MountKind::RoNullfs), ("/var/run/atrium/ide/alice/org.atrium.artifex", MountKind::RoNullfs)] {
+            ws.mounts = vec![m(src, kind)];
+            assert_eq!(rule_of(validate_create(&ws, &p)), "ok", "{src}");
+        }
+        for (src, kind) in [("/home/bob/Documents", MountKind::RwNullfs), ("/home/alicex", MountKind::RwNullfs),
+                            ("/home/alice/../bob", MountKind::RwNullfs), ("/usr/bin", MountKind::RwNullfs),
+                            ("/var/run/atrium/ide/bob/x", MountKind::RoNullfs)] {
+            ws.mounts = vec![m(src, kind)];
+            assert_ne!(rule_of(validate_create(&ws, &p)), "ok", "{src}");
+        }
+        // Without a class, the service rules: a person's home is refused.
+        ws.class = None;
+        ws.name = "svc".into();
+        ws.path = "/var/lib/atrium/jails/svc".into();
+        ws.mounts = vec![m("/home/alice/Documents", MountKind::RwNullfs)];
+        assert_ne!(rule_of(validate_create(&ws, &p)), "ok");
     }
 
     #[test]

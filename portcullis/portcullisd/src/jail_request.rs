@@ -9,7 +9,6 @@
 //! and the system call class (jaild resolves it from its own policy).
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use jaild::protocol::{
     CreateJailRequest, DeviceClass, EnvPair, ExecSpec, JailClass, MountKind, MountSpec,
@@ -226,8 +225,9 @@ pub fn to_create_request(jc: &JailConfig, parts: RequestParts) -> Result<CreateJ
         Some(r) => {
             let Some(e) = entry else { return refuse("an exec with no exec.start".into()) };
             let path = entry_path(&e)?;
-            let name = Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string();
-            let mut argv = vec![name];
+            // argv[0] is the path, as a shell or jail(8) gives it: what ps
+            // and pkill -f show.
+            let mut argv = vec![path.clone()];
             argv.extend(r.args);
             Some(ExecSpec { cwd: r.cwd,
                 path, argv, env: r.env, uid: r.uid, gid: r.gid, groups: r.groups,
@@ -267,6 +267,7 @@ pub fn to_create_request(jc: &JailConfig, parts: RequestParts) -> Result<CreateJ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::path::PathBuf;
 
     fn repo() -> PathBuf {
@@ -447,7 +448,7 @@ mod tests {
         let r = to_create_request(&sheets(), p).unwrap();
         let e = r.exec.unwrap();
         assert_eq!(e.argv[1..], ["--persona".to_string(), "work; rm -rf /".to_string()]);
-        assert_eq!(e.argv[0], Path::new(&e.path).file_name().unwrap().to_str().unwrap());
+        assert_eq!(e.argv[0], e.path, "argv[0] is the path, as ps shows it");
     }
 
     #[test]

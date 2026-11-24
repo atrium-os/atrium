@@ -717,6 +717,13 @@ pub struct AppsPolicy {
     /// for the class's owner.
     #[serde(default)]
     pub class_roots:               Vec<String>,
+    /// Sources a classed jail may mount read-only, beyond the mount_sources
+    /// lists: each a subtree, with `{owner}` standing for the class's owner.
+    #[serde(default)]
+    pub class_ro_subtrees:         Vec<String>,
+    /// And read-write (or read-only).
+    #[serde(default)]
+    pub class_rw_subtrees:         Vec<String>,
 }
 
 impl Policy {

@@ -148,7 +148,7 @@ check "the file manager's file keeps Work's group" "files-alice-work" "$(V "stat
 # without it is refused.
 NAVP=org.test.navprobe; DLP=org.test.dlprobe
 V 'sh -s' <<EOS
-for s in navigator navigator-page fresco-chrome fresco-activation limen arca arca-courier monstrator opifex; do mkdir -p /atrium/sockets/\$s; done
+for s in navigator navigator-page fresco-chrome fresco-activation limen arca arca-courier sigillum monstrator opifex; do mkdir -p /atrium/sockets/\$s; done
 rm -f /home/alice/Downloads/report*.pdf /home/alice/.atrium/personas/work/Downloads/report*.pdf
 for id in $NAVP $DLP; do
   opifex uninstall \$id >/dev/null 2>&1 || true
