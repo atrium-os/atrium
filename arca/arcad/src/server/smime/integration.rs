@@ -42,6 +42,10 @@ const KEY: &[u8] = include_bytes!("../../../../../mail/mail-smime/tests/data/lea
 const CMS: &[u8] = include_bytes!("../../../../../mail/mail-smime/tests/data/env.der");
 
 fn launch() -> io::Result<(UnixStream, UnixStream)> {
+    launch_worker(WORKER)
+}
+
+fn launch_worker(app_id: &str) -> io::Result<(UnixStream, UnixStream)> {
     let mut launch =
         UnixStream::connect(portcullis_ipc::resolve_socket_path().ok_or_else(closed)?)?;
     let timeout = Some(Duration::from_secs(8));
@@ -59,7 +63,7 @@ fn launch() -> io::Result<(UnixStream, UnixStream)> {
     portcullis_ipc::write_request(
         &mut launch,
         &Request::ExecInstance {
-            app_id: WORKER.into(),
+            app_id: app_id.into(),
             instance: None,
             tmpfs_mb: 16,
             memory_mb: None,
@@ -1279,5 +1283,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(target_os = "freebsd", feature = "legacy-jmap-worker")))]
 mod jmap_account_gate;
+
+#[cfg(all(target_os = "freebsd", feature = "legacy-jmap-worker"))]
+pub use jmap_account_gate::serve_jmap_proof;

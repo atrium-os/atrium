@@ -1050,10 +1050,25 @@ binding, and signs receipts over account identity and exact fetched bytes.
 It uses a private test value for worker and TLS evidence, a fixture
 signing key, and filesystem revocation markers. Tests reopen the markers
 after an injected cleanup failure and check account and persona
-recreation. The signed sheet still uses its fixed enrollment. Connecting
-a signed network worker, persisting the account and signing authority in
-Arca, and wiring production cancellation and cleanup remain separate work.
-The six whole-path timing trials cover two operational failures only.
+recreation. The signed sheet still uses its fixed enrollment.
+
+The optional `legacy-jmap-worker` fixture adds a trusted-UI probe for the
+signed synthetic Work launch. It launches a separate signed Portcullis
+worker as a dedicated uid with a loopback-only stack and a private
+inherited Arca channel. Arca keeps both IP stacks disabled. A synthetic
+HTTPS server runs on the worker jail's own loopback using a disposable
+CA and leaf key. The worker validates the TLS name, authenticates with a
+fixed fixture token, and fetches Session, Email/get and the raw message.
+Arca rechecks the challenge, signed Work launch, account ID, Email ID,
+download identity and exact bytes. It issues and verifies an ephemeral
+receipt inside Arca and gives the operator probe only a test outcome.
+Staged controls cover the wrong TLS name, a substituted account, direct
+signed Mail requests and trusted-UI requests for Personal. No live
+account, credential store lookup or provider authorization is involved.
+This proves a transport path for the disposable fixture. A separately
+deployed service, persistent account and receipt authority, and
+production revocation remain later work. The six whole-path timing
+trials cover two operational failures only.
 
 ##### Failure observability review
 

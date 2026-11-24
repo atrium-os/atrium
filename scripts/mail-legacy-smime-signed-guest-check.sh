@@ -45,6 +45,7 @@ run_suite limen-binding-test 1 legacy_sheet_accepts_one_selection_before_attach
 app=org.atrium.mail
 person=maillegacyfixture
 worker=org.atrium.smime-legacy-reader
+jmap_worker=org.atrium.jmap-proof-fixture
 registry=/var/run/atrium/app-registry
 s=/atrium/sockets
 arca=$s/arca/arcad.sock
@@ -89,6 +90,7 @@ ensure_user _arca-ui 65021
 ensure_user _limen 65022
 ensure_user _ostiarius 50093
 ensure_user legacyreadworker 51973
+ensure_user legacyjmapworker 51974
 if id "$person" >/dev/null 2>&1; then
     echo "Expected a fresh synthetic account" >&2
     exit 1
@@ -150,7 +152,7 @@ publisher=$(sha256 -q "$signing/publisher.der")
 install -d /etc/atrium/publishers
 openssl pkey -in "$signing/key" -pubout -out "/etc/atrium/publishers/mail-smime-gate.pem"
 install -d "$d/bundle/bin"
-for bin in atrium-mail mail-sync-worker mail-parse-jail mail-office-copy smime_installed_probe; do
+for bin in atrium-mail mail-sync-worker mail-parse-jail mail-office-copy smime_installed_probe arca-jmap-proof; do
     install -m 0555 "$d/$bin" "$d/bundle/bin/$bin"
 done
 sed '/^embeds = /s/"smime-provision"/"smime-provision", "smime-legacy-read"/' \
@@ -178,12 +180,40 @@ MANIFEST
 install -m 0555 "$d/mail-legacy-smime-worker" "$d/worker/bin/mail-legacy-smime-worker"
 "$d/opifex" pack "$d/worker" --sign "$signing/key"
 "$d/opifex" install "$d/worker"
+
+install -d "$d/jmap-worker/bin" "$d/jmap-worker/fixture"
+cat >"$d/jmap-worker/atrium.toml" <<MANIFEST
+[app]
+id = "$jmap_worker"
+name = "Synthetic JMAP account proof"
+version = "1"
+entry = "bin/arca-jmap-proof"
+[capabilities]
+network = "loopback"
+[resources]
+memory = "128M"
+cpu = 30
+MANIFEST
+install -m 0555 "$d/arca-jmap-proof" "$d/jmap-worker/bin/arca-jmap-proof"
+install -m 0444 "$d/jmap-ca.der" "$d/jmap-worker/fixture/ca.der"
+install -m 0444 "$d/jmap-server.der" "$d/jmap-worker/fixture/server.der"
+# Disposable fixture leaf key, usable only with the private synthetic CA.
+install -m 0444 "$d/jmap-key.pk8" "$d/jmap-worker/fixture/key.pk8"
+"$d/opifex" pack "$d/jmap-worker" --sign "$signing/key"
+"$d/opifex" install "$d/jmap-worker"
+cmp "$d/arca-jmap-proof" "/var/lib/atrium/apps/$jmap_worker/bin/arca-jmap-proof"
+"$d/portcullis" policy grant --system "$jmap_worker"
 rm "$signing/key"
 cat >> /etc/atrium/policy.toml <<POLICY
 
 [workers."$worker"]
 callers = ["_arca"]
 run_as = "legacyreadworker"
+concurrent = 1
+
+[workers."$jmap_worker"]
+callers = ["_arca"]
+run_as = "legacyjmapworker"
 concurrent = 1
 POLICY
 
@@ -335,6 +365,14 @@ personaluid=$(verify_uid "$(wait_mail "$personal")" personal)
 test "$personaluid" != "$workuid"
 echo "MAIL_SIGNED_PERSONAL_UID=$personaluid"
 scenario closed approve personal "$personaluid" 6
+
+jexec -u "$(id -nu "$workuid")" "$work" /bin/arca-jmap-proof deny "$arca" "$workuid"
+su -m _arca-ui -c "exec $d/arca-jmap-proof deny $arca $personaluid"
+su -m _arca-ui -c "exec $d/arca-jmap-proof probe $arca $workuid"
+test "$(grep -Fc "_arca starts $jmap_worker as legacyjmapworker (system worker rule)" "$d/portcullisd.log")" = 3
+jls -q name >"$d/jmap-proof.jails"
+! grep -F 'app-org-atrium-jmap-proof-fixture' "$d/jmap-proof.jails"
+echo MAIL_JMAP_PROOF_SIGNED_TESSERA_OK
 
 worker_total=6
 for sample in 1 2 3; do

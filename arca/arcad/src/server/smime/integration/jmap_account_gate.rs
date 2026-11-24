@@ -1,5 +1,5 @@
-//! Disabled synthetic backend. A private test value stands in for the signed
-//! worker channel and verified HTTPS transport. Nothing here serves sockets.
+//! Disabled synthetic backend. The native tests use in-process replies.
+//! The optional installed gate receives replies from one signed worker.
 
 use super::{closed, wire};
 use arca_store::codec::Writer;
@@ -8,14 +8,18 @@ use mail_proto::jmap;
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(test)]
+use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(test)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 type Instance = [u8; 16];
 const ORIGIN: &str = "https://jmap.fixture.invalid";
+#[cfg(test)]
 const MAIL: &str = "urn:ietf:params:jmap:mail";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +274,7 @@ impl Fences {
         Ok(())
     }
 
+    #[cfg(test)]
     fn revoke(
         &self,
         prefix: &str,
@@ -293,6 +298,7 @@ impl Fences {
     }
 }
 
+#[cfg(test)]
 fn binding(persona: u8, credential: u8) -> Binding {
     Binding {
         owner: [1; 16],
@@ -303,6 +309,7 @@ fn binding(persona: u8, credential: u8) -> Binding {
     }
 }
 
+#[cfg(test)]
 fn session(account: &str, personal: bool) -> String {
     serde_json::json!({
         "username": "login@fixture.invalid",
@@ -318,6 +325,7 @@ fn session(account: &str, personal: bool) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn proof<'a>(challenge: &Challenge, binding: &'a Binding, json: &'a str) -> WorkerSession<'a> {
     WorkerSession {
         nonce: challenge.nonce,
@@ -327,6 +335,7 @@ fn proof<'a>(challenge: &Challenge, binding: &'a Binding, json: &'a str) -> Work
     }
 }
 
+#[cfg(test)]
 fn enrolled(binding: Binding, account: &str) -> Enrollment {
     let challenge = Challenge::new(binding.clone()).unwrap();
     let body = session(account, true);
@@ -334,6 +343,7 @@ fn enrolled(binding: Binding, account: &str) -> Enrollment {
     challenge.approve(reply, &binding).unwrap()
 }
 
+#[cfg(test)]
 fn email_reply(account: &str, email: &str, bytes: &[u8]) -> String {
     serde_json::json!({"methodResponses": [["Email/get", {
         "accountId": account, "state": "s", "notFound": [],
@@ -343,6 +353,7 @@ fn email_reply(account: &str, email: &str, bytes: &[u8]) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn received(enrollment: &Enrollment, fences: &Fences, key: &SigningKey, bytes: &[u8]) -> Receipt {
     enrollment
         .issue(
@@ -541,4 +552,164 @@ fn jmap_legacy_persona_revocation_isolated_across_reopen_and_recreation() {
             &key.verifying_key()
         )
         .is_err());
+}
+
+#[cfg(all(target_os = "freebsd", feature = "legacy-jmap-worker"))]
+pub fn serve_jmap_proof(
+    state: &std::sync::Mutex<super::State>,
+    mut client: &std::os::unix::net::UnixStream,
+    body: &[u8],
+) -> io::Result<()> {
+    use super::{launch_worker, op, proto, signed_persona, status, Label, SYNTHETIC_USER};
+    use arca_store::codec::Reader;
+    use portcullis_ipc::Response;
+
+    let run = || -> io::Result<u8> {
+        let [a, b, c, d, mode @ (0 | 1 | 2)] = *body else {
+            return Err(closed());
+        };
+        let uid = u32::from_le_bytes([a, b, c, d]);
+        let lock = || state.lock().unwrap_or_else(|p| p.into_inner());
+        let (registry, publisher, ledger) = {
+            let state = lock();
+            if !state
+                .stores
+                .get(SYNTHETIC_USER)
+                .is_some_and(|store| store.state() == arca_store::LockState::Unlocked)
+            {
+                return Err(closed());
+            }
+            (
+                state.legacy_smime_registry.clone().ok_or_else(closed)?,
+                state.mail_sign_ins.mail_publisher.ok_or_else(closed)?,
+                state.dir.clone(),
+            )
+        };
+        let live = || {
+            signed_persona(&registry, uid, publisher)
+                .as_ref()
+                .and_then(|p| p.as_deref())
+                == Some("work")
+        };
+        if !live() {
+            return Err(closed());
+        }
+
+        // Every authority field is selected by Arca for this lab account.
+        let binding = Binding {
+            owner: [1; 16],
+            persona: [2; 16],
+            publisher,
+            credential: [3; 16],
+            generation: 1,
+        };
+        let challenge = Challenge::new(binding.clone())?;
+        let (mut control, mut lifetime) = launch_worker("org.atrium.jmap-proof-fixture")?;
+        let data = (|| {
+            control.set_read_timeout(Some(Duration::from_secs(7)))?;
+            control.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let mut request = challenge.nonce.to_vec();
+            request.push(mode);
+            wire::write(&mut control, &request, 33)?;
+            wire::read(&mut control, 64 << 10)
+        })();
+        // Closing the private channel does not release the launch lifetime.
+        drop(control);
+        if !matches!(
+            portcullis_ipc::read_response(&mut lifetime)?,
+            Response::LaunchExit { code: Some(0) }
+        ) || !live()
+        {
+            return Err(closed());
+        }
+        let data = data?;
+        if mode == 2 {
+            return if data == [2] { Ok(2) } else { Err(closed()) };
+        }
+        let mut reader = Reader::new(&data);
+        let parsed = (|| {
+            let nonce = reader.array::<32>()?;
+            let origin = reader.str(128)?;
+            let session = reader.bytes(4096)?;
+            let metadata = reader.bytes(4096)?;
+            let url = reader.str(512)?;
+            let bytes = reader.bytes(wire::MAX_RECEIVED)?;
+            reader.end()?;
+            Ok::<_, arca_store::Error>((nonce, origin, session, metadata, url, bytes))
+        })()
+        .map_err(|_| closed())?;
+        let (nonce, origin, session, metadata, url, bytes) = parsed;
+        let enrollment = challenge.approve(
+            WorkerSession {
+                nonce,
+                binding: &binding,
+                effective_origin: origin,
+                json: session,
+            },
+            &binding,
+        )?;
+        if enrollment.session.account != "a1" || bytes != wire::fixture_message() {
+            return Err(closed());
+        }
+        let fences = Fences::open(&ledger)?;
+        let mut seed = zeroize::Zeroizing::new([0; 32]);
+        getrandom::getrandom(seed.as_mut()).map_err(io::Error::other)?;
+        let key = SigningKey::from_bytes(&seed);
+        let issue = enrollment.issue(
+            WorkerDownload {
+                binding: &binding,
+                requested_email: "message",
+                metadata,
+                effective_url: url,
+                bytes,
+            },
+            &fences,
+            &key,
+        );
+        let state = lock();
+        if !live()
+            || !state
+                .stores
+                .get(SYNTHETIC_USER)
+                .is_some_and(|store| store.state() == arca_store::LockState::Unlocked)
+        {
+            return Err(closed());
+        }
+        if mode == 1 {
+            let answers = jmap::answers(metadata).map_err(|_| closed())?;
+            jmap::emails(&answers, "substituted-account", &["message".into()])
+                .map_err(|_| closed())?;
+            return if issue.is_err() { Ok(1) } else { Err(closed()) };
+        }
+        let receipt = issue?;
+        let verifier = key.verifying_key();
+        enrollment.authorize(&binding, "message", bytes, &receipt, &fences, &verifier)?;
+        if enrollment
+            .authorize(
+                &binding,
+                "message",
+                &wire::unsupported_fixture_message(),
+                &receipt,
+                &fences,
+                &verifier,
+            )
+            .is_ok()
+        {
+            return Err(closed());
+        }
+        // This public synthetic witness carries neither the receipt nor key.
+        Ok(0)
+    };
+    let result = run();
+    let (code, witness) = match result {
+        Ok(witness) => (status::OK, vec![witness]),
+        Err(_) => (status::DENIED, Vec::new()),
+    };
+    state.lock().unwrap_or_else(|p| p.into_inner()).audit(
+        &Label::TrustedUi,
+        op::U_SMIME_SYNTHETIC_JMAP,
+        None,
+        code,
+    );
+    proto::write_reply(&mut client, code, &witness)
 }

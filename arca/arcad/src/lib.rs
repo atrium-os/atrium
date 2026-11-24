@@ -56,6 +56,10 @@ pub fn serve_conn_with(stream: UnixStream, label: &label::Label, state: &Mutex<s
         if op == proto::op::U_SMIME_SYNTHETIC_RESERVE && *label == label::Label::TrustedUi {
             return server::integration::serve_synthetic_open(state, &rd, &b[2..]);
         }
+        #[cfg(all(target_os = "freebsd", feature = "legacy-jmap-worker"))]
+        if op == proto::op::U_SMIME_SYNTHETIC_JMAP && *label == label::Label::TrustedUi {
+            return server::integration::serve_jmap_proof(state, &rd, &b[2..]);
+        }
         let mut r = lock().handle(label, op, &b[2..]);
         if r.status == proto::status::NEEDS_VERIFICATION {
             let prompt = verifier.and_then(|v| Some((v, lock().verify_prompt(label, op, &b[2..])?)));

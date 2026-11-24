@@ -22,6 +22,9 @@ legacy-smime-prototype = ["dep:mail-smime", "dep:subtle"]
 # Integration lab only. Daemon dispatch requires a separate synthetic setup.
 legacy-smime-integration = ["dep:subtle", "dep:mail-smime", "dep:portcullis-ipc"]
 
+# Signed synthetic HTTPS fixture only, with no default build or production route.
+legacy-jmap-worker = ["legacy-smime-integration", "dep:mail-proto", "dep:serde", "dep:serde_json", "dep:rustls"]
+
 [dependencies]
 arca-store      = { path = "../arca-store" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }
@@ -40,6 +43,11 @@ mail-smime      = { path = "../../mail/mail-smime", optional = true, features = 
 portcullis-ipc = { path = "../../portcullis/portcullis-ipc", optional = true }
 subtle         = { version = "2.6", optional = true }
 
+mail-proto = { path = "../../mail/mail-proto", optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+
 [dev-dependencies]
 mail-proto = { path = "../../mail/mail-proto" }
 serde = "1"
@@ -51,3 +59,9 @@ libc = "0.2"
 [[bin]]
 name = "arca-probe"
 path = "src/bin/arca-probe.rs"
+
+
+[[bin]]
+name = "arca-jmap-proof"
+path = "src/bin/arca-jmap-proof.rs"
+required-features = ["legacy-jmap-worker"]
