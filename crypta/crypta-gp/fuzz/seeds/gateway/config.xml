@@ -1,0 +1,6 @@
+<response status="success">
+  <ssl-tunnel-url>/ssl-tunnel-connect.sslvpn</ssl-tunnel-url>
+  <ip-address>10.0.0.2</ip-address><netmask>255.255.255.0</netmask><timeout>60</timeout>
+  <access-routes><member>10.0.0.0/24</member></access-routes>
+  <dns><member>10.0.0.1</member></dns><dns-suffix><member>corp.test</member></dns-suffix>
+</response>

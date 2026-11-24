@@ -1,0 +1,7 @@
+<jnlp><application-desc>
+  <argument></argument><argument>fixture-cookie</argument><argument></argument>
+  <argument>portal</argument><argument>alice</argument><argument>ldap</argument>
+  <argument>vsys1</argument><argument>corp</argument><argument></argument>
+  <argument></argument><argument>tunnel</argument><argument>-1</argument>
+  <argument>4100</argument><argument>10.0.0.9</argument>
+</application-desc></jnlp>

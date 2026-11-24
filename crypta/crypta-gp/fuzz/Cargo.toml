@@ -1,0 +1,36 @@
+[package]
+name = "crypta-gp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crypta-gp = { path = ".." }
+zeroize = "1"
+
+[[bin]]
+name = "gateway"
+path = "fuzz_targets/gateway.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssl"
+path = "fuzz_targets/ssl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "esp"
+path = "fuzz_targets/esp.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

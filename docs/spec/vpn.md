@@ -621,6 +621,15 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
   AnyConnect stand-in and ocserv fixtures. See the fixture recipe below.
 - **Fuzzing:** every engine parser on the host (WireGuard messages, ESP, CSTP framing, the
   XML subset, HTTP heads), and cryptad's `.conf` importer.
+  GlobalProtect's test-only crate at `crypta/crypta-gp/fuzz` covers gateway
+  responses, TLS framing and ESP reception. It seeds the response target
+  with synthetic prelogin, challenge, portal, login, config and HIP replies.
+  From `crypta/crypta-gp`, give `cargo fuzz run gateway` a writable corpus
+  directory followed by `fuzz/seeds/gateway`, with `-- -max_total_time=60`.
+  Run the `ssl` and `esp` targets with the same time budget. Both packet
+  targets exercise arbitrary input and build valid
+  frames to verify round trips. The ESP target also checks that rejecting
+  a modified tag leaves the valid packet receivable exactly once.
 
 ### Installed Sign In gate fixture
 

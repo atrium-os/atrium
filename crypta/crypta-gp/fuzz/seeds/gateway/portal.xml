@@ -1,0 +1,3 @@
+<policy><gateways><external><list>
+  <entry name="vpn.example.test:4443"><description>Fixture gateway</description></entry>
+</list></external></gateways></policy>
