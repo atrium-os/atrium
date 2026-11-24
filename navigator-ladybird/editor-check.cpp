@@ -36,6 +36,7 @@ extern "C" NavigatorScene* navigator_counter_scene_create();
 extern "C" bool navigator_fixture_channel(int);
 extern "C" int navigator_standby_fetch();
 extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
+extern "C" size_t navigator_live_page(u8*, size_t, size_t*, u8*, size_t);
 #if defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
 extern "C" bool navigator_video_channel(int);
 #endif
@@ -129,7 +130,37 @@ int main(int argc, char** argv)
     if (standby && !attach_fetch(navigator_standby_fetch()))
         return 1;
 #endif
-#if defined(ATRIUM_I1_COUNTER)
+#if defined(ATRIUM_I6_PAGE)
+    // A whole page live (navigator-islands.md I6.1): the page comes from
+    // navigatord as the answer to "this island's page"; the engine never
+    // names it. Its resources go through the loader to navigator_live_get.
+    if (!embedded) return 1;
+    auto* scene = navigator_counter_scene_create();
+    if (!scene) return 4;
+    ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+    if (!Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(GC::Heap::the());
+    auto storage = ByteBuffer::create_uninitialized(8 * 1024 * 1024);
+    if (storage.is_error()) return 4;
+    document_body = storage.release_value();
+    static u8 page_url[8192];
+    size_t page_url_length = 0;
+    auto body_length = navigator_live_page(page_url, sizeof(page_url), &page_url_length, document_body.data(), document_body.size());
+    if (!body_length || body_length > document_body.size() || document_body.try_resize(body_length).is_error()) return 4;
+    StringView location { page_url, page_url_length };
+    client->page().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
+    auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);
+    if (result.is_error()) return 4;
+    auto document = client->page().local_traversable()->active_document();
+    auto origin = document->origin().serialize();
+    auto title = document->title().to_well_formed_utf8();
+    if (!navigator_counter_started(scene, origin.bytes().data(), origin.byte_count(), title.bytes().data(), title.byte_count()))
+        return 4;
+    client->island_scene = scene;
+    auto status = Navigator::drive_page(*client, scene, loop);
+    navigator_counter_ended(scene, status != 0);
+    return status;
+#elif defined(ATRIUM_I1_COUNTER)
     if (!embedded) return 1;
 #ifdef ATRIUM_I4_YOUTUBE
     constexpr auto location = "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"sv;

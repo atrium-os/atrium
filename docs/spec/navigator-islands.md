@@ -2386,6 +2386,82 @@ Evidence is in `~/atrium-vm/evidence/navigator-i6-0-20261125/`.
   I6.1 with every resource kind allowed, before deciding whether JIT off
   is acceptable for them.
 
+#### I6.1 as built (2026-11-25)
+
+Host-tested in the cloud; the engine side is written but not yet built
+(Ladybird builds on the Mac). Everything is off unless
+`NAVIGATORD_LIVE_PAGES=1`, which navigatord also passes to the UI as
+`NAVIGATOR_UI_LIVE_PAGES=1`.
+
+- **The press.** The tier popover ends with a **Run this page live** row
+  on an HTTPS page from navigatord (`shell::popover_action`). The row
+  only asks: the prompt row says "Run this page live? Its scripts run on
+  this computer, in a jail, and can send what you type here to
+  <site>'s sites.", and its **Run live** is the counted press (500 ms
+  still and uncovered, frescod's token). "Not now" is remembered until
+  the person asks again from the popover.
+- **Starting.** The UI sends `RunPageLive { url, rect, press }` with the
+  page area. navigatord (`live_page::Live::start`) checks the address is
+  the page it showed, spends the press, ends any widget, and asks Limen
+  for a `web-island` in the UI's window (a standby takes it when one
+  waits), placed over the page area.
+- **The engine never names its page.** Its first request is for
+  `limen::web_island::LIVE_PAGE` (`https://live-page.atrium.invalid/`);
+  navigatord answers with the page, whose address is the answer's final
+  URL, and ends an engine that asks for anything else first or gets
+  something other than an HTML 200.
+- **Resources.** Every later request is a whole GET checked by
+  `live_page::scope` (D12): plain HTTPS in its normal spelling, the
+  page's port, no credentials or fragment, and the same registrable site
+  as the page (sibling hosts in, public suffixes respected). In scope it
+  goes through fetchd's new `L` verb (one GET, no redirect, any status and
+  type, at most 8 MiB, the content type passed back as one token); out of
+  scope it is refused with the host and site logged and never reaches the
+  network. POSTs, ranges and conditional requests are refused in I6.1.
+  A page is ended after 4,096 requests or 512 MiB.
+- **Live code and Stop.** When the engine reports `Started` with the
+  page's origin, navigatord sends `LiveStarted`; the page's facts read
+  tier Live (the chip says "Live code") until it ends. The popover's row
+  becomes **Stop running live**. Stop (`PlaceLive { rect: None }`),
+  leaving the page (any `Show` or `Blank`), or the engine's end
+  (`LiveEnded` with why) retire the island, and the document-lane child,
+  which stayed underneath, shows again. The island follows the page area
+  as the window resizes (`PlaceLive { rect: Some }`).
+- **Engine** (`navigator-ladybird`, unbuilt here): CMake option
+  `I6_PAGE` defines `ATRIUM_I6_PAGE` (with the island fixtures'
+  `ATRIUM_I1_COUNTER` wiring). `editor-check.cpp` attaches the island,
+  gets the page from `navigator_live_page`, paints it, reports its origin
+  and title, and drives it. `patches/ladybird/live-page.patch` (after
+  `fixture-fetch.patch`; LibWeb must be built with `ATRIUM_I6_PAGE` too)
+  sends every HTTPS GET to `navigator_live_get` in `fixture_fetch.rs` and
+  fails everything else closed. The Rust side type-checks on its own.
+
+**Known gaps, by step.** No cookies or storage yet (I6.3): the fixture's
+`session` and `local-storage` checks stay failed. Responses carry only
+their content type, so a cross-origin `fetch()` to a sibling host fails
+Ladybird's CORS check until navigatord passes the CORS headers (I6.5).
+Links and `history.pushState` don't become trail entries yet (I6.2).
+
+**Gate (Mac, arm64 Tessera).** Build the `I6_PAGE` engine, main's
+navigatord, navigator-ui and navigator-fetchd, and serve the I6 fixture
+(`scripts/navigator-i6-fixture.py`, names forwarded as
+`scripts/navigator-i6-window.py` does). With `NAVIGATORD_LIVE_PAGES=1`:
+
+1. Open `https://app.example/app.html` in an ordinary trail: the document
+   lane shows it, the fixture server logs only the converter's fetches,
+   and no engine process exists.
+2. Press Run this page live, then Not now: still no engine.
+3. Press it again and Run live: the engine starts, the chip reads Live
+   code, the amber frame and tag show over the page area, and the
+   server's log shows `/app.js` from the engine and the `module`,
+   `indexeddb` and `wasm` check lines; `third-party` reads refused and
+   navigatord logs `cdn.thirdparty.example` refused.
+4. Stop: the engine process ends within 2 s, the chip returns to the
+   document lane's tier, and the document-lane rendering is on screen.
+5. Run live again and navigate to another trail entry: the engine ends.
+6. Record Start (press to `live-started`) and the engine's peak RSS, three
+   runs each.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

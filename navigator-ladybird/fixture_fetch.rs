@@ -204,3 +204,99 @@ unsafe fn fixture_request(
     let _ = client.cancel(request_id);
     0
 }
+
+/// A whole page live (navigator-islands.md I6.1). The engine asks for its
+/// page by `limen::web_island::LIVE_PAGE` and learns the address from the
+/// answer's final URL; then every resource the page loads is asked of
+/// navigatord by its own address, which serves it only inside the page's
+/// site. Requests are numbered on from the page's; one at a time.
+static LIVE_NEXT: Mutex<u32> = Mutex::new(1);
+
+/// One whole GET on the channel: (status, final URL, content type, length)
+/// with the body in `out`. `None` on a refusal, a failure, or anything out
+/// of shape (a body over `out`, data out of order, a second head).
+fn live_exchange(url: &str, out: &mut [u8], wait: Duration) -> Option<(u16, String, Option<String>, usize)> {
+    let mut state = CLIENT.get()?.lock().ok()?;
+    let (client, _, _) = state.as_mut()?;
+    let id = {
+        let mut next = LIVE_NEXT.lock().ok()?;
+        let id = *next;
+        *next = next.checked_add(1)?;
+        id
+    };
+    let mut open = Open::get(id, url);
+    open.limits.max_bytes = out.len() as u64;
+    open.retry.max_attempts = 0;
+    client.open(open).ok()?;
+    let until = Instant::now() + wait;
+    let mut head = None;
+    let mut used = 0usize;
+    while Instant::now() < until {
+        match client.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(Some(Event::Head { id: got, status, final_url, content_type, length: Some(n), .. }))
+                if got == id && head.is_none() && n <= out.len() as u64 =>
+            {
+                head = Some((status, final_url, content_type, n as usize));
+            }
+            Ok(Some(Event::Data { id: got, offset, bytes }))
+                if got == id && offset == used as u64 && head.as_ref().is_some_and(|h| bytes.len() <= h.3 - used) =>
+            {
+                out[used..used + bytes.len()].copy_from_slice(&bytes);
+                used += bytes.len();
+            }
+            Ok(Some(Event::Done { id: got, bytes })) if got == id => {
+                let (status, final_url, kind, n) = head?;
+                return (n == used && bytes == used as u64).then_some((status, final_url, kind, used));
+            }
+            Ok(Some(Event::Error { id: got, .. })) if got == id => return None,
+            Ok(Some(_)) => continue,
+            Ok(None) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = client.cancel(id);
+    None
+}
+
+/// The page itself: its body in `out`, its address in `url_out`. Returns
+/// the body's length, 0 when navigatord gave no HTML page.
+/// # Safety
+/// Both output buffers are writable for their lengths for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_page(url_out: *mut u8, url_cap: usize, url_len: *mut usize, out: *mut u8, cap: usize) -> usize {
+    if url_out.is_null() || url_len.is_null() || out.is_null() || cap == 0 { return 0; }
+    let body = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    let Some((200, url, Some(kind), n)) = live_exchange(limen::web_island::LIVE_PAGE, body, Duration::from_secs(30)) else { return 0 };
+    if kind != "text/html" || !url.starts_with("https://") || url.len() > url_cap { return 0; }
+    unsafe {
+        std::ptr::copy_nonoverlapping(url.as_ptr(), url_out, url.len());
+        *url_len = url.len();
+    }
+    n
+}
+
+/// One resource of the live page, any type: its length (the body in
+/// `out`), with the status and content type (`kind`, not terminated, its
+/// length in `kind_len`, 0 for none). -1: refused or failed.
+/// # Safety
+/// The URL is readable and the outputs writable for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_get(
+    url: *const u8, len: usize, out: *mut u8, cap: usize,
+    status: *mut u16, kind: *mut u8, kind_cap: usize, kind_len: *mut usize,
+) -> isize {
+    if url.is_null() || out.is_null() || status.is_null() || kind.is_null() || kind_len.is_null() || len > 8192 { return -1; }
+    let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else { return -1 };
+    let body = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    let Some((code, final_url, content_type, n)) = live_exchange(url, body, Duration::from_secs(30)) else { return -1 };
+    // navigatord follows no redirect for a resource: the answer is for this address.
+    if final_url != url { return -1; }
+    let content_type = content_type.unwrap_or_default();
+    if content_type.len() > kind_cap { return -1; }
+    unsafe {
+        *status = code;
+        std::ptr::copy_nonoverlapping(content_type.as_ptr(), kind, content_type.len());
+        *kind_len = content_type.len();
+    }
+    n as isize
+}
