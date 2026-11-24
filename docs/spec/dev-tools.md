@@ -259,6 +259,19 @@ Order: (1) toolbar, view strip, file icons; (2) Fuzz and Composition views;
 (3) the image service and `assets::image`; (4) Assets with Import SVG; (5) the
 icon editor.
 
+As built (steps 1 and 2, `artifex/app/src/ui.rs`, `views.rs`): Files,
+Composition and Fuzz in the strip switch the view right of it (`State.view`);
+Problems and Debug open the panel under the code, which is now Output,
+Problems and Debug only. A full view hides the panel; opening a file, a
+problem, a frame, a task or Debug goes back to the code. The Fuzz view lists
+targets and crashes, shows the chosen crash with its first 128 input bytes as
+hex (read by the engine from the project), and puts `worker add --dry-run`'s
+answer in a right-hand pane with Move and Cancel. The Composition view draws
+the grants, the core (flagged with a core crash and its Move button), the
+workers with their fuzz state, and the check's findings. The trace prints
+`view=`, and `vm-artifex-check.sh` drives the Fuzz view's buttons and opens
+the Composition view.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today
