@@ -18,25 +18,7 @@ use crate::eap::{self, typ};
 use crate::tls::{self, Frames, In, Seen, Trust};
 use crate::{mschapv2, peap, ttls};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Method {
-    /// PEAPv0 with EAP-MSCHAPv2 inside.
-    Peap,
-    TtlsPap,
-    TtlsMschapv2,
-    /// EAP-TLS: a client certificate, no password.
-    Tls,
-}
-
-impl Method {
-    pub fn eap_type(self) -> u8 {
-        match self {
-            Method::Peap => typ::PEAP,
-            Method::TtlsPap | Method::TtlsMschapv2 => typ::TTLS,
-            Method::Tls => typ::TLS,
-        }
-    }
-}
+pub use crate::profile::Method;
 
 pub struct Config {
     pub method: Method,
@@ -48,6 +30,31 @@ pub struct Config {
     pub trust: Trust,
     /// EAP-TLS only.
     pub client: Option<Arc<CertifiedKey>>,
+}
+
+impl Config {
+    /// The settings for a join from the stored profile.
+    pub fn from_profile(p: &crate::profile::Profile) -> Config {
+        let trust = match (&p.pin, p.ca.is_empty()) {
+            (Some(top), _) => Trust::Pinned { top: top.clone().into(), domain: p.domain.clone() },
+            (None, false) => {
+                let mut roots = rustls::RootCertStore::empty();
+                for c in &p.ca {
+                    let _ = roots.add(c.clone().into());
+                }
+                Trust::Roots { roots: Arc::new(roots), domain: p.domain.clone() }
+            }
+            (None, true) => Trust::Unset,
+        };
+        Config {
+            method: p.method,
+            outer_identity: p.outer_identity(),
+            identity: p.identity.clone(),
+            password: p.password.clone(),
+            trust,
+            client: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +76,23 @@ pub enum Why {
     EarlySuccess,
     /// PEAP's crypto-binding did not check out.
     Binding,
+}
+
+impl Why {
+    /// A word for logs and reply lines (no spaces, nothing secret).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Why::Malformed(_) => "malformed",
+            Why::Refused => "refused",
+            Why::Rejected => "rejected",
+            Why::Method => "method",
+            Why::Untrusted(_) => "untrusted",
+            Why::Tls(_) => "tls",
+            Why::ServerProof => "server-proof",
+            Why::EarlySuccess => "early-success",
+            Why::Binding => "binding",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -198,6 +222,11 @@ impl Peer {
     }
 
     fn method(&mut self, id: u8, data: &[u8]) -> Out {
+        if self.conn.is_none() && !self.phase2 && data.first().is_some_and(|f| f & tls::START == 0) {
+            // A retransmission from an earlier conversation the AP still
+            // holds (a lost deauth): ours starts with the S flag.
+            return Out::Dropped("TLS before start");
+        }
         let input = match self.frames.take(data) {
             Ok(i) => i,
             Err(_) => return self.fail(Why::Malformed("TLS framing")),
@@ -205,9 +234,13 @@ impl Peer {
         let t = self.cfg.method.eap_type();
         match input {
             In::Start => {
-                if self.conn.is_some() {
+                if self.sent_credentials || self.phase2 {
                     return self.fail(Why::Malformed("a second start"));
                 }
+                // The AP began again (our EAPOL-Start crossed its first
+                // request): a new handshake, nothing was sent yet.
+                self.conn = None;
+                self.verifier = None;
                 let client = if self.cfg.method == Method::Tls { self.cfg.client.clone() } else { None };
                 let (mut conn, v) = match tls::client(self.cfg.trust.clone(), client) {
                     Ok(c) => c,
@@ -476,6 +509,9 @@ mod tests {
         let Out::Send(hello) = p.handle(&[1, 3, 0, 6, typ::TTLS, tls::START]) else { panic!() };
         assert_eq!(hello[4], typ::TTLS);
         assert_eq!(p.handle(&[1, 4, 0, 6, typ::PEAP, 0x21]), Out::Failed(Why::Method), "no switching once started");
+        let mut q = peer(Method::Peap);
+        assert_eq!(q.handle(&[1, 9, 0, 8, typ::PEAP, 0, 22, 3]), Out::Dropped("TLS before start"), "a stale record before our start");
+        assert!(matches!(q.handle(&[1, 10, 0, 6, typ::PEAP, tls::START]), Out::Send(_)));
     }
 
     #[test]

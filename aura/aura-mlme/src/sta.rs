@@ -38,6 +38,8 @@ pub enum Want {
     Password,
     /// WPA3 only (the user said so, or the network disabled transition).
     Wpa3,
+    /// 802.1X (WPA2/WPA3-Enterprise); aura-keys runs EAP.
+    Enterprise,
 }
 
 /// Which address to use on a network (wifi.md §3.4, decision 8).
@@ -89,6 +91,7 @@ pub const MAX_RESULTS: usize = 128;
 const MGMT_TIMEOUT_MS: u64 = 2000;
 const MGMT_TRIES: u8 = 3;
 const KEYS_TIMEOUT_MS: u64 = 20_000;
+const EAP_KEYS_TIMEOUT_MS: u64 = 60_000;
 const SA_QUERY_TIMEOUT_MS: u64 = 1000;
 /// SAE's crypto in aura-keys under TCG takes a while.
 const SAE_KEYS_TIMEOUT_MS: u64 = 5000;
@@ -308,6 +311,7 @@ impl Station {
                     Some("open") => Some(Want::Open),
                     Some("psk") => Some(Want::Password),
                     Some("sae") => Some(Want::Wpa3),
+                    Some("eap") => Some(Want::Enterprise),
                     _ => None,
                 };
                 let mac = match l.get("mac") {
@@ -365,6 +369,8 @@ impl Station {
                 if let Some(t) = self.target() {
                     let used = match t.akm {
                         Some(Akm::Sae) => if t.h2e { "sae-h2e" } else { "sae" },
+                        Some(Akm::Eap) => "eap",
+                        Some(Akm::EapSha256) => "eap-sha256",
                         Some(_) => "psk",
                         None => "open",
                     };
@@ -395,6 +401,7 @@ impl Station {
                 (Want::Open, Security::Open) => true,
                 (Want::Password, Security::Psk { .. }) => !wpa3,
                 (Want::Password | Want::Wpa3, Security::Sae { .. }) => true,
+                (Want::Enterprise, Security::Eap { .. }) => true,
                 _ => false,
             };
             if !ok {
@@ -414,6 +421,11 @@ impl Station {
         let t = match b.security {
             Security::Psk { akm, pmf } => {
                 // PMF capable by default; on whenever the AP offers it.
+                let on = pmf != Pmf::No;
+                let caps = if on { rsne::CAP_MFPC } else { 0 };
+                Target { bss: b.clone(), own_rsne: build(akm, caps), own_rsnxe: None, akm: Some(akm), pmf: on, h2e: false }
+            }
+            Security::Eap { akm, pmf } => {
                 let on = pmf != Pmf::No;
                 let caps = if on { rsne::CAP_MFPC } else { 0 };
                 Target { bss: b.clone(), own_rsne: build(akm, caps), own_rsnxe: None, akm: Some(akm), pmf: on, h2e: false }
@@ -744,7 +756,10 @@ impl Station {
                 }
                 out.push(Out::Keys(k));
                 out.push(Out::Ctl(state_line("associated").with("bssid", fmt_mac(&t.bss.bssid)).with("aid", aid).with("qos", qos as u8).with("pmf", t.pmf as u8)));
-                self.st = State::Keys { t, deadline: now + KEYS_TIMEOUT_MS, m2: false };
+                // EAP runs a TLS handshake through the AP and its RADIUS
+                // server before the 4-way handshake starts.
+                let wait = if t.akm.is_some_and(Akm::is_eap) { EAP_KEYS_TIMEOUT_MS } else { KEYS_TIMEOUT_MS };
+                self.st = State::Keys { t, deadline: now + wait, m2: false };
             }
             (mgmt::DEAUTH | mgmt::DISASSOC, _) => {
                 let reason = mgmt::reason(f).unwrap_or(0);

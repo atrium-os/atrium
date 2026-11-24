@@ -5,15 +5,28 @@ description = "Aura's EAP peer for WPA2/WPA3-Enterprise (docs/spec/wifi.md §7.4
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The EAP peer and its helper binary. aura-keys turns it off: it needs only
+# the profile and the helper's framing, not TLS.
+default = ["peer"]
+peer = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki", "dep:md4", "dep:des", "dep:sha1", "dep:hmac"]
+
+[[bin]]
+name = "atrium-aura-eap"
+required-features = ["peer"]
+
 [dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = { version = "1", features = ["std"] }
-webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
-md4 = "0.10"
-des = "0.8"
-sha1 = "0.10"
-hmac = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"], optional = true }
+md4 = { version = "0.10", optional = true }
+des = { version = "0.8", optional = true }
+sha1 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 md-5 = "0.10"

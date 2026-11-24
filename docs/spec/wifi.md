@@ -418,10 +418,13 @@ server": that pins the chain's root and the server's name for this network only
 (the "trust on first use" phones do for eduroam). A later change of root is refused
 and shown, never accepted silently.
 
-**Where it runs (§8.3's `aura-eap`).** A new process, `aura-eap`, one per join, uid
-`_aura-eap` (65056), started by aura-keys over a socket pair from a spawner forked
-before capability mode, chroot `/var/empty`, no network, no files, capability mode
-before the first EAP byte. It parses EAP, the TLS records and the server's certificate
+**Where it runs (§8.3's `aura-eap`).** A new process, `atrium-aura-eap`, one per join,
+started by aura-keys (`execve`, so it inherits none of aura-keys' memory) with one
+socket as its stdin and nothing else, no network, no files, capability mode before the
+first EAP byte. It runs as aura-keys' uid inside aura-keys' jail: aura-keys is not root
+and cannot give it another uid, and capability mode already takes away every global
+name (no files, no sockets, no signals to other processes), which is more than a
+separate uid and a chroot would. It parses EAP, the TLS records and the server's certificate
 chain (the large hostile parsers) and holds the password only for that join. aura-keys
 keeps EAPOL and the controlled port: it passes EAP packets (EAPOL type 0) both ways,
 gives aura-eap the network's settings and credential for that join, and takes back the
@@ -458,11 +461,11 @@ and the pinned server.
 | Step | What | Done when |
 |---|---|---|
 | E1 | `aura-eap` crate: EAP state machine, PEAP/TTLS/EAP-TLS, MSCHAPv2 (RFC 2759 vectors), server checks; fuzz targets for EAP and the inner methods | host tests against hostapd's EAP server (`eapol_test`-style harness on the Linux host) for each method, wrong password, wrong CA, wrong domain, TLS 1.0-only server. **Done 2026-11-24**: `aura/aura-eap`, `cargo test` there runs hostapd 2.10 as a RADIUS server (`tests/hostapd.rs`): PEAP (with crypto-binding), TTLS-MSCHAPv2, TTLS-PAP and EAP-TLS each end with the MSK the server gives the AP; wrong passwords, another CA, another domain, an evil twin with the same name (also after pinning), first join with nothing set stopping at the certificate, a TLS 1.0-only server, EAP-TLS without a certificate all refused; fuzz target `aura/fuzz` `eap_peer` (1.3 M runs clean) |
-| E2 | aura-keys: AKM 1/5, the `aura-eap` process and jail, MSK to PMK; atrium-net and Arca: enterprise profile and credential | `aura-sim-gate.sh w7`: the VM joins hostapd WPA2- and WPA3-Enterprise on hwsim with PEAP and TTLS, gets an address; an evil-twin AP with another certificate is refused before any password leaves |
+| E2 | aura-keys: AKM 1/5, the `aura-eap` process and jail, MSK to PMK; atrium-net and Arca: enterprise profile and credential | `aura-sim-gate.sh w7`: the VM joins hostapd WPA2- and WPA3-Enterprise on hwsim with PEAP and TTLS, gets an address; an evil-twin AP with another certificate is refused before any password leaves. **Done 2026-11-24**: 25/25 on the cloud VMs. AKM 1 and 5 in aura-rsn and aura-mlme (`security=eap`/`eap-sha256`); aura-keys stores an 802.1X profile in Arca (`remember-eap`, the profile carries the password), runs `atrium-aura-eap` per join and the 4-way handshake on the MSK; `eap-seen`/`eap-trust` pin the server a first join stopped at (only when nothing is set; a changed server needs the network set up again). On a join EAP does not finish aura-keys sends EAPOL-Logoff first: under PMF the AP ignores our unprotected deauth and would hold the half-done conversation and its retry count (hostapd then refuses the next association with reason 23). After an EAP failure the AP ignores the station for its quiet period (hostapd: 60 s). Atrium-net and Settings learn 802.1X profiles in E4; aura-ctl drives the gate. System roots for `Trust::Roots` (no CA file) also come with E4 |
 | E3 | EAP-TLS with the client key in Arca | same gate, certificate login |
 | E4 | Settings sheet, first-join trust, bar menu | joined from Settings in the VM, shown in frames |
 
-**Decisions for Shankar**
+**Decisions** (Shankar accepted all six as recommended, 2026-11-24: Q1–Q5 yes, Q6 later)
 - Q1. Methods in v1: PEAP-MSCHAPv2, TTLS (PAP, MSCHAPv2), EAP-TLS; nothing weaker. *Recommend yes.*
 - Q2. The server certificate always checked (CA plus domain); no "don't validate". *Recommend yes.*
 - Q3. First join without a CA: show the server's certificate and "Trust this server",

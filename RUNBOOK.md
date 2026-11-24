@@ -5552,6 +5552,8 @@ sh scripts/aura-sim-gate.sh vms     # both VMs up (FreeBSD with udp 7701 forward
 sh scripts/aura-sim-gate.sh w1      # WPA2-PSK + PMF: build, hostapd + udhcpd, arcad, jailed daemons, checks
 sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens), transition mode, roaming,
                                     # atrium-net auto-join, tunnel and long-drop scenarios
+sh scripts/aura-sim-gate.sh w7      # WPA2/WPA3-Enterprise: hostapd's EAP server, PEAP, TTLS, wrong password,
+                                    # first-join trust, an evil twin refused (certs made per run)
 sh scripts/aura-ap-vm.sh ap CONF... # AP configs from aura/sim-ap (two at most: one radio each, bridged)
 sh scripts/aura-ap-vm.sh signal 2412 -85 2437 -40   # what the FreeBSD side hears per channel
 sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there

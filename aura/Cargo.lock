@@ -57,6 +57,7 @@ version = "0.1.0"
 dependencies = [
  "des",
  "hmac",
+ "libc",
  "md-5",
  "md4",
  "rustls",
@@ -78,11 +79,13 @@ dependencies = [
 name = "aura-keys"
 version = "0.1.0"
 dependencies = [
+ "aura-eap",
  "aura-ipc",
  "aura-proto",
  "aura-rsn",
  "getrandom",
  "libc",
+ "sha2",
  "zeroize",
 ]
 

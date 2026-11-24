@@ -16,11 +16,20 @@
 //!   ssid=..`, `prepare ssid=..` (release the credential for the next join;
 //!   Arca hands out one per join, never the list); gets `ok` or `error`.
 //!
+//!
+//! 802.1X networks (wifi.md §7.4): `remember-eap ssid=.. method=..
+//! identity=.. [anonymous=..] [domain=..] [ca=<DER hex>] secret=..|handle=..`
+//! stores the network's profile; an `assoc` with AKM 1 or 5 runs EAP in
+//! `atrium-aura-eap` (eap.rs) and the 4-way handshake on its MSK. A first
+//! join with no CA stops at the server's certificate: `eap-seen ssid=..`
+//! shows it, `eap-trust ssid=..` pins it for that network.
+//!
 //! usage: aura-keys [-v] [--dev /dev/aura/key0] [--sock PATH]
 //!                  [--mlme-uid UID] [--ctl-uid UID]
-//!                  [--arca PATH | --memory-store]
+//!                  [--arca PATH | --memory-store] [--eap-helper PATH]
 
 mod creds;
+mod eap;
 
 use aura_ipc::sock::{self, Conn};
 use aura_ipc::{Got, Line};
@@ -43,6 +52,7 @@ struct Opts {
     mlme_uid: u32,
     ctl_uid: u32,
     arca: Option<PathBuf>,
+    eap_helper: String,
 }
 
 fn opts() -> Opts {
@@ -53,6 +63,7 @@ fn opts() -> Opts {
         mlme_uid: 65033,
         ctl_uid: 0,
         arca: Some("/atrium/sockets/arca/arcad.sock".into()),
+        eap_helper: "/usr/local/bin/atrium-aura-eap".into(),
     };
     let mut a = std::env::args().skip(1);
     while let Some(x) = a.next() {
@@ -64,8 +75,9 @@ fn opts() -> Opts {
             "--ctl-uid" => o.ctl_uid = a.next().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX),
             "--arca" => o.arca = a.next().map(Into::into),
             "--memory-store" => o.arca = None,
+            "--eap-helper" => o.eap_helper = a.next().unwrap_or_default(),
             _ => {
-                eprintln!("usage: aura-keys [-v] [--dev DEV] [--sock PATH] [--mlme-uid UID] [--ctl-uid UID] [--arca PATH | --memory-store]");
+                eprintln!("usage: aura-keys [-v] [--dev DEV] [--sock PATH] [--mlme-uid UID] [--ctl-uid UID] [--arca PATH | --memory-store] [--eap-helper PATH]");
                 std::process::exit(2);
             }
         }
@@ -90,6 +102,29 @@ struct Join {
     /// a wrong passphrase); the pairwise key is set.
     told_m2: bool,
     ptk: bool,
+    /// 802.1X: the EAP helper, until it hands back the MSK.
+    eap: Option<eap::Run>,
+    /// What the supplicant needs besides the PMK, kept until EAP ends.
+    params: Option<Params>,
+    /// EAPOL-Key frames that came before EAP finished.
+    early_keys: Vec<Vec<u8>>,
+}
+
+struct Params {
+    akm: Akm,
+    spa: [u8; 6],
+    own_rsne: Vec<u8>,
+    ap_rsne: Vec<u8>,
+    own_rsnxe: Option<Vec<u8>>,
+    ap_rsnxe: Option<Vec<u8>>,
+    pmf: bool,
+}
+
+/// The certificate an 802.1X server showed on a first join (no CA set).
+struct Seen {
+    ssid: Vec<u8>,
+    names: Vec<String>,
+    chain: Vec<Vec<u8>>,
 }
 
 /// An SAE exchange in progress, and its PMK once done (kept for the
@@ -120,6 +155,8 @@ struct Keys {
     join: Option<Join>,
     /// EAPOL that arrived before aura-mlme's `assoc` (they race).
     pending: Vec<([u8; 6], Vec<u8>)>,
+    eap_helper: String,
+    seen: Option<Seen>,
 }
 
 impl Keys {
@@ -199,6 +236,24 @@ impl Keys {
         if src != j.bssid {
             return None;
         }
+        if let Some(run) = &mut j.eap {
+            match eap::parse_eapol(body) {
+                Some((eap::EAPOL_EAP, p)) => {
+                    if let Err(e) = run.packet(p) {
+                        eprintln!("aura-keys: EAP helper: {e}");
+                        j.eap = None;
+                        return Some(Line::new("failed").with("why", "eap-helper"));
+                    }
+                }
+                Some((eap::EAPOL_KEY, _)) if j.early_keys.len() < MAX_PENDING => j.early_keys.push(body.to_vec()),
+                _ => eprintln!("aura-keys: EAPOL ignored during EAP"),
+            }
+            return None;
+        }
+        if eap::parse_eapol(body).is_some_and(|(t, _)| t == eap::EAPOL_EAP) {
+            // A late EAP retransmission after the MSK: nothing to do.
+            return None;
+        }
         let s = j.supp.as_mut()?;
         match s.rx(body) {
             Ok(acts) => self.apply(acts),
@@ -207,6 +262,68 @@ impl Keys {
                 None
             }
         }
+    }
+
+    /// EAPOL-Logoff before we leave a join EAP did not finish: under PMF
+    /// the AP ignores our unprotected deauth and would keep the half-done
+    /// conversation (and its retry count) for our next association.
+    fn logoff(&mut self, bssid: [u8; 6]) {
+        self.send(&Msg::TxEapol { dst: bssid, body: &eap::eapol(eap::EAPOL_LOGOFF, &[]) });
+    }
+
+    /// What the EAP helper said; lines for aura-mlme.
+    fn eap_events(&mut self) -> Vec<Line> {
+        let mut out = Vec::new();
+        let Some(j) = &mut self.join else { return out };
+        let Some(run) = &mut j.eap else { return out };
+        let events = match run.read() {
+            Ok(e) => e,
+            Err(e) => vec![eap::Event::Failed(format!("helper-{}", e.kind()).replace(' ', "-"))],
+        };
+        let bssid = j.bssid;
+        for ev in events {
+            match ev {
+                eap::Event::Send(f) => self.send(&Msg::TxEapol { dst: bssid, body: &f }),
+                eap::Event::Log(w) => eprintln!("aura-keys: EAP helper dropped a packet: {w}"),
+                eap::Event::Done(msk) => {
+                    let Some(j) = &mut self.join else { break };
+                    j.eap = None;
+                    let Some(p) = j.params.take() else { break };
+                    let mut pmk = [0u8; 32];
+                    pmk.copy_from_slice(&msk[..32]);
+                    let mut snonce = [0u8; 32];
+                    if getrandom::getrandom(&mut snonce).is_err() {
+                        die("no randomness");
+                    }
+                    eprintln!("aura-keys: EAP succeeded with {}; 4-way handshake next", aura_ipc::fmt_mac(&bssid));
+                    let cfg = Config { akm: p.akm, pmk: Pmk(pmk), aa: bssid, spa: p.spa, own_rsne: p.own_rsne, ap_rsne: p.ap_rsne, own_rsnxe: p.own_rsnxe, ap_rsnxe: p.ap_rsnxe, pmf: p.pmf };
+                    j.supp = Some(Supplicant::new(cfg, snonce));
+                    for f in std::mem::take(&mut j.early_keys) {
+                        if let Some(r) = self.eapol(bssid, &f) {
+                            out.push(r);
+                        }
+                    }
+                    break;
+                }
+                eap::Event::Failed(why) => {
+                    eprintln!("aura-keys: EAP failed: {why}");
+                    self.logoff(bssid);
+                    self.join = None;
+                    out.push(Line::new("failed").with("why", format!("eap-{why}")));
+                    break;
+                }
+                eap::Event::Trust(names, chain) => {
+                    eprintln!("aura-keys: EAP stopped at the server's certificate ({}); waiting for the user", names.join(","));
+                    self.logoff(bssid);
+                    let ssid = self.prepared.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
+                    self.seen = Some(Seen { ssid, names, chain });
+                    self.join = None;
+                    out.push(Line::new("failed").with("why", "eap-trust"));
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// aura-mlme reports an association.
@@ -221,7 +338,7 @@ impl Keys {
         self.join = None;
         if akm == 0 {
             // Open network: nothing to negotiate, open the port.
-            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false });
+            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new() });
             self.pending.clear();
             self.send(&Msg::PortAuthorized(true));
             out.push(Line::new("authorized"));
@@ -239,6 +356,31 @@ impl Keys {
         };
         if *pssid != ssid {
             return fail("not-prepared");
+        }
+        if akm.is_eap() {
+            let Some(profile) = aura_eap::profile::Profile::decode(secret) else {
+                return fail("not-enterprise");
+            };
+            let run = match eap::Run::start(&self.eap_helper, &profile.encode()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("aura-keys: starting {}: {e}", self.eap_helper);
+                    return fail("eap-helper");
+                }
+            };
+            eprintln!("aura-keys: EAP ({}) with {}", profile.method.name(), aura_ipc::fmt_mac(&bssid));
+            let params = Params { akm, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
+            self.td = 0;
+            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: Some(run), params: Some(params), early_keys: Vec::new() });
+            for (src, body) in std::mem::take(&mut self.pending) {
+                if let Some(r) = self.eapol(src, &body) {
+                    out.push(r);
+                }
+            }
+            return out;
+        }
+        if aura_eap::profile::Profile::is_profile(secret) {
+            return fail("enterprise-credential");
         }
         let pmk = if akm == Akm::Sae {
             // The PMK from the SAE exchange with this very BSS.
@@ -258,7 +400,7 @@ impl Keys {
         }
         self.td = 0;
         let cfg = Config { akm, pmk, aa: bssid, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
-        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme, told_m2: false, ptk: false });
+        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new() });
         for (src, body) in std::mem::take(&mut self.pending) {
             if let Some(r) = self.eapol(src, &body) {
                 out.push(r);
@@ -398,6 +540,19 @@ impl Keys {
                     Err(e) => err(&store_err(&e)),
                 }
             }
+            "remember-eap" => self.remember_eap(l, ssid),
+            "eap-seen" => match &self.seen {
+                Some(seen) if seen.ssid == ssid => {
+                    use sha2::Digest;
+                    let top = seen.chain.last().expect("a chain");
+                    Line::new("seen")
+                        .with("names", if seen.names.is_empty() { "-".to_string() } else { seen.names.join(",") })
+                        .with("certs", seen.chain.len())
+                        .with_hex("top_sha256", &sha2::Sha256::digest(top))
+                }
+                _ => err("nothing-seen"),
+            },
+            "eap-trust" => self.eap_trust(l, ssid),
             "forget" => match {
                 self.trial = self.trial.take().filter(|(s, _)| *s != ssid);
                 self.store.forget(&creds::account(&ssid))
@@ -423,6 +578,75 @@ impl Keys {
                 Err(e) => err(&store_err(&e)),
             },
             _ => err("unknown-command"),
+        }
+    }
+}
+
+impl Keys {
+    /// `remember-eap`: an 802.1X network's profile, kept in Arca like a
+    /// passphrase (the profile carries the password).
+    fn remember_eap(&mut self, l: &Line, ssid: Vec<u8>) -> Line {
+        use aura_eap::profile::{Method, Profile};
+        let err = |why: &str| Line::new("error").with("why", why);
+        let text = |k: &str| l.hex(k).and_then(|v| String::from_utf8(v).ok());
+        let Some(method) = l.get("method").and_then(Method::from_name) else { return err("bad-method") };
+        let Some(identity) = text("identity").filter(|i| !i.is_empty() && i.len() <= 253) else { return err("bad-identity") };
+        let password = match (l.hex("secret"), l.hex("handle")) {
+            (Some(s), None) => zeroize::Zeroizing::new(s),
+            (None, Some(h)) => {
+                let Ok(h) = <[u8; 16]>::try_from(h.as_slice()) else { return err("bad-handle") };
+                match self.store.take_typed(&h) {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return err("handle-refused"),
+                    Err(e) => return err(&store_err(&e)),
+                }
+            }
+            (None, None) if method == Method::Tls => zeroize::Zeroizing::new(Vec::new()),
+            _ => return err("bad-secret"),
+        };
+        let Ok(password) = String::from_utf8(password.to_vec()).map(zeroize::Zeroizing::new) else { return err("bad-secret") };
+        let domain = text("domain").unwrap_or_default();
+        let ca: Vec<Vec<u8>> = l.hex("ca").into_iter().collect();
+        if !ca.is_empty() && domain.is_empty() {
+            // A CA without a name trusts every server that CA ever signed.
+            return err("ca-needs-domain");
+        }
+        let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, pin: None, password };
+        match self.store.remember(&creds::account(&ssid), &p.encode()) {
+            Ok(()) => Line::new("ok"),
+            Err(e) => err(&store_err(&e)),
+        }
+    }
+
+    /// `eap-trust`: pin the certificate the last first join stopped at
+    /// ("Trust this server"), with its name, for that network only.
+    fn eap_trust(&mut self, _l: &Line, ssid: Vec<u8>) -> Line {
+        let err = |why: &str| Line::new("error").with("why", why);
+        let Some(seen) = self.seen.take_if(|s| s.ssid == ssid) else { return err("nothing-seen") };
+        let acc = creds::account(&ssid);
+        let mut p = match self.store.release(&acc) {
+            Ok(Some(v)) => match aura_eap::profile::Profile::decode(&v) {
+                Some(p) => p,
+                None => return err("not-enterprise"),
+            },
+            Ok(None) => return err("no-credential"),
+            Err(e) => return err(&store_err(&e)),
+        };
+        if p.pin.is_some() || !p.ca.is_empty() {
+            // A changed server is never trusted by a press: forget the
+            // network and set it up again.
+            return err("already-trusted");
+        }
+        if p.domain.is_empty() {
+            let Some(d) = seen.names.first() else { return err("no-name") };
+            p.domain = d.clone();
+        } else if !seen.names.iter().any(|n| n.eq_ignore_ascii_case(&p.domain) || n.to_ascii_lowercase().ends_with(&format!(".{}", p.domain.to_ascii_lowercase()))) {
+            return err("name-mismatch");
+        }
+        p.pin = seen.chain.last().cloned();
+        match self.store.remember(&acc, &p.encode()) {
+            Ok(()) => Line::new("ok").with("domain", &p.domain),
+            Err(e) => err(&store_err(&e)),
         }
     }
 }
@@ -471,7 +695,7 @@ fn main() {
             Box::new(creds::Memory::default())
         }
     };
-    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, trial: None, prepared_trial: false, join: None, pending: Vec::new() };
+    let mut k = Keys { sae: None, sae_pmk: None, td: 0, f, seq: 0, verbose: o.verbose, store, prepared: None, trial: None, prepared_trial: false, join: None, pending: Vec::new(), eap_helper: o.eap_helper.clone(), seen: None };
     let listener = sock::listen(&o.sock, 0o666).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut buf = vec![0u8; HEADER_LEN + MAX_BODY];
@@ -482,8 +706,18 @@ fn main() {
         let mut fds = vec![k.f.as_raw_fd(), listener.as_raw_fd()];
         let live: Vec<usize> = (0..conns.len()).filter(|&i| conns[i].is_some()).collect();
         fds.extend(live.iter().map(|&i| conns[i].as_ref().map(|c| c.fd()).unwrap_or(-1)));
+        let helper_fd = k.join.as_ref().and_then(|j| j.eap.as_ref()).map(|r| r.fd());
+        fds.push(helper_fd.unwrap_or(-1));
         let ready = sock::poll_read(&fds, 500);
         let mut to_mlme: Vec<(usize, Line)> = Vec::new();
+        if helper_fd.is_some() && *ready.last().unwrap() {
+            let mlme = k.join.as_ref().map(|j| j.mlme);
+            for r in k.eap_events() {
+                if let Some(m) = mlme {
+                    to_mlme.push((m, r));
+                }
+            }
+        }
 
         if ready[0] {
             loop {
@@ -575,7 +809,7 @@ fn main() {
                         k.join = None;
                         k.pending.clear();
                     }
-                    "remember" | "forget" | "prepare" if uid == o.ctl_uid => {
+                    "remember" | "forget" | "prepare" | "remember-eap" | "eap-seen" | "eap-trust" if uid == o.ctl_uid => {
                         let r = k.ctl(&l);
                         to_mlme.push((i, r));
                     }

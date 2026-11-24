@@ -9,6 +9,8 @@ license.workspace = true
 aura-proto = { path = "../aura-proto" }
 aura-rsn = { path = "../aura-rsn" }
 aura-ipc = { path = "../aura-ipc" }
+aura-eap = { path = "../aura-eap", default-features = false }
+sha2 = "0.10"
 libc = "0.2"
 getrandom = "0.2"
 zeroize = "1"

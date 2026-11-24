@@ -214,6 +214,60 @@ fn join(port: u16, cfg: Config) -> Out {
     panic!("no end after 60 round trips");
 }
 
+/// The same join through the helper binary aura-keys runs, over its pipe.
+fn join_helper(port: u16, profile: &aura_eap::profile::Profile) -> Result<Zeroizing<[u8; 64]>, String> {
+    use aura_eap::helper::{self, Reader};
+    use std::io::{Read, Write};
+    use std::os::fd::OwnedFd;
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atrium-aura-eap")).stdin(Stdio::from(OwnedFd::from(theirs))).spawn().unwrap();
+    helper::write(&mut ours, helper::CONFIG, &profile.encode()).unwrap();
+    ours.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut radius = Radius::new(port);
+    let mut rd = Reader::default();
+    let mut eap = vec![1, 0, 0, 5, 1];
+    let mut server_msk = None;
+    let r = 'outer: loop {
+        helper::write(&mut ours, helper::PACKET, &eap).unwrap();
+        loop {
+            if let Some((tag, d)) = rd.next().unwrap() {
+                match tag {
+                    helper::SEND => match radius.exchange(&d) {
+                        Answer::Challenge(e) | Answer::Reject(e) => {
+                            eap = e;
+                            continue 'outer;
+                        }
+                        Answer::Accept(e, m) => {
+                            server_msk = Some(m);
+                            eap = e;
+                            continue 'outer;
+                        }
+                    },
+                    helper::DONE => {
+                        let mut m = Zeroizing::new([0u8; 64]);
+                        m.copy_from_slice(&d);
+                        assert_eq!(Some(&m[..]), server_msk.as_ref().map(|s| &s[..]), "the helper's MSK is the server's");
+                        break 'outer Ok(m);
+                    }
+                    helper::FAILED => break 'outer Err(String::from_utf8_lossy(&d).into_owned()),
+                    helper::TRUST => break 'outer Err("trust".into()),
+                    _ => {}
+                }
+            }
+            let mut b = [0u8; 4096];
+            let n = ours.read(&mut b).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break 'outer Err("helper exited".into());
+            }
+            rd.push(&b[..n]);
+        }
+    };
+    let _ = ours.flush();
+    drop(ours);
+    let _ = child.wait();
+    r
+}
+
 fn der(dir: &Path, name: &str) -> CertificateDer<'static> {
     CertificateDer::from(std::fs::read(dir.join(format!("{name}.der"))).unwrap())
 }
@@ -269,6 +323,20 @@ fn against_hostapd() {
     c.client = Some(Arc::new(rustls::sign::CertifiedKey::new(vec![der(&dir, "client")], key)));
     let o = join(base, c);
     assert!(done(&o), "EAP-TLS: {o:?}");
+
+    // The same through the helper binary and its pipe, as aura-keys runs it.
+    let profile = |pw: &str, ca: bool| aura_eap::profile::Profile {
+        method: Method::Peap,
+        identity: "alice".into(),
+        anonymous: Some(anon.into()),
+        domain: if ca { DOMAIN.into() } else { String::new() },
+        ca: if ca { vec![der(&dir, "corp").to_vec()] } else { vec![] },
+        pin: None,
+        password: Zeroizing::new(pw.into()),
+    };
+    assert!(join_helper(base, &profile("s3cret", true)).is_ok(), "the helper joins");
+    assert_eq!(join_helper(base, &profile("wrong", true)), Err("rejected".into()));
+    assert_eq!(join_helper(base, &profile("s3cret", false)), Err("trust".into()));
 
     // Wrong passwords.
     assert_eq!(join(base, cfg(Method::Peap, anon, "alice", "wrong", corp())), Out::Failed(Why::Rejected));

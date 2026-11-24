@@ -92,14 +92,25 @@ pub enum Akm {
     PskSha256,
     /// 00-0f-ac:8, SAE (WPA3-Personal), the SHA-256 KDF.
     Sae,
+    /// 00-0f-ac:1, 802.1X (WPA2-Enterprise): the PMK is the EAP MSK's
+    /// first 32 bytes, then as `Psk`.
+    Eap,
+    /// 00-0f-ac:5, 802.1X with the SHA-256 KDF (WPA3-Enterprise), as `PskSha256`.
+    EapSha256,
 }
 
 impl Akm {
+    /// 802.1X: the PMK comes from EAP.
+    pub fn is_eap(self) -> bool {
+        matches!(self, Akm::Eap | Akm::EapSha256)
+    }
     pub fn suite(self) -> u32 {
         match self {
             Akm::Psk => 0x000f_ac02,
             Akm::PskSha256 => 0x000f_ac06,
             Akm::Sae => 0x000f_ac08,
+            Akm::Eap => 0x000f_ac01,
+            Akm::EapSha256 => 0x000f_ac05,
         }
     }
     pub fn from_suite(s: u32) -> Option<Akm> {
@@ -107,6 +118,8 @@ impl Akm {
             0x000f_ac02 => Some(Akm::Psk),
             0x000f_ac06 => Some(Akm::PskSha256),
             0x000f_ac08 => Some(Akm::Sae),
+            0x000f_ac01 => Some(Akm::Eap),
+            0x000f_ac05 => Some(Akm::EapSha256),
             _ => None,
         }
     }
@@ -114,8 +127,8 @@ impl Akm {
     /// by the AKM", which for SAE is AES-128-CMAC and AES key wrap.
     pub fn key_version(self) -> u16 {
         match self {
-            Akm::Psk => 2,
-            Akm::PskSha256 => 3,
+            Akm::Psk | Akm::Eap => 2,
+            Akm::PskSha256 | Akm::EapSha256 => 3,
             Akm::Sae => 0,
         }
     }
@@ -154,8 +167,8 @@ pub fn ptk(akm: Akm, pmk: &Pmk, aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], 
     data[44..76].copy_from_slice(n2);
     let mut out = [0u8; 48];
     match akm {
-        Akm::Psk => prf_sha1(&pmk.0, b"Pairwise key expansion", &data, &mut out),
-        Akm::PskSha256 | Akm::Sae => kdf_sha256(&pmk.0, b"Pairwise key expansion", &data, &mut out),
+        Akm::Psk | Akm::Eap => prf_sha1(&pmk.0, b"Pairwise key expansion", &data, &mut out),
+        Akm::PskSha256 | Akm::EapSha256 | Akm::Sae => kdf_sha256(&pmk.0, b"Pairwise key expansion", &data, &mut out),
     }
     let mut p = Ptk { kck: [0; 16], kek: [0; 16], tk: [0; 16] };
     p.kck.copy_from_slice(&out[..16]);

@@ -27,6 +27,10 @@
 #                                     services (atrium-net-service.sh)
 #   sh scripts/aura-sim-gate.sh wifi6 IPv6 over Wi-Fi: RAs from the AP
 #                                     (aura/sim-ap/ra6.py), SLAAC, RDNSS
+#   sh scripts/aura-sim-gate.sh w7    WPA2/WPA3-Enterprise (802.1X) against
+#                                     hostapd's EAP server: PEAP, TTLS,
+#                                     wrong password, first-join trust, an
+#                                     evil twin refused (wifi.md §7.4)
 #
 # AURA_JAIL=0 runs the daemons unjailed; AURA_ARCA=0 uses aura-keys'
 # memory store. The FreeBSD VM must have been started with
@@ -76,11 +80,14 @@ start_net() {
 setup() {
     TARGET=arm64 KERNCONF="$KERNCONF" sh "$ROOT/scripts/aura-kmod.sh" >&2
     X="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
-    (cd "$ROOT/aura" && RUSTFLAGS="$X" cargo build --release -p aura-air -p aura-mlme -p aura-keys -p aura-ctl --target "$T" >&2)
+    # ring (rustls, in the EAP helper) compiles C: clang for the target.
+    export CC_aarch64_unknown_freebsd="${CC_aarch64_unknown_freebsd:-clang}" AR_aarch64_unknown_freebsd="${AR_aarch64_unknown_freebsd:-$(command -v llvm-ar || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+    export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$S"
+    (cd "$ROOT/aura" && RUSTFLAGS="$X" cargo build --release -p aura-air -p aura-mlme -p aura-keys -p aura-ctl -p aura-eap --target "$T" >&2)
     R="$ROOT/aura/target/$T/release"
     B=$(mktemp -d)/aura
     mkdir -p "$B"
-    cp "$ROOT/aura/kmod/out/arm64-$KERNCONF/"*.ko "$R/aura-air" "$R/aura-mlme" "$R/aura-keys" "$R/aura-ctl" "$B/"
+    cp "$ROOT/aura/kmod/out/arm64-$KERNCONF/"*.ko "$R/aura-air" "$R/aura-mlme" "$R/aura-keys" "$R/aura-ctl" "$R/atrium-aura-eap" "$B/"
     if [ "$ARCA" = 1 ]; then
         (cd "$ROOT/arca/arcad" && RUSTFLAGS="$X" cargo build --release --bin arcad --target "$T" >&2)
         cp "$ROOT/arca/arcad/target/$T/release/arcad" "$B/"
@@ -145,6 +152,7 @@ setup() {
         "$V" "set -e
             install -m 755 /tmp/aura/aura-mlme /usr/local/bin/atrium-aura-mlme
             install -m 755 /tmp/aura/aura-keys /usr/local/bin/atrium-aura-keys
+            install -m 755 /tmp/aura/atrium-aura-eap /usr/local/bin/atrium-aura-eap
             sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets' >/dev/null
             for id in 28 29; do [ -n \"\$(devfs rule -s \$id show)\" ] || { echo ruleset \$id not loaded; exit 1; }; done
             for j in aura-mlme aura-keys; do
@@ -166,7 +174,7 @@ setup() {
             cd /tmp/aura
             chown _aura /dev/aura/ctl0
             chown _aura-keys /dev/aura/key0
-            daemon -f -u _aura-keys -o /tmp/aura/keys.log ./aura-keys -v $STORE --mlme-uid 65033 --ctl-uid 0
+            daemon -f -u _aura-keys -o /tmp/aura/keys.log ./aura-keys -v $STORE --mlme-uid 65033 --ctl-uid 0 --eap-helper /tmp/aura/atrium-aura-eap
             sleep 1
             daemon -f -u _aura -o /tmp/aura/mlme.log ./aura-mlme -v --capsicum
             sleep 2
@@ -884,6 +892,108 @@ nat() {
     cable on
 }
 
+# WPA2/WPA3-Enterprise (wifi.md §7.4): hostapd's own EAP server in the AP
+# VM; aura-keys runs EAP through atrium-aura-eap. aura-ctl drives the joins
+# (atrium-net learns 802.1X profiles with the Settings sheet, E4).
+w7_certs() {
+    C=$(mktemp -d)
+    o() { openssl "$@" >/dev/null 2>&1 || fail "openssl $1"; }
+    for ca in corp evil; do
+        o req -x509 -newkey rsa:2048 -nodes -keyout "$C/$ca-ca.key" -out "$C/$ca-ca.pem" -days 30 -subj "/CN=$ca Test CA" \
+            -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+        o x509 -in "$C/$ca-ca.pem" -outform DER -out "$C/$ca-ca.der"
+    done
+    printf 'subjectAltName=DNS:radius.corp.example\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' > "$C/ext"
+    for leaf in server:corp twin:evil; do
+        n=${leaf%%:*} ca=${leaf#*:}
+        o req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$C/eap-$n.key" -out "$C/$n.csr" -subj /CN=radius.corp.example
+        o x509 -req -in "$C/$n.csr" -CA "$C/$ca-ca.pem" -CAkey "$C/$ca-ca.key" -CAcreateserial -days 30 -out "$C/eap-$n.pem" -extfile "$C/ext"
+    done
+    cp "$C/corp-ca.pem" "$C/eap-ca.pem"; cp "$C/evil-ca.pem" "$C/eap-evil-ca.pem"
+    printf '%s\n' '* PEAP,TTLS' '"alice@corp.example" MSCHAPV2,TTLS-MSCHAPV2 "s3cret" [2]' '"bob@corp.example" TTLS-PAP "pap-pass" [2]' > "$C/eap-users"
+    scp -q -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P "${AURA_AP_SSH:-2223}" \
+        "$C/eap-ca.pem" "$C/eap-evil-ca.pem" "$C/eap-server.pem" "$C/eap-server.key" "$C/eap-twin.pem" "$C/eap-twin.key" "$C/eap-users" ubuntu@localhost:/tmp/ \
+        || fail "certificates to the AP VM"
+    W7C=$C
+}
+
+w7() {
+    AC="/tmp/aura/aura-ctl"
+    # aura-ctl drives Wi-Fi here; atrium-net would answer the same events.
+    "$V" 'pkill -x atrium-net 2>/dev/null; true'
+    # ej NAME SSID ARGS: an 802.1X join; prints its lines into $out.
+    ej() { out=$("$V" "$AC join $2 --eap --wait 240 $3" 2>&1) || true; echo "$out" | sed 's/^/    /'; }
+    leave() { "$V" "$AC leave" >/dev/null 2>&1 || true; sleep 2; }
+    aplog() { sh "$AP" ssh "cat /tmp/hostapd.log" 2>/dev/null | tr -d '\000'; }
+    mark() { sh "$AP" ssh ": > /tmp/hostapd.log" >/dev/null 2>&1 || true; }
+
+    out=$("$V" "$AC scan" 2>&1) || fail "scan: $out"
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -q 'ssid="aura-corp".*security=eap-sha256' && ok "scan: aura-corp is WPA3-Enterprise (802.1X SHA-256, PMF)" || fail "aura-corp in the scan"
+    echo "$out" | grep -q 'ssid="aura-corp2".*security=eap$' && ok "scan: aura-corp2 is WPA2-Enterprise (802.1X)" || fail "aura-corp2 in the scan"
+
+    r=$("$V" "echo s3cret | $AC remember-eap aura-corp --method peap --identity alice@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap: $r"
+    ej peap aura-corp "--dhcp wlan0"
+    echo "$out" | grep -q 'state=authorized' && ok "PEAP-MSCHAPv2 on WPA3-Enterprise: authorized" || fail "PEAP join"
+    echo "$out" | grep -q 'address .*10\.77\.0\.' && ok "an address from the network (DHCP over the 802.1X port)" || fail "no address after PEAP"
+    k=$("$V" "cat $KLOG")
+    echo "$k" | grep -q 'EAP (peap) with' && echo "$k" | grep -q 'EAP succeeded' && ok "aura-keys ran EAP in its helper, then the 4-way handshake" || fail "keys log: no EAP"
+    echo "$k" | grep -q 'atrium-aura-eap: in capability mode' && ok "the EAP helper ran in capability mode" || fail "helper not in capability mode"
+    "$V" "ping -c 2 -t 20 10.77.0.1" >/dev/null 2>&1 && ok "pings the AP's network over the 802.1X link" || fail "ping"
+    aplog | grep -qa 'EAP-PEAP: Valid cryptobinding' && ok "hostapd checked PEAP's crypto-binding" || echo "note  no crypto-binding line in hostapd's log"
+    leave
+
+    r=$("$V" "echo pap-pass | $AC remember-eap aura-corp2 --method ttls-pap --identity bob@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap 2: $r"
+    ej ttls aura-corp2 ""
+    echo "$out" | grep -q 'state=authorized' && ok "TTLS-PAP on WPA2-Enterprise (AKM 1, no PMF): authorized" || fail "TTLS-PAP join"
+    leave
+
+    r=$("$V" "echo wrong | $AC remember-eap aura-corp --method peap --identity alice@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap 3: $r"
+    ej wrong aura-corp ""
+    echo "$out" | grep -q 'why=eap-rejected' && ok "a wrong password: refused as such (eap-rejected)" || fail "wrong password not reported"
+    # 802.1X: after a failure the authenticator holds this station for its
+    # quiet period (hostapd: 60 s) and ignores it.
+    sleep 65
+
+    # First join with nothing set: stops at the certificate, nothing sent.
+    r=$("$V" "echo s3cret | $AC remember-eap aura-corp --method ttls-mschapv2 --identity alice@corp.example" 2>&1) || fail "remember-eap 4: $r"
+    mark
+    ej first aura-corp ""
+    echo "$out" | grep -q 'why=eap-trust' && ok "first join with no CA stops at the server's certificate" || fail "unset trust did not stop"
+    aplog | grep -qaE 'Phase ?2|MSCHAPV2|alice' && fail "phase 2 reached the server before trust" || ok "nothing past the TLS handshake reached the server"
+    r=$("$V" "$AC eap-seen aura-corp" 2>&1) || true; echo "    $r"
+    echo "$r" | grep -q 'names=radius.corp.example' && ok "the certificate it saw: radius.corp.example" || fail "eap-seen: $r"
+    r=$("$V" "$AC eap-trust aura-corp" 2>&1) || true; echo "    $r"
+    echo "$r" | grep -q '^ok.*domain=radius.corp.example' && ok "Trust this server: pinned with its name" || fail "eap-trust: $r"
+    mark
+    ej pinned aura-corp ""
+    echo "$out" | grep -q 'state=authorized' && ok "TTLS-MSCHAPv2 to the pinned server: authorized" || fail "pinned join"
+    aplog | grep -qaE 'Phase ?2|MSCHAPV2' && ok "positive control: hostapd's log shows phase 2 when it happens" || fail "hostapd's log never shows phase 2: the no-credential checks prove nothing"
+    leave
+    r=$("$V" "$AC eap-trust aura-corp" 2>&1) || true
+    echo "$r" | grep -q 'nothing-seen\|already-trusted' && ok "no second trust without a new first join" || fail "eap-trust again: $r"
+
+    # The evil twin: same name, its own CA, heard louder.
+    HOSTAPD_ARGS=-dd sh "$AP" ap hostapd-eap.conf hostapd-eap-twin.conf >&2
+    sh "$AP" signal 2412 -30 2437 -85
+    sleep 5
+    mark
+    ej twin aura-corp ""
+    echo "$out" | grep -q 'freq=2412' || fail "the twin (2412 MHz) was not the one tried"
+    echo "$out" | grep -q 'why=eap-untrusted' && ok "the evil twin is refused (pinned server)" || fail "twin with a pin: not refused"
+    aplog | grep -qaE 'MSCHAPV2|alice' && fail "credentials reached the twin" || ok "no credential reached the twin"
+    r=$("$V" "echo s3cret | $AC remember-eap aura-corp --method peap --identity alice@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap 5: $r"
+    ej twin-ca aura-corp ""
+    echo "$out" | grep -q 'why=eap-untrusted' && ok "the evil twin is refused (CA and domain)" || fail "twin with a CA: not refused"
+    sh "$AP" signal 2412 -85 2437 -30
+    sleep 5
+    ej back aura-corp ""
+    echo "$out" | grep -q 'state=authorized' && ok "the real server again: authorized" || fail "real server after the twin"
+    leave
+    n=$("$V" 'pgrep -f atrium-aura-eap | wc -l | tr -d " "')
+    [ "$n" = 0 ] && ok "no EAP helper left running" || fail "$n EAP helpers left"
+}
+
 teardown() {
     "$V" 'sysctl net.aura.wlan0; service atrium-portcullisd-bootstrap onestop >/dev/null 2>&1; pkill -x atrium-net atrium-aura-mlme atrium-aura-keys aura-mlme aura-keys aura-air arcad dhclient; sleep 3; kldunload aura_sim && kldunload aura_wlan && echo "modules unloaded cleanly"'
 }
@@ -980,6 +1090,19 @@ wifi6)
     trap - EXIT
     teardown
     echo "IPv6 over Wi-Fi: $pass checks passed" ;;
+w7)
+    "$V" true >/dev/null 2>&1 || { echo "FreeBSD VM down: run the vms step"; exit 1; }
+    pass=0
+    ok() { echo "ok   $1"; pass=$((pass + 1)); }
+    fail() { echo "FAIL $1"; exit 1; }
+    w7_certs
+    export HOSTAPD_ARGS=-dd
+    setup hostapd-eap.conf hostapd-eap-wpa2.conf
+    "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
+    rm -rf "$W7C"
+    w7
+    teardown
+    echo "W7 gate: $pass checks passed" ;;
 n3)
     setup hostapd-wpa2.conf
     n3

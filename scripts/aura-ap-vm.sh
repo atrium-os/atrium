@@ -10,6 +10,7 @@
 #                                       (CONF: files in aura/sim-ap, default
 #                                       hostapd-wpa2.conf; one radio and BSS
 #                                       each, all bridged on br0 = 10.77.0.1)
+#                                       (HOSTAPD_ARGS=-dd: hostapd's debug log)
 #   sh scripts/aura-ap-vm.sh signal FREQ DBM [FREQ DBM...]
 #                                       what the FreeBSD side hears per channel
 #   sh scripts/aura-ap-vm.sh blackout SECS    # every channel out of range for SECS s (timed in the VM)
@@ -124,7 +125,7 @@ ap() {
     gssh "set -e; [ \$(ls /sys/class/ieee80211 2>/dev/null | wc -l) -ge 2 ] || { rmmod mac80211_hwsim 2>/dev/null || true; depmod -a; modprobe mac80211_hwsim radios=2; sleep 2; }; \
         ip link show br0 >/dev/null 2>&1 || { ip link add br0 type bridge; ip link set br0 up; ip addr add 10.77.0.1/24 dev br0; }; \
         (nohup python3 /tmp/air-hwsim.py 10.0.2.2 $AIR_PORT >/tmp/air.log 2>&1 &) && sleep 1 && \
-        (nohup hostapd$confs >/tmp/hostapd.log 2>&1 &) && sleep 4 && \
+        (nohup hostapd ${HOSTAPD_ARGS:-}$confs >/tmp/hostapd.log 2>&1 &) && sleep 4 && \
         (nohup busybox udhcpd -f /tmp/udhcpd.conf >/tmp/udhcpd.log 2>&1 &) && true"
     t=0
     until [ "$(gssh "grep -c AP-ENABLED /tmp/hostapd.log" || echo 0)" -ge "$i" ]; do

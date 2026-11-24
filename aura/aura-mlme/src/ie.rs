@@ -83,6 +83,8 @@ pub enum Security {
     Psk { akm: Akm, pmf: Pmf },
     /// WPA3-Personal; `psk` is the WPA2 AKM also offered (transition mode).
     Sae { pmf: Pmf, psk: Option<Akm> },
+    /// WPA2/WPA3-Enterprise (802.1X, wifi.md §7.4): `Eap` or `EapSha256`.
+    Eap { akm: Akm, pmf: Pmf },
     /// Refused outright (WEP, TKIP, WPA1, unknown AKMs): wifi.md §3.4.
     Refused(&'static str),
 }
@@ -93,7 +95,9 @@ impl Security {
             Security::Open => "open",
             Security::Psk { akm: Akm::Psk, .. } => "psk",
             Security::Psk { akm: Akm::PskSha256, .. } => "psk-sha256",
-            Security::Psk { akm: Akm::Sae, .. } => "sae",
+            Security::Psk { .. } => "sae",
+            Security::Eap { akm: Akm::EapSha256, .. } => "eap-sha256",
+            Security::Eap { .. } => "eap",
             Security::Sae { psk: None, .. } => "sae",
             Security::Sae { psk: Some(_), .. } => "sae-transition",
             Security::Refused(w) => w,
@@ -171,6 +175,20 @@ pub fn security(cap: u16, rsne_el: Option<&[u8]>, wpa1: bool) -> Security {
     } else {
         None
     };
+    // Enterprise only when it offers no password AKM (a mixed network is
+    // joined the personal way); SHA-256 whenever PMF is on.
+    if psk.is_none() && !has(Akm::Sae.suite()) {
+        let eap = if has(Akm::EapSha256.suite()) && (pmf != Pmf::No || !has(Akm::Eap.suite())) {
+            Some(Akm::EapSha256)
+        } else if has(Akm::Eap.suite()) {
+            Some(Akm::Eap)
+        } else {
+            None
+        };
+        if let Some(akm) = eap {
+            return Security::Eap { akm, pmf };
+        }
+    }
     // SAE needs management frame protection (§12.4); an AP offering SAE
     // without it gets its WPA2 AKM used, or nothing.
     match (has(Akm::Sae.suite()) && pmf != Pmf::No, psk) {

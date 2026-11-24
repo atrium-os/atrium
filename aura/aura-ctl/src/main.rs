@@ -5,7 +5,12 @@
 //!   aura-ctl scan
 //!   aura-ctl remember SSID        (passphrase on stdin; stored in Arca)
 //!   aura-ctl forget SSID
-//!   aura-ctl join SSID [--open | --wpa3] [--mac network|random|device]
+//!   aura-ctl remember-eap SSID --method peap|ttls-pap|ttls-mschapv2|tls
+//!                --identity NAME [--anonymous NAME] [--domain DOMAIN]
+//!                [--ca FILE.der]   (password on stdin; an 802.1X network)
+//!   aura-ctl eap-seen SSID   (the certificate a first join stopped at)
+//!   aura-ctl eap-trust SSID  (pin it: "Trust this server")
+//!   aura-ctl join SSID [--open | --wpa3 | --eap] [--mac network|random|device]
 //!                [--wait SECS] [--dhcp IFACE]
 //!   aura-ctl watch SECS     (print aura-mlme's events)
 //!   aura-ctl country CC     (regulatory domain, ISO 3166 alpha-2; 00 = world)
@@ -117,6 +122,39 @@ fn main() {
             println!("{}", show(&r));
             exit((r.verb != "ok") as i32);
         }
+        "remember-eap" => {
+            let ssid = ssid_arg();
+            let mut l = Line::new("remember-eap").with_hex("ssid", &ssid);
+            let mut a = args[2..].iter();
+            let mut method = String::new();
+            while let Some(x) = a.next() {
+                let v = a.next().unwrap_or_else(|| die(&format!("{x} needs a value")));
+                l = match x.as_str() {
+                    "--method" => {
+                        method = v.clone();
+                        l.with("method", v)
+                    }
+                    "--identity" => l.with_hex("identity", v.as_bytes()),
+                    "--anonymous" => l.with_hex("anonymous", v.as_bytes()),
+                    "--domain" => l.with_hex("domain", v.as_bytes()),
+                    "--ca" => l.with_hex("ca", &std::fs::read(v).unwrap_or_else(|e| die(&format!("{v}: {e}")))),
+                    _ => die("remember-eap SSID --method M --identity NAME [--anonymous NAME] [--domain D] [--ca FILE.der]"),
+                };
+            }
+            if method != "tls" {
+                let mut pass = Zeroizing::new(String::new());
+                std::io::stdin().lock().read_line(&mut pass).ok();
+                l = l.with_hex("secret", pass.trim_end_matches(['\n', '\r']).as_bytes());
+            }
+            let r = Peer::connect(&keys).call(&l);
+            println!("{}", show(&r));
+            exit((r.verb != "ok") as i32);
+        }
+        "eap-seen" | "eap-trust" => {
+            let r = Peer::connect(&keys).call(&Line::new(&args[0]).with_hex("ssid", &ssid_arg()));
+            println!("{}", show(&r));
+            exit((r.verb == "error") as i32);
+        }
         "forget" => {
             let r = Peer::connect(&keys).call(&Line::new("forget").with_hex("ssid", &ssid_arg()));
             println!("{}", show(&r));
@@ -126,6 +164,7 @@ fn main() {
             let ssid = ssid_arg();
             let mut open = false;
             let mut wpa3 = false;
+            let mut eap = false;
             let mut mac = "network".to_string();
             let mut wait = 60u64;
             let mut dhcp: Option<String> = None;
@@ -134,10 +173,11 @@ fn main() {
                 match x.as_str() {
                     "--open" => open = true,
                     "--wpa3" => wpa3 = true,
+                    "--eap" => eap = true,
                     "--mac" => mac = a.next().cloned().unwrap_or_default(),
                     "--wait" => wait = a.next().and_then(|v| v.parse().ok()).unwrap_or(60),
                     "--dhcp" => dhcp = a.next().cloned(),
-                    _ => die("join SSID [--open | --wpa3] [--mac network|random|device] [--wait SECS] [--dhcp IFACE]"),
+                    _ => die("join SSID [--open | --wpa3 | --eap] [--mac network|random|device] [--wait SECS] [--dhcp IFACE]"),
                 }
             }
             if !open {
@@ -147,7 +187,7 @@ fn main() {
                 }
             }
             let mut p = Peer::connect(&mlme);
-            let sec = if open { "open" } else if wpa3 { "sae" } else { "psk" };
+            let sec = if open { "open" } else if wpa3 { "sae" } else if eap { "eap" } else { "psk" };
             p.send(&Line::new("join").with_hex("ssid", &ssid).with("security", sec).with("mac", &mac));
             let start = Instant::now();
             let end = start + Duration::from_secs(wait);

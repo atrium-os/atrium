@@ -58,6 +58,14 @@ fn beacon_parsing_and_security() {
     let t = Rsne::build(rsne::CIPHER_TKIP, rsne::CIPHER_CCMP128, Akm::Psk.suite(), 0, None);
     let t = ie::parse_bss(&beacon(b"x", Some(t), true, 6), 2437, -40).unwrap();
     assert!(matches!(t.security, Security::Refused("tkip")));
+    // Enterprise: 802.1X alone, and with SHA-256 when PMF is on.
+    let e = Rsne::build(rsne::CIPHER_CCMP128, rsne::CIPHER_CCMP128, Akm::Eap.suite(), 0, None);
+    let e = ie::parse_bss(&beacon(b"x", Some(e), true, 6), 2437, -40).unwrap();
+    assert_eq!(e.security, Security::Eap { akm: Akm::Eap, pmf: Pmf::No });
+    assert_eq!(e.security.name(), "eap");
+    let e = Rsne::build(rsne::CIPHER_CCMP128, rsne::CIPHER_CCMP128, Akm::EapSha256.suite(), rsne::CAP_MFPC | rsne::CAP_MFPR, None);
+    let e = ie::parse_bss(&beacon(b"x", Some(e), true, 6), 2437, -40).unwrap();
+    assert_eq!(e.security, Security::Eap { akm: Akm::EapSha256, pmf: Pmf::Required });
     // Mutations never panic.
     let base = beacon(b"aura-test", Some(wpa2_pmf()), true, 6);
     let mut x: u64 = 0x2545F4914F6CDD1D;
