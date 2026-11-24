@@ -513,13 +513,15 @@ impl ServiceManifest {
     /// Translate to the wire-protocol type.
     pub fn to_create_request(&self) -> CreateJailRequest {
         CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name:          self.name.clone(),
             path:          self.path.clone(),
             children_max:  self.children_max,
             devfs_ruleset: self.devfs_ruleset,
             network:       (&self.network).into(),
-            mounts: self.mounts.iter().map(|m| MountSpec {
+            mounts: self.mounts.iter().map(|m| MountSpec { noexec: false,
                 source: m.source.clone(),
                 dest:   m.dest.clone(),
                 kind:   m.kind.into(),
@@ -527,6 +529,7 @@ impl ServiceManifest {
                 owner: None,
             }).collect(),
             exec: self.exec.as_ref().map(|e| ExecSpec {
+                groups: vec![],
                 path: e.path.clone(),
                 argv: e.argv.clone(),
                 uid:  e.uid,

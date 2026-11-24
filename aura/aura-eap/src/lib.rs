@@ -1,5 +1,6 @@
 //! Aura's EAP peer for WPA2/WPA3-Enterprise (docs/spec/wifi.md §7.4).
 
+pub mod cert;
 pub mod csr;
 pub mod eap;
 pub mod helper;

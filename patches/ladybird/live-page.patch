@@ -1,0 +1,46 @@
+--- a/Libraries/LibWeb/Loader/ResourceLoader.cpp
++++ b/Libraries/LibWeb/Loader/ResourceLoader.cpp
+@@ -39,6 +39,9 @@
+ #endif
+ extern "C" size_t navigator_page_get(u8 const*, size_t, u8*, size_t);
+ extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
++#ifdef ATRIUM_I6_PAGE
++extern "C" ssize_t navigator_live_get(u8 const*, size_t, u8*, size_t, u16*, u8*, size_t, size_t*);
++#endif
+ #endif
+ 
+ namespace Web {
+@@ -518,6 +521,33 @@
+     }
+ 
+ #ifdef ATRIUM_I0_EDITOR
++#ifdef ATRIUM_I6_PAGE
++    // A whole page live (navigator-islands.md I6.1): every HTTPS GET is
++    // asked of navigatord, which serves only the page's own site; anything
++    // else fails closed here, unsent.
++    if (url.scheme() == "https"sv && request.method() == "GET"sv && request.body().is_empty()) {
++        auto const& name = url.serialize();
++        auto buffer = ByteBuffer::create_uninitialized(8 * 1024 * 1024);
++        if (!buffer.is_error()) {
++            auto body = buffer.release_value();
++            u16 status = 0;
++            u8 kind[128];
++            size_t kind_length = 0;
++            auto got = navigator_live_get(name.bytes().data(), name.bytes().size(), body.data(), body.size(), &status, kind, sizeof(kind), &kind_length);
++            if (got >= 0 && static_cast<size_t>(got) <= body.size() && kind_length <= sizeof(kind)) {
++                auto headers = HTTP::HeaderList::create();
++                if (kind_length > 0)
++                    headers->append({ "Content-Type"sv, StringView { kind, kind_length } });
++                on_headers_received->function()(nullptr, *headers, status, {}, Requests::CacheState::NotCached);
++                on_data_received->function()(nullptr, Requests::ResponseData::from_bytes(body.bytes().slice(0, static_cast<size_t>(got))));
++                on_complete->function()(true, {}, {}, {});
++                return nullptr;
++            }
++        }
++    }
++    on_complete->function()(false, {}, "Resource unavailable from the live page's site"sv, {});
++    return nullptr;
++#endif
+     // The broker supplies only the resources granted to this fixture.
+     // All other schemes, request methods, and resources fail closed.
+ #ifdef ATRIUM_I4_YOUTUBE

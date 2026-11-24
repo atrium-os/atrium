@@ -93,6 +93,8 @@ pub fn run_init(
         .collect();
 
     let req = Request::CreateJail(CreateJailRequest {
+        class: None,
+        devices: vec![],
         rctl: None,
         name:          init_jail_name.clone(),
         path:          path.to_string(),

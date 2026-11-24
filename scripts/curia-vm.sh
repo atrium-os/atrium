@@ -10,7 +10,7 @@
 #                                               # arca-ui; then Curia, one frame
 #   sh scripts/curia-vm.sh shot                 # start Curia, one frame
 #   sh scripts/curia-vm.sh click X Y [name]     # a click, then a frame
-#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, 0-9, . / , space, Enter as |), then a frame
+#   sh scripts/curia-vm.sh type TEXT [name]     # keys (a-z, 0-9, @ . / , space, Enter as |, Backspace as <), then a frame
 #   sh scripts/curia-vm.sh frame [name]
 #   sh scripts/curia-vm.sh status               # atrium-netctl status + list
 #   sh scripts/curia-vm.sh away                 # after `arca`: each service Settings talks to
@@ -49,6 +49,8 @@ arca)
         set -- $c
         (cd "$ROOT/$1" && RUSTFLAGS="$X" cargo build -q --release --target "$T" $2 $3) || exit 1
     done
+    # A running binary can't be replaced over scp.
+    "$V" "pkill -x limend; pkill -x arca-ui; pkill -x curia; sleep 1; true"
     for b in limen/target/$T/release/limend arca/arca-ui/target/$T/release/arca-ui arca/arcad/target/$T/release/arca-probe; do
         scp $K -P 2222 -q "$ROOT/$b" "root@localhost:$D/"
     done
@@ -172,7 +174,9 @@ type)
             ,) u=54 ;;
             " ") u=44 ;;
             "|") u=40 ;;   # Enter
-            *) echo "type: only a-z, 0-9, . / , space and | (Enter)"; exit 2 ;;
+            @) out="${out}KEY 31 1 2\nKEY 31 0 2\n"; continue ;;   # Shift-2 (modifier byte 2: left Shift)
+            "<") u=42 ;;   # Backspace
+            *) echo "type: only a-z, 0-9, @ . / , space, | (Enter) and < (Backspace)"; exit 2 ;;
         esac
         out="${out}KEY $u 1\nKEY $u 0\n"
     done

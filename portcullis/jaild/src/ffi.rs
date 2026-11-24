@@ -24,7 +24,7 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 
 /// Flags for `jail_set(2)`. Mirrors `<sys/jail.h>` values.
@@ -133,12 +133,35 @@ pub struct JailCreateSpec<'a> {
     /// (/dev/tesserakeys, tessera-encryption.md §4.3). Validator-gated to
     /// `policy.tessera_keys.allow_jails`: arcad's jail alone.
     pub allow_tessera_keys: bool,
+    /// A jail with a class (app, develop, terminal) gets its `allow.*` set
+    /// explicitly rather than from the kernel's defaults, which allow
+    /// `set_hostname` and `unprivileged_proc_debug`: no mount, raw sockets,
+    /// chflags or hostname changes, `enforce_statfs = 2`, and
+    /// `unprivileged_proc_debug` exactly as `allow_proc_debug` says.
+    pub classed: bool,
+    /// `allow.unprivileged_proc_debug`: a workspace, or an app started under
+    /// the debugger, may debug its own processes.
+    pub allow_proc_debug: bool,
     /// The kernel system call filter (`sysfil.*`, jail-sysfil.md). Only
     /// settable at creation; `None` = no filter.
     pub sysfil:         Option<&'a jaild_policy::SysfilParams>,
 }
 
 impl IovBuilder {
+    /// The explicit `allow.*` set of a classed jail (see `JailCreateSpec::classed`).
+    /// An unclassed jail with `allow_proc_debug` gets only that flag.
+    fn add_allow_class(&mut self, spec: &JailCreateSpec) {
+        if spec.classed {
+            for p in ["allow.mount", "allow.raw_sockets", "allow.chflags", "allow.set_hostname"] {
+                self.add_i32(p, 0);
+            }
+            self.add_i32("enforce_statfs", 2);
+            self.add_i32("allow.unprivileged_proc_debug", i32::from(spec.allow_proc_debug));
+        } else if spec.allow_proc_debug {
+            self.add_i32("allow.unprivileged_proc_debug", 1);
+        }
+    }
+
     /// The host.* parameters. ★ `host.hostid` is an `unsigned long` in the
     /// kernel (kern_jail.c copies `sizeof(unsigned long)`), so it is passed as
     /// 8 native bytes — a 4-byte value would be rejected or misread.
@@ -198,6 +221,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
         // jail (arcad's) is made without it rather than not at all.
         iob.add_i32("allow.tessera_keys", 1);
     }
+    iob.add_allow_class(spec);
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -401,6 +425,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
         // jail (arcad's) is made without it rather than not at all.
         iob.add_i32("allow.tessera_keys", 1);
     }
+    iob.add_allow_class(spec);
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)
@@ -671,7 +696,7 @@ impl IovBuilder {
 /// is the destination (typically inside the jail's path).
 /// `read_only` selects MNT_RDONLY.
 #[cfg(target_os = "freebsd")]
-pub fn nullfs_mount(source: &str, target: &str, read_only: bool) -> io::Result<()> {
+pub fn nullfs_mount(source: &str, target: &str, read_only: bool, extra: MountFlags) -> io::Result<()> {
     let c_fstype = c_string("nullfs")?;
     let c_fspath = c_string(target)?;
     let c_target = c_string(source)?;
@@ -702,7 +727,9 @@ pub fn nullfs_mount(source: &str, target: &str, read_only: bool) -> io::Result<(
         iov[5].iov_base = c_target.as_ptr() as *mut _;
         iov[5].iov_len  = c_target.as_bytes_with_nul().len();
 
-        let flags = if read_only { libc::MNT_RDONLY } else { 0 };
+        let mut flags = if read_only { libc::MNT_RDONLY } else { 0 };
+        if extra.nosuid { flags |= libc::MNT_NOSUID; }
+        if extra.noexec { flags |= libc::MNT_NOEXEC; }
         let rc = libc::nmount(iov.as_mut_ptr(), iov.len() as u32, flags as i32);
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -835,6 +862,19 @@ pub fn devfs_grant(mount: &str, node: &str, uid: u32) -> io::Result<()> {
             return Err(io::Error::new(io::ErrorKind::Other,
                 format!("devfs {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())));
         }
+    }
+    Ok(())
+}
+
+/// Show a device class's nodes in one devfs mount (`devfs -m MOUNT rule
+/// apply path PATTERN unhide`), no shell. The pattern is one of
+/// [`crate::protocol::DeviceClass::pattern`]'s fixed strings.
+pub fn devfs_unhide(mount: &str, class: crate::protocol::DeviceClass) -> io::Result<()> {
+    let args = ["-m", mount, "rule", "apply", "path", class.pattern(), "unhide"];
+    let out = std::process::Command::new("devfs").args(args).output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("devfs {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())));
     }
     Ok(())
 }
@@ -1210,7 +1250,7 @@ pub fn sysctl_set_string(_name: &str, _value: &str) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
+pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool, _extra: MountFlags) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 #[cfg(not(target_os = "freebsd"))]
@@ -1225,6 +1265,13 @@ pub fn devfs_mount(_t: &str, _r: u32) -> io::Result<()> {
 /// Drop privileges to (gid, uid) in the calling process.
 /// Order matters: setgid before setuid.
 pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
+    drop_privileges_groups(uid, gid, &[])
+}
+
+/// [`drop_privileges`] with supplementary groups past `gid` (the validator
+/// has bounded and checked them). The list becomes exactly `{gid} ∪ extra`,
+/// and the drop verifies that set.
+pub fn drop_privileges_groups(uid: u32, gid: u32, extra: &[u32]) -> io::Result<()> {
     // ★★★ `setgroups` FIRST — IT WAS MISSING, AND THIS IS THE TCB.
     //
     // jaild runs as root, whose supplementary groups are wheel(0) and
@@ -1236,14 +1283,15 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
     // uid/gid fields looked dropped and the credential was not.
     //
     // Order is load-bearing: setgroups needs privilege, so it must precede
-    // setuid, and setgid must too. The list is exactly {gid} — correct under
+    // setuid, and setgid must too. The list is exactly {gid} ∪ extra, gid first — correct under
     // both the historical semantics (groups[0] is the egid) and FreeBSD 15+'s
     // (setgroups no longer touches the egid).
     //
     // SAFETY: leaf syscalls; the groups array outlives the call.
+    let mut groups: Vec<libc::gid_t> = vec![gid as libc::gid_t];
+    groups.extend(extra.iter().filter(|&&g| g != gid).map(|&g| g as libc::gid_t));
     unsafe {
-        let groups = [gid as libc::gid_t];
-        if libc::setgroups(1, groups.as_ptr()) != 0 {
+        if libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) != 0 {
             return Err(io::Error::last_os_error());
         }
         if libc::setgid(gid) != 0 {
@@ -1253,7 +1301,7 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    verify_dropped(uid, gid)
+    verify_dropped_groups(uid, gid, extra)
 }
 
 /// ★★ A PRIVILEGE DROP THAT DOES NOT CHECK ITSELF IS A PRIVILEGE DROP THAT
@@ -1268,6 +1316,12 @@ pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
 /// differently, fails loudly at the first launch instead of silently at the
 /// first compromise.
 pub fn verify_dropped(uid: u32, gid: u32) -> io::Result<()> {
+    verify_dropped_groups(uid, gid, &[])
+}
+
+/// [`verify_dropped`] for a drop that kept `extra` supplementary groups: the
+/// list must be exactly `{gid} ∪ extra`, nothing missing and nothing more.
+pub fn verify_dropped_groups(uid: u32, gid: u32, extra: &[u32]) -> io::Result<()> {
     let bad = |why: String| Err(io::Error::new(io::ErrorKind::PermissionDenied,
         format!("privilege drop incomplete: {why}")));
     // SAFETY: getters with no side effects; the buffer is sized by the kernel's
@@ -1283,10 +1337,15 @@ pub fn verify_dropped(uid: u32, gid: u32) -> io::Result<()> {
         let mut buf = vec![0 as libc::gid_t; n as usize];
         let n = libc::getgroups(n, buf.as_mut_ptr());
         if n < 0 { return Err(io::Error::last_os_error()) }
-        let extra: Vec<u32> = buf[..n as usize].iter().map(|&g| g as u32)
+        let mut have: Vec<u32> = buf[..n as usize].iter().map(|&g| g as u32)
             .filter(|&g| g != gid).collect();
-        if !extra.is_empty() {
-            return bad(format!("supplementary groups {extra:?} survived (want only {gid})"));
+        have.sort_unstable();
+        have.dedup();
+        let mut want: Vec<u32> = extra.iter().copied().filter(|&g| g != gid).collect();
+        want.sort_unstable();
+        want.dedup();
+        if have != want {
+            return bad(format!("supplementary groups {have:?}, want exactly {want:?} past {gid}"));
         }
 
         // And root must not be regainable. If this succeeds, something above
@@ -1861,7 +1920,8 @@ mod privilege_drop_tests {
         let spec = JailCreateSpec {
             name: &name, path: "/", persist: 1, children_max: 0, devfs_ruleset: 0,
             ip4_addr: None, ip4_inherit: false, isolated: false, hostname: "sysfil-test",
-            hostid: None, hostuuid: None, allow_mlock: false, allow_tessera_keys: false, sysfil: Some(&f),
+            hostid: None, hostuuid: None, allow_mlock: false, allow_tessera_keys: false, classed: false, allow_proc_debug: false,
+            sysfil: Some(&f),
         };
         let jid = create_persistent_jail(&spec).expect("jail_set with sysfil").jid;
         let get = |p: &str| {
@@ -1899,4 +1959,118 @@ pub fn monotonic_us() -> u64 {
     // SAFETY: clock_gettime writes the one timespec it is given.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+}
+
+/// The login name and primary gid of account `uid`, from the password
+/// database. `None` when there is no such account or the lookup fails.
+pub fn account(uid: u32) -> Option<(String, u32)> {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: zeroed passwd is a valid out-parameter; getpwuid_r writes it and
+    // points its strings into `buf`, which outlives every read below.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to storage owned here, with its true length.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: getpwuid_r succeeded, so pw_name is a NUL-terminated string in `buf`.
+    let name = unsafe { CStr::from_ptr(pw.pw_name) }.to_str().ok()?.to_string();
+    Some((name, pw.pw_gid))
+}
+
+/// The name of group `gid`, from the group database. `None` when there is no
+/// such group or the lookup fails.
+pub fn group_name(gid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 16384];
+    // SAFETY: as in `account`: a zeroed out-parameter and a buffer we own.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: every pointer is to storage owned here, with its true length.
+    let rc = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || gr.gr_name.is_null() {
+        return None;
+    }
+    // SAFETY: getgrgid_r succeeded, so gr_name is a NUL-terminated string in `buf`.
+    Some(unsafe { CStr::from_ptr(gr.gr_name) }.to_str().ok()?.to_string())
+}
+
+/// Take ownership of a descriptor a syscall wrapper here returned as a raw
+/// number (pdfork's procdesc), so that dropping it closes it.
+pub fn owned_fd(fd: i32) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd;
+    // SAFETY: called only on a descriptor this process just received from
+    // the kernel and has not handed to anything else.
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}
+
+/// Give up ownership of a descriptor, for the reply that sends and closes it.
+pub fn into_raw(fd: std::os::fd::OwnedFd) -> i32 {
+    std::os::fd::IntoRawFd::into_raw_fd(fd)
+}
+
+/// A TCP socket listening on 127.0.0.1:`port` (0: any) in this process's
+/// network stack: after `jail_attach`, the jail's.
+#[cfg(target_os = "freebsd")]
+pub fn listen_loopback(port: u16) -> io::Result<std::os::fd::OwnedFd> {
+    // SAFETY: socket returns a new descriptor or -1.
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if s < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = owned_fd(s);
+    let one: libc::c_int = 1;
+    // SAFETY: an int option on our socket, with its true size.
+    unsafe {
+        libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_REUSEADDR,
+                         (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+    // SAFETY: an all-zero sockaddr_in is valid; every field used is set below.
+    let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+    sin.sin_port = port.to_be();
+    sin.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+    // SAFETY: `sin` is a sockaddr_in of the length given.
+    if unsafe { libc::bind(s, (&sin as *const libc::sockaddr_in).cast(), sin.sin_len as libc::socklen_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: plain syscall on our socket.
+    if unsafe { libc::listen(s, 64) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn listen_loopback(_port: u16) -> io::Result<std::os::fd::OwnedFd> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "listen_loopback: FreeBSD only"))
+}
+
+/// Set the umask and enter `dir` in the post-drop child. A directory the
+/// identity cannot enter is an error, never a silent `/`.
+pub fn child_cwd_umask(dir: &str, mask: u32) -> io::Result<()> {
+    let c = c_string(dir)?;
+    // SAFETY: umask cannot fail; chdir reads a NUL-terminated path we own.
+    unsafe {
+        libc::umask(mask as libc::mode_t);
+        if libc::chdir(c.as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Start a new session in the child, so the caller's terminal signals do not
+/// reach the process.
+pub fn setsid() {
+    // SAFETY: setsid has no memory effects; failure (already a leader) is harmless.
+    unsafe { libc::setsid(); }
+}
+
+/// Flags past read-only for a nullfs mount.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MountFlags {
+    pub nosuid: bool,
+    pub noexec: bool,
 }

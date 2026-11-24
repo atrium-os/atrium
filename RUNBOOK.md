@@ -5553,7 +5553,11 @@ sh scripts/aura-sim-gate.sh w1      # WPA2-PSK + PMF: build, hostapd + udhcpd, a
 sh scripts/aura-sim-gate.sh w2      # WPA3-SAE (H2E, hunting-and-pecking, tokens), transition mode, roaming,
                                     # atrium-net auto-join, tunnel and long-drop scenarios
 sh scripts/aura-sim-gate.sh w7      # WPA2/WPA3-Enterprise: hostapd's EAP server, PEAP, TTLS, wrong password,
-                                    # first-join trust, an evil twin refused (certs made per run)
+                                    # first-join trust, an evil twin refused, EAP-TLS with the key in Arca
+sh scripts/aura-sim-gate.sh bar-eap # the w7 APs, atrium-net/netconf and the bar, nothing joined; then
+sh scripts/curia-vm.sh arca         # Settings with Arca's field: click a work network, `type` the
+                                    # username (@ works), the password into Arca's field, Join, then
+                                    # "Trust this server" (wifi.md §7.4 E4)
 sh scripts/aura-ap-vm.sh ap CONF... # AP configs from aura/sim-ap (two at most: one radio each, bridged)
 sh scripts/aura-ap-vm.sh signal 2412 -85 2437 -40   # what the FreeBSD side hears per channel
 sh scripts/aura-ap-vm.sh log        # hostapd and the medium's logs; `ssh CMD` runs a command as root there

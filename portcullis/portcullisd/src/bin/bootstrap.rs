@@ -312,6 +312,7 @@ fn main() -> ExitCode {
                 continue 'manifest;
             };
             let init_exec = ExecSpec {
+                groups: vec![],
                 path: init_exec_m.path.clone(),
                 argv: init_exec_m.argv.clone(),
                 uid:  init_exec_m.uid,
@@ -478,7 +479,7 @@ fn main() -> ExitCode {
 fn capability_mounts(m: &ServiceManifest) -> Vec<MountSpec> {
     let mut out = Vec::new();
     if m.capabilities.attach_mount {
-        out.push(MountSpec {
+        out.push(MountSpec { noexec: false,
             source: "/var/run/atrium/caps/portcullisd/".into(),
             dest:   "/atrium/sockets/portcullisd/".into(),
             kind:   MountKind::RoNullfs,
@@ -505,7 +506,7 @@ fn resolve_volumes(
     for v in &m.volumes {
         match v.kind {
             ManifestVolumeKind::Tmpfs => {
-                mounts.push(MountSpec {
+                mounts.push(MountSpec { noexec: false,
                     source: format!("tmpfs::{}/{}", m.name, v.name),
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::Tmpfs,
@@ -547,7 +548,7 @@ fn resolve_volumes(
                     Err(e) => return Err(format!("volume {:?}: rpc: {e}", v.name)),
                 };
                 info!("{}: provisioned volume {} → {}", m.name, v.name, host_path);
-                mounts.push(MountSpec {
+                mounts.push(MountSpec { noexec: false,
                     source: host_path.clone(),
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::RwNullfs,

@@ -712,7 +712,9 @@ bar() {
         pkill -x atrium-netconf 2>/dev/null || true; sleep 1; rm -rf /tmp/aura/sockets
         daemon -f -o /tmp/aura/netconf.log /tmp/aura/atrium-netconf -v --ctl /tmp/aura/net.sock --dir /tmp/aura/sockets --uid 65036 --capsicum
         sleep 2"
-    out=$("$V" "echo '$PASS' | /tmp/aura/atrium-netctl --dir /tmp/aura/sockets --app network-wifi join aura-test" 2>&1) && ok "joined aura-test for the bar" || fail "join: $out"
+    if [ "${BAR_JOIN:-1}" = 1 ]; then
+        out=$("$V" "echo '$PASS' | /tmp/aura/atrium-netctl --dir /tmp/aura/sockets --app network-wifi join aura-test" 2>&1) && ok "joined aura-test for the bar" || fail "join: $out"
+    fi
     for c in frescod forum-wm forum-bar; do
         (cd "$ROOT/$c" && RUSTFLAGS="$X" cargo build -q --release --target "$T" --bin "$c" >&2)
     done
@@ -1089,6 +1091,20 @@ move)
 bar)
     setup hostapd-wpa2.conf
     bar
+    echo "bar: frames in scratch/ (VMs left running; teardown with w1's end or reboot)" ;;
+# The UI for work networks (wifi.md §7.4 E4): the 802.1X APs of w7, the
+# bar up and nothing joined; then curia-vm.sh arca and its clicks.
+bar-eap)
+    "$V" true >/dev/null 2>&1 || { echo "FreeBSD VM down: run the vms step"; exit 1; }
+    pass=0
+    ok() { echo "ok   $1"; pass=$((pass + 1)); }
+    fail() { echo "FAIL $1"; exit 1; }
+    w7_certs
+    export HOSTAPD_ARGS=-dd
+    setup hostapd-eap.conf hostapd-eap-wpa2.conf
+    "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
+    rm -rf "$W7C"
+    BAR_JOIN=0 bar
     echo "bar: frames in scratch/ (VMs left running; teardown with w1's end or reboot)" ;;
 n4)
     setup hostapd-wpa2.conf

@@ -18,7 +18,7 @@ use vinculum_control::Prompt;
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
 use crate::sound::{self as snd, SoundPage};
-use crate::network::{headline, manual_fields, name, security_label, NetPage, MAC_POLICIES};
+use crate::network::{headline, manual_fields, name, security_label, NetPage, EAP_METHODS, MAC_POLICIES};
 use atrium_netconf::Target;
 use pergola::text_edit::TextEdit;
 
@@ -68,8 +68,9 @@ pub struct CuriaView {
     pub persona_scroll: Mutable<ScrollState>,
     /// The IP settings row's address, router and DNS fields, then the DNS
     /// servers row's field.
-    /// Address, router, DNS of a fixed setting; own DNS servers; their TLS name.
-    pub net_fields: [Mutable<TextEdit>; 5],
+    /// Address, router, DNS of a fixed setting; own DNS servers; their TLS
+    /// name; a work network's username and its server's domain.
+    pub net_fields: [Mutable<TextEdit>; 7],
     pub net_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
@@ -262,6 +263,10 @@ impl CuriaView {
             return;
         }
 
+        if p.trusting.is_some() {
+            y = self.trust_prompt(ctx, &p, x0, pw, y);
+        }
+
         // Networks around.
         text(ctx, x0, y + em(10.0), "Wi-Fi networks", type_size::SM, Weight::Semibold, t.text_secondary());
         {
@@ -297,7 +302,9 @@ impl CuriaView {
             text(ctx, x0 + pw - rw - em(12.0), y + rh / 2.0, &right, type_size::SM, Weight::Regular, t.text_secondary());
             ctx.pop();
             y += rh;
-            if p.asking.as_deref() == Some(n.ssid.as_slice()) {
+            if p.asking.as_deref() == Some(n.ssid.as_slice()) && p.ent.is_some() {
+                y = self.enterprise_sheet(ctx, &p, x0, pw, y);
+            } else if p.asking.as_deref() == Some(n.ssid.as_slice()) {
                 let fy = y + em(4.0);
                 let fx = x0 + em(44.0);
                 let fw = (pw - em(260.0)).clamp(em(160.0), em(320.0));
@@ -423,6 +430,87 @@ impl CuriaView {
     /// IP settings (curia.md §3): a fixed address for each saved network
     /// and wired port, and the machine's own DNS servers. Under "Show
     /// details", as most people never need them.
+    ///
+    /// A work or campus network (802.1X, wifi.md §7.4): username, Arca's
+    /// password field, the sign-in method, and how its server is checked.
+    fn enterprise_sheet(&self, ctx: &mut Ctx, p: &NetPage, x0: f32, pw: f32, mut y: f32) -> f32 {
+        let t = ctx.theme;
+        let Some(f) = &p.ent else { return y };
+        let fx = x0 + em(44.0);
+        let fw = ((pw - em(120.0)) / 2.0).clamp(em(150.0), em(260.0));
+        let fy = y + em(4.0);
+        let (pg, user, dom) = (self.page.clone(), self.net_fields[5].clone(), self.net_fields[6].clone());
+        pergola::widgets::TextField::new(self.net_fields[5].clone())
+            .placeholder("Username (e.g. alice@corp.example)")
+            .autofocus(true)
+            .at(fx, fy)
+            .width(fw)
+            .on_submit(move |_| {
+                let (u, d) = (user.get_cloned().text().to_string(), dom.get_cloned().text().to_string());
+                with(&pg, |p| p.ent_join_pressed(&u, &d, std::time::Instant::now()));
+            })
+            .render(ctx);
+        // Arca draws its key badge left of the field's rect.
+        self.cred.clone().at(fx + fw + em(32.0), fy).size(fw, em(32.0)).render(ctx);
+        y = fy + em(40.0);
+        let pg = self.page.clone();
+        let mut bx = fx;
+        bx += button(ctx, bx, y, &format!("Sign-in: {}", EAP_METHODS[f.method].1), Look::Secondary, true, move || with(&pg, NetPage::next_method)) + em(8.0);
+        let (pg, on) = (self.page.clone(), f.system_roots);
+        bx += button(ctx, bx, y, if on { "Check server: system certificates" } else { "Check server: ask on first join" }, Look::Secondary, true, move || {
+            with(&pg, |p| p.set_system_roots(!on))
+        }) + em(8.0);
+        pergola::widgets::TextField::new(self.net_fields[6].clone())
+            .placeholder(if on { "Server's domain (needed)" } else { "Server's domain (optional)" })
+            .at(bx, y)
+            .width((fx + 2.0 * fw + em(32.0) - bx).max(em(140.0)))
+            .render(ctx);
+        y += em(40.0);
+        let ready = p.joining.is_none() && p.armed.is_none() && p.field_up;
+        let (pg, user, dom) = (self.page.clone(), self.net_fields[5].clone(), self.net_fields[6].clone());
+        let jw = button(ctx, fx, y, "Join", Look::Primary, ready, move || {
+            let (u, d) = (user.get_cloned().text().to_string(), dom.get_cloned().text().to_string());
+            with(&pg, |p| p.ent_join_pressed(&u, &d, std::time::Instant::now()));
+        });
+        let pg = self.page.clone();
+        button(ctx, fx + jw + em(8.0), y, "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_ask));
+        y += em(40.0);
+        if !p.field_up {
+            text(ctx, fx, y - em(2.0), "The password field is not available right now; trying again…", type_size::XS, Weight::Regular, t.text_tertiary());
+            y += em(20.0);
+        }
+        y
+    }
+
+    /// A first join stopped at the server's certificate: what it is, and
+    /// "Trust this server" (pinned for this network only).
+    fn trust_prompt(&self, ctx: &mut Ctx, p: &NetPage, x0: f32, pw: f32, mut y: f32) -> f32 {
+        let t = ctx.theme;
+        let Some((ssid, seen)) = &p.trusting else { return y };
+        let h = em(150.0);
+        rect(ctx, x0, y, pw, h, t.bg_surface(), 8.0);
+        let tx = x0 + em(16.0);
+        text(ctx, tx, y + em(20.0), &format!("Trust the server of {}?", name(ssid)), type_size::MD, Weight::Semibold, t.text_primary());
+        let names = if seen.names.is_empty() { seen.subject.clone() } else { seen.names.join(", ") };
+        let lines = [
+            format!("Server: {names}"),
+            format!("Issued by {} · valid until {}", if seen.issuer.is_empty() { "?" } else { &seen.issuer }, if seen.not_after.is_empty() { "?" } else { &seen.not_after }),
+            format!("SHA-256 {}", seen.sha256.iter().take(16).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")),
+            "Ask your network's IT team if this is their server. Your password is sent only once you trust it.".to_string(),
+        ];
+        for (i, l) in lines.iter().enumerate() {
+            let c = if i == 3 { t.text_tertiary() } else { t.text_secondary() };
+            text(ctx, tx, y + em(44.0 + 18.0 * i as f32), l, type_size::SM, Weight::Regular, c);
+        }
+        let by = y + h - em(40.0);
+        let pg = self.page.clone();
+        let w = button(ctx, tx, by, "Trust this server", Look::Primary, p.joining.is_none(), move || with(&pg, NetPage::trust));
+        let pg = self.page.clone();
+        button(ctx, tx + w + em(8.0), by, "Don't trust", Look::Ghost, true, move || with(&pg, NetPage::dont_trust));
+        y += h + em(16.0);
+        y
+    }
+
     fn ip_settings(&self, ctx: &mut Ctx, p: &NetPage, x0: f32, pw: f32, mut y: f32) -> f32 {
         let t = ctx.theme;
         text(ctx, x0, y + em(10.0), "IP settings", type_size::SM, Weight::Semibold, t.text_secondary());
@@ -1657,7 +1745,7 @@ mod tests {
         let v = CuriaView { workspaces: Mutable::new(Default::default()), workspace_scroll: Mutable::new(Default::default()), which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())), vpn: Mutable::new(Default::default()), vpn_scroll: Mutable::new(Default::default()), vpn_fields: std::array::from_fn(|_| Mutable::new(Default::default())), vpn_cred: CredentialField::vpn_secret(Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
-        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false, manual: None }])));
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false, manual: None, enterprise: false }])));
         p.apply(Got::Nearby(Ok(vec![Nearby { ssid: b"home".to_vec(), security: "wpa2".into(), bars: 3, known: true }, Nearby { ssid: b"cafe".to_vec(), security: "wpa3".into(), bars: 2, known: false }])));
         p.pick(b"cafe");
         v.page.set(p);
@@ -1722,7 +1810,7 @@ mod tests {
         pergola::commit(&mut s, &app.tick()).unwrap();
         assert_eq!(labels(&s), vec!["Show details".to_string()]);
         // The saved networks arrive: the label moves down.
-        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }])));
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None, enterprise: false }])));
         page.set(p.clone());
         pergola::commit(&mut s, &app.tick()).unwrap();
         assert_eq!(labels(&s), vec!["Show details".to_string()], "after the list came");
@@ -1739,7 +1827,7 @@ mod tests {
         p.take_wants();
         p.apply(Got::Status(Some(Status { link: Link::Wired, online: Online::Yes, metered: false, bars: None, ssid: None, portal: None })));
         let m = Manual { addr: "10.0.0.5".parse().unwrap(), prefix: 24, router: Some("10.0.0.1".parse().unwrap()), dns: vec![] };
-        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: Some(m) }])));
+        p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: Some(m), enterprise: false }])));
         let em0 = Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: Some("192.168.1.9/24".into()), router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::Yes, metered: false, egress: true, manual: None };
         p.apply(Got::Details(Ok(vec![em0])));
         p.apply(Got::OwnDns(Ok((vec!["9.9.9.9".into()], Some("dns.quad9.net".into())))));

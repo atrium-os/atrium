@@ -65,7 +65,7 @@ fn shipped_smoke_manifests_pass_the_shipped_policy() {
     for m in out.manifests {
         let mut req = m.to_create_request();
         if m.capabilities.attach_mount {
-            req.mounts.push(MountSpec {
+            req.mounts.push(MountSpec { noexec: false,
                 source: "/var/run/atrium/caps/portcullisd/".into(),
                 dest:   "/atrium/sockets/portcullisd/".into(),
                 kind:   jaild::protocol::MountKind::RoNullfs,

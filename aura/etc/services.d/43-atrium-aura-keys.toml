@@ -37,6 +37,10 @@ source = "/usr/local/bin"
 dest   = "usr/local/bin"
 kind   = "ro_nullfs"
 [[mounts]]
+source = "/etc/ssl"                              # ro: system roots for 802.1X servers (the EAP helper)
+dest   = "etc/ssl"
+kind   = "ro_nullfs"
+[[mounts]]
 source = "/atrium/sockets/aura-keys"             # rw: binds keys.sock (aura-mlme and atrium-net connect)
 dest   = "atrium/sockets/aura-keys"
 kind   = "rw_nullfs"

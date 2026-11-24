@@ -96,10 +96,10 @@ fn build_root(cfg: &Config, root: &Path) -> Result<(), String> {
 }
 
 fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> Result<Courier, String> {
-    let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+    let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
     let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin"), ro(&cfg.registry)];
     mounts[4].dest = arcad::courier::DEFAULT_REGISTRY.into();
-    mounts.push(MountSpec {
+    mounts.push(MountSpec { noexec: false,
         source: "/atrium/sockets/arca".into(),
         dest: "/atrium/sockets/arca".into(),
         kind: MountKind::RwNullfs,
@@ -126,13 +126,15 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         env.push(EnvPair { key: "ATRIUM_COURIER_GRANT_PRIVATE_NETWORK".into(), value: "1".into() });
     }
     let req = Request::CreateJail(CreateJailRequest {
+        class: None,
+        devices: vec![],
         name: name(uid),
         path: root.to_string_lossy().into_owned(),
         children_max: 0,
         mounts,
         devfs_ruleset: DEVFS_RULESET,
         network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
-        exec: Some(ExecSpec { path: EXEC_PATH.into(), argv: vec![EXEC_PATH.into()], env, uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
+        exec: Some(ExecSpec { groups: vec![], path: EXEC_PATH.into(), argv: vec![EXEC_PATH.into()], env, uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
         rctl: None,
         hostname: Some(name(uid)),
         hostid: Some(id.hostid),

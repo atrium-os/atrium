@@ -2174,10 +2174,12 @@ checksum = "4754a1731458af0443709c9667302793d3f63cc90ec4ba4c8259f2b9515478e5"
 name = "jaild"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "env_logger",
  "jaild-policy",
  "libc",
  "log",
+ "portcullis-peer",
  "serde",
  "serde_json",
  "sockmux",

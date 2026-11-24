@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 512;
 
+/// A whole-page island's first request (navigator-islands.md I6.1): the
+/// engine asks for "its page" by this address, which never resolves
+/// (`.invalid`), and navigatord answers with the page the person pressed
+/// on, its address as the answer's final URL. The engine never names the
+/// page it runs.
+pub const LIVE_PAGE: &str = "https://live-page.atrium.invalid/";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndReason { Closed, Failed }
 

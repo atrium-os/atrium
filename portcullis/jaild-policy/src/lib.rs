@@ -682,6 +682,13 @@ pub struct AppsPolicy {
     pub allowed_exec_root:         String,
     pub default_devfs_ruleset:     String,
     pub max_simultaneous_per_user: u32,
+    /// Where services' socket directories are on the host.
+    #[serde(default)]
+    pub sockets_dir:               String,
+    /// The socket directories (by name under `sockets_dir`) an app jail may
+    /// be given read-write: one per capability that reaches a service.
+    #[serde(default)]
+    pub sockets:                   Vec<String>,
 }
 
 impl Policy {

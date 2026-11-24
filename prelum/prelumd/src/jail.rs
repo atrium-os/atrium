@@ -209,7 +209,7 @@ impl Jailed {
         for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "dev", "tmp"] {
             std::fs::create_dir_all(root.join(d))?;
         }
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
         if pin {
             std::fs::create_dir_all(root.join(ARCA_DIR.trim_start_matches('/')))?;
@@ -217,13 +217,15 @@ impl Jailed {
         }
         let id = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(format!("host identity: {e}")))?;
         let req = Request::CreateJail(CreateJailRequest {
+            class: None,
+            devices: vec![],
             name: name(uid),
             path: root.to_string_lossy().into_owned(),
             children_max: 0,
             mounts,
             devfs_ruleset: DEVFS_RULESET,
             network,
-            exec: Some(ExecSpec { path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
+            exec: Some(ExecSpec { groups: vec![], path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
             rctl,
             hostname: Some(name(uid)),
             hostid: Some(id.hostid),

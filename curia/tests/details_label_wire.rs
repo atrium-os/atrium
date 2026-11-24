@@ -86,7 +86,7 @@ fn the_details_label_is_held_once_after_a_resize_and_a_change_in_one_tick() {
     pergola::commit(&mut surface, &app.tick()).unwrap();
     wait(1);
     assert_eq!(held().len(), 1);
-    p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"aura-test".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None }])));
+    p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"aura-test".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: None, enterprise: false }])));
     page.set(p.clone());
     // The WM's size arrives in the same tick (pergola resends on resize).
     app.resend_all();

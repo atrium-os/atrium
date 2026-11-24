@@ -18,7 +18,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atrium_netconf::server::{serve, Backend};
-use atrium_netconf::{lines, status, Fail, Grant, Iface, Join, Nearby, Profile, Res, Routes, SetStatic, Status, Target};
+use atrium_netconf::{lines, status, Fail, Grant, Enterprise, Iface, Join, Nearby, Profile, Res, Routes, ServerSeen, SetStatic, Status, Target};
 use aura_ipc::{Got, Line, Reader};
 
 fn die(s: &str) -> ! {
@@ -226,6 +226,23 @@ impl Front {
     }
 }
 
+/// An 802.1X join waits for the network's RADIUS server too.
+const ENTERPRISE_JOIN: Duration = Duration::from_secs(120);
+
+/// The end of a join atrium-net was asked for: authorized, or why not.
+fn joined(rx: &mpsc::Receiver<Line>, wait: Duration) -> Res<()> {
+    let end = Instant::now() + wait;
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        let Ok(x) = rx.recv_timeout(left) else { break };
+        match (x.verb.as_str(), x.get("state")) {
+            ("state", Some("authorized")) => return Ok(()),
+            ("state", Some("failed")) => return Err(Fail::new(status::FAILED, x.get("why").unwrap_or("failed"))),
+            _ => {}
+        }
+    }
+    Err(Fail::new(status::FAILED, "timed out"))
+}
+
 impl Backend for Front {
     fn status(&self) -> Res<Status> {
         self.status_now()
@@ -274,16 +291,49 @@ impl Backend for Front {
             l = l.with("security", "open");
         }
         self.call(&l)?;
-        let end = Instant::now() + Duration::from_secs(60);
-        while let Some(left) = end.checked_duration_since(Instant::now()) {
-            let Ok(x) = rx.recv_timeout(left) else { break };
-            match (x.verb.as_str(), x.get("state")) {
-                ("state", Some("authorized")) => return Ok(()),
-                ("state", Some("failed")) => return Err(Fail::new(status::FAILED, x.get("why").unwrap_or("failed"))),
-                _ => {}
-            }
+        joined(&rx, Duration::from_secs(60))
+    }
+
+    fn join_enterprise(&self, e: Enterprise) -> Res<()> {
+        self.log(&format!("join 802.1X {:?} ({})", String::from_utf8_lossy(&e.ssid), e.method));
+        let mut r = Line::new("wifi-remember-eap")
+            .with_hex("ssid", &e.ssid)
+            .with("method", &e.method)
+            .with_hex("identity", e.identity.as_bytes())
+            .with_hex("domain", e.domain.as_bytes())
+            .with_hex("handle", &e.handle);
+        if let Some(a) = &e.anonymous {
+            r = r.with_hex("anonymous", a.as_bytes());
         }
-        Err(Fail::new(status::FAILED, "timed out"))
+        if let Some(c) = &e.ca {
+            r = r.with_hex("ca", c);
+        }
+        if e.system_roots {
+            r = r.with("roots", "system");
+        }
+        self.call(&r)?;
+        let rx = self.wait_lines();
+        self.call(&Line::new("wifi-join").with_hex("ssid", &e.ssid))?;
+        joined(&rx, ENTERPRISE_JOIN)
+    }
+
+    fn server_seen(&self, ssid: Vec<u8>) -> Res<ServerSeen> {
+        let v = self.call(&Line::new("wifi-eap-seen").with_hex("ssid", &ssid))?;
+        let Some(l) = v.iter().find(|l| l.verb == "seen") else { return Err(Fail::new(status::FAILED, "nothing-seen")) };
+        let text = |k: &str| l.hex(k).map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+        Ok(ServerSeen {
+            names: l.get("names").filter(|n| *n != "-").map(|n| n.split(',').take(16).map(str::to_string).collect()).unwrap_or_default(),
+            subject: text("subject"),
+            issuer: text("issuer"),
+            not_after: l.get("not_after").unwrap_or("").to_string(),
+            sha256: l.hex("top_sha256").filter(|h| h.len() == 32).ok_or_else(|| Fail::new(status::FAILED, "bad-seen"))?,
+        })
+    }
+
+    fn trust_server(&self, ssid: Vec<u8>) -> Res<()> {
+        let rx = self.wait_lines();
+        self.call(&Line::new("wifi-eap-trust").with_hex("ssid", &ssid))?;
+        joined(&rx, ENTERPRISE_JOIN)
     }
 
     fn leave(&self) -> Res<()> {

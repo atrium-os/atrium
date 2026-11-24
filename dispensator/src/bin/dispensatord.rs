@@ -1202,9 +1202,9 @@ mod run {
         let name = jail_name(uid);
         let root = format!("{JAIL_ROOT}/{name}");
         std::fs::create_dir_all(&root).map_err(|e| format!("{root}: {e}"))?;
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut mounts: Vec<MountSpec> = proto.ro_mounts().iter().map(|d| ro(d)).collect();
-        mounts.push(MountSpec { source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
+        mounts.push(MountSpec { noexec: false, source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
         let id = portcullis_identity::for_app(&format!("org.atrium.share.{uid}")).map_err(|e| format!("host identity: {e}"))?;
         let grants = NetGrants {
             app_key: portcullis_identity::consent_key(&name),
@@ -1218,13 +1218,15 @@ mod run {
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {
+            class: None,
+            devices: vec![],
             name: name.clone(),
             path: root,
             children_max: 0,
             mounts,
             devfs_ruleset: 22,
             network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
-            exec: Some(ExecSpec { path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio, listen: Vec::new(), ready: false }),
+            exec: Some(ExecSpec { groups: vec![], path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio, listen: Vec::new(), ready: false }),
             rctl: None,
             hostname: Some(name),
             hostid: Some(id.hostid),
@@ -2289,7 +2291,7 @@ mod run {
         }
 
         fn request(p: &JailPlan) -> CreateJailRequest {
-            let ro = |m: &str| MountSpec {
+            let ro = |m: &str| MountSpec { noexec: false,
                 source: m.to_string(),
                 dest: m.trim_start_matches('/').to_string(),
                 kind: MountKind::RoNullfs,
@@ -2297,6 +2299,8 @@ mod run {
                 owner: None,
             };
             CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name: p.name.clone(),
                 path: p.path.clone(),
@@ -2304,7 +2308,7 @@ mod run {
                 devfs_ruleset: p.devfs_ruleset,
                 network: NetworkConfig::Disable,
                 mounts: p.mounts_ro.iter().map(|m| ro(m)).collect(),
-                exec: Some(ExecSpec { path: p.exec.clone(), argv: p.argv.clone(), env: vec![], uid: p.uid, gid: p.gid, stdio: false, listen: Vec::new(), ready: false }),
+                exec: Some(ExecSpec { groups: vec![], path: p.exec.clone(), argv: p.argv.clone(), env: vec![], uid: p.uid, gid: p.gid, stdio: false, listen: Vec::new(), ready: false }),
                 hostname: None,
                 hostid: None,
                 hostuuid: None,
@@ -2491,19 +2495,21 @@ mod run {
                 return fail(format!("{mnt} is still mounted"));
             }
             let _ = std::fs::remove_dir(&mnt);
-            let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+            let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
             let mut argv: Vec<String> = ["atrium-capsa-local", "--root-fd", "3", "--fuse-fd", "4", "--control-fd", "5"].iter().map(|a| a.to_string()).collect();
             if read_only {
                 argv.push("--ro".into());
             }
             let req = CreateJailRequest {
+                class: None,
+                devices: vec![],
                 name: name.clone(),
                 path: root,
                 children_max: 0,
                 mounts: STICK_MOUNTS.iter().map(|m| ro(m)).collect(),
                 devfs_ruleset: 22,
                 network: NetworkConfig::Disable,
-                exec: Some(ExecSpec { path: STICK_EXEC.into(), argv, env: vec![], uid, gid, stdio: false, listen: Vec::new(), ready: false }),
+                exec: Some(ExecSpec { groups: vec![], path: STICK_EXEC.into(), argv, env: vec![], uid, gid, stdio: false, listen: Vec::new(), ready: false }),
                 rctl: None,
                 hostname: None,
                 hostid: None,

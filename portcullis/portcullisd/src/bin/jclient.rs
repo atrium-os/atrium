@@ -82,6 +82,8 @@ fn main() -> ExitCode {
         "create" => {
             if rest.len() < 2 { return usage(); }
             Request::CreateJail(CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name:          rest[0].clone(),
                 path:          rest[1].clone(),
@@ -118,6 +120,8 @@ fn main() -> ExitCode {
             let argv: Vec<String> = rest[2..].to_vec();
             let (uid, gid) = env_ids();
             Request::CreateJail(CreateJailRequest {
+                class: None,
+                devices: vec![],
                 rctl: None,
                 name,
                 path,
@@ -126,6 +130,7 @@ fn main() -> ExitCode {
                 devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec: Some(ExecSpec {
+                    groups: vec![],
                     path: bin,
                     argv,
                     env:  vec![EnvPair {
@@ -240,7 +245,7 @@ fn env_ids() -> (u32, u32) {
 /// same paths inside the jail, for `exec`.
 fn env_mounts_ro() -> Vec<MountSpec> {
     std::env::var("ATRIUM_JCLIENT_MOUNTS_RO").ok().map(|v| v.split(',').filter(|s| !s.is_empty())
-        .map(|p| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None })
+        .map(|p| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None })
         .collect()).unwrap_or_default()
 }
 

@@ -505,3 +505,16 @@ fn a_wrong_passphrase_is_said_at_once() {
     };
     assert_eq!(why(&o).as_deref(), Some("auth-timeout"));
 }
+
+#[test]
+fn an_eap_failure_before_the_keys_is_a_failed_join() {
+    let (mut s, _) = joined(true);
+    let o = s.keys_msg(&Line::new("failed").with("why", "eap-trust"), 5);
+    assert_eq!(ctl_states(&o), vec!["failed"], "atrium-net ends the join and says why, not a dropout to rejoin");
+    assert_eq!(ctl(&o)[0].get("why"), Some("eap-trust"));
+    // Keys failing for any other reason after the join is still a drop.
+    let (mut s, _) = joined(true);
+    s.keys_msg(&Line::new("authorized"), 0);
+    let o = s.keys_msg(&Line::new("failed").with("why", "keys"), 5);
+    assert_eq!(ctl_states(&o), vec!["disconnected"]);
+}

@@ -3757,6 +3757,10 @@ fn handle_exec_in_jail(uid: u32, req: Request, writer: &mut UnixStream) -> std::
 
     // 2. forward to jaild (the sole jail_attach caller).
     let jreq = jaild::protocol::Request::ExecInJail(jaild::protocol::ExecInJailRequest {
+        identity: None,
+        cwd: None,
+        umask: None,
+        stdio: false,
         name: jail_name.clone(),
         path,
         argv,
@@ -4055,7 +4059,7 @@ fn launch_session_component(component_id: &str, owner_name: &str,
     // writable only by this component's session uid, at STATE_DEST in the jail.
     match prepare_state_dir(owner_name, &app_id, owner_uid) {
         Ok(src) => {
-            create.mounts.push(jaild::protocol::MountSpec {
+            create.mounts.push(jaild::protocol::MountSpec { noexec: false,
                 source: src, dest: STATE_DEST.into(),
                 kind: jaild::protocol::MountKind::RwNullfs, size_mb: None, owner: None,
             });

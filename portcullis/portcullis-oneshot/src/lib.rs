@@ -473,6 +473,8 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     };
     let entry = format!("/{}", manifest.entry());
     let req = jaild::protocol::Request::CreateJail(jaild::protocol::CreateJailRequest {
+        class: None,
+        devices: vec![],
         name:          jail_name.clone(),
         path:          jail_path.to_string_lossy().into_owned(),
         children_max:  0,
@@ -482,6 +484,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
         // list the host's interfaces or read its real MAC (§9.1c).
         network,
         exec: Some(jaild::protocol::ExecSpec {
+            groups: vec![],
             path:  entry.clone(),
             argv:  vec![entry],
             env:   clean_env(&pw).into_iter().chain(spec.extra_env.iter()
@@ -610,7 +613,7 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
         }
         let rel = m.dst.strip_prefix(root).map_err(|_| format!(
             "mount destination {} is outside the jail root", m.dst.display()))?;
-        Ok(MountSpec {
+        Ok(MountSpec { noexec: false,
             source:  m.src.to_string_lossy().into_owned(),
             dest:    format!("/{}", rel.display()),
             kind:    if m.opts.iter().any(|o| o == "ro") { MountKind::RoNullfs } else { MountKind::RwNullfs },

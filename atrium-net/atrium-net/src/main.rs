@@ -1504,7 +1504,7 @@ mod imp {
             let ok = || vec![Line::new("ok")];
             let err = |why: &str| vec![Line::new("error").with("why", why)];
             let ssid = || l.hex("ssid").filter(|s| !s.is_empty() && s.len() <= 32);
-            let wifi_needed = matches!(l.verb.as_str(), "wifi-scan" | "wifi-status" | "wifi-list" | "wifi-leave" | "wifi-join" | "wifi-remember" | "wifi-forget" | "country");
+            let wifi_needed = matches!(l.verb.as_str(), "wifi-scan" | "wifi-status" | "wifi-list" | "wifi-leave" | "wifi-join" | "wifi-remember" | "wifi-forget" | "country" | "wifi-remember-eap" | "wifi-eap-seen" | "wifi-eap-trust" | "wifi-eap-key");
             if wifi_needed && self.wifi.is_none() {
                 return err("no-wifi");
             }
@@ -1589,6 +1589,7 @@ mod imp {
                             None => return err("aura-keys-unreachable"),
                         }
                     }
+                    let enterprise = l.get("secret").is_none() && l.get("handle").is_none() && self.wifi.as_ref().unwrap().saved.get(&s).is_some_and(|p| p.enterprise);
                     let p = Profile {
                         ssid: s,
                         open,
@@ -1600,6 +1601,9 @@ mod imp {
                         metered: l.get("metered") == Some("1"),
                         // Kept from the saved profile (set by `static`).
                         manual: None,
+                        // Changing settings keeps an 802.1X network one; a
+                        // passphrase makes it a personal network again.
+                        enterprise,
                     };
                     if trial && !open {
                         self.wifi.as_mut().unwrap().remember_on_trial(p);
@@ -1608,6 +1612,64 @@ mod imp {
                     let a = self.wifi.as_mut().unwrap().remember(p, now);
                     self.wifi_acts(a);
                     ok()
+                }
+                // 802.1X (wifi.md §7.4): the profile and its credential go
+                // to aura-keys; only that the network is one stays here.
+                "wifi-remember-eap" => {
+                    let Some(s) = ssid() else { return err("bad-ssid") };
+                    let mut r = Line::new("remember-eap").with_hex("ssid", &s);
+                    for k in ["method", "identity", "anonymous", "domain", "ca", "roots", "secret", "handle", "key", "cert"] {
+                        if let Some(v) = l.get(k) {
+                            r = r.with(k, v);
+                        }
+                    }
+                    match self.keys_call(&r) {
+                        Some(r) if r.verb == "ok" => {}
+                        Some(r) => return vec![r],
+                        None => return err("aura-keys-unreachable"),
+                    }
+                    let old = self.wifi.as_ref().unwrap().saved.get(&s).cloned();
+                    let p = Profile {
+                        ssid: s,
+                        open: false,
+                        wpa3_only: false,
+                        mac: old.as_ref().map(|p| p.mac.clone()).unwrap_or_else(|| "network".into()),
+                        auto: old.as_ref().is_none_or(|p| p.auto),
+                        prio: old.as_ref().map(|p| p.prio).unwrap_or(0),
+                        metered: old.as_ref().is_some_and(|p| p.metered),
+                        manual: None,
+                        enterprise: true,
+                    };
+                    let a = self.wifi.as_mut().unwrap().remember(p, now);
+                    self.wifi_acts(a);
+                    ok()
+                }
+                "wifi-eap-seen" | "wifi-eap-key" => {
+                    let Some(s) = ssid() else { return err("bad-ssid") };
+                    let mut r = Line::new(&l.verb["wifi-".len()..]).with_hex("ssid", &s);
+                    if let Some(cn) = l.get("cn") {
+                        r = r.with("cn", cn);
+                    }
+                    match self.keys_call(&r) {
+                        Some(r) if r.verb == "error" => vec![r],
+                        Some(r) => vec![r, Line::new("ok")],
+                        None => err("aura-keys-unreachable"),
+                    }
+                }
+                // "Trust this server": pin what the first join stopped at,
+                // then join again.
+                "wifi-eap-trust" => {
+                    let Some(s) = ssid() else { return err("bad-ssid") };
+                    match self.keys_call(&Line::new("eap-trust").with_hex("ssid", &s)) {
+                        Some(r) if r.verb == "ok" => {
+                            self.wifi.as_mut().unwrap().failures_clear(&s);
+                            let a = self.wifi.as_mut().unwrap().join(s, None, None);
+                            self.wifi_acts(a);
+                            vec![r]
+                        }
+                        Some(r) => vec![r],
+                        None => err("aura-keys-unreachable"),
+                    }
                 }
                 "static" => {
                     let m = nlines::manual(l);

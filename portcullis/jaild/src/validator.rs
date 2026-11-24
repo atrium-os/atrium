@@ -34,7 +34,9 @@ pub fn validate_create(
     validate_mlock(req, policy)?;
     validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
-        validate_mount(m, policy)?;
+        if !is_app_socket_mount(req, m, policy) {
+            validate_mount(m, policy)?;
+        }
         validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
@@ -43,6 +45,7 @@ pub fn validate_create(
                           || is_crypta_engine(req, policy))?;
     }
     validate_host_identity(req)?;
+    validate_class(req, policy)?;
     resolve_sysfil(req, policy)?;
     Ok(())
 }
@@ -689,6 +692,19 @@ pub fn validate_mount_for_runtime(policy: &Policy, m: &MountSpec) -> Result<(), 
     validate_tmpfs_owner(m, None)
 }
 
+/// An app jail's capability socket: `<apps.sockets_dir>/<name>` read-write
+/// for a name the policy lists, at a destination with no `..`.
+fn is_app_socket_mount(req: &CreateJailRequest, m: &MountSpec, policy: &Policy) -> bool {
+    let dir = policy.apps.sockets_dir.trim_end_matches('/');
+    matches!(req.class, Some(crate::protocol::JailClass::App { .. }))
+        && m.kind == MountKind::RwNullfs
+        && !dir.is_empty()
+        && !m.dest.is_empty()
+        && !m.dest.split('/').any(|seg| seg == "..")
+        && m.source.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|n| policy.apps.sockets.iter().any(|s| s == n))
+}
+
 fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     /* dest is a path inside the jail's chroot. Reject `..` and
      * empty (we don't enforce absolute — relative is fine and
@@ -954,6 +970,220 @@ fn matches_glob(pattern: &str, path: &str) -> bool {
         })
 }
 
+
+// ── Person-owned jail classes (app-jails-via-jaild.md §3) ─────────────────
+
+/// What jaild looks up on the host to check a classed request. A trait so
+/// the rules can be tested without a passwd, group or registry file.
+pub trait Identity {
+    /// The (owner, app id) the launch registry binds `uid` to.
+    fn app_binding(&self, uid: u32) -> Option<(String, String)>;
+    /// The account `uid` names: its login name and primary gid.
+    fn account(&self, uid: u32) -> Option<(String, u32)>;
+    /// The name of group `gid`.
+    fn group_name(&self, gid: u32) -> Option<String>;
+}
+
+fn deny(rule: &'static str, detail: String) -> Result<(), JaildError> {
+    Err(JaildError::PolicyViolation { rule, detail })
+}
+
+/// Whether group `name` is one of `owner`'s files groups: `files-<owner>`,
+/// or a persona's, `files-<owner>-<persona>`, or the hashed form home.rs
+/// uses when that is too long for a group name (its first 22 characters,
+/// a dash, eight hex digits).
+pub fn is_files_group_of(name: &str, owner: &str) -> bool {
+    let base = format!("files-{owner}");
+    if name == base {
+        return true;
+    }
+    if let Some(rest) = name.strip_prefix(&base) {
+        if rest.starts_with('-') && rest.len() > 1 && base.len() + rest.len() <= 32 {
+            return true;
+        }
+    }
+    /* Past 22 characters the hashed form keeps only a prefix of the owner's
+     * name, so two owners who share those 22 characters share the form: a
+     * limit of home.rs's naming, which a 16-character login name never meets. */
+    let short: String = base.chars().take(22).collect();
+    if base.len() > 22 {
+        if let Some(h) = name.strip_prefix(&short).and_then(|r| r.strip_prefix('-')) {
+            return h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
+/// The parts of a classed request that need no host lookups: children,
+/// devices, groups' shape, and which classes take an exec.
+pub fn validate_class(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    let Some(class) = &req.class else {
+        if !req.devices.is_empty() {
+            return deny("class.devices", "device classes are for app jails".into());
+        }
+        if req.exec.as_ref().is_some_and(|e| !e.groups.is_empty()) {
+            return deny("class.groups", "supplementary groups are for app jails".into());
+        }
+        return Ok(());
+    };
+    validate_owner_name(class.owner())?;
+    if req.children_max != 0 {
+        return deny("class.children", format!("a {} jail has no children", class_name(class)));
+    }
+    match class {
+        crate::protocol::JailClass::App { app_id, .. } => {
+            if app_id.is_empty() || app_id.len() > 255 || !app_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+                return deny("class.app_id", format!("app id {app_id:?} is not a plain id"));
+            }
+            let Some(exec) = &req.exec else {
+                return deny("class.app.exec", "an app jail runs its entry".into());
+            };
+            if exec.uid == 0 || exec.gid == 0 {
+                return deny("class.app.root", "an app never runs as root".into());
+            }
+            if !req.devices.is_empty() && req.devfs_ruleset == 0 {
+                return deny("class.devices.devfs", "device classes need the jail's own devfs".into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            if !req.devices.iter().all(|d| seen.insert(*d)) {
+                return deny("class.devices.repeat", "a device class named twice".into());
+            }
+            validate_groups(&exec.groups, exec.gid, policy)?;
+        }
+        crate::protocol::JailClass::Develop { .. } | crate::protocol::JailClass::Terminal { .. } => {
+            if req.exec.is_some() {
+                return deny("class.persistent.exec", format!("a {} jail is created empty; its processes come by ExecInJail", class_name(class)));
+            }
+            if !req.devices.is_empty() {
+                return deny("class.devices", "device classes are for app jails".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn class_name(c: &crate::protocol::JailClass) -> &'static str {
+    match c {
+        crate::protocol::JailClass::App { .. } => "app",
+        crate::protocol::JailClass::Develop { .. } => "develop",
+        crate::protocol::JailClass::Terminal { .. } => "terminal",
+    }
+}
+
+fn validate_owner_name(owner: &str) -> Result<(), JaildError> {
+    if owner.is_empty() || owner.len() > 32 || owner.starts_with('-')
+        || !owner.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+    {
+        return deny("class.owner", format!("owner {owner:?} is not a login name"));
+    }
+    Ok(())
+}
+
+fn validate_groups(groups: &[u32], gid: u32, policy: &Policy) -> Result<(), JaildError> {
+    if groups.len() > crate::protocol::MAX_EXEC_GROUPS {
+        return deny("exec.groups.count", format!("{} supplementary groups, at most {}", groups.len(), crate::protocol::MAX_EXEC_GROUPS));
+    }
+    for &g in groups {
+        if g == gid {
+            continue;
+        }
+        if g < policy.uid.min_user_uid || g > policy.uid.max_user_uid {
+            return deny("exec.groups.range", format!("group {g} is outside the user range"));
+        }
+    }
+    Ok(())
+}
+
+/// The host lookups for an app jail: its uid is the one the launch
+/// registry binds to this app and owner, its gid is that account's, and
+/// every supplementary group is one of the owner's files groups.
+pub fn validate_class_identity(req: &CreateJailRequest, ids: &dyn Identity) -> Result<(), JaildError> {
+    let Some(crate::protocol::JailClass::App { owner, app_id, .. }) = &req.class else { return Ok(()) };
+    let Some(exec) = &req.exec else { return Ok(()) };
+    match ids.app_binding(exec.uid) {
+        Some((o, a)) if &o == owner && &a == app_id => {}
+        Some((o, a)) => return deny("class.app.registry", format!("uid {} is {o}'s {a}, not {owner}'s {app_id}", exec.uid)),
+        None => return deny("class.app.registry", format!("uid {} is not in the launch registry", exec.uid)),
+    }
+    validate_account(exec.uid, exec.gid, &exec.groups, owner, ids)
+}
+
+fn validate_account(uid: u32, gid: u32, groups: &[u32], owner: &str, ids: &dyn Identity) -> Result<(), JaildError> {
+    match ids.account(uid) {
+        Some((_, g)) if g == gid => {}
+        Some((name, g)) => return deny("exec.gid.account", format!("{name}'s gid is {g}, not {gid}")),
+        None => return deny("exec.uid.account", format!("uid {uid} has no account")),
+    }
+    for &g in groups.iter().filter(|&&g| g != gid) {
+        match ids.group_name(g) {
+            Some(n) if is_files_group_of(&n, owner) => {}
+            Some(n) => return deny("exec.groups.owner", format!("group {n} is not one of {owner}'s files groups")),
+            None => return deny("exec.groups.owner", format!("group {g} does not exist")),
+        }
+    }
+    Ok(())
+}
+
+/// Who an ExecInJail into a classed jail may run as. An app jail: its own
+/// recorded uid only (no identity, no root). A workspace or console: the
+/// jail's root, the owner's own account, or an account the registry binds
+/// to the owner, with that account's gid and the owner's files groups.
+pub fn validate_exec_in_jail(
+    class: Option<&crate::protocol::JailClass>,
+    req: &crate::protocol::ExecInJailRequest,
+    ids: &dyn Identity,
+) -> Result<(), JaildError> {
+    if let Some(cwd) = &req.cwd {
+        if !cwd.starts_with('/') || cwd.len() > 1024 || cwd.split('/').any(|c| c == "..") || cwd.bytes().any(|b| b == 0) {
+            return deny("exec_in_jail.cwd", format!("{cwd:?} is not an absolute path"));
+        }
+    }
+    if req.umask.is_some_and(|m| m > 0o777) {
+        return deny("exec_in_jail.umask", "umask above 0o777".into());
+    }
+    let Some(class) = class else {
+        if req.identity.is_some() {
+            return deny("exec_in_jail.identity", "an identity is for classed jails".into());
+        }
+        return Ok(());
+    };
+    let owner = class.owner();
+    match class {
+        crate::protocol::JailClass::App { .. } => {
+            if req.want_root || req.identity.is_some() {
+                return deny("exec_in_jail.app", "into an app jail only as the app's own uid".into());
+            }
+            Ok(())
+        }
+        crate::protocol::JailClass::Develop { .. } | crate::protocol::JailClass::Terminal { .. } => {
+            let Some(id) = &req.identity else {
+                if req.want_root {
+                    return Ok(());
+                }
+                return deny("exec_in_jail.identity", format!("into a {} jail as root or a named identity", class_name(class)));
+            };
+            if req.want_root {
+                return deny("exec_in_jail.identity", "want_root and an identity together".into());
+            }
+            if id.groups.len() > crate::protocol::MAX_EXEC_GROUPS {
+                return deny("exec.groups.count", format!("{} supplementary groups, at most {}", id.groups.len(), crate::protocol::MAX_EXEC_GROUPS));
+            }
+            if id.uid == 0 {
+                if id.gid != 0 || !id.groups.is_empty() {
+                    return deny("exec_in_jail.root", "the jail's root runs as 0:0 with no other groups".into());
+                }
+                return Ok(());
+            }
+            let own = ids.account(id.uid).is_some_and(|(n, _)| n == owner);
+            let bound = ids.app_binding(id.uid).is_some_and(|(o, _)| o == owner);
+            if !own && !bound {
+                return deny("exec_in_jail.identity.owner", format!("uid {} is not {owner}'s", id.uid));
+            }
+            validate_account(id.uid, id.gid, &id.groups, owner, ids)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1277,8 @@ mod tests {
     fn create_request_full_validate() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name:          "atrium-test".into(),
             path:          "/var/lib/atrium/jails/atrium-test".into(),
@@ -1071,7 +1303,7 @@ mod tests {
     #[test]
     fn listen_paths_must_lie_under_an_rw_nullfs_source() {
         let mut r = instance_req("atrium-lyrad", "/var/lib/atrium/jails/lyrad", "/usr/local/bin/atrium-lyrad", false);
-        let m = |source: &str, kind| MountSpec { source: source.into(), dest: "x".into(), kind, size_mb: None, owner: None };
+        let m = |source: &str, kind| MountSpec { noexec: false, source: source.into(), dest: "x".into(), kind, size_mb: None, owner: None };
         r.mounts = vec![m("/usr/local/bin", MountKind::RoNullfs), m("/atrium/sockets/", MountKind::RwNullfs)];
         assert!(listen_path_allowed(&r, "/atrium/sockets/lyrad/lyrad.sock"));
         // dest "x" in the helper: where the service finds it inside its jail
@@ -1093,6 +1325,8 @@ mod tests {
 
     fn instance_req(name: &str, path: &str, entry: &str, stdio: bool) -> CreateJailRequest {
         CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name:          name.into(),
             path:          path.into(),
@@ -1101,6 +1335,7 @@ mod tests {
             devfs_ruleset: 22,
             network:       NetworkConfig::Disable,
             exec:          Some(ExecSpec {
+                groups: vec![],
                 path: entry.into(),
                 argv: vec![entry.rsplit('/').next().unwrap().into()],
                 env:  vec![],
@@ -1484,7 +1719,7 @@ mod tests {
         dev.fuse.as_mut().unwrap().device = "da0p1".into();
         let mut stdio = ok.clone();
         stdio.exec.as_mut().unwrap().stdio = true;
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut libs = ok.clone();
         libs.mounts = STICK_SERVER_MOUNTS.iter().map(|m| ro(m)).collect();
         assert!(is_stick_server(&libs, &p), "its binary and libraries");
@@ -1596,6 +1831,8 @@ mod tests {
     fn create_request_bad_name_rejected() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name:          "evil-x".into(),
             path:          "/var/lib/atrium/jails/atrium-test".into(),
@@ -1623,6 +1860,8 @@ mod tests {
 
     fn req_default() -> CreateJailRequest {
         CreateJailRequest {
+            class: None,
+            devices: vec![],
             rctl: None,
             name: "atrium-test".into(),
             path: "/var/lib/atrium/jails/atrium-test".into(),
@@ -1647,7 +1886,7 @@ mod tests {
     fn mount_ro_accepted_from_allowlist() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/local/lib".into(),
             dest:   "usr/local/lib".into(),
             kind:   MountKind::RoNullfs,
@@ -1661,7 +1900,7 @@ mod tests {
     fn mount_ro_rejects_unlisted() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/etc/master.passwd.bak".into(),
             dest:   "etc".into(),
             kind:   MountKind::RoNullfs,
@@ -1679,7 +1918,7 @@ mod tests {
     fn mount_rejects_traversal() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/local/lib".into(),
             dest:   "../escape".into(),
             kind:   MountKind::RoNullfs,
@@ -1695,7 +1934,7 @@ mod tests {
     fn mount_tmpfs_no_source_check() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "ignored".into(),
             dest:   "tmp".into(),
             kind:   MountKind::Tmpfs,
@@ -1711,7 +1950,7 @@ mod tests {
         p.mount_sources.ro_subtrees = vec!["/usr/local/libexec/atrium/drivers/".into()];
         let ro = |src: &str| {
             let mut r = req_default();
-            r.mounts.push(MountSpec { source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
+            r.mounts.push(MountSpec { noexec: false, source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
             validate_create(&r, &p)
         };
         ro("/usr/local/libexec/atrium/drivers/org.atrium.driver.x").unwrap();
@@ -1728,7 +1967,7 @@ mod tests {
         let mut p = load_sample_policy();
         p.mount_sources.rw_subtrees = vec!["/var/lib/atrium/storage/jails/".into()];
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/var/lib/atrium/storage/jails/mysqld/data".into(),
             dest:   "var/db/mysql".into(),
             kind:   MountKind::RwNullfs,
@@ -1739,7 +1978,7 @@ mod tests {
 
         // outside the subtree → reject
         let mut r2 = req_default();
-        r2.mounts.push(MountSpec {
+        r2.mounts.push(MountSpec { noexec: false,
             source: "/var/lib/something-else/x".into(),
             dest:   "x".into(),
             kind:   MountKind::RwNullfs,
@@ -1753,7 +1992,7 @@ mod tests {
     fn mount_rw_glob() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/home/alice".into(),
             dest:   "home/alice".into(),
             kind:   MountKind::RwNullfs,
@@ -1768,6 +2007,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["atrium-frescod".into()],
             env:  vec![],
@@ -1784,6 +2024,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/bin/sh".into(),
             argv: vec!["sh".into()],
             env:  vec![],
@@ -1802,6 +2043,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["i-am-something-else".into()],
             env:  vec![],
@@ -1820,6 +2062,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["atrium-frescod".into()],
             env:  vec![EnvPair { key: "EVIL_VAR".into(), value: "x".into() }],
@@ -1838,6 +2081,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["atrium-frescod".into()],
             env:  vec![EnvPair {
@@ -2037,6 +2281,7 @@ mod tests {
         r.name = name.into();
         r.devfs_ruleset = 23;
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: path.into(), argv: vec![path.into()], env: vec![],
             uid, gid: uid, stdio: false,
             listen: Vec::new(), ready: false,
@@ -2238,6 +2483,7 @@ mod tests {
         let p = load_sample_policy();
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["atrium-frescod".into()],
             env:  vec![],
@@ -2254,6 +2500,7 @@ mod tests {
     fn exec_as(uid: u32, gid: u32) -> CreateJailRequest {
         let mut r = req_default();
         r.exec = Some(ExecSpec {
+            groups: vec![],
             path: "/usr/local/bin/atrium-frescod".into(),
             argv: vec!["atrium-frescod".into()],
             env:  vec![],
@@ -2305,12 +2552,12 @@ mod tests {
     }
 
     fn tmpfs(size_mb: Option<u64>) -> MountSpec {
-        MountSpec { source: "tmpfs".into(), dest: "tmp".into(),
+        MountSpec { noexec: false, source: "tmpfs".into(), dest: "tmp".into(),
                     kind: MountKind::Tmpfs, size_mb, owner: None }
     }
 
     fn owned_tmpfs(mode: u32, uid: u32, gid: u32) -> MountSpec {
-        MountSpec { owner: Some(crate::protocol::TmpfsOwner { mode, uid, gid }), ..tmpfs(None) }
+        MountSpec { noexec: false, owner: Some(crate::protocol::TmpfsOwner { mode, uid, gid }), ..tmpfs(None) }
     }
 
     /// A service's tmpfs may belong to the service (or root), so a non-root
@@ -2350,7 +2597,7 @@ mod tests {
     fn only_a_tmpfs_takes_an_owner() {
         let p = load_sample_policy();
         let mut r = exec_as(1001, 1001);
-        r.mounts = vec![MountSpec { source: "/lib".into(), dest: "lib".into(), kind: MountKind::RoNullfs,
+        r.mounts = vec![MountSpec { noexec: false, source: "/lib".into(), dest: "lib".into(), kind: MountKind::RoNullfs,
                                     size_mb: None, owner: Some(crate::protocol::TmpfsOwner { mode: 0o755, uid: 0, gid: 0 }) }];
         assert!(matches!(validate_create(&r, &p).unwrap_err(),
             JaildError::PolicyViolation { rule: "mount.owner.not_tmpfs", .. }));
@@ -2408,5 +2655,259 @@ mod tests {
         assert!(!matches_glob(st, "/usr/home/alice/.atrium/apps/x"));
         assert!(!matches_glob(st, "/usr/home/alice/.atrium/state/.."));
     }
-}
 
+
+    /* ---- Classed jails (app-jails-via-jaild.md §3) ---- */
+
+    use crate::protocol::{DeviceClass, ExecIdentity, ExecInJailRequest, JailClass};
+
+    /// alice owns uid 1001 (gid 1001) and the app uid 2001 (gid 2001, bound
+    /// to her `org.example.sheets`); bob owns 1002 and app uid 2002.
+    struct FakeIds;
+    impl Identity for FakeIds {
+        fn app_binding(&self, uid: u32) -> Option<(String, String)> {
+            match uid {
+                2001 => Some(("alice".into(), "org.example.sheets".into())),
+                2002 => Some(("bob".into(), "org.example.sheets".into())),
+                _ => None,
+            }
+        }
+        fn account(&self, uid: u32) -> Option<(String, u32)> {
+            match uid {
+                1001 => Some(("alice".into(), 1001)),
+                1002 => Some(("bob".into(), 1002)),
+                2001 => Some(("app2001".into(), 2001)),
+                2002 => Some(("app2002".into(), 2002)),
+                _ => None,
+            }
+        }
+        fn group_name(&self, gid: u32) -> Option<String> {
+            match gid {
+                3001 => Some("files-alice".into()),
+                3002 => Some("files-alice-work".into()),
+                3003 => Some("files-bob".into()),
+                3004 => Some("wheel-ish".into()),
+                _ => None,
+            }
+        }
+    }
+
+    fn rule_of(r: Result<(), JaildError>) -> &'static str {
+        match r {
+            Err(JaildError::PolicyViolation { rule, .. }) => rule,
+            Ok(()) => "ok",
+            Err(other) => panic!("not a policy refusal: {other:?}"),
+        }
+    }
+
+    fn app_req(uid: u32, groups: Vec<u32>) -> CreateJailRequest {
+        let mut r = instance_req("app-sheets-1", "/var/lib/atrium/jails/app-sheets-1", "/usr/local/bin/sheets", false);
+        let e = r.exec.as_mut().unwrap();
+        e.uid = uid;
+        e.gid = uid;
+        e.groups = groups;
+        r.class = Some(JailClass::App { owner: "alice".into(), app_id: "org.example.sheets".into(), debug: false });
+        r
+    }
+
+    #[test]
+    fn devices_and_groups_need_a_class() {
+        let p = load_sample_policy();
+        let mut r = instance_req("app-x", "/var/lib/atrium/jails/app-x", "/usr/local/bin/x", false);
+        r.devices = vec![DeviceClass::Camera];
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.devices");
+        r.devices.clear();
+        r.exec.as_mut().unwrap().groups = vec![3001];
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.groups");
+        r.exec.as_mut().unwrap().groups.clear();
+        assert_eq!(rule_of(validate_class(&r, &p)), "ok");
+    }
+
+    #[test]
+    fn an_app_class_holds_its_shape() {
+        let p = load_sample_policy();
+        assert_eq!(rule_of(validate_class(&app_req(2001, vec![3001]), &p)), "ok");
+
+        let mut r = app_req(2001, vec![]);
+        r.children_max = 1;
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.children");
+
+        for owner in ["", "Alice", "-x", "a/b", &"a".repeat(33)] {
+            let mut r = app_req(2001, vec![]);
+            r.class = Some(JailClass::App { owner: owner.into(), app_id: "org.example.sheets".into(), debug: false });
+            assert_eq!(rule_of(validate_class(&r, &p)), "class.owner", "{owner:?}");
+        }
+        for id in ["", "a b", "../x", "a/b"] {
+            let mut r = app_req(2001, vec![]);
+            r.class = Some(JailClass::App { owner: "alice".into(), app_id: id.into(), debug: false });
+            assert_eq!(rule_of(validate_class(&r, &p)), "class.app_id", "{id:?}");
+        }
+
+        let mut r = app_req(2001, vec![]);
+        r.exec = None;
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.app.exec");
+
+        let mut r = app_req(2001, vec![]);
+        r.exec.as_mut().unwrap().uid = 0;
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.app.root");
+        let mut r = app_req(2001, vec![]);
+        r.exec.as_mut().unwrap().gid = 0;
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.app.root");
+
+        let mut r = app_req(2001, vec![]);
+        r.devices = vec![DeviceClass::Input];
+        assert_eq!(rule_of(validate_class(&r, &p)), "ok");
+        r.devices = vec![DeviceClass::Input, DeviceClass::Input];
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.devices.repeat");
+        r.devices = vec![DeviceClass::Input];
+        r.devfs_ruleset = 0;
+        assert_eq!(rule_of(validate_class(&r, &p)), "class.devices.devfs");
+
+        let r = app_req(2001, (3001..3001 + 17).collect());
+        assert_eq!(rule_of(validate_class(&r, &p)), "exec.groups.count");
+        let r = app_req(2001, vec![0]);
+        assert_eq!(rule_of(validate_class(&r, &p)), "exec.groups.range");
+        let r = app_req(2001, vec![65001]);
+        assert_eq!(rule_of(validate_class(&r, &p)), "exec.groups.range");
+    }
+
+    #[test]
+    fn workspace_and_console_jails_are_created_empty() {
+        let p = load_sample_policy();
+        for class in [JailClass::Develop { owner: "alice".into() }, JailClass::Terminal { owner: "alice".into() }] {
+            let mut r = req_default();
+            r.class = Some(class.clone());
+            assert_eq!(rule_of(validate_class(&r, &p)), "ok");
+            r.devices = vec![DeviceClass::Camera];
+            assert_eq!(rule_of(validate_class(&r, &p)), "class.devices");
+            let mut r = app_req(2001, vec![]);
+            r.class = Some(class);
+            assert_eq!(rule_of(validate_class(&r, &p)), "class.persistent.exec");
+        }
+    }
+
+    #[test]
+    fn an_app_uid_must_be_the_registrys_for_that_app_and_owner() {
+        let ok = app_req(2001, vec![3001, 3002]);
+        assert_eq!(rule_of(validate_class_identity(&ok, &FakeIds)), "ok");
+        // not in the registry; bob's instance of the same app
+        assert_eq!(rule_of(validate_class_identity(&app_req(1001, vec![]), &FakeIds)), "class.app.registry");
+        assert_eq!(rule_of(validate_class_identity(&app_req(2002, vec![]), &FakeIds)), "class.app.registry");
+        // another app id for alice's uid
+        let mut r = app_req(2001, vec![]);
+        r.class = Some(JailClass::App { owner: "alice".into(), app_id: "org.example.mail".into(), debug: false });
+        assert_eq!(rule_of(validate_class_identity(&r, &FakeIds)), "class.app.registry");
+        // a gid other than the account's
+        let mut r = app_req(2001, vec![]);
+        r.exec.as_mut().unwrap().gid = 1001;
+        assert_eq!(rule_of(validate_class_identity(&r, &FakeIds)), "exec.gid.account");
+        // bob's files group, a group that is no files group, a missing group
+        for g in [3003, 3004, 3999] {
+            assert_eq!(rule_of(validate_class_identity(&app_req(2001, vec![g]), &FakeIds)), "exec.groups.owner", "{g}");
+        }
+        // an unclassed request is not asked about
+        let mut r = app_req(1, vec![]);
+        r.class = None;
+        assert_eq!(rule_of(validate_class_identity(&r, &FakeIds)), "ok");
+    }
+
+    fn exec_req(identity: Option<ExecIdentity>, want_root: bool) -> ExecInJailRequest {
+        ExecInJailRequest {
+            name: "ws-alice-1".into(), path: "/bin/sh".into(), argv: vec!["sh".into()], env: vec![],
+            want_root, cols: 80, rows: 24, identity, cwd: None, umask: None, stdio: false,
+        }
+    }
+    fn id(uid: u32, gid: u32, groups: Vec<u32>) -> Option<ExecIdentity> {
+        Some(ExecIdentity { uid, gid, groups })
+    }
+
+    #[test]
+    fn who_may_run_in_a_classed_jail() {
+        let app = JailClass::App { owner: "alice".into(), app_id: "org.example.sheets".into(), debug: false };
+        let ws = JailClass::Develop { owner: "alice".into() };
+        let term = JailClass::Terminal { owner: "alice".into() };
+        let v = |c: Option<&JailClass>, r: &ExecInJailRequest| rule_of(validate_exec_in_jail(c, r, &FakeIds));
+
+        // An app jail: its own uid only.
+        assert_eq!(v(Some(&app), &exec_req(None, false)), "ok");
+        assert_eq!(v(Some(&app), &exec_req(None, true)), "exec_in_jail.app");
+        assert_eq!(v(Some(&app), &exec_req(id(2001, 2001, vec![]), false)), "exec_in_jail.app");
+
+        for c in [&ws, &term] {
+            // the jail's root, or a named identity, never the recorded default
+            assert_eq!(v(Some(c), &exec_req(None, true)), "ok");
+            assert_eq!(v(Some(c), &exec_req(None, false)), "exec_in_jail.identity");
+            assert_eq!(v(Some(c), &exec_req(id(0, 0, vec![]), false)), "ok");
+            assert_eq!(v(Some(c), &exec_req(id(0, 0, vec![3001]), false)), "exec_in_jail.root");
+            assert_eq!(v(Some(c), &exec_req(id(0, 5, vec![]), false)), "exec_in_jail.root");
+            assert_eq!(v(Some(c), &exec_req(id(1001, 1001, vec![]), true)), "exec_in_jail.identity");
+            // the owner's account, or an app uid bound to the owner
+            assert_eq!(v(Some(c), &exec_req(id(1001, 1001, vec![3001, 3002]), false)), "ok");
+            assert_eq!(v(Some(c), &exec_req(id(2001, 2001, vec![3001]), false)), "ok");
+            // bob's account or app uid; an unknown uid; a wrong gid; bob's group
+            assert_eq!(v(Some(c), &exec_req(id(1002, 1002, vec![]), false)), "exec_in_jail.identity.owner");
+            assert_eq!(v(Some(c), &exec_req(id(2002, 2002, vec![]), false)), "exec_in_jail.identity.owner");
+            assert_eq!(v(Some(c), &exec_req(id(4242, 4242, vec![]), false)), "exec_in_jail.identity.owner");
+            assert_eq!(v(Some(c), &exec_req(id(1001, 2001, vec![]), false)), "exec.gid.account");
+            assert_eq!(v(Some(c), &exec_req(id(1001, 1001, vec![3003]), false)), "exec.groups.owner");
+            assert_eq!(v(Some(c), &exec_req(id(1001, 1001, (3001..3018).collect()), false)), "exec.groups.count");
+        }
+
+        // An unclassed jail takes no identity.
+        assert_eq!(v(None, &exec_req(None, false)), "ok");
+        assert_eq!(v(None, &exec_req(id(1001, 1001, vec![]), false)), "exec_in_jail.identity");
+
+        // cwd and umask, for every jail
+        for cwd in ["work", "/a/../b", "/a/..", "", "/a\0b"] {
+            let mut r = exec_req(None, true);
+            r.cwd = Some(cwd.into());
+            assert_eq!(v(Some(&ws), &r), "exec_in_jail.cwd", "{cwd:?}");
+        }
+        let mut r = exec_req(None, true);
+        r.cwd = Some("/usr/home/alice/work/a..b".into());
+        assert_eq!(v(Some(&ws), &r), "ok");
+        r.umask = Some(0o1000);
+        assert_eq!(v(Some(&ws), &r), "exec_in_jail.umask");
+        r.umask = Some(0o002);
+        assert_eq!(v(Some(&ws), &r), "ok");
+    }
+
+    #[test]
+    fn files_groups_belong_to_their_owner() {
+        assert!(is_files_group_of("files-alice", "alice"));
+        assert!(is_files_group_of("files-alice-work", "alice"));
+        assert!(!is_files_group_of("files-alice-", "alice"));
+        assert!(!is_files_group_of("files-alicex", "alice"));
+        assert!(!is_files_group_of("files-bob", "alice"));
+        assert!(!is_files_group_of("files-al", "alice"));
+        assert!(!is_files_group_of("wheel", "alice"));
+        // the hashed form, for an owner whose name leaves no room
+        let owner = "averyveryverylongname"; // files-<owner> is 27 characters
+        assert!(is_files_group_of("files-averyveryverylon-0123abcd", owner));
+        assert!(!is_files_group_of("files-averyveryverylon-0123abcz", owner));
+        assert!(!is_files_group_of("files-averyveryverylon-0123abc", owner));
+        // a short owner has no hashed form of its own: its prefix is the whole base
+        assert!(!is_files_group_of("files-bob-0123abcd-x", "alice"));
+    }
+
+    #[test]
+    fn an_app_jail_gets_listed_capability_sockets_only() {
+        let p = load_sample_policy();
+        let sock = |src: &str, dest: &str| MountSpec { noexec: false, source: src.into(), dest: dest.into(), kind: MountKind::RwNullfs, size_mb: None, owner: None };
+        let mut r = app_req(2001, vec![]);
+        r.mounts = vec![sock("/atrium/sockets/workers", "atrium/sockets/workers")];
+        assert_eq!(rule_of(validate_create(&r, &p)), "ok");
+        // not for a service, which takes the global list
+        let mut svc = r.clone();
+        svc.class = None;
+        assert_eq!(rule_of(validate_create(&svc, &p)), "mount.source.not_in_rw");
+        // a name the list lacks, a deeper path, a traversal, read-only
+        for (src, dest) in [("/atrium/sockets/jaild", "x"), ("/atrium/sockets/workers/x", "x"),
+                            ("/atrium/sockets/../workers", "x"), ("/atrium/sockets/workers", "../x")] {
+            r.mounts = vec![sock(src, dest)];
+            assert_ne!(rule_of(validate_create(&r, &p)), "ok", "{src} -> {dest}");
+        }
+        r.mounts = vec![MountSpec { kind: MountKind::RoNullfs, ..sock("/atrium/sockets/workers", "x") }];
+        assert_eq!(rule_of(validate_create(&r, &p)), "mount.source.not_in_ro");
+    }
+}

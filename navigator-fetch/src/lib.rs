@@ -560,6 +560,23 @@ pub fn serve_options(args: &[String]) -> (usize, bool) {
     (workers, !args.iter().any(|a| a == "--no-reuse"))
 }
 
+/// The most one live page's resource may be (navigator-islands.md I6.1):
+/// a large script bundle or stylesheet, well under the engine's memory.
+pub const LIVE_RESOURCE_MAX: usize = 8 << 20;
+
+/// A response's content type as one token for the ``L` answer: the
+/// `type/subtype`, lower case, when it is plain ASCII token characters,
+/// else `-`. Parameters (charset) are dropped; the engine sniffs as a
+/// browser does.
+pub fn live_content_type(value: Option<&str>) -> String {
+    let Some(mime) = value.and_then(|v| v.split(';').next()).map(str::trim) else { return "-".into() };
+    let token = |t: &str| !t.is_empty() && t.len() <= 64 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b));
+    match mime.split_once('/') {
+        Some((a, b)) if token(a) && token(b) => mime.to_ascii_lowercase(),
+        _ => "-".into(),
+    }
+}
+
 /// `--peek-window-ms N`: the header window (`prefetch::PEEK_WINDOW` by default).
 pub fn peek_window_option(args: &[String]) -> Duration {
     args.iter().position(|a| a == "--peek-window-ms").and_then(|i| args.get(i + 1))
@@ -586,6 +603,10 @@ pub fn peek_window_option(args: &[String]) -> Duration {
 /// - `N <url>`: the page itself, never from a prefetch, answered as a fetch
 ///   then followed by its chain (`hops <n>`, n lines `<status> <0|1> <url>`,
 ///   status 0 for a redirect target that would loop);
+/// - `L <url>`: a live page's resource (navigator-islands.md I6.1): one GET,
+///   no redirect, any status and type, at most `LIVE_RESOURCE_MAX`, answered
+///   `ok <status> <type> <len> <url>\n` + body (`live_content_type`, where
+///   a fetch has its redirects);
 /// - `B <bytes>`: the most hints may pull, no answer;
 /// - `--gate`: `gate` is called (fetchd prints its M1 gate).
 pub fn serve(conv: &Conversation<'_>, workers: usize, input: impl std::io::BufRead, out: impl std::io::Write,
@@ -641,6 +662,20 @@ pub fn serve_with(conv: &Conversation<'_>, workers: usize, peek_window: Duration
                 let _ = out.flush();
                 continue;
             }
+            // `L <url>`: a live page's resource, any type (I6.1), answered
+            // `ok <status> <type> <len> <url>\n` + body, or `err <why>\n`.
+            if let Some(u) = url.strip_prefix("L ") {
+                let u = u.trim();
+                match pf.live_resource(u) {
+                    Ok((status, kind, body)) => {
+                        let _ = writeln!(out, "ok {status} {kind} {} {u}", body.len());
+                        let _ = out.write_all(&body);
+                    }
+                    Err(e) => { let _ = writeln!(out, "err {}", e.replace(['\n', '\r'], " ")); }
+                }
+                let _ = out.flush();
+                continue;
+            }
             // `N <url>`: the page itself (a navigation), answered as a fetch
             // is, then `hops <n>\n` and n lines `<status> <0|1 set-cookie> <url>`.
             if let Some(u) = url.strip_prefix("N ") {
@@ -682,6 +717,20 @@ impl<C: Connect + Send> Connect for Locked<C> {
     fn connect_addr(&self, addr: SocketAddr) -> std::io::Result<TcpStream> { self.0.lock().unwrap().connect_addr(addr) }
 }
 
+
+#[cfg(test)]
+mod live_tests {
+    #[test]
+    fn a_live_resources_type_is_one_plain_token_or_a_dash() {
+        assert_eq!(super::live_content_type(Some("Text/JavaScript; charset=utf-8")), "text/javascript");
+        assert_eq!(super::live_content_type(Some("image/svg+xml")), "image/svg+xml");
+        assert_eq!(super::live_content_type(None), "-");
+        assert_eq!(super::live_content_type(Some("text/html evil")), "-");
+        assert_eq!(super::live_content_type(Some("text/ht\nml")), "-");
+        assert_eq!(super::live_content_type(Some("nonsense")), "-");
+        assert_eq!(super::live_content_type(Some("/x")), "-");
+    }
+}
 
 #[cfg(test)]
 mod policy_tests {

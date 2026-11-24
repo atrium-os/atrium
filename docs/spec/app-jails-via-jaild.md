@@ -1,7 +1,7 @@
 # App, workspace and console jails through jaild
 
-**Status: ACCEPTED 2026-11-25, J0 in progress** (codebase review H3, option (a), chosen by
-Shankar 2026-11-24). Nothing here is built yet.
+**Status: ACCEPTED 2026-11-25. J0 and J1 built (§3.1, §4.1); J2 next** (codebase review
+H3, option (a), chosen by Shankar 2026-11-24). portcullisd does not use any of it yet.
 
 ## 1. Why
 
@@ -76,6 +76,47 @@ What the rendered jail.conf carries, and its jaild equivalent:
 Every new field is bounded and validated as the existing ones are, and
 anything the validator does not know is refused.
 
+### 3.1 As built (J0)
+
+- `CreateJailRequest.class`: `app { owner, app_id, debug }`, `develop
+  { owner }`, `terminal { owner }`. Any class needs a login-name owner and
+  `children_max = 0`. An app needs an exec whose uid and gid are not 0,
+  whose uid the launch registry binds to that owner and app (read fresh
+  per request; an unreadable registry denies), whose gid is that
+  account's, and whose `groups` (at most 16, user range) are the owner's
+  files groups (`files-<owner>`, `files-<owner>-<persona>` or home.rs's
+  hashed form). `develop` and `terminal` are created empty.
+- A classed jail gets `allow.mount/raw_sockets/chflags/set_hostname = 0`
+  and `enforce_statfs = 2` set explicitly, not left to the kernel's
+  defaults (which allow `set_hostname` and `unprivileged_proc_debug`), and
+  `allow.unprivileged_proc_debug` only for `develop` or `app` with `debug`
+  (an app under lldb-server, M10). Unclassed service jails are unchanged.
+- `devices`: `fresco` (`fresco0`), `input` (`input/event*`), `camera`
+  (`video*`), unhidden in the jail's own devfs by `devfs rule apply` with
+  an argument vector, no shell. Audio has no class: Lyra serves it.
+- `ExecInJail` gains `identity { uid, gid, groups }`, `cwd`, `umask` and
+  `stdio` (exactly three descriptors, no pty, `setsid`). Into an app jail
+  only as its recorded uid. Into `develop`/`terminal`: the jail's root as
+  0:0 with no other groups, or the owner's own account or an app uid the
+  registry binds to the owner, with that account's gid and the owner's
+  files groups; with no identity and no `want_root` it is refused. The
+  directory is entered after the drop, and failing to enter it is fatal.
+- `JailInfo { name }` answers `{ jid, path, persist }` from jaild's state
+  for jails jaild made (jid `None` when nothing runs in it).
+- `ListenInJail { name, port }` (for `egress.rs`'s proxy and the M10
+  debugger): a child attaches, binds 127.0.0.1:`port`, listens and passes
+  the socket back; `develop` jails and `app` jails with `debug` only.
+- Mounts: jaild now makes the mounts of a classed jail created empty (it
+  ignored them before, which a workspace's would have hit); an unclassed
+  jail with no exec still gets none, and says so in the log. Every nullfs
+  into an `app` jail is `nosuid`, and `MountSpec.noexec` maps jail.conf's
+  `noexec`. A destination that resolves outside the jail root once
+  symlinks are followed is refused (a writable root can hold a link from
+  an earlier run, and nmount follows it).
+- An `app` jail may have `<apps.sockets_dir>/<name>` read-write for each
+  name in `jaild.policy.toml` `[apps] sockets`, beside the global
+  allowlist; a test keeps the list equal to what portcullis-jail mounts.
+
 ## 4. Changes to portcullisd and portcullis-jail
 
 - `portcullis-jail` gets `JailConfig::to_create_request(&self) ->
@@ -90,6 +131,33 @@ anything the validator does not know is refused.
   into jails.
 - When the last caller is gone, `render_jail_conf`, `write_jail_conf` and
   the jail(8) code are deleted, which removes C1's whole surface.
+
+### 4.1 As built (J1)
+
+`to_create_request` lives in portcullisd (`src/jail_request.rs`), not in
+portcullis-jail: portcullis-jail is also a dependency of memfed, which would
+otherwise take jaild and its dependencies into its lockfile. It takes the
+class, who the entry runs as (uid, gid, groups, arguments, environment,
+stdio), the `full` network's resolved grants and the system call class,
+and maps each jail.conf parameter or refuses the request:
+
+- `exec.start` must be one plain absolute path; arguments come only from
+  the caller, so J2 stops formatting `--persona …` into the string.
+- `exec.prestart` is accepted only as exactly the devfs grants `build`
+  renders, each of which must be a jaild device class.
+- `exec.created` is accepted only as the loopback capability's string;
+  a network already attached for jail(8) is refused.
+- `allow.*`, `enforce_statfs` and `children.max` are accepted only at the
+  values jaild itself sets for the class.
+- `sysfil.*` needs a named class, which jaild resolves again.
+- `mount.devfs = false` means no devfs; mounts must be nullfs `ro` or
+  `rw`, under the root, with `noexec`, or `nosuid` in an app jail.
+- `persist`, `exec.clean`, `exec.system_jail_user` and `exec.jail_user`
+  carry nothing jaild needs: an exec'd jail ends with its entry, an
+  empty one persists, and the identity is numbers from the caller.
+
+Its tests run every shipped app manifest through `build` and the mapping
+and then through jaild's validator with the shipped policy.
 
 ## 5. Order of work
 

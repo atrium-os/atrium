@@ -217,6 +217,15 @@ pub enum Request {
     /// document's own HTTPS origin, through the profile's couriers, and
     /// answers `VpnResource` with the same `id`.
     VpnResource { page: u32, id: u32, url: String },
+    /// Run the page on screen live (navigator-islands.md I6.1), on the
+    /// person's press on "Run this page live" in the tier popover. `url`:
+    /// the page shown, which navigatord checks is the one it showed;
+    /// `rect`: the page area in the window. Answered by `LiveStarted`
+    /// and later `LiveEnded`, or `LiveEnded` with why it could not start.
+    RunPageLive { url: String, rect: [u32; 4], press: Press },
+    /// The page area moved (`Some`), or Stop / leaving the page (`None`:
+    /// the engine ends and no `LiveEnded` follows).
+    PlaceLive { url: String, rect: Option<[u32; 4]> },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
@@ -399,6 +408,12 @@ pub enum Event {
     /// The answer to `VpnResource`: with `kind`, a sealed descriptor of the
     /// body follows; without, it was refused or failed (`why`).
     VpnResource { id: u32, kind: Option<VpnResourceKind>, why: Option<String> },
+    /// `RunPageLive`'s page runs live: the engine delivered it and reported
+    /// `origin`, the page's own. The chip reads "Live code".
+    LiveStarted { url: String, origin: String },
+    /// The live page ended by itself or failed (`why`), or never started:
+    /// the trail shows the document lane again.
+    LiveEnded { url: String, why: Option<String> },
 }
 
 /// What a VPN page's resource is, from its content type.

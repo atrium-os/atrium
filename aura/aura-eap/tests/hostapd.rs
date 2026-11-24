@@ -216,17 +216,21 @@ fn join(port: u16, cfg: Config) -> Out {
 
 /// The same join through the helper binary aura-keys runs, over its pipe.
 fn join_helper(port: u16, profile: &aura_eap::profile::Profile) -> Result<Zeroizing<[u8; 64]>, String> {
-    join_helper_signing(port, profile, None)
+    join_helper_signing(port, profile, None, None)
 }
 
 /// As `join_helper`, answering the helper's signing requests with `key`
 /// the way aura-keys answers them with Arca.
-fn join_helper_signing(port: u16, profile: &aura_eap::profile::Profile, key: Option<&p256::ecdsa::SigningKey>) -> Result<Zeroizing<[u8; 64]>, String> {
+fn join_helper_signing(port: u16, profile: &aura_eap::profile::Profile, key: Option<&p256::ecdsa::SigningKey>, roots: Option<&Path>) -> Result<Zeroizing<[u8; 64]>, String> {
     use aura_eap::helper::{self, Reader};
     use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
     let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_atrium-aura-eap")).stdin(Stdio::from(OwnedFd::from(theirs))).spawn().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_atrium-aura-eap"));
+    if let Some(r) = roots {
+        cmd.arg("--roots").arg(r);
+    }
+    let mut child = cmd.stdin(Stdio::from(OwnedFd::from(theirs))).spawn().unwrap();
     helper::write(&mut ours, helper::CONFIG, &profile.encode()).unwrap();
     ours.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut radius = Radius::new(port);
@@ -350,6 +354,7 @@ fn against_hostapd() {
         anonymous: Some(anon.into()),
         domain: if ca { DOMAIN.into() } else { String::new() },
         ca: if ca { vec![der(&dir, "corp").to_vec()] } else { vec![] },
+        system_roots: false,
         pin: None,
         password: Zeroizing::new(pw.into()),
         cert: vec![],
@@ -358,6 +363,17 @@ fn against_hostapd() {
     assert!(join_helper(base, &profile("s3cret", true)).is_ok(), "the helper joins");
     assert_eq!(join_helper(base, &profile("wrong", true)), Err("rejected".into()));
     assert_eq!(join_helper(base, &profile("s3cret", false)), Err("trust".into()));
+
+    // The system's roots: a bundle holding the corp CA admits the server;
+    // one without it, or none at all, does not.
+    let sys = aura_eap::profile::Profile { system_roots: true, ca: vec![], ..profile("s3cret", true) };
+    std::fs::write(dir.join("bundle.pem"), [std::fs::read(dir.join("evil.pem")).unwrap(), std::fs::read(dir.join("corp.pem")).unwrap()].concat()).unwrap();
+    assert!(join_helper_signing(base, &sys, None, Some(&dir.join("bundle.pem"))).is_ok(), "system roots holding the CA");
+    assert_eq!(join_helper_signing(base, &sys, None, Some(&dir.join("evil.pem"))), Err("untrusted".into()), "system roots without it");
+    assert_eq!(join_helper_signing(base, &sys, None, Some(&dir.join("missing.pem"))), Err("no-system-roots".into()));
+    let s = aura_eap::cert::summary(&der(&dir, "server")).unwrap();
+    assert_eq!((s.subject.as_str(), s.issuer.as_str()), ("radius.corp.example", "corp Test CA"));
+    assert_eq!(s.not_after.len(), 10, "{s:?}");
 
     // EAP-TLS through the helper with a key it never holds, as with Arca:
     // the request is built by aura_eap::csr, signed over its digest, the
@@ -379,15 +395,16 @@ fn against_hostapd() {
         anonymous: None,
         domain: DOMAIN.into(),
         ca: vec![der(&dir, "corp").to_vec()],
+        system_roots: false,
         pin: None,
         password: Zeroizing::new(String::new()),
         cert: vec![cert],
         key: Some([7; 16]),
     };
-    assert!(join_helper_signing(base, &tls, Some(&arca)).is_ok(), "EAP-TLS through the helper");
+    assert!(join_helper_signing(base, &tls, Some(&arca), None).is_ok(), "EAP-TLS through the helper");
     // A key that does not match the certificate: the server refuses.
     let other = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
-    assert!(join_helper_signing(base, &tls, Some(&other)).is_err(), "a wrong key is refused");
+    assert!(join_helper_signing(base, &tls, Some(&other), None).is_err(), "a wrong key is refused");
     // No key in the profile: the helper says so before any packet.
     let nokey = aura_eap::profile::Profile { key: None, ..tls.clone() };
     assert_eq!(join_helper(base, &nokey), Err("no-client-certificate".into()));

@@ -156,6 +156,12 @@ pub struct Shell {
     pub portal: Option<String>,
     /// The sign-in window's form panel, for the page shown.
     pub form: Option<FormPanel>,
+    /// Whole pages may run live on a press (`NAVIGATOR_UI_LIVE_PAGES=1`,
+    /// set by navigatord while I6.1 is built).
+    pub live_pages: bool,
+    /// The page running live, or asked to: its address, and its origin
+    /// once the engine started (navigator-islands.md I6.1).
+    pub live_run: Option<LiveRun>,
 }
 
 /// The form panel (navigator-ui.md "Forms in the sign-in window"): the
@@ -233,6 +239,15 @@ pub enum Region {
     Page,
 }
 
+/// A whole page running live (I6.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveRun {
+    pub key: (u64, PageId),
+    pub url: String,
+    /// `None` until navigatord reports the engine started.
+    pub origin: Option<String>,
+}
+
 /// The live page's state, as navigatord and the page child reported it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LivePage {
@@ -266,6 +281,10 @@ pub enum Out {
     AnswerUnload { start: navigator_control::Press, query: u32, leave: bool, press: navigator_control::Press },
     StartWidget { page: (u64, PageId), key: u32, src: String, press: navigator_control::Press },
     RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
+    /// Run the page on screen live (I6.1), with the press on "Run live".
+    RunPageLive { url: String, press: navigator_control::Press },
+    /// Stop the page running live: back to the document lane.
+    StopLive { url: String },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
@@ -411,7 +430,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -699,6 +718,64 @@ impl Shell {
         }
     }
 
+    /// Whether the tier popover offers "Run this page live" (I6.1): live
+    /// pages are on, the page on screen is an HTTPS page from navigatord,
+    /// and it isn't running live already.
+    pub fn offers_live(&self) -> bool {
+        self.live_pages && self.live.is_some() && self.history.is_none() && self.live_run.is_none()
+            && self.shown_url().is_some_and(|u| u.starts_with("https://"))
+    }
+
+    /// The popover's "Run this page live": ask in the prompt row, whose
+    /// "Run live" is the press that counts (§6.4's 500 ms still and
+    /// uncovered). Asking again after "Not now" is the person's choice.
+    pub fn offer_live(&mut self, now: f64) -> bool {
+        if !self.offers_live() { return false; }
+        let Some(url) = self.shown_url() else { return false };
+        let site = crate::trail::site(&url).to_string();
+        self.popover = false;
+        if let Some(page) = self.store.trail_mut().page_mut() {
+            page.prompts.dismissed.retain(|k| k != "run-page-live");
+            page.prompts.last_ms = None;
+        }
+        self.ask(Prompt::RunPageLive { site }, now)
+    }
+
+    /// The popover's "Stop running live", or leaving the page: the
+    /// document lane shows again.
+    pub fn stop_live(&mut self) {
+        let Some(run) = self.live_run.take() else { return };
+        self.popover = false;
+        self.set_live_whole(run.key, false);
+        self.outbox.push(Out::StopLive { url: run.url });
+    }
+
+    /// navigatord said the page runs live (`origin`), or ended it (`None`).
+    pub fn live_reported(&mut self, url: &str, origin: Option<String>, why: Option<String>) {
+        let Some(run) = self.live_run.as_mut().filter(|r| r.url == url) else { return };
+        let key = run.key;
+        match origin {
+            Some(o) => {
+                run.origin = Some(o);
+                self.set_live_whole(key, true);
+            }
+            None => {
+                self.live_run = None;
+                self.set_live_whole(key, false);
+                self.last_note = Some(match why {
+                    Some(w) => format!("the page stopped running live: {w}"),
+                    None => "the page stopped running live".into(),
+                });
+            }
+        }
+    }
+
+    fn set_live_whole(&mut self, key: (u64, PageId), on: bool) {
+        if let Some(page) = self.store.page_by_key_mut(key.0, key.1) {
+            page.live_whole = on;
+        }
+    }
+
     /// Ask on the page on screen.
     pub fn ask(&mut self, p: Prompt, now: f64) -> bool {
         let Some(key) = self.shown_key() else { return false };
@@ -860,6 +937,12 @@ impl Shell {
             (Prompt::WidgetUnload { start, query, .. }, "Leave" | "Stay") if live => {
                 self.outbox.push(Out::AnswerUnload { start: *start, query: *query, leave: what == "Leave", press });
             }
+            (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
+                if let (Some(url), Some(key)) = (self.shown_url(), key) {
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None });
+                    self.outbox.push(Out::RunPageLive { url, press });
+                }
+            }
             (Prompt::RunLive, "Run live") if live => {
                 if let Some(url) = self.shown_url() {
                     self.outbox.push(Out::RunLive { url, jar: self.store.trail().jar(), press });
@@ -868,7 +951,7 @@ impl Shell {
             (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
-        if matches!(self.outbox.last(), Some(Out::RunLive { .. } | Out::Save { .. } | Out::OpenFile { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
+        if matches!(self.outbox.last(), Some(Out::RunLive { .. } | Out::RunPageLive { .. } | Out::Save { .. } | Out::OpenFile { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
             self.answered = key.map(|k| (k, prompt));
         }
         true
@@ -1774,8 +1857,24 @@ pub fn popover_height(s: &Shell, w: f32) -> f32 {
     for r in &f.reasons {
         n += lines(r);
     }
-    // Top 14, heading 28, two section labels 16 each, two 6 gaps, lines 16, bottom 14.
-    em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + 16.0 * n + 14.0)
+    // Top 14, heading 28, two section labels 16 each, two 6 gaps, lines 16, bottom 14;
+    // the action row 6 + 32.
+    let action = if popover_action(s).is_some() { 6.0 + 32.0 } else { 0.0 };
+    em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + 16.0 * n + 14.0 + action)
+}
+
+/// The popover's one action (I6.1), if it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopoverAction { RunLive, Stop }
+
+pub fn popover_action(s: &Shell) -> Option<PopoverAction> {
+    if s.live_run.as_ref().is_some_and(|r| Some(r.key) == s.shown_key()) {
+        Some(PopoverAction::Stop)
+    } else if s.offers_live() {
+        Some(PopoverAction::RunLive)
+    } else {
+        None
+    }
 }
 
 /// The popover's connection line.
@@ -2482,6 +2581,61 @@ mod tests {
         s.press_refused("covered", 1000.0);
         assert!(s.answer_pressed(0, 1700.0, Some([4; 16])));
         assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_page_runs_live_only_on_a_counted_press_and_stop_brings_the_document_back() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        // Off unless navigatord turned it on: no offer, no prompt.
+        assert_eq!(popover_action(&s), None);
+        assert!(!s.offer_live(0.0));
+        s.live_pages = true;
+        assert_eq!(popover_action(&s), Some(PopoverAction::RunLive));
+        // The popover's row only asks; nothing is sent yet.
+        s.popover = true;
+        assert!(s.offer_live(0.0));
+        assert!(!s.popover);
+        assert!(s.outbox.is_empty());
+        let asked = s.store.trail().page().unwrap().asked.clone().unwrap();
+        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "app.example".into() });
+        // "Not now", then asked again from the popover: the person's choice.
+        assert!(s.answer_pressed(0, 600.0, Some([1; 16])));
+        assert!(s.outbox.is_empty() && s.live_run.is_none());
+        assert!(s.offer_live(700.0));
+        // A press before the row was still for 500 ms does nothing.
+        assert!(!s.answer_pressed(1, 900.0, Some([2; 16])));
+        assert!(s.outbox.is_empty());
+        assert!(s.answer_pressed(1, 1300.0, Some([2; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16] }));
+        assert_eq!(popover_action(&s), Some(PopoverAction::Stop));
+        // The chip reads Live code only once the engine started the page.
+        assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        s.live_reported(url, Some("https://app.example".into()), None);
+        assert_eq!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        s.stop_live();
+        assert_eq!(s.outbox.pop(), Some(Out::StopLive { url: url.into() }));
+        assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        assert_eq!(popover_action(&s), Some(PopoverAction::RunLive));
+        // An engine that ends by itself does the same, with why.
+        assert!(s.offer_live(2000.0));
+        assert!(s.answer_pressed(1, 2600.0, Some([5; 16])));
+        s.live_reported(url, Some("https://app.example".into()), None);
+        s.live_reported(url, None, Some("the page's engine failed".into()));
+        assert!(s.live_run.is_none());
+        assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        assert!(s.last_note.as_deref().is_some_and(|n| n.contains("engine failed")));
+    }
+
+    #[test]
+    fn an_http_page_is_not_offered_live() {
+        let mut s = shell();
+        s.enter("http://plain.example/");
+        s.live = Some(LivePage::Shown("http://plain.example/".into()));
+        s.live_pages = true;
+        assert_eq!(popover_action(&s), None);
     }
 
     #[test]

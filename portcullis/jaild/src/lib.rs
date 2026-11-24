@@ -21,7 +21,8 @@
 //!   `thiserror`, `log`, `env_logger`, plus the workspace's own
 //!   `sockmux` (the kqueue connection multiplexer shared with
 //!   atrium-volumes and portcullisd-daemon; libc + log only, one
-//!   unsafe module). New deps require a written
+//!   unsafe module), `atrium-fdpass` (descriptor passing) and
+//!   `portcullis-peer` (reading the launch registry). New deps require a written
 //!   case in this crate's `CONTRIBUTING.md` (TODO: add when the
 //!   first PR proposing one arrives).
 //! - "C with safety" reading style. A FreeBSD developer should be
@@ -32,6 +33,7 @@
 pub mod client;
 pub mod error;
 pub mod ffi;
+pub mod identity;
 pub mod protocol;
 pub mod routed;
 pub mod server;
