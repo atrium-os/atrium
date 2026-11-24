@@ -12,6 +12,8 @@ struct Player {
     buffers: [Option<Buffer>; 2],
     time: f64,
     playing: bool,
+    ended: bool,
+    end_event: bool,
 }
 
 struct Buffer {
@@ -48,11 +50,28 @@ pub unsafe extern "C" fn navigator_video_channel(fd: i32) -> bool {
             buffers: [None, None],
             time: 0.0,
             playing: false,
+            ended: false,
+            end_event: false,
         }))
         .is_ok()
 }
 
 impl Player {
+    fn read_clock(&mut self) {
+        let (secs, ended) = match self.call(Request::Clock) {
+            Some(Reply::Position { secs }) => (secs, false),
+            Some(Reply::EndedPosition { secs }) => (secs, true),
+            _ => return,
+        };
+        if limen::media_player::finite_secs(secs) {
+            self.time = secs;
+            if self.ended != ended {
+                self.end_event = ended;
+                self.ended = ended;
+            }
+        }
+    }
+
     fn call(&mut self, request: Request) -> Option<Reply> {
         video::send(&mut self.socket, &request).ok()?;
         video::receive(&mut self.socket).ok()
@@ -161,6 +180,8 @@ pub extern "C" fn navigator_video_seek(seconds: f64) -> bool {
         return false;
     }
     p.time = secs;
+    p.ended = false;
+    p.end_event = false;
     true
 }
 #[unsafe(no_mangle)]
@@ -168,11 +189,10 @@ pub extern "C" fn navigator_video_playing(playing: bool) {
     if let Some(mut p) = player() {
         if matches!(p.call(Request::SetPlaying(playing)), Some(Reply::Ok)) {
             if !playing {
-                if let Some(Reply::Position { secs }) = p.call(Request::Clock) {
-                    if limen::media_player::finite_secs(secs) {
-                        p.time = secs;
-                    }
-                }
+                p.read_clock();
+            } else {
+                p.ended = false;
+                p.end_event = false;
             }
             p.playing = playing;
         }
@@ -187,14 +207,20 @@ pub extern "C" fn navigator_video_volume(volume: f64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn navigator_video_take_end_event() -> bool {
+    player().is_some_and(|mut p| std::mem::take(&mut p.end_event))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_video_ended() -> bool {
+    player().is_some_and(|p| p.ended)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn navigator_video_time() -> f64 {
     let Some(mut p) = player() else { return 0.0 };
     if p.playing {
-        if let Some(Reply::Position { secs }) = p.call(Request::Clock) {
-            if limen::media_player::finite_secs(secs) {
-                p.time = secs;
-            }
-        }
+        p.read_clock();
     }
     p.time
 }

@@ -756,14 +756,17 @@ Fingerprint verification is deferred.
 
 #### Bounded delivery renewal and frame presentation
 
-The initial media grant covers 12 POSTs. The broker can renew that count
-three times on the same private channel. At each boundary it consumes a
-fresh indication from the native player that playback time advanced in the
-last five seconds. A pause, seek or end clears that indication. The TLS
-worker accepts the renewal opcode only on requests 13, 25 and 37. Both
-layers continue to validate each destination against the current player
-response. Each session retains its original 120-second deadline and shared
-10 MiB budget across renewals.
+The broker and TLS worker account for startup resources and media delivery
+separately. Startup retains its 10 MiB budget. The broker and courier must authorize
+the player POST within the initial 120-second window. Media POSTs must
+match the destination and signed fields from the authenticated player reply.
+Each media window allows 12 requests and 8 MiB for up to 120 seconds. When
+another maximum-sized reply would exceed that window, the broker must renew
+before sending the request. Renewal on the private channel consumes a fresh
+indication that native playback advanced in the last five seconds. A pause,
+seek or end clears that indication. Both endpoints enforce an absolute limit
+of 128 windows, 128 MiB and one hour per session. Each reply is capped at
+2 MiB or the remaining session allowance, whichever is smaller.
 
 Fresco imports a video buffer before its scheduled display time and can
 release the buffer immediately. The supervisor now holds early decoded
@@ -798,11 +801,37 @@ per elapsed guest second during a 12-second observation at a nominal
 48 kHz. Median landed intervals were about 62 ms, consistent with the
 guest audio mapping. A hardware-display refresh measurement is still open.
 
-The provider reports a duration of 1,344 seconds. Full-clip playback
-requires a policy for continuing after the session-wide byte or time
-limit. The renewal gate exercised request-count renewal only. Raw timing
-events, the guest mix and frame evidence are in
+The earlier request-count renewal trials and their raw timings are in
 `~/atrium-vm/evidence/navigator-i4-renewal-cadence-20261124/`.
+
+#### Full-clip continuation on Tessera
+
+Installed Navigator played the public demo from zero to 1,343.567 s after
+one Play press and zero chapter activations in JIT-off Ladybird. Over 453
+media replies the restricted broker delivered 39,445,202 bytes and renewed
+37 times. The final buffered range reached 1,343.6745 s. The last sampled
+native video submission had PTS 1,343.467 s (every fifteenth submission
+was sampled). A final-minute Lyra excerpt contained 144,000 stereo frames
+with a signed 16-bit peak of 21,287. The provider entered state 0 (ended).
+
+The full run exposed a mismatch at the end. The DOM still reported
+`ended=false` because LibWeb consulted its unused playback manager.
+The broker now exposes the native player's drained end state on the clock
+channel. LibWeb runs its existing end-of-media steps once on that transition,
+even when the last timestamp has already been reported. A fresh installed
+run sought to 1,325 s, filled the final range and finished at 1,343.567 s
+with the provider in state 0, the element paused, `ended=true` and exactly
+one DOM end event. The end-event fix was verified with that final chapter.
+
+The virtual HDA sink negotiated 48 kHz stereo S16. Three 12-second guest
+intervals produced 47,637, 47,328 and 44,352 frames/s. Of the first 4,096
+landed-event records, 4,095 were parseable. Their median interval was
+34.28 ms. The 280 matches with sampled audio deadlines had a median signed
+landing error of +8.73 ms. The intervals measure one virtual-device run.
+Physical display cadence and the DOM's zero decoded-frame count remain open.
+
+Guest captures, the progress log and the focused end-event observations
+are in `~/atrium-vm/evidence/navigator-i4-fullclip-20261124/`.
 
 ## 6a. Sign-in: SSO and WebAuthn
 

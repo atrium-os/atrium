@@ -87,7 +87,7 @@ impl Widget {
         let video = if matches!(source, VIDEO | YOUTUBE_ENTRY) {
             use std::os::fd::AsRawFd;
             let append_budget = if source == YOUTUBE_ENTRY {
-                navigator_control::youtube::ASSET_BUDGET
+                navigator_control::youtube_media::SESSION_BYTES
             } else {
                 65536
             };
@@ -239,6 +239,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
     let deadline = Instant::now() + navigator_control::youtube::PLAYER_WINDOW;
     let mut provider = None;
     use navigator_control::youtube_media as media;
+    let mut budget = media::DeliveryBudget::new(Instant::now());
     let mut delivery = None::<String>;
     let mut media_posts = 0;
     let mut posts = 0;
@@ -273,6 +274,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             return Err("startup request count exhausted".into());
         }
         let mut media_kind = None;
+        let mut media_limit = 0;
         let payload = if player {
             let body = open.body.as_ref().ok_or("missing player request")?;
             if body.content_type != "application/json" || posts >= navigator_control::youtube::PLAYER_REQUESTS { return Err("outside player grant".into()); }
@@ -286,8 +288,9 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             {
                 return Err("outside delivery grant".into());
             }
-            let kind = media::request_kind(media_posts).ok_or("delivery session exhausted")?;
-            if kind == 5 {
+            let now = Instant::now();
+            let renew = budget.needs_renewal(now);
+            if renew {
                 let recent = playback.lock().unwrap().take();
                 if !recent.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
                     output.send(Event::Error { id: open.id, code: nuntius::ErrorCode::Policy })
@@ -296,11 +299,12 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
                 }
                 eprintln!("navigatord: renewed delivery after {media_posts} media requests");
             }
-            media_kind = Some(kind);
+            media_limit = budget.begin(now, renew)?;
+            media_kind = Some(if renew { 5 } else { 4 });
             media_posts += 1;
             Some(body.bytes.clone())
         } else {None};
-        if (player || stream) && Instant::now() >= deadline { return Err("player grant expired".into()); }
+        if player && Instant::now() >= deadline { return Err("player grant expired".into()); }
         let (url, mime) = if stream {
             (open.url.as_str(), media::MIME)
         } else if player {
@@ -320,7 +324,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
         }
         let (body, limit) = if source == YOUTUBE_ENTRY {
             let limit = if stream {
-                media::REPLY
+                media_limit
             } else if player {
                 navigator_control::youtube::PLAYER_RESPONSE_LIMIT
             } else if step == 0 {
@@ -328,11 +332,11 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str, playback: Arc<Mutex<Opt
             } else {
                 navigator_control::youtube::asset_limit(url)
             };
-            if step > 0 && remaining == 0 { return Err("provider startup budget exhausted".into()); }
+            if step > 0 && !stream && remaining == 0 { return Err("provider startup budget exhausted".into()); }
             if provider.is_none() { provider = Some(youtube_worker()?); }
             let (socket, _worker) = provider.as_mut().ok_or("provider worker missing")?;
-            let body = youtube_resource(socket, url, payload.as_deref(), media_kind, if step == 0 {limit} else {limit.min(remaining)})?;
-            if step > 0 { remaining -= body.len(); }
+            let body = youtube_resource(socket, url, payload.as_deref(), media_kind, if step == 0 || stream {limit} else {limit.min(remaining)})?;
+            if stream { budget.received(body.len())?; } else if step > 0 { remaining -= body.len(); }
             (body, limit)
         } else {
             let Some(Upstream::Fetchd(fetcher, _)) = &mut upstream else {

@@ -53,6 +53,7 @@ fn run() -> Result<(), String> {
         use std::io::Read;
         let mut remaining = navigator_control::youtube::ASSET_BUDGET;
         use navigator_control::youtube_media as media;
+        let mut budget = media::DeliveryBudget::new(std::time::Instant::now());
         let mut issued = None::<String>;
         let mut media_posts = 0;
         let until = std::time::Instant::now() + navigator_control::youtube::PLAYER_WINDOW;
@@ -63,9 +64,7 @@ fn run() -> Result<(), String> {
                 break;
             }
             if matches!(kind[0], 4 | 5) {
-                if media::request_kind(media_posts) != Some(kind[0]) || std::time::Instant::now() >= until {
-                    return Err("delivery window exhausted".into());
-                }
+                let limit = budget.begin(std::time::Instant::now(), kind[0] == 5)?;
                 let mut read_part = |max: usize| -> Result<Vec<u8>, String> {
                     let mut len = [0; 2];
                     out.read_exact(&mut len).map_err(|e| e.to_string())?;
@@ -86,8 +85,8 @@ fn run() -> Result<(), String> {
                 }
                 let body = read_part(media::BODY)?;
                 let reply =
-                    youtube::delivery(&url, &body, &mut conversation, remaining.min(media::REPLY))?;
-                remaining -= reply.len();
+                    youtube::delivery(&url, &body, &mut conversation, limit)?;
+                budget.received(reply.len())?;
                 media_posts += 1;
                 send(&mut out, &reply)?;
                 continue;
@@ -97,7 +96,7 @@ fn run() -> Result<(), String> {
             }
             if step > 0 && kind[0] == 3 {
                 use navigator_control::youtube::{PLAYER_BODY_LIMIT, PLAYER_REQUESTS};
-                if posts >= PLAYER_REQUESTS || remaining == 0 {
+                if std::time::Instant::now() >= until || posts >= PLAYER_REQUESTS || remaining == 0 {
                     return Err("player budget exhausted".into());
                 }
                 let mut header = [0; 2];

@@ -30,6 +30,7 @@ pub enum Reply {
     Seeked { secs: f64 },
     Failed,
     Position { secs: f64 },
+    EndedPosition { secs: f64 },
 }
 
 pub fn send<T: Serialize>(socket: &mut impl Write, message: &T) -> io::Result<()> {

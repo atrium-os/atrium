@@ -96,7 +96,12 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #ifdef ATRIUM_I1_COUNTER
     Gfx::IntSize last_extent { 640, 360 };
 #endif
+#ifdef ATRIUM_I4_YOUTUBE
+    auto deadline = AK::MonotonicTime::now() + AK::Duration::from_seconds(3600);
+    for (unsigned tick = 0; AK::MonotonicTime::now() < deadline; ++tick) {
+#else
     for (unsigned tick = 0; tick < 15000; ++tick) {
+#endif
         loop.pump(Core::EventLoop::WaitMode::PollForEvents);
 #ifdef ATRIUM_I1_COUNTER
         if (client.closed) break;

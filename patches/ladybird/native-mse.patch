@@ -11,7 +11,7 @@
  #include <LibWeb/Page/Page.h>
  #include <LibWeb/Page/ScreenWakeLockHandle.h>
  #include <LibWeb/Painting/BoxViews.h>
-@@ -73,6 +77,12 @@
+@@ -73,6 +77,14 @@
  #include <LibWeb/StorageAPI/StorageKey.h>
  #include <LibWeb/WebIDL/Promise.h>
  #include <LibWebCommon/MimeSniff/MimeType.h>
@@ -20,11 +20,13 @@
 +extern "C" bool navigator_video_open(u16, u16, u16, u16);
 +extern "C" bool navigator_video_seek(double);
 +extern "C" double navigator_video_time();
++extern "C" bool navigator_video_ended();
++extern "C" bool navigator_video_take_end_event();
 +#endif
  
  namespace Web::HTML {
  
-@@ -558,6 +568,32 @@
+@@ -558,6 +570,32 @@
      // NB: Cancelling the fetching process stops the resource selection algorithm when the error is set.
  }
  
@@ -57,7 +59,7 @@
  // https://html.spec.whatwg.org/multipage/media.html#dom-media-buffered
  GC::Ref<TimeRanges> HTMLMediaElement::buffered() const
  {
-@@ -565,6 +601,13 @@
+@@ -565,6 +603,13 @@
      // The buffered attribute must return a new static normalized TimeRanges object that represents the ranges of the
      // media resource, if any, that the user agent has buffered, at the time the attribute is evaluated.
      auto time_ranges = TimeRanges::create();
@@ -71,7 +73,7 @@
      if (m_playback_manager) {
          for (auto const& range : m_playback_manager->buffered_time_ranges().time_ranges)
              time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
-@@ -599,6 +642,12 @@
+@@ -599,6 +644,12 @@
          time_ranges->add_range(0, m_duration);
          return time_ranges;
      }
@@ -84,7 +86,7 @@
      if (auto range = m_playback_manager->seekable_time_ranges(); range.has_value())
          time_ranges->add_range(range->start.to_seconds_f64(), range->end.to_seconds_f64());
      return time_ranges;
-@@ -707,6 +756,10 @@
+@@ -707,6 +758,10 @@
  // https://html.spec.whatwg.org/multipage/media.html#current-playback-position
  double HTMLMediaElement::current_playback_position() const
  {
@@ -95,7 +97,7 @@
      if (m_media_stream_playback)
          return m_media_stream_playback->current_time();
      if (!m_playback_manager)
-@@ -2038,7 +2091,17 @@
+@@ -2038,7 +2093,17 @@
                  media_source->set_assigned_to_media_element({}, *this);
                  m_attached_media_source = media_source;
                  update_pending_activity();
@@ -113,7 +115,23 @@
  
                  // 4. Set the readyState attribute to "open".
                  // 5. Queue a task to fire an event named sourceopen at the MediaSource.
-@@ -2395,7 +2458,12 @@
+@@ -2362,6 +2427,15 @@
+         return;
+ 
+     auto current_position = current_playback_position();
++#ifdef ATRIUM_I4_VIDEO
++    if (m_attached_media_source && navigator_video_take_end_event()) {
++        // The clock reply reflects the native decoder and audio drain. This
++        // transition can arrive after the timestamp has stopped advancing.
++        upon_has_ended_playback_possibly_changed();
++        reached_end_of_media_playback();
++        return;
++    }
++#endif
+     if (m_last_known_current_playback_position == current_position)
+         return;
+ 
+@@ -2395,7 +2469,12 @@
  {
      static constexpr int playback_position_update_interval_ms = 20;
  
@@ -127,7 +145,7 @@
          if (m_playback_position_update_timer)
              m_playback_position_update_timer->stop();
          return;
-@@ -3121,8 +3189,18 @@
+@@ -3121,8 +3200,18 @@
      // -> If HTMLMediaElement's buffered does not contain a TimeRanges for the current playback position:
      auto current_time = m_playback_manager->current_time();
      auto ranges = m_playback_manager->buffered_time_ranges().time_ranges;
@@ -147,7 +165,7 @@
  
      if (available_data == Media::AvailableData::None
          || (available_data == Media::AvailableData::Current && !current_range.has_value())) {
-@@ -3466,6 +3544,20 @@
+@@ -3466,6 +3555,20 @@
      }));
  
      // 11. Set the current playback position to the new playback position.
@@ -168,7 +186,7 @@
      if (m_playback_manager) {
          AK::Duration new_playback_position_as_duration;
          if (new_playback_position == m_duration)
-@@ -3550,6 +3642,10 @@
+@@ -3550,6 +3653,10 @@
          m_media_stream_playback->play();
  
      m_has_started_playback = true;
@@ -179,7 +197,7 @@
      update_audio_play_state();
  
      update_screen_wake_lock();
-@@ -3594,6 +3690,10 @@
+@@ -3594,6 +3701,10 @@
  
      if (m_paused) {
          m_has_started_playback = false;
@@ -190,6 +208,18 @@
  
          if (m_playback_manager)
              m_playback_manager->pause();
+@@ -3836,7 +3947,11 @@
+         // The current playback position is the end of the media resource, and
+         // NB: This is represented by the playback manager's Ended state, which is only entered once the pipeline has
+         //     consumed all real media data.
++#ifdef ATRIUM_I4_VIDEO
++        (m_attached_media_source ? navigator_video_ended() : m_playback_manager->state() == Media::PlaybackState::Ended) &&
++#else
+         m_playback_manager->state() == Media::PlaybackState::Ended &&
++#endif
+ 
+         // The direction of playback is forwards, and
+         direction_of_playback() == PlaybackDirection::Forwards &&
 --- a/Libraries/LibWeb/HTML/HTMLMediaElement.h
 +++ b/Libraries/LibWeb/HTML/HTMLMediaElement.h
 @@ -188,6 +188,15 @@

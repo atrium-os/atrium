@@ -271,9 +271,12 @@ impl Session {
                         break;
                     }
                 }
-                Ok(Reply::Position {
-                    secs: self.media.current_time,
-                })
+                let secs = self.media.current_time;
+                if self.media.ended {
+                    Ok(Reply::EndedPosition { secs })
+                } else {
+                    Ok(Reply::Position { secs })
+                }
             }
             Request::End if self.bytes > 0 && !self.ended => {
                 self.media.end_of_stream(None).map_err(dom)?;

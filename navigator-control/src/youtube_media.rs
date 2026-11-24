@@ -1,30 +1,120 @@
 //! The current embed may use the delivery URL issued by its successful player reply.
 //! Preserve the signed query. The provider script fills in its transport counters.
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 pub const MIME: &str = "application/vnd.yt-ump";
 pub const BODY: usize = 8192;
 pub const REPLY: usize = 2 * 1024 * 1024;
 pub const REQUESTS: usize = 12;
-// One initial window and at most three playback-backed renewals. The byte
-// budget, expiry and provider-issued URL belong to the original session.
-pub const MAX_REQUESTS: usize = 4 * REQUESTS;
+// The full-clip fixture uses one destination and bounded windows. Bootstrap
+// bytes are accounted separately and never replenished by media progress.
+const WINDOWS: usize = 128;
+pub const MAX_REQUESTS: usize = WINDOWS * REQUESTS;
+pub const SESSION_BYTES: usize = 128 * 1024 * 1024;
+const WINDOW_BYTES: usize = 8 * 1024 * 1024;
+pub const LIFETIME: Duration = Duration::from_secs(3600);
 
-/// Kind 5 is a broker-authorized renewal carried on the next media POST.
-/// Both ends enforce the boundary and the absolute session ceiling.
-pub fn request_kind(previous: usize) -> Option<u8> {
-    if previous >= MAX_REQUESTS { return None; }
-    Some(if previous > 0 && previous % REQUESTS == 0 { 5 } else { 4 })
+pub struct DeliveryBudget {
+    started: Instant,
+    window: Instant,
+    windows: usize,
+    requests: usize,
+    bytes: usize,
+    total: usize,
 }
 
-#[cfg(test)]
+impl DeliveryBudget {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            window: now,
+            windows: 1,
+            requests: 0,
+            bytes: 0,
+            total: 0,
+        }
+    }
+
+    pub fn needs_renewal(&self, now: Instant) -> bool {
+        self.requests >= REQUESTS
+            || WINDOW_BYTES - self.bytes < REPLY
+            || now.duration_since(self.window) >= crate::youtube::PLAYER_WINDOW
+    }
+
+    // The broker authorizes a renewal using native playback progress. The
+    // courier independently caps every request, window and session.
+    pub fn begin(&mut self, now: Instant, renew: bool) -> Result<usize, &'static str> {
+        if now.duration_since(self.started) >= LIFETIME || self.total >= SESSION_BYTES {
+            return Err("media session exhausted");
+        }
+        if renew {
+            if self.windows >= WINDOWS || self.requests == 0 {
+                return Err("invalid media renewal");
+            }
+            self.windows += 1;
+            self.window = now;
+            self.requests = 0;
+            self.bytes = 0;
+        } else if self.needs_renewal(now) {
+            return Err("media renewal required");
+        }
+        self.requests += 1;
+        Ok(REPLY.min(SESSION_BYTES - self.total))
+    }
+
+    pub fn received(&mut self, bytes: usize) -> Result<(), &'static str> {
+        if bytes
+            > REPLY
+                .min(WINDOW_BYTES - self.bytes)
+                .min(SESSION_BYTES - self.total)
+        {
+            return Err("media response exceeded grant");
+        }
+        self.bytes += bytes;
+        self.total += bytes;
+        Ok(())
+    }
+}
+
 #[test]
 fn renewal_boundaries() {
-    assert_eq!(request_kind(0), Some(4));
-    assert_eq!(request_kind(11), Some(4));
-    for n in [12, 24, 36] { assert_eq!(request_kind(n), Some(5)); }
-    assert_eq!(request_kind(47), Some(4));
-    assert_eq!(request_kind(48), None);
+    let start = Instant::now();
+    let mut grant = DeliveryBudget::new(start);
+    assert!(grant.begin(start, true).is_err());
+    for _ in 0..REQUESTS {
+        grant.begin(start, false).unwrap();
+        grant.received(1).unwrap();
+    }
+    assert!(grant.begin(start, false).is_err());
+    grant.begin(start, true).unwrap();
+    grant.received(REPLY).unwrap();
+    for _ in 1..WINDOW_BYTES / REPLY {
+        grant.begin(start, false).unwrap();
+        grant.received(REPLY).unwrap();
+    }
+    assert!(grant.begin(start, false).is_err());
+    grant.begin(start, true).unwrap();
+    let later = start + crate::youtube::PLAYER_WINDOW;
+    assert!(grant.begin(later, false).is_err());
+    grant.begin(later, true).unwrap();
+    assert!(grant.begin(start + LIFETIME, true).is_err());
+    grant.total = SESSION_BYTES - 1;
+    assert_eq!(grant.begin(later, false), Ok(1));
+    assert!(grant.received(2).is_err());
+    grant.received(1).unwrap();
+    assert!(grant.begin(later, true).is_err());
+
+    let mut grant = DeliveryBudget::new(start);
+    for window in 0..WINDOWS {
+        grant.begin(start, window != 0).unwrap();
+        for _ in 1..REQUESTS {
+            grant.begin(start, false).unwrap();
+        }
+    }
+    assert!(grant.begin(start, true).is_err());
 }
 
 pub fn endpoint(url: &str) -> Option<(&str, &str)> {
