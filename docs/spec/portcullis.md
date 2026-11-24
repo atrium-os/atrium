@@ -20,6 +20,8 @@ The Calendar session supervisor publishes the public device time-zone name in a 
 
 A Mail invitation uses a separate private session. Portcullis checks the Mail instance’s registered owner, app ID, platform publisher and attachment grant, then spends a fresh display activation. It derives Calendar’s instance from the caller’s persona and hands each app one end of a new Unix socket pair. Mail sends a sealed scheduling part and reads one RSVP choice. An existing Calendar receives a window-activation request, and a cold Calendar receives the session on launch. [Calendar invitation contract](calendar.md#711-reviewing-an-invitation-from-mail)
 
+For unattended organizer updates, the signed Mail manifest needs a separate `calendar-updates` grant. Portcullis checks both current grants and the pinned publisher, derives the registered Calendar instance from the Mail peer’s owner and persona, and forwards one bounded proposal to Fasti. This operation opens no window. Only the broker can use the deposit opcode on the persona endpoint. Mail receives a uniform receipt and has no access to the schedule, review tokens or the Calendar socket. [Unopened meeting updates](calendar.md#724-unopened-updates-to-an-accepted-meeting)
+
 **Live properties** (VM-verified):
 - Manifest schema: `enabled`, `name`, `path`, `[[mounts]]`, `[[volumes]]` (with `[volumes.init]` first-run sentinels), `[exec]`, `[supervision]`, `[capabilities]`.
 - `[capabilities] attach_mount = true` derives a ro_nullfs mount of `/var/run/atrium/caps/portcullisd/` → `/atrium/sockets/portcullisd/` at jail-create time. In-jail services connect to the daemon over aqueduct.

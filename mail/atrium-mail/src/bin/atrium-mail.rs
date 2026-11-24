@@ -391,6 +391,7 @@ fn main() {
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
     let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
+    invitation::start_updates(store.clone(), Parser { program: jail.clone() });
     let mut thumbnails = thumbnails::Thumbnails::start(store.clone(), Parser { program: jail.clone() });
     let mut engine = Engine::new(store, Parser { program: jail });
     // Senders whose key couldn't be fetched at arrival are checked again on opening.
@@ -545,8 +546,13 @@ fn main() {
                         let blob = selected.blob;
                         let tx = reviewed.clone();
                         invite_pending = true;
+                        let store = engine.store.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send((msg, blob, invitation::offer(selected, press)));
+                            let result = invitation::offer(selected, press);
+                            if result.is_ok() && store.write(|w| w.replay_calendar_revisions(msg)).is_err() {
+                                eprintln!("atrium-mail: could not requeue later meeting updates");
+                            }
+                            let _ = tx.send((msg, blob, result));
                         });
                     }
                     Err(e) => mail.file_note(e.to_string()),

@@ -19,6 +19,7 @@ navigator-style = { path = "../../navigator-style", optional = true }
 # A picture's natural size from its header alone (inline `cid:` pictures).
 navigator-image = { path = "../../navigator-image", optional = true }
 # The jail runner: the engine conversation's fixed format.
+atrium-calendar = { default-features = false, path = "../../atrium-calendar", optional = true }
 mail-schema = { path = "../mail-schema", optional = true }
 mail-smime = { path = "../mail-smime", optional = true }
 libc = { version = "0.2", optional = true }
@@ -30,7 +31,7 @@ mail-pgp = { path = "../mail-pgp", optional = true }
 
 [features]
 default = ["html", "jail"]
-jail = ["html", "dep:mail-schema", "dep:mail-smime", "dep:serde_json", "dep:mail-pgp"]
+jail = ["dep:atrium-calendar", "html", "dep:mail-schema", "dep:mail-smime", "dep:serde_json", "dep:mail-pgp"]
 legacy-receive-worker = ["dep:mail-smime", "mail-smime/legacy-receive-prototype", "dep:libc", "dep:zeroize"]
 html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", "dep:navigator-style", "dep:navigator-image"]
 

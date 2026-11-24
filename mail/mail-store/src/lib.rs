@@ -30,6 +30,7 @@ pub use drafts::LocalDraft;
 mod outbox;
 pub use outbox::{retry_after, JmapSendActivity, Outgoing, SendState};
 pub mod search;
+mod calendar;
 pub mod senders;
 pub mod certs;
 pub mod dns;
@@ -269,6 +270,8 @@ impl Store {
             tx.open_table(FOLDERS)?;
             tx.open_table(FOLDER_NAMES)?;
             tx.open_table(MESSAGES)?;
+            tx.open_table(calendar::PENDING)?;
+            tx.open_table(calendar::REVISIONS)?;
             tx.open_table(LOCATIONS)?;
             tx.open_table(LIST)?;
             tx.open_table(SERVER_IDS)?;
@@ -599,13 +602,20 @@ impl Writer<'_> {
         let id = match at.or(by_sid).or(link) {
             Some(id) => {
                 let mut old = self.get_msg(id)?.ok_or(Error::Corrupt("location without message"))?;
-                if m.full && old.full.is_none() {
+                let hydrated = m.full && old.full.is_none();
+                if hydrated {
                     old.full = Some(m.blob);
                     old.summary = m.summary;
                     self.index(id, &old, None)?;
                 }
-                if !old.locations.contains(&(folder, uid)) && !old.leaving.contains(&(folder, uid)) && !old.held.contains(&(folder, uid)) {
+                let linked = !old.locations.contains(&(folder, uid))
+                    && !old.leaving.contains(&(folder, uid))
+                    && !old.held.contains(&(folder, uid));
+                if linked {
                     old.locations.push((folder, uid));
+                }
+                if hydrated || linked {
+                    self.queue_calendar(id, &old)?;
                 }
                 // The list key carries the date: re-key if it changed.
                 if old.date != date && m.full {
@@ -636,6 +646,7 @@ impl Writer<'_> {
                     leaving: Vec::new(),
                     held: Vec::new(),
                 };
+                self.queue_calendar(id, &msg)?;
                 self.put_msg(id, &msg)?;
                 self.index(id, &msg, None)?;
                 if let Some(s) = &m.server_id {
@@ -671,7 +682,9 @@ impl Writer<'_> {
     /// A sender check done again (a key that couldn't be fetched before).
     pub fn set_sender_check(&mut self, id: MsgId, check: mail_schema::SenderCheck) -> Result<()> {
         let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        if m.summary.sender_check == check { return Ok(()); }
         m.summary.sender_check = check;
+        self.queue_calendar(id, &m)?;
         self.put_msg(id, &m)
     }
 
@@ -754,6 +767,10 @@ impl Writer<'_> {
     }
 
     fn remove_unplaced(&mut self, id: MsgId, m: &Message) -> Result<()> {
+        if let Some(invite) = &m.summary.invite {
+            self.tx.open_table(calendar::REVISIONS)?.remove((m.account,invite.uid.as_str(),id))?;
+            self.tx.open_table(calendar::PENDING)?.remove(id)?;
+        }
         self.tx.open_table(MESSAGES)?.remove(id)?;
         self.unindex(id)?;
         if let Some(s) = &m.server_id {

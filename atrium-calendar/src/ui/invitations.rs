@@ -987,7 +987,7 @@ impl Planner {
         Label::new(when(&change.accepted)).at(18., 211.).render(ctx);
         Label::new(&change.old_location).at(18., 237.).render(ctx);
         Label::new(format!(
-            "Latest reviewed invitation · revision {}",
+            "Latest organizer update · revision {}",
             change.latest.sequence
         ))
         .at(18., 300.)

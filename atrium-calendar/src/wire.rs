@@ -29,6 +29,9 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    PollMeetingChanges {
+        selected: Option<uuid::Uuid>,
+    },
     MeetingChange {
         index: usize,
     },
@@ -208,9 +211,9 @@ fn read_frame<T: DeserializeOwned>(
     } else {
         limit
     };
+    let allowed_op = expected_op.map_or(matches!(h.op, OP_V1 | OP_PREPARE_IMPORT), |op| op == h.op);
     if h.opcode_class != CLASS_CALENDAR
-        || !matches!(h.op, OP_V1 | OP_PREPARE_IMPORT)
-        || expected_op.is_some_and(|op| h.op != op)
+        || !allowed_op
         || h.flags != flags
         || h.length as usize > limit
     {
@@ -323,6 +326,20 @@ pub fn refuse(s: &mut UnixStream, reason: &str) -> io::Result<()> {
     )
 }
 
+/// The root broker can deposit one normalized update. It cannot query the
+/// schedule or obtain the review token used by the Calendar window.
+pub fn serve_deposit(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
+    use portcullis_ipc::calendar::BACKGROUND_OP;
+    s.set_nonblocking(true)?;
+    let (_, update) = read_frame(s, flag::RESPONSE_EXPECTED, 16384, Some(BACKGROUND_OP))?;
+    send_op(
+        s,
+        flag::IS_RESPONSE,
+        BACKGROUND_OP,
+        &store.receive_mail_update(update).is_ok(),
+    )
+}
+
 pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
     let mut reply_op = OP_V1;
@@ -344,6 +361,16 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
                     flag::IS_RESPONSE,
                     OP_PREPARE_IMPORT,
                     &store.review_invitation(revision, &source, proposal),
+                );
+            }
+            Ok(Request::PollMeetingChanges { selected }) => {
+                let count = store.change_count();
+                let detail = selected
+                    .and_then(|id| store.change_detail(0, chrono::Utc::now(), Some(id)).ok());
+                return send(
+                    s,
+                    flag::IS_RESPONSE,
+                    &Result::<_, String>::Ok((count, detail)),
                 );
             }
             Ok(Request::MeetingChange { index }) => {

@@ -440,6 +440,7 @@ pub enum Request {
 
     /// Mail spends a fresh press to open a private invitation session in its persona.
     CalendarInvitation { activation: [u8; 16] },
+    CalendarUpdate,
 
     /// ★ Open an attachment (mail.md §8.2). Only from an app whose
     /// installed manifest holds `open-attachments` (Mail), with

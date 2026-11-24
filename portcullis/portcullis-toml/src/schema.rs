@@ -472,6 +472,8 @@ pub struct Capabilities {
     /// app for its type (`OpenAttachment`). Never a path, never a program.
     #[serde(rename = "open-attachments")]
     pub open_attachments: Option<bool>,
+    #[serde(rename = "calendar-updates")]
+    pub calendar_updates: Option<bool>,
     /// The person's workspaces (homes.md §5): list, make, change, stop and
     /// delete them, and open their terminals, over portcullisd's socket.
     /// Restricted to the Workspaces app.
@@ -564,7 +566,7 @@ impl Capabilities {
             ("network-configure", self.network_configure), ("vpn-use", self.vpn_use), ("vpn-configure", self.vpn_configure), ("navigator-page", self.navigator_page),
             ("navigator-broker", self.navigator_broker), ("notification-shelf", self.notification_shelf),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
-            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("calendar-updates", self.calendar_updates), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
             ("protected-media", self.protected_media), ("network-portal", self.network_portal),
         ];
@@ -783,6 +785,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         home_files:       ovr.home_files.or(base.home_files),
         consoles:         ovr.consoles.or(base.consoles),
         app_grants:       ovr.app_grants.or(base.app_grants),
+        calendar_updates: ovr.calendar_updates.or(base.calendar_updates),
         open_attachments: ovr.open_attachments.or(base.open_attachments),
         workspaces:       ovr.workspaces.or(base.workspaces),
         workspace_exec:   ovr.workspace_exec.or(base.workspace_exec),

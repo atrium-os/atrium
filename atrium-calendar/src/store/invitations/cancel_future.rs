@@ -244,6 +244,7 @@ impl Store {
         review.can_save = true;
         review.token = Some(token);
         *pending = Some(Pending {
+            one_off: None,
             token,
             created: Instant::now(),
             revision,

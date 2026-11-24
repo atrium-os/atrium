@@ -28,7 +28,7 @@ impl Ledger {
         Ok(ledger)
     }
 
-    fn for_entry(&self, row: &Entry) -> Option<&MeetingChange> {
+    pub(super) fn for_entry(&self, row: &Entry) -> Option<&MeetingChange> {
         let saved = row.invitation.as_ref()?;
         let (key, latest) = self.0.get(&row.id)?;
         (*key == saved.key && latest.sequence > saved.sequence).then_some(latest)
@@ -58,8 +58,9 @@ impl MeetingChange {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangeDetail {
+    pub meeting_id: Uuid,
     pub total: usize,
     pub index: usize,
     pub accepted: EventEdit,
@@ -150,7 +151,20 @@ impl Store {
         })
     }
 
+    pub fn change_count(&self) -> usize {
+        self.outstanding().count()
+    }
+
     pub fn meeting_change(&self, index: usize, now: DateTime<Utc>) -> Result<ChangeDetail, String> {
+        self.change_detail(index, now, None)
+    }
+
+    pub(crate) fn change_detail(
+        &self,
+        index: usize,
+        now: DateTime<Utc>,
+        selected: Option<Uuid>,
+    ) -> Result<ChangeDetail, String> {
         let mut changes: Vec<_> = self.outstanding().collect();
         let local = now.with_timezone(&self.viewing_zone());
         changes.sort_by_cached_key(|(row, latest)| {
@@ -175,11 +189,19 @@ impl Store {
                 (ended, date.date, u32::from(date.span.start), row.id)
             }
         });
+        let index = match selected {
+            Some(id) => changes
+                .iter()
+                .position(|(row, _)| row.id == id)
+                .ok_or("Meeting change resolved")?,
+            None => index,
+        };
         let (row, latest) = changes
             .get(index)
             .ok_or("This meeting change is no longer pending.")?;
         let saved = row.invitation.as_ref().unwrap();
         Ok(ChangeDetail {
+            meeting_id: row.id,
             total: changes.len(),
             index,
             accepted: saved.accepted.clone(),

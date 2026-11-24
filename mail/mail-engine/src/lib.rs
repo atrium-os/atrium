@@ -133,18 +133,28 @@ fn check_local_sender_verdict(verdict: &wire::SenderCheck) -> Result<(), Error> 
 }
 
 impl Parser {
+    fn installed_worker() -> Result<Jail, Error> {
+        let workers = atrium_worker::Workers::from_root(std::path::Path::new("/"), false)
+            .map_err(|e| Error::Jail(format!("Mail parse worker unavailable: {e}")))?;
+        Self::worker(workers)
+    }
+
+    fn worker(w: atrium_worker::Workers) -> Result<Jail, Error> {
+        let mut p = w.spawn_stdio(PARSE_WORKER).map_err(|e| Error::Jail(format!("start the parse worker: {e}")))?;
+        let r: Box<dyn std::io::Read + Send> = Box::new(p.stdout.take().expect("piped"));
+        let w: Box<dyn std::io::Write + Send> = Box::new(p.stdin.take().expect("piped"));
+        // Its stderr is dropped, as the child's is.
+        drop(p.stderr.take());
+        Ok(Jail { proc: Proc::Worker(p), r: BufReader::new(r), w: BufWriter::new(w) })
+    }
+
     /// Installed, Mail declares the parser as its `parse` worker: a jail of
     /// its own, as a uid of its own, with no capability (app-composition.md
     /// §4). Elsewhere (development, tests) `program` runs as a child.
     fn start(&self) -> Result<Jail, Error> {
         let named = std::env::var_os("MAIL_PARSE_JAIL").is_some();
         if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| !named && w.has(PARSE_WORKER)) {
-            let mut p = w.spawn_stdio(PARSE_WORKER).map_err(|e| Error::Jail(format!("start the parse worker: {e}")))?;
-            let r: Box<dyn std::io::Read + Send> = Box::new(p.stdout.take().expect("piped"));
-            let w: Box<dyn std::io::Write + Send> = Box::new(p.stdin.take().expect("piped"));
-            // Its stderr is dropped, as the child's is.
-            drop(p.stderr.take());
-            return Ok(Jail { proc: Proc::Worker(p), r: BufReader::new(r), w: BufWriter::new(w) });
+            return Self::worker(w);
         }
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
@@ -172,7 +182,7 @@ impl Parser {
         loop {
             let f: FromJail = wire::read_frame(reader).map_err(|e| Error::Jail(e.to_string()))?.ok_or_else(|| Error::Jail("closed".into()))?;
             let raw_len = match &f {
-                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } | FromJail::SchedulingPart { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
+                FromJail::Summary { id, .. } | FromJail::Opened { id, .. } | FromJail::Attachment { id, .. } | FromJail::SchedulingPart { id, .. } | FromJail::OneOffUpdate { id, .. } => lens(*id).ok_or_else(|| Error::Jail("answer for a message it was not given".into()))?,
                 _ => 0,
             };
             f.check(&caps, raw_len).map_err(|e| Error::Jail(e.to_string()))?;

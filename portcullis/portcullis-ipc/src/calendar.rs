@@ -6,6 +6,7 @@ use std::{
 };
 
 pub const MIME: &str = "application/vnd.atrium.mail-invitation-session";
+pub const BACKGROUND_OP: u16 = 3;
 pub const FILE_MAX: usize = 4 << 20;
 pub const REVIEW_SECONDS: u64 = 300;
 
@@ -29,6 +30,15 @@ pub struct Source {
     pub verified: bool,
     pub reply_destination_matches: bool,
 }
+/// A normalized scheduling update from the pinned Mail instance. Routing identity
+/// comes from the broker. There is no destination, schedule query or response token.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundUpdate {
+    pub source: Source,
+    pub proposal: String,
+}
+
 pub fn address(s: &str) -> bool {
     let Some((local, domain)) = s.split_once('@') else {
         return false;
@@ -96,5 +106,36 @@ pub fn read<T: DeserializeOwned>(s: &mut UnixStream) -> io::Result<T> {
     }
     let mut bytes = vec![0; n];
     s.read_exact(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Bound the entire deposit, including a peer that trickles one byte at a time.
+pub fn read_deposit(s: &mut UnixStream) -> io::Result<BackgroundUpdate> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut fill = |mut buf: &mut [u8]| -> io::Result<()> {
+        while !buf.is_empty() {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|v| !v.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            s.set_read_timeout(Some(left))?;
+            match s.read(buf) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => buf = &mut buf[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    };
+    let mut len = [0; 4];
+    fill(&mut len)?;
+    let n = u32::from_be_bytes(len) as usize;
+    if n > 16384 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut bytes = vec![0; n];
+    fill(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }

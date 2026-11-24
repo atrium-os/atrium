@@ -8,6 +8,7 @@ use portcullis_ipc::calendar::{Source, REVIEW_SECONDS};
 use std::time::Instant;
 
 pub(super) struct Pending {
+    one_off: Option<(Uuid, u32)>,
     token: Uuid,
     revision: u64,
     created: Instant,
@@ -128,12 +129,84 @@ impl Store {
             }
         }
         if let Some(p) = change {
+            if let (Some(plan), Some(base)) = (&mut pending, &review.previous) {
+                plan.one_off = Some((base.id, p.sequence));
+            }
             review = self.remember_change(&p, review)?;
         }
         if review.token.is_some() {
             self.invite = pending;
         }
         Ok(review)
+    }
+
+    /// Only the authenticated broker can submit this operation. Unmatched
+    /// meetings, stale revisions and unsupported input get the same receipt.
+    pub fn receive_mail_update(
+        &mut self,
+        update: portcullis_ipc::calendar::BackgroundUpdate,
+    ) -> Result<(), String> {
+        let source = &update.source;
+        if update.proposal.len() > 4096
+            || !source.verified
+            || !source.reply_destination_matches
+            || !source
+                .delivery
+                .as_ref()
+                .is_some_and(|d| d.scope.is_none() && d.sequence > 0)
+        {
+            return Ok(());
+        }
+        let Ok(p) = serde_json::from_str::<Proposal>(&update.proposal) else {
+            return Ok(());
+        };
+        if p.scope().is_some()
+            || p.this_and_future
+            || p.attendees.len() > 1
+            || !p.organizer.eq_ignore_ascii_case(&source.from)
+            || p.validate(source).is_err()
+        {
+            return Ok(());
+        }
+        let mut plan = None;
+        let Ok(review) = Self::prepare(
+            &self.state.entries,
+            &self.state.cancelled,
+            self.viewing_zone(),
+            self.state.revision,
+            source,
+            p.clone(),
+            None,
+            None,
+            &mut plan,
+        ) else {
+            return Ok(());
+        };
+        let Some(base) = review
+            .previous
+            .as_ref()
+            .filter(|r| matches!(r.kind, Kind::Appointment | Kind::AllDay))
+        else {
+            return Ok(());
+        };
+        let id = base.id;
+        self.remember_change(&p, review)?;
+        if let Some((watched, sequence)) = self.invite.as_ref().and_then(|i| i.one_off) {
+            if watched == id
+                && self
+                    .state
+                    .entries
+                    .iter()
+                    .find(|row| row.id == id)
+                    .and_then(|row| self.meeting_changes.for_entry(row))
+                    .is_some_and(|last| {
+                        last.sequence > sequence || last.sequence == sequence && last.conflicted
+                    })
+            {
+                self.invite = None;
+            }
+        }
+        Ok(())
     }
 
     fn review_cancelled_dates(
@@ -746,6 +819,7 @@ impl Store {
         }
         let token = Uuid::new_v4();
         *pending = Some(Pending {
+            one_off: None,
             token,
             revision,
             created: Instant::now(),

@@ -129,6 +129,39 @@ case "${2-}" in
                 ;;
         esac
         exit 0 ;;
+    background-personal|background-arrive|background-receipt|background-check)
+        calendar_paths
+        case "$2" in
+            background-personal)
+                jexec -u "$(id -nu "$(cat personal.uid)")" "$personal_jail" /bin/installed-probe /atrium/sockets/calendar/calendar.sock 2026-12-01 --accept-personal-fixture
+                saved "$personal_store" "Studio planning" ;;
+            background-arrive)
+                stop_mail
+                uid=$(stat -f %u "$mail_folder/index.redb")
+                ./invitation_probe background-batch "$mail_folder" "$D/mail-parse-jail"
+                chown -R "$uid:$uid" "$mail_folder"
+                start_mail ;;
+            background-receipt)
+                for i in $(jot 90); do
+                    if grep -qs '"sequence":5' "$work_store/meeting-changes.json"; then break; fi
+                    sleep 1
+                done
+                grep -q '"sequence":5' "$work_store/meeting-changes.json"
+                if jls -j "$work_jail" jid >/dev/null 2>&1; then echo "Calendar window launched on delivery" >&2; exit 1; fi
+                test ! -f "$personal_store/meeting-changes.json" ;;
+            background-check)
+                # This is the final store inspection. The read/write probe takes the
+                # database lock itself. No later launch reuses these mounts.
+                kill -TERM "$(pgrep -j "$mail_jail" -x atrium-mail)"
+                for i in $(jot 20); do
+                    if ! jls -j "$mail_jail" jid >/dev/null 2>&1; then break; fi
+                    sleep 1
+                done
+                if jls -j "$mail_jail" jid >/dev/null 2>&1; then exit 1; fi
+                ./invitation_probe background-check "$mail_folder" "$D/mail-parse-jail"
+                test ! -f "$personal_store/meeting-changes.json" ;;
+        esac
+        exit 0 ;;
     invitation-check-empty|series-check-empty)
         stop_mail
         ./invitation_probe empty "$mail_folder" "$D/mail-parse-jail"
@@ -194,6 +227,7 @@ entry = "bin/atrium-mail"
 graphics = "fresco"
 network = "none"
 open-attachments = true
+calendar-updates = true
 net-fetch = true
 [[workers]]
 name = "parse"

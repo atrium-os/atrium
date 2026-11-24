@@ -188,6 +188,7 @@ pub fn endpoint(
     app_uid: u32,
 ) -> io::Result<PathBuf> {
     let mut services = SERVICES.lock().unwrap();
+    directory(Path::new(ENDPOINTS), 0, 0o700)?;
     let endpoint = Path::new(ENDPOINTS).join(app_uid.to_string());
     if let Some(service) = services.get(&app_uid) {
         if !service.worker.is_finished() {

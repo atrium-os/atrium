@@ -6,6 +6,15 @@ license = "MIT OR Apache-2.0"
 publish = false
 default-run = "atrium-calendar"
 
+[features]
+default = ["desktop"]
+desktop = ["dep:atrium-open", "dep:limen", "dep:pergola"]
+
+[[bin]]
+name = "atrium-calendar"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 [dependencies]
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 atrium-message = { path = "../sdk/atrium-message" }
@@ -23,6 +32,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
-atrium-open = { path = "../atrium-open" }
-limen = { path = "../limen" }
-pergola = { path = "../pergola" }
+atrium-open = { optional = true, path = "../atrium-open" }
+limen = { optional = true, path = "../limen" }
+pergola = { optional = true, path = "../pergola" }

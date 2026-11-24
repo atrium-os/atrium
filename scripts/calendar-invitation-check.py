@@ -96,6 +96,33 @@ def run(ui):
     print("PASS preview, local save, reschedule comparison, Cancel, Send, SMTP receipt and replay")
 
 
+def background(ui):
+    print(guest(ui, "invitation-setup"))
+    open_mail(ui, first=True)
+    review(ui, 248)
+    ui.see("background-original", "Review invitation", "14:00")
+    click(ui, 568, 550)
+    ui.see("background-accepted", "Invitation saved on this device", "14:00")
+    before = ui.store("work")
+    ui.control("close", "work")
+    ui.control("open", "personal")
+    print(guest(ui, "background-personal"))
+    personal = ui.store("personal")
+    ui.control("close", "personal")
+    print(guest(ui, "background-arrive"))
+    print(guest(ui, "background-receipt"))
+    assert ui.store("work") == before
+    ui.control("open", "work")
+    ui.see("unopened-summary", r"Meeting changes \(1\)")
+    click(ui, 367, 524)
+    ui.see("unopened-detail", "Meeting change 1 of 1", "revision 5", "14:00", "17:00", "Studio C")
+    ui.control("close", "work")
+    print(guest(ui, "background-check"))
+    assert ui.store("work") == before
+    assert ui.store("personal") == personal
+    print("PASS unopened deliveries, closed Work window, latest revision, unread mail, private persona and empty outbox")
+
+
 def series(ui):
     print(guest(ui, "series-setup"))
     open_mail(ui, first=True)
@@ -701,9 +728,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

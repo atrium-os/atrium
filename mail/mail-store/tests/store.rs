@@ -200,3 +200,73 @@ fn an_archive_leaves_the_list_at_once_and_undo_brings_it_back() {
     let other = s.folder_id(b, "Archive", Role::Archive).unwrap();
     assert!(s.write(|w| w.queue(inbox, 10, OpKind::Move { to: other }, 0)).is_err());
 }
+
+#[test]
+fn calendar_delivery_survives_restart_hydration_and_racing_receipts() {
+    use mail_schema::{Invite, InviteMethod, SenderCheck};
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path()).unwrap();
+    let account = s.add_account("dev@fixture.invalid").unwrap();
+    let inbox = s.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let invitation = |seq, full| {
+        let mut m = inc(&s, "Design", 100 + seq as i64, None, full);
+        m.summary.invite = Some(Invite {
+            method: InviteMethod::Request,
+            uid: "design".into(),
+            sequence: seq,
+            title: "Design".into(),
+            start: None,
+            end: None,
+            location: String::new(),
+            organizer: "p@example.org".into(),
+            attendees: 1,
+            my_status: None,
+            cancelled: false,
+            repeats: false,
+        });
+        m
+    };
+    let original = s
+        .write(|w| w.put(inbox, account, 1, invitation(1, true)))
+        .unwrap();
+    let later = s
+        .write(|w| w.put(inbox, account, 2, invitation(3, false)))
+        .unwrap();
+    assert!(!s.index_calendar_page().unwrap());
+    assert!(s.pending_calendar(0).unwrap().is_empty());
+    let verified = SenderCheck::Verified {
+        domain: "example.org".into(),
+        by_provider: false,
+    };
+    s.write(|w| w.set_sender_check(later, verified.clone()))
+        .unwrap();
+    assert!(s.pending_calendar(0).unwrap().is_empty());
+    let mut full = invitation(3, true);
+    full.summary.sender_check = verified;
+    s.write(|w| w.put(inbox, account, 2, full)).unwrap();
+    let old = s.pending_calendar(0).unwrap()[0];
+    assert_eq!(old.0, later);
+    drop(s);
+    let s = Store::open(d.path()).unwrap();
+    assert_eq!(s.pending_calendar(0).unwrap(), [old]);
+    s.write(|w| w.replay_calendar_revisions(original)).unwrap();
+    s.write(|w| w.finish_calendar_delivery(old.0, old.1))
+        .unwrap();
+    let newest = s.pending_calendar(0).unwrap()[0];
+    assert_eq!(newest.0, later);
+    assert!(newest.1 > old.1);
+    s.write(|w| w.finish_calendar_delivery(newest.0, newest.1))
+        .unwrap();
+    assert!(s.pending_calendar(0).unwrap().is_empty());
+    assert!(s.write(|w| w.hold(inbox, 2, 1)).unwrap());
+    s.write(|w| w.release(later)).unwrap();
+    let released = s.pending_calendar(0).unwrap()[0];
+    assert_eq!(released.0, later);
+    s.write(|w| w.finish_calendar_delivery(later, released.1))
+        .unwrap();
+    let archive = s.folder_id(account, "Archive", Role::Archive).unwrap();
+    let header = inc(&s, "Design", 103, None, false);
+    s.write(|w| w.put_linked(archive, account, 3, header, Some(later)))
+        .unwrap();
+    assert_eq!(s.pending_calendar(0).unwrap()[0].0, later);
+}

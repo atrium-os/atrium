@@ -1,4 +1,5 @@
 //! Persona-local planning with floating, all-day and source-zoned commitments.
+pub mod ical_format;
 pub mod import;
 pub mod invitation;
 mod invitation_limit;

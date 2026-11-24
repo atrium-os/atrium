@@ -678,6 +678,25 @@ pub fn run() -> io::Result<()> {
     let mut clock_name = std::fs::read_to_string(&clock_path).ok();
     let mut checked = std::time::Instant::now();
     let mut refresh_zone = false;
+    type ReviewPoll = (
+        usize,
+        Option<atrium_calendar::store::meeting_changes::ChangeDetail>,
+    );
+    let (changes_tx, changes_rx) = mpsc::channel::<(Option<Uuid>, Result<ReviewPoll, String>)>();
+    let (poll_changes, requests) = mpsc::sync_channel(1);
+    let path = socket.clone();
+    std::thread::spawn(move || {
+        while let Ok(selected) = requests.recv() {
+            let result = atrium_calendar::wire::exchange::<ReviewPoll>(
+                &path,
+                &Request::PollMeetingChanges { selected },
+            );
+            if changes_tx.send((selected, result)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut polling = false;
     let invitations = invitations::listen();
     let mut picker: Option<Picker> = None;
     let (parsed, previews) = mpsc::channel();
@@ -723,7 +742,32 @@ pub fn run() -> io::Result<()> {
                 .import
                 .set(Some(result.unwrap_or_else(Screen::Problem)));
         }
+        let selected_review = || match planner.import.get_cloned() {
+            Some(Screen::MeetingChange(change)) => Some(change.meeting_id),
+            _ => None,
+        };
+        if let Ok((index, result)) = changes_rx.try_recv() {
+            polling = false;
+            if let Ok((count, detail)) = result {
+                if let Some(mut data) = planner
+                    .data
+                    .get_cloned()
+                    .filter(|d| d.meeting_changes != count)
+                {
+                    data.meeting_changes = count;
+                    planner.data.set(Some(data));
+                }
+                if let Some(Screen::MeetingChange(shown)) = planner.import.get_cloned() {
+                    if index == Some(shown.meeting_id) && detail.as_ref() != Some(&shown) {
+                        planner.import.set(detail.map(Screen::MeetingChange));
+                    }
+                }
+            }
+        }
         if checked.elapsed() >= Duration::from_secs(2) {
+            if !polling && planner.data.get_cloned().is_some() {
+                polling = poll_changes.try_send(selected_review()).is_ok();
+            }
             let current = std::fs::read_to_string(&clock_path).ok();
             refresh_zone |= current != clock_name;
             clock_name = current;

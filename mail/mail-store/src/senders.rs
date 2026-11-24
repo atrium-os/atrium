@@ -181,12 +181,16 @@ impl Writer<'_> {
     /// Put a held message back in its folder's list.
     pub fn release(&mut self, msg: MsgId) -> Result<()> {
         let Some(mut m) = self.get_msg(msg)? else { return Ok(()) };
+        let previous_locations = m.locations.len();
         for (folder, uid) in std::mem::take(&mut m.held) {
             self.tx.open_table(HELD)?.remove((m.account, date_key(m.date), msg))?;
             if self.tx.open_table(crate::LOCATIONS)?.get((folder, uid))?.is_some() {
                 self.tx.open_table(LIST)?.insert((folder, date_key(m.date), msg), uid)?;
                 m.locations.push((folder, uid));
             }
+        }
+        if m.locations.len() > previous_locations {
+            self.queue_calendar(msg, &m)?;
         }
         self.put_msg(msg, &m)?;
         self.thread_refresh(m.thread)

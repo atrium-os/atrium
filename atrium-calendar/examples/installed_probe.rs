@@ -271,6 +271,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let [socket, date, expected] = args.as_slice() else {
         return Err("expected socket, date and title (or --denied)".into());
     };
+    if expected == "--accept-personal-fixture" {
+        use atrium_calendar::{ical_format, import::Outcome, invitation::Review, wire};
+        use portcullis_ipc::calendar::Source;
+        let socket = Path::new(socket);
+        let revision = call(
+            socket,
+            &Request::Day {
+                date: date.parse()?,
+            },
+        )?
+        .revision;
+        let parsed =
+            ical_format::parse_mode(include_bytes!("../tests/fixtures/invitation.ics"), true)
+                .map_err(|_| "Invalid synthetic meeting")?;
+        let Outcome::Invitation(proposal) = parsed else {
+            return Err("Expected a synthetic invitation".into());
+        };
+        let source = Source {
+            account: 1,
+            from: proposal.organizer.clone(),
+            identities: vec!["dev@fixture.invalid".into()],
+            verified: true,
+            reply_destination_matches: true,
+            delivery: None,
+        };
+        let review: Review = wire::exchange(
+            socket,
+            &Request::ReviewInvitation {
+                revision,
+                source,
+                proposal,
+            },
+        )?;
+        wire::page(
+            socket,
+            &Request::ApplyInvitation {
+                revision,
+                token: review.token.ok_or(review.notice)?,
+                choices: vec![],
+            },
+        )?;
+        return Ok(());
+    }
     if matches!(
         expected.as_str(),
         "--check-travel" | "--check-pinned" | "--check-follow"

@@ -212,3 +212,40 @@ fn socket_enforces_identity_and_retains_the_accepted_revision() {
     assert_eq!(page(&socket, &resume).unwrap().view, CalendarView::Week);
     assert!(page(&socket, &set_week).is_err());
 }
+
+#[test]
+fn broker_deposit_and_window_query_use_separate_operations() {
+    use aqueduct::{classes::CLASS_CALENDAR, envelope, flag, Header};
+    use atrium_calendar::{store::Store, wire};
+    use portcullis_ipc::calendar::BACKGROUND_OP;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let query = serde_json::to_vec(&Request::Today { view: None }).unwrap();
+    let request = |op| {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let header = Header::new(
+            CLASS_CALENDAR,
+            op,
+            flag::RESPONSE_EXPECTED,
+            query.len() as u32,
+        );
+        envelope::write_message(&mut sender, header, &query).unwrap();
+        (sender, receiver)
+    };
+    let (_client, mut broker) = request(1);
+    assert_eq!(
+        wire::serve_deposit(&mut broker, &mut store)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let (mut client, mut window) = request(BACKGROUND_OP);
+    wire::serve(&mut window, &mut store).unwrap();
+    let (_, bytes) = envelope::read_message_alloc(&mut client).unwrap();
+    assert!(
+        serde_json::from_slice::<Result<atrium_calendar::CalendarPage, String>>(&bytes)
+            .unwrap()
+            .is_err()
+    );
+}

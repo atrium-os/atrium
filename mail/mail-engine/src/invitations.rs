@@ -54,6 +54,14 @@ pub fn proposed_time(invite: &mail_schema::Invite) -> Option<String> {
 
 impl Engine {
     pub fn selected_invitation(&self, msg: MsgId) -> Result<Selected, Error> {
+        self.extract_invitation(msg, || self.parser.start())
+    }
+
+    fn extract_invitation(
+        &self,
+        msg: MsgId,
+        worker: impl FnOnce() -> Result<crate::Jail, Error>,
+    ) -> Result<Selected, Error> {
         let m = self.store.message(msg)?;
         let blob = m
             .full
@@ -101,7 +109,7 @@ impl Engine {
                 .is_none_or(|a| a.addr.eq_ignore_ascii_case(&from));
         let raw = self.store.blob(&blob)?;
         let len = raw.len() as u64;
-        let mut jail = self.parser.start()?;
+        let mut jail = worker()?;
         mail_schema::write_frame(
             &mut jail.w,
             &mail_schema::ToJail::SchedulingPart {
@@ -156,6 +164,87 @@ impl Engine {
             bytes,
             blob,
         })
+    }
+
+    /// Prepare an unopened inbox delivery. A permanent content refusal consumes
+    /// its queue record. Transport, store and worker failures remain retryable.
+    pub fn unopened_update(
+        &self,
+        msg: MsgId,
+    ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
+        use mail_schema::{FromJail, Raw, ToJail};
+        let m = match self.store.message(msg) {
+            Ok(m) => m,
+            Err(mail_store::Error::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut inbox = false;
+        for (folder, _) in &m.locations {
+            inbox |= self.store.folder(*folder)?.role == mail_store::Role::Inbox;
+        }
+        if !inbox
+            || !m.held.is_empty()
+            || !matches!(m.summary.sender_check, SenderCheck::Verified { .. })
+        {
+            return Ok(None);
+        }
+        let Some(i) = m
+            .summary
+            .invite
+            .as_ref()
+            .filter(|i| i.sequence > 0 && !i.repeats)
+        else {
+            return Ok(None);
+        };
+        let selected = match self.extract_invitation(msg, crate::Parser::installed_worker) {
+            Ok(s) => s,
+            Err(Error::Refused(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut source = selected.source;
+        if !source.verified
+            || !source.reply_destination_matches
+            || !i.organizer.eq_ignore_ascii_case(&source.from)
+            || source.delivery.as_ref().is_some_and(|d| d.scope.is_some())
+        {
+            return Ok(None);
+        }
+        source.delivery = Some(Delivery {
+            uid: i.uid.clone(),
+            sequence: i.sequence,
+            organizer: i.organizer.clone(),
+            cancelled: i.cancelled,
+            scope: None,
+        });
+        let mut jail = crate::Parser::installed_worker()?;
+        let len = selected.bytes.len() as u64;
+        mail_schema::write_frame(
+            &mut jail.w,
+            &ToJail::OneOffUpdate {
+                part: Raw {
+                    id: 1,
+                    bytes: selected.bytes,
+                },
+                identities: source.identities.clone(),
+            },
+        )
+        .map_err(|e| Error::Jail(e.to_string()))?;
+        let frames = crate::Parser::exchange(
+            &mut jail.r,
+            &mut jail.w,
+            &|id| (id == 1).then_some(len),
+            &[],
+            &|_| None,
+        )?;
+        let [FromJail::OneOffUpdate { id: 1, proposal }] = frames.as_slice() else {
+            return Err(Error::Jail("Invalid meeting update response".into()));
+        };
+        Ok(proposal
+            .as_ref()
+            .map(|proposal| portcullis_ipc::calendar::BackgroundUpdate {
+                source,
+                proposal: proposal.clone(),
+            }))
     }
 
     /// Bind the Calendar choice to the scope in the immutable selected Mail part.

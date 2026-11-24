@@ -231,6 +231,7 @@ impl Store {
         marks.retain(|c| !(c.this_and_future && c.key == mark.key && c.original == Some(cut)));
         let token = Uuid::new_v4();
         *pending = Some(Pending {
+            one_off: None,
             token,
             revision,
             created: Instant::now(),

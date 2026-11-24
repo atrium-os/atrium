@@ -14,6 +14,90 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Drain durable inbox work independently of opening a message or a window
+/// activation. Calendar never learns an unrelated folder or message ID.
+pub fn start_updates(store: mail_store::Store, parser: mail_engine::Parser) {
+    std::thread::spawn(move || {
+        let engine = Engine::new(store, parser);
+        let mut reported = false;
+        let mut after = 0;
+        loop {
+            let result = (|| -> Result<bool, String> {
+                let more = engine
+                    .store
+                    .index_calendar_page()
+                    .map_err(|e| e.to_string())?;
+                let pending = engine
+                    .store
+                    .pending_calendar(after)
+                    .map_err(|e| e.to_string())?;
+                let full = pending.len() == 16;
+                if pending.is_empty() {
+                    after = 0;
+                }
+                for (msg, generation) in pending {
+                    after = msg;
+                    if let Some(update) = engine.unopened_update(msg).map_err(|e| e.to_string())? {
+                        deposit(&update).map_err(|e| e.to_string())?;
+                    }
+                    engine
+                        .store
+                        .write(|w| w.finish_calendar_delivery(msg, generation))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(more || full)
+            })();
+            let delay = match result {
+                Ok(more) => {
+                    reported = false;
+                    if more {
+                        1
+                    } else {
+                        5
+                    }
+                }
+                Err(_) => {
+                    if !reported {
+                        eprintln!("atrium-mail: background calendar delivery deferred");
+                        reported = true;
+                    }
+                    30
+                }
+            };
+            std::thread::sleep(Duration::from_secs(delay));
+        }
+    });
+}
+
+fn deposit(update: &calendar::BackgroundUpdate) -> io::Result<()> {
+    let mut broker = UnixStream::connect(atrium_mail::files::portcullis_socket())?;
+    let timeout = Some(Duration::from_secs(8));
+    broker.set_read_timeout(timeout)?;
+    broker.set_write_timeout(timeout)?;
+    if !matches!(
+        portcullis_ipc::round_trip(
+            &mut broker,
+            &Request::Hello {
+                version: portcullis_ipc::PROTO_VERSION
+            }
+        )?,
+        Response::Hello { .. }
+    ) || !matches!(
+        portcullis_ipc::round_trip(&mut broker, &Request::CalendarUpdate)?,
+        Response::Ok
+    ) {
+        return Err(io::Error::other("Calendar updates unavailable"));
+    }
+    calendar::write(&mut broker, update)?;
+    if !matches!(
+        portcullis_ipc::read_response_unbuffered(&mut broker)?,
+        Response::Ok
+    ) {
+        return Err(io::Error::other("Calendar receipt unavailable"));
+    }
+    Ok(())
+}
+
 pub fn offer(selected: Selected, activation: [u8; 16]) -> Result<Option<Reply>, String> {
     fn handoff(selected: Selected, activation: [u8; 16]) -> io::Result<Option<Reply>> {
         let mut broker = UnixStream::connect(atrium_mail::files::portcullis_socket())?;

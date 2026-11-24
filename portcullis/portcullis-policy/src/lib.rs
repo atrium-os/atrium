@@ -450,6 +450,7 @@ pub struct CapabilityDelta {
     pub consoles:        bool,
     pub app_grants:      bool,
     pub open_attachments: bool,
+    pub calendar_updates: bool,
     pub workspaces:      bool,
     pub workspace_exec:  bool,
     pub bluetooth_control: bool,
@@ -521,6 +522,7 @@ impl CapabilityDelta {
             && !self.home_files
             && !self.consoles
             && !self.app_grants
+            && !self.calendar_updates
             && !self.open_attachments
             && !self.workspaces
             && !self.workspace_exec
@@ -587,6 +589,7 @@ impl CapabilityDelta {
         if self.home_files      { out.push("Read and change all of your own files (Documents, Downloads, Pictures, Music, Videos)".into()); }
         if self.consoles        { out.push("Show apps' consoles, and open more of them".into()); }
         if self.app_grants      { out.push("See what each app may do, and allow or remove it".into()); }
+        if self.calendar_updates { out.push("Deliver verified meeting updates to this persona’s Calendar for review".into()); }
         if self.open_attachments { out.push("Open the files you receive in your apps, when you press Open".into()); }
         if self.workspaces      { out.push("Make, change and delete your workspaces, and open their terminals".into()); }
         if self.workspace_exec  { out.push("Build and run commands in the workspaces you pick in it".into()); }
@@ -717,6 +720,7 @@ pub fn compute_delta(
     bool_cap!(consoles);
     bool_cap!(app_grants);
     bool_cap!(open_attachments);
+    bool_cap!(calendar_updates);
     bool_cap!(workspaces);
     bool_cap!(workspace_exec);
     bool_cap!(bluetooth_control);
@@ -1065,6 +1069,7 @@ run_as = "_navpage"
             consoles: None,
             app_grants: None,
             open_attachments: None,
+            calendar_updates: None,
             workspaces: None,
             workspace_exec: None,
             bluetooth_control: None,
@@ -1106,6 +1111,15 @@ run_as = "_navpage"
         assert_eq!(d.filesystem_added.len(), 2);
         assert_eq!(d.network_upgrade, Some(NetworkCap::Loopback));
         assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn opening_attachments_does_not_grant_background_calendar_updates() {
+        let old = Capabilities { open_attachments: Some(true), ..Default::default() };
+        let new = Capabilities { calendar_updates: Some(true), ..old.clone() };
+        let delta = compute_delta(&new, Some(&old), None, "h");
+        assert!(delta.calendar_updates && !delta.is_empty());
+        assert!(compute_delta(&new, Some(&new), None, "h").is_empty());
     }
 
     #[test]

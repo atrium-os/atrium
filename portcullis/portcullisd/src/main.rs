@@ -749,6 +749,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Attachments (mail.md §8.2): from a mail app, by its installed
          * manifest's `open-attachments`; a sealed memory file follows. */
+        if let Request::CalendarUpdate = req {
+            handle_calendar_update(uid, &owner, &shared, &mut writer)?;
+            return Ok(());
+        }
         if let Request::CalendarInvitation { activation } = req {
             handle_calendar_invitation(uid, &owner, activation, &shared, &mut writer)?;
             continue;
@@ -1512,19 +1516,40 @@ static STARTED_FOR_OPEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Whether `app_id` may run for `user` now without asking (the Launch
 /// gate, without its prompt: an open is not where a new grant is given).
 fn may_run_unasked(app_id: &str, user: &str, shared: &Mutex<Tenants>) -> Result<(), String> {
+    granted_manifest(app_id, user, shared).map(drop)
+}
+
+fn granted_manifest(
+    app_id: &str,
+    user: &str,
+    shared: &Mutex<Tenants>,
+) -> Result<(portcullis_toml::Manifest, Option<[u8; 32]>), String> {
     let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(app_id);
-    let text = std::fs::read_to_string(tree.join("atrium.toml")).map_err(|e| format!("{app_id}: {e}"))?;
-    manifest_trust::verify(&tree, &text)?;
-    let manifest = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{app_id}: {e}"))?;
+    let text =
+        std::fs::read_to_string(tree.join("atrium.toml")).map_err(|e| format!("{app_id}: {e}"))?;
+    let publisher = manifest_trust::verify_publisher(&tree, &text)?;
+    let manifest =
+        portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{app_id}: {e}"))?;
     let hash = hash_manifest(text.as_bytes());
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-    let tp = s.get_or_load(user).map_err(|e| format!("policy for {user}: {e}"))?;
+    let tp = s
+        .get_or_load(user)
+        .map_err(|e| format!("policy for {user}: {e}"))?;
     let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
-    let d = decide(app_id, &manifest.capabilities, &hash, &tp.policy, system.as_ref());
+    let d = decide(
+        app_id,
+        &manifest.capabilities,
+        &hash,
+        &tp.policy,
+        system.as_ref(),
+    );
     if d.delta.is_empty() {
-        Ok(())
+        Ok((manifest, publisher))
     } else {
-        Err(format!("{} needs your approval first: open it once from Applications", manifest.app.name))
+        Err(format!(
+            "{} needs your approval first: open it once from Applications",
+            manifest.app.name
+        ))
     }
 }
 
@@ -1856,6 +1881,93 @@ fn handle_open_download(
     }
     eprintln!("portcullisd: a download “{name}” ({}) from {} opened in {key} for {owner}", t.mime, caller.as_deref().unwrap_or("?"));
     write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })
+}
+
+/// Only the broker connects to Fasti as root. Mail gets a uniform receipt
+/// and never receives that socket or a Calendar query or editing token.
+fn handle_calendar_update(
+    uid: u32,
+    owner: &str,
+    shared: &Mutex<Tenants>,
+    mail: &mut UnixStream,
+) -> std::io::Result<()> {
+    use portcullis_ipc::calendar::{self as protocol, BackgroundUpdate};
+    let result = (|| -> Result<(), String> {
+        let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .map_err(|e| e.to_string())?;
+        let signer = reg.publisher(uid).flatten().ok_or("Signed Mail required")?;
+        let pin = std::fs::read_to_string("/etc/atrium/calendar-publisher")
+            .map_err(|_| "Calendar unavailable")?;
+        if reg.resolve(uid) != Some((owner, "org.atrium.mail")) || hex::encode(signer) != pin.trim()
+        {
+            return Err("Calendar updates unavailable".into());
+        }
+        let (mail_manifest, mail_signer) = granted_manifest("org.atrium.mail", owner, shared)?;
+        let (cal_manifest, cal_signer) = granted_manifest(calendar::APP, owner, shared)?;
+        if mail_signer != Some(signer)
+            || cal_signer != Some(signer)
+            || mail_manifest.app.id != "org.atrium.mail"
+            || cal_manifest.app.id != calendar::APP
+            || mail_manifest.capabilities.calendar_updates != Some(true)
+        {
+            return Err("Calendar updates unavailable".into());
+        }
+        let persona = reg.persona(uid).ok_or("Unknown Mail persona")?;
+        let calendar_uid = reg
+            .uid_for_instance(owner, calendar::APP, Some(&signer), persona)
+            .ok_or("Calendar has not been opened for this persona")?;
+        let dir = calendar::endpoint(owner, persona, pin.trim(), calendar_uid)
+            .map_err(|_| "Calendar unavailable")?;
+        let timeout = Some(std::time::Duration::from_secs(3));
+        mail.set_read_timeout(timeout).map_err(|e| e.to_string())?;
+        mail.set_write_timeout(timeout).map_err(|e| e.to_string())?;
+        write_response(mail, &Response::Ok).map_err(|e| e.to_string())?;
+        let update: BackgroundUpdate =
+            protocol::read_deposit(mail).map_err(|_| "Invalid meeting update")?;
+        if !update.source.valid()
+            || !update.source.verified
+            || !update.source.reply_destination_matches
+            || update.proposal.len() > 4096
+        {
+            return Err("Invalid meeting update".into());
+        }
+        let mut service =
+            UnixStream::connect(dir.join("calendar.sock")).map_err(|_| "Calendar unavailable")?;
+        service
+            .set_read_timeout(timeout)
+            .map_err(|e| e.to_string())?;
+        service
+            .set_write_timeout(timeout)
+            .map_err(|e| e.to_string())?;
+        use aqueduct::{classes::CLASS_CALENDAR, envelope, flag, Header};
+        let bytes = serde_json::to_vec(&update).map_err(|_| "Invalid meeting update")?;
+        let header = Header::new(
+            CLASS_CALENDAR,
+            protocol::BACKGROUND_OP,
+            flag::RESPONSE_EXPECTED,
+            bytes.len() as u32,
+        );
+        envelope::write_message(&mut service, header, &bytes)
+            .map_err(|_| "Calendar unavailable")?;
+        let mut receipt = [0; 5];
+        let (header, kept) = envelope::read_message(&mut service, &mut receipt)
+            .map_err(|_| "Calendar unavailable")?;
+        if header.opcode_class != CLASS_CALENDAR
+            || header.op != protocol::BACKGROUND_OP
+            || header.flags != flag::IS_RESPONSE
+            || kept != b"true"
+        {
+            return Err("Calendar could not keep the update".into());
+        }
+        Ok(())
+    })();
+    write_response(
+        mail,
+        &match result {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error { message },
+        },
+    )
 }
 
 /// Bind one private conversation between the signed Mail launch and its persona's
@@ -4076,7 +4188,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::CalendarInvitation { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
+        Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::CalendarInvitation { .. } | Request::CalendarUpdate | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

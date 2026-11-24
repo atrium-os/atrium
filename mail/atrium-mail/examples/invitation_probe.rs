@@ -407,6 +407,71 @@ fn submit(e: &Engine, series: bool) {
     assert!(e.store.outbox().unwrap().is_empty());
     println!("PASS SMTP received one ACCEPTED for revision 2, organizer only. Replay queued zero additional messages.");
 }
+// The guest fixture supplies sender evidence explicitly and never contacts a provider.
+fn background_batch(e: &Engine) {
+    let account = e.store.accounts().unwrap()[0].0;
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    for (uid, seq, hour, verified) in [
+        (3, 5, 17, true),
+        (4, 4, 16, true),
+        (5, 5, 17, true),
+        (6, 8, 18, false),
+    ] {
+        let body = REQUEST
+            .replace("SEQUENCE:1", &format!("SEQUENCE:{seq}"))
+            .replace("T14", &format!("T{hour}"))
+            .replace("Studio A", "Studio C");
+        let raw = format!("From: Mina <mina@fixture.invalid>\r\nTo: dev@fixture.invalid\r\nSubject: Studio update {uid}\r\nMessage-ID: <update-{uid}@fixture.invalid>\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n{}",body.replace('\n',"\r\n")).into_bytes();
+        let mut summary = e
+            .parser
+            .summarize(&[(1, &raw)], false, &[])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        if verified {
+            summary.sender_check = mail_schema::SenderCheck::Verified {
+                domain: "fixture.invalid".into(),
+                by_provider: false,
+            };
+        }
+        let blob = e.store.put_blob(&raw).unwrap();
+        e.store
+            .write(|w| {
+                w.put(
+                    inbox,
+                    account,
+                    uid,
+                    Incoming {
+                        server_id: None,
+                        size: raw.len() as u64,
+                        internal_date: None,
+                        flags: 0,
+                        blob,
+                        full: true,
+                        summary,
+                    },
+                )
+            })
+            .unwrap();
+    }
+}
+
+fn check_background(e: &Engine) {
+    let account = e.store.accounts().unwrap()[0].0;
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    for uid in 2..=6 {
+        let (_, flags) = e.store.at(inbox, uid).unwrap().unwrap();
+        assert_eq!(
+            flags & mail_store::flag::SEEN,
+            0,
+            "fixture UID {uid} was read"
+        );
+    }
+    assert!(e.store.pending_calendar(0).unwrap().is_empty());
+    assert!(e.store.outbox().unwrap().is_empty());
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -419,6 +484,8 @@ fn main() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
         | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate"
         | "seed-restart" | "seed-restore-one" | "seed-reissue") => seed(&e, mode),
+        "background-batch" => background_batch(&e),
+        "background-check" => check_background(&e),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),

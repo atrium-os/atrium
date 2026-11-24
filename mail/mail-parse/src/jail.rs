@@ -86,6 +86,10 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 };
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
+            wire::ToJail::OneOffUpdate { part, identities } => {
+                let proposal = one_off_update(&part.bytes, &identities);
+                port.borrow_mut().send(&wire::FromJail::OneOffUpdate { id: part.id, proposal })?;
+            }
             wire::ToJail::SchedulingPart { message, path } => {
                 let result = crate::parse(&message.bytes, &Limits::default()).map_err(refusal).and_then(|s| {
                     let part = s.parts.iter().find(|p|p.path == path && p.kind == mime::PartKind::Calendar).ok_or(wire::Refusal::NotMail)?;
@@ -539,4 +543,46 @@ fn text_of(bytes: &[u8], charset: Option<&str>) -> Option<String> {
         t.truncate(at);
     }
     Some(t)
+}
+
+/// Use the same strict calendar decoder as an explicit review. Only the recipient's
+/// own matching address may leave Mail in a background update.
+fn one_off_update(bytes: &[u8], identities: &[String]) -> Option<String> {
+    use atrium_calendar::{ical_format::parse_mode, import::Outcome};
+    if identities.len() > 32 || identities.iter().any(|addr| addr.len() > 254) {
+        return None;
+    }
+    let Outcome::Invitation(mut p) = parse_mode(bytes, true).ok()? else {
+        return None;
+    };
+    if p.scope().is_some() || p.sequence == 0 {
+        return None;
+    }
+    let omit_attendees = p.row.is_none() && p.attendees.is_empty();
+    p.attendees
+        .retain(|addr| identities.iter().any(|id| id.eq_ignore_ascii_case(addr)));
+    if !omit_attendees && p.attendees.len() != 1 {
+        return None;
+    }
+    serde_json::to_string(&p).ok().filter(|s| s.len() <= 4096)
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::one_off_update;
+    #[test]
+    fn unopened_update_exposes_only_the_matching_attendee_and_rejects_series() {
+        let fixture = include_str!("../../../atrium-calendar/tests/fixtures/invitation.ics");
+        let me = vec!["dev@fixture.invalid".into()];
+        let part = one_off_update(fixture.as_bytes(), &me).unwrap();
+        assert!(part.contains("dev@fixture.invalid") && !part.contains("guest@fixture.invalid"));
+        for wrong in [
+            fixture.replace("dev@fixture.invalid", "other@fixture.invalid"),
+            fixture.replace("END:VEVENT", "RRULE:FREQ=WEEKLY\nEND:VEVENT"),
+            fixture.replace("END:VEVENT", "RECURRENCE-ID:20261201T140000Z\nEND:VEVENT"),
+            fixture.replace("SEQUENCE:1", "SEQUENCE:0"),
+        ] {
+            assert!(one_off_update(wrong.as_bytes(), &me).is_none());
+        }
+    }
 }

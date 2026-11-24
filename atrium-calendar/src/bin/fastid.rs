@@ -74,6 +74,14 @@ fn main() -> io::Result<()> {
         let Ok((uid, _)) = portcullis_peer::uid_gid(conn.as_raw_fd()) else {
             continue;
         };
+        if installed && uid == 0 {
+            // The root-owned endpoint is reached here by Portcullis. This
+            // connection can only deposit an update and gets a uniform receipt.
+            if let Err(error) = wire::serve_deposit(&mut conn, &mut store) {
+                eprintln!("fastid: meeting delivery failed ({:?})", error.kind());
+            }
+            continue;
+        }
         let Ok(bindings) = AppRegistry::load(&registry) else {
             eprintln!("fastid: Calendar launch registry unavailable");
             continue;
