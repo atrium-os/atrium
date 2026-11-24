@@ -7,4 +7,5 @@ license.workspace = true
 
 [dependencies]
 aura-ipc = { path = "../../aura/aura-ipc" }
+atrium-fdpass = { path = "../../atrium-fdpass" }
 libc = "0.2"

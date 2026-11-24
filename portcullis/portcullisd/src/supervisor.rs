@@ -1028,7 +1028,7 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_services::{ManifestExec, ManifestEnv, ManifestNetwork, MountKindStr, RestartPolicy};
+    use crate::system_services::{ManifestExec, ManifestNetwork, RestartPolicy};
 
     fn never_restart_manifest() -> ServiceManifest {
         ServiceManifest {

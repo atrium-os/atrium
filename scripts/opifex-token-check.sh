@@ -3,7 +3,7 @@
 # SoftHSM, a software PKCS#11 token: the key ceremony and a handover to new
 # owners, through the real `opifex` CLI with PINs typed at a terminal (a pty
 # here). Runs on the HOST: `apt install softhsm2 opensc` or
-# `brew install softhsm opensc`. Ends "opifex-token: N failed".
+# `brew install softhsm opensc`. Ends "opifex-token: N ok, M failed" and exits non-zero on a failure.
 #
 #   - six tokens with a P-256 key each; `opifex token list` sees them and
 #     `opifex token ref` writes key files naming them;
@@ -16,20 +16,18 @@
 #   - a new platform key: the old one stays in root.toml, retired.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-fails=0
-ok() { echo "  ok $1"; }
-bad() { echo "  FAIL $1"; fails=$((fails+1)); }
-check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: expected [$2] got [$3]"; fi; }
+. "$ROOT/scripts/lib/gate.sh"
+gate_begin opifex-token 18
 M=""
 for m in /usr/lib/softhsm/libsofthsm2.so /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
          /usr/local/lib/softhsm/libsofthsm2.so /opt/homebrew/lib/softhsm/libsofthsm2.so; do
     [ -f "$m" ] && { M=$m; break; }
 done
-[ -n "$M" ] || { echo "no SoftHSM: apt install softhsm2 opensc (or brew install softhsm opensc)"; echo "opifex-token: 1 failed"; exit 1; }
-command -v pkcs11-tool >/dev/null || { echo "no pkcs11-tool (opensc)"; echo "opifex-token: 1 failed"; exit 1; }
+[ -n "$M" ] || gate_abort "no SoftHSM: apt install softhsm2 opensc (or brew install softhsm opensc)"
+command -v pkcs11-tool >/dev/null || gate_abort "no pkcs11-tool (opensc)"
 
 echo "=== build"
-(cd "$ROOT/portcullis" && cargo build -q --bin opifex) || { echo "opifex-token: 1 failed"; exit 1; }
+(cd "$ROOT/portcullis" && cargo build -q --bin opifex) || gate_abort "opifex did not build"
 O="${CARGO_TARGET_DIR:-$ROOT/portcullis/target}/debug/opifex"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
@@ -122,4 +120,4 @@ check "the machine adopts it" "1" "$("$O" catalog sync state --from site 2>&1 | 
 check "a retired key never comes back" "1" "$("$O" catalog root-new site --next yes --name Atrium --root r4.key --root r5.key --root r6.key \
     --catalog catalog.pem --platform platform.pem 2>&1 | grep -c 'never comes back')"
 
-echo "opifex-token: $fails failed"
+gate_end

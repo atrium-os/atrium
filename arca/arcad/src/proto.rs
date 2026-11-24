@@ -71,7 +71,8 @@ pub mod op {
     pub const DH_X25519: u16 = 0x0D;
     // The crypta service also (V4): `MINT` a `TlsClientKey` (P-256; the
     // answer's public part is the 65-byte SEC1 point), `PUBKEY` of it, and
-    // `SIGN_DIGEST` with it; `STORE` a
+    // `SIGN_DIGEST` with it (the Wi-Fi key service too, for 802.1X
+    // EAP-TLS: wifi.md §7.4 E3, `TlsClientKey` only); `STORE` a
     // `Password` (a saved VPN password) or a `Cookie` (the gateway's
     // session, for a reconnect), `RELEASE` and `DELETE` them.
     /// The crypta service only (vpn.md §9.3): `handle[16]` → `bytes value`,
@@ -416,12 +417,15 @@ pub mod volume_op {
 /// one service trusted to); the private key never leaves arcad.
 pub mod ssh_op {
     /// The person (through the agent's control socket): `owner | str
-    /// comment [| u8 verify-each-use class]` → `id[16] | pubkey[32]`.
+    /// comment [| u8 class [| u16 kind]]` → `id[16] | pubkey`. The class is
+    /// while-unlocked or verify-each-use; the kind `Ed25519` (the default,
+    /// pubkey 32 bytes) or `P256` (an SSH `ecdsa-sha2-nistp256` key that
+    /// also signs bundles; pubkey the 65-byte uncompressed point).
     pub const SA_MINT: u16 = 0xC0;
-    /// The person: `owner` → `u32 n | n × (id[16] | u16 kind | pubkey[32]
+    /// The person: `owner` → `u32 n | n × (id[16] | u16 kind | bytes pubkey
     /// | str comment | str grants)`, grants newline-separated: keys
-    /// (`Ed25519`) and HTTPS tokens (`ApiKey`, pubkey zeros, comment `host
-    /// username`).
+    /// (`Ed25519`, `P256`) and HTTPS tokens (`ApiKey`, pubkey empty, comment
+    /// `host username`).
     pub const SA_LIST: u16 = 0xC1;
     /// The person: `owner | id[16] | str workspace` → nothing.
     pub const SA_GRANT: u16 = 0xC2;
@@ -430,10 +434,12 @@ pub mod ssh_op {
     /// The person: `owner | id[16]` → nothing.
     pub const SA_DELETE: u16 = 0xC4;
     /// A workspace's agent connection: `owner | str workspace` → `u32 n |
-    /// n × (id[16] | pubkey[32] | str comment)`, the keys granted to it.
+    /// n × (id[16] | u16 kind | bytes pubkey | str comment)`, the keys
+    /// granted to it.
     pub const SA_KEYS: u16 = 0xC5;
     /// A workspace's agent connection: `owner | str workspace | id[16] |
-    /// bytes msg` → `sig[64]`. `DENIED` unless the key is granted to it. A
+    /// bytes msg` → `sig[64]` (Ed25519; for P-256, ECDSA over SHA-256(msg)
+    /// as `r[32] | s[32]`). `DENIED` unless the key is granted to it. A
     /// verify-each-use key requires a successful Sigillum security-key ceremony.
     pub const SA_SIGN: u16 = 0xC6;
     /// portcullisd, through the agent, when a workspace is deleted: `owner |

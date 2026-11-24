@@ -10,7 +10,7 @@
 //!
 //!   atrium-netconf [--ctl PATH] [--dir DIR] [--uid N] [--capsicum] [-v]
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -40,36 +40,19 @@ struct WithFds<'a> {
     fds: &'a mut Vec<OwnedFd>,
 }
 
+/// atrium-net sends descriptors only with an `mdns4` reply (two sockets), and
+/// `print_discovery` clears them first; more than this waiting is a broken
+/// peer.
+const MAX_PENDING_FDS: usize = 4;
+
 impl std::io::Read for WithFds<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let mut cbuf = [0u64; 8];
-        // SAFETY: msghdr is plain data; the buffers outlive the call.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-        // SAFETY: valid socket and message.
-        let n = unsafe { libc::recvmsg(self.s.as_raw_fd(), &mut msg, 0) };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
+        let got = atrium_fdpass::recv(self.s.as_raw_fd(), buf, MAX_PENDING_FDS)?;
+        if self.fds.len() + got.fds.len() > MAX_PENDING_FDS {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too many descriptors pending from atrium-net"));
         }
-        // SAFETY: the kernel filled the control buffer; only SCM_RIGHTS is read.
-        unsafe {
-            let mut c = libc::CMSG_FIRSTHDR(&msg);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-                    let d = libc::CMSG_DATA(c) as *const RawFd;
-                    for i in 0..k {
-                        self.fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(d.add(i))));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&msg, c);
-            }
-        }
-        Ok(n as usize)
+        self.fds.extend(got.fds);
+        Ok(got.n)
     }
 }
 
@@ -399,8 +382,7 @@ fn listen(dir: &Path, g: Grant) -> UnixListener {
     // are root's alone: no jail gets them either.
     let root_only = g.root_only();
     /* For a root-only grant the mode is the access control: fail loudly
-     * rather than serve with whatever mode the directory had (review
-     * 2026-11-24, M2). */
+     * rather than serve with whatever mode the directory had. */
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if root_only { 0o700 } else { 0o755 }))
         .unwrap_or_else(|e| die(&format!("chmod {}: {e}", d.display())));
     let p: PathBuf = d.join(format!("{}.sock", g.name()));

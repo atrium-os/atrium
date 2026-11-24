@@ -119,3 +119,4 @@ check "gone" "none" "$(V "ls -d /var/lib/atrium/apps/$ID 2>/dev/null || echo non
 
 V "pkill -x opifexd" >/dev/null 2>&1
 echo "opifex-c2: $fails failed"
+[ "$fails" -eq 0 ]

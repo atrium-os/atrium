@@ -12,5 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
+atrium-fdpass = { path = "../atrium-fdpass" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }

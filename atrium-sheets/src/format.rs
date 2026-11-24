@@ -35,6 +35,8 @@ pub enum FormatCmd {
     Indent(bool),
     /// Text turned by degrees (-90..=90, counter-clockwise), or stacked (255).
     Rotate(i16),
+    /// Opens the bar for a rotation angle of one's own; the window runs it.
+    Angle,
     /// The line the plain border commands draw (one of [`PEN_LINES`]).
     PenLine(usize),
     /// Their colour: one of the tab colours, or automatic.
@@ -138,6 +140,7 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         }
         v.push((item, Some(FormatCmd::Rotate(*deg))));
     }
+    v.push((MenuItem::new("Rotation Angle…").radio(!ROTATIONS.iter().any(|r| r.1 == st.rotation)), Some(FormatCmd::Angle)));
     v
 }
 
@@ -187,7 +190,7 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
         }};
     }
     match cmd {
-        FormatCmd::Custom => Ok(String::new()),
+        FormatCmd::Custom | FormatCmd::Angle => Ok(String::new()),
         FormatCmd::PenLine(i) => {
             let (name, line) = *PEN_LINES.get(i).ok_or("Unknown line.")?;
             d.border_pen.0 = line;
@@ -479,4 +482,22 @@ pub fn parse_hex(text: &str) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// The selection's text turned by `text` degrees (counter-clockwise, -90 to
+/// 90, as Excel's Format Cells takes it), as one step.
+pub fn set_angle(d: &mut Doc, sel: CellRange, text: &str) -> Result<String, String> {
+    let t = text.trim().trim_end_matches('°').trim();
+    let deg: i16 = t.parse().map_err(|_| format!("Type an angle from -90 to 90 degrees; {t:?} isn't one."))?;
+    if !(-90..=90).contains(&deg) {
+        return Err(format!("Text turns from -90 to 90 degrees; {deg} is outside."));
+    }
+    let r = Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    d.status.clear();
+    let op = GridOp::restyle(&d.wb, r, &|st: &Style| Style { rotation: deg, ..st.clone() });
+    d.run("Text Rotation", vec![op]);
+    if d.status == crate::sheet_protection::REFUSED {
+        return Err(d.status.clone());
+    }
+    Ok(if deg == 0 { "Rotation taken off.".into() } else { format!("Text turned {deg}°.") })
 }

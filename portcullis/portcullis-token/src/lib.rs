@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub mod agent;
+
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CkError, RvError};
 use cryptoki::mechanism::Mechanism;
@@ -209,6 +211,9 @@ static PIN_SOURCE: Mutex<Option<PinSource>> = Mutex::new(None);
 static PINS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 fn sign_ref(msg: &[u8], text: &str) -> Option<Result<Vec<u8>, String>> {
+    if let Some(r) = agent::sign_ref(msg, text) {
+        return Some(r);
+    }
     let r = match KeyRef::parse(text)? {
         Ok(r) => r,
         Err(e) => return Some(Err(e)),
@@ -228,10 +233,14 @@ fn sign_ref(msg: &[u8], text: &str) -> Option<Result<Vec<u8>, String>> {
 }
 
 fn public_ref(text: &str) -> Option<Result<String, String>> {
+    if let Some(r) = agent::public_ref(text) {
+        return Some(r);
+    }
     Some(KeyRef::parse(text)?.and_then(|r| public_pem(&r)))
 }
 
-/// Make `portcullis_sig::sign`/`public_pem` take token key files.
+/// Make `portcullis_sig::sign`/`public_pem` take token key files and agent
+/// key files ([`agent`]: a key in Arca, through the SSH agent).
 pub fn install() {
     portcullis_sig::set_external_signer(portcullis_sig::ExternalSigner { sign: sign_ref, public_pem: public_ref });
 }

@@ -3,7 +3,9 @@
 //! account string is `wifi <ssid hex>`; the value is the passphrase (or the
 //! 64-hex-digit PSK). One more item, `aura mac-key`, holds the key that
 //! per-network MAC addresses are derived from, so they stay the same across
-//! reboots. aura-keys (uid `_aura-keys`, named in arcad's
+//! reboots. An EAP-TLS network's client key is a `TlsClientKey` (P-256)
+//! minted in Arca under the network's account plus " tls"; Arca signs with
+//! it and never releases it (wifi.md §7.4 E3). aura-keys (uid `_aura-keys`, named in arcad's
 //! `ARCA_SERVICES` as `aura-keys`) is the only reader and writer.
 //!
 //! `Memory` keeps credentials in this process only: for the sim gate before
@@ -27,10 +29,27 @@ pub trait Store {
     fn take_typed(&mut self, _handle: &[u8; 16]) -> io::Result<Secret> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "no Arca"))
     }
+    /// A new EAP-TLS key (P-256) that never leaves Arca: (id, SEC1 point).
+    fn mint_tls(&mut self, _acc: &str) -> io::Result<([u8; 16], Vec<u8>)> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no Arca"))
+    }
+    /// The SEC1 point of an EAP-TLS key.
+    fn tls_public(&mut self, _id: &[u8; 16]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no Arca"))
+    }
+    /// A DER ECDSA signature over a SHA-256 digest with an EAP-TLS key.
+    fn tls_sign(&mut self, _id: &[u8; 16], _digest: &[u8; 32]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no Arca"))
+    }
 }
 
 pub fn account(ssid: &[u8]) -> String {
     format!("wifi {}", aura_ipc::hex(ssid))
+}
+
+/// The account of an EAP-TLS network's client key.
+pub fn tls_account(ssid: &[u8]) -> String {
+    format!("{} tls", account(ssid))
 }
 
 pub const MAC_KEY: &str = "aura mac-key";
@@ -54,6 +73,12 @@ impl Store for Memory {
     }
 }
 
+const OP_MINT: u16 = 0x01;
+const OP_PUBKEY: u16 = 0x02;
+const OP_SIGN_DIGEST: u16 = 0x0F;
+const KIND_TLS_KEY: u16 = 0x105;
+/// An uncompressed P-256 point.
+const POINT_LEN: usize = 65;
 const OP_STORE: u16 = 0x04;
 const OP_RELEASE: u16 = 0x05;
 const OP_LIST: u16 = 0x06;
@@ -124,7 +149,7 @@ impl Arca {
                 return Err(short());
             }
             let acc = String::from_utf8_lossy(&take(alen)?).into_owned();
-            if kind == KIND_WIFI {
+            if kind == KIND_WIFI || kind == KIND_TLS_KEY {
                 out.push((id, acc));
             }
         }
@@ -178,5 +203,40 @@ impl Store for Arca {
 
     fn take_typed(&mut self, handle: &[u8; 16]) -> io::Result<Secret> {
         value(self.call(OP_TAKE_WIFI, handle)?)
+    }
+
+    fn mint_tls(&mut self, acc: &str) -> io::Result<([u8; 16], Vec<u8>)> {
+        self.forget(acc)?;
+        let mut body = Vec::new();
+        body.extend_from_slice(&KIND_TLS_KEY.to_le_bytes());
+        body.push(CLASS_AFTER_BOOT);
+        body.extend_from_slice(&(acc.len() as u32).to_le_bytes());
+        body.extend_from_slice(acc.as_bytes());
+        let r = self.call(OP_MINT, &body)?;
+        if r.len() != 16 + POINT_LEN || r[16] != 4 {
+            return Err(io::Error::other("bad arcad MINT reply"));
+        }
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&r[..16]);
+        Ok((id, r[16..].to_vec()))
+    }
+
+    fn tls_public(&mut self, id: &[u8; 16]) -> io::Result<Vec<u8>> {
+        let r = self.call(OP_PUBKEY, id)?;
+        if r.len() != POINT_LEN || r[0] != 4 {
+            return Err(io::Error::other("bad arcad PUBKEY reply"));
+        }
+        Ok(r.to_vec())
+    }
+
+    fn tls_sign(&mut self, id: &[u8; 16], digest: &[u8; 32]) -> io::Result<Vec<u8>> {
+        let mut body = id.to_vec();
+        body.extend_from_slice(digest);
+        let r = self.call(OP_SIGN_DIGEST, &body)?;
+        // A DER ECDSA-P256 signature is at most 72 bytes.
+        if r.is_empty() || r.len() > 72 || r[0] != 0x30 {
+            return Err(io::Error::other("bad arcad signature"));
+        }
+        Ok(r.to_vec())
     }
 }

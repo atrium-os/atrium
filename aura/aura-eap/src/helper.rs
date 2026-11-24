@@ -4,7 +4,9 @@
 //! To the helper: `c` the profile (once, first), `p` an EAP packet from
 //! the AP. From it: `s` an EAP packet to send, `d` the MSK (the end),
 //! `f` why it failed (the end), `t` the certificate the user has to decide
-//! about (the end), `x` a packet it dropped and why (logged).
+//! about (the end), `x` a packet it dropped and why (logged), `g` a
+//! SHA-256 digest to sign with the EAP-TLS key, answered with `G` and the
+//! DER signature (empty when Arca would not).
 
 use std::io::{self, Write};
 use zeroize::Zeroizing;
@@ -16,6 +18,8 @@ pub const DONE: u8 = b'd';
 pub const FAILED: u8 = b'f';
 pub const TRUST: u8 = b't';
 pub const DROPPED: u8 = b'x';
+pub const SIGN: u8 = b'g';
+pub const SIGNED: u8 = b'G';
 
 pub const MAX_FRAME: usize = 64 * 1024;
 

@@ -173,3 +173,4 @@ check "no updates for it any more" "0" "$(A updates | grep -c $APP)"
 
 V "pkill -x opifexd" >/dev/null 2>&1
 echo "opifex-c7: $fails failed"
+[ "$fails" -eq 0 ]

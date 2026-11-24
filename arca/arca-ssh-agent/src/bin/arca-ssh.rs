@@ -1,6 +1,9 @@
 //! arca-ssh: the person's SSH keys in Arca (arca.md §9.1).
 //!
-//!     arca-ssh new [--persona P] [--verify-each-use] COMMENT    make a key; prints its id and public line
+//!     arca-ssh new [--persona P] [--verify-each-use] [--p256] COMMENT
+//!                                           make a key; prints its id and public line.
+//!                                           --p256: ecdsa-sha2-nistp256, which also
+//!                                           signs bundles (`opifex token agent`)
 //!     arca-ssh list [--persona P]           keys, public lines, the workspaces granted
 //!     arca-ssh grant [--persona P] ID WORKSPACE
 //!     arca-ssh revoke [--persona P] ID WORKSPACE
@@ -29,11 +32,22 @@ fn main() -> ExitCode {
     let Some(verb) = args.first().cloned() else { return usage() };
     let rest = &args[1..];
     let line = match (verb.as_str(), rest.len()) {
-        ("new", 1) if rest[0] == "--verify-each-use" => return usage(),
-        ("new", _) if rest.first().is_some_and(|s| s == "--verify-each-use") => {
-            format!("new-touch {persona} {}", rest[1..].join(" "))
+        ("new", _) => {
+            let (mut touch, mut p256, mut i) = (false, false, 0);
+            while let Some(f) = rest.get(i).filter(|f| f.starts_with("--")) {
+                match f.as_str() {
+                    "--verify-each-use" => touch = true,
+                    "--p256" => p256 = true,
+                    _ => return usage(),
+                }
+                i += 1;
+            }
+            if i >= rest.len() {
+                return usage();
+            }
+            let verb = format!("new{}{}", if p256 { "-p256" } else { "" }, if touch { "-touch" } else { "" });
+            format!("{verb} {persona} {}", rest[i..].join(" "))
         }
-        ("new", n) if n >= 1 => format!("new {persona} {}", rest.join(" ")),
         ("list", 0) => format!("list {persona}"),
         ("grant" | "revoke", 2) => format!("{verb} {persona} {} {}", rest[0], rest[1]),
         ("delete", 1) => format!("delete {persona} {}", rest[0]),
@@ -96,6 +110,6 @@ fn no_echo<T>(tty: bool, f: impl FnOnce() -> T) -> T {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: arca-ssh [--persona P] new [--verify-each-use] COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID | token HOST USERNAME");
+    eprintln!("usage: arca-ssh [--persona P] new [--verify-each-use] [--p256] COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID | token HOST USERNAME");
     ExitCode::from(2)
 }

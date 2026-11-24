@@ -65,6 +65,7 @@ dependencies = [
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -93,6 +94,13 @@ dependencies = [
  "aqueduct",
  "postcard",
  "serde",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -780,6 +788,7 @@ checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 name = "sockmux"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "log",
 ]

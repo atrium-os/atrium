@@ -205,6 +205,8 @@ pub enum DataCmd {
     DuplicateSheet,
     /// The bar naming the selection; the window runs it.
     DefineName,
+    /// The bar sorting by several columns; the window runs it.
+    CustomSort,
     /// The shown sheet hidden (not the last that shows); the window runs it.
     HideSheet,
     /// Hidden sheet `.0` shown again and opened; the window runs it.
@@ -424,6 +426,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Align Bottom").checked(v_at(wb, s, sel) == VAlign::Bottom), Some(DataCmd::AlignBottom)),
         (MenuItem::new("Reapply Filter").enabled(any_cond).separated(), Some(DataCmd::ReapplyFilter)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
+        (MenuItem::new("Custom Sort…").enabled(some), Some(DataCmd::CustomSort)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
         (MenuItem::new(format!("Show Only {shown}")).enabled(in_filter.is_some()), Some(DataCmd::KeepValue)),
@@ -580,6 +583,89 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
 /// The most rows Remove Duplicates looks through.
 /// Hidden sheets the Data menu offers to unhide by name.
 pub const MAX_UNHIDE_ITEMS: usize = 32;
+
+/// The rows a sort reorders (the header row left out) and the target they
+/// came from; refused, with why, when a filter hides some or merges differ.
+fn sort_rect(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Result<(Rect, Target), String> {
+    let s = d.sheet;
+    let t = target(d, sel, cursor).ok_or("Select the data to sort, or put the cursor in it.")?;
+    if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0)
+        || d.wb.sheet(s).table_hidden().iter().any(|&(a, b)| a <= t.rect.r1 && b >= t.rect.r0) {
+        return Err("Show all rows before sorting: the filter hides some of them.".into());
+    }
+    let mut rect = t.rect;
+    if t.header {
+        rect.r0 += 1;
+    }
+    if rect.r0 > rect.r1 {
+        return Err("There is nothing under the header to sort.".into());
+    }
+    if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
+        return Err("To sort, every row needs the same merged cells; unmerge them first.".into());
+    }
+    Ok((rect, t))
+}
+
+/// The most columns a Custom Sort sorts by (Excel allows 64 levels).
+pub const MAX_SORT_KEYS: usize = 64;
+
+/// The Custom Sort bar's text to start from: the cursor's column, by its
+/// header when the data has one.
+pub fn custom_sort_start(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> String {
+    match target(d, sel, cursor) {
+        Some(t) if t.header => {
+            let h = d.wb.formatted(officina_grid::CellAddr::new(d.sheet, t.rect.r0, cursor.1.clamp(t.rect.c0, t.rect.c1))).text;
+            if h.is_empty() || h.contains(',') { officina_grid::addr::col_name(cursor.1) } else { h.to_string() }
+        }
+        _ => officina_grid::addr::col_name(cursor.1),
+    }
+}
+
+/// Custom Sort: the data at the selection or cursor sorted by the columns
+/// `spec` lists, first to last, as one step. Each is a column letter or a
+/// header, optionally followed by `desc` (Z to A) or `asc`, separated by
+/// commas or `then`: `Region, Sales desc`.
+pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) -> Result<String, String> {
+    let (rect, t) = sort_rect(d, sel, cursor)?;
+    let s = d.sheet;
+    let header = |c: u32| t.header.then(|| d.wb.formatted(officina_grid::CellAddr::new(s, t.rect.r0, c)).text.trim().to_lowercase());
+    let mut keys: Vec<SortKey> = Vec::new();
+    let mut names = Vec::new();
+    let spec = spec.replace(" then ", ",").replace(" THEN ", ",").replace(" Then ", ",");
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if keys.len() == MAX_SORT_KEYS {
+            return Err(format!("Custom Sort sorts by at most {MAX_SORT_KEYS} columns."));
+        }
+        let lower = part.to_lowercase();
+        let (what, descending) = if let Some(w) = ["descending", "desc", "z-a", "z to a"].iter().find_map(|x| lower.strip_suffix(x)) {
+            (w.trim(), true)
+        } else if let Some(w) = ["ascending", "asc", "a-z", "a to z"].iter().find_map(|x| lower.strip_suffix(x)) {
+            (w.trim(), false)
+        } else {
+            (lower.as_str(), false)
+        };
+        let by_header = (rect.c0..=rect.c1).find(|&c| header(c).is_some_and(|h| !h.is_empty() && h == what));
+        let by_letter = officina_grid::addr::parse_col(&what.to_uppercase()).filter(|c| (rect.c0..=rect.c1).contains(c));
+        let Some(col) = by_header.or(by_letter) else {
+            return Err(format!("{part:?} isn't a column of the data: use a letter from {} to {} or a header.", officina_grid::addr::col_name(rect.c0), officina_grid::addr::col_name(rect.c1)));
+        };
+        if keys.iter().any(|k| k.col == col) {
+            return Err(format!("Column {} is listed twice.", officina_grid::addr::col_name(col)));
+        }
+        keys.push(SortKey { col, descending });
+        names.push(format!("{}{}", officina_grid::addr::col_name(col), if descending { " (Z to A)" } else { "" }));
+    }
+    if keys.is_empty() {
+        return Err("Type the columns to sort by, such as: Region, Sales desc".into());
+    }
+    match sort_op(&d.wb, rect, &keys) {
+        Some(op) => {
+            d.run("Custom Sort", vec![op]);
+            Ok(format!("Sorted {} rows by {}{}.", rect.r1 - rect.r0 + 1, names.join(", then "), if t.header { " (the first row is kept as the header)" } else { "" }))
+        }
+        None => Ok("Already in that order.".into()),
+    }
+}
 
 /// The most used cells Duplicate Sheet copies.
 pub const MAX_DUPLICATE_CELLS: u64 = 20_000_000;
@@ -1699,22 +1785,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
         }
         DataCmd::InsertCellsDown | DataCmd::InsertCellsRight | DataCmd::DeleteCellsUp | DataCmd::DeleteCellsLeft => shift_cells(d, sel, cmd),
+        DataCmd::CustomSort => Ok(String::new()),
         DataCmd::SortAsc | DataCmd::SortDesc => {
-            let t = target(d, sel, cursor).ok_or_else(need)?;
-            if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0)
-                || d.wb.sheet(s).table_hidden().iter().any(|&(a,b)| a <= t.rect.r1 && b >= t.rect.r0) {
-                return Err("Show all rows before sorting: the filter hides some of them.".into());
-            }
-            let mut rect = t.rect;
-            if t.header {
-                rect.r0 += 1;
-            }
-            if rect.r0 > rect.r1 {
-                return Err("There is nothing under the header to sort.".into());
-            }
-            if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
-                return Err("To sort, every row needs the same merged cells; unmerge them first.".into());
-            }
+            let (rect, t) = sort_rect(d, sel, cursor)?;
             let key = col.clamp(rect.c0, rect.c1);
             let descending = cmd == DataCmd::SortDesc;
             match sort_op(&d.wb, rect, &[SortKey { col: key, descending }]) {

@@ -131,6 +131,7 @@ dependencies = [
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -146,6 +147,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "zeroize",
 ]
 
 [[package]]
@@ -186,6 +188,8 @@ dependencies = [
  "psl",
  "sha2",
  "sigillum-proto",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -219,6 +223,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1358,6 +1369,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-control"
+version = "0.1.0"
+dependencies = [
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "navigator-cookies"
 version = "0.1.0"
 dependencies = [
@@ -1381,6 +1402,7 @@ name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "navigator-control",
  "nuntius",
  "rustls",
  "rustls-pki-types",
@@ -1742,6 +1764,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",
@@ -1763,6 +1786,7 @@ dependencies = [
 name = "portcullis-mounts"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-jail",
 ]
 
@@ -2228,6 +2252,7 @@ checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 name = "sockmux"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "log",
 ]
@@ -2760,6 +2785,18 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xml5ever"

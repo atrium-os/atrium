@@ -579,7 +579,7 @@ pub fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
 /// The largest frame either side reads. Intents and replies are small
 /// (lists of surfaces, outputs, status nodes already bounded by
 /// `bound_nodes`); the cap stops a peer's length prefix from making the
-/// window manager allocate up to 4 GiB (review 2026-11-24, H5).
+/// window manager allocate up to 4 GiB.
 pub const MAX_FRAME: usize = 1 << 20;
 
 /// Read one length-prefixed frame of at most [`MAX_FRAME`] bytes.

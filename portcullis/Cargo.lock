@@ -81,6 +81,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -159,6 +160,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-fonts"
 version = "0.1.0"
 dependencies = [
@@ -195,6 +203,7 @@ name = "atrium-netconf"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-fdpass",
  "aura-ipc",
  "libc",
  "postcard",
@@ -1234,6 +1243,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",
@@ -1322,6 +1332,7 @@ dependencies = [
 name = "portcullis-token"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cryptoki",
  "opifex-catalog",
  "p256",
@@ -1686,6 +1697,7 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 name = "sockmux"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "log",
  "tempfile",

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 crypta-proto = { path = "../crypta-proto" }
+atrium-fdpass = { path = "../../atrium-fdpass" }
 net-proto    = { path = "../../atrium-net/net-proto" }
 aura-ipc     = { path = "../../aura/aura-ipc" }
 arcad        = { path = "../../arca/arcad" }

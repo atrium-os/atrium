@@ -1198,6 +1198,12 @@ fn daemon(o: Opts) {
                     gone.push(j);
                     continue;
                 }
+                // One descriptor is used per line, so a peer may not have
+                // more than one message's worth waiting.
+                Ok((_, f)) if c.fds.len() + f.len() > fd::MAX_FDS => {
+                    gone.push(j);
+                    continue;
+                }
                 Ok((n, f)) => {
                     c.buf.extend_from_slice(&b[..n]);
                     c.fds.extend(f);

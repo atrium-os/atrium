@@ -89,6 +89,9 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 - Most subsystems have a VM check script in `scripts/` (`*-vm-check.sh`,
   `*-gate.sh`, `*-vm.sh`). Run the one for the area you changed; the RUNBOOK
   section for that subsystem names it.
+- A new check script sources `scripts/lib/gate.sh` (`ok`/`bad`/`check`,
+  `gate_begin NAME COUNT`, `gate_end`) so it exits non-zero on a failure and
+  fails when fewer checks ran than it declared.
 - Cargo intermediates share `$CARGO_HOME/atrium-build` (default
   `~/.cargo/atrium-build`) across the main checkout and scratch worktrees.
   Final binaries are still in each crate's `target/` directory. Concurrent
@@ -114,6 +117,10 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 - `vssh` has a 3 s connect timeout and fails with empty output when the guest
   is busy; use `VSSH_CONNECT_TIMEOUT=30` for scripted work and check for a
   marker at the destination.
+- On the Mac, macOS's daily `periodic` job `110.clean-tmps` (about 00:00
+  IST) deletes anything under `/tmp` (`/private/tmp`) not accessed for 3
+  days. Long-lived build trees and VM base images live under `~/atrium-vm`
+  or `~/src`, never `/tmp`.
 - In cloud sessions use `scripts/cloud-vm.sh` (QEMU under TCG; never quote its
   timings as product numbers). See RUNBOOK §13.
 
@@ -127,8 +134,10 @@ on:
 1. Commit and push what you have (or say in the row exactly what is left
    uncommitted and where).
 2. Update that workstream's row in [docs/HANDOFF.md](docs/HANDOFF.md): where
-   it stands, the exact next step, and what it is waiting on. Add a row for a
-   new workstream; move a finished one to "Recently finished".
+   it stands, the exact next step, and what it is waiting on. Keep the row to
+   a few lines that link the spec's as-built section; history goes there.
+   Add a row for a new workstream; move a finished one to "Recently
+   finished".
 3. Push. When picking work up, read the row, then the spec it links, then
    `git log` for that area.
 
@@ -160,8 +169,8 @@ thread checks them too.
   rather than escapes anything else.
 - Root never writes a predictable path in a shared directory: `O_EXCL`,
   0600, fresh name, or a root-only directory.
-- Reuse the shared helper (fd passing, peer uid, framing, hex) instead of
-  writing a new one.
+- Reuse the shared helper (fd passing is `atrium-fdpass`; peer uid,
+  framing, hex) instead of writing a new one.
 - Every `unsafe` block has a `SAFETY:` comment saying why it holds.
 - A comment states the invariant, not the history; history goes in the
   commit message.

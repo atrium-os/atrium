@@ -99,3 +99,4 @@ grep -E "frescod: span|frescod: window [0-9]+ (no longer )?spans" $L | sed 's/[0
 grep -c "told the user" /tmp/wm.log | sed 's/^/flapping notices posted or tried: /'
 ps axo comm | grep -q atrium-frescod && echo "  ok frescod alive" || { echo "  FAIL frescod DEAD"; fails=$((fails+1)); }
 echo "span chaos: $STEPS steps, $fails failed"
+[ "$fails" -eq 0 ]

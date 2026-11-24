@@ -216,6 +216,12 @@ fn join(port: u16, cfg: Config) -> Out {
 
 /// The same join through the helper binary aura-keys runs, over its pipe.
 fn join_helper(port: u16, profile: &aura_eap::profile::Profile) -> Result<Zeroizing<[u8; 64]>, String> {
+    join_helper_signing(port, profile, None)
+}
+
+/// As `join_helper`, answering the helper's signing requests with `key`
+/// the way aura-keys answers them with Arca.
+fn join_helper_signing(port: u16, profile: &aura_eap::profile::Profile, key: Option<&p256::ecdsa::SigningKey>) -> Result<Zeroizing<[u8; 64]>, String> {
     use aura_eap::helper::{self, Reader};
     use std::io::{Read, Write};
     use std::os::fd::OwnedFd;
@@ -251,6 +257,12 @@ fn join_helper(port: u16, profile: &aura_eap::profile::Profile) -> Result<Zeroiz
                     }
                     helper::FAILED => break 'outer Err(String::from_utf8_lossy(&d).into_owned()),
                     helper::TRUST => break 'outer Err("trust".into()),
+                    helper::SIGN => {
+                        let Some(k) = key else { break 'outer Err("unexpected sign".into()) };
+                        assert_eq!(d.len(), 32, "a SHA-256 digest");
+                        let sig = sign_digest(k, &d);
+                        helper::write(&mut ours, helper::SIGNED, &sig).unwrap();
+                    }
                     _ => {}
                 }
             }
@@ -266,6 +278,13 @@ fn join_helper(port: u16, profile: &aura_eap::profile::Profile) -> Result<Zeroiz
     drop(ours);
     let _ = child.wait();
     r
+}
+
+/// What Arca's SIGN_DIGEST answers: DER ECDSA over a SHA-256 digest.
+fn sign_digest(k: &p256::ecdsa::SigningKey, digest: &[u8]) -> Vec<u8> {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    let s: p256::ecdsa::Signature = k.sign_prehash(digest).unwrap();
+    s.to_der().as_bytes().to_vec()
 }
 
 fn der(dir: &Path, name: &str) -> CertificateDer<'static> {
@@ -333,10 +352,45 @@ fn against_hostapd() {
         ca: if ca { vec![der(&dir, "corp").to_vec()] } else { vec![] },
         pin: None,
         password: Zeroizing::new(pw.into()),
+        cert: vec![],
+        key: None,
     };
     assert!(join_helper(base, &profile("s3cret", true)).is_ok(), "the helper joins");
     assert_eq!(join_helper(base, &profile("wrong", true)), Err("rejected".into()));
     assert_eq!(join_helper(base, &profile("s3cret", false)), Err("trust".into()));
+
+    // EAP-TLS through the helper with a key it never holds, as with Arca:
+    // the request is built by aura_eap::csr, signed over its digest, the
+    // CA issues from it, and the TLS signature comes back over the pipe.
+    let arca = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let point = arca.verifying_key().to_encoded_point(false);
+    let info = aura_eap::csr::info("tls-user", point.as_bytes());
+    let req = aura_eap::csr::der(&info, &sign_digest(&arca, &aura_eap::csr::digest(&info)));
+    std::fs::write(dir.join("arca.csr.der"), &req).unwrap();
+    std::fs::write(dir.join("arca.ext"), "extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n").unwrap();
+    openssl(&dir, &["req", "-inform", "DER", "-in", "arca.csr.der", "-verify", "-noout"]);
+    openssl(&dir, &["x509", "-req", "-inform", "DER", "-in", "arca.csr.der", "-CA", "corp.pem", "-CAkey", "corp.key", "-CAcreateserial", "-days", "30", "-outform", "DER", "-out", "arca.der", "-extfile", "arca.ext"]);
+    let cert = std::fs::read(dir.join("arca.der")).unwrap();
+    assert!(aura_eap::csr::certifies(&cert, point.as_bytes()), "the issued certificate is for the key");
+    assert!(!aura_eap::csr::certifies(&std::fs::read(dir.join("client.der")).unwrap(), point.as_bytes()), "another certificate is not");
+    let tls = aura_eap::profile::Profile {
+        method: Method::Tls,
+        identity: "tls-user".into(),
+        anonymous: None,
+        domain: DOMAIN.into(),
+        ca: vec![der(&dir, "corp").to_vec()],
+        pin: None,
+        password: Zeroizing::new(String::new()),
+        cert: vec![cert],
+        key: Some([7; 16]),
+    };
+    assert!(join_helper_signing(base, &tls, Some(&arca)).is_ok(), "EAP-TLS through the helper");
+    // A key that does not match the certificate: the server refuses.
+    let other = p256::ecdsa::SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    assert!(join_helper_signing(base, &tls, Some(&other)).is_err(), "a wrong key is refused");
+    // No key in the profile: the helper says so before any packet.
+    let nokey = aura_eap::profile::Profile { key: None, ..tls.clone() };
+    assert_eq!(join_helper(base, &nokey), Err("no-client-certificate".into()));
 
     // Wrong passwords.
     assert_eq!(join(base, cfg(Method::Peap, anon, "alice", "wrong", corp())), Out::Failed(Why::Rejected));

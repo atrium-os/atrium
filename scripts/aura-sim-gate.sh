@@ -910,7 +910,7 @@ w7_certs() {
         o x509 -req -in "$C/$n.csr" -CA "$C/$ca-ca.pem" -CAkey "$C/$ca-ca.key" -CAcreateserial -days 30 -out "$C/eap-$n.pem" -extfile "$C/ext"
     done
     cp "$C/corp-ca.pem" "$C/eap-ca.pem"; cp "$C/evil-ca.pem" "$C/eap-evil-ca.pem"
-    printf '%s\n' '* PEAP,TTLS' '"alice@corp.example" MSCHAPV2,TTLS-MSCHAPV2 "s3cret" [2]' '"bob@corp.example" TTLS-PAP "pap-pass" [2]' > "$C/eap-users"
+    printf '%s\n' '"tls-user@corp.example" TLS' '* PEAP,TTLS' '"alice@corp.example" MSCHAPV2,TTLS-MSCHAPV2 "s3cret" [2]' '"bob@corp.example" TTLS-PAP "pap-pass" [2]' > "$C/eap-users"
     scp -q -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P "${AURA_AP_SSH:-2223}" \
         "$C/eap-ca.pem" "$C/eap-evil-ca.pem" "$C/eap-server.pem" "$C/eap-server.key" "$C/eap-twin.pem" "$C/eap-twin.key" "$C/eap-users" ubuntu@localhost:/tmp/ \
         || fail "certificates to the AP VM"
@@ -946,6 +946,31 @@ w7() {
     r=$("$V" "echo pap-pass | $AC remember-eap aura-corp2 --method ttls-pap --identity bob@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap 2: $r"
     ej ttls aura-corp2 ""
     echo "$out" | grep -q 'state=authorized' && ok "TTLS-PAP on WPA2-Enterprise (AKM 1, no PMF): authorized" || fail "TTLS-PAP join"
+    leave
+
+    # EAP-TLS with the key in Arca: aura-keys mints it and makes the
+    # request, the corp CA (IT) issues the certificate, Arca signs the
+    # handshake. The helper never holds the key.
+    r=$("$V" "$AC eap-key aura-corp2 --cn tls-user@corp.example --out /tmp/aura/tls.csr" 2>&1) || fail "eap-key: $r"
+    echo "    $r"
+    kid=$(echo "$r" | sed -n 's/^key id=\([0-9a-f]\{32\}\) .*/\1/p')
+    [ -n "$kid" ] || fail "eap-key gave no key id"
+    "$V" 'cat /tmp/aura/tls.csr' > "$W7C/tls.csr"
+    openssl req -inform DER -in "$W7C/tls.csr" -verify -noout >/dev/null 2>&1 && ok "the key's certificate request verifies (signed by Arca)" || fail "CSR does not verify"
+    printf 'extendedKeyUsage=clientAuth\nbasicConstraints=CA:FALSE\n' > "$W7C/cext"
+    openssl x509 -req -inform DER -in "$W7C/tls.csr" -CA "$W7C/corp-ca.pem" -CAkey "$W7C/corp-ca.key" -CAcreateserial -days 30 \
+        -outform DER -out "$W7C/tls.der" -extfile "$W7C/cext" >/dev/null 2>&1 || fail "issuing the client certificate"
+    "$V" 'cat > /tmp/aura/tls.der' < "$W7C/tls.der"
+    openssl x509 -in "$W7C/eap-server.pem" -outform DER -out "$W7C/other.der"
+    "$V" 'cat > /tmp/aura/other.der' < "$W7C/other.der"
+    r=$("$V" "$AC remember-eap aura-corp2 --method tls --identity tls-user@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der --key $kid --cert /tmp/aura/other.der" 2>&1) || true
+    echo "$r" | grep -q 'cert-not-for-key' && ok "a certificate for another key is refused" || fail "remember-eap with another key's certificate: $r"
+    r=$("$V" "$AC remember-eap aura-corp2 --method tls --identity tls-user@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der --key $kid --cert /tmp/aura/tls.der" 2>&1) || fail "remember-eap tls: $r"
+    mark
+    ej tls aura-corp2 ""
+    echo "$out" | grep -q 'state=authorized' && ok "EAP-TLS with the key in Arca: authorized" || fail "EAP-TLS join"
+    aplog | grep -qa 'EAP-TLS: Valid authentication\|EAP-TLS.*[Ss]uccess\|CTRL-EVENT-EAP-SUCCESS' && ok "hostapd accepted the client certificate" || echo "note  no EAP-TLS success line in hostapd's log"
+    "$V" "cat $KLOG" | grep -q 'Arca did not sign' && fail "Arca refused to sign" || true
     leave
 
     r=$("$V" "echo wrong | $AC remember-eap aura-corp --method peap --identity alice@corp.example --domain corp.example --ca /tmp/aura/eap-ca.der" 2>&1) || fail "remember-eap 3: $r"
@@ -1099,8 +1124,8 @@ w7)
     export HOSTAPD_ARGS=-dd
     setup hostapd-eap.conf hostapd-eap-wpa2.conf
     "$V" 'cat > /tmp/aura/eap-ca.der' < "$W7C/corp-ca.der"
-    rm -rf "$W7C"
     w7
+    rm -rf "$W7C"
     teardown
     echo "W7 gate: $pass checks passed" ;;
 n3)

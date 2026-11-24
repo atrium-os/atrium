@@ -116,3 +116,4 @@ ps axo comm | grep -q atrium-frescod && ok "frescod alive" || bad "frescod DEAD"
 pgrep -x forum-wm >/dev/null && ok "forum-wm alive" || bad "forum-wm DEAD"
 cp $L /tmp/frescod-span-e2e.log
 echo "span: $fails failed"
+[ "$fails" -eq 0 ]

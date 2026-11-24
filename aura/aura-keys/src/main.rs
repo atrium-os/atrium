@@ -22,7 +22,11 @@
 //! stores the network's profile; an `assoc` with AKM 1 or 5 runs EAP in
 //! `atrium-aura-eap` (eap.rs) and the 4-way handshake on its MSK. A first
 //! join with no CA stops at the server's certificate: `eap-seen ssid=..`
-//! shows it, `eap-trust ssid=..` pins it for that network.
+//! shows it, `eap-trust ssid=..` pins it for that network. EAP-TLS:
+//! `eap-key ssid=.. cn=..` mints the network's key in Arca and answers
+//! `key id=.. csr=..` (a PKCS #10 request for IT to sign); `remember-eap
+//! method=tls key=.. cert=<DER hex>` takes the certificate issued for it.
+//! The helper never holds the key: it asks here, and Arca signs.
 //!
 //! usage: aura-keys [-v] [--dev /dev/aura/key0] [--sock PATH]
 //!                  [--mlme-uid UID] [--ctl-uid UID]
@@ -108,6 +112,8 @@ struct Join {
     params: Option<Params>,
     /// EAPOL-Key frames that came before EAP finished.
     early_keys: Vec<Vec<u8>>,
+    /// EAP-TLS: the network's key in Arca, for the helper's one signature.
+    tls_key: Option<[u8; 16]>,
 }
 
 struct Params {
@@ -285,6 +291,21 @@ impl Keys {
             match ev {
                 eap::Event::Send(f) => self.send(&Msg::TxEapol { dst: bssid, body: &f }),
                 eap::Event::Log(w) => eprintln!("aura-keys: EAP helper dropped a packet: {w}"),
+                eap::Event::Sign(digest) => {
+                    // One CertificateVerify per join, with this network's key.
+                    let Some(j) = &mut self.join else { break };
+                    let sig = match j.tls_key.take() {
+                        Some(id) => self.store.tls_sign(&id, &digest).unwrap_or_else(|e| {
+                            eprintln!("aura-keys: Arca did not sign: {e}");
+                            Vec::new()
+                        }),
+                        None => Vec::new(),
+                    };
+                    let Some(run) = self.join.as_mut().and_then(|j| j.eap.as_mut()) else { break };
+                    if run.signed(&sig).is_err() {
+                        eprintln!("aura-keys: the EAP helper went away while signing");
+                    }
+                }
                 eap::Event::Done(msk) => {
                     let Some(j) = &mut self.join else { break };
                     j.eap = None;
@@ -338,7 +359,7 @@ impl Keys {
         self.join = None;
         if akm == 0 {
             // Open network: nothing to negotiate, open the port.
-            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new() });
+            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new(), tls_key: None });
             self.pending.clear();
             self.send(&Msg::PortAuthorized(true));
             out.push(Line::new("authorized"));
@@ -371,7 +392,7 @@ impl Keys {
             eprintln!("aura-keys: EAP ({}) with {}", profile.method.name(), aura_ipc::fmt_mac(&bssid));
             let params = Params { akm, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
             self.td = 0;
-            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: Some(run), params: Some(params), early_keys: Vec::new() });
+            self.join = Some(Join { bssid, supp: None, mlme, told_m2: false, ptk: false, eap: Some(run), params: Some(params), early_keys: Vec::new(), tls_key: profile.key });
             for (src, body) in std::mem::take(&mut self.pending) {
                 if let Some(r) = self.eapol(src, &body) {
                     out.push(r);
@@ -400,7 +421,7 @@ impl Keys {
         }
         self.td = 0;
         let cfg = Config { akm, pmk, aa: bssid, spa: own, own_rsne, ap_rsne, own_rsnxe: l.hex("own_rsnxe"), ap_rsnxe: l.hex("ap_rsnxe"), pmf: pmf == 1 };
-        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new() });
+        self.join = Some(Join { bssid, supp: Some(Supplicant::new(cfg, snonce)), mlme, told_m2: false, ptk: false, eap: None, params: None, early_keys: Vec::new(), tls_key: None });
         for (src, body) in std::mem::take(&mut self.pending) {
             if let Some(r) = self.eapol(src, &body) {
                 out.push(r);
@@ -553,9 +574,11 @@ impl Keys {
                 _ => err("nothing-seen"),
             },
             "eap-trust" => self.eap_trust(l, ssid),
+            "eap-key" => self.eap_key(l, ssid),
             "forget" => match {
                 self.trial = self.trial.take().filter(|(s, _)| *s != ssid);
-                self.store.forget(&creds::account(&ssid))
+                let key = self.store.forget(&creds::tls_account(&ssid));
+                self.store.forget(&creds::account(&ssid)).and_then(|f| key.map(|k| f || k))
             } {
                 Ok(true) => Line::new("ok"),
                 Ok(false) => err("unknown"),
@@ -611,11 +634,47 @@ impl Keys {
             // A CA without a name trusts every server that CA ever signed.
             return err("ca-needs-domain");
         }
-        let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, pin: None, password };
+        let (mut cert, mut key) = (Vec::new(), None);
+        if method == Method::Tls {
+            // The certificate must be for the key this network's request
+            // was made with: a certificate for another key fails at the
+            // server only after the password-free handshake has begun.
+            let (Some(id), Some(c)) = (l.hex("key").and_then(|k| <[u8; 16]>::try_from(k.as_slice()).ok()), l.hex("cert")) else {
+                return err("tls-needs-key-and-cert");
+            };
+            let public = match self.store.tls_public(&id) {
+                Ok(p) => p,
+                Err(e) => return err(&store_err(&e)),
+            };
+            if !aura_eap::csr::certifies(&c, &public) {
+                return err("cert-not-for-key");
+            }
+            (cert, key) = (vec![c], Some(id));
+        }
+        let p = Profile { method, identity, anonymous: text("anonymous"), domain, ca, pin: None, password, cert, key };
         match self.store.remember(&creds::account(&ssid), &p.encode()) {
             Ok(()) => Line::new("ok"),
             Err(e) => err(&store_err(&e)),
         }
+    }
+
+    /// `eap-key`: a new EAP-TLS key for this network, made and kept in
+    /// Arca, and a certificate request for it with `cn` as its name.
+    fn eap_key(&mut self, l: &Line, ssid: Vec<u8>) -> Line {
+        let err = |why: &str| Line::new("error").with("why", why);
+        let Some(cn) = l.hex("cn").and_then(|v| String::from_utf8(v).ok()).filter(|c| !c.is_empty() && c.len() <= 64) else {
+            return err("bad-cn");
+        };
+        let (id, public) = match self.store.mint_tls(&creds::tls_account(&ssid)) {
+            Ok(k) => k,
+            Err(e) => return err(&store_err(&e)),
+        };
+        let info = aura_eap::csr::info(&cn, &public);
+        let sig = match self.store.tls_sign(&id, &aura_eap::csr::digest(&info)) {
+            Ok(s) => s,
+            Err(e) => return err(&store_err(&e)),
+        };
+        Line::new("key").with_hex("id", &id).with_hex("csr", &aura_eap::csr::der(&info, &sig))
     }
 
     /// `eap-trust`: pin the certificate the last first join stopped at
@@ -809,7 +868,7 @@ fn main() {
                         k.join = None;
                         k.pending.clear();
                     }
-                    "remember" | "forget" | "prepare" | "remember-eap" | "eap-seen" | "eap-trust" if uid == o.ctl_uid => {
+                    "remember" | "forget" | "prepare" | "remember-eap" | "eap-seen" | "eap-trust" | "eap-key" if uid == o.ctl_uid => {
                         let r = k.ctl(&l);
                         to_mlme.push((i, r));
                     }

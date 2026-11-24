@@ -12,7 +12,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,8 @@ use aura_ipc::Line;
 const MAX_CONNS: usize = 16;
 const CONN_IDLE: Duration = Duration::from_secs(10);
 const MAX_MSG: usize = 512;
+/// The start message carries three sockets: the listener, receive and send.
+const MAX_START_FDS: usize = 3;
 
 fn die(s: &str) -> ! {
     eprintln!("atrium-mdns: {s}");
@@ -34,34 +36,15 @@ fn start(s: &UnixStream) -> (Line, Vec<OwnedFd>) {
     let mut fds = Vec::new();
     loop {
         let mut buf = [0u8; 256];
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-        let mut cbuf = [0u64; 8];
-        // SAFETY: plain data; buffers outlive the call.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-        // SAFETY: valid socket and message.
-        let n = unsafe { libc::recvmsg(s.as_raw_fd(), &mut msg, 0) };
-        if n <= 0 {
+        let Ok(r) = atrium_fdpass::recv(s.as_raw_fd(), &mut buf, MAX_START_FDS - fds.len()) else {
+            die("bad start message from atrium-net")
+        };
+        if r.n == 0 {
             die("atrium-net went away before start");
         }
-        // SAFETY: the kernel filled the control buffer.
-        unsafe {
-            let mut c = libc::CMSG_FIRSTHDR(&msg);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-                    let d = libc::CMSG_DATA(c) as *const RawFd;
-                    for i in 0..k {
-                        fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(d.add(i))));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&msg, c);
-            }
-        }
-        got.extend_from_slice(&buf[..n as usize]);
+        fds.extend(r.fds);
+        let n = r.n;
+        got.extend_from_slice(&buf[..n]);
         if let Some(e) = got.iter().position(|&b| b == b'\n') {
             let l = std::str::from_utf8(&got[..e]).ok().and_then(Line::parse).unwrap_or_else(|| die("bad start line"));
             return (l, fds);

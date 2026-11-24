@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use arca_store::codec::{Reader, Writer};
+use arca_store::Kind;
 use arcad::proto::{self, ssh_op, status};
 
 use crate::wire::Key;
@@ -18,7 +19,7 @@ pub struct Arca {
 /// A key as the person sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
-    /// An HTTPS token (its comment is `host username`, pk zeros), not a key.
+    /// An HTTPS token (its comment is `host username`, pk empty), not a key.
     pub token: bool,
     pub key: Key,
     pub grants: Vec<String>,
@@ -77,18 +78,20 @@ impl Arca {
         Ok(b.as_ref().to_vec())
     }
 
-    pub fn mint(&self, user: &str, persona: &str, comment: &str, touch: bool) -> Result<Key, Error> {
+    /// A new key: P-256 (`p256`) or Ed25519, verify-each-use (`touch`) or
+    /// while-unlocked.
+    pub fn mint(&self, user: &str, persona: &str, comment: &str, touch: bool, p256: bool) -> Result<Key, Error> {
         let mut w = Writer::new();
         owner(&mut w, user, persona);
         w.str(comment);
-        if touch {
-            w.u8(arca_store::Class::VerifyEachUse as u8);
-        }
+        w.u8(if touch { arca_store::Class::VerifyEachUse } else { arca_store::Class::WhileUnlocked } as u8);
+        w.u16(if p256 { Kind::P256 } else { Kind::Ed25519 } as u16);
         let b = self.call(ssh_op::SA_MINT, &w.buf)?;
         let mut r = Reader::new(&b);
-        let k = Key { id: r.array()?, pk: r.array()?, comment: comment.into() };
+        let id = r.array()?;
+        let pk = r.raw(if p256 { 65 } else { 32 })?.to_vec();
         r.end()?;
-        Ok(k)
+        Ok(Key { id, p256, pk, comment: comment.into() })
     }
 
     pub fn list(&self, user: &str, persona: &str) -> Result<Vec<Listed>, Error> {
@@ -100,8 +103,10 @@ impl Arca {
         let mut v = Vec::new();
         for _ in 0..n {
             let id = r.array()?;
-            let token = r.u16()? == arca_store::model::Kind::ApiKey as u16;
-            let key = Key { id, pk: r.array()?, comment: r.str(arca_store::model::caps::ACCOUNT)?.into() };
+            let kind = r.u16()?;
+            let token = kind == Kind::ApiKey as u16;
+            let p256 = kind == Kind::P256 as u16;
+            let key = Key { id, p256, pk: r.bytes(65)?.to_vec(), comment: r.str(arca_store::model::caps::ACCOUNT)?.into() };
             let grants = arcad::ssh::grants(r.str(arca_store::model::caps::SCOPE)?.as_bytes()).into_iter().map(String::from).collect();
             v.push(Listed { token, key, grants });
         }
@@ -169,7 +174,13 @@ impl Arca {
         let n = r.u32()?;
         let mut v = Vec::new();
         for _ in 0..n {
-            v.push(Key { id: r.array()?, pk: r.array()?, comment: r.str(ssh_op::COMMENT_MAX)?.into() });
+            let id = r.array()?;
+            let p256 = r.u16()? == Kind::P256 as u16;
+            let pk = r.bytes(65)?.to_vec();
+            if pk.len() != if p256 { 65 } else { 32 } {
+                return Err(Error::Malformed);
+            }
+            v.push(Key { id, p256, pk, comment: r.str(ssh_op::COMMENT_MAX)?.into() });
         }
         r.end()?;
         Ok(v)

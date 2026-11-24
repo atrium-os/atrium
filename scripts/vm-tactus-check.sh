@@ -322,3 +322,4 @@ V 'grep -q "usage=0x0008 pressed=1" /tmp/probe.log' && ok "input after tactusd r
 V 'echo $(ls /var/lib/atrium/jails/tactusd/dev)' | sed 's/^/  tactusd jail \/dev: /'
 V 'ls /var/lib/atrium/jails/frescod/dev 2>/dev/null | grep -c hidraw' | sed 's/^/  hidraw nodes in frescod jail devfs (needs a frescod jail restart to apply): /'
 echo "tactus: $fails failed"
+[ "$fails" -eq 0 ]

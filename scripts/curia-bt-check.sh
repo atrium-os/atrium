@@ -102,3 +102,4 @@ run "a Classic keyboard found by inquiry, a code it types" keyboard "" classic
 # One that leaves its name out of the inquiry answer: asked for it.
 run "a Classic keyboard that is asked its name" display-yes-no "" classic-unnamed
 echo "curia-bt: $fails failed"
+[ "$fails" -eq 0 ]

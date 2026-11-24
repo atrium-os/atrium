@@ -69,6 +69,12 @@ pub enum TabCmd {
     /// The Custom Format bar's field submitted; closed.
     CodeDone,
     CodeCancel,
+    /// The Custom Sort bar's field submitted; closed.
+    SortDone,
+    SortCancel,
+    /// The Rotation Angle bar's field submitted; closed.
+    AngleDone,
+    AngleCancel,
     /// The Define Name bar's field submitted; closed.
     NameDone,
     NameCancel,

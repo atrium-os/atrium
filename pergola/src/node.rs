@@ -310,6 +310,38 @@ pub fn fill_to(p: &fresco_protocol::FillParams, origin: crate::geom::Point, scal
 }
 
 impl Node {
+    /// This leaf under a uniform scale `s > 0` and a translation, the only
+    /// transform a Fresco group takes (`x' = s x + tx`, `y' = s y + ty`):
+    /// for a page's CSS `transform: scale(...)` or `translate(...)`.
+    /// `None` for a container (`Stack`, `Scroll`), a turned glyph run, or a
+    /// scale that is not finite and positive.
+    pub fn mapped(&self, s: f32, tx: f32, ty: f32) -> Option<Node> {
+        if !(s.is_finite() && s > 0.0 && tx.is_finite() && ty.is_finite()) {
+            return None;
+        }
+        let rect = |r: &Rect| Rect::new(r.origin.x * s + tx, r.origin.y * s + ty, r.size.w * s, r.size.h * s);
+        Some(match self {
+            Node::Rect { rect: r, fill, radius } => Node::Rect { rect: rect(r), fill: *fill, radius: radius * s },
+            Node::Image { rect: r, image } => Node::Image { rect: rect(r), image: image.clone() },
+            Node::Glyphs { origin, face, size, color, glyphs, turn: None } => Node::Glyphs {
+                origin: crate::geom::Point::new(origin.x * s + tx, origin.y * s + ty),
+                face: face.clone(),
+                size: size * s,
+                color: *color,
+                glyphs: glyphs.iter().map(|g| crate::glyphs::Glyph { id: g.id, dx: g.dx * s, dy: g.dy * s }).collect(),
+                turn: None,
+            },
+            Node::Fill(f) => {
+                let [a, b, c, d, e, g] = f.transform;
+                let mut f = (**f).clone();
+                f.transform = [a * s, b * s, c * s, d * s, e * s + tx, g * s + ty];
+                f.clip = f.clip.map(|[x0, y0, x1, y1]| [x0 * s + tx, y0 * s + ty, x1 * s + tx, y1 * s + ty]);
+                Node::Fill(std::sync::Arc::new(f))
+            }
+            _ => return None,
+        })
+    }
+
     /// Layout-only stack (no paint).
     pub fn stack(axis: Axis, rect: Rect, spacing: f32) -> Self {
         Node::Stack { rect, axis, spacing, fill: None, radius: 0.0, opacity: 1.0, isolate: false, alpha_mask: false, clip: false }
@@ -792,6 +824,23 @@ mod diff_tests {
     use super::*;
     use crate::color::Color;
     use crate::geom::Rect;
+
+    #[test]
+    fn a_leaf_maps_under_a_uniform_scale_and_a_translation() {
+        let r = Node::Rect { rect: Rect::new(10.0, 20.0, 30.0, 40.0), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 2.0 };
+        let Some(Node::Rect { rect, radius, .. }) = r.mapped(2.0, 5.0, -1.0) else { panic!("a rect maps") };
+        assert_eq!((rect.origin.x, rect.origin.y, rect.size.w, rect.size.h, radius), (25.0, 39.0, 60.0, 80.0, 4.0));
+        let fill = Node::Fill(std::sync::Arc::new(fresco_protocol::FillParams {
+            rule: 0, transform: [1.0, 0.0, 0.0, 1.0, 3.0, 4.0], paint: fresco_protocol::FillPaint::Solid { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+            opacity: 1.0, clip: Some([0.0, 0.0, 10.0, 10.0]), verbs: vec![], points: vec![] }));
+        let Some(Node::Fill(f)) = fill.mapped(1.5, 1.0, 2.0) else { panic!("a fill maps") };
+        assert_eq!(f.transform, [1.5, 0.0, 0.0, 1.5, 5.5, 8.0]);
+        assert_eq!(f.clip, Some([1.0, 2.0, 16.0, 17.0]));
+        assert!(r.mapped(0.0, 0.0, 0.0).is_none(), "no collapse");
+        assert!(r.mapped(f32::NAN, 0.0, 0.0).is_none());
+        let stack = Node::layer(Rect::new(0.0, 0.0, 1.0, 1.0), 1.0, true);
+        assert!(stack.mapped(1.0, 0.0, 0.0).is_none(), "a container is not a leaf");
+    }
 
     #[test]
     fn empty_to_empty_is_noop() {

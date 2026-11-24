@@ -38,6 +38,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,6 +85,7 @@ version = "0.1.0"
 name = "capsa-fuse"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "capsa-fat",
  "libc",
  "tessera-sys",

@@ -75,20 +75,20 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
 | H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed `2bd8429`** in portcullis-peer, portcullisd, ostiarius; other daemons' `.ok()`/default sites fail closed and keep their code |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `931bfc7`** |
-| M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | Open |
+| M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | **Mostly fixed `3208109`**: one crate, `atrium-fdpass`; the broker-facing receivers use it, 15 lower-risk copies remain (listed below) |
 | M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | **Fixed `61feb4a`** |
 | M3 | Medium | portcullisd | One root daemon carries 71 request kinds, with app features inside the broker | L | Open |
-| M4 | Medium | jaild, many crates | Security predicates and helpers are copy-pasted | M | Open |
+| M4 | Medium | jaild, many crates | Security predicates and helpers are copy-pasted | M | **jaild part fixed `a716051`**; peer-uid, username and hex copies still open |
 | M5 | Medium | tessera, gpu-rs, vk-icd, atrium-net | `unsafe` without justification; FFI entry points with no panic boundary | M | Open |
 | M6 | Medium | atrium-tessera | One 36,480-line C file in the kernel | L | Open |
 | M7 | Medium | repo | The licence policy describes enforcement that does not exist | S | **Fixed**: `scripts/licence-audit.py`, policy text matches it |
-| M8 | Medium | frescod, tabula, others | A poisoned mutex takes down every client | M | Open |
+| M8 | Medium→Low | frescod, tabula, others | A poisoned mutex takes down every client | M | **Reframed**: no lock rewrite; see below |
 | L1 | Low | everywhere | 2,304 "★" war-story comments, dangling ticket numbers, misplaced doc comments | ongoing | Open |
 | L2 | Low | portcullis-peer | A four-level wrapper chain for one function | S | Open |
-| L3 | Low | repo | Dead crates, a dead CI workflow, fake tests, tracked `scratch/` | S | Open: needs an OK to delete |
-| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | Open |
-| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | Open |
-| L6 | Low | several | Compiler warnings, silent parse drops, a personal path in tests | S | Open |
+| L3 | Low | repo | Dead crates, a dead CI workflow, fake tests, tracked `scratch/` | S | **Fixed `ee1552e`** (Shankar's OK): atrium-pt-demo and the Insula CI removed; 4 of the 5 listed crates are in use and stay; `scratch/` still tracked |
+| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | **Started `5078c65`**: `scripts/lib/gate.sh`; 18 gates that always exited 0 now fail on a failure |
+| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | README fixed `5078c65`; AGENTS.md row-size rule; the five long rows go back to their owners |
+| L6 | Low | several | Compiler warnings, silent parse drops, a personal path in tests | S | **Mostly fixed `ee1552e`**: bridge tests, 27 stale lockfiles, home path, imports |
 
 ### C1. A manifest entry could inject jail.conf parameters (fixed)
 
@@ -250,6 +250,23 @@ best of them: it checks truncation and closes extras.
 **Fix:** one audited fd-passing module (sockmux's, extended), with callers
 moved over one crate at a time by the thread that owns each crate.
 
+**Status (`3208109`):** `atrium-fdpass` (top level) is the one copy. Every
+received descriptor is an `OwnedFd` and close-on-exec atomically; more
+descriptors than the caller accepts, or truncated control data, is an error
+with every descriptor closed. Its tests fail when either check is removed.
+Moved onto it: `portcullis-ipc` (portcullisd's client fds), sockmux (jaild,
+atrium-volumes; its own `fdrecv.rs` is gone), aqueduct (extras past 16 per
+message, or 64 queued, were dropped silently; now the peer is dropped),
+cryptad (and a cap on descriptors waiting per control connection), netconf,
+atrium-mdns, capsa-fuse and lyra-protocol.
+
+Still hand-rolled, lower risk (trusted peer or a test), to move when their
+owners touch them: jaild `client.rs`/`ffi.rs` (the peer is jaild),
+opifex `fdpass.rs`, arca-courierd, crypta-engine `ac/link.rs`, capsa-share
+`dialer.rs`, carillon-transport, atrium-open, stoad, vinculum-hid-wire,
+fresco-split, sdk `atrium-worker`, prelum-browse, atrium-net `spawn.rs`,
+the Player's `sys.rs`, and a scrinium test.
+
 ### M2. Permission changes that act as access control ignore errors
 
 These are fail-open: if the call fails, the socket keeps its default mode.
@@ -352,11 +369,14 @@ A panic while one client's request holds the lock poisons it, and every later
 request from every client then panics. One bad request becomes a
 compositor-wide outage.
 
-**Fix:**
-
-- Recover the guard from a poisoned lock (`lock().unwrap_or_else(|p|
-  p.into_inner())`) where the state stays consistent.
-- Or catch panics per request and drop only that client.
+**Reframed after a closer look (Wave 3):** no mass rewrite of
+`lock().unwrap()`. A panic in frescod already ends the process, poisoned
+lock or not, and frescod is supervised (`boot_graph`, `system_services`), so
+recovering a poisoned guard would only keep running on state a panic left
+half-written. The real defect is a client request that can panic at all.
+**Fix:** treat panics on client input as bugs where they are found (no
+`unwrap`/slicing on peer bytes, per the checklist), and keep the supervisor
+restarting the daemon. Severity drops to Low.
 
 ### L1. Comments that read like a changelog
 
@@ -386,7 +406,11 @@ newline would forge a registry line.
 
 - **Crates nothing references** (no Cargo path or script mentions them):
   `memprobe`, `atrium-pt-demo`, `forum-demo`, `aqueduct-echo`,
-  `kmod-rust-spike`.
+  `kmod-rust-spike`. *Correction (Wave 4):* only `atrium-pt-demo` was dead.
+  `kmod-rust-spike/kpi-patches` is applied by `scripts/rust-kmod-spike.sh`
+  for the Rust kmods; `memprobe` produced the numbers in
+  `atrium-zram-v2.md` §3; `aqueduct-echo` is the spec's example service;
+  `forum-demo` is the RUNBOOK's frescod smoke test. They stay.
 - **A dead CI workflow.** `.github/workflows/insula.yml` watches `insula-*`,
   `atrium-netd-macos`, `atrium-fetch` and `atrium-mon`, none of which
   exist. `scripts/build-insula.sh` builds them.
@@ -413,6 +437,15 @@ under-used.
 access, deploy of main's build), adopted when a script is next touched. No
 mass rewrite.
 
+**Status (`5078c65`):** `scripts/lib/gate.sh` has the bookkeeping: `gate_end`
+exits non-zero on a failure, and fails when no checks or fewer than the
+declared count ran; `scripts/lib/gate-selftest.sh` checks each case and fails
+when `gate_end` is made to always pass. `opifex-token-check.sh` uses it (18
+of 18 before and after, and an abort now exits 1). 18 VM gates ended with
+`echo "...: $fails failed"` and so exited 0 whatever failed; each now ends
+with `[ "$fails" -eq 0 ]`, output unchanged. VM access and deploy helpers
+are not in the library yet.
+
 ### L5. Docs that drift
 
 - `docs/HANDOFF.md` calls itself "the short list", but its Mail cell is
@@ -428,7 +461,16 @@ mass rewrite.
   (`supervisor.rs:1031`); portcullis-sig has an unused import
   (`lib.rs:192`).
 - jaild's tests hardcode `/usr/home/girivs`.
-- `portcullis-toml` depends on `thiserror` but does not use it.
+- `portcullis-toml` depends on `thiserror` but does not use it. (Left: 63
+  lockfiles carry portcullis-toml, so removing it means editing them all.)
+- `portcullisd::launch::launch_with_stdio` is unused (launch path, left for
+  H3).
+- 20 `Cargo.lock` files are out of date with their manifests (`cargo
+  metadata --locked` fails in aqueduct-gpu-host, forum-demo,
+  forum-overview, fresco-aqueduct-bridge, fresco-scene-server, hospes,
+  mail-engine, memfed, memoryd, navigator-backend, opifex-sheet,
+  pergola-richtext, vestibulum and the macOS and fuzz crates), so a
+  `--locked` build of them, as Opifex's reproducible builds use, fails.
 - `fresco-aqueduct-bridge`'s tests no longer compile: `RectParams` gained a
   `radius` field the tests never set. A suite that doesn't build checks
   nothing.

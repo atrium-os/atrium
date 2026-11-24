@@ -238,3 +238,4 @@ i=0; while [ $i -lt 40 ] && [ "$(V "grep -c 'console-probe: workspace/scratch ->
 check "the jail is back" "1" "$(V "jls -j ws_alice_scratch jid >/dev/null 2>&1 && echo 1")"
 
 echo "workspace: $fails failed"
+[ "$fails" -eq 0 ]

@@ -131,7 +131,9 @@ fn usage() {
              Sign packed manifests built elsewhere; --expect: only if a second build matches.\n  \
            token list --module <pkcs11 lib> | token pub <key file>\n  \
            token ref --module <lib> --serial <s> --id <hex> --out <key file> [--pub <pem>]\n      \
-             Keys on hardware tokens (YubiKey PIV): a key file names one; any --key/--sign takes it.\n\n\
+             Keys on hardware tokens (YubiKey PIV): a key file names one; any --key/--sign takes it.\n  \
+           token agent [--comment <c>] --out <key file> [--pub <pem>]\n      \
+             A P-256 key in Arca, through the SSH agent (arca-ssh new --p256); signs like a PEM.\n\n\
          Through opifexd (OPIFEX_SOCKET, default /atrium/sockets/opifex/opifex.sock):\n  \
            describe <id> | search <text> | installed\n  \
            get <id>            install the newest catalog release (root)\n  \

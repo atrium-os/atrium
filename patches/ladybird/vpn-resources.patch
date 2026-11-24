@@ -19,7 +19,7 @@
 +        // document's origin (vpn.md "Scripts in the sign-in window"). The
 +        // fixture's continue.js keeps its sealed copy.
 +        if (name != "https://sso.crypta.test:447/+CSCOE+/saml/sp/continue.js"sv && navigator_vpn_get(name.bytes().data(), name.bytes().size(), nullptr, 0, nullptr) >= 0) {
-+            auto vpn_buffer = ByteBuffer::create_uninitialized(1024 * 1024);
++            auto vpn_buffer = ByteBuffer::create_uninitialized(4 * 1024 * 1024);
 +            if (!vpn_buffer.is_error()) {
 +                auto vpn_body = vpn_buffer.release_value();
 +                u8 kind = 0;

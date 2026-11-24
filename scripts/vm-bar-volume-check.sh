@@ -62,3 +62,4 @@ ok() { echo "  ok $1"; }; bad() { echo "  FAIL $1"; fails=$((fails+1)); }
 awk -v m="$master" 'BEGIN { exit !(m > 0.3 && m < 0.6) }' && ok "the level reached choragusd ($master)" || bad "master = $master"
 echo "== frame: $OUT"
 echo "bar-volume: $fails failed"
+[ "$fails" -eq 0 ]

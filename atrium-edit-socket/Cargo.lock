@@ -6,6 +6,7 @@ version = 4
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -25,6 +26,13 @@ version = "0.1.0"
 dependencies = [
  "fresco-client",
  "fresco-protocol",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -1,5 +1,10 @@
 # Insula — implementation status
 
+> **History.** The `insula-*` crates, their scripts (`build-insula.sh`,
+> `test-insula.sh`, `install-insula.sh`, `insula-demo.sh`) and the `insula`
+> CI workflow are gone from the tree. This
+> page records what was built.
+
 **Branch:** `claude/romantic-rubin-42085b`
 **Last updated:** 2026-05-22
 **Phase:** M1A (Foundation) + M1B (service-catalogue MVP) + M1C (Pergola path) complete. **Tabellarius Phase B (push relay + wake-on-push) complete** — the full path publisher → relay → device daemon → {queue, wake the owning app} works end-to-end, with kernel-attested app identity and opt-in CBOR-over-mutual-TLS on the relay wire. Beyond the ABI: full publish-side toolchain (`keygen` / `sign` / `bundle` / `release` / `publishers`), dev-iteration tooling (`init` / `run` / `install --link` / `doctor` / `clean`), four convenience scripts, GitHub Actions CI on macos-14, opt-in macOS NotificationCenter backend, encryption-at-rest for both keystores. Five sample apps cover all four scene-node primitives. 271 tests across 16 crates.

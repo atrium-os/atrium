@@ -16,6 +16,7 @@ dependencies = [
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -34,8 +35,10 @@ dependencies = [
  "arcad",
  "libc",
  "navigator-fetch",
+ "ring",
  "rustls",
  "rustls-pki-types",
+ "zeroize",
 ]
 
 [[package]]
@@ -62,6 +65,7 @@ name = "arcad"
 version = "0.1.0"
 dependencies = [
  "arca-store",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "libc",
@@ -70,6 +74,8 @@ dependencies = [
  "psl",
  "sha2",
  "sigillum-proto",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -91,6 +97,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -677,10 +690,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "navigator-control"
+version = "0.1.0"
+dependencies = [
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "navigator-control",
  "nuntius",
  "rustls",
  "rustls-pki-types",
@@ -773,6 +797,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",
@@ -794,6 +819,7 @@ dependencies = [
  "atrium-links",
  "atrium-types",
  "hex",
+ "portcullis-peer",
  "portcullis-toml",
  "serde",
  "sha2",
@@ -1386,6 +1412,18 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "yoke"
