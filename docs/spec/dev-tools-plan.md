@@ -415,8 +415,15 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   <program>`; atrium-run then starts lldb connected with the program loaded (it prints
   the lldb line instead without a tty or without lldb). The console class allows
   `TIOCGETD`, so stty (and the wrappers' no-echo) works there. `scripts/vm-terminal-apps-check.sh`
-  drives it through the Terminal to a breakpoint, 37/37. Not done: Artifex's DAP launch
-  (it can send `WorkspaceDebug`).
+  drives it through the Terminal to a breakpoint, 37/37. Artifex (2026-11-24): F5 on a
+  project with an `atrium.toml` asks "<workspace> asks to Debug <folder>" over its output;
+  Debug (a press) sends `WorkspaceDebug`, and lldb-dap in the workspace attaches with
+  `attachCommands: ["gdb-remote <address>"]` and the program's path, so breakpoints, stack
+  and locals work as for a workspace program. Off Atrium, Artifex's local executor stands
+  in with `lldb-server gdbserver`; `engine::tests::debugs_a_dev_app_by_attaching` runs it
+  end to end (a breakpoint, its locals, to the end). Not done: the same in the VM, which
+  waits on an `lldb-dap` in a workspace (FreeBSD's base has lldb and lldb-server only; the
+  c-dev layer is where it belongs).
   The frame tag (2026-11-24): while a dev build runs under lldb-server, portcullisd keeps
   an empty file named for it in `/var/db/atrium/debugging` (removed when it exits and
   at portcullisd's start); frescod, which already mounts `/var/db/atrium` read-only,

@@ -90,6 +90,10 @@ pub struct Session {
     /// Wanted breakpoints, by file (Artifex's path) → 1-based lines.
     pub breakpoints: BTreeMap<PathBuf, Vec<usize>>,
     initialized: bool,
+    /// Attach to a program already started under lldb-server at this
+    /// `gdb-remote` address (a dev app: it runs in its own jail), instead
+    /// of launching it.
+    attach: Option<String>,
     pub run: Run,
     pub thread: Option<i64>,
     pub frames: Vec<Frame>,
@@ -113,6 +117,7 @@ impl Session {
             cwd: cwd.to_string(),
             breakpoints,
             initialized: false,
+            attach: None,
             run: Run::Starting,
             thread: None,
             frames: Vec::new(),
@@ -124,6 +129,12 @@ impl Session {
             "supportsVariableType": true, "supportsRunInTerminalRequest": false,
         }));
         s
+    }
+
+    /// Attach through `gdb-remote address` rather than launch.
+    pub fn attaching(mut self, address: &str) -> Session {
+        self.attach = Some(address.to_string());
+        self
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {
@@ -237,7 +248,12 @@ impl Session {
                 let program = if self.program.starts_with('/') { self.program.clone() } else { self.remote(&self.program) };
                 let cwd = self.remote(&self.cwd);
                 let args = self.args.clone();
-                self.request(Pending::Launch, "launch", json!({ "program": program, "args": args, "cwd": cwd, "stopOnEntry": false }));
+                match self.attach.clone() {
+                    // The dev app waits under lldb-server; lldb connects to it.
+                    Some(a) => self.request(Pending::Launch, "attach", json!({
+                        "program": program, "attachCommands": [format!("gdb-remote {a}")], "stopOnEntry": false })),
+                    None => self.request(Pending::Launch, "launch", json!({ "program": program, "args": args, "cwd": cwd, "stopOnEntry": false })),
+                }
             }
             Pending::SetBreakpoints(file) => {
                 let lines = body.get("breakpoints").and_then(Value::as_array).map(|a| a.iter()
@@ -357,6 +373,18 @@ mod tests {
 
     fn event(name: &str, body: Value) -> Vec<u8> {
         frame(&json!({ "seq": 101, "type": "event", "event": name, "body": body }))
+    }
+
+    #[test]
+    fn a_dev_app_is_attached_to_through_gdb_remote() {
+        let mut s = Session::new(Path::new("/work/app"), "/home/p/work", "/var/lib/atrium/apps/dev.p.ws.org.x/app", &[], "app",
+                                 BTreeMap::new()).attaching("127.0.0.1:4711");
+        let m = sent(&mut s);
+        s.feed(&reply(&m[0]["seq"], json!({}))).unwrap();
+        let m = sent(&mut s);
+        assert_eq!(m[0]["command"], "attach");
+        assert_eq!(m[0]["arguments"]["program"], "/var/lib/atrium/apps/dev.p.ws.org.x/app");
+        assert_eq!(m[0]["arguments"]["attachCommands"], json!(["gdb-remote 127.0.0.1:4711"]));
     }
 
     #[test]

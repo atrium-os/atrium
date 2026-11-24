@@ -531,6 +531,18 @@ impl Engine {
     }
 
     fn start_debug(&mut self, s: &mut State) {
+        // A dev app (an atrium.toml): it runs as itself, in its own jail,
+        // so it is debugged as Run does it, after the person's press
+        // (dev-tools.md §7.3), not as a program in the workspace.
+        let dir = if s.project.is_empty() { self.root.clone() } else { self.root.join(&s.project) };
+        if self.remote_root.is_some() && dir.join("atrium.toml").is_file() {
+            let folder = if s.project.is_empty() { ".".to_string() } else { s.project.clone() };
+            s.ask = Some(folder);
+            s.ask_debug = true;
+            s.panel = Panel::Output;
+            s.panel_open = true;
+            return;
+        }
         let Some(program) = self.program(s) else {
             s.note = Some(("Artifex can't tell what this project runs: debugging needs a Cargo package or one C file".into(), true));
             return;
@@ -862,6 +874,9 @@ impl Engine {
     /// workspace was given to Artifex); without, cancel. The task hears
     /// the answer as atrium-run reads it.
     fn answer_run(&mut self, press: Option<[u8; 16]>, s: &mut State) {
+        if std::mem::take(&mut s.ask_debug) {
+            return self.answer_debug(press, s);
+        }
         let Some(folder) = s.ask.take() else { return };
         let answer = match (press, self.ws.clone()) {
             (Some(token), Some(ws)) => match self.exec.run(&ws, &folder, token) {
@@ -882,6 +897,42 @@ impl Engine {
         if let Some((_, p, _)) = self.jobs.iter_mut().find(|(j, _, _)| matches!(j, Job::Task { .. })) {
             p.write(&answer);
         }
+    }
+
+    /// The person's answer to Debug as an app: with a press, portcullisd
+    /// installs the dev build waiting for a debugger on the workspace's
+    /// loopback, and lldb-dap in the workspace attaches to it there.
+    fn answer_debug(&mut self, press: Option<[u8; 16]>, s: &mut State) {
+        let Some(folder) = s.ask.take() else { return };
+        let (Some(token), Some(ws), Some(remote)) = (press, self.ws.clone(), self.remote_root.clone()) else { return };
+        if self.debugger.is_some() {
+            s.note = Some(("Stop the program being debugged first".into(), true));
+            return;
+        }
+        let (app, address, program) = match self.exec.debug(&ws, &folder, token) {
+            Ok(r) => r,
+            Err(e) => {
+                s.output.push_str(&format!("[Debug: {e}]\n"));
+                s.note = Some((format!("Can't Debug {folder}: {e}"), true));
+                return;
+            }
+        };
+        let proc = match self.exec.spawn(&ws, &quiet(&dap::ADAPTER), &s.project) {
+            Ok(p) => p,
+            Err(e) => {
+                s.note = Some((format!("Can't start lldb-dap in the workspace: {e}"), true));
+                return;
+            }
+        };
+        let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
+        let sess = dap::Session::new(&self.root, &remote, &program, &[], &s.project, bps).attaching(&address);
+        self.debugger = Some((sess, proc));
+        self.ran = Some(app.clone());
+        s.debug = Some(Debug { run: format!("Starting {app}"), live: true, ..Debug::default() });
+        s.output = format!("$ lldb-dap: {app} at {address}\n");
+        s.note = Some((format!("Debugging {app}"), false));
+        s.panel = Panel::Debug;
+        s.panel_open = true;
     }
 
     fn run_task(&mut self, i: usize, s: &mut State) {
@@ -1059,6 +1110,7 @@ impl Engine {
                         match ask {
                             Ok(folder) if s.ask.is_none() => {
                                 s.ask = Some(folder);
+                                s.ask_debug = false;
                                 s.panel = Panel::Output;
                                 s.panel_open = true;
                             }
@@ -1680,6 +1732,66 @@ mod tests {
         e.act(Act::Debug, &mut s); // continue to the end
         assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| !d.live)), "{:?}", s.debug);
         assert!(s.output.contains("6"), "{}", s.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A dev app (an atrium.toml) is debugged as an app: F5 asks, a press
+    /// starts it waiting under lldb-server (here, Local's stand-in for
+    /// portcullisd's), and lldb-dap attaches over gdb-remote and stops at
+    /// the breakpoint.
+    #[test]
+    fn debugs_a_dev_app_by_attaching() {
+        let llvm = PathBuf::from("/usr/lib/llvm-18/bin");
+        let has = |b: &str| std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join(b).is_file());
+        if !(has("lldb-dap") && has("lldb-server")) {
+            if !llvm.join("lldb-dap").is_file() || !llvm.join("lldb-server").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("dapapp");
+        std::fs::create_dir_all(d.join("proj/app")).unwrap();
+        std::fs::write(d.join("proj/app/app.c"), "#include <stdio.h>\n\nint main(void) {\n\tint n = 3;\n\tn = n * 2;\n\tprintf(\"%d\\n\", n);\n\treturn 0;\n}\n").unwrap();
+        std::fs::write(d.join("proj/app/atrium.toml"), "[app]\nid = \"org.example.app\"\nname = \"App\"\nversion = \"1\"\nentry = \"app\"\n").unwrap();
+        let cc = std::process::Command::new("cc").args(["-g", "-O0", "-o", "app", "app.c"]).current_dir(d.join("proj/app")).status();
+        if !cc.is_ok_and(|s| s.success()) {
+            return;
+        }
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("app/app.c".into()), &mut s);
+        assert_eq!(s.project, "app");
+        // No Build task to wait on: take it from the question.
+        s.tasks.clear();
+        e.act(Act::Breakpoint(4), &mut s); // n = n * 2;
+        e.act(Act::Debug, &mut s);
+        assert_eq!((s.ask.as_deref(), s.ask_debug), (Some("app"), true), "F5 asks to Debug app");
+        assert!(e.debugger.is_none(), "nothing starts before the press");
+        e.act(Act::AnswerRun(Some([7; 16])), &mut s);
+        assert!(s.ask.is_none() && !s.ask_debug);
+        let wait = |e: &mut Engine, s: &mut State, f: &dyn Fn(&State) -> bool| {
+            for _ in 0..1500 {
+                e.tick(s);
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let stopped = wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && !d.locals.is_empty()));
+        if !stopped && s.note.as_ref().is_some_and(|n| n.0.contains("ptrace") || n.0.contains("Operation not permitted")) {
+            eprintln!("debugger couldn't run here: {:?} {:?}", s.debug, s.note);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(stopped, "{:?} {:?}\n{}", s.debug, s.note, s.output);
+        let dbg = s.debug.clone().unwrap();
+        assert_eq!(dbg.frames[0].1.as_deref(), Some("app/app.c"), "{:?}", dbg.frames);
+        assert_eq!(dbg.frames[0].2, 5);
+        assert!(dbg.locals.iter().any(|(n, v)| n == "n" && v == "3"), "{:?}", dbg.locals);
+        e.act(Act::Debug, &mut s); // continue to the end
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| !d.live)), "{:?}", s.debug);
         let _ = std::fs::remove_dir_all(&d);
     }
 

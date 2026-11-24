@@ -177,6 +177,8 @@ pub struct State {
     pub fuzz: Option<crate::fuzz::Fuzz>,
     /// A Run task's question (atrium-run, W5): the folder it asks to Run.
     pub ask: Option<String>,
+    /// The question is Artifex's own: Debug that folder as an app.
+    pub ask_debug: bool,
     /// Move into a worker: what `cargo atrium worker add --dry-run` would do,
     /// waiting for the person's yes.
     pub moving: Option<crate::fuzz::Move>,
@@ -523,9 +525,10 @@ impl View for ArtifexView {
                         // What atrium-run asks, as the Terminal asks it.
                         let y = body_y + em(10.0);
                         ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
-                        text(ctx, side_w() + em(16.0), y, &format!("{ws} asks to Run {folder}"), type_size::SM, Weight::Medium, t.text_primary());
+                        let (verb, yes) = if s.ask_debug { ("Debug", "Debug") } else { ("Run", "Run") };
+                        text(ctx, side_w() + em(16.0), y, &format!("{ws} asks to {verb} {folder}"), type_size::SM, Weight::Medium, t.text_primary());
                         ctx.key(4030);
-                        Button::primary("Run").at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(pressed(q, |t| Act::AnswerRun(Some(t)))).render(ctx);
+                        Button::primary(yes).at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(pressed(q, |t| Act::AnswerRun(Some(t)))).render(ctx);
                         ctx.key(4031);
                         Button::ghost("Cancel").at(w - em(112.0), y - em(14.0)).width(em(90.0)).on_click(plain(q, Act::AnswerRun(None))).render(ctx);
                         body_y += em(40.0);

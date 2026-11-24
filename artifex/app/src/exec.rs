@@ -120,6 +120,11 @@ pub trait Exec {
     /// Run folder `folder` of `ws`'s work as a dev app (W5), with a press:
     /// the app's id.
     fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, String>;
+    /// Debug folder `folder` as a dev app, with a press (dev-tools.md
+    /// §7.3): the app's id, the debugger's address on the workspace's
+    /// loopback (`gdb-remote`) and the program's path. The app waits for
+    /// the debugger.
+    fn debug(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, String, String), String>;
     /// Where picked workspaces' `work` folders are (`/work`).
     fn work_root(&self) -> PathBuf;
 }
@@ -193,6 +198,13 @@ impl Exec for Portcullis {
         }
     }
 
+    fn debug(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, String, String), String> {
+        match ask(&Request::WorkspaceDebug { name: ws.into(), project: folder.into(), activation })? {
+            Response::WorkspaceDebugging { app_id, address, program, .. } => Ok((app_id, address, program)),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
     fn work_root(&self) -> PathBuf {
         PathBuf::from("/work")
     }
@@ -256,6 +268,43 @@ impl Exec for Local {
 
     fn run(&self, _ws: &str, _folder: &str, _activation: [u8; 16]) -> Result<String, String> {
         Err("No Run off Atrium".into())
+    }
+
+    /// Off Atrium there is no app jail: the manifest's entry is started
+    /// under `lldb-server gdbserver` on the loopback, as portcullisd starts
+    /// a dev build, and waits for the debugger the same way.
+    fn debug(&self, ws: &str, folder: &str, _activation: [u8; 16]) -> Result<(String, String, String), String> {
+        if folder.split('/').any(|c| c == "..") || folder.starts_with('/') {
+            return Err(format!("{folder:?} is not a folder in work"));
+        }
+        let dir = self.root.join(ws).join(folder);
+        let m: toml::Value = std::fs::read_to_string(dir.join("atrium.toml")).map_err(|e| format!("atrium.toml: {e}"))?
+            .parse().map_err(|e| format!("atrium.toml: {e}"))?;
+        let app = m.get("app").ok_or("atrium.toml has no [app]")?;
+        let id = app.get("id").and_then(|v| v.as_str()).ok_or("no app id")?;
+        let entry = app.get("entry").and_then(|v| v.as_str()).ok_or("no entry")?;
+        let program = dir.join(entry);
+        if !program.is_file() {
+            return Err(format!("{} isn't built", program.display()));
+        }
+        let fifo = std::env::temp_dir().join(format!("artifex-gdbserver-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_file(&fifo);
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: a path we own, a fresh FIFO.
+        if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+            return Err(format!("mkfifo: {}", std::io::Error::last_os_error()));
+        }
+        std::process::Command::new("lldb-server")
+            .args(["gdbserver", "127.0.0.1:0", "--named-pipe"]).arg(&fifo).arg("--").arg(&program)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("lldb-server: {e}"))?;
+        // Blocks until lldb-server listens and names its port.
+        let port = std::fs::read_to_string(&fifo).map_err(|e| format!("lldb-server's port: {e}"))?;
+        let _ = std::fs::remove_file(&fifo);
+        let port: u16 = port.trim_end_matches('\0').trim().parse().map_err(|_| format!("lldb-server's port: {port:?}"))?;
+        Ok((format!("local.{id}"), format!("127.0.0.1:{port}"), program.to_string_lossy().into_owned()))
     }
 
     fn work_root(&self) -> PathBuf {
