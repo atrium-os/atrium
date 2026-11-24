@@ -21,6 +21,8 @@ use crate::value::{ErrorKind, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+mod visible;
+
 #[derive(Debug, Default, Clone)]
 pub struct RecalcStats {
     /// Groups evaluated.
@@ -80,7 +82,7 @@ impl Workbook {
     /// Recalculates everything affected by changes since the last call: rounds of
     /// [`Workbook::recalc_pass`] while dynamic arrays spill into cells others read.
     pub fn recalc(&mut self) -> RecalcStats {
-        self.recalc_until(None).0
+        self.recalc_until(None, &[]).0
     }
 
     /// Recalculates for about `budget`, then stops between groups (or between
@@ -89,7 +91,13 @@ impl Workbook {
     /// [`Workbook::recalc_pending`]; cells not yet done keep their old values and
     /// [`Workbook::is_stale`] says which. Edits made in between join the work.
     pub fn recalc_for(&mut self, budget: std::time::Duration) -> (RecalcStats, bool) {
-        self.recalc_until(Some(Instant::now() + budget))
+        self.recalc_for_view(budget, &[])
+    }
+
+    /// Uses the current viewport to prioritize dirty, independently evaluable
+    /// rows and their precedents within the usual time budget.
+    pub fn recalc_for_view(&mut self, budget: std::time::Duration, visible: &[Rect]) -> (RecalcStats, bool) {
+        self.recalc_until(Some(Instant::now() + budget), visible)
     }
 
     /// Whether recalculation has work left (a [`Workbook::recalc_for`] that ran out
@@ -107,13 +115,13 @@ impl Workbook {
         self.group_at(sheet, row, col).is_some_and(|g| self.pending.get(&g).is_some_and(|rs| rs.contains(row)))
     }
 
-    fn recalc_until(&mut self, deadline: Option<Instant>) -> (RecalcStats, bool) {
+    fn recalc_until(&mut self, deadline: Option<Instant>, visible: &[Rect]) -> (RecalcStats, bool) {
         let t0 = Instant::now();
         let mut stats = RecalcStats::default();
         self.recalcs += 1;
         self.spill_edits();
         for _ in 0..crate::spill::MAX_SPILL_ROUNDS {
-            let done = self.recalc_pass(&mut stats, deadline);
+            let done = self.recalc_pass(&mut stats, deadline, visible);
             let more = self.apply_spills();
             if !done {
                 stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
@@ -126,7 +134,7 @@ impl Workbook {
         self.claims.clear();
         // Past the last round: the last writes' readers once more, without spilling.
         if !self.changed.is_empty() {
-            let done = self.recalc_pass(&mut stats, deadline);
+            let done = self.recalc_pass(&mut stats, deadline, visible);
             self.spill_out.lock().unwrap().clear();
             if !done {
                 stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
@@ -138,7 +146,7 @@ impl Workbook {
     }
 
     /// One pass; false when `deadline` passed first (what is left is pending).
-    fn recalc_pass(&mut self, stats: &mut RecalcStats, deadline: Option<Instant>) -> bool {
+    fn recalc_pass(&mut self, stats: &mut RecalcStats, deadline: Option<Instant>, visible: &[Rect]) -> bool {
         let mut dirty: HashMap<GroupId, RowSet> = HashMap::new();
         let mut edges: HashSet<(GroupId, GroupId)> = HashSet::new();
         // Work list: (source group, rows newly dirty) or (None, changed rect).
@@ -194,28 +202,22 @@ impl Workbook {
         }
         let sccs = tarjan(&nodes, &adj);
 
+        if let Some(limit) = deadline.filter(|d| !visible.is_empty() && Instant::now() < *d) {
+            self.recalc_visible(&mut dirty, &edges, &sccs, stats, limit, visible);
+        }
+
         for scc in sccs.into_iter().rev() {
             if deadline.is_some_and(|d| Instant::now() >= d) {
-                // Out of time: what is still dirty waits for the next call.
-                for (g, rs) in dirty {
-                    let p = self.pending.entry(g).or_default();
-                    for (a, b) in rs.0 {
-                        p.add(a, b);
-                    }
-                }
-                return false;
+                self.pending.extend(dirty.into_iter().filter(|(_, rows)| !rows.is_empty()));
+                return !self.recalc_pending();
             }
             if scc.len() == 1 {
                 let g = scc[0];
                 let rows = dirty.remove(&g).unwrap_or_default();
                 if !edges.contains(&(g, g)) {
-                    if !self.eval_parallel(g, &rows, stats, deadline) {
-                        for (g, rs) in dirty {
-                            let p = self.pending.entry(g).or_default();
-                            for (a, b) in rs.0 {
-                                p.add(a, b);
-                            }
-                        }
+                    if let Some(rest) = self.eval_parallel(g, &rows, stats, deadline) {
+                        dirty.insert(g, rest);
+                        self.pending.extend(dirty.into_iter().filter(|(_, rows)| !rows.is_empty()));
                         return false;
                     }
                     continue;
@@ -293,11 +295,11 @@ impl Workbook {
         (v, false)
     }
 
-    /// False when `deadline` passed between slices (the rest is pending).
-    fn eval_parallel(&mut self, g: GroupId, rows: &RowSet, stats: &mut RecalcStats, deadline: Option<Instant>) -> bool {
+    /// The dirty rows left if the deadline passes between waves.
+    fn eval_parallel(&mut self, g: GroupId, rows: &RowSet, stats: &mut RecalcStats, deadline: Option<Instant>) -> Option<RowSet> {
         let total = rows.len();
         if total == 0 {
-            return true;
+            return None;
         }
         stats.groups += 1;
         let (sheet, col) = (self.group(g).sheet, self.group(g).col);
@@ -332,8 +334,7 @@ impl Workbook {
         let mut first = true;
         while rows.tail.is_some() {
             if !first && deadline.is_some_and(|d| Instant::now() >= d) {
-                self.pending.insert(g, rows.remaining());
-                return false;
+                return Some(rows.remaining());
             }
             first = false;
             let (workers, capacity) = if deadline.is_some() {
@@ -377,7 +378,7 @@ impl Workbook {
                 }
             }
         }
-        true
+        None
     }
 
     fn eval_sequential(&mut self, g: GroupId, rows: &RowSet, top_down: bool, stats: &mut RecalcStats) {

@@ -63,7 +63,7 @@ fn sliced_recalc_stops_in_time_and_ends_where_one_call_does() {
 
 #[test]
 fn a_workbook_past_the_budget_is_refused_while_loading() {
-    use officina_grid::{CellAddr, Value, Workbook};
+    use officina_grid::{Value, Workbook};
     let mut wb = Workbook::new();
     wb.add_sheet("Sparse").unwrap();
     // 300 columns of 8,192 numbers: about 20 MB open.
@@ -106,5 +106,82 @@ fn sliced_groups_preserve_disjoint_dirty_runs_and_count_completed_cells() {
     for row in 0..ROWS {
         let changed = STARTS.iter().any(|&start| (start..start + WRITES).contains(&row));
         assert_eq!(wb.value(0, row, 1), Value::Num(if changed { 2.0 } else { 0.33 }), "row {row}");
+    }
+}
+
+#[test]
+fn visible_rows_and_cross_sheet_precedents_advance_before_the_background() {
+    use officina_grid::Rect;
+    const ROWS: u32 = 350_000;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Source").unwrap();
+    wb.add_sheet("Report").unwrap();
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(1.0));
+    wb.fill_formula(0, 1, 0, ROWS - 1, "=ROUND(ROW()/3,2)*$A$1").unwrap();
+    wb.fill_formula(1, 0, 0, ROWS - 3, "=Source!B3+1").unwrap();
+    let total = CellAddr::new(1, 0, 2);
+    wb.set_formula(total, "=SUM(Source!B1:B350000)").unwrap();
+    wb.recalc();
+    let old_total = wb.get(total);
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(7.0));
+
+    let budget = Duration::from_millis(8);
+    let target = |row| Rect { sheet: 1, r0: row, c0: 0, r1: row + 15, c1: 0 };
+    for row in [240_000, 310_000] {
+        for _ in 0..6 {
+            wb.recalc_for_view(budget, &[target(row), Rect::cell(total)]);
+            if !wb.is_stale(1, row + 15, 0) { break; }
+        }
+        assert!(wb.is_stale(1, 160_000, 0), "the earlier offscreen row should stay pending");
+        assert!(wb.is_stale(1, 0, 2), "the wide aggregate must wait for all of its inputs");
+        assert_eq!(wb.get(total), old_total);
+        for r in row..row + 16 {
+            let want = ((f64::from(r + 3) / 3.0 * 100.0).round() / 100.0) * 7.0;
+            assert!(!wb.is_stale(0, r + 2, 1), "cross-sheet precedent at {r}");
+            assert!(!wb.is_stale(1, r, 0), "visible cell at {r}");
+            assert_eq!(wb.value(0, r + 2, 1), Value::Num(want));
+            assert_eq!(wb.value(1, r, 0), Value::Num(want + 1.0));
+        }
+    }
+    wb.recalc();
+    assert!(!wb.recalc_pending());
+    let (Value::Num(before), Value::Num(after)) = (old_total, wb.get(total)) else { panic!() };
+    assert!((after - before * 7.0).abs() < 1e-3);
+}
+
+#[test]
+fn visible_priority_preserves_running_totals_in_both_directions_and_cycles() {
+    use officina_grid::{ErrorKind, Rect};
+    const ROWS: u32 = 512;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Ordered").unwrap();
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(1.0));
+    wb.set_formula(CellAddr::new(0, 0, 1), "=$A$1").unwrap();
+    wb.fill_formula(0, 1, 1, ROWS - 1, "=B1+$A$1").unwrap();
+    wb.set_formula(CellAddr::new(0, ROWS - 1, 2), "=$A$1").unwrap();
+    wb.fill_formula(0, 2, 0, ROWS - 2, "=C2+$A$1").unwrap();
+    wb.fill_formula(0, 3, 0, ROWS - 1, "=B1-C1").unwrap();
+    wb.set_formula(CellAddr::new(0, 4, 4), "=F5+$A$1").unwrap();
+    wb.set_formula(CellAddr::new(0, 4, 5), "=E5+1").unwrap();
+    wb.recalc();
+    wb.set_value(CellAddr::new(0, 0, 0), Value::Num(3.0));
+
+    let view = [Rect { sheet: 0, r0: 400, c0: 1, r1: 415, c1: 3 }, Rect { sheet: 0, r0: 4, c0: 4, r1: 4, c1: 5 }];
+    for _ in 0..100 {
+        wb.recalc_for_view(Duration::from_millis(8), &view);
+        for row in 400..=415 {
+            if !wb.is_stale(0, row, 3) {
+                assert_eq!(wb.value(0, row, 3), Value::Num(3.0 * (f64::from(row + 1) - f64::from(ROWS - row))));
+            }
+        }
+        if !wb.recalc_pending() { break; }
+    }
+    assert!(!wb.recalc_pending());
+    for row in 0..ROWS {
+        assert_eq!(wb.value(0, row, 1), Value::Num(3.0 * f64::from(row + 1)));
+        assert_eq!(wb.value(0, row, 2), Value::Num(3.0 * f64::from(ROWS - row)));
+    }
+    for col in [4, 5] {
+        assert_eq!(wb.value(0, 4, col), Value::Err(ErrorKind::Circ));
     }
 }

@@ -4,6 +4,7 @@
 //! `recalc_responsiveness make FILE`
 //! `recalc_responsiveness check FILE MULTIPLIER`
 //! `recalc_responsiveness measure FILE`
+//! `recalc_responsiveness visible FILE`
 
 use std::fs::{self, File};
 use std::path::Path;
@@ -15,7 +16,7 @@ use atrium_sheets::doc::{Doc, RECALC_SLICE};
 use officina_grid::{CellAddr, Value, Workbook};
 use pergola::event::ScrollPhase;
 use pergola::geom::Point;
-use pergola::widgets::{GridState, ScrollState};
+use pergola::widgets::{GridSource, GridState, ScrollState};
 use pergola::{App, Event, Key, KeyEventKind, Modifiers, Mutable, SizeSpec, Window, WindowDesc};
 
 const ROWS: u32 = 1 << 20;
@@ -225,6 +226,59 @@ fn measure(bytes: &[u8]) {
     report("background recalculation slices", &mut samples.slice);
 }
 
+fn measure_visible(bytes: &[u8]) {
+    let doc = Doc::from_native("responsive.osheet", bytes).unwrap();
+    verify(&doc.wb, 1.0);
+    let mut driver = Driver::new(doc);
+    let at = Point::new(50.0, 111.0);
+    driver.dispatch(Event::PointerDown { at });
+    driver.dispatch(Event::PointerUp { at });
+    driver.type_digit("7");
+    driver.dispatch(key(Key::Enter, "", false));
+    let background = ROWS / 3;
+    let stale = |driver: &Driver, row| driver.sheets.doc.borrow().wb.is_stale(0, row, 3);
+    assert!(stale(&driver, background));
+    for target in [ROWS / 2, ROWS * 3 / 4] {
+        assert!(stale(&driver, target), "the target must be stale before scrolling");
+        driver.dispatch(scroll(ScrollPhase::Begin, 0.0));
+        let dy = driver.sheets.source.row_top(target) - driver.sheets.scroll.get().physics.y;
+        driver.dispatch(scroll(ScrollPhase::Update, dy as f32));
+        let top = driver.sheets.scroll.get().physics.y;
+        let row = driver.sheets.source.row_at(top);
+        assert_eq!(row, target);
+        let (w, h) = driver.sheets.size.get();
+        let height = Sheets::grid_rect(w, h).h() - pergola::widgets::grid_view::HEADER_H;
+        let last = driver.sheets.source.row_at(top + f64::from(height) - 0.001);
+        driver.dispatch(scroll(ScrollPhase::End, 0.0));
+        let start = Instant::now();
+        let mut slices = 0;
+        while (row..=last).any(|r| stale(&driver, r)) {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            assert!(stale(&driver, background), "background finished before the viewport");
+            driver.sheets.doc.borrow_mut().settle();
+            driver.sheets.changed();
+            driver.window.paint(&mut driver.app).unwrap();
+            slices += 1;
+        }
+        let doc = driver.sheets.doc.borrow();
+        for r in row..=last {
+            let value = expected(r, LATEST);
+            assert!(!doc.wb.is_stale(0, r, 1));
+            assert_eq!(doc.wb.value(0, r, 1), Value::Num(value));
+            assert_eq!(doc.wb.value(0, r, 3), Value::Num(value + 1.0));
+        }
+        assert!(doc.wb.is_stale(0, background, 3));
+        println!("PASS visible rows {}–{} updated in {slices} slices; row {} still stale", row + 1, last + 1, background + 1);
+    }
+    let start = Instant::now();
+    while driver.pending() {
+        assert!(start.elapsed() < Duration::from_secs(60));
+        driver.sheets.doc.borrow_mut().settle();
+    }
+    verify(&driver.sheets.doc.borrow().wb, LATEST);
+    println!("PASS final calculation verified across {ROWS} rows");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -237,6 +291,7 @@ fn main() {
             println!("verified {ROWS} rows, {} formula results, multiplier {factor}", 2 * ROWS);
         }
         [mode, path] if mode == "measure" => measure(&fs::read(path).unwrap()),
-        _ => panic!("usage: recalc_responsiveness make FILE | check FILE MULTIPLIER | measure FILE"),
+        [mode, path] if mode == "visible" => measure_visible(&fs::read(path).unwrap()),
+        _ => panic!("usage: recalc_responsiveness make FILE | check FILE MULTIPLIER | measure FILE | visible FILE"),
     }
 }

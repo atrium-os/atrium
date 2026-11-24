@@ -394,6 +394,28 @@ impl RowSet {
         v.splice(i..j, [(lo, hi)]);
         new
     }
+    /// Rows left after removing another set of rows.
+    pub(crate) fn without(&self, removed: &Self) -> Self {
+        let mut keep = Vec::new();
+        let mut i = 0;
+        for &(first, last) in &self.0 {
+            let mut start = first as u64;
+            let end = last as u64;
+            while let Some(&(a, b)) = removed.0.get(i) {
+                let (a, b) = (u64::from(a), u64::from(b));
+                if a > end { break; }
+                if start < a {
+                    keep.push((start as u32, (a - 1) as u32));
+                }
+                start = start.max(b + 1);
+                if start > end { break; }
+                i += 1;
+            }
+            if start <= end { keep.push((start as u32, last)); }
+        }
+        Self(keep)
+    }
+
     pub fn contains(&self, r: u32) -> bool {
         let i = self.0.partition_point(|&(_, e)| e < r);
         i < self.0.len() && self.0[i].0 <= r

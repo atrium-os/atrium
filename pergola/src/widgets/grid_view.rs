@@ -806,6 +806,31 @@ impl Geom {
     }
 }
 
+/// Visible runs between two edges in content coordinates. The inverse
+/// position lookup skips zero-size runs at a shared edge.
+fn visible_runs(
+    start: f64, end: f64, first: u32, last: u32,
+    index: impl Fn(f64) -> u32, offset: impl Fn(u32) -> f64,
+) -> Vec<(u32, u32)> {
+    if start >= end || first > last { return Vec::new(); }
+    let mut i = index(start).max(first);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    while i <= last && runs.len() < 64 {
+        let at = offset(i);
+        if at >= end { break; }
+        let next = offset(i + 1);
+        if next > at {
+            if let Some(run) = runs.last_mut().filter(|run| run.1 + 1 == i) {
+                run.1 = i;
+            } else {
+                runs.push((i, i));
+            }
+        }
+        i = if next > at { i + 1 } else { index(next).max(i + 1) };
+    }
+    runs
+}
+
 pub struct GridView {
     pub source: Rc<dyn GridSource>,
     pub scroll: Mutable<ScrollState>,
@@ -813,13 +838,14 @@ pub struct GridView {
     pub rect: Rect,
     on_action: Option<ActionFn>,
     on_activate: Option<Rc<dyn Fn()>>,
+    on_visible: Option<Rc<dyn Fn(CellRange)>>,
     display_editor: bool,
     key: u64,
 }
 
 impl GridView {
     pub fn new(source: Rc<dyn GridSource>, scroll: Mutable<ScrollState>, state: Mutable<GridState>, rect: Rect) -> Self {
-        Self { source, scroll, state, rect, on_action: None, on_activate: None, display_editor: true, key: 0x6772_6964 }
+        Self { source, scroll, state, rect, on_action: None, on_activate: None, on_visible: None, display_editor: true, key: 0x6772_6964 }
     }
 
     pub fn on_action(mut self, f: impl Fn(GridAction) + 'static) -> Self {
@@ -829,6 +855,13 @@ impl GridView {
 
     pub fn on_activate(mut self, f: impl Fn() + 'static) -> Self {
         self.on_activate = Some(Rc::new(f));
+        self
+    }
+
+    /// Reports the visible cell rectangles for this pane when it renders.
+    /// Excludes the resident tiles outside the viewport.
+    pub fn on_visible(mut self, f: impl Fn(CellRange) + 'static) -> Self {
+        self.on_visible = Some(Rc::new(f));
         self
     }
 
@@ -905,6 +938,25 @@ impl GridView {
             self.scroll.set(st);
         }
         let (x, y) = (st.physics_x.y, st.physics.y);
+        if let Some(report) = self.on_visible.as_ref().filter(|_| rows > 0 && cols > 0) {
+            let (fw, fh) = (fz[0], fz[1]);
+            let (width, height) = (f64::from(body.w()), f64::from(body.h()));
+            let row_runs = |a, b, r0, r1| visible_runs(a, b, r0, r1, |v| src.row_at(v), |i| src.row_top(i));
+            let col_runs = |a, b, c0, c1| visible_runs(a, b, c0, c1, |v| src.col_at(v), |i| src.col_left(i));
+            let mut shown_rows = row_runs(y + fh, y + height, frozen.0, rows - 1);
+            let mut shown_cols = col_runs(x + fw, x + width, frozen.1, cols - 1);
+            if fh > 0.0 {
+                shown_rows.extend(row_runs(skip[1], skip[1] + fh, from.0, frozen.0 - 1));
+            }
+            if fw > 0.0 {
+                shown_cols.extend(col_runs(skip[0], skip[0] + fw, from.1, frozen.1 - 1));
+            }
+            for (r0, r1) in shown_rows {
+                for &(c0, c1) in &shown_cols {
+                    report(CellRange { r0, r1, c0, c1 });
+                }
+            }
+        }
         let (bx, by) = ((x / REBASE).floor() * REBASE, (y / REBASE).floor() * REBASE);
         let (tiles_r, tiles_c) = Self::tiles(&*src, x, y, body.w() as f64, body.h() as f64);
         let sel = gs.selection();
@@ -2600,7 +2652,46 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn visible_runs_clip_edges_and_skip_hidden_cells() {
+        let edges = [0.0, 10.0, 10.0, 10.0, 20.0, 30.0, 40.0];
+        let index = |px| edges.partition_point(|&value| value <= px).saturating_sub(1).min(5) as u32;
+        let offset = |row| edges[row as usize];
+        assert_eq!(super::visible_runs(5.0, 30.0, 0, 5, index, offset), vec![(0, 0), (3, 4)]);
+        assert_eq!(super::visible_runs(10.0, 25.0, 0, 3, index, offset), vec![(3, 3)]);
+        assert!(super::visible_runs(10.0, 10.0, 0, 5, index, offset).is_empty());
+    }
+
     use super::*;
+
+    #[test]
+    fn viewport_reports_scrolled_and_frozen_bands_without_tile_padding() {
+        struct Probe {
+            sheet: Rc<Sheet>,
+            scroll: Mutable<ScrollState>,
+            reported: Rc<RefCell<Vec<CellRange>>>,
+        }
+        impl View for Probe {
+            fn render(&self, ctx: &mut Ctx) {
+                let reported = self.reported.clone();
+                GridView::new(self.sheet.clone(), self.scroll.clone(), Mutable::new(GridState::default()), Rect::new(0.0, 0.0, 400.0, 220.0))
+                    .on_visible(move |r| reported.borrow_mut().push(r)).emit(ctx);
+            }
+        }
+        let sheet = Rc::new(Sheet::new(100, 20));
+        sheet.frozen.set((2, 1));
+        let mut scroll = ScrollState::default();
+        scroll.physics.set_max(1900.0);
+        scroll.physics_x.set_max(1000.0);
+        scroll.physics.set_position(400.0);
+        scroll.physics_x.set_position(128.0);
+        let reported = Rc::new(RefCell::new(Vec::new()));
+        let probe = Probe { sheet, scroll: Mutable::new(scroll), reported: reported.clone() };
+        crate::view::render(&probe, crate::theme::Semantic::LIGHT);
+        let draws = |row, col| reported.borrow().iter().any(|r| (r.r0..=r.r1).contains(&row) && (r.c0..=r.c1).contains(&col));
+        assert!(draws(0, 0) && draws(1, 3) && draws(22, 0) && draws(22, 3));
+        assert!(!draws(2, 0) && !draws(21, 3) && !draws(22, 2) && !draws(30, 3));
+    }
 
     #[test]
     fn every_cell_icon_draws_inside_its_square() {

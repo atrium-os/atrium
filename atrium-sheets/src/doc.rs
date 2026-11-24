@@ -540,6 +540,8 @@ pub struct Doc {
     /// app's event loop finishes the work a slice a frame). None: all at once,
     /// as tests and batch work want.
     pub recalc_budget: Option<std::time::Duration>,
+    /// The last view painted by the grid, including split and frozen panes.
+    pub(crate) calculation_view: Vec<Rect>,
     /// The most memory the workbook's cells may grow to by editing
     /// ([`Workbook::memory_bytes`]): a change that would take it past is undone
     /// and the user told. [`MAKE_LIMIT`], so a workbook made here opens anywhere.
@@ -619,7 +621,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, calculation_view: Vec::new(), memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -728,7 +730,12 @@ impl Doc {
     pub fn recalc(&mut self) {
         match self.recalc_budget {
             Some(b) => {
-                self.wb.recalc_for(b);
+                let view = self.calculation_view.as_slice();
+                if view.first().is_some_and(|r| r.sheet == self.sheet) {
+                    self.wb.recalc_for_view(b, view);
+                } else {
+                    self.wb.recalc_for(b);
+                }
             }
             None => {
                 self.wb.recalc();

@@ -669,11 +669,14 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   arrays, not cell by cell, so `=A2*B2` over a million rows is a loop over two `f64` slices.
 - **Parallel.** Independent groups and partitions of large groups run on a thread pool
   inside the document process.
-- **Visible first, never blocking.** Recalculation never holds the UI thread for more than
-  a slice (built as 12 ms slices between frames, §16.70; on-screen cells first not yet). Cells on screen
-  are computed first; cells still dirty draw their previous value greyed with a small
-  "calculating" mark in the status bar, so typing and scrolling never wait for a big
-  recalc. A new edit cancels and restarts the affected part.
+- **Visible-first recalculation.** Interactive slices prioritize dirty independent
+  scalar rows in the viewport, including split and frozen panes. The scheduler
+  brings bounded precedent ranges forward in dependency order. Formulas with broad
+  prerequisites wait for those inputs. Ordered fills, cycles, volatile formulas
+  and dependencies on unsettled spills use their regular evaluation path.
+  Each slice targets 12 ms and can finish the current wave (§16.70). Dirty cells
+  show their previous values in grey and the status bar shows “Calculating…”.
+  A new edit restarts the affected work.
 - **Lookup indexes.** Repeated `XLOOKUP`/`MATCH`/`VLOOKUP` over the same column build a
   hash or sorted index of that column once, invalidated by edits to it.
 - **Correctness bar:** results match Excel on a differential corpus of real workbooks
@@ -4032,6 +4035,22 @@ scene update. Commit timing also includes the first calculation slice.
 
 The measured slices can still exceed the 12 ms target. Timing covers app scene
 submission in the VM, while the installed check covers input and file lifecycle.
+
+**Visible-first check (2026-11-24).** The grid reports visible cell ranges when
+it paints, so the next slice follows the scroll position. Recalculation builds
+a bounded priority subset of the same dirty graph, evaluates ready ranges, and
+leaves the remaining rows for the regular pass. Whole-workbook recalculation
+and Save use the regular dependency pass.
+
+The `visible` mode of `recalc_responsiveness` scrolls twice into stale rows of
+the million-row native fixture. In three live Tessera-root trials, all 29
+visible rows refreshed in the next slice at both positions while an earlier
+offscreen witness stayed stale. The probe checks each visible result and both
+formula columns after the calculation finishes. The installed Save and picker
+reopen gate checks the cached results again. Grid tests cover shifted
+cross-sheet precedents, a wide aggregate waiting for its source, running
+totals in both directions, and cycles. Pergola tests cover viewport clipping,
+hidden cells, and frozen bands.
 
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 

@@ -1760,9 +1760,15 @@ impl Sheets {
         let (cmds, press) = (self.cmds.clone(), self.link_press.clone());
         let grid = self.grid.clone();
         let active = self.authoring.activation();
+        let viewport_doc = self.doc.clone();
         GridView::new(self.source.clone(), scroll, self.grid.clone(), rect)
             .key(0x6772_6964 + pane as u64 * 16)
             .display_editor(editor)
+            .on_visible(move |r| {
+                let mut doc = viewport_doc.borrow_mut();
+                let sheet = doc.sheet;
+                doc.calculation_view.push(officina_grid::Rect { sheet, r0: r.r0, r1: r.r1, c0: r.c0, c1: r.c1 });
+            })
             .on_activate(move || active.set(pane))
             .on_action(move |a| match a {
                 GridAction::Outline { rows, start, end } => {
@@ -2111,6 +2117,7 @@ impl View for Sheets {
 
         // The grid, with the cursor cell's comment beside it while not editing.
         self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none() && self.linking.get().is_none()).then_some(g.cursor));
+        self.doc.borrow_mut().calculation_view.clear();
         let rect = Self::grid_rect(w, h);
         let active = self.authoring.active(rect);
         for (pane, bounds, scroll) in self.authoring.panes(self, rect) {
@@ -2136,6 +2143,14 @@ impl View for Sheets {
             pergola::widgets::EditMode::Edit => "Edit",
         });
         let mut room = if mode.is_some() { 72.0 } else { 0.0 };
+        if self.doc.borrow().wb.recalc_pending() {
+            let notice = "Calculating…";
+            let style = st(type_size::XS, Weight::Semibold, t.text_secondary());
+            let width = Node::measure_text(notice, &style).w.ceil() + 2.0;
+            let x = (w - 12.0 - room - width).max(12.0);
+            ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: notice.into(), style });
+            room += width + 12.0;
+        }
         if macros {
             let notice = "Macros are inactive";
             let style = st(type_size::XS, Weight::Semibold, t.text_primary());
