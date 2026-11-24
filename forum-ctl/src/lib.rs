@@ -576,11 +576,20 @@ pub fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.flush()
 }
 
-/// Read one length-prefixed frame.
+/// The largest frame either side reads. Intents and replies are small
+/// (lists of surfaces, outputs, status nodes already bounded by
+/// `bound_nodes`); the cap stops a peer's length prefix from making the
+/// window manager allocate up to 4 GiB (review 2026-11-24, H5).
+pub const MAX_FRAME: usize = 1 << 20;
+
+/// Read one length-prefixed frame of at most [`MAX_FRAME`] bytes.
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let n = u32::from_le_bytes(len) as usize;
+    if n > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("forum-ctl frame of {n} bytes > {MAX_FRAME}")));
+    }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     Ok(buf)
@@ -635,5 +644,17 @@ mod tests {
         }
         let r = Reply::Appearance { dark: true, text_size_milli: 1300 };
         assert_eq!(decode::<Reply>(&encode(&r).unwrap()).unwrap(), r);
+    }
+
+    #[test]
+    fn oversized_frames_are_refused_before_allocating() {
+        let mut ok = Vec::new();
+        write_frame(&mut ok, b"abc").unwrap();
+        assert_eq!(read_frame(&mut &ok[..]).unwrap(), b"abc");
+        let huge = u32::MAX.to_le_bytes();
+        let e = read_frame(&mut &huge[..]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+        let edge = ((MAX_FRAME + 1) as u32).to_le_bytes();
+        assert_eq!(read_frame(&mut &edge[..]).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

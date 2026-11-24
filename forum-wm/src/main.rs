@@ -733,6 +733,13 @@ fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
         if let Some(uid) = peer_uid(&s) {
             eprintln!("forum-wm: forum-ctl: chrome connected (uid {uid})");
         }
+        /* One connection at a time is served here, so a client that connects
+         * and sends nothing would stall every other control request: bound
+         * the wait as the settings socket does (review 2026-11-24, H5). */
+        let limit = Some(std::time::Duration::from_secs(5));
+        if s.set_read_timeout(limit).is_err() || s.set_write_timeout(limit).is_err() {
+            continue;
+        }
         let intent = match forum_ctl::read_frame(&mut s)
             .ok()
             .and_then(|b| forum_ctl::decode::<forum_ctl::Intent>(&b).ok())
