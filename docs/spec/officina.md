@@ -4052,6 +4052,56 @@ cross-sheet precedents, a wide aggregate waiting for its source, running
 totals in both directions, and cycles. Pergola tests cover viewport clipping,
 hidden cells, and frozen bands.
 
+**Excel-saved workbook check (2026-11-24).** Four workbook originals come
+from the [SpreadsheetBench archive at revision 49b73a9](https://github.com/RUCKBReasoning/SpreadsheetBench/blob/49b73a94775fb489063f60ca1865e3a650079a79/data/spreadsheetbench_912_v0.1.tar.gz).
+The paths below are relative to `all_data_912_v0.1/spreadsheet` in that
+archive. The packages identify Microsoft Excel in their application
+properties and have a cached result for every source formula, including
+empty strings.
+
+Run `atrium-sheets/examples/excel_scale.rs` in release mode with
+`officina-convert` beside it. Give the probe an original XLSX and an empty
+output directory. It takes three trials on the same bytes and checks each
+formula cell's result after reopening each export with the Sheets loader.
+Open and reopen include the workbook read, subprocess conversion, and
+initial calculation. Recalculation is a separate full pass on the loaded
+workbook. Save measures the same XLSX encoder as the app followed by a write
+and sync to Tessera. The picker, document jail setup, and Scrinium's commit
+protocol are outside those timings. The timings are medians from a private
+arm64 HVF guest running FreeBSD 16-CURRENT on Tessera with four vCPUs and
+4 GiB RAM.
+
+| SpreadsheetBench input | Source formulas | Live formulas after reopen | Open | Recalculate | Save | Reopen |
+|---|---:|---:|---:|---:|---:|---:|
+| `55427/3_55427_answer.xlsx` | 1,418 | 1,418 | 2,599 ms | 1.0 ms | 64 ms | 2,536 ms |
+| `55392/1_55392_input.xlsx` | 16,669 | 16,642 | 6,920 ms | 389 ms | 91 ms | 7,110 ms |
+| `31745/1_31745_answer.xlsx` | 42,042 | 42,042 | 3,289 ms | 9.3 ms | 65 ms | 3,097 ms |
+| `59932/1_59932_answer.xlsx` | 36,344 | 15,950 | 8,386 ms | 262 ms | 286 ms | 6,537 ms |
+
+All twelve trials kept the Sheets-computed results of live formulas through
+reopen. On the installed desktop, ordinary Save through Scrinium and picker
+reopen in a new document jail also kept all 76,052 live formula results across
+the four cases. The probe's `check` mode compares the cached native recovery
+baselines from before Save and after picker reopen without recalculating.
+Compare original and exported packages with
+`python3 scripts/sheets-xlsx-cache-check.py ORIGINAL.xlsx EXPORT.xlsx …`.
+This checks what the packages actually stored before any reader can
+recalculate and treats a frozen formula as a fidelity difference even when
+its value matches:
+
+| Case | Matching live formulas | Different live results | Excel values kept in static cells |
+|---|---:|---:|---:|
+| Lookup (55427), including 106 saved errors | 1,418 | 0 | 0 |
+| Schedules (55392), including volatile dates and external references | 9,979 | 6,663 | 27 |
+| Shared fills (31745), using `--TEXTAFTER(…)` | 0 | 42,042 | 0 |
+| Ranking (59932), with external workbook links | 142 | 15,808 | 20,394 |
+
+Sheets reported the differences when opening the three affected workbooks.
+The formula follow-up is to cover `TEXTAFTER` and Excel's date-text coercion
+together, then reproduce the external-link results against the caches in
+the workbook. Keep these fixtures in the repeatable test. The outputs and
+trial logs are under `/private/tmp/atrium-sheets-excel`.
+
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 
 Sheets showed only a workbook's first sheet. A tab strip now sits under the grid: a press on a tab shows that sheet (at its top left; the filter and conditional-format panels about the last sheet close), **+** adds a sheet at the end and shows it, and ‹ › move the strip a tab at a time. Only the tabs that fit are measured and drawn (`atrium-sheets::tabs::visible`, `reveal`), so 3,000 sheets render as a few do. The Data menu gains Add Sheet and Rename Sheet…, which opens a bar in the strip's place; a taken name (case aside) or one with `[ ] : * ? / \` is refused with the reason, and formulas follow a rename because they name sheets by number.
