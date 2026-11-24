@@ -71,6 +71,9 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("RANDBETWEEN", 2, 2, randbetween, volatile),
     // statistics
     f!("MEDIAN", 1, N, median),
+    f!("LARGE", 2, 2, large),
+    f!("SMALL", 2, 2, small),
+    f!("SUBTOTAL", 2, N, subtotal),
     f!("STDEV", 1, N, stdev_s),
     f!("STDEV.S", 1, N, stdev_s),
     f!("STDEV.P", 1, N, stdev_p),
@@ -132,6 +135,8 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("XLOOKUP", 3, 6, xlookup),
     // dates
     f!("DATE", 3, 3, date),
+    f!("DATEVALUE", 1, 1, datevalue),
+    f!("EOMONTH", 2, 2, eomonth),
     f!("YEAR", 1, 1, year),
     f!("MONTH", 1, 1, month),
     f!("DAY", 1, 1, day),
@@ -769,6 +774,114 @@ fn median(c: &Ctx, a: &[Expr]) -> Ev {
     let m = v.len() / 2;
     n(if v.len() % 2 == 1 { v[m] } else { (v[m - 1] + v[m]) / 2.0 })
 }
+fn large(c: &Ctx, a: &[Expr]) -> Ev {
+    select_rank(c, a, true)
+}
+
+fn small(c: &Ctx, a: &[Expr]) -> Ev {
+    select_rank(c, a, false)
+}
+
+fn select_rank(c: &Ctx, a: &[Expr], descending: bool) -> Ev {
+    let mut values = Vec::new();
+    let mut overflow = false;
+    tri!(each_num(c, &a[..1], &mut |x| {
+        if values.len() < super::MAX_ARRAY as usize {
+            values.push(x);
+        } else {
+            overflow = true;
+        }
+    }));
+    if overflow {
+        return e(ErrorKind::Limit);
+    }
+    let rank = tri!(num(c, &a[1]));
+    if !(1.0..=values.len() as f64).contains(&rank) {
+        return e(ErrorKind::Num);
+    }
+    let index = if descending {
+        values.len() - rank.ceil() as usize
+    } else {
+        rank.trunc() as usize - 1
+    };
+    n(*values.select_nth_unstable_by(index, f64::total_cmp).1)
+}
+
+fn subtotal(c: &Ctx, a: &[Expr]) -> Ev {
+    let code = tri!(num(c, &a[0])).trunc() as u16;
+    let skip_hidden = match code {
+        1..=11 => false,
+        101..=111 => true,
+        _ => return e(ErrorKind::Value),
+    };
+    let op = code % 100;
+    let (mut count, mut nonempty) = (0u64, 0u64);
+    let mut total = match op {
+        4 => f64::NEG_INFINITY,
+        5 => f64::INFINITY,
+        6 => 1.0,
+        _ => 0.0,
+    };
+    let (mut mean, mut squares) = (0.0, 0.0);
+    let mut error = None;
+    for input in &a[1..] {
+        let range = match c.eval(input) {
+            Ev::R(range) => range,
+            Ev::V(Value::Err(err)) => return e(err),
+            _ => return e(ErrorKind::Value),
+        };
+        let sheet = c.wb.sheet(range.sheet);
+        c.wb.each_cell(&range, &mut |row, col, cell| {
+            use crate::column::Cell;
+            if error.is_some() || sheet.row_filtered(row)
+                || (skip_hidden && (sheet.row_hidden(row) || sheet.row_sizes.size(row) == 0.0))
+                || c.wb.is_subtotal(range.sheet, row, col)
+            {
+                return;
+            }
+            if !matches!(cell, Cell::Empty) {
+                nonempty += 1;
+            }
+            match cell {
+                Cell::Num(value) => {
+                    count += 1;
+                    match op {
+                        1 | 9 => total += value,
+                        4 => total = total.max(value),
+                        5 => total = total.min(value),
+                        6 => total *= value,
+                        7 | 8 | 10 | 11 => {
+                            let delta = value - mean;
+                            mean += delta / count as f64;
+                            squares += delta * (value - mean);
+                        }
+                        _ => {}
+                    }
+                }
+                Cell::Err(err) if op != 2 && op != 3 => error = Some(err),
+                _ => {}
+            }
+        });
+        if let Some(err) = error {
+            return e(err);
+        }
+    }
+    match op {
+        1 if count == 0 => e(ErrorKind::Div0),
+        1 => n(total / count as f64),
+        2 => n(count as f64),
+        3 => n(nonempty as f64),
+        7 | 10 if count < 2 => e(ErrorKind::Div0),
+        8 | 11 if count == 0 => e(ErrorKind::Div0),
+        7 => n((squares / (count - 1) as f64).sqrt()),
+        8 => n((squares / count as f64).sqrt()),
+        10 => n(squares / (count - 1) as f64),
+        11 => n(squares / count as f64),
+        _ if count == 0 => n(0.0),
+        _ => n(total),
+    }
+}
+
 fn variance(c: &Ctx, a: &[Expr], sample: bool) -> Result<f64, ErrorKind> {
     let v = collect(c, a)?;
     let k = v.len() as f64;
@@ -1532,8 +1645,29 @@ fn date(c: &Ctx, a: &[Expr]) -> Ev {
         None => e(ErrorKind::Num),
     }
 }
+fn datevalue(c: &Ctx, a: &[Expr]) -> Ev {
+    match c.scalar(&a[0]) {
+        Value::Str(text) => match c.wb.date_system().datevalue(&text) {
+            Some(serial) => n(serial),
+            None => e(ErrorKind::Value),
+        },
+        Value::Err(err) => e(err),
+        _ => e(ErrorKind::Value),
+    }
+}
+fn eomonth(c: &Ctx, a: &[Expr]) -> Ev {
+    let serial = tri!(num(c, &a[0]));
+    let months = tri!(num(c, &a[1]));
+    match c.wb.date_system().month_end(serial, months) {
+        Some(last_day) => n(last_day),
+        None => e(ErrorKind::Num),
+    }
+}
 fn ymd_part(c: &Ctx, a: &[Expr], part: usize) -> Ev {
-    let x = tri!(num(c, &a[0]));
+    date_part(c, &c.scalar(&a[0]), part)
+}
+fn date_part(c: &Ctx, value: &Value, part: usize) -> Ev {
+    let x = tri!(c.number(value));
     match c.wb.date_system().ymd(x) {
         Some((y, m, d)) => n([y, m, d][part] as f64),
         None => e(ErrorKind::Num),
@@ -1543,7 +1677,14 @@ fn year(c: &Ctx, a: &[Expr]) -> Ev {
     ymd_part(c, a, 0)
 }
 fn month(c: &Ctx, a: &[Expr]) -> Ev {
-    ymd_part(c, a, 1)
+    let value = c.scalar(&a[0]);
+    // Excel files use MONTH(header & 0) to turn a month name into its number.
+    if let Value::Str(text) = &value {
+        if let Some(month) = text.trim().strip_suffix('0').and_then(|s| super::dates::english_month(s.trim_end())) {
+            return n(f64::from(month));
+        }
+    }
+    date_part(c, &value, 1)
 }
 fn day(c: &Ctx, a: &[Expr]) -> Ev {
     ymd_part(c, a, 2)

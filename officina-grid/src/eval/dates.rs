@@ -199,7 +199,11 @@ impl DateSystem {
                 .filter(|field| !field.is_empty());
             let first = fields.next()?;
             let second = fields.next()?;
-            let third = fields.next()?;
+            let (second, third) = match fields.next() {
+                Some(third) => (second, third),
+                // A common compact spelling is "1-JAN" & YEAR.
+                None => second.split_at(second.find(|ch: char| ch.is_ascii_digit())?),
+            };
             if fields.next().is_some() || !text.starts_with(first) || !text.ends_with(third) {
                 return None;
             }
@@ -219,6 +223,41 @@ impl DateSystem {
         }
         let serial = self.date(year.into(), month.into(), day.into())?;
         (self.ymd(serial) == Some((year.into(), month.into(), day.into()))).then_some(serial)
+    }
+
+    pub(super) fn datevalue(self, text: &str) -> Option<f64> {
+        let text = text.trim();
+        if let Some(serial) = self.formula_text(text) {
+            return Some(serial.floor());
+        }
+        let (year, _, _) = self.ymd(self.now())?;
+        let separator = if text.contains('/') {
+            '/'
+        } else if text.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            '-'
+        } else {
+            ' '
+        };
+        self.formula_text(&format!("{text}{separator}{year}"))
+    }
+
+    pub(super) fn month_end(self, serial: f64, months: f64) -> Option<f64> {
+        let (year, month, _) = self.ymd(serial)?;
+        if !months.is_finite() || months.abs() > 120_000.0 {
+            return None;
+        }
+        let target = year * 12 + month - 1 + months.trunc() as i64;
+        let year = target.div_euclid(12);
+        let month = target.rem_euclid(12) + 1;
+        if !(1900..=9999).contains(&year) {
+            return None;
+        }
+        if (year, month) == (1900, 2) {
+            return self.from_1900(60.0);
+        }
+        let (next_year, next_month) = (year + i64::from(month == 12), month % 12 + 1);
+        let days = days_from_civil(next_year, next_month, 1) - days_from_civil(year, month, 1);
+        self.date(year as f64, month as f64, days as f64)
     }
 
     pub fn contains(self, serial: f64) -> bool {
@@ -269,7 +308,7 @@ fn numeric_date(text: &str, separator: char) -> Option<(u32, u32, u32)> {
     if fields.next().is_some() {
         return None;
     }
-    if separator == '-' && first.len() == 4 {
+    if first.len() == 4 {
         Some((text_year(first)?, date_digits(second, 1, 2)?, date_digits(third, 1, 2)?))
     } else {
         Some((text_year(third)?, date_digits(first, 1, 2)?, date_digits(second, 1, 2)?))
@@ -291,7 +330,7 @@ fn text_year(text: &str) -> Option<u32> {
     }
 }
 
-fn english_month(text: &str) -> Option<u32> {
+pub(super) fn english_month(text: &str) -> Option<u32> {
     const MONTHS: [&str; 12] = [
         "January", "February", "March", "April", "May", "June", "July", "August",
         "September", "October", "November", "December",
@@ -310,6 +349,9 @@ mod tests {
         let old = DateSystem::Excel1900;
         let mac = DateSystem::Excel1904;
         assert_eq!(mac.iso("1904-01-01"), Some((0.0, "yyyy-mm-dd")));
+        assert_eq!(mac.datevalue("1-JAN1904"), Some(0.0));
+        assert_eq!(mac.month_end(0.0, 1.0), Some(59.0));
+        assert_eq!(mac.month_end(0.0, -1.0), None);
         assert_eq!(mac.iso("1904-02-29"), Some((59.0, "yyyy-mm-dd")));
         assert_eq!(old.iso("1904-02-29"), Some((1521.0, "yyyy-mm-dd")));
         assert_eq!(mac.iso("1904-01-02T00:30:00+01:00"), mac.iso("1904-01-01T23:30:00Z"));

@@ -1874,6 +1874,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     for (sheet, rows) in saved_filter_rows {
         wb.restore_table_visibility(sheet, Some(&rows));
     }
+    if wb.recalc_pending() {
+        wb.recalc();
+    }
     for (a, want) in cached {
         let got = wb.get(a);
         if !same(&got, &want) {

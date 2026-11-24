@@ -190,6 +190,7 @@ pub struct Workbook {
     /// Groups (and their rows) to evaluate at the next recalculation.
     pub(crate) pending: HashMap<GroupId, RowSet>,
     pub(crate) volatile: HashSet<GroupId>,
+    subtotals: HashSet<GroupId>,
     lookup: Mutex<HashMap<LookupKey, (u64, Arc<LookupIndex>)>>,
     /// Dynamic arrays spilled, by anchor ([`crate::spill`]).
     pub(crate) spills: HashMap<CellAddr, crate::spill::Spill>,
@@ -242,6 +243,7 @@ impl Workbook {
             changed: Vec::new(),
             pending: HashMap::new(),
             volatile: HashSet::new(),
+            subtotals: HashSet::new(),
             lookup: Mutex::new(HashMap::new()),
             spills: HashMap::new(),
             blocked: HashMap::new(),
@@ -728,9 +730,12 @@ impl Workbook {
 
     pub(crate) fn add_group(&mut self, sheet: u16, col: u32, r0: u32, r1: u32, expr: Arc<Expr>, dirty: Option<(u32, u32)>) -> GroupId {
         let mut volatile = false;
+        let mut subtotal = false;
         expr.walk(&mut |n| {
             if let Expr::Call(Func::Known(id), _) = n {
-                volatile |= funcs::FUNCS[*id as usize].volatile;
+                let spec = &funcs::FUNCS[*id as usize];
+                volatile |= spec.volatile;
+                subtotal |= spec.name == "SUBTOTAL";
             }
         });
         let fps = footprints(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));
@@ -763,10 +768,25 @@ impl Workbook {
         if volatile {
             self.volatile.insert(id);
         }
+        if subtotal {
+            self.subtotals.insert(id);
+        }
         if let Some((a, b)) = dirty {
             self.pending.entry(id).or_default().add(a, b);
         }
         id
+    }
+
+    pub(crate) fn invalidate_subtotals(&mut self) {
+        for &id in &self.subtotals {
+            let group = self.groups[id as usize].as_ref().unwrap();
+            self.pending.entry(id).or_default().add(group.r0, group.r1);
+        }
+    }
+
+    pub(crate) fn is_subtotal(&self, sheet: u16, row: u32, col: u32) -> bool {
+        !self.subtotals.is_empty()
+            && self.group_at(sheet, row, col).is_some_and(|id| self.subtotals.contains(&id))
     }
 
     /// Takes a group out. With `keep_pending` its pending rows move to whatever replaces
@@ -778,6 +798,7 @@ impl Workbook {
         }
         self.sheets[grp.sheet as usize].fidx[grp.col as usize].remove(&grp.r0);
         self.volatile.remove(&g);
+        self.subtotals.remove(&g);
         self.free_groups.push(g);
         let p = self.pending.remove(&g);
         if keep_pending {

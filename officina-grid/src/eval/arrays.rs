@@ -15,6 +15,8 @@ const ALL: u32 = u32::MAX;
 /// positions (bits) they lift over: given arrays there they give an array.
 const LIFT: &[(&str, u32)] = &[
     ("ABS", ALL),
+    ("LARGE", 0b10),
+    ("SMALL", 0b10),
     ("ROUND", ALL),
     ("ROUNDUP", ALL),
     ("ROUNDDOWN", ALL),
@@ -57,6 +59,8 @@ const LIFT: &[(&str, u32)] = &[
     ("TEXT", ALL),
     ("EXACT", ALL),
     ("DATE", ALL),
+    ("DATEVALUE", ALL),
+    ("EOMONTH", ALL),
     ("YEAR", ALL),
     ("MONTH", ALL),
     ("DAY", ALL),

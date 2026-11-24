@@ -488,6 +488,12 @@ impl Sheet {
         contains_row(&self.hidden, r) || contains_row(&self.table_hidden, r) || self.outline(crate::shift::Axis::Rows).hides(r)
     }
 
+    pub(crate) fn row_filtered(&self, row: u32) -> bool {
+        contains_row(&self.table_hidden, row) || self.filter.as_ref().is_some_and(|filter| {
+            row > filter.rect.r0 && row <= filter.rect.r1 && contains_row(&self.hidden, row)
+        })
+    }
+
     pub fn table_hidden(&self) -> &[(u32, u32)] {
         &self.table_hidden
     }
@@ -534,6 +540,7 @@ impl Workbook {
         let sh = self.sheet_mut(st.sheet);
         sh.filter = st.filter;
         sh.hidden = merge(st.hidden);
+        self.invalidate_subtotals();
         old
     }
 
@@ -633,11 +640,15 @@ impl Workbook {
     }
 
     pub(crate) fn rebuild_table_visibility(&mut self, sheet: u16) {
-        self.sheets[sheet as usize].table_hidden = merge(self.tables.iter()
+        let hidden = merge(self.tables.iter()
             .filter(|t| t.rect.sheet == sheet)
             .filter_map(|t| t.filter.as_ref().map(|f| (t.rect.r0, f)))
             .flat_map(|(base, f)| f.hidden.iter().map(move |(a, b)| (a + base, b + base)))
             .collect());
+        if self.sheets[sheet as usize].table_hidden != hidden {
+            self.sheets[sheet as usize].table_hidden = hidden;
+            self.invalidate_subtotals();
+        }
     }
 
     /// Foreign row visibility is sheet-wide. Attribute saved hidden rows to the

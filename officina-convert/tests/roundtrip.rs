@@ -434,3 +434,45 @@ fn ods_keeps_basic_byte_for_byte() {
     assert!(officina_convert::ods::read(&officina_convert::ods::write(&x, Vec::new()).unwrap()).unwrap().0.macros().is_none());
     assert!(xlsx::read(&xlsx::write_xlsm(&wb, Vec::new()).unwrap()).unwrap().0.macros().is_none());
 }
+
+#[test]
+fn visibility_aware_subtotals_reopen_as_formulas_in_xlsx_and_ods() {
+    use officina_grid::filter::{AutoFilter, Cond, FilterState};
+    use officina_grid::Rect;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Source").unwrap();
+    wb.add_sheet("Totals").unwrap();
+    let source = |row| CellAddr::new(0, row, 0);
+    let total = |row| CellAddr::new(1, row, 0);
+    wb.set_value(source(0), Value::str("Amount"));
+    for (row, value) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+        wb.set_value(source(row), Value::Num(value));
+    }
+    let filter = FilterState {
+        sheet: 0,
+        filter: Some(AutoFilter {
+            rect: Rect { sheet: 0, r0: 0, r1: 2, c0: 0, c1: 0 },
+            conds: vec![(0, Cond::Values(vec!["10".into()]))],
+        }),
+        hidden: vec![(2, 3)],
+    };
+    wb.replace_filter(filter);
+    wb.set_formula(total(0), "=SUBTOTAL(9,Source!A2:A4)").unwrap();
+    wb.set_formula(total(1), "=SUBTOTAL(109,Source!A2:A4)").unwrap();
+    wb.recalc();
+    let xlsx = xlsx::write(&wb, Vec::new()).unwrap();
+    let ods = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    for mut reopened in [
+        xlsx::read(&xlsx).unwrap().0,
+        officina_convert::ods::read(&ods).unwrap().0,
+    ] {
+        assert_eq!(reopened.get(total(0)), Value::Num(40.0));
+        assert_eq!(reopened.get(total(1)), Value::Num(10.0));
+        assert!(reopened.group_at(1, 0, 0).is_some());
+        assert!(reopened.group_at(1, 1, 0).is_some());
+        reopened.set_value(source(1), Value::Num(15.0));
+        reopened.recalc();
+        assert_eq!(reopened.get(total(0)), Value::Num(45.0));
+        assert_eq!(reopened.get(total(1)), Value::Num(15.0));
+    }
+}

@@ -633,6 +633,25 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
 - **External** functions (`WEBSERVICE`, stock and currency data, links to other workbooks)
   are off until the user allows them for this document (§11.2).
 
+- **Ranked values and subtotals.** LARGE and SMALL select the requested
+  numeric rank, keeping ties and propagating input errors. For an in-range
+  fractional rank, LARGE rounds up and SMALL truncates. SUBTOTAL supports codes 1–11 and 101–111, skips nested
+  subtotals and filtered rows, and excludes manual hides and collapsed native
+  outlines for codes 101–111. Sheet and table filter changes, row sizes, and
+  outline changes invalidate subtotal groups and their dependents. Older
+  workbooks store worksheet-filter and manual hides together. A saved hide
+  inside the active worksheet filter's data range is interpreted as a filtered
+  row, consistent with the existing filter state.
+  [Microsoft LARGE](https://support.microsoft.com/en-us/excel/functions/large-function)
+  [Microsoft SUBTOTAL](https://support.microsoft.com/en-us/excel/functions/subtotal-function)
+- **Date headers.** MONTH accepts English month labels followed by zero in
+  Excel's `MONTH(header & 0)` idiom. DATEVALUE uses the workbook date system
+  and recognizes explicit ISO, US numeric and English named dates, including
+  `1-JAN2021`. An omitted year uses the current year. ISO time components
+  are discarded by DATEVALUE. EOMONTH calculates the last day of an offset
+  month in the same date system.
+  [Microsoft DATEVALUE](https://support.microsoft.com/en-us/excel/functions/datevalue-function)
+  [Microsoft EOMONTH](https://support.microsoft.com/en-us/excel/functions/eomonth-function)
 - **Closed workbook references in XLSX and XLSM.** The converter keeps a
   formula that directly refers to another workbook as its last saved result,
   including shared fills and array results. A direct single-cell reference
@@ -4175,6 +4194,35 @@ The focused converter tests exercise a missing
 consuming cache, quoted names, direct and shared links, array values,
 a missing link, and local recalculation after an edit and a reopen.
 Evidence is under `/private/tmp/atrium-sheets-external`.
+
+**Rank, subtotal, and date-header check (2026-11-24).** The ranking corpus
+uses LARGE in 3,399 formulas that previously imported as static values.
+They now recalculate through XLSX Save and reopen. The schedules workbook
+uses SUBTOTAL on its budget tables and uses DATEVALUE and EOMONTH for date
+headers. Its monthly SUMPRODUCT formulas depend on `MONTH(header & 0)`.
+Resolving the month label lets the calculation produce numeric zero for
+empty months and retain nonzero totals and dependent results.
+
+Three Save and reopen trials per input preserved the Sheets-computed values.
+Ranking matched all 36,344 Excel results, including 10,981 live formulas and
+25,363 static external-link values. The schedules workbook now keeps all
+16,669 formulas live. At the guest's current date, its 25 year and date
+header results followed the clock. With the isolated guest set to June 15,
+2021, the source workbook's saved year, all 16,669 matched the Excel caches
+in all three trials. The lookup and shared-formula cases retained their
+previous exact matches. Installed Save and picker reopen in fresh document
+jails preserved all 71,110 live formula results across the four workbooks.
+
+The two 26-case Excel rank-function references and a 27-case subtotal
+fixture matched. A second subtotal fixture's collapsed Excel outline
+differs for code 9 because the XLSX importer retains the hidden rows
+without the outline state. Several comparison cells in the same fixture
+also differ.
+
+The focused checks cover rank arrays, invalid ranks, ties, filter and
+outline changes, undo, nested subtotals, cross-sheet dependents, edits
+after XLSX and ODS reopen, and both date systems. Evidence is under
+`/private/tmp/atrium-sheets-aggregates`.
 
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 

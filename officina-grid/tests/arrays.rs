@@ -42,6 +42,8 @@ const CASES: &[(&str, &str)] = &[
     (r#"=IFERROR(E10:E12,"fallback")"#, ";;"),
     (r#"=TEXTAFTER({"a-x";"b:y";"missing"},{"-",":"},1,,,7)"#, "x;y;7"),
     (r#"=--TEXTAFTER({"Sun, 1 January 2023";"Mon, 2 January 2023"},", ")"#, "44927;44928"),
+    ("=LARGE(A1:A5,{1;3})", "5;3"),
+    ("=SMALL(A1:A5,{1;3})", "1;3"),
     // making arrays
     ("=SEQUENCE(3)", "1;2;3"),
     ("=SEQUENCE(2,3)", "1,2,3;4,5,6"),

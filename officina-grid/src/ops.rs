@@ -759,6 +759,9 @@ impl Op<Workbook> for GridOp {
             GridOp::Outline { sheet, axis, mut outline } => {
                 if let Some(sh) = wb.sheets.get_mut(sheet as usize) {
                     std::mem::swap(&mut sh.outlines[axis.index()], &mut outline);
+                    if axis == crate::shift::Axis::Rows {
+                        wb.invalidate_subtotals();
+                    }
                 }
                 GridOp::Outline { sheet, axis, outline }
             }
@@ -809,6 +812,9 @@ impl Op<Workbook> for GridOp {
                     sheet, rows, default: sizes.default, over: sizes.overrides().to_vec(),
                 };
                 *sizes = crate::column::Sizes::from_parts(default, over);
+                if rows {
+                    wb.invalidate_subtotals();
+                }
                 old
             }
             GridOp::Sizes { sheet, rows, over } => {
@@ -819,6 +825,9 @@ impl Op<Workbook> for GridOp {
                 let sizes = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
                 let old = sizes.overrides().to_vec();
                 *sizes = crate::column::Sizes::from_overrides(sizes.default, over);
+                if rows {
+                    wb.invalidate_subtotals();
+                }
                 GridOp::Sizes { sheet, rows, over: old }
             }
             GridOp::Batch(ops) => {

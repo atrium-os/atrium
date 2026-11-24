@@ -1519,6 +1519,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     for sheet in 0..wb.sheet_count() as u16 {
         wb.restore_table_visibility(sheet, None);
     }
+    if wb.recalc_pending() {
+        wb.recalc();
+    }
     // The differential: our results against the file's.
     differential(&wb, cached, &mut out, &mut rep);
     // Macros, kept inert.
