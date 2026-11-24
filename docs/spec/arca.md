@@ -931,6 +931,61 @@ or network effects. The signed fixture gate verifies the process
 boundaries and the three sheet outcomes for the fixture. The production
 path for arbitrary received messages remains disabled.
 
+##### Account enrollment and received-message review
+
+The signed fixture reserves the selected account, local message ID and
+exact RFC 5322 bytes. It authenticates the launch through Portcullis and
+checks the digest returned by the jailed parser. These checks bind the
+approval to a snapshot. Portcullis attests the user, signed Mail
+publisher and persona. Its registry carries no mail account identity.
+The legacy key lookup scopes by user, persona, publisher, certificate
+digest and key fingerprint. Its stored account field is a display
+label. In the fixture, the only Work account can enroll a built-in key
+on its first approved open. The existing provisioning, discovery and
+forget operations apply to the separate OAEP recipient. Mail account
+removal cleans up the account's credential items and local data.
+
+A production enrollment needs a stable instance binding that Arca can
+validate independently of a Mail store ID. An Arca-issued opaque handle
+can identify the enrolled account and its generation. The trusted
+enrollment must associate that handle with the authenticated receiving
+account, local user, launch persona and Mail publisher. The trusted
+sheet should identify the account and obtain explicit approval before
+storing a matching certificate and dedicated legacy key. The enrolled
+identity may include explicitly confirmed receiving aliases. Envelope
+and message headers and provider authentication results convey no
+enrollment authority. Opening the first received message must never
+create or repair an enrollment. Keep the existing key-purpose exclusion
+across a user's accounts, personas and publishers.
+
+Reserve the account handle and generation with the signed launch and
+message snapshot. Mail must resolve the account from the selected
+stored message or its mailbox location. Arca must check the active
+enrollment and generation before private-key use and before publishing
+the result. The jailed worker receives bounded complete stored bytes,
+validates the top-level profile, and returns a witness for the actual
+bytes and the unique enrolled recipient. Keep routing explicit for
+legacy and OAEP. The preview remains local and bypasses the ordinary
+reader's Seen path, external content and mailbox operations.
+
+Give the user a dedicated forget action. Account removal and persona
+erasure must also invalidate the enrollment and revoke outstanding
+reservations, worker calls and previews. Invalidate the account binding
+before reporting revocation complete. If deletion of the sealed item
+needs a retry, the old binding must stay unusable and the cleanup must
+be idempotent. Re-adding the same address produces a new account
+instance. A changed account identity or publisher requires a new
+explicit enrollment.
+
+The next synthetic gate should use two accounts in the same persona
+with distinct keys. Check that only the selected enrolled account can
+open, that an approved alias works only for its own enrollment, and that
+removal, re-addition, or a changed account during an open invalidates the
+old authorization. Exercise these cases through signed Mail, the
+trusted enrollment sheet and the jailed reader, with one generic
+refusal and no outcome-dependent mailbox writes. The existing six
+whole-path timing trials cover two operational failures only.
+
 ##### Failure observability review
 
 - **Remote sender and mailbox provider.** The current legacy operation

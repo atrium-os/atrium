@@ -1135,6 +1135,12 @@ remote-picture loading. A mailbox provider can observe ordinary read
 activity. The production gate must verify that the legacy action itself
 adds no outcome-dependent mailbox changes or external activity.
 
+The selected local message supplies the account association. Mail's
+numeric account ID indexes its own database. The private-key request
+must also carry the enrolled account instance that Arca can validate
+and revoke. Removing the account or changing its receiving identity
+invalidates the old enrollment, including any open approval.
+
 See [Arca §9.2.1](arca.md#921-proposed-legacy-smime-receive-operation),
 [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),
 and [RFC 3218](https://www.rfc-editor.org/rfc/rfc3218.html).
