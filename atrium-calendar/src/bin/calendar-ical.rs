@@ -433,9 +433,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         {
             return Err(Issue::Scheduling);
         }
-        if e.original.is_some() && e.weekly
-            || e.this_and_future && (cancelled || !children.is_empty())
-        {
+        if e.original.is_some() && e.weekly || e.this_and_future && !children.is_empty() {
             return Err(Issue::Recurrence);
         }
         let occurrence = |stamp: Stamp| -> Result<_> {
@@ -1355,7 +1353,7 @@ mod tests {
                 uid: p.uid.clone(),
                 sequence: p.sequence,
                 organizer: p.organizer.clone(),
-                cancelled: false,
+                cancelled: p.row.is_none(),
                 scope: p.scope(),
             }),
         }
@@ -1519,7 +1517,7 @@ mod tests {
                 .as_bytes(),
             true
         )
-        .is_err());
+        .is_ok());
         assert!(parse_mode(
             RANGE_REQUEST
                 .replace(
@@ -1530,6 +1528,333 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    const CANCEL_FUTURE: &str = include_str!("../../tests/fixtures/cancel-future.ics");
+
+    #[test]
+    fn range_cancellation_uses_original_dates_and_undo_restores_the_open_tail() {
+        use atrium_calendar::{
+            invitation::{SkipDecision, SkipEffect},
+            EditScope,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(&mut store, 0, weekly).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let t = review_range(&mut store, 1, RANGE_REQUEST).token.unwrap();
+        store.apply_invitation(1, t).unwrap();
+        let move_here = |s: &mut Store, rev, day: &str, to: &str| {
+            let shown = date(day);
+            let row = s.day(shown).entries.pop().unwrap();
+            let mut edit = row.fields_on(shown);
+            edit.date = date(to);
+            edit.span = Span {
+                start: 675,
+                end: 720,
+            };
+            s.change(rev, row.id, shown, EditScope::ThisEvent, Some(edit))
+                .unwrap();
+            row.id
+        };
+        let before = move_here(&mut store, 2, "2026-12-09", "2026-12-18");
+        let moved = move_here(&mut store, 3, "2026-12-23", "2026-12-11");
+        let text = CANCEL_FUTURE.replace("SEQUENCE:2", "SEQUENCE:3");
+        let r = review_range(&mut store, 4, &text);
+        assert_eq!(
+            r.skips.iter().map(|s| s.effect).collect::<Vec<_>>(),
+            [
+                SkipEffect::KeepEarlier,
+                SkipEffect::Cancel,
+                SkipEffect::ChooseLocalMove,
+                SkipEffect::Cancel
+            ]
+        );
+        assert_eq!(
+            r.skips[1].current.as_ref().unwrap().date,
+            date("2026-12-16")
+        );
+        assert_eq!(
+            r.skips[2].current.as_ref().unwrap().date,
+            date("2026-12-11")
+        );
+        let t = r.token.unwrap();
+        assert!(store.apply_invitation(4, t).is_err());
+        assert!(store
+            .apply_reviewed_invitation(
+                4,
+                t,
+                &[SkipDecision {
+                    original: date("2026-12-11"),
+                    keep: true
+                }]
+            )
+            .is_err());
+        let far = date("2026-12-09") + chrono::Days::new(7 * 2500);
+        let distant_id = store.day(far).entries[0].id;
+        let mut decision = SkipDecision {
+            original: date("2026-12-22"),
+            keep: true,
+        };
+        let undo = store
+            .apply_reviewed_invitation(4, t, &[decision])
+            .unwrap()
+            .1;
+        assert!(store.day(far).entries.is_empty());
+        let copy = store.day(date("2026-12-11")).entries.pop().unwrap();
+        assert_eq!((copy.id, copy.kind), (moved, Kind::Appointment));
+        assert!(copy.invitation.is_none());
+        assert_eq!(store.day(date("2026-12-18")).entries[0].id, before);
+        assert_eq!(store.day(date("2026-12-01")).entries[0].span.start, 840);
+        assert!(review_range(&mut store, 5, &text).token.is_none());
+        assert!(
+            review_range(&mut store, 5, &weekly.replace("SEQUENCE:1", "SEQUENCE:4"))
+                .token
+                .is_none()
+        );
+        store.undo(undo).unwrap();
+        assert!(store.undo(undo).is_err());
+        assert_eq!(store.day(far).entries[0].id, distant_id);
+        assert!(store.day(date("2026-12-11")).entries[0]
+            .invitation
+            .is_some());
+        decision.keep = false;
+        let t = review_range(&mut store, 6, &text).token.unwrap();
+        assert!(store.apply_reviewed_invitation(4, t, &[decision]).is_err());
+        store.apply_reviewed_invitation(6, t, &[decision]).unwrap();
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(
+            store.day(far).entries.is_empty() && store.day(date("2026-12-11")).entries.is_empty()
+        );
+        assert_eq!(store.day(date("2026-12-18")).entries[0].id, before);
+        assert!(review_range(&mut store, 7, &text).token.is_none());
+    }
+
+    #[test]
+    fn private_copy_decisions_are_independent_when_two_moves_share_a_saved_day() {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(&mut store, 0, weekly).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let destination = date("2026-12-11");
+        let first = date("2026-12-15");
+        let second = date("2026-12-22");
+        for (index, day) in [first, second].into_iter().enumerate() {
+            let source = store.day(day).entries.pop().unwrap();
+            let mut fields = source.fields_on(day);
+            fields.date = destination;
+            fields.span = Span {
+                start: 600 + index as u16 * 60,
+                end: 645 + index as u16 * 60,
+            };
+            store
+                .change(
+                    1 + index as u64,
+                    source.id,
+                    day,
+                    EditScope::ThisEvent,
+                    Some(fields),
+                )
+                .unwrap();
+        }
+        let baseline = store.day(destination).entries;
+        assert_eq!(baseline.len(), 2);
+        let t = review_range(&mut store, 3, CANCEL_FUTURE).token.unwrap();
+        let keep = SkipDecision {
+            original: second,
+            keep: true,
+        };
+        assert!(store
+            .apply_reviewed_invitation(3, t, &[keep, keep])
+            .is_err());
+        assert_eq!(store.day(destination).entries.len(), 2);
+        let undo = store
+            .apply_reviewed_invitation(
+                3,
+                t,
+                &[
+                    keep,
+                    SkipDecision {
+                        original: first,
+                        keep: false,
+                    },
+                ],
+            )
+            .unwrap()
+            .1;
+        let copies = store.day(destination).entries;
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].id, baseline[1].id);
+        assert_eq!(copies[0].kind, Kind::Appointment);
+        store.undo(undo).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.day(destination).entries).unwrap(),
+            serde_json::to_value(baseline).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_large_cancellation_choice_list_round_trips_through_fasti() {
+        use atrium_calendar::{invitation::SkipDecision, wire, CalendarPage, EditScope};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(&mut store, 0, weekly).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let start = date("2026-12-15");
+        let mut choices = Vec::new();
+        for week in 0..120 {
+            let original = start + chrono::Days::new(week * 7);
+            let row = store.day(original).entries.pop().unwrap();
+            let mut edit = row.fields_on(original);
+            edit.date = original.succ_opt().unwrap();
+            store
+                .change(week + 1, row.id, original, EditScope::ThisEvent, Some(edit))
+                .unwrap();
+            choices.push(SkipDecision {
+                original,
+                keep: week % 2 == 0,
+            });
+        }
+        let p = range_proposal(CANCEL_FUTURE);
+        let review = wire::Request::ReviewInvitation {
+            revision: 121,
+            source: range_source(&p),
+            proposal: p,
+        };
+        let socket = dir.path().join("fasti.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut served = 0;
+                while served < 2 {
+                    match listener.accept() {
+                        Ok((mut client, _)) => {
+                            wire::serve(&mut client, &mut store).unwrap();
+                            served += 1;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "Missing Fasti test request"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(e) => panic!("Fasti test listener failed: {e}"),
+                    }
+                }
+            });
+            let r: atrium_calendar::invitation::Review = wire::exchange(&socket, &review).unwrap();
+            let apply = wire::Request::ApplyInvitation {
+                revision: 121,
+                token: r.token.unwrap(),
+                choices,
+            };
+            assert!(serde_json::to_vec(&apply).unwrap().len() > 4096);
+            let page: CalendarPage = wire::exchange(&socket, &apply).unwrap();
+            assert_eq!(page.revision, 122);
+        });
+        assert_eq!(
+            store.day(start.succ_opt().unwrap()).entries[0].kind,
+            Kind::Appointment
+        );
+        assert!(store.day(start + chrono::Days::new(8)).entries.is_empty());
+    }
+
+    #[test]
+    fn range_cancellation_checks_delivery_and_newer_exceptions_before_removing_any_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let t = review_range(&mut store, 0, RANGE_MASTER).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let p = range_proposal(CANCEL_FUTURE);
+        for fault in 0..4 {
+            let mut mail = range_source(&p);
+            match fault {
+                0 => mail.verified = false,
+                1 => mail.from = "other@fixture.invalid".into(),
+                2 => mail.delivery.as_mut().unwrap().scope = Some(p.original.unwrap().property()),
+                _ => mail.delivery.as_mut().unwrap().cancelled = false,
+            }
+            assert!(store
+                .review_invitation(1, &mail, p.clone())
+                .ok()
+                .and_then(|r| r.token)
+                .is_none());
+        }
+        let new = include_str!("../../tests/fixtures/move-one.ics")
+            .replace("SEQUENCE:2", "SEQUENCE:5")
+            .replace("20261208T", "20261222T")
+            .replace("20261209T", "20261223T");
+        let t = review_range(&mut store, 1, &new).token.unwrap();
+        store.apply_invitation(1, t).unwrap();
+        assert!(review_range(&mut store, 2, CANCEL_FUTURE).token.is_none());
+        assert_eq!(store.day(date("2026-12-17")).entries.len(), 1);
+        let fresh = CANCEL_FUTURE
+            .replace("SEQUENCE:2", "SEQUENCE:6")
+            .replace("20261215T", "20261201T");
+        let r = review_range(&mut store, 2, &fresh);
+        assert_eq!(r.skips.len(), 4);
+        let undo = store.apply_invitation(2, r.token.unwrap()).unwrap().1;
+        assert!(store.day(date("2026-12-01")).entries.is_empty());
+        assert!(store.day(date("2026-12-23")).entries.is_empty());
+        assert!(review_range(&mut store, 3, &fresh).token.is_none());
+        store.undo(undo).unwrap();
+        assert_eq!(store.day(date("2026-12-23")).entries.len(), 1);
+        // A newer detached meeting in the prefix cannot invalidate a cancellation of the tail.
+        let last = CANCEL_FUTURE
+            .replace("20261215T", "20261222T")
+            .replace("SEQUENCE:2", "SEQUENCE:6");
+        let update_before =
+            include_str!("../../tests/fixtures/move-one.ics").replace("SEQUENCE:2", "SEQUENCE:7");
+        let t = review_range(&mut store, 4, &update_before).token.unwrap();
+        store.apply_invitation(4, t).unwrap();
+        let keep = store.day(date("2026-12-09")).entries[0].id;
+        let t = review_range(&mut store, 5, &last).token.unwrap();
+        let undo = store.apply_invitation(5, t).unwrap().1;
+        assert_eq!(store.day(date("2026-12-09")).entries[0].id, keep);
+        store.undo(undo).unwrap();
+
+        // The starting meeting can itself be a private move, even at DTSTART.
+        let day = date("2026-12-01");
+        let row = store.day(day).entries.pop().unwrap();
+        let mut edit = row.fields_on(day);
+        edit.date = date("2026-11-30");
+        store
+            .change(
+                7,
+                row.id,
+                day,
+                atrium_calendar::EditScope::ThisEvent,
+                Some(edit),
+            )
+            .unwrap();
+        let t = review_range(&mut store, 8, &fresh.replace("SEQUENCE:6", "SEQUENCE:8"))
+            .token
+            .unwrap();
+        assert!(store.apply_invitation(8, t).is_err());
+        store
+            .apply_reviewed_invitation(
+                8,
+                t,
+                &[atrium_calendar::invitation::SkipDecision {
+                    original: day,
+                    keep: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.day(date("2026-11-30")).entries[0].kind,
+            Kind::Appointment
+        );
+        assert!(store.day(day).entries.is_empty());
     }
 
     #[test]

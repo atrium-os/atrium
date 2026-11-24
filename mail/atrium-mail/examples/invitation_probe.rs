@@ -28,8 +28,9 @@ fn seed(e: &Engine, mode: &str) {
     let grouped = mode == "seed-cancel-dates";
     let skipped = mode == "seed-exdates";
     let long = mode == "seed-long-range";
+    let cancel_future = mode == "seed-cancel-future";
     let future = mode == "seed-future" || long;
-    let bounded = mode == "seed-bounded" || grouped || skipped || future;
+    let bounded = mode == "seed-bounded" || grouped || skipped || future || cancel_future;
     assert!(e.store.accounts().unwrap().is_empty());
     let account = e.store.add_account("dev@fixture.invalid").unwrap();
     let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
@@ -46,7 +47,15 @@ fn seed(e: &Engine, mode: &str) {
         .replace("20261209T160000Z", "20270310T180000Z")
         .replace("20261209T170000Z", "20270310T190000Z");
     let spring_scope = FUTURE_SCOPE.replace("20261208", "20270309");
-    let messages: &[(&str, &str)] = if long {
+    let messages: &[(&str, &str)] = if cancel_future {
+        &[
+            ("Weekly studio meetings", WEEKLY),
+            (
+                "Cancel December 15 onward",
+                include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics"),
+            ),
+        ]
+    } else if long {
         &[
             ("Twelve studio meetings", &twelve),
             ("Move the remaining meetings", FUTURE),
@@ -130,6 +139,8 @@ fn seed(e: &Engine, mode: &str) {
         if series || bounded {
             use portcullis_ipc::calendar::{Answer, Reply};
             let scope = match (bounded, id) {
+                (true, 1) if cancel_future => Some("weekly".into()),
+                (true, 2) if cancel_future => Some(FUTURE_SCOPE.replace("20261208", "20261215")),
                 (true, 1) if long => Some("weekly;COUNT=12".into()),
                 (true, 3) if long => Some("weekly".into()),
                 (true, 4) if long => Some(spring_scope.clone()),
@@ -148,7 +159,7 @@ fn seed(e: &Engine, mode: &str) {
                 (false, 2 | 4) => Some(ORIGINAL.into()),
                 _ => None,
             };
-            if grouped || skipped || future {
+            if grouped || skipped || future || cancel_future {
                 assert_eq!(
                     e.selected_invitation(msg)
                         .unwrap()
@@ -344,7 +355,7 @@ fn main() {
     );
     match args[1].as_str() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
-        | "seed-future" | "seed-long-range") => seed(&e, mode),
+        | "seed-future" | "seed-long-range" | "seed-cancel-future") => seed(&e, mode),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),

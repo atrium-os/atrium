@@ -4,8 +4,19 @@ use crate::invitation::{IncludedMove, SkipDecision, SkipEffect, SkipReview};
 
 pub(super) struct LocalMove {
     original: NaiveDate,
-    series: Uuid,
+    series: Option<Uuid>,
     child: Uuid,
+}
+
+impl LocalMove {
+    /// The prepared snapshot already contains a standalone private appointment.
+    pub(super) fn private_copy(original: NaiveDate, child: Uuid) -> Self {
+        Self {
+            original,
+            series: None,
+            child,
+        }
+    }
 }
 
 pub(super) fn prepare(
@@ -68,7 +79,7 @@ pub(super) fn prepare(
                 } else {
                     conflicts.push(LocalMove {
                         original: date,
-                        series: row.id,
+                        series: Some(row.id),
                         child: child.id,
                     });
                     SkipEffect::ChooseLocalMove
@@ -112,9 +123,12 @@ pub(super) fn resolve(
             .ok_or("Missing decision for a local move")?;
         if !decision.keep {
             rows.retain(|r| r.id != conflict.child);
+            let Some(series) = conflict.series else {
+                continue;
+            };
             let origin = rows
                 .iter_mut()
-                .find(|r| r.id == conflict.series)
+                .find(|r| r.id == series)
                 .and_then(|r| r.invitation.as_mut())
                 .ok_or("Missing reviewed series")?;
             origin.owned_skips.push(conflict.original);

@@ -388,7 +388,7 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     if events
         .iter()
         .any(|(scope, _)| scope.as_ref().is_some_and(|s| s.contains(";RANGE=")))
-        && (events.len() != 1 || method.as_deref() != Some("REQUEST"))
+        && (events.len() != 1 || !matches!(method.as_deref(), Some("REQUEST" | "CANCEL")))
     {
         return None;
     }

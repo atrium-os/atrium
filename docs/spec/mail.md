@@ -1387,6 +1387,8 @@ For a weekly request with `EXDATE`, Mail binds the skipped slots to the selected
 
 For a weekly range update, Mail binds the original slot and `RANGE=THISANDFUTURE` to response review. The organizer receives one RSVP with that same recurrence identifier and range. Calendar keeps the list of affected local dates within the selected persona. [Changing this and future occurrences](calendar.md#716-changing-this-and-future-occurrences)
 
+A directly delivered range cancellation carries the organizer’s cancellation method and original cutoff to Calendar. Calendar reviews the affected dates and offers one local Undo. Mail sends no response for a cancellation. [Cancelling this and future occurrences](calendar.md#718-cancelling-this-and-future-occurrences)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

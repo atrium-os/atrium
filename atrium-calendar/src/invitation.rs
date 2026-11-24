@@ -182,7 +182,7 @@ impl Proposal {
                 || self
                     .row
                     .as_ref()
-                    .is_none_or(|r| r.kind != Kind::Appointment)
+                    .is_some_and(|r| r.kind != Kind::Appointment)
                 || self.limit.is_some()
                 || !self.exceptions.is_empty()
                 || !self.skips.is_empty()
@@ -323,6 +323,8 @@ impl Proposal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cancellation {
+    #[serde(default)]
+    pub this_and_future: bool,
     pub key: MeetingKey,
     pub original: Option<NaiveDate>,
     pub sequence: u32,
@@ -330,6 +332,8 @@ pub struct Cancellation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkipEffect {
+    Cancel,
+    KeepEarlier,
     Skip,
     AlreadyAbsent,
     ChooseLocalMove,

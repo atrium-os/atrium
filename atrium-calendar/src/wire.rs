@@ -287,18 +287,22 @@ pub fn discard_import(socket: &Path, token: uuid::Uuid) -> Result<(), String> {
     exchange(socket, &Request::DiscardImport { token })
 }
 
+impl Request {
+    fn operation(&self) -> u16 {
+        match self {
+            Self::PrepareImport { .. } | Self::ReviewInvitation { .. } => OP_PREPARE_IMPORT,
+            // A decision per private move on a long series can exceed the 4 KiB frame.
+            Self::ApplyInvitation { choices, .. } if choices.len() > 64 => OP_PREPARE_IMPORT,
+            _ => OP_V1,
+        }
+    }
+}
+
 pub fn exchange<T: DeserializeOwned>(socket: &Path, request: &Request) -> Result<T, String> {
     let mut s =
         UnixStream::connect(socket).map_err(|e| format!("Calendar service unavailable: {e}"))?;
     s.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let op = if matches!(
-        request,
-        Request::PrepareImport { .. } | Request::ReviewInvitation { .. }
-    ) {
-        OP_PREPARE_IMPORT
-    } else {
-        OP_V1
-    };
+    let op = request.operation();
     send_op(&mut s, flag::RESPONSE_EXPECTED, op, request).map_err(|e| e.to_string())?;
     read_frame(&mut s, flag::IS_RESPONSE, 1024 * 1024, Some(op))
         .map(|(_, value)| value)
@@ -318,16 +322,13 @@ pub fn refuse(s: &mut UnixStream, reason: &str) -> io::Result<()> {
 
 pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
     s.set_nonblocking(true)?;
+    let mut reply_op = OP_V1;
     let reply: Result<CalendarPage, String> =
-        match read_frame(s, flag::RESPONSE_EXPECTED, 4096, None).and_then(|(op, req)| {
-            if (op == OP_PREPARE_IMPORT)
-                != matches!(
-                    req,
-                    Request::PrepareImport { .. } | Request::ReviewInvitation { .. }
-                )
-            {
+        match read_frame::<Request>(s, flag::RESPONSE_EXPECTED, 4096, None).and_then(|(op, req)| {
+            if req.operation() != op {
                 return Err(io::ErrorKind::InvalidData.into());
             }
+            reply_op = op;
             Ok(req)
         }) {
             Ok(Request::ReviewInvitation {
@@ -460,7 +461,7 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
                 .map(|receipt| mutation_page(store, date, Some(receipt))),
             Err(_) => Err("Invalid Calendar request".into()),
         };
-    send(s, flag::IS_RESPONSE, &reply)
+    send_op(s, flag::IS_RESPONSE, reply_op, &reply)
 }
 
 fn mutation_page(store: &Store, date: NaiveDate, undo: Option<super::UndoReceipt>) -> CalendarPage {

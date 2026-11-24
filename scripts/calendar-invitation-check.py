@@ -414,10 +414,79 @@ def long_range(ui):
     print("PASS long and open-ended range review, inherited extension, distant agenda and both private moves")
 
 
+def cancel_future(ui):
+    print(guest(ui, "cancel-future-setup"))
+    open_mail(ui, first=True)
+    review(ui, 248)
+    ui.see("cut-master", "Whole weekly series")
+    click(ui, 568, 550)
+    ui.see("cut-saved", "Invitation saved")
+
+    def move(day, dest, start, end):
+        ui.open_date(day)
+        click(ui, 450, 268)
+        ui.field(80, 256, dest)
+        ui.field(225, 256, start)
+        ui.field(330, 256, end)
+        click(ui, 92, 506)
+        ui.see("cut-move-" + dest, dest, start)
+
+    move("2026-12-08", "2026-12-18", "10:00", "10:45")
+    move("2026-12-22", "2026-12-11", "16:30", "17:15")
+    baseline = ui.store("work")
+    earlier = next(r for r in baseline["entries"] if r["date"] == "2026-12-18")
+    local = next(r for r in baseline["entries"] if r["date"] == "2026-12-11")
+
+    def inspect(keep):
+        ui.control("close", "work")
+        review(ui, 178)
+        ui.see("cut-overview", "This and future occurrences", "from 2026-12-15 onward", "no end date", "Review 4 dates")
+        click(ui, 355, 412)
+        ui.see("cut-earlier", "2026-12-08", "2026-12-18", "10:00", "stays put")
+        click(ui, 355, 412)
+        ui.see("cut-start", "2026-12-15", "14:00", "removes this meeting")
+        click(ui, 355, 412)
+        ui.see("cut-private", "2026-12-22", "2026-12-11", "16:30", "Keep private copy", "Remove it here")
+        click(ui, 355, 412)
+        ui.see("cut-choice-required", "Keep private copy", "Remove it here")
+        click(ui, 105 if keep else 290, 300)
+        click(ui, 355, 412)
+        ui.see("cut-regular", "2026-12-29", "removes this meeting", "Apply range cancellation")
+        assert ui.store("work") == baseline
+
+    inspect(True)
+    click(ui, 70, 550)
+    assert ui.store("work") == baseline
+    for keep in (True, False):
+        inspect(keep)
+        click(ui, 568, 550)
+        ui.see("cut-applied", "Cancellation applied", "Undo cancellation")
+        saved = ui.store("work")
+        assert saved["revision"] == baseline["revision"] + 1 and earlier in saved["entries"]
+        master = next(r for r in saved["entries"] if r["kind"] == "Weekly")
+        assert master["date"] == "2026-12-01" and master["span"] == {"start": 840, "end": 885}
+        assert master["invitation"]["last"] == "2026-12-08"
+        copies = [r for r in saved["entries"] if r["id"] == local["id"]]
+        assert len(copies) == int(keep)
+        if keep:
+            assert copies[0]["kind"] == "Appointment" and "invitation" not in copies[0]
+            assert (copies[0]["date"], copies[0]["span"]) == (local["date"], local["span"])
+        assert len(saved["cancelled"]) == 1 and saved["cancelled"][0]["this_and_future"]
+        click(ui, 590, 562)
+        ui.see("cut-undone", "Change undone")
+        restored = ui.store("work")
+        assert restored == dict(baseline, revision=saved["revision"] + 1)
+        baseline = restored
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS both boundary crossings, private copy and removal, untouched prefix, one Undo and empty outbox")
+
+
 if __name__ == "__main__":
-    runner = {"--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

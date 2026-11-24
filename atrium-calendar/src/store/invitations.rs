@@ -1,3 +1,4 @@
+mod cancel_future;
 mod future;
 use super::*;
 use crate::invitation::{Cancellation, MeetingKey, Origin, Proposal, Review};
@@ -25,7 +26,7 @@ impl Store {
             return Err("Calendar changed. Review this invitation again.".into());
         }
         p.skips = p.validate_delivery(source)?;
-        if p.this_and_future {
+        if p.this_and_future && p.row.is_some() {
             return self.review_future(revision, source, p);
         }
         if !p.cancelled_dates.is_empty() {
@@ -205,12 +206,16 @@ impl Store {
         let organizer = p.organizer.to_ascii_lowercase();
         let mut mine = source.identities.iter().filter(|id| {
             if cancelled && p.attendees.is_empty() {
-                return rows.iter().filter_map(|e| e.invitation.as_ref()).any(|o| {
-                    o.key.account == source.account
-                        && o.key.organizer == organizer
-                        && o.key.uid == p.uid
-                        && o.key.attendee.eq_ignore_ascii_case(id)
-                });
+                return rows
+                    .iter()
+                    .filter_map(|e| e.invitation.as_ref().map(|o| &o.key))
+                    .chain(history.iter().map(|c| &c.key))
+                    .any(|k| {
+                        k.account == source.account
+                            && k.organizer == organizer
+                            && k.uid == p.uid
+                            && k.attendee.eq_ignore_ascii_case(id)
+                    });
             }
             p.attendees.iter().any(|a| a.eq_ignore_ascii_case(id))
         });
@@ -245,6 +250,17 @@ impl Store {
             token: None,
             notice: String::new(),
         };
+        if !source.from.eq_ignore_ascii_case(&key.organizer) || !source.reply_destination_matches {
+            return Ok(
+                review.blocked("The Mail sender or reply address differs from the organizer.")
+            );
+        }
+
+        if p.this_and_future && cancelled {
+            return Self::prepare_range_cancellation(
+                rows, history, view, revision, source, &p, key, master, review, pending,
+            );
+        }
         // Only a saved series can give a RECURRENCE-ID its meaning.
         let inherited = master
             .zip(p.original)
@@ -286,15 +302,10 @@ impl Store {
                 );
             }
         }
-        if !source.from.eq_ignore_ascii_case(&key.organizer) || !source.reply_destination_matches {
-            return Ok(
-                review.blocked("The Mail sender or reply address differs from the organizer.")
-            );
-        }
-
         let relevant = |c: &&Cancellation| {
             c.key == key
                 && (c.original.is_none()
+                    || c.this_and_future && original_date.is_none()
                     || c.original == original_date
                     || cancelled && original_date.is_none())
         };
@@ -392,6 +403,18 @@ impl Store {
             .zip(p.row.as_ref())
             .map(|(rule, row)| rule.last(row))
             .transpose()?;
+        if !cancelled
+            && history.iter().any(|c| {
+                c.key == key
+                    && c.this_and_future
+                    && c.original.is_some_and(|cut| {
+                        original_date
+                            .map_or_else(|| last.is_none_or(|end| end >= cut), |date| date >= cut)
+                    })
+            })
+        {
+            return Ok(review.blocked("This request includes dates in a cancelled range."));
+        }
         if let Some(base) = master.filter(|_| p.original.is_none()) {
             let saved = base.invitation.as_ref().unwrap();
             if let Some(sequence) = saved.range_sequence {
@@ -572,6 +595,7 @@ impl Store {
                 c.key != key || (original_date.is_some() && c.original != original_date)
             });
             marks.push(Cancellation {
+                this_and_future: false,
                 key,
                 original: original_date,
                 sequence: p.sequence,

@@ -250,6 +250,7 @@ impl Sheet {
             .map_or("Meeting", |e| &e.title);
         line(ctx, 98., 17., title.into());
         let grouped = !p.cancelled_dates.is_empty();
+        let cancel_range = p.row.is_none() && p.this_and_future;
         let scope = if grouped {
             format!(
                 "{} occurrences in this weekly series",
@@ -319,7 +320,12 @@ impl Sheet {
                 14.,
                 format!("Invited as · {}", self.review.attendee),
             );
-            if let Some(old) = self.review.previous.as_ref().filter(|_| !grouped) {
+            if let Some(old) = self
+                .review
+                .previous
+                .as_ref()
+                .filter(|_| !grouped && !cancel_range)
+            {
                 line(
                     ctx,
                     238.,
@@ -388,7 +394,9 @@ impl Sheet {
                     ctx,
                     302.,
                     16.,
-                    if grouped {
+                    if cancel_range {
+                        "Earlier original dates keep their saved times. Review local moves below."
+                    } else if grouped {
                         "Review each date before removing these meetings."
                     } else if p.original.is_some() {
                         "Remove only this occurrence on this device."
@@ -496,7 +504,9 @@ impl Sheet {
             );
         } else if let Some(skip) = self.skip_page() {
             let is_restore = skip.effect == SkipEffect::Restore;
-            let heading = if is_restore {
+            let heading = if cancel_range {
+                "Cancellation review"
+            } else if is_restore {
                 "Reinstated date"
             } else {
                 "Skipped date"
@@ -544,6 +554,13 @@ impl Sheet {
                 }
             }
             let note = match skip.effect {
+                SkipEffect::Cancel => "Applying the cancellation removes this meeting.",
+                SkipEffect::KeepEarlier => {
+                    "Its original date is earlier. This saved meeting stays put."
+                }
+                SkipEffect::ChooseLocalMove if cancel_range => {
+                    "You moved this meeting. Keep a private copy or remove it here."
+                }
                 SkipEffect::Skip => "Saving the series skips this meeting.",
                 SkipEffect::AlreadyAbsent => "This date is already absent from your calendar.",
                 SkipEffect::Restore => "Saving the series restores this regular meeting.",
@@ -559,7 +576,11 @@ impl Sheet {
                     18.,
                     284.,
                     175.,
-                    "Keep my move",
+                    if cancel_range {
+                        "Keep private copy"
+                    } else {
+                        "Keep my move"
+                    },
                     Action::ChooseSkip(true),
                 );
                 planner.button(
@@ -567,7 +588,11 @@ impl Sheet {
                     211.,
                     284.,
                     175.,
-                    "Skip it here",
+                    if cancel_range {
+                        "Remove it here"
+                    } else {
+                        "Skip it here"
+                    },
                     Action::ChooseSkip(false),
                 );
                 if let Some(c) = self.choices.iter().find(|c| c.original == original.date) {
@@ -575,7 +600,11 @@ impl Sheet {
                         ctx,
                         328.,
                         14.,
-                        if c.keep {
+                        if cancel_range && c.keep {
+                            "Selected · keep private copy"
+                        } else if cancel_range {
+                            "Selected · remove it here"
+                        } else if c.keep {
                             "Selected · keep my move"
                         } else {
                             "Selected · skip it here"
@@ -771,7 +800,9 @@ impl Sheet {
                 535.,
                 224.,
                 if p.row.is_none() {
-                    if grouped {
+                    if cancel_range {
+                        "Apply range cancellation"
+                    } else if grouped {
                         "Remove reviewed dates"
                     } else if p.original.is_some() {
                         "Remove this occurrence"
