@@ -302,6 +302,7 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     }
     let mut stack = Vec::new();
     let mut events = Vec::new();
+    let mut method = None;
     let mut scope = None;
     let mut identity = Identity::default();
     for line in unfold(text) {
@@ -320,6 +321,10 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
                     return None;
                 }
                 events.push((scope.take(), std::mem::take(&mut identity)));
+            }
+        } else if key == "METHOD" && stack.as_slice() == ["VCALENDAR"] {
+            if !params.is_empty() || method.replace(value.to_ascii_uppercase()).is_some() {
+                return None;
             }
         } else if stack.last().is_some_and(|s| s == "VEVENT") {
             match key.as_str() {
@@ -343,15 +348,44 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     if !stack.is_empty() {
         return None;
     }
+    let grouped_cancel = method.as_deref() == Some("CANCEL") && events.len() > 1;
+    if grouped_cancel && events.len() > 8 {
+        return None;
+    }
     let mut parts = events.into_iter();
     let (mut master, identity) = parts.next()?;
+    if grouped_cancel {
+        let first = master
+            .as_deref()
+            .filter(|s| s.starts_with("RECURRENCE-ID"))?;
+        master = Some(format!("cancel-dates|{}/{first}", identity.sequence));
+    } else if parts.len() > 0
+        && !(method.as_deref() == Some("REQUEST")
+            && master.as_ref().is_some_and(|s| s.starts_with("weekly")))
+    {
+        return None;
+    }
     for (scope, child) in parts {
-        let root = master.as_mut().filter(|s| s.starts_with("weekly"))?;
+        let root = master.as_mut()?;
         let original = scope.filter(|s| s.starts_with("RECURRENCE-ID"))?;
-        if identity != child || root.split('|').any(|s| s == original) {
+        if identity.uid != child.uid
+            || identity.organizer != child.organizer
+            || identity.attendees != child.attendees
+            || (!grouped_cancel && identity.sequence != child.sequence)
+            || root.split('|').any(|s| {
+                if grouped_cancel {
+                    s.split_once('/').is_some_and(|(_, id)| id == original)
+                } else {
+                    s == original
+                }
+            })
+        {
             return None;
         }
         root.push('|');
+        if grouped_cancel {
+            root.push_str(&format!("{}/", child.sequence));
+        }
         root.push_str(&original);
     }
     Some(master)

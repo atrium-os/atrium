@@ -1378,6 +1378,8 @@ Mail parses a bounded invitation summary in its parse jail. **Review in Calendar
 
 Recurring requests show the organizer’s scope again at final Send. Mail derives the original occurrence independently from the selected part and includes that occurrence identifier in an individual reply. Duplicate detection separates each occurrence from its siblings and the whole series. An organizer cancellation opens Calendar’s removal review and has no Send action. [Calendar scopes and synthetic gate](calendar.md#712-reviewing-a-recurring-meeting-or-cancellation) A bounded series also shows the count or end time and the number of included moves. The selected part binds the reviewed limit and every original occurrence to a whole-series response. [Grouped review](calendar.md#713-weekly-invitations-with-an-end-and-included-moves)
 
+For a cancellation listing several dates, Mail binds each original occurrence and its individual revision to the Calendar review. Calendar offers one local removal and one Undo for the group. [Grouped cancellations](calendar.md#714-reviewing-several-cancelled-occurrences)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

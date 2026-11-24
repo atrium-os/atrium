@@ -23,6 +23,9 @@ impl Store {
             return Err("Calendar changed. Review this invitation again.".into());
         }
         p.validate(source)?;
+        if !p.cancelled_dates.is_empty() {
+            return self.review_cancelled_dates(revision, source, p);
+        }
         let view = self.viewing_zone();
         let children = p
             .exceptions
@@ -38,6 +41,7 @@ impl Store {
                 weekly_cancellation: false,
                 limit: None,
                 exceptions: vec![],
+                cancelled_dates: vec![],
             })
             .collect::<Vec<_>>();
         let mut pending = None;
@@ -90,7 +94,7 @@ impl Store {
                     previous.as_ref(),
                     &mut child_plan,
                 )?;
-                review.before_moves.push(previous);
+                review.previous_dates.push(previous);
                 if result.token.is_none() {
                     return Ok(review.blocked(&format!("Included move: {}", result.notice)));
                 }
@@ -105,6 +109,72 @@ impl Store {
             }
         }
         self.invite = pending;
+        Ok(review)
+    }
+
+    fn review_cancelled_dates(
+        &mut self,
+        revision: u64,
+        source: &Source,
+        mut p: Proposal,
+    ) -> Result<Review, String> {
+        let mut group: Option<Pending> = None;
+        let mut first_review = None;
+        let mut previous_dates = Vec::new();
+        let mut conflict = None;
+        for date in std::mem::take(&mut p.cancelled_dates) {
+            let original = date.original;
+            p.sequence = date.sequence;
+            p.original = Some(original);
+            let (rows, marks) = group
+                .as_ref()
+                .and_then(|g| g.changes.as_ref())
+                .map(|(r, m)| (r.as_slice(), m.as_slice()))
+                .unwrap_or((&self.state.entries, &self.state.cancelled));
+            let mut part = None;
+            let review = Self::prepare(
+                rows,
+                marks,
+                self.viewing_zone(),
+                revision,
+                source,
+                p.clone(),
+                None,
+                &mut part,
+            )?;
+            // A single-date conflict can show the series pattern even when that
+            // date has already been removed. Only label a saved date as current.
+            previous_dates.push(
+                review
+                    .previous
+                    .as_ref()
+                    .filter(|e| e.kind != Kind::Weekly || !e.excluded.contains(&original.date))
+                    .cloned(),
+            );
+            match part {
+                Some(plan) => {
+                    if let Some(g) = &mut group {
+                        g.changes = plan.changes;
+                    } else {
+                        group = Some(plan);
+                    }
+                }
+                None => {
+                    conflict
+                        .get_or_insert_with(|| format!("{} · {}", original.date, review.notice));
+                }
+            }
+            first_review.get_or_insert(review);
+        }
+        let mut review = first_review.ok_or("Missing cancelled dates")?;
+        if let Some(id) = review.previous.as_ref().and_then(Entry::series_id) {
+            review.previous = self.state.entries.iter().find(|e| e.id == id).cloned();
+        }
+        review.previous_dates = previous_dates;
+        if let Some(reason) = conflict {
+            return Ok(review.blocked(&reason));
+        }
+        self.invite = group;
         Ok(review)
     }
 
@@ -151,7 +221,7 @@ impl Store {
         });
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
-            before_moves: vec![],
+            previous_dates: vec![],
             previous: master.cloned(),
             weekly: master.is_some_and(|e| e.kind == Kind::Weekly)
                 || p.row.as_ref().is_some_and(|e| e.kind == Kind::Weekly),
@@ -253,13 +323,16 @@ impl Store {
                 }
             }
             if let Some(date) = original_date {
-                if base.excluded.contains(&date)
-                    && explicit.is_none()
-                    && !history
+                if base.excluded.contains(&date) && explicit.is_none() {
+                    if !history
                         .iter()
                         .any(|c| c.key == key && c.original == Some(date))
-                {
-                    return Ok(review.blocked("This occurrence was removed locally."));
+                    {
+                        return Ok(review.blocked("This occurrence was removed locally."));
+                    }
+                    if cancelled {
+                        return Ok(review.blocked("This occurrence was already removed."));
+                    }
                 }
             }
             if cancelled && original_date.is_none() && base.kind == Kind::Weekly {

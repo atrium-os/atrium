@@ -58,6 +58,8 @@ pub struct Proposal {
     pub limit: Option<crate::WeeklyLimit>,
     #[serde(default)]
     pub exceptions: Vec<IncludedMove>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancelled_dates: Vec<CancelledDate>,
     pub uid: String,
     pub sequence: u32,
     pub organizer: String,
@@ -76,12 +78,35 @@ pub struct IncludedMove {
     pub location: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CancelledDate {
+    pub original: OccurrenceId,
+    pub sequence: u32,
+}
 pub const MAX_MOVES: usize = 8;
+pub const MAX_CANCELLED_DATES: usize = 8;
 
 impl Proposal {
     pub fn validate(&self, source: &Source) -> Result<(), String> {
         if self.exceptions.len() > MAX_MOVES {
             return Err("Too many included moves".into());
+        }
+        if !self.cancelled_dates.is_empty() {
+            let mut dates = std::collections::HashSet::new();
+            if !(2..=MAX_CANCELLED_DATES).contains(&self.cancelled_dates.len())
+                || self.cancelled_dates[0].sequence != self.sequence
+                || self.row.is_some()
+                || self.original.is_some()
+                || self.weekly_cancellation
+                || self.limit.is_some()
+                || !self.exceptions.is_empty()
+                || self
+                    .cancelled_dates
+                    .iter()
+                    .any(|o| o.original.minute >= 1440 || !dates.insert(o.original.date))
+            {
+                return Err("Invalid group of cancelled occurrences".into());
+            }
         }
         let scope = self.scope();
         let bound = source
@@ -159,6 +184,13 @@ impl Proposal {
         Ok(())
     }
     pub fn scope(&self) -> Option<String> {
+        if !self.cancelled_dates.is_empty() {
+            let mut scope = String::from("cancel-dates");
+            for date in &self.cancelled_dates {
+                scope.push_str(&format!("|{}/{}", date.sequence, date.original.property()));
+            }
+            return Some(scope);
+        }
         if self.weekly_cancellation {
             return Some("weekly".into());
         }
@@ -192,7 +224,8 @@ pub struct Cancellation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
     #[serde(default)]
-    pub before_moves: Vec<Option<Entry>>,
+    #[serde(rename = "before_moves")]
+    pub previous_dates: Vec<Option<Entry>>,
     pub previous: Option<Entry>,
     pub attendee: String,
     pub weekly: bool,

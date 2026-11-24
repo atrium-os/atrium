@@ -138,30 +138,31 @@ def series(ui):
     print("PASS scoped RSVP, preserved exception, single and whole cancellation, spoof, replay and empty outbox")
 
 
+def inspect_moves(ui):
+    review(ui, 248)
+    ui.see("bounded-overview", "4 meetings", "last 2026-12-22", "Review 2 included moves")
+    click(ui, 355, 412)
+    ui.see("bounded-first-move", "Included move 1 of 2", "2026-12-08", "2026-12-09", "Studio B")
+    click(ui, 355, 412)
+    ui.see("bounded-second-move", "Included move 2 of 2", "2026-12-15", "2026-12-17", "Studio C", "response applies to the whole series")
+
+
 def bounded(ui):
     print(guest(ui, "bounded-setup"))
     open_mail(ui, first=True)
 
-    def inspect_moves():
-        review(ui, 248)
-        ui.see("bounded-overview", "4 meetings", "last 2026-12-22", "Review 2 included moves")
-        click(ui, 355, 412)
-        ui.see("bounded-first-move", "Included move 1 of 2", "2026-12-08", "2026-12-09", "Studio B")
-        click(ui, 355, 412)
-        ui.see("bounded-second-move", "Included move 2 of 2", "2026-12-15", "2026-12-17", "Studio C", "response applies to the whole series")
-
-    inspect_moves()
+    inspect_moves(ui)
     click(ui, 70, 550)
     assert ui.control("fingerprint", "work").strip() == b"empty"
     ui.control("close", "work")
-    inspect_moves()
+    inspect_moves(ui)
     click(ui, 80, 462)
     ui.see("bounded-response", "Whole weekly series", "4 meetings", "2 included moves", "ACCEPTED")
     # Dismiss the response and confirm the inspected local schedule separately.
     click(ui, 70, 355)
     ui.control("close", "work")
     assert ui.control("fingerprint", "work").strip() == b"empty"
-    inspect_moves()
+    inspect_moves(ui)
     click(ui, 568, 550)
     ui.see("bounded-saved", "Invitation saved", "14:00")
     rows = ui.store("work")["entries"]
@@ -182,10 +183,54 @@ def bounded(ui):
     print("PASS bounded review, both included moves, dismissal, whole-series RSVP review, atomic save, extension and empty outbox")
 
 
+def cancel_dates(ui):
+    print(guest(ui, "cancel-dates-setup"))
+    open_mail(ui, first=True)
+    inspect_moves(ui)
+    click(ui, 568, 550)
+    ui.see("group-series-saved", "Invitation saved")
+    baseline = ui.store("work")
+    master = next(r for r in baseline["entries"] if r["kind"] == "Weekly")
+    survivor = next(r for r in baseline["entries"] if r["date"] == "2026-12-17")
+    ui.control("close", "work")
+
+    def inspect_cancellations():
+        review(ui, 178)
+        ui.see("group-overview", "Review cancellation", "2 occurrences", "Review 2 dates")
+        click(ui, 355, 412)
+        ui.see("group-moved-date", "Cancellation 1 of 2", "2026-12-08", "2026-12-09", "15:00", "Studio B")
+        click(ui, 568, 550)  # The final action must still be unavailable.
+        assert ui.store("work") == baseline
+        click(ui, 355, 412)
+        ui.see("group-regular-date", "Cancellation 2 of 2", "2026-12-22", "14:00", "Studio A", "Remove reviewed dates")
+
+    inspect_cancellations()
+    click(ui, 70, 550)
+    assert ui.store("work") == baseline
+    ui.control("close", "work")
+    inspect_cancellations()
+    click(ui, 568, 550)
+    ui.see("group-cancelled", "Cancellation applied", "Undo cancellation")
+    after = ui.store("work")
+    assert after["revision"] == baseline["revision"] + 1
+    assert len(after["entries"]) == 2 and survivor in after["entries"]
+    expected_master = dict(master, excluded=["2026-12-08", "2026-12-15", "2026-12-22"])
+    assert expected_master in after["entries"]
+    assert sorted((c["original"], c["sequence"]) for c in after["cancelled"]) == [("2026-12-08", 2), ("2026-12-22", 4)]
+    click(ui, 590, 562)
+    ui.see("group-undone", "Change undone", "15:00")
+    restored = ui.store("work")
+    assert restored == dict(baseline, revision=after["revision"] + 1)
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS reviewed moved and regular dates, cancelled together, preserved sibling schedules, one Undo restored both, empty outbox")
+
+
 if __name__ == "__main__":
-    runner = {"--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

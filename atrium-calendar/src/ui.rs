@@ -881,6 +881,7 @@ pub fn run() -> io::Result<()> {
                     let date = data.date;
                     if let Some(receipt) = data.undo {
                         let label = match action {
+                            Action::ApplyInvitation { cancellation: true } => "Undo cancellation",
                             Action::ApplyInvitation { .. } => "Undo invitation change",
                             Action::SaveImport => "Undo import",
                             Action::Change(true) => "Undo deletion",

@@ -261,9 +261,19 @@ The whole-series review shows the last regular date. A count-limited invitation 
 
 One request can carry the master followed by up to eight individually moved meetings. **Review included moves** opens each move in turn, showing the original slot, any saved schedule, the proposed time and the place. From the last move the person can save the whole series, review a whole-series RSVP in Mail, or leave. Saving publishes every included move in one calendar revision. One Undo restores the previous schedule. A later series update preserves exceptions it does not mention. A proposed end that would discard a saved exception requires separate resolution.
 
-Applying new bundled moves requires verified sender evidence. Every included component must name the same meeting, organizer, invited addresses and sequence. Mail and Calendar independently identify the weekly limit and original dates. A duplicate, out-of-series date or conflicting saved revision blocks the entire proposal. Grouped cancellations and batches of unrelated invitations are outside this profile. A whole-series RSVP addresses the organizer and carries one answer for the series.
+Applying new bundled moves requires verified sender evidence. Every included component must name the same meeting, organizer, invited addresses and sequence. Mail and Calendar independently identify the weekly limit and original dates. A duplicate, out-of-series date or conflicting saved revision blocks the entire proposal. A group of cancellations follows §7.14. Batches of unrelated invitations require separate review. A whole-series RSVP addresses the organizer and carries one answer for the series.
 
 The synthetic fixture starts with four Tuesdays in December 2026. Two moves take December 8 to Wednesday the 9th and December 15 to Thursday the 17th. A second request extends the regular schedule through December 29. The installed check exercises dismissal after both moves, Mail response review and atomic local save. Run the §7.11 driver with `--bounded`. [Synthetic series and two moves](../../atrium-calendar/tests/fixtures/bounded-moves.ics) · [Inclusive extension](../../atrium-calendar/tests/fixtures/weekly-until.ics)
+
+### 7.14 Reviewing several cancelled occurrences
+
+A single Mail cancellation can name two to eight dates in the same weekly series. **Review dates** opens one date at a time. Each page shows the original occurrence and the currently saved date, time and place in the active calendar. For a moved occurrence, the original slot identifies the meeting and the current slot shows what will disappear. The final page offers **Remove reviewed dates**. Back to calendar dismisses the entire review.
+
+Mail and Calendar independently bind each original occurrence and its organizer revision to the selected delivery. Each component must name the same meeting, organizer and invited addresses. An omitted attendee list must resolve to one saved identity on that account. Fasti requires verified sender evidence and checks each date against its saved schedule. A stale revision, missing date, local edit or duplicate prevents applying the batch. A whole-series cancellation is reviewed separately.
+
+Confirmation removes only the listed occurrences in one calendar revision. **Undo cancellation** restores the schedule and the prior per-occurrence revision records together. Reviewing, removing and undoing send no response to the organizer.
+
+The synthetic studio fixture cancels the December 8 meeting that moved to Wednesday, December 9 at 15:00 in Studio B, plus the regular December 22 meeting. December 1 remains at 14:00 and the December 15 meeting stays on Thursday, December 17 at 11:00 in Studio C. Run the §7.11 installed check with `--cancel-dates`. [Synthetic cancellation](../../atrium-calendar/tests/fixtures/cancel-dates.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
 ## 8. Accepted decisions
 

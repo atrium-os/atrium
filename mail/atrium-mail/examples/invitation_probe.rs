@@ -17,11 +17,13 @@ const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/c
 const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
 
 const BOUNDED: &str = include_str!("../../../atrium-calendar/tests/fixtures/bounded-moves.ics");
+const CANCEL_DATES: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-dates.ics");
 const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly-until.ics");
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
-    let bounded = mode == "seed-bounded";
+    let grouped = mode == "seed-cancel-dates";
+    let bounded = mode == "seed-bounded" || grouped;
     assert!(e.store.accounts().unwrap().is_empty());
     let account = e.store.add_account("dev@fixture.invalid").unwrap();
     let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
@@ -33,7 +35,11 @@ fn seed(e: &Engine, mode: &str) {
     let messages: &[(&str, &str)] = if bounded {
         &[
             ("Four studio meetings", BOUNDED),
-            ("Extend to December 29", UNTIL),
+            if grouped {
+                ("Cancel two studio dates", CANCEL_DATES)
+            } else {
+                ("Extend to December 29", UNTIL)
+            },
         ]
     } else if series {
         &[
@@ -102,11 +108,25 @@ fn seed(e: &Engine, mode: &str) {
                 (true, 1) => Some(format!(
                     "weekly;COUNT=4|{ORIGINAL}|RECURRENCE-ID:20261215T140000Z"
                 )),
+                (true, 2) if grouped => Some(format!(
+                    "cancel-dates|2/{ORIGINAL}|4/RECURRENCE-ID:20261222T140000Z"
+                )),
                 (true, 2) => Some("weekly;UNTIL=20261229T140000Z".into()),
                 (false, 1 | 3) => Some("weekly".into()),
                 (false, 2 | 4) => Some(ORIGINAL.into()),
                 _ => None,
             };
+            if grouped {
+                assert_eq!(
+                    e.selected_invitation(msg)
+                        .unwrap()
+                        .source
+                        .delivery
+                        .unwrap()
+                        .scope,
+                    scope
+                );
+            }
             let reply = Reply {
                 scope,
                 answer: Answer::Maybe,
@@ -281,7 +301,7 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        mode @ ("seed" | "seed-series" | "seed-bounded") => seed(&e, mode),
+        mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates") => seed(&e, mode),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),
