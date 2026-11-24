@@ -81,3 +81,34 @@ fn indexed_if_functions_match_the_walk() {
         eprintln!("{f}: {rows} rows in {took:?}");
     }
 }
+
+#[test]
+fn conditional_indexes_preserve_matched_errors_after_edits() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Summary").unwrap();
+    for row in 0..3 {
+        wb.set_value(CellAddr::new(0, row, 0), Value::Num(f64::from(row + 1)));
+        wb.set_value(CellAddr::new(0, row, 1), Value::Num(f64::from((row + 1) * 10)));
+    }
+    let input = CellAddr::new(0, 1, 1);
+    wb.set_value(input, Value::Err(officina_grid::ErrorKind::Div0));
+    let rows = 64;
+    for r in 0..rows {
+        wb.set_value(CellAddr::new(0, r, 2), Value::Num(if r % 2 == 0 { 1.0 } else { 2.0 }));
+    }
+    wb.fill_formula(0, 3, 0, rows - 1, "=SUMIF($A$1:$A$3,C1+1,$B$1)").unwrap();
+    wb.fill_formula(0, 4, 0, rows - 1, r#"=AVERAGEIFS($B$1:$B$3,$A$1:$A$3,">"&C1)"#).unwrap();
+    wb.recalc();
+    let err = Value::Err(officina_grid::ErrorKind::Div0);
+    for r in 0..rows {
+        for c in [3, 4] {
+            assert_eq!(wb.value(0, r, c), if r % 2 == 0 { err.clone() } else { Value::Num(30.0) });
+        }
+    }
+    wb.set_value(input, Value::Num(40.0));
+    wb.recalc();
+    for r in 0..rows {
+        assert_eq!(wb.value(0, r, 3), Value::Num(if r % 2 == 0 { 40.0 } else { 30.0 }));
+        assert_eq!(wb.value(0, r, 4), Value::Num(if r % 2 == 0 { 35.0 } else { 30.0 }));
+    }
+}

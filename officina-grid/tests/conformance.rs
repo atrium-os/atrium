@@ -108,6 +108,7 @@ const CASES: &[(&str, &str)] = &[
     ("=COUNTIF(D1:D4,\"<>\")", "3"),
     ("=COUNTIFS(A1:A5,\">1\",A1:A5,\"<5\")", "3"),
     ("=SUMIFS(A1:A5,A1:A5,\">=2\",B1:B5,\"<>date\")", "9"),
+    ("=COUNTIFS(D1:D5,F1)", "0"),
     ("=AVERAGEIF(A1:A5,\"<>3\")", "3"),
     // statistics
     ("=MEDIAN(A1:A4)", "2.5"),

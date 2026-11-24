@@ -930,10 +930,13 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
             let _ = write!(out, r#" table:number-matrix-columns-spanned="{cols}" table:number-matrix-rows-spanned="{rows}""#);
         }
     } else if let Value::Err(e) = v {
-        // A constant error: a formula of just the error.
-        out.push_str(r#" table:formula="of:="#);
-        esc(out, e.text());
-        out.push('"');
+        // A matrix member carries only a cached value. A constant formula
+        // here would block the anchor's spill when the file is reopened.
+        if wb.spilled_from(officina_grid::CellAddr::new(s, r, c)).is_none() {
+            out.push_str(r#" table:formula="of:="#);
+            esc(out, e.text());
+            out.push('"');
+        }
     }
     match v {
         Value::Empty if wb.comment(s, r, c).is_none() && wb.link(s, r, c).is_none() => {

@@ -66,6 +66,7 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("COUNTIF", 2, 2, countif),
     f!("COUNTIFS", 2, N, countifs),
     f!("AVERAGEIF", 2, 3, averageif),
+    f!("AVERAGEIFS", 3, N, averageifs),
     f!("RAND", 0, 0, rand, volatile),
     f!("RANDBETWEEN", 2, 2, randbetween, volatile),
     // statistics
@@ -550,29 +551,6 @@ fn sumproduct(c: &Ctx, a: &[Expr]) -> Ev {
     n(s)
 }
 
-/// The cells of `range` and the matching cells of `other` (same shape, same offset), for
-/// the -IF functions: calls `f(value in range, value in other)`. Empty cells of `range`
-/// are visited only when `with_empty`.
-fn pairs(c: &Ctx, range: &Rect, other: Option<&Rect>, with_empty: bool, f: &mut dyn FnMut(&Value, Value)) {
-    let read = |row: u32, col: u32| -> Value {
-        match other {
-            Some(o) => c.wb.value(o.sheet, o.r0 + (row - range.r0), o.c0 + (col - range.c0)),
-            None => Value::Empty,
-        }
-    };
-    if with_empty {
-        let Some(cl) = c.clip(range) else { return };
-        for row in cl.r0..=cl.r1 {
-            for col in cl.c0..=cl.c1 {
-                let x = c.wb.value(range.sheet, row, col);
-                f(&x, read(row, col));
-            }
-        }
-    } else if let Some(cl) = c.clip(range) {
-        c.wb.each(&cl, &mut |row, col, x| f(&x, read(row, col)));
-    }
-}
-
 fn rect_arg(c: &Ctx, a: &Expr) -> Result<Rect, ErrorKind> {
     match c.eval(a) {
         Ev::R(r) => Ok(r),
@@ -581,53 +559,21 @@ fn rect_arg(c: &Ctx, a: &Expr) -> Result<Rect, ErrorKind> {
     }
 }
 
-fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
-    let range = tri!(rect_arg(c, &a[0]));
-    let crit = Criterion::new(&c.scalar(&a[1]));
-    let sum_range = if a.len() > 2 && !missing(&a[2]) { Some(tri!(rect_arg(c, &a[2]))) } else { None };
-    let mut s = 0.0;
-    let target = sum_range.as_ref().or(Some(&range)).copied();
-    // One column: the index adds in the walk's order (rows down).
-    if let Some(k) = crit.eq_key().filter(|_| range.c0 == range.c1) {
-        let built = ifcache::lookup((vec![range], target), &[k], |emit| {
-            pairs(c, &range, target.as_ref(), true, &mut |x, y| {
-                if let Some(k) = Key::of(x) {
-                    emit(vec![k], if let Value::Num(z) = y { Some(z) } else { None });
-                }
-            });
-            true
-        });
-        if let Some(a) = built {
-            return n(a.sum);
-        }
-    }
-    if let Some(b) = crit.bound() {
-        let built = ifcache::lookup_sorted((vec![range], target), &[], &[b], true, |emit| {
-            pairs(c, &range, target.as_ref(), false, &mut |x, y| {
-                if let Value::Num(x) = x {
-                    emit(vec![], *x, if let Value::Num(z) = y { Some(z) } else { None });
-                }
-            });
-            true
-        });
-        if let Some(a) = built {
-            return n(a.sum);
-        }
-    }
-    pairs(c, &range, target.as_ref(), crit.matches_empty(), &mut |x, y| {
-        if crit.test(x) {
-            if let Value::Num(z) = y {
-                s += z
-            }
-        }
-    });
-    n(s)
+/// SUMIF and AVERAGEIF use the optional range's top-left cell and the
+/// criteria range's size. The -IFS forms require equal sizes.
+fn paired_range(c: &Ctx, src: Rect, args: &[Expr]) -> Result<Rect, ErrorKind> {
+    use crate::addr::{MAX_COLS, MAX_ROWS};
+    let Some(target) = args.get(2).filter(|a| !missing(a)) else { return Ok(src) };
+    let target = rect_arg(c, target)?;
+    let r1 = target.r0.checked_add(src.r1 - src.r0).filter(|&end| end < MAX_ROWS).ok_or(ErrorKind::Ref)?;
+    let c1 = target.c0.checked_add(src.c1 - src.c0).filter(|&end| end < MAX_COLS).ok_or(ErrorKind::Ref)?;
+    Ok(Rect { r1, c1, ..target })
 }
 
-/// SUMIFS / COUNTIFS / AVERAGEIF(S): walks the first criteria range (stored cells, or all
-/// cells when an empty cell can match) and tests the others at the same offsets.
-fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn FnMut(Value)) -> Result<Option<ifcache::Agg>, ErrorKind> {
-    multi_if_with(c, value_range, pairs_args, true, f)
+/// Empty cells in an explicit bounded range can match even outside its
+/// sheet's used extent. Keep the used-area bound for very large ranges.
+fn blank_extent(c: &Ctx, range: &Rect) -> Option<Rect> {
+    if range.cells() <= super::MAX_ARRAY { Some(*range) } else { c.clip(range) }
 }
 
 /// Ordered criteria on one range, with equality criteria on any others:
@@ -660,17 +606,14 @@ fn sorted_if(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)], su
                 let Some(k) = Key::of(&c.wb.value(r.sheet, r.r0 + dr, r.c0 + dc)) else { return };
                 ks.push(k);
             }
-            let v = value_range.and_then(|vr| match c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc) {
-                Value::Num(z) => Some(z),
-                _ => None,
-            });
+            let v = value_range.map(|vr| c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc));
             emit(ks, x, v);
         });
         true
     })
 }
 
-fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: bool, f: &mut dyn FnMut(Value)) -> Result<Option<ifcache::Agg>, ErrorKind> {
+fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr]) -> Result<ifcache::Agg, ErrorKind> {
     let mut crits = Vec::new();
     for p in pairs_args.chunks(2) {
         if p.len() < 2 {
@@ -679,6 +622,11 @@ fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: b
         let r = rect_arg(c, &p[0])?;
         crits.push((r, Criterion::new(&c.scalar(&p[1]))));
     }
+    matching(c, value_range, &crits)
+}
+
+/// Counts and totals only the rows that pass every criterion.
+fn matching(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)]) -> Result<ifcache::Agg, ErrorKind> {
     let (first, fc) = &crits[0];
     if crits.iter().any(|(r, _)| r.rows() != first.rows() || r.cols() != first.cols()) {
         return Err(ErrorKind::Value);
@@ -700,16 +648,10 @@ fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: b
                     let Some(k) = Key::of(&c.wb.value(r.sheet, r.r0 + dr, r.c0 + dc)) else { return };
                     ks.push(k);
                 }
-                let v = match &value_range {
-                    Some(vr) => match c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc) {
-                        Value::Num(z) => Some(z),
-                        _ => None,
-                    },
-                    None => None,
-                };
+                let v = value_range.map(|vr| c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc));
                 emit(ks, v);
             };
-            if let Some(cl) = c.clip(first) {
+            if let Some(cl) = blank_extent(c, first) {
                 for row in cl.r0..=cl.r1 {
                     for col in cl.c0..=cl.c1 {
                         walk(row, col, &c.wb.value(first.sheet, row, col));
@@ -718,14 +660,13 @@ fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: b
             }
             true
         });
-        if built.is_some() {
-            return Ok(built);
-        }
+        if let Some(agg) = built { return Ok(agg); }
     }
-    if let Some(a) = sorted_if(c, value_range, &crits, sum) {
-        return Ok(Some(a));
+    if let Some(a) = sorted_if(c, value_range, crits, value_range.is_some()) {
+        return Ok(a);
     }
     let with_empty = fc.matches_empty();
+    let mut agg = ifcache::Agg::default();
     let mut visit = |row: u32, col: u32, x: &Value| {
         if !fc.test(x) {
             return;
@@ -736,13 +677,10 @@ fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: b
                 return;
             }
         }
-        match &value_range {
-            Some(vr) => f(c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc)),
-            None => f(Value::Num(1.0)),
-        }
+        agg.add(value_range.map(|vr| c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc)));
     };
     if with_empty {
-        if let Some(cl) = c.clip(first) {
+        if let Some(cl) = blank_extent(c, first) {
             for row in cl.r0..=cl.r1 {
                 for col in cl.c0..=cl.c1 {
                     visit(row, col, &c.wb.value(first.sheet, row, col));
@@ -752,48 +690,42 @@ fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: b
     } else if let Some(cl) = c.clip(first) {
         c.wb.each(&cl, &mut |row, col, x| visit(row, col, &x));
     }
-    Ok(None)
+    Ok(agg)
 }
 
+fn conditional_result(agg: ifcache::Agg, average: bool) -> Ev {
+    if let Some(error) = agg.error { return e(error); }
+    if !average { return n(agg.sum); }
+    if agg.nums == 0 { return e(ErrorKind::Div0); }
+    n(agg.sum / agg.nums as f64)
+}
+
+fn single_if(c: &Ctx, a: &[Expr], average: bool) -> Ev {
+    let src = tri!(rect_arg(c, &a[0]));
+    let range = tri!(paired_range(c, src, a));
+    let crit = Criterion::new(&c.scalar(&a[1]));
+    conditional_result(tri!(matching(c, Some(range), &[(src, crit)])), average)
+}
+
+fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
+    single_if(c, a, false)
+}
 fn sumifs(c: &Ctx, a: &[Expr]) -> Ev {
-    let vr = tri!(rect_arg(c, &a[0]));
-    let mut s = 0.0;
-    if let Some(a) = tri!(multi_if(c, Some(vr), &a[1..], &mut |x| {
-        if let Value::Num(z) = x {
-            s += z
-        }
-    })) {
-        return n(a.sum);
-    }
-    n(s)
+    let range = tri!(rect_arg(c, &a[0]));
+    conditional_result(tri!(multi_if(c, Some(range), &a[1..])), false)
 }
 fn countif(c: &Ctx, a: &[Expr]) -> Ev {
     countifs(c, a)
 }
 fn countifs(c: &Ctx, a: &[Expr]) -> Ev {
-    let mut k = 0u64;
-    if let Some(a) = tri!(multi_if_with(c, None, a, false, &mut |_| k += 1)) {
-        return n(a.count as f64);
-    }
-    n(k as f64)
+    n(tri!(multi_if(c, None, a)).count as f64)
 }
 fn averageif(c: &Ctx, a: &[Expr]) -> Ev {
+    single_if(c, a, true)
+}
+fn averageifs(c: &Ctx, a: &[Expr]) -> Ev {
     let range = tri!(rect_arg(c, &a[0]));
-    let vr = if a.len() > 2 && !missing(&a[2]) { tri!(rect_arg(c, &a[2])) } else { range };
-    let (mut s, mut k) = (0.0, 0u64);
-    if let Some(agg) = tri!(multi_if(c, Some(vr), &a[..2], &mut |x| {
-        if let Value::Num(z) = x {
-            s += z;
-            k += 1;
-        }
-    })) {
-        (s, k) = (agg.sum, agg.nums);
-    }
-    if k == 0 {
-        e(ErrorKind::Div0)
-    } else {
-        n(s / k as f64)
-    }
+    conditional_result(tri!(multi_if(c, Some(range), &a[1..])), true)
 }
 
 pub(super) fn rng() -> f64 {
@@ -898,11 +830,14 @@ fn hyperlink(c: &Ctx, a: &[Expr]) -> Ev {
     Ev::V(c.scalar(&a[0]))
 }
 fn iferror(c: &Ctx, a: &[Expr]) -> Ev {
-    match c.eval(&a[0]) {
-        Ev::V(Value::Err(_)) => c.eval(&a[1]),
-        Ev::R(r) if r.cells() == 1 && matches!(c.wb.value(r.sheet, r.r0, r.c0), Value::Err(_)) => c.eval(&a[1]),
-        other => other,
-    }
+    let value = c.eval(&a[0]);
+    let scalar = |v: &Ev| match v {
+        Ev::V(v) => Some(v.clone()),
+        Ev::R(r) if r.cells() == 1 => Some(c.wb.value(r.sheet, r.r0, r.c0)),
+        _ => None,
+    };
+    let chosen = if matches!(scalar(&value), Some(Value::Err(_))) { c.eval(&a[1]) } else { value };
+    if scalar(&chosen) == Some(Value::Empty) { v(Value::str("")) } else { chosen }
 }
 fn ifna(c: &Ctx, a: &[Expr]) -> Ev {
     match c.eval(&a[0]) {

@@ -241,3 +241,52 @@ fn volatile_formulas_recalculate_every_time() {
     assert_ne!(a, b);
     assert_eq!(wb.get(CellAddr::new(0, 0, 1)), b);
 }
+
+#[test]
+fn conditional_totals_track_the_used_value_rectangle() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Report").unwrap();
+    wb.add_sheet("Source data").unwrap();
+    wb.define_name("Amounts", None, "='Source data'!$C$1").unwrap();
+
+    let cases = [
+        ("=SUMIF('Source data'!$A$1:$B$2,\"yes\",Amounts)", Value::Num(60.0)),
+        ("=AVERAGEIF('Source data'!$A$1:$B$2,\"yes\",Amounts)", Value::Num(20.0)),
+        ("=AVERAGEIFS('Source data'!$C$1:$C$2,'Source data'!$A$1:$A$2,\"yes\")", Value::Num(15.0)),
+        ("=COUNTIF('Source data'!$A$1:$A$4,\"\")", Value::Num(2.0)),
+        ("=SUMIFS('Source data'!$C$1:$C$2,'Source data'!$A$1:$A$2,\"yes\")", Value::Num(30.0)),
+    ];
+    for (r, c, text) in [(0, 0, "yes"), (1, 0, "yes"), (0, 1, "no"), (1, 1, "yes"), (0, 2, "10"), (1, 2, "20"), (0, 3, "#N/A"), (1, 3, "30")] {
+        wb.set_input(CellAddr::new(1, r, c), text).unwrap();
+    }
+    for (r, (formula, _)) in cases.iter().enumerate() {
+        wb.set_formula(CellAddr::new(0, r as u32, 0), formula).unwrap();
+    }
+    // D4 is in the written target range, outside the effective rectangle.
+    wb.set_formula(CellAddr::new(1, 3, 3), "=SUMIF(A1:A2,\"yes\",D1:D5)").unwrap();
+    wb.recalc();
+    for (r, (_, result)) in cases.into_iter().enumerate() {
+        assert_eq!(wb.value(0, r as u32, 0), result);
+    }
+    assert_eq!(wb.value(1, 3, 3), Value::Err(officina_grid::ErrorKind::NA));
+    wb.set_input(CellAddr::new(1, 0, 3), "100").unwrap();
+    wb.recalc();
+    assert_eq!(wb.value(1, 3, 3), Value::Num(130.0));
+
+    // D2 is beyond the written name's extent but inside the matched rectangle.
+    wb.set_input(CellAddr::new(1, 1, 3), "90").unwrap();
+    wb.recalc();
+    assert_eq!(wb.value(0, 0, 0), Value::Num(120.0));
+    assert_eq!(wb.value(0, 1, 0), Value::Num(40.0));
+    wb.set_input(CellAddr::new(1, 1, 2), "#DIV/0!").unwrap();
+    wb.recalc();
+    for row in [0, 1, 2, 4] {
+        assert_eq!(wb.value(0, row, 0), Value::Err(officina_grid::ErrorKind::Div0));
+    }
+
+    let before = (0..5).map(|r| wb.value(0, r, 0)).collect::<Vec<_>>();
+    wb.recalc_all();
+    assert_eq!((0..5).map(|r| wb.value(0, r, 0)).collect::<Vec<_>>(), before);
+    let reopened = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
+    assert_eq!((0..5).map(|r| reopened.value(0, r, 0)).collect::<Vec<_>>(), before);
+}

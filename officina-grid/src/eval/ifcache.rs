@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use super::criteria::{Key, Side};
 use crate::addr::Rect;
+use crate::value::{ErrorKind, Value};
 
 /// What the matching cells add up to.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -30,6 +31,22 @@ pub struct Agg {
     /// The numbers among the values beside them, and how many there were.
     pub sum: f64,
     pub nums: u64,
+    /// The first matching error, in range traversal order.
+    pub error: Option<ErrorKind>,
+}
+
+impl Agg {
+    pub fn add(&mut self, value: Option<Value>) {
+        self.count += 1;
+        match value {
+            Some(Value::Num(x)) => {
+                self.sum += x;
+                self.nums += 1;
+            }
+            Some(Value::Err(error)) => { self.error.get_or_insert(error); }
+            _ => {}
+        }
+    }
 }
 
 /// The ranges a call reads: its criteria ranges and the range it sums.
@@ -82,7 +99,7 @@ impl Sorted {
             return Agg::default();
         }
         let sum = if exact { self.sums[hi] - self.sums[lo] } else { f64::NAN };
-        Agg { count: (hi - lo) as u64, sum: if sum == 0.0 { 0.0 } else { sum }, nums: self.nums[hi] - self.nums[lo] }
+        Agg { count: (hi - lo) as u64, sum: if sum == 0.0 { 0.0 } else { sum }, nums: self.nums[hi] - self.nums[lo], error: None }
     }
 }
 
@@ -113,7 +130,7 @@ impl Drop for Frozen {
 /// The matching cells' totals for `keys` over `shape`, from an index built by
 /// `build` (which walks the ranges calling its argument with each matching
 /// candidate's keys and value), or None to walk as usual.
-pub fn lookup(shape: Shape, keys: &[Key], build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<f64>)) -> bool) -> Option<Agg> {
+pub fn lookup(shape: Shape, keys: &[Key], build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<Value>)) -> bool) -> Option<Agg> {
     with_index((shape, false), build_eq(build), |idx| match idx {
         Index::Eq(m) => Some(m.get(keys).copied().unwrap_or_default()),
         Index::Sorted { .. } => None,
@@ -125,7 +142,7 @@ pub fn lookup(shape: Shape, keys: &[Key], build: impl FnOnce(&mut dyn FnMut(Vec<
 /// argument with each candidate's keys, number and value beside it), or None to
 /// walk as usual. `sum` says whether the caller needs the sum: without an exact
 /// one, an index answers only counts.
-pub fn lookup_sorted(shape: Shape, keys: &[Key], bounds: &[(Side, f64)], sum: bool, build: impl FnOnce(&mut dyn FnMut(Vec<Key>, f64, Option<f64>)) -> bool) -> Option<Agg> {
+pub fn lookup_sorted(shape: Shape, keys: &[Key], bounds: &[(Side, f64)], sum: bool, build: impl FnOnce(&mut dyn FnMut(Vec<Key>, f64, Option<Value>)) -> bool) -> Option<Agg> {
     with_index((shape, true), build_sorted(build), |idx| match idx {
         Index::Sorted { groups, exact } => {
             if sum && !exact {
@@ -137,7 +154,7 @@ pub fn lookup_sorted(shape: Shape, keys: &[Key], bounds: &[(Side, f64)], sum: bo
     })
 }
 
-fn build_eq(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<f64>)) -> bool) -> impl FnOnce() -> Option<Index> {
+fn build_eq(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<Value>)) -> bool) -> impl FnOnce() -> Option<Index> {
     move || {
         let mut map: HashMap<Vec<Key>, Agg> = HashMap::new();
         let mut over = false;
@@ -149,18 +166,13 @@ fn build_eq(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<f64>)) -> bool) -
                 over = true;
                 return;
             }
-            let a = map.entry(k).or_default();
-            a.count += 1;
-            if let Some(x) = v {
-                a.sum += x;
-                a.nums += 1;
-            }
+            map.entry(k).or_default().add(v);
         });
         (ok && !over).then_some(Index::Eq(map))
     }
 }
 
-fn build_sorted(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, f64, Option<f64>)) -> bool) -> impl FnOnce() -> Option<Index> {
+fn build_sorted(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, f64, Option<Value>)) -> bool) -> impl FnOnce() -> Option<Index> {
     move || {
         let mut rows: HashMap<Vec<Key>, Vec<(f64, Option<f64>)>> = HashMap::new();
         let (mut n, mut over, mut exact, mut mag) = (0usize, false, true, 0.0f64);
@@ -173,10 +185,17 @@ fn build_sorted(build: impl FnOnce(&mut dyn FnMut(Vec<Key>, f64, Option<f64>)) -
                 over = true;
                 return;
             }
-            if let Some(v) = v {
-                mag += v.abs();
-                exact &= v.fract() == 0.0 && mag < EXACT;
-            }
+            let v = match v {
+                Some(Value::Num(v)) => {
+                    mag += v.abs();
+                    exact &= v.fract() == 0.0 && mag < EXACT;
+                    Some(v)
+                }
+                // Sorting loses the original order of errors. Walk for sums
+                // and averages when there is an error in the value range.
+                Some(Value::Err(_)) => { exact = false; None }
+                _ => None,
+            };
             rows.entry(k).or_default().push((x, v));
         });
         if !ok || over {

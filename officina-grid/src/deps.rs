@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
-use crate::formula::{Coord, Expr};
+use crate::formula::{Coord, Expr, Func, RangeKind, RangeRef};
 use std::collections::HashMap;
 
 pub type GroupId = u32;
@@ -72,6 +72,50 @@ pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn 
     out
 }
 
+/// The reference a range argument denotes without running a formula.
+fn static_range(
+    expr: &Expr,
+    resolve: &dyn Fn(&Expr) -> Option<Arc<Expr>>,
+    depth: u32,
+) -> Option<RangeRef> {
+    if depth >= crate::names::MAX_NAME_DEPTH { return None; }
+    match expr {
+        Expr::Ref(r) => Some(RangeRef { sheet: r.sheet, r0: r.row, r1: r.row, c0: r.col, c1: r.col, kind: RangeKind::Cells }),
+        Expr::Range(r) => Some(*r),
+        Expr::Paren(inner) => static_range(inner, resolve, depth + 1),
+        Expr::Name(_) | Expr::Table(_) => static_range(resolve(expr)?.as_ref(), resolve, depth + 1),
+        _ => None,
+    }
+}
+
+fn position(coord: Coord, row: u32) -> i64 {
+    match coord {
+        Coord::Abs(pos) => i64::from(pos),
+        Coord::Rel(delta) => i64::from(row) + i64::from(delta),
+    }
+}
+
+/// SUMIF and AVERAGEIF read a rectangle sized by their first argument and
+/// positioned at the top left of the third. Keep sliding fills sliding.
+fn paired_footprint(source: RangeRef, target: RangeRef, sheet: u16, col: u32, r0: u32, r1: u32) -> Option<Footprint> {
+    let width = |r: RangeRef| Some(r.c0.resolve(col, MAX_COLS)?.abs_diff(r.c1.resolve(col, MAX_COLS)?));
+    let c0 = target.c0.resolve(col, MAX_COLS)?.min(target.c1.resolve(col, MAX_COLS)?);
+    let c1 = (c0 + width(source)?).min(MAX_COLS - 1);
+    let depth = |row| (position(source.r0, row) - position(source.r1, row)).abs();
+    let top = |row| position(target.r0, row).min(position(target.r1, row));
+    let height = depth(r0).max(depth(r1));
+    let rows = if source.r0.is_rel() == source.r1.is_rel() && target.r0.is_rel() && target.r1.is_rel() {
+        let d0 = top(0);
+        Span::Slide { d0, d1: d0 + height }
+    } else {
+        let a = top(r0).max(0);
+        let b = (top(r1) + height).min(i64::from(MAX_ROWS - 1));
+        if a > b { return None; }
+        Span::Fixed { a: a as u32, b: b as u32 }
+    };
+    Some(Footprint { sheet: target.sheet.unwrap_or(sheet), c0, c1, rows })
+}
+
 fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>, depth: u32) -> Vec<Footprint> {
     let mut out = Vec::new();
     let mut named: Vec<Arc<Expr>> = Vec::new();
@@ -86,37 +130,51 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
             }
         }
     };
-    e.walk(&mut |n| match n {
-        Expr::Ref(r) => {
-            if let Some(c) = r.col.resolve(col, MAX_COLS) {
-                out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+    let mut replaced = Vec::<*const Expr>::new();
+    let resolve = |expr: &Expr| names(sheet, r0, col, expr);
+    e.walk_pruned(&mut |n| {
+        if replaced.contains(&(n as *const Expr)) { return false; }
+        match n {
+            Expr::Ref(r) => {
+                if let Some(c) = r.col.resolve(col, MAX_COLS) {
+                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+                }
             }
-        }
-        Expr::Range(r) => {
-            if let (Some(a), Some(b)) = (r.c0.resolve(col, MAX_COLS), r.c1.resolve(col, MAX_COLS)) {
-                out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
+            Expr::Range(r) => {
+                if let (Some(a), Some(b)) = (r.c0.resolve(col, MAX_COLS), r.c1.resolve(col, MAX_COLS)) {
+                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
+                }
             }
-        }
-        // `A1#` reads the spill anchored there; a spill that changes re-dirties its
-        // anchor's readers (recalc.rs).
-        Expr::Spill(r) => {
-            if let Some(c) = r.col.resolve(col, MAX_COLS) {
-                out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+            // `A1#` reads the spill anchored there; a spill that changes re-dirties its
+            // anchor's readers (recalc.rs).
+            Expr::Spill(r) => {
+                if let Some(c) = r.col.resolve(col, MAX_COLS) {
+                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+                }
             }
-        }
-        // A function Officina doesn't have may be a name bound to a LAMBDA.
-        Expr::Call(crate::formula::Func::Unknown(x), _) if depth < crate::names::MAX_NAME_DEPTH => {
-            if let Some(x) = names(sheet, r0, col, &Expr::Name(x.clone())) {
-                named.push(x);
+            Expr::Call(Func::Known(id), args) if args.len() == 3 && matches!(crate::eval::funcs::FUNCS[*id as usize].name, "SUMIF" | "AVERAGEIF") => {
+                if let (Some(source), Some(target)) = (static_range(&args[0], &resolve, 0), static_range(&args[2], &resolve, 0)) {
+                    if let Some(fp) = paired_footprint(source, target, sheet, col, r0, r1) {
+                        out.push(fp);
+                        replaced.push(&args[2]);
+                    }
+                }
             }
-        }
-        Expr::Name(x) if x.is_empty() => {}
-        Expr::Name(_) | Expr::Table(_) if depth < crate::names::MAX_NAME_DEPTH => {
-            if let Some(x) = names(sheet, r0, col, n) {
-                named.push(x);
+            // A function Officina doesn't have may be a name bound to a LAMBDA.
+            Expr::Call(crate::formula::Func::Unknown(x), _) if depth < crate::names::MAX_NAME_DEPTH => {
+                if let Some(x) = names(sheet, r0, col, &Expr::Name(x.clone())) {
+                    named.push(x);
+                }
             }
+            Expr::Name(x) if x.is_empty() => {}
+            Expr::Name(_) | Expr::Table(_) if depth < crate::names::MAX_NAME_DEPTH => {
+                if let Some(x) = names(sheet, r0, col, n) {
+                    named.push(x);
+                }
+            }
+            _ => {}
         }
-        _ => {}
+        true
     });
     for x in named {
         out.extend(footprints_d(&x, sheet, col, r0, r1, names, depth + 1));

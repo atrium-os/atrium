@@ -219,12 +219,7 @@ fn multi(e: &Ev) -> bool {
 /// An element of an array taken to `rows` × `cols`: one row or column broadcasts,
 /// past the end is `#N/A` (Excel's rule for arrays of different sizes).
 fn at(a: &Array, r: usize, c: usize) -> Value {
-    let r = if a.rows == 1 { 0 } else { r };
-    let c = if a.cols == 1 { 0 } else { c };
-    if r >= a.rows || c >= a.cols {
-        return Value::Err(ErrorKind::NA);
-    }
-    a.vals[r * a.cols + c].clone()
+    a.get(r, c).clone()
 }
 
 fn one(c: &Ctx, ev: Ev) -> Value {

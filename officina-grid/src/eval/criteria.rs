@@ -69,7 +69,7 @@ impl Criterion {
         match v {
             Value::Num(x) => Criterion { op: Op::Eq, num: Some(*x), text: String::new(), wild: false, boolean: None },
             Value::Bool(b) => Criterion { op: Op::Eq, num: None, text: String::new(), wild: false, boolean: Some(*b) },
-            Value::Empty => Criterion { op: Op::Eq, num: None, text: String::new(), wild: false, boolean: None },
+            Value::Empty => Criterion { op: Op::Eq, num: Some(0.0), text: String::new(), wild: false, boolean: None },
             Value::Err(_) => Criterion { op: Op::Eq, num: None, text: "\u{0}err".into(), wild: false, boolean: None },
             Value::Str(s) => {
                 let s: &str = s;

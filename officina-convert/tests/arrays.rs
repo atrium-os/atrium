@@ -30,6 +30,21 @@ fn book() -> Workbook {
     wb
 }
 
+#[test]
+fn ods_spill_errors_are_cached_as_matrix_members() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Data").unwrap();
+    wb.set_formula(CellAddr::new(0, 0, 0), "=SEQUENCE(2)+SEQUENCE(3)").unwrap();
+    wb.recalc();
+    assert_eq!(wb.value(0, 2, 0), Value::Err(officina_grid::ErrorKind::NA));
+    let bytes = ods::write(&wb, Vec::new()).unwrap();
+    let content = part(&bytes, "content.xml");
+    assert!(!content.contains(r#"table:formula="of:=#N/A""#));
+    let (reopened, loaded) = ods::read(&bytes).unwrap();
+    same_cells(&wb, &reopened);
+    assert_eq!(loaded.differ, 0, "{:?}", loaded.report.human());
+}
+
 fn part(file: &[u8], name: &str) -> String {
     let z = Archive::open(file).unwrap();
     let e = z.entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("no {name}"));

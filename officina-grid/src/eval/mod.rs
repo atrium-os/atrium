@@ -35,6 +35,9 @@ impl Array {
         // Broadcast a single row or column, as Excel does.
         let r = if self.rows == 1 { 0 } else { r };
         let c = if self.cols == 1 { 0 } else { c };
+        if r >= self.rows || c >= self.cols {
+            return &Value::Err(ErrorKind::NA);
+        }
         self.vals.get(r * self.cols + c).unwrap_or(&Value::Err(ErrorKind::NA))
     }
 }
@@ -345,17 +348,21 @@ impl<'a> Ctx<'a> {
         Some(Rect { r1: r.r1.min(rows - 1), c1: r.c1.min(cols - 1), ..*r })
     }
 
-    /// A range or array as an array (bounded by [`MAX_ARRAY`]). Ranges are clipped to
-    /// the used area, except that a range's shape is kept when it is within it.
+    /// A range or array as an array (bounded by [`MAX_ARRAY`]). Explicit ranges
+    /// include blank cells. Whole-axis references use the used extent on that axis.
     pub fn to_array(&self, ev: Ev) -> Result<Arc<Array>, ErrorKind> {
         match ev {
             Ev::A(a) => Ok(a),
             Ev::V(v) => Ok(Arc::new(Array { rows: 1, cols: 1, vals: vec![v] })),
             Ev::F(_) => Err(ErrorKind::Calc),
-            Ev::R(r) => {
-                let Some(c) = self.clip(&r) else {
-                    return Ok(Arc::new(Array { rows: 1, cols: 1, vals: vec![Value::Empty] }));
-                };
+            Ev::R(mut c) => {
+                let (rows, cols) = self.wb.extent(c.sheet);
+                if c.r0 == 0 && c.r1 == MAX_ROWS - 1 {
+                    c.r1 = rows.saturating_sub(1);
+                }
+                if c.c0 == 0 && c.c1 == MAX_COLS - 1 {
+                    c.c1 = cols.saturating_sub(1);
+                }
                 if c.cells() > MAX_ARRAY {
                     return Err(ErrorKind::Limit);
                 }
@@ -394,8 +401,11 @@ impl<'a> Ctx<'a> {
             (Ok(x), Ok(y)) => (x, y),
             (Err(e), _) | (_, Err(e)) => return Ev::err(e),
         };
-        let rows = if x.rows == 1 { y.rows } else if y.rows == 1 { x.rows } else { x.rows.min(y.rows) };
-        let cols = if x.cols == 1 { y.cols } else if y.cols == 1 { x.cols } else { x.cols.min(y.cols) };
+        let rows = x.rows.max(y.rows);
+        let cols = x.cols.max(y.cols);
+        if rows as u64 * cols as u64 > MAX_ARRAY {
+            return Ev::err(ErrorKind::Limit);
+        }
         let mut vals = Vec::with_capacity(rows * cols);
         for r in 0..rows {
             for c in 0..cols {

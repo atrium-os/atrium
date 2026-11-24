@@ -633,11 +633,34 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
 - **External** functions (`WEBSERVICE`, stock and currency data, links to other workbooks)
   are off until the user allows them for this document (§11.2).
 
+- **Conditional totals.** SUMIF and AVERAGEIF take the shape of their criteria
+  range and begin at the top-left cell of the optional value range. SUMIFS and
+  AVERAGEIFS require matching shapes. Errors in matched values propagate through
+  sums and averages, including indexed equality queries. Ordered indexes fall
+  back to the walk when sorting could change which error is returned. A blank
+  criterion reference means zero. An explicit empty string can match blanks
+  beyond the used extent in a bounded explicit range.
+  [Microsoft AVERAGEIF](https://support.microsoft.com/en-us/excel/functions/averageif-function)
+  [Microsoft AVERAGEIFS](https://support.microsoft.com/en-us/excel/functions/averageifs-function)
+  [Microsoft COUNTIFS](https://support.microsoft.com/en-us/excel/functions/countifs-function)
+- **Array coercion.** Explicit ranges retain trailing blank cells when converted
+  to arrays. Whole-axis references still use the used extent on that axis.
+  Binary operators broadcast singleton axes and pad unmatched positions with
+  `#N/A`. IFERROR handles those errors per element and returns empty text for a
+  selected empty cell. ODS writes spilled error cells as cached matrix members
+  so they cannot block the anchor on reopen.
+  [Microsoft IFERROR](https://support.microsoft.com/en-us/excel/functions/iferror-function)
+
 ### 8.3 Dependency graph and recalculation
 
 - **Range edges, not cell edges.** A formula that reads `A1:A1000000` is one edge to a range,
   kept in an interval index per column; a formula group depends on a sliding range once,
   not a million times. Changing a cell finds its dependents by interval lookup.
+- **Implicit conditional ranges.** SUMIF and AVERAGEIF footprints cover the
+  effective value rectangle for static cell, range, and named references, even
+  when the formula spells only its anchor. A longer written target does not add
+  dependencies past the effective range. Relative fills keep sliding footprints
+  when the criteria height is constant.
 - **Dirty propagation, then ordered evaluation.** An edit marks dependents dirty
   transitively; evaluation runs them in dependency order (topological, by strongly
   connected components so circular references are found and reported, or iterated when the
@@ -655,6 +678,14 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   hash or sorted index of that column once, invalidated by edits to it.
 - **Correctness bar:** results match Excel on a differential corpus of real workbooks
   (§15); LibreOffice's results are a second oracle where Excel's aren't available.
+
+The focused gate in `officina-convert/examples/lo_check.rs` checks conditional
+totals, blank and text coercion, error propagation, and unequal array shapes
+before and after source edits. It verifies Sheets XLSX and ODS reopen, then
+checks the caches written by Calc after forced recalculation. The gate puts
+a wrong cache on a control formula and requires Calc to replace it. Calc 26.8
+differs on a direct text argument to SUM and on an IFERROR result at a missing
+position of a short array operand. Both differences are asserted separately.
 
 ### 8.4 Data features
 

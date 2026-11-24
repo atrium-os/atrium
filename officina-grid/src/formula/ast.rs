@@ -168,19 +168,24 @@ pub enum Expr {
 impl Expr {
     /// Calls `f` on every node, depth first.
     pub fn walk(&self, f: &mut dyn FnMut(&Expr)) {
-        f(self);
+        self.walk_pruned(&mut |node| { f(node); true });
+    }
+
+    /// Visit a node and then its children when the visitor returns true.
+    pub(crate) fn walk_pruned(&self, f: &mut dyn FnMut(&Expr) -> bool) {
+        if !f(self) { return; }
         match self {
-            Expr::Neg(e) | Expr::Plus(e) | Expr::Pct(e) | Expr::Paren(e) | Expr::At(e) => e.walk(f),
+            Expr::Neg(e) | Expr::Plus(e) | Expr::Pct(e) | Expr::Paren(e) | Expr::At(e) => e.walk_pruned(f),
             Expr::Invoke(g, args) => {
-                g.walk(f);
-                args.iter().for_each(|a| a.walk(f));
+                g.walk_pruned(f);
+                args.iter().for_each(|a| a.walk_pruned(f));
             }
             Expr::Bin(_, a, b) => {
-                a.walk(f);
-                b.walk(f);
+                a.walk_pruned(f);
+                b.walk_pruned(f);
             }
-            Expr::Call(_, args) => args.iter().for_each(|a| a.walk(f)),
-            Expr::Array(rows) => rows.iter().flatten().for_each(|a| a.walk(f)),
+            Expr::Call(_, args) => args.iter().for_each(|a| a.walk_pruned(f)),
+            Expr::Array(rows) => rows.iter().flatten().for_each(|a| a.walk_pruned(f)),
             _ => {}
         }
     }

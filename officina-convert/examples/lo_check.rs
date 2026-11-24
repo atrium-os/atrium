@@ -1,6 +1,13 @@
 //! lo_check: `.xlsx` against LibreOffice, an independent implementation.
 //!
 //!   cargo run --release --example lo_check
+//!   cargo run --example lo_check -- --focused-make DIR
+//!   cargo run --example lo_check -- --focused-check CALC_OUTPUT_DIR
+//!
+//! For the focused matrix, use an isolated Calc profile configured to always
+//! recalculate Excel files on load (OOXMLRecalcMode=0), then open and save each
+//! generated XLSX with `--headless --convert-to xlsx --outdir CALC_OUTPUT_DIR`.
+//! The check validates both phases and requires Calc to replace a poisoned cache.
 //!
 //! 1. Builds officina-grid's conformance workbook (the fixture and its 152 formulas,
 //!    each with the result Excel shows), writes it with our `.xlsx` writer.
@@ -77,6 +84,17 @@ fn fixture() -> Workbook {
 }
 
 fn main() {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(command) = args.next() {
+        let dir = std::path::PathBuf::from(args.next().expect("expected a workbook directory"));
+        assert!(args.next().is_none(), "unexpected argument");
+        match command.to_str() {
+            Some("--focused-make") => focused_make(&dir),
+            Some("--focused-check") => focused_check(&dir),
+            _ => panic!("unknown command: {command:?}"),
+        }
+        return;
+    }
     let cases = cases();
     assert!(cases.len() >= 150, "read {} cases", cases.len());
     let mut wb = fixture();
@@ -90,7 +108,7 @@ fn main() {
     std::fs::create_dir_all(&b).unwrap();
     let ours = a.join("conformance.xlsx");
     std::fs::write(&ours, officina_convert::xlsx::write(&wb, Vec::new()).unwrap()).unwrap();
-    let st = Command::new("soffice")
+    let st = Command::new(std::env::var_os("SOFFICE").unwrap_or_else(|| "soffice".into()))
         .args(["--headless", "--norestore", "--convert-to", "xlsx:Calc MS Excel 2007 XML", "--outdir"])
         .arg(&b)
         .arg(&ours)
@@ -200,4 +218,145 @@ fn cached_values(xlsx: &[u8]) -> std::collections::HashMap<(u32, u32), String> {
         }
     }
     out
+}
+
+struct Check {
+    cell: &'static str,
+    before: &'static str,
+    after: &'static str,
+}
+
+const CHECKS: &[Check] = &[
+    Check { cell: "A1", before: "60", after: "#DIV/0!" },
+    Check { cell: "A2", before: "20", after: "#DIV/0!" },
+    Check { cell: "A3", before: "30", after: "#DIV/0!" },
+    Check { cell: "A4", before: "15", after: "#DIV/0!" },
+    Check { cell: "A5", before: "3", after: "2" },
+    Check { cell: "A6", before: "30", after: "90" },
+    Check { cell: "D1", before: "2", after: "2" },
+    Check { cell: "D2", before: "4", after: "4" },
+    Check { cell: "D3", before: "#N/A", after: "#N/A" },
+    Check { cell: "E1", before: "4", after: "4" },
+    Check { cell: "E2", before: "6", after: "6" },
+    Check { cell: "E3", before: "0", after: "0" },
+    Check { cell: "E4", before: "0", after: "20" },
+    Check { cell: "F1", before: "1", after: "1" },
+    Check { cell: "F2", before: "99", after: "99" },
+    Check { cell: "F3", before: "99", after: "99" },
+    Check { cell: "H1", before: "42", after: "42" },
+    Check { cell: "H2", before: "42", after: "42" },
+    Check { cell: "H3", before: "42", after: "42" },
+];
+
+fn focused_cell(name: &str) -> CellAddr {
+    let (row, col) = officina_grid::addr::parse_a1(name).unwrap();
+    CellAddr::new(0, row, col)
+}
+
+fn focused_book() -> Workbook {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Report").unwrap();
+    wb.add_sheet("Source data").unwrap();
+    wb.define_name("Amounts", None, "='Source data'!$C$1").unwrap();
+    for (name, value) in [
+        ("A1", "yes"), ("A2", "yes"), ("B1", "no"), ("B2", "yes"),
+        ("C1", "10"), ("C2", "20"), ("D1", "=NA()"), ("D2", "30"),
+        ("F1", "1"), ("F2", "2"), ("F3", "3"),
+    ] {
+        wb.set_input(CellAddr { sheet: 1, ..focused_cell(name) }, value).unwrap();
+    }
+    for (name, code) in [
+        ("A1", r#"=SUMIF('Source data'!$A$1:$B$2,"yes",Amounts)"#),
+        ("A2", r#"=AVERAGEIF('Source data'!$A$1:$B$2,"yes",Amounts)"#),
+        ("A3", r#"=SUMIFS('Source data'!$C$1:$C$2,'Source data'!$A$1:$A$2,"yes")"#),
+        ("A4", r#"=AVERAGEIFS('Source data'!$C$1:$C$2,'Source data'!$A$1:$A$2,"yes")"#),
+        ("A5", r#"=COUNTIF('Source data'!$A$1:$A$5,"")"#),
+        ("A6", r#"=SUMIF('Source data'!$B$1:$B$2,"yes",'Source data'!$D$1)"#),
+        ("D1", "='Source data'!F1:F2+'Source data'!F1:F3"),
+        ("E1", "='Source data'!F2:F5*2"),
+        ("F1", "=IFERROR('Source data'!F1:F3/{1;0},99)"),
+        ("H1", "=40+2"),
+        ("H2", r#"=SUM("4",TRUE,37)"#),
+        ("H3", r#"=VALUE("4")+38"#),
+    ] {
+        wb.set_formula(focused_cell(name), code).unwrap();
+    }
+    wb.recalc();
+    wb
+}
+
+fn phase_check(after: bool, calc: bool, mut get: impl FnMut(CellAddr) -> String) -> bool {
+    let mut ok = true;
+    for check in CHECKS {
+        let sheets = if after { check.after } else { check.before };
+        // Calc 26.8 retains the short array operand's missing row through
+        // IFERROR, and rejects the direct text argument to SUM.
+        let want = match (calc, check.cell) {
+            (true, "F3") => "#N/A",
+            (true, "H2") => "#VALUE!",
+            _ => sheets,
+        };
+        let got = get(focused_cell(check.cell));
+        let matched = got == want || close(&got, want);
+        ok &= matched;
+        println!("{} {} expected {want:<8} actual {got:<8} {}",
+            if after { "edited " } else { "initial" },
+            check.cell,
+            if !matched { "DIFF" } else if want != sheets { "documented Calc difference" } else { "ok" });
+    }
+    ok
+}
+
+fn focused_make(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut wb = focused_book();
+    for (phase, after) in [("initial", false), ("edited", true)] {
+        if after {
+            for (cell, value) in [("C2", "=1/0"), ("D2", "90"), ("A5", "no"), ("F5", "10")] {
+                wb.set_input(CellAddr { sheet: 1, ..focused_cell(cell) }, value).unwrap();
+            }
+            wb.recalc();
+        }
+        assert!(phase_check(after, false, |at| wb.get(at).display()));
+        let xlsx = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
+        let ods = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+        for (label, reopened) in [
+            ("XLSX", officina_convert::xlsx::read(&xlsx).unwrap().0),
+            ("ODS", officina_convert::ods::read(&ods).unwrap().0),
+        ] {
+            println!("Reopened {label}");
+            assert!(phase_check(after, false, |at| reopened.get(at).display()));
+        }
+        // A deliberately stale scalar cache positively verifies Calc recalculated
+        // the formulas rather than copying our caches into its output.
+        let zip = officina_convert::zip::Archive::open(&xlsx).unwrap();
+        let mut out = officina_convert::zip::ZipWriter::new(Vec::new());
+        for entry in &zip.entries {
+            let mut data = zip.read(entry).unwrap();
+            if entry.name == "xl/worksheets/sheet1.xml" {
+                let xml = String::from_utf8(data).unwrap();
+                let cache = "40+2</f><v>42</v>";
+                assert_eq!(xml.matches(cache).count(), 1);
+                data = xml.replace(cache, "40+2</f><v>987654</v>").into_bytes();
+            }
+            out.add(&entry.name, &data).unwrap();
+        }
+        std::fs::write(dir.join(format!("{phase}.xlsx")), out.finish().unwrap()).unwrap();
+    }
+}
+
+fn focused_check(dir: &std::path::Path) {
+    let mut ok = true;
+    for (phase, after) in [("initial", false), ("edited", true)] {
+        let data = std::fs::read(dir.join(format!("{phase}.xlsx"))).unwrap();
+        let vals = cached_values(&data);
+        let get = |a: CellAddr| vals.get(&(a.row, a.col)).cloned().unwrap_or_default();
+        assert_eq!(get(focused_cell("H1")), "42", "Calc must replace the stale cache");
+        println!("Calc caches");
+        ok &= phase_check(after, true, get);
+        let (reopened, _) = officina_convert::xlsx::read(&data).unwrap();
+        println!("Recalculated in Sheets after opening Calc’s XLSX");
+        ok &= phase_check(after, false, |a| reopened.get(a).display());
+    }
+    assert!(ok, "Formula results differ");
 }
