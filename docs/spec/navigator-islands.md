@@ -1828,6 +1828,61 @@ and to the red pixel against the cold first press; `navigator-i5-worker-check.sh
 on an assigned standby; the standby's resident memory while it waits; and
 a standby whose channel receives a data byte without a descriptor exits.
 
+#### Results on arm64 Tessera, 2026-11-24 (rerun from main)
+
+The engine was rebuilt from main `58f533c1b` with `fixture-fetch.patch` and
+`native-mse.patch` (not `webauthn-submit.patch`): the seven patched media
+and loader units, `editor-check.cpp` and `EditorPage.cpp` with
+`ATRIUM_I4_VIDEO`, and the painter staticlib were rebuilt and relinked with
+the rest of the audited I5 link inputs. `navigator-i5-worker-audit.sh`
+passed for digest `6b2b35bb…5092eb`, and the installed engine had that
+digest. navigatord, limend, portcullisd, jaild, the embedded player
+supervisor, lyrad, choragusd and navigator-fetchd came from main. The
+older navigator-fetchd refused the fourth fetch (`BadUrl` on
+`tone-opus.webm`), so the fetcher must come from main too. The guest was
+a disposable overlay of the newest surviving Navigator guest disk, since
+the I5 run's own disk was gone. All three arms used one guest session.
+
+Press to the decoded red pixel is measured as in the I5 gate (headless
+PNG over SSH). The stage times are milliseconds since `widget-start`.
+
+| | No choragusd | choragusd answering | Warm (standby assigned) |
+| --- | ---: | ---: | ---: |
+| Presses | 3 | 3 | 4 (presses 2 to 5) |
+| `pdfork-done` | 13.0 / 30.7 / 19.3 | 10.2 / 20.6 / 43.4 | none (`standby-assigned` at 0.4 to 0.6) |
+| `first-request`, median | 113.5 (67 to 156) | 69.0 (60 to 170) | 55.0 (41 to 172) |
+| `engine-started`, median | 298 | 333 | 318 |
+| Press to red pixel | 1,588 / 1,697 / 1,748 | 1,696 / 1,764 / 1,777 | 1,770 / 1,727 / 1,741 / 1,700 |
+| Median to red | 1,697 | 1,764 | 1,734 |
+
+The 2 s audio wait is gone: both cold arms reach `first-request` within
+tens of milliseconds, and the press to red fell from 3,176 ms in the I5
+gate to about 1.7 s, with the fourth (Opus) fetch now made and served.
+choragusd still refused the ticket because the Navigator grant has no
+`audio`.
+
+The standby worked as built. The first press with `LIMEN_ISLAND_STANDBY=1`
+was cold (1,723 ms to red), and each later press took the waiting standby
+(same embed id, no portcullisd or jaild stages for the island) while the
+next standby forked 42 to 63 ms after the press. `navigator-i5-worker-check.sh`
+passed on assigned standby PID 11980 (jail 72): uid 50007, Capsicum, IP
+disabled, `memoryuse:sigkill=1073741824` and `pcpu:deny=100`, and the
+mapping checks. A waiting standby held 70,396 to 70,408 KB resident
+(four samples, 7 to 8 s after its fork).
+
+The warm path misses its two targets. `first-request` came 41 to 172 ms
+after the press, not under 20 ms, and the red pixel did not move. The
+trace does not cover the gap: navigatord starts the fetch thread only after
+`Video::start` has asked Limen for the embedded player, and the next
+standby's launch runs at the same moment. About 1.4 s of the 1.7 s lies
+after `engine-started` (the four fetches, MSE appends, the native player's
+start and first decoded frame, and the headless capture), which no stage
+instruments. In one cold press with standbys on, the standby's jail was
+created before the island's, delaying the island's fork to 141 ms. The
+standby that receives a data byte without a descriptor was not tested on
+the guest. Evidence is in
+`~/atrium-vm/evidence/navigator-i5-rerun-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
