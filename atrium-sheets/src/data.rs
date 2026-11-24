@@ -143,6 +143,10 @@ pub enum DataCmd {
     DeleteCellsLeft,
     /// The selection as one merged cell, its top-left's value centred across it.
     Merge,
+    /// Each row of the selection merged on its own, keeping its left value.
+    MergeAcross,
+    /// Formulas at the cursor reading the cells last copied, one for each.
+    PasteLink,
     /// The selection's text centred across its columns without merging
     /// them (again: back to General).
     CenterAcross,
@@ -386,6 +390,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste and Multiply").enabled(special), Some(DataCmd::PasteMultiply)),
         (MenuItem::new("Paste and Divide").enabled(special), Some(DataCmd::PasteDivide)),
         (MenuItem::new("Paste Special…").enabled(special), Some(DataCmd::PasteSpecial)),
+        (MenuItem::new("Paste Link").enabled(special), Some(DataCmd::PasteLink)),
         (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
@@ -421,6 +426,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         } else {
             (MenuItem::new("Merge Cells").enabled(nr > 1 || nc > 1).separated(), Some(DataCmd::Merge))
         },
+        (MenuItem::new("Merge Across").enabled(nc > 1), Some(DataCmd::MergeAcross)),
         (MenuItem::new("Center Across Selection").checked(across_at(wb, s, sel)).enabled(nc > 1 || across_at(wb, s, sel)), Some(DataCmd::CenterAcross)),
         (MenuItem::new("Wrap Text").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).wrap), Some(DataCmd::WrapText)),
         (MenuItem::new("Align Top").checked(v_at(wb, s, sel) == VAlign::Top), Some(DataCmd::AlignTop)),
@@ -670,6 +676,11 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
     }
 }
 
+/// The most rows Merge Across merges at once.
+pub const MAX_MERGE_ROWS: u32 = 100_000;
+/// The most formulas Paste Link makes.
+pub const MAX_LINK_CELLS: u64 = 1_000_000;
+
 /// The most used cells Duplicate Sheet copies.
 pub const MAX_DUPLICATE_CELLS: u64 = 20_000_000;
 
@@ -784,6 +795,26 @@ pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
     if !more.is_empty() {
         tables.extend(more);
         ops.push(GridOp::Tables(tables));
+    }
+    // Pivot tables whose output is on the sheet, each under a fresh name; a
+    // source on the sheet becomes the copy's, one elsewhere stays.
+    let state = d.wb.pivot_state();
+    let mut extra = Vec::new();
+    for (p, area) in state.iter().filter(|(p, _)| p.dest.sheet == s) {
+        let taken = |n: &str| state.iter().map(|x| &x.0).chain(extra.iter().map(|x: &(officina_grid::pivot::Pivot, Option<Rect>)| &x.0)).any(|x| x.name.eq_ignore_ascii_case(n));
+        let Some(name) = (2..).map(|k| format!("{}_{k}", p.name)).take(10_000).find(|n| !taken(n)) else { continue };
+        let mut q = p.clone();
+        q.name = name.into();
+        q.dest.sheet = t;
+        if q.source.sheet == s {
+            q.source.sheet = t;
+        }
+        extra.push((q, area.map(|a| Rect { sheet: t, ..a })));
+    }
+    if !extra.is_empty() {
+        let mut all = state.clone();
+        all.extend(extra);
+        ops.push(GridOp::Pivots(all));
     }
     // Moved last: everything above names the copy by its place at the end.
     if s + 1 < t {
@@ -1727,6 +1758,63 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 n => format!("Cells merged; the {n} other values in them were cleared."),
             })
         }
+        DataCmd::MergeAcross => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            if r.c1 == r.c0 {
+                return Err("Select two or more columns to merge across.".into());
+            }
+            if r.r1 - r.r0 >= MAX_MERGE_ROWS {
+                return Err(format!("Merge Across merges at most {MAX_MERGE_ROWS} rows."));
+            }
+            if r.cells() > MAX_MERGE_CELLS {
+                return Err("That's too many cells to merge.".into());
+            }
+            // As Excel does: what was merged there is unmerged, and in each
+            // row only the leftmost value stays.
+            let mut others = 0u64;
+            d.wb.each(&r, &mut |_, col, v| {
+                if col != r.c0 && v != officina_grid::Value::Empty {
+                    others += 1;
+                }
+            });
+            let mut ops = vec![GridOp::clear(Rect { c0: r.c0 + 1, ..r })];
+            let mut list: Vec<Rect> = d.wb.merges(s).iter().filter(|m| !m.intersects(&r)).copied().collect();
+            list.extend((r.r0..=r.r1).map(|row| Rect { r0: row, r1: row, ..r }));
+            list.sort_by_key(|m| (m.r0, m.c0));
+            ops.push(GridOp::Merges { sheet: s, list });
+            d.run("Merge Across", ops);
+            let n = r.r1 - r.r0 + 1;
+            let rows = if n == 1 { "1 row".to_string() } else { format!("{n} rows") };
+            Ok(match others {
+                0 => format!("Merged across {rows}."),
+                1 => format!("Merged across {rows}; the one other value in them was cleared."),
+                k => format!("Merged across {rows}; the {k} other values in them were cleared."),
+            })
+        }
+        DataCmd::PasteLink => {
+            let from = d.clip.as_ref().filter(|c| !c.clip.cut).map(|c| c.clip.from).ok_or("Copy cells first; Paste Link points at them.")?;
+            let (h, w) = (from.r1 - from.r0 + 1, from.c1 - from.c0 + 1);
+            if h as u64 * w as u64 > MAX_LINK_CELLS {
+                return Err(format!("Paste Link makes at most {MAX_LINK_CELLS} formulas."));
+            }
+            let (row, col) = (sel.r0, sel.c0);
+            if row as u64 + h as u64 > officina_grid::addr::MAX_ROWS as u64 || col as u64 + w as u64 > officina_grid::addr::MAX_COLS as u64 {
+                return Err("That doesn't fit on the sheet there.".into());
+            }
+            let to = Rect { sheet: s, r0: row, c0: col, r1: row + h - 1, c1: col + w - 1 };
+            if d.wb.merges_in(&to).next().is_some() {
+                return Err("Unmerge the cells there before pasting links.".into());
+            }
+            if (from.sheet as usize) >= d.wb.sheet_count() {
+                return Err("The sheet they came from is gone.".into());
+            }
+            let prefix = if from.sheet == s { String::new() } else { format!("{}!", quoted(&d.wb.sheet_name(from.sheet))) };
+            // One fill a column: the top formula, moved down as a copy moves it.
+            let fills = (0..w).map(|j| officina_grid::ops::Fill { col: col + j, r0: row, r1: to.r1, src: format!("={prefix}{}", officina_grid::addr::a1(from.r0, from.c0 + j)) }).collect();
+            d.run("Paste Link", vec![GridOp::Replace(officina_grid::ops::Region { rect: to, values: Vec::new(), fills })]);
+            let k = h as u64 * w as u64;
+            Ok(if k == 1 { "1 link pasted.".into() } else { format!("{k} links pasted.") })
+        }
         DataCmd::DeleteComments => {
             let set: Vec<_> = comments_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
             if set.is_empty() {
@@ -2213,6 +2301,64 @@ mod tests {
         assert_eq!((1..=4).map(|r| cell(&d, r, 0)).collect::<Vec<_>>(), ["apple", "apple", "fig", "pear"]);
         assert_eq!(cell(&d, 4, 1), "3");
         assert_eq!(d.wb.merges(0), &list[..]);
+    }
+
+    #[test]
+    fn paste_link_points_at_the_copied_cells_and_merge_across_merges_each_row() {
+        let mut d = doc();
+        let r = Rect { sheet: 0, r0: 1, c0: 1, r1: 2, c1: 2 };
+        d.take_clip(r, false, String::new());
+        assert!(menu(&d, one(0, 0), (0, 0)).iter().any(|(m, c)| *c == Some(DataCmd::PasteLink) && m.enabled));
+        run(&mut d, one(8, 4), (8, 4), DataCmd::PasteLink);
+        assert_eq!(d.status, "4 links pasted.");
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 8, 4)).as_deref(), Some("=B2"));
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 9, 5)).as_deref(), Some("=C3"));
+        // They follow the source.
+        d.type_into(1, 1, "42");
+        d.wb.recalc();
+        assert_eq!(cell(&d, 8, 4), "42");
+        // From another sheet, the sheet is named.
+        d.run("Add", vec![GridOp::add_sheet("Two".into())]);
+        d.sheet = 1;
+        run(&mut d, one(0, 0), (0, 0), DataCmd::PasteLink);
+        let own = d.wb.sheet_name(0);
+        assert_eq!(d.wb.formula_text(CellAddr::new(1, 0, 0)), Some(format!("={}!B2", quoted(&own))));
+        d.sheet = 0;
+        // Merge Across: one merge a row, the left value kept.
+        let sel = CellRange { r0: 1, c0: 0, r1: 2, c1: 2 };
+        run(&mut d, sel, (1, 0), DataCmd::MergeAcross);
+        assert_eq!(d.status, "Merged across 2 rows; the 4 other values in them were cleared.");
+        assert_eq!(d.wb.merges(0), &[Rect { sheet: 0, r0: 1, c0: 0, r1: 1, c1: 2 }, Rect { sheet: 0, r0: 2, c0: 0, r1: 2, c1: 2 }]);
+        assert_eq!((cell(&d, 1, 0), cell(&d, 2, 0), cell(&d, 1, 1)), ("pear".into(), "apple".into(), "".into()));
+        assert!(d.undo());
+        assert!(d.wb.merges(0).is_empty());
+    }
+
+    #[test]
+    fn duplicate_sheet_copies_a_pivot_table_reading_the_copy() {
+        let mut d = Doc::from_csv("p.csv", b"Fruit,Qty\npear,3\napple,10\nfig,7\n").unwrap().0;
+        d.wb.recalc();
+        let sel = CellRange { r0: 0, c0: 0, r1: 3, c1: 1 };
+        run(&mut d, sel, (0, 0), DataCmd::InsertPivot);
+        assert_eq!(d.wb.pivots().len(), 1, "{}", d.status);
+        let name = d.wb.pivots()[0].name.to_string();
+        let t = duplicate_sheet(&mut d).unwrap();
+        assert_eq!(t, 1);
+        let ps = d.wb.pivots();
+        assert_eq!(ps.len(), 2);
+        let copy = ps.iter().find(|p| p.dest.sheet == 1).unwrap();
+        assert_eq!((copy.name.to_string(), copy.source.sheet), (format!("{name}_2"), 1));
+        assert!(ps.iter().any(|p| p.dest.sheet == 0 && p.source.sheet == 0));
+        // The copy's source is the copy's data: a change there shows after refresh.
+        d.sheet = 1;
+        d.type_into(1, 1, "100");
+        let i = d.wb.pivots().iter().position(|p| p.dest.sheet == 1).unwrap();
+        d.wb.refresh_pivot(i).unwrap();
+        let p = &d.wb.pivots()[i];
+        let mut found = false;
+        let out = Rect { sheet: 1, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row + 10, c1: p.dest.col + 3 };
+        d.wb.each(&out, &mut |_, _, v| found |= v == Value::Num(100.0));
+        assert!(found, "the copy's pivot reads the copy");
     }
 
     #[test]

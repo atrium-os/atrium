@@ -4778,7 +4778,7 @@ Gates: atrium-sheets `insert_and_delete_cells_shift_their_neighbours_and_formula
 
 ### 16.99 Duplicate Sheet, Define Name, indent (2026-11-24)
 
-- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: pivots stay with the original. (Conditional formats, validations and sheet-scoped names are copied since §16.100; charts, pictures and tables since §16.106.)
+- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Pivot tables are copied since §16.108. (Conditional formats, validations and sheet-scoped names are copied since §16.100; charts, pictures and tables since §16.106.)
 - **Define Name…** (Data menu) opens a bar that names the selection for the whole workbook as one step (`data::define_name`), for example `Sheet1!$A$1:$B$2`. A name already in use now means the new place. Names that look like cells, or that break Excel's rules, are refused and the bar stays open. Formulas and Go To use the names at once. A Name Manager came in §16.100.
 - **Increase Indent / Decrease Indent** (Format menu) step text in from the left by up to 15 steps. Indenting General or centred text moves it to the left, as Excel does. The grid now draws a cell style's indent for left-aligned and General cells, which also covers indents that files bring in.
 
@@ -4833,7 +4833,7 @@ Gates: atrium-sheets `custom_sort_orders_by_several_columns_named_by_letter_or_h
 
 ### 16.106 Duplicate Sheet brings charts and tables; renames reach rules (2026-11-24)
 
-- **Duplicate Sheet** now copies the sheet's charts and pictures onto the copy. A chart's series ranges, and its title or series names taken from cells, follow to the copy when they were on the original sheet; ranges on other sheets stay. Tables are copied too, each under a fresh workbook-wide name `Name_2` (or the next free number, clashing with neither tables nor defined names). Formulas in the copy that name a copied table name the copy instead (since §16.107), as Excel's do. Pivots stay with the original.
+- **Duplicate Sheet** now copies the sheet's charts and pictures onto the copy. A chart's series ranges, and its title or series names taken from cells, follow to the copy when they were on the original sheet; ranges on other sheets stay. Tables are copied too, each under a fresh workbook-wide name `Name_2` (or the next free number, clashing with neither tables nor defined names). Formulas in the copy that name a copied table name the copy instead (since §16.107), as Excel's do. Pivots are copied since §16.108.
 - **Renaming a name** also rewrites conditional-format rule formulas and data-validation formulas, on the sheets where the spelling means that name, with the same LET and LAMBDA exception as cell formulas (`names::rename_ops`).
 
 Gates: atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` and `renaming_a_name_reaches_conditional_formats_and_validations`. Both fail on the code before. All 136 Sheets lib and 121 officina-grid lib tests pass.
@@ -4844,6 +4844,13 @@ Gates: atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names
 - **Freeze First Column** (Data menu, beside Freeze Top Row) keeps the view's first column in view, as Freeze Top Row does for the top row.
 
 Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_under_fresh_names` (the copy's `=SUM(Table[Qty])` names the copy and sums to 3) and `panes_freeze_at_the_cursor_and_unfreeze`; all 136 Sheets lib tests pass.
+
+### 16.108 Paste Link, Merge Across, and pivots in Duplicate Sheet (2026-11-24)
+
+- **Paste Link** (cell menu, after Paste Special…, enabled after a copy, not a cut) puts one formula per copied cell at the cursor, each reading its source cell (`=B2`, or `='Sheet 1'!B2` from another sheet), as one undo step. At most 1,000,000 links; it refuses when the block would run off the sheet, covers merged cells, or the source sheet is gone.
+- **Merge Across** (cell menu, before Center Across Selection, two or more columns) merges each selected row on its own. As in Excel, merges the selection touched are replaced, and only each row's leftmost value stays; the status line says how many other values were cleared. At most 100,000 rows; one undo step.
+- **Duplicate Sheet** now copies pivot tables whose output is on the sheet, each under a fresh name `Name_2` (or the next free number). A pivot reading data on the same sheet reads the copy's data; one reading another sheet keeps its source.
+- Tests: `paste_link_points_at_the_copied_cells_and_merge_across_merges_each_row`, `duplicate_sheet_copies_a_pivot_table_reading_the_copy`. All 138 Sheets lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 
