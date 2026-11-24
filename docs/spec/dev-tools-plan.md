@@ -421,9 +421,15 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   `attachCommands: ["gdb-remote <address>"]` and the program's path, so breakpoints, stack
   and locals work as for a workspace program. Off Atrium, Artifex's local executor stands
   in with `lldb-server gdbserver`; `engine::tests::debugs_a_dev_app_by_attaching` runs it
-  end to end (a breakpoint, its locals, to the end). Not done: the same in the VM, which
-  waits on an `lldb-dap` in a workspace (FreeBSD's base has lldb and lldb-server only; the
-  c-dev layer is where it belongs).
+  end to end (a breakpoint, its locals, to the end). In the VM (2026-11-24): the c-dev
+  layer now carries FreeBSD llvm21's `lldb-dap`, `lldb-server`, `lldb-argdumper` and
+  `liblldb` (base has lldb and lldb-server only), and `scripts/vm-artifex-check.sh` sets a
+  breakpoint in a c-app with F9, presses Debug after F5, stops at app.c:32 with its
+  locals, checks the dev jail and the debugging mark, and continues to the next stop
+  (0 failed). Two fixes it needed: `egress::bind_in` brings up lo0 in a `none`
+  workspace's vnet before binding (it was down, so the helper could not bind), and
+  `atrium.app.mk` adds `-g` with `CFLAGS+=` (sys.mk sets CFLAGS first, so `?= -g` never
+  applied and dev builds had no DWARF).
   The frame tag (2026-11-24): while a dev build runs under lldb-server, portcullisd keeps
   an empty file named for it in `/var/db/atrium/debugging` (removed when it exits and
   at portcullisd's start); frescod, which already mounts `/var/db/atrium` read-only,

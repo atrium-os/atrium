@@ -340,6 +340,41 @@ fi
 V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
 GAP=8 press 700 640
 
+echo "=== Debug a dev app (lldb-dap from the c-dev layer)"
+# F5 on app (an atrium.toml) asks to Debug it; the press sends
+# WorkspaceDebug, and lldb-dap in proj attaches over gdb-remote to the build
+# portcullisd started under lldb-server, in its own jail.
+if V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_proj test -x /atrium/toolchains/c-dev/bin/lldb-dap"; then
+    ROW=$(rows | grep -n '^app/app.c$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[[^]]*app/app.c\]' 20 || bad "app.c: $(state)"
+    # The caret to line 32 (`float span = ...`, run every frame), and F9.
+    press 700 200
+    i=0; while [ $i -lt 40 ]; do inj "KEY 0x4a 1 1" "KEY 0x4a 0 1"; state | grep -q 'caret=(1,' && break; sleep 1; i=$((i+1)); done
+    keys=""; for n in $(seq 1 31); do keys="$keys \"KEY 0x51 1\" \"KEY 0x51 0\""; done
+    eval inj $keys; sleep 4
+    waitstate 'caret=(32,' 30 || bad "caret: $(state)"
+    inj "KEY 0x42 1" "KEY 0x42 0"; sleep 4
+    waitstate 'bps={"app/app.c": \[31\]}' 20 && ok "F9 sets a breakpoint on app.c:32" || bad "breakpoint: $(state)"
+    inj "KEY 0x3e 1" "KEY 0x3e 0"
+    waitstate 'ask=Some("app")' 300 && ok "F5 builds app and asks to Debug it" || bad "debug ask: $(state) $(V "tail -5 $B/artifex.log")"
+    shot artifex-8-debug-ask
+    GAP=8 press 980 520
+    DEV=dev.alice.proj.org.example.app
+    waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3' 300 \
+        && ok "the press starts it and lldb-dap stops it at the breakpoint ($(state | grep -o 'app/app.c:[0-9]*' | tail -1))" || bad "debug: $(state) $(V "grep -i 'debug\|REFUSED' $LOG | tail -4")"
+    check "it runs in its own jail as the dev build" "1" "$(V "jls name | grep -c '^dev_alice_proj'")"
+    check "marked as debugging (the frame tag)" "$DEV" "$(V "ls /var/db/atrium/debugging 2>/dev/null")"
+    shot artifex-9-debug-stopped
+    inj "KEY 0x3e 1" "KEY 0x3e 0"   # F5: continue, to the next frame
+    waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3' 120 && ok "continue stops at it again (the next frame)" || bad "continue: $(state)"
+    V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+    sleep 10
+    GAP=8 press 700 640
+else
+    echo "  (no app project, or no lldb-dap in proj (CDEV= a c-dev layer with it): skipped)"
+fi
+
 echo "=== New project"
 if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
     press 962 52               # the bar's New project (ui.rs)

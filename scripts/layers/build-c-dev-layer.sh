@@ -1,6 +1,6 @@
 #!/bin/sh
 # The c-dev layer (dev-tools-plan.md M3, dev-tools.md §6.2): pkgconf, CMake,
-# Meson, Ninja, GNU make, git, clangd and clang-format, bear, Helix, from
+# Meson, Ninja, GNU make, git, clangd and clang-format, lldb-dap, bear, Helix, from
 # FreeBSD packages, relocated to /atrium/toolchains/c-dev. GPL tools are
 # fine here: a layer is development tooling, never the base or a bundle.
 #
@@ -43,18 +43,22 @@ rm -rf "$STAGE"
 
 say "trim"
 cd "$L"
-# clangd and clang-format only, with what they load and clangd's headers.
+# clangd and clang-format, and lldb-dap (Artifex's debugger, dev-tools.md
+# §7.3) with the lldb-server and lldb-argdumper it runs beside it, with
+# what they load and clangd's headers.
 if [ -d llvm21 ]; then
-    find llvm21/bin -type f ! -name clangd ! -name clang-format -delete
+    find llvm21/bin -type f ! -name clangd ! -name clang-format ! -name lldb-dap ! -name lldb-server ! -name lldb-argdumper -delete
     find llvm21/bin -type l -delete
     rm -rf llvm21/include llvm21/share llvm21/libexec
-    # What clangd and clang-format load (RUNPATH $ORIGIN/../lib), and the
-    # headers clangd parses with; nothing else of LLVM.
-    find llvm21/lib -mindepth 1 -maxdepth 1 ! -name 'libLLVM*.so*' ! -name 'libclang-cpp.so*' ! -name clang -exec rm -rf {} +
+    # What they load (RUNPATH $ORIGIN/../lib), the headers clangd parses
+    # with, and lldb's Python module; nothing else of LLVM.
+    find llvm21/lib -mindepth 1 -maxdepth 1 ! -name 'libLLVM*.so*' ! -name 'libclang-cpp.so*' ! -name 'liblldb.so*' ! -name clang ! -name 'python3*' -exec rm -rf {} +
     find llvm21/lib/clang -mindepth 2 -maxdepth 2 ! -name include -exec rm -rf {} +
     # The port's bin/*21 wrappers exec the binaries removed above.
     rm -f bin/*21
-    for t in clangd clang-format; do ln -sf ../llvm21/bin/$t bin/$t; done
+    # lldb-dap on PATH; its lldb-server stays beside it (the base's lldb
+    # keeps the base's).
+    for t in clangd clang-format lldb-dap; do ln -sf ../llvm21/bin/$t bin/$t; done
 fi
 rm -rf share/doc share/examples include libdata/pkgconfig share/aclocal share/info share/locale
 # No perl in the layer (git's perl helpers go with it); Python without its
@@ -121,7 +125,7 @@ version = "$VERSION"
 arch = "$ARCH"
 mount = "/atrium/toolchains/c-dev"
 path = ["bin"]
-summary = "C tools: pkgconf, CMake, Meson, Ninja, gmake, git, clangd, clang-format, bear, Helix"
+summary = "C tools: pkgconf, CMake, Meson, Ninja, gmake, git, clangd, clang-format, lldb-dap, bear, Helix"
 
 [layer.env]
 LD_LIBRARY_PATH = "\${LAYER}/lib"

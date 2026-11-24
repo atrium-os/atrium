@@ -24,8 +24,11 @@ PROG?=		${.CURDIR:T}
 SRCS?=		${PROG}.c
 OBJS=		${SRCS:R:S/$/.o/g}
 CC?=		cc
-CFLAGS?=	-O2 -g
-CFLAGS+=	-Wall -I/usr/include/atrium
+CFLAGS?=	-O2
+# Debug info always (sys.mk sets CFLAGS before this file, so a ?= -g never
+# applied): Debug and cores need it, and `make bundle` strips it into
+# <tree>.debug for a release (dev-tools-plan.md M10).
+CFLAGS+=	-g -Wall -I/usr/include/atrium
 LDFLAGS+=	-Wl,-rpath,/usr/local/lib
 
 .for _l in ${ATRIUM_LIBS}

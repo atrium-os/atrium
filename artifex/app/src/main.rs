@@ -106,12 +106,14 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
                 s.note.as_ref().map(|n| &n.0), s.ask,
-                s.composition.as_ref().map(|c| (&c.id, c.workers.len(), c.checked, c.check_error.is_none())), s.templates.len());
+                s.composition.as_ref().map(|c| (&c.id, c.workers.len(), c.checked, c.check_error.is_none())), s.templates.len(),
+                s.debug.as_ref().map(|d| (&d.run, d.stopped, d.frames.iter().find(|f| f.1.is_some()).map(|f| format!("{}:{}", f.1.as_deref().unwrap_or(""), f.2)))),
+                s.breakpoints);
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

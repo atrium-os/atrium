@@ -75,6 +75,12 @@ pub fn bind_in_jail_main(jid: &str, port: Option<&str>) -> ! {
 /// A socket listening on 127.0.0.1:`port` (0: any) in jail `jid`'s network
 /// stack: the proxy's here, a debugger's way in for M10.
 pub fn bind_in(jid: i32, port: u16) -> Result<OwnedFd, String> {
+    /* A `none` workspace's own vnet has lo0 down with no address (only a
+     * routed one gets 127.0.0.1 from jaild): its loopback is still its
+     * own, and a debugger's way in (M10) needs it. Nothing leaves the jail
+     * by it. */
+    let _ = std::process::Command::new("ifconfig").args(["-j", &jid.to_string(), "lo0", "inet", "127.0.0.1/8", "up"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let st = std::process::Command::new(exe).arg(BIND_ARG).arg(jid.to_string()).arg(port.to_string())
