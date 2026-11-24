@@ -2462,6 +2462,68 @@ navigatord, navigator-ui and navigator-fetchd, and serve the I6 fixture
 6. Record Start (press to `live-started`) and the engine's peak RSS, three
    runs each.
 
+#### I6.1 gate results on arm64 Tessera, 2026-11-25
+
+Built on the Mac from main `cc12e8534`: the `I6_PAGE` engine
+(`fixture-fetch.patch` then `live-page.patch` on a pristine
+`ResourceLoader.cpp`; the worker audit passed), and main's navigatord,
+navigator-ui, navigator-fetchd and limend, on a disposable overlay of
+`~/atrium-vm/navigator-signin-base` with `NAVIGATORD_LIVE_PAGES=1`. The
+fixture names pointed at 1.2.3.100 on a `net=1.2.3.0/24` QEMU network,
+because jailed fetchd refuses private addresses (10.0.2.102) and cannot be
+given the private-network grant.
+
+Five fixes were needed, all now on main:
+
+- navigatord refused Run live on a page the UI had just opened ("that page
+  is no longer on screen"): a first open sends `OpenWithRecordingTier`,
+  never `Show`. navigatord now remembers the page opened last and accepts
+  it; opening another page ends a live engine.
+- navigatord could end a healthy engine ("the engine reported
+  https://app.example, not the page's origin") when the engine's `Started`
+  arrived before the serve thread recorded the delivery; it now waits up to
+  2 s for the delivery.
+- The engine aborted (`VERIFICATION FAILED: agent.fetch_executor`):
+  `editor-check.cpp` installs the inline fetch executor for `ATRIUM_I6_PAGE`
+  too.
+- The engine aborted on the fixture's cross-origin frame (`PageClient::
+  request_navigation_start`, `VERIFY_NOT_REACHED`): `EditorPage.h` now
+  refuses a live page's navigations, loudly (`live page: navigation to ...
+  refused`), until I6.2 and I6.5.
+- Module scripts never ran and `DOMContentLoaded` never fired, and nothing
+  below 360 px was painted: `paint_document` now runs "the end" of parsing
+  for `ATRIUM_I6_PAGE` (as for the VPN page) and lays a live page out at
+  1024 x 768 instead of an island's 640 x 360. The engine still does not
+  learn its placed size.
+
+Results (engine `dd887c64…7861`):
+
+1. The document lane showed the page; no engine process existed.
+2. Not now: still no engine.
+3. Run live: the engine started, the amber frame and the "live code" tag
+   covered the page area, and the page's checks read `module` pass,
+   `third-party` refused, `session` pass (not signed in), `indexeddb` pass,
+   `notifications` pass, `service-worker` pass (refused), `webgl` pass
+   (none), `wasm` pass (interpreter ran), `done` pass; `local-storage`
+   failed (5,242,880-byte cap), `same-site-api` failed (CORS tainting, as
+   expected until I6.5) and `geolocation` timed out. navigatord logged
+   `cdn.thirdparty.example` refused (another site) and served
+   `api.app.example` (same site). The check lines did not reach the
+   fixture server, since `/report` is a POST, which I6.1 refuses.
+4. Stop: the engine process was gone within 108 ms and the document lane
+   showed again.
+5. Opening another page from the Where field ended the engine, and so did
+   choosing another trail entry in the rail (gone within 93 ms).
+6. Start, press to `live-started`: 235, 295 and 313 ms; engine peak RSS
+   92,228, 92,196 and 92,216 KB (sampled each second for 12 s).
+
+Seen but not fixed: a live page whose own background is transparent
+(`second.html`) shows the document lane through it, slightly offset, so its
+text appears doubled; the tier chip sat under the headless display's top
+strip in the captures, so the chip's "Live code" was read from the island's
+tag and navigatord's `LiveStarted`, not from the chip. Evidence is in
+`~/atrium-vm/evidence/navigator-i6-1-20261125/`.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

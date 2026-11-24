@@ -1169,6 +1169,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     // the UI showed, the page's own address as delivered).
     let mut live: Option<live_page::Live> = None;
     let mut shown: Option<(String, String)> = None;
+    // The page the UI opened last, in the foreground: a first open never
+    // sends Show, so Run live must accept it too (I6.1 gate, 2026-11-25).
+    let mut opened: Option<String> = None;
     let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
     let mut spend = move |p: ctl::Press| -> Result<(), String> {
         let ui_uid = *presenter_s.lock().unwrap();
@@ -1307,6 +1310,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 widget = None;
                 live = None;
                 shown = None;
+                opened = None;
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;
                 st.widget_document = None;
@@ -1318,6 +1322,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 let p = state.lock().unwrap().page(&url);
                 // Leaving the page ends its live engine (I6.1).
                 shown = p.as_ref().map(|p| (url.clone(), p.url.clone()));
+                opened = None;
                 if live.as_ref().is_some_and(|l| shown.as_ref().is_none_or(|(_, page)| *page != l.url)) {
                     live = None;
                 }
@@ -1525,6 +1530,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     continue;
                 }
                 widget = None;
+                // Opening another page leaves this one, and its live engine.
+                live = None;
+                shown = None;
+                opened = Some(url.clone());
                 {
                     let mut st = strip.lock().unwrap();
                     st.latest = id;
@@ -1920,7 +1929,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
             }
             Request::RunPageLive { url, rect, press } => {
-                let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone());
+                let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone())
+                    .or_else(|| opened.as_ref().filter(|o| **o == url).and_then(|_| state.lock().unwrap().page(&url)).map(|p| p.url.clone()));
                 let window = strip.lock().unwrap().window_token;
                 let result = (|| {
                     if !cfg.live_pages_enabled() { return Err("running a page live is off".to_string()); }

@@ -2,7 +2,7 @@
 
 #include <LibWeb/Page/Page.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
-#ifdef ATRIUM_I0_SIGN_IN
+#if defined(ATRIUM_I0_SIGN_IN) || defined(ATRIUM_I6_PAGE)
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #endif
 
@@ -64,6 +64,16 @@ public:
             return;
         }
         pending_navigation = url;
+    }
+#endif
+#if defined(ATRIUM_I6_PAGE) && !defined(ATRIUM_I0_SIGN_IN)
+    // A live page (I6.1) runs its one document: a navigation it starts (a
+    // link, a form, a frame's document) is refused, loudly, until links
+    // become trail entries (I6.2) and frames run (I6.5). The base
+    // PageClient's VERIFY_NOT_REACHED would end the engine.
+    void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget target, URL::URL const& url, Utf16String, Optional<Web::HTML::NavigationStartRequest>) override
+    {
+        warnln("live page: navigation to {} refused (top-level={})", url.serialize(), target == Web::NavigationTarget::TopLevel);
     }
 #endif
 #ifdef ATRIUM_MAIL_PAGE
