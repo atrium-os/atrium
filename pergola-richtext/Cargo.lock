@@ -62,6 +62,7 @@ dependencies = [
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -93,6 +94,13 @@ version = "0.1.0"
 dependencies = [
  "skrifa",
  "tiny-skia 0.11.4",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -919,6 +927,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "lyra-protocol"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "postcard",
  "serde",
@@ -1322,6 +1331,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",

@@ -235,7 +235,7 @@ fn load_registry() -> portcullis_peer::AppRegistry {
 /// Connections one non-root uid may hold open at once, across both
 /// sockets. Each is a thread here; without a cap any local process, a jailed
 /// app included, could open connections until the broker runs out of
-/// threads (review 2026-11-24, H2). Long-lived holders (the dock, the
+/// threads. Long-lived holders (the dock, the
 /// session bootstrap) use a handful.
 const MAX_CONNS_PER_UID: usize = 64;
 
@@ -399,7 +399,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
      * is escalation. */
     /* Who the peer is: an app or a person. An unreadable registry would
      * make every app look like a person, so refuse the connection instead
-     * (review 2026-11-24, H4). */
+     *. */
     let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .map_err(|e| std::io::Error::other(format!("launch registry unreadable, refusing uid {uid}: {e}")))?;
     if let Some((reg_owner, app)) = registry.resolve(uid) {

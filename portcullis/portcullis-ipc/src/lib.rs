@@ -1144,7 +1144,7 @@ pub const MAX_REQUEST_LINE: usize = 1 << 20;
 
 /// Read one request line. The daemon reads from any local uid, jailed apps
 /// included, so the line is bounded: past [`MAX_REQUEST_LINE`] without a
-/// newline is an error, not more memory (review 2026-11-24, H2).
+/// newline is an error, not more memory.
 pub fn read_request<R: BufRead>(r: &mut R) -> io::Result<Request> {
     let mut line = Vec::new();
     let n = r.take(MAX_REQUEST_LINE as u64 + 1).read_until(b'\n', &mut line)?;

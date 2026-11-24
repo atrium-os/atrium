@@ -1,0 +1,10 @@
+[package]
+name = "atrium-fdpass"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The one audited SCM_RIGHTS send/receive for Atrium's Unix sockets: received descriptors are owned and close-on-exec at once, truncated control data and descriptors past the caller's limit are errors."
+
+[dependencies]
+libc = "0.2"

@@ -116,6 +116,7 @@ dependencies = [
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2 0.10.9",
 ]
@@ -172,6 +173,13 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "uuid",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -2339,6 +2347,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",

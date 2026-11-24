@@ -2336,7 +2336,7 @@ fn main() {
     if cfg.ui.is_some() {
         use std::os::unix::fs::PermissionsExt;
         // The mode is the access control here: if it cannot be set, do not
-        // serve (review 2026-11-24, M2).
+        // serve.
         if let Err(e) = std::fs::set_permissions(&ctl_path, std::fs::Permissions::from_mode(0o600)) {
             eprintln!("navigatord: chmod 0600 {ctl_path}: {e}; refusing to serve an open control socket");
             std::process::exit(1);

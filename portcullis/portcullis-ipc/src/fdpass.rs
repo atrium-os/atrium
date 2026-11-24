@@ -10,9 +10,10 @@
 //! fds into the receiver's process and the new fd numbers come
 //! back via CMSG_DATA.
 //!
-//! Why not the `passfd` / `sendfd` crates: the operation is small
-//! and we want to keep the dependency graph minimal. ~80 lines of
-//! libc beats a transitive crate.
+//! The syscalls are in `atrium-fdpass`, the one audited copy: received
+//! descriptors are close-on-exec at once (portcullisd forks children that
+//! exec into jails), and a client that sends more than `max_fds` or
+//! truncated ancillary data gets an error with every descriptor closed.
 //!
 //! BufReader interaction: see `protocol.rs` — the Launch path uses
 //! a `ReadyForFds` round-trip so the daemon's read buffer is
@@ -21,8 +22,7 @@
 //! drops the cmsg silently.
 
 use std::io;
-use std::mem;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
 /// Send `fds` over `stream`. The kernel requires at least one byte
 /// of normal data to carry the cmsg; we send a literal 'F' byte
@@ -35,102 +35,23 @@ pub fn send_fds<S: AsRawFd>(stream: &S, fds: &[RawFd]) -> io::Result<()> {
 /// receiver that reads a short message beside the descriptors (hospes-cdm
 /// reads its key system and memory limit that way).
 pub fn send_fds_with<S: AsRawFd>(stream: &S, fds: &[RawFd], data: &[u8]) -> io::Result<()> {
-    if data.is_empty() {
-        return Err(io::Error::other("send_fds_with: no data byte to carry the descriptors"));
-    }
-    let mut iov = libc::iovec {
-        iov_base: data.as_ptr() as *mut _,
-        iov_len:  data.len(),
-    };
-
-    /* Allocate the cmsg buffer. CMSG_SPACE includes the cmsghdr +
-     * data + alignment padding; we lay out N RawFds (i32) inside. */
-    let cmsg_space = unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-    msg.msg_iov     = &mut iov;
-    msg.msg_iovlen  = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_space as _;
-
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
-        }
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type  = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len   = libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as u32) as _;
-
-        let data_ptr = libc::CMSG_DATA(cmsg) as *mut RawFd;
-        std::ptr::copy_nonoverlapping(fds.as_ptr(), data_ptr, fds.len());
-
-        let sent = libc::sendmsg(stream.as_raw_fd(), &msg, 0);
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if sent as usize != data.len() {
-            return Err(io::Error::other(
-                format!("partial sendmsg: wrote {sent} of {} bytes", data.len())));
-        }
+    let sent = atrium_fdpass::send(stream.as_raw_fd(), data, fds)?;
+    if sent != data.len() {
+        return Err(io::Error::other(format!("partial sendmsg: wrote {sent} of {} bytes", data.len())));
     }
     Ok(())
 }
 
-/// Receive up to `max_fds` file descriptors. Returns OwnedFds so
-/// the caller controls lifetime; the kernel has dup'd into our
-/// process so closing them on this side is safe and necessary.
-///
-/// Discards the 1-byte data payload (matching `send_fds`'s 'F').
+/// Receive at most `max_fds` descriptors riding on one payload byte, which
+/// is discarded (matching `send_fds`'s 'F'). More than `max_fds`, truncated
+/// ancillary data, or end of stream is an error.
 pub fn recv_fds<S: AsRawFd>(stream: &S, max_fds: usize) -> io::Result<Vec<OwnedFd>> {
-    let mut payload: u8 = 0;
-    let mut iov = libc::iovec {
-        iov_base: &mut payload as *mut u8 as *mut _,
-        iov_len:  1,
-    };
-
-    let cmsg_space = unsafe { libc::CMSG_SPACE((max_fds * mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-    msg.msg_iov     = &mut iov;
-    msg.msg_iovlen  = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-    msg.msg_controllen = cmsg_space as _;
-
-    unsafe {
-        let n = libc::recvmsg(stream.as_raw_fd(), &mut msg, 0);
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
-                       "peer closed before sending fds"));
-        }
-        if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-            return Err(io::Error::other(
-                "ancillary data truncated — buffer too small for the fd array"));
-        }
-
-        let mut out = Vec::with_capacity(max_fds);
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                /* cmsg_len includes the cmsghdr + alignment; the data
-                 * portion is what's left after subtracting CMSG_LEN(0). */
-                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                let n_fds = data_len / mem::size_of::<RawFd>();
-                let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
-                for i in 0..n_fds {
-                    let fd = *data_ptr.add(i);
-                    out.push(OwnedFd::from_raw_fd(fd));
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-        Ok(out)
+    let mut payload = [0u8; 1];
+    let got = atrium_fdpass::recv(stream.as_raw_fd(), &mut payload, max_fds)?;
+    if got.n == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed before sending fds"));
     }
+    Ok(got.fds)
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -139,6 +60,7 @@ pub fn recv_fds<S: AsRawFd>(stream: &S, max_fds: usize) -> io::Result<Vec<OwnedF
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::net::UnixStream;
 
     #[test]

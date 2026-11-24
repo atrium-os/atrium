@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 sha2  = "0.10"
 libc  = "0.2"
+atrium-fdpass = { path = "../atrium-fdpass" }
 
 [dev-dependencies]
 # unit tests use the std stuff that's already in the library

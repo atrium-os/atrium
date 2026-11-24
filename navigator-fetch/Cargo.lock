@@ -6,6 +6,7 @@ version = 4
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -17,6 +18,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
+]
+
+[[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -403,6 +411,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",

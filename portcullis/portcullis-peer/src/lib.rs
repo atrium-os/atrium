@@ -46,7 +46,7 @@ pub fn lock_registry(path: &str) -> io::Result<std::fs::File> {
 ///
 /// An unreadable registry is an error: allocating from an empty one would
 /// hand out a uid already bound to another app, which would then share that
-/// app's grants, overlay and secrets (review 2026-11-24, H4).
+/// app's grants, overlay and secrets.
 pub fn allocate(registry_path: &str) -> io::Result<u32> {
     let reg = AppRegistry::load(registry_path)?;
     Ok(allocate_in(&reg, |uid| match username(uid) {
@@ -243,7 +243,7 @@ impl AppRegistry {
     /// Read the registry file. A missing file is an empty registry (no app
     /// launched yet); any other error is returned, never an empty registry,
     /// because "not in the registry" means "not an app", and callers grant
-    /// a person more than an app (review 2026-11-24, H4).
+    /// a person more than an app.
     ///
     /// A line that is not UTF-8 is void like any other malformed line and
     /// logged; it no longer empties the whole registry, which

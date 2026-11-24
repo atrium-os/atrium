@@ -160,8 +160,8 @@ thread checks them too.
   rather than escapes anything else.
 - Root never writes a predictable path in a shared directory: `O_EXCL`,
   0600, fresh name, or a root-only directory.
-- Reuse the shared helper (fd passing, peer uid, framing, hex) instead of
-  writing a new one.
+- Reuse the shared helper (fd passing is `atrium-fdpass`; peer uid,
+  framing, hex) instead of writing a new one.
 - Every `unsafe` block has a `SAFETY:` comment saying why it holds.
 - A comment states the invariant, not the history; history goes in the
   commit message.

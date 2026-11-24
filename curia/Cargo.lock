@@ -71,6 +71,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "aqueduct"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "sha2",
 ]
@@ -134,6 +135,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-fdpass"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-fonts"
 version = "0.1.0"
 dependencies = [
@@ -161,6 +169,7 @@ name = "atrium-netconf"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-fdpass",
  "aura-ipc",
  "libc",
  "postcard",
@@ -1049,6 +1058,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "lyra-protocol"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "postcard",
  "serde",
@@ -1175,6 +1185,7 @@ dependencies = [
 name = "portcullis-ipc"
 version = "0.1.0"
 dependencies = [
+ "atrium-fdpass",
  "libc",
  "portcullis-policy",
  "portcullis-toml",

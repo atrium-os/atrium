@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind};
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
-use crate::{fdrecv, Session};
+use crate::Session;
 
 /// A connection speaking `[u32 LE length][body]` frames, optionally carrying
 /// descriptors (SCM_RIGHTS) on a frame.
@@ -105,8 +105,8 @@ impl Session for LengthPrefixed {
                 Ok(Some(_)) | Err(_) => return Ok(true),   // serve/report it first
                 Ok(None) => {}
             }
-            match fdrecv::recv(self.stream.as_raw_fd(), &mut chunk, self.max_fds) {
-                Ok(r) if r.control_truncated => {
+            match atrium_fdpass::recv(self.stream.as_raw_fd(), &mut chunk, self.max_fds) {
+                Err(e) if e.kind() == ErrorKind::InvalidData => {
                     return Err(io::Error::new(
                         ErrorKind::InvalidData,
                         if self.max_fds == 0 {

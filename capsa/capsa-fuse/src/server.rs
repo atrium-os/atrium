@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 
@@ -594,41 +594,13 @@ pub const MAX_GRANTS: usize = 64;
 /// the mounted `/dev/fuse` descriptor attached (SCM_RIGHTS).
 fn recv_grant(c: &UnixStream) -> std::io::Result<Option<(String, Option<File>)>> {
     let mut data = [0u8; 4096];
-    let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
-    // Room for one descriptor (and stray extras, which are closed).
-    let mut cbuf = [0u64; 16];
-    // SAFETY: a zeroed msghdr is valid; every pointer set below outlives
-    // the call.
-    let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
-    m.msg_iov = &mut iov;
-    m.msg_iovlen = 1;
-    m.msg_control = cbuf.as_mut_ptr().cast();
-    m.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-    // SAFETY: m describes buffers we own.
-    let n = unsafe { libc::recvmsg(c.as_raw_fd(), &mut m, 0) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut fds: Vec<File> = Vec::new();
-    // SAFETY: walking the control buffer the kernel filled, with its macros.
-    unsafe {
-        let mut h = libc::CMSG_FIRSTHDR(&m);
-        while !h.is_null() {
-            if (*h).cmsg_level == libc::SOL_SOCKET && (*h).cmsg_type == libc::SCM_RIGHTS {
-                let p = libc::CMSG_DATA(h) as *const RawFd;
-                let count = ((*h).cmsg_len as usize - (p as usize - h as usize)) / std::mem::size_of::<RawFd>();
-                for i in 0..count {
-                    fds.push(File::from_raw_fd(std::ptr::read_unaligned(p.add(i))));
-                }
-            }
-            h = libc::CMSG_NXTHDR(&m, h);
-        }
-    }
-    if n == 0 {
+    let got = atrium_fdpass::recv(c.as_raw_fd(), &mut data, 1)?;
+    if got.n == 0 {
         return Ok(None);
     }
-    let line = String::from_utf8_lossy(&data[..n as usize]).trim_end_matches('\n').to_string();
-    let fd = if fds.len() == 1 { fds.pop() } else { None };
+    let n = got.n;
+    let fd = got.fds.into_iter().next().map(File::from);
+    let line = String::from_utf8_lossy(&data[..n]).trim_end_matches('\n').to_string();
     Ok(Some((line, fd)))
 }
 

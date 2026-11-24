@@ -134,9 +134,7 @@ pub fn is_instance_root(req: &CreateJailRequest, policy: &Policy) -> bool {
 /// `uid` in `[uid_first, uid_last]`, running as `uid:uid`, rooted at exactly
 /// `<instance_root_dir>/<name>`. Returns the uid and the exec on a match.
 ///
-/// One function, so a tightening reaches every class: the four used to be
-/// copies of each other and had already drifted apart (review 2026-11-24,
-/// M4).
+/// One function, so a tightening reaches every service class at once.
 fn service_instance<'a>(
     req: &'a CreateJailRequest,
     policy: &Policy,

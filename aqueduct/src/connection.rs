@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufWriter, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -252,11 +252,10 @@ impl Connection {
             self.wr.flush()?;
         }
         let (n, fds) = recv_with_fds(&self.rd, chunk)?;
-        for fd in fds {
-            if self.infds.len() < MAX_QUEUED_FDS {
-                self.infds.push_back(fd);
-            }
+        if self.infds.len() + fds.len() > MAX_QUEUED_FDS {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "peer queued more descriptors than any message takes"));
         }
+        self.infds.extend(fds);
         Ok(n)
     }
 
@@ -885,87 +884,33 @@ impl Connection {
 /// `sendmsg` the start of `bytes` with `fds` attached; returns how many
 /// bytes went (at least one, or an error).
 fn send_with_fds(s: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
-    let space = unsafe { libc::CMSG_SPACE((fds.len() * std::mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut cbuf = vec![0u8; space];
-    let mut iov = libc::iovec { iov_base: bytes.as_ptr() as *mut _, iov_len: bytes.len() };
-    // SAFETY: msghdr is plain data; every pointer in it points into
-    // `iov`, `bytes` and `cbuf`, which outlive the sendmsg call, and the
-    // control message is written inside `cbuf`'s CMSG_SPACE.
-    unsafe {
-        let mut m: libc::msghdr = std::mem::zeroed();
-        m.msg_iov = &mut iov;
-        m.msg_iovlen = 1;
-        m.msg_control = cbuf.as_mut_ptr().cast();
-        m.msg_controllen = space as _;
-        let c = libc::CMSG_FIRSTHDR(&m);
-        (*c).cmsg_level = libc::SOL_SOCKET;
-        (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN((fds.len() * std::mem::size_of::<RawFd>()) as u32) as _;
-        std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast::<RawFd>(), fds.len());
-        loop {
-            let n = libc::sendmsg(s.as_raw_fd(), &m, 0);
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e);
-            }
-        }
-    }
+    atrium_fdpass::send(s.as_raw_fd(), bytes, fds)
 }
 
 /// `recvmsg` into `buf`, returning the bytes read and any fds that came
-/// with them (close-on-exec). Fds past [`MAX_FDS_PER_MESSAGE`] in one
-/// control message are closed.
+/// with them (close-on-exec). More than [`MAX_FDS_PER_MESSAGE`] in one
+/// message, or truncated control data, is an error with every fd closed.
 fn recv_with_fds(s: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
-    let space = unsafe { libc::CMSG_SPACE((MAX_FDS_PER_MESSAGE * std::mem::size_of::<RawFd>()) as u32) } as usize;
-    let mut cbuf = vec![0u8; space];
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-    // SAFETY: as in send_with_fds; the kernel writes at most `space`
-    // control bytes and `buf.len()` data bytes, and every fd we read out
-    // of a SCM_RIGHTS message is a fresh descriptor we now own.
-    unsafe {
-        let mut m: libc::msghdr = std::mem::zeroed();
-        m.msg_iov = &mut iov;
-        m.msg_iovlen = 1;
-        m.msg_control = cbuf.as_mut_ptr().cast();
-        m.msg_controllen = space as _;
-        // macOS has no MSG_CMSG_CLOEXEC: close-on-exec is set on each fd
-        // below instead (this process doesn't fork in between).
-        #[cfg(not(target_vendor = "apple"))]
-        let flags = libc::MSG_CMSG_CLOEXEC;
-        #[cfg(target_vendor = "apple")]
-        let flags = 0;
-        let n = libc::recvmsg(s.as_raw_fd(), &mut m, flags);
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut fds = Vec::new();
-        let mut c = libc::CMSG_FIRSTHDR(&m);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(c).cast::<RawFd>();
-                let len = (*c).cmsg_len as usize - (data as usize - c as usize);
-                for i in 0..len / std::mem::size_of::<RawFd>() {
-                    let fd = OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i)));
-                    #[cfg(target_vendor = "apple")]
-                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-                    if fds.len() < MAX_FDS_PER_MESSAGE {
-                        fds.push(fd);
-                    }
-                }
-            }
-            c = libc::CMSG_NXTHDR(&m, c);
-        }
-        Ok((n as usize, fds))
-    }
+    let got = atrium_fdpass::recv(s.as_raw_fd(), buf, MAX_FDS_PER_MESSAGE)?;
+    Ok((got.n, got.fds))
 }
 
 #[cfg(test)]
 mod fd_tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn a_peer_sending_too_many_fds_is_dropped() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let f = std::fs::File::from(tempfile_fd());
+        let raw = vec![f.as_raw_fd(); MAX_FDS_PER_MESSAGE + 1];
+        atrium_fdpass::send(a.as_raw_fd(), b"x", &raw).unwrap();
+        let mut rx = Connection::wrap(b).unwrap();
+        // Before the limit was loud, the extras were dropped and this timed out.
+        let e = rx.recv_message_or_timeout(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn fds_ride_along_with_their_message() {
