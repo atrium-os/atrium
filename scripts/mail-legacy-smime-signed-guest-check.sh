@@ -119,7 +119,12 @@ install -m 0555 "$d/arcad" /usr/local/bin/atrium-arcad
 install -m 0644 "$d/devfs.rules" /usr/local/etc/atrium/devfs.rules
 sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules"; devfs_init_rulesets'
 test -n "$(devfs rule -s 32 show)"
-sh "$d/jaild-policy-merge.sh" "$d/jaild.policy.toml" /etc/atrium/jaild.policy.toml >"$d/policy.toml"
+# Admit the gate-only environment key in this disposable jaild policy.
+sed '/^    "ARCA_MAIL_PUBLISHER",$/a\
+    "ARCA_LEGACY_SMIME_SYNTHETIC_USER",
+' "$d/jaild.policy.toml" >"$d/synthetic-policy.toml"
+grep -qx '    "ARCA_LEGACY_SMIME_SYNTHETIC_USER",' "$d/synthetic-policy.toml"
+sh "$d/jaild-policy-merge.sh" "$d/synthetic-policy.toml" /etc/atrium/jaild.policy.toml >"$d/policy.toml"
 install -m 0644 "$d/policy.toml" /etc/atrium/jaild.policy.toml
 install -m 0555 "$d/atrium-jaild" /usr/local/bin/atrium-jaild
 service atrium-jaild onestart
