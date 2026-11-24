@@ -114,6 +114,10 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 - `vssh` has a 3 s connect timeout and fails with empty output when the guest
   is busy; use `VSSH_CONNECT_TIMEOUT=30` for scripted work and check for a
   marker at the destination.
+- On the Mac, macOS's daily `periodic` job `110.clean-tmps` (about 00:00
+  IST) deletes anything under `/tmp` (`/private/tmp`) not accessed for 3
+  days. Long-lived build trees and VM base images live under `~/atrium-vm`
+  or `~/src`, never `/tmp`.
 - In cloud sessions use `scripts/cloud-vm.sh` (QEMU under TCG; never quote its
   timings as product numbers). See RUNBOOK §13.
 
