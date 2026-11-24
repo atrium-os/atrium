@@ -72,7 +72,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | C1 | Critical | portcullis-jail, portcullis-toml | An app manifest's entry could add jail.conf parameters (host root) | S | **Fixed `5bf45cf`** |
 | H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | **Fixed `2af0740`** |
 | H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | **Fixed `6cbc9c0`** (connection cap not yet VM-tested) |
-| H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Shankar chose (a). Design proposed: [app-jails-via-jaild.md](../spec/app-jails-via-jaild.md) (steps J0–J5) |
+| H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | **Fixed (J2)**: apps, workspaces and consoles are made by jaild from typed requests; portcullisd's jail(8) path is deleted. VM gates personas, console, workspace, artifex and image-decode pass. Left for later: [app-jails-via-jaild.md §4.2](../spec/app-jails-via-jaild.md) |
 | H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed `2bd8429`** in portcullis-peer, portcullisd, ostiarius; other daemons' `.ok()`/default sites fail closed and keep their code |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `931bfc7`** |
 | M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | **Mostly fixed `3208109`**: one crate, `atrium-fdpass`; the broker-facing receivers use it, 15 lower-risk copies remain (listed below) |
