@@ -50,14 +50,22 @@ The fork ships `atrium-mesa/LICENSES.md` inventorying every distinct license pre
 
 ## Enforcement
 
-- **License manifest per repo.** Every repo with a `Cargo.toml` workspace ships a generated `LICENSES.md` listing the distinct licenses across all transitive deps. CI fails if a forbidden license appears.
-- **Vendoring requires an explicit `LICENSES.md` entry** documenting the license of each vendored crate or directory.
-- **Pull-request template** asks "does this introduce any new dependency? If so, what license?" — same way LANGUAGE-POLICY.md is enforced through review discipline.
-- **License-scanner** (e.g. `cargo deny check licenses`) runs in CI with the allowlist baked in.
+- **Licence audit.** `python3 scripts/licence-audit.py` walks every
+  `Cargo.lock` in the tree (each crate has its own; there is no workspace),
+  asks crates.io for every third-party crate version's SPDX licence, and
+  fails if any version cannot be satisfied with the allowlist in the script.
+  Run it after adding or updating a dependency; the coding agents' review
+  checklist (AGENTS.md) asks for it. A licence added to the allowlist carries
+  a comment saying why it is permissive. There is no CI job yet: the only
+  enforcement is running it.
+- **Vendoring** (`vendor/`, `third_party/`) is outside the audit: each
+  vendored directory documents its licence in its README.
+- **Review discipline**: a new dependency's licence is stated in the commit
+  message, the same way LANGUAGE-POLICY.md is enforced.
 
 ## Practical consequences
 
-- New Rust crate dep → check `cargo deny`'s license output. If MIT/Apache/BSD/ISC/Zlib, fine. Otherwise reject or open a discussion.
+- New Rust crate dep → run `scripts/licence-audit.py <crate dir>`. If MIT/Apache/BSD/ISC/Zlib, fine. Otherwise reject or open a discussion.
 - New vendored C library → audit license headers per file. Reject if any GPL/LGPL/AGPL surfaces.
 - New tool used in CI but not shipped → fewer constraints; document in `tools/LICENSES.md` if non-trivial.
 - New spec / doc → CC-BY-4.0 or Apache-2.0.
