@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use arca_store::{RootKey, Store};
 use arcad::server::integration::{
-    self, received_selection, Prepared, Selection, FAILURE, FIXTURE_ACCOUNT,
+    self, received_selection, Lifecycle, Prepared, FAILURE, FIXTURE_ACCOUNT,
 };
 use fresco_client::{Connection, Event};
 use fresco_protocol::WindowHints;
@@ -60,15 +60,20 @@ fn reserve_via_arcad(uid: u32, snapshot: &[u8]) -> io::Result<UnixStream> {
 
 fn open_via_arcad(
     mut stream: UnixStream,
-    selection: Selection,
+    approval: &[u8],
+    lifecycle: Option<Lifecycle>,
     mut still_approved: impl FnMut() -> bool,
 ) -> io::Result<bool> {
     use arcad::proto;
     stream.set_read_timeout(Some(Duration::from_secs(24)))?;
     proto::write_request(
         &mut stream,
-        proto::op::U_SMIME_SYNTHETIC_OPEN,
-        &selection.encode(),
+        if lifecycle.is_some() {
+            proto::op::U_SMIME_SYNTHETIC_MANAGE
+        } else {
+            proto::op::U_SMIME_SYNTHETIC_OPEN
+        },
+        approval,
     )?;
     let mut reply = stream.try_clone()?;
     std::thread::scope(|scope| {
@@ -84,10 +89,13 @@ fn open_via_arcad(
             match receive.recv_timeout(Duration::from_millis(20)) {
                 Ok(result) => {
                     let (status, body) = result?;
-                    if !still_approved() || body.as_ref() != [0] {
+                    let expected: &[u8] = if lifecycle.is_some() { &[] } else { &[0] };
+                    if !still_approved() || body.as_ref() != expected {
                         return Err(closed());
                     }
-                    println!("LEGACY_JAILED_WORKER_EXIT=0");
+                    if lifecycle.is_none() {
+                        println!("LEGACY_JAILED_WORKER_EXIT=0");
+                    }
                     return Ok(status == proto::status::OK);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -113,6 +121,7 @@ fn draw(
     persona: &str,
     content: Option<&str>,
     selected: bool,
+    lifecycle: Option<Lifecycle>,
 ) -> io::Result<()> {
     let t = if win
         .appearance()
@@ -134,7 +143,12 @@ fn draw(
         24.,
         50.,
         t.text_primary(),
-        "Open legacy S/MIME message".into(),
+        match lifecycle {
+            Some(Lifecycle::Enroll) => "Enroll legacy S/MIME key",
+            Some(Lifecycle::Forget) => "Forget legacy S/MIME key",
+            None => "Open legacy S/MIME message",
+        }
+        .into(),
     )?;
     px.text(
         font,
@@ -170,7 +184,12 @@ fn draw(
                 40.,
                 254.,
                 t.text_on_accent(),
-                "Open local message".into(),
+                match lifecycle {
+                    Some(Lifecycle::Enroll) => "Enroll key",
+                    Some(Lifecycle::Forget) => "Forget key",
+                    None => "Open local message",
+                }
+                .into(),
             )?;
             px.rect(CANCEL.x, CANCEL.y, CANCEL.w, CANCEL.h, t.bg_elevated(), 6.)?;
             px.text(font, 15., 266., 254., t.text_primary(), "Cancel".into())?;
@@ -221,14 +240,21 @@ impl Sheet<'_> {
                     _ => {}
                 }
             };
-            let (selection, _) = received_selection(&snapshot).ok_or_else(closed)?;
+            let lifecycle = Lifecycle::decode(&snapshot);
+            let approval = if let Some(action) = lifecycle {
+                action.encode().to_vec()
+            } else {
+                let (selection, _) = received_selection(&snapshot).ok_or_else(closed)?;
+                println!("LEGACY_FIXTURE_SELECTED_MESSAGE={}", selection.message);
+                selection.encode().to_vec()
+            };
             let stream = reserve_via_arcad(self.uid, &snapshot)?;
-            println!("LEGACY_FIXTURE_SELECTED_MESSAGE={}", selection.message);
-            Some((stream, selection))
+            Some((stream, approval, lifecycle))
         } else {
             None
         };
         let selected = reservation.is_some();
+        let lifecycle = reservation.as_ref().and_then(|(_, _, action)| *action);
         let mut win = Connection::connect(fresco)?;
         let id = win.window_create(
             620,
@@ -243,7 +269,15 @@ impl Sheet<'_> {
         let font = Font::open(&mut win);
         let scale = win.window_scale(id);
         let shown_persona = persona.unwrap_or("Personal");
-        draw(&mut win, font, scale, shown_persona, None, selected)?;
+        draw(
+            &mut win,
+            font,
+            scale,
+            shown_persona,
+            None,
+            selected,
+            lifecycle,
+        )?;
         let until = Instant::now() + Duration::from_secs(5);
         let token = loop {
             if Instant::now() >= until {
@@ -332,8 +366,8 @@ impl Sheet<'_> {
                     })?
                     .map(|text| text.as_str() == integration::SYNTHETIC_PREVIEW)
                 } else if still_approved() {
-                    let (stream, selection) = reservation.take().ok_or_else(closed)?;
-                    open_via_arcad(stream, selection, || {
+                    let (stream, approval, _) = reservation.take().ok_or_else(closed)?;
+                    open_via_arcad(stream, &approval, lifecycle, || {
                         still_approved()
                             && matches!(
                                 win.poll_event(),
@@ -350,6 +384,8 @@ impl Sheet<'_> {
                 }
             })();
             let outcome: &'static [u8] = match result {
+                Ok(true) if lifecycle == Some(Lifecycle::Enroll) => b"enrolled",
+                Ok(true) if lifecycle == Some(Lifecycle::Forget) => b"forgotten",
                 Ok(true) => {
                     draw(
                         &mut win,
@@ -358,6 +394,7 @@ impl Sheet<'_> {
                         shown_persona,
                         Some(integration::SYNTHETIC_PREVIEW),
                         selected,
+                        lifecycle,
                     )?;
                     b"opened"
                 }
@@ -367,8 +404,13 @@ impl Sheet<'_> {
                         font,
                         scale,
                         shown_persona,
-                        Some(FAILURE),
+                        Some(if lifecycle.is_some() {
+                            "Couldn’t update this legacy S/MIME enrollment."
+                        } else {
+                            FAILURE
+                        }),
                         selected,
+                        lifecycle,
                     )?;
                     b"closed"
                 }

@@ -29,7 +29,7 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 20 server::smime
+run_suite arcad-unit 21 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
 run_suite mail-received-unit 1 legacy_received_envelope
@@ -271,9 +271,16 @@ scenario() {
     wait_marker "$d/$scenario_log.log" LEGACY_FIXTURE_PROVIDER_READY
     timeout 52 "$d/smime_installed_probe" drive-legacy "$d/wm.sock" "$d/input.sock" "$uid" "$action"
     wait_marker "$d/$scenario_log.log" "LEGACY_FIXTURE_$marker"
-    expected_message=1
-    if [ "$action" = unsupported ]; then expected_message=2; fi
-    wait_marker "$d/$scenario_log.log" "LEGACY_FIXTURE_SELECTED_MESSAGE=$expected_message"
+    case "$action" in
+        enroll|forget|cancel-enroll|cancel-forget)
+            ! grep -q 'LEGACY_FIXTURE_SELECTED_MESSAGE=' "$d/$scenario_log.log"
+            ;;
+        *)
+            expected_message=1
+            if [ "$action" = unsupported ]; then expected_message=2; fi
+            wait_marker "$d/$scenario_log.log" "LEGACY_FIXTURE_SELECTED_MESSAGE=$expected_message"
+            ;;
+    esac
     for _ in $(jot 40); do
         tail -n "+$((prior_lines + 1))" "$d/$login.log" >"$d/$scenario_log.mail"
         if grep -qx "MAIL_SIGNED_LEGACY_$marker" "$d/$scenario_log.mail"; then break; fi
@@ -289,9 +296,10 @@ scenario() {
         exit 1
     fi
     echo "MAIL_SIGNED_LEGACY_$marker"
-    if [ "$outcome" != cancelled ]; then
-        test "$(grep -xc 'LEGACY_JAILED_WORKER_EXIT=0' "$d/$scenario_log.log")" = 1
-    fi
+    case "$outcome" in
+        opened|closed) test "$(grep -xc 'LEGACY_JAILED_WORKER_EXIT=0' "$d/$scenario_log.log")" = 1 ;;
+        *) ! grep -q 'LEGACY_JAILED_WORKER_EXIT=' "$d/$scenario_log.log" ;;
+    esac
     # The trusted fixture keeps its connection briefly to deliver the outcome.
     sleep 1
 }
@@ -304,15 +312,25 @@ echo "MAIL_SIGNED_WORK_UID=$workuid"
 jexec -u "$(id -nu "$workuid")" "$work" /bin/smime_installed_probe legacy-denied "$arca" "$workuid"
 test "$(worker_count)" = 0
 scenario cancelled cancel work "$workuid" 0
-scenario opened approve work "$workuid" 1
+scenario cancelled cancel-enroll work "$workuid" 0 cancel-enroll
+scenario closed approve work "$workuid" 1 before-enroll
+scenario enrolled enroll work "$workuid" 1 enroll
+scenario opened approve work "$workuid" 2 after-enroll
+scenario cancelled cancel-forget work "$workuid" 2 cancel-forget
+scenario opened approve work "$workuid" 3 after-cancel-forget
+scenario forgotten forget work "$workuid" 3 forget
+scenario closed approve work "$workuid" 4 after-forget
+scenario enrolled enroll work "$workuid" 4 re-enroll
+scenario opened approve work "$workuid" 5 after-re-enroll
+echo MAIL_LEGACY_ENROLLMENT_LIFECYCLE_OK
 
 start personal su -m "$person" -c "$d/portcullis launch $app"
 personaluid=$(verify_uid "$(wait_mail "$personal")" personal)
 test "$personaluid" != "$workuid"
 echo "MAIL_SIGNED_PERSONAL_UID=$personaluid"
-scenario closed approve personal "$personaluid" 2
+scenario closed approve personal "$personaluid" 6
 
-worker_total=2
+worker_total=6
 for sample in 1 2 3; do
     for profile in missing-key unsupported; do
         worker_total=$((worker_total + 1))
@@ -325,7 +343,12 @@ $2 == "ui" && $3 == "op=0x006f" {
     if ($5 == "status=0") opened++
     else if ($5 == "status=1") closed++
     else unexpected++
-} END { exit !(abandoned == 1 && opened == 1 && closed == 7 && !unexpected) }' /var/db/arca/audit.log
+}
+$2 == "ui" && $3 == "op=0x00e7" {
+    if ($5 == "status=0") managed++
+    else if ($5 == "status=1") cancelled++
+    else unexpected++
+} END { exit !(abandoned == 1 && opened == 3 && closed == 9 && managed == 3 && cancelled == 2 && !unexpected) }' /var/db/arca/audit.log
 echo MAIL_LEGACY_ARCA_DISPATCH_OK
 if grep -Ei 'broken pipe|caller hung up; removing worker jail' "$d/portcullisd.log"; then
     echo "Portcullis detected a premature disconnect" >&2

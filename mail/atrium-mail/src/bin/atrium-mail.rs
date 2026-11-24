@@ -764,7 +764,12 @@ fn main() {
                     let mut e = e.borrow_mut();
                     #[cfg(feature = "legacy-smime-integration")]
                     if let Some(preview) = &legacy_preview {
-                        let snapshot = preview.snapshot(ask == SmimeAsk::LegacyUnsupported)?;
+                        use mail_smime::legacy_wire::Lifecycle;
+                        let snapshot = match ask {
+                            SmimeAsk::LegacyEnroll => Lifecycle::Enroll.encode().to_vec(),
+                            SmimeAsk::LegacyForget => Lifecycle::Forget.encode().to_vec(),
+                            _ => preview.snapshot(ask == SmimeAsk::LegacyUnsupported)?,
+                        };
                         let id = e.request(role, token, atrium_mail::settings::SYSTEM_SHEET_SLOT).ok()?;
                         if e.send(id, snapshot).is_err() {
                             let _ = e.detach_embed(id);
@@ -1328,7 +1333,9 @@ fn main() {
                             let outcome = match bytes.as_slice() {
                                 b"opened" => Some(("OPENED", "Opened the synthetic legacy S/MIME message.")),
                                 b"closed" => Some(("CLOSED", "Couldn’t open this legacy S/MIME message.")),
-                                b"cancelled" => Some(("CANCELLED", "Legacy S/MIME open cancelled.")),
+                                b"cancelled" => Some(("CANCELLED", "Legacy S/MIME action cancelled.")),
+                                b"enrolled" => Some(("ENROLLED", "Enrolled the synthetic account’s legacy S/MIME key.")),
+                                b"forgotten" => Some(("FORGOTTEN", "Forgot the synthetic account’s legacy S/MIME key.")),
                                 _ => None,
                             };
                             if let (Some(sw), Some((marker, note))) = (settings.as_mut(), outcome) {

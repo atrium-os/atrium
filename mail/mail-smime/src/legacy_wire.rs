@@ -14,6 +14,36 @@ pub const FAILURE: &str = "Couldn’t open this legacy S/MIME message.";
 
 pub const FIXTURE_ACCOUNT: &str = "legacy-preview@fixture.invalid";
 
+/// An explicit management request for the disabled gate's one synthetic account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Enroll,
+    Forget,
+}
+
+impl Lifecycle {
+    pub fn encode(self) -> [u8; 5] {
+        [
+            match self {
+                Self::Enroll => 1,
+                Self::Forget => 2,
+            },
+            1,
+            0,
+            0,
+            0,
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [1, 1, 0, 0, 0] => Some(Self::Enroll),
+            [2, 1, 0, 0, 0] => Some(Self::Forget),
+            _ => None,
+        }
+    }
+}
+
 /// The fixture's exact RFC 5322 bytes. The checked-in file uses LF.
 pub fn fixture_message() -> Vec<u8> {
     include_str!("../tests/data/legacy-preview.eml")

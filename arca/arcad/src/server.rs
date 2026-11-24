@@ -43,6 +43,8 @@ pub struct State {
     pub legacy_smime_registry: Option<PathBuf>,
     #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
     legacy_smime_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+    legacy_smime_management: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The machine store (arca.md §6.4): open from boot, for services.
     machine: Option<Store>,
     /// Unrecorded trails' cookie jars: in memory only (`crate::jar`).
@@ -166,6 +168,8 @@ impl State {
             legacy_smime_registry: None,
         #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
             legacy_smime_pending: None,
+            #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
+            legacy_smime_management: None,
             dir,
             kdf_default: KdfParams::NO_TPM,
             stores: HashMap::new(),
@@ -1442,6 +1446,9 @@ impl State {
                 }
         #[cfg(all(feature = "legacy-smime-integration", any(target_os = "freebsd", all(test, feature = "host-openssl-tests"))))]
                 if user == integration::SYNTHETIC_USER {
+                    if let Some(management) = &self.legacy_smime_management {
+                        management.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     if let Some(pending) = &self.legacy_smime_pending {
                         pending.store(true, std::sync::atomic::Ordering::Release);
                     }

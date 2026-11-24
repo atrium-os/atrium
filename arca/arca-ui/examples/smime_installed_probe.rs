@@ -52,7 +52,7 @@ fn enter_for_picker(wm: &mut Connection, inject: &str, sheet: u32) {
     panic!("Scrinium did not attach within Arca");
 }
 
-fn settings_sheet(wm: &mut Connection, inject: &str, uid: u32, offset: i32) -> (u32, Duration) {
+fn settings_sheet(wm: &mut Connection, inject: &str, uid: u32, x_offset: i32, y_offset: i32) -> (u32, Duration) {
     let settings = wait("Mail Settings surface", || {
         let reply = wm.wm_enumerate_all().unwrap();
         reply
@@ -63,7 +63,7 @@ fn settings_sheet(wm: &mut Connection, inject: &str, uid: u32, offset: i32) -> (
     });
     // The WM can enumerate the surface before the first Settings frame.
     sleep(Duration::from_secs(3));
-    let (x, y) = (settings.rect.x + offset, settings.rect.y + 222);
+    let (x, y) = (settings.rect.x + x_offset, settings.rect.y + y_offset);
     let started = Instant::now();
     inject_input(inject, &format!("MOVE {x} {y}\nBTN 1 1\nBTN 1 0\n"));
     let sheet = wait("Mail Settings opens the Arca sheet", || {
@@ -79,7 +79,7 @@ fn settings_sheet(wm: &mut Connection, inject: &str, uid: u32, offset: i32) -> (
 
 fn drive(wm_path: &str, inject: &str, uid: u32) {
     let mut wm = Connection::connect(wm_path).unwrap();
-    let (sheet, _) = settings_sheet(&mut wm, inject, uid, 80);
+    let (sheet, _) = settings_sheet(&mut wm, inject, uid, 80, 222);
     println!("MAIL_SETTINGS_ARCA_SHEET={sheet}");
     for certificate in [true, false] {
         sleep(Duration::from_millis(1800));
@@ -117,14 +117,16 @@ fn drive(wm_path: &str, inject: &str, uid: u32) {
 
 #[cfg(feature = "legacy-smime-integration")]
 fn drive_legacy(wm_path: &str, inject: &str, uid: u32, action: &str) {
-    let (offset, profile) = match action {
-        "approve" | "cancel" => (80, None),
-        "missing-key" => (80, Some(action)),
-        "unsupported" => (380, Some(action)),
+    let (x, y, profile) = match action {
+        "approve" | "cancel" => (80, 222, None),
+        "missing-key" => (80, 222, Some(action)),
+        "unsupported" => (380, 222, Some(action)),
+        "enroll" | "cancel-enroll" => (80, 258, None),
+        "forget" | "cancel-forget" => (380, 258, None),
         _ => panic!("unknown legacy sheet action"),
     };
     let mut wm = Connection::connect(wm_path).unwrap();
-    let (sheet, selection_elapsed) = settings_sheet(&mut wm, inject, uid, offset);
+    let (sheet, selection_elapsed) = settings_sheet(&mut wm, inject, uid, x, y);
     sleep(Duration::from_secs(2));
     assert!(
         wm.wm_enumerate_all()
@@ -134,7 +136,7 @@ fn drive_legacy(wm_path: &str, inject: &str, uid: u32, action: &str) {
             .any(|e| e[0] == sheet),
         "legacy sheet resolved before the user's press"
     );
-    let usage = if action == "cancel" { 41 } else { 40 };
+    let usage = if action.starts_with("cancel") { 41 } else { 40 };
     let started = Instant::now();
     inject_input(inject, &format!("KEY {usage} 1 0\nKEY {usage} 0 0\n"));
     wait("Mail dismisses the legacy Arca sheet", || {

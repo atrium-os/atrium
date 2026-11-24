@@ -1112,12 +1112,16 @@ receive-only path and its verification gate.
   unsigned. A valid inner signature is required for a verified-sender
   indicator.
 
-The disposable verification bundle adds an explicit synthetic open in Mail
-Settings. It uses the signed Mail launch’s persona, two synthetic
-received messages, and the jailed Arca daemon’s trusted-UI dispatch. The ordinary bundle
-omits that action and role grant. The signed gate checks Work
-cancellation, approved Work opening, and approved Personal refusal in
-one private overlay, with clean worker exit for both approved scenarios.
+The disposable verification bundle adds explicit synthetic open, enroll
+and forget actions in Mail Settings. It uses the signed Mail launch’s
+persona, two synthetic received messages and the jailed Arca daemon’s
+trusted-UI dispatch. The ordinary bundle omits these actions and role
+grant. The trusted sheet names the fixed synthetic Work account.
+Opening a message never enrolls a key. The signed gate covers
+enrollment and forget cancellation, refusal before enrollment and after
+forgetting, successful opening after enrollment and re-enrollment, and
+Personal refusal. Management actions start no reader. The open checks
+verify clean reader exit.
 
 The synthetic Settings action selects the local fixture account and
 message and hashes the complete stored bytes before requesting the

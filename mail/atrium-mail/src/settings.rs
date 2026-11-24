@@ -1149,6 +1149,8 @@ pub enum SmimeAsk {
     Provision,
     LegacyPreview,
     LegacyUnsupported,
+    LegacyEnroll,
+    LegacyForget,
 }
 
 pub const SYSTEM_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
@@ -1364,6 +1366,11 @@ impl SettingsView {
             button(ctx, x, y + em(14.0), "Open synthetic legacy S/MIME message", true, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyPreview)));
             let s = self.s.clone();
             button(ctx, x + em(315.0), y + em(14.0), "Open synthetic unsupported message", false, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyUnsupported)));
+            y += em(36.0);
+            let s = self.s.clone();
+            button(ctx, x, y + em(14.0), "Enroll synthetic legacy key", true, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyEnroll)));
+            let s = self.s.clone();
+            button(ctx, x + em(315.0), y + em(14.0), "Forget synthetic legacy key", false, true, move || s.smime_asked.set(Some(SmimeAsk::LegacyForget)));
         } else {
             button(ctx, x, y + em(14.0), "Add S/MIME identity", true, true, move || s.smime_asked.set(Some(SmimeAsk::Provision)));
         }

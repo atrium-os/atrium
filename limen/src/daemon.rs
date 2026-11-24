@@ -769,8 +769,10 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
     if e.role.name == "smime-legacy-read" {
-        // One bounded selection and message copy per sheet. Arca validates the binding.
-        if e.bound || e.legacy_selection_sent || fd.is_some() || s.bytes.len() <= 44 || s.bytes.len() > 44 + (48 << 10) {
+        // One bounded request per sheet. Arca validates the binding and action.
+        let lifecycle = matches!(s.bytes.as_slice(), [1 | 2, 1, 0, 0, 0]);
+        let snapshot = (45..=44 + (48 << 10)).contains(&s.bytes.len());
+        if e.bound || e.legacy_selection_sent || fd.is_some() || !(lifecycle || snapshot) {
             return Err(Reply::Refused { reason: refusal::MALFORMED });
         }
         e.legacy_selection_sent = true;
@@ -840,7 +842,7 @@ fn emit(shared: &Arc<Shared>, conn: ConnId, m: proto::Emit, fd: Option<OwnedFd>)
         return Err(Reply::Refused { reason: refusal::TOO_BIG });
     }
     if e.role.name == "smime-legacy-read" {
-        if !e.bound || fd.is_some() || !matches!(&m.bytes[..], b"opened" | b"closed" | b"cancelled") {
+        if !e.bound || fd.is_some() || !matches!(&m.bytes[..], b"opened" | b"closed" | b"cancelled" | b"enrolled" | b"forgotten") {
             return Err(Reply::Refused { reason: refusal::MALFORMED });
         }
     } else if e.smime_scope.is_some() {

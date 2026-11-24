@@ -939,10 +939,12 @@ checks the digest returned by the jailed parser. These checks bind the
 approval to a snapshot. Portcullis attests the user, signed Mail
 publisher and persona. Its registry carries no mail account identity.
 The legacy key lookup scopes by user, persona, publisher, certificate
-digest and key fingerprint. Its stored account field is a display
-label. In the fixture, the only Work account can enroll a built-in key
-on its first approved open. The existing provisioning, discovery and
-forget operations apply to the separate OAEP recipient. Mail account
+digest and key fingerprint. The old one-account fixture used its first approved open to install the
+built-in key. The current signed gate stores the fixed Work enrollment
+with an account scope and uses a separate trusted approval to add or
+forget it. An open can only look up the enrollment. The existing
+provisioning, discovery and forget operations apply to the separate OAEP
+recipient. Mail account
 removal cleans up the account's credential items and local data.
 
 A production enrollment needs a stable instance binding that Arca can
@@ -990,10 +992,17 @@ fingerprint checks still apply.
 
 The native gate supplies account selection and approval directly,
 generates its second synthetic key inside a temporary directory, and
-uses a socket peer for the reader. The separate signed regression lane
-still exercises the existing fixed one-account fixture. A subsequent
-gate must connect account provisioning and removal to signed Mail,
-the trusted enrollment sheet and the jailed reader. The existing six
+uses a socket peer for the reader. The signed lane uses signed Mail,
+Limen, the Fresco approval sheet, jailed arcad and the jailed reader
+with one fixed Work account and one compiled synthetic key pair. The
+trusted sheet reserves the exact enroll or forget action, authenticates
+the Fresco press and redeems the reservation over the same connection.
+Arca rechecks the signed launch and the reserved sealed item ID. A
+preview checks that ID again before key release and result publication.
+Forgetting the active enrollment revokes pending preview approval.
+Neither account management action launches the reader. Personal stays
+isolated. Production account provisioning and account deletion still
+need an independently authenticated account binding. The six
 whole-path timing trials cover two operational failures only.
 
 ##### Failure observability review

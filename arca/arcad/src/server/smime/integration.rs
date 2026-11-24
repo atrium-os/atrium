@@ -13,7 +13,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use arca_store::{secret::LockedBuf, Access, Class, Kind, NewItem, Provenance, Recipient, Store};
+use arca_store::{
+    secret::LockedBuf, Access, Class, ItemId, Kind, NewItem, Provenance, Recipient, Store,
+};
 use mail_smime::legacy_wire as wire;
 use portcullis_ipc::{Request, Response};
 use sha2::{Digest, Sha256};
@@ -24,7 +26,7 @@ use crate::label::Label;
 use crate::proto::{self, op, status};
 use crate::server::{reply, Body, Reply, State};
 
-pub use wire::{received_selection, Selection, FAILURE, FIXTURE_ACCOUNT};
+pub use wire::{received_selection, Lifecycle, Selection, FAILURE, FIXTURE_ACCOUNT};
 type Fingerprint = [u8; 32];
 
 fn closed() -> io::Error {
@@ -117,6 +119,7 @@ struct Approval {
     uid: u32,
     publisher: [u8; 32],
     persona: Option<String>,
+    item: Option<ItemId>,
     selection: Selection,
     received: Vec<u8>,
     cancelled: Arc<AtomicBool>,
@@ -125,22 +128,44 @@ struct Approval {
 
 impl Approval {
     fn valid(&self, client: &UnixStream) -> bool {
-        if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
-            return false;
-        }
-        // This trusted UI connection carries one request. Readability, EOF
-        // or an error while the reply is pending ends its approval.
-        let mut poll = libc::pollfd {
-            fd: client.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll receives one initialized descriptor for this call.
-        let quiet = unsafe { libc::poll(&mut poll, 1, 0) } == 0;
-        quiet
-            && signed_persona(&self.registry, self.uid, self.publisher)
-                == Some(self.persona.clone())
+        binding_valid(
+            client,
+            &self.registry,
+            self.uid,
+            self.publisher,
+            self.persona.as_deref(),
+            &self.cancelled,
+            self.deadline,
+        )
     }
+}
+
+fn binding_valid(
+    client: &UnixStream,
+    registry: &Path,
+    uid: u32,
+    publisher: [u8; 32],
+    persona: Option<&str>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> bool {
+    if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+        return false;
+    }
+    // This trusted UI connection carries one request. Readability, EOF
+    // or an error while the reply is pending ends its approval.
+    let mut poll = libc::pollfd {
+        fd: client.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one initialized descriptor for this call.
+    let quiet = unsafe { libc::poll(&mut poll, 1, 0) } == 0;
+    quiet
+        && signed_persona(registry, uid, publisher)
+            .as_ref()
+            .map(|p| p.as_deref())
+            == Some(persona)
 }
 
 fn watch_worker<T>(
@@ -180,6 +205,12 @@ fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
         return None;
     }
     let persona = signed_persona(&registry, uid, publisher)?;
+    let item = fixture_item(
+        state.stores.get(SYNTHETIC_USER)?,
+        persona.as_deref(),
+        publisher,
+    )
+    .ok()?;
     let cancelled = Arc::new(AtomicBool::new(false));
     state.legacy_smime_pending = Some(cancelled.clone());
     Some(Approval {
@@ -187,6 +218,7 @@ fn approval(state: &mut State, body: &[u8]) -> Option<Approval> {
         uid,
         publisher,
         persona,
+        item,
         selection,
         received: received.to_vec(),
         cancelled,
@@ -212,23 +244,30 @@ fn synthetic_open(
         |control, mut lifetime, close_control| {
             let result = (|| {
                 let prepared = Prepared::start_received(control, CERT, &approval.received)?;
-                if !valid() || prepared.message_digest != approval.selection.digest {
+                if !valid()
+                    || prepared.message_digest != approval.selection.digest
+                    || prepared.cert_digest.as_slice() != Sha256::digest(CERT).as_slice()
+                    || prepared.fingerprint
+                        != native::certificate_fingerprint(CERT).map_err(|_| closed())?
+                {
                     return Err(closed());
                 }
                 let persona = approval.persona.as_deref();
                 let publisher = approval.publisher;
                 let secret = {
-                    let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-                    if approval.cancelled.load(Ordering::Acquire) {
+                    let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                    let store = state.stores.get(SYNTHETIC_USER).ok_or_else(closed)?;
+                    let item = approval.item.ok_or_else(closed)?;
+                    if approval.cancelled.load(Ordering::Acquire)
+                        || fixture_item(store, persona, publisher)? != Some(item)
+                    {
                         return Err(closed());
                     }
-                    let store = state.stores.get_mut(SYNTHETIC_USER).ok_or_else(closed)?;
-                    if persona == Some("work")
-                        && prepared.key_row(store, persona, publisher)?.is_none()
-                    {
-                        enroll(store, persona, publisher, CERT, KEY)?;
-                    }
-                    prepared.store_key(store, persona, publisher)?
+                    let recipient = Recipient::SmimeLegacy { publisher };
+                    store
+                        .release(&item, &fixture_access(persona, &recipient)?, None)
+                        .map_err(|_| closed())?
+                        .1
                 };
                 if !valid() {
                     return Err(closed());
@@ -250,7 +289,128 @@ pub fn serve_synthetic_open(
     client: &UnixStream,
     body: &[u8],
 ) -> io::Result<()> {
+    if let Some(action) = body.get(4..).and_then(Lifecycle::decode) {
+        return serve_lifecycle(state, client, body, action);
+    }
     serve_open(state, client, body, launch)
+}
+
+const FIXTURE_SCOPE: &[u8] = wire::FIXTURE_ACCOUNT.as_bytes();
+
+fn fixture_access<'a>(
+    persona: Option<&'a str>,
+    recipient: &'a Recipient,
+) -> io::Result<Access<'a>> {
+    Ok(Access {
+        persona: storage_persona(persona).ok_or_else(closed)?,
+        recipient,
+    })
+}
+
+fn fixture_item(
+    store: &Store,
+    persona: Option<&str>,
+    publisher: [u8; 32],
+) -> io::Result<Option<ItemId>> {
+    let recipient = Recipient::SmimeLegacy { publisher };
+    let digest = Sha256::digest(CERT);
+    Ok(store
+        .list(&fixture_access(persona, &recipient)?)
+        .map_err(|_| closed())?
+        .into_iter()
+        .find(|row| {
+            row.kind == Kind::SmimeLegacyRsaKey
+                && row.scope.get(32..64) == Some(digest.as_slice())
+                && row.scope.get(64..) == Some(FIXTURE_SCOPE)
+        })
+        .map(|row| row.id))
+}
+
+fn serve_lifecycle(
+    state: &Mutex<State>,
+    mut client: &UnixStream,
+    body: &[u8],
+    action: Lifecycle,
+) -> io::Result<()> {
+    let uid = u32::from_le_bytes(body[..4].try_into().map_err(|_| closed())?);
+    let lock = || state.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = (|| {
+        let mut state = lock();
+        let registry = state.legacy_smime_registry.clone()?;
+        let publisher = state.mail_sign_ins.mail_publisher?;
+        if state.legacy_smime_management.is_some()
+            || signed_persona(&registry, uid, publisher)?.as_deref() != Some("work")
+        {
+            return None;
+        }
+        let item = fixture_item(state.stores.get(SYNTHETIC_USER)?, Some("work"), publisher).ok()?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.legacy_smime_management = Some(cancelled.clone());
+        Some((registry, publisher, item, cancelled))
+    })();
+    let Some((registry, publisher, item, cancelled)) = pending else {
+        return proto::write_reply(&mut client, status::DENIED, &[]);
+    };
+    let result = (|| {
+        client.set_read_timeout(Some(Duration::from_secs(32)))?;
+        let deadline = Instant::now() + Duration::from_secs(32);
+        proto::write_reply(&mut client, status::OK, &[])?;
+        let frame = proto::read_frame(&mut client)?.ok_or_else(closed)?;
+        let bytes = frame.as_ref();
+        if bytes[..2] != op::U_SMIME_SYNTHETIC_MANAGE.to_le_bytes()
+            || Lifecycle::decode(&bytes[2..]) != Some(action)
+        {
+            return Err(closed());
+        }
+        let mut state = lock();
+        if !binding_valid(
+            client,
+            &registry,
+            uid,
+            publisher,
+            Some("work"),
+            &cancelled,
+            deadline,
+        ) {
+            return Err(closed());
+        }
+        let store = state.stores.get_mut(SYNTHETIC_USER).ok_or_else(closed)?;
+        if fixture_item(store, Some("work"), publisher)? != item {
+            return Err(closed());
+        }
+        match (action, item) {
+            (Lifecycle::Enroll, None) => {
+                enroll_key(store, Some("work"), publisher, CERT, KEY, FIXTURE_SCOPE)?;
+            }
+            (Lifecycle::Forget, Some(item)) => {
+                let recipient = Recipient::SmimeLegacy { publisher };
+                store
+                    .delete(&item, &fixture_access(Some("work"), &recipient)?)
+                    .map_err(|_| closed())?;
+                if let Some(preview) = &state.legacy_smime_pending {
+                    preview.store(true, Ordering::Release);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })();
+    let status = if result.is_ok() {
+        status::OK
+    } else {
+        status::DENIED
+    };
+    {
+        let mut state = lock();
+        state.legacy_smime_management = None;
+        state.audit(
+            &Label::TrustedUi,
+            op::U_SMIME_SYNTHETIC_MANAGE,
+            None,
+            status,
+        );
+    }
+    proto::write_reply(&mut client, status, &[])
 }
 
 fn serve_open(
@@ -294,10 +454,19 @@ fn serve_open(
         state.legacy_smime_pending = None;
         let result = match result {
             // Only the fixture UI sees the synthetic clean-exit marker.
-            Ok(opened) if approval.valid(client) => Reply {
-                status: if opened { status::OK } else { status::DENIED },
-                body: Body::Plain(vec![0]),
-            },
+            Ok(opened)
+                if approval.valid(client)
+                    && (!opened
+                        || state.stores.get(SYNTHETIC_USER).and_then(|store| {
+                            fixture_item(store, approval.persona.as_deref(), approval.publisher)
+                                .ok()
+                        }) == Some(approval.item)) =>
+            {
+                Reply {
+                    status: if opened { status::OK } else { status::DENIED },
+                    body: Body::Plain(vec![0]),
+                }
+            }
             _ => reply(status::DENIED),
         };
         let operation = if attempted {
@@ -806,6 +975,59 @@ mod tests {
     }
 
     #[test]
+    fn signed_fixture_enrollment_requires_matching_work_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Mutex::new(configured_fixture(dir.path()));
+        let enrolled = || {
+            let state = state.lock().unwrap();
+            fixture_item(&state.stores[SYNTHETIC_USER], Some("work"), [8; 32]).unwrap()
+        };
+        let exchange = |uid: u32, action: Lifecycle, next: Option<Lifecycle>| {
+            let (ui, mut client) = socket_pair();
+            std::thread::scope(|scope| {
+                let serve = scope.spawn(|| crate::serve_conn(ui, &Label::TrustedUi, &state));
+                let mut body = uid.to_le_bytes().to_vec();
+                body.extend_from_slice(&action.encode());
+                proto::write_request(&mut client, op::U_SMIME_SYNTHETIC_RESERVE, &body).unwrap();
+                let ack = read_reply(&mut client);
+                let reply = if ack.0 == status::OK {
+                    if let Some(next) = next {
+                        proto::write_request(
+                            &mut client,
+                            op::U_SMIME_SYNTHETIC_MANAGE,
+                            &next.encode(),
+                        )
+                        .unwrap();
+                        read_reply(&mut client).0
+                    } else {
+                        drop(client);
+                        status::OK
+                    }
+                } else {
+                    ack.0
+                };
+                serve.join().unwrap().unwrap_or_else(|e| {
+                    assert!(next.is_none(), "{e}");
+                });
+                reply
+            })
+        };
+        use Lifecycle::{Enroll, Forget};
+        assert_eq!(exchange(51001, Enroll, Some(Enroll)), status::DENIED);
+        assert_eq!(exchange(51000, Enroll, None), status::OK);
+        assert_eq!(exchange(51000, Enroll, Some(Forget)), status::DENIED);
+        assert!(enrolled().is_none());
+        assert_eq!(exchange(51000, Enroll, Some(Enroll)), status::OK);
+        let first = enrolled().unwrap();
+        assert_eq!(exchange(51000, Forget, None), status::OK);
+        assert_eq!(enrolled(), Some(first));
+        assert_eq!(exchange(51000, Forget, Some(Forget)), status::OK);
+        assert!(enrolled().is_none());
+        assert_eq!(exchange(51000, Enroll, Some(Enroll)), status::OK);
+        assert_ne!(enrolled(), Some(first));
+    }
+
+    #[test]
     fn synthetic_failure_timing_samples_include_admission_and_worker_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let state = Mutex::new(configured_fixture(dir.path()));
@@ -893,7 +1115,16 @@ mod tests {
 
     fn revoke_during_worker_read(revoke: Revoke) {
         let dir = tempfile::tempdir().unwrap();
-        let fixture = configured_fixture(dir.path());
+        let mut fixture = configured_fixture(dir.path());
+        enroll_key(
+            fixture.stores.get_mut(SYNTHETIC_USER).unwrap(),
+            Some("work"),
+            [8; 32],
+            CERT,
+            KEY,
+            FIXTURE_SCOPE,
+        )
+        .unwrap();
         let registry = fixture.legacy_smime_registry.clone().unwrap();
         let state = Mutex::new(fixture);
         let user = body(|w| w.str(SYNTHETIC_USER));
