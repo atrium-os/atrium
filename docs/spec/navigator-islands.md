@@ -2016,6 +2016,41 @@ re-audit it, rerun the three arms, and compare `served` step 1 to
 stages inside the engine (painter `navigator_video_ready`, the fixture
 loader's completion) before changing anything else.
 
+#### Results on arm64 Tessera, 2026-11-24 (drained event loop)
+
+The hypothesis holds. The engine was rebuilt from main `d4a26635e`
+(`Core::EventLoop::pump` returns `size_t`, so the change compiled as
+written) and audited, and the installed digest matched (`1000beb6…a7a0`).
+The daemons, player and guest setup were as in the trace run. Medians in
+milliseconds since `widget-start`, before (`97d4a9bdb`) and after:
+
+| Stage | No choragusd | choragusd | Warm |
+| --- | ---: | ---: | ---: |
+| `served` step 1 | 391 → 473 | 358 → 430 | 367 → 362 |
+| `video-open` | 665 → 478 | 602 → 434 | 607 → 388 |
+| `request` step 3 | 980 → 547 | 913 → 528 | 928 → 467 |
+| `add-vp9` | 1,222 → 620 | 1,158 → 592 | 1,181 → 545 |
+| player `first-frame` | 1,398 → 683 | 1,330 → 678 | 1,363 → 629 |
+| `player-ready` | 1,462 → 689 | 1,375 → 691 | 1,425 → 632 |
+| Press to red pixel | 1,744 → 1,027 | 1,724 → 1,062 | 1,740 → 962 |
+
+The three gaps the follow-up named are gone. Step 1 served to
+`video-open` fell from 210 to 275 ms to 4 to 26 ms, step 2 served to
+step 3's `request` from about 220 ms to 2 ms, and step 3 served to
+`add-vp9` from about 195 ms to 1 to 3 ms. Press to red is now 1,444, 892
+and 1,027 ms without choragusd, 1,067, 1,062 and 1,006 ms with it, and
+938, 961, 963 and 1,001 ms warm (presses 2 to 5). The first cold press
+was slower throughout (fork at 49 ms, first request at 327 ms).
+
+What remains in the median warm press: about 55 ms to the first request,
+the four fetches at 60 to 180 ms for the first and 60 to 80 ms for each
+of the others (each the fetch worker's round trip upstream), about 90 ms
+of appends and first frame, and about 330 ms from `player-ready` to the
+observed red pixel (composition, the headless PNG and the SSH poll). The
+standby now saves about 65 ms against the cold arms. Cold first-request
+times varied from 70 to 327 ms with the jail fork (15 to 116 ms). Evidence
+is in `~/atrium-vm/evidence/navigator-i5-drain-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
