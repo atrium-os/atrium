@@ -229,3 +229,4 @@ check "no zombie shells" "0" "$(V "ps -ax -o jid= -o stat= | awk '\$1==$JID && \
 
 V "pkill -f console_probe; pkill -f stay_probe; pkill -f atrium-term-socket; pkill -x stoad" >/dev/null 2>&1
 echo "console: $fails failed"
+[ "$fails" -eq 0 ]

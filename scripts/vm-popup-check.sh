@@ -37,3 +37,4 @@ for mode in direct split; do
 done
 V 'pkill -x frescod'
 echo "popup-check: $fails failed"
+[ "$fails" -eq 0 ]

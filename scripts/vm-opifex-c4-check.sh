@@ -209,3 +209,4 @@ V "pkill -x opifexd; opifex uninstall $ID >/dev/null 2>&1; opifex uninstall org.
    cd $B && PATH=/usr/local/bin:\$PATH sh nuntius-bundle.sh $B/nuntiusd /root/e2e-key.pem /usr/local/bin/opifex /etc/ssl/cert.pem >/dev/null 2>&1" \
    && ok "Nuntius trusts the system's store again" || bad "cleanup"
 echo "opifex-c4: $fails failed"
+[ "$fails" -eq 0 ]

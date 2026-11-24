@@ -115,3 +115,4 @@ done
 V 'pkill -x frescod; pkill -f atrium-input-probe'
 rm -rf "$T"
 echo "lock-check: $fails failed"
+[ "$fails" -eq 0 ]

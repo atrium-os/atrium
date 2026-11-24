@@ -140,3 +140,4 @@ check "opifexd says praecod refused" "1" "$(V "grep -c 'opifexd: praecod' $B/opi
 
 V "pkill -x opifexd; pkill -f praecod" >/dev/null 2>&1
 echo "opifex-c5: $fails failed"
+[ "$fails" -eq 0 ]

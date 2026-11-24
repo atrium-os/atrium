@@ -173,3 +173,4 @@ check "nothing stays held" "0" "$(V "ls /var/db/atrium/opifex/held | wc -l | tr 
 V "pkill -x opifex-sheetd; pkill -x opifexd; pkill -x frescod" >/dev/null 2>&1
 V "OPIFEX_SOCKET=/nonexistent opifex uninstall $ID >/dev/null 2>&1; OPIFEX_SOCKET=/nonexistent opifex uninstall org.atrium.c3file >/dev/null 2>&1; rm -f /etc/atrium/publishers/opifex-c3.pem; true"
 echo "opifex-c3: $fails failed"
+[ "$fails" -eq 0 ]

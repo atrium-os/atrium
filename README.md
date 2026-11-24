@@ -13,9 +13,23 @@ For the full thesis see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For canoni
 
 ## Status
 
-Work since 2026-11-03 (native RDNA4 backend and gpusim, the Fresco display pipeline and its process split, compressed memory, Navigator security fixes, the x86_64 port) is tracked in [docs/STATUS.md](docs/STATUS.md); how to run it is in [RUNBOOK.md](RUNBOOK.md) §13.
+Where every workstream stands is in [docs/STATUS.md](docs/STATUS.md) (long
+form) and [docs/HANDOFF.md](docs/HANDOFF.md) (open work and the next step for
+each). In short, as of 2026-11-25:
 
-As of 2026-10-02, these pieces work:
+- **Platform**: Tessera is the default root, with XAES-256-GCM encryption;
+  every app runs in its own jail with its own vnet stack; system services are
+  jailed, privilege-separated Rust daemons (Arca, Ostiarius, Stoa, Lyra,
+  Curia, Scrinium, Praeco, Tabula, Opifex, Monstrator, Prelum, Crypta,
+  Dispensator, Capsa). The VM boots to ssh in about 5 s.
+- **Apps**, built on the SDK and Pergola: Navigator (personas, sign-in,
+  printing), Mail (IMAP/JMAP, sending, Sieve filters), Officina (Sheets,
+  Write, Slides), Calendar, Terminal and the Artifex editor.
+- **Services in progress**: printing (driverless IPP), VPN (Crypta),
+  Wi-Fi (Aura, 802.1X under way), the package catalog (Opifex, built;
+  publishing waits on the key ceremony).
+
+### Foundations, as of 2026-10-02
 
 - **D0 / D1**: a native virtio-gpu kmod through scanout, and `frescod` running Fresco on FreeBSD with atrium-edit interactive over the full protocol on a Unix socket.
 - **D1.5 Tessera**: the in-kernel CAS filesystem (`tessera_fs.ko`), with POSIX behaviour checked by pjdfstest, mmap/exec, snapshots, and fsync performance matching ZFS. July to September went into hardening it: crash recovery, GC correctness, metadata-reserve exhaustion returning ENOSPC cleanly, snapshot pinning, quota and dedup domains, `tessera-fsck` / `tessera-repack`, and a namespace verifier that runs after every commit (on by default).
@@ -25,7 +39,7 @@ As of 2026-10-02, these pieces work:
 - **D6 Navigator (the JS-free document lane)**: M0 (Markdown to NSG, byte-identical across machines) and M1 (a jailed fetcher that can reach the network but cannot name a file) have passed. In M2 the strict profile renderer matches all 64 property rows, the normalizer brings the real-document corpus to 29/29, images paint from the CAS store, and WPT reftests serve as an oracle.
 - **Started, not finished**: Stoa (persistent sessions), Lyra + Choragus (audio on the Laminar deadline scheduler), memoryd / memfed (memory pressure), atrium-gpu-amd (RDNA2), Pergola (the native toolkit) with first apps including the Vestibulum login screen, and the Forum shell pieces (`forum-wm`, `forum-bar`, `forum-dock`).
 
-Still ahead: D2 Vestibulum login and session handoff end to end, the D3 Forum shell with the capability prompt UI (Portcullis phase 5), Fresco onto the Aqueduct envelope (`docs/spec/fresco-production-rollout.md`), D4.5 declarative animation, the D5 atrium-mesa fork and CLASS_AX accessibility, and Navigator's semantic tree.
+Still ahead at that point: D2 Vestibulum login and session handoff end to end, the D3 Forum shell with the capability prompt UI (Portcullis phase 5), Fresco onto the Aqueduct envelope (`docs/spec/fresco-production-rollout.md`), D4.5 declarative animation, the D5 atrium-mesa fork and CLASS_AX accessibility, and Navigator's semantic tree.
 
 See [RUNBOOK.md](RUNBOOK.md) for the bring-up procedure (`--virtio-gpu --display` QEMU flags, the `vtgpu` disable hint, host cross-compile setup) and [docs/ROADMAP.md](docs/ROADMAP.md) for per-phase scope and remaining work.
 

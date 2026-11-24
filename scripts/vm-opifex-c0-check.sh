@@ -102,3 +102,4 @@ V "opifex uninstall $ID >/dev/null"
 check "uninstall clears it and prev" "none" "$(V "ls -d $APPS/$ID /var/lib/atrium/opifex/prev/$ID 2>/dev/null || echo none")"
 
 echo "opifex-c0: $fails failed"
+[ "$fails" -eq 0 ]

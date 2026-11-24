@@ -279,3 +279,4 @@ case "$R" in *" 0 failed"*) ok "chrome: $R" ;; *) bad "chrome tests: $R" ;; esac
 fi
 
 echo "personas: $fails failed"
+[ "$fails" -eq 0 ]

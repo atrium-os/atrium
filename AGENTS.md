@@ -89,6 +89,9 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 - Most subsystems have a VM check script in `scripts/` (`*-vm-check.sh`,
   `*-gate.sh`, `*-vm.sh`). Run the one for the area you changed; the RUNBOOK
   section for that subsystem names it.
+- A new check script sources `scripts/lib/gate.sh` (`ok`/`bad`/`check`,
+  `gate_begin NAME COUNT`, `gate_end`) so it exits non-zero on a failure and
+  fails when fewer checks ran than it declared.
 - Cargo intermediates share `$CARGO_HOME/atrium-build` (default
   `~/.cargo/atrium-build`) across the main checkout and scratch worktrees.
   Final binaries are still in each crate's `target/` directory. Concurrent
@@ -131,8 +134,10 @@ on:
 1. Commit and push what you have (or say in the row exactly what is left
    uncommitted and where).
 2. Update that workstream's row in [docs/HANDOFF.md](docs/HANDOFF.md): where
-   it stands, the exact next step, and what it is waiting on. Add a row for a
-   new workstream; move a finished one to "Recently finished".
+   it stands, the exact next step, and what it is waiting on. Keep the row to
+   a few lines that link the spec's as-built section; history goes there.
+   Add a row for a new workstream; move a finished one to "Recently
+   finished".
 3. Push. When picking work up, read the row, then the spec it links, then
    `git log` for that area.
 

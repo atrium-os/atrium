@@ -124,3 +124,4 @@ check "the plain app's uid is not" "no" "$(V "pw groupshow files-alice" | cut -d
 check "nobody else can read the folder" "Permission denied" "$(V "su -m bob -c 'ls /home/alice/Documents' 2>&1" | grep -o 'Permission denied' | head -1)"
 
 echo "homes: $fails failed"
+[ "$fails" -eq 0 ]

@@ -134,3 +134,4 @@ done
 echo "== windows after the storm"; $C outputs; $C surfaces
 grep -E "flip on output|reconfiguration failed|stays dark|refused" /var/log/atrium/atrium-frescod.log | sort | uniq -c | head
 echo "chaos: $STEPS steps, $fails failed"
+[ "$fails" -eq 0 ]

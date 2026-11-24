@@ -85,10 +85,10 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | M8 | Medium→Low | frescod, tabula, others | A poisoned mutex takes down every client | M | **Reframed**: no lock rewrite; see below |
 | L1 | Low | everywhere | 2,304 "★" war-story comments, dangling ticket numbers, misplaced doc comments | ongoing | Open |
 | L2 | Low | portcullis-peer | A four-level wrapper chain for one function | S | Open |
-| L3 | Low | repo | Dead crates, a dead CI workflow, fake tests, tracked `scratch/` | S | Open: needs an OK to delete |
-| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | Open |
-| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | Open |
-| L6 | Low | several | Compiler warnings, silent parse drops, a personal path in tests | S | Open |
+| L3 | Low | repo | Dead crates, a dead CI workflow, fake tests, tracked `scratch/` | S | **Fixed `ee1552e`** (Shankar's OK): atrium-pt-demo and the Insula CI removed; 4 of the 5 listed crates are in use and stay; `scratch/` still tracked |
+| L4 | Low | scripts | Copy-pasted gate boilerplate (44.7k lines of shell) | M | **Started `L4HASH`**: `scripts/lib/gate.sh`; 18 gates that always exited 0 now fail on a failure |
+| L5 | Low | docs | HANDOFF cells of 83 KB, a stale README, spec drift | S | README fixed `L4HASH`; AGENTS.md row-size rule; the five long rows go back to their owners |
+| L6 | Low | several | Compiler warnings, silent parse drops, a personal path in tests | S | **Mostly fixed `ee1552e`**: bridge tests, 27 stale lockfiles, home path, imports |
 
 ### C1. A manifest entry could inject jail.conf parameters (fixed)
 
@@ -406,7 +406,11 @@ newline would forge a registry line.
 
 - **Crates nothing references** (no Cargo path or script mentions them):
   `memprobe`, `atrium-pt-demo`, `forum-demo`, `aqueduct-echo`,
-  `kmod-rust-spike`.
+  `kmod-rust-spike`. *Correction (Wave 4):* only `atrium-pt-demo` was dead.
+  `kmod-rust-spike/kpi-patches` is applied by `scripts/rust-kmod-spike.sh`
+  for the Rust kmods; `memprobe` produced the numbers in
+  `atrium-zram-v2.md` §3; `aqueduct-echo` is the spec's example service;
+  `forum-demo` is the RUNBOOK's frescod smoke test. They stay.
 - **A dead CI workflow.** `.github/workflows/insula.yml` watches `insula-*`,
   `atrium-netd-macos`, `atrium-fetch` and `atrium-mon`, none of which
   exist. `scripts/build-insula.sh` builds them.
@@ -433,6 +437,15 @@ under-used.
 access, deploy of main's build), adopted when a script is next touched. No
 mass rewrite.
 
+**Status (`L4HASH`):** `scripts/lib/gate.sh` has the bookkeeping: `gate_end`
+exits non-zero on a failure, and fails when no checks or fewer than the
+declared count ran; `scripts/lib/gate-selftest.sh` checks each case and fails
+when `gate_end` is made to always pass. `opifex-token-check.sh` uses it (18
+of 18 before and after, and an abort now exits 1). 18 VM gates ended with
+`echo "...: $fails failed"` and so exited 0 whatever failed; each now ends
+with `[ "$fails" -eq 0 ]`, output unchanged. VM access and deploy helpers
+are not in the library yet.
+
 ### L5. Docs that drift
 
 - `docs/HANDOFF.md` calls itself "the short list", but its Mail cell is
@@ -448,7 +461,10 @@ mass rewrite.
   (`supervisor.rs:1031`); portcullis-sig has an unused import
   (`lib.rs:192`).
 - jaild's tests hardcode `/usr/home/girivs`.
-- `portcullis-toml` depends on `thiserror` but does not use it.
+- `portcullis-toml` depends on `thiserror` but does not use it. (Left: 63
+  lockfiles carry portcullis-toml, so removing it means editing them all.)
+- `portcullisd::launch::launch_with_stdio` is unused (launch path, left for
+  H3).
 - 20 `Cargo.lock` files are out of date with their manifests (`cargo
   metadata --locked` fails in aqueduct-gpu-host, forum-demo,
   forum-overview, fresco-aqueduct-bridge, fresco-scene-server, hospes,
