@@ -1416,6 +1416,14 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let mut last_video = None;
     let mut capture_pending = false;
     let island_idle = island_idle_timeout();
+    // FRESCOD_START_TRACE=1: a `start-trace` line (navigator-islands.md
+    // "I5 Start trace") for each composited frame and each saved capture,
+    // on CLOCK_MONOTONIC like the other hops, so the span from the player's
+    // first frame to the observed pixel splits into composition and capture.
+    let start_trace = std::env::var_os("FRESCOD_START_TRACE").is_some();
+    let trace = |stage: &str, tag: String| if start_trace {
+        eprintln!("start-trace frescod {stage} mono_us={} pid={} {tag}", video::monotonic_ns() / 1000, std::process::id());
+    };
     loop {
         let next_island = socket_server::retire_idle_islands(&comp, island_idle);
         let cur = redraw2.current();
@@ -1447,7 +1455,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 
         last_gen = redraw2.current();
         let t_render = Instant::now();
+        trace("frame-begin", format!("gen={last_gen} slept_ms={}", floor.saturating_sub(since).as_millis()));
         render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), W, H).map_err(io_other)?;
+        trace("composited", format!("frame={}", frame_no + 1));
         /* No flip here: on screen once captured. */
         video::VIDEOS.landed(video::monotonic_ns(), &comp);
         frame_no += 1;
@@ -1472,6 +1482,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             let tmp = format!("{out}.new");
             if img.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {
                 let _ = std::fs::rename(&tmp, &out);
+                trace("png-saved", format!("frame={frame_no}"));
             }
         }
         last_capture = Instant::now();

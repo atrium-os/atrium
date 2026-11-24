@@ -2051,6 +2051,21 @@ standby now saves about 65 ms against the cold arms. Cold first-request
 times varied from 70 to 327 ms with the jail fork (15 to 116 ms). Evidence
 is in `~/atrium-vm/evidence/navigator-i5-drain-20261124/`.
 
+#### Follow-up: splitting the last 330 ms
+
+Headless frescod (`FRESCOD_START_TRACE=1`) now prints `frescod
+frame-begin` (with the generation and how long it slept to keep the
+capture floor), `composited` and `png-saved` for each frame. Two things in
+the headless loop alone can account for much of the 330 ms: captures are
+at least 200 ms apart (`HEADLESS_MIN_INTERVAL`) once no video is playing,
+which the paused poster is not, and each capture is a full-screen PNG
+encode before the SSH poll can see it. If the trace shows the time is
+there, it is the measurement and not the Start; the product figure is then
+`player-ready` to `composited`, and the end of the gate should be
+`composited` rather than the pixel poll. Next on the Mac: run frescod with
+`FRESCOD_START_TRACE=1`, repeat the three arms, and pass frescod's stderr
+to `navigator-i5-start-trace.sh` with the other logs.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
