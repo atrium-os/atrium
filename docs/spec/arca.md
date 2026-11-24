@@ -918,8 +918,52 @@ authorization and a changed message, Personal isolation, lock and
 dismissal, key-purpose separation, and one user-visible failure outcome.
 It must also verify that unsupported envelopes and failed OAEP opens
 cannot dispatch legacy RSA, and that legacy reads have no background
-or network effects. The complete request and content path needs
-review for externally observable differences before enablement.
+or network effects. The signed fixture gate verifies the process
+boundaries and the three sheet outcomes for a fixed input. Whole-path
+timing and the production path for received messages remain unverified.
+
+##### Failure observability review
+
+- **Remote sender and mailbox provider.** The current legacy operation
+  has no path from received mail to key use. The signed gate starts in
+  Settings and accepts a built-in certificate and ciphertext under a
+  disposable identity. Its Capsicum reader has no network and returns
+  bounded text to Arca on a private socket. A future local preview must
+  also avoid indirect effects from Mail, including sync writes, receipts,
+  external content, indexing and notifications.
+- **Mail and local UI.** Limen delivers only opened, closed or cancelled.
+  Approval and cancellation are distinct by design. After approval, the
+  fixture draws one refusal message, but Mail can observe completion
+  time, and sheet attachment or loss is separately visible through
+  Limen. The work differs by stage, so the elapsed time may differ too.
+- **Arca and local services.** The trusted fixture can distinguish a
+  clean worker exit from a launch or transport failure by the synthetic
+  reply marker. The daemon audit records the operation and coarse
+  status. Worker lifecycle diagnostics can distinguish operational
+  failures. No reviewed public field names an RSA or content-padding
+  failure. The worker and store are still handled under Arca's shared
+  state mutex, making contention observable in principle. The
+  signed fixture checks the live launch registry before key use, while
+  a lock request handled by Arca can wait on that mutex. The fixture
+  does not attest a real account and message selection or continued
+  sheet and session liveness throughout the operation.
+- **Private crypto and content.** OpenSSL's default provider is pinned
+  and implicit rejection is required and checked. Arca selects a
+  fixed-width candidate without returning the provider status or
+  recovered length. The worker's CBC decryption and inner-text checks
+  can do different amounts of work. The provider protection applies
+  to RSA processing, and the current checks establish no equivalence
+  across the composed key lookup, worker, content parser, and reply.
+  CBC encryption also provides no sender authenticity.
+
+Keep legacy receiving disabled. Before enablement, bind the real
+immutable message, selected account and signed launch to a one-use
+approval, make revocation effective during worker I/O, and keep worker
+I/O off the shared Arca state lock. Verify consistent failure replies,
+local timing and contention, and zero legacy-outcome-dependent network
+and mailbox effects on the whole message path. Use a synthetic gate
+with controlled comparisons across failure stages.
+
 See [OpenSSL EVP documentation](https://docs.openssl.org/3.5/man3/EVP_PKEY_decrypt/#warnings)
 and [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6).
 

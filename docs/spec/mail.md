@@ -1119,6 +1119,14 @@ omits that action and role grant. The signed gate checks Work
 cancellation, approved Work opening, and approved Personal refusal in
 one private overlay, with clean worker exit for both approved scenarios.
 
+The synthetic Settings action is separate from the regular reader. In
+the regular reader, opening an unread conversation queues a Seen update
+independently of whether the message decrypts. A legacy preview must
+keep its request and outcome outside that update, HTML rendering and
+remote-picture loading. A mailbox provider can observe ordinary read
+activity. The production gate must verify that the legacy action itself
+adds no outcome-dependent mailbox changes or external activity.
+
 See [Arca §9.2.1](arca.md#921-proposed-legacy-smime-receive-operation),
 [RFC 8017 §6](https://www.rfc-editor.org/rfc/rfc8017.html#section-6),
 and [RFC 3218](https://www.rfc-editor.org/rfc/rfc3218.html).
