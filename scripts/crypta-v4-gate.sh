@@ -327,20 +327,15 @@ run)
         fail "no corp.crypta.test forward"
     fi
     # unbound restarted under a tunnel (rc late in a slow boot did this
-    # once): its zones are runtime state, so they go; atrium-net's check
-    # puts them back. How long the tunnel's names go to the LAN's servers.
-    # Timed in the guest: gone right after the restart, then back.
+    # once): live zones go with it, so atrium-net also keeps them in
+    # conf.d/atrium-vpn.conf, and the restarted unbound starts with them.
+    "$V" "grep -A3 'name: \"corp.crypta.test.\"' /var/unbound/conf.d/atrium-vpn.conf | grep -q 'forward-addr: 10.98.0.1'" \
+        && ok "the pushed domain is in unbound's conf.d too ($("$V" 'stat -f %Sp /var/unbound/conf.d/atrium-vpn.conf'))" || fail "atrium-vpn.conf: $("$V" 'cat /var/unbound/conf.d/atrium-vpn.conf')"
     r=$("$V" "service local_unbound restart >/dev/null 2>&1
-        local-unbound-control list_forwards | grep -q corp.crypta.test && echo still-there
-        t0=\$(date +%s); n=0
-        until local-unbound-control list_forwards 2>/dev/null | grep -q corp.crypta.test; do
-            n=\$((n + 1)); [ \$n -lt 60 ] || { echo never; exit 0; }; sleep 0.5; done
-        echo back \$((\$(date +%s) - t0))")
-    case "$r" in
-        "back "*) ok "unbound restarted under the tunnel: its zones went with it, and atrium-net put the pushed domain back after ${r#back } s" ;;
-        *) fail "unbound restarted under the tunnel: $r" ;;
-    esac
-    "$V" "grep -q 'unbound forwards .* (restarted), not ours' $G/net.log" && ok "atrium-net noticed the restart" || fail "no restart in atrium-net's log: $("$V" "tail -5 $G/net.log")"
+        local-unbound-control list_forwards | grep -q corp.crypta.test && echo at-once || echo missing")
+    [ "$r" = at-once ] && ok "unbound restarted under the tunnel: the pushed domain forwards at once, no gap" || fail "unbound restarted under the tunnel: $r"
+    "$V" 'local-unbound-control lookup web.corp.crypta.test' | grep -q '10\.98\.0\.1' \
+        && ok "after the restart unbound asks the tunnel's DNS for its names" || fail "lookup after the restart: $("$V" 'local-unbound-control lookup web.corp.crypta.test')"
     l=$(acleaks); [ -z "$l" ] && ok "nothing for the tunnel's networks on the LAN, only the gateway's TCP ($(stat ac_out) bytes out)" || fail "leaked: $l"
     "$V" "grep -rq alice-pw $G/state $G/cryptad.log" && fail "the password is in cryptad's state or log" || ok "the password is not in cryptad's state or log"
     [ "$(tl corp user)" = "$(hexof alice)" ] && ok "the profile remembers the username" || fail "user: $(tl corp user)"
@@ -466,6 +461,7 @@ run)
         echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"
     fi
 
+    "$V" 'grep -c forward-zone /var/unbound/conf.d/atrium-vpn.conf' | grep -qx 0 && ok "no tunnel up: atrium-vpn.conf holds no zone" || fail "zones left in atrium-vpn.conf: $("$V" 'cat /var/unbound/conf.d/atrium-vpn.conf')"
     echo "== delete: everything Arca kept for the profiles"
     for n in corp ann otp cert pin badpin hostile sso win; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
     left=$(arca_items)

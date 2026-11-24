@@ -296,6 +296,46 @@ pub fn domain_table(fib: u32) -> String {
 /// Loaded with `pfctl -a atrium/vpn -f -`: its `nat` rules run from the
 /// base ruleset's `nat-anchor "atrium/vpn"` (before the apps' NAT on the
 /// egress), its filter rules from `anchor "atrium/*"`.
+/// The tunnels' DNS zones as an unbound config file (vpn.md §5.5), so a
+/// restart of local-unbound starts with them rather than sending a
+/// tunnel's names to the network's servers until atrium-net sets them
+/// again. Each entry: the zones applied, the tunnel's servers, whether
+/// they are DNSSEC-insecure. A name is written once (the first tunnel's),
+/// and only a valid, unreserved one: a duplicate zone or a stray byte
+/// would stop unbound from starting at all.
+pub fn render_zones(tunnels: &[(&[String], &[Ipv4Addr], bool)]) -> String {
+    let mut out = String::from("# Written by atrium-net: the VPN tunnels' DNS zones (vpn.md §5.5). Do not edit.\n");
+    let mut seen: Vec<&str> = Vec::new();
+    let mut insecure = Vec::new();
+    let mut zones = String::new();
+    for (names, dns, ins) in tunnels {
+        if dns.is_empty() {
+            continue;
+        }
+        for d in names.iter() {
+            if !valid_domain(d) || reserved_domain(d) || seen.contains(&d.as_str()) {
+                continue;
+            }
+            seen.push(d);
+            zones.push_str(&format!("forward-zone:\n    name: \"{d}.\"\n"));
+            for a in dns.iter() {
+                zones.push_str(&format!("    forward-addr: {a}\n"));
+            }
+            if *ins {
+                insecure.push(d.as_str());
+            }
+        }
+    }
+    if !insecure.is_empty() {
+        out.push_str("server:\n");
+        for d in insecure {
+            out.push_str(&format!("    domain-insecure: \"{d}.\"\n"));
+        }
+    }
+    out.push_str(&zones);
+    out
+}
+
 pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
     let out = phys.unwrap_or("atrium_egress");
     let mut r = String::new();
@@ -346,6 +386,25 @@ pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
         r.push_str(&format!("block out quick on {out} all\n"));
     }
     r
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+
+    #[test]
+    fn zones_are_written_once_each_and_only_valid() {
+        let a = vec!["corp.example".to_string(), "lab.corp.example".to_string()];
+        let b = vec!["corp.example".to_string(), "bad\"\ninclude: /etc".to_string(), "local".to_string()];
+        let dns1 = [Ipv4Addr::new(10, 98, 0, 1), Ipv4Addr::new(10, 98, 0, 2)];
+        let dns2 = [Ipv4Addr::new(10, 99, 0, 1)];
+        let t = render_zones(&[(&a, &dns1, true), (&b, &dns2, false), (&a, &[], false)]);
+        assert_eq!(t.matches("forward-zone:").count(), 2, "{t}");
+        assert!(t.contains("name: \"corp.example.\"\n    forward-addr: 10.98.0.1\n    forward-addr: 10.98.0.2\n"), "{t}");
+        assert!(t.contains("server:\n    domain-insecure: \"corp.example.\"\n    domain-insecure: \"lab.corp.example.\"\n"), "{t}");
+        assert!(!t.contains("include") && !t.contains("10.99.0.1") && !t.contains("\"local."), "{t}");
+        assert_eq!(render_zones(&[]).lines().count(), 1, "only the header");
+    }
 }
 
 #[cfg(test)]

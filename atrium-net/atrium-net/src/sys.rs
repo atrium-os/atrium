@@ -750,14 +750,23 @@ impl Dir {
 
     /// Replace `name` atomically (write a temporary, fsync, rename), mode 0600.
     pub fn write(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.write_mode(name, data, 0o600)
+    }
+
+    /// As [`Dir::write`], with the file's mode (one another daemon reads).
+    pub fn write_mode(&self, name: &str, data: &[u8], mode: libc::c_uint) -> io::Result<()> {
         let tmp = CString::new(format!("{name}.tmp")).unwrap();
         let fin = CString::new(name).unwrap();
         let d = self.fd.as_raw_fd();
-        let fd = unsafe { libc::openat(d, tmp.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600 as libc::c_uint) };
+        let fd = unsafe { libc::openat(d, tmp.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW, mode) };
         if fd < 0 {
             return err("openat");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // An existing temporary keeps its mode: set it.
+        if unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return err("fchmod");
+        }
         let n = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
         if n != data.len() as isize || unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
             return err("write");

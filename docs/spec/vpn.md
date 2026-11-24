@@ -1273,13 +1273,23 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   fingerprint or Windows Hello passkey in Sigillum's own sheet. The answer
   goes back as `Event::Credential` and on to the page. A page that goes, or
   a window that closes, retires the ceremony.
-- *unbound restarts.* A tunnel's forward zones are unbound's runtime
-  state, so a restart of local-unbound (seen once when rc started it late
-  in a slow boot, during the gate) drops them, and the tunnel's names go to
-  the network's servers until atrium-net's check puts them back. That check
-  ran every 10 s; it now runs every 2 s while any tunnel has zones. The
-  gate restarts unbound under a tunnel and times it: back within 1 s.
-- *Checks.* `scripts/crypta-v4-gate.sh run` now 78 checks on the amd64
+- *unbound restarts.* A tunnel's forward zones set through unbound's
+  control socket are runtime state, so a restart of local-unbound (seen
+  once when rc started it late in a slow boot, during the gate) dropped
+  them, and the tunnel's names went to the network's servers until
+  atrium-net's check put them back (every 10 s, then 2 s while a tunnel has
+  zones). atrium-net now also writes them to
+  `/var/unbound/conf.d/atrium-vpn.conf` (0644, `--unbound-conf-dir`; a
+  directory descriptor opened before capability mode): one `forward-zone`
+  per applied zone with the tunnel's servers, `domain-insecure` for `+i`.
+  Each name is written once and only if it passes the tunnel checks again,
+  since a duplicate zone or a stray byte would keep unbound from starting.
+  It is emptied at start and when a tunnel closes. A restarted unbound
+  starts with the zones: the gate restarts it under a tunnel and finds the
+  forward there at once. Still runtime only: a full tunnel's root
+  forwarders (`.`), which come back from FreeBSD's `forward.conf` until
+  atrium-net's check; with the block on, pf drops what goes to the LAN.
+- *Checks.* `scripts/crypta-v4-gate.sh run` now 80 checks on the amd64
   VM: the V4 ones plus GlobalProtect SAML through the window against
   Keycloak (the stand-in serves a GlobalProtect portal front: prelogin
   REDIRECT, ACS checked with xmlsec1, a token checked once with an empty

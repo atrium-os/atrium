@@ -42,7 +42,7 @@ mod imp {
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
     use net_proto::{check_dns6, check_lease6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
-    use net_proto::tunnel::{check_tunnel, render_anchor, AnchorTunnel, Net4, Tunnel};
+    use net_proto::tunnel::{check_tunnel, render_anchor, render_zones, AnchorTunnel, Net4, Tunnel};
     use std::io;
     use atrium_netconf::{check_dns, lines as nlines, tls_name_ok, Manual};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -179,6 +179,8 @@ mod imp {
         aura: String,
         keys: String,
         unbound: Option<String>,
+        /// unbound's `conf.d`, where the tunnels' zones are kept for a restart.
+        unbound_conf: Option<String>,
         capsicum: bool,
         probe: Option<String>,
         probe_expect: Option<String>,
@@ -229,6 +231,7 @@ mod imp {
             aura: "/atrium/sockets/aura".into(),
             keys: "/atrium/sockets/aura-keys".into(),
             unbound: Some("/var/run".into()),
+            unbound_conf: Some("/var/unbound/conf.d".into()),
             capsicum: false,
             // Off unless a URL is given: no third party learns when this
             // machine joins a network (spec §4.2, endpoint decision pending).
@@ -247,7 +250,8 @@ mod imp {
             match x.as_str() {
                 "-v" => o.verbose = true,
                 "--capsicum" => o.capsicum = true,
-                "--no-unbound" => o.unbound = None,
+                "--no-unbound" => { o.unbound = None; o.unbound_conf = None; }
+                "--unbound-conf-dir" => o.unbound_conf = Some(val(&mut a, "--unbound-conf-dir")),
                 "--iface" => o.ifaces.push(val(&mut a, "--iface")),
                 "--wifi" => o.wifi = Some(val(&mut a, "--wifi")),
                 "--lease" => o.lease = val(&mut a, "--lease"),
@@ -381,6 +385,9 @@ mod imp {
         ifc: Ifc,
         rt: Rtsock,
         unbound: Option<Unbound>,
+        /// unbound's `conf.d` and what was last written there
+        /// (`atrium-vpn.conf`, the tunnels' zones).
+        unbound_conf: Option<(Dir, String)>,
         host: Vec<(String, Ipv4Addr, u8)>,
         /// The host's IPv6 addresses, by interface; with `host`, read at
         /// start and then kept from the routing socket's address messages.
@@ -2074,6 +2081,7 @@ mod imp {
                     let _ = u.cmd(&format!("forward_remove {z}"));
                 }
             }
+            self.persist_zones();
             if was_full {
                 self.lease_routes(true);
                 self.forwarders.clear();
@@ -2128,8 +2136,34 @@ mod imp {
             }
         }
 
+        /// Keep the applied zones in unbound's config too: a restart starts
+        /// with them (no window where a tunnel's names go to the network).
+        fn persist_zones(&mut self) {
+            let Some((dir, last)) = self.unbound_conf.as_mut() else { return };
+            let v: Vec<(&[String], &[Ipv4Addr], bool)> = self.tunnels.iter()
+                .filter_map(|t| t.applied.as_ref().map(|a| (t.zones.as_slice(), a.dns.as_slice(), a.insecure)))
+                .collect();
+            let text = render_zones(&v);
+            if *last == text {
+                return;
+            }
+            match dir.write_mode("atrium-vpn.conf", text.as_bytes(), 0o644) {
+                Ok(()) => {
+                    let n = text.matches("forward-zone:").count();
+                    *last = text;
+                    self.log(&format!("unbound: atrium-vpn.conf holds {n} tunnel zone(s)"));
+                }
+                Err(e) => eprintln!("atrium-net: unbound: atrium-vpn.conf: {e}"),
+            }
+        }
+
         /// unbound forward zones for tunnel k's domains (vpn.md §5.5).
         fn tunnel_zones(&mut self, k: usize) {
+            self.tunnel_zones_live(k);
+            self.persist_zones();
+        }
+
+        fn tunnel_zones_live(&mut self, k: usize) {
             let Some(a) = self.tunnels[k].applied.clone() else { return };
             if a.dns.is_empty() {
                 return;
@@ -2461,6 +2495,13 @@ mod imp {
             ifc: Ifc::new().unwrap_or_else(|e| die(&e.to_string())),
             rt: Rtsock::new().unwrap_or_else(|e| die(&e.to_string())),
             unbound: o.unbound.as_ref().map(|d| Unbound::new(d, "local_unbound.ctl").unwrap_or_else(|e| die(&format!("unbound: {e}")))),
+            unbound_conf: o.unbound_conf.as_ref().and_then(|d| match Dir::open(d) {
+                Ok(dir) => Some((dir, String::new())),
+                Err(e) => {
+                    eprintln!("atrium-net: {d}: {e}: tunnels' DNS zones won't outlive an unbound restart");
+                    None
+                }
+            }),
             host: Vec::new(),
             host6: Vec::new(),
             names: all.iter().map(|i| (i.index, i.name.clone())).collect(),
@@ -2610,6 +2651,8 @@ mod imp {
             }
             Err(e) => eprintln!("atrium-net: no route domains: {e}"),
         }
+        // No tunnel yet: a file a crash left names none any more.
+        net.persist_zones();
         if o.capsicum {
             sys::cap_enter().unwrap_or_else(|e| die(&e.to_string()));
             net.log("in capability mode");
