@@ -23,8 +23,10 @@ test -S "$D/net.sock"
 # With --no-unbound atrium-net leaves /etc/resolv.conf without a server;
 # give it QEMU user networking's resolver back so couriers can resolve a
 # real host (the fixture hosts are in /etc/hosts either way).
-for i in $(jot 20); do grep -q '^nameserver' /etc/resolv.conf && break; sleep .25; done
+# It rewrites the file once its first lease applies, so wait for that.
+sleep 2
 grep -q '^nameserver' /etc/resolv.conf || echo 'nameserver 10.0.2.3' >> /etc/resolv.conf
+grep -q '^nameserver' /etc/resolv.conf
 daemon -f -o "$D/crypta.log" /usr/local/bin/atrium-cryptad -v --state "$D/state" --net-sock "$D/net.sock" --sock "$D/crypta.sock" --arca /atrium/sockets/arca/arcad.sock
 for i in $(jot 20); do test -S "$D/crypta.sock" && break; sleep .25; done
 test -S "$D/crypta.sock"
