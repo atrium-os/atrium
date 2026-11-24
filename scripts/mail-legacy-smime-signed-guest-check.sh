@@ -68,6 +68,9 @@ evidence() {
             tail -35 "$d/$log.log"
         fi
     done
+    # A timeout wrapper can wait on long-lived guest daemons after this
+    # script exits. Report the gate's own status before that wait.
+    printf 'MAIL_LEGACY_GATE_EXIT=%s\n' "$code"
     exit "$code"
 }
 trap evidence EXIT
