@@ -333,6 +333,28 @@ impl<'a> Prefetcher<'a> {
         Ok(r.body)
     }
 
+    /// A live page's resource (`L`, navigator-islands.md I6.1): one HTTPS
+    /// GET, no redirect followed, any status and any type, at most
+    /// [`crate::LIVE_RESOURCE_MAX`]. The caller (navigatord) has already
+    /// checked the address is in the page's scope; here only the network's
+    /// own rules apply (public addresses, ports 80 and 443). Returns the
+    /// status, the content type as one token (`-` when absent or not a
+    /// plain `type/subtype`), and the body.
+    pub fn live_resource(&mut self, url: &str) -> Result<(u16, String, Vec<u8>), String> {
+        let u = url::Url::parse(url).map_err(|e| e.to_string())?;
+        if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() || u.fragment().is_some() {
+            return Err("a live page's resource is a plain HTTPS address".into());
+        }
+        let r = self.conv.get_once(&u, None).map_err(|e| e.to_string())?;
+        if (300..400).contains(&r.status) {
+            return Err(format!("a live page's resource was redirected (HTTP {})", r.status));
+        }
+        if r.body.len() > crate::LIVE_RESOURCE_MAX {
+            return Err("a live page's resource is over its bound".into());
+        }
+        Ok((r.status, crate::live_content_type(r.header("content-type")), r.body))
+    }
+
     /// A navigation (`N`): fetched on the asking thread with its chain.
     pub fn fetch_traced(&mut self, url: &str) -> (Result<Fetched, FetchError>, Vec<crate::Hop>) {
         self.conv.fetch_traced(url)

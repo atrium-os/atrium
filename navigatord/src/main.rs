@@ -54,6 +54,7 @@ mod vpn;
 mod mail_sheet;
 mod credential_get;
 mod inbox_fixture;
+mod live_page;
 mod press;
 mod settings;
 mod worker;

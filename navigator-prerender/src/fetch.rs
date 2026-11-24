@@ -314,6 +314,17 @@ pub struct FetchdFetcher {
     broken: Option<String>,
 }
 
+/// The most one live page's resource may be: navigator-fetch's
+/// `LIVE_RESOURCE_MAX`, which fetchd enforces; checked again here.
+pub const LIVE_RESOURCE_MAX: usize = 8 << 20;
+
+/// A content type as fetchd's `L` answer spells it: `-`, or a lower-case
+/// `type/subtype` of token characters.
+pub fn live_type_token(t: &str) -> bool {
+    let token = |t: &str| !t.is_empty() && t.len() <= 64 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$&-^_.+".contains(&b));
+    t == "-" || t.split_once('/').is_some_and(|(a, b)| token(a) && token(b))
+}
+
 /// One reply as fetchd frames it, read and bounded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
@@ -352,6 +363,25 @@ impl FetchdFetcher {
             Reply::Ok { status: 200, rest, body } if rest == format!("0 {} {url}", body.len()) && body.len() <= 65536 => Ok(body),
             Reply::Err(why) => Err(why),
             _ => Err("unexpected widget document reply".into()),
+        }
+    }
+
+    /// `L <url>`: a live page's resource (navigator-islands.md I6.1): the
+    /// status, the content type token (`-` for none) and the body, at most
+    /// [`LIVE_RESOURCE_MAX`]. Only fetchd itself answers it.
+    pub fn live_resource(&mut self, url: &str) -> Result<(u16, String, Vec<u8>), String> {
+        match self.exchange_line(url, "", "L ")? {
+            Reply::Ok { status, rest, body } => {
+                let mut f = rest.splitn(3, ' ');
+                let (Some(kind), Some(len), Some(got)) = (f.next(), f.next(), f.next()) else {
+                    return Err("unexpected live resource reply".into());
+                };
+                if got != url || len != body.len().to_string() || body.len() > LIVE_RESOURCE_MAX || !live_type_token(kind) {
+                    return Err("unexpected live resource reply".into());
+                }
+                Ok((status, kind.to_string(), body))
+            }
+            Reply::Err(why) => Err(why),
         }
     }
 
@@ -746,5 +776,22 @@ mod fetchd_tests {
     fn a_fetcher_that_dies_is_reported() {
         let mut f = fake("exit 0");
         assert!(f.get("https://a.example/").is_err());
+    }
+
+    #[test]
+    fn a_live_resource_comes_back_with_its_type_and_a_wrong_reply_is_refused() {
+        let reply = |text: &'static [u8]| FetchdFetcher::over(Box::new(std::io::sink()), Box::new(std::io::Cursor::new(text)), "");
+        let url = "https://app.example/app.js";
+        let mut f = reply(b"ok 200 text/javascript 3 https://app.example/app.js\nx=1");
+        assert_eq!(f.live_resource(url), Ok((200, "text/javascript".into(), b"x=1".to_vec())));
+        let mut f = reply(b"ok 404 - 0 https://app.example/app.js\n");
+        assert_eq!(f.live_resource(url), Ok((404, "-".into(), vec![])));
+        // Another address's answer, or a type out of shape, is not this one.
+        let mut f = reply(b"ok 200 text/javascript 3 https://evil.example/app.js\nx=1");
+        assert!(f.live_resource(url).is_err());
+        let mut f = reply(b"ok 200 Text/JS 3 https://app.example/app.js\nx=1");
+        assert!(f.live_resource(url).is_err());
+        let mut f = reply(b"err a live page's resource was redirected (HTTP 302)\n");
+        assert!(f.live_resource(url).is_err_and(|e| e.contains("redirected")));
     }
 }
