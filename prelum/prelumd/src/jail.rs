@@ -209,7 +209,7 @@ impl Jailed {
         for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "dev", "tmp"] {
             std::fs::create_dir_all(root.join(d))?;
         }
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
         if pin {
             std::fs::create_dir_all(root.join(ARCA_DIR.trim_start_matches('/')))?;

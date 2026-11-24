@@ -96,10 +96,10 @@ fn build_root(cfg: &Config, root: &Path) -> Result<(), String> {
 }
 
 fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> Result<Courier, String> {
-    let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+    let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
     let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin"), ro(&cfg.registry)];
     mounts[4].dest = arcad::courier::DEFAULT_REGISTRY.into();
-    mounts.push(MountSpec {
+    mounts.push(MountSpec { noexec: false,
         source: "/atrium/sockets/arca".into(),
         dest: "/atrium/sockets/arca".into(),
         kind: MountKind::RwNullfs,

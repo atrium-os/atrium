@@ -4059,7 +4059,7 @@ fn launch_session_component(component_id: &str, owner_name: &str,
     // writable only by this component's session uid, at STATE_DEST in the jail.
     match prepare_state_dir(owner_name, &app_id, owner_uid) {
         Ok(src) => {
-            create.mounts.push(jaild::protocol::MountSpec {
+            create.mounts.push(jaild::protocol::MountSpec { noexec: false,
                 source: src, dest: STATE_DEST.into(),
                 kind: jaild::protocol::MountKind::RwNullfs, size_mb: None, owner: None,
             });

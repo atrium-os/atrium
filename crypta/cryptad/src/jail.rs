@@ -54,7 +54,7 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
     }
     let root = root(uid);
     std::fs::create_dir_all(&root).map_err(|e| format!("root: {e}"))?;
-    let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+    let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
     let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
     if ac {
         // The system's CA file (certctl's /etc/ssl/cert.pem), read once.

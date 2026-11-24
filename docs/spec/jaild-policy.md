@@ -95,6 +95,11 @@ children_max          = N
 allowed_exec_root     = "/usr/local/share/atrium/apps"
 default_devfs_ruleset = "atrium-baseline"
 max_simultaneous_per_user = 32
+# Capability sockets an `app`-class jail may be given read-write, by
+# name under sockets_dir (app-jails-via-jaild.md §3.1). portcullisd's
+# jail_request tests check every socket portcullis-jail mounts is here.
+sockets_dir = "/atrium/sockets"
+sockets     = ["workers", "notify", "audio", ...]
 ```
 
 ## Validation rules

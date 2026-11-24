@@ -245,7 +245,7 @@ fn env_ids() -> (u32, u32) {
 /// same paths inside the jail, for `exec`.
 fn env_mounts_ro() -> Vec<MountSpec> {
     std::env::var("ATRIUM_JCLIENT_MOUNTS_RO").ok().map(|v| v.split(',').filter(|s| !s.is_empty())
-        .map(|p| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None })
+        .map(|p| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None })
         .collect()).unwrap_or_default()
 }
 

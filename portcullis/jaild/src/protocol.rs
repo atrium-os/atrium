@@ -508,6 +508,11 @@ pub struct MountSpec {
     /// setgid or sticky-less world-writable mode. Ignored for nullfs.
     #[serde(default)]
     pub owner: Option<TmpfsOwner>,
+    /// nullfs only: nothing on the mount may be executed (`MNT_NOEXEC`), for
+    /// an app's data folders. An app jail's nullfs mounts are always
+    /// `nosuid` as well.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub noexec: bool,
 }
 
 /// A tmpfs mount's root: `mode` (permission bits only), `uid`, `gid`.

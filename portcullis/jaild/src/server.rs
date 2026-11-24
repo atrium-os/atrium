@@ -537,7 +537,7 @@ fn handle_attach_mount(
     /* Validate source against the same mount allow-list used at
      * create time. Reuses validator::validate_mount via a one-mount
      * MountSpec. */
-    let mount = protocol::MountSpec {
+    let mount = protocol::MountSpec { noexec: false,
         source:  req.source.clone(),
         dest:    req.dest.clone(),
         kind:    req.mount_kind,
@@ -589,8 +589,8 @@ fn handle_attach_mount(
     }
 
     let mount_res = match req.mount_kind {
-        MountKind::RoNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, true),
-        MountKind::RwNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, false),
+        MountKind::RoNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, true, ffi::MountFlags::default()),
+        MountKind::RwNullfs => ffi::nullfs_mount(&req.source, &host_dest_str, false, ffi::MountFlags::default()),
         MountKind::Tmpfs    => ffi::tmpfs_mount(
             &host_dest_str, req.size_mb.unwrap_or(policy.mount_sources.max_tmpfs_mb), None),
     };
@@ -1099,6 +1099,34 @@ fn handle_create(
         }
     }
 
+    /* A persistent classed jail (a workspace, a console) gets its mounts
+     * here, from jaild itself; an exec'd jail's child makes them. What is
+     * mounted under the root is unmounted by whoever tears the root down. */
+    if req.exec.is_none() {
+        if req.class.is_none() && !req.mounts.is_empty() {
+            warn!("jaild: {}: {} mount(s) on an unclassed jail with no exec are not made", req.name, req.mounts.len());
+        }
+        let mounts = if req.class.is_some() { resolve_mounts(req, policy.mount_sources.max_tmpfs_mb) } else { Vec::new() };
+        for (i, m) in mounts.iter().enumerate() {
+            if let Err(e) = mount_one(m, &req.path) {
+                for done in mounts[..i].iter().rev() {
+                    ffi::unmount_quiet(&done.dest);
+                }
+                if req.devfs_ruleset != 0 {
+                    ffi::unmount_quiet(&format!("{}/dev", req.path.trim_end_matches('/')));
+                }
+                if let Some(addr) = &lo0_alias {
+                    let _ = ffi::ifconfig_lo0_alias_del(addr);
+                }
+                return Err(JaildError::Syscall {
+                    name:  "nmount",
+                    errno: e.raw_os_error().unwrap_or(-1),
+                    msg:   format!("mount {:?} {} -> {}: {e}", m.kind, m.source, m.dest),
+                });
+            }
+        }
+    }
+
     /* ★★ A networked jail's own stack (network.md §0) is built BEFORE anything
      * runs in it: the jail is created persistent, its interface moved in and
      * configured, and only then does a child attach and exec. The plain exec
@@ -1480,6 +1508,50 @@ fn check_listen(req: &CreateJailRequest, paths: &[String], fds: &[OwnedFd]) -> R
     Ok(())
 }
 
+/// One mount of a create request, its destination resolved under the root.
+struct ResolvedMount {
+    source:  String,
+    dest:    String,
+    kind:    MountKind,
+    size_mb: u64,
+    owner:   Option<crate::protocol::TmpfsOwner>,
+    flags:   ffi::MountFlags,
+}
+
+/// The request's mounts with every destination under the jail root (a
+/// leading '/' is the jail's, never the host's: a host path here was an
+/// escape), and tmpfs sizes resolved from the policy the request was
+/// validated against, so the child never decides a ceiling on its own.
+fn resolve_mounts(req: &CreateJailRequest, tmpfs_ceiling: u64) -> Vec<ResolvedMount> {
+    let app = matches!(req.class, Some(JailClass::App { .. }));
+    req.mounts.iter().map(|m| ResolvedMount {
+        source:  m.source.clone(),
+        dest:    PathBuf::from(&req.path).join(m.dest.trim_start_matches('/')).to_string_lossy().into_owned(),
+        kind:    m.kind,
+        size_mb: m.size_mb.unwrap_or(tmpfs_ceiling),
+        owner:   m.owner,
+        flags:   ffi::MountFlags { nosuid: app, noexec: m.noexec },
+    }).collect()
+}
+
+/// Make the destination and mount it. The destination must still lie under
+/// the root once symlinks are resolved: a jail's writable root can hold a
+/// link left by an earlier run, and nmount follows it.
+fn mount_one(m: &ResolvedMount, root: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(&m.dest)?;
+    let real_root = std::fs::canonicalize(root)?;
+    let real_dest = std::fs::canonicalize(&m.dest)?;
+    if !real_dest.starts_with(&real_root) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            format!("{} resolves to {}, outside the jail root", m.dest, real_dest.display())));
+    }
+    match m.kind {
+        MountKind::RoNullfs => ffi::nullfs_mount(&m.source, &m.dest, true, m.flags),
+        MountKind::RwNullfs => ffi::nullfs_mount(&m.source, &m.dest, false, m.flags),
+        MountKind::Tmpfs    => ffi::tmpfs_mount(&m.dest, m.size_mb, m.owner),
+    }
+}
+
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
@@ -1501,23 +1573,7 @@ fn handle_create_with_exec(
     // ★ The effective tmpfs size is resolved HERE, in the parent, from the
     // policy the request was validated against — the child only has the
     // request, and must not decide a resource ceiling on its own.
-    let resolved_mounts: Vec<(String, String, MountKind, u64, Option<crate::protocol::TmpfsOwner>)> = req.mounts.iter()
-        .map(|m| {
-            /* ALWAYS under the jail root. A leading '/' used to mean a
-             * HOST path, so a real-root jail's capability socket mount
-             * ("/atrium/sockets/portcullisd/") and volumes
-             * (mount_at = "/atrium-data", e.g. stoad) landed on the host
-             * and never appeared inside the jail — invisible while every
-             * jail was path="/", where the two coincide. It was also an
-             * escape: the validator checks sources and "..", not
-             * absolute dests, so an allow-listed source could be mounted
-             * over any host path. Runtime AttachMount already re-rooted
-             * this way; create time now matches it. */
-            let dest = PathBuf::from(&req.path).join(m.dest.trim_start_matches('/'));
-            (m.source.clone(), dest.to_string_lossy().into_owned(), m.kind,
-             m.size_mb.unwrap_or(tmpfs_ceiling), m.owner)
-        })
-        .collect();
+    let resolved_mounts = resolve_mounts(req, tmpfs_ceiling);
 
     /* ★ FUSE serving (device-assignment.md §6.4): jaild, not the jail, opens
      * the partition and /dev/fuse and mounts fusefs on the host. The jailed
@@ -1619,25 +1675,9 @@ fn handle_create_with_exec(
             }
         }
 
-        for (src, dst, kind, size_mb, owner) in &resolved_mounts {
-            /* nullfs / tmpfs need the destination dir to exist —
-             * otherwise mount(2) returns ENOENT. We create it
-             * pre-jail_attach with mode 0755 (the mount overlays
-             * any contents anyway). Idempotent: existing dirs
-             * are fine. */
-            if let Err(e) = std::fs::create_dir_all(dst) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    eprintln!("jaild-child: mkdir -p {dst}: {e}");
-                    ffi::child_exit(101);
-                }
-            }
-            let res = match kind {
-                MountKind::RoNullfs => ffi::nullfs_mount(src, dst, true),
-                MountKind::RwNullfs => ffi::nullfs_mount(src, dst, false),
-                MountKind::Tmpfs    => ffi::tmpfs_mount(dst, *size_mb, *owner),
-            };
-            if let Err(e) = res {
-                eprintln!("jaild-child: mount {kind:?} {src} -> {dst}: {e}");
+        for m in &resolved_mounts {
+            if let Err(e) = mount_one(m, &req.path) {
+                eprintln!("jaild-child: mount {:?} {} -> {}: {e}", m.kind, m.source, m.dest);
                 ffi::child_exit(101);
             }
         }

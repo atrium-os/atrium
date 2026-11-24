@@ -1202,9 +1202,9 @@ mod run {
         let name = jail_name(uid);
         let root = format!("{JAIL_ROOT}/{name}");
         std::fs::create_dir_all(&root).map_err(|e| format!("{root}: {e}"))?;
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut mounts: Vec<MountSpec> = proto.ro_mounts().iter().map(|d| ro(d)).collect();
-        mounts.push(MountSpec { source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
+        mounts.push(MountSpec { noexec: false, source: "/atrium/sockets/arca".into(), dest: "/atrium/sockets/arca".into(), kind: MountKind::RwNullfs, size_mb: None, owner: None });
         let id = portcullis_identity::for_app(&format!("org.atrium.share.{uid}")).map_err(|e| format!("host identity: {e}"))?;
         let grants = NetGrants {
             app_key: portcullis_identity::consent_key(&name),
@@ -2291,7 +2291,7 @@ mod run {
         }
 
         fn request(p: &JailPlan) -> CreateJailRequest {
-            let ro = |m: &str| MountSpec {
+            let ro = |m: &str| MountSpec { noexec: false,
                 source: m.to_string(),
                 dest: m.trim_start_matches('/').to_string(),
                 kind: MountKind::RoNullfs,
@@ -2495,7 +2495,7 @@ mod run {
                 return fail(format!("{mnt} is still mounted"));
             }
             let _ = std::fs::remove_dir(&mnt);
-            let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+            let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
             let mut argv: Vec<String> = ["atrium-capsa-local", "--root-fd", "3", "--fuse-fd", "4", "--control-fd", "5"].iter().map(|a| a.to_string()).collect();
             if read_only {
                 argv.push("--ro".into());

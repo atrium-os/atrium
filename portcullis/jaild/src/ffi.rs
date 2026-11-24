@@ -696,7 +696,7 @@ impl IovBuilder {
 /// is the destination (typically inside the jail's path).
 /// `read_only` selects MNT_RDONLY.
 #[cfg(target_os = "freebsd")]
-pub fn nullfs_mount(source: &str, target: &str, read_only: bool) -> io::Result<()> {
+pub fn nullfs_mount(source: &str, target: &str, read_only: bool, extra: MountFlags) -> io::Result<()> {
     let c_fstype = c_string("nullfs")?;
     let c_fspath = c_string(target)?;
     let c_target = c_string(source)?;
@@ -727,7 +727,9 @@ pub fn nullfs_mount(source: &str, target: &str, read_only: bool) -> io::Result<(
         iov[5].iov_base = c_target.as_ptr() as *mut _;
         iov[5].iov_len  = c_target.as_bytes_with_nul().len();
 
-        let flags = if read_only { libc::MNT_RDONLY } else { 0 };
+        let mut flags = if read_only { libc::MNT_RDONLY } else { 0 };
+        if extra.nosuid { flags |= libc::MNT_NOSUID; }
+        if extra.noexec { flags |= libc::MNT_NOEXEC; }
         let rc = libc::nmount(iov.as_mut_ptr(), iov.len() as u32, flags as i32);
         if rc < 0 {
             return Err(io::Error::last_os_error());
@@ -1248,7 +1250,7 @@ pub fn sysctl_set_string(_name: &str, _value: &str) -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "freebsd"))]
-pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
+pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool, _extra: MountFlags) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 #[cfg(not(target_os = "freebsd"))]
@@ -2064,4 +2066,11 @@ pub fn child_cwd_umask(dir: &str, mask: u32) -> io::Result<()> {
 pub fn setsid() {
     // SAFETY: setsid has no memory effects; failure (already a leader) is harmless.
     unsafe { libc::setsid(); }
+}
+
+/// Flags past read-only for a nullfs mount.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MountFlags {
+    pub nosuid: bool,
+    pub noexec: bool,
 }

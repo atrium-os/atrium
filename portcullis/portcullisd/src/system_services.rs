@@ -521,7 +521,7 @@ impl ServiceManifest {
             children_max:  self.children_max,
             devfs_ruleset: self.devfs_ruleset,
             network:       (&self.network).into(),
-            mounts: self.mounts.iter().map(|m| MountSpec {
+            mounts: self.mounts.iter().map(|m| MountSpec { noexec: false,
                 source: m.source.clone(),
                 dest:   m.dest.clone(),
                 kind:   m.kind.into(),

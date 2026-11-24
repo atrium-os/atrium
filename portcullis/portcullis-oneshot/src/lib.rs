@@ -613,7 +613,7 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
         }
         let rel = m.dst.strip_prefix(root).map_err(|_| format!(
             "mount destination {} is outside the jail root", m.dst.display()))?;
-        Ok(MountSpec {
+        Ok(MountSpec { noexec: false,
             source:  m.src.to_string_lossy().into_owned(),
             dest:    format!("/{}", rel.display()),
             kind:    if m.opts.iter().any(|o| o == "ro") { MountKind::RoNullfs } else { MountKind::RwNullfs },

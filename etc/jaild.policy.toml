@@ -764,6 +764,22 @@ children_max = 32              # for app jails
 allowed_exec_root         = "/usr/local/share/atrium/apps"
 default_devfs_ruleset     = "atrium-baseline"
 max_simultaneous_per_user = 32
+# The capability sockets an app jail (class `app`, app-jails-via-jaild.md
+# §3.1) may be given read-write: <sockets_dir>/<name>, one directory per
+# service an app capability reaches (portcullis-jail apply_socket). A
+# portcullisd test checks every name it mounts is listed here.
+sockets_dir = "/atrium/sockets"
+sockets = [
+    "aqueduct-gpu", "arca", "arca-courier", "audio", "audio-capture",
+    "audio-control", "audio-device", "audio-monitor", "bluetooth-control",
+    "clipboard", "device-list", "display-settings", "forum-ctl",
+    "forum-status", "fresco", "fresco-activation", "fresco-chrome",
+    "fresco-wm", "limen", "media-control", "monstrator", "navigator",
+    "navigator-page", "network-configure", "network-details", "network-read",
+    "network-wifi", "notify", "opifex", "opifex-sheet", "ostiarius-lock",
+    "portcullis", "print", "removable-media", "sigillum", "vpn-configure",
+    "vpn-read", "vpn-use", "wifi-nearby", "workers",
+]
 
 
 # ---------------------------------------------------------------

@@ -34,7 +34,9 @@ pub fn validate_create(
     validate_mlock(req, policy)?;
     validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
-        validate_mount(m, policy)?;
+        if !is_app_socket_mount(req, m, policy) {
+            validate_mount(m, policy)?;
+        }
         validate_tmpfs_owner(m, req.exec.as_ref())?;
     }
     if let Some(exec) = &req.exec {
@@ -690,6 +692,19 @@ pub fn validate_mount_for_runtime(policy: &Policy, m: &MountSpec) -> Result<(), 
     validate_tmpfs_owner(m, None)
 }
 
+/// An app jail's capability socket: `<apps.sockets_dir>/<name>` read-write
+/// for a name the policy lists, at a destination with no `..`.
+fn is_app_socket_mount(req: &CreateJailRequest, m: &MountSpec, policy: &Policy) -> bool {
+    let dir = policy.apps.sockets_dir.trim_end_matches('/');
+    matches!(req.class, Some(crate::protocol::JailClass::App { .. }))
+        && m.kind == MountKind::RwNullfs
+        && !dir.is_empty()
+        && !m.dest.is_empty()
+        && !m.dest.split('/').any(|seg| seg == "..")
+        && m.source.strip_prefix(dir).and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|n| policy.apps.sockets.iter().any(|s| s == n))
+}
+
 fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     /* dest is a path inside the jail's chroot. Reject `..` and
      * empty (we don't enforce absolute — relative is fine and
@@ -1288,7 +1303,7 @@ mod tests {
     #[test]
     fn listen_paths_must_lie_under_an_rw_nullfs_source() {
         let mut r = instance_req("atrium-lyrad", "/var/lib/atrium/jails/lyrad", "/usr/local/bin/atrium-lyrad", false);
-        let m = |source: &str, kind| MountSpec { source: source.into(), dest: "x".into(), kind, size_mb: None, owner: None };
+        let m = |source: &str, kind| MountSpec { noexec: false, source: source.into(), dest: "x".into(), kind, size_mb: None, owner: None };
         r.mounts = vec![m("/usr/local/bin", MountKind::RoNullfs), m("/atrium/sockets/", MountKind::RwNullfs)];
         assert!(listen_path_allowed(&r, "/atrium/sockets/lyrad/lyrad.sock"));
         // dest "x" in the helper: where the service finds it inside its jail
@@ -1704,7 +1719,7 @@ mod tests {
         dev.fuse.as_mut().unwrap().device = "da0p1".into();
         let mut stdio = ok.clone();
         stdio.exec.as_mut().unwrap().stdio = true;
-        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let ro = |p: &str| MountSpec { noexec: false, source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
         let mut libs = ok.clone();
         libs.mounts = STICK_SERVER_MOUNTS.iter().map(|m| ro(m)).collect();
         assert!(is_stick_server(&libs, &p), "its binary and libraries");
@@ -1871,7 +1886,7 @@ mod tests {
     fn mount_ro_accepted_from_allowlist() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/local/lib".into(),
             dest:   "usr/local/lib".into(),
             kind:   MountKind::RoNullfs,
@@ -1885,7 +1900,7 @@ mod tests {
     fn mount_ro_rejects_unlisted() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/etc/master.passwd.bak".into(),
             dest:   "etc".into(),
             kind:   MountKind::RoNullfs,
@@ -1903,7 +1918,7 @@ mod tests {
     fn mount_rejects_traversal() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/local/lib".into(),
             dest:   "../escape".into(),
             kind:   MountKind::RoNullfs,
@@ -1919,7 +1934,7 @@ mod tests {
     fn mount_tmpfs_no_source_check() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "ignored".into(),
             dest:   "tmp".into(),
             kind:   MountKind::Tmpfs,
@@ -1935,7 +1950,7 @@ mod tests {
         p.mount_sources.ro_subtrees = vec!["/usr/local/libexec/atrium/drivers/".into()];
         let ro = |src: &str| {
             let mut r = req_default();
-            r.mounts.push(MountSpec { source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
+            r.mounts.push(MountSpec { noexec: false, source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
             validate_create(&r, &p)
         };
         ro("/usr/local/libexec/atrium/drivers/org.atrium.driver.x").unwrap();
@@ -1952,7 +1967,7 @@ mod tests {
         let mut p = load_sample_policy();
         p.mount_sources.rw_subtrees = vec!["/var/lib/atrium/storage/jails/".into()];
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/var/lib/atrium/storage/jails/mysqld/data".into(),
             dest:   "var/db/mysql".into(),
             kind:   MountKind::RwNullfs,
@@ -1963,7 +1978,7 @@ mod tests {
 
         // outside the subtree → reject
         let mut r2 = req_default();
-        r2.mounts.push(MountSpec {
+        r2.mounts.push(MountSpec { noexec: false,
             source: "/var/lib/something-else/x".into(),
             dest:   "x".into(),
             kind:   MountKind::RwNullfs,
@@ -1977,7 +1992,7 @@ mod tests {
     fn mount_rw_glob() {
         let p = load_sample_policy();
         let mut r = req_default();
-        r.mounts.push(MountSpec {
+        r.mounts.push(MountSpec { noexec: false,
             source: "/usr/home/alice".into(),
             dest:   "home/alice".into(),
             kind:   MountKind::RwNullfs,
@@ -2537,12 +2552,12 @@ mod tests {
     }
 
     fn tmpfs(size_mb: Option<u64>) -> MountSpec {
-        MountSpec { source: "tmpfs".into(), dest: "tmp".into(),
+        MountSpec { noexec: false, source: "tmpfs".into(), dest: "tmp".into(),
                     kind: MountKind::Tmpfs, size_mb, owner: None }
     }
 
     fn owned_tmpfs(mode: u32, uid: u32, gid: u32) -> MountSpec {
-        MountSpec { owner: Some(crate::protocol::TmpfsOwner { mode, uid, gid }), ..tmpfs(None) }
+        MountSpec { noexec: false, owner: Some(crate::protocol::TmpfsOwner { mode, uid, gid }), ..tmpfs(None) }
     }
 
     /// A service's tmpfs may belong to the service (or root), so a non-root
@@ -2582,7 +2597,7 @@ mod tests {
     fn only_a_tmpfs_takes_an_owner() {
         let p = load_sample_policy();
         let mut r = exec_as(1001, 1001);
-        r.mounts = vec![MountSpec { source: "/lib".into(), dest: "lib".into(), kind: MountKind::RoNullfs,
+        r.mounts = vec![MountSpec { noexec: false, source: "/lib".into(), dest: "lib".into(), kind: MountKind::RoNullfs,
                                     size_mb: None, owner: Some(crate::protocol::TmpfsOwner { mode: 0o755, uid: 0, gid: 0 }) }];
         assert!(matches!(validate_create(&r, &p).unwrap_err(),
             JaildError::PolicyViolation { rule: "mount.owner.not_tmpfs", .. }));
@@ -2873,5 +2888,26 @@ mod tests {
         assert!(!is_files_group_of("files-averyveryverylon-0123abc", owner));
         // a short owner has no hashed form of its own: its prefix is the whole base
         assert!(!is_files_group_of("files-bob-0123abcd-x", "alice"));
+    }
+
+    #[test]
+    fn an_app_jail_gets_listed_capability_sockets_only() {
+        let p = load_sample_policy();
+        let sock = |src: &str, dest: &str| MountSpec { noexec: false, source: src.into(), dest: dest.into(), kind: MountKind::RwNullfs, size_mb: None, owner: None };
+        let mut r = app_req(2001, vec![]);
+        r.mounts = vec![sock("/atrium/sockets/workers", "atrium/sockets/workers")];
+        assert_eq!(rule_of(validate_create(&r, &p)), "ok");
+        // not for a service, which takes the global list
+        let mut svc = r.clone();
+        svc.class = None;
+        assert_eq!(rule_of(validate_create(&svc, &p)), "mount.source.not_in_rw");
+        // a name the list lacks, a deeper path, a traversal, read-only
+        for (src, dest) in [("/atrium/sockets/jaild", "x"), ("/atrium/sockets/workers/x", "x"),
+                            ("/atrium/sockets/../workers", "x"), ("/atrium/sockets/workers", "../x")] {
+            r.mounts = vec![sock(src, dest)];
+            assert_ne!(rule_of(validate_create(&r, &p)), "ok", "{src} -> {dest}");
+        }
+        r.mounts = vec![MountSpec { kind: MountKind::RoNullfs, ..sock("/atrium/sockets/workers", "x") }];
+        assert_eq!(rule_of(validate_create(&r, &p)), "mount.source.not_in_ro");
     }
 }
