@@ -62,6 +62,59 @@ impl SignIn {
     }
 }
 
+/// A SAML POST binding's start (vpn.md, "GlobalProtect SAML"): the
+/// engine spells the gateway's form as `<IdP address>#atrium-saml-post=
+/// <base64url form body>`. The fragment never leaves the machine.
+pub const START_POST: &str = "#atrium-saml-post=";
+
+/// The start was posted: once per window. A second try starts the sign-in
+/// again from Settings, with a request the gateway made anew.
+pub static START_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where a POST-binding start goes and the body it carries: `None` for a
+/// plain address. Only an https address with no query fragment of its own,
+/// and only a `SAMLRequest` (once, required) and a `RelayState` (once) in
+/// the body, each at most 8 KiB.
+pub fn start_post(start: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+    let Some((target, b)) = start.split_once(START_POST) else { return Ok(None) };
+    let bad = || "the VPN sign-in's start form is out of shape".to_string();
+    if !target.starts_with("https://") || target.contains('#') || url::Url::parse(target).is_err() {
+        return Err(bad());
+    }
+    let body = base64url(b).ok_or_else(bad)?;
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(&body).into_owned().collect();
+    let count = |k: &str| pairs.iter().filter(|(n, _)| n == k).count();
+    let shaped = count("SAMLRequest") == 1 && count("RelayState") <= 1 && pairs.len() == count("SAMLRequest") + count("RelayState")
+        && pairs.iter().all(|(_, v)| !v.is_empty() && v.len() <= 8192 && !v.chars().any(char::is_control));
+    if !shaped {
+        return Err(bad());
+    }
+    Ok(Some((target.to_string(), crate::portal::encode(&pairs).into_bytes())))
+}
+
+/// Base64url without padding (RFC 4648 §5); `None` for anything else.
+fn base64url(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (s.len() % 4 != 1 && acc & ((1 << bits) - 1) == 0).then_some(out)
+}
+
 /// portcullisd's `VpnSignInStatus`, on a connection of our own.
 pub fn status() -> Result<SignIn, String> {
     use portcullis_ipc::{round_trip, Request, Response};
@@ -91,5 +144,22 @@ mod tests {
         assert!(!s.ends_at("https://gw.example/+CSCOE+/saml/sp/login"));
         assert_eq!(s.title(), "the corp VPN");
         assert_eq!(SignIn::parse("corp http://a https://b"), None);
+    }
+
+    #[test]
+    fn a_post_binding_start_posts_only_its_saml_request() {
+        assert_eq!(start_post("https://idp.example/sso?SAMLRequest=x"), Ok(None));
+        // "SAMLRequest=PHg%2B&RelayState=r%26s"
+        let start = "https://idp.example/realms/c/protocol/saml#atrium-saml-post=U0FNTFJlcXVlc3Q9UEhnJTJCJlJlbGF5U3RhdGU9ciUyNnM";
+        let (target, body) = start_post(start).unwrap().unwrap();
+        assert_eq!(target, "https://idp.example/realms/c/protocol/saml");
+        assert_eq!(String::from_utf8(body).unwrap(), "SAMLRequest=PHg%2B&RelayState=r%26s");
+        // "SAMLRequest=x&password=y": nothing but the request goes.
+        assert!(start_post("https://idp.example/#atrium-saml-post=U0FNTFJlcXVlc3Q9eCZwYXNzd29yZD15").is_err());
+        // "RelayState=r": no request.
+        assert!(start_post("https://idp.example/#atrium-saml-post=UmVsYXlTdGF0ZT1y").is_err());
+        assert!(start_post("http://idp.example/#atrium-saml-post=U0FNTFJlcXVlc3Q9eA").is_err(), "plain http");
+        assert!(start_post("https://idp.example/#atrium-saml-post=U0FNTFJlcXVlc3Q9eA==").is_err(), "padding is not base64url");
+        assert!(start_post("https://idp.example/#atrium-saml-post=U0FNTFJlcXVlc3Q9eA").is_ok());
     }
 }

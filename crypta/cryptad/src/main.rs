@@ -30,7 +30,8 @@
 //! - `create-ac name=N host=H[:P] [path=] [user=HEX] [group=HEX] [pin=HEX] [ca=B64] [scoped=0]`
 //! - `prompt name=N`: what the gateway asks (`text k= v=HEX` lines, then
 //!   `field i= kind= name=HEX label=HEX` and `choice i= value=HEX
-//!   label=HEX`), or `sso login=HEX final=HEX cookie=HEX`
+//!   label=HEX`), or the sign-on start in parts (`sso-login v=HEX`, at
+//!   most 1500 bytes each) then `sso final=HEX cookie=HEX`
 //! - `answer name=N tI=HEX | hI=HANDLE [keep=1] ... | cancel=1`: field I's
 //!   text, or the handle of what was typed into Arca's field
 //! - `sso-attempt name=N`: the live sign-in attempt ID (for Portcullis)
@@ -211,6 +212,9 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddrV4, String> {
         })
         .ok_or_else(|| "no-v4-address".to_string())
 }
+
+/// A single sign-on start's bytes in one `sso-login` line.
+const SSO_LOGIN_PART: usize = 1500;
 
 /// Free text for a line: hex, at most `max` bytes of it.
 fn texts(out: &mut Vec<Line>, k: &str, v: &str) {
@@ -537,7 +541,12 @@ impl D {
         let r = &self.runs[k];
         let mut v = Vec::new();
         if let Some((login, fin, cookie)) = &r.ac.sso {
-            v.push(Line::new("sso").with_hex("login", login.as_bytes()).with_hex("final", fin.as_bytes()).with_hex("cookie", cookie.as_bytes()));
+            // The start can outgrow a line (a SAML POST binding's request):
+            // in parts, then the rest.
+            for c in login.as_bytes().chunks(SSO_LOGIN_PART) {
+                v.push(Line::new("sso-login").with_hex("v", c));
+            }
+            v.push(Line::new("sso").with_hex("final", fin.as_bytes()).with_hex("cookie", cookie.as_bytes()));
             return Ok(v);
         }
         let p = r.ac.prompt.as_ref().ok_or("no-prompt")?;

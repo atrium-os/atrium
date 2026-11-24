@@ -167,6 +167,26 @@ impl Engine {
                 return Err(refused("GlobalProtect prelogin failed"));
             }
             if let gp::Prelogin::Saml { login: url } = gp::prelogin(&body).map_err(refused)? {
+                // The portal's SAML sign-in already named the person: its
+                // cookie for this gateway, once, before a second window.
+                if let Some((user, cookie)) = self.gp_portal_cookie.take().filter(|_| !portal) {
+                    let body = gp::saml_sign_in(&self.st.host, &self.st.hostname, &user, gp::SamlKind::PortalUserAuthCookie, &cookie);
+                    let (status, result) = self.gp_post(jar, login, &body)?;
+                    if status == 200 && gp::challenge(&result).map_err(refused)?.is_none() {
+                        log("GlobalProtect gateway: signed in with the portal's SAML sign-in");
+                        return Ok((result, false));
+                    }
+                    log("GlobalProtect gateway: the portal's sign-in was not taken; single sign-on again");
+                    *jar = Jar::default();
+                    let (status, body) = self.gp_post(jar, prelogin, "")?;
+                    if status != 200 {
+                        return Err(refused("GlobalProtect prelogin failed"));
+                    }
+                    let gp::Prelogin::Saml { login: url } = gp::prelogin(&body).map_err(refused)? else {
+                        return Err(refused("GlobalProtect gateway changed how it signs in"));
+                    };
+                    return self.gp_saml(jar, login, url);
+                }
                 return self.gp_saml(jar, login, url);
             }
             let mut kept = false;
@@ -228,6 +248,7 @@ impl Engine {
             .map_err(|e| refused(&format!("the sign-on token could not be had from Arca: {e}")))?;
         let (kind, user, token) = gp::saml_token(tok.as_bytes()).map_err(refused)?;
         let body = gp::saml_sign_in(&self.st.host, &self.st.hostname, &user, kind, &token);
+        self.gp_saml_user = Some(user);
         let (status, result) = self.gp_post(jar, login, &body)?;
         match status {
             200 if gp::challenge(&result).map_err(refused)?.is_none() => Ok((result, false)),
@@ -238,8 +259,14 @@ impl Engine {
     }
 
     fn gp_discover(&mut self, jar: &mut Jar) -> Result<(), Stop> {
+        self.gp_saml_user = None;
         let (body, _) = self.gp_auth(jar, true, false)?;
         let choices = gp::gateways(&body).map_err(refused)?;
+        // Only after a SAML sign-in: a password portal's gateway asks again.
+        let portal_cookie = match self.gp_saml_user.take() {
+            Some(user) => gp::portal_cookie(&body).map_err(refused)?.map(|c| (user, c)),
+            None => None,
+        };
         let form = Form {
             id: "globalprotect-gateway".into(),
             title: "Choose a GlobalProtect gateway".into(),
@@ -260,6 +287,8 @@ impl Engine {
                 "GlobalProtect gateway selection requires a new engine jail",
             ));
         }
+        // The same origin: the portal's cookie may stand in for SAML there.
+        self.gp_portal_cookie = portal_cookie;
         Ok(())
     }
 

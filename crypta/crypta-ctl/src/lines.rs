@@ -108,10 +108,21 @@ pub fn banner(v: &[Line]) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// The longest single sign-on start a window opens.
+pub const SSO_LOGIN_MAX: usize = 8192;
+
 /// What `prompt` answered.
 pub fn ask(v: &[Line]) -> Option<Ask> {
     if let Some(s) = v.iter().find(|l| l.verb == "sso") {
-        return Some(Ask::Sso { login: text(s, "login")?, final_url: text(s, "final")? });
+        // The start in parts (`sso-login`), bounded as portcullisd bounds it.
+        let mut login = String::new();
+        for l in v.iter().filter(|l| l.verb == "sso-login") {
+            login.push_str(&text(l, "v")?);
+            if login.len() > SSO_LOGIN_MAX {
+                return None;
+            }
+        }
+        return (!login.is_empty()).then(|| Some(Ask::Sso { login, final_url: text(s, "final")? })).flatten();
     }
     let mut f = Form { title: String::new(), message: String::new(), error: String::new(), banner: String::new(), fields: Vec::new() };
     for l in v {

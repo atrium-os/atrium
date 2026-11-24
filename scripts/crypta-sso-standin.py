@@ -43,6 +43,7 @@ Prints one line per event to stdout; `GET /stats` on the port answers
 counts as JSON (from 127.0.0.1 only).
 """
 import base64
+import html
 import datetime
 import json
 from http.cookies import CookieError, SimpleCookie
@@ -76,11 +77,12 @@ lock = threading.Lock()
 tokens = {}   # token -> (subject, minted at)
 gp_tokens = {}  # GlobalProtect prelogin-cookie -> (subject, minted at)
 gp_minted = []  # every GlobalProtect token, for the gate to look for in logs
+gp_binding = ["REDIRECT"]  # or POST: set from localhost by /gp-binding?POST
 pending = {}  # AuthnRequest id -> the ACS it names
 stats = dict.fromkeys((
     "init", "sso_login", "script_delivered", "script_posts", "script_accepted",
     "acs_ok", "acs_refused", "token_ok", "token_refused", "proxied",
-    "gp_prelogin", "gp_acs_ok", "gp_acs_refused", "gp_token_ok", "gp_token_refused",
+    "gp_prelogin", "gp_prelogin_post", "gp_acs_ok", "gp_acs_refused", "gp_token_ok", "gp_token_refused",
 ), 0)
 
 
@@ -199,17 +201,26 @@ def sso_request():
         "<sso-v2-token-cookie-name>acSamlv2Token</sso-v2-token-cookie-name><form></form></auth>")
 
 
-def authn_request(acs=ACS):
+def authn_request(acs=ACS, post=False):
     rid = "_" + uuid.uuid4().hex
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     x = (f'<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" '
          f'ID="{rid}" Version="2.0" IssueInstant="{now}" Destination="{IDP_SSO}" AssertionConsumerServiceURL="{acs}" '
          f'ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"><saml:Issuer>{ENTITY}</saml:Issuer>'
          '<samlp:NameIDPolicy Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified" AllowCreate="true"/></samlp:AuthnRequest>')
-    c = zlib.compressobj(9, zlib.DEFLATED, -15)
-    d = c.compress(x.encode()) + c.flush()
     with lock:
         pending[rid] = acs
+    if post:
+        # The POST binding (SAML bindings §3.5): the request base64'd, not
+        # deflated, in a page whose form the browser sends on load.
+        req = html.escape(base64.b64encode(x.encode()).decode())
+        return ('<!DOCTYPE html><html><head><title>Sign in</title></head><body onload="document.forms[0].submit()">'
+                '<noscript><p>Press Continue to sign in.</p></noscript>'
+                f'<form method="POST" action="{html.escape(IDP_SSO)}"><input type="hidden" name="SAMLRequest" value="{req}"/>'
+                '<input type="hidden" name="RelayState" value="gp&amp;post"/><input type="submit" value="Continue"/></form>'
+                '<script>if (1 < 2) document.forms[0].submit();</script></body></html>')
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    d = c.compress(x.encode()) + c.flush()
     return IDP_SSO + "?" + urllib.parse.urlencode({"SAMLRequest": base64.b64encode(d).decode(), "RelayState": "sso"})
 
 
@@ -363,6 +374,11 @@ def serve(sock, peer):
                 with lock:
                     respond(f, "200 OK", body="\n".join(gp_minted).encode(), ctype="text/plain")
                 continue
+            if path == "/gp-binding" and peer[0] == "127.0.0.1" and method == "GET":
+                with lock:
+                    gp_binding[0] = "POST" if target.endswith("?POST") else "REDIRECT"
+                respond(f, "200 OK", body=gp_binding[0].encode(), ctype="text/plain")
+                continue
             if path == "/stats" and peer[0] == "127.0.0.1" and method == "GET":
                 with lock:
                     respond(f, "200 OK", body=json.dumps(stats).encode(), ctype="application/json")
@@ -422,8 +438,11 @@ def serve(sock, peer):
                 continue
             if path in ("/global-protect/prelogin.esp", "/ssl-vpn/prelogin.esp"):
                 bump("gp_prelogin")
-                req = base64.b64encode(authn_request(GP_ACS).encode()).decode()
-                respond(f, "200 OK", body=("<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method>"
+                binding = gp_binding[0]
+                if binding == "POST":
+                    bump("gp_prelogin_post")
+                req = base64.b64encode(authn_request(GP_ACS, post=binding == "POST").encode()).decode()
+                respond(f, "200 OK", body=(f"<prelogin-response><status>Success</status><saml-auth-method>{binding}</saml-auth-method>"
                                            f"<saml-request>{req}</saml-request></prelogin-response>").encode(), ctype="application/xml")
                 continue
             if method == "POST" and path == "/SAML20/SP/ACS":

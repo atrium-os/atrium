@@ -202,8 +202,13 @@ fn anyconnect_lines() {
     assert_eq!((f.title.as_str(), f.error.as_str(), f.fields.len()), ("Sign in", "Login failed.", 3));
     assert_eq!(f.fields[1].choices, vec![("Staff".into(), "Staff".into()), ("Eng".into(), "Engineering".into())]);
     assert_eq!(f.fields[2].kind, FieldKind::Password);
-    let sso = Line::parse(&format!("sso login={} final={} cookie={}", hx("https://idp/x"), hx("https://gw/done"), hx("acSamlv2Token"))).unwrap();
-    assert_eq!(lines::ask(&[sso]), Some(Ask::Sso { login: "https://idp/x".into(), final_url: "https://gw/done".into() }));
+    let sso = Line::parse(&format!("sso final={} cookie={}", hx("https://gw/done"), hx("acSamlv2Token"))).unwrap();
+    let part = |p: &str| Line::parse(&format!("sso-login v={}", hx(p))).unwrap();
+    assert_eq!(lines::ask(&[part("https://idp/x"), part("#atrium-saml-post=U0F"), sso.clone()]),
+        Some(Ask::Sso { login: "https://idp/x#atrium-saml-post=U0F".into(), final_url: "https://gw/done".into() }));
+    assert_eq!(lines::ask(std::slice::from_ref(&sso)), None, "no start");
+    let long: Vec<Line> = (0..6).map(|_| part(&"a".repeat(1500))).chain([sso]).collect();
+    assert_eq!(lines::ask(&long), None, "longer than a window opens");
 
     let a = Answer { name: "corp".into(), values: Some(vec![Value::Text("alice".into()), Value::Text("Staff".into()), Value::Held([0xab; 16])]), keep: true };
     assert_eq!(String::from_utf8(lines::answer(&a).encode().unwrap()).unwrap(), format!("answer name=corp t0={} t1={} h2={} keep=1\n", hx("alice"), hx("Staff"), "ab".repeat(16)));

@@ -94,7 +94,7 @@ sso_checks() {
     "$V" "$CTL up name=sso" >/dev/null
     wait_for sso signin sso "no single sign-on asked"
     pr=$("$V" "$CTL prompt name=sso")
-    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    login=$(unhex "$(echo "$pr" | awk '/^sso-login /{split($2,a,"=");printf "%s",a[2]}')")
     case "$login" in https://sso.crypta.test:447/+CSCOE+/saml/sp/login*) ok "the gateway asks for single sign-on at $login" ;; *) fail "sso prompt: $pr" ;; esac
     [ "$(asks)" = "$a5" ] && ok "no form asked: the sign-in window's" || fail "a form was asked"
     # The window's sign-in, from the host: the gateway's sign-on address,
@@ -155,20 +155,37 @@ nav_window() { # $1 profile, $2 login, $3 final; prints the probe's lines
 # with it once instead of a password. The stand-in serves no tunnel after
 # the login (crypta-gp-packet-check.py --saml carries one).
 st() { curl -sk https://127.0.0.1:8447/stats | sed -n "s/.*\"$1\": \([0-9]*\).*/\1/p"; }
+# $1: the portal's SAML binding, REDIRECT (an address to open) or POST (a
+# page whose form posts the request: the engine reads the form, never runs
+# the page, and the window posts it once, vpn.md "GlobalProtect SAML").
 gp_window_checks() {
-    a0=$(st gp_acs_ok); t0=$(st gp_token_ok)
+    binding=${1:-REDIRECT}
+    [ "$(curl -sk "https://127.0.0.1:8447/gp-binding?$binding")" = "$binding" ] || fail "the stand-in's binding"
+    echo "   GlobalProtect SAML, the $binding binding"
+    a0=$(st gp_acs_ok); t0=$(st gp_token_ok); p0=$(st gp_prelogin_post)
     "$V" "$CTL create-gp name=gps host=sso.crypta.test:447 ca=$CA scoped=0" >/dev/null || fail "create-gp gps"
     "$V" "$CTL up name=gps" >/dev/null
     wait_for gps signin sso "GlobalProtect asked for no single sign-on"
     pr=$("$V" "$CTL prompt name=gps")
-    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    login=$(unhex "$(echo "$pr" | awk '/^sso-login /{split($2,a,"=");printf "%s",a[2]}')")
     fin=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="final")print a[2]}}')")
     cookie=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="cookie")print a[2]}}')")
     case "$login $fin $cookie" in
         "https://idp.crypta.test:448/"*" https://sso.crypta.test:447/SAML20/SP/ACS gpSamlToken") ok "GlobalProtect's prelogin asks for SAML: the IdP's address, the portal's ACS" ;;
         *) fail "GlobalProtect SSO prompt: $login $fin $cookie" ;;
     esac
+    if [ "$binding" = POST ]; then
+        [ "$(st gp_prelogin_post)" = $((p0 + 1)) ] || fail "the stand-in sent no POST binding"
+        case "$login" in
+            "https://idp.crypta.test:448/realms/"*"#atrium-saml-post="*) ok "the engine took the request from the portal's form: the window's start is that form (${#login} bytes)" ;;
+            *) fail "POST binding start: $login" ;;
+        esac
+    fi
     r=$(nav_window gps "$login" "$fin")
+    if [ "$binding" = POST ]; then
+        "$V" "grep -q 'starts with the gateway.s SAML form, posted to https://idp.crypta.test:448' $NV/navigatord.log" \
+            && ok "navigatord posted the form's request to Keycloak through the couriers" || fail "no start form posted: $("$V" "tail -5 $NV/navigatord.log")"
+    fi
     echo "$r" | cut -c1-200 | sed 's/^/     /'
     echo "$r" | grep -q "^final https://sso.crypta.test:447/SAML20/SP/ACS" && ok "the window reached the portal's ACS (Keycloak's session from the jar)" || fail "GlobalProtect window: $r"
     [ "$(st gp_acs_ok)" = $((a0 + 1)) ] && ok "the portal checked Keycloak's signed answer and minted a token" || fail "GlobalProtect ACS: $(curl -sk https://127.0.0.1:8447/stats)"
@@ -199,7 +216,7 @@ window_checks() {
     "$V" "$CTL up name=win" >/dev/null
     wait_for win signin sso "no single sign-on asked"
     pr=$("$V" "$CTL prompt name=win")
-    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    login=$(unhex "$(echo "$pr" | awk '/^sso-login /{split($2,a,"=");printf "%s",a[2]}')")
     fin=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="final")print a[2]}}')")
     r=$(nav_window win "$login" "$fin")
     echo "$r" | sed 's/^/     /'
@@ -419,7 +436,8 @@ run)
     echo "== the sign-in window: navigatord, Arca's couriers, Keycloak"
     if nc -z 127.0.0.1 8447 2>/dev/null && nc -z 127.0.0.1 8448 2>/dev/null; then
         window_checks
-        gp_window_checks
+        gp_window_checks REDIRECT
+        gp_window_checks POST
         "$V" "pkill -f 'navigatord --unconfined'; pkill -x arca-courierd" || true
     else
         echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"

@@ -142,6 +142,12 @@ struct Engine {
     approved_hip: Option<String>,
     /// The saved password was tried this run (and is not tried again).
     saved_used: bool,
+    /// A SAML portal's `portal-userauthcookie` and the user SAML named,
+    /// for the chosen gateway at the same origin: used once, instead of a
+    /// second SAML window, and kept only in this engine's memory.
+    gp_portal_cookie: Option<(String, zeroize::Zeroizing<String>)>,
+    /// The user the last SAML sign-in named.
+    gp_saml_user: Option<String>,
     rx: u64,
     tx: u64,
     dropped: u64,
@@ -744,7 +750,7 @@ fn main() {
     };
     drop(system);
     log(&format!("gateway {} at {}", st.host, st.gateway));
-    let mut e = Engine { st, ctl, secrets, conn, cfg, tun, esp, hip_os, approved_hip: None, saved_used: false, rx: 0, tx: 0, dropped: 0 };
+    let mut e = Engine { st, ctl, secrets, conn, cfg, tun, esp, hip_os, approved_hip: None, saved_used: false, gp_portal_cookie: None, gp_saml_user: None, rx: 0, tx: 0, dropped: 0 };
     let result = match globalprotect { Some(mode) => e.run_gp(mode), None => e.run() };
     match result {
         Ok(()) => log("stopping"),

@@ -1239,11 +1239,26 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   own field and an empty `passwd`; a challenge or a refusal after a SAML login
   is a failed sign-in, never a password prompt. Portal engines take the item
   too.
-- *Not yet:* the POST binding (`saml-auth-method` POST, an HTML form to
-  post) is refused with a clear error. With a SAML portal, the chosen
-  gateway runs its own SAML again (a second window; the IdP's session in the
-  jar makes it a click, not a password); `portal-userauthcookie` is not
-  carried from portal to gateway.
+- *The POST binding* (`saml-auth-method` POST: a page whose form posts the
+  request to the IdP). The engine reads that page and never runs it: one
+  form, method POST, an https action without a fragment, and only hidden
+  `SAMLRequest` (required, base64) and `RelayState` fields; a password field,
+  a second form or any other field refuses it. The window's start is that
+  form spelled as an address, `<action>#atrium-saml-post=<base64url form
+  body>` (at most 8 KiB, portcullisd's bound). navigatord takes it only as
+  the VPN window's start: it posts the body to the action once, through the
+  profile's couriers, as the gateway's page would have (initiator the
+  gateway), and refuses a second post in that window. The fragment never
+  leaves the machine. Between cryptad and Settings' front the start goes in
+  `sso-login` parts of 1500 bytes (a control line is at most 4096 bytes).
+- *A SAML portal's gateway.* After the portal's SAML sign-in, its
+  `portal-userauthcookie` (not `empty`) is kept in the engine's memory with
+  the user SAML named. When the chosen gateway, at the portal's origin (a
+  gateway elsewhere already gets an engine of its own, which takes nothing
+  from the portal), asks for SAML too, the engine logs in there once with
+  that cookie and an empty password instead of opening a second window; if
+  the gateway refuses it, single sign-on runs again. A password portal's
+  gateway still asks for its own credentials.
 - *Security keys and passkeys in the sign-in window.* The VPN window's page
   (the Ladybird mail-page worker in role `vpn-sign-in-page`) now has a
   credential channel to its window, so `navigator.credentials.get` and
@@ -1258,15 +1273,18 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   fingerprint or Windows Hello passkey in Sigillum's own sheet. The answer
   goes back as `Event::Credential` and on to the page. A page that goes, or
   a window that closes, retires the ceremony.
-- *Checks.* `scripts/crypta-v4-gate.sh run` now 67 checks on the amd64
+- *Checks.* `scripts/crypta-v4-gate.sh run` now 76 checks on the amd64
   VM: the V4 ones plus GlobalProtect SAML through the window against
   Keycloak (the stand-in serves a GlobalProtect portal front: prelogin
   REDIRECT, ACS checked with xmlsec1, a token checked once with an empty
   password): the window reaches the portal's ACS, the portal mints a token,
   the engine logs in with it once and no password, the token goes courier →
   Arca → engine, the page gets the answer page, and the token is in no log
-  and never in the window. `scripts/crypta-gp-packet-check.py --saml` (host,
-  or `--vm`) checks the engine half against the GlobalProtect peer. Host
+  and never in the window; the same with the POST binding (the engine's
+  start is the form, navigatord posts it to Keycloak). `scripts/crypta-gp-packet-check.py --saml` (host,
+  or `--vm`) checks the engine half against the GlobalProtect peer, and
+  `--saml-portal` a SAML portal whose cookie signs in to its gateway: one
+  sign-on, no password, an echo through the tunnel. Host
   tests for the parser, arcad's filing, the courier's capture, navigatord's
   origin rule, navigator-control and navigator-ui pass. The security-key
   path in the installed window (Ladybird page, Sigillum's sheet) needs the

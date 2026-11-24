@@ -263,11 +263,212 @@ pub fn prelogin(bytes: &[u8]) -> Result<Prelogin> {
             }
             Ok(Prelogin::Saml { login: url.to_string() })
         }
-        // The POST binding hands over a page with a form to send: the
-        // window starts from an address only.
-        (Some(m), Some(_)) if m.eq_ignore_ascii_case("POST") => Err("GlobalProtect SAML with the POST binding is not supported yet"),
+        // The POST binding hands over a page whose form posts the request to
+        // the IdP: the window's start is that form, spelled as an address.
+        (Some(m), Some(r)) if m.eq_ignore_ascii_case("POST") => {
+            let page = base64(r).and_then(|b| String::from_utf8(b).ok()).ok_or("invalid GlobalProtect SAML request")?;
+            let (action, fields) = saml_post_form(&page)?;
+            let login = format!("{action}{SAML_POST_START}{}", base64url(form_encode(&fields).as_bytes()));
+            if login.len() > SAML_LOGIN_MAX {
+                return Err("GlobalProtect SAML request is too large");
+            }
+            Ok(Prelogin::Saml { login })
+        }
         _ => Err("invalid GlobalProtect SAML prelogin"),
     }
+}
+
+/// A POST binding's start, as the VPN sign-in window takes it (vpn.md,
+/// "GlobalProtect SAML"): `<IdP address>#atrium-saml-post=<base64url form
+/// body>`. A fragment is never sent; navigatord posts the body to the
+/// address once, through the profile's couriers.
+pub const SAML_POST_START: &str = "#atrium-saml-post=";
+
+const SAML_PAGE_MAX: usize = 16 * 1024;
+
+/// The one form of a POST binding's page: an https action, method POST,
+/// and only hidden `SAMLRequest` (required) and `RelayState` fields. The
+/// page's script is never run; anything else in the form refuses it.
+pub fn saml_post_form(page: &str) -> Result<(String, Vec<(String, String)>)> {
+    if page.len() > SAML_PAGE_MAX {
+        return Err("GlobalProtect SAML page is too large");
+    }
+    let bad = "GlobalProtect SAML page has no plain SAML form";
+    let mut action = None;
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut in_form = false;
+    let mut rest = page;
+    while let Some(at) = rest.find('<') {
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix("!--") {
+            rest = after.find("-->").map(|e| &after[e + 3..]).ok_or(bad)?;
+            continue;
+        }
+        let (tag, attrs, after) = html_tag(rest).ok_or(bad)?;
+        rest = after;
+        if tag == "script" || tag == "style" {
+            // Never run, and its text is not markup.
+            let close = format!("</{tag}");
+            let end = rest.to_ascii_lowercase().find(&close).ok_or(bad)?;
+            rest = &rest[end..];
+            continue;
+        }
+        match tag.as_str() {
+            "form" if action.is_none() && !in_form => {
+                let method = attr(&attrs, "method").unwrap_or_default();
+                let a = attr(&attrs, "action").ok_or(bad)?;
+                let a = a.trim();
+                if !method.eq_ignore_ascii_case("post") || !a.starts_with("https://") || a.len() > SAML_LOGIN_MAX
+                    || a.contains('#') || a.bytes().any(|b| b <= b' ' || b == 0x7f) {
+                    return Err(bad);
+                }
+                action = Some(a.to_string());
+                in_form = true;
+            }
+            "form" => return Err("GlobalProtect SAML page has more than one form"),
+            "/form" if in_form => in_form = false,
+            "input" | "button" if in_form => {
+                let kind = attr(&attrs, "type").unwrap_or_else(|| if tag == "button" { "submit".into() } else { "text".into() });
+                match (kind.to_ascii_lowercase().as_str(), attr(&attrs, "name")) {
+                    ("submit", None) => {}
+                    ("hidden", Some(n)) if n == "SAMLRequest" || n == "RelayState" => {
+                        let v = attr(&attrs, "value").unwrap_or_default();
+                        if fields.iter().any(|(k, _)| *k == n) || v.len() > SAML_LOGIN_MAX || v.chars().any(|c| c.is_control()) {
+                            return Err(bad);
+                        }
+                        fields.push((n, v));
+                    }
+                    _ => return Err("GlobalProtect SAML form asks for more than its request"),
+                }
+            }
+            "select" | "textarea" if in_form => return Err("GlobalProtect SAML form asks for more than its request"),
+            _ => {}
+        }
+    }
+    let request = fields.iter().find(|(k, _)| k == "SAMLRequest").map(|(_, v)| v.as_str()).ok_or(bad)?;
+    if base64(request).is_none_or(|b| b.is_empty()) {
+        return Err("invalid GlobalProtect SAML request");
+    }
+    Ok((action.ok_or(bad)?, fields))
+}
+
+/// `name attrs...>` after a `<`: the lower-cased name (`/form` for a close)
+/// and its attributes, entity-decoded; and the rest after `>`.
+fn html_tag(s: &str) -> Option<(String, Vec<(String, String)>, &str)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || (i == 0 && (b[i] == b'/' || b[i] == b'!'))) {
+        i += 1;
+    }
+    let name = s[..i].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+    loop {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        if b[i] == b'>' {
+            return Some((name, attrs, &s[i + 1..]));
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
+            i += 1;
+        }
+        let key = s[start..i].to_ascii_lowercase();
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < b.len() && b[i] == b'=' {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let raw = match b.get(i) {
+                Some(&q @ (b'"' | b'\'')) => {
+                    let end = s[i + 1..].find(q as char)? + i + 1;
+                    let v = &s[i + 1..end];
+                    i = end + 1;
+                    v
+                }
+                Some(_) => {
+                    let start = i;
+                    while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                        i += 1;
+                    }
+                    &s[start..i]
+                }
+                None => return None,
+            };
+            value = entities(raw)?;
+        }
+        if attrs.len() >= 32 {
+            return None;
+        }
+        attrs.push((key, value));
+    }
+}
+
+fn attr(attrs: &[(String, String)], key: &str) -> Option<String> {
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+/// The character references a form's attribute may carry.
+fn entities(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let end = rest.find(';').filter(|&e| e <= 10)?;
+        let name = &rest[..end];
+        let c = match name {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => {
+                let n = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")).map(|h| u32::from_str_radix(h, 16))
+                    .or_else(|| name.strip_prefix('#').map(str::parse::<u32>))?.ok()?;
+                char::from_u32(n)?
+            }
+        };
+        out.push(c);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+fn form_encode(fields: &[(String, String)]) -> String {
+    let enc = |s: &str| {
+        let mut o = String::new();
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                o.push(b as char);
+            } else {
+                o.push_str(&format!("%{b:02X}"));
+            }
+        }
+        o
+    };
+    fields.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
+}
+
+/// Base64url without padding (RFC 4648 §5).
+fn base64url(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for k in 0..=c.len() {
+            out.push(A[(n >> (18 - 6 * k)) as usize & 63] as char);
+        }
+    }
+    out
 }
 
 /// Standard base64 with padding, whitespace ignored.
@@ -421,6 +622,18 @@ pub fn challenge(bytes: &[u8]) -> Result<Option<&str>> {
         })
         .map(Some)
         .ok_or("invalid GlobalProtect challenge token")
+}
+
+/// A portal's `portal-userauthcookie` (`empty` or absent: none), which
+/// its gateways take in place of a second sign-in.
+pub fn portal_cookie(bytes: &[u8]) -> Result<Option<Zeroizing<String>>> {
+    let mut root = document(bytes)?;
+    let result = scalar(&root, "portal-userauthcookie").map(|v| {
+        v.filter(|v| *v != "empty" && v.len() <= 4096 && v.bytes().all(|b| b.is_ascii_graphic()))
+            .map(|v| Zeroizing::new(v.to_string()))
+    });
+    clear_xml(&mut root);
+    result
 }
 
 pub fn gateways(bytes: &[u8]) -> Result<Vec<(String, String)>> {
@@ -1060,6 +1273,49 @@ thisForm.inputStr.value = getValue();"#;
         assert!(prelogin(b"<prelogin-response><status>Success</status><saml-request>opaque</saml-request></prelogin-response>").is_err());
         assert!(prelogin(b"<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method><saml-request>!!</saml-request></prelogin-response>").is_err());
         assert!(prelogin(b"<prelogin-response><status>Success</status><status>Failure</status></prelogin-response>").is_err());
+    }
+
+    fn b64(b: &[u8]) -> String {
+        base64url(b).replace('-', "+").replace('_', "/") + ["", "===", "==", "="][base64url(b).len() % 4]
+    }
+
+    #[test]
+    fn the_post_binding_starts_the_window_at_its_form() {
+        let page = r#"<!DOCTYPE html><html><body onload="document.forms[0].submit()"><noscript><p>Press</p></noscript>
+            <!-- <form action="https://evil.example/"> -->
+            <form id="f" method="POST" action="https://idp.example/realms/c/protocol/saml?a=1&amp;b=2">
+            <input type="hidden" name="SAMLRequest" value="PHNhbWxwOkF1dGhuUmVxdWVzdC8+" />
+            <input type='hidden' name='RelayState' value='x&amp;y+z'><input type="submit" value="Continue"></form>
+            <script>if (1 < 2) document.forms[0].submit();</script></body></html>"#;
+        let r = format!("<prelogin-response><status>Success</status><saml-auth-method>POST</saml-auth-method><saml-request>{}</saml-request></prelogin-response>", b64(page.as_bytes()));
+        let Ok(Prelogin::Saml { login }) = prelogin(r.as_bytes()) else { panic!("{:?}", prelogin(r.as_bytes())) };
+        let (action, body) = login.split_once(SAML_POST_START).unwrap();
+        assert_eq!(action, "https://idp.example/realms/c/protocol/saml?a=1&b=2");
+        let body = base64url_decode(body);
+        assert_eq!(String::from_utf8(body).unwrap(), "SAMLRequest=PHNhbWxwOkF1dGhuUmVxdWVzdC8%2B&RelayState=x%26y%2Bz");
+
+        let refused = |page: &str| saml_post_form(page).is_err();
+        assert!(refused(r#"<form method="post" action="http://idp.example/"><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "plain http");
+        assert!(refused(r#"<form method="get" action="https://idp.example/"><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "a GET");
+        assert!(refused(r#"<form method="post" action="https://idp.example/"><input type="password" name="pw"><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "asks for more");
+        assert!(refused(r#"<form method="post" action="https://idp.example/"><input type="hidden" name="SAMLRequest" value="eA=="><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "twice");
+        assert!(refused(r#"<form method="post" action="https://idp.example/"><input type="hidden" name="RelayState" value="r"></form>"#), "no request");
+        assert!(refused(r#"<form method="post" action="https://idp.example/"><input type="hidden" name="SAMLRequest" value="!!"></form>"#), "not base64");
+        assert!(refused(r#"<form method="post" action="https://a.example/"></form><form method="post" action="https://b.example/"><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "two forms");
+        assert!(refused(r#"<form method="post" action="https://idp.example/#x"><input type="hidden" name="SAMLRequest" value="eA=="></form>"#), "a fragment of its own");
+    }
+
+    fn base64url_decode(s: &str) -> Vec<u8> {
+        base64(&s.replace('-', "+").replace('_', "/")).unwrap()
+    }
+
+    #[test]
+    fn a_portals_cookie_is_kept_unless_empty() {
+        let p = |c: &str| portal_cookie(format!("<policy><gateways/><portal-userauthcookie>{c}</portal-userauthcookie></policy>").as_bytes());
+        assert_eq!(p("abc+/=").unwrap().as_deref().map(|c| c.as_str()), Some("abc+/="));
+        assert_eq!(p("empty").unwrap(), None);
+        assert_eq!(portal_cookie(b"<policy><gateways/></policy>").unwrap(), None);
+        assert!(portal_cookie(b"<policy><portal-userauthcookie>a</portal-userauthcookie><portal-userauthcookie>b</portal-userauthcookie></policy>").is_err());
     }
 
     #[test]

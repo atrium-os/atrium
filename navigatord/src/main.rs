@@ -1441,7 +1441,20 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                     if let Some(Err(e)) = other {
                                         eprintln!("navigatord: {url}: not reopened from the store ({e}); fetching");
                                     }
-                                    let mut got = convert(&cfg, &url, ctx, cookied);
+                                    // A SAML POST binding's start: its form, posted once
+                                    // through the profile's couriers, as the gateway's page
+                                    // would have (its script is never run).
+                                    let start = cfg.vpn.as_ref().filter(|v| v.start_url == url).map(|v| (vpn::start_post(&v.start_url), v.final_url.clone()));
+                                    let mut got = match start {
+                                        Some((Ok(Some((target, body))), fin)) if !vpn::START_SENT.swap(true, std::sync::atomic::Ordering::SeqCst) => {
+                                            let from = url::Url::parse(&fin).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+                                            eprintln!("navigatord: the VPN sign-in starts with the gateway's SAML form, posted to {} ({} bytes)", origin(&target).unwrap_or_default(), body.len());
+                                            convert_with(&cfg, &target, ctx, cookied, Some((body, from, None)))
+                                        }
+                                        Some((Ok(Some(_)), _)) => Err("the sign-in's request was sent once; start the sign-in again from Settings".into()),
+                                        Some((Err(why), _)) => Err(why),
+                                        _ => convert(&cfg, &url, ctx, cookied),
+                                    };
                                     if let Ok(Got::NeedsCookies(failed)) = &got {
                                         // The backend's own rule (legacy-web §5.4.1e): the
                                         // view turns cookied, in this page's jar, and the
