@@ -287,7 +287,14 @@ the kmod-level enforcement mechanics.
 At parse time:
 - `app.id` matches `^[a-z][a-z0-9.-]*$` (reverse-DNS style).
 - `app.entry` is a relative path within the tree, points at an
-  executable file.
+  executable file. It, `[bundle].entry` and every `[[workers]].entry` are
+  plain paths: `/`-separated components of `A-Z a-z 0-9 . _ + -`, none empty,
+  `.` or `..`. The entry becomes the jail's `exec.start` in a jail.conf, so a
+  quote, `$`, `\`, space or control character in it could add jail.conf
+  parameters (`exec.prestart` runs on the host as root). The renderer
+  (`portcullis-jail`, `render_jail_conf`) refuses such values too rather than
+  escaping them, and writes the file with `O_EXCL` and mode 0600 under a
+  fresh name (review 2026-11-24).
 - `capabilities.filesystem` paths are absolute (after `~/`
   expansion to the user's home) and not under `/atrium/`,
   `/dev/`, `/var/lib/tessera/` (those are managed mounts).

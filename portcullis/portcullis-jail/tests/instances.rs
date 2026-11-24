@@ -85,7 +85,7 @@ fn sanitizing_does_not_collapse_distinct_tags() {
 #[test]
 fn the_hostname_does_not_leak_the_instance() {
     let jc = build(&manifest("org.atrium.worker"), &opts(Some("7"))).expect("builds");
-    let conf = jc.render_jail_conf();
+    let conf = jc.render_jail_conf().unwrap();
     assert!(conf.contains("host.hostname = \"org.atrium.worker\""),
         "hostname leaked the instance: {conf}");
 }
@@ -101,7 +101,7 @@ fn the_hostname_does_not_leak_the_instance() {
 #[test]
 fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
     let jc = build(&manifest("org.atrium.worker"), &opts(Some("1"))).expect("builds");
-    let conf = jc.render_jail_conf();
+    let conf = jc.render_jail_conf().unwrap();
     assert!(conf.contains("vnet = new"), "{conf}");
     assert!(!conf.contains("ip4") && !conf.contains("ip6"), "{conf}");
     assert!(conf.contains("allow.raw_sockets = false"), "{conf}");
@@ -120,10 +120,10 @@ fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
 fn a_one_shot_jail_does_not_persist_and_an_application_does() {
     let mut o = opts(Some("1"));
     o.persist = false;
-    let conf = build(&manifest("org.atrium.worker"), &o).expect("builds").render_jail_conf();
+    let conf = build(&manifest("org.atrium.worker"), &o).expect("builds").render_jail_conf().unwrap();
     assert!(conf.contains("persist = false"), "a one-shot jail would outlive its work: {conf}");
 
-    let conf = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds").render_jail_conf();
+    let conf = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds").render_jail_conf().unwrap();
     assert!(conf.contains("persist = true"), "an application lost its persistence: {conf}");
 }
 

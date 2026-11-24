@@ -50,6 +50,15 @@ pub fn validate(m: &Manifest) -> Report {
     }
     if e.trim().is_empty() {
         r.errors.push("[app].entry: must be non-empty".into());
+    } else if !is_safe_entry(e) {
+        r.errors.push(format!("[app].entry {e:?}: {ENTRY_RULE}"));
+    }
+    /* [bundle].entry overrides [app].entry (Manifest::entry) and becomes the
+     * jail's exec.start, so it gets every check [app].entry gets. */
+    if let Some(be) = m.bundle.as_ref().and_then(|b| b.entry.as_deref()) {
+        if !is_safe_entry(be) {
+            r.errors.push(format!("[bundle].entry {be:?}: {ENTRY_RULE}"));
+        }
     }
 
     if let Some(b) = &m.bundle {
@@ -80,6 +89,8 @@ pub fn validate(m: &Manifest) -> Report {
         let e = &w.entry;
         if e.trim().is_empty() || e.starts_with('/') || e.split('/').any(|c| c == "..") {
             r.errors.push(format!("{ctx}.entry {e:?}: a relative path in the bundle, without `..`"));
+        } else if !is_safe_entry(e) {
+            r.errors.push(format!("{ctx}.entry {e:?}: {ENTRY_RULE}"));
         }
         if e == &m.app.entry {
             r.errors.push(format!("{ctx}.entry {e:?}: is the app's own entry; a worker is a separate program"));
@@ -458,6 +469,21 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
 }
 
 /// `^[a-z][a-z0-9.-]*$` without pulling in regex.
+const ENTRY_RULE: &str =
+    "a relative path of `A-Z a-z 0-9 . _ + -` components separated by `/`, no `.` or `..` component";
+
+/// An entry path becomes a jail's `exec.start` (portcullis-jail renders it
+/// into jail.conf and jail(8) splits it into argv), so it is a plain path and
+/// nothing else: no quotes, `$`, `\`, spaces or control characters, which
+/// would let a manifest add jail.conf parameters (an `exec.prestart` runs on
+/// the host as root) or extra arguments.
+pub fn is_safe_entry(e: &str) -> bool {
+    !e.is_empty() && e.len() <= 1024 && e.split('/').all(|c| {
+        !c.is_empty() && c != "." && c != ".."
+            && c.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    })
+}
+
 fn is_valid_app_id(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else { return false };
@@ -622,5 +648,27 @@ mod extra_libs_tests {
         assert!(glob_match("libvulkan.so.?", "libvulkan.so.1"));
         assert!(!glob_match("libp_*.so", "libp_alsa.so.1"));
         assert!(!glob_match("libp_*.so", "libq_alsa.so"));
+    }
+
+    /// The 2026-11-24 review's proof of concept: an entry that closes the
+    /// jail's exec.start string and adds an exec.prestart. Every entry field
+    /// refuses it, including `[bundle].entry`, which was not checked at all.
+    #[test]
+    fn entries_are_plain_paths() {
+        let evil = r#"bin/y\"; exec.prestart = \"/usr/bin/touch /root/pwned"#;
+        let base = "[app]\nid = \"org.x.y\"\nname = \"Y\"\nversion = \"1\"\n";
+        let app = crate::Manifest::from_str(&format!("{base}entry = \"{evil}\"\n")).unwrap();
+        assert!(crate::validate::validate(&app).errors.iter().any(|e| e.starts_with("[app].entry")), "{:?}", crate::validate::validate(&app).errors);
+        let bundle = crate::Manifest::from_str(&format!("{base}entry = \"bin/y\"\n\n[bundle]\nentry = \"{evil}\"\n")).unwrap();
+        assert!(crate::validate::validate(&bundle).errors.iter().any(|e| e.starts_with("[bundle].entry")), "{:?}", crate::validate::validate(&bundle).errors);
+        let worker = crate::Manifest::from_str(&format!(
+            "{base}entry = \"bin/y\"\n\n[[workers]]\nname = \"w\"\nentry = \"{evil}\"\n")).unwrap();
+        assert!(crate::validate::validate(&worker).errors.iter().any(|e| e.contains(".entry")), "{:?}", crate::validate::validate(&worker).errors);
+        for bad in ["bin/a b", "bin/$x", "bin/a\\b", "bin//a", "./bin/a", "bin/a\n"] {
+            assert!(!crate::validate::is_safe_entry(bad), "{bad:?}");
+        }
+        for good in ["bin/atrium-mail", "bin/a.b_c+d-e", "y"] {
+            assert!(crate::validate::is_safe_entry(good), "{good:?}");
+        }
     }
 }

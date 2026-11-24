@@ -18,6 +18,7 @@ use thiserror::Error;
 use portcullis_toml::Manifest;
 
 pub use config::{JailConfig, MountSpec, Value};
+pub use render::RenderError;
 
 #[derive(Debug, Error)]
 pub enum BuildError {

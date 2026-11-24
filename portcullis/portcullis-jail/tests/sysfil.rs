@@ -50,13 +50,13 @@ fn the_resolved_filter_is_rendered_into_jail_conf() {
     let policy = jaild_policy::Policy::load(&sample).unwrap();
     let m = manifest("");
     let f = policy.sysfil.resolve(&sysfil_class(&m.capabilities)).unwrap();
-    let conf = build(&m, &opts(Some(f.clone()))).unwrap().render_jail_conf();
+    let conf = build(&m, &opts(Some(f.clone()))).unwrap().render_jail_conf().unwrap();
     assert!(conf.contains(&format!("sysfil.mode = {};", f.mode)), "{conf}");
     assert!(conf.contains("sysfil.families = \"unix\";"), "{conf}");
     assert!(conf.contains(&format!("sysfil.syscalls = \"{}\";", f.syscalls.as_deref().unwrap())));
     assert!(conf.contains("sysfil.ioctls = \"") && conf.contains("sysfil.sockopts = \""));
 
-    let open = build(&m, &opts(None)).unwrap().render_jail_conf();
+    let open = build(&m, &opts(None)).unwrap().render_jail_conf().unwrap();
     assert!(!open.contains("sysfil"), "{open}");
 }
 

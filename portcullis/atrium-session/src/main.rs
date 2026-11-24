@@ -114,7 +114,10 @@ fn placeholder_identity() -> portcullis_identity::HostIdentity {
 fn cmd_render(user: &str) -> ExitCode {
     let jc = build_session_jail(user, &placeholder_identity());
     println!("# session jail for {user} ──────────────────────");
-    print!("{}", jc.render_jail_conf());
+    match jc.render_jail_conf() {
+        Ok(conf) => print!("{conf}"),
+        Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
+    }
     println!();
     println!("# devfs.rules ruleset ────────────────────────────");
     print!("{}", jc.render_devfs_rules());
@@ -288,12 +291,14 @@ fn cmd_create(user: &str) -> ExitCode {
     }
 
     /* 6. Write the jail.conf and run jail -c. */
-    let conf_path = std::env::temp_dir().join(format!("atrium-session-{user}.conf"));
-    if let Err(e) = std::fs::write(&conf_path, jc.render_jail_conf()) {
-        eprintln!("write {}: {e}", conf_path.display());
-        layout.umount_all_silent();
-        return ExitCode::from(1);
-    }
+    let conf_path = match jc.write_jail_conf(&format!("atrium-session-{user}")) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            layout.umount_all_silent();
+            return ExitCode::from(1);
+        }
+    };
     let st = Command::new("jail")
         .arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
         .status();
@@ -599,7 +604,7 @@ mod tests {
     #[test]
     fn build_session_jail_renders() {
         let jc = build_session_jail("alice", &portcullis_identity::derive(&[7u8; 32], "session:alice"));
-        let conf = jc.render_jail_conf();
+        let conf = jc.render_jail_conf().unwrap();
         assert!(conf.contains("session_alice"));
         assert!(conf.contains("alice-session"));
         assert!(conf.contains("persist"));

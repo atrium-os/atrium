@@ -1316,11 +1316,13 @@ pub fn create_persistent(jc: &JailConfig, jail_path: &Path) -> Result<(), Launch
         release(&jc);
         return Err(e);
     }
-    let conf_path = std::env::temp_dir().join(format!("portcullisd-{}-{}.conf", std::process::id(), jc.name));
-    if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
-        release(&jc);
-        return Err(LaunchError::Failed("jail-c", format!("write {}: {e}", conf_path.display())));
-    }
+    let conf_path = match jc.write_jail_conf(&format!("portcullisd-{}", jc.name)) {
+        Ok(p) => p,
+        Err(e) => {
+            release(&jc);
+            return Err(LaunchError::Failed("jail-c", e));
+        }
+    };
     let out = Command::new("jail").arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
         .stdin(Stdio::null()).output();
     let _ = fs::remove_file(&conf_path);
@@ -1410,12 +1412,8 @@ fn run_one_jail_inner(
     /* ★★ And a networked config whose network was never attached. */
     portcullis_mounts::ensure_network_ready(jc)
         .map_err(|e| LaunchError::Failed("network", e))?;
-    let conf_path = std::env::temp_dir().join(format!(
-        "portcullisd-{}-{}.conf", std::process::id(), jc.name));
-    if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
-        return Err(LaunchError::Failed("jail-c",
-                   format!("write {}: {e}", conf_path.display())));
-    }
+    let conf_path = jc.write_jail_conf(&format!("portcullisd-{}", jc.name))
+        .map_err(|e| LaunchError::Failed("jail-c", e))?;
     let mut cmd = Command::new("jail");
     /* ★★ `-q`: jail(8) prints "<name>: created" on STDOUT, and stdout here is
      * the CALLER's (received over SCM_RIGHTS) — the app's own output stream.

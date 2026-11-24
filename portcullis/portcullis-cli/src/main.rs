@@ -427,7 +427,10 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&s
 
     if dry_run {
         println!("# jail.conf section ──────────────────────────────");
-        print!("{}", jc.render_jail_conf());
+        match jc.render_jail_conf() {
+            Ok(conf) => print!("{conf}"),
+            Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
+        }
         println!();
         println!("# devfs.rules ruleset ────────────────────────────");
         print!("{}", jc.render_devfs_rules());
@@ -679,14 +682,15 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&s
     }
 
     /* Write jail.conf, run jail -c. */
-    let conf_path = std::env::temp_dir().join(format!("portcullis-{}.conf",
-        std::process::id()));
-    if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
-        eprintln!("write {}: {e}", conf_path.display());
-        release(&jc.name);
-        teardown(&jail_path);
-        return ExitCode::from(1);
-    }
+    let conf_path = match jc.write_jail_conf("portcullis") {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            release(&jc.name);
+            teardown(&jail_path);
+            return ExitCode::from(1);
+        }
+    };
     let status = Command::new("jail")
         // -q: jail(8)'s "<name>: created" goes to stdout — the app's stream.
         .arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
