@@ -59,7 +59,7 @@ pub enum BorderKind {
 }
 
 /// The number formats the menu offers: name and format code.
-pub const NUMBER_FORMATS: [(&str, &str); 8] = [
+pub const NUMBER_FORMATS: [(&str, &str); 12] = [
     ("General", "General"),
     ("Number", "#,##0.00"),
     ("Currency", "$#,##0.00"),
@@ -68,6 +68,10 @@ pub const NUMBER_FORMATS: [(&str, &str); 8] = [
     ("Time", "hh:mm"),
     ("Scientific", "0.00E+00"),
     ("Text", "@"),
+    ("Accounting", r#"_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)"#),
+    ("Comma Style", r#"_(* #,##0.00_);_(* (#,##0.00);_(* "-"??_);_(@_)"#),
+    ("Long Date", "dddd, mmmm d, yyyy"),
+    ("Fraction", "# ?/?"),
 ];
 
 /// Light colours for fills, after the tab colours.
@@ -103,7 +107,7 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Increase Indent").enabled(st.indent < MAX_INDENT), Some(FormatCmd::Indent(true))),
         (MenuItem::new("Decrease Indent").enabled(st.indent > 0), Some(FormatCmd::Indent(false))),
     ];
-    let keys = ["Ctrl+Shift+~", "Ctrl+Shift+!", "Ctrl+Shift+$", "Ctrl+Shift+%", "Ctrl+Shift+#", "Ctrl+Shift+@", "Ctrl+Shift+^", ""];
+    let keys = ["Ctrl+Shift+~", "Ctrl+Shift+!", "Ctrl+Shift+$", "Ctrl+Shift+%", "Ctrl+Shift+#", "Ctrl+Shift+@", "Ctrl+Shift+^", "", "", "", "", ""];
     for (i, (name, code)) in NUMBER_FORMATS.iter().enumerate() {
         let mut item = MenuItem::new(*name).radio(&*st.num_fmt == *code);
         if i == 0 {
@@ -114,17 +118,17 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         }
         v.push((item, Some(FormatCmd::Number(i))));
     }
-    v.push((MenuItem::new("Custom Format…"), Some(FormatCmd::Custom)));
+    v.push((MenuItem::new("Custom Format…").shortcut("Ctrl+1"), Some(FormatCmd::Custom)));
     v.push((MenuItem::new("More Decimals"), Some(FormatCmd::MoreDecimals)));
     v.push((MenuItem::new("Fewer Decimals"), Some(FormatCmd::FewerDecimals)));
     v.push((MenuItem::new("All Borders").separated(), Some(FormatCmd::Borders(BorderKind::All))));
-    v.push((MenuItem::new("Outside Borders"), Some(FormatCmd::Borders(BorderKind::Outside))));
+    v.push((MenuItem::new("Outside Borders").shortcut("Ctrl+Shift+&"), Some(FormatCmd::Borders(BorderKind::Outside))));
     v.push((MenuItem::new("Bottom Border"), Some(FormatCmd::Borders(BorderKind::Bottom))));
     v.push((MenuItem::new("Top and Bottom Border"), Some(FormatCmd::Borders(BorderKind::TopAndBottom))));
     v.push((MenuItem::new("Thick Outside Borders"), Some(FormatCmd::Borders(BorderKind::ThickOutside))));
     v.push((MenuItem::new("Thick Bottom Border"), Some(FormatCmd::Borders(BorderKind::ThickBottom))));
     v.push((MenuItem::new("Double Bottom Border"), Some(FormatCmd::Borders(BorderKind::DoubleBottom))));
-    v.push((MenuItem::new("No Borders"), Some(FormatCmd::Borders(BorderKind::None))));
+    v.push((MenuItem::new("No Borders").shortcut("Ctrl+Shift+_"), Some(FormatCmd::Borders(BorderKind::None))));
     for (i, (name, line)) in PEN_LINES.iter().enumerate() {
         let item = MenuItem::new(format!("Border Line: {name}")).radio(d.border_pen.0 == *line);
         v.push((if i == 0 { item.separated() } else { item }, Some(FormatCmd::PenLine(i))));
@@ -158,6 +162,9 @@ pub fn for_key(k: char) -> Option<FormatCmd> {
         '#' => FormatCmd::Number(4),
         '@' => FormatCmd::Number(5),
         '^' => FormatCmd::Number(6),
+        '&' => FormatCmd::Borders(BorderKind::Outside),
+        '_' => FormatCmd::Borders(BorderKind::None),
+        '1' => FormatCmd::Custom,
         _ => return None,
     })
 }

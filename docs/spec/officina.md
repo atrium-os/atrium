@@ -4859,6 +4859,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **AutoFit Row Height** and **AutoFit Column Width** (after Row Height… and Column Width…) fit every selected row or column in the used area to its contents, as one undo step, like a double-click on the header edge. Hidden rows and columns stay hidden; at most 1,000 at a time.
 - Tests: `goal_seek_finds_roots_and_leaves_the_cell_alone_without_one`, `goal_seek_show_formulas_and_autofit_from_the_menu`. All 140 Sheets lib tests pass.
 
+### 16.110 Excel's formatting keys, Accounting and Comma Style (2026-11-25)
+
+- Keys as in Excel: **Ctrl+`** turns Show Formulas on and off, **Ctrl+1** opens the Custom Format bar, **Ctrl+Shift+&** draws outside borders and **Ctrl+Shift+_** takes borders away. The menus show them. The keys are mapped in pergola's grid (`format_key`) and in `format::for_key`.
+- The Format menu's number formats gain **Accounting** (`_($* #,##0.00_);…`), **Comma Style** (the same without the currency sign: negatives in brackets, zero as a dash), **Long Date** (`dddd, mmmm d, yyyy`) and **Fraction** (`# ?/?`), after Text. The `*` fill is not stretched to the column width yet, so the sign isn't pushed to the left edge as in Excel.
+- Tests: the format-menu test checks the new keys and that each new format shows a value as Excel does; pergola's grid key test checks the four keys. All 140 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

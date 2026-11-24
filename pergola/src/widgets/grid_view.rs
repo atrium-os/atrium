@@ -2333,10 +2333,12 @@ fn format_key(chars: &str, shift: bool) -> Option<char> {
             '4' | '$' => Some('$'),
             '5' | '%' => Some('%'),
             '6' | '^' => Some('^'),
+            '7' | '&' => Some('&'),
+            '-' | '_' => Some('_'),
             _ => None,
         };
     }
-    matches!(c, 'b' | 'i' | 'u' | '5').then_some(c)
+    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`').then_some(c)
 }
 
 /// How far down a cell `ch` px tall lines `th` px tall start, by `v`.
@@ -3086,7 +3088,7 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&GridAction::AutoSum(CellRange { r0: 4, c0: 3, r1: 4, c1: 3 })));
         key(&mut app, Key::Char, "g", Modifiers { ctrl: true, ..Modifiers::default() });
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
-        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~')] {
+        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~'), ("`", false, '`'), ("1", false, '1'), ("7", true, '&'), ("_", true, '_')] {
             key(&mut app, Key::Char, k, Modifiers { ctrl: true, shift, ..Modifiers::default() });
             assert_eq!(log.borrow().last(), Some(&GridAction::Format(want)), "{k}");
         }

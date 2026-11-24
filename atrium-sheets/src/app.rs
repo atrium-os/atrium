@@ -2176,6 +2176,8 @@ impl Sheets {
                 // Alt+=: totals; Ctrl+G or F5: the Go To bar.
                 GridAction::AutoSum(_) => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AutoSum)),
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
+                // Ctrl+`: formulas shown in their cells, or values again.
+                GridAction::Format('`') => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowFormulas)),
                 GridAction::Format(k) => {
                     if let Some(f) = crate::format::for_key(k) {
                         cmds.lock().unwrap().push(Cmd::Format(f));
@@ -6688,6 +6690,28 @@ mod tests {
         assert_eq!(edges(1, 2), [true; 4]);
         // The keys reach the same commands.
         assert_eq!(crate::format::for_key('%'), Some(FormatCmd::Number(3)));
+        assert_eq!(crate::format::for_key('1'), Some(FormatCmd::Custom));
+        assert_eq!(crate::format::for_key('&'), Some(FormatCmd::Borders(crate::format::BorderKind::Outside)));
+        assert_eq!(crate::format::for_key('_'), Some(FormatCmd::Borders(crate::format::BorderKind::None)));
+        // Accounting, Comma Style, Long Date and Fraction as Excel shows them.
+        let mut d = s.doc.borrow_mut();
+        d.type_into(5, 0, "1234.5");
+        d.type_into(6, 0, "-1234.5");
+        d.type_into(7, 0, "0");
+        d.wb.recalc();
+        drop(d);
+        let named = |n: &str| crate::format::NUMBER_FORMATS.iter().position(|f| f.0 == n).unwrap();
+        select(&s, (5, 0), (7, 0));
+        assert_eq!(fmt(&s, FormatCmd::Number(named("Comma Style"))), "Formatted as comma style.");
+        assert_eq!((shown(&s, 5, 0), shown(&s, 6, 0), shown(&s, 7, 0).trim().to_string()), ("  1,234.50 ".into(), "  (1,234.50)".into(), "-".into()));
+        fmt(&s, FormatCmd::Number(named("Accounting")));
+        assert_eq!(shown(&s, 5, 0), " $ 1,234.50 ");
+        fmt(&s, FormatCmd::Number(named("Fraction")));
+        assert_eq!(shown(&s, 5, 0), "1234 1/2");
+        select(&s, (5, 0), (5, 0));
+        s.doc.borrow_mut().type_into(5, 0, "45000");
+        fmt(&s, FormatCmd::Number(named("Long Date")));
+        assert_eq!(shown(&s, 5, 0), "Wednesday, March 15, 2023");
         assert_eq!(crate::format::for_key('z'), None);
         // The menu shows the first cell's state.
         select(&s, (0, 0), (0, 0));
