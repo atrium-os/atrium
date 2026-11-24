@@ -114,6 +114,18 @@ fn rotation_face() -> pergola::glyphs::Face {
     }).clone()
 }
 
+/// The grid's italic, underline and strikethrough bits for `f`.
+pub fn font_marks(f: &officina_grid::style::Font) -> u8 {
+    use pergola::inline::Emphasis;
+    (if f.italic { Emphasis::Italic as u8 } else { 0 }) | (if f.underline { Emphasis::Underline as u8 } else { 0 }) | (if f.strike { Emphasis::Strike as u8 } else { 0 })
+}
+
+/// The text size `f` asks for, px, when not the default 11 pt (the grid's
+/// own size); 6 to 72 pt.
+pub fn font_px(f: &officina_grid::style::Font) -> Option<f32> {
+    f.size.filter(|&s| s != 220 && s > 0).map(|s| pergola::theme::type_size::SM * (s.clamp(120, 1440) as f32) / 220.0)
+}
+
 fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Option<CellView> {
     let st = t.get(id);
     // An empty cell centring across shows, so the run can reach over it.
@@ -137,6 +149,8 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
         cv.color = st.font.color.map(rgb);
     }
     cv.bold = st.font.bold;
+    cv.marks = font_marks(&st.font);
+    cv.size = font_px(&st.font);
     cv.fill = st.fill.map(rgb);
     cv.pattern = st.pattern.map(|p| (p.name(), rgb(p.foreground.unwrap_or(0)), rgb(p.background.unwrap_or(0xFFFFFF))));
     cv.gradient = st.gradient.as_ref().map(|g| (g.angle, g.stops.clone()));

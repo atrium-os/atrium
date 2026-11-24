@@ -81,6 +81,10 @@ pub enum Cmd {
     FilterOpen(u32, u32),
     /// The filter panel's condition chosen (an index of `data::FILTER_CONDS`).
     FilterCond(usize),
+    /// A Format menu command on the selection.
+    Format(crate::format::FormatCmd),
+    /// The text or fill colour bar closed.
+    ColorBarClose,
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
@@ -334,6 +338,9 @@ pub struct Sheets {
     pub link_text: Mutable<TextEdit>,
     /// The Go To bar is open, and what is typed in it.
     pub going: Mutable<bool>,
+    /// The Format menu, and the colour bar (for the fill when true) when open.
+    pub format_menu: Mutable<MenuState>,
+    pub color_bar: Mutable<Option<bool>>,
     pub goto_text: Mutable<TextEdit>,
     /// The exact-size bar: sheet, rows (else columns), first and last.
     pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
@@ -357,7 +364,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), goto_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1751,6 +1758,23 @@ impl Sheets {
             Button::secondary("Cancel").at(394.0, y + 2.0).width(72.0).on_click(push(TabCmd::SizeCancel)).render(ctx);
             return;
         }
+        if let Some(fill) = self.color_bar.get() {
+            use crate::format::FormatCmd;
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 90.0, 18.0), content: if fill { "Fill colour" } else { "Text colour" }.into(), style: st });
+            let mut x = 100.0;
+            for (rgb, _) in crate::tabs::COLORS.iter().chain(&crate::format::LIGHT_COLORS) {
+                let sw = ctx.add(Node::Rect { rect: Rect::new(x, y + 5.0, 18.0, 18.0), fill: crate::tabs::color(*rgb), radius: 4.0 });
+                let (cmds, rgb) = (self.cmds.clone(), *rgb);
+                ctx.on_click(sw, move || cmds.lock().unwrap().push(Cmd::Format(FormatCmd::Color(fill, Some(rgb)))));
+                x += 24.0;
+            }
+            let cmds = self.cmds.clone();
+            Button::secondary(if fill { "No Fill" } else { "Automatic" }).at(x + 8.0, y + 2.0).width(88.0).on_click(move || cmds.lock().unwrap().push(Cmd::Format(FormatCmd::Color(fill, None)))).render(ctx);
+            let cmds = self.cmds.clone();
+            Button::secondary("Cancel").at(x + 104.0, y + 2.0).width(72.0).on_click(move || cmds.lock().unwrap().push(Cmd::ColorBarClose)).render(ctx);
+            return;
+        }
         if self.coloring.get() {
             let st = crate::tabs::style(t.text_primary(), true);
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Tab colour".into(), style: st });
@@ -1922,6 +1946,11 @@ impl Sheets {
                 // Alt+=: totals; Ctrl+G or F5: the Go To bar.
                 GridAction::AutoSum(_) => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AutoSum)),
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
+                GridAction::Format(k) => {
+                    if let Some(f) = crate::format::for_key(k) {
+                        cmds.lock().unwrap().push(Cmd::Format(f));
+                    }
+                }
                 GridAction::FillToData(sel) => {
                     let mut d = doc.borrow_mut();
                     let from = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -1962,7 +1991,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -2167,6 +2196,18 @@ impl View for Sheets {
             .width(76.0)
             .render(ctx);
             x += 84.0;
+            let entries = crate::format::menu(&self.doc.borrow(), g.selection());
+            let (items, cmds_of): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+            let cmds = self.cmds.clone();
+            MenuButton::new("Format", self.format_menu.clone(), items, move |i| {
+                if let Some(Some(c)) = cmds_of.get(i) {
+                    cmds.lock().unwrap().push(Cmd::Format(*c));
+                }
+            })
+            .at(x, 8.0)
+            .width(84.0)
+            .render(ctx);
+            x += 92.0;
         }
         {
             let cmds = self.cmds.clone();
@@ -3191,6 +3232,33 @@ impl Sheets {
                 }
                 Cmd::FilterCancel => {
                     self.filter.set(FilterPanel::default());
+                    self.changed();
+                    false
+                }
+                Cmd::Format(crate::format::FormatCmd::Colors(fill)) => {
+                    self.renaming.set(false);
+                    self.coloring.set(false);
+                    self.close_comment_bar();
+                    self.linking.set(None);
+                    self.size_bar.set(None);
+                    self.paste_bar.set(None);
+                    self.going.set(false);
+                    self.color_bar.set(Some(fill));
+                    self.changed();
+                    false
+                }
+                Cmd::Format(f) => {
+                    if matches!(f, crate::format::FormatCmd::Color(..)) {
+                        self.color_bar.set(None);
+                    }
+                    let g = self.grid.get_cloned();
+                    crate::format::run(&mut self.doc.borrow_mut(), g.selection(), f);
+                    self.rev.set(self.rev.get().wrapping_add(1));
+                    self.changed();
+                    false
+                }
+                Cmd::ColorBarClose => {
+                    self.color_bar.set(None);
                     self.changed();
                     false
                 }
@@ -6068,6 +6136,82 @@ mod tests {
         s.cmds.lock().unwrap().push(Cmd::Tab(TabCmd::GoToDone));
         s.take_cmds();
         assert!(s.going.get() && s.doc.borrow().status.contains("no sheet"));
+    }
+
+    fn fmt(s: &Sheets, f: crate::format::FormatCmd) -> String {
+        s.cmds.lock().unwrap().push(Cmd::Format(f));
+        s.take_cmds();
+        s.doc.borrow().status.clone()
+    }
+
+    #[test]
+    fn the_format_menu_styles_the_selection_and_the_grid_shows_it() {
+        use crate::format::{BorderKind, FormatCmd};
+        use officina_grid::addr::CellAddr;
+        use officina_grid::style::{HAlign, Line};
+        let s = sheets_of(b"1234.5,x\n0.25,y\n");
+        let st = |r, c| s.doc.borrow().wb.style(CellAddr::new(0, r, c)).clone();
+        select(&s, (0, 0), (1, 1));
+        assert_eq!(fmt(&s, FormatCmd::Bold), "Bold on.");
+        assert!((0..2).all(|r| (0..2).all(|c| st(r, c).font.bold)));
+        assert_eq!(fmt(&s, FormatCmd::Bold), "Bold off.");
+        assert!(!st(1, 1).font.bold);
+        fmt(&s, FormatCmd::Italic);
+        fmt(&s, FormatCmd::Underline);
+        fmt(&s, FormatCmd::Strike);
+        fmt(&s, FormatCmd::Larger);
+        fmt(&s, FormatCmd::Larger);
+        assert_eq!(st(1, 1).font.size, Some(280));
+        assert!(fmt(&s, FormatCmd::Smaller).contains("12 pt"));
+        fmt(&s, FormatCmd::Align(HAlign::Center));
+        assert_eq!(st(0, 1).h_align, HAlign::Center);
+        // The grid draws what the styles say.
+        let cv = {
+            use pergola::widgets::GridSource;
+            s.source.cell(0, 1).unwrap()
+        };
+        let em = pergola::inline::Emphasis::Italic as u8 | pergola::inline::Emphasis::Underline as u8 | pergola::inline::Emphasis::Strike as u8;
+        assert_eq!(cv.marks, em);
+        assert!(cv.size.unwrap() > pergola::theme::type_size::SM);
+        assert_eq!(cv.align, pergola::widgets::CellAlign::Center);
+        // Number formats and decimals on the first column.
+        select(&s, (0, 0), (1, 0));
+        assert!(fmt(&s, FormatCmd::Number(1)).contains("number"));
+        assert_eq!(shown(&s, 0, 0), "1,234.50");
+        fmt(&s, FormatCmd::FewerDecimals);
+        assert_eq!(shown(&s, 0, 0), "1,234.5");
+        fmt(&s, FormatCmd::Number(3));
+        assert_eq!(shown(&s, 1, 0), "25%");
+        fmt(&s, FormatCmd::MoreDecimals);
+        assert_eq!(shown(&s, 1, 0), "25.0%");
+        // Colours through the bar.
+        fmt(&s, FormatCmd::Colors(true));
+        assert_eq!(s.color_bar.get(), Some(true));
+        fmt(&s, FormatCmd::Color(true, Some(0xC6EFCE)));
+        assert_eq!((s.color_bar.get(), st(0, 0).fill), (None, Some(0xC6EFCE)));
+        fmt(&s, FormatCmd::Color(false, Some(0xC62828)));
+        assert_eq!(st(1, 0).font.color, Some(0xC62828));
+        // Borders around B1:C3: corners get two edges, the inside none.
+        select(&s, (0, 1), (2, 2));
+        fmt(&s, FormatCmd::Borders(BorderKind::Outside));
+        let edges = |r, c| st(r, c).borders.map(|e| e.line != Line::None);
+        assert_eq!(edges(0, 1), [true, false, true, false]);
+        assert_eq!(edges(1, 1), [true, false, false, false]);
+        assert_eq!(edges(2, 2), [false, true, false, true]);
+        fmt(&s, FormatCmd::Borders(BorderKind::All));
+        assert_eq!(edges(1, 2), [true; 4]);
+        fmt(&s, FormatCmd::Borders(BorderKind::None));
+        assert_eq!(edges(1, 2), [false; 4]);
+        // Each command is one undo step.
+        s.doc.borrow_mut().undo();
+        assert_eq!(edges(1, 2), [true; 4]);
+        // The keys reach the same commands.
+        assert_eq!(crate::format::for_key('%'), Some(FormatCmd::Number(3)));
+        assert_eq!(crate::format::for_key('z'), None);
+        // The menu shows the first cell's state.
+        select(&s, (0, 0), (0, 0));
+        let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Format")));
     }
 
     #[test]

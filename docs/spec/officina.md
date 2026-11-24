@@ -4755,6 +4755,19 @@ pergola sends `GridAction::AutoSum` and `GridAction::GoTo`. Gates: atrium-sheets
 
 Gates: atrium-sheets `a_filter_column_takes_a_condition` (each condition applied, read back and refused) and `a_table_total_row_sums_the_shown_rows_and_goes_again`. Not yet: Above or below average, date conditions in the panel (the engine has `DynamicDate`), two conditions joined by and or or, and a total row function other than SUM.
 
+### 16.97 Cell formatting: the Format menu (2026-11-24)
+
+Before this, Sheets showed the formatting a file brought in but had no way to set it. A **Format** menu beside Data now acts on the selection, as one undo step per command (`atrium-sheets::format`). Bold, italic, underline and strikethrough follow the first cell's state: a command turns the effect on for every cell when that cell lacks it, and off otherwise.
+
+- **Font:** Bold (Ctrl+B), Italic (Ctrl+I), Underline (Ctrl+U), Strikethrough (Ctrl+5). Larger Text and Smaller Text step through 8–72 pt; 11 pt is the default size.
+- **Colours:** Text Colour… and Fill Colour… open a bar under the grid with fourteen swatches: the eight tab colours and six light fills. The bar also has Automatic (text) or No Fill, and Cancel. A fill takes off any pattern or gradient.
+- **Alignment:** Align Left, Centre and Right, and Align by Value (General). Vertical alignment stays in Data.
+- **Number formats:** General (Ctrl+Shift+~), Number `#,##0.00` (Ctrl+Shift+!), Currency `$#,##0.00` (Ctrl+Shift+$), Percent `0%` (Ctrl+Shift+%), Date `yyyy-mm-dd` (Ctrl+Shift+#), Time `hh:mm` (Ctrl+Shift+@), Scientific `0.00E+00` (Ctrl+Shift+^) and Text `@`. More Decimals and Fewer Decimals change each section of the first cell's format code (`format::decimals`); exponent digits and quoted or bracketed parts are left alone.
+- **Borders:** All Borders, Outside Borders (built from disjoint corners and strips, so a corner gets both of its edges), Bottom Border, and No Borders. All are thin and automatic in colour.
+- **Grid:** cells now show italic, underline, strikethrough and font size. pergola's `CellView` gains `marks` (the `inline::Emphasis` bits) and `size`. Fitting a column or row measures with them. pergola sends `GridAction::Format(char)` for the keys.
+
+Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it` and `format::tests::decimals_are_added_and_taken_in_every_section`; pergola `italic_and_size_reach_the_cell_style` and the grid key test. Not yet: a font name picker, custom colours, other border styles and colours, a format code box (Format Cells), Format Painter, rows growing for larger text by themselves, and italic, underline and size in printed sheets (print.rs belongs to the printing thread).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

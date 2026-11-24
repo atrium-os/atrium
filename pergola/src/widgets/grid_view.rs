@@ -126,6 +126,11 @@ pub struct CellView {
     /// either way.
     pub wrap: bool,
     pub valign: CellVAlign,
+    /// Italic, underline and strikethrough, as [`crate::inline::Emphasis`]
+    /// bits (bold is `bold`).
+    pub marks: u8,
+    /// Text size, px, when not the grid's own.
+    pub size: Option<f32>,
 }
 
 /// One step of a cell's indent, px.
@@ -287,7 +292,7 @@ pub fn icon_shapes(icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32,
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, pattern: None, gradient: None, diagonals: [None; 2], rotation: 0, rotation_face: None, shrink_to_fit: false, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false, valign: CellVAlign::Center, marks: 0, size: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -573,6 +578,11 @@ pub enum GridAction {
     AutoSum(CellRange),
     /// Ctrl+G or F5: ask where to go (the app asks).
     GoTo,
+    /// A formatting key on the selection: `b`, `i`, `u` and `5` (bold,
+    /// italic, underline, strikethrough) with Ctrl; `~ ! @ # $ % ^` with
+    /// Ctrl+Shift (General, number, time, date, currency, percent,
+    /// scientific), as Excel's.
+    Format(char),
 }
 
 impl GridState {
@@ -1879,7 +1889,7 @@ pub fn needed_height(cv: &CellView, width: f64) -> f64 {
     }
     let st = cell_style(cv, &crate::theme::Semantic::LIGHT);
     let n = text_lines(cv, (width as f32 - 2.0 * PAD - cv.indent as f32 * INDENT_STEP).max(1.0), &st).len().max(1);
-    (n as f32 * TEXT_SIZE * 1.3 + 2.0 * LINE_PAD).ceil() as f64
+    (n as f32 * st.size * 1.3 + 2.0 * LINE_PAD).ceil() as f64
 }
 
 /// Space above and below a cell's lines, px.
@@ -1908,7 +1918,18 @@ pub fn needed_width(cv: &CellView) -> f64 {
 }
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
-    TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) }
+    let st = TextStyle { family: font::SANS.into(), size: cv.size.unwrap_or(TEXT_SIZE), weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
+    crate::inline::style(&st, cv.marks & crate::inline::Emphasis::Italic as u8)
+}
+
+/// A cell's text node, with its underline and strikethrough under and
+/// through what is shown.
+fn cell_text(ctx: &mut Ctx, rect: Rect, content: String, style: TextStyle, marks: u8) {
+    let rules: Vec<Node> = crate::inline::rules(rect, &style, marks).collect();
+    ctx.add(Node::Text { rect, content, style });
+    for r in rules {
+        ctx.add(r);
+    }
 }
 
 /// The visible column at `col`, or the first one beyond its hidden run.
@@ -1968,7 +1989,7 @@ fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u3
     if est < room * 0.7 {
         return None;
     }
-    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: Color::TRANSPARENT };
+    let style = TextStyle { color: Color::TRANSPARENT, ..cell_style(cv, &crate::theme::Semantic::LIGHT) };
     let w = crate::text::measure_chars(&cv.text, &style);
     if w <= room {
         return None;
@@ -2064,8 +2085,8 @@ fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, 
                 // Centred across the whole run.
                 CellAlign::Across => q((((x0 + x1) / 2.0 - w / 2.0).max(x0 + PAD)) as f64),
             };
-            let lh = TEXT_SIZE * 1.3;
-            ctx.add(Node::Text { rect: Rect::new(tx0, y0 + line_top(cv.valign, y1 - y0, lh), w, lh), content: shown, style });
+            let lh = style.size * 1.3;
+            cell_text(ctx, Rect::new(tx0, y0 + line_top(cv.valign, y1 - y0, lh), w, lh), shown, style, cv.marks);
         }
     }
     if layer.is_some() {
@@ -2283,7 +2304,7 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
                 CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
                 CellAlign::Right => cx + q((cw - PAD - w) as f64),
             };
-            ctx.add(Node::Text { rect: Rect::new(tx0, top + i as f32 * lh, w, lh), content: shown, style: style.clone() });
+            cell_text(ctx, Rect::new(tx0, top + i as f32 * lh, w, lh), shown, style.clone(), cv.marks);
         }
         return;
     }
@@ -2293,7 +2314,29 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
-    ctx.add(Node::Text { rect: Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), content: shown, style });
+    cell_text(ctx, Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), shown, style, cv.marks);
+}
+
+/// The formatting a Ctrl (Ctrl+Shift) key asks for: see [`GridAction::Format`].
+/// A shifted digit may arrive as the digit or as its symbol.
+fn format_key(chars: &str, shift: bool) -> Option<char> {
+    let c = chars.chars().next()?.to_ascii_lowercase();
+    if chars.chars().count() != 1 {
+        return None;
+    }
+    if shift {
+        return match c {
+            '`' | '~' => Some('~'),
+            '1' | '!' => Some('!'),
+            '2' | '@' => Some('@'),
+            '3' | '#' => Some('#'),
+            '4' | '$' => Some('$'),
+            '5' | '%' => Some('%'),
+            '6' | '^' => Some('^'),
+            _ => None,
+        };
+    }
+    matches!(c, 'b' | 'i' | 'u' | '5').then_some(c)
 }
 
 /// How far down a cell `ch` px tall lines `th` px tall start, by `v`.
@@ -2609,6 +2652,10 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             send(GridAction::GoTo);
             return true;
         }
+        Key::Char if cmd && src.fills() && format_key(chars, m.shift).is_some() => {
+            send(GridAction::Format(format_key(chars, m.shift).unwrap()));
+            return true;
+        }
         Key::Char if cmd => {
             match chars.to_ascii_lowercase().as_str() {
                 "g" => send(GridAction::GoTo),
@@ -2677,6 +2724,15 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn italic_and_size_reach_the_cell_style() {
+        let base = CellView::text("Hello");
+        let big = CellView { size: Some(TEXT_SIZE * 2.0), ..base.clone() };
+        assert!(needed_width(&big) > needed_width(&base) * 1.5);
+        assert!(needed_height(&big, 200.0) > needed_height(&base, 200.0) * 1.5);
+        let it = CellView { marks: crate::inline::Emphasis::Italic as u8 | crate::inline::Emphasis::Underline as u8, ..base };
+        assert_eq!(cell_style(&it, &crate::theme::Semantic::LIGHT).family, "IBMPlexSans-Italic");
+    }
 
     #[test]
     fn viewport_reports_scrolled_and_frozen_bands_without_tile_padding() {
@@ -3030,6 +3086,10 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&GridAction::AutoSum(CellRange { r0: 4, c0: 3, r1: 4, c1: 3 })));
         key(&mut app, Key::Char, "g", Modifiers { ctrl: true, ..Modifiers::default() });
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
+        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~')] {
+            key(&mut app, Key::Char, k, Modifiers { ctrl: true, shift, ..Modifiers::default() });
+            assert_eq!(log.borrow().last(), Some(&GridAction::Format(want)), "{k}");
+        }
         log.borrow_mut().clear();
         key(&mut app, Key::F(5), "", Modifiers::default());
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
