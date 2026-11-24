@@ -35,7 +35,8 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 25 server::smime
+# arcad-unit is built with legacy-smime-prototype and legacy-jmap-worker.
+run_suite arcad-unit 30 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
 run_suite mail-received-unit 1 legacy_received_envelope
@@ -114,7 +115,16 @@ for endpoint in "$arca" "$activation" "$fresco" "$limen" "$portcullis" /var/run/
     fi
     test ! -S "$endpoint" || unlink "$endpoint"
 done
-install -d /var/run/atrium "$s/arca" "$s/sigillum" "$s/portcullis" "$s/fresco" "$s/fresco-activation" "$s/limen"
+# Mail's notify and arca-courier capabilities mount these socket directories.
+install -d /var/run/atrium "$s/arca" "$s/sigillum" "$s/portcullis" "$s/fresco" "$s/fresco-activation" "$s/limen" \
+    "$s/arca-courier" "$s/notify"
+# frescod needs system-sans. A bare guest disk has no fonts, so the staging
+# side copies the repo's fonts/ibm-plex and fonts/phosphor into $d/fonts.
+if test -d "$d/fonts"; then
+    install -d /usr/local/share/fonts/ibm-plex
+    install -m 0444 "$d"/fonts/*.ttf /usr/local/share/fonts/ibm-plex/
+fi
+ls /usr/local/share/fonts/ibm-plex/IBMPlexSans-*.ttf >/dev/null
 touch "$registry" /var/run/atrium/courier-registry
 # No synthetic launch registry entries are written by the gate.
 if awk -v person="$person" -v app="$app" '$2 == person && $3 == app { found=1 } END { exit !found }' "$registry"; then
