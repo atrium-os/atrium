@@ -876,7 +876,7 @@ A Forum Release press retried the job and held it again without uploading.
 After the original UUID returned, Release completed the same job and the
 simulator received one PDF.
 
-### 11.6 R7 in progress
+### 11.6 R7 as built (2026-11-24)
 
 The arm64 desktop gate used registered Personal and Work app instances,
 jailed workers, and three IPPS simulators. It verified private and shared
@@ -974,6 +974,329 @@ usual mount directory. A separate SHA-256 Digest run on arm64 FreeBSD used the
 same desktop flow and verified that the IPPS simulator challenged an
 anonymous Validate-Job, checked the Digest response for Create-Job,
 Send-Document and job polling, and received exactly one PDF.
+
+
+### 11.7 R7 gate history
+
+This is the running log of the R7 work and the combined gate (`scripts/prelum-r7-vm.sh`, RUNBOOK §13.8b), moved here from docs/HANDOFF.md on 2026-11-24.
+
+R0–R5 done (§11.1–§11.5, R5 cloud gate 40/40 at `a3a8fd47`). Sheets prints
+merged cells, Center Across, and frozen rows/columns as print titles. R7
+(§11.6): private cross-persona jobs refused, Curia asks before sharing, and
+Arca delivers a one-use PIN to the IPP worker after the TLS key and UUID
+match. Host IPPS simulator covers key and UUID changes, PIN before PDF, replay
+refusal, and ignored attributes. Prelum host suite 25/25, Arca library 9/9,
+and arm64 FreeBSD check passed. Jailed PIN gate passed on arm64 FreeBSD at
+`88f52b4f`: jaild launched the IPP worker under its real worker UID, Arca
+redeemed once and denied replay, and the IPPS simulator received the PIN
+before the PDF. The worker build changed only the fixture socket pathname
+within the normal Arca mount. The desktop PIN prompt also passed on the
+running arm64 FreeBSD guest. Empty PIN queued nothing. The demo app received
+Queued, Arca recorded a successful stage and redemption by the jailed worker,
+and the IPPS simulator accepted the PIN before the PDF. Saved Basic IPPS
+logins now live in Arca under the owning persona and the printer TLS key and
+UUID. Prelum host suite 26/26 and Arca persistence/authorization regression
+passed. The desktop gate passed on arm64 FreeBSD: HTTP 401 without a login, no
+release on changed UUID, and a completed authenticated job with the jailed
+worker. Curia sharing now requires Sigillum approval from the owning user
+before Prelum persists the change. The arm64 FreeBSD desktop gate confirmed
+private while pending and after cancellation, Work visibility after passcode
+approval through PAM, and immediate revocation from Curia. Test fixtures
+removed and VM left running HTTP Digest now uses a document-free challenge
+probe after the key and UUID check. Host IPP tests 9/9. The arm64 desktop gate
+confirmed HTTP 401 without a login, no redemption on a changed UUID, and a
+completed jailed SHA-256 Digest IPPS job with the Arca login. Saved job PINs
+are encrypted in Arca per person, persona, TLS key and UUID. The arm64 desktop
+gate confirmed a missing PIN did not queue a job, then saved and reused a PIN
+in separate jobs. The jailed worker redeemed a fresh handle for each, and the
+IPPS simulator accepted two PINs before two PDFs. Arca persistence and
+isolation regression passed. The legacy R5 gate passed all 42 checks on the
+shared arm64 FreeBSD guest with a test-only Sigillum endpoint. Curia kept Hall
+private after refusal and shared it after the endpoint verified the retry.
+Personal and Work each printed privately and to the shared printer in the
+arm64 desktop gate. Private crossings were blocked both ways by default. A
+fixture Work-to-Personal switch allowed that direction, revocation blocked it,
+and an unavailable Work VPN route sent no PDF. All nine Prelum daemon tests
+and the Sigillum printer-switch authorization regression passed. Live VPN gate
+passed on a separate arm64 FreeBSD clone with nine FIBs: a Work desktop print
+reached Done over WireGuard from the jailed IPP worker. FIB 0 could not
+connect, and taking down the tunnel sent no second PDF. The Crypta-managed
+rerun also passed with an Arca-backed WireGuard profile, FIB 1 on tun0, and a
+completed Work desktop job. Crypta down withdrew the route and no second PDF
+arrived. The shared VM was untouched. Curia’s Printed notices preference
+passed in the isolated arm64 VM: the default and re-enabled notices reached
+Praeco, a muted job remained in history without a success notice, and its
+out-of-paper alert still posted and withdrew. Held jobs now have Release in
+the status item. The isolated arm64 gate verified that Release re-held a
+changed-UUID job without uploading and printed the same job once the original
+UUID returned. Mail message printing now lists attachment names and refuses a
+preview-only message. The isolated arm64 gate printed a three-page message
+through a jailed IPP worker and checked the simulator PDF for the final body
+line and attachment name. Sheets honors a saved rectangular XLSX print area.
+The isolated arm64 gate opened the workbook in Sheets, printed through the
+jailed IPP worker, and verified the simulator PDF included the selected cells
+and excluded both outside sentinels. Six Sheets print tests passed. Charts
+print as PDF text and vectors, and embedded XLSX PNG and JPEG pictures print
+at their anchors. The isolated arm64 Sheets-to-IPP gate verified the completed
+jailed-worker job and checked the simulator PDF for the chart title, plotted
+bars, both in-area images, and exclusion of a third image outside the saved
+area. Seven Sheets print regressions passed. Sheets preserves XLSX picture
+source crops and rotations through XLSX, native saves, and undo. The isolated
+arm64 desktop gate completed the jailed IPP job. Cairo rendering of the
+simulator PDF confirmed cropped colors were excluded and retained colors were
+correctly positioned for a clockwise quarter-turn and a negative 30-degree
+rotation. All seven Sheets print regressions passed with the updated fixture.
+The crop-fringe fix strips fully excluded source pixels before embedding. The
+same isolated desktop IPP gate completed, and Poppler raster checks at 96 and
+192 dpi confirmed both rotations and zero excluded-color pixels in the
+simulator PDF. Seven PDF library tests and seven Sheets print regressions
+passed. XLSX linked pictures print from the workbook cache or from a PNG or
+JPEG picked for the print session. The isolated desktop gate used both paths,
+confirmed picker cancellation queued nothing, and verified both cropped and
+rotated images in the simulator PDF. Eight Sheets print regressions passed.
+Slides prints speaker notes and three- or six-slide handouts. The isolated
+arm64 desktop gate completed all three jobs through jailed IPP. The simulator
+PDFs included every line of long notes, excluded hidden slides and notes,
+grouped four visible slides over two Letter pages after relayout in the
+three-slide format, and put all four on one page in the six-slide format. All
+nine PDF print regressions passed. Slides also offers two-, four-, and
+nine-slide handouts. In the isolated arm64 desktop gate, jailed IPP completed
+all three jobs. The simulator PDFs preserved order and excluded the hidden
+slide, with ten visible slides grouped 2+2+2+2+2, 4+4+2, and 9+1 in the
+expected grids. All nine PDF print regressions passed with the expanded layout
+test. Slides now has an Include Hidden Slides checkbox in the Print menu, off
+by default. In the isolated arm64 desktop gate, three jobs completed through
+jailed IPP. The default handout skipped the hidden slide, the opt-in handout
+kept it in deck order after a Letter relayout, and opt-in speaker notes
+included its notes. All ten PDF print regressions passed. The hidden-slide
+choice now resets when a different deck opens. The combined isolated FreeBSD
+run passed the Slides reset check, eight Sheets print tests, and ten PDF
+tests, including both hidden-slide settings across every layout. Rechecks of
+the saved simulator PDFs covered notes, handout grouping, Sheets print areas,
+charts, cropped pictures and linked pictures. Scrinium can print PDF Quick
+Look from its Print button or Ctrl+P in the active viewer. One isolated arm64
+desktop run completed four jobs through jailed IPP. Both Quick Look jobs
+printed the original read-only PDF after its pathname was replaced, Sheets
+printed a chart and two pictures, and Slides printed the three-slide handout
+with the hidden slide omitted. All 45 Scrinium library tests passed. Quick
+Look also prints plain-text files from the retained descriptor, up to 4 MiB.
+The isolated arm64 desktop gate completed a jailed IPP job and the simulator
+PDF contained all 122 original lines in order across five pages after the
+pathname was replaced. All 46 Scrinium library tests passed. Quick Look now
+prints images through the jailed document viewer. The isolated desktop test
+printed a PNG through jailed IPP and verified a centered A4 image with its 2:1
+aspect ratio and both source colors. Pergola now recovers cleanly when Limen
+refuses a descriptor, and Scrinium reseals the image viewer’s returned PDF for
+Prelum. All 49 Scrinium tests and both Pergola print regressions passed. Quick
+Look also prints multi-page HTML through the jailed viewer and refuses
+truncated output. One isolated FreeBSD run completed both the HTML and PNG
+jobs through jailed IPP. The simulator PDF retained all 95 original HTML
+paragraphs after pathname replacement, and the PNG raster exactly matched the
+earlier reference. All 50 Scrinium tests passed. A combined isolated arm64
+gate reused the staged Quick Look, Sheets and Slides builds and printed all
+three jobs over IPPS through jailed workers. The received PDFs preserved all
+95 HTML paragraphs after pathname replacement, the Sheets chart and both
+in-area pictures, and the Slides handout order with the hidden slide omitted.
+The four-app rerun rebuilt Scrinium, Sheets, Slides and Mail from main at
+`fa8c0a26` and matched their staged hashes. One isolated arm64 boot completed
+all four desktop jobs through jailed workers over IPPS. The received HTML,
+Sheets and Slides PDFs passed the same content checks. Mail printed all 75
+synthetic body lines in order across three pages and included the attachment
+name without its contents. The repeatable four-app gate is now
+`scripts/prelum-r7-vm.sh` (RUNBOOK §13.8b). With all four app binaries rebuilt
+from main at `e98c7a25`, it completed exactly four desktop jobs in a single
+isolated FreeBSD boot and passed all PDF content checks. The gate creates its
+own disk overlay, TLS printer and synthetic inputs. It now cross-builds all 15
+staged executables, including the jailed IPP and render workers, from a clean
+checkout and records the source revision and matching host and guest SHA-256
+manifests. The source-building gate on main snapshot `dc14cd99` plus harness
+revision `8e0a84f8` completed all four jobs and PDF checks in one isolated
+arm64 FreeBSD boot. The next isolated four-app run also checked the dimensions
+of each in-area Sheets picture and confirmed that a third picture and cells
+beyond the right and bottom edges were excluded. The new check rejected the
+earlier PDF containing two same-sized pictures. The combined gate now prints
+the three-slide handout twice. One isolated arm64 boot completed five desktop
+jobs through jailed IPP over IPPS. The received Slides PDFs grouped visible
+slides 3 + 1 with Include Hidden Slides off and all slides 3 + 2 in deck order
+with it on. The combined gate now also verifies speaker notes with hidden
+slides enabled. A single isolated arm64 boot completed all six desktop jobs
+through jailed IPP over IPPS. The ten-page notes PDF preserved all 90 numbered
+lines, the final line and the hidden slide's note. Both handouts excluded
+notes. The combined gate now toggles Include Hidden Slides off again and
+reprints notes from the same deck. One isolated arm64 boot completed all seven
+desktop jobs over IPPS. The nine-page hidden-off notes excluded the hidden
+slide and its note while preserving all 90 numbered visible lines and the
+final line. In the next combined run all seven jobs passed again. The
+hidden-on three-slide handout switched from A4 to Letter in the print sheet
+and retained deck order across both Letter pages. The hidden-off handout
+remained A4. The combined gate also prints plain-text Quick Look. One isolated
+arm64 boot completed eight jobs through jailed IPP over IPPS. The five-page
+text PDF preserved all 122 original lines after the pathname was replaced. The
+combined gate now prints a two-color PNG through jailed Quick Look and
+verifies a centered 2:1 image in the simulator PDF. All nine jobs completed
+over IPPS in one isolated arm64 boot. The combined gate now builds and
+installs the jailed PDF viewer and prints a two-page PDF from Quick Look after
+replacing the pathname with a different PDF. Both original pages reached the
+simulator in order, and all ten jobs passed in one isolated arm64 boot. The
+next combined run also pressed Ctrl+P in the focused PDF viewer after the
+Print-button job. Both PDFs contained the same two original pages after
+pathname replacement, and all eleven jobs passed in one isolated arm64 boot.
+The combined gate now cancels the first Mail print preview, observes an
+unchanged job list, and prints from the reopened preview. One isolated arm64
+run completed all eleven jobs and verified that the Mail PDF still contained
+all 75 body lines and the attachment filename. The host gate now archives
+guest diagnostics before power-down. The next isolated run passed all eleven
+jobs and preserved all eleven previews, the worker and service logs, and both
+Mail cancellation snapshots. On a subsequent successful eleven-job run the
+gate archived diagnostics, shut down QEMU, and removed only the run's overlay
+and EFI variables. Failed runs and `PRELUM_R7_KEEP_VM=1` retain them. The
+combined gate now checks the simulator transcript for one Create-Job, one
+Send-Document, and one completion per job and reconciles upload byte counts
+with the PDFs. The next isolated run passed all eleven jobs and the new
+transcript checks. The simulator now records a SHA-256 of each incoming PDF. A
+subsequent isolated arm64 run matched all eleven upload hashes to the saved
+PDFs and passed all content checks. A same-size, one-byte change failed the
+hash check. The combined gate now requires a newly observed jailed IPP worker
+during each desktop submission and archives the job-to-jail log. The next
+isolated run observed a distinct jail ID for each of the eleven completed jobs
+and passed the simulator and PDF checks. The next isolated run also verified
+real and effective worker UID and GID from the process table. All eleven
+workers ran with UID/GID 62000 in their individual jails, and the simulator
+and PDF checks passed. The gate now waits for worker teardown and checks the
+jail list including dying VNET jails and the jail root directory. In the next
+isolated run all eleven jobs passed, and neither the jail list nor the
+filesystem retained a Prelum worker after printing. The next isolated run also
+verified Prelum's displayed completed and total sheet counts for each of the
+eleven jobs and archived the counts. The simulator, PDF and jail teardown
+checks passed. The gate now archives the final desktop job list and compares
+each title with its simulator receipt. All eleven titles, upload hashes and
+PDF checks matched in one isolated arm64 run. The next isolated run verified
+the complete ordered IPPS lifecycle for all eleven jobs and matched every
+desktop sheet count to the page count of its received PDF. The check rejected
+a completion before upload and a mismatched desktop count. The next isolated
+run verified the declared IPP document format and negotiated TLS version on
+each upload. The simulator received all eleven jobs as application/pdf over
+TLS 1.3, and all lifecycle and PDF checks passed. The next isolated run added
+a diagnostic submission after the simulator changed only its advertised UUID.
+Job 12 was held with IdentityChanged and zero sheets, the simulator had
+exactly eleven creations and uploads, and the worker jails and roots were gone
+before shutdown. The next isolated arm64 run restored the original UUID and
+released the same job after verifying there was no upload while held. Job 12
+reached Done with two sheets and exactly one upload containing both original
+pages. All desktop checks and worker teardown checks passed. The next isolated
+run released the same job while the UUID still differed and observed a fresh
+IdentityChanged hold. The simulator had no additional upload until the
+original UUID returned. The final release completed job 12 once, and all
+checks and worker teardown passed. The combined gate now also rotates the
+simulator TLS key while keeping the original UUID. In one isolated arm64 run,
+job 13 held with IdentityChanged and the simulator still had twelve uploads. A
+loopback probe verified the restored original key, and the same job then
+printed both original pages in one upload. All desktop and recovery checks
+passed. The next isolated arm64 run released job 13 while the alternate TLS
+key remained active and observed a fresh IdentityChanged hold with no new
+simulator creation or upload. After key restoration, the same job reached Done
+in one upload with both original pages. The combined gate now stages a one-use
+PIN in a disposable Arca store before rotating the simulator TLS key. In one
+isolated arm64 boot, job 14 held with zero redemption requests and no
+simulator creation or upload. After the original key returned, Release
+redeemed the original handle exactly once, sent the PIN in Create-Job, and
+uploaded both original pages once. The eleven desktop jobs, both identity
+recovery checks, and worker teardown also passed. The next isolated arm64 run
+retried Release on PIN job 14 with the alternate key still active. It recorded
+a fresh IdentityChanged hold, no Arca redemption attempt, and no simulator
+creation or upload. After restoring the key, the same job redeemed once and
+uploaded both original pages once. The next isolated arm64 run changed only
+the printer UUID for PIN job 15. The initial hold and Release retry had no
+additional Arca redemption attempt or simulator creation or upload. Restoring
+the UUID and releasing the same job added one successful redemption and one
+two-page upload. All fifteen jobs and worker teardown checks passed. In the
+next isolated arm64 run the gate replayed job 15's redeemed handle as job 16
+with the original printer identity active. Arca denied the request, Prelum
+marked the replay Failed with an explicit PIN error, and the simulator still
+had exactly fifteen creations and uploads. Render progress previously leaked
+into the completed-sheet display. Prelum now clears it when rendering ends and
+keeps the planned total. The next isolated run reported the failed replay as
+0/2 while the simulator still had exactly fifteen uploads and no job 16 PDF.
+All nine host daemon tests passed. In the next isolated run, after job 16
+failed at 0/2 with the consumed handle, Arca staged a new handle in the same
+store. It redeemed exactly once for desktop job 17, and the simulator accepted
+its PIN before uploading both pages once as printer job 16. Worker teardown
+passed. The combined gate at `7cc7735c` passed in one isolated arm64 FreeBSD
+boot. Desktop job 18 redeemed a fresh Arca handle. The simulator created
+printer job 17 and reported ignored attributes. The jailed IPP worker canceled
+job 17 without a document request or PDF, and Prelum reported Failed at 0/2.
+The other sixteen PDFs and worker teardown checks passed. At `72635205`, the
+next combined gate omitted Send-Document from the printer's advertised
+operations while keeping PIN support. Desktop job 17 failed at 0/2 with no
+Arca redemption attempt, printer job or upload. Restoring the operation let
+the same handle redeem once and print both pages for desktop job 18. All
+sixteen uploads, ignored PIN cancellation and worker teardown passed in one
+isolated FreeBSD boot. At `67148f9d`, the gate also removed
+job-password-supported while keeping split submission. Desktop job 18 failed
+at 0/2 with no Arca redemption attempt, printer job or upload. Restoring the
+capability let the same handle redeem once for desktop job 19 and print both
+pages. The full combined gate passed in one isolated FreeBSD boot. At
+`211093e1`, the gate also omitted Create-Job while advertising PIN support and
+Send-Document. Desktop job 19 failed at 0/2 with no Arca redemption attempt,
+printer job or upload. Restoring Create-Job let the same handle redeem once
+and print both pages for desktop job 20. The combined gate verified all
+sixteen uploads, ignored PIN cancellation and worker teardown in one isolated
+FreeBSD boot. At `ed8ad95b9`, the combined gate covered ignored and
+conflicting attributes, an unsupported attributes group in a success reply, an
+unsupported attributes status and server busy, each with and without a job ID,
+plus success without a job ID. All eleven jobs failed at 0/2 after one Arca
+redemption each. The jailed worker canceled all five returned job IDs, and the
+six replies without an ID led to no cancel request. No case sent a document
+request or PDF. All sixteen expected uploads and worker teardown passed in one
+isolated FreeBSD boot. At `9cdf7ad6d`, the same gate added four Cancel-Job
+failures after PIN rejection: IPP refusal, HTTP refusal, a connection drop
+before the reply and a truncated reply. The jailed worker attempted each
+cancellation once for printer jobs 22–25. All four desktop jobs failed at 0/2
+without a document request or PDF upload. The combined gate verified the
+sixteen expected uploads and worker teardown in one isolated FreeBSD boot. At
+`7911644ca`, the gate paired each of the four cancellation failures with a new
+desktop job and a fresh Arca PIN handle. The four rejected jobs stayed Failed
+at 0/2 and sent no document request or PDF. Each recovery redeemed once,
+finished 2/2 and uploaded one PDF to its own printer job. All twenty expected
+uploads and worker teardown passed in one isolated FreeBSD boot. At
+`3790d20c`, the gate replayed each exact consumed Arca handle after the
+original PIN rejection and failed Cancel-Job. Arca denied one redemption
+attempt per replay without staging another handle. Desktop jobs 33, 36, 39 and
+42 failed at 0/2. The simulator's Create-Job, Print-Job, Send-Document and
+Cancel-Job transcript was unchanged through each replay. A fresh handle still
+printed once after each denial. All twenty expected uploads and worker
+teardown passed in one isolated FreeBSD boot. At `91873f310`, the combined
+gate added HTTP refusal, a dropped connection, a truncated response and
+invalid IPP at Create-Job after successful PIN redemption. The four original
+jobs failed at 0/2 without a document or Cancel-Job request. Arca denied
+replay of each exact handle before the worker created a printer job. Each
+fresh-handle follow-up printed both pages in one upload. All twenty-four
+expected uploads and worker teardown passed in one isolated FreeBSD boot. At
+`a985c7a6b`, the gate tested IPP refusal and server busy, HTTP refusal,
+disconnect, truncated reply and invalid IPP after the printer accepted a PIN
+and received Send-Document. Each failed job sent one complete PDF and ended at
+0/2 without resubmission or completion polling. Each follow-up redeemed a
+fresh handle once and printed both pages with one upload. The gate verified 30
+completed jobs, six failed uploads and worker teardown in one isolated FreeBSD
+boot. The gate now replays each exact consumed handle after the six
+Send-Document failures, checks Arca denial and unchanged printer operations,
+then runs the fresh-handle recovery. Host transcript controls passed. The
+first isolated run stopped before those six replays because a worker root
+vanished during the teardown scan. The scan now tolerates concurrent removal
+and still detects existing roots. On 2026-11-24 the full combined gate passed
+in one isolated cloud FreeBSD VM (TCG, `PRELUM_R7_BOOT_WAIT=600`,
+`PRELUM_R7_SHUTDOWN_WAIT=180`; base overlay with `_limen`, `/atrium/sockets`,
+main's jailed stack and a `/bin/sleep` ×4 wrapper for TCG). All 73 desktop
+jobs ran: eleven app jobs, the UUID/TLS/PIN identity holds, and all fourteen
+PIN failure cases. Each of the six Send-Document failures (and the eight
+earlier cases) had its exact handle denied on replay with no change to the
+printer's operation transcript and no PDF, then a fresh handle printed both
+pages with one upload. The simulator reported 30 completed jobs and 6 failed
+uploads, and all PDF and teardown checks passed. Getting there needed the
+prelum and mail lockfile updates (`a23063d9`, `e2c72bf2`), the Mail print
+fixture manifest in the guest script (`3f039d1b`) and the TCG waits
+(`b801ea26`). Sheets print also now draws italic, underline and per-cell font
+sizes (`768f83f4`).
 
 ## 12. Decisions, with recommendations
 
