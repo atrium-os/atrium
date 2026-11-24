@@ -73,7 +73,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | **Fixed `2af0740`** |
 | H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | **Fixed `6cbc9c0`** (connection cap not yet VM-tested) |
 | H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
-| H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed** in portcullis-peer, portcullisd, ostiarius (Wave 2); other daemons' `.ok()`/default sites fail closed and keep their code |
+| H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed `2bd8429`** in portcullis-peer, portcullisd, ostiarius; other daemons' `.ok()`/default sites fail closed and keep their code |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `931bfc7`** |
 | M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | Open |
 | M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | **Fixed `61feb4a`** |
