@@ -2351,6 +2351,41 @@ real hosts until it is put back; and a stand-in on cryptad's socket must
 read a whole line, because portcullisd writes the request in two writes.
 Evidence is in `~/atrium-vm/evidence/navigator-i6-0-20261125/`.
 
+**What I6.0 says for the build.**
+
+- **Why `/api/me` reached the server.** The window's loader asked
+  navigatord for every same-origin GET, including the page's `fetch()`.
+  navigatord fetched it through the courier, with the jar's cookie, and
+  only then refused it for not being a script. So a page could make
+  credentialed same-origin GETs that the log called refused. The loader
+  now asks the window only for a script or stylesheet load (the request's
+  destination). Any other load fails in the engine and is never sent
+  (`vpn-resources.patch`). The engine must be rebuilt for the next run.
+- **Why no `wasm`, `webgl` or `push-state` line.** The fixture's checks
+  ran in sequence, and the `geolocation` check waited on a callback the
+  engine never called, so every check after it was held. Each check now
+  reports `timeout` after 5 s. `push-state` needs its link pressed, and
+  links did nothing in this window. `frame` was expected to be missing.
+- **D12 holds.** On real pages, sibling hosts on the page's site were
+  almost never asked for, and third parties were rare (Google Fonts on
+  MapLibre). The blocker was the window's script-and-stylesheet rule,
+  so I6.1 needs every resource kind (images, fonts, JSON, `fetch`) from
+  the page's site, through its Nuntius.
+- **The jar (D9) is needed before public apps.** Khan Academy's edge
+  stops at a cookie challenge because the page has no `document.cookie`.
+  The I6.3 jar gives cookies to the courier, not to the engine. Pages that
+  read `document.cookie` need a view of the jar that leaves out HttpOnly
+  cookies, which is the browser's normal rule. That is I6.3's design
+  question.
+- **Storage (D10).** `localStorage` refused even a few bytes against a
+  5 MiB cap, so the engine has no storage backend in the jail. I6.3
+  provides one per origin.
+- **Cost.** Start was about 1.0 s to the first drawn frame, and the
+  engine held 88 to 185 MiB. Script-heavy maps and Notion drew nothing in
+  60 s with JIT off and most resources refused. They are re-measured in
+  I6.1 with every resource kind allowed, before deciding whether JIT off
+  is acceptable for them.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,

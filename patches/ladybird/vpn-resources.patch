@@ -8,7 +8,7 @@
  #endif
  
  namespace Web {
-@@ -525,8 +526,30 @@
+@@ -525,8 +526,37 @@
      // The broker supplies only the resources granted to this fixture.
      // All other schemes, request methods, and resources fail closed.
      if (url.scheme() == "https"sv && request.method() == "GET"sv && request.body().is_empty()) {
@@ -19,6 +19,13 @@
 +        // document's origin (vpn.md "Scripts in the sign-in window"). The
 +        // fixture's continue.js keeps its sealed copy.
 +        if (name != "https://sso.crypta.test:447/+CSCOE+/saml/sp/continue.js"sv && navigator_vpn_get(name.bytes().data(), name.bytes().size(), nullptr, 0, nullptr) >= 0) {
++            // Only a script or stylesheet element's load is asked of the
++            // window; a fetch(), XHR, image or font fails here, unsent.
++            auto destination = request.destination();
++            if (!destination.has_value() || (*destination != Fetch::Infrastructure::Request::Destination::Script && *destination != Fetch::Infrastructure::Request::Destination::Style)) {
++                on_complete->function()(false, {}, "Only scripts and stylesheets come from the VPN sign-in window"sv, {});
++                return nullptr;
++            }
 +            auto vpn_buffer = ByteBuffer::create_uninitialized(4 * 1024 * 1024);
 +            if (!vpn_buffer.is_error()) {
 +                auto vpn_body = vpn_buffer.release_value();

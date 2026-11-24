@@ -12,8 +12,11 @@ async function report(name, outcome, detail = "") {
             body: JSON.stringify({ name, outcome, detail }) });
     } catch (_) { /* the server log is a convenience; the page shows the line */ }
 }
+// A check that never settles (a permission prompt nobody answers) reports
+// "timeout" after 5 s instead of holding back every check after it.
+const within = p => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timeout")), 5000))]);
 const step = async (name, fn) => {
-    try { const detail = await fn(); await report(name, "pass", detail || ""); }
+    try { const detail = await within(Promise.resolve().then(fn)); await report(name, "pass", detail || ""); }
     catch (e) { await report(name, "fail", String(e && e.message || e)); }
 };
 

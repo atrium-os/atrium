@@ -1306,8 +1306,10 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   script from `/resources/…/js/` importing `rfc4648` through an import map,
   then a hidden-field form submitted from script). Shankar chose the
   general path, not a VPN-only lane.
-  - *Its own scripts and stylesheets.* For any https GET other than the
-    stand-in's sealed `continue.js`, the page's loader
+  - *Its own scripts and stylesheets.* For a script or stylesheet load
+    (the request's destination; any other load, `fetch()` included, fails
+    in the engine unsent) by https GET other than the stand-in's sealed
+    `continue.js`, the page's loader
     (`patches/ladybird/vpn-resources.patch`, after `fixture-fetch.patch`)
     asks the painter (`navigator_vpn_get`), which sends `limen::sign_in`
     `Resource { id, url }` to the window. navigator-ui forwards it, one at
