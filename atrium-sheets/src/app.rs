@@ -355,6 +355,8 @@ pub struct Sheets {
     pub hex_text: Mutable<TextEdit>,
     /// The Define Name bar is open, with its name field.
     pub naming: Mutable<bool>,
+    /// The bar renames this Name Manager row rather than naming the selection.
+    pub name_rename: Mutable<Option<usize>>,
     pub name_text: Mutable<TextEdit>,
     /// The exact-size bar: sheet, rows (else columns), first and last.
     pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
@@ -384,7 +386,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1506,10 +1508,14 @@ impl Sheets {
             TabCmd::NameDone => {
                 let typed = self.name_text.get_cloned().text().to_string();
                 let sel = self.grid.get_cloned().selection();
-                let res = crate::data::define_name(&mut self.doc.borrow_mut(), sel, &typed);
+                let res = match self.name_rename.get() {
+                    Some(i) => crate::data::rename_name(&mut self.doc.borrow_mut(), i, &typed),
+                    None => crate::data::define_name(&mut self.doc.borrow_mut(), sel, &typed),
+                };
                 match res {
                     Ok(m) => {
                         self.naming.set(false);
+                        self.name_rename.set(None);
                         self.rev.set(self.rev.get().wrapping_add(1));
                         self.set_status(m);
                     }
@@ -1519,6 +1525,7 @@ impl Sheets {
             }
             TabCmd::NameCancel => {
                 self.naming.set(false);
+                self.name_rename.set(None);
                 self.changed();
             }
             TabCmd::SizeDone => {
@@ -1756,11 +1763,15 @@ impl Sheets {
         if self.naming.get() {
             let st = crate::tabs::style(t.text_primary(), true);
             let sel = self.grid.get_cloned().selection();
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 150.0, 18.0), content: format!("Name {}", range_name(sel)), style: st });
+            let label = match self.name_rename.get() {
+                Some(i) => format!("Rename {} to", crate::data::name_rows(&self.doc.borrow().wb).get(i).map_or(String::new(), |r| crate::data::shown_name(&r.name).to_string())),
+                None => format!("Name {}", range_name(sel)),
+            };
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 150.0, 18.0), content: label, style: st });
             let fw = (w - 160.0 - 170.0).clamp(120.0, 320.0);
             let cmds = self.cmds.clone();
             TextField::new(self.name_text.clone()).key(0x5348_4e4d).autofocus(true).placeholder("Prices, Tax_rate…").at(152.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::NameDone))).render(ctx);
-            Button::primary("Name").at(160.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::NameDone)).render(ctx);
+            Button::primary(if self.name_rename.get().is_some() { "Rename" } else { "Name" }).at(160.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::NameDone)).render(ctx);
             Button::secondary("Cancel").at(232.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::NameCancel)).render(ctx);
             return;
         }
@@ -2576,12 +2587,13 @@ impl View for Sheets {
                     Some(sh) => format!("{} ({sh})", crate::data::shown_name(&r.name)),
                     None => crate::data::shown_name(&r.name).to_string(),
                 };
-                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0, FILTER_W - 170.0, 18.0), content: title, style: st(type_size::SM, Weight::Semibold, t.text_primary()) });
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0, FILTER_W - 250.0, 18.0), content: title, style: st(type_size::SM, Weight::Semibold, t.text_primary()) });
                 let mut refers: String = r.refers.chars().take(60).collect();
                 if r.refers.chars().count() > 60 {
                     refers.push('…');
                 }
                 ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 3.0 + FILTER_ROW_H, FILTER_W - 24.0, 18.0), content: format!("={refers}"), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                Button::secondary("Rename").at(x0 + FILTER_W - 236.0, y + 2.0).width(72.0).on_click(push(Cmd::Names(NamesCmd::Rename(i)))).render(ctx);
                 Button::secondary("Go").at(x0 + FILTER_W - 156.0, y + 2.0).width(64.0).on_click(push(Cmd::Names(NamesCmd::Go(i)))).render(ctx);
                 Button::secondary("Delete").at(x0 + FILTER_W - 84.0, y + 2.0).width(72.0).on_click(push(Cmd::Names(NamesCmd::Delete(i)))).render(ctx);
             }
@@ -3216,6 +3228,7 @@ impl Sheets {
                     self.coding.set(false);
                     self.color_bar.set(None);
                     self.name_text.set(TextEdit::new(""));
+                    self.name_rename.set(None);
                     self.naming.set(true);
                     self.changed();
                     false
@@ -3364,6 +3377,18 @@ impl Sheets {
                 Cmd::Data(crate::data::DataCmd::NameManager) => {
                     self.lists_open.set(false);
                     self.names_open.set(true);
+                    self.changed();
+                    false
+                }
+                Cmd::Names(crate::data::NamesCmd::Rename(i)) => {
+                    let name = crate::data::name_rows(&self.doc.borrow().wb).get(i).map(|r| r.name.clone());
+                    if let Some(name) = name {
+                        let mut ed = TextEdit::new(&name);
+                        ed.select_all();
+                        self.name_text.set(ed);
+                        self.name_rename.set(Some(i));
+                        self.naming.set(true);
+                    }
                     self.changed();
                     false
                 }
@@ -7100,5 +7125,65 @@ mod tests {
         assert_eq!(data(&s, DataCmd::ClearComments), "Comment cleared.");
         assert!(s.doc.borrow().wb.comment(0, 0, 0).is_none());
         assert_eq!(shown(&s, 0, 0), "a");
+    }
+
+    #[test]
+    fn border_pens_draw_their_line_and_colour() {
+        use crate::format::{BorderKind, FormatCmd};
+        use officina_grid::style::Line;
+        let s = sheets_of(b"a,b\n");
+        let st = |c: u32| s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, 0, c)).clone();
+        select(&s, (0, 0), (0, 1));
+        assert_eq!(fmt(&s, FormatCmd::PenLine(2)), "Borders now draw dashed lines.");
+        assert_eq!(fmt(&s, FormatCmd::PenColor(Some(0xC62828))), "Borders now draw in red.");
+        assert!(crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection()).iter().any(|(m, c)| *c == Some(FormatCmd::PenLine(2)) && m.label == "Border Line: Dashed"));
+        fmt(&s, FormatCmd::Borders(BorderKind::All));
+        assert_eq!((st(1).borders[3].line, st(1).borders[3].color), (Line::Dashed, Some(0xC62828)));
+        // Thick keeps its own line, in the pen's colour.
+        fmt(&s, FormatCmd::Borders(BorderKind::ThickBottom));
+        assert_eq!((st(0).borders[3].line, st(0).borders[3].color), (Line::Thick, Some(0xC62828)));
+    }
+
+    #[test]
+    fn renaming_a_name_rewrites_the_formulas_and_names_using_it() {
+        use crate::data::NamesCmd;
+        let s = sheets_of(b"1,2\n3,4\n");
+        {
+            let mut d = s.doc.borrow_mut();
+            let own = d.wb.sheet_name(0);
+            d.wb.define_name("Block", None, &format!("='{own}'!$A$1:$B$2")).unwrap();
+            d.wb.define_name("Twice", None, "=SUM(Block)*2").unwrap();
+        }
+        {
+            let mut d = s.doc.borrow_mut();
+            d.type_into(3, 0, "=SUM(Block)");
+            d.type_into(4, 0, "=Twice");
+            d.type_into(5, 0, "=LET(Block,5,Block+1)");
+        }
+        assert_eq!((shown(&s, 3, 0), shown(&s, 4, 0), shown(&s, 5, 0)), ("10".into(), "20".into(), "6".into()));
+        let i = crate::data::name_rows(&s.doc.borrow().wb).iter().position(|r| r.name == "Block").unwrap();
+        s.cmds.lock().unwrap().push(Cmd::Names(NamesCmd::Rename(i)));
+        s.take_cmds();
+        assert!(s.naming.get() && s.name_rename.get() == Some(i));
+        assert_eq!(s.name_text.get_cloned().text(), "Block");
+        s.name_text.set(TextEdit::new("Twice"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::NameDone));
+        s.take_cmds();
+        assert!(s.naming.get() && s.doc.borrow().status.contains("already a name"));
+        s.name_text.set(TextEdit::new("Grid"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::NameDone));
+        s.take_cmds();
+        assert_eq!(s.doc.borrow().status, "Block is now Grid; 1 formula with its own Block (LET or LAMBDA) is unchanged.");
+        assert!(!s.naming.get() && s.name_rename.get().is_none());
+        let f = |r: u32| s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, r, 0));
+        assert_eq!(f(3).as_deref(), Some("=SUM(Grid)"));
+        assert_eq!(f(5).as_deref(), Some("=LET(Block,5,Block+1)"));
+        assert_eq!((shown(&s, 3, 0), shown(&s, 4, 0), shown(&s, 5, 0)), ("10".into(), "20".into(), "6".into()));
+        assert!(s.doc.borrow().wb.names().get(0, "Block").is_none());
+        // One undo: the old name and formulas back.
+        s.cmds.lock().unwrap().push(Cmd::Undo);
+        s.take_cmds();
+        assert_eq!(f(3).as_deref(), Some("=SUM(Block)"));
+        assert_eq!(shown(&s, 4, 0), "20");
     }
 }

@@ -202,3 +202,94 @@ impl crate::book::Workbook {
         old
     }
 }
+
+/// Renaming defined name `old` of `scope` to `new`: the edits that put the
+/// renamed definition in place and rewrite the formulas and other names that
+/// use it (where that spelling means this name: not on a sheet whose own
+/// name of that spelling hides a workbook one), as one step. A formula that
+/// binds the spelling itself with LET or LAMBDA is left as it is; how many
+/// were left is returned with the edits.
+pub fn rename_ops(wb: &crate::book::Workbook, scope: Option<u16>, old: &str, new: &str) -> Result<(Vec<crate::ops::GridOp>, usize), String> {
+    use crate::ops::{Fill, GridOp, Region};
+    let new = new.trim();
+    if !valid_name(new) {
+        return Err(format!("{new:?} can't be a name: start with a letter or _, use letters, digits, _ and ., and don't spell a cell like A1."));
+    }
+    if wb.names().iter().any(|n| n.scope == scope && key(&n.name) == key(new)) && key(old) != key(new) {
+        return Err(format!("There is already a name {new} there."));
+    }
+    if !wb.names().iter().any(|n| n.scope == scope && *n.name == *old) {
+        return Err(format!("There's no name {old}."));
+    }
+    let means = |sheet: u16| match scope {
+        Some(s) => s == sheet,
+        None => wb.names().get(sheet, old).is_none_or(|d| d.scope.is_none()),
+    };
+    let binders = [crate::eval::funcs::lookup("LET"), crate::eval::funcs::lookup("LAMBDA")];
+    let binds = |e: &Expr| {
+        let mut hit = false;
+        e.walk(&mut |x| {
+            if let Expr::Call(crate::formula::ast::Func::Known(id), args) = x {
+                if binders.contains(&Some(*id)) && args.iter().any(|a| matches!(a, Expr::Name(n) if key(n) == key(old))) {
+                    hit = true;
+                }
+            }
+        });
+        hit
+    };
+    let uses = |e: &Expr| {
+        let mut hit = false;
+        e.walk(&mut |x| hit |= matches!(x, Expr::Name(n) if key(n) == key(old)));
+        hit
+    };
+    let to: Arc<str> = new.into();
+    let mut ops = Vec::new();
+    // Other names first: their definitions, and the renamed one itself.
+    let defs: Vec<NameDef> = wb.names().iter().map(|n| {
+        let mut n = n.clone();
+        if n.scope == scope && *n.name == *old {
+            n.name = to.clone();
+        }
+        let here = match n.scope { Some(x) => means(x), None => scope.is_none() };
+        if here {
+            if uses(&n.expr) && !binds(&n.expr) {
+                n.expr = Arc::new(swap_name(&n.expr, old, &to));
+            }
+        }
+        n
+    }).collect();
+    ops.push(GridOp::names(wb, &defs));
+    let mut kept = 0;
+    for (_, g) in wb.groups() {
+        if !means(g.sheet) || !uses(&g.expr) {
+            continue;
+        }
+        if binds(&g.expr) {
+            kept += 1;
+            continue;
+        }
+        let e = swap_name(&g.expr, old, &to);
+        let src = crate::formula::to_a1(&e, g.r0, g.col, &|id| wb.sheet_name(id));
+        ops.push(GridOp::Replace(Region { rect: crate::addr::Rect { sheet: g.sheet, r0: g.r0, c0: g.col, r1: g.r1, c1: g.col }, values: Vec::new(), fills: vec![Fill { col: g.col, r0: g.r0, r1: g.r1, src }] }));
+    }
+    Ok((ops, kept))
+}
+
+/// `e` with every use of name `old` spelled `new`.
+fn swap_name(e: &Expr, old: &str, new: &Arc<str>) -> Expr {
+    let b = |x: &Expr| Box::new(swap_name(x, old, new));
+    let all = |xs: &[Expr]| xs.iter().map(|a| swap_name(a, old, new)).collect::<Vec<_>>();
+    match e {
+        Expr::Name(n) if key(n) == key(old) => Expr::Name(new.clone()),
+        Expr::Neg(x) => Expr::Neg(b(x)),
+        Expr::Plus(x) => Expr::Plus(b(x)),
+        Expr::Pct(x) => Expr::Pct(b(x)),
+        Expr::Paren(x) => Expr::Paren(b(x)),
+        Expr::At(x) => Expr::At(b(x)),
+        Expr::Bin(op, x, y) => Expr::Bin(*op, b(x), b(y)),
+        Expr::Call(f, args) => Expr::Call(f.clone(), all(args)),
+        Expr::Invoke(g, args) => Expr::Invoke(b(g), all(args)),
+        Expr::Array(rows) => Expr::Array(rows.iter().map(|r| all(r)).collect()),
+        other => other.clone(),
+    }
+}

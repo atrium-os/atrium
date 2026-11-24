@@ -4786,7 +4786,7 @@ Gates: atrium-sheets `duplicate_sheet_copies_cells_formats_sizes_and_merges_afte
 
 ### 16.100 Name Manager, and a fuller Duplicate Sheet (2026-11-24)
 
-- **Name Manager…** (Data menu) opens a panel at the right of the grid. It lists every defined name: workbook names first, then sheet names with their sheet, each with what it refers to. Excel's own names show without `_xlnm.`, for example Print_Area. **Go** selects what a name covers, on its sheet; a name for a constant or a formula says it isn't a place. **Delete** removes a name as one undo step, and formulas that used it show `#NAME?` (`data::name_rows`, `name_place`, `delete_name`). Not yet: renaming a name or editing what it refers to in the panel. Define Name with the same spelling moves a name.
+- **Name Manager…** (Data menu) opens a panel at the right of the grid. It lists every defined name: workbook names first, then sheet names with their sheet, each with what it refers to. Excel's own names show without `_xlnm.`, for example Print_Area. **Go** selects what a name covers, on its sheet; a name for a constant or a formula says it isn't a place. **Delete** removes a name as one undo step, and formulas that used it show `#NAME?` (`data::name_rows`, `name_place`, `delete_name`). Not yet: editing what a name refers to in the panel. (Rename came in §16.104.) Define Name with the same spelling moves a name.
 - **Duplicate Sheet** now also copies the sheet's conditional formats, data validations and sheet-scoped names (such as its print area) onto the copy. The sheet move comes last so that these follow the copy to its place.
 
 Gates: atrium-sheets `the_name_manager_lists_goes_to_and_deletes_names` and the extended `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`; all 127 Sheets lib tests pass.
@@ -4814,7 +4814,14 @@ Gates: atrium-sheets `deleted_cells_turn_formulas_reading_them_into_ref_errors`.
 - **Typed colours:** the text and fill colour bar has a `#RRGGBB` field (`#RGB` and a bare `RRGGBB` also work, via `format::parse_hex`). Set applies the colour as one step and closes the bar. A colour the field can't read keeps the bar open and says how to write one.
 - **Clear Comments** (Data menu) takes the selection's comments off as one step, leaving contents and formats.
 
-Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Not yet: border colours and dashed or dotted styles, a rotation angle typed by hand.
+Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Not yet: a rotation angle typed by hand. (Border lines and colours came in §16.104.)
+
+### 16.104 Border pens, and renaming names (2026-11-24)
+
+- **Border pen** (Format menu): Border Line: Thin, Medium, Dashed, Dotted or Hair, and Border Colour: Automatic or one of the eight tab colours. Both are radio items and stay set for the session (`Doc::border_pen`). All, Outside, Bottom, and Top and Bottom draw with the pen. Thick and Double keep their own line and take the pen's colour.
+- **Rename** in the Name Manager opens the name bar filled with the name. `officina_grid::names::rename_ops` renames the definition and rewrites every formula and other name that uses it, as one step. A workbook name isn't rewritten on a sheet whose own name of that spelling hides it, and a sheet name is rewritten only on its sheet. A formula that binds the spelling itself with LET or LAMBDA is left unchanged and counted in the status. Clashing and invalid names are refused, and the bar stays open. Not yet: names used in conditional formats, validations and charts aren't rewritten.
+
+Gates: atrium-sheets `border_pens_draw_their_line_and_colour` and `renaming_a_name_rewrites_the_formulas_and_names_using_it`; all 132 Sheets lib and 121 officina-grid lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -35,6 +35,10 @@ pub enum FormatCmd {
     Indent(bool),
     /// Text turned by degrees (-90..=90, counter-clockwise), or stacked (255).
     Rotate(i16),
+    /// The line the plain border commands draw (one of [`PEN_LINES`]).
+    PenLine(usize),
+    /// Their colour: one of the tab colours, or automatic.
+    PenColor(Option<u32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +123,14 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
     v.push((MenuItem::new("Thick Bottom Border"), Some(FormatCmd::Borders(BorderKind::ThickBottom))));
     v.push((MenuItem::new("Double Bottom Border"), Some(FormatCmd::Borders(BorderKind::DoubleBottom))));
     v.push((MenuItem::new("No Borders"), Some(FormatCmd::Borders(BorderKind::None))));
+    for (i, (name, line)) in PEN_LINES.iter().enumerate() {
+        let item = MenuItem::new(format!("Border Line: {name}")).radio(d.border_pen.0 == *line);
+        v.push((if i == 0 { item.separated() } else { item }, Some(FormatCmd::PenLine(i))));
+    }
+    v.push((MenuItem::new("Border Colour: Automatic").radio(d.border_pen.1.is_none()), Some(FormatCmd::PenColor(None))));
+    for (rgb, name) in crate::tabs::COLORS {
+        v.push((MenuItem::new(format!("Border Colour: {name}")).radio(d.border_pen.1 == Some(rgb)), Some(FormatCmd::PenColor(Some(rgb)))));
+    }
     for (i, (name, deg)) in ROTATIONS.iter().enumerate() {
         let mut item = MenuItem::new(*name).radio(st.rotation == *deg);
         if i == 0 {
@@ -176,6 +188,18 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
     }
     match cmd {
         FormatCmd::Custom => Ok(String::new()),
+        FormatCmd::PenLine(i) => {
+            let (name, line) = *PEN_LINES.get(i).ok_or("Unknown line.")?;
+            d.border_pen.0 = line;
+            Ok(format!("Borders now draw {} lines.", name.to_lowercase()))
+        }
+        FormatCmd::PenColor(c) => {
+            d.border_pen.1 = c;
+            Ok(match c.and_then(|c| crate::tabs::COLORS.iter().find(|x| x.0 == c)) {
+                Some((_, name)) => format!("Borders now draw in {}.", name.to_lowercase()),
+                None => "Borders now draw in the automatic colour.".into(),
+            })
+        }
         FormatCmd::Rotate(deg) => {
             let (name, _) = ROTATIONS.iter().find(|r| r.1 == deg).ok_or("Unknown rotation.")?;
             one(d, "Text Rotation", &|st| Style { rotation: deg, ..st.clone() });
@@ -248,12 +272,13 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
             const R: usize = 1;
             const T: usize = 2;
             const B: usize = 3;
+            let (pen, color) = d.border_pen;
             let line = match kind {
                 BorderKind::ThickOutside | BorderKind::ThickBottom => Line::Thick,
                 BorderKind::DoubleBottom => Line::Double,
-                _ => Line::Thin,
+                _ => pen,
             };
-            let thin = Edge { line, color: None };
+            let thin = Edge { line, color };
             let set = |edges: &'static [usize]| move |st: &Style| {
                 let mut st = st.clone();
                 for &e in edges {
@@ -389,6 +414,15 @@ pub const ROTATIONS: [(&str, i16); 6] = [
     ("Vertical Text", 255),
     ("Rotate Text Up", 90),
     ("Rotate Text Down", -90),
+];
+
+/// The lines the plain border commands can draw with.
+pub const PEN_LINES: [(&str, Line); 5] = [
+    ("Thin", Line::Thin),
+    ("Medium", Line::Medium),
+    ("Dashed", Line::Dashed),
+    ("Dotted", Line::Dotted),
+    ("Hair", Line::Hair),
 ];
 
 /// The most indent steps a cell takes (Excel's indent buttons stop at 15).

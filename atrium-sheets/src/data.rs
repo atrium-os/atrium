@@ -699,11 +699,31 @@ pub fn delete_name(d: &mut Doc, i: usize) -> Result<String, String> {
     Ok(format!("{} deleted.", shown_name(&row.name)))
 }
 
+/// Renames row `i` of the Name Manager to `new`, as one step: formulas and
+/// other names using it follow ([`officina_grid::names::rename_ops`]).
+pub fn rename_name(d: &mut Doc, i: usize, new: &str) -> Result<String, String> {
+    let row = name_rows(&d.wb).into_iter().nth(i).ok_or("That name is gone.")?;
+    let (ops, kept) = officina_grid::names::rename_ops(&d.wb, row.scope, &row.name, new)?;
+    d.status.clear();
+    d.run("Rename Name", ops);
+    if d.status == crate::sheet_protection::REFUSED {
+        return Err(d.status.clone());
+    }
+    let new = new.trim();
+    Ok(match kept {
+        0 => format!("{} is now {new}.", shown_name(&row.name)),
+        1 => format!("{} is now {new}; 1 formula with its own {} (LET or LAMBDA) is unchanged.", shown_name(&row.name), row.name),
+        k => format!("{} is now {new}; {k} formulas with their own {} (LET or LAMBDA) are unchanged.", shown_name(&row.name), row.name),
+    })
+}
+
 /// The Name Manager panel's commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamesCmd {
     /// Go to what row `.0` refers to.
     Go(usize),
+    /// Open the bar that renames row `.0`.
+    Rename(usize),
     Delete(usize),
     Close,
 }
