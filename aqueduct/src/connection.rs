@@ -42,6 +42,21 @@ pub const MAX_FDS_PER_MESSAGE: usize = 16;
 /// past this, more are closed on arrival (a peer can't exhaust our fds).
 pub const MAX_QUEUED_FDS: usize = 64;
 
+/// Incoming uploads one connection may have open at once. A sender
+/// publishes synchronously (one upload, then its ACK), so a well-behaved
+/// peer has at most one; the rest of the room is for pipelining later.
+pub const MAX_PENDING_UPLOADS: usize = 4;
+
+/// Bytes the open incoming uploads of one connection may declare in total.
+/// Bounds what a hostile peer can make the receiver buffer: every
+/// `UPLOAD_BEGIN` past it, and every `UPLOAD_DATA` past its own declared
+/// `total_size`, is a protocol violation that ends the connection.
+pub const MAX_PENDING_UPLOAD_BYTES: u64 = 2 * MAX_PAYLOAD as u64;
+
+/// What an `UPLOAD_BEGIN` reserves up front; the rest grows as data arrives,
+/// so a declared size the peer never sends costs nothing.
+const UPLOAD_RESERVE: usize = 256 * 1024;
+
 /// What the caller asked recv_message for. Matches the envelope's
 /// flag bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,9 +394,26 @@ impl Connection {
                         "upload total_size exceeds MAX_PAYLOAD",
                     ));
                 }
+                if ub.inline.len() as u64 > ub.total_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UPLOAD_BEGIN inline bytes exceed its total_size",
+                    ));
+                }
+                /* A BEGIN for a hash already open replaces that upload. */
+                let open: Vec<u64> = self.incoming_uploads.iter()
+                    .filter(|(h, _)| **h != ub.hash).map(|(_, e)| e.total_size).collect();
+                if open.len() >= MAX_PENDING_UPLOADS
+                    || open.iter().sum::<u64>() + ub.total_size > MAX_PENDING_UPLOAD_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("UPLOAD_BEGIN past the open-upload limit ({} uploads, {} bytes declared)",
+                            open.len(), open.iter().sum::<u64>()),
+                    ));
+                }
                 let mut entry = IncomingUpload {
                     total_size: ub.total_size,
-                    bytes: Vec::with_capacity(ub.total_size as usize),
+                    bytes: Vec::with_capacity((ub.total_size as usize).min(UPLOAD_RESERVE)),
                 };
                 entry.bytes.extend_from_slice(ub.inline);
                 if entry.bytes.len() as u64 == ub.total_size {
@@ -405,6 +437,12 @@ impl Connection {
                         io::ErrorKind::InvalidData,
                         format!("UPLOAD_DATA offset {} expected {}",
                             ud.offset, entry.bytes.len()),
+                    ));
+                }
+                if entry.bytes.len() as u64 + ud.data.len() as u64 > entry.total_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("UPLOAD_DATA past the declared total_size {}", entry.total_size),
                     ));
                 }
                 entry.bytes.extend_from_slice(ud.data);
@@ -721,6 +759,87 @@ mod tests {
         raw.write_all(&m[6..]).unwrap();
         let got = cb.recv_message_or_timeout(Duration::from_secs(2)).unwrap().unwrap();
         assert_eq!((got.op, got.payload.as_slice()), (9, &b"split"[..]));
+    }
+
+
+    fn send_core(raw: &mut UnixStream, op: u16, payload: &[u8]) {
+        use std::io::Write;
+        raw.write_all(&envelope_bytes(crate::classes::CLASS_CORE, op, payload)).unwrap();
+    }
+
+    /// Drain everything buffered; the first error ends the drain.
+    fn drain(cb: &mut Connection) -> io::Result<()> {
+        loop {
+            if !cb.fill_available()? { return Ok(()) }
+            if cb.try_recv_message()?.is_none() { return Ok(()) }
+        }
+    }
+
+    /// Review 2026-11-24 (H1): an upload that declared 16 bytes took
+    /// 4 MB of UPLOAD_DATA. The first byte past total_size now ends it.
+    #[test]
+    fn upload_data_past_total_size_is_refused() {
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        cb.set_nonblocking(true).unwrap();
+        let h = [7u8; 32];
+        send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN,
+            &crate::cas::UploadBegin { hash: h, total_size: 16, inline: &[0; 10] }.encode());
+        drain(&mut cb).unwrap();
+        /* Exactly up to the declared size is fine... */
+        send_core(&mut raw, crate::cas::op::UPLOAD_DATA,
+            &crate::cas::UploadData { hash: h, offset: 10, data: &[0; 6] }.encode());
+        drain(&mut cb).unwrap();
+        assert_eq!(cb.incoming_uploads[&h].bytes.len(), 16);
+        /* ...one byte more is a protocol violation, and nothing is kept. */
+        send_core(&mut raw, crate::cas::op::UPLOAD_DATA,
+            &crate::cas::UploadData { hash: h, offset: 16, data: &[0; 1] }.encode());
+        let e = drain(&mut cb).unwrap_err();
+        assert!(e.to_string().contains("past the declared total_size"), "{e}");
+        assert_eq!(cb.incoming_uploads[&h].bytes.len(), 16);
+    }
+
+    /// Review 2026-11-24 (H1): 1,000 UPLOAD_BEGINs of 16 MiB each reserved
+    /// 16 GiB. Open uploads are now capped in number and declared bytes, and
+    /// a BEGIN reserves at most UPLOAD_RESERVE.
+    #[test]
+    fn open_uploads_are_bounded() {
+        let begin = |i: u8, size: u64| {
+            let mut h = [0u8; 32]; h[0] = i; h[31] = 1;
+            crate::cas::UploadBegin { hash: h, total_size: size, inline: &[] }.encode()
+        };
+        /* By count. */
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        cb.set_nonblocking(true).unwrap();
+        for i in 0..MAX_PENDING_UPLOADS as u8 {
+            send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN, &begin(i, 1 << 20));
+            drain(&mut cb).unwrap();
+        }
+        let reserved: usize = cb.incoming_uploads.values().map(|e| e.bytes.capacity()).sum();
+        assert!(reserved <= MAX_PENDING_UPLOADS * UPLOAD_RESERVE, "reserved {reserved}");
+        send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN, &begin(200, 1));
+        assert!(drain(&mut cb).unwrap_err().to_string().contains("open-upload limit"));
+        assert_eq!(cb.incoming_uploads.len(), MAX_PENDING_UPLOADS);
+
+        /* By declared bytes: two MAX_PAYLOAD uploads fill the budget. */
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        cb.set_nonblocking(true).unwrap();
+        for i in 0..2 {
+            send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN, &begin(i, MAX_PAYLOAD as u64));
+            drain(&mut cb).unwrap();
+        }
+        send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN, &begin(9, 1));
+        assert!(drain(&mut cb).unwrap_err().to_string().contains("open-upload limit"));
+
+        /* Inline bytes beyond the declared size are refused too. */
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        cb.set_nonblocking(true).unwrap();
+        send_core(&mut raw, crate::cas::op::UPLOAD_BEGIN,
+            &crate::cas::UploadBegin { hash: [3; 32], total_size: 2, inline: &[0; 3] }.encode());
+        assert!(drain(&mut cb).unwrap_err().to_string().contains("inline bytes exceed"));
     }
 
     fn envelope_bytes(class: u8, op: u16, payload: &[u8]) -> Vec<u8> {
