@@ -23,7 +23,102 @@ impl Store {
             return Err("Calendar changed. Review this invitation again.".into());
         }
         p.validate(source)?;
-        let rows = &self.state.entries;
+        let view = self.viewing_zone();
+        let children = p
+            .exceptions
+            .iter()
+            .map(|m| Proposal {
+                uid: p.uid.clone(),
+                sequence: p.sequence,
+                organizer: p.organizer.clone(),
+                attendees: p.attendees.clone(),
+                location: m.location.clone(),
+                original: Some(m.original),
+                row: Some(m.row.clone()),
+                weekly_cancellation: false,
+                limit: None,
+                exceptions: vec![],
+            })
+            .collect::<Vec<_>>();
+        let mut pending = None;
+        let mut review = Self::prepare(
+            &self.state.entries,
+            &self.state.cancelled,
+            view,
+            revision,
+            source,
+            p,
+            None,
+            &mut pending,
+        )?;
+        if let Some(plan) = &mut pending {
+            for child in children {
+                let previous = review.previous.as_ref().and_then(|master| {
+                    let date = child.original?.date;
+                    self.state
+                        .entries
+                        .iter()
+                        .find(|e| {
+                            e.kind
+                                == Kind::Occurrence {
+                                    series: master.id,
+                                    original: date,
+                                }
+                        })
+                        .cloned()
+                        .or_else(|| {
+                            master.appears(date).then(|| {
+                                let mut row = master.clone();
+                                row.date = date;
+                                row
+                            })
+                        })
+                });
+                let (rows, marks) = plan
+                    .changes
+                    .as_ref()
+                    .map(|(r, m)| (r.as_slice(), m.as_slice()))
+                    .unwrap_or((&self.state.entries, &self.state.cancelled));
+                let mut child_plan = None;
+                let result = Self::prepare(
+                    rows,
+                    marks,
+                    view,
+                    revision,
+                    source,
+                    child,
+                    previous.as_ref(),
+                    &mut child_plan,
+                )?;
+                review.before_moves.push(previous);
+                if result.token.is_none() {
+                    return Ok(review.blocked(&format!("Included move: {}", result.notice)));
+                }
+                if let Some(changes) = child_plan.and_then(|c| c.changes) {
+                    if !review.can_save {
+                        return Ok(
+                            review.blocked("A move conflicts with the saved series revision.")
+                        );
+                    }
+                    plan.changes = Some(changes);
+                }
+            }
+        }
+        self.invite = pending;
+        Ok(review)
+    }
+
+    // Build an in-memory proposal. A bundle publishes only its final snapshot.
+    fn prepare(
+        rows: &[Entry],
+        history: &[Cancellation],
+        view: Tz,
+        revision: u64,
+        source: &Source,
+        p: Proposal,
+        prior_occurrence: Option<&Entry>,
+        pending: &mut Option<Pending>,
+    ) -> Result<Review, String> {
         let cancelled = p.row.is_none();
         let organizer = p.organizer.to_ascii_lowercase();
         let mut mine = source.identities.iter().filter(|id| {
@@ -56,6 +151,7 @@ impl Store {
         });
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
+            before_moves: vec![],
             previous: master.cloned(),
             weekly: master.is_some_and(|e| e.kind == Kind::Weekly)
                 || p.row.as_ref().is_some_and(|e| e.kind == Kind::Weekly),
@@ -87,13 +183,13 @@ impl Store {
             });
             let original_matches = match explicit.and_then(|e| e.invitation.as_ref()) {
                 Some(saved) => saved.original == Some(original),
-                None => {
-                    base.span.start == original.minute
-                        && base.zone.map(|z| z.name) == original.zone
-                        && base
+                None => std::iter::once(base).chain(prior_occurrence).any(|row| {
+                    row.span.start == original.minute
+                        && row.zone.map(|z| z.name) == original.zone
+                        && row
                             .zone
-                            .is_none_or(|z| z.interval(original.date, base.span, true).is_ok())
-                }
+                            .is_none_or(|z| z.interval(original.date, row.span, true).is_ok())
+                }),
             };
             if !original_matches {
                 return Ok(
@@ -106,7 +202,7 @@ impl Store {
                 review.blocked("The Mail sender or reply address differs from the organizer.")
             );
         }
-        let history = &self.state.cancelled;
+
         let relevant = |c: &&Cancellation| {
             c.key == key
                 && (c.original.is_none()
@@ -193,6 +289,18 @@ impl Store {
                 }
             }
         }
+        let last = p
+            .limit
+            .zip(p.row.as_ref())
+            .map(|(rule, row)| rule.last(row))
+            .transpose()?;
+        if let Some(base) = master.filter(|_| p.original.is_none()) {
+            if last.is_some_and(|end| base.excluded.iter().any(|d| *d > end)) {
+                return Ok(review
+                    .blocked("The new end would drop a saved exception. Review that date first."));
+            }
+        }
+        let included: Vec<_> = p.exceptions.iter().map(|m| m.original).collect();
         let mut replay = false;
         if let Some(saved) = explicit {
             let Some(o) = saved
@@ -210,10 +318,12 @@ impl Store {
                 return Ok(review.blocked("An older revision of this meeting."));
             }
             if o.sequence == p.sequence {
-                replay = p
-                    .row
-                    .as_ref()
-                    .is_some_and(|r| r.fields_on(r.date) == o.accepted && o.location == p.location);
+                replay = p.row.as_ref().is_some_and(|r| {
+                    r.fields_on(r.date) == o.accepted
+                        && o.location == p.location
+                        && o.limit == p.limit
+                        && o.included == included
+                });
                 if !replay {
                     return Ok(review.blocked("Conflicting changes use the same revision."));
                 }
@@ -230,9 +340,9 @@ impl Store {
             .as_ref()
             .or(review.previous.as_ref())
             .ok_or("Missing schedule")?;
-        let date = date.fields_on(date.date).agenda_date(self.viewing_zone())?;
-        let mut next = rows.clone();
-        let mut marks = history.clone();
+        let date = date.fields_on(date.date).agenda_date(view)?;
+        let mut next = rows.to_vec();
+        let mut marks = history.to_vec();
         if let (Some(original), Some(base)) = (original_date, master) {
             let exclusions = &mut next.iter_mut().find(|e| e.id == base.id).unwrap().excluded;
             if let Err(at) = exclusions.binary_search(&original) {
@@ -251,6 +361,9 @@ impl Store {
             }
             row.invitation = Some(Origin {
                 key,
+                limit: p.limit,
+                last,
+                included,
                 sequence: p.sequence,
                 accepted: row.fields_on(row.date),
                 location: p.location,
@@ -284,7 +397,7 @@ impl Store {
             review.notice = "Mail has not verified the sender.".into();
         }
         let token = Uuid::new_v4();
-        self.invite = Some(Pending {
+        *pending = Some(Pending {
             token,
             revision,
             created: Instant::now(),

@@ -55,6 +55,7 @@ enum Action {
     PickImport,
     CloseImport,
     ApplyInvitation { cancellation: bool },
+    InvitationPage(usize),
     ReplyInvitation(portcullis_ipc::calendar::Answer),
     SaveImport,
     ImportPage(usize),
@@ -737,6 +738,12 @@ pub fn run() -> io::Result<()> {
                 continue;
             }
             match action {
+                Action::InvitationPage(page) => {
+                    if let Some(Screen::Invitation(mut sheet)) = planner.import.get_cloned() {
+                        sheet.set_page(page);
+                        planner.import.set(Some(Screen::Invitation(sheet)));
+                    }
+                }
                 Action::ReplyInvitation(answer) => {
                     if let Some(Screen::Invitation(sheet)) = planner.import.get_cloned() {
                         planner.import.set(Some(match sheet.reply(&socket, answer) {

@@ -140,7 +140,7 @@ case "${2-}" in
         ./invitation_probe "$mode" "$mail_folder" "$D/mail-parse-jail"
         if [ "$2" = series-submit ]; then start_mail; fi
         exit 0 ;;
-    keyboard-setup|import-setup|invitation-setup|series-setup|'') ;;
+    keyboard-setup|import-setup|invitation-setup|series-setup|bounded-setup|'') ;;
     *) exit 2 ;;
 esac
 
@@ -163,11 +163,12 @@ mkdir -p "/var/db/atrium/$person"
 printf '[personas.work]\ncolour = "blue"\n' >"/var/db/atrium/$person/policy.toml"
 daemon -f -o "$D/portcullis.log" env RUST_LOG=info /usr/local/bin/portcullisd --socket "$psock"
 activation="$D/act.sock"
-if [ "${2-}" = import-setup ] || [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then
+case "${2-}" in invitation-setup|series-setup|bounded-setup) mail_setup=yes ;; *) mail_setup=no ;; esac
+if [ "${2-}" = import-setup ] || [ "$mail_setup" = yes ]; then
     activation=/atrium/sockets/fresco-activation/fresco-activation.sock
     if sockstat -ul | grep -Fq "$activation"; then echo "activation socket in use" >&2; exit 1; fi
 fi
-if [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then export FRESCOD_INJECT_ACTIVATION=1; fi
+if [ "$mail_setup" = yes ]; then export FRESCOD_INJECT_ACTIVATION=1; fi
 daemon -f -o "$D/fresco.log" env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG="$D/screen" FRESCOD_SOCK="$fsock" FRESCOD_WM_SOCK="$D/wm.sock" FRESCOD_INPUT_SOCK="$D/inject.sock" FRESCOD_ACTIVATION_SOCK="$activation" FRESCOD_DEV_CAPS=all "$D/frescod"
 for socket in "$psock" "$fsock" "$D/inject.sock"; do
     for i in $(jot 20); do test -S "$socket" && break; sleep 1; done
@@ -176,7 +177,7 @@ done
 chmod 666 "$psock" "$fsock"
 su -m "$person" -c "portcullis policy grant $app"
 su -m "$person" -c "$D/forum-dock list" | grep -F "$app"
-if [ "${2-}" = invitation-setup ] || [ "${2-}" = series-setup ]; then
+if [ "$mail_setup" = yes ]; then
     if [ -d /var/lib/atrium/apps/org.atrium.mail ]; then
         test -z "$(jls -n name | grep org_atrium_mail || :)"
         mv /var/lib/atrium/apps/org.atrium.mail "$D/stock-mail"
@@ -207,7 +208,7 @@ MANIFEST
     opifex install mail-app
     su -m "$person" -c 'portcullis policy grant org.atrium.mail'
     ./invitation_probe exercise "$D/standalone-store" "$D/mail-parse-jail"
-    mode=seed; if [ "$2" = series-setup ]; then mode=seed-series; fi
+    case "$2" in series-setup) mode=seed-series ;; bounded-setup) mode=seed-bounded ;; *) mode=seed ;; esac
     ./invitation_probe "$mode" "$D/seeded" "$D/mail-parse-jail"
     start_mail
     for i in $(jot 20); do test -f "$mail_folder/index.redb" && break; sleep 1; done

@@ -16,7 +16,12 @@ const CANCEL_ONE: &str = include_str!("../../../atrium-calendar/tests/fixtures/c
 const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-series.ics");
 const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
 
-fn seed(e: &Engine, series: bool) {
+const BOUNDED: &str = include_str!("../../../atrium-calendar/tests/fixtures/bounded-moves.ics");
+const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly-until.ics");
+
+fn seed(e: &Engine, mode: &str) {
+    let series = mode == "seed-series";
+    let bounded = mode == "seed-bounded";
     assert!(e.store.accounts().unwrap().is_empty());
     let account = e.store.add_account("dev@fixture.invalid").unwrap();
     let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
@@ -25,7 +30,12 @@ fn seed(e: &Engine, series: bool) {
         .replace("T140000Z", "T150000Z")
         .replace("T144500Z", "T154500Z")
         .replace("Studio A", "Studio B");
-    let messages: &[(&str, &str)] = if series {
+    let messages: &[(&str, &str)] = if bounded {
+        &[
+            ("Four studio meetings", BOUNDED),
+            ("Extend to December 29", UNTIL),
+        ]
+    } else if series {
         &[
             ("Weekly studio", WEEKLY),
             ("Move Wednesday", MOVED),
@@ -86,11 +96,15 @@ fn seed(e: &Engine, series: bool) {
                 )
             })
             .unwrap();
-        if series {
+        if series || bounded {
             use portcullis_ipc::calendar::{Answer, Reply};
-            let scope = match id {
-                1 | 3 => Some("weekly".into()),
-                2 | 4 => Some(ORIGINAL.into()),
+            let scope = match (bounded, id) {
+                (true, 1) => Some(format!(
+                    "weekly;COUNT=4|{ORIGINAL}|RECURRENCE-ID:20261215T140000Z"
+                )),
+                (true, 2) => Some("weekly;UNTIL=20261229T140000Z".into()),
+                (false, 1 | 3) => Some("weekly".into()),
+                (false, 2 | 4) => Some(ORIGINAL.into()),
                 _ => None,
             };
             let reply = Reply {
@@ -109,12 +123,21 @@ fn seed(e: &Engine, series: bool) {
                     ..reply.clone()
                 };
                 assert!(e.send_invitation_reply(msg, blob, &widened).is_err());
+                if bounded {
+                    for scope in ["weekly;COUNT=3", "weekly;COUNT=4", ORIGINAL] {
+                        let substituted = Reply {
+                            scope: Some(scope.into()),
+                            ..reply.clone()
+                        };
+                        assert!(e.send_invitation_reply(msg, blob, &substituted).is_err());
+                    }
+                }
                 let operation = e.send_invitation_reply(msg, blob, &reply).unwrap();
                 let draft = e.undo_send(operation).unwrap().unwrap();
                 let ics = std::str::from_utf8(&draft.attachments[0].bytes).unwrap();
                 assert_eq!(
                     ics.lines().find(|line| line.starts_with("RECURRENCE-ID")),
-                    (id == 2).then_some(ORIGINAL)
+                    (!bounded && id == 2).then_some(ORIGINAL)
                 );
                 assert!(ics.contains("PARTSTAT=TENTATIVE"));
             }
@@ -258,13 +281,12 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        "seed" => seed(&e, false),
-        "seed-series" => seed(&e, true),
+        mode @ ("seed" | "seed-series" | "seed-bounded") => seed(&e, mode),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),
         "exercise" => {
-            seed(&e, false);
+            seed(&e, "seed");
             let (account, _) = e.store.accounts().unwrap().remove(0);
             let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
             let msg = e

@@ -37,6 +37,12 @@ impl OccurrenceId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<crate::WeeklyLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<NaiveDate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub included: Vec<OccurrenceId>,
     #[serde(flatten)]
     pub key: MeetingKey,
     pub sequence: u32,
@@ -48,6 +54,10 @@ pub struct Origin {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
+    #[serde(default)]
+    pub limit: Option<crate::WeeklyLimit>,
+    #[serde(default)]
+    pub exceptions: Vec<IncludedMove>,
     pub uid: String,
     pub sequence: u32,
     pub organizer: String,
@@ -59,8 +69,20 @@ pub struct Proposal {
     pub row: Option<Entry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncludedMove {
+    pub original: OccurrenceId,
+    pub row: Entry,
+    pub location: String,
+}
+
+pub const MAX_MOVES: usize = 8;
+
 impl Proposal {
     pub fn validate(&self, source: &Source) -> Result<(), String> {
+        if self.exceptions.len() > MAX_MOVES {
+            return Err("Too many included moves".into());
+        }
         let scope = self.scope();
         let bound = source
             .delivery
@@ -107,6 +129,33 @@ impl Proposal {
                 return Err("Unsupported invitation schedule".into());
             }
         }
+        if self.limit.is_some() || !self.exceptions.is_empty() {
+            let base = self
+                .row
+                .as_ref()
+                .filter(|r| r.kind == Kind::Weekly)
+                .ok_or("Missing weekly master")?;
+            let last = self.limit.map(|rule| rule.last(base)).transpose()?;
+            let mut dates = std::collections::HashSet::new();
+            for m in &self.exceptions {
+                if !dates.insert(m.original.date)
+                    || !base.scheduled_on(m.original.date)
+                    || last.is_some_and(|end| m.original.date > end)
+                    || m.original.minute >= 1440
+                    || m.location.len() > 160
+                    || m.location.chars().any(char::is_control)
+                    || m.row.kind != Kind::Appointment
+                    || m.row.invitation.is_some()
+                    || m.row.source.is_some()
+                    || m.row.import_hash.is_some()
+                    || !m.row.excluded.is_empty()
+                    || !m.row.span.valid()
+                    || m.row.validate().is_err()
+                {
+                    return Err("Invalid or duplicate occurrence in this series".into());
+                }
+            }
+        }
         Ok(())
     }
     pub fn scope(&self) -> Option<String> {
@@ -117,7 +166,18 @@ impl Proposal {
             self.row
                 .as_ref()
                 .filter(|r| r.kind == Kind::Weekly)
-                .map(|_| "weekly".into())
+                .map(|_| {
+                    let mut scope = String::from("weekly");
+                    if let Some(rule) = self.limit {
+                        scope.push(';');
+                        scope.push_str(&rule.property());
+                    }
+                    for m in &self.exceptions {
+                        scope.push('|');
+                        scope.push_str(&m.original.property());
+                    }
+                    scope
+                })
         })
     }
 }
@@ -131,6 +191,8 @@ pub struct Cancellation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub before_moves: Vec<Option<Entry>>,
     pub previous: Option<Entry>,
     pub attendee: String,
     pub weekly: bool,
@@ -142,6 +204,8 @@ pub struct Review {
 impl Review {
     pub(super) fn blocked(mut self, reason: &str) -> Self {
         self.notice = reason.into();
+        self.token = None;
+        self.can_save = false;
         self
     }
 }

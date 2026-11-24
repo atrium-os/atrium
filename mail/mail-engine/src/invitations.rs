@@ -167,7 +167,42 @@ impl Engine {
         }
         match scope.as_deref() {
             None => Ok(None),
-            Some("weekly") => Ok(Some("Whole weekly series".into())),
+            Some(s) if s.split([';', '|']).next() == Some("weekly") => {
+                let mut parts = s.split('|');
+                let rule = parts.next().unwrap();
+                let mut label = "Whole weekly series".to_string();
+                if let Some(limit) = rule.strip_prefix("weekly;") {
+                    if let Some(n) = limit
+                        .strip_prefix("COUNT=")
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .filter(|n| (1..=520).contains(n))
+                    {
+                        label.push_str(&format!(" · {n} meetings"));
+                    } else if let Some(until) = limit.strip_prefix("UNTIL=") {
+                        let wall = chrono::NaiveDateTime::parse_from_str(
+                            until.trim_end_matches('Z'),
+                            "%Y%m%dT%H%M%S",
+                        )
+                        .map_err(|_| Error::Refused("Invalid end time"))?;
+                        label.push_str(&format!(
+                            " · until {} {}",
+                            wall,
+                            if until.ends_with('Z') {
+                                "UTC"
+                            } else {
+                                "floating"
+                            }
+                        ));
+                    } else {
+                        return Err(Error::Refused("Invalid weekly limit"));
+                    }
+                }
+                let moves = parts.count();
+                if moves > 0 {
+                    label.push_str(&format!(" · {moves} included moves"));
+                }
+                Ok(Some(label))
+            }
             Some(property) => {
                 let (head, value) = property
                     .split_once(':')
@@ -311,7 +346,7 @@ impl Engine {
             "END:VEVENT".into(),
             "END:VCALENDAR".into(),
         ];
-        if let Some(id) = r.scope.as_ref().filter(|v| v.as_str() != "weekly") {
+        if let Some(id) = r.scope.as_ref().filter(|v| v.starts_with("RECURRENCE-ID")) {
             lines.insert(7, id.clone());
         }
         for line in lines {
@@ -336,7 +371,7 @@ impl Engine {
             r.attendee.to_ascii_lowercase(),
             r.uid
         );
-        if let Some(id) = r.scope.as_ref().filter(|v| v.as_str() != "weekly") {
+        if let Some(id) = r.scope.as_ref().filter(|v| v.starts_with("RECURRENCE-ID")) {
             key.push('/');
             key.push_str(id);
         }

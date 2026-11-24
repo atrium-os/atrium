@@ -217,71 +217,144 @@ pub fn invite(text: &str, me: &[String]) -> Option<Invite> {
     Some(inv)
 }
 
-/// Return the single scheduling scope. Only an unbounded weekly master or a
-/// timed original occurrence can be represented by Calendar.
+/// Scope is read independently of Calendar from the selected MIME part.
+#[cfg(feature = "jail")]
+fn occurrence_scope(params: &[(String, String)], value: &str) -> Option<String> {
+    let mut tz = None;
+    for (key, v) in params {
+        match key.as_str() {
+            "TZID"
+                if tz.is_none()
+                    && !v.is_empty()
+                    && v.len() <= 64
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_/+-".contains(&b)) =>
+            {
+                tz = Some(v.as_str())
+            }
+            "VALUE" if v.eq_ignore_ascii_case("DATE-TIME") => (),
+            _ => return None,
+        }
+    }
+    let stamp = value.strip_suffix('Z').unwrap_or(value);
+    if stamp.len() != 15
+        || stamp.as_bytes()[8] != b'T'
+        || !stamp
+            .bytes()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(match tz {
+        Some(_) if stamp != value => return None,
+        Some("UTC") => format!("RECURRENCE-ID:{stamp}Z"),
+        Some(zone) => format!("RECURRENCE-ID;TZID={zone}:{stamp}"),
+        None => format!("RECURRENCE-ID:{value}"),
+    })
+}
+
+#[cfg(feature = "jail")]
+fn weekly_scope(rule: &str) -> Option<String> {
+    let mut frequency = false;
+    let mut limit = None;
+    for part in rule.to_ascii_uppercase().split(';') {
+        let (name, value) = part.split_once('=')?;
+        match name {
+            "FREQ" if value == "WEEKLY" && !frequency => frequency = true,
+            "COUNT" if limit.is_none() && value.bytes().all(|b| b.is_ascii_digit()) => {
+                let count = value.parse::<u16>().ok()?;
+                if !(1..=520).contains(&count) {
+                    return None;
+                }
+                limit = Some(format!("COUNT={count}"));
+            }
+            "UNTIL" if limit.is_none() => {
+                let wall = value.strip_suffix('Z').unwrap_or(value);
+                if wall.len() != 15
+                    || wall.as_bytes()[8] != b'T'
+                    || !wall
+                        .bytes()
+                        .enumerate()
+                        .all(|(i, b)| i == 8 || b.is_ascii_digit())
+                {
+                    return None;
+                }
+                limit = Some(format!("UNTIL={value}"));
+            }
+            _ => return None,
+        }
+    }
+    frequency.then(|| limit.map_or_else(|| "weekly".into(), |v| format!("weekly;{v}")))
+}
+
 #[cfg(feature = "jail")]
 pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
+    #[derive(Default, PartialEq)]
+    struct Identity {
+        uid: Option<String>,
+        organizer: Option<String>,
+        sequence: u32,
+        attendees: std::collections::BTreeSet<String>,
+    }
     if text.len() > 4 << 20 {
         return None;
     }
     let mut stack = Vec::new();
-    let mut events = 0;
+    let mut events = Vec::new();
     let mut scope = None;
+    let mut identity = Identity::default();
     for line in unfold(text) {
         let (key, params, value) = split_line(&line)?;
         if key == "BEGIN" {
             if stack.len() >= 8 {
                 return None;
             }
-            if value.eq_ignore_ascii_case("VEVENT") {
-                events += 1;
-            }
             stack.push(value.to_ascii_uppercase());
         } else if key == "END" {
             if stack.pop()? != value.to_ascii_uppercase() {
                 return None;
             }
+            if value.eq_ignore_ascii_case("VEVENT") {
+                if events.len() >= 9 {
+                    return None;
+                }
+                events.push((scope.take(), std::mem::take(&mut identity)));
+            }
         } else if stack.last().is_some_and(|s| s == "VEVENT") {
             match key.as_str() {
-                "RRULE"
-                    if scope.is_none()
-                        && params.is_empty()
-                        && value.eq_ignore_ascii_case("FREQ=WEEKLY") =>
-                {
-                    scope = Some("weekly".into())
+                "RRULE" if scope.is_none() && params.is_empty() => {
+                    scope = Some(weekly_scope(&value)?)
                 }
                 "RECURRENCE-ID" if scope.is_none() => {
-                    let mut tz = None;
-                    for (key, v) in &params {
-                        match key.as_str() {
-                            "TZID" if tz.is_none() => tz = Some(v.as_str()),
-                            "VALUE" if v.eq_ignore_ascii_case("DATE-TIME") => (),
-                            _ => return None,
-                        }
-                    }
-                    let stamp = value.strip_suffix('Z').unwrap_or(&value);
-                    if stamp.len() != 15
-                        || stamp.as_bytes()[8] != b'T'
-                        || !stamp
-                            .bytes()
-                            .enumerate()
-                            .all(|(i, c)| i == 8 || c.is_ascii_digit())
-                    {
-                        return None;
-                    }
-                    scope = Some(match tz {
-                        Some(_) if stamp != value => return None,
-                        Some("UTC") => format!("RECURRENCE-ID:{stamp}Z"),
-                        Some(zone) => format!("RECURRENCE-ID;TZID={zone}:{stamp}"),
-                        None => format!("RECURRENCE-ID:{value}"),
-                    });
+                    scope = Some(occurrence_scope(&params, &value)?)
                 }
                 "RECURRENCE-ID" | "RRULE" | "RDATE" | "EXDATE" | "EXRULE" => return None,
+                "UID" => identity.uid = Some(value),
+                "ORGANIZER" => identity.organizer = Some(value.to_ascii_lowercase()),
+                "SEQUENCE" => identity.sequence = value.parse().ok()?,
+                "ATTENDEE" => {
+                    identity.attendees.insert(value.to_ascii_lowercase());
+                }
                 _ => (),
             }
         }
     }
-    (events == 1 && stack.is_empty()).then_some(scope)
+    if !stack.is_empty() {
+        return None;
+    }
+    let mut parts = events.into_iter();
+    let (mut master, identity) = parts.next()?;
+    for (scope, child) in parts {
+        let root = master.as_mut().filter(|s| s.starts_with("weekly"))?;
+        let original = scope.filter(|s| s.starts_with("RECURRENCE-ID"))?;
+        if identity != child || root.split('|').any(|s| s == original) {
+            return None;
+        }
+        root.push('|');
+        root.push_str(&original);
+    }
+    Some(master)
 }
 
 fn mailto(v: &str) -> String {

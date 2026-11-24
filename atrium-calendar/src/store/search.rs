@@ -103,6 +103,15 @@ impl Store {
             let Some(mut date) = first_candidate(entry, first) else {
                 continue;
             };
+            let last = if entry.kind == Kind::Weekly {
+                entry
+                    .invitation
+                    .as_ref()
+                    .and_then(|o| o.last)
+                    .map_or(last, |end| end.min(last))
+            } else {
+                last
+            };
             while date <= last {
                 candidates += 1;
                 if candidates > MAX_CANDIDATES {

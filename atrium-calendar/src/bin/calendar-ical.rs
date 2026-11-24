@@ -74,6 +74,12 @@ struct Event {
     end: Option<Stamp>,
     original: Option<Stamp>,
     weekly: bool,
+    limit: Option<atrium_calendar::WeeklyLimit>,
+    organizer: Option<String>,
+    sequence: Option<u32>,
+    attendees: Vec<String>,
+    location: Option<String>,
+    cancelled_status: bool,
     skipped: Vec<Stamp>,
 }
 fn once<T>(slot: &mut Option<T>, v: T) -> Result<()> {
@@ -239,12 +245,7 @@ fn parse(bytes: &[u8]) -> Result<Candidates> {
 }
 fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
     use portcullis_ipc::calendar::address;
-    let mut organizer = None;
-    let mut sequence = None;
-    let mut attendees = Vec::new();
-    let mut location = None;
     let mut method = None;
-    let mut cancelled_status = false;
     if bytes.len() > FILE_LIMIT {
         return Err(Issue::Limit);
     }
@@ -355,19 +356,19 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                             return Err(Issue::Scheduling);
                         }
                         if key == "ORGANIZER" {
-                            once(&mut organizer, a)?;
-                        } else if attendees.len() < 256 {
-                            attendees.push(a);
+                            once(&mut event.organizer, a)?;
+                        } else if event.attendees.len() < 256 {
+                            event.attendees.push(a);
                         } else {
                             return Err(Issue::Limit);
                         }
                     }
                     "SEQUENCE" if params.is_empty() => once(
-                        &mut sequence,
+                        &mut event.sequence,
                         v.parse::<u32>().map_err(|_| Issue::Scheduling)?,
                     )?,
                     "LOCATION" if params.is_empty() => once(
-                        &mut location,
+                        &mut event.location,
                         if v.is_empty() {
                             String::new()
                         } else {
@@ -375,7 +376,12 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                         },
                     )?,
                     "STATUS" if params.is_empty() && v.eq_ignore_ascii_case("CANCELLED") => {
-                        cancelled_status = true
+                        event.cancelled_status = true
+                    }
+                    "RRULE" if params.is_empty() && !event.weekly => {
+                        event.limit =
+                            atrium_calendar::WeeklyLimit::parse(v).ok_or(Issue::Recurrence)?;
+                        event.weekly = true;
                     }
                     "EXDATE" | "RDATE" | "EXRULE" => return Err(Issue::Recurrence),
                     "URL" | "ATTACH" | "LOCATION" | "SEQUENCE" => return Err(Issue::Component),
@@ -392,29 +398,58 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
     }
     if invitation {
         let cancelled = method.ok_or(Issue::Scheduling)?;
-        if events.len() != 1 || (cancelled_status && !cancelled) {
+        let (e, children) = events.split_first().ok_or(Issue::Format)?;
+        if children.len() > atrium_calendar::invitation::MAX_MOVES
+            || (!children.is_empty() && (cancelled || !e.weekly))
+            || (e.cancelled_status && !cancelled)
+            || (cancelled && e.limit.is_some())
+        {
             return Err(Issue::Scheduling);
         }
-        let e = &events[0];
         if e.original.is_some() && e.weekly {
             return Err(Issue::Recurrence);
         }
-        let original = e
-            .original
-            .map(|stamp| {
-                Ok(atrium_calendar::invitation::OccurrenceId {
-                    date: stamp.date,
-                    minute: stamp.minute.ok_or(Issue::Recurrence)?,
-                    zone: stamp.zone,
-                })
+        let occurrence = |stamp: Stamp| -> Result<_> {
+            Ok(atrium_calendar::invitation::OccurrenceId {
+                date: stamp.date,
+                minute: stamp.minute.ok_or(Issue::Recurrence)?,
+                zone: stamp.zone,
             })
-            .transpose()?;
+        };
+        let original = e.original.map(occurrence).transpose()?;
+        let mut exceptions = Vec::new();
+        let identities = |event: &Event| {
+            event
+                .attendees
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let invited = identities(e);
+        for child in children {
+            if child.weekly
+                || child.cancelled_status
+                || child.uid != e.uid
+                || child.organizer != e.organizer
+                || child.sequence.unwrap_or(0) != e.sequence.unwrap_or(0)
+                || identities(child) != invited
+            {
+                return Err(Issue::Scheduling);
+            }
+            exceptions.push(atrium_calendar::invitation::IncludedMove {
+                original: occurrence(child.original.ok_or(Issue::Recurrence)?)?,
+                row: child.row()?,
+                location: child.location.clone().unwrap_or_default(),
+            });
+        }
         return Ok(Outcome::Invitation(atrium_calendar::invitation::Proposal {
             uid: e.uid.clone().ok_or(Issue::Format)?,
-            sequence: sequence.unwrap_or(0),
-            organizer: organizer.ok_or(Issue::Scheduling)?,
-            attendees,
-            location: location.unwrap_or_default(),
+            exceptions,
+            limit: e.limit,
+            sequence: e.sequence.unwrap_or(0),
+            organizer: e.organizer.clone().ok_or(Issue::Scheduling)?,
+            attendees: e.attendees.clone(),
+            location: e.location.clone().unwrap_or_default(),
             original,
             weekly_cancellation: cancelled && e.weekly,
             row: if cancelled { None } else { Some(e.row()?) },
@@ -737,11 +772,126 @@ mod tests {
             .is_none());
         assert!(starts(&store, "2026-12-22").is_empty());
         for invalid in [
-            weekly.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=3"),
+            weekly.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=0"),
             moved.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDFUTURE:"),
         ] {
             assert!(parse_mode(invalid.as_bytes(), true).is_err());
         }
+    }
+
+    #[test]
+    fn finite_series_and_included_moves_share_one_review_and_undo() {
+        use portcullis_ipc::calendar::{Delivery, Source};
+        let bundle = include_str!("../../tests/fixtures/bounded-moves.ics");
+        let until = include_str!("../../tests/fixtures/weekly-until.ics");
+        let proposal = |text: &str| match parse_mode(text.as_bytes(), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!("expected invitation"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let review = |s: &mut Store, rev, text: &str| {
+            let p = proposal(text);
+            let src = Source {
+                account: 7,
+                from: p.organizer.clone(),
+                verified: true,
+                identities: vec!["dev@fixture.invalid".into()],
+                reply_destination_matches: true,
+                delivery: Some(Delivery {
+                    uid: p.uid.clone(),
+                    sequence: p.sequence,
+                    organizer: p.organizer.clone(),
+                    scope: p.scope(),
+                    cancelled: false,
+                }),
+            };
+            s.review_invitation(rev, &src, p)
+        };
+        let starts = |s: &Store, day: &str| {
+            s.day(date(day))
+                .entries
+                .iter()
+                .map(|e| e.span.start)
+                .collect::<Vec<_>>()
+        };
+        let first = review(&mut store, 0, bundle).unwrap();
+        assert!(first.can_save, "{}", first.notice);
+        assert!(starts(&store, "2026-12-01").is_empty());
+        let receipt = store.apply_invitation(0, first.token.unwrap()).unwrap().1;
+        for (day, want) in [
+            ("2026-12-01", vec![840]),
+            ("2026-12-08", vec![]),
+            ("2026-12-09", vec![900]),
+            ("2026-12-15", vec![]),
+            ("2026-12-17", vec![660]),
+            ("2026-12-22", vec![840]),
+            ("2026-12-29", vec![]),
+        ] {
+            assert_eq!(starts(&store, day), want, "{day}");
+        }
+        assert!(!review(&mut store, 1, bundle).unwrap().can_save);
+        let conflict = bundle.replace("T110000Z", "T111500Z");
+        assert!(review(&mut store, 1, &conflict).unwrap().token.is_none());
+        store.undo(receipt).unwrap();
+        assert!(starts(&store, "2026-12-09").is_empty());
+        assert!(starts(&store, "2026-12-01").is_empty());
+        let first = review(&mut store, 2, bundle).unwrap();
+        store.apply_invitation(2, first.token.unwrap()).unwrap();
+        let shortened = until.replace("20261229T140000Z", "20261208T135959Z");
+        assert!(review(&mut store, 3, &shortened).unwrap().token.is_none());
+        let next = review(&mut store, 3, until).unwrap();
+        store.apply_invitation(3, next.token.unwrap()).unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(starts(&store, "2026-12-29"), [840]);
+        assert!(starts(&store, "2027-01-05").is_empty());
+        assert_eq!(starts(&store, "2026-12-17"), [660]);
+        let incompatible = bundle.replacen("UID:studio-planning", "UID:other", 1);
+        assert!(parse_mode(incompatible.as_bytes(), true).is_err());
+        for bad in [
+            bundle.replace("COUNT=4", "COUNT=2"),
+            bundle.replace("20261215T140000Z", "20261208T140000Z"),
+        ] {
+            // Invalid input must be rejected in the worker or by Fasti even on an empty calendar.
+            let tmp = tempfile::tempdir().unwrap();
+            let mut clean = Store::open(tmp.path()).unwrap();
+            assert!(review(&mut clean, 0, &bad).is_err());
+            assert!(starts(&clean, "2026-12-01").is_empty());
+        }
+    }
+
+    #[test]
+    fn weekly_limits_follow_the_source_clock_and_skip_missing_times() {
+        use atrium_calendar::WeeklyLimit;
+        let p = match parse_mode(include_bytes!("../../tests/fixtures/weekly.ics"), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!(),
+        };
+        let mut row = p.row.unwrap();
+        row.date = date("2026-03-01");
+        row.span = Span {
+            start: 150,
+            end: 165,
+        };
+        row.zone = Some(Zone {
+            name: chrono_tz::America::New_York,
+            start_fold: None,
+            end_fold: None,
+        });
+        let last = |rule: &str| WeeklyLimit::parse(rule).unwrap().unwrap().last(&row);
+        assert_eq!(last("COUNT=2;FREQ=WEEKLY").unwrap(), date("2026-03-15"));
+        assert_eq!(
+            last("FREQ=WEEKLY;UNTIL=20260315T062959Z").unwrap(),
+            date("2026-03-01")
+        );
+        assert_eq!(
+            last("FREQ=WEEKLY;UNTIL=20260315T063000Z").unwrap(),
+            date("2026-03-15")
+        );
+        assert!(last("FREQ=WEEKLY;UNTIL=20260315T063000").is_err());
+        assert!(WeeklyLimit::parse("FREQ=WEEKLY;COUNT=2;UNTIL=20260315T063000Z").is_none());
+        assert!(WeeklyLimit::parse("FREQ=WEEKLY;COUNT=521").is_none());
     }
 
     #[test]

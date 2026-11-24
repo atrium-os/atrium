@@ -1,6 +1,8 @@
 //! Persona-local planning with floating, all-day and source-zoned commitments.
 pub mod import;
 pub mod invitation;
+mod invitation_limit;
+pub use invitation_limit::WeeklyLimit;
 pub mod zone;
 pub use zone::{Fold, SourceSlot, Zone};
 mod period;
@@ -117,7 +119,15 @@ impl Entry {
 
     pub fn scheduled_on(&self, date: NaiveDate) -> bool {
         let days = (date - self.date).num_days();
-        days == 0 || (self.kind == Kind::Weekly && days > 0 && days % 7 == 0)
+        days == 0
+            || (self.kind == Kind::Weekly
+                && days > 0
+                && days % 7 == 0
+                && self
+                    .invitation
+                    .as_ref()
+                    .and_then(|o| o.last)
+                    .is_none_or(|last| date <= last))
     }
 
     pub fn appears(&self, date: NaiveDate) -> bool {

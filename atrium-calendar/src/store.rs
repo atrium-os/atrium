@@ -71,7 +71,7 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=5)
+                if !matches!(snapshot.version, 1..=6)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -377,6 +377,12 @@ impl Store {
             entries[index].title = fields.title;
             entries[index].span = fields.span;
             entries[index].zone = fields.zone;
+            if entries[index].kind == Kind::Weekly {
+                if let Some(rule) = entries[index].invitation.as_ref().and_then(|o| o.limit) {
+                    let last = rule.last(&entries[index])?;
+                    entries[index].invitation.as_mut().unwrap().last = Some(last);
+                }
+            }
         } else {
             entries.remove(index);
         }
@@ -454,7 +460,7 @@ impl Store {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 5,
+            version: 6,
             cancelled,
             pinned_zone,
             device_zone,

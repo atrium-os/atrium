@@ -24,6 +24,8 @@ pub(super) struct Sheet {
     review: Review,
     revision: u64,
     stream: Arc<UnixStream>,
+    page: usize,
+    proposed_last: Option<NaiveDate>,
 }
 fn receive(file: File) -> Result<Incoming, String> {
     let mut stream = UnixStream::from(OwnedFd::from(file));
@@ -92,10 +94,18 @@ impl Incoming {
             proposal: self.proposal.clone(),
         };
         let review = wire::exchange(path, &request)?;
+        let proposed_last = self
+            .proposal
+            .limit
+            .zip(self.proposal.row.as_ref())
+            .map(|(limit, row)| limit.last(row))
+            .transpose()?;
         Ok(Sheet {
+            proposed_last,
             source: self.source,
             proposal: self.proposal,
             stream: Arc::new(self.stream),
+            page: 0,
             review,
             revision,
         })
@@ -135,17 +145,28 @@ fn viewing_schedule(row: &Entry, view: chrono_tz::Tz) -> String {
     )
 }
 impl Sheet {
+    pub(super) fn set_page(&mut self, page: usize) {
+        if page <= self.proposal.exceptions.len() {
+            self.page = page;
+        }
+    }
+
+    fn reviewed_token(&self) -> Result<uuid::Uuid, String> {
+        if self.page != self.proposal.exceptions.len() {
+            return Err("Review each included move first.".into());
+        }
+        self.review
+            .token
+            .ok_or_else(|| "Review this proposal again".into())
+    }
     pub fn save(&self) -> Result<Request, String> {
         Ok(Request::ApplyInvitation {
             revision: self.revision,
-            token: self.review.token.ok_or("Review this proposal again")?,
+            token: self.reviewed_token()?,
         })
     }
     pub fn reply(&self, path: &Path, answer: Answer) -> Result<(), String> {
-        let token = self
-            .review
-            .token
-            .ok_or("This proposal cannot be answered")?;
+        let token = self.reviewed_token()?;
         let _: () = wire::exchange(
             path,
             &Request::CheckInvitation {
@@ -208,112 +229,240 @@ impl Sheet {
         } else {
             "One meeting".into()
         };
+        let scope = if self.review.weekly && p.original.is_none() {
+            let prior_bound = self
+                .review
+                .previous
+                .as_ref()
+                .and_then(|e| e.invitation.as_ref())
+                .and_then(|o| o.last);
+            let visible_bound = if p.row.is_some() && p.limit.is_none() && prior_bound.is_some() {
+                " · proposed with no end date".to_string()
+            } else if p.row.is_some() {
+                match p.limit.zip(self.proposed_last) {
+                    Some((atrium_calendar::WeeklyLimit::Count(n), date)) => {
+                        format!(" · {n} meetings · last {date}")
+                    }
+                    Some((_, date)) => format!(" · last regular meeting {date}"),
+                    None => String::new(),
+                }
+            } else {
+                self.review
+                    .previous
+                    .as_ref()
+                    .and_then(|e| e.invitation.as_ref())
+                    .and_then(|o| o.last)
+                    .map_or_else(String::new, |d| format!(" · last regular meeting {d}"))
+            };
+            format!("{scope}{visible_bound}")
+        } else {
+            scope
+        };
         line(ctx, 121., 16., scope);
-        line(
-            ctx,
-            143.,
-            14.,
-            format!("Mail sender · {}", self.source.from),
-        );
-        line(ctx, 170., 14., format!("Organizer · {}", p.organizer));
-        line(
-            ctx,
-            197.,
-            14.,
-            format!("Invited as · {}", self.review.attendee),
-        );
-        if let Some(old) = &self.review.previous {
+        if self.page == 0 {
             line(
                 ctx,
-                238.,
-                15.,
-                format!(
-                    "Current · {}",
-                    viewing_schedule(old, planner.viewing_zone())
-                ),
+                143.,
+                14.,
+                format!("Mail sender · {}", self.source.from),
             );
-            if let Some(o) = &old.invitation {
+            line(ctx, 170., 14., format!("Organizer · {}", p.organizer));
+            line(
+                ctx,
+                197.,
+                14.,
+                format!("Invited as · {}", self.review.attendee),
+            );
+            if let Some(old) = &self.review.previous {
                 line(
                     ctx,
-                    263.,
+                    238.,
+                    15.,
+                    format!(
+                        "Current · {}",
+                        viewing_schedule(old, planner.viewing_zone())
+                    ),
+                );
+                if let Some(o) = &old.invitation {
+                    if old.kind == Kind::Weekly
+                        && p.original.is_none()
+                        && p.row.is_some()
+                        && (o.limit.is_some() || p.limit.is_some())
+                    {
+                        line(
+                            ctx,
+                            282.,
+                            14.,
+                            o.last.map_or_else(
+                                || "Current series · no end date".into(),
+                                |d| format!("Current series · last {d}"),
+                            ),
+                        );
+                    }
+                    line(
+                        ctx,
+                        263.,
+                        14.,
+                        format!(
+                            "Current place · {}",
+                            if o.location.is_empty() {
+                                "Unspecified"
+                            } else {
+                                &o.location
+                            }
+                        ),
+                    );
+                }
+            }
+            if let Some(row) = &p.row {
+                line(
+                    ctx,
+                    302.,
+                    16.,
+                    format!(
+                        "Proposed · {}",
+                        viewing_schedule(row, planner.viewing_zone())
+                    ),
+                );
+                line(
+                    ctx,
+                    333.,
                     14.,
                     format!(
-                        "Current place · {}",
-                        if o.location.is_empty() {
+                        "Proposed place · {}",
+                        if p.location.is_empty() {
                             "Unspecified"
                         } else {
-                            &o.location
+                            &p.location
                         }
                     ),
                 );
+            } else {
+                line(
+                    ctx,
+                    302.,
+                    16.,
+                    if p.original.is_some() {
+                        "Remove only this occurrence on this device."
+                    } else if self.review.weekly {
+                        "Remove the weekly series and its exceptions on this device."
+                    } else {
+                        "Remove this meeting on this device."
+                    }
+                    .into(),
+                );
             }
-        }
-        if let Some(row) = &p.row {
+            if let Some(base) = self.review.previous.as_ref().filter(|e| {
+                e.kind == Kind::Weekly && p.original.is_none() && !e.excluded.is_empty()
+            }) {
+                let verb = if p.row.is_none() {
+                    "removed"
+                } else {
+                    "preserved"
+                };
+                line(
+                    ctx,
+                    356.,
+                    14.,
+                    format!(
+                        "Dates with saved exceptions {} · {}",
+                        verb,
+                        base.excluded
+                            .iter()
+                            .filter(|d| !p.exceptions.iter().any(|m| m.original.date == **d))
+                            .count()
+                    ),
+                );
+            }
+        } else {
+            let m = &p.exceptions[self.page - 1];
             line(
                 ctx,
-                302.,
+                160.,
+                19.,
+                format!("Included move {} of {}", self.page, p.exceptions.len()),
+            );
+            line(ctx, 194., 16., m.row.title.clone());
+            line(
+                ctx,
+                222.,
+                15.,
+                format!(
+                    "Originally · {} {} · {}",
+                    m.original.date,
+                    clock(m.original.minute),
+                    m.original.zone.map_or("Floating", |z| z.name())
+                ),
+            );
+            if let Some(Some(saved)) = self.review.before_moves.get(self.page - 1) {
+                line(
+                    ctx,
+                    248.,
+                    15.,
+                    format!(
+                        "Current · {}",
+                        viewing_schedule(saved, planner.viewing_zone())
+                    ),
+                );
+            }
+            line(
+                ctx,
+                277.,
                 16.,
                 format!(
                     "Proposed · {}",
-                    viewing_schedule(row, planner.viewing_zone())
+                    viewing_schedule(&m.row, planner.viewing_zone())
                 ),
             );
             line(
                 ctx,
-                333.,
-                14.,
+                307.,
+                15.,
                 format!(
-                    "Proposed place · {}",
-                    if p.location.is_empty() {
+                    "Place · {}",
+                    if m.location.is_empty() {
                         "Unspecified"
                     } else {
-                        &p.location
+                        &m.location
                     }
                 ),
             );
-        } else {
-            line(
+            planner.button(
                 ctx,
-                302.,
-                16.,
-                if p.original.is_some() {
-                    "Remove only this occurrence on this device."
-                } else if self.review.weekly {
-                    "Remove the weekly series and its exceptions on this device."
-                } else {
-                    "Remove this meeting on this device."
-                }
-                .into(),
+                18.,
+                337.,
+                145.,
+                "Previous",
+                Action::InvitationPage(self.page - 1),
             );
         }
-        if let Some(base) =
-            self.review.previous.as_ref().filter(|e| {
-                e.kind == Kind::Weekly && p.original.is_none() && !e.excluded.is_empty()
-            })
-        {
-            let verb = if p.row.is_none() {
-                "removed"
+        if self.page < p.exceptions.len() {
+            let label = if self.page == 0 {
+                format!("Review {} included moves", p.exceptions.len())
             } else {
-                "preserved"
+                "Next move".into()
             };
-            line(
+            planner.button(
                 ctx,
-                356.,
-                14.,
-                format!(
-                    "Dates with saved exceptions {} · {}",
-                    verb,
-                    base.excluded.len()
-                ),
+                250.,
+                399.,
+                220.,
+                &label,
+                Action::InvitationPage(self.page + 1),
             );
         }
         line(ctx, 377., 14., self.review.notice.clone());
-        if self.review.token.is_some() && p.row.is_some() {
+        if self.page == p.exceptions.len() && self.review.token.is_some() && p.row.is_some() {
             line(
                 ctx,
                 421.,
                 14.,
-                "Choose a response to review in Mail before sending.".into(),
+                if p.exceptions.is_empty() {
+                    "Choose a response to review in Mail before sending."
+                } else {
+                    "Your response applies to the whole series. Review it in Mail before sending."
+                }
+                .into(),
             );
             for (i, (label, answer)) in [
                 ("Accept…", Answer::Accept),
@@ -333,7 +482,7 @@ impl Sheet {
                 );
             }
         }
-        if self.review.token.is_some() && self.review.can_save {
+        if self.page == p.exceptions.len() && self.review.token.is_some() && self.review.can_save {
             planner.button(
                 ctx,
                 456.,

@@ -138,10 +138,54 @@ def series(ui):
     print("PASS scoped RSVP, preserved exception, single and whole cancellation, spoof, replay and empty outbox")
 
 
+def bounded(ui):
+    print(guest(ui, "bounded-setup"))
+    open_mail(ui, first=True)
+
+    def inspect_moves():
+        review(ui, 248)
+        ui.see("bounded-overview", "4 meetings", "last 2026-12-22", "Review 2 included moves")
+        click(ui, 355, 412)
+        ui.see("bounded-first-move", "Included move 1 of 2", "2026-12-08", "2026-12-09", "Studio B")
+        click(ui, 355, 412)
+        ui.see("bounded-second-move", "Included move 2 of 2", "2026-12-15", "2026-12-17", "Studio C", "response applies to the whole series")
+
+    inspect_moves()
+    click(ui, 70, 550)
+    assert ui.control("fingerprint", "work").strip() == b"empty"
+    ui.control("close", "work")
+    inspect_moves()
+    click(ui, 80, 462)
+    ui.see("bounded-response", "Whole weekly series", "4 meetings", "2 included moves", "ACCEPTED")
+    # Dismiss the response and confirm the inspected local schedule separately.
+    click(ui, 70, 355)
+    ui.control("close", "work")
+    assert ui.control("fingerprint", "work").strip() == b"empty"
+    inspect_moves()
+    click(ui, 568, 550)
+    ui.see("bounded-saved", "Invitation saved", "14:00")
+    rows = ui.store("work")["entries"]
+    master = next(r for r in rows if r["kind"] == "Weekly")
+    assert len(rows) == 3 and master["invitation"]["last"] == "2026-12-22"
+    assert master["excluded"] == ["2026-12-08", "2026-12-15"]
+    assert sorted((r["date"], r["span"]["start"]) for r in rows if r is not master) == [("2026-12-09", 900), ("2026-12-17", 660)]
+    ui.control("close", "work")
+    review(ui, 178)
+    ui.see("bounded-extension", "last regular meeting 2026-12-29", "Current series", "last 2026-12-22")
+    click(ui, 568, 550)
+    ui.see("bounded-extended", "Invitation saved")
+    saved = ui.store("work")["entries"]
+    assert len(saved) == 3 and next(r for r in saved if r["kind"] == "Weekly")["invitation"]["last"] == "2026-12-29"
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS bounded review, both included moves, dismissal, whole-series RSVP review, atomic save, extension and empty outbox")
+
+
 if __name__ == "__main__":
-    runner = series if sys.argv[1:2] == ["--series"] else run
-    if runner == series:
+    runner = {"--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

@@ -717,7 +717,7 @@ impl FromJail {
                 Ok(())
             }
             FromJail::SchedulingPart { result: Ok((bytes, scope)), .. } => {
-                if bytes.len() > 4 << 20 || bytes.len() as u64 > raw_len || scope.as_ref().is_some_and(|s| s.len()>128 || !s.is_ascii() || s.bytes().any(|b| b.is_ascii_control())) {
+                if bytes.len() > 4 << 20 || bytes.len() as u64 > raw_len || scope.as_ref().is_some_and(|s| s.len()>1024 || !s.is_ascii() || s.bytes().any(|b| b.is_ascii_control())) {
                     return Err(Lie("invalid scheduling part"));
                 }
                 Ok(())
