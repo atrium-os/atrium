@@ -181,6 +181,9 @@ impl Workbook {
             self.deps.query(&rect, &mut hits);
             for &id in &hits {
                 let e = self.deps.entry(id).clone();
+                if src.is_some() && e.fp.source_only {
+                    continue;
+                }
                 let h = e.group;
                 let grp = self.group(h);
                 let Some((a, b)) = e.fp.affected(grp.r0, grp.r1, rect.r0, rect.r1) else { continue };

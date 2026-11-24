@@ -28,6 +28,8 @@ pub enum Span {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
+    /// Reads the stored formula, independent of its calculated value.
+    pub source_only: bool,
     pub sheet: u16,
     pub c0: u32,
     pub c1: u32,
@@ -67,9 +69,15 @@ impl Footprint {
 /// row, column): a formula's footprints include those of the names and tables it uses
 /// (names are relative to the using cell, as if inlined).
 pub fn footprints(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>) -> Vec<Footprint> {
-    let mut out = footprints_d(e, sheet, col, r0, r1, names, 0);
+    dependencies(e, sheet, col, r0, r1, names).0
+}
+
+// Also identify formula-text readers reached through a defined name.
+pub(crate) fn dependencies(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>) -> (Vec<Footprint>, bool) {
+    let mut reads_formula_text = false;
+    let mut out = footprints_d(e, sheet, col, r0, r1, names, 0, &mut reads_formula_text);
     out.dedup();
-    out
+    (out, reads_formula_text)
 }
 
 /// The reference a range argument denotes without running a formula.
@@ -113,10 +121,37 @@ fn paired_footprint(source: RangeRef, target: RangeRef, sheet: u16, col: u32, r0
         if a > b { return None; }
         Span::Fixed { a: a as u32, b: b as u32 }
     };
-    Some(Footprint { sheet: target.sheet.unwrap_or(sheet), c0, c1, rows })
+    Some(Footprint { source_only: false, sheet: target.sheet.unwrap_or(sheet), c0, c1, rows })
 }
 
-fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>, depth: u32) -> Vec<Footprint> {
+/// In a reference-returning expression, selectors still read values. Mark
+/// just the references that can supply the cell whose formula is displayed.
+fn formula_sources<'a>(
+    expr: &'a Expr,
+    resolve: &dyn Fn(&Expr) -> Option<Arc<Expr>>,
+    sources: &mut Vec<(&'a Expr, RangeRef)>,
+) {
+    if let Some(range) = static_range(expr, resolve, 0) {
+        sources.push((expr, range));
+        return;
+    }
+    match expr {
+        Expr::Paren(arg) | Expr::Plus(arg) => formula_sources(arg, resolve, sources),
+        Expr::Call(Func::Known(id), args) => {
+            let references = match crate::eval::funcs::FUNCS[*id as usize].name {
+                "INDEX" => &args[..1],
+                "IF" | "CHOOSE" => &args[1..],
+                _ => return,
+            };
+            for arg in references {
+                formula_sources(arg, resolve, sources);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn(u16, u32, u32, &Expr) -> Option<Arc<Expr>>, depth: u32, reads_formula_text: &mut bool) -> Vec<Footprint> {
     let mut out = Vec::new();
     let mut named: Vec<Arc<Expr>> = Vec::new();
     let rowspan = |a: Coord, b: Coord| -> Span {
@@ -137,19 +172,31 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
         match n {
             Expr::Ref(r) => {
                 if let Some(c) = r.col.resolve(col, MAX_COLS) {
-                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+                    out.push(Footprint { source_only: false, sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
                 }
             }
             Expr::Range(r) => {
                 if let (Some(a), Some(b)) = (r.c0.resolve(col, MAX_COLS), r.c1.resolve(col, MAX_COLS)) {
-                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
+                    out.push(Footprint { source_only: false, sheet: r.sheet.unwrap_or(sheet), c0: a.min(b), c1: a.max(b), rows: rowspan(r.r0, r.r1) });
                 }
             }
             // `A1#` reads the spill anchored there; a spill that changes re-dirties its
             // anchor's readers (recalc.rs).
             Expr::Spill(r) => {
                 if let Some(c) = r.col.resolve(col, MAX_COLS) {
-                    out.push(Footprint { sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+                    out.push(Footprint { source_only: false, sheet: r.sheet.unwrap_or(sheet), c0: c, c1: c, rows: rowspan(r.row, r.row) });
+                }
+            }
+            Expr::Call(Func::Known(id), args) if crate::eval::funcs::FUNCS[*id as usize].name == "FORMULATEXT" => {
+                *reads_formula_text = true;
+                let mut sources = Vec::new();
+                formula_sources(&args[0], &resolve, &mut sources);
+                for (arg, range) in sources {
+                    if let (Some(a), Some(b)) = (range.c0.resolve(col, MAX_COLS), range.c1.resolve(col, MAX_COLS)) {
+                        out.push(Footprint { source_only: true, sheet: range.sheet.unwrap_or(sheet),
+                            c0: a.min(b), c1: a.max(b), rows: rowspan(range.r0, range.r1) });
+                        replaced.push(arg);
+                    }
                 }
             }
             Expr::Call(Func::Known(id), args) if args.len() == 3 && matches!(crate::eval::funcs::FUNCS[*id as usize].name, "SUMIF" | "AVERAGEIF") => {
@@ -177,7 +224,7 @@ fn footprints_d(e: &Expr, sheet: u16, col: u32, r0: u32, r1: u32, names: &dyn Fn
         true
     });
     for x in named {
-        out.extend(footprints_d(&x, sheet, col, r0, r1, names, depth + 1));
+        out.extend(footprints_d(&x, sheet, col, r0, r1, names, depth + 1, reads_formula_text));
     }
     out
 }
@@ -456,7 +503,7 @@ mod tests {
     fn index_queries() {
         let mut d = DepIndex::default();
         let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
-        let fp = Footprint { sheet: 0, c0: 0, c1: 0, rows: Span::Fixed { a: 0, b: 0 } };
+        let fp = Footprint { source_only: false, sheet: 0, c0: 0, c1: 0, rows: Span::Fixed { a: 0, b: 0 } };
         let a = d.add(1, fp, r(0, 0, 99, 0));
         let b = d.add(2, fp, r(50, 0, 60, 2));
         let c = d.add(3, fp, r(0, 0, 10, 100_000)); // wide
@@ -478,7 +525,7 @@ mod tests {
     fn affected_rows() {
         // B2:B1000001 = A1 + A2 (rows r-1 and r): changing A10 affects rows 10 and 11
         // (0-based 9 hits formulas at 9 and 10).
-        let fp = Footprint { sheet: 0, c0: 0, c1: 0, rows: Span::Slide { d0: -1, d1: 0 } };
+        let fp = Footprint { source_only: false, sheet: 0, c0: 0, c1: 0, rows: Span::Slide { d0: -1, d1: 0 } };
         assert_eq!(fp.affected(1, 1_000_000, 9, 9), Some((9, 10)));
         assert_eq!(fp.affected(1, 1_000_000, 0, 0), Some((1, 1)));
         let fixed = Footprint { rows: Span::Fixed { a: 0, b: 9 }, ..fp };

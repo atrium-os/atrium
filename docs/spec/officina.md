@@ -630,6 +630,14 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   XLSX and XLSM preserve `workbookPr date1904`. XLS imports the BIFF setting and
   native Save As stores it as an optional trailing byte in the WORKBOOK chunk.
   A native workbook without that byte uses the 1900 system. [Excel date systems](https://support.microsoft.com/en-us/excel/date-systems-in-excel)
+- **Formula text.** `FORMULATEXT(reference)` returns the formula bar’s A1 text for
+  the top-left cell of the reference. It observes formula edits even when the value
+  stays equal. A direct self-reference can display its own formula. A cell without
+  a formula, a formula hidden by sheet protection, or displayed source longer than
+  8,192 UTF-16 code units gives `#N/A`. A number or text literal gives `#VALUE!`.
+  XLSX and XLSM use `_xlfn.FORMULATEXT`. ODS uses OpenFormula’s `FORMULA`.
+  [Excel FORMULATEXT](https://support.microsoft.com/en-us/excel/functions/formulatext-function)
+  [OpenFormula §6.13.12](https://docs.oasis-open.org/office/OpenDocument/v1.3/OpenDocument-v1.3-part4-formula.pdf)
 - **Volatile** functions (`NOW`, `RAND`, `INDIRECT`, `OFFSET`) recompute on every recalc and
   are flagged in the dependency graph.
 - **External** functions (`WEBSERVICE`, stock and currency data, links to other workbooks)
@@ -4250,6 +4258,19 @@ The focused checks cover rank arrays, invalid ranks, ties, filter and
 outline changes, undo, nested subtotals, cross-sheet dependents, edits
 after XLSX and ODS reopen, and both date systems. Evidence is under
 `/private/tmp/atrium-sheets-aggregates`.
+
+**Live formula-text check (2026-11-24).** Reimporting the grouped subtotal
+reference now brings in all 80 formulas. In each of three full recalculation,
+XLSX Save and reopen trials on a private arm64 Tessera-root guest, all 26
+formula strings in Sheet2!D2:D27 matched the Excel caches. Across the workbook,
+76 caches matched and the four subtotal-related differences above remained.
+
+In installed Sheets, replacing Sheet2!A2 with `=11/2` kept its numeric result
+at 5.5 and changed D2 to the new formula text. Ordinary Save replaced the
+granted XLSX. A fresh picker jail reopened all 80 live results. Independent
+inspection of the saved XML confirmed the new formula and its displayed text,
+the other 25 strings, and the five grouped rows. Evidence is under
+`/private/tmp/atrium-sheets-formulatext/guest/final`.
 
 ### 16.71 Sheet tabs in Sheets (2026-11-18)
 

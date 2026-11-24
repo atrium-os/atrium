@@ -112,7 +112,11 @@ pub fn from_of(f: &str) -> Option<String> {
                 }
                 let word: String = ch[i..j].iter().collect();
                 let w = word.strip_prefix("COM.MICROSOFT.").or_else(|| word.strip_prefix("_xlfn.")).unwrap_or(&word);
-                out.push_str(w);
+                if ch.get(j) == Some(&'(') && w.eq_ignore_ascii_case("FORMULA") {
+                    out.push_str("FORMULATEXT");
+                } else {
+                    out.push_str(w);
+                }
                 i = j;
                 // OpenFormula's TRUE() and FALSE() are Excel's constants.
                 if (w.eq_ignore_ascii_case("TRUE") || w.eq_ignore_ascii_case("FALSE")) && ch.get(i) == Some(&'(') && ch.get(i + 1) == Some(&')') {
@@ -311,7 +315,7 @@ pub fn to_of(a1: &str) -> String {
                     if MICROSOFT.iter().any(|f| f.eq_ignore_ascii_case(&word)) {
                         out.push_str("COM.MICROSOFT.");
                     }
-                    out.push_str(&word);
+                    out.push_str(if word.eq_ignore_ascii_case("FORMULATEXT") { "FORMULA" } else { &word });
                     i = j;
                 } else if is_ref_start(&word) || is_col(&word) && ch.get(j) == Some(&':') {
                     let (r, n) = read_ref(&ch, i);

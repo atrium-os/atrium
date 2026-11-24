@@ -476,3 +476,33 @@ fn visibility_aware_subtotals_reopen_as_formulas_in_xlsx_and_ods() {
         assert_eq!(reopened.get(total(1)), Value::Num(15.0));
     }
 }
+
+#[test]
+fn formula_text_reads_edited_source_after_foreign_and_native_reopen() {
+    use officina_grid::native;
+    let mut wb = Workbook::new();
+    wb.add_sheet("Data").unwrap();
+    let source = CellAddr::new(0, 0, 0);
+    let text = CellAddr::new(0, 0, 1);
+    wb.set_formula(source, "=3+2").unwrap();
+    wb.set_formula(text, "=FORMULATEXT(A1)").unwrap();
+    wb.recalc();
+    let xlsx_bytes = xlsx::write(&wb, Vec::new()).unwrap();
+    let ods_bytes = officina_convert::ods::write(&wb, Vec::new()).unwrap();
+    for (bytes, part, expected) in [
+        (&xlsx_bytes, "xl/worksheets/sheet1.xml", "_xlfn.FORMULATEXT(A1)"),
+        (&ods_bytes, "content.xml", "of:=FORMULA([.A1])"),
+    ] {
+        let xml = officina_convert::zip::Archive::open(bytes).unwrap().read_name(part).unwrap().unwrap();
+        assert!(String::from_utf8(xml).unwrap().contains(expected));
+    }
+    for imported in [xlsx::read(&xlsx_bytes).unwrap().0, officina_convert::ods::read(&ods_bytes).unwrap().0] {
+        let mut reopened = native::load(&native::save_to_vec(&imported)).unwrap();
+        assert_eq!(reopened.formula_text(text).as_deref(), Some("=FORMULATEXT(A1)"));
+        assert_eq!(reopened.get(text), Value::str("=3+2"));
+        reopened.set_formula(source, "=10/2").unwrap();
+        reopened.recalc();
+        assert_eq!(reopened.get(source), Value::Num(5.0));
+        assert_eq!(reopened.get(text), Value::str("=10/2"));
+    }
+}

@@ -95,6 +95,7 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("TRUE", 0, 0, tru),
     f!("FALSE", 0, 0, fals),
     // information
+    f!("FORMULATEXT", 1, 1, formulatext),
     f!("ISBLANK", 1, 1, isblank),
     f!("ISNUMBER", 1, 1, isnumber),
     f!("ISTEXT", 1, 1, istext),
@@ -1020,6 +1021,18 @@ fn fals(_: &Ctx, _: &[Expr]) -> Ev {
 fn is(c: &Ctx, a: &[Expr], f: fn(&Value) -> bool) -> Ev {
     v(Value::Bool(f(&c.scalar(&a[0]))))
 }
+fn formulatext(c: &Ctx, args: &[Expr]) -> Ev {
+    let rect = tri!(rect_arg(c, &args[0]));
+    let cell = crate::addr::CellAddr::new(rect.sheet, rect.r0, rect.c0);
+    if c.wb.hides_formula(cell) {
+        return e(ErrorKind::NA);
+    }
+    match c.wb.formula_text(cell) {
+        Some(text) if text.encode_utf16().count() <= 8192 => s(text),
+        _ => e(ErrorKind::NA),
+    }
+}
+
 fn isblank(c: &Ctx, a: &[Expr]) -> Ev {
     is(c, a, |x| x.is_empty())
 }

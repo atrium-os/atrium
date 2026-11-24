@@ -3,7 +3,7 @@
 
 use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
 use crate::column::{Cell, Column, Sizes};
-use crate::deps::{footprints, DepIndex, Footprint, GroupId, RowSet};
+use crate::deps::{dependencies, DepIndex, Footprint, GroupId, RowSet};
 use crate::eval::funcs::{self, text_key};
 use crate::eval::parse_number;
 use crate::fast::Fast;
@@ -101,6 +101,7 @@ pub struct Group {
     pub r1: u32,
     pub expr: Arc<Expr>,
     pub volatile: bool,
+    /// Precedents whose values must be calculated before this group.
     pub fps: Vec<Footprint>,
     pub(crate) fast: Option<Arc<Fast>>,
     pub(crate) dep_ids: Vec<u32>,
@@ -191,6 +192,7 @@ pub struct Workbook {
     pub(crate) pending: HashMap<GroupId, RowSet>,
     pub(crate) volatile: HashSet<GroupId>,
     subtotals: HashSet<GroupId>,
+    formula_text_readers: HashSet<GroupId>,
     lookup: Mutex<HashMap<LookupKey, (u64, Arc<LookupIndex>)>>,
     /// Dynamic arrays spilled, by anchor ([`crate::spill`]).
     pub(crate) spills: HashMap<CellAddr, crate::spill::Spill>,
@@ -244,6 +246,7 @@ impl Workbook {
             pending: HashMap::new(),
             volatile: HashSet::new(),
             subtotals: HashSet::new(),
+            formula_text_readers: HashSet::new(),
             lookup: Mutex::new(HashMap::new()),
             spills: HashMap::new(),
             blocked: HashMap::new(),
@@ -331,6 +334,12 @@ impl Workbook {
             return Err("no such sheet");
         }
         self.sheet_name_ok(name, Some(s))?;
+        // A rename can change displayed source on any sheet, even when every
+        // value stays equal. Work scales with the groups that display formulas.
+        for &id in &self.formula_text_readers {
+            let group = self.groups[id as usize].as_ref().unwrap();
+            self.pending.entry(id).or_default().add(group.r0, group.r1);
+        }
         Ok(std::mem::replace(&mut self.sheets[s as usize].name, name.to_string()))
     }
 
@@ -738,9 +747,10 @@ impl Workbook {
                 subtotal |= spec.name == "SUBTOTAL";
             }
         });
-        let fps = footprints(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));
+        let (fps, reads_formula_text) = dependencies(&expr, sheet, col, r0, r1, &|s, row, c, n| self.bound(s, row, c, n).map(Arc::new));
         let fast = Fast::compile(&expr, sheet, col).map(Arc::new);
-        let g = Group { sheet, col, r0, r1, expr, volatile, fps, fast, dep_ids: Vec::new() };
+        let values = fps.iter().copied().filter(|fp| !fp.source_only).collect();
+        let g = Group { sheet, col, r0, r1, expr, volatile, fps: values, fast, dep_ids: Vec::new() };
         let id = match self.free_groups.pop() {
             Some(id) => {
                 self.groups[id as usize] = Some(g);
@@ -751,7 +761,6 @@ impl Workbook {
                 (self.groups.len() - 1) as GroupId
             }
         };
-        let fps = self.group(id).fps.clone();
         let mut ids = Vec::with_capacity(fps.len());
         for fp in fps {
             if let Some(rect) = fp.rect(r0, r1) {
@@ -767,6 +776,9 @@ impl Workbook {
         }
         if volatile {
             self.volatile.insert(id);
+        }
+        if reads_formula_text {
+            self.formula_text_readers.insert(id);
         }
         if subtotal {
             self.subtotals.insert(id);
@@ -799,6 +811,7 @@ impl Workbook {
         self.sheets[grp.sheet as usize].fidx[grp.col as usize].remove(&grp.r0);
         self.volatile.remove(&g);
         self.subtotals.remove(&g);
+        self.formula_text_readers.remove(&g);
         self.free_groups.push(g);
         let p = self.pending.remove(&g);
         if keep_pending {
@@ -921,6 +934,10 @@ impl Workbook {
         let Some(sh) = self.sheets.get_mut(r.sheet as usize) else { return };
         if id == 0 && r.c0 as usize >= sh.styles.len() {
             return;
+        }
+        if sh.protection.is_some() && !self.formula_text_readers.is_empty() {
+            // The style can change whether this range's formulas may be displayed.
+            self.changed.push(*r);
         }
         let need = (r.c1 as usize + 1).min(MAX_COLS as usize);
         if id != 0 && sh.styles.len() < need {
