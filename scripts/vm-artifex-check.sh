@@ -440,9 +440,10 @@ if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/tool
     done
     waitstate 'tabs=\[[^]]*photos/src/lib.rs' 20 && ok "photos/src/lib.rs opens" || bad "lib.rs: $(state)"
     waitstate 'fuzz=Some((false, "core:album", 0' 300 && ok "the fuzz panel lists core:album" || bad "fuzz list: $(state)"
-    # Fuzz tab, then Start fuzzing (ui.rs: tabs from the panel's left, the
-    # button 220 from the right).
-    press 622 485
+    # The view strip's Fuzz (ui.rs: Files, Problems, Composition, Fuzz, 42
+    # apart from 8 under the toolbar), then Start fuzzing (220 from the right).
+    press 64 226
+    waitstate 'panel=Some(Fuzz)' 20 && ok "the view strip opens Fuzz" || bad "strip: $(state)"
     press 985 485
     # libFuzzer and the harness build in the workspace under TCG: slow.
     waitstate 'fuzz=Some((true, "core:album", [1-9][0-9]*, true' 3600 && ok "fuzzing finds the crash in the core" || bad "fuzz: $(state) $(V "tail -5 $B/artifex.log")"

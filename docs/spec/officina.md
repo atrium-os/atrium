@@ -4852,6 +4852,26 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Duplicate Sheet** now copies pivot tables whose output is on the sheet, each under a fresh name `Name_2` (or the next free number). A pivot reading data on the same sheet reads the copy's data; one reading another sheet keeps its source.
 - Tests: `paste_link_points_at_the_copied_cells_and_merge_across_merges_each_row`, `duplicate_sheet_copies_a_pivot_table_reading_the_copy`. All 138 Sheets lib tests pass.
 
+### 16.109 Goal Seek, Show Formulas, AutoFit from the menu (2026-11-25)
+
+- **Goal Seek…** (cell menu after Go To, enabled on a formula) opens a bar "Set B2 to [goal, cell]" prefilled with the formula's value and the first cell on the sheet it reads that holds a number (`data::goal_seek_start`). Seek changes that cell by Newton steps on a measured slope until the formula is within 0.001 of the goal (Excel's default), at most 100 steps and 3 s, then prefers a round number that does as well (20 rather than 20.0000000003). The answer goes in as one undo step; with no answer the cell is left as it was and the bar says the closest value. It refuses a cursor without a formula, an input cell holding a formula or text, and a goal that isn't a number. `goal, cell` may also be typed `goal by changing cell`.
+- **Show Formulas** (checked item, not saved) shows each formula as typed in its cell instead of its value; hidden formulas stay hidden.
+- **AutoFit Row Height** and **AutoFit Column Width** (after Row Height… and Column Width…) fit every selected row or column in the used area to its contents, as one undo step, like a double-click on the header edge. Hidden rows and columns stay hidden; at most 1,000 at a time.
+- Tests: `goal_seek_finds_roots_and_leaves_the_cell_alone_without_one`, `goal_seek_show_formulas_and_autofit_from_the_menu`. All 140 Sheets lib tests pass.
+
+### 16.110 Excel's formatting keys, Accounting and Comma Style (2026-11-25)
+
+- Keys as in Excel: **Ctrl+`** turns Show Formulas on and off, **Ctrl+1** opens the Custom Format bar, **Ctrl+Shift+&** draws outside borders and **Ctrl+Shift+_** takes borders away. The menus show them. The keys are mapped in pergola's grid (`format_key`) and in `format::for_key`.
+- The Format menu's number formats gain **Accounting** (`_($* #,##0.00_);…`), **Comma Style** (the same without the currency sign: negatives in brackets, zero as a dash), **Long Date** (`dddd, mmmm d, yyyy`) and **Fraction** (`# ?/?`), after Text. The `*` fill is not stretched to the column width yet, so the sign isn't pushed to the left edge as in Excel.
+- Tests: the format-menu test checks the new keys and that each new format shows a value as Excel does; pergola's grid key test checks the four keys. All 140 Sheets lib tests pass.
+
+### 16.111 Excel's row, column and selection keys (2026-11-25)
+
+- **Ctrl+Space** selects the selection's whole columns and **Shift+Space** its whole rows, as a header click does (pergola grid, so every grid app gets them).
+- **Ctrl+9** / **Ctrl+0** hide the selected rows / columns; **Ctrl+Shift+(** / **Ctrl+Shift+)** unhide them.
+- **Ctrl+-** deletes and **Ctrl++** (or Ctrl+Shift+=) inserts: whole rows or columns when those are selected, otherwise cells, shifting them up or down. Excel asks in a dialog; Sheets takes the dialog's first choice, and the menu offers the others (`data::key_cmd`).
+- The menu shows these keys. Tests: `excel_row_and_column_keys_pick_the_command_for_the_selection`, and pergola's grid key test. All 141 Sheets lib tests and 229 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

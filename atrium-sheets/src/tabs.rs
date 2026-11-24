@@ -72,6 +72,8 @@ pub enum TabCmd {
     /// The Custom Sort bar's field submitted; closed.
     SortDone,
     SortCancel,
+    SeekDone,
+    SeekCancel,
     /// The Rotation Angle bar's field submitted; closed.
     AngleDone,
     AngleCancel,

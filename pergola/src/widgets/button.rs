@@ -47,6 +47,9 @@ pub struct Button {
     /// size so it grows with the text (an icon-only button). The label
     /// still names it: its tooltip, and its entry in an overflow menu.
     pub icon: Option<char>,
+    /// Drawn before the label (icon and label, centred together), from
+    /// `font::ICONS` at the label's size.
+    pub lead: Option<char>,
 }
 
 impl Button {
@@ -59,6 +62,7 @@ impl Button {
             tooltip: None,
             retain_focus_on_press: false,
             icon: None,
+            lead: None,
         }
     }
 
@@ -81,6 +85,12 @@ impl Button {
         if self.tooltip.is_none() {
             self.tooltip = Some(self.label.clone());
         }
+        self
+    }
+
+    /// Draw `ch` (an icon in `font::ICONS`) before the label.
+    pub fn lead(mut self, ch: char) -> Self {
+        self.lead = Some(ch);
         self
     }
 
@@ -236,12 +246,20 @@ impl Button {
             }
         } else {
             let label_size = Node::measure_text(&content, &style);
-            let label_rect = Rect::new(
-                rect.x() + (rect.w() - label_size.w) / 2.0,
-                rect.y() + (rect.h() - label_size.h) / 2.0,
-                label_size.w,
-                label_size.h,
-            );
+            let lead = self.lead.filter(|_| self.icon.is_none()).map(|ch| {
+                let icon_style = TextStyle { family: font::ICONS.into(), size: type_size::MD, weight: Weight::Regular, color: label_color };
+                let size = Node::measure_text(&ch.to_string(), &icon_style);
+                (ch, icon_style, size)
+            });
+            let gap = if lead.is_some() { crate::theme::size::em(6.0) } else { 0.0 };
+            let lead_w = lead.as_ref().map_or(0.0, |l| l.2.w);
+            let mut x = rect.x() + (rect.w() - label_size.w - lead_w - gap) / 2.0;
+            if let Some((ch, icon_style, size)) = lead {
+                let r = Rect::new(x, rect.y() + (rect.h() - size.h) / 2.0, size.w, size.h);
+                ctx.tree.insert(Some(bg_id), Node::Text { rect: r, content: ch.to_string(), style: icon_style });
+                x += size.w + gap;
+            }
+            let label_rect = Rect::new(x, rect.y() + (rect.h() - label_size.h) / 2.0, label_size.w, label_size.h);
             ctx.tree.insert(Some(bg_id), Node::Text { rect: label_rect, content, style });
         }
 

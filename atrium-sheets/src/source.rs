@@ -900,6 +900,12 @@ impl GridSource for SheetSource {
         if d.wb.hides_value(CellAddr::new(d.sheet, r, c)) {
             return None;
         }
+        if d.show_formulas {
+            let a = CellAddr::new(d.sheet, r, c);
+            if let Some(f) = d.wb.formula_text(a).filter(|_| !d.wb.hides_formula(a)) {
+                return Some(CellView::text(f));
+            }
+        }
         let v = d.wb.value(d.sheet, r, c);
         let sh = d.wb.sheet(d.sheet);
         let id = sh.style_id(r, c);

@@ -44,7 +44,8 @@ impl Button {
             // Square, as tall as the button.
             size::button_height()
         } else {
-            text_w(&self.label, type_size::MD, Weight::Medium) + 2.0 * size::em(space::SM)
+            let lead = if self.lead.is_some() { type_size::MD + size::em(6.0) } else { 0.0 };
+            text_w(&self.label, type_size::MD, Weight::Medium) + lead + 2.0 * size::em(space::SM)
         }
     }
 }

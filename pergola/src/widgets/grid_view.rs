@@ -2333,10 +2333,15 @@ fn format_key(chars: &str, shift: bool) -> Option<char> {
             '4' | '$' => Some('$'),
             '5' | '%' => Some('%'),
             '6' | '^' => Some('^'),
+            '7' | '&' => Some('&'),
+            '9' | '(' => Some('('),
+            '0' | ')' => Some(')'),
+            '=' | '+' => Some('+'),
+            '-' | '_' => Some('_'),
             _ => None,
         };
     }
-    matches!(c, 'b' | 'i' | 'u' | '5').then_some(c)
+    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`' | '9' | '0' | '-' | '+').then_some(c)
 }
 
 /// How far down a cell `ch` px tall lines `th` px tall start, by `v`.
@@ -2650,6 +2655,19 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
         Key::F(5) if !cmd && !m.alt => {
             send(GridAction::GoTo);
+            return true;
+        }
+        // Ctrl+Space: the selection's whole columns; Shift+Space: its whole rows.
+        Key::Char if chars == " " && cmd && !m.shift && !m.alt => {
+            let s = g.selection();
+            g.anchor = (0, s.c0);
+            g.cursor = (last_r, s.c1);
+            return true;
+        }
+        Key::Char if chars == " " && m.shift && !cmd && !m.alt => {
+            let s = g.selection();
+            g.anchor = (s.r0, 0);
+            g.cursor = (s.r1, last_c);
             return true;
         }
         Key::Char if cmd && src.fills() && format_key(chars, m.shift).is_some() => {
@@ -3086,10 +3104,29 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&GridAction::AutoSum(CellRange { r0: 4, c0: 3, r1: 4, c1: 3 })));
         key(&mut app, Key::Char, "g", Modifiers { ctrl: true, ..Modifiers::default() });
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
-        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~')] {
+        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~'), ("`", false, '`'), ("1", false, '1'), ("7", true, '&'), ("_", true, '_'), ("9", false, '9'), ("0", false, '0'), ("(", true, '('), ("0", true, ')'), ("-", false, '-'), ("+", false, '+'), ("=", true, '+')] {
             key(&mut app, Key::Char, k, Modifiers { ctrl: true, shift, ..Modifiers::default() });
             assert_eq!(log.borrow().last(), Some(&GridAction::Format(want)), "{k}");
         }
+        // Ctrl+Space and Shift+Space: whole columns, whole rows.
+        let kept = state.get_cloned();
+        let mut g = state.get_cloned();
+        g.anchor = (4, 2);
+        g.cursor = (5, 3);
+        state.set(g);
+        key(&mut app, Key::Char, " ", Modifiers { ctrl: true, ..Modifiers::default() });
+        let all = state.get_cloned().selection();
+        assert_eq!((all.r0, all.c0, all.c1), (0, 2, 3));
+        assert!(all.r1 > 5, "{all:?}");
+        let mut g = state.get_cloned();
+        g.anchor = (4, 2);
+        g.cursor = (5, 3);
+        state.set(g);
+        key(&mut app, Key::Char, " ", Modifiers { shift: true, ..Modifiers::default() });
+        let all = state.get_cloned().selection();
+        assert_eq!((all.r0, all.r1, all.c0), (4, 5, 0));
+        assert!(all.c1 > 3, "{all:?}");
+        state.set(kept);
         log.borrow_mut().clear();
         key(&mut app, Key::F(5), "", Modifiers::default());
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));

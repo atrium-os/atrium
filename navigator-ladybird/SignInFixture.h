@@ -49,6 +49,12 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     // at 1280 x 840), not the Mail sheet's 640 x 360: an IdP's button below
     // its first screen must be on it, since the page does not scroll.
     nav->set_viewport_size(navigator_is_vpn_page(scene) ? Web::CSSPixelSize { 1024, 600 } : Web::CSSPixelSize { 640, 360 });
+#elif defined(ATRIUM_I6_PAGE)
+    // A live page (I6.1) covers the window's page area, not an island's
+    // 640 x 360; content below 360 px was never laid out or painted. The
+    // engine does not learn the placed size yet, so this is the page area of
+    // a 1280 x 840 window (an open gap: PlaceLive resizes the island only).
+    nav->set_viewport_size({ 1024, 768 });
 #else
     nav->set_viewport_size({ 640, 360 });
 #endif
@@ -65,7 +71,7 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     navigator_get_realm(&Web::HTML::relevant_realm(*doc));
 #endif
     doc->remove_all_children();
-#ifdef ATRIUM_MAIL_PAGE
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I6_PAGE)
     // Run "the end" of parsing too: module and deferred scripts run only
     // there, and DOMContentLoaded and load fire there. An IdP's sign-in page
     // (Keycloak's security-key pages) is module scripts (vpn.md "Scripts in

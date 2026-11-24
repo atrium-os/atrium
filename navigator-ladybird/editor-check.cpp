@@ -12,7 +12,7 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
-#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE) || defined(ATRIUM_I6_PAGE)
 #include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #endif
@@ -115,7 +115,7 @@ int main(int argc, char** argv)
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
-#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE)
+#if defined(ATRIUM_MAIL_PAGE) || defined(ATRIUM_I4_VIDEO) || defined(ATRIUM_I4_YOUTUBE) || defined(ATRIUM_I6_PAGE)
     auto& agent = Web::HTML::surrounding_agent();
     agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
 #endif

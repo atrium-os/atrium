@@ -246,6 +246,10 @@ impl Live {
                     Ok(Some(ParentEvent::Message { embed: id, bytes })) if id == embed => match reports.receive(&bytes) {
                         Some(Report::Started { origin }) => {
                             // The engine's origin must be the page's, as delivered.
+                            // The serve thread records the delivery just after the
+                            // page's last byte, so an engine that reports at once
+                            // can be here first: wait for it briefly.
+                            if page.is_none() { page = delivered.recv_timeout(Duration::from_secs(2)).ok(); }
                             let expected = page.as_deref().and_then(crate::origin);
                             if expected.as_deref() != Some(origin) {
                                 break Some(format!("the engine reported {origin}, not the page's origin"));

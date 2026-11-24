@@ -353,6 +353,18 @@ impl Live {
             (right-left) as u32, (bottom-top) as u32]))
     }
 
+    /// The document-lane child of the page on screen goes back in the
+    /// page slot (a live page ended or was stopped).
+    fn reshow_document(&self) {
+        let Some(key) = self.shown else { return };
+        let Some(c) = self.children.iter().find(|c| c.key == key) else { return };
+        if let Some(e) = &self.embeds {
+            if let Err(err) = e.borrow_mut().show(PAGE_SLOT, c.embed) {
+                eprintln!("navigator-ui: limend: {err:?}");
+            }
+        }
+    }
+
     fn id(&mut self) -> u32 {
         let id = self.next;
         self.next += 1;
@@ -884,11 +896,17 @@ impl Live {
                 Event::LiveStarted { url, origin } => {
                     eprintln!("navigator-ui: {url} runs live ({origin})");
                     s.live_reported(&url, Some(origin), None);
+                    // The page may draw with a clear background: the
+                    // document-lane child under it is hidden, not shown through.
+                    if s.live_run.as_ref().is_some_and(|r| r.origin.is_some() && Some(r.key) == self.shown) {
+                        if let Some(e) = &self.embeds { let _ = e.borrow_mut().hide(PAGE_SLOT); }
+                    }
                 }
                 Event::LiveEnded { url, why } => {
                     eprintln!("navigator-ui: {url} stopped running live{}", why.as_deref().map(|w| format!(": {w}")).unwrap_or_default());
                     if self.live_placed.as_ref().is_some_and(|(u, _)| *u == url) { self.live_placed = None; }
                     s.live_reported(&url, None, why);
+                    self.reshow_document();
                 }
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
@@ -1190,6 +1208,7 @@ impl Live {
                 Out::StopLive { url } => {
                     send(&mut self.w, &Request::PlaceLive { url, rect: None });
                     self.live_placed = None;
+                    self.reshow_document();
                 }
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
