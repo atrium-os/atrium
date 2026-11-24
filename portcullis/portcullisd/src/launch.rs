@@ -1608,10 +1608,11 @@ fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, p
     let _guard = portcullis_peer::lock_registry(reg).map_err(|e| fail(e.to_string()))?;
     /* Reuse only a binding with the SAME publisher: an app id re-installed under
      * another publisher's key is another app (arca.md §4.1) and gets a new uid. */
-    let uid = match portcullis_peer::AppRegistry::load(reg).unwrap_or_default().uid_for_document(owner, app_id, publisher, persona, document) {
+    let registry = portcullis_peer::AppRegistry::load(reg).map_err(|e| fail(format!("read {reg}: {e}")))?;
+    let uid = match registry.uid_for_document(owner, app_id, publisher, persona, document) {
         Some(uid) => uid,
         None => {
-            let uid = portcullis_peer::allocate(reg);
+            let uid = portcullis_peer::allocate(reg).map_err(|e| fail(format!("allocate: {e}")))?;
             portcullis_peer::register_document(reg, uid, owner, app_id, publisher, persona, document)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
@@ -2078,7 +2079,7 @@ pub fn running_jid_instance(app_id: &str, persona: Option<&str>) -> Option<i32> 
 /// The apps of `user`'s persona `persona` with a process running now (any
 /// of the persona's uids), by app id.
 pub fn running_in_persona(user: &str, persona: &str) -> Vec<String> {
-    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let reg = crate::load_registry();
     let mut v: Vec<String> = reg.persona_uids(user, persona).into_iter()
         .filter(|(uid, _)| Command::new("pgrep").args(["-U", &uid.to_string()]).output().map(|o| o.status.success()).unwrap_or(false))
         .map(|(_, app)| app.to_string())
@@ -2091,7 +2092,7 @@ pub fn running_in_persona(user: &str, persona: &str) -> Vec<String> {
 /// Every app uid of `user` (each persona's instances and workers; not
 /// session components, which ostiarius tears down itself).
 pub fn user_uids(user: &str) -> Vec<u32> {
-    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default().user_uids(user)
+    crate::load_registry().user_uids(user)
 }
 
 /// End the processes of `uids`: TERM, up to 3 s for them to go, then KILL.

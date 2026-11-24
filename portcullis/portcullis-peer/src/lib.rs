@@ -43,12 +43,16 @@ pub fn lock_registry(path: &str) -> io::Result<std::fs::File> {
 /// Without it, the 91st app launched on a machine would be given 50090 and
 /// run as `_memoryd`, and services that trust that uid (Arca trusts
 /// `_ostiarius` to unlock stores) would trust the app.
-pub fn allocate(registry_path: &str) -> u32 {
-    let reg = AppRegistry::load(registry_path).unwrap_or_default();
-    allocate_in(&reg, |uid| match username(uid) {
+///
+/// An unreadable registry is an error: allocating from an empty one would
+/// hand out a uid already bound to another app, which would then share that
+/// app's grants, overlay and secrets (review 2026-11-24, H4).
+pub fn allocate(registry_path: &str) -> io::Result<u32> {
+    let reg = AppRegistry::load(registry_path)?;
+    Ok(allocate_in(&reg, |uid| match username(uid) {
         None => false,
         Some(name) => name != app_username(uid),
-    })
+    }))
 }
 
 fn allocate_in(reg: &AppRegistry, system_account: impl Fn(u32) -> bool) -> u32 {
@@ -236,8 +240,28 @@ impl AppRegistry {
         AppRegistry { map }
     }
 
+    /// Read the registry file. A missing file is an empty registry (no app
+    /// launched yet); any other error is returned, never an empty registry,
+    /// because "not in the registry" means "not an app", and callers grant
+    /// a person more than an app (review 2026-11-24, H4).
+    ///
+    /// A line that is not UTF-8 is void like any other malformed line and
+    /// logged; it no longer empties the whole registry, which
+    /// `read_to_string` did.
     pub fn load(path: &str) -> io::Result<AppRegistry> {
-        Ok(AppRegistry::parse(&std::fs::read_to_string(path)?))
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(AppRegistry::default()),
+            Err(e) => return Err(e),
+        };
+        let mut text = String::with_capacity(bytes.len());
+        for (n, line) in bytes.split(|&b| b == b'\n').enumerate() {
+            match std::str::from_utf8(line) {
+                Ok(l) => { text.push_str(l); text.push('\n'); }
+                Err(_) => eprintln!("portcullis-peer: {path}: line {} is not UTF-8; ignored", n + 1),
+            }
+        }
+        Ok(AppRegistry::parse(&text))
     }
 
     /// The verified `(owning user, app-id)` for a uid, if Portcullis launched an
@@ -720,5 +744,32 @@ mod tests {
         let line = "100003 bob org.atrium.editor\n";
         let r = AppRegistry::parse(line);
         assert_eq!(r.resolve(100003), Some(("bob", "org.atrium.editor")));
+    }
+
+    /// Review 2026-11-24 (H4): one non-UTF-8 byte used to empty the whole
+    /// registry (read_to_string failed, callers took the default), and
+    /// allocate then reused bound uids. Now only that line is void, a
+    /// missing file is empty, and any other read error is an error.
+    #[test]
+    fn a_bad_registry_fails_closed() {
+        let d = std::env::temp_dir().join(format!("peer-h4-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("registry");
+        let p = path.to_str().unwrap();
+        let mut bytes = b"50000 alice org.a.one\n".to_vec();
+        bytes.extend_from_slice(b"50001 alice org.\xff.bad\n50002 alice org.a.two\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let r = AppRegistry::load(p).unwrap();
+        assert_eq!(r.resolve(50000), Some(("alice", "org.a.one")));
+        assert_eq!(r.resolve(50001), None);
+        assert_eq!(r.resolve(50002), Some(("alice", "org.a.two")));
+        assert!(AppRegistry::load(d.join("absent").to_str().unwrap()).unwrap().resolve(50000).is_none());
+        /* A directory where the file should be: an error, for load and for
+         * allocate, never an empty registry. */
+        let dir = d.join("dir-not-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(AppRegistry::load(dir.to_str().unwrap()).is_err());
+        assert!(allocate(dir.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -98,6 +98,8 @@ pub enum DataCmd {
     /// and links too.
     ClearFormats,
     ClearAll,
+    /// The selection's comments taken off.
+    ClearComments,
     /// Ask for a cell, range, sheet or name to go to; the window runs it (a bar
     /// under the grid).
     GoTo,
@@ -434,6 +436,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("AutoSum").shortcut("Alt+="), Some(DataCmd::AutoSum)),
         (MenuItem::new("Clear Formats").separated(), Some(DataCmd::ClearFormats)),
         (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
+        (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
@@ -696,11 +699,31 @@ pub fn delete_name(d: &mut Doc, i: usize) -> Result<String, String> {
     Ok(format!("{} deleted.", shown_name(&row.name)))
 }
 
+/// Renames row `i` of the Name Manager to `new`, as one step: formulas and
+/// other names using it follow ([`officina_grid::names::rename_ops`]).
+pub fn rename_name(d: &mut Doc, i: usize, new: &str) -> Result<String, String> {
+    let row = name_rows(&d.wb).into_iter().nth(i).ok_or("That name is gone.")?;
+    let (ops, kept) = officina_grid::names::rename_ops(&d.wb, row.scope, &row.name, new)?;
+    d.status.clear();
+    d.run("Rename Name", ops);
+    if d.status == crate::sheet_protection::REFUSED {
+        return Err(d.status.clone());
+    }
+    let new = new.trim();
+    Ok(match kept {
+        0 => format!("{} is now {new}.", shown_name(&row.name)),
+        1 => format!("{} is now {new}; 1 formula with its own {} (LET or LAMBDA) is unchanged.", shown_name(&row.name), row.name),
+        k => format!("{} is now {new}; {k} formulas with their own {} (LET or LAMBDA) are unchanged.", shown_name(&row.name), row.name),
+    })
+}
+
 /// The Name Manager panel's commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamesCmd {
     /// Go to what row `.0` refers to.
     Go(usize),
+    /// Open the bar that renames row `.0`.
+    Rename(usize),
     Delete(usize),
     Close,
 }
@@ -1621,6 +1644,15 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
             d.run(if all { "Clear All" } else { "Clear Formats" }, ops);
             Ok(if all { "Cleared: contents, formats, comments and links.".into() } else { "Formats cleared.".into() })
+        }
+        DataCmd::ClearComments => {
+            let set: Vec<_> = comments_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+            if set.is_empty() {
+                return Ok("No comments there.".into());
+            }
+            let n = set.len();
+            d.run(if n == 1 { "Clear Comment" } else { "Clear Comments" }, vec![GridOp::Comments { sheet: s, set }]);
+            Ok(if n == 1 { "Comment cleared.".into() } else { format!("{n} comments cleared.") })
         }
         // The window opens its bar.
         DataCmd::GoTo => Ok(String::new()),

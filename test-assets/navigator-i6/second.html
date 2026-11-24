@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>I6 second page</title></head>
+<body><h1>Second page</h1><p><a href="/app.html">Back to the app</a></p>
+<script>fetch("/report", { method: "POST", headers: { "content-type": "application/json" },
+  body: JSON.stringify({ name: "same-origin-nav", outcome: "pass", detail: location.pathname }) });</script>
+</body></html>

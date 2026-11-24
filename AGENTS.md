@@ -166,6 +166,8 @@ thread checks them too.
 - A comment states the invariant, not the history; history goes in the
   commit message.
 - A test asserts something, and fails on the code before the fix.
+- A new or updated dependency passes `python3 scripts/licence-audit.py
+  <crate dir>`.
 - No new code in portcullisd for one app's feature: ask whether the
   owning service can do it with a generic primitive.
   See [docs/reviews/2026-11-24-codebase-review.md](docs/reviews/2026-11-24-codebase-review.md).

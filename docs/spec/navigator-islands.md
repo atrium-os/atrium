@@ -1530,7 +1530,7 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
    handling (an island that dies leaves its box and a note), and fork-before-taint start-up.
    Then measure the time to first frame.
 7. **I6. Whole-page live code** for fat clients in everyday browsing, on a press
-   (§9 D5). Planned in [I6 plan](#i6-plan-whole-pages-live-on-a-press-proposed).
+   (§9 D5). Planned in [I6 plan](#i6-plan-whole-pages-live-on-a-press-accepted).
 
 ### I5 installed-worker hardening on Tessera
 
@@ -2067,10 +2067,51 @@ there, it is the measurement and not the Start; the product figure is then
 `FRESCOD_START_TRACE=1`, repeat the three arms, and pass frescod's stderr
 to `navigator-i5-start-trace.sh` with the other logs.
 
-### I6 plan: whole pages live on a press (proposed)
+#### Results on arm64 Tessera, 2026-11-24 (frescod traced)
+
+frescod from main `f0682dae8` with `FRESCOD_START_TRACE=1`; the engine
+(`1000beb6…`), daemons and player were byte-identical to the drained-loop
+run, so frescod was the only change. Times in milliseconds since
+`widget-start`; "frame" is the first frescod frame after the player's
+`first-frame`.
+
+| Press | `player-ready` | frame `frame-begin` (slept) | `composited` | `png-saved` | Red observed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| No choragusd 2 | 623 | 794 (199) | 846 | 849 | 942 |
+| No choragusd 3 | 692 | 838 (199) | 892 | 896 | 1,062 |
+| choragusd 1 | 642 | 782 (199) | 835 | 838 | 959 |
+| choragusd 2 | 694 | 837 (199) | 889 | 892 | 992 |
+| choragusd 3 | 705 | 819 (199) | 872 | 875 | 1,015 |
+| Warm 2 | 680 | 797 (199) | 850 | 854 | 994 |
+| Warm 3 | 714 | 801 (199) | 855 | 858 | 988 |
+| Warm 4 | 695 | 824 (199) | 875 | 878 | 977 |
+
+The 330 ms is the measurement, as the follow-up expected. After
+`player-ready`, the next frame waits 89 to 175 ms for the 200 ms headless
+capture floor (every such frame slept 199 ms), composition takes 52 to
+55 ms, the PNG 3 ms, and the SSH poll finds the red pixel 94 to 170 ms
+after the PNG is written. The gate therefore now ends at frescod's
+`composited` for the first frame after the player's `first-frame`, not at
+the pixel poll. On that end the median press to `composited` is 869 ms
+without choragusd (two presses), 872 ms with it and 855 ms warm. Without
+the headless floor, which a real display does not have, composition would
+follow the first decoded frame by about 55 ms, about 730 to 770 ms after
+the press.
+
+Two of the eleven presses took about 1.6 s to red, both before the engine
+work: the first press after boot made its first request at 452 ms, and
+warm press 5's first fetch took 765 ms upstream. They are left out above.
+
+The same guest then took main `afdae0373`'s portcullisd (with the launch
+registry check from `2bd8429`), frescod and navigatord. Three cold Starts
+reached red at 1,050, 881 and 893 ms, and portcullisd logged no registry
+error with `/var/run/atrium/app-registry` present. Evidence for both is in
+`~/atrium-vm/evidence/navigator-i5-frescod-trace-20261124/`.
+
+### I6 plan: whole pages live on a press (accepted)
 
 Shankar asked for this plan on 2026-11-24 while the I5 timing waited on the
-Mac. D5 settled the shape: everyday trails stay in the document lane with
+Mac, and accepted it with D8 to D13 as recommended the same day. D5 settled the shape: everyday trails stay in the document lane with
 islands, and a whole page goes live only when the person asks, for the few
 fat clients that need it (legacy-web §11.8.3: Figma, WhatsApp Web, Notion's
 editor, Khan Academy's exercises, map-heavy pages, banking, checkout).
@@ -2185,6 +2226,63 @@ origin that saved it.
 7. **I6.6 Hardening.** The remembered choice (D8) in Curia with revoke,
    recycling under memory pressure, the worker audit and check on a
    whole-page engine, and the fuzzed channel's new navigation messages.
+
+#### I6.0 qualification run
+
+Until I6.1 builds the press, the vehicle is the VPN sign-in window, the one
+built path that runs a whole page live: the installed JIT-off engine in its
+jail, the page and its same-origin scripts and stylesheets through Arca's
+couriers, everything else refused. Start it the way the Crypta Sign In
+runners do (portcullisd's `vpn_sign_in_window`, or
+`NAVIGATORD_VPN_SIGN_IN="<profile> <start> <final>"` with
+`--unconfined-for-testing`), with the page under test as the start and a
+final address the run never reaches. navigatord logs each refused resource
+with its host and registrable site (`... refused: only the page's own
+origin (host cdn.example.net, site example.net)`), which is the D12
+measurement: how many refusals were sibling hosts of the page's site, and
+how many were third parties.
+
+The fixture sites are `test-assets/navigator-i6/`, served by
+`scripts/navigator-i6-fixture.py`:
+
+    python3 scripts/navigator-i6-fixture.py cert /tmp/i6-cert   # prints ca.pem
+    python3 scripts/navigator-i6-fixture.py serve /tmp/i6-cert --port 443
+
+It answers `app.example`, `api.app.example`, `pay.example`,
+`cdn.thirdparty.example` and `elsewhere.example` by Host header. Point
+those names at it the way the Crypta stand's `idp.crypta.test` is, and
+trust its `ca.pem` for the couriers. The page reports each check as a line
+in its own `#checks` list and as a JSON line in the server's log (`"check":
+...`); every request the server saw is a line too, so a request the window
+refused is one that never appears. Sign in on the page's form, add an item,
+choose a file, press each link, and record the lines.
+
+Run, each three times, cold:
+
+1. `https://app.example/app.html` (the fixture).
+2. A Khan Academy public exercise
+   (`https://www.khanacademy.org/math/arithmetic/.../e/...`, any one that
+   opens without an account).
+3. An OpenStreetMap page (`https://www.openstreetmap.org/#map=12/...`) and a
+   MapLibre demo page.
+4. A public Notion page (a published `notion.site` page).
+
+Record for each: what the window drew (a capture), the refused hosts from
+navigatord's log grouped by same site or third party, Start (press to
+first composited frame, from the I5 trace lines) and the engine's peak
+resident memory (`ps -o rss` on the engine jail's process, every second).
+Figma is opened once and recorded, not chased (D13).
+
+What the run is expected to show, so a surprise is visible:
+
+- The fixture's `module`, `local-storage`, `push-state` and `wasm` lines
+  pass; `third-party` reads refused; `webgl` reads none.
+- Script-made requests (`session`, `script-post`, `same-site-api`) fail,
+  because the window fetches only scripts and stylesheets for a page: that
+  is what I6.3 and I6.5 build, and the run records the shape of what fails.
+- The `frame` line does not appear: no cross-origin frame runs before I6.5.
+- Public apps that load their code from a CDN host on another site render
+  little; the refused hosts list says which.
 
 #### Costs
 
@@ -3039,12 +3137,12 @@ alongside I0.
 | **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
 | **D7** ✓ | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Decided (Shankar, 2026-11-24): warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
-| **D8** | Is "run this page live" remembered (I6) | ask on every visit · remember per (persona, origin) until revoked · remember for the session only | **Remember per (persona, origin), revocable in Curia and from the chip.** A fat client used daily should not need a press every visit, and a choice that is per persona and visible in the chip keeps it the person's. Never automatic for an origin not chosen |
-| **D9** | Whose jar a live page uses (I6) | a jar per (persona, origin) kept by Nuntius through Arca couriers · a throwaway jar per run | **Kept per (persona, origin) through Arca's couriers**, as sign-in windows do (D6). Apps people run live are the ones they sign in to; a throwaway jar would sign them out at every Stop. The engine still never holds a cookie |
-| **D10** | Where a live page's storage lives (I6) | a per-(persona, origin) directory on the persona's encrypted volume, mounted into the engine jail · in memory for the run only | **On the persona's encrypted volume, one directory per origin**, mounted read-write into that origin's engine jail only. Offline-capable apps (Notion, WhatsApp) need it; persona removal destroys it with the rest (Tessera E5) |
-| **D11** | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
-| **D12** | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
-| **D13** | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |
+| **D8** ✓ | Is "run this page live" remembered (I6) | ask on every visit · remember per (persona, origin) until revoked · remember for the session only | **Remember per (persona, origin), revocable in Curia and from the chip.** A fat client used daily should not need a press every visit, and a choice that is per persona and visible in the chip keeps it the person's. Never automatic for an origin not chosen |
+| **D9** ✓ | Whose jar a live page uses (I6) | a jar per (persona, origin) kept by Nuntius through Arca couriers · a throwaway jar per run | **Kept per (persona, origin) through Arca's couriers**, as sign-in windows do (D6). Apps people run live are the ones they sign in to; a throwaway jar would sign them out at every Stop. The engine still never holds a cookie |
+| **D10** ✓ | Where a live page's storage lives (I6) | a per-(persona, origin) directory on the persona's encrypted volume, mounted into the engine jail · in memory for the run only | **On the persona's encrypted volume, one directory per origin**, mounted read-write into that origin's engine jail only. Offline-capable apps (Notion, WhatsApp) need it; persona removal destroys it with the rest (Tessera E5) |
+| **D11** ✓ | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
+| **D12** ✓ | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
+| **D13** ✓ | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |
 
 ### Local Mail callback and account storage
 

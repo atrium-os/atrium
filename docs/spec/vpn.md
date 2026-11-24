@@ -1286,9 +1286,21 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   since a duplicate zone or a stray byte would keep unbound from starting.
   It is emptied at start and when a tunnel closes. A restarted unbound
   starts with the zones: the gate restarts it under a tunnel and finds the
-  forward there at once. Still runtime only: a full tunnel's root
-  forwarders (`.`), which come back from FreeBSD's `forward.conf` until
-  atrium-net's check; with the block on, pf drops what goes to the LAN.
+  forward there at once. The root's forwarders (`.`) likewise: atrium-net
+  rewrites FreeBSD's `/var/unbound/forward.conf` (included before conf.d,
+  so a second `.` zone there would be ignored) with the forwarders it set
+  live, whenever they change: a full tunnel's servers, nothing under a full
+  tunnel without DNS (unbound resolves from the roots, through it), and
+  otherwise the own or the network's servers (`forward-tls-upstream` for
+  DNS over TLS). Before, a restart under a full tunnel without the block
+  asked the LAN's DNS until atrium-net's check. rc's start doesn't
+  rewrite it (`local-unbound-setup` runs only without an unbound.conf);
+  resolvconf does, from dhclient, but on Atrium atrium-net runs the
+  interfaces, so only a dhclient someone starts (the dev VM's management
+  NIC) can, and its `reload` is then healed by atrium-net's check as
+  before. The V1 gate restarts unbound under the
+  full tunnel without the block: the root forwards to the tunnel's DNS at
+  once and the LAN sees no DNS; after `down` the file is the LAN's again.
 - *Scripts in the sign-in window (2026-11-24).* An IdP's sign-in page
   runs its own scripts, as Keycloak's security-key pages do (a module
   script from `/resources/…/js/` importing `rfc4648` through an import map,

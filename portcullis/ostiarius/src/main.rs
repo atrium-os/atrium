@@ -40,7 +40,7 @@ impl Launcher for AllocLauncher {
     fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
         let reg = portcullis_peer::DEFAULT_REGISTRY;
         let _guard = portcullis_peer::lock_registry(reg).map_err(|e| e.to_string())?;
-        let uid = portcullis_peer::allocate(reg);
+        let uid = portcullis_peer::allocate(reg).map_err(|e| format!("allocate uid: {e}"))?;
         portcullis_peer::register(reg, uid, &s.owner, &s.app_id)
             .map_err(|e| format!("register uid {uid}: {e}"))?;
         eprintln!(

@@ -42,7 +42,7 @@ mod imp {
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
     use net_proto::{check_dns6, check_lease6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
-    use net_proto::tunnel::{check_tunnel, render_anchor, render_zones, AnchorTunnel, Net4, Tunnel};
+    use net_proto::tunnel::{check_tunnel, render_anchor, render_forward, render_zones, AnchorTunnel, Net4, Tunnel};
     use std::io;
     use atrium_netconf::{check_dns, lines as nlines, tls_name_ok, Manual};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -388,6 +388,8 @@ mod imp {
         /// unbound's `conf.d` and what was last written there
         /// (`atrium-vpn.conf`, the tunnels' zones).
         unbound_conf: Option<(Dir, String)>,
+        /// unbound's own directory, for forward.conf (the root's forwarders).
+        unbound_root: Option<(Dir, String)>,
         host: Vec<(String, Ipv4Addr, u8)>,
         /// The host's IPv6 addresses, by interface; with `host`, read at
         /// start and then kept from the routing socket's address messages.
@@ -568,6 +570,30 @@ mod imp {
         /// after '%'). Kept as is when nothing is known (an empty list would
         /// leave unbound resolving from the roots).
         fn forward(&mut self) {
+            self.forward_live();
+            self.persist_forward();
+        }
+
+        /// Keep the root's forwarders in forward.conf too: a restart of
+        /// unbound starts with them, not with the LAN's servers it had at
+        /// setup (under a full tunnel, a window where names leave outside it).
+        fn persist_forward(&mut self) {
+            if self.forwarders.is_empty() {
+                return;
+            }
+            let text = render_forward(&self.forwarders);
+            let Some((dir, last)) = self.unbound_root.as_mut() else { return };
+            if *last == text {
+                return;
+            }
+            match dir.write_mode("forward.conf", text.as_bytes(), 0o644) {
+                Ok(()) => *last = text,
+                Err(e) => return eprintln!("atrium-net: unbound: forward.conf: {e}"),
+            }
+            self.log(&format!("unbound: forward.conf holds {}", self.forwarders.join(" ")));
+        }
+
+        fn forward_live(&mut self) {
             // A full tunnel's DNS servers take every name (vpn.md §5.5);
             // without any, unbound resolves from the roots, through it.
             if let Some(dns) = self.full_tunnel().map(|t| t.dns.clone()) {
@@ -2495,6 +2521,16 @@ mod imp {
             ifc: Ifc::new().unwrap_or_else(|e| die(&e.to_string())),
             rt: Rtsock::new().unwrap_or_else(|e| die(&e.to_string())),
             unbound: o.unbound.as_ref().map(|d| Unbound::new(d, "local_unbound.ctl").unwrap_or_else(|e| die(&format!("unbound: {e}")))),
+            unbound_root: o.unbound_conf.as_ref().and_then(|d| {
+                let root = std::path::Path::new(d).parent()?.to_str()?.to_string();
+                match Dir::open(&root) {
+                    Ok(dir) => Some((dir, String::new())),
+                    Err(e) => {
+                        eprintln!("atrium-net: {root}: {e}: the root's forwarders won't outlive an unbound restart");
+                        None
+                    }
+                }
+            }),
             unbound_conf: o.unbound_conf.as_ref().and_then(|d| match Dir::open(d) {
                 Ok(dir) => Some((dir, String::new())),
                 Err(e) => {

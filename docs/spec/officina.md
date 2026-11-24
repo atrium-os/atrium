@@ -4786,7 +4786,7 @@ Gates: atrium-sheets `duplicate_sheet_copies_cells_formats_sizes_and_merges_afte
 
 ### 16.100 Name Manager, and a fuller Duplicate Sheet (2026-11-24)
 
-- **Name Manager…** (Data menu) opens a panel at the right of the grid. It lists every defined name: workbook names first, then sheet names with their sheet, each with what it refers to. Excel's own names show without `_xlnm.`, for example Print_Area. **Go** selects what a name covers, on its sheet; a name for a constant or a formula says it isn't a place. **Delete** removes a name as one undo step, and formulas that used it show `#NAME?` (`data::name_rows`, `name_place`, `delete_name`). Not yet: renaming a name or editing what it refers to in the panel. Define Name with the same spelling moves a name.
+- **Name Manager…** (Data menu) opens a panel at the right of the grid. It lists every defined name: workbook names first, then sheet names with their sheet, each with what it refers to. Excel's own names show without `_xlnm.`, for example Print_Area. **Go** selects what a name covers, on its sheet; a name for a constant or a formula says it isn't a place. **Delete** removes a name as one undo step, and formulas that used it show `#NAME?` (`data::name_rows`, `name_place`, `delete_name`). Not yet: editing what a name refers to in the panel. (Rename came in §16.104.) Define Name with the same spelling moves a name.
 - **Duplicate Sheet** now also copies the sheet's conditional formats, data validations and sheet-scoped names (such as its print area) onto the copy. The sheet move comes last so that these follow the copy to its place.
 
 Gates: atrium-sheets `the_name_manager_lists_goes_to_and_deletes_names` and the extended `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`; all 127 Sheets lib tests pass.
@@ -4806,6 +4806,22 @@ Gates: officina-grid `sheets_are_hidden_shown_undone_and_saved_but_one_always_sh
 Delete Cells (shift up or left) now turns references to the deleted cells into `#REF!`, as Excel does, even when nothing moves in to replace them. `officina_grid::clip::kill_refs(wb, rect)` rewrites every formula outside `rect` that names a cell inside it, or a range wholly inside it. It uses the cut mover with nothing moving. Ranges that only overlap the deleted cells keep their ends. Excel would shrink them; that is not done yet. The rewrite and the clearing run first, then the cells past the deletion are cut and pasted in from the workbook as it now is, so the mover never sees a stale formula. The two halves are one undo step, and if the paste is refused the first half is undone.
 
 Gates: atrium-sheets `deleted_cells_turn_formulas_reading_them_into_ref_errors`. It fails on the code before (`=D4` stayed `=D4` after D4 was deleted with nothing to its right). All 129 Sheets lib and 121 officina-grid lib tests pass.
+
+### 16.103 Text rotation, more border styles, typed colours, Clear Comments (2026-11-24)
+
+- **Rotation** (Format menu): No Rotation, Angle Counterclockwise (45°), Angle Clockwise (−45°), Vertical Text (stacked, 255), Rotate Text Up (90°) and Rotate Text Down (−90°), as Excel's Orientation button offers them. The grid already draws `Style::rotation`.
+- **Borders:** Top and Bottom Border (thin), Thick Outside Borders, Thick Bottom Border and Double Bottom Border join All, Outside, Bottom and None. Thick outside uses the same disjoint corner and strip rectangles as Outside, so the inside cells keep their own edges.
+- **Typed colours:** the text and fill colour bar has a `#RRGGBB` field (`#RGB` and a bare `RRGGBB` also work, via `format::parse_hex`). Set applies the colour as one step and closes the bar. A colour the field can't read keeps the bar open and says how to write one.
+- **Clear Comments** (Data menu) takes the selection's comments off as one step, leaving contents and formats.
+
+Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Not yet: a rotation angle typed by hand. (Border lines and colours came in §16.104.)
+
+### 16.104 Border pens, and renaming names (2026-11-24)
+
+- **Border pen** (Format menu): Border Line: Thin, Medium, Dashed, Dotted or Hair, and Border Colour: Automatic or one of the eight tab colours. Both are radio items and stay set for the session (`Doc::border_pen`). All, Outside, Bottom, and Top and Bottom draw with the pen. Thick and Double keep their own line and take the pen's colour.
+- **Rename** in the Name Manager opens the name bar filled with the name. `officina_grid::names::rename_ops` renames the definition and rewrites every formula and other name that uses it, as one step. A workbook name isn't rewritten on a sheet whose own name of that spelling hides it, and a sheet name is rewritten only on its sheet. A formula that binds the spelling itself with LET or LAMBDA is left unchanged and counted in the status. Clashing and invalid names are refused, and the bar stays open. Not yet: names used in conditional formats, validations and charts aren't rewritten.
+
+Gates: atrium-sheets `border_pens_draw_their_line_and_colour` and `renaming_a_name_rewrites_the_formulas_and_names_using_it`; all 132 Sheets lib and 121 officina-grid lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 

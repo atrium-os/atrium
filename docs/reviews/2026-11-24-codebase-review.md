@@ -73,7 +73,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | **Fixed `2af0740`** |
 | H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | **Fixed `6cbc9c0`** (connection cap not yet VM-tested) |
 | H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
-| H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | Open |
+| H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed `2bd8429`** in portcullis-peer, portcullisd, ostiarius; other daemons' `.ok()`/default sites fail closed and keep their code |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `931bfc7`** |
 | M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | Open |
 | M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | **Fixed `61feb4a`** |
@@ -81,7 +81,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | M4 | Medium | jaild, many crates | Security predicates and helpers are copy-pasted | M | Open |
 | M5 | Medium | tessera, gpu-rs, vk-icd, atrium-net | `unsafe` without justification; FFI entry points with no panic boundary | M | Open |
 | M6 | Medium | atrium-tessera | One 36,480-line C file in the kernel | L | Open |
-| M7 | Medium | repo | The licence policy describes enforcement that does not exist | S | Open |
+| M7 | Medium | repo | The licence policy describes enforcement that does not exist | S | **Fixed**: `scripts/licence-audit.py`, policy text matches it |
 | M8 | Medium | frescod, tabula, others | A poisoned mutex takes down every client | M | Open |
 | L1 | Low | everywhere | 2,304 "★" war-story comments, dangling ticket numbers, misplaced doc comments | ongoing | Open |
 | L2 | Low | portcullis-peer | A four-level wrapper chain for one function | S | Open |
@@ -455,19 +455,30 @@ per AGENTS.md "How to verify".
 ## 5. Licence sweep
 
 All 981 distinct (crate, version) pairs from the 185 lockfiles were checked
-against crates.io's licence field. Result: **clean**.
+against crates.io's licence field. Result: **clean**, after a correction.
 
-- Every one of the 981 pairs offers a licence the policy allows.
+- Every one of the 978 pairs offers a licence the policy allows.
 - `r-efi` is MIT OR Apache-2.0 OR LGPL-2.1-or-later. We take it under MIT,
   and it only builds for UEFI targets anyway.
-- `libbz2-rs-sys` uses the bzip2-1.0.6 licence, which is BSD-style and
-  permissive. Add it to the allowlist explicitly.
+- These licences are permissive but not named in the policy. They are now
+  listed, with reasons, in `scripts/licence-audit.py`:
+  - `libbz2-rs-sys` uses the bzip2-1.0.6 licence (BSD-style).
+  - `jpeg-encoder` is `(MIT OR Apache-2.0) AND IJG`.
+  - `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA`, and is used for
+    fuzzing only.
+- The correction: this section's first version missed the last two. My
+  first filter split on `OR` before parentheses, so it misread them. The
+  script parses SPDX properly and caught both.
 - No crate is GPL-only, MPL or EPL.
 
 Vendored code (`hospes/vendor`, `navigator-fonts/vendor`,
 `vinculum/third_party`) and the Navigator engines were not part of this
-sweep. M7 still stands: the check exists now only because this review ran
-it.
+sweep.
+
+**Tool:** `python3 scripts/licence-audit.py [dirs...] [--offline]`. It walks
+every `Cargo.lock`, caches crates.io answers in
+`~/.cache/atrium/licences.json`, exits 1 on any failure, and names the crates
+that use each failing dependency.
 
 ## 6. Ongoing adversarial review of new code
 
