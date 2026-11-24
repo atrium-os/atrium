@@ -985,6 +985,16 @@ fn vpn_resource_target(document: &str, url: &str) -> Result<String, &'static str
     doc.host_str().map(str::to_ascii_lowercase).ok_or("the page has no host")
 }
 
+/// A refused resource's host and registrable site, for the log: bounded,
+/// and only the host, never the path or query.
+fn refused_target(url: &str) -> String {
+    let parsed = url::Url::parse(url).ok().filter(|_| url.len() <= limen::sign_in::VPN_RESOURCE_URL_MAX);
+    let Some(host) = parsed.as_ref().and_then(|u| u.host_str()) else { return "host unreadable".into() };
+    let host: String = host.chars().filter(|c| c.is_ascii_graphic()).take(253).collect();
+    let site = site_of(url).map(|s| s.chars().filter(|c| c.is_ascii_graphic()).take(253).collect::<String>()).unwrap_or_default();
+    format!("host {host}, site {site}")
+}
+
 /// What a fetched VPN page resource is: a script or a stylesheet by its one
 /// content type, within the size bound; anything else is refused.
 fn vpn_resource_kind(status: u16, headers: &[(String, String)], body: &[u8]) -> Result<ctl::VpnResourceKind, &'static str> {
@@ -1391,8 +1401,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 ceremony.0.lock().unwrap().take_if(|p| p.id == id);
             }
             Request::VpnResource { page, id, url } => {
+                // The refused host and its site, for the I6.0 measurement of
+                // what whole pages reach (navigator-islands.md D12).
+                let target = refused_target(&url);
                 let refuse = |why: &str| {
-                    eprintln!("navigatord: a VPN page's resource refused: {why}");
+                    eprintln!("navigatord: a VPN page's resource refused: {why} ({target})");
                     send(&w, &Event::VpnResource { id, kind: None, why: Some(why.into()) });
                 };
                 let (Some(v), Some(c)) = (cfg.vpn.clone(), cookies.clone()) else {
@@ -2569,6 +2582,8 @@ mod tests {
         assert!(vpn_resource_target(doc, "http://idp.crypta.test:448/a.js").is_err(), "never plain http");
         assert!(vpn_resource_target(doc, "https://u:p@idp.crypta.test:448/a.js").is_err(), "no credentials");
         assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/a.js#x").is_err(), "no fragment");
+        assert_eq!(refused_target("https://cdn.thirdparty.example/lib.js?k=secret"), "host cdn.thirdparty.example, site thirdparty.example");
+        assert_eq!(refused_target("not an address"), "host unreadable");
         assert!(vpn_resource_target(doc, "https://IDP.crypta.test:448/a.js").is_err(), "only the normal spelling");
         assert!(vpn_resource_target("http://idp.crypta.test/", "http://idp.crypta.test/a.js").is_err());
         let long = format!("https://idp.crypta.test:448/{}", "a".repeat(limen::sign_in::VPN_RESOURCE_URL_MAX));

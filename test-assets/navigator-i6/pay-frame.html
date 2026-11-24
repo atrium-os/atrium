@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Payment frame</title></head>
+<body style="font: 14px sans-serif; margin: 8px">
+<label>Card <input id="card" autocomplete="cc-number"></label>
+<script>
+  // Runs in pay.example's own engine (D11); it can't read the app's DOM.
+  let reach = "parent DOM unreachable";
+  try { reach = parent.document.title; } catch (_) {}
+  parent.postMessage("pay.example running; " + reach, "https://app.example");
+</script>
+</body></html>

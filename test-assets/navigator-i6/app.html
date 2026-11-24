@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>I6 fixture app</title>
+<style>
+  body { font: 16px sans-serif; margin: 16px; background: #fff; color: #111; }
+  #checks li { margin: 2px 0; }
+  .pass { color: #070; } .fail { color: #b00; } .refused { color: #850; }
+  iframe { width: 320px; height: 80px; border: 1px solid #888; }
+</style>
+<!-- D12: a third-party script. It must be refused; app.js reports whether it ran. -->
+<script src="https://cdn.thirdparty.example/lib.js"></script>
+<script type="module" src="/app.js"></script>
+</head>
+<body>
+<h1 id="who">Not signed in</h1>
+<form id="sign-in" method="post" action="/login">
+  <input name="user" value="ana"> <button>Sign in</button>
+</form>
+<form id="add"><input id="item" value="first item"> <button>Add</button></form>
+<ul id="items"></ul>
+<p><input type="file" id="file"> <span id="file-out">no file</span></p>
+<p><a id="dl-blob" download="notes.txt" href="#">Download notes</a>
+   <a id="dl-server" href="/report.csv">Download report</a></p>
+<p><a id="same" href="/second.html">Same origin page</a>
+   <a id="route" href="#">Route (pushState)</a>
+   <a id="cross" href="https://elsewhere.example/">Another site</a>
+   <button id="popup">Open another site</button></p>
+<!-- D11: a cross-origin frame, its own jail. -->
+<iframe id="pay" src="https://pay.example/frame.html" title="Payment"></iframe>
+<ol id="checks"></ol>
+</body>
+</html>
