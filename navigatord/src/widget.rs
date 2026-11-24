@@ -439,3 +439,25 @@ fn youtube_resource(
     reader.read_exact(&mut body).map_err(|e| e.to_string())?;
     Ok(body)
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    /// The local video widget's fetches are fixed in three places: this
+    /// grant, the engine's fixture sequence and the page's script. When they
+    /// drift, every Start fails at the first missing fetch (navigator-islands.md
+    /// "I5 Start trace": a worker without the Opus fetch).
+    #[test]
+    fn the_video_grant_matches_the_engines_fixture_sequence_and_the_page() {
+        let engine = include_str!("../../navigator-ladybird/fixture_fetch.rs");
+        let start = engine.find("const VIDEO: [&str;").expect("the engine's VIDEO sequence");
+        let list = &engine[start..start + engine[start..].find("];").unwrap()];
+        let engine_urls: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        let ours: Vec<&str> = super::VIDEO_RESOURCES.iter().map(|(u, _)| *u).collect();
+        assert_eq!(ours, engine_urls, "navigatord's grant and the engine's fixture sequence");
+        let page = include_str!("../../test-assets/navigator-i4/local-player.js");
+        for (url, _) in &super::VIDEO_RESOURCES[2..] {
+            let file = url.rsplit('/').next().unwrap();
+            assert!(page.contains(&format!("../media/{file}")), "local-player.js fetches {file}");
+        }
+    }
+}

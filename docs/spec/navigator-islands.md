@@ -1706,6 +1706,33 @@ audio service and about 0.95 s with it. Before the next Start measurement,
 pair main's navigatord with a worker and fixture that make the Opus fetch.
 Evidence is in `~/atrium-vm/evidence/navigator-i5-start-trace-20261124/`.
 
+#### Follow-up: the audio wait and the Opus fetch
+
+limend asked choragusd for the player's audio ticket inside `request`,
+under its state lock, before replying to navigatord. navigatord's
+`Video::start` waits for that reply before it starts serving the engine's
+fetches, so an absent or stalled choragusd delayed the engine's first
+request and, while it lasted, every other Limen request. limend now asks on
+a thread of its own after the embed exists, and cancels a ticket whose
+embed ended meanwhile; cancels at embed end also leave the state lock. The
+player opens its sound again when a late ticket arrives
+([lyra-v1.md §4](lyra-v1.md)). `limen/tests/daemon.rs` holds a 1.5 s
+choragusd and checks that the embed and a second request still answer
+within 1 s; on the old code it failed at 1.52 s.
+
+Main's sources already agree on the four fetches: navigatord's grant,
+`navigator-ladybird/fixture_fetch.rs` and `local-player.js` all name
+`tone-opus.webm`. The audited I5 worker binary predated that, so the rerun
+needs an engine rebuilt from main (with `fixture-fetch.patch` and
+`native-mse.patch` as on main) and audited again with
+`scripts/navigator-i5-worker-audit.sh`. A navigatord unit test now fails
+when the grant, the engine's sequence and the page's fetches drift.
+
+Rerun: rebuild and audit the engine from main, deploy main's navigatord,
+limend, portcullisd and jaild, then run three Starts without choragusd and
+three with it. Both arms should now reach `first-request` in tens of
+milliseconds; record press to red pixel as in the I5 gate.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a

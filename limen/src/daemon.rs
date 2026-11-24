@@ -586,20 +586,19 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         }
     };
     // A player's ticket: choragusd checks the parent's `audio` grant. Only a
-    // spawned child, whose uid limend knows from its own launch.
-    let audio_ticket = (spawned && catalogue::AUDIO_ROLES.contains(&role.name))
-        .then(|| shared.attribution.lock().unwrap().as_mut().and_then(|a| a.issue(child_uid, uid)))
-        .flatten();
+    // spawned child, whose uid limend knows from its own launch. Asked for
+    // after the embed exists, off this lock: choragusd may take seconds to
+    // answer or be absent (its connect waits up to 2 s), and limend's whole
+    // state, and the parent's reply, must not wait on it (navigator-islands.md
+    // "I5 Start trace": the island's first request came 2 s late).
+    let wants_ticket = spawned && catalogue::AUDIO_ROLES.contains(&role.name);
     let e = Embed {
-        role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket,
+        role, parent: conn, parent_uid: uid, parent_window: req.window, z: req.z, child, child_uid, spawned, audio_ticket: None,
         child_window: None, rect: None, visible: true, bound: false, binding_generation: 0, island: with_fetch.then(Default::default), media_ready: false, attached: false, pip: false,
         legacy_selection_sent: false, smime_scope, smime_picker: None,
         to_child: Rate::default(), to_parent: Rate::default(),
     };
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
-    if let Some(ticket) = audio_ticket {
-        st.to_child(&e, ChildEvent::AudioTicket { embed, ticket });
-    }
     if let Some(persona) = e.smime_scope.clone() {
         st.to_child(&e, ChildEvent::ParentPersona { embed, persona });
     } else if catalogue::PERSONA_ROLES.contains(&role.name) {
@@ -613,7 +612,36 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request, wi
         st.to_parent_fd(&e, ParentEvent::IslandFetch { embed }, socket.into());
     }
     st.embeds.insert(embed, e);
+    if wants_ticket {
+        let sh = shared.clone();
+        std::thread::spawn(move || issue_audio_ticket(&sh, embed, child_uid, uid));
+    }
     Ok(Reply::Embed { embed })
+}
+
+/// Ask choragusd for a player's ticket and hand it over, if the embed is
+/// still the same child by then; otherwise the ticket is cancelled at once.
+fn issue_audio_ticket(shared: &Arc<Shared>, embed: EmbedId, child_uid: u32, parent_uid: u32) {
+    let ticket = shared.attribution.lock().unwrap().as_mut().and_then(|a| a.issue(child_uid, parent_uid));
+    let Some(ticket) = ticket else { return };
+    {
+        let mut st = shared.state.lock().unwrap();
+        let taken = match st.embeds.get_mut(&embed) {
+            Some(e) if e.child_uid == child_uid && e.audio_ticket.is_none() => {
+                e.audio_ticket = Some(ticket);
+                true
+            }
+            _ => false,
+        };
+        if taken {
+            let e = &st.embeds[&embed];
+            st.to_child(e, ChildEvent::AudioTicket { embed, ticket });
+            return;
+        }
+    }
+    if let Some(a) = shared.attribution.lock().unwrap().as_mut() {
+        a.cancel(ticket);
+    }
 }
 
 fn request_smime_picker(shared: &Arc<Shared>, conn: ConnId, uid: u32, sheet: EmbedId, window: WindowToken) -> Result<Reply, Reply> {
@@ -1100,9 +1128,14 @@ fn end(shared: &Arc<Shared>, st: &mut State, embed: EmbedId, e: Embed, tell_pare
     }
     st.to_child(&e, ChildEvent::Detaching { embed });
     if let Some(t) = e.audio_ticket {
-        if let Some(a) = shared.attribution.lock().unwrap().as_mut() {
-            a.cancel(t);
-        }
+        // Off the state lock, like the issue: a stalled choragusd must not
+        // hold every other embed's traffic.
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            if let Some(a) = sh.attribution.lock().unwrap().as_mut() {
+                a.cancel(t);
+            }
+        });
     }
     if tell_parent {
         st.to_parent(&e, ParentEvent::Detached { embed });

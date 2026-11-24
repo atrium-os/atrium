@@ -36,6 +36,10 @@ pub enum HostEvent {
     Gone,
     /// limend put our window into picture-in-picture, or took it back.
     Pip(bool),
+    /// Limen's audio ticket arrived. limend asks choragusd for it off its
+    /// own lock, so it can come after the media's audio track did: open the
+    /// sound then.
+    AudioTicket,
 }
 
 pub trait Host {
@@ -109,7 +113,10 @@ impl Host for LimenHost {
                 ChildEvent::Suspended { embed } if embed == self.embed => out.push(HostEvent::Suspend),
                 ChildEvent::Resumed { embed } if embed == self.embed => out.push(HostEvent::Resume),
                 ChildEvent::Detaching { embed } if embed == self.embed => out.push(HostEvent::Gone),
-                ChildEvent::AudioTicket { embed, ticket } if embed == self.embed => self.ticket = Some(ticket),
+                ChildEvent::AudioTicket { embed, ticket } if embed == self.embed => {
+                    self.ticket = Some(ticket);
+                    out.push(HostEvent::AudioTicket);
+                }
                 ChildEvent::Pip { embed, on } if embed == self.embed => out.push(HostEvent::Pip(on)),
                 _ => {}
             }
@@ -163,6 +170,8 @@ pub struct App<H: Host> {
     /// Buffered ranges of the first track the feed reported, in seconds.
     shown_track: Option<u8>,
     pub audio: Option<AudioOut>,
+    /// The audio track's rate and channels, once the media reported one.
+    audio_format: Option<(u32, u16)>,
     /// choragusd's socket.
     pub audio_socket: String,
     volume: f32,
@@ -251,6 +260,7 @@ impl<H: Host> App<H> {
             done: false,
             shown_track: None,
             audio: None,
+            audio_format: None,
             audio_socket: std::env::var("ATRIUM_AUDIO_SOCKET").unwrap_or_else(|_| crate::audio_out::DEFAULT_SOCKET.into()),
             volume: 1.0,
             rate: 1.0,
@@ -393,6 +403,12 @@ impl<H: Host> App<H> {
         let m = match ev {
             HostEvent::Gone => {
                 self.done = true;
+                return Ok(());
+            }
+            HostEvent::AudioTicket => {
+                // Only a stream opened without the ticket is reopened: one
+                // that has the ticket already plays as the parent.
+                if self.audio.is_none() { self.open_audio(); }
                 return Ok(());
             }
             HostEvent::Pip(on) => {
@@ -592,7 +608,26 @@ impl<H: Host> App<H> {
         }
     }
 
-    fn on_player(&mut self, ev: PlayerEvent) {
+    /// Open the sound for the media's audio track, with Limen's ticket if
+    /// one has come (an embedded player plays as its parent).
+    fn open_audio(&mut self) {
+        let Some((rate, channels)) = self.audio_format else { return };
+        match AudioOut::open(&self.audio_socket, self.host.audio_ticket(), rate, channels) {
+            Ok(mut a) => {
+                let v = if self.muted { 0.0 } else { self.volume };
+                if v < 1.0 {
+                    a.set_volume(v);
+                }
+                a.set_rate(self.rate);
+                self.audio = Some(a);
+                self.sync_paused();
+            }
+            // No sound for us (no grant, or no Lyra): play silent.
+            Err(e) => eprintln!("atrium-player: no audio: {e}"),
+        }
+    }
+
+        fn on_player(&mut self, ev: PlayerEvent) {
         match ev {
             PlayerEvent::VideoTrack { width, height, bit_depth } => {
                 self.video = Some((width, height));
@@ -600,21 +635,8 @@ impl<H: Host> App<H> {
                 println!("video-track {width}x{height} {bit_depth}-bit");
             }
             PlayerEvent::AudioTrack { rate, channels } => {
-                if self.audio.is_none() {
-                    match AudioOut::open(&self.audio_socket, self.host.audio_ticket(), rate, channels) {
-                        Ok(mut a) => {
-                            let v = if self.muted { 0.0 } else { self.volume };
-                            if v < 1.0 {
-                                a.set_volume(v);
-                            }
-                            a.set_rate(self.rate);
-                            self.audio = Some(a);
-                            self.sync_paused();
-                        }
-                        // No sound for us (no grant, or no Lyra): play silent.
-                        Err(e) => eprintln!("atrium-player: no audio: {e}"),
-                    }
-                }
+                self.audio_format = Some((rate, channels));
+                if self.audio.is_none() { self.open_audio(); }
             }
             PlayerEvent::Sandboxed(_) | PlayerEvent::Probe { .. } | PlayerEvent::Restarted => {}
             PlayerEvent::Duration(d) => {

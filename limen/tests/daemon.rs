@@ -392,6 +392,16 @@ impl Attribution for Tickets {
     fn cancel(&mut self, t: [u8; 16]) { self.0.lock().unwrap().1.push(t) }
 }
 
+/// Tickets are issued and cancelled off limend's state lock, on a thread of
+/// their own: wait (bounded) for `done` to hold.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done() {
+        assert!(std::time::Instant::now() < until, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn an_embedded_player_gets_an_audio_ticket_that_dies_with_the_embed() {
     let w = World::new();
@@ -405,6 +415,7 @@ fn an_embedded_player_gets_an_audio_ticket_that_dies_with_the_embed() {
     // Asked for the player's uid (from limend's own launch) under the parent's.
     assert_eq!(tickets.0.lock().unwrap().0, vec![(PLAYER_UID, APP)]);
     app.detach(e).unwrap();
+    eventually("the cancel", || !tickets.0.lock().unwrap().1.is_empty());
     assert_eq!(tickets.0.lock().unwrap().1, vec![[PLAYER_UID as u8; 16]], "cancelled when the embed ends");
 
     // A parent choragusd refuses (no audio): the player gets no ticket.
@@ -412,12 +423,58 @@ fn an_embedded_player_gets_an_audio_ticket_that_dies_with_the_embed() {
     let e = other.request("media-player", W_OTHER).unwrap();
     let (_, mut player) = w.spawned();
     assert!(matches!(next_c(&mut player), ChildEvent::Attach { .. }));
+    eventually("the refused issue", || tickets.0.lock().unwrap().0.len() == 2);
     other.detach(e).unwrap();
     assert_eq!(next_c(&mut player), ChildEvent::Detaching { embed: e }, "no AudioTicket in between");
     // Roles that don't play sound never ask.
     let _ = app.request("doc-viewer", W_APP).unwrap();
     let _ = w.spawned();
+    std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(tickets.0.lock().unwrap().0.len(), 2);
+}
+
+/// choragusd that takes its time (absent: limend's connect waits 2 s).
+struct Slow(std::time::Duration, Tickets);
+impl Attribution for Slow {
+    fn issue(&mut self, child: u32, parent: u32) -> Option<[u8; 16]> {
+        std::thread::sleep(self.0);
+        self.1.issue(child, parent)
+    }
+    fn cancel(&mut self, t: [u8; 16]) { self.1.cancel(t) }
+}
+
+#[test]
+fn a_slow_audio_service_delays_neither_the_embed_nor_other_requests() {
+    let w = World::new();
+    let tickets = Tickets::default();
+    w.shared.set_attribution(Box::new(Slow(std::time::Duration::from_millis(1500), tickets.clone())));
+    let mut app = w.parent(APP);
+    let started = std::time::Instant::now();
+    let e = app.request("media-player", W_APP).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { embed, .. } if embed == e));
+    // limend's state is free while choragusd thinks: another request goes through.
+    let _ = app.request("doc-viewer", W_APP).unwrap();
+    let _ = w.spawned();
+    assert!(started.elapsed() < std::time::Duration::from_millis(1000),
+        "the embed waited on the audio service ({:?})", started.elapsed());
+    // The ticket still arrives, after Attach.
+    assert_eq!(next_c(&mut player), ChildEvent::AudioTicket { embed: e, ticket: [PLAYER_UID as u8; 16] });
+}
+
+#[test]
+fn a_ticket_for_an_embed_that_ended_meanwhile_is_cancelled() {
+    let w = World::new();
+    let tickets = Tickets::default();
+    w.shared.set_attribution(Box::new(Slow(std::time::Duration::from_millis(300), tickets.clone())));
+    let mut app = w.parent(APP);
+    let e = app.request("media-player", W_APP).unwrap();
+    let (_, mut player) = w.spawned();
+    assert!(matches!(next_c(&mut player), ChildEvent::Attach { .. }));
+    app.detach(e).unwrap();
+    assert_eq!(next_c(&mut player), ChildEvent::Detaching { embed: e });
+    eventually("the late ticket's cancel", || !tickets.0.lock().unwrap().1.is_empty());
+    assert_eq!(tickets.0.lock().unwrap().1, vec![[PLAYER_UID as u8; 16]]);
 }
 
 #[test]

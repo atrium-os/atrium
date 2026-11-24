@@ -110,8 +110,12 @@ Each of these was found by reading the code, not the spec.
   for an **attribution ticket** (`ToAttribution::Issue { child_uid, parent_uid }`): "the
   instance with uid U plays for the app with uid P". choragusd names P through the launch
   registry, refuses unless P's user granted it `audio`, and answers a random 128-bit
-  ticket. limend passes it to the child as `AudioTicket`, right after `Attach`. The child
-  puts it in `Hello` (`Client::connect(path, Some(ticket))`). choragusd accepts it only
+  ticket. limend asks on a thread of its own, after the embed exists and off its state
+  lock (an absent or stalled choragusd once held an island's Start for 2 s), and passes
+  the ticket to the child as `AudioTicket`, some time after `Attach`; a ticket for an
+  embed that ended meanwhile is cancelled at once. The child puts it in `Hello`
+  (`Client::connect(path, Some(ticket))`); a player whose audio track came first, and
+  so opened without one and was refused, opens its sound again when the ticket comes. choragusd accepts it only
   from a peer whose uid is U, only once, and only while limend's embed is alive: limend
   cancels it when the embed ends (`Cancel`, which also hangs up a connection that used
   it), and every ticket dies if limend's connection does. The streams are then listed,
