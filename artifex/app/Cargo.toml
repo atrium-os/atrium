@@ -19,6 +19,9 @@ artifex-syntax = { path = "../syntax" }
 pergola = { path = "../../pergola" }
 fresco-protocol = { path = "../../fresco-protocol" }
 portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
+# Previews: the system's image decoder, never a decoder in Artifex.
+atrium-assets = { path = "../../sdk/atrium-assets" }
+atrium-worker = { path = "../../sdk/atrium-worker" }
 serde_json = "1"
 toml = "0.8"
 libc = "0.2"

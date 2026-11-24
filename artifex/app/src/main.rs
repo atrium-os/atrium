@@ -106,7 +106,7 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -115,7 +115,20 @@ fn main() {
                 s.debug.as_ref().map(|d| (&d.run, d.stopped, d.frames.iter().find(|f| f.1.is_some()).map(|f| format!("{}:{}", f.1.as_deref().unwrap_or(""), f.2)))),
                 s.breakpoints,
                 s.fuzz.as_ref().map(|f| (f.on, f.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("+"), f.crashes.len(), f.crashes.iter().any(|c| c.in_core))),
-                s.moving.is_some(), s.panel_open.then_some(s.panel), s.view);
+                s.moving.is_some(), s.panel_open.then_some(s.panel), s.view,
+                // (files, shown, decoded previews, uses, icon check ok, import)
+                s.assets.as_ref().map(|a| (a.files.len(), a.selected().map(|f| f.rel.clone()).unwrap_or_default(),
+                    a.preview.as_ref().map(|p| p.images.iter().filter(|i| i.is_ok()).count()).unwrap_or(0),
+                    a.preview.as_ref().and_then(|p| p.uses.as_ref().map(Vec::len)),
+                    a.check.as_ref().map(|(_, r)| r.as_ref().map(|r| r.ok).unwrap_or(false)),
+                    match &a.importing {
+                        None => "none".to_string(),
+                        Some(artifex::assets::Importing::Choosing(l)) => format!("choosing {}", l.len()),
+                        Some(artifex::assets::Importing::Asking(_)) => "asking".into(),
+                        Some(artifex::assets::Importing::Planned(p)) => format!("planned {} ok={} dropped={} preview={}", p.path, p.report.ok, p.dropped.len(),
+                            a.import_preview.as_ref().map(|v| v.iter().filter(|i| i.is_ok()).count()).unwrap_or(0)),
+                        Some(artifex::assets::Importing::Failed(e)) => format!("failed {e}"),
+                    })));
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

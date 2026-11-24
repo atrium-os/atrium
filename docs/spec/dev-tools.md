@@ -303,6 +303,21 @@ gradients kept in `<defs>`, rectangular clips, opacity, even-odd).
 are its CLI, and `cargo atrium bundle` now carries every file under
 `assets/` (plain names, no links, at most 4096).
 
+As built (step 4, the view): the strip's Assets (an `atrium.toml`
+project) lists `assets/` (icons in `assets/icons/`, then pictures, then
+other files; at most 500, links not followed). An icon shows at 16, 24,
+32 and 48 points on a light and a dark ground, a picture fitted into
+480×320; both are decoded at 2× by the system's decoder (Artifex's
+manifest names `decoders = ["image"]`; one `atrium_assets::Decoder` on a
+thread of its own), never in Artifex. Under each: where the project's
+sources name it (a bounded search), and for an icon the dock's verdict
+from `cargo atrium icon check --json` in the workspace. Import SVG lists
+the project's SVGs outside `assets/`; picking one runs `cargo atrium icon
+import --dry-run --json` and shows the result decoded, its counts against
+the limits, what was converted and what wasn't kept; Import writes it.
+`artifex::assets` is the model, `views::assets` the view;
+`vm-artifex-check.sh`'s "Assets" section is its VM check.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today

@@ -50,6 +50,7 @@ xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-vol
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex --bin artifex"
+xb atrium-image-decode ""
 [ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
 
 echo "=== install"
@@ -67,6 +68,10 @@ for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/releas
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "artifex: 1 failed"; exit 1; }
 done
 scp -q $K -P 2222 "$ROOT/artifex/app/atrium.toml" root@localhost:$B/artifex.toml
+# The system's image decoder, for the Assets view's previews.
+for f in atrium-image-decode/target/$TARGET/release/atrium-image-decode scripts/image-decode-bundle.sh etc/jaild.policy.toml; do
+    scp -q $K -P 2222 "$ROOT/$f" root@localhost:$B/ || { echo "copy $f failed"; echo "artifex: 1 failed"; exit 1; }
+done
 scp -q $K -P 2222 "$ROOT/atrium-term-socket/atrium.toml" root@localhost:$B/terminal.toml
 if [ -n "${BUNDLE:-}" ]; then
     echo "=== cargo atrium bundle"
@@ -121,6 +126,12 @@ O=$B/b-$ART; mkdir -p \$O/bin; cp $B/artifex \$O/bin/; cp $B/artifex.toml \$O/at
 echo on > \$O/.trace; echo 40,30 > \$O/.at
 sign \$O; opifex install \$O >/dev/null
 fi
+# The image decoder (vm-image-decode-check.sh installs it the same way):
+# jaild's policy with its uid and rctl on (the bundle has [resources]).
+cp $B/jaild.policy.toml $B/jaild.policy.new
+printf '\n[resource_control]\nallow_rctl = true\n' >> $B/jaild.policy.new
+cmp -s $B/jaild.policy.new /etc/atrium/jaild.policy.toml || { cp $B/jaild.policy.new /etc/atrium/jaild.policy.toml; service atrium-jaild restart >/dev/null 2>&1 || true; }
+(cd $B && sh image-decode-bundle.sh $B/atrium-image-decode /root/of-key.pem /usr/local/bin/opifex >/dev/null)
 mkdir -p /atrium/sockets/portcullis /atrium/sockets/clipboard /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
 daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=off $B/stoad
@@ -397,6 +408,14 @@ if V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_proj test -x /atri
     shot artifex-8-debug-ask
     GAP=8 press 980 520
     DEV=dev.alice.proj.org.example.app
+    # As for Run: a press that reached frescod too late is asked again.
+    n=0
+    while [ $n -lt 3 ] && waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3\|press was too long ago' 300 \
+        && state | grep -q 'press was too long ago'; do
+        n=$((n + 1)); echo "  (the press expired on the way: again, $n)"
+        inj "KEY 0x3e 1" "KEY 0x3e 0"
+        waitstate 'ask=Some("app")' 300 && GAP=8 press 980 520
+    done
     waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3' 300 \
         && ok "the press starts it and lldb-dap stops it at the breakpoint ($(state | grep -o 'app/app.c:[0-9]*' | tail -1))" || bad "debug: $(state) $(V "grep -i 'debug\|REFUSED' $LOG | tail -4")"
     check "it runs in its own jail as the dev build" "1" "$(V "jls name | grep -c '^dev_alice_proj'")"
@@ -470,6 +489,79 @@ if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/tool
     shot artifex-15-composition
 else
     echo "  (no vendored fuzz crates (FUZZ_VENDOR), or no cargo-atrium with worker add in the Rust layer: skipped)"
+fi
+
+echo "=== Assets"
+# The Assets view (dev-tools.md §3.5, step 4): the project's assets/, an
+# icon at four sizes and a picture decoded by the system's decoder (never
+# in Artifex), where the icon is used, the dock's check of it (cargo
+# atrium icon check) and Import SVG (cargo atrium icon import).
+P=; F=
+if V "test -f $W/proj/work/photos/atrium.toml"; then P=photos; F=photos/Cargo.toml
+elif V "test -f $W/proj/work/app/atrium.toml"; then P=app; F=app/app.c; fi
+if [ -n "$P" ]; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    FX=$(mktemp -d)
+    python3 -I - "$FX" <<'PY'
+import struct, sys, zlib
+d = sys.argv[1]
+def png(w, h, px):
+    raw = b"".join(b"\0" + b"".join(bytes(px(x, y)) for x in range(w)) for y in range(h))
+    chunk = lambda t, b: struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+open(d + "/photo.png", "wb").write(png(300, 180, lambda x, y: (0x30 + x // 3, 0x90, 0x40 + y, 0xff)))
+open(d + "/app.svg", "w").write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="5" fill="#c06030"/><circle cx="12" cy="12" r="5" fill="#ffffff"/></svg>')
+open(d + "/Logo.svg", "w").write('<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" width="48" height="48" viewBox="0 0 48 48"><metadata>drawn elsewhere</metadata><g inkscape:label="Layer 1" transform="translate(4,4)"><rect width="40" height="40" rx="8" fill="#3060c0"/><path d="M10 30 L20 10 L30 30 Z" fill="#ffd040" style="fill-opacity:0.9"/></g><text x="4" y="46">Logo</text></svg>')
+open(d + "/ui.rs", "w").write('// The window\'s icon.\npub fn icon() -> Option<atrium_assets::Picture> {\n    atrium_assets::image("icons/app.svg", 48, 48).ok()\n}\n')
+PY
+    for f in photo.png app.svg Logo.svg ui.rs; do scp -q $K -P 2222 "$FX/$f" root@localhost:$B/fx-$f; done
+    rm -rf "$FX"
+    V "Q=$W/proj/work/$P; mkdir -p \$Q/assets/icons \$Q/art \$Q/src; cp $B/fx-photo.png \$Q/assets/photo.png; cp $B/fx-app.svg \$Q/assets/icons/app.svg; \
+       cp $B/fx-Logo.svg \$Q/art/Logo.svg; cp $B/fx-ui.rs \$Q/src/ui.rs; rm -f \$Q/assets/icons/logo.svg; chown -R alice:files-alice \$Q; chmod -R g+rwX \$Q"
+    # Into the project (a file of it), then the strip's Assets: after Fuzz
+    # when the project has fuzz targets listed (ui.rs, 42 apart).
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
+    # The project's folder opens (unless it is open already), then its file.
+    for r in $P $F; do
+        [ "$r" = "$P" ] && rows | grep -q "^$P/" && continue
+        ROW=$(rows | grep -n "^$r\$" | cut -d: -f1)
+        [ -n "$ROW" ] || { bad "no row $r: $(state)"; break; }
+        press 100 $((89 + 22 * (ROW - 1)))
+    done
+    waitstate "tabs=\[[^]]*$F" 20 || bad "open $F: $(state)"
+    if state | grep -q 'fuzz=Some'; then AY=268; else AY=226; fi
+    press 64 $AY
+    waitstate 'view=Assets' 20 && ok "the strip opens the Assets view" || bad "assets view: $(state)"
+    waitstate 'assets=Some((2, "assets/icons/app.svg", 4, Some(1)' 300 \
+        && ok "the icon is decoded at 16, 24, 32 and 48 by the system's decoder, and src/ui.rs uses it" || bad "icon preview: $(state) $(V "grep -i 'system worker\|image-decode' $LOG | tail -3")"
+    ICON=; V "jexec ws_alice_proj /atrium/toolchains/rust/bin/cargo-atrium atrium help 2>&1 | grep -q 'icon import'" && ICON=1
+    if [ -n "$ICON" ]; then
+        waitstate 'assets=Some((2, "assets/icons/app.svg", 4, Some(1), Some(true)' 300 && ok "cargo atrium icon check: the dock draws it" || bad "icon check: $(state)"
+    fi
+    V "grep -q 'system worker org.atrium.image-decode .* for $ART .*runs as _imagedec' $LOG" && ok "the decoder ran as _imagedec for Artifex" || bad "decoder: $(V "grep -i 'system worker' $LOG | tail -3")"
+    shot artifex-16-assets-icon
+    # The picture: the list's second row (views.rs: under PICTURES).
+    press 200 211
+    waitstate 'assets=Some((2, "assets/photo.png", 1, Some(0)' 120 && ok "the picture is decoded, fitted, and nothing uses it yet" || bad "picture: $(state)"
+    shot artifex-17-assets-picture
+    if [ -n "$ICON" ]; then
+        press 314 100            # Import SVG (the list's top right)
+        waitstate '"choosing 1")' 30 && ok "Import SVG lists the project's SVG outside assets/" || bad "choose: $(state)"
+        press 512 217            # its row
+        waitstate '"planned assets/icons/logo.svg ok=true dropped=[1-9][0-9]* preview=4")' 300 \
+            && ok "the preview converts it, names what it drops, and is decoded" || bad "import preview: $(state)"
+        check "the preview writes nothing" "0" "$(V "test -e $W/proj/work/$P/assets/icons/logo.svg && echo 1 || echo 0")"
+        shot artifex-18-import-preview
+        press 467 630            # Import
+        waitstate 'note=Some("Imported art/Logo.svg as assets/icons/logo.svg")' 120 && ok "Import writes assets/icons/logo.svg" || bad "import: $(state)"
+        waitstate 'assets=Some((3, "assets/icons/logo.svg", 4' 120 && ok "and shows it, decoded" || bad "imported: $(state)"
+        shot artifex-19-imported
+    else
+        echo "  (no cargo-atrium with icon in the Rust layer: the check and Import SVG skipped)"
+    fi
+else
+    echo "  (no atrium.toml project: skipped)"
 fi
 
 echo "=== terminal"

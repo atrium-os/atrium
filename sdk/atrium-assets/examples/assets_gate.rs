@@ -51,16 +51,23 @@ fn main() {
     });
     // A few decoders per app at once (portcullisd's per-caller cap, 4):
     // the fifth is refused while four are held, and each held one works.
+    // The decoders above are gone first: a jail's slot is given back once
+    // portcullisd has removed it, a moment after the caller lets go.
+    std::thread::sleep(std::time::Duration::from_secs(8));
     let held: Vec<_> = (0..5).map(|_| atrium_assets::Decoder::new()).collect();
     let mut kept = 0;
     let mut refused = String::new();
+    let mut failed = Vec::new();
     for d in held {
         match d {
-            Ok(mut d) => if d.image("icons/app.svg", 16, 16).is_ok() { kept += 1 },
+            Ok(mut d) => match d.image("icons/app.svg", 16, 16) {
+                Ok(_) => kept += 1,
+                Err(e) => failed.push(e.to_string()),
+            },
             Err(e) => refused = e.to_string(),
         }
     }
-    say("per-caller", format!("held {kept} refused {refused}"));
+    say("per-caller", format!("held {kept} refused {refused}{}", if failed.is_empty() { String::new() } else { format!(" (held but failed: {})", failed.join("; ")) }));
     say("done", String::new());
 }
 

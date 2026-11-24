@@ -40,6 +40,16 @@ Commands:
       archive to <out>.insula, which installs through the install sheet.
       Programs are stripped; their debug info goes to <out>.debug/.
       Without Cargo.toml (a C project) it bundles what make built.
+  icon check <file.svg> [--json]
+      Would the dock draw this SVG as an app icon? Its shapes, points and
+      size against the limits (64 shapes, 8192 points, 32 KB), and the
+      first thing it can't take.
+  icon import <file.svg> [--name <n>] [--dry-run] [--json]
+      An SVG drawn in another app, as an icon the dock draws, in
+      assets/icons/<n>.svg (n from the file name by default): editor data,
+      hidden layers, scripts and links are dropped, transforms and styles
+      are folded into plain filled paths. Says what it converted and what
+      it couldn't keep (text, filters, masks, pictures).
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer

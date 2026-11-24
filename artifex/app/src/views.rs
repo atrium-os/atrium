@@ -21,6 +21,7 @@ pub enum Main {
     Code,
     Composition,
     Fuzz,
+    Assets,
 }
 
 /// The preview pane's width (Move into a worker).
@@ -615,5 +616,256 @@ mod tests {
         assert_eq!(grant_icon("Pictures folder picked in the file picker"), phosphor::FOLDER);
         assert_eq!(grant_icon("network = [\"api.example.org\"]"), phosphor::GLOBE);
         assert_eq!(grant_icon("arca = true"), phosphor::KEY);
+    }
+}
+
+/// An asset's size for people.
+fn size_label(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1 << 20 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+    }
+}
+
+/// Icon tiles: each decoded size on a light and a dark ground, labelled.
+fn icon_tiles(ctx: &mut Ctx, x: f32, y: f32, images: &[Result<pergola::node::Image, String>], t: Theme) -> f32 {
+    let tile = em(64.0);
+    let grounds = [Color::rgba(1.0, 1.0, 1.0, 1.0), Color::rgba(0.11, 0.11, 0.12, 1.0)];
+    for (row, ground) in grounds.iter().enumerate() {
+        for (i, n) in crate::assets::ICON_SIZES.iter().enumerate() {
+            let r = Rect::new(x + i as f32 * (tile + em(10.0)), y + row as f32 * (tile + em(8.0)), tile, tile);
+            framed(ctx, r, *ground, t.border_default(), radius::MD);
+            match images.get(i) {
+                Some(Ok(img)) => {
+                    let sz = img.pt_size();
+                    let (w, h) = (em(sz.w), em(sz.h));
+                    ctx.add(Node::Image { rect: Rect::new(r.x() + (tile - w) / 2.0, r.y() + (tile - h) / 2.0, w, h), image: img.clone() });
+                }
+                Some(Err(_)) => icon(ctx, r.x() + tile / 2.0 - em(7.0), r.y() + tile / 2.0, phosphor::WARNING, type_size::MD, t.warning_fg()),
+                None => {}
+            }
+            if row == 1 {
+                text(ctx, r.x() + tile / 2.0 - em(8.0), r.y() + tile + em(14.0), &format!("{n} pt"), type_size::XXS, Weight::Regular, t.text_tertiary());
+            }
+        }
+    }
+    2.0 * tile + em(30.0)
+}
+
+/// The dock's verdict on an icon, as a line.
+fn report_line(r: &crate::assets::IconReport) -> (String, bool) {
+    let counts = format!("{} of {} shapes · {} of {} points · {} of {}",
+        r.shapes, r.limits.0, r.points, r.limits.1, size_label(r.bytes), size_label(r.limits.2));
+    match &r.problem {
+        None => (format!("The dock draws it: {counts}"), true),
+        Some(why) => (format!("The dock won't draw it: {why} ({counts})"), false),
+    }
+}
+
+/// The Assets view: the project's `assets/` on the left, the chosen one
+/// (or an import) on the right.
+pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
+    use crate::assets::{Importing, Kind};
+    let t = ctx.theme;
+    let (x0, y0, x1, y1) = (area.x(), area.y(), area.x() + area.w(), area.y() + area.h());
+    let lw = fuzz_list_w();
+    ctx.add(Node::Rect { rect: Rect::new(x0, y0, lw, area.h()), fill: t.bg_surface(), radius: 0.0 });
+    ctx.add(Node::Rect { rect: Rect::new(x0 + lw - 1.0, y0, 1.0, area.h()), fill: t.border_default(), radius: 0.0 });
+    text(ctx, x0 + em(16.0), y0 + em(26.0), "Assets", type_size::LG, Weight::Semibold, t.text_primary());
+    ctx.key(8400);
+    Button::secondary("Import SVG").lead(phosphor::TRAY_ARROW_DOWN).at(x0 + lw - em(136.0), y0 + em(10.0)).width(em(124.0))
+        .on_click(plain(q, Act::ImportSvg)).render(ctx);
+    let Some(a) = &s.assets else {
+        text(ctx, x0 + em(16.0), y0 + em(60.0), "Reading assets/…", type_size::SM, Weight::Regular, t.text_secondary());
+        return;
+    };
+    let mut y = y0 + em(56.0);
+    if let Some(e) = &a.error {
+        icon(ctx, x0 + em(16.0), y + em(10.0), phosphor::WARNING, type_size::SM, t.warning_fg());
+        y += para(ctx, x0 + em(36.0), y + em(10.0), e, lw - em(48.0), type_size::XS, Weight::Regular, t.text_secondary(), 3);
+    } else if a.files.is_empty() {
+        y += para(ctx, x0 + em(16.0), y + em(10.0), "No assets yet. Pictures go in assets/ and icons in assets/icons/; Import SVG brings in an icon drawn in another app.",
+                  lw - em(32.0), type_size::SM, Weight::Regular, t.text_secondary(), 5);
+    }
+    let mut last: Option<Kind> = None;
+    for (i, f) in a.files.iter().enumerate() {
+        if y > y1 - em(80.0) {
+            break;
+        }
+        if last != Some(f.kind) {
+            last = Some(f.kind);
+            y += em(4.0);
+            heading(ctx, x0 + em(16.0), y + em(6.0), match f.kind { Kind::Icon => "ICONS", Kind::Picture => "PICTURES", Kind::Other => "OTHER FILES" }, t);
+            y += em(16.0);
+        }
+        ctx.key(8500 + i as u64);
+        let r = Rect::new(x0 + em(8.0), y, lw - em(16.0), em(26.0));
+        row(ctx, r, a.selected == i && a.importing.is_none(), t, q, Act::SelectAsset(i));
+        let ch = match f.kind { Kind::Icon => phosphor::PAINT_BRUSH_BROAD, Kind::Picture => phosphor::IMAGE, Kind::Other => phosphor::FILE };
+        icon(ctx, r.x() + em(8.0), r.y() + em(13.0), ch, type_size::SM, t.text_secondary());
+        let size = size_label(f.bytes);
+        let sw = Node::measure_text(&size, &style(font::SANS, type_size::XS, Weight::Regular, t.text_tertiary())).w;
+        let shown = f.rel.strip_prefix("assets/icons/").or(f.rel.strip_prefix("assets/")).unwrap_or(&f.rel);
+        text(ctx, r.x() + em(30.0), r.y() + em(13.0), &fit(shown, r.w() - em(46.0) - sw, type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
+        text(ctx, r.x() + r.w() - sw - em(8.0), r.y() + em(13.0), &size, type_size::XS, Weight::Regular, t.text_tertiary());
+        ctx.pop();
+        y += em(28.0);
+    }
+    if a.truncated {
+        text(ctx, x0 + em(16.0), y + em(10.0), &format!("Only the first {} are listed.", crate::assets::MAX_LISTED), type_size::XS, Weight::Regular, t.text_tertiary());
+    }
+    icon(ctx, x0 + em(16.0), y1 - em(40.0), phosphor::SHIELD_CHECK, type_size::SM, t.text_tertiary());
+    text(ctx, x0 + em(36.0), y1 - em(40.0), "Previews come from the system's image", type_size::XS, Weight::Regular, t.text_tertiary());
+    text(ctx, x0 + em(36.0), y1 - em(24.0), "decoder, in a jail of its own.", type_size::XS, Weight::Regular, t.text_tertiary());
+
+    // The right pane.
+    let pad = em(24.0);
+    let cx = x0 + lw + pad;
+    let cw = x1 - cx - pad;
+    let mut y = y0 + em(36.0);
+    if let Some(imp) = &a.importing {
+        match imp {
+            Importing::Choosing(list) => {
+                text(ctx, cx, y, "Import an SVG as an icon", type_size::LG, Weight::Semibold, t.text_primary());
+                y += em(26.0);
+                para(ctx, cx, y, "Pick an SVG in this project. It becomes plain filled shapes the dock can draw; what it can't keep is listed before anything is written.",
+                     cw, type_size::SM, Weight::Regular, t.text_secondary(), 3);
+                // The list at a fixed place, under at most three lines.
+                y = y0 + em(130.0);
+                if list.is_empty() {
+                    y += para(ctx, cx, y, "There's no SVG in this project outside assets/. Copy one into the project and try again.", cw, type_size::SM, Weight::Regular, t.text_secondary(), 3);
+                }
+                for (i, f) in list.iter().enumerate() {
+                    if y > y1 - em(70.0) {
+                        break;
+                    }
+                    ctx.key(8600 + i as u64);
+                    let r = Rect::new(cx - em(8.0), y, cw.min(em(520.0)), em(26.0));
+                    row(ctx, r, false, t, q, Act::ImportFrom(i));
+                    icon(ctx, r.x() + em(8.0), r.y() + em(13.0), phosphor::FILE, type_size::SM, t.text_secondary());
+                    text(ctx, r.x() + em(30.0), r.y() + em(13.0), &fit(f, r.w() - em(40.0), type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
+                    ctx.pop();
+                    y += em(28.0);
+                }
+                ctx.key(8690);
+                Button::ghost("Cancel").at(cx, y1 - em(52.0)).width(em(96.0)).on_click(plain(q, Act::ConfirmImport(false))).render(ctx);
+            }
+            Importing::Asking(src) => {
+                text(ctx, cx, y, &fit(&format!("Converting {src}…"), cw, type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+            }
+            Importing::Failed(why) => {
+                icon(ctx, cx, y, phosphor::WARNING, type_size::LG, t.warning_fg());
+                text(ctx, cx + em(30.0), y, "It can't be imported", type_size::LG, Weight::Semibold, t.text_primary());
+                y += em(28.0);
+                para(ctx, cx, y, why, cw, type_size::SM, Weight::Regular, t.text_secondary(), 6);
+                ctx.key(8690);
+                Button::ghost("Close").at(cx, y1 - em(52.0)).width(em(96.0)).on_click(plain(q, Act::ConfirmImport(false))).render(ctx);
+            }
+            Importing::Planned(p) => {
+                text(ctx, cx, y, &fit(&format!("Import {} as {}", p.src, p.path), cw, type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+                y += em(30.0);
+                let images = a.import_preview.clone().unwrap_or_default();
+                y += icon_tiles(ctx, cx, y, &images, t);
+                if let Some(Err(e)) = images.first() {
+                    y += para(ctx, cx, y, &format!("No preview: {e}"), cw, type_size::XS, Weight::Regular, t.text_tertiary(), 2);
+                }
+                let (line, ok) = report_line(&p.report);
+                icon(ctx, cx, y + em(8.0), if ok { phosphor::CHECK_CIRCLE } else { phosphor::WARNING }, type_size::SM, if ok { t.success_fg() } else { t.warning_fg() });
+                y += para(ctx, cx + em(22.0), y + em(8.0), &line, cw - em(22.0), type_size::SM, Weight::Regular, t.text_primary(), 2) + em(6.0);
+                if !p.converted.is_empty() {
+                    y += para(ctx, cx, y + em(8.0), &format!("Converted: {}.", p.converted.join(", ")), cw, type_size::SM, Weight::Regular, t.text_secondary(), 3) + em(4.0);
+                }
+                if !p.dropped.is_empty() {
+                    y += para(ctx, cx, y + em(8.0), &format!("Not kept: {}.", p.dropped.join(", ")), cw, type_size::SM, Weight::Medium, t.warning_fg(), 3) + em(4.0);
+                }
+                if p.replaces {
+                    para(ctx, cx, y + em(8.0), &format!("This replaces the {} already there.", p.path), cw, type_size::SM, Weight::Regular, t.text_secondary(), 2);
+                }
+                if ok {
+                    ctx.key(8691);
+                    Button::primary("Import").lead(phosphor::TRAY_ARROW_DOWN).at(cx, y1 - em(52.0)).width(em(110.0)).on_click(plain(q, Act::ConfirmImport(true))).render(ctx);
+                }
+                ctx.key(8690);
+                Button::ghost("Cancel").at(cx + if ok { em(120.0) } else { 0.0 }, y1 - em(52.0)).width(em(96.0)).on_click(plain(q, Act::ConfirmImport(false))).render(ctx);
+            }
+        }
+        return;
+    }
+    let Some(f) = a.selected() else { return };
+    let shown = f.rel.strip_prefix("assets/").unwrap_or(&f.rel);
+    text(ctx, cx, y, &fit(shown, cw, type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+    y += em(22.0);
+    let kind = match f.kind { Kind::Icon => "Icon", Kind::Picture => "Picture", Kind::Other => "File" };
+    text(ctx, cx, y, &format!("{kind} · {} · atrium_assets::image(\"{}\", …)", size_label(f.bytes), f.name()), type_size::XS, Weight::Regular, t.text_tertiary());
+    y += em(22.0);
+    let preview = a.preview.as_ref().filter(|p| p.rel == f.rel);
+    let images = preview.map(|p| p.images.clone()).unwrap_or_default();
+    match f.kind {
+        Kind::Icon => {
+            y += icon_tiles(ctx, cx, y, &images, t);
+            if let Some(Err(e)) = images.first() {
+                y += para(ctx, cx, y, &format!("No preview: {e}"), cw, type_size::XS, Weight::Regular, t.text_tertiary(), 2);
+            }
+            match a.check.as_ref().filter(|(rel, _)| *rel == f.rel).map(|(_, r)| r) {
+                Some(Ok(r)) => {
+                    let (line, ok) = report_line(r);
+                    icon(ctx, cx, y + em(8.0), if ok { phosphor::CHECK_CIRCLE } else { phosphor::WARNING }, type_size::SM, if ok { t.success_fg() } else { t.warning_fg() });
+                    y += para(ctx, cx + em(22.0), y + em(8.0), &line, cw - em(22.0), type_size::SM, Weight::Regular, t.text_primary(), 2);
+                }
+                Some(Err(e)) => y += para(ctx, cx, y + em(8.0), &format!("Not checked: {e}"), cw, type_size::SM, Weight::Regular, t.text_tertiary(), 2),
+                None => {
+                    text(ctx, cx, y + em(8.0), "Checking it against the dock's limits…", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(20.0);
+                }
+            }
+        }
+        Kind::Picture => {
+            let (bw, bh) = (em(crate::assets::PICTURE_BOX.0 as f32).min(cw), em(crate::assets::PICTURE_BOX.1 as f32));
+            let r = Rect::new(cx, y, bw, bh);
+            framed(ctx, r, t.bg_surface(), t.border_default(), radius::MD);
+            match images.first() {
+                Some(Ok(img)) => {
+                    let sz = img.pt_size();
+                    let k = (bw / em(sz.w)).min(bh / em(sz.h)).min(1.0);
+                    let (w, h) = (em(sz.w) * k, em(sz.h) * k);
+                    ctx.add(Node::Image { rect: Rect::new(r.x() + (bw - w) / 2.0, r.y() + (bh - h) / 2.0, w, h), image: img.clone() });
+                    let d = img.data();
+                    text(ctx, cx, y + bh + em(16.0), &format!("Shown at {}×{} pixels", d.width, d.height), type_size::XS, Weight::Regular, t.text_tertiary());
+                }
+                Some(Err(e)) => {
+                    para(ctx, r.x() + em(16.0), r.y() + em(24.0), &format!("No preview: {e}"), bw - em(32.0), type_size::SM, Weight::Regular, t.text_secondary(), 3);
+                }
+                None => text(ctx, r.x() + em(16.0), r.y() + em(24.0), "Decoding…", type_size::SM, Weight::Regular, t.text_tertiary()),
+            }
+            y += bh + em(28.0);
+        }
+        Kind::Other => {
+            y += para(ctx, cx, y, "Not a picture the decoder opens. It is still bundled with the app.", cw, type_size::SM, Weight::Regular, t.text_secondary(), 2);
+        }
+    }
+    y += em(18.0);
+    heading(ctx, cx, y, "WHERE IT'S USED", t);
+    y += em(18.0);
+    match preview.and_then(|p| p.uses.as_ref()) {
+        None => text(ctx, cx, y, "Searching the project…", type_size::SM, Weight::Regular, t.text_tertiary()),
+        Some(u) if u.is_empty() => text(ctx, cx, y, &fit(&format!("Nothing in the project names \"{}\" yet.", f.name()), cw, type_size::SM), type_size::SM, Weight::Regular, t.text_tertiary()),
+        Some(u) => {
+            for (i, (file, line, l)) in u.iter().enumerate() {
+                if y > y1 - em(30.0) {
+                    break;
+                }
+                let rel = if s.project.is_empty() { file.clone() } else { format!("{}/{file}", s.project) };
+                ctx.key(8700 + i as u64);
+                let r = Rect::new(cx - em(8.0), y - em(12.0), cw + em(8.0), em(24.0));
+                row(ctx, r, false, t, q, Act::Open(rel));
+                let at = format!("{file}:{line}");
+                let aw = Node::measure_text(&at, &style(font::SANS, type_size::XS, Weight::Medium, t.text_secondary())).w;
+                text(ctx, cx, y, &at, type_size::XS, Weight::Medium, t.text_secondary());
+                mono(ctx, cx + aw + em(12.0), y, &fitm(l, cw - aw - em(16.0)), t.text_primary());
+                ctx.pop();
+                y += em(26.0);
+            }
+        }
     }
 }

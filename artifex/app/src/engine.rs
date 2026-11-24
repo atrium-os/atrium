@@ -60,6 +60,10 @@ enum Job {
     WorkerAdd { project: String, worker: String, from: String, dry: bool },
     /// Streams JSON lines; `buf` holds the unfinished one.
     FuzzRun { target: String },
+    /// `cargo atrium icon check` of an asset.
+    IconCheck { project: String, rel: String },
+    /// `cargo atrium icon import` (`dry`: the preview).
+    IconImport { project: String, src: String, dry: bool },
 }
 
 /// Files that make a folder a project (its tasks, its composition).
@@ -78,6 +82,8 @@ pub struct Engine {
     remote_root: Option<String>,
     /// A crash input that could not be read, and when (tried again later).
     crash_miss: Option<(String, Instant)>,
+    /// The thread that decodes previews (made when the Assets view opens).
+    pictures: Option<(std::sync::mpsc::Sender<crate::assets::Request>, std::sync::mpsc::Receiver<crate::assets::Answer>)>,
     servers: HashMap<&'static str, Server>,
     /// Servers that failed to start: not tried again this session.
     no_server: Vec<&'static str>,
@@ -123,6 +129,7 @@ impl Engine {
             jobs: Vec::new(),
             remote_root: None,
             crash_miss: None,
+            pictures: None,
             servers: HashMap::new(),
             no_server: Vec::new(),
             next_git: Instant::now(),
@@ -182,9 +189,48 @@ impl Engine {
         match a {
             Act::View(v) => {
                 s.view = v;
+                if v == Main::Assets {
+                    self.refresh_assets(None, s);
+                }
                 // A full view has the window to itself.
                 if v != Main::Code {
                     s.panel_open = false;
+                }
+            }
+            Act::SelectAsset(i) => {
+                if let Some(a) = s.assets.as_mut().filter(|a| i < a.files.len()) {
+                    a.selected = i;
+                    a.importing = None;
+                    self.show_asset(s);
+                }
+            }
+            Act::ImportSvg => {
+                let dir = self.project_dir(s);
+                if let Some(a) = s.assets.as_mut() {
+                    a.importing = Some(crate::assets::Importing::Choosing(crate::assets::svgs(&dir)));
+                    a.import_preview = None;
+                }
+            }
+            Act::ImportFrom(i) => {
+                let src = match s.assets.as_ref().and_then(|a| a.importing.as_ref()) {
+                    Some(crate::assets::Importing::Choosing(list)) => list.get(i).cloned(),
+                    _ => None,
+                };
+                if let Some(src) = src {
+                    self.import_icon(&src, true, s);
+                }
+            }
+            Act::ConfirmImport(yes) => {
+                let plan = match s.assets.as_ref().and_then(|a| a.importing.as_ref()) {
+                    Some(crate::assets::Importing::Planned(p)) if p.report.ok => Some(p.src.clone()),
+                    _ => None,
+                };
+                match plan {
+                    Some(src) if yes => self.import_icon(&src, false, s),
+                    _ => if let Some(a) = s.assets.as_mut() {
+                        a.importing = None;
+                        a.import_preview = None;
+                    },
                 }
             }
             Act::SelectCrash(i) => {
@@ -472,6 +518,95 @@ impl Engine {
         }
     }
 
+    fn project_dir(&self, s: &State) -> PathBuf {
+        if s.project.is_empty() { self.root.clone() } else { self.root.join(&s.project) }
+    }
+
+    /// List the project's assets again, keeping the one shown (or showing
+    /// `select`).
+    fn refresh_assets(&mut self, select: Option<&str>, s: &mut State) {
+        let dir = self.project_dir(s);
+        let mut a = crate::assets::list(&s.project, &dir);
+        let keep = select.map(str::to_string)
+            .or_else(|| s.assets.as_ref().filter(|o| o.project == s.project).and_then(|o| o.selected().map(|f| f.rel.clone())));
+        a.selected = keep.and_then(|k| a.files.iter().position(|f| f.rel == k)).unwrap_or(0);
+        if let Some(o) = s.assets.take().filter(|o| o.project == s.project) {
+            a.importing = o.importing;
+            a.import_preview = o.import_preview;
+            if o.preview.as_ref().map(|p| &p.rel) == a.selected().map(|f| &f.rel) {
+                a.preview = o.preview;
+                a.check = o.check;
+            }
+        }
+        let fresh = a.preview.is_none();
+        s.assets = Some(a);
+        if fresh {
+            self.show_asset(s);
+        }
+    }
+
+    /// Ask for the selected asset's preview, uses and (an icon) check.
+    fn show_asset(&mut self, s: &mut State) {
+        use crate::assets::{Kind, Preview, Request, Source, DENSITY, ICON_SIZES, PICTURE_BOX};
+        let dir = self.project_dir(s);
+        let Some(a) = s.assets.as_mut() else { return };
+        let Some(f) = a.selected().cloned() else {
+            a.preview = None;
+            a.check = None;
+            return;
+        };
+        a.preview = Some(Preview { rel: f.rel.clone(), images: Vec::new(), uses: None });
+        a.check = None;
+        let boxes: Vec<(u32, u32)> = match f.kind {
+            Kind::Icon => ICON_SIZES.iter().map(|&n| (n * DENSITY, n * DENSITY)).collect(),
+            Kind::Picture => vec![(PICTURE_BOX.0 * DENSITY, PICTURE_BOX.1 * DENSITY)],
+            Kind::Other => Vec::new(),
+        };
+        let req = Request { tag: f.rel.clone(), source: Source::File(dir.join(&f.rel)), boxes, uses: Some((dir, f.name().to_string())) };
+        self.ask_pictures(req);
+        if f.kind == Kind::Icon {
+            let job = Job::IconCheck { project: s.project.clone(), rel: f.rel.clone() };
+            let project = s.project.clone();
+            self.start_job(job, &crate::assets::check_argv(&f.rel), &project, s);
+        }
+    }
+
+    fn ask_pictures(&mut self, req: crate::assets::Request) {
+        let (tx, _) = self.pictures.get_or_insert_with(crate::assets::start);
+        if tx.send(req).is_err() {
+            self.pictures = None;
+        }
+    }
+
+    fn import_icon(&mut self, src: &str, dry: bool, s: &mut State) {
+        let project = s.project.clone();
+        let job = Job::IconImport { project: project.clone(), src: src.to_string(), dry };
+        if self.start_job(job, &crate::assets::import_argv(src, dry), &project, s) {
+            if let Some(a) = s.assets.as_mut() {
+                a.importing = Some(crate::assets::Importing::Asking(src.to_string()));
+                a.import_preview = None;
+            }
+        } else {
+            s.note = Some(("Can't run cargo atrium icon import".into(), true));
+        }
+    }
+
+    /// Previews decoded since the last frame.
+    fn take_pictures(&mut self, s: &mut State) {
+        let Some((_, rx)) = &self.pictures else { return };
+        while let Ok(ans) = rx.try_recv() {
+            let Some(a) = s.assets.as_mut() else { continue };
+            if let Some(rest) = ans.tag.strip_prefix("import:") {
+                if matches!(&a.importing, Some(crate::assets::Importing::Planned(p)) if p.src == rest) {
+                    a.import_preview = Some(ans.images);
+                }
+            } else if let Some(p) = a.preview.as_mut().filter(|p| p.rel == ans.tag) {
+                p.images = ans.images;
+                p.uses = ans.uses;
+            }
+        }
+    }
+
     fn worker_add(&mut self, project: &str, worker: &str, from: &str, dry: bool, s: &mut State) {
         let mut argv: Vec<String> = crate::fuzz::WORKER_ADD.iter().map(|a| a.to_string()).collect();
         argv.extend([worker.to_string(), "--from".into(), from.to_string(), "--json".into()]);
@@ -491,7 +626,14 @@ impl Engine {
             s.fuzz = None;
             s.moving = None;
         }
+        let changed = s.project != p;
         s.project = p.to_string();
+        if changed {
+            s.assets = None;
+            if s.view == Main::Assets {
+                self.refresh_assets(None, s);
+            }
+        }
         let dir = if p.is_empty() { self.root.clone() } else { self.root.join(p) };
         s.tasks = tasks::detect(&dir, p);
         self.load_composition(s);
@@ -1098,6 +1240,7 @@ impl Engine {
     pub fn tick(&mut self, s: &mut State) {
         let now = Instant::now();
         self.crash_input(s);
+        self.take_pictures(s);
         // The active file: edits into its tree, colours, the server.
         if let Some(i) = self.active {
             let mut d = std::mem::replace(&mut self.docs[i], placeholder());
@@ -1294,6 +1437,43 @@ impl Engine {
                             s.panel_open = true;
                             s.output = format!("cargo atrium worker add {worker}: {e}\n");
                             s.note = Some((format!("Can't move it: {e}"), true));
+                        }
+                    }
+                }
+                Job::IconCheck { project, rel } => {
+                    if let Some(a) = s.assets.as_mut().filter(|a| a.project == project) {
+                        if a.selected().is_some_and(|f| f.rel == rel) {
+                            a.check = Some((rel, crate::assets::read_check(&buf)));
+                        }
+                    }
+                }
+                Job::IconImport { project, src, dry } => {
+                    if s.project != project {
+                        // Another project's answer.
+                    } else if let Some(a) = s.assets.as_mut() {
+                        match crate::assets::read_import(&buf, &src) {
+                            Ok(p) if dry => {
+                                let req = crate::assets::Request {
+                                    tag: format!("import:{src}"),
+                                    source: crate::assets::Source::Svg(p.svg.clone()),
+                                    boxes: crate::assets::ICON_SIZES.iter().map(|&n| (n * crate::assets::DENSITY, n * crate::assets::DENSITY)).collect(),
+                                    uses: None,
+                                };
+                                a.importing = Some(crate::assets::Importing::Planned(p));
+                                self.ask_pictures(req);
+                            }
+                            Ok(p) if p.report.ok => {
+                                a.importing = None;
+                                a.import_preview = None;
+                                // What was shown may be the file just replaced.
+                                a.preview = None;
+                                s.note = Some((format!("Imported {src} as {}", p.path), false));
+                                self.tree.refresh();
+                                self.refresh_assets(Some(&p.path), s);
+                            }
+                            Ok(p) => a.importing = Some(crate::assets::Importing::Failed(
+                                p.report.problem.unwrap_or_else(|| "the dock wouldn't draw it".into()))),
+                            Err(e) => a.importing = Some(crate::assets::Importing::Failed(e)),
                         }
                     }
                 }
@@ -1968,6 +2148,106 @@ mod tests {
 
     /// The Artifex move action against the real SDK command. A crash report
     /// fixture lets FreeBSD check this without building the libFuzzer harness.
+    /// A project with an icon, a picture, a source naming the icon and an
+    /// SVG to import.
+    fn asset_project(name: &str) -> (PathBuf, Engine, State) {
+        let (d, mut e, mut s) = setup(name);
+        let p = d.join("proj/pics");
+        std::fs::create_dir_all(p.join("assets/icons")).unwrap();
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::create_dir_all(p.join("art")).unwrap();
+        std::fs::write(p.join("atrium.toml"), "[app]\nid = \"org.example.pics\"\nentry = \"bin/pics\"\n").unwrap();
+        std::fs::write(p.join("assets/icons/app.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="20" height="20" fill="#c06030"/></svg>"##).unwrap();
+        std::fs::write(p.join("assets/photo.png"), [0u8; 40]).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {\n    let _ = atrium_assets::image(\"icons/app.svg\", 48, 48);\n}\n").unwrap();
+        std::fs::write(p.join("art/Logo.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" viewBox="0 0 24 24"><metadata>x</metadata><g transform="translate(2,2)"><rect width="10" height="10" fill="#3060c0"/></g><text x="1" y="20">Hi</text></svg>"##).unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("pics/src/main.rs".into()), &mut s);
+        e.wait_jobs(&mut s);
+        (d, e, s)
+    }
+
+    fn wait_preview(e: &mut Engine, s: &mut State) {
+        for _ in 0..1000 {
+            e.tick(s);
+            if s.assets.as_ref().and_then(|a| a.preview.as_ref()).is_some_and(|p| p.uses.is_some()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no preview: {:?}", s.assets);
+    }
+
+    #[test]
+    fn the_assets_view() {
+        let (d, mut e, mut s) = asset_project("assets-view");
+        assert_eq!(s.project, "pics");
+        e.act(Act::View(Main::Assets), &mut s);
+        assert_eq!((s.view, s.panel_open), (Main::Assets, false));
+        let a = s.assets.clone().unwrap();
+        assert_eq!(a.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), ["assets/icons/app.svg", "assets/photo.png"]);
+        // The icon's uses are found; off Atrium there is no decoder, and
+        // each size says why rather than showing nothing.
+        wait_preview(&mut e, &mut s);
+        let p = s.assets.as_ref().unwrap().preview.clone().unwrap();
+        assert_eq!(p.rel, "assets/icons/app.svg");
+        assert_eq!(p.uses.as_deref().unwrap()[0].0, "src/main.rs");
+        assert_eq!(p.images.len(), 4);
+        assert!(p.images.iter().all(|i| i.is_err()));
+        // The picture: one box, nothing names it.
+        e.act(Act::SelectAsset(1), &mut s);
+        wait_preview(&mut e, &mut s);
+        let p = s.assets.as_ref().unwrap().preview.clone().unwrap();
+        assert_eq!((p.rel.as_str(), p.images.len(), p.uses.as_ref().map(Vec::len)), ("assets/photo.png", 1, Some(0)));
+        e.act(Act::SelectAsset(9), &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().selected, 1);
+        // Import SVG lists the project's SVGs outside assets/.
+        e.act(Act::ImportSvg, &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().importing, Some(crate::assets::Importing::Choosing(vec!["art/Logo.svg".into()])));
+        e.act(Act::ConfirmImport(false), &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().importing, None);
+        // A file goes back to the code.
+        e.act(Act::Open("pics/src/main.rs".into()), &mut s);
+        assert_eq!(s.view, Main::Code);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires cargo and cargo-atrium on PATH"]
+    fn imports_an_svg_with_cargo_atrium() {
+        let (d, mut e, mut s) = asset_project("import-svg");
+        e.act(Act::View(Main::Assets), &mut s);
+        // The icon's check comes from cargo atrium icon check.
+        for _ in 0..1000 {
+            e.tick(&mut s);
+            if s.assets.as_ref().unwrap().check.is_some() { break }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (rel, r) = s.assets.as_ref().unwrap().check.clone().unwrap();
+        assert_eq!(rel, "assets/icons/app.svg");
+        let r = r.unwrap();
+        assert!(r.ok && r.shapes == 1 && r.limits == (64, 8192, 32768), "{r:?}");
+        e.act(Act::ImportSvg, &mut s);
+        e.act(Act::ImportFrom(0), &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().importing, Some(crate::assets::Importing::Asking("art/Logo.svg".into())));
+        e.wait_jobs(&mut s);
+        let Some(crate::assets::Importing::Planned(p)) = s.assets.as_ref().unwrap().importing.clone() else {
+            panic!("{:?}", s.assets.as_ref().unwrap().importing);
+        };
+        assert_eq!(p.path, "assets/icons/logo.svg");
+        assert!(p.report.ok && p.dropped.iter().any(|x| x.contains("text")), "{p:?}");
+        assert!(!d.join("proj/pics/assets/icons/logo.svg").exists(), "a preview writes nothing");
+        e.act(Act::ConfirmImport(true), &mut s);
+        e.wait_jobs(&mut s);
+        let a = s.assets.as_ref().unwrap();
+        assert_eq!(a.importing, None);
+        assert_eq!(a.selected().map(|f| f.rel.as_str()), Some("assets/icons/logo.svg"));
+        assert!(d.join("proj/pics/assets/icons/logo.svg").is_file());
+        assert!(s.note.as_ref().is_some_and(|n| n.0.contains("Imported art/Logo.svg")), "{:?}", s.note);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     #[ignore = "requires cargo and cargo-atrium on PATH"]
     fn moves_a_reported_core_crash_with_cargo_atrium() {
