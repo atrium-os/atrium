@@ -154,6 +154,9 @@ pub struct Live {
     /// A VPN page's security-key request waiting on navigatord (Sigillum):
     /// the page child and its request number. One at a time.
     credential: Option<(EmbedId, u32)>,
+    /// A VPN page's script or stylesheet waiting on navigatord: the page
+    /// child and its request number. The engine waits for each in turn.
+    resource: Option<(EmbedId, u32)>,
 }
 
 type ArcaFor = (Option<(u64, PageId)>, u32);
@@ -260,7 +263,7 @@ impl Live {
         std::thread::spawn(move || loop {
             match ctl::read_frame::<Event>(&mut r) {
                 Ok(Some(e)) => {
-                    let document = if matches!(e, Event::VpnDocument { .. }) {
+                    let document = if matches!(e, Event::VpnDocument { .. } | Event::VpnResource { kind: Some(_), .. }) {
                         match ctl::recv_fd(&r) { Ok(fd) => Some(fd), Err(_) => return }
                     } else { None };
                     if tx.send((e, document)).is_err() {
@@ -304,6 +307,7 @@ impl Live {
                 arca_post: None,
                 arca_next: Instant::now(),
                 credential: None,
+                resource: None,
             },
             Hello { frescod: fd, limen, measure, trails: kept },
         ))
@@ -417,6 +421,7 @@ impl Live {
         if let Some((_, id)) = self.credential.take_if(|(e, _)| *e == c.embed) {
             send(&mut self.w, &Request::CredentialAbort { id });
         }
+        self.resource.take_if(|(e, _)| *e == c.embed);
         if self.shown == Some(c.key) {
             self.shown = None;
         }
@@ -473,6 +478,16 @@ impl Live {
                     send(&mut self.w, &Request::CredentialAbort { id });
                 }
             }
+            // A script or stylesheet (vpn.md "Scripts in the sign-in
+            // window"): navigatord fetches it from the delivered document's
+            // own origin, never from where the page says it is.
+            Some(M::Resource { id, url }) => match (self.children[i].vpn_page, self.resource) {
+                (Some(page), None) if url.len() <= limen::sign_in::VPN_RESOURCE_URL_MAX => {
+                    self.resource = Some((embed, id));
+                    send(&mut self.w, &Request::VpnResource { page, id, url: url.into() });
+                }
+                _ => self.to_page(embed, M::ResourceFailed { id }),
+            },
             _ => eprintln!("navigator-ui: dropped a credential message the page may not send"),
         }
     }
@@ -648,6 +663,27 @@ impl Live {
                         };
                         eprintln!("navigator-ui: the security-key request {}", if json.is_some() { "was answered" } else { "failed" });
                         self.to_page(embed, reply);
+                    }
+                }
+                Event::VpnResource { id, kind, why } => {
+                    if let Some((embed, _)) = self.resource.take_if(|(_, asked)| *asked == id) {
+                        let kind = kind.map(|k| match k {
+                            navigator_control::VpnResourceKind::Script => limen::sign_in::ResourceKind::Script,
+                            navigator_control::VpnResourceKind::Stylesheet => limen::sign_in::ResourceKind::Stylesheet,
+                        });
+                        let sent = match (kind, document, &self.embeds) {
+                            (Some(kind), Some(fd), Some(e)) => {
+                                let ready = limen::sign_in::ResourceReady { id, kind }.encode();
+                                e.borrow_mut().send_fd(embed, ready, fd.as_fd()).map_err(|err| eprintln!("navigator-ui: the page's resource: {err:?}")).is_ok()
+                            }
+                            _ => false,
+                        };
+                        if !sent {
+                            if let Some(why) = why {
+                                eprintln!("navigator-ui: the VPN page's resource was refused: {why}");
+                            }
+                            self.to_page(embed, limen::sign_in::CredentialMessage::ResourceFailed { id });
+                        }
                     }
                 }
                 Event::ReplayedRecording { id } => {
@@ -1066,6 +1102,7 @@ impl Live {
                     if let Some((_, id)) = self.credential.take_if(|(e, _)| *e == embed) {
                         send(&mut self.w, &Request::CredentialAbort { id });
                     }
+                    self.resource.take_if(|(e, _)| *e == embed);
                     if self.print_ask.as_ref().is_some_and(|a| a.0 == embed) {
                         self.print_done(s, Outcome::Failed("the page closed".into()));
                     }

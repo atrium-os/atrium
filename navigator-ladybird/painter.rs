@@ -504,6 +504,9 @@ fn assemble_scene(
         let mut path = Vec::new();
         let mut index = leaf.context.spatial;
         let mut clip = leaf.context.clip;
+        // Clips inside a scrolling viewport's content (a form control's),
+        // in document coordinates like the leaf's own.
+        let mut content_clips = Vec::new();
         let table = &tree.compositor_scroll_table().nodes;
         while index != ROOT {
             let spatial = tree
@@ -514,15 +517,27 @@ fn assemble_scene(
                 Ok(row) => row,
                 Err(_)
                     if matches!(spatial.data, SpatialData::Scroll(_))
-                        && spatial.parent == ROOT
                         && snapshot.device_offset_for_index(index) == Default::default() =>
                 {
-                    // A stationary layout viewport has a spatial node even when
-                    // it has no scroll range and hence no compositor table row.
-                    index = ROOT;
+                    // A stationary scroll node (the layout viewport, or a text
+                    // field's own scroller) has a spatial node even when it has
+                    // no scroll range and hence no compositor table row. It
+                    // moves nothing: walk on to its parent.
+                    index = spatial.parent;
                     continue;
                 }
-                Err(_) => return Err(format!("unsupported spatial context {index:?}")),
+                Err(_) => {
+                    let kind = match &spatial.data {
+                        SpatialData::Scroll(_) => "a scroll moved without a row",
+                        SpatialData::Sticky(_) => "sticky",
+                        SpatialData::Transform(_) => "transform",
+                        SpatialData::Perspective(_) => "perspective",
+                        SpatialData::BackfaceVisibility(_) => "backface",
+                        SpatialData::AnchorScrollShift(_) => "anchor shift",
+                        SpatialData::Dead => "dead",
+                    };
+                    return Err(format!("unsupported spatial context {index:?} ({kind}, parent {:?})", spatial.parent));
+                }
             };
             let scroll = &table[row];
             let port = scroll.scrollport_rect;
@@ -535,11 +550,25 @@ fn assemble_scene(
             {
                 return Err("unsupported editor scroll geometry".into());
             }
-            // Fresco clips the assigned window to the outer viewport.
-            if scroll.is_viewport && clip.is_none() && spatial.parent == ROOT {
-                path.push(row);
-                index = ROOT;
-                continue;
+            // Fresco clips the assigned window to the outer viewport. A page
+            // taller than its window scrolls that viewport; the clips of its
+            // content (a form control's) are taken in document coordinates.
+            if scroll.is_viewport && spatial.parent == ROOT {
+                while !clip.is_none() {
+                    let c = tree.clip_nodes.get(clip.0 as usize).ok_or("invalid content clip")?;
+                    if c.spatial != index || content_clips.len() > tree.clip_nodes.len() { break; }
+                    let ClipNodeData::Rect(r) = &c.data else { return Err("nonrectangular content clip".into()); };
+                    if r.mode != ClipMode::Intersect || r.corner_radii != Default::default() {
+                        return Err("unsupported content clip geometry".into());
+                    }
+                    content_clips.push(r.rect);
+                    clip = c.parent;
+                }
+                if clip.is_none() {
+                    path.push(row);
+                    index = ROOT;
+                    continue;
+                }
             }
             let c = tree
                 .clip_nodes
@@ -556,7 +585,7 @@ fn assemble_scene(
                 || r.rect.width != port.width as f32
                 || r.rect.height != port.height as f32
             {
-                return Err("scroll clip differs from scrollport".into());
+                return Err(format!("scroll clip differs from scrollport (clip {:?} on spatial {:?}, port {:?})", r.rect, c.spatial, port));
             }
             path.push(row);
             if path.len() > table.len() {
@@ -568,6 +597,9 @@ fn assemble_scene(
         // A form control clips text in the stationary document coordinate space.
         // Intersect its ancestor clips in that same space.
         let mut bounds = leaf.inline_clip;
+        for r in content_clips {
+            intersect_clip(&mut bounds, r)?;
+        }
         let mut depth = 0;
         while !clip.is_none() {
             let c = tree
@@ -1052,8 +1084,14 @@ pub mod host {
             bytes = doc.html.to_vec();
         }
         let child = std::rc::Rc::new(std::cell::RefCell::new(child));
-        if vpn && VPN_SCRIPT.with_borrow(|s| !s.is_empty()) {
+        // A VPN page's script may submit a form; the window shows it for a
+        // press (vpn.md "Scripts in the sign-in window").
+        if vpn {
             VPN_FORM_CHANNEL.with(|s| s.replace(Some((child.clone(), embed))));
+            let source = String::from_utf8_lossy(&bytes);
+            let secret = navigator_forms::forms(&source).into_iter().flat_map(|f| f.fields)
+                .filter(|f| f.kind == limen::doc_viewer::FieldKind::Password).map(|f| f.name).collect();
+            VPN_PAGE.with(|p| p.replace(Some((location.clone(), secret))));
         }
         if !vpn { RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed)))); }
         // A VPN page has no resource channel (its window answers none), but
@@ -1105,6 +1143,82 @@ pub mod host {
     }
 
     thread_local! { static VPN_SCRIPT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+    // A VPN page's delivered address, and the names of its password
+    // fields (a password goes only through Arca's field, never a script).
+    thread_local! { static VPN_PAGE: std::cell::RefCell<Option<(String, Vec<String>)>> = const { std::cell::RefCell::new(None) }; }
+    thread_local! { static LAST_RESOURCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+
+    /// A VPN page's script submitted a form to `url` (a top-level POST of
+    /// the page's own origin): it goes to the window, which sends it only
+    /// on the person's press. False when this is not a VPN page or the
+    /// form is refused; the navigation then goes nowhere.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_vpn_script_post(url: *const u8, url_len: usize, body: *const u8, len: usize) -> bool {
+        if url.is_null() || url_len > limen::doc_viewer::URL_MAX || (body.is_null() && len > 0) || len > 256 * 1024 { return false; }
+        let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, url_len) }) else { return false };
+        let body = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(body, len) } };
+        let Some(form) = VPN_PAGE.with_borrow(|p| p.as_ref().and_then(|(location, secret)| navigator_forms::scripted_form(location, secret, url, body))) else {
+            eprintln!("VPN page: a script's form was refused");
+            return false;
+        };
+        eprintln!("VPN page: a script submitted a form of {} fields; the window asks", form.fields.len() - 1);
+        VPN_FORM_CHANNEL.with_borrow(|binding| binding.as_ref().is_some_and(|(child, embed)| {
+            child.borrow_mut().emit(*embed, limen::doc_viewer::ToParent::Forms { forms: vec![form] }.encode()).is_ok()
+        }))
+    }
+
+    /// A VPN page's script or stylesheet (vpn.md "Scripts in the sign-in
+    /// window"): asked of the window, which has navigatord fetch it from the
+    /// delivered document's origin. -1: not a VPN page (the caller goes on
+    /// as before); 0: refused or failed; else the length, with `kind` 1 for
+    /// a script and 2 for a stylesheet.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_vpn_get(url: *const u8, len: usize, out: *mut u8, cap: usize, kind: *mut u8) -> isize {
+        use std::io::Read;
+        if VPN_PAGE.with_borrow(|p| p.is_none()) { return -1; }
+        if url.is_null() || out.is_null() || kind.is_null() || len > limen::sign_in::VPN_RESOURCE_URL_MAX { return 0; }
+        let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else { return 0 };
+        let Some(id) = LAST_RESOURCE.get().checked_add(1) else { return 0 };
+        LAST_RESOURCE.set(id);
+        if emit_credential(CredentialMessage::Resource { id, url }).is_none() { return 0; }
+        let got = CREDENTIAL_CHANNEL.with_borrow(|channel| {
+            let (child, embed) = channel.as_ref()?;
+            let mut channel = child.borrow_mut();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let ready = loop {
+                let wait = until.saturating_duration_since(std::time::Instant::now());
+                if wait.is_zero() { return None; }
+                match channel.poll(wait).ok()?? {
+                    limen::proto::ChildEvent::MessageFd { embed: from, bytes } if from == *embed => match limen::sign_in::ResourceReady::decode(&bytes) {
+                        Some(r) if r.id == id => break r,
+                        _ => { drop(channel.take_fd()); continue }
+                    },
+                    limen::proto::ChildEvent::Message { embed: from, bytes } if from == *embed => match limen::sign_in::decode(&bytes) {
+                        Some(CredentialMessage::ResourceFailed { id: failed }) if failed == id => return None,
+                        _ => { take_credential_reply(&bytes); continue }
+                    },
+                    limen::proto::ChildEvent::Resumed { .. } | limen::proto::ChildEvent::Suspended { .. } => continue,
+                    _ => return None,
+                }
+            };
+            let mut file = std::fs::File::from(channel.take_fd()?);
+            let n = usize::try_from(file.metadata().ok()?.len()).ok()?;
+            if n == 0 || n > cap || n > limen::sign_in::VPN_RESOURCE_MAX { return None; }
+            file.read_exact(unsafe { std::slice::from_raw_parts_mut(out, n) }).ok()?;
+            Some((n, ready.kind))
+        });
+        match got {
+            Some((n, k)) => {
+                unsafe { *kind = match k { limen::sign_in::ResourceKind::Script => 1, limen::sign_in::ResourceKind::Stylesheet => 2 } };
+                n as isize
+            }
+            None => {
+                eprintln!("VPN page: no {url}");
+                0
+            }
+        }
+    }
 
     thread_local! { static VPN_FORM_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
 
@@ -1168,11 +1282,18 @@ pub mod host {
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn navigator_credential_begin(realm: *const std::ffi::c_void, registering: bool, bytes: *const u8, len: usize) -> u32 {
-        if bytes.is_null() || realm.is_null() || realm != SIGN_IN_REALM.get() || ACTIVE_GET.get().is_some() || len > 32 * 1024 { return 0; }
+        if bytes.is_null() || realm.is_null() || realm != SIGN_IN_REALM.get() || ACTIVE_GET.get().is_some() || len > 32 * 1024 {
+            eprintln!("sign-in page: a security-key request refused (realm {}, one already active {}, {len} bytes)",
+                if realm == SIGN_IN_REALM.get() { "matches" } else { "is another" }, ACTIVE_GET.get().is_some());
+            return 0;
+        }
         let Ok(options) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes, len) }) else { return 0 };
         let Some(id) = LAST_GET.get().checked_add(1) else { return 0 };
         let message = if registering { CredentialMessage::Create { id, options } } else { CredentialMessage::Get { id, options } };
-        if emit_credential(message).is_none() { return 0; }
+        if emit_credential(message).is_none() {
+            eprintln!("sign-in page: no channel for the security-key request");
+            return 0;
+        }
         LAST_GET.set(id);
         ACTIVE_GET.set(Some((id, std::time::Instant::now())));
         id

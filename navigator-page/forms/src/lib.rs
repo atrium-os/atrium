@@ -133,3 +133,86 @@ pub fn forms(doc: &str) -> Vec<limen::doc_viewer::Form> {
     }
     out
 }
+
+/// `scheme://host[:port]` of an absolute address.
+fn origin_of(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    (end > 0).then(|| &url[..8 + end])
+}
+
+/// `application/x-www-form-urlencoded`, decoded. `None` for anything
+/// malformed or not UTF-8.
+fn form_decode(body: &[u8]) -> Option<Vec<(String, String)>> {
+    fn part(b: &[u8]) -> Option<String> {
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => out.push(b' '),
+                b'%' => {
+                    let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                    out.push(u8::from_str_radix(hex, 16).ok()?);
+                    i += 2;
+                }
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).ok()
+    }
+    if body.is_empty() { return Some(vec![]); }
+    body.split(|&c| c == b'&').map(|pair| {
+        let mut it = pair.splitn(2, |&c| c == b'=');
+        Some((part(it.next()?)?, part(it.next().unwrap_or(b""))?))
+    }).collect()
+}
+
+/// The form a VPN page's script submitted, as the window's panel shows
+/// it: the script's values, never shown, and one button. `None` when it
+/// is out of shape, not to the page's own HTTPS origin, or carries a
+/// field the document has as a password.
+pub fn scripted_form(location: &str, secret: &[String], url: &str, body: &[u8]) -> Option<limen::doc_viewer::Form> {
+    use limen::doc_viewer::{Field, FieldKind, Form, FIELDS_MAX};
+    let origin = origin_of(location)?;
+    if origin_of(url)? != origin { return None; }
+    let pairs = form_decode(body)?;
+    if pairs.len() >= FIELDS_MAX || pairs.iter().any(|(n, _)| n.is_empty() || secret.contains(n)) { return None; }
+    let mut fields: Vec<Field> = pairs.into_iter().map(|(name, value)| Field { kind: FieldKind::Scripted, name, label: String::new(), value, checked: false }).collect();
+    fields.push(Field { kind: FieldKind::Submit, name: String::new(), label: "Continue".into(), value: String::new(), checked: false });
+    let form = Form { action: url.into(), post: true, fields };
+    form.ok().then_some(form)
+}
+
+#[cfg(test)]
+mod scripted_tests {
+    use super::*;
+    use limen::doc_viewer::FieldKind;
+
+    #[test]
+    fn a_script_form_goes_only_to_its_pages_origin_without_a_password() {
+        let page = "https://idp.example:448/realms/corp/login-actions/authenticate?session_code=1";
+        let to = "https://idp.example:448/realms/corp/login-actions/authenticate?session_code=1&execution=2";
+        let f = scripted_form(page, &[], to, b"clientDataJSON=eyJ0eXBl&signature=MEUC%2Bx&error=").expect("a form");
+        let got: Vec<_> = f.fields.iter().map(|x| (x.kind, x.name.as_str(), x.value.as_str())).collect();
+        assert_eq!(got, vec![(FieldKind::Scripted, "clientDataJSON", "eyJ0eXBl"), (FieldKind::Scripted, "signature", "MEUC+x"),
+            (FieldKind::Scripted, "error", ""), (FieldKind::Submit, "", "")]);
+        assert!(f.post && f.action == to);
+        assert!(scripted_form(page, &[], "https://evil.example/x", b"a=1").is_none(), "another origin");
+        assert!(scripted_form(page, &[], "https://idp.example/x", b"a=1").is_none(), "another port");
+        assert!(scripted_form("http://idp.example/", &[], "http://idp.example/x", b"a=1").is_none(), "never http");
+        assert!(scripted_form(page, &["password".into()], to, b"username=a&password=b").is_none(), "a password only through Arca");
+        assert!(scripted_form(page, &[], to, b"a=%zz").is_none());
+        assert!(scripted_form(page, &[], to, b"=1").is_none());
+        let many: Vec<String> = (0..40).map(|i| format!("f{i}=1")).collect();
+        assert!(scripted_form(page, &[], to, many.join("&").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn an_origin_ends_at_the_path() {
+        assert_eq!(origin_of("https://a.example:8443/x?y"), Some("https://a.example:8443"));
+        assert_eq!(origin_of("https://a.example?y"), Some("https://a.example"));
+        assert_eq!(origin_of("https://a.example"), Some("https://a.example"));
+        assert_eq!(origin_of("http://a.example/"), None);
+    }
+}

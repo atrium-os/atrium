@@ -77,13 +77,13 @@ fn main() {
                 continue;
             }
             match f.kind {
-                FieldKind::Text => fields.push(FormField { name: f.name.clone(), value: user.clone(), typed: true, arca: None }),
-                FieldKind::Password => fields.push(FormField { name: f.name.clone(), value: String::new(), typed: true, arca: arca.take() }),
-                FieldKind::Fixed => fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None }),
-                FieldKind::Checkbox | FieldKind::Radio if f.checked => fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None }),
+                FieldKind::Text => fields.push(FormField { name: f.name.clone(), value: user.clone(), typed: true, arca: None, scripted: false }),
+                FieldKind::Password => fields.push(FormField { name: f.name.clone(), value: String::new(), typed: true, arca: arca.take(), scripted: false }),
+                FieldKind::Fixed => fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None, scripted: false }),
+                FieldKind::Checkbox | FieldKind::Radio if f.checked => fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None, scripted: false }),
                 FieldKind::Submit if !pressed => {
                     pressed = true;
-                    fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None });
+                    fields.push(FormField { name: f.name.clone(), value: f.value.clone(), typed: false, arca: None, scripted: false });
                 }
                 _ => {}
             }

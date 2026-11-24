@@ -1447,7 +1447,7 @@ impl Shell {
                     }
                 }
             }
-            Fixed | Submit => {}
+            Fixed | Scripted | Submit => {}
         }
     }
 
@@ -1511,17 +1511,18 @@ impl Shell {
                 continue;
             }
             if Some(j) == arca {
-                fields.push(navigator_control::FormField { name: f.name.clone(), value: String::new(), typed: true, arca: p.arca });
+                fields.push(navigator_control::FormField { name: f.name.clone(), value: String::new(), typed: true, arca: p.arca, scripted: false });
                 continue;
             }
             let (value, typed) = match f.kind {
                 Fixed => (f.value.clone(), false),
+                Scripted => (f.value.clone(), false),
                 Text | Password => (p.edits[j].text().to_string(), true),
                 Checkbox | Radio if p.checked[j] => (f.value.clone(), false),
                 Submit if j == i => (f.value.clone(), false),
                 _ => continue,
             };
-            fields.push(navigator_control::FormField { name: f.name.clone(), value, typed, arca: None });
+            fields.push(navigator_control::FormField { name: f.name.clone(), value, typed, arca: None, scripted: f.kind == Scripted });
         }
         let (label, action, post) = (p.form.fields[i].label.clone(), p.form.action.clone(), p.form.post);
         // Spent: a handle goes with one form.
@@ -1981,6 +1982,28 @@ mod tests {
         assert!(s.outbox.is_empty());
         s.set_forms(vec![]);
         assert!(s.form.is_none());
+    }
+
+    #[test]
+    fn a_page_scripts_values_go_unshown_and_marked_on_a_press() {
+        use limen::doc_viewer::{Field, FieldKind::*, Form};
+        let f = |kind, name: &str, label: &str, value: &str| Field { kind, name: name.into(), label: label.into(), value: value.into(), checked: false };
+        let form = Form { action: "https://idp.example/realms/corp/login-actions/authenticate?x=1".into(), post: true, fields: vec![
+            f(Scripted, "clientDataJSON", "", "eyJ0"), f(Scripted, "signature", "", "MEUC"), f(Submit, "", "Continue", "")] };
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(true);
+        s.enter("https://idp.example/realms/corp/login-actions/authenticate?x=1");
+        s.portal = Some("Corp VPN".into());
+        s.set_forms(vec![form]);
+        let p = s.form.as_ref().unwrap();
+        assert_eq!((p.rows(), p.buttons()), (vec![], vec![2]), "a script's values are never shown");
+        assert!(s.outbox.is_empty(), "nothing goes before the press");
+        s.submit_form(2, None);
+        let Some(Out::SubmitForm { fields, post, .. }) = s.outbox.pop() else { panic!("{:?}", s.outbox) };
+        assert!(post);
+        let got: Vec<_> = fields.iter().map(|f| (f.name.as_str(), f.value.as_str(), f.typed, f.scripted)).collect();
+        assert_eq!(got, vec![("clientDataJSON", "eyJ0", false, true), ("signature", "MEUC", false, true)]);
     }
 
     #[test]

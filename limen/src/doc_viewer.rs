@@ -215,6 +215,11 @@ pub enum FieldKind {
     /// A submit button: pressing it sends the form, with its own name and
     /// value when it has a name.
     Submit,
+    /// A value the page's own script set before it submitted the form (a
+    /// VPN sign-in page, vpn.md "Scripts in the sign-in window"): sent as
+    /// the page gives it, never shown. The broker cannot find it in the
+    /// document, so it goes only to the page's own HTTPS origin, on a press.
+    Scripted,
 }
 
 pub const FORMS_MAX: usize = 4;
@@ -232,7 +237,7 @@ impl Form {
         clean_text(&self.action, URL_MAX) && self.fields.len() <= FIELDS_MAX
             && self.fields.iter().any(|f| f.kind == FieldKind::Submit)
             && self.fields.iter().all(|f| clean_text(&f.name, FIELD_NAME_MAX) && clean_text(&f.label, FIELD_LABEL_MAX)
-                && clean_text(&f.value, if f.kind == FieldKind::Fixed { FIXED_VALUE_MAX } else { FIELD_VALUE_MAX }))
+                && clean_text(&f.value, if matches!(f.kind, FieldKind::Fixed | FieldKind::Scripted) { FIXED_VALUE_MAX } else { FIELD_VALUE_MAX }))
     }
 }
 

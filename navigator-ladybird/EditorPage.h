@@ -9,6 +9,7 @@
 struct NavigatorScene;
 #ifdef ATRIUM_MAIL_PAGE
 extern "C" bool navigator_vpn_script_submit(u8 const*, size_t);
+extern "C" bool navigator_vpn_script_post(u8 const*, size_t, u8 const*, size_t);
 #endif
 
 namespace Navigator {
@@ -36,15 +37,41 @@ public:
                 && post.request_body.has_value() && navigator_vpn_script_submit(post.request_body->data(), post.request_body->size()))
                 return;
         }
+        // Any other form a VPN page submits to its own origin (a script's,
+        // such as an IdP's security-key answer) goes to the window, which
+        // sends it only on the person's press (vpn.md "Scripts in the
+        // sign-in window"). Never followed here.
+        if (target == Web::NavigationTarget::TopLevel && request.has_value() && request->url == url
+            && request->initiator_origin == url.origin() && request->document_resource.has<Web::HTML::POSTResource>()) {
+            auto const& post = request->document_resource.get<Web::HTML::POSTResource>();
+            auto const& name = url.serialize();
+            if (post.request_content_type == Web::HTML::POSTResource::RequestContentType::ApplicationXWWWFormUrlencoded) {
+                u8 const* body = post.request_body.has_value() ? post.request_body->data() : nullptr;
+                size_t length = post.request_body.has_value() ? post.request_body->size() : 0;
+                if (navigator_vpn_script_post(name.bytes().data(), name.bytes().size(), body, length))
+                    return;
+            }
+        }
 #endif
         if (target != Web::NavigationTarget::TopLevel || pending_navigation.has_value()
             || !request.has_value() || request->url != url || !request->document_resource.has<Empty>()
             || request->history_handling != Web::Bindings::NavigationHistoryBehavior::Replace) {
+            // Loud: a refused navigation is otherwise a page that just stops.
+            warnln("sign-in page: navigation to {} refused (top-level={} same-origin={} post={})", url.serialize(),
+                target == Web::NavigationTarget::TopLevel, request.has_value() && request->initiator_origin == url.origin(),
+                request.has_value() && request->document_resource.has<Web::HTML::POSTResource>());
             navigation_refused = true;
             return;
         }
         pending_navigation = url;
     }
+#endif
+#ifdef ATRIUM_MAIL_PAGE
+    // A sign-in page has no dialogs: each is dismissed at once (an IdP's
+    // passkey label prompt keeps its default), never left to wait.
+    void page_did_request_alert(Utf16String const&) override { m_page->alert_closed(); }
+    void page_did_request_confirm(Utf16String const&) override { m_page->confirm_closed(false); }
+    void page_did_request_prompt(Utf16String const&, Utf16String const&) override { m_page->prompt_closed({}); }
 #endif
 #ifdef ATRIUM_I1_COUNTER
     void page_did_request_unload_check(Web::HTML::CrossProcessId, GC::Ref<GC::Function<void(Web::HTML::CheckIfUnloadingIsCanceledResult)>>) override;

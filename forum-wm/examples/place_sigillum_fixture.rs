@@ -14,6 +14,24 @@ fn main() -> io::Result<()> {
         );
     }
     println!("embeds {:?}", layout.embeds);
+    // `--focus UID`: give the focus back to that uid's window (a press
+    // after the sheet closed is otherwise spent in a window without focus),
+    // keeping every rectangle where it is.
+    if std::env::args().nth(1).as_deref() == Some("--focus") {
+        let uid: u32 = std::env::args().nth(2).and_then(|u| u.parse().ok()).ok_or_else(|| io::Error::other("--focus UID"))?;
+        let target = layout.surfaces.iter()
+            .filter(|w| w.owner_uid == uid && !layout.embeds.iter().any(|pair| pair[0] == w.surface_id))
+            .max_by_key(|w| w.rect.w as u64 * w.rect.h as u64)
+            .ok_or_else(|| io::Error::other("no window of that uid"))?;
+        let slots = layout.surfaces.iter()
+            .filter(|w| !layout.embeds.iter().any(|pair| pair[0] == w.surface_id))
+            .map(|w| WmSlot { surface_id: w.surface_id, rect: w.rect, layer: if w.surface_id == target.surface_id { 0 } else { 1 } })
+            .collect();
+        wm.wm_declare_layout(&WmDeclareLayoutPayload { slots, focus: target.surface_id, focus_cause: focus_cause::PROGRAM })?;
+        wm.wm_enumerate()?;
+        println!("focus {}", target.surface_id);
+        return Ok(());
+    }
     let settings = std::env::args().nth(1).as_deref() == Some("--settings");
     let mut targets = layout.surfaces.iter().filter(|w| {
         if settings {

@@ -1188,7 +1188,7 @@ fn form_bar(ctx: &mut Ctx, r: Rect, network: &str, f: Option<&shell::FormPanel>,
                 text(ctx, x + em(28.0), row_cy, &fit(&fld.label, &ls, label_w + cw - em(12.0)), type_size::SM, Weight::Regular, t.text_primary());
                 ctx.pop();
             }
-            FieldKind::Fixed | FieldKind::Submit => {}
+            FieldKind::Fixed | FieldKind::Scripted | FieldKind::Submit => {}
         }
     }
     let bs = sans(type_size::XS, Weight::Medium, t.text_primary());

@@ -211,6 +211,12 @@ pub enum Request {
     Credential { page: u32, id: u32, registering: bool, options: String },
     /// The page gave up on that request (or went): Sigillum's sheet closes.
     CredentialAbort { id: u32 },
+    /// A VPN sign-in window's page asked for a script or stylesheet (vpn.md
+    /// "Scripts in the sign-in window"). `page`: the `Open` whose
+    /// `VpnDocument` that page is; navigatord fetches `url` only from that
+    /// document's own HTTPS origin, through the profile's couriers, and
+    /// answers `VpnResource` with the same `id`.
+    VpnResource { page: u32, id: u32, url: String },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
@@ -235,6 +241,10 @@ pub struct FormField {
     /// handle, and `value` is empty. The value never reaches the UI or
     /// navigatord; Arca's courier puts it in the form (arca-autofill.md §3).
     pub arca: Option<[u8; 16]>,
+    /// A value the page's script set (`FieldKind::Scripted`): navigatord
+    /// does not look for it in the document, and sends it only from a VPN
+    /// sign-in window to the page's own HTTPS origin.
+    pub scripted: bool,
 }
 
 /// The most fields a form sent has, and the longest name or value.
@@ -248,7 +258,7 @@ pub const FORM_FIXED_MAX: usize = 32 * 1024;
 pub fn form_ok(action: &str, fields: &[FormField]) -> bool {
     clean(action, URL_MAX) && fields.len() <= FORM_FIELDS_MAX
         && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, if f.typed { FORM_TEXT_MAX } else { FORM_FIXED_MAX })
-            && (f.arca.is_none() || (f.typed && f.value.is_empty())))
+            && (f.arca.is_none() || (f.typed && f.value.is_empty())) && !(f.scripted && (f.typed || f.arca.is_some())))
         && fields.iter().filter(|f| f.arca.is_some()).count() <= 1
 }
 
@@ -386,7 +396,14 @@ pub enum Event {
     /// The answer to `Credential`: the assertion's or registration's JSON,
     /// or the DOM error's name (`NotAllowedError`, `SecurityError`, ...).
     Credential { id: u32, registering: bool, json: Option<String>, error: Option<String> },
+    /// The answer to `VpnResource`: with `kind`, a sealed descriptor of the
+    /// body follows; without, it was refused or failed (`why`).
+    VpnResource { id: u32, kind: Option<VpnResourceKind>, why: Option<String> },
 }
+
+/// What a VPN page's resource is, from its content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VpnResourceKind { Script, Stylesheet }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WidgetFailure { Start, Fetch, Exit }
@@ -561,11 +578,15 @@ pub fn raw(s: &impl AsRawFd) -> RawFd { s.as_raw_fd() }
 mod tests {
     #[test]
     fn an_arca_field_sends_a_handle_never_a_value() {
-        let f = |v: &str, typed, arca| FormField { name: "password".into(), value: v.into(), typed, arca };
+        let f = |v: &str, typed, arca| FormField { name: "password".into(), value: v.into(), typed, arca, scripted: false };
         assert!(form_ok("/login", &[f("", true, Some([1; 16]))]));
         assert!(!form_ok("/login", &[f("pw", true, Some([1; 16]))]), "a handle and a value");
         assert!(!form_ok("/login", &[f("", false, Some([1; 16]))]), "the page's value can't be Arca's");
         assert!(!form_ok("/login", &[f("", true, Some([1; 16])), f("", true, Some([2; 16]))]), "one per form");
+        let scripted = |typed, arca| FormField { name: "signature".into(), value: "MEUCIQ".into(), typed, arca, scripted: true };
+        assert!(form_ok("/authenticate", &[scripted(false, None)]));
+        assert!(!form_ok("/authenticate", &[scripted(true, None)]), "a script's value is not the person's");
+        assert!(!form_ok("/authenticate", &[scripted(false, Some([1; 16]))]), "nor Arca's");
     }
 
 

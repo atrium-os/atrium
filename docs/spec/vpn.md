@@ -806,7 +806,7 @@ Gate: `scripts/crypta-v2-gate.sh run` (the V1 stand; its setup is shared). Two v
 - Single sign-on (SAML, SSO v2): when the gateway offers `sso-v2-login`, Settings shows "Sign in…", which asks portcullisd (`VpnSignInWindow`, with the press) to start the person's Navigator in the reserved persona `vpn`. That Navigator asks `VpnSignInStatus` for the start and final addresses, fetches every page through Arca's couriers in the profile's own jar (partitions `vpn-<profile>.<gateway site>`, one per sign-in, kept apart from browsing for the next sign-in), sends the page's plain forms as courier POSTs only on the person's press (303 becomes GET, 307/308 after a form refused), keeps no trail, store or download, and closes 3 s after the final address opens or after 10 minutes. The gateway's `acSamlv2Token`, set in that jar, never reaches the page: arcad files it as Crypta's item `<profile>/sso@<host>`; cryptad notices it, the engine takes it once and sends it as `<sso-token>` to its own gateway only. Noscript content is read (Keycloak's SAML auto-post "Continue").
 - The IdP's password (added 2026-11-19): in a VPN sign-in window the form's first password field is Arca's field, not a line of the form panel. What is typed stays with arca-ui; the panel sends navigatord Arca's handle (`FormField.arca`), never a value, and only for a POST from a VPN window (the portal window refuses one). navigatord's broker rebinds the handle to that form's endpoint and partition (arcad `W_HANDLE_FOR`, only a pending handle the broker's app holds), and the courier puts the value into the form body (`SOURCE_HANDLE`, form-encoded); a spent handle is never retried. Navigator keeps the field mounted until the broker replies to the form, so detaching the field cannot revoke the handle during submission.
 - The jar goes with its profile: cryptad asks arcad to forget a profile's sign-in jar (`VPN_FORGET_JAR`, Crypta only) when it is created and when it is deleted, so a profile made again under the same name starts signed out at the IdP.
-- Not yet: sign-ins that need scripts (Okta, Entra), and security keys, passkeys and fingerprints at the IdP (WebAuthn), wait for Navigator's live code (navigator-islands.md step I3; Shankar's choice 2026-11-19, no VPN-only script lane); one secret field per form.
+- Scripts at the IdP: see "Scripts in the sign-in window" (2026-11-24), the general path Shankar chose over a VPN-only lane (2026-11-19, confirmed 2026-11-24). Not yet proven against Okta or Entra; one secret field per form.
 - Check: `scripts/crypta-v4-gate.sh run` 60 checks pass on the amd64 VM against ocserv 1.2.4 in the Ubuntu VM (password with a group, plain-text refused, roam resumes on a reset connection, saved password, wrong password asked again, password plus TOTP, a certificate from Arca's key, a pinned gateway, a wrong pin refused, hostile pushes refused, the password and token in no state or log) and SAML against Keycloak 26 through a stand-in gateway (`scripts/crypta-sso-stand.sh`: ocserv has no SAML, so a small Python gateway checks Keycloak's signed answer with xmlsec1, mints the token and logs in to ocserv behind it): the token reaches Arca through the courier path, the engine signs on with it once, and a replay is refused. The sign-in window end to end: a real navigatord in the `vpn` persona's mode with real courier jails (a private relay on the LAN, since couriers refuse documentation ranges), driven by `sign-in-probe` (navigator-page example) where the window's panel and page child would be: Keycloak's login form goes with the password from Arca's field, the signed answer goes on to the gateway, the tunnel comes up on the window's token, the password is in no log, a second sign-in needs no password (Keycloak's session in the jar), and after the profile is removed and made again the password is asked again. Not covered by the gate: portcullisd's launch of the window and the drawn panel (unit-tested in navigator-ui). Both stand pieces are test tools on the host and VM only.
 - Frames: `scripts/crypta-v4-gate.sh ui` (then `click`, `type`, `frame`) shows Settings' sign-ins under a headless frescod with limend and arca-ui: the gateway's username and group, the password in Arca's field, and the single sign-on card. It found Settings crashing when Arca's field was asked for (a RefCell borrow held across the request), fixed.
 - Fuzzing: `crypta/crypta-ac/fuzz` (auth/XML, HTTP head and body read whole and split, CSTP deframing read whole and split); 5 minutes each found one split-stream difference in chunk-size lines, fixed (a 256-byte line limit either way).
@@ -1289,6 +1289,76 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
   forward there at once. Still runtime only: a full tunnel's root
   forwarders (`.`), which come back from FreeBSD's `forward.conf` until
   atrium-net's check; with the block on, pf drops what goes to the LAN.
+- *Scripts in the sign-in window (2026-11-24).* An IdP's sign-in page
+  runs its own scripts, as Keycloak's security-key pages do (a module
+  script from `/resources/…/js/` importing `rfc4648` through an import map,
+  then a hidden-field form submitted from script). Shankar chose the
+  general path, not a VPN-only lane.
+  - *Its own scripts and stylesheets.* For any https GET other than the
+    stand-in's sealed `continue.js`, the page's loader
+    (`patches/ladybird/vpn-resources.patch`, after `fixture-fetch.patch`)
+    asks the painter (`navigator_vpn_get`), which sends `limen::sign_in`
+    `Resource { id, url }` to the window. navigator-ui forwards it, one at
+    a time and only from a page it gave a VPN document, as
+    `Request::VpnResource { page, id, url }`. navigatord fetches only the
+    delivered document's own HTTPS origin, in its normal spelling, with no
+    credentials or fragment (URL at most 2 KiB). It fetches once and
+    follows no redirects, through the profile's couriers in the sign-in
+    jar, and only while the attempt is current. The answer must be 200
+    with one content type, a script or a stylesheet, at most 1 MiB.
+    navigatord answers `Event::VpnResource` with a sealed memfd, which
+    the window hands the page as `ResourceReady` (or `ResourceFailed`).
+    The page never names where a resource comes from beyond its own
+    origin, and has no network of its own.
+  - *Forms a script submits.* A top-level form POST
+    (`application/x-www-form-urlencoded`) of the page's own origin, such as
+    a script's `requestSubmit()`, is never followed in the page.
+    `navigator_vpn_script_post` turns it into a form of `Scripted` fields
+    and one Continue button for the window's form panel. Scripted values
+    are never shown. The window sends nothing without the person's press,
+    like any other form. Only the page's own HTTPS origin is accepted, at
+    most 31 fields. A field the delivered document has as a password is
+    refused, so a password still goes only through Arca's field.
+    navigatord takes `FormField.scripted` values without finding them in
+    the document (names and the action still must be there), only in a VPN
+    window, only as a POST, and only to the HTTPS origin of the page that
+    set them.
+  - *Dialogs.* A sign-in page's `alert`, `confirm` and `prompt` are
+    dismissed at once (Keycloak's passkey-label prompt keeps its default
+    label), so a page never waits on a dialog nobody can see.
+  - *The sign-in page runs "the end" of parsing* (SignInFixture.h, mail
+    and VPN pages): module and deferred scripts run only there, and
+    DOMContentLoaded and load fire there. Before, a module script never
+    ran in a sign-in page. The worker must also link the bindings that
+    expose `PublicKeyCredential` (the I3 registration build's
+    `IntrinsicDefinitions` and `WindowExposedInterfaces`).
+  - *Result on arm64 Tessera (2026-11-24),* against Keycloak 26.0.7 with
+    WebAuthn required after the password (`crypta-sso-stand.sh webauthn
+    on`), stock `keycloak.v2` pages. The window took the password through
+    Arca's field and opened Keycloak's Passkey Registration page. Its four
+    scripts came through navigatord from Keycloak's origin. Register
+    opened Sigillum's "Create a passkey" sheet for `idp.crypta.test`, and
+    the soft key registered after its PIN. The page's `requestSubmit` went
+    to the panel as a scripted form, and the press sent it (607 bytes).
+    Keycloak stored the passkey and answered its SAML page. The gateway
+    accepted the assertion and redeemed its token once, and the tunnel came
+    up and fetched `crypta-ac-ok` over `tun6`. Not yet shown: a later
+    sign-in with that passkey (`navigator.credentials.get`). Keycloak's
+    security-key sign-in page has a CSS transform (a 1.14 scale) that the
+    native painter refuses, so its page child exits. The painter now takes
+    the content clips of a scrolling viewport and stationary nested
+    scrollers, which this page needed first. Evidence:
+    `~/atrium-vm/evidence/vpn-passkey-keycloak-20261124/`.
+  - *Gate fixture notes.* frescod needs `FRESCOD_ACTIVATION_UIDS=65021,65030`
+    so Sigillum's sheet can spend its press. With no Forum,
+    `place_sigillum_fixture` places the sheet, and `place_sigillum_fixture
+    --focus 50000` gives the focus back to Navigator after the sheet
+    closes; otherwise the panel's press is refused as "the window lost the
+    focus". Navigator's manifest now also needs `/atrium/sockets/audio`.
+  - *Checks.* Host tests cover the wire (limen), the field rules
+    (navigator-control), the origin, type and size rules and the scripted
+    form check (navigatord), the panel (navigator-ui), and the scripted form's
+    decoding and origin rule (navigator-forms).
 - *Checks.* `scripts/crypta-v4-gate.sh run` now 80 checks on the amd64
   VM: the V4 ones plus GlobalProtect SAML through the window against
   Keycloak (the stand-in serves a GlobalProtect portal front: prelogin

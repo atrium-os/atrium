@@ -55,7 +55,15 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
     navigator_get_realm(&Web::HTML::relevant_realm(*doc));
 #endif
     doc->remove_all_children();
+#ifdef ATRIUM_MAIL_PAGE
+    // Run "the end" of parsing too: module and deferred scripts run only
+    // there, and DOMContentLoaded and load fire there. An IdP's sign-in page
+    // (Keycloak's security-key pages) is module scripts (vpn.md "Scripts in
+    // the sign-in window").
+    Web::HTML::HTMLParser::create_from_byte_string(*doc, html, Web::HTML::ParserScriptingMode::Normal, "utf-8"sv)->run(url);
+#else
     Web::HTML::HTMLParser::create_from_byte_string(*doc, html, Web::HTML::ParserScriptingMode::Normal, "utf-8"sv)->run();
+#endif
 #ifdef ATRIUM_I4_VIDEO
     // The Limen player owns this rectangle, including its playback controls.
     // Keep the element in layout so the native slot uses its CSS geometry.

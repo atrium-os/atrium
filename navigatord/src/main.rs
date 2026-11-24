@@ -963,6 +963,47 @@ fn vpn_origin(url: &str) -> Option<sigillum_webauthn::Origin> {
     sigillum_webauthn::Origin::parse(&url.origin().ascii_serialization()).filter(|o| o.is_secure())
 }
 
+/// A VPN page's resource request (vpn.md "Scripts in the sign-in window"):
+/// the address, checked against the delivered document's URL. Only that
+/// document's own HTTPS origin, with no credentials or fragment in the
+/// address; returns the document's host for the courier's initiator.
+fn vpn_resource_target(document: &str, url: &str) -> Result<String, &'static str> {
+    if url.len() > limen::sign_in::VPN_RESOURCE_URL_MAX || !ctl::clean(url, limen::sign_in::VPN_RESOURCE_URL_MAX) {
+        return Err("the address is out of shape");
+    }
+    let doc = url::Url::parse(document).ok().filter(|u| u.scheme() == "https").ok_or("the page is not an HTTPS document")?;
+    let target = url::Url::parse(url).map_err(|_| "not an address")?;
+    if target.scheme() != "https" || !target.username().is_empty() || target.password().is_some() || target.fragment().is_some() {
+        return Err("only a plain HTTPS address");
+    }
+    if target.origin() != doc.origin() {
+        return Err("only the page's own origin");
+    }
+    if target.as_str() != url {
+        return Err("the address is not in its normal spelling");
+    }
+    doc.host_str().map(str::to_ascii_lowercase).ok_or("the page has no host")
+}
+
+/// What a fetched VPN page resource is: a script or a stylesheet by its one
+/// content type, within the size bound; anything else is refused.
+fn vpn_resource_kind(status: u16, headers: &[(String, String)], body: &[u8]) -> Result<ctl::VpnResourceKind, &'static str> {
+    if status != 200 {
+        return Err("the site did not answer 200");
+    }
+    if body.len() > limen::sign_in::VPN_RESOURCE_MAX {
+        return Err("the resource is over its bound");
+    }
+    let mut types = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    let (Some((_, value)), None) = (types.next(), types.next()) else { return Err("not one content type") };
+    let mime = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "text/javascript" | "application/javascript" | "application/x-javascript" | "text/ecmascript" | "application/ecmascript" => Ok(ctl::VpnResourceKind::Script),
+        "text/css" => Ok(ctl::VpnResourceKind::Stylesheet),
+        _ => Err("neither a script nor a stylesheet"),
+    }
+}
+
 /// The connection's one security-key ceremony, retired when it goes.
 struct Ceremony(Arc<Mutex<Option<credential_get::Pending>>>);
 
@@ -1349,6 +1390,70 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             Request::CredentialAbort { id } => {
                 ceremony.0.lock().unwrap().take_if(|p| p.id == id);
             }
+            Request::VpnResource { page, id, url } => {
+                let refuse = |why: &str| {
+                    eprintln!("navigatord: a VPN page's resource refused: {why}");
+                    send(&w, &Event::VpnResource { id, kind: None, why: Some(why.into()) });
+                };
+                let (Some(v), Some(c)) = (cfg.vpn.clone(), cookies.clone()) else {
+                    refuse("only a VPN sign-in window fetches a page's resources");
+                    continue;
+                };
+                if !v.is_current() {
+                    refuse("the VPN sign-in attempt ended");
+                    continue;
+                }
+                let document = strip.lock().unwrap().vpn_documents.iter().rev().find(|(p, _)| *p == page).map(|(_, u)| u.clone());
+                let Some(document) = document else {
+                    refuse("a resource for a page this window wasn't given");
+                    continue;
+                };
+                let host = match vpn_resource_target(&document, &url) {
+                    Ok(h) => h,
+                    Err(why) => {
+                        refuse(why);
+                        continue;
+                    }
+                };
+                let w = w.clone();
+                std::thread::spawn(move || {
+                    let reply = |kind, why: Option<String>| send(&w, &Event::VpnResource { id, kind, why });
+                    let fetched = {
+                        let mut b = c.lock().unwrap();
+                        b.show_sign_in(vpn::VIEW, &v.start_url, &v.profile)
+                            .and_then(|_| b.fetch_once(vpn::VIEW, &Fetch::subresource(&url, &host)))
+                    };
+                    let r = match fetched {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("navigatord: a VPN page's resource failed: {e:?}");
+                            reply(None, Some(format!("{e:?}")));
+                            return;
+                        }
+                    };
+                    if r.url != url || r.redirects != 0 {
+                        reply(None, Some("the resource was redirected".into()));
+                        return;
+                    }
+                    let kind = match vpn_resource_kind(r.status, &r.headers, &r.body) {
+                        Ok(k) => k,
+                        Err(why) => {
+                            eprintln!("navigatord: a VPN page's resource refused: {why}");
+                            reply(None, Some(why.into()));
+                            return;
+                        }
+                    };
+                    eprintln!("navigatord: a VPN page's {kind:?} from its own origin ({} bytes)", r.body.len());
+                    let result = limen::fdpass::sealed_file("vpn-sign-in-resource", &r.body).and_then(|fd| {
+                        let socket = w.lock().unwrap();
+                        ctl::write_frame(&mut &*socket, &Event::VpnResource { id, kind: Some(kind), why: None })?;
+                        ctl::send_fd(&socket, std::os::fd::AsRawFd::as_raw_fd(&fd))
+                    });
+                    if let Err(e) = result {
+                        eprintln!("navigatord: a VPN page's resource not handed over: {e}");
+                    }
+                });
+            }
             Request::Accounts { url } => {
                 let reply = |accounts: Vec<ctl::Account>, why: Option<String>| send(&w, &Event::Accounts { url: url.clone(), accounts, why });
                 let Some(site) = ctl::clean(&url, ctl::URL_MAX).then(|| site_of(&url)).flatten() else {
@@ -1645,6 +1750,13 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 if arca.is_some() && !url::Url::parse(&p.url).ok().zip(url::Url::parse(&target).ok())
                     .is_some_and(|(page, target)| page.scheme() == "https" && page.origin() == target.origin()) {
                     refuse("a trusted password goes only to the HTTPS origin displaying its field".into());
+                    continue;
+                }
+                // Values a VPN page's script set (vpn.md "Scripts in the
+                // sign-in window"): only a VPN window's POST, and only to the
+                // HTTPS origin of the page whose script set them.
+                if fields.iter().any(|f| f.scripted) && (cfg.vpn.is_none() || !post || !same_https_origin(&p.url, &target)) {
+                    refuse("a page script's form goes only from a VPN sign-in window to that page's HTTPS origin".into());
                     continue;
                 }
                 let secret_of = arca.and_then(|i| fields[i].arca);
@@ -1976,6 +2088,12 @@ fn about_of(v: &serde_json::Value) -> Option<AppAbout> {
 /// every name, and every value the person didn't type, must be spelled in
 /// the page's recording, as a link's href must (`activate`): the UI can only
 /// send what the page holds, plus what the person typed.
+/// Both addresses are HTTPS and of one origin.
+fn same_https_origin(page: &str, target: &str) -> bool {
+    url::Url::parse(page).ok().zip(url::Url::parse(target).ok())
+        .is_some_and(|(page, target)| page.scheme() == "https" && page.origin() == target.origin())
+}
+
 fn form_target(page: &Page, action: &str, fields: &[ctl::FormField], schemes: &SchemeAllowlist) -> Result<String, String> {
     use navigator_backend::links;
     let has = |n: &[u8]| page.recording.windows(n.len()).any(|w| w == n);
@@ -1986,7 +2104,9 @@ fn form_target(page: &Page, action: &str, fields: &[ctl::FormField], schemes: &S
         if !has(&links::attr_spelling("name", &f.name)) {
             return Err(format!("the page has no field {:?}", f.name));
         }
-        if !f.typed && !f.value.is_empty() && f.value != "on" && !has(&links::attr_spelling("value", &f.value)) {
+        // A script's value is the page's own and not in the document:
+        // the caller sends it only to the page's HTTPS origin.
+        if !f.typed && !f.scripted && !f.value.is_empty() && f.value != "on" && !has(&links::attr_spelling("value", &f.value)) {
             return Err(format!("{:?} isn't a value the page gives", f.name));
         }
     }
@@ -2410,7 +2530,7 @@ mod tests {
     #[test]
     fn a_form_goes_only_where_the_page_says_with_what_it_holds() {
         let p = page("http://10.88.0.1/welcome", r#"<form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"t\" value=\"9f\"><input name=\"room\"><button name=\"go\" value=\"1\">Connect</button></form>"#);
-        let f = |name: &str, value: &str, typed| ctl::FormField { name: name.into(), value: value.into(), typed, arca: None };
+        let f = |name: &str, value: &str, typed| ctl::FormField { name: name.into(), value: value.into(), typed, arca: None, scripted: false };
         let ok = [f("t", "9f", false), f("room", "4 12", true), f("go", "1", false)];
         let s = SchemeAllowlist::default();
         assert_eq!(form_target(&p, "/login", &ok, &s).as_deref(), Ok("http://10.88.0.1/login"));
@@ -2419,6 +2539,49 @@ mod tests {
         assert!(form_target(&p, "/login", &[f("password", "x", true)], &s).is_err(), "a name the page doesn't have");
         assert!(form_target(&p, "/login", &[f("t", "forged", false)], &s).is_err(), "a page value the page doesn't give");
         assert!(form_target(&p, "/login", &[f("t", "typed is fine", true)], &s).is_ok());
+    }
+
+    #[test]
+    fn a_page_scripts_value_needs_only_its_field_and_goes_only_to_its_https_origin() {
+        let p = page("https://idp.example/realms/corp/login", r#"<form id=\"webauth\" method=\"post\" action=\"https://idp.example/realms/corp/login-actions/authenticate?x=1\"><input type=\"hidden\" name=\"signature\"></form>"#);
+        let field = |name: &str, scripted| ctl::FormField { name: name.into(), value: "MEUCIQDx".into(), typed: false, arca: None, scripted };
+        let s = SchemeAllowlist::default();
+        let action = "https://idp.example/realms/corp/login-actions/authenticate?x=1";
+        assert!(form_target(&p, action, &[field("signature", true)], &s).is_ok(), "a script's value need not be in the document");
+        assert!(form_target(&p, action, &[field("signature", false)], &s).is_err(), "a page value must be");
+        assert!(form_target(&p, action, &[field("password", true)], &s).is_err(), "only a field the page has");
+        assert!(same_https_origin(&p.url, action));
+        assert!(!same_https_origin(&p.url, "https://evil.example/x"));
+        assert!(!same_https_origin("http://idp.example/", "http://idp.example/x"), "never plain http");
+    }
+
+    #[test]
+    fn a_vpn_pages_resource_comes_only_from_its_documents_https_origin() {
+        let doc = "https://idp.crypta.test:448/realms/corp/login-actions/authenticate?session_code=1";
+        assert_eq!(vpn_resource_target(doc, "https://idp.crypta.test:448/resources/abc/login/keycloak/js/webauthnAuthenticate.js").as_deref(), Ok("idp.crypta.test"));
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test/resources/a.js").is_err(), "another port is another origin");
+        assert!(vpn_resource_target(doc, "https://evil.example:448/a.js").is_err());
+        assert!(vpn_resource_target(doc, "http://idp.crypta.test:448/a.js").is_err(), "never plain http");
+        assert!(vpn_resource_target(doc, "https://u:p@idp.crypta.test:448/a.js").is_err(), "no credentials");
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/a.js#x").is_err(), "no fragment");
+        assert!(vpn_resource_target(doc, "https://IDP.crypta.test:448/a.js").is_err(), "only the normal spelling");
+        assert!(vpn_resource_target("http://idp.crypta.test/", "http://idp.crypta.test/a.js").is_err());
+        let long = format!("https://idp.crypta.test:448/{}", "a".repeat(limen::sign_in::VPN_RESOURCE_URL_MAX));
+        assert!(vpn_resource_target(doc, &long).is_err());
+    }
+
+    #[test]
+    fn a_vpn_pages_resource_is_one_script_or_stylesheet_within_its_bound() {
+        let h = |v: &str| vec![("Content-Type".to_string(), v.to_string())];
+        assert_eq!(vpn_resource_kind(200, &h("text/javascript; charset=utf-8"), b"x"), Ok(ctl::VpnResourceKind::Script));
+        assert_eq!(vpn_resource_kind(200, &h("application/javascript"), b"x"), Ok(ctl::VpnResourceKind::Script));
+        assert_eq!(vpn_resource_kind(200, &h("TEXT/CSS"), b"x"), Ok(ctl::VpnResourceKind::Stylesheet));
+        assert!(vpn_resource_kind(200, &h("text/html"), b"x").is_err());
+        assert!(vpn_resource_kind(404, &h("text/javascript"), b"x").is_err());
+        assert!(vpn_resource_kind(200, &[], b"x").is_err(), "no content type");
+        let two = vec![("content-type".to_string(), "text/css".to_string()), ("Content-Type".to_string(), "text/javascript".to_string())];
+        assert!(vpn_resource_kind(200, &two, b"x").is_err(), "two content types");
+        assert!(vpn_resource_kind(200, &h("text/javascript"), &vec![b' '; limen::sign_in::VPN_RESOURCE_MAX + 1]).is_err());
     }
 
     #[test]

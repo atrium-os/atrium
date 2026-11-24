@@ -4,6 +4,7 @@
 #
 #   sh scripts/crypta-sso-stand.sh up      Keycloak and the stand-in gateway
 #   sh scripts/crypta-sso-stand.sh token   a browser's sign-in from the host: the gateway's token
+#   sh scripts/crypta-sso-stand.sh webauthn   security keys required (on|off|reset)
 #   sh scripts/crypta-sso-stand.sh down
 #
 # - Keycloak (Apache-2.0; KEYCLOAK_HOME, default ~/keycloak/keycloak-26.0.7)
@@ -82,12 +83,50 @@ token)
     python3 "$ROOT/scripts/crypta-sso-browser.py" "$P/ca.pem" "$GW/+CSCOE+/saml/sp/login?tgname=sso" "${2:-alice}" "${3:-alice-sso-pw}" \
         sso.crypta.test:447=127.0.0.1:8447 idp.crypta.test:448=127.0.0.1:8448
     ;;
+webauthn)
+    # Security keys required (vpn.md "Scripts in the sign-in window"): the
+    # realm's browser flow becomes a copy with Keycloak's WebAuthn
+    # Authenticator required after the password. A user with no key
+    # registers one on the next sign-in (navigator.credentials.create),
+    # later sign-ins use it (.get). Stock Keycloak pages and scripts.
+    # `webauthn off` puts the plain flow back; `webauthn reset` forgets
+    # alice's keys.
+    B=http://127.0.0.1:8180/admin/realms/corp
+    T=$(curl -s -d client_id=admin-cli -d username=admin -d password=admin-gate -d grant_type=password \
+        http://127.0.0.1:8180/realms/master/protocol/openid-connect/token | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    H="Authorization: Bearer $T"
+    case "${2:-on}" in
+    on)
+        if ! curl -sf -o /dev/null -H "$H" "$B/authentication/flows/browser-webauthn/executions"; then
+            curl -sf -H "$H" -H 'Content-Type: application/json' -d '{"newName":"browser-webauthn"}' "$B/authentication/flows/browser/copy"
+            curl -sf -H "$H" -H 'Content-Type: application/json' -d '{"provider":"webauthn-authenticator"}' \
+                "$B/authentication/flows/browser-webauthn%20forms/executions/execution"
+            ex=$(curl -sf -H "$H" "$B/authentication/flows/browser-webauthn/executions" | python3 -c 'import json,sys
+e=[e for e in json.load(sys.stdin) if e.get("providerId")=="webauthn-authenticator"][0]; e["requirement"]="REQUIRED"; print(json.dumps(e))')
+            curl -sf -X PUT -H "$H" -H 'Content-Type: application/json' -d "$ex" "$B/authentication/flows/browser-webauthn/executions"
+        fi
+        curl -sf -X PUT -H "$H" -H 'Content-Type: application/json' -d '{"browserFlow":"browser-webauthn"}' "$B"
+        echo "corp: WebAuthn required after the password"
+        ;;
+    off)
+        curl -sf -X PUT -H "$H" -H 'Content-Type: application/json' -d '{"browserFlow":"browser"}' "$B"
+        echo "corp: password only"
+        ;;
+    reset)
+        u=$(curl -sf -H "$H" "$B/users?username=alice&exact=true" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+        for c in $(curl -sf -H "$H" "$B/users/$u/credentials" | python3 -c 'import json,sys; print(" ".join(c["id"] for c in json.load(sys.stdin) if c["type"]=="webauthn"))'); do
+            curl -sf -X DELETE -H "$H" "$B/users/$u/credentials/$c"
+        done
+        echo "alice: no security keys"
+        ;;
+    esac
+    ;;
 down)
     pkill -f crypta-sso-standin.py 2>/dev/null || true
     pkill -f 'keycloak.*quarkus' 2>/dev/null || true
     ;;
 *)
-    echo "usage: $0 up|token|down" >&2
+    echo "usage: $0 up|token|webauthn [on|off|reset]|down" >&2
     exit 2
     ;;
 esac

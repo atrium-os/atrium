@@ -1400,6 +1400,21 @@ authorization flow on the same overlay produced exactly one each of
 The screenshots, logs, worker hashes and shutdown evidence are in
 `~/atrium-vm/evidence/navigator-i3-platform-20261122/`.
 
+### Sign-in pages: module scripts, IdP resources and the painter (2026-11-24)
+
+A sign-in page (`ATRIUM_MAIL_PAGE`) now runs "the end" of parsing
+(`HTMLParser::run(url)` in `SignInFixture.h`), so module and deferred
+scripts run and DOMContentLoaded and load fire. Before this, an IdP page
+built from module scripts (Keycloak's) never ran them. A VPN sign-in page
+fetches its own origin's scripts and stylesheets through its window, and a
+form its script submits goes to the window's panel. See vpn.md "Scripts in
+the sign-in window". The native painter now accepts clips inside a
+scrolling viewport's content (a text field's in a page taller than its
+window). It also accepts stationary scrollers below the viewport. It still
+refuses CSS transforms other than the identity, which Keycloak's
+security-key sign-in page needs (a 1.14 scale). Errors name the spatial
+kind and the clip that did not fit.
+
 ### I3 physical YubiKey on Tessera
 
 On 2026-11-23, installed Navigator's JIT-off Ladybird sign-in worker ran
