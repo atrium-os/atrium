@@ -4865,6 +4865,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - The Format menu's number formats gain **Accounting** (`_($* #,##0.00_);…`), **Comma Style** (the same without the currency sign: negatives in brackets, zero as a dash), **Long Date** (`dddd, mmmm d, yyyy`) and **Fraction** (`# ?/?`), after Text. The `*` fill is not stretched to the column width yet, so the sign isn't pushed to the left edge as in Excel.
 - Tests: the format-menu test checks the new keys and that each new format shows a value as Excel does; pergola's grid key test checks the four keys. All 140 Sheets lib tests pass.
 
+### 16.111 Excel's row, column and selection keys (2026-11-25)
+
+- **Ctrl+Space** selects the selection's whole columns and **Shift+Space** its whole rows, as a header click does (pergola grid, so every grid app gets them).
+- **Ctrl+9** / **Ctrl+0** hide the selected rows / columns; **Ctrl+Shift+(** / **Ctrl+Shift+)** unhide them.
+- **Ctrl+-** deletes and **Ctrl++** (or Ctrl+Shift+=) inserts: whole rows or columns when those are selected, otherwise cells, shifting them up or down. Excel asks in a dialog; Sheets takes the dialog's first choice, and the menu offers the others (`data::key_cmd`).
+- The menu shows these keys. Tests: `excel_row_and_column_keys_pick_the_command_for_the_selection`, and pergola's grid key test. All 141 Sheets lib tests and 229 pergola lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

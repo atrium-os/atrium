@@ -403,13 +403,13 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
-        (MenuItem::new("Insert Cells, Shift Down"), Some(DataCmd::InsertCellsDown)),
+        (MenuItem::new("Insert Cells, Shift Down").shortcut("Ctrl+Shift++"), Some(DataCmd::InsertCellsDown)),
         (MenuItem::new("Insert Cells, Shift Right"), Some(DataCmd::InsertCellsRight)),
-        (MenuItem::new("Delete Cells, Shift Up"), Some(DataCmd::DeleteCellsUp)),
+        (MenuItem::new("Delete Cells, Shift Up").shortcut("Ctrl+-"), Some(DataCmd::DeleteCellsUp)),
         (MenuItem::new("Delete Cells, Shift Left"), Some(DataCmd::DeleteCellsLeft)),
-        (MenuItem::new(format!("Hide {}", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::HideRows)),
-        (MenuItem::new("Unhide Rows").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
-        (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
+        (MenuItem::new(format!("Hide {}", plural(nr, "Row", "Rows"))).shortcut("Ctrl+9").separated(), Some(DataCmd::HideRows)),
+        (MenuItem::new("Unhide Rows").shortcut("Ctrl+Shift+(").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
+        (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).shortcut("Ctrl+0").enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
         (MenuItem::new("Row Height…"), Some(DataCmd::RowHeight)),
         (MenuItem::new("AutoFit Row Height"), Some(DataCmd::AutoFitRows)),
         (MenuItem::new("Column Width…"), Some(DataCmd::ColWidth)),
@@ -686,6 +686,28 @@ pub fn custom_sort(d: &mut Doc, sel: CellRange, cursor: (u32, u32), spec: &str) 
         }
         None => Ok("Already in that order.".into()),
     }
+}
+
+/// The row and column command for an Excel key (Ctrl+9, Ctrl+0, Ctrl+Shift+(,
+/// Ctrl+Shift+), Ctrl+-, Ctrl++). Delete and insert act on whole rows or
+/// columns when those are selected, else on cells, shifting them up or down,
+/// as Excel's dialog suggests first.
+pub fn key_cmd(k: char, sel: CellRange, rows: u32, cols: u32) -> Option<DataCmd> {
+    let whole_rows = sel.c0 == 0 && sel.c1 + 1 >= cols;
+    let whole_cols = sel.r0 == 0 && sel.r1 + 1 >= rows;
+    Some(match k {
+        '9' => DataCmd::HideRows,
+        '0' => DataCmd::HideCols,
+        '(' => DataCmd::UnhideRows,
+        ')' => DataCmd::UnhideCols,
+        '-' if whole_rows => DataCmd::DeleteRows,
+        '-' if whole_cols => DataCmd::DeleteCols,
+        '-' => DataCmd::DeleteCellsUp,
+        '+' if whole_rows => DataCmd::InsertRows,
+        '+' if whole_cols => DataCmd::InsertCols,
+        '+' => DataCmd::InsertCellsDown,
+        _ => return None,
+    })
 }
 
 /// The most steps Goal Seek takes.
@@ -2482,6 +2504,32 @@ mod tests {
         assert_eq!((cell(&d, 1, 0), cell(&d, 2, 0), cell(&d, 1, 1)), ("pear".into(), "apple".into(), "".into()));
         assert!(d.undo());
         assert!(d.wb.merges(0).is_empty());
+    }
+
+    #[test]
+    fn excel_row_and_column_keys_pick_the_command_for_the_selection() {
+        let (rows, cols) = (1000, 50);
+        let cells = CellRange { r0: 2, c0: 1, r1: 3, c1: 2 };
+        let rows_sel = CellRange { r0: 2, c0: 0, r1: 3, c1: 49 };
+        let cols_sel = CellRange { r0: 0, c0: 1, r1: 999, c1: 2 };
+        assert_eq!(key_cmd('9', cells, rows, cols), Some(DataCmd::HideRows));
+        assert_eq!(key_cmd('0', cells, rows, cols), Some(DataCmd::HideCols));
+        assert_eq!(key_cmd('(', cells, rows, cols), Some(DataCmd::UnhideRows));
+        assert_eq!(key_cmd(')', cells, rows, cols), Some(DataCmd::UnhideCols));
+        assert_eq!(key_cmd('-', cells, rows, cols), Some(DataCmd::DeleteCellsUp));
+        assert_eq!(key_cmd('-', rows_sel, rows, cols), Some(DataCmd::DeleteRows));
+        assert_eq!(key_cmd('-', cols_sel, rows, cols), Some(DataCmd::DeleteCols));
+        assert_eq!(key_cmd('+', cells, rows, cols), Some(DataCmd::InsertCellsDown));
+        assert_eq!(key_cmd('+', rows_sel, rows, cols), Some(DataCmd::InsertRows));
+        assert_eq!(key_cmd('+', cols_sel, rows, cols), Some(DataCmd::InsertCols));
+        assert_eq!(key_cmd('x', cells, rows, cols), None);
+        // Ctrl+9 then Ctrl+Shift+( on a document: the rows go and come back.
+        let mut d = doc();
+        let sel = CellRange { r0: 1, c0: 0, r1: 2, c1: 0 };
+        run(&mut d, sel, (1, 0), key_cmd('9', sel, rows, cols).unwrap());
+        assert!(d.wb.sheet(0).row_hidden(1) && d.wb.sheet(0).row_hidden(2));
+        run(&mut d, CellRange { r0: 0, c0: 0, r1: 3, c1: 0 }, (0, 0), key_cmd('(', sel, rows, cols).unwrap());
+        assert!(!d.wb.sheet(0).row_hidden(1));
     }
 
     #[test]

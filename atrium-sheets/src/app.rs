@@ -2178,6 +2178,14 @@ impl Sheets {
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
                 // Ctrl+`: formulas shown in their cells, or values again.
                 GridAction::Format('`') => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowFormulas)),
+                // Ctrl+9 / Ctrl+0 hide, Ctrl+Shift+( / ) unhide, Ctrl+- / Ctrl++ delete and insert.
+                GridAction::Format(k @ ('9' | '0' | '(' | ')' | '-' | '+')) => {
+                    use pergola::widgets::GridSource;
+                    let sel = grid.get_cloned().selection();
+                    if let Some(c) = crate::data::key_cmd(k, sel, src.rows(), src.cols()) {
+                        cmds.lock().unwrap().push(Cmd::Data(c));
+                    }
+                }
                 GridAction::Format(k) => {
                     if let Some(f) = crate::format::for_key(k) {
                         cmds.lock().unwrap().push(Cmd::Format(f));
