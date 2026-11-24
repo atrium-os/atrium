@@ -689,6 +689,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         continue;
                                     }
+                                    Some(pkgask::Ask::Debug(folder)) => {
+                                        let answer = pkgask::debug(&ws, &folder, activation).and_then(|(id, addr, prog)| {
+                                            let r = pkgask::debug_reply(&addr, &prog).ok_or_else(|| format!("odd answer {addr} {prog}"))?;
+                                            Ok((id, addr, r))
+                                        });
+                                        match answer {
+                                            Ok((id, addr, r)) => {
+                                                eprintln!("atrium-term-socket: window {}: {folder} of {ws} waits for a debugger at {addr} as {id}", s.win);
+                                                s.strip.hint = format!("debugging {folder} as {id}");
+                                                s.io.input(&r);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("atrium-term-socket: debug {folder} of {ws}: {e}");
+                                                s.strip.hint = format!("not debugged: {e}");
+                                                s.io.input(&pkgask::ok_reply(1));
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     None => continue,
                                 };
                                 match pkgask::Admin::start(&ws, &words, activation, cols, rows) {

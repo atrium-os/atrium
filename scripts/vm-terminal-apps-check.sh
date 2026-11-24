@@ -11,6 +11,8 @@
 #    gives the shell its screen back; less pages; top draws and quits;
 #    Neovim and Helix too when the Scratch workspace has them (after M2).
 #    The Terminal's trace line shows `<alt>` on the alternate screen.
+#    `atrium-run --debug` opens lldb on a dev build in Scratch, a
+#    breakpoint stops it, and it is marked as debugging meanwhile.
 #
 # On-screen checks that need a person's eyes or the clipboard (a frame of
 # each editor, a click moving Helix's cursor, a bracketed paste) run on the
@@ -94,6 +96,8 @@ sleep 3; test -S $PSOCK; chmod 666 $PSOCK
 EOS
 [ $? = 0 ] && ok "portcullisd and the apps installed" || { bad "setup: $(V "tail -3 $LOG")"; echo "terminal-apps: $fails failed"; exit 1; }
 for a in $TERM_ID; do V "su -m alice -c 'portcullis policy grant $a' >/dev/null 2>&1; portcullis policy grant --system $a >/dev/null 2>&1"; done
+# A Scratch left from an earlier run keeps that run's policy: start afresh.
+V "su -m alice -c 'cd /tmp; portcullis workspace stop scratch' >/dev/null 2>&1"
 
 echo "=== frescod"
 V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=$B/wm.sock \
@@ -231,6 +235,51 @@ k1 0x28
 typ "echo run=\$?
 "
 waitscreen "run=1" 30 && ok "Run with nothing built answers 1" || bad "run: $(screen) $(V "grep 'run nothing-here' $LOG | tail -2")"
+# Debug (dev-tools.md §7.3, M10): `atrium-run --debug` asks to Debug; Debug
+# (a press) installs the dev build waiting for its debugger, and atrium-run
+# opens lldb connected with the program loaded; a breakpoint stops it, it is
+# marked as debugging meanwhile (frescod's frame tag), and it runs to its end.
+WW=/home/alice/.atrium/workspaces/scratch/work
+typ "mkdir -p ~/work/dbg
+"
+V "cat > $WW/dbg/dbg.c" <<'C'
+#include <stdio.h>
+int __attribute__((noinline)) marker(int answer) { return answer + 1; }
+int main(void) { int r = marker(41); printf("debug-after %d\n", r); return 0; }
+C
+V "printf '[app]\nid = \"org.example.dbg\"\nname = \"Dbg\"\nversion = \"1\"\nentry = \"dbg\"\n' > $WW/dbg/atrium.toml"
+typ "cc -g -O0 -o ~/work/dbg/dbg ~/work/dbg/dbg.c; echo cc=\$?
+"
+waitscreen "cc=0" 180 && ok "dbg built in Scratch" || bad "cc: $(screen)"
+typ "atrium-run --debug dbg
+"
+waitscreen "menu=scratch asks to Debug dbg,Debug,Cancel@1" 30 && ok "atrium-run --debug asks to Debug" || bad "debug ask: $(screen)"
+check "stty works in the console (the answer isn't echoed)" "0" "$(V "grep 'atrium-term: screen' $B/term.log | tail -1 | grep -c 'TIOCGETD'")"
+k1 0x28
+waitscreen "Process [0-9]* stopped" 180
+# Every screen the Terminal traced, not only the last (lldb redraws).
+case "$(V "grep 'atrium-term: screen' $B/term.log | grep 'gdb-remote 127.0.0.1' | grep -c 'Process [0-9]* stopped'")" in
+    0|"") bad "lldb: $(screen) $(V "grep -i debug $LOG | tail -3")" ;; *) ok "lldb opened, connected and stopped at the start" ;; esac
+typ "breakpoint set -n marker
+"
+typ "continue
+"
+# (The trace can catch lldb mid-redraw: read the stop once the next
+# command's answer is on screen.)
+waitscreen "breakpoint 1.1" 120
+check "marked as debugging (the frame tag)" "dev.alice.scratch.org.example.dbg" "$(V "ls /var/db/atrium/debugging 2>/dev/null")"
+typ "frame variable answer
+"
+waitscreen "answer = 41" 30 && ok "marker's argument is 41" || bad "frame variable: $(screen)"
+screen | grep -q "stop reason = breakpoint 1.1" && ok "the breakpoint stopped it" || bad "no breakpoint: $(screen)"
+shot apps-4-debug
+typ "continue
+"
+waitscreen "exited with status = 0" 120 && ok "it ran to its end" || bad "no exit: $(screen)"
+typ "quit
+"
+waitscreen "scratch \\$" 30 && ok "quit gives the shell back" || bad "after lldb: $(screen)"
+check "and the mark goes" "" "$(V "i=0; while [ \$i -lt 20 ] && [ -n \"\$(ls /var/db/atrium/debugging 2>/dev/null)\" ]; do sleep 1; i=\$((i+1)); done; ls /var/db/atrium/debugging 2>/dev/null")"
 for ed in nvim hx; do
     if V "jexec ws_alice_scratch sh -c 'PATH=/usr/local/bin:\$PATH command -v $ed'" >/dev/null 2>&1; then
         typ "$ed /tmp/gate.txt

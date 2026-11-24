@@ -962,6 +962,7 @@ ioctls = [
     "0x80047476",   # TIOCSPGRP
     "0x40047477",   # TIOCGPGRP
     "0x40047463",   # TIOCGSID
+    "0x4004741a",   # TIOCGETD (stty reads the line discipline first)
 ]
 
 # Workspaces (dev-tools.md §7.1, dev-tools-plan.md M0): the shell and what it

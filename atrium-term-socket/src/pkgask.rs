@@ -10,6 +10,12 @@
 //!   run`): "<workspace> asks to Run <folder>" with Run and Cancel. Run
 //!   sends `WorkspaceRun` with the press and answers `ok;0`, or shows the
 //!   error and answers `ok;1`.
+//! - `ESC ] 7770 ; debug ; <folder> BEL` from `atrium-run --debug`:
+//!   "<workspace> asks to Debug <folder>" with Debug and Cancel. Debug sends
+//!   `WorkspaceDebug` with the press and answers `dbg;<address>;<program>`
+//!   (lldb's `gdb-remote` address on the workspace's own loopback, and the
+//!   program's path), or `ok;1` with the error shown. The app starts when
+//!   the debugger connects (dev-tools.md §7.3).
 //!
 //! Cancel (or Esc) answers `cancel`. Answers go on the pty's input.
 
@@ -38,6 +44,7 @@ pub fn workspace_of(app: Option<&str>) -> Option<&str> {
 pub enum Ask {
     Pkg(String),
     Run(String),
+    Debug(String),
 }
 
 impl Ask {
@@ -46,6 +53,7 @@ impl Ask {
         match s.split_once(' ')? {
             ("pkg", w) => Some(Ask::Pkg(w.to_string())),
             ("run", f) => Some(Ask::Run(f.to_string())),
+            ("debug", f) => Some(Ask::Debug(f.to_string())),
             _ => None,
         }
     }
@@ -55,6 +63,7 @@ impl Ask {
         match self {
             Ask::Pkg(words) => (format!("{ws} asks to run: pkg {words}"), "Install"),
             Ask::Run(folder) => (format!("{ws} asks to Run {folder}"), "Run"),
+            Ask::Debug(folder) => (format!("{ws} asks to Debug {folder}"), "Debug"),
         }
     }
 }
@@ -64,6 +73,26 @@ pub fn run(ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, Strin
     let mut s = connect()?;
     match round_trip(&mut s, &Request::WorkspaceRun { name: ws.into(), project: folder.into(), activation }) {
         Ok(Response::WorkspaceRan { app_id, .. }) => Ok(app_id),
+        Ok(Response::Error { message }) => Err(message),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+/// The answer to a Debug: where lldb connects and the program to load.
+/// Only characters the wrapper's checks pass go out.
+pub fn debug_reply(address: &str, program: &str) -> Option<Vec<u8>> {
+    let addr_ok = address.split_once(':').is_some_and(|(h, p)| h == "127.0.0.1" && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let prog_ok = program.starts_with('/') && !program.split('/').any(|c| c == "..")
+        && program.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b));
+    (addr_ok && prog_ok).then(|| format!("\x1b]7770;dbg;{address};{program}\x07\r").into_bytes())
+}
+
+/// Debug `folder` of workspace `ws`, spending the press: the debugger's
+/// address and the program's path.
+pub fn debug(ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, String, String), String> {
+    let mut s = connect()?;
+    match round_trip(&mut s, &Request::WorkspaceDebug { name: ws.into(), project: folder.into(), activation }) {
+        Ok(Response::WorkspaceDebugging { app_id, address, program, .. }) => Ok((app_id, address, program)),
         Ok(Response::Error { message }) => Err(message),
         other => Err(format!("{other:?}")),
     }
@@ -178,6 +207,13 @@ mod tests {
         assert_eq!(Ask::parse("pkg install helix"), Some(Ask::Pkg("install helix".into())));
         assert_eq!(Ask::parse("run app"), Some(Ask::Run("app".into())));
         assert_eq!(Ask::parse("rm x"), None);
+        assert_eq!(Ask::parse("debug app"), Some(Ask::Debug("app".into())));
+        assert_eq!(Ask::Debug("app".into()).question("proj"), ("proj asks to Debug app".into(), "Debug"));
+        assert_eq!(debug_reply("127.0.0.1:4711", "/var/lib/atrium/apps/dev.a.b.c/app").unwrap(),
+                   b"\x1b]7770;dbg;127.0.0.1:4711;/var/lib/atrium/apps/dev.a.b.c/app\x07\r");
+        assert_eq!(debug_reply("10.0.0.1:4711", "/x"), None);
+        assert_eq!(debug_reply("127.0.0.1:4711", "/x;rm"), None);
+        assert_eq!(debug_reply("127.0.0.1:4711", "x"), None);
         assert_eq!(Ask::Pkg("install helix".into()).question("scratch"), ("scratch asks to run: pkg install helix".into(), "Install"));
         assert_eq!(Ask::Run(".".into()).question("proj"), ("proj asks to Run .".into(), "Run"));
         assert_eq!(status_of("Installing helix...\npkg: exit 0\n"), Some(0));

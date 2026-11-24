@@ -1032,11 +1032,13 @@ pub const ASK_MAX: usize = 256;
 
 /// A workspace request (OSC 7770) as `"<kind> <argument>"`, if it is one
 /// the terminal knows and its argument is well formed: `pkg` with
-/// [`pkg_words`], `run` with [`run_folder`].
+/// [`pkg_words`], `run` and `debug` (Run under the debugger) with
+/// [`run_folder`].
 pub fn parse_ask(kind: &[u8], arg: &[u8]) -> Option<String> {
     match kind {
         b"pkg" => Some(format!("pkg {}", pkg_words(arg)?)),
         b"run" => Some(format!("run {}", run_folder(arg)?)),
+        b"debug" => Some(format!("debug {}", run_folder(arg)?)),
         _ => None,
     }
 }

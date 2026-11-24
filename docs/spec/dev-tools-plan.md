@@ -409,8 +409,14 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   25/25 in deny mode (a breakpoint, its argument and stack from lldb in Scratch;
   an installed app can't be seen or attached; a core read there). The gate's
   crashing app gets a tmpfs overlay: FreeBSD 16-CURRENT fails every core on ZFS
-  with EFAULT, GENERIC too. Not done: Run under debugger from the Terminal's
-  `atrium-run` and Artifex's DAP launch (both can send `WorkspaceDebug`).
+  with EFAULT, GENERIC too. Debug from the Terminal (2026-11-24): `atrium-run
+  --debug [folder]` asks with OSC 7770 `debug`; the Terminal shows "<workspace> asks to
+  Debug <folder>", and Debug (a press) sends `WorkspaceDebug` and answers `dbg;<address>;
+  <program>`; atrium-run then starts lldb connected with the program loaded (it prints
+  the lldb line instead without a tty or without lldb). The console class allows
+  `TIOCGETD`, so stty (and the wrappers' no-echo) works there. `scripts/vm-terminal-apps-check.sh`
+  drives it through the Terminal to a breakpoint, 37/37. Not done: Artifex's DAP launch
+  (it can send `WorkspaceDebug`).
   The frame tag (2026-11-24): while a dev build runs under lldb-server, portcullisd keeps
   an empty file named for it in `/var/db/atrium/debugging` (removed when it exits and
   at portcullisd's start); frescod, which already mounts `/var/db/atrium` read-only,

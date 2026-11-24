@@ -212,6 +212,10 @@ esac
 const RUN_WRAPPER: &str = r#"#!/bin/sh
 # Run what this workspace built, as an app (docs/spec/homes.md §5.3), after
 # you press Run in the Terminal. The folder is in ~/work (default: ~/work).
+# --debug: Debug instead (dev-tools.md §7.3): the app waits for lldb, which
+# this starts for you (connected, the program loaded) when lldb is here.
+kind=run
+if [ "${1:-}" = --debug ]; then kind=debug; shift; fi
 p=${1:-.}
 case "$p" in
 ""|/*|*..*|*[!A-Za-z0-9._/-]*) echo "atrium-run: "$p" isn't a folder in ~/work" >&2; exit 64 ;;
@@ -231,12 +235,22 @@ if [ -n "$tty" ]; then
     echo "atrium-run: asking for your OK in this window (Ctrl-C to cancel)"
     stty -echo
 fi
-printf ']7770;run;%s' "$p"
+printf ']7770;%s;%s' "$kind" "$p"
 IFS= read -r reply
 [ -z "$tty" ] || stty "$old"
 [ -z "$tty" ] || printf '[1A
 [2K'
 case "$reply" in
+*"]7770;dbg;"*)
+    r=${reply#*7770;dbg;}; addr=${r%%;*}; prog=${r#*;}; prog=${prog%%[!A-Za-z0-9._/-]*}
+    case "$addr" in 127.0.0.1:[0-9]*) ;; *) echo "atrium-run: an odd answer" >&2; exit 1 ;; esac
+    case "$addr" in *[!0-9.:]*) echo "atrium-run: an odd answer" >&2; exit 1 ;; esac
+    echo "atrium-run: $p waits for the debugger at $addr"
+    if [ -n "$tty" ] && command -v lldb >/dev/null 2>&1; then
+        exec lldb -o "settings set plugin.process.gdb-remote.packet-timeout 30" -o "target create $prog" -o "gdb-remote $addr"
+    fi
+    echo "atrium-run: connect with: lldb -o 'target create $prog' -o 'gdb-remote $addr'"
+    exit 0 ;;
 *"]7770;ok;"*) s=${reply##*;}; s=${s%%[!0-9]*}; exit "${s:-1}" ;;
 *"]7770;cancel"*) echo "atrium-run: cancelled"; exit 1 ;;
 *) echo "atrium-run: this terminal can't ask for your OK" >&2; exit 1 ;;
