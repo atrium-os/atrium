@@ -1382,6 +1382,8 @@ For a cancellation listing several dates, Mail binds each original occurrence an
 
 For a weekly request with `EXDATE`, Mail binds the skipped slots to the selected delivery and includes their count in response review. Calendar shows each date and resolves any local move privately. A whole-series reply addresses the organizer and contains only the attendee’s series response. [Reviewing skipped dates](calendar.md#715-reviewing-dates-skipped-by-a-weekly-invitation)
 
+For a weekly range update, Mail binds the original slot and `RANGE=THISANDFUTURE` to response review. The organizer receives one RSVP with that same recurrence identifier and range. Calendar keeps the list of affected local dates within the selected persona. [Changing this and future occurrences](calendar.md#716-changing-this-and-future-occurrences)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

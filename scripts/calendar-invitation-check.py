@@ -289,10 +289,65 @@ def exdates(ui):
     print("PASS private local move choices, each skipped date reviewed, regular and moved siblings preserved, Undo and empty outbox")
 
 
+def future(ui):
+    print(guest(ui, "future-setup"))
+    open_mail(ui, first=True)
+    inspect_moves(ui)
+    click(ui, 568, 550)
+    ui.see("range-series-saved", "Invitation saved")
+    # Move a later exception across the range boundary on this device.
+    ui.open_date("2026-12-17")
+    click(ui, 450, 268)
+    ui.field(80, 256, "2026-12-07")
+    ui.field(225, 256, "11:30")
+    ui.field(330, 256, "12:15")
+    click(ui, 92, 506)
+    ui.see("range-private-move", "2026-12-07", "11:30")
+    baseline = ui.store("work")
+    local = next(r for r in baseline["entries"] if r["date"] == "2026-12-07")
+    assert local["span"] == {"start": 690, "end": 735}
+
+    def inspect():
+        ui.control("close", "work")
+        review(ui, 178)
+        ui.see("range-overview", "This and future occurrences", "2026-12-08", "Review 3 dates")
+        click(ui, 355, 412)
+        ui.see("range-anchor", "Range date 1 of 3", "2026-12-09", "15:00", "16:00")
+        click(ui, 355, 412)
+        ui.see("range-preserved", "Range date 2 of 3", "2026-12-15", "2026-12-07", "11:30", "separately edited meeting")
+        click(ui, 355, 412)
+        ui.see("range-last", "Range date 3 of 3", "2026-12-22", "2026-12-23", "16:00", "Apply reviewed range")
+        assert ui.store("work") == baseline
+
+    inspect()
+    click(ui, 80, 462)
+    response = ui.see("range-rsvp", "This and future occurrences", "2026-12-08", "ACCEPTED")
+    assert "11:30" not in response
+    click(ui, 70, 355)
+    inspect()
+    click(ui, 568, 550)
+    ui.see("range-saved", "Invitation saved")
+    saved = ui.store("work")
+    assert saved["revision"] == baseline["revision"] + 1 and local in saved["entries"]
+    base = next(r for r in saved["entries"] if r["kind"] == "Weekly")
+    assert base["date"] == "2026-12-01" and base["span"] == {"start": 840, "end": 885}
+    assert base["excluded"] == ["2026-12-08", "2026-12-15", "2026-12-22"]
+    changed = [r for r in saved["entries"] if r is not base and r != local]
+    assert sorted(r["date"] for r in changed) == ["2026-12-09", "2026-12-23"]
+    assert all(r["span"] == {"start": 960, "end": 1020} for r in changed)
+    click(ui, 590, 562)
+    ui.see("range-undone", "Change undone")
+    assert ui.store("work") == dict(baseline, revision=saved["revision"] + 1)
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS scoped range RSVP, private exception across boundary, earlier meeting preserved and atomic Undo")
+
+
 if __name__ == "__main__":
-    runner = {"--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

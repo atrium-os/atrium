@@ -229,14 +229,19 @@ impl Engine {
                 {
                     return Err(Error::Refused("Invalid occurrence time"));
                 }
-                let zone = if head == "RECURRENCE-ID" {
+                let range = head.strip_prefix("RECURRENCE-ID;RANGE=THISANDFUTURE");
+                let params = range
+                    .or_else(|| head.strip_prefix("RECURRENCE-ID"))
+                    .ok_or(Error::Refused("Invalid occurrence identifier"))?;
+                let zone = if params.is_empty() {
                     if value.ends_with('Z') {
                         "UTC"
                     } else {
                         "Floating"
                     }
                 } else {
-                    head.strip_prefix("RECURRENCE-ID;TZID=")
+                    params
+                        .strip_prefix(";TZID=")
                         .filter(|z| {
                             !z.is_empty()
                                 && z.len() <= 64
@@ -247,7 +252,12 @@ impl Engine {
                         .ok_or(Error::Refused("Invalid occurrence zone"))?
                 };
                 Ok(Some(format!(
-                    "One occurrence · originally {} · {zone}",
+                    "{} {} · {zone}",
+                    if range.is_some() {
+                        "This and future occurrences ·"
+                    } else {
+                        "One occurrence · originally"
+                    },
                     date.format("%Y-%m-%d %H:%M")
                 )))
             }

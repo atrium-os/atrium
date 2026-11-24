@@ -72,7 +72,7 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=7)
+                if !matches!(snapshot.version, 1..=8)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -461,7 +461,7 @@ impl Store {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 7,
+            version: 8,
             cancelled,
             pinned_zone,
             device_zone,

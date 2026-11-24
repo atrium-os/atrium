@@ -1,3 +1,4 @@
+mod future;
 use super::*;
 use crate::invitation::{Cancellation, MeetingKey, Origin, Proposal, Review};
 use portcullis_ipc::calendar::{Source, REVIEW_SECONDS};
@@ -24,6 +25,9 @@ impl Store {
             return Err("Calendar changed. Review this invitation again.".into());
         }
         p.skips = p.validate_delivery(source)?;
+        if p.this_and_future {
+            return self.review_future(revision, source, p);
+        }
         if !p.cancelled_dates.is_empty() {
             return self.review_cancelled_dates(revision, source, p);
         }
@@ -32,6 +36,7 @@ impl Store {
             .exceptions
             .iter()
             .map(|m| Proposal {
+                this_and_future: false,
                 uid: p.uid.clone(),
                 sequence: p.sequence,
                 organizer: p.organizer.clone(),
@@ -54,6 +59,7 @@ impl Store {
             revision,
             source,
             p,
+            None,
             None,
             &mut pending,
         )?;
@@ -94,6 +100,7 @@ impl Store {
                     source,
                     child,
                     previous.as_ref(),
+                    None,
                     &mut child_plan,
                 )?;
                 review.previous_dates.push(previous);
@@ -142,6 +149,7 @@ impl Store {
                 source,
                 p.clone(),
                 None,
+                None,
                 &mut part,
             )?;
             // A single-date conflict can show the series pattern even when that
@@ -181,7 +189,7 @@ impl Store {
     }
 
     // Build an in-memory proposal. A bundle publishes only its final snapshot.
-    fn prepare(
+    pub(super) fn prepare(
         rows: &[Entry],
         history: &[Cancellation],
         view: Tz,
@@ -189,6 +197,7 @@ impl Store {
         source: &Source,
         p: Proposal,
         prior_occurrence: Option<&Entry>,
+        range_from: Option<NaiveDate>,
         pending: &mut Option<Pending>,
     ) -> Result<Review, String> {
         let cancelled = p.row.is_none();
@@ -223,6 +232,7 @@ impl Store {
         });
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
+            range_dates: vec![],
             previous_dates: vec![],
             skips: vec![],
             previous: master.cloned(),
@@ -377,6 +387,19 @@ impl Store {
             .map(|(rule, row)| rule.last(row))
             .transpose()?;
         if let Some(base) = master.filter(|_| p.original.is_none()) {
+            let saved = base.invitation.as_ref().unwrap();
+            if let Some(sequence) = saved.range_sequence {
+                if p.sequence <= sequence {
+                    return Ok(
+                        review.blocked("A saved range update supersedes this series revision.")
+                    );
+                }
+                if !cancelled && (last.is_none() || last > saved.last) {
+                    return Ok(review.blocked(
+                        "Extending a series with a saved range change needs separate review.",
+                    ));
+                }
+            }
             if last.is_some_and(|end| base.excluded.iter().any(|d| *d > end)) {
                 return Ok(review
                     .blocked("The new end would drop a saved exception. Review that date first."));
@@ -402,6 +425,7 @@ impl Store {
             if o.sequence == p.sequence {
                 replay = p.row.as_ref().is_some_and(|r| {
                     r.fields_on(r.date) == o.accepted
+                        && o.range_from == range_from
                         && o.location == p.location
                         && o.limit == p.limit
                         && o.included == included
@@ -448,6 +472,12 @@ impl Store {
                 row.excluded.clone_from(&base.excluded);
             }
             row.invitation = Some(Origin {
+                range_from,
+                range_sequence: if row.kind == Kind::Weekly {
+                    master.and_then(|m| m.invitation.as_ref()?.range_sequence)
+                } else {
+                    None
+                },
                 key,
                 limit: p.limit,
                 last,

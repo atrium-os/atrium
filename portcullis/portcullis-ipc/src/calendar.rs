@@ -69,7 +69,7 @@ impl Answer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reply {
-    /// None for an ordinary meeting, an original RECURRENCE-ID for one date,
+    /// None for an ordinary meeting, an original RECURRENCE-ID for one date or a THISANDFUTURE range,
     /// or "weekly" with optional COUNT/UNTIL, EXDATE slots and bundled move identifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,

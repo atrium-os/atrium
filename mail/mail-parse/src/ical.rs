@@ -340,7 +340,19 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
                     scope = Some(weekly_scope(&value)?)
                 }
                 "RECURRENCE-ID" if scope.is_none() => {
-                    scope = Some(occurrence_scope(&params, &value)?)
+                    let mut clock_params = params;
+                    let range = clock_params.iter().position(|(key, v)| {
+                        key == "RANGE" && v.eq_ignore_ascii_case("THISANDFUTURE")
+                    });
+                    if let Some(index) = range {
+                        clock_params.remove(index);
+                    }
+                    let property = occurrence_scope(&clock_params, &value)?;
+                    scope = Some(if range.is_some() {
+                        property.replacen("RECURRENCE-ID", "RECURRENCE-ID;RANGE=THISANDFUTURE", 1)
+                    } else {
+                        property
+                    });
                 }
                 "EXDATE" => {
                     for stamp in value.split(',') {
@@ -371,6 +383,13 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     }
     let grouped_cancel = method.as_deref() == Some("CANCEL") && events.len() > 1;
     if grouped_cancel && events.len() > 8 {
+        return None;
+    }
+    if events
+        .iter()
+        .any(|(scope, _)| scope.as_ref().is_some_and(|s| s.contains(";RANGE=")))
+        && (events.len() != 1 || method.as_deref() != Some("REQUEST"))
+    {
         return None;
     }
     let mut parts = events.into_iter();

@@ -78,6 +78,12 @@ impl OccurrenceId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
+    /// The range update that generated this detached occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_from: Option<NaiveDate>,
+    /// Highest accepted range revision on the weekly master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_sequence: Option<u32>,
     /// Organizer's most recently accepted EXDATE set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skips: Vec<OccurrenceId>,
@@ -101,6 +107,8 @@ pub struct Origin {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
+    #[serde(default)]
+    pub this_and_future: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skips: Vec<OccurrenceId>,
     #[serde(default)]
@@ -158,6 +166,20 @@ impl Proposal {
             {
                 return Err("Invalid group of cancelled occurrences".into());
             }
+        }
+        if self.this_and_future
+            && (self.original.is_none()
+                || self
+                    .row
+                    .as_ref()
+                    .is_none_or(|r| r.kind != Kind::Appointment)
+                || self.limit.is_some()
+                || !self.exceptions.is_empty()
+                || !self.skips.is_empty()
+                || !self.cancelled_dates.is_empty()
+                || self.weekly_cancellation)
+        {
+            return Err("Unsupported range invitation".into());
         }
         let scope = self.scope();
         let bound = source
@@ -259,6 +281,12 @@ impl Proposal {
         if self.weekly_cancellation {
             return Some("weekly".into());
         }
+        if self.this_and_future {
+            return self.original.map(|o| {
+                o.property()
+                    .replacen("RECURRENCE-ID", "RECURRENCE-ID;RANGE=THISANDFUTURE", 1)
+            });
+        }
         self.original.map(OccurrenceId::property).or_else(|| {
             self.row
                 .as_ref()
@@ -313,7 +341,16 @@ pub struct SkipDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RangeDate {
+    pub original: NaiveDate,
+    pub before: Option<EventEdit>,
+    pub after: Option<EventEdit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub range_dates: Vec<RangeDate>,
     #[serde(default)]
     pub skips: Vec<SkipReview>,
     #[serde(default)]

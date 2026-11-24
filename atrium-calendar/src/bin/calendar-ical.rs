@@ -68,6 +68,7 @@ fn stamp(params: &[&str], value: &str) -> Result<Stamp> {
 
 #[derive(Default)]
 struct Event {
+    this_and_future: bool,
     uid: Option<String>,
     title: Option<String>,
     start: Option<Stamp>,
@@ -363,6 +364,19 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                             return Err(Issue::Limit);
                         }
                     }
+                    "RECURRENCE-ID" => {
+                        let mut clock_params = Vec::new();
+                        for param in &params {
+                            if param.eq_ignore_ascii_case("RANGE=THISANDFUTURE")
+                                && !event.this_and_future
+                            {
+                                event.this_and_future = true;
+                            } else {
+                                clock_params.push(*param);
+                            }
+                        }
+                        once(&mut event.original, stamp(&clock_params, v)?)?;
+                    }
                     "SEQUENCE" if params.is_empty() => once(
                         &mut event.sequence,
                         v.parse::<u32>().map_err(|_| Issue::Scheduling)?,
@@ -419,7 +433,9 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         {
             return Err(Issue::Scheduling);
         }
-        if e.original.is_some() && e.weekly {
+        if e.original.is_some() && e.weekly
+            || e.this_and_future && (cancelled || !children.is_empty())
+        {
             return Err(Issue::Recurrence);
         }
         let occurrence = |stamp: Stamp| -> Result<_> {
@@ -447,7 +463,8 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         };
         let invited = identities(e);
         for child in children {
-            if child.weekly
+            if child.this_and_future
+                || child.weekly
                 || !child.skipped.is_empty()
                 || child.cancelled_status.is_some_and(|s| s != cancelled)
                 || child.uid != e.uid
@@ -498,6 +515,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
             Some(row)
         };
         return Ok(Outcome::Invitation(atrium_calendar::invitation::Proposal {
+            this_and_future: e.this_and_future,
             uid: e.uid.clone().ok_or(Issue::Format)?,
             exceptions,
             skips,
@@ -830,7 +848,7 @@ mod tests {
         assert!(starts(&store, "2026-12-22").is_empty());
         for invalid in [
             weekly.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=0"),
-            moved.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDFUTURE:"),
+            moved.replace("RECURRENCE-ID:", "RECURRENCE-ID;RANGE=THISANDPRIOR:"),
         ] {
             assert!(parse_mode(invalid.as_bytes(), true).is_err());
         }
@@ -1313,6 +1331,205 @@ mod tests {
             let bad = invite.replace("20261104T073000Z", wrong);
             assert!(parse_mode(bad.as_bytes(), true).is_err());
         }
+    }
+
+    #[test]
+    fn reviewed_future_range_respects_exceptions_revisions_and_undo() {
+        use atrium_calendar::invitation::Proposal;
+        use portcullis_ipc::calendar::{Delivery, Source};
+        const MASTER: &str = include_str!("../../tests/fixtures/bounded-moves.ics");
+        const RANGE: &str = include_str!("../../tests/fixtures/future.ics");
+        let parse = |text: &str| match parse_mode(text.as_bytes(), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!("expected an invitation"),
+        };
+        let source = |p: &Proposal| Source {
+            account: 8,
+            from: p.organizer.clone(),
+            verified: true,
+            identities: vec!["dev@fixture.invalid".into()],
+            reply_destination_matches: true,
+            delivery: Some(Delivery {
+                uid: p.uid.clone(),
+                sequence: p.sequence,
+                organizer: p.organizer.clone(),
+                cancelled: false,
+                scope: p.scope(),
+            }),
+        };
+        let review = |s: &mut Store, rev, text: &str| {
+            let p = parse(text);
+            s.review_invitation(rev, &source(&p), p).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let t = review(&mut store, 0, MASTER).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let snapshot = |s: &Store| {
+            (1..=31)
+                .map(|d| {
+                    s.day(NaiveDate::from_ymd_opt(2026, 12, d).unwrap())
+                        .entries
+                        .into_iter()
+                        .map(|e| (e.id, e.span))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let old = snapshot(&store);
+        let p = parse(RANGE);
+        let mut forged = source(&p);
+        forged.delivery.as_mut().unwrap().scope = Some(p.original.unwrap().property());
+        assert!(store.review_invitation(1, &forged, p.clone()).is_err());
+        let unverified = Source {
+            verified: false,
+            ..source(&p)
+        };
+        assert!(store
+            .review_invitation(1, &unverified, p)
+            .unwrap()
+            .token
+            .is_none());
+        let r = review(&mut store, 1, RANGE);
+        assert_eq!(
+            r.range_dates
+                .iter()
+                .map(|r| (r.original, r.after.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                (date("2026-12-08"), true),
+                (date("2026-12-15"), false),
+                (date("2026-12-22"), true)
+            ]
+        );
+        assert_eq!(snapshot(&store), old);
+        let receipt = store.apply_invitation(1, r.token.unwrap()).unwrap().1;
+        let saved = snapshot(&store);
+        assert_eq!(old[0], saved[0]);
+        assert_eq!(old[16], saved[16]);
+        assert_eq!(
+            saved[8][0].1,
+            Span {
+                start: 960,
+                end: 1020
+            }
+        );
+        assert!(saved[21].is_empty());
+        assert_eq!(saved[22][0].1, saved[8][0].1);
+        assert_eq!(saved.iter().map(Vec::len).sum::<usize>(), 4);
+        assert!(!review(&mut store, 2, RANGE).can_save);
+        let different = RANGE.replace("T170000Z", "T173000Z");
+        assert!(review(&mut store, 2, &different).token.is_none());
+        let single = RANGE.replace(";RANGE=THISANDFUTURE", "");
+        assert!(review(&mut store, 2, &single).token.is_none());
+        store.undo(receipt).unwrap();
+        assert_eq!(snapshot(&store), old);
+        let t = review(&mut store, 3, RANGE).token.unwrap();
+        store.apply_invitation(3, t).unwrap();
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        let later = different.replace("SEQUENCE:2", "SEQUENCE:3");
+        let t = review(&mut store, 4, &later).token.unwrap();
+        store.apply_invitation(4, t).unwrap();
+        assert_eq!(snapshot(&store)[22][0].1.end, 1050);
+        assert!(review(&mut store, 5, RANGE).token.is_none());
+        assert_eq!(snapshot(&store)[16], old[16]);
+
+        // A separately excluded date stays absent, and a local edit at the
+        // organizer's starting slot blocks the range as a whole.
+        let dir = tempfile::tempdir().unwrap();
+        let mut separate = Store::open(dir.path()).unwrap();
+        let excluded = MASTER.replace("COUNT=4", "COUNT=4\nEXDATE:20261222T140000Z");
+        let t = review(&mut separate, 0, &excluded).token.unwrap();
+        separate.apply_invitation(0, t).unwrap();
+        let r = review(&mut separate, 1, RANGE);
+        assert!(r.range_dates[2].before.is_none() && r.range_dates[2].after.is_none());
+        let undo = separate.apply_invitation(1, r.token.unwrap()).unwrap().1;
+        assert!(separate.day(date("2026-12-23")).entries.is_empty());
+        separate.undo(undo).unwrap();
+        let current = date("2026-12-09");
+        let moved = separate.day(current).entries.pop().unwrap();
+        let mut local = moved.fields_on(current);
+        local.date = date("2026-12-10");
+        separate
+            .change(
+                3,
+                moved.id,
+                current,
+                atrium_calendar::EditScope::ThisEvent,
+                Some(local),
+            )
+            .unwrap();
+        let saved = snapshot(&separate);
+        let blocked = review(&mut separate, 4, RANGE);
+        assert!(blocked.token.is_none() && blocked.notice.contains("locally"));
+        assert_eq!(snapshot(&separate), saved);
+        // A spring clock change falls between the original slot and its replacement.
+        let master = include_str!("../../tests/fixtures/weekly.ics")
+            .replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=3")
+            .replace(
+                "DTSTART:20261201T140000Z",
+                "DTSTART;TZID=America/New_York:20260307T090000",
+            )
+            .replace(
+                "DTEND:20261201T144500Z",
+                "DTEND;TZID=America/New_York:20260307T094500",
+            );
+        let range = RANGE
+            .replace(
+                "THISANDFUTURE:20261208T140000Z",
+                "THISANDFUTURE;TZID=America/New_York:20260307T090000",
+            )
+            .replace(
+                "DTSTART:20261209T160000Z",
+                "DTSTART;TZID=America/New_York:20260308T090000",
+            )
+            .replace(
+                "DTEND:20261209T170000Z",
+                "DTEND;TZID=America/New_York:20260308T100000",
+            );
+        let dst = tempfile::tempdir().unwrap();
+        let mut dst_store = Store::open(dst.path()).unwrap();
+        let t = review(&mut dst_store, 0, &master).token.unwrap();
+        dst_store.apply_invitation(0, t).unwrap();
+        let r = review(&mut dst_store, 1, &range);
+        let later = r.range_dates[1].after.as_ref().unwrap();
+        assert_eq!(
+            (later.date, later.span),
+            (
+                date("2026-03-15"),
+                Span {
+                    start: 480,
+                    end: 540
+                }
+            )
+        );
+        let t = r.token.unwrap();
+        dst_store.apply_invitation(1, t).unwrap();
+        for rule in ["FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=11"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = Store::open(dir.path()).unwrap();
+            let t = review(&mut store, 0, &MASTER.replace("FREQ=WEEKLY;COUNT=4", rule))
+                .token
+                .unwrap();
+            store.apply_invitation(0, t).unwrap();
+            assert!(review(&mut store, 1, RANGE).token.is_none());
+        }
+        assert!(parse_mode(
+            RANGE.replace("METHOD:REQUEST", "METHOD:CANCEL").as_bytes(),
+            true
+        )
+        .is_err());
+        assert!(parse_mode(
+            RANGE
+                .replace(
+                    "RANGE=THISANDFUTURE",
+                    "RANGE=THISANDFUTURE;RANGE=THISANDFUTURE"
+                )
+                .as_bytes(),
+            true
+        )
+        .is_err());
     }
 
     #[test]

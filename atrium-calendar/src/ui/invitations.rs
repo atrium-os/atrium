@@ -151,6 +151,7 @@ impl Sheet {
         self.proposal.exceptions.len()
             + self.proposal.cancelled_dates.len()
             + self.review.skips.len()
+            + self.review.range_dates.len()
     }
     fn skip_page(&self) -> Option<&SkipReview> {
         let index = self.page.checked_sub(
@@ -256,7 +257,12 @@ impl Sheet {
             )
         } else if let Some(o) = p.original {
             format!(
-                "One occurrence · originally {} {:02}:{:02} · {}",
+                "{} · originally {} {:02}:{:02} · {}",
+                if p.this_and_future {
+                    "This and future occurrences"
+                } else {
+                    "One occurrence"
+                },
                 o.date,
                 o.minute / 60,
                 o.minute % 60,
@@ -435,6 +441,54 @@ impl Sheet {
                     ),
                 );
             }
+        } else if p.this_and_future {
+            let date = &self.review.range_dates[self.page - 1];
+            line(
+                ctx,
+                160.,
+                19.,
+                format!(
+                    "Range date {} of {} · {}",
+                    self.page,
+                    self.detail_count(),
+                    date.original
+                ),
+            );
+            let display = |e: &atrium_calendar::EventEdit| {
+                format!(
+                    "{} · {}–{} · {}",
+                    e.date,
+                    clock(e.span.start),
+                    clock(e.span.end),
+                    e.zone.map_or("Floating", |z| z.name.name())
+                )
+            };
+            if let Some(before) = &date.before {
+                line(ctx, 203., 16., format!("Saved here · {}", display(before)));
+            }
+            if let Some(after) = &date.after {
+                line(ctx, 242., 16., format!("Proposed · {}", display(after)));
+            } else {
+                line(
+                    ctx,
+                    242.,
+                    16.,
+                    if date.before.is_some() {
+                        "Keep the separately edited meeting."
+                    } else {
+                        "This date stays absent."
+                    }
+                    .into(),
+                );
+            }
+            planner.button(
+                ctx,
+                18.,
+                347.,
+                145.,
+                "Previous",
+                Action::InvitationPage(self.page - 1),
+            );
         } else if let Some(skip) = self.skip_page() {
             let is_restore = skip.effect == SkipEffect::Restore;
             let heading = if is_restore {
@@ -632,13 +686,13 @@ impl Sheet {
         }
         if self.page < self.detail_count() && self.can_advance() {
             let label = if self.page == 0 {
-                if grouped || !self.review.skips.is_empty() {
+                if grouped || p.this_and_future || !self.review.skips.is_empty() {
                     format!("Review {} dates", self.detail_count())
                 } else {
                     format!("Review {} included moves", p.exceptions.len())
                 }
             } else {
-                if grouped || !self.review.skips.is_empty() {
+                if grouped || p.this_and_future || !self.review.skips.is_empty() {
                     "Next date"
                 } else {
                     "Next move"
@@ -664,7 +718,9 @@ impl Sheet {
                 ctx,
                 421.,
                 14.,
-                if p.exceptions.is_empty() && self.review.skips.is_empty() {
+                if p.this_and_future {
+                    "Your response covers this and future occurrences. Review it in Mail."
+                } else if p.exceptions.is_empty() && self.review.skips.is_empty() {
                     "Choose a response to review in Mail before sending."
                 } else {
                     "Your response applies to the whole series. Review it in Mail before sending."
@@ -709,6 +765,8 @@ impl Sheet {
                     } else {
                         "Remove meeting"
                     }
+                } else if p.this_and_future {
+                    "Apply reviewed range"
                 } else if self.review.weekly && p.original.is_none() {
                     "Save whole series"
                 } else if p.original.is_some() {
