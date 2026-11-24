@@ -41,6 +41,9 @@ portcullis-ipc = { path = "../../portcullis/portcullis-ipc", optional = true }
 subtle         = { version = "2.6", optional = true }
 
 [dev-dependencies]
+mail-proto = { path = "../../mail/mail-proto" }
+serde = "1"
+serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 libc = "0.2"

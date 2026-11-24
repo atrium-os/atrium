@@ -1044,9 +1044,16 @@ Arca rechecks the signed launch and the reserved sealed item ID. A
 preview checks that ID again before key release and result publication.
 Forgetting the active enrollment revokes pending preview approval.
 Neither account management action launches the reader. Personal stays
-isolated. JMAP account proof, receive receipts and durable account and
-persona revocation still need a synthetic gate. The six whole-path timing
-trials cover two operational failures only.
+isolated. The new opt-in native test lane parses synthetic JMAP Session
+and Email/get replies with Mail's codecs, checks challenge and credential
+binding, and signs receipts over account identity and exact fetched bytes.
+It uses a private test value for worker and TLS evidence, a fixture
+signing key, and filesystem revocation markers. Tests reopen the markers
+after an injected cleanup failure and check account and persona
+recreation. The signed sheet still uses its fixed enrollment. Connecting
+a signed network worker, persisting the account and signing authority in
+Arca, and wiring production cancellation and cleanup remain separate work.
+The six whole-path timing trials cover two operational failures only.
 
 ##### Failure observability review
 

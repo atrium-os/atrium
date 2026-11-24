@@ -43,11 +43,14 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "libc",
+ "mail-proto",
  "mail-smime",
  "p256",
  "portcullis-ipc",
  "portcullis-peer",
  "psl",
+ "serde",
+ "serde_json",
  "sha2",
  "sigillum-proto",
  "subtle",
@@ -677,6 +680,13 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "mail-proto"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "mail-smime"

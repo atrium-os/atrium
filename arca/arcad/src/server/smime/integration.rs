@@ -1278,3 +1278,6 @@ mod tests {
         assert_eq!(reply.body.bytes(), 0u32.to_le_bytes());
     }
 }
+
+#[cfg(test)]
+mod jmap_account_gate;
