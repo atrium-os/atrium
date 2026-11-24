@@ -396,6 +396,8 @@ struct Seg {
     rep: Report,
     first_row: Option<u32>,
     last_row: Option<u32>,
+    outline: Vec<(u32, super::outline::Row)>,
+    summary_above: bool,
     /// Rows with `hidden="1"`.
     hidden: Vec<u32>,
     /// `<autoFilter ref>` and its columns' conditions.
@@ -454,6 +456,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     seg.valid.root_namespaces.push(b'"');
                 }
             }
+            b"outlinePr" if first => seg.summary_above = attr(&e, b"summaryBelow")?.is_some_and(|v| v == "0" || v == "false"),
             b"tabColor" if first => seg.tab = super::styles::color_of(&e, theme),
             b"sheetFormatPr" => {
                 seg.default_h = attr(&e, b"defaultRowHeight")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v < 410.0);
@@ -494,6 +497,11 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool, system: Da
                     return Err(bad("rows out of order"));
                 }
                 row = rr;
+                let level = attr(&e, b"outlineLevel")?.map_or(0, |v| v.parse::<u8>().unwrap_or(255));
+                let summary = attr(&e, b"collapsed")?.is_some_and(|v| v == "1" || v == "true");
+                if (level != 0 || summary) && seg.outline.len() <= super::outline::MAX_ROW_RECORDS {
+                    seg.outline.push((rr as u32, super::outline::Row { level, summary }));
+                }
                 col = -1;
                 seg.first_row.get_or_insert(rr as u32);
                 seg.last_row = Some(rr as u32);
@@ -813,6 +821,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut last_row: Option<u32> = None;
         let mut widths = Vec::new();
         let mut heights = Vec::new();
+        let mut outline_rows = std::collections::BTreeMap::new();
+        let mut outline_too_large = false;
+        let mut summary_above = false;
         let mut hidden: Vec<u32> = Vec::new();
         let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut links = Vec::new();
@@ -857,6 +868,10 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 widths.extend(seg.widths);
                 heights.extend(seg.heights);
                 hidden.extend(seg.hidden);
+                summary_above |= seg.summary_above;
+                // At most the native detail-row limit plus one summary per group.
+                outline_too_large |= outline_rows.len() + seg.outline.len() > super::outline::MAX_ROW_RECORDS;
+                if !outline_too_large { outline_rows.extend(seg.outline); }
                 merges.extend(seg.merges);
                 links.extend(seg.links);
                 filter = seg.filter.or(filter);
@@ -933,6 +948,15 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             let kept = wb.merges(s).len();
             if kept < n {
                 rep.note_n(Kind::Dropped, "merged cells overlapping others or of one cell", (n - kept) as u64);
+            }
+        }
+        if outline_too_large || !outline_rows.is_empty() {
+            use officina_core::history::Op;
+            use officina_grid::{ops::GridOp, shift::Axis};
+            if let Some(outline) = (!outline_too_large).then(|| super::outline::decode(&outline_rows, !summary_above)).flatten() {
+                GridOp::Outline { sheet: s, axis: Axis::Rows, outline }.apply(wb);
+            } else {
+                rep.note(Kind::Dropped, "row outline beyond the supported group limits");
             }
         }
         let sh = wb.sheet_mut(s);
@@ -1518,6 +1542,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     wb.recalc();
     for sheet in 0..wb.sheet_count() as u16 {
         wb.restore_table_visibility(sheet, None);
+        wb.restore_outline_visibility(sheet);
     }
     if wb.recalc_pending() {
         wb.recalc();

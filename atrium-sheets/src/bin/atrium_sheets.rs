@@ -85,10 +85,18 @@ fn read_all(f: &mut File) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
+fn needs_native_outline_copy(d: &Doc, format: Format) -> bool {
+    d.wb.has_outlines() && match format {
+        Format::Native => false,
+        Format::Xlsx | Format::Xlsm => !officina_convert::xlsx::supports_outlines(&d.wb),
+        _ => true,
+    }
+}
+
 /// The file's bytes in `format`; a protected document's encrypted with its
 /// password (CSV has no way to carry one and is written as is).
 fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
-    if format != Format::Native && d.wb.has_outlines() {
+    if needs_native_outline_copy(d, format) {
         return Err(io::Error::other("Choose an .osheet file to keep the workbook’s outline groups."));
     }
     let protect = |kind: &str, b: Vec<u8>| match &d.protection {
@@ -341,7 +349,7 @@ impl Run {
     fn save(&mut self) -> bool {
         let Some(Target::Path { path, format }) = self.target.as_ref() else { return false };
         let format = *format;
-        if format != Format::Native && self.sheets.doc.borrow().wb.has_outlines() {
+        if needs_native_outline_copy(&self.sheets.doc.borrow(), format) {
             self.set_status("Choose where to save an .osheet copy with its outline groups.");
             return false;
         }
@@ -808,10 +816,10 @@ fn main() {
                 Cmd::Data(atrium_sheets::data::DataCmd::PrintComments) => want_print = Some(true),
                 Cmd::Save | Cmd::CloseSave if matches!(run.target, Some(Target::Picked { .. })) => {
                     close_after_save = matches!(c, Cmd::CloseSave);
-                    let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if format != Format::Native) && {
+                    let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if {
                         let doc = run.sheets.doc.borrow();
-                        doc.wb.tracked_cells().is_some() || doc.wb.has_outlines()
-                    };
+                        (format != Format::Native && doc.wb.tracked_cells().is_some()) || needs_native_outline_copy(&doc, format)
+                    });
                     want_picker = Some(if native_copy { Asking::SaveAs } else { Asking::Commit });
                 }
                 Cmd::Save => {

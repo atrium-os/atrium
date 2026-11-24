@@ -11,6 +11,8 @@ pub mod condfmt;
 #[cfg(feature = "read")]
 mod external;
 pub mod macros;
+mod outline;
+pub use outline::supports_outlines;
 pub mod pivot;
 #[cfg(feature = "read")]
 pub mod read;

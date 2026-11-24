@@ -759,8 +759,14 @@ expanded from their header buttons, and Data can group and ungroup the selection
 Collapse leaves original dimensions, manual hides, and filters in place. Groups
 follow inserted and deleted rows or columns and participate in undo and crash
 recovery. Native files carry an optional per-sheet `OUTLINES` chunk (27), and the
-grid journal records the group change as operation 26. For a workbook with
-outlines, Save offers an `.osheet` copy from an imported file.
+grid journal records the group change as operation 26. XLSX and XLSM Save
+preserve row groups that SpreadsheetML can represent, including empty detail
+rows. Import reads summary markers above or below the details. Export places
+the markers below, preserving the grouped rows and collapse state. A row group
+without a collapse marker keeps its individually hidden rows. Expanding a
+collapsed group leaves independently filtered rows hidden. Column groups,
+ambiguous group boundaries, and overlapping independent hides on folded rows
+use native Save As. Other foreign formats also use native Save As for outlines.
 
 ### 8.5 The grid on screen
 
@@ -4216,10 +4222,29 @@ previous exact matches. Installed Save and picker reopen in fresh document
 jails preserved all 71,110 live formula results across the four workbooks.
 
 The two 26-case Excel rank-function references and a 27-case subtotal
-fixture matched. A second subtotal fixture's collapsed Excel outline
-differs for code 9 because the XLSX importer retains the hidden rows
-without the outline state. Several comparison cells in the same fixture
-also differ.
+fixture matched. The second subtotal reference contains a five-row group in
+Sheet3!16:20. All five rows have outline level 1 and the hidden bit. The file
+has no collapsed summary marker, and its worksheet filter ends at row 9.
+XLSX Save and reopen now retain the group and the five hidden rows.
+
+For Sheet3!A16:A26, the values 1 through 11 total 66. The visible values 6
+through 11 total 51. Sheet2!A26 (code 109) yields 51. Sheet2!A27 (code 9)
+yields 66, which matches the fixture’s expected value in B27. The source
+caches 51 in A27 and FALSE in the three dependent cells Sheet2!C27 and
+Sheet1!B8 and B3. Sheets recalculates all three as TRUE. A fresh Excel
+recalculation of this file remains unverified. Microsoft documents both
+codes’ treatment of hidden and filtered rows.
+[Excel SUBTOTAL](https://support.microsoft.com/en-us/excel/functions/subtotal-function)
+
+Three arm64 Tessera-root guest trials per reference retained all 54 live
+results in the grouped workbook and all 27 in the control. The grouped
+workbook matched 50 live Excel caches and kept 26 FORMULATEXT caches as
+static values. Installed Sheets edited Sheet1!A1 to 8, saved through
+Scrinium and reopened the grouped XLSX in a fresh document jail. The saved
+XML retained the group, the edit, the subtotals and all three dependent
+comparisons. The converter’s row-outline tests also exercise an explicitly
+collapsed nested group, a summary above filtered rows, manual hides and
+native fallback. Evidence is under `/private/tmp/atrium-sheets-outline`.
 
 The focused checks cover rank arrays, invalid ranks, ties, filter and
 outline changes, undo, nested subtotals, cross-sheet dependents, edits

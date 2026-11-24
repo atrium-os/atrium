@@ -691,6 +691,28 @@ impl Workbook {
         self.rebuild_table_visibility(sheet);
     }
 
+    /// SpreadsheetML writes a single hidden bit for folded and filtered rows.
+    /// Table filters have already claimed their rows. Keep worksheet filter
+    /// failures independently hidden so expanding a group preserves the filter.
+    pub fn restore_outline_visibility(&mut self, sheet: u16) {
+        let sh = self.sheet(sheet);
+        let folded = sh.outline(crate::shift::Axis::Rows).hidden();
+        let claimed = intersect_rows(&sh.hidden, folded);
+        if claimed.is_empty() {
+            return;
+        }
+        let mut remove = claimed;
+        if let Some(mut filter) = sh.filter.clone() {
+            let first = filter.rect.r0 + 1;
+            if !filter.conds.is_empty() && !intersect_rows(&remove, &[(first, filter.rect.r1)]).is_empty() {
+                let rejected = self.filter_rows(&mut filter, first, false);
+                remove = subtract_rows(&remove, &rejected);
+            }
+        }
+        self.sheets[sheet as usize].hidden = subtract_rows(&sh.hidden, &remove);
+        self.invalidate_subtotals();
+    }
+
     /// The values a filter column offers to pick from: distinct shown texts below the
     /// header, sorted, with how many rows show each (at most `max`).
     pub fn filter_values(&self, rect: &Rect, col: u32, max: usize) -> Vec<(String, u32)> {

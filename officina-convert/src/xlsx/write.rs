@@ -297,9 +297,15 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         }
         let _ = write!(o, r#" topLeftCell="{}" activePane="{pane}" state="frozen"/><selection pane="{pane}"/></sheetView></sheetViews>"#, a1(fr, fc));
     }
+    let outline = sh.outline(officina_grid::shift::Axis::Rows);
+    let outline_rows = super::outline::encode(outline);
     let dw = sh.col_sizes.default / MDW;
     let dh = sh.row_sizes.default * 72.0 / 96.0;
-    let _ = write!(o, r#"<sheetFormatPr defaultRowHeight="{dh}" defaultColWidth="{dw}" customHeight="1"/>"#);
+    let _ = write!(o, r#"<sheetFormatPr defaultRowHeight="{dh}" defaultColWidth="{dw}" customHeight="1""#);
+    if let Some(level) = outline_rows.values().map(|r| r.level).max() {
+        let _ = write!(o, r#" outlineLevelRow="{level}""#);
+    }
+    o.extend_from_slice(b"/>");
     // Styles: a run to the last row is the column's style (it covers the empty
     // cells below); other styled empty cells are written as cells of their own.
     let last = XLSX_ROWS - 1;
@@ -372,8 +378,15 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
             meta.entry(r).or_insert((None, false)).1 = true;
         }
     }
+    for &row in outline_rows.keys() {
+        meta.entry(row).or_default().1 |= outline.hides(row);
+    }
     let heights: Vec<(u32, (Option<f64>, bool))> = meta.into_iter().collect();
-    let row_attrs = |o: &mut Vec<u8>, m: &(Option<f64>, bool)| {
+    let row_attrs = |o: &mut Vec<u8>, r: u32, m: &(Option<f64>, bool)| {
+        if let Some(row) = outline_rows.get(&r) {
+            if row.level > 0 { let _ = write!(o, r#" outlineLevel="{}""#, row.level); }
+            if row.summary { o.extend_from_slice(br#" collapsed="1""#); }
+        }
         if let Some(px) = m.0 {
             let _ = write!(o, r#" ht="{}" customHeight="1""#, px * 72.0 / 96.0);
         }
@@ -399,13 +412,13 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         while *hi < heights.len() && heights[*hi].0 < r {
             // A sized or hidden row with no cells.
             let _ = write!(o, r#"<row r="{}""#, heights[*hi].0 + 1);
-            row_attrs(o, &heights[*hi].1);
+            row_attrs(o, heights[*hi].0, &heights[*hi].1);
             o.extend_from_slice(b"/>");
             *hi += 1;
         }
         let _ = write!(o, r#"<row r="{}""#, r + 1);
         if *hi < heights.len() && heights[*hi].0 == r {
-            row_attrs(o, &heights[*hi].1);
+            row_attrs(o, heights[*hi].0, &heights[*hi].1);
             *hi += 1;
         }
         o.push(b'>');
@@ -511,7 +524,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>, d
         let (hr, m) = heights[hi];
         if hr < XLSX_ROWS {
             let _ = write!(o, r#"<row r="{}""#, hr + 1);
-            row_attrs(&mut o, &m);
+            row_attrs(&mut o, hr, &m);
             o.extend_from_slice(b"/>");
         }
         hi += 1;
@@ -747,6 +760,9 @@ pub fn write_xlsm<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
 }
 
 fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::macros::Macros>) -> io::Result<W> {
+    if !super::supports_outlines(wb) {
+        return Err(io::Error::other("choose a native workbook to keep these outline groups"));
+    }
     let mut z = ZipWriter::new(out);
     let code_of = |s: usize| macros.and_then(|m| m.sheet_codes.iter().find(|(i, _)| *i as usize == s)).map(|(_, c)| &**c);
     let n = wb.sheet_count();

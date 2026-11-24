@@ -3,8 +3,8 @@ use officina_core::wire::{Reader, WireError, Writer};
 
 use crate::shift::{Axis, Shift};
 
-const MAX_GROUPS: u64 = 1024;
-const MAX_SPAN: u64 = 65_536;
+pub const MAX_GROUPS: u64 = 1024;
+pub const MAX_SPAN: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Group {
