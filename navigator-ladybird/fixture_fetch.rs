@@ -46,7 +46,7 @@ pub unsafe extern "C" fn navigator_fixture_channel(fd: i32) -> bool {
 pub unsafe extern "C" fn navigator_youtube_asset(url: *const u8, len: usize) -> u8 {
     let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {return 0};
     if !CLIENT.get().and_then(|c| c.lock().ok()).is_some_and(|s| s.as_ref().is_some_and(|(_,_,seq)| *seq == Some(PROVIDER))) {return 0;}
-    match navigator_control::youtube::asset_mime(url) {Some("text/javascript") => 1, Some("text/css") => 2, _ => 0}
+    match navigator_control::youtube::asset_mime(url) {Some("text/javascript") => 1, Some("text/css") => 2, Some("image/svg+xml") => 3, _ => 0}
 }
 
 /// # Safety
@@ -62,7 +62,7 @@ pub unsafe extern "C" fn navigator_fixture_get(
         return 0;
     };
     let asset = navigator_control::youtube::asset_mime(url);
-    let limit = if asset.is_some() { navigator_control::youtube::ASSET_LIMIT } else if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
+    let limit = if asset.is_some() { navigator_control::youtube::asset_limit(url) } else if url == navigator_control::YOUTUBE_ENTRY { navigator_control::YOUTUBE_ENTRY_LIMIT } else { 65536 };
     if capacity > limit { return 0; }
     let Some(mut state) = CLIENT.get().and_then(|c| c.lock().ok()) else {
         return 0;

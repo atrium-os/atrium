@@ -1,11 +1,26 @@
 //! Resources for the opt-in YouTube startup gate. URL input is the serialized
-//! URL from LibWeb. Only versioned static script and style paths are admitted.
+//! URL from LibWeb. The grant includes versioned scripts and styles and one anonymous Play icon.
 pub const ORIGIN: &str = "https://www.youtube-nocookie.com";
+pub const PLAY_ICON: &str =
+    "https://www.gstatic.com/youtube/img/icons/mweb/youtube_fill/logo/v2/67px.svg";
+pub const ICON_LIMIT: usize = 16 * 1024;
+
+pub fn asset_limit(url: &str) -> usize {
+    if url == PLAY_ICON {
+        ICON_LIMIT
+    } else {
+        ASSET_LIMIT
+    }
+}
+
 pub const ASSET_LIMIT: usize = 3 * 1024 * 1024;
 pub const ASSET_COUNT: usize = 12;
 pub const ASSET_BUDGET: usize = 10 * 1024 * 1024;
 
 pub fn asset_mime(url: &str) -> Option<&'static str> {
+    if url == PLAY_ICON {
+        return Some("image/svg+xml");
+    }
     let path = url.strip_prefix(ORIGIN)?;
     if !path.starts_with('/')
         || path.len() > 2048
@@ -64,5 +79,18 @@ mod tests {
         ] {
             assert_eq!(asset_mime(&format!("{ORIGIN}{tail}")), None);
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn icon_grant_is_one_anonymous_resource() {
+    assert_eq!(asset_mime(PLAY_ICON), Some("image/svg+xml"));
+    for other in [
+        PLAY_ICON.replace("67px", "68px"),
+        format!("{PLAY_ICON}?v=1"),
+        PLAY_ICON.replace("www.gstatic.com", "other.gstatic.com"),
+    ] {
+        assert_eq!(asset_mime(&other), None);
     }
 }

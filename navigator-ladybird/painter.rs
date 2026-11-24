@@ -232,6 +232,8 @@ fn scrollbar_nodes(
     nodes
 }
 
+mod text_shadow;
+use text_shadow::shadow_image;
 mod gradient;
 mod mask;
 
@@ -340,6 +342,17 @@ pub fn editor_leaves(
                             .into_iter()
                             .enumerate()
                         {
+                            append(part, node);
+                        }
+                        return Ok(());
+                    }
+                    if header.command_type == DisplayListCommandType::PaintTextShadow {
+                        use libcompositing_rust::display_list::commands::PaintTextShadow;
+                        let command = read_command::<PaintTextShadow>(payload);
+                        let (face, size, ascent) = resolve_font(command.font_id)
+                            .ok_or("unregistered shadow font")?;
+                        let shadows = text_shadow::nodes(payload, command, face, size, ascent)?;
+                        for (part, node) in shadows.into_iter().enumerate() {
                             append(part, node);
                         }
                         return Ok(());
@@ -465,13 +478,23 @@ fn assemble_scene(
     let mut seen = HashSet::new();
     let mut keys = HashSet::new();
     let mut leaf_slots = HashMap::new();
+    let effect_base = tree.compositor_scroll_table().nodes.len() + leaves.len();
+    let mut active_effects: Vec<EffectNodeIndex> = Vec::new();
     for (leaf_index, leaf) in leaves.into_iter().enumerate() {
-        if !leaf.context.effect.is_none() && !tree.effect_nodes.get(leaf.context.effect.0 as usize).is_some_and(|e|
-            Some(leaf.context.effect)==tree.root_isolation_effect && e.parent.is_none() && e.local_clip.is_none()
-            && matches!(&e.data,libcompositing_rust::visual_context::EffectNodeData::Effects(f)
-                if f.opacity==1. && f.blend_mode==CompositingAndBlendingOperator::Normal && f.filter.is_none() && f.backdrop_filter.is_none())) {
-            return Err("unsupported editor effect".into());
+        let mut effects = Vec::new();
+        let mut id = leaf.context.effect;
+        while !id.is_none() {
+            let e = tree.effect_nodes.get(id.0 as usize).ok_or("missing opacity effect")?;
+            let libcompositing_rust::visual_context::EffectNodeData::Effects(f) = &e.data else { return Err("unsupported editor effect".into()); };
+            if !(0.0..=1.0).contains(&f.opacity) || f.blend_mode != CompositingAndBlendingOperator::Normal
+                || f.filter.is_some() || f.backdrop_filter.is_some() || effects.len() >= 64 {
+                return Err("unsupported editor effect chain".into());
+            }
+            effects.push((id, f.opacity));
+            id = e.parent;
         }
+        effects.retain(|(_, opacity)| *opacity != 1.);
+        effects.reverse();
         let mut path = Vec::new();
         let mut index = leaf.context.spatial;
         let mut clip = leaf.context.clip;
@@ -618,6 +641,20 @@ fn assemble_scene(
             return Err("duplicate scene key".into());
         }
         let mut parent = active.last().copied();
+        if !effects.is_empty() && !active.is_empty() { return Err("unsupported scrolling opacity group".into()); }
+        let common = active_effects.iter().zip(&effects).take_while(|(a,b)| **a == b.0).count();
+        active_effects.truncate(common);
+        if let Some(id) = active_effects.last() { parent = Some(effect_base + id.0 as usize); }
+        for &(effect, opacity) in &effects[common..] {
+            let mut hash = DefaultHasher::new();
+            (3u8, effect.0).hash(&mut hash);
+            let group_key = hash.finish();
+            if !keys.insert(group_key) { return Err("interleaved opacity group".into()); }
+            let id = effect_base + effect.0 as usize;
+            rows.push((parent, Some(id), group_key, Node::isolated_layer(opacity)));
+            active_effects.push(effect);
+            parent = Some(id);
+        }
         if let Some(clip) = bounds {
             if clip.is_empty() {
                 continue;
@@ -667,6 +704,25 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static EPOCH: AtomicU64 = AtomicU64::new(1);
         EPOCH.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn overlapping_ink_shares_one_isolated_opacity_group() {
+        use libcompositing_rust::visual_context::{EffectsData, EffectNodeData};
+        let mut tree = VisualContextTree::create_identity();
+        let context = tree.append_effect_node_under(ContextRef::default(), EffectNodeData::Effects(EffectsData {
+            opacity: 0.7, isolation: false, blend_mode: CompositingAndBlendingOperator::Normal,
+            filter: None, backdrop_filter: None,
+        }));
+        let leaves = (0..2).map(|part| PaintLeaf {
+            chunk: ChunkId([10, 20]), occurrence: 0, record_in_chunk: part, part: 0,
+            inline_clip: None, context,
+            node: Node::Rect { rect: Rect::new(part as f32, 0., 10., 10.),
+                fill: pergola::Color::from_srgb8(255, 0, 51), radius: 0. },
+        }).collect();
+        let frame = assemble_scene(&tree, &ScrollStateSnapshot::default(), leaves, &mut NodeTree::new()).unwrap();
+        let (id, _) = frame.iter().find(|(_, n)| matches!(n, Node::Stack { isolate:true, opacity:0.7, .. })).unwrap();
+        assert_eq!(frame.children_of(id).len(), 2);
     }
 
     #[test]

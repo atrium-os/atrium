@@ -15,7 +15,7 @@
  
  namespace Web {
  
-@@ -507,6 +515,48 @@
+@@ -507,6 +515,50 @@
          return nullptr;
      }
  
@@ -28,7 +28,7 @@
 +#ifdef ATRIUM_I4_YOUTUBE
 +        provider_asset = navigator_youtube_asset(name.bytes().data(), name.bytes().size());
 +#endif
-+        auto buffer = ByteBuffer::create_uninitialized(provider_asset ? 3 * 1024 * 1024 : 65536);
++        auto buffer = ByteBuffer::create_uninitialized(provider_asset == 3 ? 16 * 1024 : provider_asset ? 3 * 1024 * 1024 : 65536);
 +        if (!buffer.is_error()) {
 +            auto body = buffer.release_value();
 +            StringView mime = "text/html"sv;
@@ -44,11 +44,13 @@
 +                if (name == "https://widget.example/media/red-blue.webm"sv) mime = "video/webm"sv;
 +                if (name == "https://widget.example/media/tone-opus.webm"sv) mime = "audio/webm"sv;
 +                if (provider_asset == 1) mime = "text/javascript"sv;
++                if (provider_asset == 3) mime = "image/svg+xml"sv;
 +                if (provider_asset == 2) mime = "text/css"sv;
 +                length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
 +            }
 +            if (length && length <= body.size()) {
 +                auto headers = HTTP::HeaderList::create();
++                if (provider_asset == 3) headers->append({ "Access-Control-Allow-Origin"sv, "https://www.youtube-nocookie.com"sv });
 +                headers->append({ "Content-Type"sv, mime });
 +                on_headers_received->function()(nullptr, *headers, 200, {}, Requests::CacheState::NotCached);
 +                on_data_received->function()(nullptr, Requests::ResponseData::from_bytes(body.bytes().slice(0, length)));

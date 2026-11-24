@@ -29,16 +29,25 @@ fn matrix(world: &WorldTransforms, space: SpatialNodeIndex) -> Result<[f32; 6], 
         .draw_matrix_if_known(space)
         .ok_or("unknown mask frame space")?
         .elements;
+    affine_on_plane(m).ok_or_else(|| format!("nonplanar mask frame {space:?}: {m:?}"))
+}
+
+fn affine_on_plane(m: [[f32; 4]; 4]) -> Option<[f32; 6]> {
+    // Local ink lies at z=0. Scaling the perpendicular axis leaves that plane fixed,
+    // including the roundoff a sampled rotation introduces in its z coefficient.
     let [
         [a, c, 0., x],
         [b, d, 0., y],
-        [0., 0., 1., 0.],
+        [0., 0., z_scale, 0.],
         [0., 0., 0., 1.],
     ] = m
     else {
-        return Err("nonplanar mask frame".into());
+        return None;
     };
-    Ok([a, b, c, d, x, y])
+    [a, b, c, d, x, y, z_scale]
+        .into_iter()
+        .all(f32::is_finite)
+        .then_some([a, b, c, d, x, y])
 }
 pub(super) fn to_viewport(
     tree: &VisualContextTree,
@@ -107,4 +116,21 @@ pub(super) fn to_viewport(
         ..ContextRef::spatial_only(ROOT)
     };
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn spinner_keeps_its_affine_map_but_perspective_is_rejected() {
+    let mut m = [
+        [-0.25, -0.968, 0., 648.],
+        [0.968, -0.25, 0., -146.],
+        [0., 0., 0.99999994, 0.],
+        [0., 0., 0., 1.],
+    ];
+    assert_eq!(
+        affine_on_plane(m),
+        Some([-0.25, 0.968, -0.968, -0.25, 648., -146.])
+    );
+    m[3][0] = 0.1;
+    assert_eq!(affine_on_plane(m), None);
 }

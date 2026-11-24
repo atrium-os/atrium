@@ -577,6 +577,32 @@ first post-press frame stopped at chunk 13, record 1, `PaintTextShadow`.
 The click establishes input delivery. Visible Play and playback are open.
 Evidence is in `~/atrium-vm/evidence/navigator-i4-mask-20261124/`.
 
+#### Play icon and post-press rendering on Tessera
+
+For this embed, the fetch worker admits one additional anonymous GET for
+the exact Play SVG. It checks TLS for www.gstatic.com, sends the embed
+Origin, requires HTTP 200, SVG MIME and a matching or wildcard CORS grant,
+and caps the body at 16 KiB within the existing startup budget. LibWeb
+receives the verified CORS permission. The renderer has no network access.
+
+In the installed JIT-off arm64 jail, the broker delivered 478 bytes. The
+72 × 72 CSS button painted 2,866 red pixels with a white triangle at the
+centre. The prior capture had 5,184 black pixels in the same rectangle.
+A compositor press at (577, 312) produced a trusted click and replaced
+the logo with the provider spinner. Text shadows use the pinned glyph atlas
+and a bounded separable Gaussian with the recorder's layer order and offsets.
+Fresco composites overlapping children in an isolated opacity group.
+The spinner's sampled rotation preserves the drawing plane even when its
+unused z-axis scale differs from one by floating-point roundoff.
+
+The provider moved from cued (5) to buffering (3). The spinner continued
+painting at the 11-second capture. The restricted loader refused the
+`POST /youtubei/v1/player` request. No media delivery was verified.
+The next gate needs a bounded player-request contract before it can test
+the returned media URLs. The private guest exited cleanly.
+
+Evidence is in `~/atrium-vm/evidence/navigator-i4-play-icon-20261124/`.
+
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
 now retains same-space intersecting rectangular clips and represents a

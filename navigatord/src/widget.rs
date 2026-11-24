@@ -258,7 +258,7 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             return Err("request outside the widget grant".into());
         }
         let (body, limit) = if source == YOUTUBE_ENTRY {
-            let limit = if step == 0 { YOUTUBE_ENTRY_LIMIT } else { navigator_control::youtube::ASSET_LIMIT };
+            let limit = if step == 0 { YOUTUBE_ENTRY_LIMIT } else { navigator_control::youtube::asset_limit(url) };
             if step > 0 && remaining == 0 { return Err("provider startup budget exhausted".into()); }
             if provider.is_none() { provider = Some(youtube_worker()?); }
             let (socket, _worker) = provider.as_mut().ok_or("provider worker missing")?;

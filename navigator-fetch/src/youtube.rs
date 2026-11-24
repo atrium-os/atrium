@@ -1,6 +1,6 @@
 //! Bounded HTTPS GETs for the installed I4 embed. Only its fixed entry sends
 //! the app ID. Its versioned bootstrap resources use anonymous requests.
-use crate::{http, Conn, Conversation};
+use crate::{Conn, Conversation, http};
 use std::io::{Read, Write};
 
 pub const HOST: &str = "www.youtube-nocookie.com";
@@ -13,14 +13,23 @@ pub fn resource(url: &str, conv: &mut Conversation<'_>) -> Result<Vec<u8>, Strin
     } else {
         Some(navigator_control::youtube::asset_mime(url).ok_or("outside startup grant")?)
     };
-    conv.site_check(HOST).map_err(|e| e.to_string())?;
+    let icon = url == navigator_control::youtube::PLAY_ICON;
+    let host = if icon { "www.gstatic.com" } else { HOST };
+    conv.site_check(host).map_err(|e| e.to_string())?;
     let Conn::Tls(mut stream) = conv
-        .connect(HOST, 443, true, HOST)
+        .connect(host, 443, true, host)
         .map_err(|e| e.to_string())?
     else {
         return Err("YouTube entry requires TLS".into());
     };
     if let Some(mime) = asset {
+        if icon {
+            let path = url
+                .strip_prefix("https://www.gstatic.com")
+                .ok_or("invalid icon origin")?;
+            write!(stream, "GET {path} HTTP/1.1\r\nHost: {host}\r\nOrigin: {}\r\nAccept: image/svg+xml\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", navigator_control::youtube::ORIGIN).and_then(|_| stream.flush()).map_err(|e| e.to_string())?;
+            return response(&mut *stream, mime, navigator_control::youtube::ICON_LIMIT);
+        }
         let path = url
             .strip_prefix(navigator_control::youtube::ORIGIN)
             .ok_or("invalid provider origin")?;
@@ -43,6 +52,16 @@ fn response(stream: &mut impl Read, expected: &str, limit: usize) -> Result<Vec<
         .map_err(|e| format!("YouTube entry: {e:?}"))?;
     if response.status != 200 {
         return Err(format!("YouTube entry returned HTTP {}", response.status));
+    }
+    if expected == "image/svg+xml"
+        && !matches!(
+            response
+                .header("access-control-allow-origin")
+                .map(str::trim),
+            Some("*" | navigator_control::youtube::ORIGIN)
+        )
+    {
+        return Err("Play icon did not grant access to the embed origin".into());
     }
     let mime = response
         .header("content-type")
@@ -86,6 +105,25 @@ mod tests {
     }
 
     #[test]
+    fn icon_requires_cross_origin_permission_and_svg_mime() {
+        for (origin, mime, ok) in [
+            ("", "image/svg+xml", false),
+            ("https://other.example", "image/svg+xml", false),
+            ("*", "text/html", false),
+            (navigator_control::youtube::ORIGIN, "image/svg+xml", true),
+            ("*", "image/svg+xml", true),
+        ] {
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nAccess-Control-Allow-Origin: {origin}\r\nContent-Length: 3\r\n\r\nsvg"
+            );
+            assert_eq!(
+                response(&mut wire.as_bytes(), "image/svg+xml", 3).is_ok(),
+                ok
+            );
+        }
+    }
+
+    #[test]
     fn entry_only_sends_the_package_identity_and_refuses_redirects() {
         let mut entry = Wire {
             reply: Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 3\r\n\r\nabc".to_vec()),
@@ -106,10 +144,12 @@ mod tests {
         );
         let mut ordinary = Vec::new();
         http::write_request(&mut ordinary, HOST, "/embed/M7lc1UVf-VE").unwrap();
-        assert!(!String::from_utf8(ordinary)
-            .unwrap()
-            .to_lowercase()
-            .contains("referer:"));
+        assert!(
+            !String::from_utf8(ordinary)
+                .unwrap()
+                .to_lowercase()
+                .contains("referer:")
+        );
 
         entry.reply = Cursor::new(
             b"HTTP/1.1 302 Found\r\nLocation: /another\r\nContent-Length: 0\r\n\r\n".to_vec(),

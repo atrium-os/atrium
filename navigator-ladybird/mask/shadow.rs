@@ -54,7 +54,6 @@ fn bitmap(
         return Err("shadow coverage budget".into());
     }
     let mut alpha = vec![0.; w * h];
-    let mut temp = alpha.clone();
     for y in 0..h {
         for x in 0..w {
             let px = left + x as f32;
@@ -72,42 +71,8 @@ fn bitmap(
                 );
         }
     }
-    let weights: Vec<_> = (-radius..=radius)
-        .map(|i| (-0.5 * (i as f32 / sigma).powi(2)).exp())
-        .collect();
-    let sum: f32 = weights.iter().sum();
-    for y in 0..h {
-        for x in 0..w {
-            for (i, &weight) in (-radius..=radius).zip(&weights) {
-                let u = x as i32 + i;
-                if (0..w as i32).contains(&u) {
-                    temp[y * w + x] += weight / sum * alpha[y * w + u as usize];
-                }
-            }
-        }
-    }
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for y in 0..h {
-        for x in 0..w {
-            let mut value = 0.;
-            for (i, &weight) in (-radius..=radius).zip(&weights) {
-                let v = y as i32 + i;
-                if (0..h as i32).contains(&v) {
-                    value += weight / sum * temp[v as usize * w + x];
-                }
-            }
-            rgba.extend([
-                color.red(),
-                color.green(),
-                color.blue(),
-                (value * color.alpha() as f32).round() as u8,
-            ]);
-        }
-    }
-    Ok((
-        pergola::geom::Rect::new(left, top, w as f32, h as f32),
-        pergola::node::Image::new(w as u32, h as u32, rgba),
-    ))
+    let image = crate::shadow_image(&alpha, w, h, sigma, color);
+    Ok((pergola::geom::Rect::new(left, top, w as f32, h as f32), image))
 }
 #[derive(PartialEq)]
 struct ShadowInput {
@@ -155,11 +120,16 @@ pub(super) fn append(
         let EffectNodeData::Effects(f) = &e.data else {
             return Err("missing declared mask".into());
         };
-        if f.opacity != 1.
-            || f.blend_mode != CompositingAndBlendingOperator::Normal
-            || f.backdrop_filter.is_some()
-        {
-            return Err("unsupported isolated effect".into());
+        if f.opacity != 1. {
+            if (0.0..=1.0).contains(&f.opacity) && f.blend_mode == CompositingAndBlendingOperator::Normal
+                && f.backdrop_filter.is_none() && f.filter.is_none() {
+                out.push(leaf);
+                return Ok(());
+            }
+            return Err("unsupported opacity/filter combination".into());
+        }
+        if f.blend_mode != CompositingAndBlendingOperator::Normal || f.backdrop_filter.is_some() {
+            return Err("unsupported blend or backdrop filter".into());
         }
         if let Some(bytes) = &f.filter {
             let Some(Filter::DropShadow {

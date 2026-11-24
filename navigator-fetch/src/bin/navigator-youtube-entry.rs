@@ -1,6 +1,6 @@
 //! An exec-only Navigator worker. Its installed bundle restricts the caller
 //! to the broker. One Start opens the entry, followed by bounded anonymous
-//! script and style requests on the same private socket.
+//! requests for scripts, styles and the Play icon on the same private socket.
 use navigator_fetch::{addr::Policy, tls_config, youtube, Conversation};
 use std::io::Write;
 
