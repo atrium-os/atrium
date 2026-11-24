@@ -76,8 +76,18 @@ impl OccurrenceId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeRule {
+    pub anchor: NaiveDate,
+    pub sequence: u32,
+    pub schedule: EventEdit,
+    pub location: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<RangeRule>,
     /// The range update that generated this detached occurrence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_from: Option<NaiveDate>,
@@ -349,6 +359,8 @@ pub struct RangeDate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub range_summary: Option<String>,
     #[serde(default)]
     pub range_dates: Vec<RangeDate>,
     #[serde(default)]

@@ -78,6 +78,7 @@ impl Store {
                                 }
                         })
                         .cloned()
+                        .or_else(|| master.inherited(date))
                         .or_else(|| {
                             master.appears(date).then(|| {
                                 let mut row = master.clone();
@@ -232,6 +233,7 @@ impl Store {
         });
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
+            range_summary: None,
             range_dates: vec![],
             previous_dates: vec![],
             skips: vec![],
@@ -244,6 +246,9 @@ impl Store {
             notice: String::new(),
         };
         // Only a saved series can give a RECURRENCE-ID its meaning.
+        let inherited = master
+            .zip(p.original)
+            .and_then(|(m, o)| m.inherited(o.date));
         let mut explicit = master;
         if let Some(original) = p.original {
             let Some(base) =
@@ -259,6 +264,7 @@ impl Store {
                         original: original.date,
                     }
             });
+            explicit = explicit.or(inherited.as_ref());
             review.previous = explicit.cloned().or_else(|| {
                 let mut occurrence = base.clone();
                 occurrence.date = original.date;
@@ -394,10 +400,53 @@ impl Store {
                         review.blocked("A saved range update supersedes this series revision.")
                     );
                 }
-                if !cancelled && (last.is_none() || last > saved.last) {
-                    return Ok(review.blocked(
-                        "Extending a series with a saved range change needs separate review.",
-                    ));
+                if !cancelled && last != saved.last {
+                    if saved.ranges.iter().map(|r| r.sequence).max() != Some(sequence) {
+                        return Ok(review.blocked(
+                            "A new organizer range update is needed to confirm the inherited time.",
+                        ));
+                    }
+                    if p.row.as_ref().is_some_and(|row| {
+                        row.date != base.date || row.span != base.span || row.zone != base.zone
+                    }) {
+                        return Ok(review.blocked("The extension also changes the underlying weekly time. Review it separately."));
+                    }
+                    if let Some(old) = saved.last.filter(|old| last.is_none_or(|end| end > *old)) {
+                        let mut date = old;
+                        while let Some(next) = date.checked_add_days(chrono::Days::new(7)) {
+                            date = next;
+                            if last.is_some_and(|end| date > end) {
+                                break;
+                            }
+                            if p.skips.iter().any(|s| s.date == date)
+                                || p.exceptions.iter().any(|m| m.original.date == date)
+                            {
+                                continue;
+                            }
+                            if let Some(row) = base
+                                .range_at(date)
+                                .and_then(|r| r.occurrence(base, date).ok())
+                            {
+                                review.range_summary = Some(format!(
+                                    "New dates inherit the reviewed time · first {}",
+                                    row.date
+                                ));
+                                review.range_dates.push(crate::invitation::RangeDate {
+                                    original: date,
+                                    before: None,
+                                    after: Some(row.fields_on(row.date)),
+                                });
+                                break;
+                            }
+                            if (date - old).num_days()
+                                > 7 * (crate::invitation::MAX_MOVES as i64 + 2)
+                            {
+                                return Ok(
+                                    review.blocked("Cannot resolve the first extended meeting.")
+                                );
+                            }
+                        }
+                    }
                 }
             }
             if last.is_some_and(|end| base.excluded.iter().any(|d| *d > end)) {
@@ -472,6 +521,11 @@ impl Store {
                 row.excluded.clone_from(&base.excluded);
             }
             row.invitation = Some(Origin {
+                ranges: if row.kind == Kind::Weekly {
+                    master.map_or_else(Vec::new, |m| m.ranges().to_vec())
+                } else {
+                    vec![]
+                },
                 range_from,
                 range_sequence: if row.kind == Kind::Weekly {
                     master.and_then(|m| m.invitation.as_ref()?.range_sequence)

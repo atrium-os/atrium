@@ -1,8 +1,9 @@
-//! Expand a bounded range using original slots. Detached exceptions keep their own schedule.
+//! Review a weekly range on its original slots and retain separately edited meetings.
+use super::super::ranges::shifted;
 use super::*;
-use crate::invitation::{RangeDate, MAX_MOVES};
-use crate::{Fold, Span, Zone};
-use chrono::{Days, LocalResult, TimeZone, Timelike};
+use crate::invitation::{RangeDate, RangeRule, MAX_MOVES};
+use chrono::Days;
+use std::collections::BTreeSet;
 
 impl Store {
     pub(super) fn review_future(
@@ -40,11 +41,62 @@ impl Store {
             .iter()
             .find(|r| r.id == id)
             .ok_or("Missing weekly master")?;
-        let Some(last) = base.invitation.as_ref().and_then(|o| o.last) else {
-            return Ok(review.blocked("Range review needs a weekly series with an end date."));
+        if base
+            .range_at(anchor.date)
+            .is_some_and(|r| r.sequence > p.sequence)
+        {
+            return Ok(review.blocked("A newer range already covers this occurrence."));
+        }
+        let last = base.invitation.as_ref().and_then(|o| o.last);
+        let summarized =
+            last.is_none_or(|end| (end - anchor.date).num_days() / 7 >= MAX_MOVES as i64);
+        let rule = RangeRule {
+            anchor: anchor.date,
+            sequence: p.sequence,
+            schedule: proposed.fields_on(proposed.date),
+            location: p.location.clone(),
         };
-        if (last - anchor.date).num_days() / 7 >= MAX_MOVES as i64 {
-            return Ok(review.blocked("This range exceeds the eight-date review limit."));
+        let mut dates = BTreeSet::new();
+        let next = anchor.date.checked_add_days(Days::new(7));
+        if summarized {
+            dates.extend(next.filter(|d| last.is_none_or(|end| *d <= end)));
+            let mut sample = next;
+            while let Some(d) = sample.filter(|d| last.is_none_or(|end| *d <= end)) {
+                if base.excluded.binary_search(&d).is_err() {
+                    dates.insert(d);
+                    break;
+                }
+                sample = d.checked_add_days(Days::new(7));
+            }
+            dates.extend(last.filter(|d| *d > anchor.date));
+            dates.extend(base.excluded.iter().copied().filter(|d| *d > anchor.date));
+            dates.extend(
+                base.ranges()
+                    .iter()
+                    .map(|r| r.anchor)
+                    .filter(|d| *d > anchor.date),
+            );
+            review.range_summary = Some(
+                if let Some(next_rule) = base.ranges().iter().find(|r| r.anchor > anchor.date) {
+                    format!(
+                        "Weekly until the separate range starting {}",
+                        next_rule.anchor
+                    )
+                } else {
+                    match last {
+                        None => "Weekly · no end date · examples and saved exceptions".into(),
+                        Some(end) => {
+                            format!("Weekly through {end} · examples and saved exceptions")
+                        }
+                    }
+                },
+            );
+        } else {
+            let mut date = next;
+            while let Some(d) = date.filter(|d| Some(*d) <= last) {
+                dates.insert(d);
+                date = d.checked_add_days(Days::new(7));
+            }
         }
         if proposed.zone.is_some() != base.zone.is_some() {
             return Ok(review.blocked("A range cannot mix floating and zoned schedules."));
@@ -64,14 +116,8 @@ impl Store {
             before: review.previous.as_ref().map(|e| e.fields_on(e.date)),
             after: Some(proposed.fields_on(proposed.date)),
         });
-        let mut date = anchor.date;
-        while date < last {
-            date = date
-                .checked_add_days(Days::new(7))
-                .ok_or("Range date out of bounds")?;
-            if date > last {
-                break;
-            }
+        for date in dates {
+            let virtual_child = base.inherited(date);
             let child = self.state.entries.iter().find(|e| {
                 e.kind
                     == Kind::Occurrence {
@@ -79,6 +125,8 @@ impl Store {
                         original: date,
                     }
             });
+            let physical = child.is_some();
+            let child = child.or(virtual_child.as_ref());
             let before = child.map(|e| e.fields_on(e.date)).or_else(|| {
                 (base.appears(date)
                     && base
@@ -106,6 +154,14 @@ impl Store {
                 Err(reason) => return Ok(review.blocked(reason)),
             };
             let after = row.fields_on(row.date);
+            if summarized && !physical {
+                review.range_dates.push(RangeDate {
+                    original: date,
+                    before,
+                    after: Some(after),
+                });
+                continue;
+            }
             p.row = Some(row);
             p.original = Some(crate::invitation::OccurrenceId { date, ..anchor });
             let (rows, marks) = plan
@@ -146,69 +202,16 @@ impl Store {
                 .find(|r| r.id == id)
                 .and_then(|r| r.invitation.as_mut())
                 .ok_or("Missing range master")?;
+            match master
+                .ranges
+                .binary_search_by_key(&rule.anchor, |r| r.anchor)
+            {
+                Ok(index) => master.ranges[index] = rule,
+                Err(index) => master.ranges.insert(index, rule),
+            }
             master.range_sequence = Some(master.range_sequence.unwrap_or_default().max(p.sequence));
         }
         self.invite = group;
         Ok(review)
     }
-}
-
-fn shifted(
-    base: &Entry,
-    anchor: NaiveDate,
-    proposed: &Entry,
-    date: NaiveDate,
-) -> Result<Entry, &'static str> {
-    let mut row = proposed.clone();
-    if let (Some(source), Some(target)) = (base.zone, proposed.zone) {
-        let (original, _) = source.interval(anchor, base.span, true)?;
-        let (first, end) = target.interval(proposed.date, proposed.span, false)?;
-        let (slot, _) = source.interval(date, base.span, true)?;
-        let start = slot
-            .checked_add_signed(first - original)
-            .ok_or("Range start out of bounds")?;
-        let finish = start
-            .checked_add_signed(end - first)
-            .ok_or("Range end out of bounds")?;
-        let start = start.with_timezone(&target.name);
-        let finish = finish.with_timezone(&target.name);
-        let minute = |t: chrono::DateTime<Tz>| (t.hour() * 60 + t.minute()) as u16;
-        let end = if start.date_naive() == finish.date_naive() {
-            minute(finish)
-        } else if start.date_naive().succ_opt() == Some(finish.date_naive()) && minute(finish) == 0
-        {
-            1440
-        } else {
-            return Err("A shifted meeting extends beyond a supported day.");
-        };
-        let fold = |t: chrono::DateTime<Tz>| match target.name.from_local_datetime(&t.naive_local())
-        {
-            LocalResult::Ambiguous(first, _) => Some(if first == t {
-                Fold::Earlier
-            } else {
-                Fold::Later
-            }),
-            _ => None,
-        };
-        row.date = start.date_naive();
-        row.span = Span {
-            start: minute(start),
-            end,
-        };
-        row.zone = Some(Zone {
-            name: target.name,
-            start_fold: fold(start),
-            end_fold: fold(finish),
-        });
-    } else {
-        row.date = proposed
-            .date
-            .checked_add_signed(date - anchor)
-            .ok_or("Range date out of bounds")?;
-    }
-    if !row.span.valid() {
-        return Err("A shifted meeting has an unsupported clock interval.");
-    }
-    row.validate()?;
-    Ok(row)
 }

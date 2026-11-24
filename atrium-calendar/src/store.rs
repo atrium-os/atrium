@@ -2,6 +2,7 @@
 mod import;
 mod invitation_skips;
 mod invitations;
+mod ranges;
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
 use chrono::NaiveDate;
@@ -70,13 +71,16 @@ impl Store {
                 if bytes.len() as u64 > MAX_BYTES {
                     return Err(io::Error::other("Calendar snapshot too large"));
                 }
-                let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
+                let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=8)
+                if !matches!(snapshot.version, 1..=9)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
                     return Err(io::Error::other("Invalid calendar snapshot"));
+                }
+                if snapshot.version == 8 {
+                    ranges::upgrade(&mut snapshot.entries).map_err(io::Error::other)?;
                 }
                 snapshot
             }
@@ -165,10 +169,10 @@ impl Store {
     pub fn page(&self, date: NaiveDate, view: Option<CalendarView>) -> CalendarPage {
         let view = view.unwrap_or(self.state.opening_view);
         let dates: Vec<_> = view.dates(date).collect();
-        let mut entries: Vec<_> = self
-            .state
-            .entries
+        let window = self.window(dates[0], *dates.last().unwrap());
+        let mut entries: Vec<_> = window
             .iter()
+            .map(|e| e.as_ref())
             .filter_map(|e| {
                 if view == CalendarView::Today {
                     e.on_day(date, self.viewing_zone())
@@ -270,10 +274,9 @@ impl Store {
         }
         if event.kind == Kind::Hold
             && self
-                .state
+                .day(event.date)
                 .entries
                 .iter()
-                .filter_map(|e| e.on_day(event.date, self.viewing_zone()))
                 .any(|e| e.busy_spans().any(|s| s.overlaps(event.span)))
         {
             return Err("That time is already busy".into());
@@ -317,12 +320,37 @@ impl Store {
             return Err("Calendar changed. Refresh before saving.".into());
         }
         let mut entries = self.state.entries.clone();
-        let selected = entries
+        let window = self.window(shown, shown);
+        let visible = window
             .iter()
-            .position(|e| e.id == id && e.on_day(shown, self.viewing_zone()).is_some())
+            .find(|e| e.id == id && e.on_day(shown, self.viewing_zone()).is_some())
             .ok_or("Event is no longer on this day")?;
+        let target = if scope == EditScope::WholeSeries {
+            visible.series_id().ok_or("Select a weekly series")?
+        } else {
+            id
+        };
+        let selected = if let Some(i) = entries.iter().position(|e| e.id == target) {
+            i
+        } else {
+            let Kind::Occurrence { series, original } = visible.kind else {
+                return Err("Missing weekly occurrence".into());
+            };
+            let parent = entries
+                .iter_mut()
+                .find(|e| e.id == series)
+                .ok_or("Missing weekly series")?;
+            let at = parent
+                .excluded
+                .binary_search(&original)
+                .err()
+                .ok_or("This occurrence changed. Refresh the calendar.")?;
+            parent.excluded.insert(at, original);
+            entries.push(visible.as_ref().clone());
+            entries.len() - 1
+        };
         let agenda_date = shown;
-        let shown = entries[selected]
+        let shown = visible
             .on_day(shown, self.viewing_zone())
             .and_then(|e| e.source)
             .map_or(shown, |s| s.date);
@@ -337,13 +365,7 @@ impl Store {
         }
         let mut index = selected;
         if scope == EditScope::WholeSeries {
-            let series = entries[selected]
-                .series_id()
-                .ok_or("Select a weekly series")?;
-            index = entries
-                .iter()
-                .position(|e| e.id == series)
-                .ok_or("Series is missing")?;
+            let series = target;
             if let Some(fields) = &replacement {
                 if *fields == entries[index].fields_on(entries[index].date) {
                     return Ok(None);
@@ -367,6 +389,10 @@ impl Store {
                     original: shown,
                 };
                 occurrence.excluded.clear();
+                if let Some(origin) = &mut occurrence.invitation {
+                    origin.ranges.clear();
+                    origin.range_sequence = None;
+                }
                 index = entries.len();
                 entries.push(occurrence);
             } else {
@@ -461,7 +487,7 @@ impl Store {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 8,
+            version: 9,
             cancelled,
             pinned_zone,
             device_zone,
@@ -504,6 +530,22 @@ fn validate_records(entries: &[Entry]) -> Result<(), &'static str> {
             return Err("A projected row cannot be stored");
         }
         e.validate()?;
+        if let Some(origin) = &e.invitation {
+            if !origin
+                .ranges
+                .windows(2)
+                .all(|pair| pair[0].anchor < pair[1].anchor)
+                || origin.ranges.iter().any(|r| {
+                    e.kind != Kind::Weekly
+                        || !e.scheduled_on(r.anchor)
+                        || !r.schedule.span.valid()
+                        || r.schedule.zone.is_some() != e.zone.is_some()
+                        || r.occurrence(e, r.anchor).is_err()
+                })
+            {
+                return Err("Invalid saved weekly range");
+            }
+        }
         if by_id.insert(e.id, e).is_some() {
             return Err("Duplicate event identity");
         }

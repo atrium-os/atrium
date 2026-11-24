@@ -87,7 +87,8 @@ impl Store {
         let words: Vec<_> = folded.split_whitespace().collect();
         let mut matches = Vec::new();
         let mut candidates = 0;
-        for entry in &self.state.entries {
+        let rows = self.window(query.start, query.end);
+        for entry in rows.iter().map(|e| e.as_ref()) {
             let title = entry.title.to_lowercase();
             if !words.iter().all(|word| title.contains(word)) {
                 continue;
@@ -179,16 +180,11 @@ impl Store {
         id: Uuid,
         date: NaiveDate,
     ) -> Result<CalendarPage, String> {
-        if revision != self.state.revision
-            || !self
-                .state
-                .entries
-                .iter()
-                .any(|e| e.id == id && e.on_day(date, self.viewing_zone()).is_some())
-        {
+        let page = self.page(date, Some(CalendarView::Today));
+        if revision != page.revision || !page.entries.iter().any(|e| e.id == id) {
             return Err("Calendar changed. Search again.".into());
         }
-        Ok(self.page(date, Some(CalendarView::Today)))
+        Ok(page)
     }
 }
 

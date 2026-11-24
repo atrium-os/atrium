@@ -344,10 +344,80 @@ def future(ui):
     print("PASS scoped range RSVP, private exception across boundary, earlier meeting preserved and atomic Undo")
 
 
+def long_range(ui):
+    print(guest(ui, "long-range-setup"))
+    open_mail(ui, first=True)
+
+    def item(number):
+        review(ui, 178 + (4 - number) * 70)
+
+    def advance(name, *labels):
+        click(ui, 355, 412)
+        ui.see("long-" + name, *labels)
+
+    def save(name):
+        click(ui, 568, 550)
+        ui.see("long-saved-" + name, "Invitation saved")
+
+    def move(day, destination):
+        ui.open_date(day)
+        click(ui, 450, 268)
+        ui.field(80, 256, destination)
+        ui.field(225, 256, "11:30")
+        ui.field(330, 256, "12:15")
+        click(ui, 92, 506)
+        ui.see("local-" + destination, destination, "11:30")
+
+    item(1)
+    ui.see("long-twelve", "12 meetings", "2027-02-16")
+    save("master")
+    move("2027-01-12", "2027-01-14")
+    baseline = ui.store("work")
+    ui.control("close", "work")
+    item(2)
+    ui.see("long-overview", "through 2027-02-16", "examples and saved exceptions", "Review 4 dates")
+    advance("anchor", "2026-12-08", "2026-12-09", "16:00")
+    advance("sample", "2026-12-15", "2026-12-16", "16:00")
+    advance("exception", "2027-01-12", "2027-01-14", "11:30", "separately edited")
+    advance("last", "2027-02-16", "2027-02-17", "16:00")
+    assert ui.store("work") == baseline
+    save("range")
+    ui.open_date("2027-02-24")
+    ui.see("long-before-extension", "No events")
+    ui.control("close", "work")
+    item(3)
+    ui.see("long-extension", "no end date", "New dates inherit", "Review date")
+    advance("first-new", "2027-02-23", "2027-02-24", "16:00")
+    save("extension")
+    ui.open_date("2027-02-24")
+    ui.see("long-inherited", "16:00", "17:00")
+    move("2027-03-17", "2027-03-18")
+    baseline = ui.store("work")
+    ui.control("close", "work")
+    item(4)
+    ui.see("long-open-review", "no end date", "examples and saved exceptions", "Review 3 dates")
+    advance("spring-anchor", "2027-03-09", "2027-03-10", "16:00", "18:00")
+    advance("spring-exception", "2027-03-16", "2027-03-18", "11:30", "separately edited")
+    advance("spring-example", "2027-03-23", "2027-03-24", "18:00")
+    assert ui.store("work") == baseline
+    save("open-range")
+    for day, value in [("2026-12-01", "14:00"), ("2027-01-14", "11:30"),
+                       ("2027-02-24", "16:00"), ("2027-03-17", "No events"),
+                       ("2027-03-18", "11:30"), ("2036-12-03", "18:00")]:
+        ui.open_date(day)
+        ui.see("long-result-" + day, value)
+    rows = ui.store("work")["entries"]
+    assert len(rows) == 5
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS long and open-ended range review, inherited extension, distant agenda and both private moves")
+
+
 if __name__ == "__main__":
-    runner = {"--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

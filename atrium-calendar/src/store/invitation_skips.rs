@@ -42,13 +42,16 @@ pub(super) fn prepare(
             original: date,
         };
         let child = rows.iter().find(|e| e.kind == kind).cloned();
-        let current = child.clone().or_else(|| {
-            previous.filter(|r| r.appears(date)).map(|r| {
-                let mut entry = r.clone();
-                entry.date = date;
-                entry
-            })
-        });
+        let current = child
+            .clone()
+            .or_else(|| previous.and_then(|r| r.inherited(date)))
+            .or_else(|| {
+                previous.filter(|r| r.appears(date)).map(|r| {
+                    let mut entry = r.clone();
+                    entry.date = date;
+                    entry
+                })
+            });
         let effect = if let Some(child) = child {
             let saved = child.invitation.as_ref();
             if saved.is_some_and(|o| {

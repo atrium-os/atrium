@@ -400,7 +400,10 @@ impl Sheet {
                     .into(),
                 );
             }
-            if !self.review.skips.is_empty() {
+            if let Some(summary) = &self.review.range_summary {
+                line(ctx, 356., 14., summary.clone());
+            }
+            if self.review.range_summary.is_none() && !self.review.skips.is_empty() {
                 let restored = self
                     .review
                     .skips
@@ -417,6 +420,7 @@ impl Sheet {
             }
             if let Some(base) = self.review.previous.as_ref().filter(|e| {
                 !grouped
+                    && self.review.range_summary.is_none()
                     && self.review.skips.is_empty()
                     && e.kind == Kind::Weekly
                     && p.original.is_none()
@@ -441,8 +445,9 @@ impl Sheet {
                     ),
                 );
             }
-        } else if p.this_and_future {
-            let date = &self.review.range_dates[self.page - 1];
+        } else if self.page > self.detail_count() - self.review.range_dates.len() {
+            let date = &self.review.range_dates
+                [self.page - 1 - (self.detail_count() - self.review.range_dates.len())];
             line(
                 ctx,
                 160.,
@@ -686,13 +691,23 @@ impl Sheet {
         }
         if self.page < self.detail_count() && self.can_advance() {
             let label = if self.page == 0 {
-                if grouped || p.this_and_future || !self.review.skips.is_empty() {
+                if self.detail_count() == 1 && self.review.range_summary.is_some() {
+                    "Review date".into()
+                } else if grouped
+                    || p.this_and_future
+                    || self.review.range_summary.is_some()
+                    || !self.review.skips.is_empty()
+                {
                     format!("Review {} dates", self.detail_count())
                 } else {
                     format!("Review {} included moves", p.exceptions.len())
                 }
             } else {
-                if grouped || p.this_and_future || !self.review.skips.is_empty() {
+                if grouped
+                    || self.review.range_summary.is_some()
+                    || p.this_and_future
+                    || !self.review.skips.is_empty()
+                {
                     "Next date"
                 } else {
                     "Next move"
