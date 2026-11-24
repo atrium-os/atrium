@@ -63,20 +63,51 @@ pub fn plan(proj: &Path, src: &Path, name: Option<&str>) -> Result<Plan, String>
     Ok(Plan { import, path, replaces })
 }
 
-/// Write the plan's icon (only one the dock accepts).
+/// Write the plan's icon (only one the dock accepts). `assets/` and
+/// `assets/icons` must be real directories of the project (a link would
+/// send the write elsewhere), and the icon goes through a fresh file made
+/// with O_EXCL, which no planted file or link can stand in for, renamed
+/// over the destination (a link there is replaced, never followed).
 pub fn apply(proj: &Path, p: &Plan) -> Result<PathBuf, String> {
     if let Some(why) = &p.import.report.problem {
         return Err(format!("the result still isn't an icon the dock draws: {why}"));
     }
-    let dest = proj.join(&p.path);
-    if let Some(d) = dest.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    let mut dir = proj.to_path_buf();
+    for part in ICON_DIR.split('/') {
+        dir.push(part);
+        real_dir(&dir, true)?;
     }
-    // Through a fresh file beside it, so a reader never sees half an icon.
-    let tmp = dest.with_extension("svg.new");
-    std::fs::write(&tmp, &p.import.svg).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let dest = proj.join(&p.path);
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = dir.join(format!(".import-{}-{nonce}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(p.import.svg.as_bytes())?;
+        f.sync_all()
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", dest.display())
+    })?;
     Ok(dest)
+}
+
+/// `d` is a directory and not a link; with `make`, one is made if none is there.
+fn real_dir(d: &Path, make: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(d) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!("{} is a link: assets stay in the project", d.display())),
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} isn't a directory", d.display())),
+        Err(e) if make && e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(d).map_err(|e| format!("{}: {e}", d.display()))
+        }
+        Err(e) => Err(format!("{}: {e}", d.display())),
+    }
 }
 
 /// A report as JSON, for Artifex.
@@ -97,11 +128,19 @@ pub fn report_json(r: &atrium_icon::Report) -> serde_json::Value {
 pub fn asset_files(proj: &Path) -> Result<Vec<String>, String> {
     let root = proj.join("assets");
     let mut out = Vec::new();
-    if !root.is_dir() {
-        return Ok(out);
+    // Not followed if it is a link: a project's `assets -> ~/.ssh` would
+    // bundle, sign and ship the keys.
+    match std::fs::symlink_metadata(&root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        _ => real_dir(&root, false)?,
     }
+    let (mut dirs, mut total) = (0usize, 0u64);
     let mut stack = vec![(root, String::from("assets"))];
     while let Some((dir, rel)) = stack.pop() {
+        dirs += 1;
+        if dirs > MAX_ASSET_DIRS {
+            return Err(format!("more than {MAX_ASSET_DIRS} folders in assets/"));
+        }
         let rd = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         for ent in rd {
             let ent = ent.map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -117,6 +156,11 @@ pub fn asset_files(proj: &Path) -> Result<Vec<String>, String> {
             if t.is_dir() {
                 stack.push((ent.path(), r));
             } else if t.is_file() {
+                // DirEntry::metadata does not follow links (it is one of these).
+                total += ent.metadata().map_err(|e| format!("{r}: {e}"))?.len();
+                if total > MAX_ASSET_BYTES {
+                    return Err(format!("assets/ holds more than {} MB", MAX_ASSET_BYTES >> 20));
+                }
                 out.push(r);
             } else {
                 return Err(format!("{r}: not a file (links aren't bundled)"));
@@ -132,6 +176,10 @@ pub fn asset_files(proj: &Path) -> Result<Vec<String>, String> {
 
 /// The most files a bundle's `assets/` may hold.
 pub const MAX_ASSETS: usize = 4096;
+/// The most folders under it.
+pub const MAX_ASSET_DIRS: usize = 512;
+/// The most bytes its files may hold together.
+pub const MAX_ASSET_BYTES: u64 = 256 << 20;
 
 fn atrium_part(n: &str) -> bool {
     !n.is_empty() && n != "." && n != ".." && n.len() <= 255
@@ -170,6 +218,36 @@ mod tests {
         assert!(plan(&d, &src, Some("../x")).is_err());
         assert_eq!(asset_files(&d).unwrap(), ["assets/icons/logo.svg"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_never_followed() {
+        let d = dir("links");
+        let outside = dir("links-outside");
+        std::fs::write(outside.join("id_ed25519"), b"secret").unwrap();
+        // A linked assets/ is neither bundled nor written into.
+        std::os::unix::fs::symlink(&outside, d.join("assets")).unwrap();
+        assert!(asset_files(&d).unwrap_err().contains("is a link"));
+        let src = d.join("logo.svg");
+        std::fs::write(&src, r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="20" height="20" fill="#c06030"/></svg>"##).unwrap();
+        let p = plan(&d, &src, None).unwrap();
+        assert!(apply(&d, &p).unwrap_err().contains("is a link"));
+        assert!(!outside.join("icons").exists());
+        // A planted temp name or a link at the destination is replaced,
+        // and what it pointed at is untouched.
+        std::fs::remove_file(d.join("assets")).unwrap();
+        std::fs::create_dir_all(d.join("assets/icons")).unwrap();
+        let victim = outside.join("profile");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("assets/icons/logo.svg.new")).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("assets/icons/logo.svg")).unwrap();
+        let out = apply(&d, &p).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(!std::fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+        assert!(atrium_icon::check(&std::fs::read(&out).unwrap()).ok());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

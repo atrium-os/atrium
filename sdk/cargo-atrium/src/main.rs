@@ -421,6 +421,10 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
         programs.push(from.clone());
     }
     for f in bundle::named_files(&manifest) {
+        // The icon is the project's own file, not a link out of it.
+        if std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+            return fail(format!("{f} is a link: the icon must be a file in the project"));
+        }
         steps.push((PathBuf::from(&f), f.clone()));
     }
     // The pictures and icons atrium-assets opens, at the same paths.

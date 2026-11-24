@@ -124,7 +124,13 @@ fn esc(s: &str, out: &mut String) {
 }
 
 fn local_refs_only(v: &str) -> bool {
-    let mut rest = v;
+    // CSS names are case-blind (URL( is url() and an escape could spell
+    // one, so a value with a backslash is not taken.
+    if v.contains('\\') {
+        return false;
+    }
+    let lower = v.to_ascii_lowercase();
+    let mut rest = lower.as_str();
     while let Some(i) = rest.find("url(") {
         let after = rest[i + 4..].trim_start_matches([' ', '"', '\'']);
         if !after.starts_with('#') {
@@ -381,6 +387,14 @@ pub fn import(src: &[u8]) -> Result<Import, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_local_urls_in_any_case() {
+        assert!(super::local_refs_only("url(#g) fill"));
+        assert!(!super::local_refs_only("URL(http://x/a.png)"));
+        assert!(!super::local_refs_only("Url( 'file:///etc/passwd')"));
+        assert!(!super::local_refs_only("u\\72l(http://x)"));
+    }
+
     use super::*;
 
     #[test]

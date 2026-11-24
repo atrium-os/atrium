@@ -1399,6 +1399,13 @@ fn handle_exec_instance(
             .then(|| std::time::Instant::now() + portcullisd::system_worker::LIFE);
         reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name, life))
     });
+    // A system worker runs only with its time bound watched.
+    if watch.is_none() && portcullis_ipc::SYSTEM_WORKERS.iter().any(|(_, b)| *b == app_id) {
+        eprintln!("portcullisd: system worker {app_id} REFUSED: no watcher for its time bound");
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "system-worker".into(), message: "can't bound its life: refused".into(),
+        });
+    }
     // A worker's caller has its answer once the jail is removed; its mounts
     // are unwound after (a dying jail can pin them for seconds).
     let run = if spec.worker.is_some() { portcullis_oneshot::run_with_fds_detached } else { portcullis_oneshot::run_with_fds };
