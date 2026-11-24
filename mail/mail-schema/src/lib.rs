@@ -128,7 +128,7 @@ pub enum ToJail {
     /// Re-read the scope of one decoded calendar part for an RSVP.
     SchedulingPart { message: Raw, path: String },
     OneOffUpdate { part: Raw, identities: Vec<String> },
-    /// Check one detached occurrence against the scope read from the MIME part.
+    /// Verify a detached update or range cancellation against the scope read from the MIME part.
     OccurrenceUpdate { part: Raw, identities: Vec<String>, scope: String },
 }
 

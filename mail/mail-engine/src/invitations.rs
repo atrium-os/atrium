@@ -26,6 +26,50 @@ pub enum LatestInvitation {
     },
 }
 
+fn occurrence_label(property: &str) -> Result<(bool, String), Error> {
+    let (head, value) = property
+        .split_once(':')
+        .ok_or(Error::Refused("Invalid occurrence"))?;
+    let local = value.strip_suffix('Z').unwrap_or(value);
+    let date = chrono::NaiveDateTime::parse_from_str(local, "%Y%m%dT%H%M%S")
+        .map_err(|_| Error::Refused("Invalid occurrence time"))?;
+    if local.len() != 15
+        || local.as_bytes()[8] != b'T'
+        || !local
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 8 || b.is_ascii_digit())
+    {
+        return Err(Error::Refused("Invalid occurrence time"));
+    }
+    let range = head.strip_prefix("RECURRENCE-ID;RANGE=THISANDFUTURE");
+    let params = range
+        .or_else(|| head.strip_prefix("RECURRENCE-ID"))
+        .ok_or(Error::Refused("Invalid occurrence identifier"))?;
+    let zone = if params.is_empty() {
+        if value.ends_with('Z') {
+            "UTC"
+        } else {
+            "Floating"
+        }
+    } else {
+        params
+            .strip_prefix(";TZID=")
+            .filter(|z| {
+                !z.is_empty()
+                    && z.len() <= 64
+                    && !value.ends_with('Z')
+                    && z.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_/+-".contains(&b))
+            })
+            .ok_or(Error::Refused("Invalid occurrence zone"))?
+    };
+    Ok((
+        range.is_some(),
+        format!("{} · {zone}", date.format("%Y-%m-%d %H:%M")),
+    ))
+}
+
 pub struct Selected {
     pub source: Source,
     pub bytes: Vec<u8>,
@@ -237,7 +281,10 @@ impl Engine {
             (None, None) => (),
             (Some(wanted), Some(raw))
                 if mail_store::OccurrenceSlot::parse(raw)
-                    .is_some_and(|found| wanted.matches(found)) =>
+                    .is_some_and(|found| wanted.matches(found))
+                    || (i.method == InviteMethod::Cancel
+                        && mail_store::OccurrenceSlot::range_cutoff(raw)
+                            .is_some_and(|cutoff| wanted.on_or_after(cutoff))) =>
             {
                 ()
             }
@@ -354,52 +401,13 @@ impl Engine {
                 Ok(Some(label))
             }
             Some(property) => {
-                let (head, value) = property
-                    .split_once(':')
-                    .ok_or(Error::Refused("Invalid occurrence"))?;
-                let local = value.strip_suffix('Z').unwrap_or(value);
-                let date = chrono::NaiveDateTime::parse_from_str(local, "%Y%m%dT%H%M%S")
-                    .map_err(|_| Error::Refused("Invalid occurrence time"))?;
-                if local.len() != 15
-                    || local.as_bytes()[8] != b'T'
-                    || !local
-                        .bytes()
-                        .enumerate()
-                        .all(|(i, b)| i == 8 || b.is_ascii_digit())
-                {
-                    return Err(Error::Refused("Invalid occurrence time"));
-                }
-                let range = head.strip_prefix("RECURRENCE-ID;RANGE=THISANDFUTURE");
-                let params = range
-                    .or_else(|| head.strip_prefix("RECURRENCE-ID"))
-                    .ok_or(Error::Refused("Invalid occurrence identifier"))?;
-                let zone = if params.is_empty() {
-                    if value.ends_with('Z') {
-                        "UTC"
-                    } else {
-                        "Floating"
-                    }
+                let (range, stamp) = occurrence_label(property)?;
+                let prefix = if range {
+                    "This and future occurrences ·"
                 } else {
-                    params
-                        .strip_prefix(";TZID=")
-                        .filter(|z| {
-                            !z.is_empty()
-                                && z.len() <= 64
-                                && !value.ends_with('Z')
-                                && z.bytes()
-                                    .all(|b| b.is_ascii_alphanumeric() || b"_/+-".contains(&b))
-                        })
-                        .ok_or(Error::Refused("Invalid occurrence zone"))?
+                    "One occurrence · originally"
                 };
-                Ok(Some(format!(
-                    "{} {} · {zone}",
-                    if range.is_some() {
-                        "This and future occurrences ·"
-                    } else {
-                        "One occurrence · originally"
-                    },
-                    date.format("%Y-%m-%d %H:%M")
-                )))
+                Ok(Some(format!("{prefix} {stamp}")))
             }
         }
     }
@@ -419,9 +427,9 @@ impl Engine {
         let revisions = self
             .store
             .write(|w| w.calendar_revisions(account, &r.uid, r.sequence, &r.organizer))?;
-        let mut latest: Option<(MsgId, mail_schema::Invite)> = None;
+        let mut latest: Option<(MsgId, mail_schema::Invite, Option<String>)> = None;
         for &(seq, id, hash) in &revisions.messages {
-            if latest.as_ref().is_some_and(|(_, i)| seq < i.sequence) {
+            if latest.as_ref().is_some_and(|(_, i, _)| seq < i.sequence) {
                 break;
             }
             if id == msg {
@@ -463,23 +471,45 @@ impl Engine {
             let Some(i) = m.summary.invite else {
                 return Err(mail_store::Error::CalendarChanged.into());
             };
-            let previous = latest.as_ref().map(|(_, v)| v).unwrap_or(original);
-            if previous.sequence == seq {
-                if previous.cancelled != i.cancelled
-                    || previous.start != i.start
-                    || previous.end != i.end
-                    || previous.location != i.location
-                {
+            let cutoff = delivery
+                .scope
+                .filter(|s| mail_store::OccurrenceSlot::range_cutoff(s).is_some());
+            let same_schedule = |other: &mail_schema::Invite| {
+                other.cancelled == i.cancelled
+                    && other.start == i.start
+                    && other.end == i.end
+                    && other.location == i.location
+            };
+            // The reviewed request can be replayed alongside a range cancellation
+            // at its sequence. Only the cancellation changes the pending response.
+            if seq == original.sequence && cutoff.is_none() {
+                if same_schedule(original) {
+                    continue;
+                }
+                return Err(Error::InvitationChanged(LatestInvitation::Conflict {
+                    sequence: seq,
+                }));
+            }
+            if let Some((_, previous, previous_cutoff)) = &latest {
+                let boundary = |scope: &Option<String>| {
+                    scope
+                        .as_deref()
+                        .and_then(mail_store::OccurrenceSlot::range_cutoff)
+                };
+                if !same_schedule(previous) || boundary(previous_cutoff) != boundary(&cutoff) {
                     return Err(Error::InvitationChanged(LatestInvitation::Conflict {
                         sequence: seq,
                     }));
                 }
             } else {
-                latest = Some((id, i));
+                latest = Some((id, i, cutoff));
             }
         }
-        if let Some((msg, i)) = latest {
-            let when = if i.cancelled {
+        if let Some((msg, i, cutoff)) = latest {
+            let when = if let Some(property) = cutoff {
+                let (_, stamp) = occurrence_label(&property)?;
+                format!("Cancelled from {stamp} onward")
+            } else if i.cancelled {
                 "Cancelled by the organizer".into()
             } else {
                 proposed_time(&i).ok_or(Error::Refused(

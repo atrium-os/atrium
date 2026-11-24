@@ -387,7 +387,13 @@ A Tuesday meeting might move to Wednesday, then Thursday. Both invitations still
 
 If the recipient has already moved the occurrence privately, Calendar shows its saved time beside the organizer’s proposal. A newer, verified request for that date can be answered while keeping the private move. The review authorizes an RSVP only. The organizer receives the reviewed proposal’s recurrence ID and attendee response. The private schedule stays in Calendar.
 
-Mail recognizes equivalent zoned recurrence IDs on incoming revisions and previous response receipts. A floating recurrence ID is compared on its own civil clock. The RSVP preserves the organizer’s original recurrence property. Conflicting changes at the same revision require clarification. This check covers individually delivered occurrences. Whole-series, grouped and future-range changes still use their existing explicit review flows. [Installed two-Tuesday check](../../scripts/calendar-invitation-check.py) · [Synthetic receipts and cancellations](../../mail/atrium-mail/examples/invitation_probe.rs)
+Mail recognizes equivalent zoned recurrence IDs on incoming revisions and previous response receipts. A floating recurrence ID is compared on its own civil clock. The RSVP preserves the organizer’s original recurrence property. Conflicting changes at the same revision require clarification. Whole-series and grouped updates use their explicit review flows. A cancellation covering this and future meetings also checks an open occurrence RSVP (§7.27). [Installed two-Tuesday check](../../scripts/calendar-invitation-check.py) · [Synthetic receipts and cancellations](../../mail/atrium-mail/examples/invitation_probe.rs)
+
+### 7.27 A range cancellation arrives while an occurrence RSVP is open
+
+At **Send response**, Mail checks the original occurrence against the verified organizer’s inclusive cancellation cutoff. The confirmation shows the original slot, the time the recipient reviewed, and **Cancelled from** with the date, time and zone. **Review latest invitation** opens that cancellation in Calendar, where the recipient can inspect the affected dates and decide whether to apply it. Opening the review sends no reply and leaves the saved schedule intact.
+
+For a cutoff of **15 December 2026 at 14:00 UTC**, the meeting originally at that time and the following Tuesdays are covered. A 22 December meeting moved to 9 December is still covered. An 8 December meeting moved to 18 December can still be answered. Its reply identifies the original 8 December occurrence. The check uses the receiving account, invited identity, organizer, UID and revision rules from §7.25. Floating cutoffs use the recurrence’s civil clock. Zoned cutoffs compare instants, including across midnight. [Synthetic range-cancellation check](../../scripts/calendar-invitation-check.py)
 
 ## 8. Accepted decisions
 

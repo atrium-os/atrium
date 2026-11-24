@@ -21,7 +21,7 @@ fn candidate(m: &Message) -> bool {
 /// Compare parser-normalized single-occurrence properties. Floating slots keep
 /// their civil clock. Without a saved fold choice, either instant of a repeated
 /// local hour can refer to that occurrence.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OccurrenceSlot {
     Floating(chrono::NaiveDateTime),
     Zoned { first: i64, last: i64 },
@@ -29,14 +29,22 @@ pub enum OccurrenceSlot {
 
 impl OccurrenceSlot {
     pub fn parse(scope: &str) -> Option<Self> {
+        Self::from_params(scope.strip_prefix("RECURRENCE-ID")?)
+    }
+
+    pub fn range_cutoff(scope: &str) -> Option<Self> {
+        Self::from_params(scope.strip_prefix("RECURRENCE-ID;RANGE=THISANDFUTURE")?)
+    }
+
+    fn from_params(params: &str) -> Option<Self> {
         use chrono::{NaiveDateTime, TimeZone};
-        let (property, value) = scope.split_once(':')?;
+        let (property, value) = params.split_once(':')?;
         let stamp = value.strip_suffix('Z').unwrap_or(value);
         let wall = NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S").ok()?;
         let zone = match property {
-            "RECURRENCE-ID" if stamp == value => return Some(Self::Floating(wall)),
-            "RECURRENCE-ID" => chrono_tz::UTC,
-            name if stamp == value => name.strip_prefix("RECURRENCE-ID;TZID=")?.parse().ok()?,
+            "" if stamp == value => return Some(Self::Floating(wall)),
+            "" => chrono_tz::UTC,
+            name if stamp == value => name.strip_prefix(";TZID=")?.parse().ok()?,
             _ => return None,
         };
         let times = zone.from_local_datetime(&wall);
@@ -44,6 +52,15 @@ impl OccurrenceSlot {
             first: times.earliest()?.timestamp(),
             last: times.latest()?.timestamp(),
         })
+    }
+
+    /// A repeated local hour can cover the reply if either possible instant does.
+    pub fn on_or_after(self, cutoff: Self) -> bool {
+        match (self, cutoff) {
+            (Self::Floating(slot), Self::Floating(start)) => slot >= start,
+            (Self::Zoned { last, .. }, Self::Zoned { first, .. }) => last >= first,
+            _ => false,
+        }
     }
 
     pub fn matches(self, other: Self) -> bool {
@@ -239,6 +256,26 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::OccurrenceSlot;
+
+    #[test]
+    fn cutoff_is_inclusive_and_compares_original_clocks() {
+        let covered = |slot: &str, start: &str| {
+            OccurrenceSlot::parse(slot).unwrap().on_or_after(
+                OccurrenceSlot::range_cutoff(&format!("RECURRENCE-ID;RANGE=THISANDFUTURE{start}"))
+                    .unwrap(),
+            )
+        };
+        let start = ";TZID=Asia/Kolkata:20261216T003000";
+        assert!(!covered("RECURRENCE-ID:20261215T185959Z", start));
+        assert!(covered("RECURRENCE-ID:20261215T190000Z", start));
+        assert!(covered("RECURRENCE-ID:20261215T190001Z", start));
+        assert!(covered("RECURRENCE-ID:20261215T140000", ":20261215T140000"));
+        assert!(!covered("RECURRENCE-ID:20261215T140000", start));
+        assert!(covered(
+            "RECURRENCE-ID:20261101T060000Z",
+            ";TZID=America/New_York:20261101T013000"
+        ));
+    }
 
     #[test]
     fn original_slots_cross_midnight_and_distinguish_floating_times_and_folds() {

@@ -173,6 +173,48 @@ def occurrence_response(ui):
     print("PASS both occurrence replies delivered once, private move and other meetings preserved")
 
 
+def range_cancel_response(ui):
+    print(guest(ui, "range-response-setup"))
+    open_mail(ui, first=True)
+    print(guest(ui, "range-window"))
+    ui.see("rsvp-before-range-arrives", "One occurrence", "2026-12-22", "2026-12-09", "ACCEPTED")
+    print(guest(ui, "response-deliver"))
+    click(ui, 485, 355)
+    ui.see("rsvp-cutoff", "Invitation changed before sending", "2026-12-22", "2026-12-09",
+           "Cancelled from 2026-12-15 14:00", "UTC onward", "Your response has not been sent")
+    click(ui, 485, 355)
+    print(guest(ui, "response-result"))
+
+    open_mail(ui)
+    review(ui, 388)
+    ui.see("range-series", "Whole weekly series", "14:00")
+    click(ui, 568, 550)
+    ui.see("range-series-saved", "Invitation saved")
+    baseline = ui.store("work")
+    ui.control("close", "work")
+    review(ui, 248)
+    ui.see("range-later-review", "One occurrence", "2026-12-22", "2026-12-09")
+    click(ui, 80, 462)
+    ui.see("range-later-confirm", "Review your invitation response", "ACCEPTED")
+    click(ui, 485, 355)
+    ui.see("range-later-paused", "Cancelled from 2026-12-15 14:00", "UTC onward")
+    click(ui, 485, 355)
+    ui.see("range-cancellation-opened", "Review cancellation", "from 2026-12-15 onward", "Review")
+    assert ui.store("work") == baseline
+    ui.control("close", "work")
+    open_mail(ui)
+    review(ui, 318)
+    ui.see("range-earlier-review", "One occurrence", "2026-12-08", "2026-12-18")
+    click(ui, 80, 462)
+    ui.see("range-earlier-confirm", "One occurrence", "2026-12-08", "2026-12-18", "ACCEPTED")
+    click(ui, 485, 355)
+    ui.control("close", "work")
+    print(guest(ui, "series-submit"))
+    assert ui.store("work") == baseline
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    print("PASS cancellation review opened from paused RSVP, earlier occurrence accepted over SMTP, calendar preserved")
+
+
 def background(ui):
     print(guest(ui, "invitation-setup"))
     open_mail(ui, first=True)
@@ -807,9 +849,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--range-cancel-response": range_cancel_response, "--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--range-cancel-response|--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

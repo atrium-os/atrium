@@ -560,7 +560,7 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
         return None;
     };
     if p.sequence == 0
-        || p.this_and_future
+        || (p.this_and_future && p.row.is_some())
         || p.scope().as_deref() != scope
         || p.original.is_some() != scope.is_some()
         || p.weekly_cancellation
@@ -580,6 +580,27 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
 #[cfg(test)]
 mod background_tests {
     use super::individual_update;
+    #[test]
+    fn only_a_matching_range_cancellation_can_pause_an_occurrence() {
+        let cancel = include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics");
+        let change = include_str!("../../../atrium-calendar/tests/fixtures/future.ics");
+        let cutoff = Some("RECURRENCE-ID;RANGE=THISANDFUTURE:20261215T140000Z");
+        let me = vec!["dev@fixture.invalid".to_owned()];
+        assert!(individual_update(cancel.as_bytes(), &me, cutoff).is_some());
+        assert!(individual_update(cancel.as_bytes(), &me, None).is_none());
+        assert!(individual_update(
+            change.as_bytes(),
+            &me,
+            Some("RECURRENCE-ID;RANGE=THISANDFUTURE:20261208T140000Z")
+        )
+        .is_none());
+        let other = cancel.replace(
+            "END:VEVENT",
+            "ATTENDEE:mailto:other@fixture.invalid\nEND:VEVENT",
+        );
+        assert!(individual_update(other.as_bytes(), &me, cutoff).is_none());
+    }
+
     #[test]
     fn detached_occurrence_requires_the_original_slot_and_individual_scope() {
         let moved = include_str!("../../../atrium-calendar/tests/fixtures/move-one.ics");

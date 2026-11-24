@@ -18,6 +18,8 @@ const MOVED: &str = include_str!("../../../atrium-calendar/tests/fixtures/move-o
 const SERIES_MOVE: &str = include_str!("../../../atrium-calendar/tests/fixtures/move-series.ics");
 const CANCEL_ONE: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-one.ics");
 const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-series.ics");
+const CANCEL_FROM: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics");
+const AFTER_CUTOFF: &str = "RECURRENCE-ID:20261222T140000Z";
 const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
 
 const NEW_YORK_ORIGINAL: &str = "RECURRENCE-ID;TZID=America/New_York:20261208T090000";
@@ -40,6 +42,10 @@ const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
+    let range_response = mode == "seed-range-response";
+    let earlier = MOVED.replace("20261209T15", "20261218T15");
+    let after = MOVED.replace(ORIGINAL, AFTER_CUTOFF);
+    let cancellation = CANCEL_FROM.replace("SEQUENCE:2", "SEQUENCE:3");
     let occurrences = mode == "seed-occurrences";
     let later = later_occurrence();
     let sibling = MOVED.replace(ORIGINAL, SIBLING);
@@ -142,6 +148,13 @@ fn seed(e: &Engine, mode: &str) {
                 ("Extend to December 29", UNTIL)
             },
         ]
+    } else if range_response {
+        &[
+            ("Weekly studio", WEEKLY),
+            ("December 8 moved to December 18", &earlier),
+            ("December 22 moved to December 9", &after),
+            ("Cancel from December 15", &cancellation),
+        ]
     } else if occurrences {
         &[
             ("Weekly studio", WEEKLY),
@@ -184,7 +197,9 @@ fn seed(e: &Engine, mode: &str) {
             .pop()
             .unwrap()
             .unwrap();
-        let sequence = if occurrences && id == 4 {
+        let sequence = if range_response {
+            [1, 2, 2, 3][n]
+        } else if occurrences && id == 4 {
             2
         } else if series {
             id.min(5)
@@ -681,6 +696,69 @@ fn during_occurrence(e: &Engine, dir: &Path) {
     println!("PASS live confirmation for a moved occurrence, sibling RSVP, zoned replay receipt, conflict and cancellation");
 }
 
+fn during_range_cancellation(e: &Engine, dir: &Path) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    let account = e.store.add_account("dev@fixture.invalid").unwrap();
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let put = |id, body: &str, verified| put_revision(e, account, inbox, id, body, verified);
+    let earlier = put(1, &MOVED.replace("20261209T15", "20261218T15"), true);
+    let at_cutoff = put(2, &MOVED.replace(ORIGINAL, SIBLING), true);
+    let later = put(3, &MOVED.replace(ORIGINAL, AFTER_CUTOFF), true);
+    let blob = |id| e.store.message(id).unwrap().full.unwrap();
+    let reply = Reply {
+        scope: Some(AFTER_CUTOFF.into()),
+        sequence: 2,
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        uid: "studio-planning@fixture.invalid".into(),
+        answer: Answer::Accept,
+    };
+    let latest = check_open_window(e, dir, later, blob(later), &reply, || {
+        // A higher unverified cancellation would incorrectly include the earlier reply.
+        put(
+            4,
+            &CANCEL_FROM
+                .replace("20261215", "20261201")
+                .replace("SEQUENCE:2", "SEQUENCE:9"),
+            false,
+        );
+        let equal = put(5, CANCEL_FROM, true);
+        assert!(
+            matches!(e.send_invitation_reply(later, blob(later), &reply),
+            Err(Error::InvitationChanged(LatestInvitation::Update {msg, sequence: 2, ..})) if msg == equal)
+        );
+        let newer = CANCEL_FROM.replace("SEQUENCE:2", "SEQUENCE:3");
+        put(
+            6,
+            &newer.replace(
+                ":20261215T140000Z",
+                ";TZID=America/New_York:20261215T090000",
+            ),
+            true,
+        );
+        put(7, &newer, true)
+    });
+    let boundary_reply = Reply {
+        scope: Some(SIBLING.into()),
+        ..reply.clone()
+    };
+    assert!(
+        matches!(e.send_invitation_reply(at_cutoff, blob(at_cutoff), &boundary_reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update { msg, sequence:3, when, .. }))
+        if msg == latest && when == "Cancelled from 2026-12-15 14:00 · UTC onward")
+    );
+    assert!(e.store.outbox().unwrap().is_empty());
+    let earlier_reply = Reply {
+        scope: Some(ORIGINAL.into()),
+        ..reply
+    };
+    e.send_invitation_reply(earlier, blob(earlier), &earlier_reply)
+        .unwrap();
+    submit(e, 2, Some(ORIGINAL));
+    println!("PASS live confirmation, inclusive cancellation cutoff, later original moved earlier blocked, earlier original moved later delivered exactly once");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -690,10 +768,21 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        mode @ ("seed" | "seed-occurrences" | "seed-series" | "seed-bounded"
-        | "seed-cancel-dates" | "seed-exdates" | "seed-future" | "seed-long-range"
-        | "seed-cancel-future" | "seed-reinstate" | "seed-restart" | "seed-restore-one"
+        mode @ ("seed"
+        | "seed-range-response"
+        | "seed-occurrences"
+        | "seed-series"
+        | "seed-bounded"
+        | "seed-cancel-dates"
+        | "seed-exdates"
+        | "seed-future"
+        | "seed-long-range"
+        | "seed-cancel-future"
+        | "seed-reinstate"
+        | "seed-restart"
+        | "seed-restore-one"
         | "seed-reissue") => seed(&e, mode),
+        "during-range-cancellation" => during_range_cancellation(&e, Path::new(&args[2])),
         "during-occurrence" => during_occurrence(&e, Path::new(&args[2])),
         "submit-occurrence" => submit(&e, 3, Some(NEW_YORK_ORIGINAL)),
         "submit-sibling" => submit(&e, 2, Some(SIBLING)),
