@@ -227,15 +227,127 @@ fn scalar<'a>(root: &'a Element, name: &str) -> Result<Option<&'a str>> {
     }
 }
 
-pub fn prelogin(bytes: &[u8]) -> Result<()> {
+/// How the portal or gateway wants the person to sign in.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Prelogin {
+    Password,
+    /// SAML through the Navigator's VPN sign-in window (vpn.md §9.3): open
+    /// `login`; the portal's answer at the end carries the token Arca's
+    /// courier keeps for Crypta (`SAML_TOKEN`).
+    Saml { login: String },
+}
+
+/// The name Arca's courier files a GlobalProtect SAML token under, in a
+/// VPN sign-in window's jar: never a cookie the page sees.
+pub const SAML_TOKEN: &str = "gpSamlToken";
+
+/// Where a PAN portal's SAML service provider takes the IdP's answer.
+pub const SAML_ACS: &str = "/SAML20/SP/ACS";
+
+const SAML_LOGIN_MAX: usize = 8192;
+
+pub fn prelogin(bytes: &[u8]) -> Result<Prelogin> {
     let root = document(bytes)?;
     if root.name != "prelogin-response" || scalar(&root, "status")? != Some("Success") {
         return Err("GlobalProtect prelogin refused");
     }
-    if scalar(&root, "saml-auth-method")?.is_some() || scalar(&root, "saml-request")?.is_some() {
-        return Err("GlobalProtect SAML sign-in is unavailable");
+    let method = scalar(&root, "saml-auth-method")?;
+    let request = scalar(&root, "saml-request")?;
+    match (method, request) {
+        (None, None) => Ok(Prelogin::Password),
+        (Some(m), Some(r)) if m.eq_ignore_ascii_case("REDIRECT") => {
+            let url = base64(r).and_then(|b| String::from_utf8(b).ok()).ok_or("invalid GlobalProtect SAML request")?;
+            let url = url.trim();
+            if url.len() > SAML_LOGIN_MAX || !url.starts_with("https://") || url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+                return Err("GlobalProtect SAML sign-in must start at an HTTPS address");
+            }
+            Ok(Prelogin::Saml { login: url.to_string() })
+        }
+        // The POST binding hands over a page with a form to send: the
+        // window starts from an address only.
+        (Some(m), Some(_)) if m.eq_ignore_ascii_case("POST") => Err("GlobalProtect SAML with the POST binding is not supported yet"),
+        _ => Err("invalid GlobalProtect SAML prelogin"),
     }
-    Ok(())
+}
+
+/// Standard base64 with padding, whitespace ignored.
+fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits, mut pad) = (0u32, 0u32, 0usize);
+    for c in s.bytes().filter(|c| !c.is_ascii_whitespace()) {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                pad += 1;
+                continue;
+            }
+            _ => return None,
+        };
+        if pad > 0 {
+            return None;
+        }
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (pad <= 2 && acc & ((1 << bits) - 1) == 0).then_some(out)
+}
+
+/// Which of the portal's SAML answers Arca kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamlKind {
+    PreloginCookie,
+    PortalUserAuthCookie,
+}
+
+impl SamlKind {
+    pub fn field(self) -> &'static str {
+        match self {
+            SamlKind::PreloginCookie => "prelogin-cookie",
+            SamlKind::PortalUserAuthCookie => "portal-userauthcookie",
+        }
+    }
+}
+
+/// The token as Arca's courier files it: `<kind>\n<saml-username>\n<token>`.
+pub fn saml_token(v: &[u8]) -> Result<(SamlKind, String, Zeroizing<String>)> {
+    let text = std::str::from_utf8(v).map_err(|_| "invalid GlobalProtect SAML token")?;
+    let mut parts = text.splitn(3, '\n');
+    let kind = match parts.next() {
+        Some("prelogin-cookie") => SamlKind::PreloginCookie,
+        Some("portal-userauthcookie") => SamlKind::PortalUserAuthCookie,
+        _ => return Err("invalid GlobalProtect SAML token"),
+    };
+    let user = parts.next().filter(|u| !u.is_empty() && u.len() <= 256).ok_or("the GlobalProtect SAML answer names no user")?;
+    let token = parts.next().filter(|t| !t.is_empty() && !t.contains('\n')).ok_or("invalid GlobalProtect SAML token")?;
+    Ok((kind, user.to_string(), Zeroizing::new(token.to_string())))
+}
+
+/// A login with the token SAML gave instead of a password.
+pub fn saml_sign_in(host: &str, computer: &str, user: &str, kind: SamlKind, token: &str) -> Zeroizing<String> {
+    form(&[
+        ("prot", "https:"),
+        ("server", host),
+        ("computer", computer),
+        ("user", user),
+        ("passwd", ""),
+        (kind.field(), token),
+        ("inputStr", ""),
+        ("ok", "Login"),
+        ("direct", "yes"),
+        ("jnlpReady", "jnlpReady"),
+        ("clientVer", "4100"),
+        ("clientos", "Linux"),
+        ("os-version", "Atrium"),
+        ("clientgpversion", "Atrium"),
+    ])
 }
 
 /// Read the challenge token from the fixed wire envelopes. The gateway
@@ -938,11 +1050,37 @@ thisForm.inputStr.value = getValue();"#;
 
     #[test]
     fn prelogin_distinguishes_password_and_saml() {
-        assert!(
-            prelogin(b"<prelogin-response><status>Success</status></prelogin-response>").is_ok()
-        );
+        assert_eq!(prelogin(b"<prelogin-response><status>Success</status></prelogin-response>"), Ok(Prelogin::Password));
+        // "https://idp.example/sso?SAMLRequest=x"
+        let r = b"<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method><saml-request>aHR0cHM6Ly9pZHAuZXhhbXBsZS9zc28/U0FNTFJlcXVlc3Q9eA==</saml-request></prelogin-response>";
+        assert_eq!(prelogin(r), Ok(Prelogin::Saml { login: "https://idp.example/sso?SAMLRequest=x".into() }));
+        // "http://idp.example/" is refused: only HTTPS.
+        assert!(prelogin(b"<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method><saml-request>aHR0cDovL2lkcC5leGFtcGxlLw==</saml-request></prelogin-response>").is_err());
+        assert!(prelogin(b"<prelogin-response><status>Success</status><saml-auth-method>POST</saml-auth-method><saml-request>PGh0bWw+</saml-request></prelogin-response>").is_err());
         assert!(prelogin(b"<prelogin-response><status>Success</status><saml-request>opaque</saml-request></prelogin-response>").is_err());
+        assert!(prelogin(b"<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method><saml-request>!!</saml-request></prelogin-response>").is_err());
         assert!(prelogin(b"<prelogin-response><status>Success</status><status>Failure</status></prelogin-response>").is_err());
+    }
+
+    #[test]
+    fn base64_decodes_and_refuses_junk() {
+        assert_eq!(base64("aGk="), Some(b"hi".to_vec()));
+        assert_eq!(base64("aGk"), Some(b"hi".to_vec()));
+        assert_eq!(base64("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64("a=Gk"), None);
+        assert_eq!(base64("aGk*"), None);
+    }
+
+    #[test]
+    fn a_saml_token_signs_in_without_a_password() {
+        let (kind, user, token) = saml_token(b"prelogin-cookie\nalice@corp\nabc&123").unwrap();
+        assert_eq!((kind, user.as_str(), token.as_str()), (SamlKind::PreloginCookie, "alice@corp", "abc&123"));
+        let body = saml_sign_in("gp.example", "atrium", &user, kind, &token);
+        assert!(body.contains("user=alice%40corp&passwd=&prelogin-cookie=abc%26123&"), "{}", body.as_str());
+        assert_eq!(saml_token(b"portal-userauthcookie\nbob\nt").unwrap().0, SamlKind::PortalUserAuthCookie);
+        assert!(saml_token(b"cookie\nbob\nt").is_err());
+        assert!(saml_token(b"prelogin-cookie\n\nt").is_err());
+        assert!(saml_token(b"prelogin-cookie\nbob\n").is_err());
     }
 
     #[test]

@@ -1042,6 +1042,9 @@ pub mod host {
             VPN_FORM_CHANNEL.with(|s| s.replace(Some((child.clone(), embed))));
         }
         if !vpn { RESOURCE_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed)))); }
+        // A VPN page has no resource channel (its window answers none), but
+        // its security-key requests go to that window, which asks navigatord.
+        CREDENTIAL_CHANNEL.with(|slot| slot.replace(Some((child.clone(), embed))));
         let state = Box::new(SceneState { embed: Some((child, embed, surface)), vpn_page: vpn, mail_document: Some((location, bytes)), ..Default::default() });
         let (location, bytes) = state.mail_document.as_ref().unwrap();
         unsafe { *out_url = location.as_ptr(); *url_len = location.len(); *html = bytes.as_ptr(); *html_len = bytes.len(); }
@@ -1114,6 +1117,7 @@ pub mod host {
 
     type ResourceChannel = (std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64);
     thread_local! { static RESOURCE_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
+    thread_local! { static CREDENTIAL_CHANNEL: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
 
     use limen::sign_in::CredentialMessage;
     use std::cell::{Cell, RefCell};
@@ -1129,7 +1133,7 @@ pub mod host {
 
     fn emit_credential(message: CredentialMessage<'_>) -> Option<()> {
         let wire = message.encode()?;
-        RESOURCE_CHANNEL.with_borrow(|channel| {
+        CREDENTIAL_CHANNEL.with_borrow(|channel| {
             let (child, embed) = channel.as_ref()?;
             child.borrow_mut().emit(*embed, wire).ok()
         })
@@ -1186,7 +1190,7 @@ pub mod host {
         if start.elapsed() > std::time::Duration::from_secs(130) { navigator_get_abort(id); return -1; }
         let waiting = GET_REPLY.with_borrow(|reply| reply.is_none());
         if waiting {
-            let valid = RESOURCE_CHANNEL.with_borrow(|channel| {
+            let valid = CREDENTIAL_CHANNEL.with_borrow(|channel| {
                 let (child, embed) = channel.as_ref()?;
                 match child.borrow_mut().poll(std::time::Duration::from_millis(16)).ok()? {
                     Some(limen::proto::ChildEvent::Message { embed: from, bytes }) if from == *embed => take_credential_reply(&bytes).then_some(()),

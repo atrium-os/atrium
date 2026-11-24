@@ -202,7 +202,20 @@ pub enum Request {
     /// Like OpenWithIslands, also report a tier-two recording before Opened.
     OpenWithRecordingTier { id: u32, url: String, saved: Option<String>, jar: Jar, knows: bool, fresh: bool },
     SeekWidgetChapter { document: Ticket, start: Press, seconds_bits: u64 },
+    /// A VPN sign-in window's page asked for a security key or passkey
+    /// (`navigator.credentials.get` or `.create`, vpn.md §9.3a). `page`:
+    /// the `Open` whose `VpnDocument` that page is: navigatord takes the
+    /// origin from the document it delivered for it, never from the page
+    /// or the UI. `id`: the page's own request number. Only a VPN
+    /// window's navigatord answers, with `Credential`, one at a time.
+    Credential { page: u32, id: u32, registering: bool, options: String },
+    /// The page gave up on that request (or went): Sigillum's sheet closes.
+    CredentialAbort { id: u32 },
 }
+
+/// The longest WebAuthn options a `Credential` carries (the page's own
+/// bound is 32 KiB).
+pub const CREDENTIAL_OPTIONS_MAX: usize = 32 * 1024;
 
 /// Fixed provider document admitted by the I4 entry worker.
 pub const YOUTUBE_ENTRY: &str = "https://www.youtube-nocookie.com/embed/M7lc1UVf-VE";
@@ -370,6 +383,9 @@ pub enum Event {
     /// A sealed VPN document descriptor follows on the installed UI channel.
     VpnDocument { id: u32, url: String },
     WidgetMediaReady { document: Ticket, start: Press },
+    /// The answer to `Credential`: the assertion's or registration's JSON,
+    /// or the DOM error's name (`NotAllowedError`, `SecurityError`, ...).
+    Credential { id: u32, registering: bool, json: Option<String>, error: Option<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

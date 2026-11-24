@@ -166,7 +166,9 @@ impl Engine {
             if status != 200 {
                 return Err(refused("GlobalProtect prelogin failed"));
             }
-            gp::prelogin(&body).map_err(refused)?;
+            if let gp::Prelogin::Saml { login: url } = gp::prelogin(&body).map_err(refused)? {
+                return self.gp_saml(jar, login, url);
+            }
             let mut kept = false;
             let values = self.answers(&form, &mut kept)?;
             let user = gp_field(&values, "username")?;
@@ -204,6 +206,35 @@ impl Engine {
             }
         }
         Err(refused("GlobalProtect sign-in refused"))
+    }
+
+    /// SAML (vpn.md §9.3): the person signs in at the IdP in the
+    /// Navigator's VPN sign-in window; the portal's answer at the end
+    /// carries a token Arca's courier keeps for Crypta, never the page.
+    /// The engine takes it once and logs in with it instead of a password.
+    fn gp_saml(&mut self, jar: &mut Jar, login: &str, url: String) -> Result<(Zeroizing<Vec<u8>>, bool), Stop> {
+        let final_url = format!("https://{}:{}{}", self.st.host, self.st.gateway.port(), gp::SAML_ACS);
+        self.ctl.send(&FromEngine::Sso { login: url, final_url, token_cookie: gp::SAML_TOKEN.into() });
+        let done = self.ctl.wait(PROMPT_WAIT, |m| match m {
+            ToEngine::SsoDone(ok) => Some(*ok),
+            _ => None,
+        })?;
+        if done != Some(true) {
+            return Err(refused("single sign-on did not finish"));
+        }
+        let tok = self
+            .secrets
+            .value(&Line::new("sso"))
+            .map_err(|e| refused(&format!("the sign-on token could not be had from Arca: {e}")))?;
+        let (kind, user, token) = gp::saml_token(tok.as_bytes()).map_err(refused)?;
+        let body = gp::saml_sign_in(&self.st.host, &self.st.hostname, &user, kind, &token);
+        let (status, result) = self.gp_post(jar, login, &body)?;
+        match status {
+            200 if gp::challenge(&result).map_err(refused)?.is_none() => Ok((result, false)),
+            200 => Err(refused("GlobalProtect asked for a code after single sign-on")),
+            401 | 403 | 512 => Err(refused("the gateway did not accept the single sign-on")),
+            _ => Err(refused("GlobalProtect login failed")),
+        }
     }
 
     fn gp_discover(&mut self, jar: &mut Jar) -> Result<(), Stop> {

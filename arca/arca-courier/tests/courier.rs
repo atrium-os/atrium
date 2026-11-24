@@ -208,6 +208,38 @@ fn the_token_goes_only_into_tls_to_the_bound_host_and_cookies_go_to_arca() {
 }
 
 #[test]
+fn a_globalprotect_portals_saml_answer_goes_to_arca_never_to_the_page() {
+    let p = pki(&["gp.example"]);
+    let h: Handler = Arc::new(|req: &[u8]| {
+        let path = String::from_utf8_lossy(req).lines().next().unwrap_or("").to_string();
+        if path.contains("/headers") {
+            http("200 OK", &["saml-auth-status: 1", "saml-username: alice@corp", "prelogin-cookie: tok-0123456789abcdef"],
+                 b"<html><!-- <saml-auth-status>1</saml-auth-status><prelogin-cookie>tok-0123456789abcdef</prelogin-cookie> --></html>")
+        } else if path.contains("/comment") {
+            http("200 OK", &[], b"<html><!-- <saml-auth-status>1</saml-auth-status><saml-username>bob</saml-username><portal-userauthcookie>pua-abcdef0123456789</portal-userauthcookie> --></html>")
+        } else {
+            // Not signed in: nothing taken.
+            http("200 OK", &["prelogin-cookie: x"], b"<saml-auth-status>-1</saml-auth-status>")
+        }
+    });
+    let (at, _seen) = serve(&p, "gp.example", h);
+    let net = Net { map: HashMap::from([("gp.example".into(), at)]), lookups: Default::default() };
+    let mut c = Courier::new(ep("gp.example"), &net, tls(&p), LOOPBACK);
+    let mut v = vault();
+    let get = |path: &str| Request { method: Method::Get, path: path.as_bytes().to_vec(), query: vec![], headers: vec![], slots: vec![], body: vec![], ticket: None };
+    let Response::Http { headers, body, .. } = c.handle(&get("/headers").encode(), &mut v) else { panic!() };
+    assert!(headers.iter().all(|(k, _)| !["prelogin-cookie", "saml-username", "saml-auth-status"].contains(&k.as_str())), "{headers:?}");
+    assert!(!String::from_utf8_lossy(&body).contains("tok-0123456789abcdef"));
+    assert_eq!(v.cookies.pop(), Some(("gpSamlToken".into(), b"prelogin-cookie\nalice@corp\ntok-0123456789abcdef".to_vec(), vec![], "/headers".into())));
+    let Response::Http { body, .. } = c.handle(&get("/comment").encode(), &mut v) else { panic!() };
+    assert!(!String::from_utf8_lossy(&body).contains("pua-abcdef0123456789"));
+    assert_eq!(v.cookies.pop().map(|c| c.1), Some(b"portal-userauthcookie\nbob\npua-abcdef0123456789".to_vec()));
+    let Response::Http { headers, .. } = c.handle(&get("/failed").encode(), &mut v) else { panic!() };
+    assert!(v.cookies.is_empty());
+    assert!(headers.iter().any(|(k, _)| k == "prelogin-cookie"));
+}
+
+#[test]
 fn arcas_cookie_header_goes_after_tls_and_long_values_never_come_back() {
     let p = pki(&["api.example"]);
     let h: Handler = Arc::new(|req: &[u8]| {

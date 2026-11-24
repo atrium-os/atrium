@@ -56,6 +56,12 @@ fn main() {
         let ends = url::Url::parse(&page).ok().zip(url::Url::parse(fin).ok())
             .is_some_and(|(p, f)| p.host_str() == f.host_str() && p.port_or_known_default() == f.port_or_known_default() && p.path() == f.path());
         if ends {
+            // SIGN_IN_PROBE_DUMP: the final page as the page child gets it,
+            // for a gate to look into (what the page must never have).
+            if let Ok(path) = std::env::var("SIGN_IN_PROBE_DUMP") {
+                let got = navigator_control::redeem(page_sock, &ticket).unwrap_or_else(|e| stuck(format!("the page socket: {e}")));
+                std::fs::write(&path, &got.recording).unwrap_or_else(|e| stuck(format!("{path}: {e}")));
+            }
             println!("final {page}");
             return;
         }

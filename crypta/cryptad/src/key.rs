@@ -191,7 +191,7 @@ pub fn serve_vpn(socket: &str, name: &str, host: &str, access: &str) {
                 }
                 Line::new("ok")
             }
-            Some("sso") if durable => {
+            Some("sso") => {
                 // Used once: a sign-on token is not kept past its sign-in.
                 let r = find(socket, &sso, SSO_TOKEN).ok_or(status::DENIED).and_then(|i| {
                     let v = release(socket, &i);

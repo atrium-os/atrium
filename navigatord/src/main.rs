@@ -951,6 +951,25 @@ struct Strip {
     widget_document: Option<Ticket>,
     // A live page can be reshown after its redemption ticket has been spent.
     widget_records: std::collections::VecDeque<(Ticket, String, String)>,
+    /// The VPN sign-in documents delivered on this connection, by `Open`
+    /// id, newest last: a page's security-key request takes its origin
+    /// from here (vpn.md §9.3a).
+    vpn_documents: std::collections::VecDeque<(u32, String)>,
+}
+
+/// The WebAuthn origin of a delivered VPN document: https only.
+fn vpn_origin(url: &str) -> Option<sigillum_webauthn::Origin> {
+    let url = url::Url::parse(url).ok().filter(|u| u.scheme() == "https")?;
+    sigillum_webauthn::Origin::parse(&url.origin().ascii_serialization()).filter(|o| o.is_secure())
+}
+
+/// The connection's one security-key ceremony, retired when it goes.
+struct Ceremony(Arc<Mutex<Option<credential_get::Pending>>>);
+
+impl Drop for Ceremony {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
 }
 
 impl Strip {
@@ -1093,6 +1112,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
         }
     };
     let (mut trail_buf, mut trail_over): (Option<String>, bool) = (None, false);
+    let ceremony = Ceremony(Arc::new(Mutex::new(None)));
     let mut r = s;
     loop {
         let req: Request = match ctl::read_frame(&mut r) {
@@ -1278,6 +1298,56 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     Ok(n) => eprintln!("navigatord: the last page of {part} went: {n} session cookies ended"),
                     Err(e) => eprintln!("navigatord: ending the session of {part}: {e}"),
                 }
+            }
+            Request::Credential { page, id, registering, options } => {
+                let reply = |error: &str| send(&w, &Event::Credential { id, registering, json: None, error: Some(error.into()) });
+                if cfg.vpn.is_none() || options.len() > ctl::CREDENTIAL_OPTIONS_MAX {
+                    reply("NotAllowedError");
+                    continue;
+                }
+                let origin = strip.lock().unwrap().vpn_documents.iter().rev().find(|(p, _)| *p == page).and_then(|(_, url)| vpn_origin(url));
+                let Some(origin) = origin else {
+                    eprintln!("navigatord: a security-key request for a page this window wasn't given");
+                    reply("SecurityError");
+                    continue;
+                };
+                let mut slot = ceremony.0.lock().unwrap();
+                if slot.is_some() {
+                    drop(slot);
+                    reply("NotAllowedError");
+                    continue;
+                }
+                match credential_get::Pending::start(id, &origin, &options, registering) {
+                    Err(e) => {
+                        drop(slot);
+                        eprintln!("navigatord: the VPN page's security-key request was refused ({})", e.name());
+                        reply(e.name());
+                    }
+                    Ok(pending) => {
+                        eprintln!("navigatord: the VPN page asked for a security key ({}); Sigillum asks the person", if registering { "registering" } else { "signing in" });
+                        *slot = Some(pending);
+                        drop(slot);
+                        let (slot, w) = (ceremony.0.clone(), w.clone());
+                        std::thread::spawn(move || loop {
+                            std::thread::sleep(Duration::from_millis(50));
+                            let mut s = slot.lock().unwrap();
+                            let Some(result) = s.as_ref().filter(|p| p.id == id).map(|p| p.poll()) else { return };
+                            let Some(result) = result else { continue };
+                            s.take();
+                            drop(s);
+                            let (json, error) = match result {
+                                Ok(json) => (Some(json), None),
+                                Err(e) => (None, Some(e.name().to_string())),
+                            };
+                            eprintln!("navigatord: the security-key request {}", if json.is_some() { "was answered" } else { "failed" });
+                            send(&w, &Event::Credential { id, registering, json, error });
+                            return;
+                        });
+                    }
+                }
+            }
+            Request::CredentialAbort { id } => {
+                ceremony.0.lock().unwrap().take_if(|p| p.id == id);
             }
             Request::Accounts { url } => {
                 let reply = |accounts: Vec<ctl::Account>, why: Option<String>| send(&w, &Event::Accounts { url: url.clone(), accounts, why });
@@ -1465,6 +1535,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                 if !sources.is_empty() { send(&w, &Event::IslandSources { id, sources }); }
                             }
                             if let Some(html) = &p.vpn_document {
+                                {
+                                    let mut st = strip.lock().unwrap();
+                                    if st.vpn_documents.len() >= 16 { st.vpn_documents.pop_front(); }
+                                    st.vpn_documents.push_back((id, p.url.clone()));
+                                }
                                 let result = limen::fdpass::sealed_file("vpn-sign-in-document", html).and_then(|fd| {
                                     let socket = w.lock().unwrap();
                                     ctl::write_frame(&mut &*socket, &Event::VpnDocument { id, url: p.url.clone() })?;
@@ -2298,6 +2373,16 @@ mod tests {
         assert_eq!(about_of(&serde_json::json!({"answer": "error", "message": "x: not in the catalog"})), None);
         // No opifexd: no description, and no wait.
         assert_eq!(app_about(Path::new("/nonexistent/opifex.sock"), "org.example.photos"), None);
+    }
+
+    #[test]
+    fn a_vpn_pages_security_key_origin_is_its_delivered_documents_https_origin() {
+        let o = vpn_origin("https://idp.corp.example:8443/realms/x/login?y=1").expect("an https document");
+        assert!(o.rp_id(Some("corp.example")).is_ok(), "a registrable suffix of the document's host");
+        assert!(o.rp_id(Some("evil.example")).is_err(), "never another site");
+        assert!(vpn_origin("http://idp.corp.example/").is_none(), "never plain http");
+        assert!(vpn_origin("file:///etc/passwd").is_none());
+        assert!(vpn_origin("not a url").is_none());
     }
 
     #[test]

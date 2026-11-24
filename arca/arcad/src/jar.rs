@@ -30,6 +30,12 @@ pub const VPN_JAR: &str = "vpn-";
 /// of a SAML sign-in.
 pub const VPN_SSO_COOKIE: &str = "acSamlv2Token";
 
+/// What the courier files a GlobalProtect portal's SAML answer under (its
+/// `prelogin-cookie` or `portal-userauthcookie` response header, with
+/// `saml-username`, as `<kind>\n<user>\n<token>`): Crypta's, in a VPN
+/// sign-in window's jar, and refused anywhere else.
+pub const VPN_GP_TOKEN: &str = "gpSamlToken";
+
 /// The VPN profile whose sign-in jar `partition` is in, if it is one.
 pub fn vpn_profile(partition: &str) -> Option<String> {
     let (p, site) = partition.strip_prefix(VPN_JAR)?.split_once('.')?;

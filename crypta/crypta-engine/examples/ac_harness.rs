@@ -10,7 +10,10 @@
 //! tunnel and waits for the answer. It prints one line per event and ends
 //! `harness: ok` or `harness: FAIL why`. On FreeBSD, `--native-tun /dev/tunN`
 //! uses a configured point-to-point tun and the system ping. `--jid ID`
-//! attaches and drops privileges before starting the engine.
+//! attaches and drops privileges before starting the engine. `--sso
+//! KIND:USER:TOKEN` stands in for the sign-in window and Arca's courier: a
+//! single sign-on ends at once with that token (GlobalProtect's form,
+//! `<kind>\n<user>\n<token>`), handed out once.
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -75,12 +78,17 @@ fn main() {
     let mut key_pem: Option<String> = None;
     let mut gp = false;
     let mut portal = false;
+    let mut sso: Option<String> = None;
     let mut native_tun = None;
     let mut jid = None;
     let mut i = 5;
     while i < a.len() {
         match a[i].as_str() {
             "--gp" => gp = true,
+            "--sso" => {
+                sso = Some(a[i + 1].replacen(':', "\n", 2));
+                i += 1;
+            }
             "--gp-portal" => { gp = true; portal = true; },
             "--native-tun" => {
                 native_tun = Some(a[i + 1].clone());
@@ -169,12 +177,21 @@ fn main() {
     let held: Arc<Mutex<Vec<([u8; 16], String)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let (cookie, held, saved, key_pem) = (cookie.clone(), held.clone(), saved.clone(), key_pem.clone());
+        let mut sso = sso.clone();
         let mut w = sec.try_clone().unwrap();
         std::thread::spawn(move || {
             for l in BufReader::new(sec).lines() {
                 let Ok(l) = l else { return };
                 let Some(r) = Line::parse(&l) else { return };
                 let ans = match r.verb.as_str() {
+                    // Used once, as Crypta's helper hands it out.
+                    "sso" => match sso.take() {
+                        Some(v) => {
+                            println!("secrets: sign-on token taken");
+                            Line::new("ok").with_hex("value", v.as_bytes())
+                        }
+                        None => Line::new("error").with("status", 1),
+                    },
                     "saved" => match &saved {
                         Some(p) => Line::new("ok").with_hex("value", p.as_bytes()),
                         None => Line::new("error").with("status", 1),
@@ -343,6 +360,10 @@ fn main() {
                             return;
                         }
                     }
+                }
+                FromEngine::Sso { login, final_url, token_cookie } => {
+                    println!("sso: login={login} final={final_url} cookie={token_cookie}");
+                    engine::write(&mut c, &ToEngine::SsoDone(true)).unwrap();
                 }
                 FromEngine::Down { why } => println!("down: {why}"),
                 FromEngine::Refused { why } => {

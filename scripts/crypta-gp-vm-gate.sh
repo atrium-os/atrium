@@ -15,13 +15,19 @@ pin=$3
 if [ ! -d "$headers/usr/include" ]; then
     headers="$HOME/src/bsd/$(basename "$headers")"
 fi
+mode=${4:-}
 (
     cd "$ROOT/crypta"
     tool_suffix=$(printf %s "$target" | tr - _)
     llvm=${CRYPTA_LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
-    env "CC_$tool_suffix=$llvm/clang" "AR_$tool_suffix=$llvm/llvm-ar" \
-        "CFLAGS_$tool_suffix=--sysroot=$headers" \
-        cargo build --offline --target "$target" -p crypta-engine --bin atrium-crypta-ac --example ac_harness
+    if [ -n "${CROSS_RUSTFLAGS:-}" ]; then
+        # A cloud session (scripts/cloud-vm.sh env): its sysroot's link args.
+        RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --target "$target" -p crypta-engine --bin atrium-crypta-ac --example ac_harness
+    else
+        env "CC_$tool_suffix=$llvm/clang" "AR_$tool_suffix=$llvm/llvm-ar" \
+            "CFLAGS_$tool_suffix=--sysroot=$headers" \
+            cargo build --offline --target "$target" -p crypta-engine --bin atrium-crypta-ac --example ac_harness
+    fi
 )
 V="$ROOT/scripts/vssh"
 guest=$(sh "$V" 'mktemp -d /tmp/crypta-gp-XXXXXXXX')
@@ -37,11 +43,12 @@ bin="$ROOT/crypta/target/$target/debug"
 scp -i "$HOME/.ssh/fresco_bsd_ed25519" -P 2222 -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
     "$bin/atrium-crypta-ac" "$bin/examples/ac_harness" "root@localhost:$guest/"
-sh "$V" "sh -s -- '$guest' '$port' '$pin'" <<'GUEST'
+sh "$V" "sh -s -- '$guest' '$port' '$pin' '$mode'" <<'GUEST'
 set -eu
 guest=$1
 port=$2
 pin=$3
+mode=$4
 name=${guest##*/}
 jail_id=
 tun=
@@ -54,7 +61,15 @@ chmod 755 "$guest"
 tun=$(ifconfig tun create)
 ifconfig "$tun" inet 10.77.0.2 10.77.0.1 netmask 255.255.255.255 up
 jail_id=$(jail -i -c "name=$name" path=/ "host.hostname=$name" ip4=inherit ip6=disable persist)
-HARNESS_REBIND=1 "$guest/ac_harness" "$guest/atrium-crypta-ac" 10.0.2.2 "10.0.2.2:$port" /dev/null \
-    --gp --pin "$pin" --native-tun "/dev/$tun" --jid "$jail_id" --ping 10.77.0.1 \
-    username=alice 'password=@held:a&+ b'
+if [ "$mode" = saml ]; then
+    # SAML: the sign-in window and Arca's courier stood in for by the token
+    # the peer will take, once.
+    "$guest/ac_harness" "$guest/atrium-crypta-ac" 10.0.2.2 "10.0.2.2:$port" /dev/null \
+        --gp --pin "$pin" --native-tun "/dev/$tun" --jid "$jail_id" --ping 10.77.0.1 \
+        --sso 'prelogin-cookie:alice@corp:saml-fixture-token&1'
+else
+    HARNESS_REBIND=1 "$guest/ac_harness" "$guest/atrium-crypta-ac" 10.0.2.2 "10.0.2.2:$port" /dev/null \
+        --gp --pin "$pin" --native-tun "/dev/$tun" --jid "$jail_id" --ping 10.77.0.1 \
+        username=alice 'password=@held:a&+ b'
+fi
 GUEST

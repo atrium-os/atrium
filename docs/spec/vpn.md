@@ -846,7 +846,8 @@ another origin. An active portal-profile session stays in engine memory.
   checks Arca for persisted credentials. The peer verifies that portal
   credentials, cookies and tokens stay at the portal. A single gateway login
   carries IPv4 echo before and after rebind, followed by logout.
-  Scripted SSO and passkeys remain parked pending Navigator I3.
+  Scripted SSO and passkeys were parked pending Navigator I3; see the
+  2026-11-24 slice below.
 - HIP submits a host-info XML report when the gateway requests it. Settings
   shows the destination, VPN user, profile hostname, the assigned IPv4
   address, the kernel's actual OS and release, and the Atrium client name.
@@ -1217,6 +1218,59 @@ another origin. An active portal-profile session stays in engine memory.
   FreeBSD arm64 gates passed 9/9 and OpenConnect 9.21 carried ESP echo.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
+
+**GlobalProtect SAML and security keys (2026-11-24).** Resumed once
+Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
+
+- *GlobalProtect SAML, REDIRECT binding.* A prelogin answering
+  `saml-auth-method` REDIRECT with a base64 `saml-request` (an https URL of at
+  most 8 KiB, no spaces or control bytes) makes the engine ask cryptad for
+  single sign-on (`Sso` with the IdP's address, the portal's or gateway's
+  `/SAML20/SP/ACS` as the final address, and token name `gpSamlToken`), the
+  same window and jar as AnyConnect's. The portal's ACS answer carries
+  `saml-auth-status`, `saml-username` and `prelogin-cookie` or
+  `portal-userauthcookie`, as headers or in an HTML comment. The courier
+  takes them (status 1, a user and a token, each printable and at most 4 KiB),
+  files `<kind>\n<user>\n<token>` with arcad as cookie `gpSamlToken`, masks
+  the token in the body and drops the headers, so the page sees the answer
+  page but never the token. arcad accepts that name only in a VPN partition
+  and files it as Crypta's item `<profile>/sso@<host>`; outside one it is
+  refused. The engine takes it once and logs in with `user`, the token in its
+  own field and an empty `passwd`; a challenge or a refusal after a SAML login
+  is a failed sign-in, never a password prompt. Portal engines take the item
+  too.
+- *Not yet:* the POST binding (`saml-auth-method` POST, an HTML form to
+  post) is refused with a clear error. With a SAML portal, the chosen
+  gateway runs its own SAML again (a second window; the IdP's session in the
+  jar makes it a click, not a password); `portal-userauthcookie` is not
+  carried from portal to gateway.
+- *Security keys and passkeys in the sign-in window.* The VPN window's page
+  (the Ladybird mail-page worker in role `vpn-sign-in-page`) now has a
+  credential channel to its window, so `navigator.credentials.get` and
+  `.create` send `limen::sign_in` `Get`/`Create`/`Abort` to navigator-ui.
+  navigator-ui forwards them, one at a time and only from a page it gave a
+  VPN document, as `Request::Credential { page, id, registering, options }`
+  (options at most 32 KiB) and `CredentialAbort`. navigatord answers only in
+  VPN mode: it takes the origin from the document it delivered for that
+  `Open` (https only, never from the page or the UI), checks the RP ID
+  against it, and runs the ceremony with Sigillum (`credential_get::Pending`,
+  the mail sheet's path), so the person touches the key or uses the
+  fingerprint or Windows Hello passkey in Sigillum's own sheet. The answer
+  goes back as `Event::Credential` and on to the page. A page that goes, or
+  a window that closes, retires the ceremony.
+- *Checks.* `scripts/crypta-v4-gate.sh run` now 67 checks on the amd64
+  VM: the V4 ones plus GlobalProtect SAML through the window against
+  Keycloak (the stand-in serves a GlobalProtect portal front: prelogin
+  REDIRECT, ACS checked with xmlsec1, a token checked once with an empty
+  password): the window reaches the portal's ACS, the portal mints a token,
+  the engine logs in with it once and no password, the token goes courier →
+  Arca → engine, the page gets the answer page, and the token is in no log
+  and never in the window. `scripts/crypta-gp-packet-check.py --saml` (host,
+  or `--vm`) checks the engine half against the GlobalProtect peer. Host
+  tests for the parser, arcad's filing, the courier's capture, navigatord's
+  origin rule, navigator-control and navigator-ui pass. The security-key
+  path in the installed window (Ladybird page, Sigillum's sheet) needs the
+  Mac build and VM and is not yet run.
 
 ### Questions for Shankar
 

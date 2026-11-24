@@ -21,6 +21,20 @@ ocserv 1.2.4 has no SAML, so this stands in front of it:
 - Anything else (CONNECT, a resumed session's requests) is carried to
   ocserv as it is: the tunnel is ocserv's.
 
+It is also a GlobalProtect portal's SAML front, for the window's half of
+GlobalProtect SAML (the tunnel's half is crypta-gp-packet-check.py --saml):
+
+- `/global-protect/prelogin.esp` and `/ssl-vpn/prelogin.esp` answer with
+  `saml-auth-method` REDIRECT and the IdP's address (AuthnRequest with our
+  `/SAML20/SP/ACS`).
+- `/SAML20/SP/ACS` checks the SAMLResponse the same way and answers the
+  minted token as PAN does: `saml-auth-status`, `saml-username` and
+  `prelogin-cookie` headers, and the same in an HTML comment.
+- `/ssl-vpn/login.esp` (and the portal's getconfig) takes `user` and
+  `prelogin-cookie`: a token we minted for that subject in the last two
+  minutes, used once (`gp_token_ok`, `gp_token_refused`). What follows the
+  login is not served (404).
+
 Usage: crypta-sso-standin.py LISTEN_PORT CERT KEY PUBLIC_BASE IDP_SSO_URL
          BACKEND_PORT BACKEND_CA [IDP_CERT_PEM]
   PUBLIC_BASE   e.g. https://sso.crypta.test:447 (our own address)
@@ -54,15 +68,19 @@ ENTITY = PUBLIC + "/+CSCOE+/saml/sp/metadata"
 ACS = PUBLIC + "/+CSCOE+/saml/sp/acs"
 LOGIN = PUBLIC + "/+CSCOE+/saml/sp/login"
 FINAL = PUBLIC + "/+CSCOE+/saml_ac_login.html"
+GP_ACS = PUBLIC + "/SAML20/SP/ACS"
 # The ocserv account each IdP subject signs in as (ocserv's own gate users).
 ACCOUNTS = {"alice": ("alice", "alice-pw", "Staff")}
 
 lock = threading.Lock()
 tokens = {}   # token -> (subject, minted at)
-pending = {}  # AuthnRequest id -> time
+gp_tokens = {}  # GlobalProtect prelogin-cookie -> (subject, minted at)
+gp_minted = []  # every GlobalProtect token, for the gate to look for in logs
+pending = {}  # AuthnRequest id -> the ACS it names
 stats = dict.fromkeys((
     "init", "sso_login", "script_delivered", "script_posts", "script_accepted",
     "acs_ok", "acs_refused", "token_ok", "token_refused", "proxied",
+    "gp_prelogin", "gp_acs_ok", "gp_acs_refused", "gp_token_ok", "gp_token_refused",
 ), 0)
 
 
@@ -181,24 +199,24 @@ def sso_request():
         "<sso-v2-token-cookie-name>acSamlv2Token</sso-v2-token-cookie-name><form></form></auth>")
 
 
-def authn_request():
+def authn_request(acs=ACS):
     rid = "_" + uuid.uuid4().hex
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     x = (f'<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" '
-         f'ID="{rid}" Version="2.0" IssueInstant="{now}" Destination="{IDP_SSO}" AssertionConsumerServiceURL="{ACS}" '
+         f'ID="{rid}" Version="2.0" IssueInstant="{now}" Destination="{IDP_SSO}" AssertionConsumerServiceURL="{acs}" '
          f'ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"><saml:Issuer>{ENTITY}</saml:Issuer>'
          '<samlp:NameIDPolicy Format="urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified" AllowCreate="true"/></samlp:AuthnRequest>')
     c = zlib.compressobj(9, zlib.DEFLATED, -15)
     d = c.compress(x.encode()) + c.flush()
     with lock:
-        pending[rid] = time.time()
+        pending[rid] = acs
     return IDP_SSO + "?" + urllib.parse.urlencode({"SAMLRequest": base64.b64encode(d).decode(), "RelayState": "sso"})
 
 
 NS = {"p": "urn:oasis:names:tc:SAML:2.0:protocol", "a": "urn:oasis:names:tc:SAML:2.0:assertion"}
 
 
-def check_response(b64):
+def check_response(b64, acs=ACS):
     """The subject of a SAMLResponse we asked for, or why not."""
     raw = base64.b64decode(b64)
     x = ET.fromstring(raw)
@@ -225,11 +243,11 @@ def check_response(b64):
     st = x.find("p:Status/p:StatusCode", NS)
     if st is None or not st.get("Value", "").endswith(":Success"):
         return None, "status " + (st.get("Value") if st is not None else "?")
-    if x.get("Destination") != ACS:
+    if x.get("Destination") != acs:
         return None, "destination " + str(x.get("Destination"))
     irt = x.get("InResponseTo")
     with lock:
-        if not irt or pending.pop(irt, None) is None:
+        if not irt or pending.pop(irt, None) != acs:
             return None, "not a request of ours"
     a = x.find("a:Assertion", NS)
     if a is None:
@@ -238,7 +256,7 @@ def check_response(b64):
     if ENTITY not in aud:
         return None, f"audience {aud}"
     sc = a.find("a:Subject/a:SubjectConfirmation/a:SubjectConfirmationData", NS)
-    if sc is None or sc.get("Recipient") != ACS:
+    if sc is None or sc.get("Recipient") != acs:
         return None, "recipient"
     na = sc.get("NotOnOrAfter")
     if na and datetime.datetime.fromisoformat(na.replace("Z", "+00:00")) < datetime.datetime.now(datetime.timezone.utc):
@@ -341,6 +359,10 @@ def serve(sock, peer):
                 return
             method, target, headers, head, body = r
             path = target.split("?")[0]
+            if path == "/gp-minted" and peer[0] == "127.0.0.1" and method == "GET":
+                with lock:
+                    respond(f, "200 OK", body="\n".join(gp_minted).encode(), ctype="text/plain")
+                continue
             if path == "/stats" and peer[0] == "127.0.0.1" and method == "GET":
                 with lock:
                     respond(f, "200 OK", body=json.dumps(stats).encode(), ctype="application/json")
@@ -397,6 +419,55 @@ def serve(sock, peer):
                 bump("acs_ok")
                 log(f"acs: {subject} signed on; token minted")
                 respond(f, "303 See Other", [("Set-Cookie", f"acSamlv2Token={tok}; Path=/; Secure; HttpOnly"), ("Location", FINAL)])
+                continue
+            if path in ("/global-protect/prelogin.esp", "/ssl-vpn/prelogin.esp"):
+                bump("gp_prelogin")
+                req = base64.b64encode(authn_request(GP_ACS).encode()).decode()
+                respond(f, "200 OK", body=("<prelogin-response><status>Success</status><saml-auth-method>REDIRECT</saml-auth-method>"
+                                           f"<saml-request>{req}</saml-request></prelogin-response>").encode(), ctype="application/xml")
+                continue
+            if method == "POST" and path == "/SAML20/SP/ACS":
+                form = urllib.parse.parse_qs(body.decode())
+                subject, why = (None, "no SAMLResponse")
+                if "SAMLResponse" in form:
+                    try:
+                        subject, why = check_response(form["SAMLResponse"][0], GP_ACS)
+                    except Exception as e:  # noqa: BLE001 - a stand-in says why
+                        subject, why = None, f"unreadable: {e}"
+                if not subject or subject not in ACCOUNTS:
+                    bump("gp_acs_refused")
+                    log(f"gp acs refused: {why or subject}")
+                    respond(f, "403 Forbidden", body=f"Sign-in refused: {why or 'unknown subject'}".encode())
+                    continue
+                tok = secrets.token_hex(24)
+                with lock:
+                    gp_tokens[tok] = (subject, time.time())
+                    gp_minted.append(tok)
+                bump("gp_acs_ok")
+                log(f"gp acs: {subject} signed on; token minted")
+                respond(f, "200 OK", [("saml-auth-status", "1"), ("saml-username", subject), ("prelogin-cookie", tok)],
+                        (f"<html><!-- <saml-auth-status>1</saml-auth-status><saml-username>{subject}</saml-username>"
+                         f"<prelogin-cookie>{tok}</prelogin-cookie> --><body>Signed in. You can close this window.</body></html>").encode())
+                continue
+            if method == "POST" and path in ("/ssl-vpn/login.esp", "/global-protect/getconfig.esp"):
+                form = urllib.parse.parse_qs(body.decode())
+                tok, user = form.get("prelogin-cookie", [""])[0], form.get("user", [""])[0]
+                with lock:
+                    got = gp_tokens.pop(tok, None)
+                if not got or got[0] != user or time.time() - got[1] > 120 or form.get("passwd", [""]) != [""]:
+                    bump("gp_token_refused")
+                    log("gp token refused")
+                    respond(f, "512 Custom Error", body=b"Invalid username or password")
+                    continue
+                bump("gp_token_ok")
+                log(f"gp token taken for {user}")
+                args = ["", "gp-session-" + secrets.token_hex(8), "fixture", "office", user, "saml", "vsys", "corp",
+                        "", "", "", "", "tunnel", "-1", "4100", "10.77.0.2"]
+                respond(f, "200 OK", body=("<jnlp><application-desc>" + "".join(f"<argument>{a}</argument>" for a in args)
+                                           + "</application-desc></jnlp>").encode(), ctype="application/xml")
+                continue
+            if path.startswith(("/ssl-vpn/", "/global-protect/")):
+                respond(f, "404 Not Found", body=b"not served by the stand-in")
                 continue
             if method == "GET" and path == "/+CSCOE+/saml_ac_login.html":
                 respond(f, "200 OK", body=b"<!doctype html><title>Signed in</title><p>You are signed in. You can close this window.</p>")

@@ -146,7 +146,40 @@ nav_window() { # $1 profile, $2 login, $3 final; prints the probe's lines
         i=0; while [ \$i -lt 30 ] && ! test -S $NV/nav.sock; do sleep 1; i=\$((i+1)); done
         test -S $NV/nav.sock || { echo \"stuck navigatord: \$(cat $NV/navigatord.log)\"; exit 1; }" || return 0
     h=$("$V" "su -m cg-ui -c '$G/arca-probe $G/arcad.sock hold alice $NAVPUB org.atrium.navigator alice-sso-pw'" | sed -n 's/^status=0 body=//p')
-    "$V" "su -m cg-nav -c '$G/sign-in-probe $NV/nav.sock $NV/page.sock \"$2\" \"$3\" alice $h'" 2>&1 || true
+    "$V" "su -m cg-nav -c 'env SIGN_IN_PROBE_DUMP=$NV/final.page $G/sign-in-probe $NV/nav.sock $NV/page.sock \"$2\" \"$3\" alice $h'" 2>&1 || true
+}
+
+# GlobalProtect SAML (vpn.md §9.3): the portal's answer at the end of the
+# window carries the token as PAN does (headers and an HTML comment); Arca's
+# courier keeps it for Crypta, the page never has it, and the engine logs in
+# with it once instead of a password. The stand-in serves no tunnel after
+# the login (crypta-gp-packet-check.py --saml carries one).
+st() { curl -sk https://127.0.0.1:8447/stats | sed -n "s/.*\"$1\": \([0-9]*\).*/\1/p"; }
+gp_window_checks() {
+    a0=$(st gp_acs_ok); t0=$(st gp_token_ok)
+    "$V" "$CTL create-gp name=gps host=sso.crypta.test:447 ca=$CA scoped=0" >/dev/null || fail "create-gp gps"
+    "$V" "$CTL up name=gps" >/dev/null
+    wait_for gps signin sso "GlobalProtect asked for no single sign-on"
+    pr=$("$V" "$CTL prompt name=gps")
+    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    fin=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="final")print a[2]}}')")
+    cookie=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="cookie")print a[2]}}')")
+    case "$login $fin $cookie" in
+        "https://idp.crypta.test:448/"*" https://sso.crypta.test:447/SAML20/SP/ACS gpSamlToken") ok "GlobalProtect's prelogin asks for SAML: the IdP's address, the portal's ACS" ;;
+        *) fail "GlobalProtect SSO prompt: $login $fin $cookie" ;;
+    esac
+    r=$(nav_window gps "$login" "$fin")
+    echo "$r" | cut -c1-200 | sed 's/^/     /'
+    echo "$r" | grep -q "^final https://sso.crypta.test:447/SAML20/SP/ACS" && ok "the window reached the portal's ACS (Keycloak's session from the jar)" || fail "GlobalProtect window: $r"
+    [ "$(st gp_acs_ok)" = $((a0 + 1)) ] && ok "the portal checked Keycloak's signed answer and minted a token" || fail "GlobalProtect ACS: $(curl -sk https://127.0.0.1:8447/stats)"
+    i=0; until [ "$(st gp_token_ok)" = $((t0 + 1)) ]; do i=$((i + 1)); [ $i -lt 60 ] || fail "the engine never logged in with the token: $("$V" "tail -5 $G/cryptad.log")"; sleep 1; done
+    ok "the engine logged in with the window's token once, with no password"
+    "$V" "grep -q 'gps: signed on; the gateway.s token is in Arca' $G/cryptad.log" && ok "the token went from the courier to Arca to the engine" || fail "no sign-on in cryptad's log"
+    tok=$(curl -sk https://127.0.0.1:8447/gp-minted | tail -1)
+    [ ${#tok} = 48 ] || fail "no minted token to look for"
+    "$V" "grep -q 'You can close this window' $NV/final.page" && ok "the page got the portal's answer page" || fail "no final page kept: $("$V" "ls -l $NV")"
+    "$V" "grep -rqs '$tok' $NV $G/cryptad.log $G/courierd.log $G/arcad.log" && fail "the GlobalProtect token is in the window's files or a log" || ok "the token is in no log and the window never had it"
+    "$V" "$CTL down name=gps; $CTL delete name=gps" >/dev/null || true
 }
 
 window_checks() {
@@ -197,7 +230,6 @@ window_checks() {
     echo "$r" | grep -q 'password=<arca>' && ok "after removing the profile, Keycloak asks for the password again: its session went with the jar" || fail "after removal: $r"
     wait_for win handshake 1 "not signed on after removal"
     "$V" "$CTL down name=win" >/dev/null
-    "$V" "pkill -f 'navigatord --unconfined'; pkill -x arca-courierd" || true
 }
 
 # arcad (alice's store unlocked, the Navigator's broker and a web courier
@@ -387,6 +419,8 @@ run)
     echo "== the sign-in window: navigatord, Arca's couriers, Keycloak"
     if nc -z 127.0.0.1 8447 2>/dev/null && nc -z 127.0.0.1 8448 2>/dev/null; then
         window_checks
+        gp_window_checks
+        "$V" "pkill -f 'navigatord --unconfined'; pkill -x arca-courierd" || true
     else
         echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"
     fi

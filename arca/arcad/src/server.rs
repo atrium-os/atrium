@@ -2603,11 +2603,15 @@ impl State {
                 }
                 // A VPN sign-in window's jar (vpn.md §9.3, SAML): the
                 // gateway's sign-on token is Crypta's, never the page's.
-                if let Some(profile) = partition.as_deref().and_then(crate::jar::vpn_profile) {
-                    if name == crate::jar::VPN_SSO_COOKIE {
+                let vpn = partition.as_deref().and_then(crate::jar::vpn_profile);
+                if let Some(profile) = vpn.as_ref() {
+                    if name == crate::jar::VPN_SSO_COOKIE || name == crate::jar::VPN_GP_TOKEN {
                         let (host, value) = (host.clone(), value.to_vec());
-                        return self.vpn_token(&profile, &host, &value, item);
+                        return self.vpn_token(profile, &host, &value, item);
                     }
+                }
+                if name == crate::jar::VPN_GP_TOKEN {
+                    return reply(status::DENIED);
                 }
                 let now = (self.clock)();
                 let sc = match crate::cookie::parse(name, value, attrs, host, path, now) {

@@ -404,7 +404,15 @@ fn scrub(
     ticket: Option<&[u8; 16]>,
     vault: &mut dyn Vault,
 ) -> Response {
-    let navigator_fetch::http::Response { status, headers, mut body } = resp;
+    let navigator_fetch::http::Response { status, mut headers, mut body } = resp;
+    // A GlobalProtect portal's SAML answer (vpn.md §9.3): its token goes to
+    // Arca (kept for Crypta only in a VPN sign-in window's jar, refused
+    // anywhere else), never to the client, as a header or in the page.
+    if let Some((value, token)) = gp_saml_token(&headers, &body) {
+        vault.set_cookie(GP_SAML_TOKEN, value.as_bytes(), b"", path, ticket);
+        mask(&mut body, token.as_bytes());
+        headers.retain(|(k, _)| !GP_SAML_HEADERS.contains(&k.as_str()));
+    }
     let mut out = Vec::with_capacity(headers.len());
     for (k, v) in headers {
         if k == "set-cookie" {
@@ -439,6 +447,39 @@ fn scrub(
     }
     mask_body(&mut body, values, cookie);
     Response::Http { status, headers: out, body }
+}
+
+/// arcad's `jar::VPN_GP_TOKEN`.
+const GP_SAML_TOKEN: &str = "gpSamlToken";
+const GP_SAML_HEADERS: [&str; 4] = ["prelogin-cookie", "portal-userauthcookie", "saml-username", "saml-auth-status"];
+const GP_SAML_MAX: usize = 4096;
+
+/// A GlobalProtect portal's answer at the end of a SAML sign-in: its
+/// `prelogin-cookie` (or `portal-userauthcookie`) and `saml-username`, as
+/// response headers or as the same-named elements in the page (PAN puts
+/// them in an HTML comment), with `saml-auth-status` 1. As Arca files it:
+/// `<kind>\n<user>\n<token>`, and the token alone.
+fn gp_saml_token(headers: &[(String, String)], body: &[u8]) -> Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)> {
+    let header = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.trim().to_string());
+    let element = |n: &str| {
+        let text = std::str::from_utf8(body).ok()?;
+        let (open, close) = (format!("<{n}>"), format!("</{n}>"));
+        let start = text.find(&open)? + open.len();
+        let end = start + text[start..].find(&close)?;
+        Some(text[start..end].trim().to_string())
+    };
+    let field = |n: &str| header(n).filter(|v| !v.is_empty()).or_else(|| element(n).filter(|v| !v.is_empty()));
+    if field("saml-auth-status").as_deref() != Some("1") {
+        return None;
+    }
+    let (kind, token) = ["prelogin-cookie", "portal-userauthcookie"].into_iter().find_map(|k| field(k).map(|t| (k, t)))?;
+    let user = field("saml-username")?;
+    let ok = |v: &str| v.len() <= GP_SAML_MAX && v.bytes().all(|b| (b' '..0x7f).contains(&b));
+    if !ok(&token) || !ok(&user) {
+        return None;
+    }
+    let value = zeroize::Zeroizing::new(format!("{kind}\n{user}\n{token}"));
+    Some((value, zeroize::Zeroizing::new(token)))
 }
 
 /// The filled values and the cookies sent, out of a body (as sent, form

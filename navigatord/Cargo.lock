@@ -172,6 +172,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "zeroize",
 ]
 
 [[package]]

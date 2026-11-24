@@ -214,7 +214,11 @@ class EspPeer:
             self.errors.append(error)
 
 
-def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None, hip=None, receipts=None):
+SAML_LOGIN = "https://idp.crypta.test/sso?SAMLRequest=fixture"
+SAML_TOKEN = "saml-fixture-token&1"
+
+
+def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None, hip=None, receipts=None, saml=False):
     done = threading.Event()
     workers = []
 
@@ -248,9 +252,15 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             assert parsed.path == "/global-protect/prelogin.esp"
                             extra = "Set-Cookie: portal_only=portal-marker; Path=/; Secure; HttpOnly\r\n"
                         assert (query or fields)["clientos"] == ["Linux"]
-                        body = ("<prelogin-response><status>Success</status>"
-                                "<username-label>Username</username-label>"
-                                "<password-label>Password</password-label></prelogin-response>")
+                        if saml:
+                            request = base64.b64encode(SAML_LOGIN.encode()).decode()
+                            body = ("<prelogin-response><status>Success</status>"
+                                    "<saml-auth-method>REDIRECT</saml-auth-method>"
+                                    f"<saml-request>{request}</saml-request></prelogin-response>")
+                        else:
+                            body = ("<prelogin-response><status>Success</status>"
+                                    "<username-label>Username</username-label>"
+                                    "<password-label>Password</password-label></prelogin-response>")
                     elif portal:
                         assert parsed.path == "/global-protect/getconfig.esp"
                         assert fields.get("user") == ["portal-alice"] and fields.get("passwd") == ["portal-secret"]
@@ -258,6 +268,16 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         body = ('<policy><gateways><external><list>'
                                 '<entry name="198.51.100.52:449"><description>Fixture gateway</description></entry>'
                                 '</list></external></gateways><portal-userauthcookie>portal-token</portal-userauthcookie></policy>')
+                    elif path == "login.esp" and saml:
+                        # The token SAML gave, once, and no password.
+                        assert fields["user"] == ["alice@corp"], fields
+                        assert fields.get("passwd", [""]) == [""] and fields["prelogin-cookie"] == [SAML_TOKEN], fields
+                        assert calls.count("login.esp") == 1, "the SAML token was used twice"
+                        args = ["", COOKIE, "fixture", "office", "alice@corp", "saml", "vsys", "corp",
+                                "", "", "", "", "tunnel", "-1", "4100", "10.77.0.2"]
+                        body = ("<jnlp><application-desc>"
+                                + "".join(f"<argument>{a}</argument>" for a in args)
+                                + "</application-desc></jnlp>")
                     elif path == "login.esp":
                         assert fields["user"] == ["alice"] and fields["passwd"] == [PASSWORD]
                         args = ["", COOKIE, "fixture", "office", "alice", "ldap", "vsys", "corp",
@@ -496,7 +516,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "ssl-tunnel-connect.sslvpn":
                         if hip in RECONNECT_HIP:
                             require_reconnect_approval(receipts, calls.count("getconfig.esp") - 1)
-                        assert query == {"user": ["alice"], "authcookie": [COOKIE]}
+                        assert query == {"user": ["alice@corp" if saml else "alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
                         return
                     elif path == "logout.esp":
@@ -602,6 +622,8 @@ def main():
     group.add_argument("--full-vm", choices=["arm64", "amd64"])
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
+    parser.add_argument("--saml", action="store_true",
+                        help="with --vm: the gateway asks for SAML; the harness hands over the token Arca would")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
     parser.add_argument("--drop-esp-after-initial", action="store_true",
                         help="use ESP initially and force TLS fallback on later Tessera connections")
@@ -621,6 +643,8 @@ def main():
     if outages and (args.hip != "tessera-cycle" or args.drop_esp):
         parser.error("staged ESP outages require --hip tessera-cycle")
     drop_config_indices = outages[0] if outages else frozenset()
+    if args.saml and (args.full_vm or args.portal_vm or args.openconnect or args.hip or args.esp or args.drop_esp):
+        parser.error("--saml goes with the host client or --vm")
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
@@ -669,7 +693,7 @@ def main():
             calls, errors = [], []
             if receipts:
                 receipts.touch()
-            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts}, daemon=True)
+            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts, "saml": args.saml}, daemon=True)
             thread.start()
             if args.openconnect:
                 marker = tmp / "reply"
@@ -700,23 +724,37 @@ def main():
                                 ("TLS" if args.drop_esp else "ESP") if esp else "", args.hip or "", str(receipts or "")],
                                check=True, timeout=full_vm_timeout)
             elif args.vm:
-                subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
+                subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin, "saml" if args.saml else ""],
                                check=True, timeout=110)
             else:
                 target = ROOT / "crypta/target/debug"
-                result = subprocess.run(
-                    [target / "examples/ac_harness", target / "atrium-crypta-ac", "localhost",
-                     f"127.0.0.1:{port}", cert, "--gp", "--pin", pin, "--ping", "10.77.0.1",
-                     "username=alice", f"password=@held:{PASSWORD}"],
-                    env={**os.environ, "HARNESS_REBIND": "1"}, check=True, timeout=25,
-                    capture_output=True, text=True,
-                )
+                sign_in = ([f"--sso", f"prelogin-cookie:alice@corp:{SAML_TOKEN}"] if args.saml
+                           else ["username=alice", f"password=@held:{PASSWORD}"])
+                try:
+                    result = subprocess.run(
+                        [target / "examples/ac_harness", target / "atrium-crypta-ac", "localhost",
+                         f"127.0.0.1:{port}", cert, "--gp", "--pin", pin, "--ping", "10.77.0.1", *sign_in],
+                        env={**os.environ, **({} if args.saml else {"HARNESS_REBIND": "1"})}, check=True, timeout=25,
+                        capture_output=True, text=True,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    print(e.stdout, e.stderr, calls, errors, sep="\n")
+                    raise
                 print(result.stdout, result.stderr, sep="")
                 assert "harness: ok" in result.stdout
-                assert result.stdout.count("echo reply from 10.77.0.1") == 2
+                if args.saml:
+                    assert f"sso: login={SAML_LOGIN} final=https://localhost:{port}/SAML20/SP/ACS cookie=gpSamlToken" in result.stdout, result.stdout
+                    assert "secrets: sign-on token taken" in result.stdout
+                    assert SAML_TOKEN not in result.stdout + result.stderr, "the token was printed"
+                assert result.stdout.count("echo reply from 10.77.0.1") == (1 if args.saml else 2)
             thread.join(2)
             assert not errors, errors
             exchange = ["getconfig.esp", "hipreportcheck.esp"]
+            if args.saml:
+                assert calls[:2] == ["prelogin.esp", "login.esp"] and calls.count("login.esp") == 1, calls
+                assert "getconfig.esp" in calls and "echo" in calls, calls
+                print("GlobalProtect SAML: the window's token signed in once, without a password, and carried an echo")
+                return
             if args.hip == "decline":
                 assert calls == ["prelogin.esp", "login.esp", *exchange], calls
                 print("Declining HIP sent no report and opened no data tunnel")

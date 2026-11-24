@@ -611,6 +611,19 @@ fn a_vpn_sign_in_jars_token_is_cryptas() {
     assert_eq!(get_t(&mut s, &plain, "/", Some(t)).0, status::OK);
     assert_eq!(set_t(&mut s, &plain, "acSamlv2Token", "Secure", "/", Some(t)), status::OK);
     assert_eq!(items(&mut s).0, 1);
+    // A GlobalProtect portal's SAML answer, as the courier files it: the
+    // same, under its own host.
+    let gp = web("gp.crypta.test", "vpn-corp.crypta.test");
+    let t = ticket(&mut s, "gp.crypta.test", "vpn-corp.crypta.test", 3, "/SAML20/SP/ACS", 3, "idp.example");
+    assert_eq!(get_exact(&mut s, &gp, 3, "/SAML20/SP/ACS", "", Some(t)).0, status::OK);
+    assert_eq!(set_t(&mut s, &gp, "gpSamlToken", "", "/SAML20/SP/ACS", Some(t)), status::OK);
+    let (n, text) = items(&mut s);
+    assert_eq!(n, 2);
+    assert!(text.contains("corp/sso@gp.crypta.test"), "{text}");
+    // Outside a sign-in jar it is refused, never a cookie.
+    let t = ticket(&mut s, "gw.crypta.test", "crypta.test", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &plain, "/", Some(t)).0, status::OK);
+    assert_eq!(set_t(&mut s, &plain, "gpSamlToken", "", "/", Some(t)), status::DENIED);
     // The profile removed: its sign-in jar goes, nothing else does.
     let forget = |s: &mut State, who: &Label, p: &str| s.handle(who, op::VPN_FORGET_JAR, &body(|w| w.str(p)));
     assert_eq!(forget(&mut s, &Label::Service("aura-keys".into()), "corp").status, status::DENIED);

@@ -61,6 +61,9 @@ struct Child {
     /// A ticket waiting for the child to attach.
     pending: Option<Ticket>,
     vpn_document: Option<(String, OwnedFd)>,
+    /// The `Open` whose VPN document this child was given: its security-key
+    /// requests name it, and navigatord takes their origin from it.
+    vpn_page: Option<u32>,
     /// Where to scroll the page when it opens.
     scroll: f32,
     /// When it was asked for, until the page is laid out (timing).
@@ -148,6 +151,9 @@ pub struct Live {
     /// The field owns its handle until this submission has a reply.
     arca_post: Option<u32>,
     arca_next: Instant,
+    /// A VPN page's security-key request waiting on navigatord (Sigillum):
+    /// the page child and its request number. One at a time.
+    credential: Option<(EmbedId, u32)>,
 }
 
 type ArcaFor = (Option<(u64, PageId)>, u32);
@@ -297,6 +303,7 @@ impl Live {
                 arca: None,
                 arca_post: None,
                 arca_next: Instant::now(),
+                credential: None,
             },
             Hello { frescod: fd, limen, measure, trails: kept },
         ))
@@ -407,6 +414,9 @@ impl Live {
     fn close(&mut self, s: &mut Shell, i: usize) {
         s.widget_placement(self.children[i].key, None, None, crate::ui::now_ms());
         let c = self.children.remove(i);
+        if let Some((_, id)) = self.credential.take_if(|(e, _)| *e == c.embed) {
+            send(&mut self.w, &Request::CredentialAbort { id });
+        }
         if self.shown == Some(c.key) {
             self.shown = None;
         }
@@ -432,6 +442,45 @@ impl Live {
             self.to_child(embed, &ToChild::Open { ticket, reading, scroll });
         } else {
             c.pending = Some(ticket);
+        }
+    }
+
+    /// A VPN sign-in page's security-key message (vpn.md §9.3a): a request
+    /// goes to navigatord, which knows the page's origin from the document
+    /// it delivered; an abort ends it. Only the page's own pending request
+    /// can be aborted, and one waits at a time.
+    fn vpn_credential(&mut self, i: usize, bytes: &[u8]) {
+        use limen::sign_in::CredentialMessage as M;
+        let embed = self.children[i].embed;
+        match limen::sign_in::decode(bytes) {
+            Some(message @ (M::Get { .. } | M::Create { .. })) => {
+                let (registering, id, options) = match message {
+                    M::Create { id, options } => (true, id, options),
+                    M::Get { id, options } => (false, id, options),
+                    _ => unreachable!(),
+                };
+                match (self.children[i].vpn_page, self.credential) {
+                    (Some(page), None) if options.len() <= ctl::CREDENTIAL_OPTIONS_MAX => {
+                        eprintln!("navigator-ui: the VPN page asked for a security key");
+                        self.credential = Some((embed, id));
+                        send(&mut self.w, &Request::Credential { page, id, registering, options: options.into() });
+                    }
+                    _ => self.to_page(embed, M::Error { id, name: "NotAllowedError" }),
+                }
+            }
+            Some(M::Abort { id }) => {
+                if self.credential.take_if(|c| *c == (embed, id)).is_some() {
+                    send(&mut self.w, &Request::CredentialAbort { id });
+                }
+            }
+            _ => eprintln!("navigator-ui: dropped a credential message the page may not send"),
+        }
+    }
+
+    fn to_page(&mut self, embed: EmbedId, message: limen::sign_in::CredentialMessage<'_>) {
+        let (Some(wire), Some(e)) = (message.encode(), &self.embeds) else { return };
+        if let Err(err) = e.borrow_mut().send(embed, wire) {
+            eprintln!("navigator-ui: the page's security-key answer: {err:?}");
         }
     }
 
@@ -512,6 +561,7 @@ impl Live {
             asked: Some(id),
             pending: None,
             vpn_document: None,
+            vpn_page: None,
             scroll,
             since: Some((Instant::now(), None)),
             seen: Instant::now(),
@@ -583,8 +633,21 @@ impl Live {
                 Event::VpnDocument { id, url } => {
                     if crate::shell::window_vpn() {
                         if let Some(child) = self.children.iter_mut().find(|c| c.asked == Some(id)) {
+                            child.vpn_page = document.is_some().then_some(id);
                             child.vpn_document = document.map(|fd| (url, fd));
                         }
+                    }
+                }
+                Event::Credential { id, registering, json, error } => {
+                    if let Some((embed, _)) = self.credential.take_if(|(_, asked)| *asked == id) {
+                        use limen::sign_in::CredentialMessage as M;
+                        let reply = match (&json, &error) {
+                            (Some(json), _) if registering => M::Registration { id, json },
+                            (Some(json), _) => M::Assertion { id, json },
+                            (None, e) => M::Error { id, name: e.as_deref().unwrap_or("NotAllowedError") },
+                        };
+                        eprintln!("navigator-ui: the security-key request {}", if json.is_some() { "was answered" } else { "failed" });
+                        self.to_page(embed, reply);
                     }
                 }
                 Event::ReplayedRecording { id } => {
@@ -870,6 +933,9 @@ impl Live {
                     }
                     _ => eprintln!("navigator-ui: a page child sent a file nobody asked for; closed"),
                 },
+                ParentEvent::Message { bytes, .. } if crate::shell::window_vpn() && limen::sign_in::decode(&bytes).is_some() => {
+                    self.vpn_credential(i, &bytes);
+                }
                 ParentEvent::Message { bytes, .. } => match ToParent::decode(&bytes) {
                     Some(ToParent::LinkActivated { url }) if on_screen => {
                         let child = &self.children[i];
@@ -997,6 +1063,9 @@ impl Live {
                     // A lost page on screen gets a new child next (from
                     // the store: it was saved when it opened).
                     eprintln!("navigator-ui: a page child went away ({})", self.children[i].url);
+                    if let Some((_, id)) = self.credential.take_if(|(e, _)| *e == embed) {
+                        send(&mut self.w, &Request::CredentialAbort { id });
+                    }
                     if self.print_ask.as_ref().is_some_and(|a| a.0 == embed) {
                         self.print_done(s, Outcome::Failed("the page closed".into()));
                     }
