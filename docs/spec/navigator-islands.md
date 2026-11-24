@@ -1516,6 +1516,40 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
    Then measure the time to first frame.
 7. **I6. Whole-page live code** for fat clients in everyday browsing, if §9 D5 says so.
 
+### I5 installed-worker hardening on Tessera
+
+The local chapter gate exercises a fresh installed engine per guarded Start.
+For the symbol audit, keep the unstripped link, strip a copy with the LLVM
+toolchain used to package it, and compare its SHA-256 with the installed
+worker's digest. Run `scripts/navigator-i5-worker-audit.sh UNSTRIPPED SHA256`
+on the Mac. It checks both interpreter entry points and searches the defined
+symbols for the LibJS and LibWasm JIT compiler crates. The audited VP9/Opus
+worker and its native player must use the same media channel revision.
+
+On FreeBSD run `scripts/navigator-i5-worker-check.sh PID 1024 100` while the
+local video fixture is active. In this fixture the manifest specifies 1 GiB
+resident memory and 100% of one CPU. Check the jail's kernel rules, Capsicum,
+IP settings and executable mappings. In both sampled workers, 15 executable
+mappings belonged to the installed bundle. The only other executable mapping
+was the kernel shared page containing `AT_TIMEKEEP`. All 16 were read-only.
+These are mapping samples during execution. The binary audit covers the linked
+compiler crates separately.
+
+On arm64 Tessera the forced exit of PID 6329 (jail 70) left the document and
+the “The live widget stopped.” note on screen. Closing the note and pressing
+Start created PID 6539 (jail 75). The broker, UI and parent viewer retained
+their PIDs. The same pixel returned to red (254, 0, 0), then turned blue
+(0, 0, 255) after Next chapter. The replacement had the same binary digest and
+limits. The resource check also rejected a deliberately incorrect 512 MiB limit.
+
+Three subsequent fresh-process Starts on the running guest took 3,176, 3,183
+and 3,169 ms from issuing the Start press over SSH to observing the decoded red
+pixel in a headless PNG (median 3,176 ms). Each run used a new worker PID and
+the same fixture. This is an end-to-end observation with warm host and guest
+caches, including input injection and PNG readback. The fork-before-taint
+comparison is pending. Evidence is in
+`~/atrium-vm/evidence/navigator-i5-worker-hardening-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
