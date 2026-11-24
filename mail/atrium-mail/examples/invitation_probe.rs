@@ -923,7 +923,7 @@ fn during_weekly_skip(e: &Engine, dir: &Path) {
     assert!(
         matches!(e.send_invitation_reply(target, blob(target), &reply),
         Err(Error::InvitationChanged(LatestInvitation::Update {msg, sequence:5, when, ..}))
-        if msg == reinstated && when.contains("revised after the skip"))
+        if msg == reinstated && when.contains("revised after the change"))
     );
     put(6, &exclusions.replace("SEQUENCE:4", "SEQUENCE:5"), true);
     assert!(matches!(
@@ -934,6 +934,83 @@ fn during_weekly_skip(e: &Engine, dir: &Path) {
     ));
     assert!(e.store.outbox().unwrap().is_empty());
     println!("PASS live confirmation, verified weekly exclusion, unlisted occurrence delivered once, newer revision and conflict");
+}
+
+/// A weekly invitation bundles a move of December 22. December 15 and 22 were
+/// each moved to the same December 9 time, so only the original slot tells them
+/// apart: December 22 pauses at Send, December 15 is delivered once.
+fn weekly_move(e: &Engine) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    let account = e.store.add_account("dev@fixture.invalid").unwrap();
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let put = |id, body: &str, verified| put_revision(e, account, inbox, id, body, verified);
+    let master = WEEKLY.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=4");
+    put(1, &master, true);
+    let sibling = put(2, &MOVED.replace(ORIGINAL, SIBLING), true);
+    let target = put(
+        3,
+        &MOVED
+            .replace(ORIGINAL, AFTER_CUTOFF)
+            .replace("SEQUENCE:2", "SEQUENCE:3"),
+        true,
+    );
+    let blob = |id| e.store.message(id).unwrap().full.unwrap();
+    let reply = Reply {
+        scope: Some(AFTER_CUTOFF.into()),
+        sequence: 3,
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        uid: "studio-planning@fixture.invalid".into(),
+        answer: Answer::Accept,
+    };
+    let other = Reply {
+        scope: Some(SIBLING.into()),
+        sequence: 2,
+        ..reply.clone()
+    };
+    // The weekly series at sequence 4 with one bundled override: December 22,
+    // given in New York time, moved on to December 23 in Studio C.
+    let bundle = |seq: &str, to: &str, place: &str| {
+        let end = MOVED.find("END:VCALENDAR").unwrap();
+        let start = MOVED.find("BEGIN:VEVENT").unwrap();
+        let moved = MOVED[start..end]
+            .replace(ORIGINAL, "RECURRENCE-ID;TZID=America/New_York:20261222T090000")
+            .replace("SEQUENCE:2", seq)
+            .replace("20261209T15", to)
+            .replace("Studio B", place);
+        let weekly = master.replace("SEQUENCE:1", seq);
+        let at = weekly.find("END:VCALENDAR").unwrap();
+        format!("{}{moved}END:VCALENDAR\n", &weekly[..at])
+    };
+    // The same move restated by the weekly invitation pauses nothing.
+    put(4, &bundle("SEQUENCE:4", "20261209T15", "Studio B"), true);
+    e.send_invitation_reply(target, blob(target), &reply).unwrap();
+    submit(e, 3, Some(AFTER_CUTOFF));
+    // An unverified bundle is not evidence either way.
+    put(5, &bundle("SEQUENCE:9", "20261230T10", "Studio D"), false);
+    e.send_invitation_reply(target, blob(target), &reply).unwrap();
+    submit(e, 3, Some(AFTER_CUTOFF));
+    let moved = put(6, &bundle("SEQUENCE:5", "20261223T11", "Studio C"), true);
+    let paused = e.send_invitation_reply(target, blob(target), &reply);
+    assert!(
+        matches!(&paused,
+        Err(Error::InvitationChanged(LatestInvitation::Update { msg, sequence: 5, when, location }))
+        if *msg == moved && when.contains("moves this occurrence") && when.contains("2026-12-23 · 11:00–11:45 · UTC") && location == "Studio C"),
+        "{paused:?}"
+    );
+    assert!(e.store.outbox().unwrap().is_empty());
+    // December 15 has the same proposed time but another original slot.
+    e.send_invitation_reply(sibling, blob(sibling), &other).unwrap();
+    submit(e, 2, Some(SIBLING));
+    // The same sequence moving December 22 somewhere else is a conflict.
+    put(7, &bundle("SEQUENCE:5", "20261224T11", "Studio C"), true);
+    assert!(matches!(
+        e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Conflict { sequence: 5 }))
+    ));
+    assert!(e.store.outbox().unwrap().is_empty());
+    println!("PASS weekly bundled move pauses only its original slot, same-time sibling delivered once, restated move, unverified bundle and conflict");
 }
 
 fn main() {
@@ -962,6 +1039,7 @@ fn main() {
         | "seed-restore-one"
         | "seed-reissue") => seed(&e, mode),
         "during-weekly-skip" => during_weekly_skip(&e, Path::new(&args[2])),
+        "weekly-move" => weekly_move(&e),
         "during-group-cancellation" => during_group_cancellation(&e, Path::new(&args[2])),
         "during-range-cancellation" => during_range_cancellation(&e, Path::new(&args[2])),
         "during-occurrence" => during_occurrence(&e, Path::new(&args[2])),

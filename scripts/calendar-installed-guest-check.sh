@@ -162,6 +162,17 @@ case "${2-}" in
                 test ! -f "$personal_store/meeting-changes.json" ;;
         esac
         exit 0 ;;
+    move-check)
+        # A weekly invitation bundling a move of one of two same-time occurrences,
+        # checked by the installed parse worker in Mail's jail (no window).
+        root=$(jls -j "$mail_jail" path)
+        uid=$(stat -f %u "$mail_folder/index.redb")
+        fixture=/tmp/rsvp-weekly-move
+        rm -rf "$root$fixture"
+        install -d -o "$uid" -g "$uid" "$root$fixture"
+        install -m 0555 invitation_probe "$root/bin/invitation-probe"
+        jexec -u "$(id -nu "$uid")" "$mail_jail" /bin/invitation-probe weekly-move "$fixture" /bin/mail-parse-jail
+        exit 0 ;;
     response-window|range-window|group-window|skip-window|occurrence-window|response-deliver|response-result)
         root=$(jls -j "$mail_jail" path)
         uid=$(stat -f %u "$mail_folder/index.redb")

@@ -581,19 +581,34 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
     }
     if weekly {
         let skips = p.validate_schedule().ok()?;
-        // Final Send only needs the checked identity and original skipped slots.
-        // A valid series with eight moves can exceed the small reply frame.
+        // Final Send only needs the checked identity, original skipped slots and,
+        // for each included move, its original slot, new time and place. A whole
+        // series with eight moved rows can exceed the small reply frame.
+        let moves: Vec<_> = p
+            .exceptions
+            .iter()
+            .map(|m| [m.original.property(), move_time(&m.row), m.location.clone()])
+            .collect();
         return Some(
             serde_json::json!({
                 "uid": p.uid, "sequence": p.sequence, "organizer": p.organizer,
                 "attendees": p.attendees, "row": true,
                 "weekly_skips": skips.iter().map(|s| s.property()).collect::<Vec<_>>(),
+                "weekly_moves": moves,
             })
             .to_string(),
         )
         .filter(|s| s.len() <= 4096);
     }
     serde_json::to_string(&p).ok().filter(|s| s.len() <= 4096)
+}
+
+/// A moved occurrence's time as Mail shows a proposed time
+/// (`mail_engine::invitations::proposed_time`): `2026-12-09 · 15:00–15:45 · UTC`.
+fn move_time(row: &atrium_calendar::Entry) -> String {
+    let clock = |m: u16| format!("{:02}:{:02}", m / 60, m % 60);
+    let zone = row.zone.as_ref().map_or("Floating".to_string(), |z| z.name.to_string());
+    format!("{} · {}–{} · {zone}", row.date.format("%Y-%m-%d"), clock(row.span.start), clock(row.span.end))
 }
 
 #[cfg(test)]
@@ -614,6 +629,14 @@ mod background_tests {
             Some(scope)
         )
         .is_none());
+        // An included move carries its original slot, new time and place.
+        let moved = include_str!("../../../atrium-calendar/tests/fixtures/bounded-moves.ics");
+        let scope = "weekly;COUNT=4|RECURRENCE-ID:20261208T140000Z|RECURRENCE-ID:20261215T140000Z";
+        let proof: serde_json::Value = serde_json::from_str(&individual_update(moved.as_bytes(), &me, Some(scope)).unwrap()).unwrap();
+        assert_eq!(proof["weekly_moves"], serde_json::json!([
+            ["RECURRENCE-ID:20261208T140000Z", "2026-12-09 · 15:00–15:45 · UTC", "Studio B"],
+            ["RECURRENCE-ID:20261215T140000Z", "2026-12-17 · 11:00–11:45 · UTC", "Studio C"],
+        ]));
         let short = ics.replace("COUNT=4", "COUNT=2");
         assert!(individual_update(
             short.as_bytes(),

@@ -173,6 +173,15 @@ def occurrence_response(ui):
     print("PASS both occurrence replies delivered once, private move and other meetings preserved")
 
 
+def weekly_move_response(ui):
+    """Mail's final Send check for a move bundled into a weekly invitation."""
+    print(guest(ui, "invitation-setup"))
+    out = guest(ui, "move-check")
+    print(out)
+    if "PASS weekly bundled move" not in out:
+        raise RuntimeError("weekly move check did not pass")
+
+
 def cancellation_response(ui, case="range"):
     change = {
         "skip": ["Weekly invitation skips this occurrence", "Organizer revision 4"],
@@ -871,9 +880,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--exdate-response": lambda ui: cancellation_response(ui, "skip"), "--group-cancel-response": lambda ui: cancellation_response(ui, "group"), "--range-cancel-response": cancellation_response, "--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--weekly-move-response": weekly_move_response, "--exdate-response": lambda ui: cancellation_response(ui, "skip"), "--group-cancel-response": lambda ui: cancellation_response(ui, "group"), "--range-cancel-response": cancellation_response, "--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--exdate-response|--group-cancel-response|--range-cancel-response|--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--weekly-move-response|--exdate-response|--group-cancel-response|--range-cancel-response|--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))
