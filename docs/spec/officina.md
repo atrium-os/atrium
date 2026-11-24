@@ -4791,6 +4791,16 @@ Gates: atrium-sheets `duplicate_sheet_copies_cells_formats_sizes_and_merges_afte
 
 Gates: atrium-sheets `the_name_manager_lists_goes_to_and_deletes_names` and the extended `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`; all 127 Sheets lib tests pass.
 
+### 16.101 Hidden sheets (2026-11-24)
+
+Before this, a hidden sheet in an .xlsx file opened shown, with a "hidden sheets shown" import note. Sheets can now be hidden end to end.
+
+- **Engine:** `Sheet::sheet_hidden`, and `GridOp::HideSheet { sheet, hidden }` (wire kind 27), which is undoable. Hiding the last sheet that shows changes nothing, so a workbook always has a sheet on screen (`Workbook::shown_sheets`). The native file keeps hidden sheets in chunk `HIDDEN_SHEETS` (28). A file that hides every sheet, names a sheet twice or names a missing sheet is refused. Deleting a hidden sheet shows it first, so undo brings it back hidden. A protected sheet can't be hidden or shown.
+- **Files:** .xlsx reads `state="hidden"` and `"veryHidden"` as hidden and writes `state="hidden"`; a very hidden sheet comes back merely hidden, which Unhide can show. .ods reads and writes `table:display="false"` on the table style. An .xlsx that hides every sheet opens with the first shown, with a note.
+- **Sheets:** Data ▸ Hide Sheet hides the shown sheet and opens the next one that shows. Data ▸ Unhide *Name* lists up to 32 hidden sheets by name; choosing one shows it and opens it. Tabs leave hidden sheets out. Go To refuses a hidden sheet and says how to unhide it. A file that opens on a hidden sheet opens on the first that shows.
+
+Gates: officina-grid `sheets_are_hidden_shown_undone_and_saved_but_one_always_shows`; officina-convert `hidden_sheets_stay_hidden_through_xlsx_and_ods`; atrium-sheets `hide_sheet_takes_its_tab_away_and_unhide_brings_it_back`. All 121 officina-grid lib, all officina-convert and all 128 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -62,6 +62,7 @@ pub const AXIS_IDENTITIES: u16 = 24;
 pub const PICTURE: u16 = 25;
 pub const SHEET_IDENTITIES: u16 = 26;
 pub const OUTLINES: u16 = 27;
+pub const HIDDEN_SHEETS: u16 = 28;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -345,6 +346,15 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             t.encode(&mut w);
         }
         c.add(TABLES, &w.into_bytes())?;
+    }
+    let hidden: Vec<usize> = wb.sheets.iter().enumerate().filter(|(_, sh)| sh.sheet_hidden).map(|(i, _)| i).collect();
+    if !hidden.is_empty() {
+        let mut w = Writer::new();
+        w.var(hidden.len() as u64);
+        for i in hidden {
+            w.u16(i as u16);
+        }
+        c.add(HIDDEN_SHEETS, &w.into_bytes())?;
     }
     let tabs: Vec<(usize, u32)> = wb.sheets.iter().enumerate().filter_map(|(i, sh)| sh.tab_color.map(|c| (i, c))).collect();
     if !tabs.is_empty() {
@@ -931,6 +941,25 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
         wb.sheets[s].hidden = st.hidden;
         wb.sheets[s].filter = st.filter;
+    }
+
+    for i in of(HIDDEN_SHEETS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n >= wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("every sheet hidden"));
+        }
+        for _ in 0..n {
+            let s = r.u16()? as usize;
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("a hidden sheet that does not exist")) };
+            if std::mem::replace(&mut sh.sheet_hidden, true) {
+                return Err(LoadError::Bad("a sheet hidden twice"));
+            }
+        }
+        done(&r)?;
+    }
+    if wb.sheets.iter().all(|s| s.sheet_hidden) {
+        return Err(LoadError::Bad("every sheet hidden"));
     }
 
     for i in of(TAB_COLORS) {

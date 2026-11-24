@@ -88,6 +88,9 @@ pub enum GridOp {
     MoveSheet { from: u16, to: u16 },
     /// A sheet's tab colour (0xRRGGBB), or none.
     TabColor { sheet: u16, color: Option<u32> },
+    /// A sheet hidden or shown again. Hiding the last sheet that shows
+    /// changes nothing.
+    HideSheet { sheet: u16, hidden: bool },
     /// A sheet's merged cells ([`crate::merges`]), swapped in whole.
     Merges { sheet: u16, list: Vec<Rect> },
     /// Comments set, or taken away (`None`), on cells of a sheet, in order.
@@ -280,6 +283,12 @@ impl GridOp {
                 w.u8(14);
                 w.u16(*from);
                 w.u16(*to);
+                return w.into_bytes();
+            }
+            GridOp::HideSheet { sheet, hidden } => {
+                w.u8(27);
+                w.u16(*sheet);
+                w.u8(u8::from(*hidden));
                 return w.into_bytes();
             }
             GridOp::TabColor { sheet, color } => {
@@ -522,6 +531,18 @@ impl GridOp {
             }
             return Ok(op);
         }
+        if kind == 27 {
+            let sheet = r.u16()?;
+            let hidden = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(WireError::Invalid("sheet hidden flag")),
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::HideSheet { sheet, hidden });
+        }
         if kind == 22 {
             let sheet = r.u16()?;
             let axis = match r.u8()? {
@@ -738,6 +759,16 @@ impl Op<Workbook> for GridOp {
                 } else {
                     GridOp::Batch(Vec::new())
                 }
+            }
+            GridOp::HideSheet { sheet, hidden } => {
+                if sheet as usize >= wb.sheet_count() || wb.sheet(sheet).sheet_hidden == hidden {
+                    return GridOp::Batch(Vec::new());
+                }
+                if hidden && wb.shown_sheets() <= 1 {
+                    return GridOp::Batch(Vec::new());
+                }
+                wb.sheet_mut(sheet).sheet_hidden = hidden;
+                GridOp::HideSheet { sheet, hidden: !hidden }
             }
             GridOp::TabColor { sheet, color } => {
                 if sheet as usize >= wb.sheet_count() {
@@ -983,6 +1014,38 @@ mod tests {
     fn a(s: &str) -> CellAddr {
         let (r, c) = crate::addr::parse_a1(s).unwrap();
         CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn sheets_are_hidden_shown_undone_and_saved_but_one_always_shows() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("One").unwrap();
+        wb.add_sheet("Two").unwrap();
+        let op = GridOp::HideSheet { sheet: 1, hidden: true };
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        assert!(GridOp::decode(&[27, 0, 0, 2]).is_err());
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Hide Sheet", vec![op]);
+        assert!(wb.sheet(1).sheet_hidden);
+        assert_eq!(wb.shown_sheets(), 1);
+        // The last sheet showing stays.
+        h.run(&mut wb, "Hide Sheet", vec![GridOp::HideSheet { sheet: 0, hidden: true }]);
+        assert!(!wb.sheet(0).sheet_hidden);
+        // Into the file and back; it moves with its sheet.
+        let back = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+        assert_eq!((back.sheet(0).sheet_hidden, back.sheet(1).sheet_hidden), (false, true));
+        h.run(&mut wb, "Move Sheet", vec![GridOp::MoveSheet { from: 1, to: 0 }]);
+        assert_eq!((wb.sheet(0).sheet_hidden, wb.sheet(1).sheet_hidden), (true, false));
+        // Undo: the move, the refused hide, then the hide.
+        h.undo(&mut wb);
+        h.undo(&mut wb);
+        assert!(wb.sheet(1).sheet_hidden);
+        h.undo(&mut wb);
+        assert!(!wb.sheet(1).sheet_hidden);
+        // A file hiding every sheet is refused.
+        wb.sheet_mut(0).sheet_hidden = true;
+        wb.sheet_mut(1).sheet_hidden = true;
+        assert!(crate::native::load(&crate::native::save_to_vec(&wb)).is_err());
     }
 
     #[test]

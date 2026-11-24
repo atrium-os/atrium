@@ -1348,6 +1348,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
 
     // Sheets in order.
     let mut sheets: Vec<(String, String)> = Vec::new();
+    let mut hidden_sheets: Vec<bool> = Vec::new();
     let mut pivot_caches: HashMap<u32, Option<String>> = HashMap::new();
     let mut external_ids = Vec::new();
     // Defined names: (name, sheet index it is local to, formula text).
@@ -1362,11 +1363,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
                     b"sheet" => {
                         let name = attr(&e, b"name")?.unwrap_or_default();
                         let Some(id) = attr(&e, b"id")? else { continue };
-                        if attr(&e, b"state")?.is_some_and(|v| v != "visible") {
-                            out.report.note(Kind::Approximate, "hidden sheets shown");
-                        }
+                        // Hidden and very hidden sheets both stay hidden; Unhide shows either.
+                        let hide = attr(&e, b"state")?.is_some_and(|v| v == "hidden" || v == "veryHidden");
                         match wb_rels.get(&id) {
-                            Some((t, p)) if t.ends_with("/worksheet") => sheets.push((name, p.clone())),
+                            Some((t, p)) if t.ends_with("/worksheet") => {
+                                sheets.push((name, p.clone()));
+                                hidden_sheets.push(hide);
+                            }
                             Some(_) => out.report.note_at(Kind::Dropped, "chart sheets and dialog sheets", || name.clone()),
                             None => return Err(bad("a sheet without its part")),
                         }
@@ -1419,7 +1422,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         if n.is_empty() || wb.sheet_id(&n).is_some() {
             n = format!("Sheet{}", wb.sheet_count() + 1);
         }
-        wb.add_sheet(&n).map_err(bad)?;
+        let id = wb.add_sheet(&n).map_err(bad)?;
+        if hidden_sheets.get(id as usize) == Some(&true) {
+            wb.sheet_mut(id).sheet_hidden = true;
+        }
+    }
+    // A workbook needs a sheet that shows: a file hiding them all shows the first.
+    if wb.shown_sheets() == 0 && wb.sheet_count() > 0 {
+        wb.sheet_mut(0).sheet_hidden = false;
+        out.report.note(Kind::Approximate, "every sheet hidden; the first is shown");
     }
     let mut rep = Report::default();
     // Styles, before the cells that name them.

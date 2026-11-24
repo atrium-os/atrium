@@ -1070,8 +1070,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
 
     out.push_str("<table:table table:name=\"");
     esc(out, &name);
-    if sh.tab_color.is_some() {
-        // Its tab colour (tableooo:tab-color) is on table style "taS{s}".
+    if sh.tab_color.is_some() || sh.sheet_hidden {
+        // Its tab colour (tableooo:tab-color) and whether it shows are on table style "taS{s}".
         let _ = write!(out, "\" table:style-name=\"taS{s}");
     }
     if let Some([r0, c0, r1, c1]) = wb.names().get(s, officina_grid::print::AREA)
@@ -1491,8 +1491,10 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     // Styles: data styles and cell styles for every style in the table.
     let mut auto = String::new();
     for s in 0..wb.sheet_count() as u16 {
-        if let Some(c) = wb.sheet(s).tab_color {
-            let _ = write!(auto, r##"<style:style style:name="taS{s}" style:family="table" style:master-page-name="Default"><style:table-properties table:display="true" style:writing-mode="lr-tb" tableooo:tab-color="#{:06x}"/></style:style>"##, c & 0xFF_FFFF);
+        let sh = wb.sheet(s);
+        if sh.tab_color.is_some() || sh.sheet_hidden {
+            let tab = sh.tab_color.map(|c| format!(r##" tableooo:tab-color="#{:06x}""##, c & 0xFF_FFFF)).unwrap_or_default();
+            let _ = write!(auto, r##"<style:style style:name="taS{s}" style:family="table" style:master-page-name="Default"><style:table-properties table:display="{}" style:writing-mode="lr-tb"{tab}/></style:style>"##, !sh.sheet_hidden);
         }
     }
     for (&key, &i) in &col_style {

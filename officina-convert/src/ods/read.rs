@@ -256,6 +256,8 @@ struct Styles {
     row_height: HashMap<String, f64>,
     /// Table styles' `tableooo:tab-color`, 0xRRGGBB.
     tab_color: HashMap<String, u32>,
+    /// Table styles with table:display="false": hidden sheets.
+    hidden_tables: std::collections::HashSet<String>,
     /// Font face name → family.
     faces: HashMap<String, String>,
     comment_text: HashMap<String, CommentStyle>,
@@ -321,6 +323,9 @@ impl Styles {
                         "style:table-properties" if cur_family == "table" => {
                             if let Some(c) = a.get("tableooo:tab-color").and_then(|v| v.strip_prefix('#')).and_then(|v| u32::from_str_radix(v, 16).ok()) {
                                 self.tab_color.insert(cur_name.clone(), c & 0xFF_FFFF);
+                            }
+                            if a.get("table:display").is_some_and(|v| v == "false") {
+                                self.hidden_tables.insert(cur_name.clone());
                             }
                         }
                         "style:table-row-properties" if cur_family == "table-row" => {
@@ -1060,6 +1065,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                         let id = wb.add_sheet(&n).map_err(bad)?;
                         wb.sheet_mut(id).tab_color = a.get("table:style-name").and_then(|t| styles.tab_color.get(t)).copied();
+                        wb.sheet_mut(id).sheet_hidden = a.get("table:style-name").is_some_and(|t| styles.hidden_tables.contains(t));
                         sheet = Some(id);
                         if let Some(area) = a.get("table:print-ranges").filter(|a| !a.is_empty()) {
                             print_areas.push((id, area.clone()));

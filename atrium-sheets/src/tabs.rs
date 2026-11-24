@@ -115,6 +115,9 @@ pub fn visible(wb: &Workbook, first: u16, room: f32) -> Vec<(u16, f32, f32)> {
     let mut out = Vec::new();
     let mut x = 0.0;
     for s in first as usize..wb.sheet_count() {
+        if wb.sheet(s as u16).sheet_hidden {
+            continue;
+        }
         let w = width(&wb.sheet_name(s as u16));
         if x + w > room && !out.is_empty() {
             break;
@@ -138,7 +141,7 @@ pub fn reveal(wb: &Workbook, first: u16, s: u16, room: f32) -> u16 {
     let mut x = width(&wb.sheet_name(s));
     let mut f = s;
     while f > 0 {
-        let w = width(&wb.sheet_name(f - 1));
+        let w = if wb.sheet(f - 1).sheet_hidden { 0.0 } else { width(&wb.sheet_name(f - 1)) };
         if x + w > room {
             break;
         }

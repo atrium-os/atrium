@@ -19,6 +19,7 @@ fn allows_op(wb: &Workbook, op: &GridOp) -> bool {
         | GridOp::LayoutSizes { sheet, .. }
         | GridOp::RenameSheet { sheet, .. }
         | GridOp::TabColor { sheet, .. }
+        | GridOp::HideSheet { sheet, .. }
         | GridOp::Merges { sheet, .. }
         | GridOp::Comments { sheet, .. }
         | GridOp::Links { sheet, .. }

@@ -841,7 +841,8 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
     for s in 0..n {
         w.extend_from_slice(b"<sheet name=\"");
         esc(&mut w, &wb.sheet_name(s as u16));
-        let _ = write!(w, r#"" sheetId="{}" r:id="rId{}"/>"#, s + 1, s + 1);
+        let state = if wb.sheet(s as u16).sheet_hidden { r#" state="hidden""# } else { "" };
+        let _ = write!(w, r#"" sheetId="{}"{state} r:id="rId{}"/>"#, s + 1, s + 1);
     }
     w.extend_from_slice(b"</sheets>");
     let filtered: Vec<u16> = (0..n as u16).filter(|&s| wb.sheet(s).filter.is_some()).collect();

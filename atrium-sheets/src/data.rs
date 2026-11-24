@@ -203,6 +203,10 @@ pub enum DataCmd {
     DuplicateSheet,
     /// The bar naming the selection; the window runs it.
     DefineName,
+    /// The shown sheet hidden (not the last that shows); the window runs it.
+    HideSheet,
+    /// Hidden sheet `.0` shown again and opened; the window runs it.
+    UnhideSheet(u16),
     /// The Name Manager panel: every defined name; the window runs it.
     NameManager,
     /// Rename the sheet on screen; the window runs it (a bar under the grid).
@@ -476,6 +480,14 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
     v.push((MenuItem::new("Duplicate Sheet").enabled(wb.sheet_count() < officina_grid::book::MAX_SHEETS), Some(DataCmd::DuplicateSheet)));
+    v.push((MenuItem::new("Hide Sheet").enabled(wb.shown_sheets() > 1), Some(DataCmd::HideSheet)));
+    let hidden: Vec<u16> = (0..wb.sheet_count() as u16).filter(|&h| wb.sheet(h).sheet_hidden).collect();
+    for &h in hidden.iter().take(MAX_UNHIDE_ITEMS) {
+        v.push((MenuItem::new(format!("Unhide {}", wb.sheet_name(h))), Some(DataCmd::UnhideSheet(h))));
+    }
+    if hidden.len() > MAX_UNHIDE_ITEMS {
+        v.push((MenuItem::new(format!("{} more hidden sheets not listed", hidden.len() - MAX_UNHIDE_ITEMS)).enabled(false), None));
+    }
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
     v.push((MenuItem::new("Tab Colour…"), Some(DataCmd::TabColor)));
     let n = wb.sheet_count() as u16;
@@ -563,6 +575,9 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
 }
 
 /// The most rows Remove Duplicates looks through.
+/// Hidden sheets the Data menu offers to unhide by name.
+pub const MAX_UNHIDE_ITEMS: usize = 32;
+
 /// The most used cells Duplicate Sheet copies.
 pub const MAX_DUPLICATE_CELLS: u64 = 20_000_000;
 
@@ -944,6 +959,10 @@ pub fn go_to_place(wb: &Workbook, own: u16, text: &str) -> Result<(u16, Rect), S
     } else {
         None
     };
+    if wb.sheet(sheet).sheet_hidden {
+        let name = wb.sheet_name(sheet);
+        return Err(format!("{name} is hidden; Data ▸ Unhide {name} shows it."));
+    }
     if let Some(r) = rect {
         return Ok((sheet, r));
     }
@@ -1721,7 +1740,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::NameManager | DataCmd::HideSheet | DataCmd::UnhideSheet(_) | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

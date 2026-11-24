@@ -146,6 +146,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if wb.sheet(s).tab_color.is_some() {
         ops.push(GridOp::TabColor { sheet: s, color: None });
     }
+    if wb.sheet(s).sheet_hidden {
+        ops.push(GridOp::HideSheet { sheet: s, hidden: false });
+    }
     if wb.sheet(s).freeze != (0, 0) {
         ops.push(GridOp::Freeze { sheet: s, rows: 0, cols: 0, from: (0, 0) });
     }

@@ -43,6 +43,9 @@ pub struct Sheet {
     pub filter: Option<crate::filter::AutoFilter>,
     /// The colour of its tab, 0xRRGGBB.
     pub tab_color: Option<u32>,
+    /// The sheet is hidden: no tab shows it. At least one sheet always shows
+    /// ([`crate::ops::GridOp::HideSheet`] refuses to hide the last).
+    pub sheet_hidden: bool,
     /// Merged areas ([`crate::merges`]): disjoint, sorted by top row then left column.
     pub(crate) merges: Vec<Rect>,
     /// Cell comments ([`crate::comments`]).
@@ -70,7 +73,7 @@ pub(crate) fn new_sheet_identity() -> u128 {
 
 impl Sheet {
     fn new(name: &str, identity: u128) -> Self {
-        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), outlines: Default::default(), axis_ids: Default::default() }
+        Sheet { identity, protection: None, name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), table_hidden: Vec::new(), filter: None, tab_color: None, sheet_hidden: false, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), outlines: Default::default(), axis_ids: Default::default() }
     }
     pub fn outline(&self, axis: crate::shift::Axis) -> &crate::outline::Outline {
         &self.outlines[axis.index()]
@@ -348,7 +351,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.freeze == (0, 0);
+        let bare = sh.protection.is_none() && sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && !sh.sheet_hidden && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.outlines.iter().all(|axis| axis.groups().is_empty()) && sh.freeze == (0, 0);
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.pictures().iter().any(|p| p.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
@@ -377,6 +380,11 @@ impl Workbook {
     /// An outline has state that requires the native workbook format.
     pub fn has_outlines(&self) -> bool {
         self.sheets.iter().any(|sheet| sheet.outlines.iter().any(|axis| !axis.groups().is_empty()))
+    }
+
+    /// How many sheets are not hidden.
+    pub fn shown_sheets(&self) -> usize {
+        self.sheets.iter().filter(|s| !s.sheet_hidden).count()
     }
 
     pub fn sheet_name(&self, s: u16) -> String {

@@ -370,7 +370,13 @@ pub struct Sheets {
 }
 
 impl Sheets {
-    pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
+    pub fn new(mut doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
+        // A file may open on a hidden sheet: show the first that shows.
+        if doc.wb.sheet(doc.sheet).sheet_hidden {
+            if let Some(s) = (0..doc.wb.sheet_count() as u16).find(|&s| !doc.wb.sheet(s).sheet_hidden) {
+                doc.sheet = s;
+            }
+        }
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
@@ -3134,6 +3140,47 @@ impl Sheets {
                 }
                 Cmd::Tab(t) => {
                     self.tab_cmd(t);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::HideSheet) => {
+                    let next = {
+                        let mut d = self.doc.borrow_mut();
+                        let s = d.sheet;
+                        let n = d.wb.sheet_count() as u16;
+                        d.status.clear();
+                        d.run("Hide Sheet", vec![officina_grid::ops::GridOp::HideSheet { sheet: s, hidden: true }]);
+                        if d.wb.sheet(s).sheet_hidden {
+                            let name = d.wb.sheet_name(s);
+                            d.status = format!("{name} hidden; Data ▸ Unhide {name} shows it again.");
+                            (s + 1..n).chain((0..s).rev()).find(|&t| !d.wb.sheet(t).sheet_hidden)
+                        } else {
+                            if d.status.is_empty() {
+                                d.status = "A workbook keeps at least one sheet showing.".into();
+                            }
+                            None
+                        }
+                    };
+                    if let Some(t) = next {
+                        self.show_sheet(t);
+                    }
+                    self.rev.set(self.rev.get().wrapping_add(1));
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::UnhideSheet(h)) => {
+                    let shown = {
+                        let mut d = self.doc.borrow_mut();
+                        d.status.clear();
+                        d.run("Unhide Sheet", vec![officina_grid::ops::GridOp::HideSheet { sheet: h, hidden: false }]);
+                        (h as usize) < d.wb.sheet_count() && !d.wb.sheet(h).sheet_hidden
+                    };
+                    if shown {
+                        self.show_sheet(h);
+                        let name = { let d = self.doc.borrow(); d.wb.sheet_name(h) };
+                        self.set_status(format!("{name} shows again."));
+                    }
+                    self.rev.set(self.rev.get().wrapping_add(1));
+                    self.changed();
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::DuplicateSheet) => {
@@ -6921,5 +6968,35 @@ mod tests {
         s.cmds.lock().unwrap().push(Cmd::Names(NamesCmd::Close));
         s.take_cmds();
         assert!(!s.names_open.get());
+    }
+
+    #[test]
+    fn hide_sheet_takes_its_tab_away_and_unhide_brings_it_back() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"1\n");
+        s.doc.borrow_mut().run("Add", vec![officina_grid::ops::GridOp::add_sheet("Two".into()), officina_grid::ops::GridOp::add_sheet("Three".into())]);
+        s.show_sheet(1);
+        let status = data(&s, DataCmd::HideSheet);
+        assert_eq!(status, "Two hidden; Data ▸ Unhide Two shows it again.");
+        assert_eq!(s.doc.borrow().sheet, 2);
+        let tabs: Vec<u16> = crate::tabs::visible(&s.doc.borrow().wb, 0, 2000.0).iter().map(|t| t.0).collect();
+        assert_eq!(tabs, [0, 2]);
+        let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (0, 0));
+        assert!(items.iter().any(|(m, c)| *c == Some(DataCmd::UnhideSheet(1)) && m.label == "Unhide Two"));
+        // Go To doesn't open a hidden sheet.
+        let place = { let d = s.doc.borrow(); crate::data::go_to_place(&d.wb, d.sheet, "Two!A1") };
+        assert!(place.is_err_and(|e| e.contains("hidden")));
+        // The last sheet showing can't go.
+        data(&s, DataCmd::HideSheet);
+        assert_eq!(s.doc.borrow().sheet, 0);
+        assert_eq!(data(&s, DataCmd::HideSheet), "A workbook keeps at least one sheet showing.");
+        assert_eq!(data(&s, DataCmd::UnhideSheet(1)), "Two shows again.");
+        assert_eq!(s.doc.borrow().sheet, 1);
+        // Opening a file whose first sheet is hidden shows the next one.
+        let mut d = Doc::new("h");
+        d.wb.add_sheet("B").unwrap();
+        d.wb.sheet_mut(0).sheet_hidden = true;
+        let t = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        assert_eq!(t.doc.borrow().sheet, 1);
     }
 }
