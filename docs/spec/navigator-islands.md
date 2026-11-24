@@ -1733,6 +1733,59 @@ limend, portcullisd and jaild, then run three Starts without choragusd and
 three with it. Both arms should now reach `first-request` in tens of
 milliseconds; record press to red pixel as in the I5 gate.
 
+### I5 warm start: how a warmed engine gets its own jail (proposed, D7)
+
+What the measurements say. On arm64 Tessera the daemons take 16 to 29 ms
+from the press to a forked worker, and with the audio wait gone the engine
+takes about 45 ms from fork to its first request and about 300 ms more to
+report its start. The offline fork gate reaches a first native scene 12 ms
+after fork from a font-warmed template. So nearly all of the remaining Start
+is the engine's own exec and initialization, and the only way to remove it
+from the press is to do that work before the press. The question is where
+the warmed process lives, given that every island must run in its own jail,
+as its persona's uid, under its own rctl limits and in Capsicum, before
+Limen gives it any page channel.
+
+Options:
+
+1. **Fork zygote inside a per-persona parent jail.** One warmed template per
+   persona, kept as root inside a parent jail with `children.max`. jaild
+   creates a child jail per island under it; the forked child attaches to
+   it, drops to the island uid, enters Capsicum and waits for channels.
+   Children share the template's memory copy-on-write. Costs: a long-lived
+   root process inside the jail tree running Ladybird's initialization code;
+   whether jailed root may `jail_attach(2)` to its own child jails must be
+   asked of the kernel, not assumed; every island shares the template's
+   address-space layout (the known zygote weakness: one leak defeats ASLR for
+   all of a persona's islands); and a second jail creator besides jaild,
+   which breaks the "jaild is the only caller of `jail_set(2)`" rule unless
+   jaild does the child creation and the template only attaches.
+2. **Fork zygote on the host, root, attaching children to jaild's jails.**
+   Simpler kernel story (host root may attach anywhere), but the warmed
+   template is an unjailed root process running engine code. Rejected.
+3. **Warm pool of ordinary one-shot workers (recommended).** limend keeps
+   one engine already started per persona that has a live parent, through
+   the same `ExecInstance` path as today: jaild jail, persona uid, rctl,
+   Capsicum, audited binary. The worker initializes (fonts, event loop, JS
+   agent) and then blocks on a standby channel to limend. On Start, limend
+   passes the island channel, the fetch socket and the frescod embed
+   connection over that channel (SCM_RIGHTS) and starts the next standby in
+   the background. Each worker is used once and exits with its island.
+   Nothing new holds privilege, jaild stays the only jail creator, every
+   island has its own ASLR layout from its own exec, and the existing I5
+   checks (`navigator-i5-worker-check.sh`, the symbol audit) apply as they
+   are. Costs: the standby's memory is not shared (one idle engine per
+   active persona, to be measured), a burst of Starts beyond the pool pays
+   today's cold path, and the worker's launch protocol gains a standby phase
+   in which it must accept only one `Assign` from limend.
+
+Recommendation: option 3, one standby per persona with a live Navigator,
+none when no Navigator runs. Gates: press-to-`first-request` under 20 ms with
+a standby, the cold path unchanged without one, the I5 worker checks on an
+assigned standby, a standby that receives anything but `Assign` exits, and
+idle memory recorded per standby. Revisit the fork zygote only if standby
+memory proves too high.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
@@ -2576,6 +2629,7 @@ alongside I0.
 | **D4** ✓ | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
 | **D5** ✓ | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** ✓ | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
+| **D7** | How a warmed engine gets its own jail (I5 warm start) | fork zygote in a per-persona parent jail · fork zygote on the host · warm pool of ordinary one-shot workers | **Warm pool, one standby per persona with a live Navigator.** No new privileged process or jail creator, its own ASLR per island, and today's I5 checks apply unchanged; the cost is one idle engine's memory per persona |
 
 ### Local Mail callback and account storage
 
