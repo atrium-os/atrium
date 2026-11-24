@@ -129,25 +129,53 @@ pub fn is_instance_root(req: &CreateJailRequest, policy: &Policy) -> bool {
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
-/// Whether `req` is one of Arca's courier jails (`[couriers]`, arca.md §5):
-/// named `<name_prefix><uid>` with `uid` in range, rooted at exactly
-/// `<instance_root_dir>/<name>`, and running exactly `exec_path` as `uid`.
-/// Anything else is judged as an ordinary jail.
-pub fn is_courier(req: &CreateJailRequest, policy: &Policy) -> bool {
-    let (Some(c), Some(dir), Some(exec)) =
-        (policy.couriers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
-    else {
-        return false;
-    };
-    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
-        return false;
-    };
-    req.name == format!("{}{uid}", c.name_prefix)
-        && (c.uid_first..=c.uid_last).contains(&uid)
+/// The identity every service-class jail (couriers, share servers, print
+/// workers, Crypta engines) shares: named exactly `<name_prefix><uid>` with
+/// `uid` in `[uid_first, uid_last]`, running as `uid:uid`, rooted at exactly
+/// `<instance_root_dir>/<name>`. Returns the uid and the exec on a match.
+///
+/// One function, so a tightening reaches every class: the four used to be
+/// copies of each other and had already drifted apart (review 2026-11-24,
+/// M4).
+fn service_instance<'a>(
+    req: &'a CreateJailRequest,
+    policy: &Policy,
+    name_prefix: &str,
+    uids: std::ops::RangeInclusive<u32>,
+) -> Option<(u32, &'a ExecSpec)> {
+    let dir = policy.exec_paths.instance_root_dir.as_deref()?;
+    let exec = req.exec.as_ref()?;
+    let uid = req.name.strip_prefix(name_prefix)?.parse::<u32>().ok()?;
+    (req.name == format!("{name_prefix}{uid}")
+        && uids.contains(&uid)
         && exec.uid == uid
         && exec.gid == uid
-        && exec.path == c.exec_path
-        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name))
+        .then_some((uid, exec))
+}
+
+/// No device, FUSE mount, child jail, or Tessera keys: what every service
+/// class that is not a filesystem server goes without. Locked memory is
+/// each class's own call.
+fn without_devices_or_children(req: &CreateJailRequest) -> bool {
+    req.fuse.is_none()
+        && req.devfs_grant.is_none()
+        && req.devfs_grants.is_empty()
+        && req.children_max == 0
+        && !req.allow_tessera_keys
+}
+
+/// Whether `req` is one of Arca's courier jails (`[couriers]`, arca.md §5):
+/// named `<name_prefix><uid>` with `uid` in range, rooted at exactly
+/// `<instance_root_dir>/<name>`, and running exactly `exec_path` as `uid`,
+/// with no device, FUSE, child jail or Tessera keys (it may lock memory).
+/// Anything else is judged as an ordinary jail.
+pub fn is_courier(req: &CreateJailRequest, policy: &Policy) -> bool {
+    let Some(c) = policy.couriers.as_ref() else { return false };
+    let Some((_, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
+        return false;
+    };
+    exec.path == c.exec_path && without_devices_or_children(req)
 }
 
 /// Whether `req` is a network share server's jail (`[share_servers]`,
@@ -159,19 +187,11 @@ pub fn is_courier(req: &CreateJailRequest, policy: &Policy) -> bool {
 /// - learning a server's host key for the user to accept (`--learn`): no
 ///   FUSE, and the caller's stdio, which carries the fingerprint back.
 pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
-    let (Some(c), Some(dir), Some(exec)) =
-        (policy.share_servers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
-    else {
+    let Some(c) = policy.share_servers.as_ref() else { return false };
+    let Some((uid, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
         return false;
     };
-    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
-        return false;
-    };
-    req.name == format!("{}{uid}", c.name_prefix)
-        && (c.uid_first..=c.uid_last).contains(&uid)
-        && exec.uid == uid
-        && exec.gid == uid
-        && c.exec_paths.contains(&exec.path)
+    c.exec_paths.contains(&exec.path)
         && match &req.fuse {
             // Serving: its own mount, and grants of folders on the control socket.
             Some(f) => !exec.stdio && f.device.is_empty() && f.root_dir.is_empty() && f.mountpoint == c.mountpoint(uid),
@@ -180,7 +200,7 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
         && req.devfs_grant.is_none()
         && req.devfs_grants.is_empty()
         && req.children_max == 0
-        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+        && !req.allow_tessera_keys
 }
 
 /// What a trusted stick's server may have mounted (read-only, at the same
@@ -239,12 +259,8 @@ pub fn is_stick_server(req: &CreateJailRequest, policy: &Policy) -> bool {
 /// No devices, no FUSE, no child jails, no locked memory.
 pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
     use crate::protocol::NetworkConfig;
-    let (Some(c), Some(dir), Some(exec)) =
-        (policy.print_workers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
-    else {
-        return false;
-    };
-    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+    let Some(c) = policy.print_workers.as_ref() else { return false };
+    let Some((_, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
         return false;
     };
     let no_net = exec.path == c.render_exec || c.browse_exec.as_deref() == Some(exec.path.as_str());
@@ -261,19 +277,7 @@ pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
     } else {
         false
     };
-    network_ok
-        && req.name == format!("{}{uid}", c.name_prefix)
-        && (c.uid_first..=c.uid_last).contains(&uid)
-        && exec.uid == uid
-        && exec.gid == uid
-        && exec.stdio
-        && req.fuse.is_none()
-        && req.devfs_grant.is_none()
-        && req.devfs_grants.is_empty()
-        && req.children_max == 0
-        && !req.allow_mlock
-        && !req.allow_tessera_keys
-        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+    network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
 }
 
 /// The pf tag the `CRYPTA_OUTER` rules key on (vpn.md §5.4).
@@ -288,12 +292,8 @@ pub const CRYPTA_TAG: &str = "CRYPTA_OUTER";
 /// resolver. No devices, no FUSE, no child jails, no locked memory.
 pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
     use crate::protocol::NetworkConfig;
-    let (Some(c), Some(dir), Some(exec)) =
-        (policy.crypta_engines.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
-    else {
-        return false;
-    };
-    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+    let Some(c) = policy.crypta_engines.as_ref() else { return false };
+    let Some((_, exec)) = service_instance(req, policy, &c.name_prefix, c.uid_first..=c.uid_last) else {
         return false;
     };
     // Which engine, and so which transport its grants may name.
@@ -318,19 +318,7 @@ pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
         }
         _ => false,
     };
-    network_ok
-        && req.name == format!("{}{uid}", c.name_prefix)
-        && (c.uid_first..=c.uid_last).contains(&uid)
-        && exec.uid == uid
-        && exec.gid == uid
-        && exec.stdio
-        && req.fuse.is_none()
-        && req.devfs_grant.is_none()
-        && req.devfs_grants.is_empty()
-        && req.children_max == 0
-        && !req.allow_mlock
-        && !req.allow_tessera_keys
-        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+    network_ok && exec.stdio && without_devices_or_children(req) && !req.allow_mlock
 }
 
 /// A pf tag on a jail's flows is Crypta's engines' alone: it is what lets
@@ -1253,6 +1241,15 @@ mod tests {
         ] {
             assert!(!is_courier(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+        /* Review 2026-11-24 (M4): the courier check was the one copy that
+         * never said "no children, no devices, no keys". It does now. */
+        let mut kids = ok.clone();
+        kids.children_max = 1;
+        let mut keys = ok.clone();
+        keys.allow_tessera_keys = true;
+        for (r, why) in [(kids, "child jails"), (keys, "Tessera keys")] {
+            assert!(!is_courier(&r, &p), "{why}");
         }
     }
 
