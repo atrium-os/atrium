@@ -1,7 +1,8 @@
 //! Jails portcullisd makes for a person (apps, workspaces, consoles), made by
 //! jaild from a typed request (app-jails-via-jaild.md §4). portcullisd never
-//! calls jail(8), `jail_attach` or `jls`: it asks jaild, and holds the
-//! process descriptor jaild hands back.
+//! creates, enters or removes a jail itself (no jail(8), `jail_set` or
+//! `jail_attach`): it asks jaild, and holds the process descriptor jaild
+//! hands back. It may still read `jls` to see what runs.
 //!
 //! Unsafe code here is limited to taking ownership of received descriptors
 //! and the kqueue calls that wait on a process descriptor.
