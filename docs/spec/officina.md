@@ -4814,7 +4814,7 @@ Gates: atrium-sheets `deleted_cells_turn_formulas_reading_them_into_ref_errors`.
 - **Typed colours:** the text and fill colour bar has a `#RRGGBB` field (`#RGB` and a bare `RRGGBB` also work, via `format::parse_hex`). Set applies the colour as one step and closes the bar. A colour the field can't read keeps the bar open and says how to write one.
 - **Clear Comments** (Data menu) takes the selection's comments off as one step, leaving contents and formats.
 
-Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Not yet: a rotation angle typed by hand. (Border lines and colours came in §16.104.)
+Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all 130 Sheets lib tests pass. Border lines and colours came in §16.104, and a typed rotation angle in §16.105.
 
 ### 16.104 Border pens, and renaming names (2026-11-24)
 
@@ -4822,6 +4822,14 @@ Gate: atrium-sheets `rotation_border_styles_hex_colours_and_clear_comments`; all
 - **Rename** in the Name Manager opens the name bar filled with the name. `officina_grid::names::rename_ops` renames the definition and rewrites every formula and other name that uses it, as one step. A workbook name isn't rewritten on a sheet whose own name of that spelling hides it, and a sheet name is rewritten only on its sheet. A formula that binds the spelling itself with LET or LAMBDA is left unchanged and counted in the status. Clashing and invalid names are refused, and the bar stays open. Not yet: names used in conditional formats, validations and charts aren't rewritten.
 
 Gates: atrium-sheets `border_pens_draw_their_line_and_colour` and `renaming_a_name_rewrites_the_formulas_and_names_using_it`; all 132 Sheets lib and 121 officina-grid lib tests pass.
+
+### 16.105 Custom Sort, and a typed rotation angle (2026-11-24)
+
+- **Custom Sort…** (Data menu) opens a bar that sorts the data at the selection or cursor by several columns, first to last, as one step (`data::custom_sort`). Each column is a letter or a header (case does not matter), optionally followed by `desc` or `Z to A`, or `asc` or `A to Z`. Columns are separated by commas or `then`, for example `Region, Sales desc`. The bar starts with the cursor's column, by its header when the data has one. Columns outside the data, a column given twice, and more than 64 columns are refused, and the bar stays open. The checks Sort A to Z makes (hidden rows, merges, the header row) are shared (`data::sort_rect`).
+- **Rotation Angle…** (Format menu, a radio item that is on for angles the presets don't cover) opens a bar for degrees from −90 to 90, counter-clockwise, as Excel's Format Cells takes them. A trailing `°` is fine.
+- Opening a bar now closes the others through one helper (`Sheets::close_bars`).
+
+Gates: atrium-sheets `custom_sort_orders_by_several_columns_named_by_letter_or_header` and `a_typed_rotation_angle_turns_the_text`; all 134 Sheets lib tests pass.
 
 ## 17. Decisions (accepted 2026-11-14)
 

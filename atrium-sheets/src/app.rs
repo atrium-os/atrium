@@ -355,6 +355,12 @@ pub struct Sheets {
     pub hex_text: Mutable<TextEdit>,
     /// The Define Name bar is open, with its name field.
     pub naming: Mutable<bool>,
+    /// The Custom Sort bar is open, with its field.
+    pub sorting: Mutable<bool>,
+    pub sort_text: Mutable<TextEdit>,
+    /// The Rotation Angle bar is open, with its field.
+    pub angling: Mutable<bool>,
+    pub angle_text: Mutable<TextEdit>,
     /// The bar renames this Name Manager row rather than naming the selection.
     pub name_rename: Mutable<Option<usize>>,
     pub name_text: Mutable<TextEdit>,
@@ -386,7 +392,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1116,6 +1122,23 @@ impl Sheets {
         self.changed();
     }
 
+    /// Closes every bar under the grid, before another opens.
+    fn close_bars(&self) {
+        self.renaming.set(false);
+        self.coloring.set(false);
+        self.close_comment_bar();
+        self.linking.set(None);
+        self.size_bar.set(None);
+        self.paste_bar.set(None);
+        self.going.set(false);
+        self.coding.set(false);
+        self.naming.set(false);
+        self.name_rename.set(None);
+        self.sorting.set(false);
+        self.angling.set(false);
+        self.color_bar.set(None);
+    }
+
     fn close_comment_bar(&self) {
         self.commenting.set(None);
         self.thread_edit.set(None);
@@ -1523,6 +1546,31 @@ impl Sheets {
                 }
                 self.changed();
             }
+            TabCmd::SortDone | TabCmd::AngleDone => {
+                let sort = c == TabCmd::SortDone;
+                let typed = if sort { self.sort_text.get_cloned() } else { self.angle_text.get_cloned() }.text().to_string();
+                let g = self.grid.get_cloned();
+                let res = if sort {
+                    crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed)
+                } else {
+                    crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed)
+                };
+                match res {
+                    Ok(m) => {
+                        self.sorting.set(false);
+                        self.angling.set(false);
+                        self.rev.set(self.rev.get().wrapping_add(1));
+                        self.set_status(m);
+                    }
+                    Err(why) => self.set_status(why),
+                }
+                self.changed();
+            }
+            TabCmd::SortCancel | TabCmd::AngleCancel => {
+                self.sorting.set(false);
+                self.angling.set(false);
+                self.changed();
+            }
             TabCmd::NameCancel => {
                 self.naming.set(false);
                 self.name_rename.set(None);
@@ -1758,6 +1806,22 @@ impl Sheets {
             }
             Button::primary("Save").at(x, y + 2.0).width(64.0).on_click(push(TabCmd::CommentDone)).render(ctx);
             Button::secondary("Cancel").at(x + 68.0, y + 2.0).width(64.0).on_click(push(TabCmd::CommentCancel)).render(ctx);
+            return;
+        }
+        if self.sorting.get() || self.angling.get() {
+            let sort = self.sorting.get();
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: if sort { "Sort by" } else { "Turn text" }.into(), style: st });
+            let fw = if sort { (w - 112.0 - 170.0).clamp(160.0, 480.0) } else { 90.0 };
+            let cmds = self.cmds.clone();
+            let done = if sort { TabCmd::SortDone } else { TabCmd::AngleDone };
+            let field = if sort { TextField::new(self.sort_text.clone()).key(0x5348_5354).placeholder("Region, Sales desc") } else { TextField::new(self.angle_text.clone()).key(0x5348_414e).placeholder("-90 to 90") };
+            field.autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(done))).render(ctx);
+            Button::primary(if sort { "Sort" } else { "Turn" }).at(112.0 + fw, y + 2.0).width(64.0).on_click(push(done)).render(ctx);
+            Button::secondary("Cancel").at(184.0 + fw, y + 2.0).width(72.0).on_click(push(if sort { TabCmd::SortCancel } else { TabCmd::AngleCancel })).render(ctx);
+            if !sort {
+                ctx.add(Node::Text { rect: Rect::new(264.0 + fw, y + 6.0, 260.0, 18.0), content: "degrees, counter-clockwise".into(), style: crate::tabs::style(t.text_secondary(), false) });
+            }
             return;
         }
         if self.naming.get() {
@@ -3214,6 +3278,27 @@ impl Sheets {
                         Err(why) => self.set_status(why),
                     }
                     self.rev.set(self.rev.get().wrapping_add(1));
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::CustomSort) => {
+                    self.close_bars();
+                    let g = self.grid.get_cloned();
+                    let start = crate::data::custom_sort_start(&self.doc.borrow(), g.selection(), g.cursor);
+                    let mut ed = TextEdit::new(&start);
+                    ed.select_all();
+                    self.sort_text.set(ed);
+                    self.sorting.set(true);
+                    self.changed();
+                    false
+                }
+                Cmd::Format(crate::format::FormatCmd::Angle) => {
+                    self.close_bars();
+                    let deg = { let d = self.doc.borrow(); let (r, c) = self.grid.get_cloned().cursor; d.wb.style(officina_grid::CellAddr::new(d.sheet, r, c)).rotation };
+                    let mut ed = TextEdit::new(&if (-90..=90).contains(&deg) { deg.to_string() } else { "0".into() });
+                    ed.select_all();
+                    self.angle_text.set(ed);
+                    self.angling.set(true);
                     self.changed();
                     false
                 }
@@ -7185,5 +7270,56 @@ mod tests {
         s.take_cmds();
         assert_eq!(f(3).as_deref(), Some("=SUM(Block)"));
         assert_eq!(shown(&s, 4, 0), "20");
+    }
+
+    #[test]
+    fn custom_sort_orders_by_several_columns_named_by_letter_or_header() {
+        use crate::data::DataCmd;
+        use crate::tabs::TabCmd;
+        let s = sheets_of(b"Region,Sales,Rep\nWest,5,Ann\nEast,7,Bo\nWest,9,Cy\nEast,2,Di\n");
+        select(&s, (1, 0), (1, 0));
+        let run = |t: TabCmd| { s.cmds.lock().unwrap().push(Cmd::Tab(t)); s.take_cmds(); };
+        data(&s, DataCmd::CustomSort);
+        assert!(s.sorting.get());
+        assert_eq!(s.sort_text.get_cloned().text(), "Region");
+        s.sort_text.set(TextEdit::new("Region, Wage desc"));
+        run(TabCmd::SortDone);
+        assert!(s.sorting.get() && s.doc.borrow().status.contains("isn't a column"), "{}", s.doc.borrow().status);
+        s.sort_text.set(TextEdit::new("region then B desc"));
+        run(TabCmd::SortDone);
+        assert!(!s.sorting.get());
+        assert_eq!(s.doc.borrow().status, "Sorted 4 rows by A, then B (Z to A) (the first row is kept as the header).");
+        let reps: Vec<String> = (1..5).map(|r| shown(&s, r, 2)).collect();
+        assert_eq!(reps, ["Bo", "Di", "Cy", "Ann"]);
+        assert_eq!(shown(&s, 0, 0), "Region");
+        // A column twice is refused.
+        data(&s, DataCmd::CustomSort);
+        s.sort_text.set(TextEdit::new("A, Region"));
+        run(TabCmd::SortDone);
+        assert!(s.doc.borrow().status.contains("twice"));
+        run(TabCmd::SortCancel);
+        assert!(!s.sorting.get());
+    }
+
+    #[test]
+    fn a_typed_rotation_angle_turns_the_text() {
+        use crate::format::FormatCmd;
+        use crate::tabs::TabCmd;
+        let s = sheets_of(b"a\n");
+        select(&s, (0, 0), (0, 0));
+        let run = |t: TabCmd| { s.cmds.lock().unwrap().push(Cmd::Tab(t)); s.take_cmds(); };
+        fmt(&s, FormatCmd::Angle);
+        assert!(s.angling.get());
+        assert_eq!(s.angle_text.get_cloned().text(), "0");
+        s.angle_text.set(TextEdit::new("120"));
+        run(TabCmd::AngleDone);
+        assert!(s.angling.get() && s.doc.borrow().status.contains("outside"));
+        s.angle_text.set(TextEdit::new("-30°"));
+        run(TabCmd::AngleDone);
+        assert!(!s.angling.get());
+        assert_eq!(s.doc.borrow().status, "Text turned -30°.");
+        assert_eq!(s.doc.borrow().wb.style(officina_grid::CellAddr::new(0, 0, 0)).rotation, -30);
+        let items = crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection());
+        assert!(items.iter().any(|(m, c)| *c == Some(FormatCmd::Angle) && m.label == "Rotation Angle…"));
     }
 }
