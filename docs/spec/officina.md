@@ -4768,6 +4768,14 @@ Before this, Sheets showed the formatting a file brought in but had no way to se
 
 Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it` and `format::tests::decimals_are_added_and_taken_in_every_section`; pergola `italic_and_size_reach_the_cell_style` and the grid key test. Not yet: a font name picker, custom colours, other border styles and colours, a format code box (Format Cells), Format Painter and rows growing for larger text by themselves. Printing draws italic, underline, strike and sizes as the grid does (officina-pdf `a_cell_prints_in_its_own_size_and_italic`).
 
+### 16.98 Insert and delete cells, custom number formats, rows that follow text size (2026-11-24)
+
+- **Insert and delete cells** (Data menu): Insert Cells, Shift Down or Shift Right, and Delete Cells, Shift Up or Shift Left, as Excel's Insert and Delete dialogs offer them. The cells from the selection (inserting) or past it (deleting) to the end of what is used, across the selection's columns or rows, are cut and pasted along by the selection's height or width as one undo step (`data::shift_cells`). Formulas elsewhere that read the moved cells follow them, as a cut does. Merged cells crossing the moving block are refused; at most 2,000,000 cells move. Not yet: formulas that read deleted cells don't turn into `#REF!`; they read whatever moves into place.
+- **Custom Format…** (Format menu) opens a bar with the cursor cell's format code. Apply sets the code on the selection as one step, and the status shows how the first cell now reads. A code with a part the formatter doesn't understand (`NumFmt::is_exact`) is refused and the bar stays open. Codes are at most 255 characters.
+- **Row heights:** Larger Text and Smaller Text refit rows nobody sized (the first 1,000 selected rows that hold something), as part of the same step. Rows a person sized keep their height.
+
+Gates: atrium-sheets `insert_and_delete_cells_shift_their_neighbours_and_formulas_follow`, `the_custom_format_bar_takes_a_code_and_refuses_what_it_cannot_read` and `larger_text_grows_rows_nobody_sized_and_smaller_brings_them_back`; all 123 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

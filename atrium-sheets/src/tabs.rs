@@ -66,6 +66,9 @@ pub enum TabCmd {
     GoTo,
     GoToDone,
     GoToCancel,
+    /// The Custom Format bar's field submitted; closed.
+    CodeDone,
+    CodeCancel,
     /// The exact-size bar's field submitted; closed.
     SizeDone,
     SizeCancel,

@@ -29,6 +29,8 @@ pub enum FormatCmd {
     /// A colour from the bar, for the text or the fill; `None` takes it off.
     Color(bool, Option<u32>),
     Borders(BorderKind),
+    /// Opens the bar for a format code of one's own; the window runs it.
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,7 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         }
         v.push((item, Some(FormatCmd::Number(i))));
     }
+    v.push((MenuItem::new("Custom Format…"), Some(FormatCmd::Custom)));
     v.push((MenuItem::new("More Decimals"), Some(FormatCmd::MoreDecimals)));
     v.push((MenuItem::new("Fewer Decimals"), Some(FormatCmd::FewerDecimals)));
     v.push((MenuItem::new("All Borders").separated(), Some(FormatCmd::Borders(BorderKind::All))));
@@ -148,6 +151,7 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
         }};
     }
     match cmd {
+        FormatCmd::Custom => Ok(String::new()),
         FormatCmd::Bold => toggle!("Bold", bold),
         FormatCmd::Italic => toggle!("Italic", italic),
         FormatCmd::Underline => toggle!("Underline", underline),
@@ -318,4 +322,39 @@ mod tests {
         assert_eq!(decimals("0.00E+00", false).as_deref(), Some("0.0E+00"));
         assert_eq!(decimals("@", true), None);
     }
+}
+
+/// The longest format code the Custom Format bar takes.
+pub const MAX_CODE: usize = 255;
+
+/// The selection given the number format `code` typed into the Custom
+/// Format bar, as one step. Refused, with why, when Sheets doesn't
+/// understand every part of it; the status shows how the first cell now
+/// reads.
+pub fn set_code(d: &mut Doc, sel: CellRange, code: &str) -> Result<String, String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err("Type a format code, such as 0.000, #,##0 \"kg\" or yyyy-mm-dd.".into());
+    }
+    if code.chars().count() > MAX_CODE {
+        return Err(format!("A format code is at most {MAX_CODE} characters."));
+    }
+    if !officina_grid::numfmt::NumFmt::parse(code).is_exact() {
+        return Err(format!("Sheets doesn't understand all of {code}; check its quotes and brackets."));
+    }
+    let s = d.sheet;
+    let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    d.status.clear();
+    let op = GridOp::restyle(&d.wb, r, &|st: &Style| Style { num_fmt: code.into(), ..st.clone() });
+    d.run("Number Format", vec![op]);
+    if d.status == crate::sheet_protection::REFUSED {
+        return Err(d.status.clone());
+    }
+    let at = CellAddr::new(s, sel.r0, sel.c0);
+    let shown = d.wb.formatted(at).text;
+    Ok(if shown.is_empty() {
+        format!("Format is {code}.")
+    } else {
+        format!("Format is {code}: {} shows {shown}.", officina_grid::addr::a1(sel.r0, sel.c0))
+    })
 }

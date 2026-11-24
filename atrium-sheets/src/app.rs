@@ -342,6 +342,9 @@ pub struct Sheets {
     pub format_menu: Mutable<MenuState>,
     pub color_bar: Mutable<Option<bool>>,
     pub goto_text: Mutable<TextEdit>,
+    /// The Custom Format bar is open, with its code field.
+    pub coding: Mutable<bool>,
+    pub code_text: Mutable<TextEdit>,
     /// The exact-size bar: sheet, rows (else columns), first and last.
     pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
     /// The Paste Special bar, open with its choices.
@@ -364,7 +367,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1426,6 +1429,7 @@ impl Sheets {
                 self.changed();
             }
             TabCmd::GoTo => {
+                self.coding.set(false);
                 self.renaming.set(false);
                 self.coloring.set(false);
                 self.close_comment_bar();
@@ -1461,6 +1465,24 @@ impl Sheets {
             }
             TabCmd::GoToCancel => {
                 self.going.set(false);
+                self.changed();
+            }
+            TabCmd::CodeDone => {
+                let typed = self.code_text.get_cloned().text().to_string();
+                let sel = self.grid.get_cloned().selection();
+                let res = crate::format::set_code(&mut self.doc.borrow_mut(), sel, &typed);
+                match res {
+                    Ok(m) => {
+                        self.coding.set(false);
+                        self.rev.set(self.rev.get().wrapping_add(1));
+                        self.set_status(m);
+                    }
+                    Err(why) => self.set_status(why),
+                }
+                self.changed();
+            }
+            TabCmd::CodeCancel => {
+                self.coding.set(false);
                 self.changed();
             }
             TabCmd::SizeDone => {
@@ -1693,6 +1715,16 @@ impl Sheets {
             }
             Button::primary("Save").at(x, y + 2.0).width(64.0).on_click(push(TabCmd::CommentDone)).render(ctx);
             Button::secondary("Cancel").at(x + 68.0, y + 2.0).width(64.0).on_click(push(TabCmd::CommentCancel)).render(ctx);
+            return;
+        }
+        if self.coding.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Format code".into(), style: st });
+            let fw = (w - 112.0 - 170.0).clamp(120.0, 420.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.code_text.clone()).key(0x5348_4643).autofocus(true).placeholder("0.000, #,##0 \"kg\" or yyyy-mm-dd").at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CodeDone))).render(ctx);
+            Button::primary("Apply").at(112.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::CodeDone)).render(ctx);
+            Button::secondary("Cancel").at(184.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::CodeCancel)).render(ctx);
             return;
         }
         if self.going.get() {
@@ -2055,6 +2087,9 @@ impl Sheets {
         rev.set(rev.get().wrapping_add(1));
     }
 }
+
+/// The most rows Larger or Smaller Text refits.
+pub const MAX_FIT_ROWS: u32 = 1_000;
 
 /// The most rows or columns one drag sizes together.
 pub const MAX_SIZED: u32 = 16_384;
@@ -3247,12 +3282,46 @@ impl Sheets {
                     self.changed();
                     false
                 }
+                Cmd::Format(crate::format::FormatCmd::Custom) => {
+                    self.renaming.set(false);
+                    self.coloring.set(false);
+                    self.close_comment_bar();
+                    self.linking.set(None);
+                    self.size_bar.set(None);
+                    self.paste_bar.set(None);
+                    self.going.set(false);
+                    self.color_bar.set(None);
+                    let code = {
+                        let d = self.doc.borrow();
+                        let (r, c) = self.grid.get_cloned().cursor;
+                        d.wb.style(officina_grid::CellAddr::new(d.sheet, r, c)).num_fmt.to_string()
+                    };
+                    let mut ed = TextEdit::new(&code);
+                    ed.select_all();
+                    self.code_text.set(ed);
+                    self.coding.set(true);
+                    self.changed();
+                    false
+                }
                 Cmd::Format(f) => {
                     if matches!(f, crate::format::FormatCmd::Color(..)) {
                         self.color_bar.set(None);
                     }
                     let g = self.grid.get_cloned();
-                    crate::format::run(&mut self.doc.borrow_mut(), g.selection(), f);
+                    let sel = g.selection();
+                    crate::format::run(&mut self.doc.borrow_mut(), sel, f);
+                    if matches!(f, crate::format::FormatCmd::Larger | crate::format::FormatCmd::Smaller) {
+                        // Rows nobody sized follow the text's new size, as
+                        // part of the same step.
+                        let (er, _) = { let d = self.doc.borrow(); d.wb.extent(d.sheet) };
+                        let last = sel.r1.min(er.saturating_sub(1)).min(sel.r0.saturating_add(MAX_FIT_ROWS - 1));
+                        if er > 0 && sel.r0 <= last {
+                            for row in sel.r0..=last {
+                                let h = self.source.fit_height(row);
+                                self.doc.borrow_mut().grow_row(row, h);
+                            }
+                        }
+                    }
                     self.rev.set(self.rev.get().wrapping_add(1));
                     self.changed();
                     false
@@ -6496,5 +6565,83 @@ mod tests {
         // A click on a cell lets it go.
         press(&mut app, Point::new(gr.x() + 80.0, gr.y() + 60.0), Point::new(gr.x() + 80.0, gr.y() + 60.0));
         assert_eq!(s.grid.get_cloned().picked, None);
+    }
+
+    #[test]
+    fn insert_and_delete_cells_shift_their_neighbours_and_formulas_follow() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"a,1,x\nb,2,y\nc,3,z\n");
+        s.doc.borrow_mut().type_into(4, 2, "=B3");
+        // B2 inserted, shift down: column B's 2 and 3 move down, A and C stay.
+        select(&s, (1, 1), (1, 1));
+        let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (1, 1));
+        assert!(items.iter().any(|(m, c)| *c == Some(DataCmd::InsertCellsDown) && m.label == "Insert Cells, Shift Down"));
+        assert_eq!(data(&s, DataCmd::InsertCellsDown), "1 cell inserted; the cells below moved down.");
+        assert_eq!((shown(&s, 1, 1), shown(&s, 2, 1), shown(&s, 3, 1)), ("".into(), "2".into(), "3".into()));
+        assert_eq!((shown(&s, 1, 0), shown(&s, 1, 2)), ("b".into(), "y".into()));
+        assert_eq!(s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, 4, 2)).as_deref(), Some("=B4"));
+        // Deleting it again, shift up, puts them back; then shift left.
+        assert_eq!(data(&s, DataCmd::DeleteCellsUp), "1 cell deleted; the cells below moved up.");
+        assert_eq!((shown(&s, 1, 1), shown(&s, 2, 1), shown(&s, 3, 1)), ("2".into(), "3".into(), "".into()));
+        select(&s, (0, 0), (1, 0));
+        assert_eq!(data(&s, DataCmd::DeleteCellsLeft), "2 cells deleted; the cells to the right moved left.");
+        assert_eq!((shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2)), ("1".into(), "x".into(), "".into()));
+        assert_eq!((shown(&s, 2, 0), shown(&s, 2, 1)), ("c".into(), "3".into()));
+        // Shift right, then one undo is the whole step.
+        select(&s, (2, 0), (2, 0));
+        data(&s, DataCmd::InsertCellsRight);
+        assert_eq!((shown(&s, 2, 0), shown(&s, 2, 1), shown(&s, 2, 2)), ("".into(), "c".into(), "3".into()));
+        s.cmds.lock().unwrap().push(Cmd::Undo);
+        s.take_cmds();
+        assert_eq!((shown(&s, 2, 0), shown(&s, 2, 1)), ("c".into(), "3".into()));
+        // Merged cells crossing what would move are refused.
+        s.doc.borrow_mut().run("Merge", vec![officina_grid::ops::GridOp::Merges { sheet: 0, list: vec![officina_grid::Rect { sheet: 0, r0: 1, c0: 0, r1: 1, c1: 1 }] }]);
+        select(&s, (0, 1), (0, 1));
+        assert!(data(&s, DataCmd::DeleteCellsUp).starts_with("Merged cells cross"));
+    }
+
+    #[test]
+    fn the_custom_format_bar_takes_a_code_and_refuses_what_it_cannot_read() {
+        use crate::format::FormatCmd;
+        let s = sheets_of(b"1234.5\n2\n");
+        select(&s, (0, 0), (1, 0));
+        assert!(crate::format::menu(&s.doc.borrow(), s.grid.get_cloned().selection()).iter().any(|(m, c)| *c == Some(FormatCmd::Custom) && m.label == "Custom Format…"));
+        fmt(&s, FormatCmd::Custom);
+        assert!(s.coding.get());
+        assert_eq!(s.code_text.get_cloned().text(), "General");
+        s.code_text.set(TextEdit::new("0.000 \"kg\""));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::CodeDone));
+        s.take_cmds();
+        assert!(!s.coding.get());
+        assert_eq!(s.doc.borrow().status, "Format is 0.000 \"kg\": A1 shows 1234.500 kg.");
+        assert_eq!(shown(&s, 1, 0), "2.000 kg");
+        // A code it can't read keeps the bar open and changes nothing.
+        fmt(&s, FormatCmd::Custom);
+        s.code_text.set(TextEdit::new("0.0[oops]"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::CodeDone));
+        s.take_cmds();
+        assert!(s.coding.get() && s.doc.borrow().status.starts_with("Sheets doesn't understand"), "{}", s.doc.borrow().status);
+        assert_eq!(shown(&s, 0, 0), "1234.500 kg");
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::CodeCancel));
+        s.take_cmds();
+        assert!(!s.coding.get());
+    }
+
+    #[test]
+    fn larger_text_grows_rows_nobody_sized_and_smaller_brings_them_back() {
+        use crate::format::FormatCmd;
+        let s = sheets_of(b"a,b\nc,d\n");
+        let h = |r: u32| { let d = s.doc.borrow(); d.wb.sheet(0).row_sizes.size(r) };
+        let base = h(0);
+        select(&s, (0, 0), (0, 1));
+        for _ in 0..4 {
+            fmt(&s, FormatCmd::Larger);
+        }
+        assert!(h(0) > base, "{} vs {base}", h(0));
+        assert_eq!(h(1), base);
+        for _ in 0..4 {
+            fmt(&s, FormatCmd::Smaller);
+        }
+        assert_eq!(h(0), base);
     }
 }

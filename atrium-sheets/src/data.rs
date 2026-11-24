@@ -131,6 +131,14 @@ pub enum DataCmd {
     DeleteRows,
     /// The selection's columns.
     DeleteCols,
+    /// Empty cells where the selection is, what was there and below it in
+    /// its columns moving down (or, right: in its rows moving right).
+    InsertCellsDown,
+    InsertCellsRight,
+    /// The selection's cells taken out, what is below them in their
+    /// columns moving up (or, left: right of them in their rows moving left).
+    DeleteCellsUp,
+    DeleteCellsLeft,
     /// The selection as one merged cell, its top-left's value centred across it.
     Merge,
     /// The selection's text centred across its columns without merging
@@ -366,6 +374,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
+        (MenuItem::new("Insert Cells, Shift Down"), Some(DataCmd::InsertCellsDown)),
+        (MenuItem::new("Insert Cells, Shift Right"), Some(DataCmd::InsertCellsRight)),
+        (MenuItem::new("Delete Cells, Shift Up"), Some(DataCmd::DeleteCellsUp)),
+        (MenuItem::new("Delete Cells, Shift Left"), Some(DataCmd::DeleteCellsLeft)),
         (MenuItem::new(format!("Hide {}", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::HideRows)),
         (MenuItem::new("Unhide Rows").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
         (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
@@ -542,6 +554,80 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
 }
 
 /// The most rows Remove Duplicates looks through.
+/// The most cells Insert or Delete Cells moves.
+pub const MAX_SHIFT_CELLS: u64 = 2_000_000;
+
+/// Insert or Delete Cells (Excel's shift down, right, up or left): the cells
+/// from the selection (inserting) or past it (deleting) to the end of what
+/// is used, in the selection's columns (down, up) or rows (right, left),
+/// cut and pasted along by the selection's height or width, as one step.
+/// Formulas reading the moved cells follow them, as a cut does.
+fn shift_cells(d: &mut Doc, sel: CellRange, cmd: DataCmd) -> Result<String, String> {
+    let s = d.sheet;
+    let (er, ec) = d.wb.extent(s);
+    let down = matches!(cmd, DataCmd::InsertCellsDown | DataCmd::DeleteCellsUp);
+    let insert = matches!(cmd, DataCmd::InsertCellsDown | DataCmd::InsertCellsRight);
+    let sel_rect = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+    // The block that moves: from the selection (inserting) or just past it
+    // (deleting) to the end of what is used, across the selection.
+    let (start, end) = match (down, insert) {
+        (true, true) => (sel.r0, er),
+        (true, false) => (sel.r1 + 1, er),
+        (false, true) => (sel.c0, ec),
+        (false, false) => (sel.c1 + 1, ec),
+    };
+    let block = (start < end).then(|| if down {
+        Rect { sheet: s, r0: start, c0: sel.c0, r1: end - 1, c1: sel.c1 }
+    } else {
+        Rect { sheet: s, r0: sel.r0, c0: start, r1: sel.r1, c1: end - 1 }
+    });
+    // Merged cells crossing the edge of what moves can't move with it.
+    let strip = if down {
+        Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: officina_grid::addr::MAX_ROWS - 1, c1: sel.c1 }
+    } else {
+        Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: officina_grid::addr::MAX_COLS - 1 }
+    };
+    if d.wb.merges(s).iter().any(|m| m.intersects(&strip) && !(m.r0 >= strip.r0 && m.r1 <= strip.r1 && m.c0 >= strip.c0 && m.c1 <= strip.c1)) {
+        return Err("Merged cells cross the cells that would move; unmerge them first.".into());
+    }
+    if block.is_some_and(|b| b.cells() > MAX_SHIFT_CELLS) {
+        return Err(format!("That would move more than {MAX_SHIFT_CELLS} cells; insert or delete whole rows or columns instead."));
+    }
+    let (n_r, n_c) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
+    let mut ops = Vec::new();
+    if !insert {
+        ops.push(GridOp::clear(sel_rect));
+        ops.push(GridOp::Restyle(officina_grid::ops::StyleRegion { rect: sel_rect, spans: Vec::new() }));
+    }
+    if let Some(b) = block {
+        let clip = officina_grid::clip::Clip::take(&d.wb, b, true);
+        let (row, col) = match (down, insert) {
+            (true, true) => (b.r0 + n_r, b.c0),
+            (true, false) => (sel.r0, b.c0),
+            (false, true) => (b.r0, b.c0 + n_c),
+            (false, false) => (b.r0, sel.c0),
+        };
+        let (moved, _) = clip.paste(&d.wb, s, row, col).map_err(|e| if e.contains("fit") { "There is no room to move those cells along.".to_string() } else { e })?;
+        ops.extend(moved);
+    }
+    if ops.is_empty() {
+        return Ok("Nothing to move there.".into());
+    }
+    let label = match cmd {
+        DataCmd::InsertCellsDown | DataCmd::InsertCellsRight => "Insert Cells",
+        _ => "Delete Cells",
+    };
+    d.run(label, ops);
+    let way = match cmd {
+        DataCmd::InsertCellsDown => "inserted; the cells below moved down",
+        DataCmd::InsertCellsRight => "inserted; the cells to the right moved right",
+        DataCmd::DeleteCellsUp => "deleted; the cells below moved up",
+        _ => "deleted; the cells to the right moved left",
+    };
+    let k = sel_rect.cells();
+    Ok(format!("{k} {} {way}.", if k == 1 { "cell" } else { "cells" }))
+}
+
 pub const MAX_DEDUP_ROWS: u32 = 1_000_000;
 /// The most rows Text to Columns and AutoSum read.
 pub const MAX_SPLIT_ROWS: u32 = 100_000;
@@ -1378,6 +1464,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 None => Err("This shift exceeds the sheet size or axis identity limits.".into()),
             }
         }
+        DataCmd::InsertCellsDown | DataCmd::InsertCellsRight | DataCmd::DeleteCellsUp | DataCmd::DeleteCellsLeft => shift_cells(d, sel, cmd),
         DataCmd::SortAsc | DataCmd::SortDesc => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
             if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0)
