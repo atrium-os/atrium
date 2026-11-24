@@ -1,0 +1,19 @@
+[package]
+name = "aura-eap"
+version = "0.1.0"
+description = "Aura's EAP peer for WPA2/WPA3-Enterprise (docs/spec/wifi.md §7.4): PEAPv0/EAP-MSCHAPv2, EAP-TTLS (PAP, MSCHAPv2) and EAP-TLS on rustls, the server certificate always checked. No I/O."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
+md4 = "0.10"
+des = "0.8"
+sha1 = "0.10"
+hmac = "0.12"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+md-5 = "0.10"

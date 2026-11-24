@@ -9,6 +9,7 @@ members = [
     "aura-wlan-core",
     "aura-sim-check",
     "aura-rsn",
+    "aura-eap",
     "aura-air",
     "aura-ipc",
     "aura-mlme",

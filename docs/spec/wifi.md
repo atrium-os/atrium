@@ -430,10 +430,17 @@ passphrase. aura-mlme sees neither the password nor the MSK. A client certificat
 stays in Arca: aura-eap asks Arca, through aura-keys, to sign the TLS CertificateVerify
 (the key never leaves Arca).
 
-**TLS.** rustls 0.23 (Apache-2.0/MIT/ISC, already in the tree), TLS 1.2 and 1.3,
-driven without sockets; keys from its RFC 5705 exporter ("client EAP encryption" for
-PEAP and EAP-TLS, "ttls keying material" for TTLS; RFC 9190 for EAP-TLS 1.3). A server
-that speaks only TLS 1.0 or 1.1 is refused with that reason. MSCHAPv2 needs MD4 and DES
+**TLS.** rustls 0.23 (Apache-2.0/MIT/ISC, already in the tree), driven without
+sockets, no SNI, no resumption. v1 speaks TLS 1.2, which every RADIUS server does and
+whose EAP keying is settled: keys from the RFC 5705 exporter ("client EAP encryption"
+for PEAP and EAP-TLS, "ttls keying material" and "ttls challenge" for TTLS). TLS 1.3
+(RFC 9190, RFC 9427 for PEAP/TTLS) follows once the servers people meet offer it. A
+server that speaks only TLS 1.0 or 1.1 is refused with that reason. PEAP runs
+Microsoft's crypto-binding when the server asks for it (the server's MAC is checked
+and the MSK then comes from the compound keys), and a Result TLV of success counts
+only after the server proved the password with MSCHAPv2's authenticator response.
+The server certificate's name check is "equal to the domain or under it" on its DNS
+names, no wildcards. MSCHAPv2 needs MD4 and DES
 (RustCrypto `md4`, `des`: MIT/Apache-2.0).
 
 **Identity privacy.** The outer, unencrypted identity is `anonymous@<realm>` (the realm
@@ -450,7 +457,7 @@ and the pinned server.
 
 | Step | What | Done when |
 |---|---|---|
-| E1 | `aura-eap` crate: EAP state machine, PEAP/TTLS/EAP-TLS, MSCHAPv2 (RFC 2759 vectors), server checks; fuzz targets for EAP and the inner methods | host tests against hostapd's EAP server (`eapol_test`-style harness on the Linux host) for each method, wrong password, wrong CA, wrong domain, TLS 1.0-only server |
+| E1 | `aura-eap` crate: EAP state machine, PEAP/TTLS/EAP-TLS, MSCHAPv2 (RFC 2759 vectors), server checks; fuzz targets for EAP and the inner methods | host tests against hostapd's EAP server (`eapol_test`-style harness on the Linux host) for each method, wrong password, wrong CA, wrong domain, TLS 1.0-only server. **Done 2026-11-24**: `aura/aura-eap`, `cargo test` there runs hostapd 2.10 as a RADIUS server (`tests/hostapd.rs`): PEAP (with crypto-binding), TTLS-MSCHAPv2, TTLS-PAP and EAP-TLS each end with the MSK the server gives the AP; wrong passwords, another CA, another domain, an evil twin with the same name (also after pinning), first join with nothing set stopping at the certificate, a TLS 1.0-only server, EAP-TLS without a certificate all refused; fuzz target `aura/fuzz` `eap_peer` (1.3 M runs clean) |
 | E2 | aura-keys: AKM 1/5, the `aura-eap` process and jail, MSK to PMK; atrium-net and Arca: enterprise profile and credential | `aura-sim-gate.sh w7`: the VM joins hostapd WPA2- and WPA3-Enterprise on hwsim with PEAP and TTLS, gets an address; an evil-twin AP with another certificate is refused before any password leaves |
 | E3 | EAP-TLS with the client key in Arca | same gate, certificate login |
 | E4 | Settings sheet, first-join trust, bar menu | joined from Settings in the VM, shown in frames |
@@ -461,7 +468,7 @@ and the pinned server.
 - Q3. First join without a CA: show the server's certificate and "Trust this server",
   pinning its root and name for that network. *Recommend yes.* (Alternative: require a
   CA file or the system roots up front; safer, but most eduroam setups would need one.)
-- Q4. rustls, TLS 1.2/1.3 only; TLS 1.0/1.1 servers refused with a clear reason. *Recommend yes.*
+- Q4. rustls, TLS 1.2 in v1 and 1.3 next; TLS 1.0/1.1 servers refused with a clear reason. *Recommend yes.*
 - Q5. `aura-eap` as its own sandboxed process per join, password from aura-keys for
   that join only, client keys signing inside Arca. *Recommend yes.*
 - Q6. Wired 802.1X (the same `aura-eap` on Ethernet) later, not in W7. *Recommend later.*
