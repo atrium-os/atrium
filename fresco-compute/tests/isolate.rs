@@ -60,6 +60,31 @@ fn a_faded_card_hides_what_it_covers() {
     assert_ne!(at(&iso, 20, 12), at(&m, 20, 12));
 }
 
+#[test]
+fn fill_mask_applies_once_and_clears_content_outside_its_tiles() {
+    let scene = Scene {
+        rects: vec![rect(0., 0., W as f32, H as f32, WHITE),
+                    rect(0., 0., 48., 32., RED), rect(4., 2., 40., 28., BLUE)],
+        fills: vec![fill::Fill {
+            verbs: vec![0, 1, 1, 1, 4],
+            points: vec![[2., 2.], [16., 2.], [16., 24.], [2., 24.]],
+            transform: [1., 0., 0., 1., 0., 0.],
+            color: [1., 0., 1., 0.5],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let children = [placed(Node::Rect(1)), placed(Node::Rect(2)), placed(Node::Pop)];
+    let draw = |layer| render(&scene, &[&[placed(Node::Rect(0)), layer][..], &children].concat());
+    let masked = draw(placed(Node::PushMask(0)));
+    let faded = draw(push(0.5));
+    for (x, y) in [(3, 10), (10, 10)] {
+        assert_eq!(at(&masked, x, y), at(&faded, x, y));
+    }
+    let white = render(&scene, &[placed(Node::Rect(0))]);
+    assert_eq!(at(&masked, 36, 10), at(&white, 36, 10));
+}
+
 /// Opacity 1, or a group over nothing that overlaps, draws as without it.
 #[test]
 fn opaque_or_disjoint_groups_change_nothing() {
@@ -118,6 +143,10 @@ fn executors_match_reference() {
         // Every element, wrapped in random nested groups.
         let mut order = Vec::new();
         let mut depth = 0;
+        if !s.fills.is_empty() {
+            order.push(placed(Node::PushMask(0)));
+            depth = 1;
+        }
         let mut items: Vec<Node> = (0..s.rects.len()).map(Node::Rect).collect();
         items.extend((0..s.paths.len()).map(Node::Path));
         items.extend((0..s.fills.len()).map(Node::Fill));

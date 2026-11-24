@@ -922,7 +922,7 @@ impl Surface for FrescoSurface {
         if let Node::Scroll { .. } = stack {
             return self.set_scroll(id, stack, group, order);
         }
-        let Node::Stack { rect, fill, radius, opacity, isolate, clip, .. } = stack else {
+        let Node::Stack { rect, fill, radius, opacity, isolate, alpha_mask, clip, .. } = stack else {
             return self.set_node(id, stack, group, order);
         };
         let k = self.scale;
@@ -932,7 +932,7 @@ impl Surface for FrescoSurface {
             transform: fresco_protocol::GroupParams::IDENTITY,
             clip: None,
             opacity: opacity.clamp(0.0, 1.0),
-            flags: if *isolate { fresco_protocol::group_flags::ISOLATE } else { 0 },
+            flags: if *alpha_mask { fresco_protocol::group_flags::ALPHA_MASK } else if *isolate { fresco_protocol::group_flags::ISOLATE } else { 0 },
         };
         // Whole device pixels, placed from the edges near it, so its
         // contents keep their snapped edges and an inset keeps its border.

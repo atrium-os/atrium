@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Overlapping colours under one mask</title>
+<style>
+html, body { margin: 0; background: white }
+#group {
+    position: absolute; left: 32px; top: 48px; width: 192px; height: 96px;
+    mask-image: linear-gradient(to right, transparent, black);
+    mask-repeat: no-repeat;
+}
+#red, #blue { position: absolute; width: 128px; height: 96px }
+#red { left: 0; background: red }
+#blue { left: 64px; background: blue }
+</style>
+<div id="group"><div id="red"></div><div id="blue"></div></div>

@@ -434,6 +434,7 @@ impl SceneState {
                 fc::Node::Fill(i) => f.fill_ids.get(i).copied(),
                 fc::Node::Quad(b, q) => f.quad_ids.get(*quad_of.get(b)?)?.get(q).copied(),
                 fc::Node::Run(b, r) => f.run_ids.get(*run_of.get(b)?)?.get(r).copied(),
+                fc::Node::PushMask(i) => f.fill_ids.get(i).copied(),
                 fc::Node::Push(_) | fc::Node::Pop => None,
             }
         };
@@ -610,7 +611,8 @@ impl SceneState {
             match o.item {
                 Node::Rect(i) => h.write(raw(f.rects.get(i..i + 1).unwrap_or(&[]))),
                 Node::Path(i) => h.write(raw(f.paths.get(i..i + 1).unwrap_or(&[]))),
-                Node::Fill(i) => {
+                Node::Fill(i) | Node::PushMask(i) => {
+                    matches!(o.item, Node::PushMask(_)).hash(h);
                     if let Some(fl) = f.fills.get(i) {
                         hash_fill(h, fl);
                     }
@@ -1012,7 +1014,7 @@ fn grouped_frame_but(
                 })
             };
             let sprite = promote.is_some_and(|keep| {
-                !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still) && !deny.contains(&id)
+                g.flags & fresco_protocol::group_flags::ALPHA_MASK == 0 && !at.sprite && at.layers == 0 && !scroll && !empty(c) && anim.is_none_or(still) && !deny.contains(&id)
                     && (anim.is_some() || keep.contains(&id) || (hidden && g.clip.is_some()))
             });
             if !sprite && (empty(c) || hidden) {
@@ -1052,6 +1054,21 @@ fn grouped_frame_but(
             // at its opacity (and what it inherited), exactly. Past the
             // kernel's depth, or at opacity 1, opacity multiplies down.
             let isolate = g.flags & fresco_protocol::group_flags::ISOLATE != 0;
+            if g.flags & fresco_protocol::group_flags::ALPHA_MASK != 0 {
+                // The first direct fill is coverage only. Keep the whole group
+                // invisible if the mask is absent or cannot be isolated.
+                let Some(((_, mask), children)) = kids.get(&Some(id)).and_then(|v| v.split_first()) else { continue };
+                if at.layers >= fresco_compute::ISOLATE_DEPTH || !state.fill_nodes.contains_key(mask) { continue; }
+                emit(w, &mut order, *mask, inner.x, inner.op, c);
+                let Some(last) = order.last_mut().filter(|o| o.node == *mask) else { continue };
+                let Item::Fill(i) = last.item else { continue };
+                last.item = Item::PushMask(i);
+                inner.op = 1.0;
+                inner.layers += 1;
+                stack.push(Walk::End(id));
+                for &(_, child) in children.iter().rev() { stack.push(Walk::Node(child, inner)); }
+                continue;
+            }
             if isolate && inner.op < 1.0 && at.layers < fresco_compute::ISOLATE_DEPTH {
                 order.push(OrderItem { item: Item::Push(inner.op.to_bits()), clip: None, node: id });
                 stack.push(Walk::End(id));
@@ -1112,7 +1129,7 @@ fn grouped_frame_but(
             let local = [local[0].max(0.0), local[1].max(0.0), local[2].min(w.size.0 as f32), local[3].min(w.size.1 as f32)];
             s.opaque = order[s.range.clone()]
                 .iter()
-                .take_while(|o| !matches!(o.item, Item::Push(_)))
+                .take_while(|o| !matches!(o.item, Item::Push(_) | Item::PushMask(_)))
                 .any(|o| {
                     let covers = |b: [f32; 4]| {
                         let b = meet(Some(b), o.clip).unwrap();
@@ -1323,7 +1340,7 @@ fn hash_ser<T: serde::Serialize, H: std::hash::Hasher>(h: &mut H, v: &T) {
 fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
     use fresco_compute::Node;
     Some(match item {
-        Node::Push(_) | Node::Pop => return None,
+        Node::Push(_) | Node::PushMask(_) | Node::Pop => return None,
         Node::Rect(i) => {
             let r = w.rects.get(i)?;
             [r.position[0], r.position[1], r.position[0] + r.size[0], r.position[1] + r.size[1]]

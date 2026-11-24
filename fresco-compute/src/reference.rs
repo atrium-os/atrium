@@ -407,16 +407,16 @@ impl Layers {
     }
 
     /// A PUSH or POP: applied, true; any other kind: false.
-    fn op(&mut self, o: &Op) -> bool {
+    fn op(&mut self, f: &Frame, o: &Op, pc: [f32; 2]) -> bool {
         match o.meta[0] {
-            crate::KIND_PUSH => {
+            crate::KIND_PUSH | crate::KIND_PUSH_MASK => {
                 hit(26);
                 if self.stack.len() as u32 >= crate::ISOLATE_DEPTH {
                     hit(27);
                     self.over += 1;
                 } else {
                     let [r, g, b] = self.dst;
-                    self.stack.push(([r, g, b, self.da], clamp_(o.p1[0], 0.0, 1.0)));
+                    self.stack.push(([r, g, b, self.da], clamp_(if o.meta[0] == crate::KIND_PUSH_MASK { fill_shade(f, o, pc)[3] } else { o.p1[0] }, 0.0, 1.0)));
                     self.dst = [0.0; 3];
                     self.da = 0.0;
                 }
@@ -485,7 +485,7 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
                 break;
             }
             let o = &f.ops[oi as usize];
-            if !l.op(o) {
+            if !l.op(f, o, pc) {
                 l.blend(shade(f, o, pc));
             }
         }
@@ -525,7 +525,7 @@ pub fn alpha_at(f: &Frame, x: u32, y: u32) -> u8 {
         if tx < t(x0 as u32) || tx > t((x1 - 1) as u32) || ty < t(y0 as u32) || ty > t((y1 - 1) as u32) {
             continue;
         }
-        if !l.op(o) {
+        if !l.op(f, o, pc) {
             l.blend(shade(f, o, pc));
         }
     }

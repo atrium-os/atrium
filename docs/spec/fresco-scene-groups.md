@@ -59,7 +59,7 @@ pub struct GroupParams {
     pub clip: Option<[f32; 4]>,
     /// Multiplies every descendant's alpha (v1; see §2.4).
     pub opacity: f32,
-    /// group_flags: SCROLL (bit 0), ISOLATE (bit 1, exact group opacity, §2.4).
+    /// group_flags: SCROLL (bit 0), ISOLATE (bit 1), ALPHA_MASK (bit 2), see §2.4.
     pub flags: u32,
 }
 ```
@@ -122,6 +122,12 @@ the same frame; frescod applies a frame atomically, so nothing is drawn half pla
   are ignored, and a layer still open after the last op is blended then. The fuzzer covers all
   three. Applies to the compute, pixel-mode and gpu renderers; the legacy Vulkan renderer ignores
   it, and an isolated group's content draws there without its opacity.
+- **Group alpha masks.** With `ALPHA_MASK`, the first direct fill child defines coverage.
+  Remaining children draw in order into a transparent layer. On pop, the kernel uses
+  the fill's alpha at that pixel to blend the completed layer over the parent.
+  Mask colour contributes no visible pixels. Outside the fill, coverage is zero.
+  The mask uses one of the four isolation levels. A missing coverage fill or an
+  exhausted layer stack suppresses the masked group.
 - **The embedded surface** (a Limen slot). A later leaf kind that names another client's surface
   by a frescod-issued handle, sized and clipped like any leaf in a group. It builds on this note.
 

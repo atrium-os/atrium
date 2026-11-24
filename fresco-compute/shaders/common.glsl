@@ -49,6 +49,7 @@ float clamp_(float v, float lo, float hi) { return v >= lo ? (v <= hi ? v : hi) 
 // after the last op is blended then.
 #define KIND_PUSH    5u
 #define KIND_POP     6u
+#define KIND_PUSH_MASK 8u
 #define ISOLATE_DEPTH 4u
 // A glyph drawn under a 2x2 turn (rotated text): see glyph_xf in raster.comp.
 #define KIND_GLYPH_XF 7u

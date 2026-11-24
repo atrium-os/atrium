@@ -26,7 +26,7 @@ pub const FAR_OVER: u64 = 1 << 31;
 /// What one op costs per pixel, relative to a solid rect.
 pub fn weight(kind: u32) -> u64 {
     match kind {
-        KIND_FILL => 4,
+        KIND_FILL | crate::KIND_PUSH_MASK => 4,
         KIND_TEXTURE | KIND_PUSH | KIND_POP => 2,
         _ => 1,
     }

@@ -90,6 +90,7 @@ pub enum Node {
         opacity: f32,
         /// Composite the children together before applying group opacity.
         isolate: bool,
+        alpha_mask: bool,
         /// Its children are cut to its box.
         clip: bool,
     },
@@ -311,14 +312,14 @@ pub fn fill_to(p: &fresco_protocol::FillParams, origin: crate::geom::Point, scal
 impl Node {
     /// Layout-only stack (no paint).
     pub fn stack(axis: Axis, rect: Rect, spacing: f32) -> Self {
-        Node::Stack { rect, axis, spacing, fill: None, radius: 0.0, opacity: 1.0, isolate: false, clip: false }
+        Node::Stack { rect, axis, spacing, fill: None, radius: 0.0, opacity: 1.0, isolate: false, alpha_mask: false, clip: false }
     }
 
     /// A layout-only Stack drawn at `opacity`, its children cut to its box
     /// when `clip`: a layer to show, hide and animate as one
     /// (`crate::anim`), such as a slide.
     pub fn layer(rect: Rect, opacity: f32, clip: bool) -> Self {
-        Node::Stack { rect, axis: Axis::Vertical, spacing: 0.0, fill: None, radius: 0.0, opacity, isolate: false, clip }
+        Node::Stack { rect, axis: Axis::Vertical, spacing: 0.0, fill: None, radius: 0.0, opacity, isolate: false, alpha_mask: false, clip }
     }
 
     pub fn vstack(rect: Rect, spacing: f32) -> Self {
@@ -332,12 +333,18 @@ impl Node {
     /// Children blend into one surface before the opacity is applied.
     pub fn isolated_layer(opacity: f32) -> Self {
         Node::Stack { rect: Rect::new(0., 0., 0., 0.), axis: Axis::Vertical, spacing: 0.,
-            fill: None, radius: 0., opacity, isolate: true, clip: false }
+            fill: None, radius: 0., opacity, isolate: true, alpha_mask: false, clip: false }
+    }
+
+    /// An isolated layer whose first child supplies alpha for the remaining children.
+    pub fn masked_layer() -> Self {
+        Node::Stack { rect: Rect::new(0., 0., 0., 0.), axis: Axis::Vertical, spacing: 0.,
+            fill: None, radius: 0., opacity: 1., isolate: true, alpha_mask: true, clip: false }
     }
 
     /// Stack that paints a rounded rect behind its children.
     pub fn stack_filled(axis: Axis, rect: Rect, spacing: f32, fill: Color, radius: f32) -> Self {
-        Node::Stack { rect, axis, spacing, fill: Some(fill), radius, opacity: 1.0, isolate: false, clip: false }
+        Node::Stack { rect, axis, spacing, fill: Some(fill), radius, opacity: 1.0, isolate: false, alpha_mask: false, clip: false }
     }
 
     /// Logical bounds in this node's own (parent-relative) coordinate
@@ -861,7 +868,7 @@ mod diff_tests {
             fill: None,
             radius: 0.0,
             opacity: 1.0,
-            isolate: false,
+            isolate: false, alpha_mask: false,
             clip: false,
         }
     }

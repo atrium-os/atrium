@@ -80,7 +80,7 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
         for v in [o.p0, o.p1, o.p2, o.p3] {
             oh = hash_words(oh, &v.map(f32::to_bits));
         }
-        if o.meta[0] == KIND_FILL {
+        if matches!(o.meta[0], KIND_FILL | crate::KIND_PUSH_MASK) {
             // Where its block sits does not change what it draws.
             oh = hash_words(oh, &[o.meta[0], o.meta[2], o.meta[3]]);
         } else {
@@ -114,7 +114,7 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
                 oh = mix(oh, content);
             }
         }
-        if o.meta[0] == KIND_FILL {
+        if matches!(o.meta[0], KIND_FILL | crate::KIND_PUSH_MASK) {
             // Its whole block (header word 7 = its length): any change
             // dirties every tile the path touches.
             let lo = (o.meta[1] as usize).min(f.texels.len());

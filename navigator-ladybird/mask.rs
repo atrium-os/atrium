@@ -483,6 +483,12 @@ pub(super) fn resolve(
 ) -> Result<Vec<PaintLeaf>, String> {
     let mut result = Vec::with_capacity(leaves.len());
     let mut used = HashSet::new();
+    let mut counts = HashMap::new();
+    for leaf in &leaves {
+        if masks.contains_key(&leaf.context.effect) {
+            *counts.entry(leaf.context.effect).or_insert(0usize) += 1;
+        }
+    }
     let world = libcompositing_rust::visual_context::WorldTransforms::new(
         tree,
         snapshot.device_offsets(),
@@ -535,10 +541,26 @@ pub(super) fn resolve(
                 _ => {}
             }
         }
-        // Multiplying the alpha of overlapping leaves independently would apply
-        // the mask before their source-over composition.
-        if !used.insert(id) {
-            return Err("mask requires isolated multi-node composition".into());
+        if counts.get(&id).copied().unwrap_or(0) > 1 {
+            leaf.context.effect = effect.parent;
+            leaf.mask_group = Some(id);
+            if used.insert(id) {
+                use pergola::shape::{Paint, PathData, Shape};
+                let white = pergola::Color::rgba(1., 1., 1., 1.);
+                let coverage = match apply(mask, white, data.kind)? {
+                    Node::Fill(fill) => fill,
+                    Node::Rect { rect, fill, radius: 0. } => Shape::new(PathData::rect(rect))
+                        .fill(Paint::Solid(fill)).fills().into_iter().next()
+                        .ok_or("empty mask rectangle")?.into(),
+                    _ => return Err("unsupported group mask coverage".into()),
+                };
+                let mut first = leaf.clone();
+                first.node = Node::Fill(coverage);
+                first.inline_clip = None;
+                result.push(first);
+            }
+            result.push(leaf);
+            continue;
         }
         if matches!(leaf.node, Node::Glyphs { .. }) {
             leaf.context.effect = effect.parent;

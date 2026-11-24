@@ -46,6 +46,8 @@ use fresco_scene_server::window::{Compositor, DisplayEvent};
 use fresco_split::chan::{Chan, Recv, Shm};
 use fresco_split::{slot, Input, Msg, Role, MAX_WINDOWS, MAX_WINDOW_DIM};
 
+#[path = "../chrome.rs"]
+mod chrome;
 #[path = "../laminar.rs"]
 mod laminar;
 #[path = "../pack.rs"]

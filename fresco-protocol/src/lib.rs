@@ -2293,7 +2293,9 @@ pub mod group_flags {
     /// its opacity (§2.4). One level: an isolated group inside another
     /// multiplies its opacity down instead.
     pub const ISOLATE: u32 = 1 << 1;
-    pub const KNOWN: u32 = SCROLL | ISOLATE;
+    /// Composite the children under the alpha of the first child, a fill.
+    pub const ALPHA_MASK: u32 = 1 << 2;
+    pub const KNOWN: u32 = SCROLL | ISOLATE | ALPHA_MASK;
 }
 
 /// Params for `scene_ops::ATRIUM_CORE_GROUP` (docs/spec/fresco-scene-groups.md §2.1).

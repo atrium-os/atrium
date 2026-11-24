@@ -418,7 +418,7 @@ void main() {
             uvec4 meta = floatBitsToUint(opv[oi * OP_VEC4S + 4u]);
             vec4 p1 = opv[oi * OP_VEC4S + 1u];
             uint kind = meta.x;
-            if (kind == KIND_PUSH) {
+            if (kind == KIND_PUSH || kind == KIND_PUSH_MASK) {
                 if (sp >= ISOLATE_DEPTH) {
                     over = over + 1u;
                 } else {
@@ -426,7 +426,12 @@ void main() {
                     SAVE_LAYER(2, 1)
                     SAVE_LAYER(1, 0)
                     s0r = dr; s0g = dg; s0b = db; s0a = da;
-                    o0 = clamp_(p1.x, 0.0, 1.0);
+                    float opacity = p1.x;
+                    if (kind == KIND_PUSH_MASK) {
+                        vec4 mask_clip = opv[oi * OP_VEC4S];
+                        opacity = fill_shade(mask_clip, p1, meta.y, pc).a;
+                    }
+                    o0 = clamp_(opacity, 0.0, 1.0);
                     sp = sp + 1u;
                     dr = 0.0;
                     dg = 0.0;

@@ -84,6 +84,8 @@ pub const KIND_FILL: u32 = 4;
 pub const KIND_PUSH: u32 = 5;
 /// Blend the newest layer over what was under it (`p3` as its PUSH).
 pub const KIND_POP: u32 = 6;
+/// Push an isolated layer with per-pixel opacity from a packed fill.
+pub const KIND_PUSH_MASK: u32 = 8;
 /// A glyph under a 2x2 turn (rotated text, [`GlyphRun::turn`]): `p0` is
 /// where the glyph box's top-left corner lands and its size in texels, `p2`
 /// the inverse turn (target offset to texels), `meta[2..4]` the glyph's
@@ -225,6 +227,8 @@ pub enum Node {
     /// to its [`Node::Pop`] is drawn into a layer, then blended at that
     /// opacity (fresco-scene-groups.md §2.4, `ISOLATE`).
     Push(u32),
+    /// Begin an isolated group with alpha from this scene fill.
+    PushMask(usize),
     /// Ends the newest [`Node::Push`].
     Pop,
 }
@@ -371,7 +375,7 @@ fn budget_owned(owned: Vec<(Op, Node)>, ops: &mut Vec<Op>, width: u32, height: u
     for (_, n) in &kept[cut..] {
         // A group's PUSH or POP is not a node a client sent; the kernel
         // closes a layer left open by the cut.
-        if matches!(n, Node::Push(_) | Node::Pop) {
+        if matches!(n, Node::Push(_) | Node::PushMask(_) | Node::Pop) {
             continue;
         }
         if last != Some(*n) {
@@ -708,6 +712,19 @@ impl Frame {
         };
         for pl in order {
             match pl.item {
+                Node::PushMask(i) => {
+                    open.push(owned.len());
+                    // A missing or over-budget mask contributes zero coverage.
+                    let mut op = Op { meta: [KIND_PUSH, 0, 0, 0], ..Op::default() };
+                    if let Some(Some(fill)) = k.fills.get(i) {
+                        op = *fill;
+                        op.meta[0] = KIND_PUSH_MASK;
+                    } else if let Some(reason) = fill_drops.iter().find(|d| d.0 == Node::Fill(i)) {
+                        dropped.push(*reason);
+                    }
+                    owned.push((op, pl.item));
+                    continue;
+                }
                 Node::Push(bits) => {
                     open.push(owned.len());
                     let o = Op { p1: [f32::from_bits(bits), 0.0, 0.0, 0.0], meta: [KIND_PUSH, 0, 0, 0], ..Op::default() };
@@ -736,7 +753,7 @@ impl Frame {
                 },
                 Node::Quad(b, q) => k.quads.get(b).and_then(|v| v.get(q..=q)).unwrap_or(&[]),
                 Node::Run(b, r) => k.runs.get(b).and_then(|v| v.get(r)).map(|v| v.as_slice()).unwrap_or(&[]),
-                Node::Push(_) | Node::Pop => unreachable!(),
+                Node::Push(_) | Node::PushMask(_) | Node::Pop => unreachable!(),
             };
             owned.extend(slice.iter().filter_map(|op| clip_op(op, pl.clip)).map(|op| (op, pl.item)));
         }

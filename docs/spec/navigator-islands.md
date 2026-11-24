@@ -853,6 +853,21 @@ the target in the new epoch. The element ended once at 1,343.567 s. A fresh
 engine process reported zero for both counters before Play. Evidence is in
 `~/atrium-vm/evidence/navigator-i4-frame-counts-20261124/`.
 
+#### Error-screen mask
+
+The provider error screen paints a dark rectangle and a horizontal colour gradient
+under one radial mask. Previously Ladybird rejected the second child and Navigator
+kept displaying the previous frame. Ladybird now sends the coverage fill and source
+children as a native Fresco group. Fresco applies coverage after composing the children.
+
+On arm64 Tessera the installed JIT-off engine rendered a horizontal mask over
+overlapping red and blue rectangles. All 14,400 sampled RGB pixels matched the
+independent linear-light blend exactly. Both adjacent columns remained white.
+The provider-error control returned `ERROR`. After Play, the sheet showed
+“This video is unavailable”, error code 152 - 18, and the purple gradient.
+The engine ran as uid 50007 in capability mode. Screenshots, pixel measurements
+and renderer tests are in `~/atrium-vm/evidence/navigator-i4-multimask-20261124/`.
+
 ## 6a. Sign-in: SSO and WebAuthn
 
 An identity provider's page is a whole page of script: a redirect chain, a password step,

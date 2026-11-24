@@ -257,6 +257,7 @@ pub struct PaintLeaf {
     pub record_in_chunk: usize,
     pub part: usize,
     pub context: ContextRef,
+    mask_group: Option<EffectNodeIndex>,
     inline_clip: Option<libgfx_rust::FloatRect>,
     pub node: Node,
 }
@@ -335,6 +336,7 @@ pub fn editor_leaves(
                             part,
                             context: run.context,
                             inline_clip,
+                            mask_group: None,
                             node,
                         })
                     };
@@ -498,6 +500,7 @@ fn assemble_scene(
         }
         effects.retain(|(_, opacity)| *opacity != 1.);
         effects.reverse();
+        if let Some(mask) = leaf.mask_group { effects.push((mask, 1.0)); }
         let mut path = Vec::new();
         let mut index = leaf.context.spatial;
         let mut clip = leaf.context.clip;
@@ -654,7 +657,8 @@ fn assemble_scene(
             let group_key = hash.finish();
             if !keys.insert(group_key) { return Err("interleaved opacity group".into()); }
             let id = effect_base + effect.0 as usize;
-            rows.push((parent, Some(id), group_key, Node::isolated_layer(opacity)));
+            let group = if leaf.mask_group == Some(effect) { Node::masked_layer() } else { Node::isolated_layer(opacity) };
+            rows.push((parent, Some(id), group_key, group));
             active_effects.push(effect);
             parent = Some(id);
         }
@@ -719,7 +723,7 @@ mod tests {
         }));
         let leaves = (0..2).map(|part| PaintLeaf {
             chunk: ChunkId([10, 20]), occurrence: 0, record_in_chunk: part, part: 0,
-            inline_clip: None, context,
+            inline_clip: None, mask_group: None, context,
             node: Node::Rect { rect: Rect::new(part as f32, 0., 10., 10.),
                 fill: pergola::Color::from_srgb8(255, 0, 51), radius: 0. },
         }).collect();
@@ -781,6 +785,7 @@ mod tests {
                 record_in_chunk: 0,
                 part: 0,
                 inline_clip: None,
+                mask_group: None,
                 context: ContextRef {
                     spatial: index,
                     clip,
