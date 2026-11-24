@@ -69,6 +69,15 @@ def run(ui):
     review(ui, 178)
     ui.see("review-change", "Current", "14:00", "Studio A", "Proposed", "15:00", "Studio B")
     assert ui.store("work") == saved
+    click(ui, 70, 550)
+    ui.see("one-pending-review", r"Meeting changes \(1\)")
+    click(ui, 367, 524)
+    ui.see("latest-organizer-change", "Meeting change 1 of 1", "Last accepted", "14:00", "Studio A", "15:00", "Studio B")
+    assert ui.store("work") == saved
+    ui.control("close", "work")
+    open_mail(ui)
+    review(ui, 178)
+    ui.see("review-before-response", "Review invitation change", "15:00")
     click(ui, 80, 462)
     ui.see("response-before-cancel", "Review your invitation response", "ACCEPTED", "To organizer")
     click(ui, 70, 323)

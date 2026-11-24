@@ -36,6 +36,7 @@ use mail_store::{flag, AccountId, MsgId, Role};
 use crate::Engine;
 
 pub const FRESH_SECS: i64 = 600;
+const POLL_GAP_SECS: i64 = 60;
 pub const BURST: usize = 2;
 pub const BURST_SECS: i64 = 30;
 /// The daily review's hour unless the person picks another time.
@@ -99,6 +100,12 @@ pub struct Notifier {
     looked_at: Option<i64>,
     /// A digest time passed while it was quiet: said when it ends.
     digest_due: bool,
+    // Mail polls about every five seconds. Keep the UTC boundary across later sync
+    // pages so a near-wake delivery never escapes through the fresh-message path.
+    last_poll: Option<i64>,
+    wake_cutoff: Option<i64>,
+    summarized_through: Option<i64>,
+    wake_meetings_waiting: bool,
 }
 
 impl Notifier {
@@ -120,6 +127,9 @@ impl Notifier {
         let minute = (local.rem_euclid(86_400) / 60) as u16;
         let weekday = (local.div_euclid(86_400) + 3).rem_euclid(7) as u8;
         let quiet = prefs.is_quiet_on(weekday, minute);
+        if self.last_poll.replace(now).is_some_and(|last| now.saturating_sub(last) >= POLL_GAP_SECS) {
+            self.wake_cutoff = Some(now);
+        }
         let mut out = self.look(e, now, offset, &prefs, quiet);
         // A digest time passed since the last look.
         if let Some(last) = self.looked_at {
@@ -136,6 +146,7 @@ impl Notifier {
             self.quiet.clear();
             self.other.clear();
             self.digest_due = false;
+            self.wake_meetings_waiting = false;
             out.retain(|p| matches!(p, Post::Withdraw { .. }));
             return out;
         }
@@ -162,6 +173,18 @@ impl Notifier {
                 body += &format!(", {} from people ({})", people.len(), first_names(people.iter().map(|a| a.from.as_str())));
             }
             out.push(Post::Summary { title: "During quiet hours".into(), body });
+        }
+        if self.wake_meetings_waiting && !quiet {
+            self.wake_meetings_waiting = false;
+            self.summarized_through = self.wake_cutoff;
+            if let Some(Post::Summary { body, .. }) = out.iter_mut().rev().find(|p| matches!(p, Post::Summary { .. })) {
+                body.push_str("\nMeeting invitations also arrived.");
+            } else {
+                out.push(Post::Summary {
+                    title: "Meeting invitations".into(),
+                    body: "Invitations arrived while you were away. Review them in Mail.".into(),
+                });
+            }
         }
         out
     }
@@ -225,6 +248,16 @@ impl Notifier {
             let mine = me.get(&m.account).cloned().unwrap_or_default();
             if s.from.iter().any(|a| mine.contains(&a.addr.to_ascii_lowercase())) {
                 continue;
+            }
+            if let Some(invite) = scheduling_message(s) {
+                if self.wake_cutoff.is_some_and(|cutoff| m.date <= cutoff) {
+                    self.wake_meetings_waiting |= self.summarized_through.is_none_or(|last| m.date > last);
+                    continue;
+                }
+                // The individual deliveries stay available for Review in Calendar.
+                if invite.sequence > 0 || invite.method != mail_schema::InviteMethod::Request {
+                    continue;
+                }
             }
             let wrote_in = e.store.thread(m.thread).unwrap_or_default().iter().any(|x| x.msg != id && x.message.summary.from.iter().any(|a| mine.contains(&a.addr.to_ascii_lowercase())));
             let vip = s.from.iter().any(|a| prefs.is_vip(&a.addr));
@@ -352,6 +385,22 @@ impl Notifier {
             lines.push(format!("Waiting over a week: {}", subjects(e, &waiting.iter().map(|x| &x.1).collect::<Vec<_>>())));
         }
         out.push(Post::Week { title: "Later this week".into(), body: lines.join("\n") });
+    }
+}
+
+/// Direct scheduling mail only. Ordinary discussion and forwarded conversations
+/// retain their usual Mail notification behavior. Classification grants no trust.
+fn scheduling_message(s: &mail_schema::Summary) -> Option<&mail_schema::Invite> {
+    use mail_schema::{InviteMethod, PartKind};
+    let invite = s.invite.as_ref()?;
+    let [from] = s.from.as_slice() else { return None };
+    if s.encrypted || s.parts.iter().any(|p| p.kind == PartKind::Message)
+        || s.parts.iter().filter(|p| p.kind == PartKind::Calendar).count() != 1
+        || invite.uid.is_empty() { return None; }
+    match invite.method {
+        InviteMethod::Request | InviteMethod::Cancel if invite.organizer.eq_ignore_ascii_case(&from.addr) => Some(invite),
+        InviteMethod::Reply => Some(invite),
+        _ => None,
     }
 }
 

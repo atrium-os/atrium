@@ -1364,6 +1364,115 @@ mod tests {
         s.review_invitation(rev, &range_source(&p), p).unwrap()
     }
     #[test]
+    fn organizer_changes_coalesce_across_restarts_without_changing_the_schedule() {
+        let base = include_str!("../../tests/fixtures/invitation.ics");
+        let day = date("2026-12-01");
+        let now = day.and_hms_opt(15, 0, 0).unwrap().and_utc();
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let t = review_range(&mut store, 0, base).token.unwrap();
+        store.apply_invitation(0, t).unwrap();
+        let revision = |seq, hour| {
+            base.replace("SEQUENCE:1", &format!("SEQUENCE:{seq}"))
+                .replace("T14", &format!("T{hour}"))
+        };
+        let schedule = || std::fs::read(dir.path().join("calendar.json")).unwrap();
+        let accepted = schedule();
+        let guests = (0..100)
+            .map(|i| format!("ATTENDEE:mailto:guest{i}@fixture.invalid\n"))
+            .collect::<String>();
+        let crowd = revision(2, 14).replace("END:VEVENT", &(guests + "END:VEVENT"));
+        assert!(review_range(&mut store, 1, &crowd).can_save);
+        assert!(store.meeting_change(0, now).is_err());
+        for (seq, hour) in [(3, 15), (5, 17), (5, 17)] {
+            assert!(review_range(&mut store, 1, &revision(seq, hour)).can_save);
+        }
+        assert!(review_range(&mut store, 1, &revision(4, 16))
+            .token
+            .is_none());
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        let pending = store.meeting_change(0, now).unwrap();
+        assert_eq!((pending.total, pending.latest.sequence), (1, 5));
+        assert_eq!(pending.accepted.span.start, 14 * 60);
+        assert_eq!(pending.latest.proposed.unwrap().span.start, 17 * 60);
+        let higher = range_proposal(&revision(9, 18));
+        let mut wrong = range_source(&higher);
+        wrong.verified = false;
+        assert!(store
+            .review_invitation(1, &wrong, higher)
+            .unwrap()
+            .token
+            .is_none());
+        assert_eq!(store.meeting_change(0, now).unwrap().latest.sequence, 5);
+        assert!(review_range(&mut store, 1, &revision(5, 16))
+            .token
+            .is_none());
+        assert!(review_range(&mut store, 1, &revision(5, 17))
+            .token
+            .is_none());
+        assert!(store.meeting_change(0, now).unwrap().latest.conflicted);
+        assert!(review_range(&mut store, 1, &revision(6, 14)).can_save);
+        assert!(store.meeting_change(0, now).is_err());
+        assert!(review_range(&mut store, 1, &revision(5, 17))
+            .token
+            .is_none());
+        assert!(review_range(&mut store, 1, &revision(7, 16)).can_save);
+        let mut cancel = range_proposal(&revision(8, 16));
+        cancel.row = None;
+        let review = store
+            .review_invitation(1, &range_source(&cancel), cancel)
+            .unwrap();
+        let pending = store.meeting_change(0, now).unwrap();
+        assert_eq!((pending.total, pending.latest.sequence), (1, 8));
+        assert!(pending.latest.proposed.is_none() && !pending.latest.conflicted);
+        assert_eq!(schedule(), accepted);
+        store.apply_invitation(1, review.token.unwrap()).unwrap();
+        assert!(store.meeting_change(0, now).is_err());
+        let personal = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Store::open(personal.path())
+                .unwrap()
+                .page(day, None)
+                .meeting_changes,
+            0
+        );
+    }
+
+    #[test]
+    fn twenty_pending_changes_share_one_calendar_summary_and_upcoming_dates_lead() {
+        let fixture = include_str!("../../tests/fixtures/invitation.ics");
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let day = date("2026-12-10");
+        let now = day.and_hms_opt(16, 0, 0).unwrap().and_utc();
+        for n in 1..=20 {
+            let original = fixture
+                .replace("studio-planning@", &format!("meeting-{n}@"))
+                .replace("20261201T", &format!("202612{n:02}T"));
+            let t = review_range(&mut store, n - 1, &original).token.unwrap();
+            store.apply_invitation(n - 1, t).unwrap();
+            let change = original
+                .replace("SEQUENCE:1", "SEQUENCE:2")
+                .replace("T14", "T15");
+            assert!(review_range(&mut store, n, &change).can_save);
+        }
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.page(day, None).meeting_changes, 20);
+        for (index, expected) in (11..=20).chain(1..=10).enumerate() {
+            let item = store.meeting_change(index, now).unwrap();
+            assert_eq!(item.total, 20);
+            assert_eq!(
+                item.latest.proposed.unwrap().date,
+                date(&format!("2026-12-{expected:02}"))
+            );
+        }
+        assert!(store.meeting_change(20, now).is_err());
+        assert_eq!(store.page(day, None).meeting_changes, 20);
+    }
+
+    #[test]
     fn reviewed_future_range_respects_exceptions_revisions_and_undo() {
         use portcullis_ipc::calendar::Source;
         let dir = tempfile::tempdir().unwrap();

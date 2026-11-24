@@ -54,6 +54,12 @@ impl Store {
                 cancelled_dates: vec![],
             })
             .collect::<Vec<_>>();
+        let standalone = p.original.is_none()
+            && !p.weekly_cancellation
+            && p.row
+                .as_ref()
+                .is_none_or(|r| matches!(r.kind, Kind::Appointment | Kind::AllDay));
+        let change = standalone.then(|| p.clone());
         let mut pending = None;
         let mut review = Self::prepare(
             &self.state.entries,
@@ -121,7 +127,12 @@ impl Store {
                 }
             }
         }
-        self.invite = pending;
+        if let Some(p) = change {
+            review = self.remember_change(&p, review)?;
+        }
+        if review.token.is_some() {
+            self.invite = pending;
+        }
         Ok(review)
     }
 

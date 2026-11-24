@@ -951,3 +951,92 @@ impl Sheet {
         );
     }
 }
+
+impl Planner {
+    pub(super) fn render_meeting_change(
+        &self,
+        ctx: &mut Ctx,
+        change: &atrium_calendar::store::meeting_changes::ChangeDetail,
+    ) {
+        let when = |edit: &EventEdit| {
+            if change.all_day {
+                format!("{} · All day", edit.date)
+            } else {
+                format!(
+                    "{} · {}–{} · {}",
+                    edit.date,
+                    clock(edit.span.start),
+                    clock(edit.span.end),
+                    edit.zone.map_or("Floating", |z| z.name.name())
+                )
+            }
+        };
+        Label::new(format!(
+            "Meeting change {} of {}",
+            change.index + 1,
+            change.total
+        ))
+        .at(18., 105.)
+        .size(22.)
+        .render(ctx);
+        Label::new(&change.accepted.title)
+            .at(18., 145.)
+            .size(18.)
+            .render(ctx);
+        Label::new("Last accepted").at(18., 182.).render(ctx);
+        Label::new(when(&change.accepted)).at(18., 211.).render(ctx);
+        Label::new(&change.old_location).at(18., 237.).render(ctx);
+        Label::new(format!(
+            "Latest reviewed invitation · revision {}",
+            change.latest.sequence
+        ))
+        .at(18., 300.)
+        .render(ctx);
+        Label::new(change.latest.proposed.as_ref().map_or_else(
+            || {
+                if change.latest.conflicted {
+                    "Conflicting updates · wait for a newer invitation".into()
+                } else {
+                    "Cancelled by organizer".into()
+                }
+            },
+            when,
+        ))
+        .at(18., 329.)
+        .render(ctx);
+        Label::new(&change.latest.location)
+            .at(18., 355.)
+            .render(ctx);
+        Label::new("Open the latest invitation in Mail to save the change or respond.")
+            .at(18., 432.)
+            .render(ctx);
+        self.button(
+            ctx,
+            18.,
+            525.,
+            145.,
+            "Back to calendar",
+            Action::CloseImport,
+        );
+        if change.index > 0 {
+            self.button(
+                ctx,
+                423.,
+                525.,
+                116.,
+                "Previous",
+                Action::MeetingChange(change.index - 1),
+            );
+        }
+        if change.index + 1 < change.total {
+            self.button(
+                ctx,
+                548.,
+                525.,
+                104.,
+                "Next",
+                Action::MeetingChange(change.index + 1),
+            );
+        }
+    }
+}

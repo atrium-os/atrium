@@ -2,6 +2,7 @@
 mod import;
 mod invitation_skips;
 mod invitations;
+pub mod meeting_changes;
 mod ranges;
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
@@ -45,6 +46,7 @@ struct UndoState {
 }
 
 pub struct Store {
+    meeting_changes: meeting_changes::Ledger,
     preview: Option<import::Pending>,
     invite: Option<invitations::Pending>,
     undo: Option<UndoState>,
@@ -96,6 +98,7 @@ impl Store {
             Err(e) => return Err(e),
         };
         Ok(Self {
+            meeting_changes: meeting_changes::Ledger::load(dir)?,
             preview: None,
             invite: None,
             undo: None,
@@ -216,6 +219,7 @@ impl Store {
             });
         }
         CalendarPage {
+            meeting_changes: self.outstanding().count(),
             undo: None,
             clock_gap: crate::zone::missing_minutes(date, self.viewing_zone()),
             date,

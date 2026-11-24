@@ -56,6 +56,7 @@ enum Action {
     CloseImport,
     ApplyInvitation { cancellation: bool },
     InvitationPage(usize),
+    MeetingChange(usize),
     ChooseSkip(bool),
     ReplyInvitation(portcullis_ipc::calendar::Answer),
     SaveImport,
@@ -70,6 +71,7 @@ enum Action {
 enum Reply {
     Calendar(CalendarPage),
     Results(Results),
+    Change(atrium_calendar::store::meeting_changes::ChangeDetail),
 }
 
 struct Planner {
@@ -154,6 +156,9 @@ impl Planner {
         }
         if let Action::Undo(receipt) = action {
             return Ok(Request::Undo { receipt });
+        }
+        if let Action::MeetingChange(index) = action {
+            return Ok(Request::MeetingChange { index });
         }
         if let Action::Search(offset) = action {
             let form = self.search.get_cloned().ok_or("Open Search first")?;
@@ -427,6 +432,20 @@ impl View for Planner {
         self.button(ctx, 283., 44., 104., "Zoned event…", Action::NewZoned);
         self.button(ctx, 396., 44., 121., "Search…", Action::SearchPanel(true));
         self.button(ctx, 531., 44., 150., "Settings…", Action::Settings(true));
+        if data.meeting_changes > 0 {
+            self.button(
+                ctx,
+                268.,
+                if view == CalendarView::Month {
+                    535.
+                } else {
+                    510.
+                },
+                212.,
+                &format!("Meeting changes ({})", data.meeting_changes),
+                Action::MeetingChange(0),
+            );
+        }
         Label::new(self.status.get_cloned())
             .at(18., 565.)
             .render(ctx);
@@ -864,6 +883,9 @@ pub fn run() -> io::Result<()> {
                                         page,
                                     })
                                 }),
+                                Request::MeetingChange { .. } => {
+                                    atrium_calendar::wire::exchange(&path, &req).map(Reply::Change)
+                                }
                                 req => page(&path, &req).map(Reply::Calendar),
                             };
                             let _ = tx.send((action, reply));
@@ -876,6 +898,12 @@ pub fn run() -> io::Result<()> {
         while let Ok((action, reply)) = answers.try_recv() {
             planner.waiting.set(false);
             match reply {
+                Ok(Reply::Change(change)) => {
+                    planner.import.set(Some(Screen::MeetingChange(change)))
+                }
+                Err(e) if matches!(action, Action::MeetingChange(_)) => {
+                    planner.import.set(Some(Screen::InvitationProblem(e)))
+                }
                 Ok(Reply::Results(results)) => {
                     if let Some(mut form) = planner.search.get_cloned() {
                         form.results = Some(results);

@@ -17,6 +17,7 @@ const SLOT: u64 = 1;
 
 #[derive(Clone)]
 pub(super) enum Screen {
+    MeetingChange(atrium_calendar::store::meeting_changes::ChangeDetail),
     Invitation(super::invitations::Sheet),
     InvitationProblem(String),
     ReplyPrepared,
@@ -203,6 +204,10 @@ pub(super) fn prepare(file: File, revision: u64, socket: &Path) -> Result<Screen
 impl Planner {
     pub(super) fn render_import(&self, ctx: &mut Ctx, screen: Screen) {
         match &screen {
+            Screen::MeetingChange(change) => {
+                self.render_meeting_change(ctx, change);
+                return;
+            }
             Screen::Invitation(sheet) => {
                 sheet.render(self, ctx);
                 return;
@@ -251,7 +256,10 @@ impl Planner {
             .at(18., 107.)
             .render(ctx);
         match screen {
-            Screen::Invitation(_) | Screen::InvitationProblem(_) | Screen::ReplyPrepared => {
+            Screen::MeetingChange(_)
+            | Screen::Invitation(_)
+            | Screen::InvitationProblem(_)
+            | Screen::ReplyPrepared => {
                 unreachable!()
             }
             Screen::Picking => {

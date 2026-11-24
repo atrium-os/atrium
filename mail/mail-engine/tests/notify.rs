@@ -244,3 +244,48 @@ fn the_notification_s_buttons() {
     // A message that's gone: nothing.
     assert!(matches!(engine.notification_action(999_999, "archive").unwrap(), Acted::Nothing));
 }
+
+fn meeting_mail(uid: u32, sequence: u32, t: i64, method: &str) -> Fetched {
+    let calendar = format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:{method}\r\nBEGIN:VEVENT\r\nUID:design@fixture.invalid\r\nSEQUENCE:{sequence}\r\nDTSTART:20261201T150000Z\r\nDTEND:20261201T153000Z\r\nORGANIZER:mailto:mina@fixture.invalid\r\nATTENDEE:mailto:arun@example.org\r\nATTENDEE:mailto:guest{uid}@fixture.invalid\r\nEND:VEVENT\r\nEND:VCALENDAR");
+    let mut mail = msg(uid, "Mina <mina@fixture.invalid>", &format!("Design meeting {uid}"), t, "", &calendar);
+    mail.bytes = String::from_utf8(mail.bytes).unwrap().replace("Content-Type: text/plain", &format!("Content-Type: text/calendar; method={method}")).into_bytes();
+    mail.size = mail.bytes.len() as u64;
+    mail
+}
+
+#[test]
+fn organizer_changes_stay_quiet_and_one_wake_summary_covers_late_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    sink.messages("INBOX", vec![msg(1, "Mina <mina@fixture.invalid>", "Old mail", NOW, "", "Hello")]).unwrap();
+    let mut n = Notifier::new();
+    assert!(n.check(&engine, NOW).is_empty());
+    for (id, revision, method) in [(2, 3, "REQUEST"), (3, 2, "REQUEST"), (4, 4, "CANCEL"), (5, 0, "REPLY")] {
+        sink.messages("INBOX", vec![meeting_mail(id, revision, NOW, method)]).unwrap();
+        assert!(n.check(&engine, NOW + i64::from(id)).is_empty());
+    }
+    let wake = NOW + 3600;
+    // Sync may finish after the first post-wake poll. The newest message is
+    // just one second old and would ordinarily qualify for a fresh alert.
+    assert!(n.check(&engine, wake).is_empty());
+    let batch = || (6..26).map(|id| meeting_mail(id, id, wake - i64::from(26-id), "REQUEST")).collect();
+    sink.messages("INBOX", batch()).unwrap();
+    assert!(matches!(&n.check(&engine, wake + 1)[..], [Post::Summary { title, .. }] if title == "Meeting invitations"));
+    sink.messages("INBOX", vec![meeting_mail(26, 26, wake - 1, "CANCEL")]).unwrap();
+    assert!(n.check(&engine, wake + 2).is_empty());
+    sink.messages("INBOX", batch()).unwrap();
+    assert!(n.check(&engine, wake + 3).is_empty());
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 26);
+    // A second gap while syncing cannot replay a late part of the first backlog.
+    sink.messages("INBOX", vec![meeting_mail(28, 27, wake - 1, "REQUEST")]).unwrap();
+    assert!(n.check(&engine, wake + 120).is_empty());
+    let mut restarted = Notifier::new();
+    assert!(restarted.check(&engine, wake + 240).is_empty());
+    // A real reply-all conversation still reaches the normal notification sink.
+    sink.messages("INBOX", vec![msg(27, "Mina <mina@fixture.invalid>", "Re: Design meeting", wake + 241, "", "Should we invite Lee?")]).unwrap();
+    assert!(matches!(&restarted.check(&engine, wake + 241)[..], [Post::One { title, .. }] if title == "Re: Design meeting"));
+}

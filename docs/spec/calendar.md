@@ -355,6 +355,16 @@ Fasti matches the selected Mail delivery to the cancelled occurrence, including 
 
 The synthetic desktop gate runs with `--reissue` using the §7.11 driver. The December 15 slot first returns on December 17 at 10:00, is cancelled, and is offered again for December 18 at 11:30. The retained copy is moved independently to December 23. The gate checks the two adjacent cancelled weeks, the resumed weekly time, both Undo operations and the Mail outbox. [Cancellation](../../atrium-calendar/tests/fixtures/cancel-restored.ics) · [Reissue](../../atrium-calendar/tests/fixtures/reissue-one.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
+### 7.23 Reviewing repeated organizer changes
+
+For a saved one-off meeting, opening a verified update from Mail records the latest reviewed revision in the current persona. **Meeting changes** shows one item per meeting. Each item shows the accepted time and venue alongside the latest proposal or cancellation. Upcoming and ongoing meetings appear before ended ones. Reopening the calendar restores the list. Saving or responding still uses the selected invitation in Mail.
+
+A return to the accepted time and venue clears the item. Fasti retains the highest reviewed revision so a delayed delivery cannot reopen it. A higher cancellation supersedes the move. Two different proposals with the same revision require a newer organizer revision before either can be applied. A sequence bump or a change to the other attendees creates no review item by itself. The private review file is separate from the accepted calendar, so previewing a revision preserves the schedule and its Undo receipt. [Review state](../../atrium-calendar/src/store/meeting_changes.rs)
+
+Mail suppresses individual notifications for parsed direct organizer updates with a positive sequence, cancellations and scheduling replies. After a gap of at least one minute in Mail’s polling, scheduling deliveries dated at or before the first returning poll share one low-urgency summary. Late sync pages use the same cutoff, and quiet hours defer the summary. An ordinary reply-all message keeps Mail’s usual notification policy. The Calendar queue receives only the invitations opened through **Review in Calendar**. Background handoff, personal RSVP-field changes, durable reminder delivery and device-level sleep and sound checks remain later C2 work. [Mail notification policy](mail.md#121-no-storm-of-pings-after-a-gap-shankar-2026-11-16)
+
+The synthetic schedules exercise out-of-order moves, replays, same-revision conflicts, a cancellation, 100 added attendees and 20 outstanding meetings across restart. The Mail test delivers 20 invitations after a simulated polling gap, then another sync page, a replay and a second gap. It checks the outgoing notification requests and uses an ordinary conversation as a positive control. The installed desktop check opens the grouped item and compares 14:00 in Studio A with 15:00 in Studio B before returning to Mail. [Calendar scenarios](../../atrium-calendar/src/bin/calendar-ical.rs) · [Mail notification tests](../../mail/mail-engine/tests/notify.rs) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

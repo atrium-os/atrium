@@ -29,6 +29,9 @@ pub enum EventChange {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Request {
+    MeetingChange {
+        index: usize,
+    },
     ReviewInvitation {
         revision: u64,
         source: portcullis_ipc::calendar::Source,
@@ -341,6 +344,13 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
                     flag::IS_RESPONSE,
                     OP_PREPARE_IMPORT,
                     &store.review_invitation(revision, &source, proposal),
+                );
+            }
+            Ok(Request::MeetingChange { index }) => {
+                return send(
+                    s,
+                    flag::IS_RESPONSE,
+                    &store.meeting_change(index, chrono::Utc::now()),
                 );
             }
             Ok(Request::CheckInvitation { revision, token }) => {
