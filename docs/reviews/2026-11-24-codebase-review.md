@@ -70,13 +70,13 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | ID | Sev | Component | Finding | Effort | Status |
 |---|---|---|---|---|---|
 | C1 | Critical | portcullis-jail, portcullis-toml | An app manifest's entry could add jail.conf parameters (host root) | S | **Fixed `5bf45cf`** |
-| H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | Open |
-| H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | Open |
+| H1 | High | aqueduct | CAS uploads are unbounded: any peer can make the server buffer without limit | S | **Fixed `e06c48a`** |
+| H2 | High | portcullis-ipc, portcullisd | Request line length and connection count are unbounded in the root broker | S | **Fixed `7ab7b5e`** (connection cap not yet VM-tested) |
 | H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
 | H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | Open |
-| H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | Open |
+| H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `05b0e6a`** |
 | M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | Open |
-| M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | Open |
+| M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | **Fixed `da28210`** |
 | M3 | Medium | portcullisd | One root daemon carries 71 request kinds, with app features inside the broker | L | Open |
 | M4 | Medium | jaild, many crates | Security predicates and helpers are copy-pasted | M | Open |
 | M5 | Medium | tessera, gpu-rs, vk-icd, atrium-net | `unsafe` without justification; FFI entry points with no panic boundary | M | Open |
@@ -429,6 +429,9 @@ mass rewrite.
   (`lib.rs:192`).
 - jaild's tests hardcode `/usr/home/girivs`.
 - `portcullis-toml` depends on `thiserror` but does not use it.
+- `fresco-aqueduct-bridge`'s tests no longer compile: `RectParams` gained a
+  `radius` field the tests never set. A suite that doesn't build checks
+  nothing.
 
 ## 4. Fix plan
 
