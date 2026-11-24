@@ -295,8 +295,8 @@ fn place(node: Node, matrix: [f32; 6]) -> Result<Node, &'static str> {
         Node::Rect {
             rect,
             fill,
-            radius: 0.,
-        } => Shape::new(PathData::rect(rect))
+            radius,
+        } => Shape::new(PathData::rounded_rect(rect, radius))
             .fill(Paint::Solid(fill))
             .fills()
             .into_iter()

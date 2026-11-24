@@ -628,3 +628,4 @@ mod parts_tests {
 }
 pub mod video;
 pub mod youtube;
+pub mod youtube_media;

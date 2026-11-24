@@ -104,9 +104,17 @@ pub(super) fn to_viewport(
                 origin.x += m[4];
                 origin.y += m[5];
             }
-            Node::Fill(_) | Node::Rect { radius: 0., .. } => {
-                leaf.node = place(leaf.node.clone(), m)?
+            Node::Image { rect, .. } if m[1] == 0. && m[2] == 0. && m[0] > 0. && m[3] > 0. => {
+                *rect = pergola::Rect::new(
+                    rect.x() * m[0] + m[4],
+                    rect.y() * m[3] + m[5],
+                    rect.w() * m[0],
+                    rect.h() * m[3],
+                );
             }
+            Node::Fill(_) | Node::Rect { .. } => leaf.node = place(leaf.node.clone(), m)?,
+            Node::Glyphs { .. } => return Err(format!("unsupported glyph transform {m:?}")),
+            Node::Image { .. } => return Err(format!("unsupported image transform {m:?}")),
             _ => return Err("unsupported transformed mask frame primitive".into()),
         }
     }

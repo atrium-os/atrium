@@ -156,12 +156,18 @@
          if (new_playback_position == m_duration)
 --- a/Libraries/LibWeb/HTML/HTMLMediaElement.h
 +++ b/Libraries/LibWeb/HTML/HTMLMediaElement.h
-@@ -188,6 +188,9 @@
+@@ -188,6 +188,15 @@
  
      GC::Ref<TextTrack> add_text_track(Bindings::TextTrackKind kind, Utf16View label, Utf16View language);
  
 +#ifdef ATRIUM_I4_VIDEO
-+    void native_media_ready(Badge<MediaSourceExtensions::MediaSource>) { set_ready_state(ReadyState::HaveMetadata); set_ready_state(ReadyState::HaveEnoughData); }
++    void native_data_appended(Badge<MediaSourceExtensions::SourceBuffer>)
++    {
++        if (m_ready_state == ReadyState::HaveNothing)
++            set_ready_state(ReadyState::HaveMetadata);
++        update_ready_state();
++    }
++    void native_media_ready(Badge<MediaSourceExtensions::MediaSource>) { if (m_ready_state == ReadyState::HaveNothing) set_ready_state(ReadyState::HaveMetadata); set_ready_state(ReadyState::HaveEnoughData); }
 +#endif
      void update_ready_state();
  
@@ -248,7 +254,7 @@
          HTML::VideoTrackList::create(),
          HTML::TextTrackList::create());
 +#ifdef ATRIUM_I4_VIDEO
-+    if (!navigator_video_add(buffer->native_buffer_id(), type == u"audio/webm; codecs=\"opus\""sv))
++    if (!navigator_video_add(buffer->native_buffer_id(), MimeSniff::MimeType::parse(type.utf16_view())->type() == "audio"sv))
 +        return WebIDL::NotSupportedError::create("Native player refused this track"_utf16);
 +#endif
      buffer->set_content_type(type.utf16_view());
@@ -271,12 +277,47 @@
  
      return {};
  }
-@@ -614,6 +632,9 @@
+@@ -614,6 +632,44 @@
      if (!mime_type_is_supported_in_a_byte_stream(*mime_type))
          return false;
  
 +#ifdef ATRIUM_I4_VIDEO
-+    return type == u"video/webm; codecs=\"vp9\""sv || (navigator_video_available() && type == u"audio/webm; codecs=\"opus\""sv);
++    if (mime_type->subtype() != "webm"sv)
++        return false;
++    auto codec = mime_type->parameters().get("codecs"sv)->bytes_as_string_view();
++    bool audio = mime_type->type() == "audio"sv;
++    if (audio) {
++        if (codec != "opus"sv)
++            return false;
++    } else {
++        auto parsed = Media::parse_codec_parameters_string(codec);
++        if (!parsed.has_value() || parsed->codec_id() != Media::CodecID::VP9)
++            return false;
++        auto vp9 = parsed->vp9_parameters();
++        if (vp9.has_value() && (vp9->profile != 0 || vp9->bit_depth != 8))
++            return false;
++    }
++    for (auto const& param : mime_type->parameters()) {
++        auto key = param.key.bytes_as_string_view();
++        auto value = param.value.bytes_as_string_view();
++        if (key == "codecs"sv)
++            continue;
++        if (!audio && key == "eotf"sv && value == "bt709"sv)
++            continue;
++        if (!audio && key == "decode-to-texture"sv && value == "false"sv)
++            continue;
++        auto number = value.to_number<unsigned>();
++        if (!number.has_value() || *number == 0)
++            return false;
++        if (audio && key == "channels"sv && *number <= 2)
++            continue;
++        if (!audio && ((key == "width"sv && *number <= 1920) || (key == "height"sv && *number <= 1080) || (key == "framerate"sv && *number <= 60)))
++            continue;
++        if (key == "bitrate"sv && *number <= 8000000)
++            continue;
++        return false;
++    }
++    return !audio || navigator_video_available();
 +#endif
      auto media_client = MediaClient::Client::acquire();
      if (media_client.is_error())
@@ -298,7 +339,18 @@
  
  static void dispatch_addtrack_event(JS::Object& global_object, DOM::EventTarget& track_list, HTML::NullableTrackType const& track)
  {
-@@ -354,6 +361,12 @@
+@@ -109,5 +116,10 @@
+     m_remote_source_buffer->on_append_completed = [self = GC::Weak(*this)](u64 append_generation) {
+         if (!self || append_generation != self->m_append_generation)
+             return;
++#ifdef ATRIUM_I4_VIDEO
++        auto element = self->m_media_source->media_element_assigned_to();
++        if (element && element->buffered()->length() > 0)
++            element->native_data_appended({});
++#endif
+         self->finish_buffer_append();
+     };
+@@ -354,6 +366,12 @@
      // NB: The remaining steps are implemented by DemuxerScanState::buffered_ranges(), which the media server also uses
      //     to limit playback. The track buffer ranges are published after each command, so this read never observes a
      //     partial append, and the end of the stream is tracked here, so readyState changes take effect at once.
@@ -311,7 +363,7 @@
      auto ranges = m_remote_source_buffer->scan_state().buffered_ranges();
      for (auto const& range : ranges)
          time_ranges->add_range(range.start.to_seconds_f64(), range.end.to_seconds_f64());
-@@ -368,6 +381,11 @@
+@@ -368,6 +386,11 @@
  
  AK::Duration SourceBuffer::highest_end_time() const
  {
@@ -323,7 +375,7 @@
      return m_remote_source_buffer->published_state().highest_end_time;
  }
  
-@@ -625,6 +643,9 @@
+@@ -625,6 +648,9 @@
      if (!MediaSource::is_type_supported(type.utf16_view()))
          return WebIDL::NotSupportedError::create("Type is not supported"_utf16);
  

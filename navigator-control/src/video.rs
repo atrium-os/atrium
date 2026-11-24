@@ -5,7 +5,8 @@ use std::io::{self, Read, Write};
 
 pub const MIME: &str = "video/webm; codecs=\"vp9\"";
 pub const OPUS_MIME: &str = "audio/webm; codecs=\"opus\"";
-pub const MAX_APPEND: usize = 60 * 1024;
+// One SourceBuffer append may contain a complete bounded CDN response.
+pub const MAX_APPEND: usize = crate::youtube_media::REPLY;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {

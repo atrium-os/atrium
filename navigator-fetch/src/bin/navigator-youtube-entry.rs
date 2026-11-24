@@ -52,11 +52,48 @@ fn run() -> Result<(), String> {
     {
         use std::io::Read;
         let mut remaining = navigator_control::youtube::ASSET_BUDGET;
+        use navigator_control::youtube_media as media;
+        let mut issued = None::<String>;
+        let mut media_posts = 0;
+        let until = std::time::Instant::now() + navigator_control::youtube::PLAYER_WINDOW;
         let mut posts = 0;
-        for step in 0..=navigator_control::youtube::ASSET_COUNT {
+        for step in 0..=navigator_control::youtube::ASSET_COUNT + media::REQUESTS {
             let mut kind = [0];
             if out.read(&mut kind).map_err(|e| e.to_string())? == 0 {
                 break;
+            }
+            if kind[0] == 4 {
+                if media_posts >= media::REQUESTS || std::time::Instant::now() >= until {
+                    return Err("delivery window exhausted".into());
+                }
+                let mut read_part = |max: usize| -> Result<Vec<u8>, String> {
+                    let mut len = [0; 2];
+                    out.read_exact(&mut len).map_err(|e| e.to_string())?;
+                    let n = u16::from_be_bytes(len) as usize;
+                    if !(1..=max).contains(&n) {
+                        return Err("invalid media field length".into());
+                    }
+                    let mut data = vec![0; n];
+                    out.read_exact(&mut data).map_err(|e| e.to_string())?;
+                    Ok(data)
+                };
+                let url = String::from_utf8(read_part(8192)?).map_err(|_| "invalid media URL")?;
+                if !issued
+                    .as_deref()
+                    .is_some_and(|grant| media::permits(grant, &url))
+                {
+                    return Err("unissued media destination".into());
+                }
+                let body = read_part(media::BODY)?;
+                let reply =
+                    youtube::delivery(&url, &body, &mut conversation, remaining.min(media::REPLY))?;
+                remaining -= reply.len();
+                media_posts += 1;
+                send(&mut out, &reply)?;
+                continue;
+            }
+            if step - media_posts > navigator_control::youtube::ASSET_COUNT {
+                return Err("startup request count exhausted".into());
             }
             if step > 0 && kind[0] == 3 {
                 use navigator_control::youtube::{PLAYER_BODY_LIMIT, PLAYER_REQUESTS};
@@ -75,6 +112,7 @@ fn run() -> Result<(), String> {
                 remaining = remaining
                     .checked_sub(reply.len())
                     .ok_or("startup byte budget")?;
+                issued = media::issued(&reply);
                 posts += 1;
                 send(&mut out, &reply)?;
                 continue;

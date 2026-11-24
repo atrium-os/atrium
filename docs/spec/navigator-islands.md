@@ -659,6 +659,46 @@ The painter suite passed 11 tests and the player request suite passed three.
 Evidence, including both guest controls and the Chrome comparison, is in
 `~/atrium-vm/evidence/navigator-i4-shadow-compare-20261124/`.
 
+#### First YouTube media delivery and guest audio
+
+Fresh signed-out Chrome used `--mute-audio`. Its successful player reply
+listed 23 formats without individual stream URLs. Chrome sent a binary POST
+to the response’s HTTPS `serverAbrStreamingUrl` on the media CDN.
+Jailed Ladybird accepted the bare VP9 and Opus MIME strings but rejected
+the qualified profile-0 eight-bit VP9 strings and capability parameters used
+for selection. With the native capabilities fixed, the page offered 144p
+through 720p, attached its MediaSource and selected separate native buffers.
+
+The broker and TLS worker each bind delivery to the current successful player
+response. They check the exact host and path and preserve the issued query
+fields, allowing the embed’s transport nonce and four bounded playback
+parameters. The grant permits 12 media POSTs during the existing 120-second
+window with 8 KiB request bodies, 2 MiB replies and the shared 10 MiB budget.
+The worker forwards no credentials or page headers. It verifies the response
+type, exact CORS origin and credentials-mode permission before returning the
+bytes to Fetch. A request for an unissued delivery host fails individually.
+
+The first media response was 546,877 bytes. Native VP9 and Opus initialization
+appends succeeded. The first real media appends of 65,825 and 125,150 bytes
+exceeded the local fixture limit. The provider gate now accepts bounded
+segments and drives LibWeb readiness when the tracks have a common buffered
+range. The original local fixture retains its 64 KiB session budget.
+The painter also handles rounded rectangles and axis-aligned images transformed
+by the playing page’s mask frame.
+
+On arm64 Tessera the JIT-off engine ran in Capsicum and both the renderer
+and the embedded player had IP disabled. A test-only counter in the native
+player observed at least 512 decoded frames through PTS 17.033 s. A guest
+frame showed the presenter, and the page reported playing at 20.7 s.
+LibWeb’s DOM frame counter and the headless presentation counter both stayed
+zero. With the headless test seat set to `mailgate`, Choragus attributed a
+48 kHz stereo stream to Navigator. The 13.488-second Lyra device capture
+peaked at 21,087 (signed 16-bit PCM). The same capture with no active seat
+was silent. Evidence is in
+`~/atrium-vm/evidence/navigator-i4-media-selection-20261124/`.
+Next test sustained delivery beyond the initial buffered interval and a
+chapter seek on the provider video.
+
 The provider recorded a 1 × 180 vertical black-to-transparent gradient
 tiled across a 640 px region under two rectangular clips. The painter
 now retains same-space intersecting rectangular clips and represents a

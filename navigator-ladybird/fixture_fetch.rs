@@ -89,15 +89,23 @@ unsafe fn fixture_request(
     let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, len) }) else {
         return 0;
     };
-    if post.is_some() && !navigator_control::youtube::player_url(url) {
+    let media = post.is_some() && navigator_control::youtube_media::endpoint(url).is_some();
+    if media && post.is_some_and(|data| data.len() > navigator_control::youtube_media::BODY) {
         return 0;
     }
-    let asset = if post.is_some() {
+    if post.is_some() && !media && !navigator_control::youtube::player_url(url) {
+        return 0;
+    }
+    let asset = if media {
+        Some(navigator_control::youtube_media::MIME)
+    } else if post.is_some() {
         Some("application/json")
     } else {
         navigator_control::youtube::asset_mime(url)
     };
-    let limit = if post.is_some() {
+    let limit = if media {
+        navigator_control::youtube_media::REPLY
+    } else if post.is_some() {
         navigator_control::youtube::PLAYER_RESPONSE_LIMIT
     } else if asset.is_some() {
         navigator_control::youtube::asset_limit(url)
@@ -132,13 +140,13 @@ unsafe fn fixture_request(
     };
     let provider_asset = sequence == PROVIDER && step > 0;
     if provider_asset {
-        if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT {return 0;}
+        if asset.is_none() || step > navigator_control::youtube::ASSET_COUNT + navigator_control::youtube_media::REQUESTS {return 0;}
     } else if sequence.get(step).copied() != Some(url) { return 0; }
     let expected_mime = if provider_asset { asset.unwrap() } else if url == VIDEO[1] { "text/javascript" }
         else if url == VIDEO[2] { "video/webm" } else if url == VIDEO[3] { "audio/webm" } else { "text/html" };
     let request_id = step as u32 + 1;
     let mut open = match post {
-        Some(bytes) => Open::post(request_id, url, "application/json", bytes.to_vec()),
+        Some(bytes) => Open::post(request_id, url, if media { "application/octet-stream" } else { "application/json" }, bytes.to_vec()),
         None => Open::get(request_id, url),
     };
     open.limits.max_bytes = capacity as u64;
@@ -183,6 +191,10 @@ unsafe fn fixture_request(
                     *state = Some((client, step + 1, Some(sequence)));
                 }
                 return used;
+            }
+            Ok(Some(Event::Error { id, .. })) if media && id == request_id => {
+                *state = Some((client, step + 1, Some(sequence)));
+                return 0;
             }
             _ => break,
         }

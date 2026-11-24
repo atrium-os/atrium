@@ -85,7 +85,12 @@ impl Widget {
             .map_err(|e| format!("place: {e:?}"))?;
         let video = if matches!(source, VIDEO | YOUTUBE_ENTRY) {
             use std::os::fd::AsRawFd;
-            let (video, worker) = crate::widget_video::Video::start(socket, window, rect)?;
+            let append_budget = if source == YOUTUBE_ENTRY {
+                navigator_control::youtube::ASSET_BUDGET
+            } else {
+                65536
+            };
+            let (video, worker) = crate::widget_video::Video::start(socket, window, rect, append_budget)?;
             navigator_control::send_fd(&channel, worker.as_raw_fd()).map_err(|e| e.to_string())?;
             Some(video)
         } else { None };
@@ -232,10 +237,13 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
     };
     let deadline = Instant::now() + navigator_control::youtube::PLAYER_WINDOW;
     let mut provider = None;
+    use navigator_control::youtube_media as media;
+    let mut delivery = None::<String>;
+    let mut media_posts = 0;
     let mut posts = 0;
     let mut remaining = navigator_control::youtube::ASSET_BUDGET;
     let requests = if source == YOUTUBE_ENTRY {
-        1 + navigator_control::youtube::ASSET_COUNT
+        1 + navigator_control::youtube::ASSET_COUNT + media::REQUESTS
     } else {
         resources.len()
     };
@@ -251,20 +259,47 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
         };
         let player = source == YOUTUBE_ENTRY && step > 0 && open.method == Method::Post
             && navigator_control::youtube::player_url(&open.url);
+        let stream = source == YOUTUBE_ENTRY
+            && open.method == Method::Post
+            && delivery.as_deref().is_some_and(|grant| media::permits(grant, &open.url));
+        if source == YOUTUBE_ENTRY && !stream && media::endpoint(&open.url).is_some() {
+            // A CDN retry must not retire the island or discard earlier media.
+            output.send(Event::Error { id: open.id, code: nuntius::ErrorCode::Policy })
+                .map_err(|e| e.to_string())?;
+            continue;
+        }
+        if source == YOUTUBE_ENTRY && !stream && step - media_posts > navigator_control::youtube::ASSET_COUNT {
+            return Err("startup request count exhausted".into());
+        }
         let payload = if player {
             let body = open.body.as_ref().ok_or("missing player request")?;
             if body.content_type != "application/json" || posts >= navigator_control::youtube::PLAYER_REQUESTS { return Err("outside player grant".into()); }
             posts += 1;
             Some(navigator_control::youtube::player_body(&body.bytes)?)
+        } else if stream {
+            let body = open.body.as_ref().ok_or("missing delivery request")?;
+            if media_posts >= media::REQUESTS
+                || body.bytes.is_empty()
+                || body.bytes.len() > media::BODY
+                || body.content_type != "application/octet-stream"
+            {
+                return Err("outside delivery grant".into());
+            }
+            media_posts += 1;
+            Some(body.bytes.clone())
         } else {None};
-        if player && Instant::now() >= deadline { return Err("player grant expired".into()); }
-        let (url, mime) = if player { (open.url.as_str(), "application/json") } else if source == YOUTUBE_ENTRY && step > 0 {
+        if (player || stream) && Instant::now() >= deadline { return Err("player grant expired".into()); }
+        let (url, mime) = if stream {
+            (open.url.as_str(), media::MIME)
+        } else if player {
+            (open.url.as_str(), "application/json")
+        } else if source == YOUTUBE_ENTRY && step > 0 {
             let mime = navigator_control::youtube::asset_mime(&open.url).ok_or("unknown provider asset")?;
             (open.url.as_str(), mime)
         } else { resources[step] };
         let id = open.id;
         if open.url != url
-            || (!player && (open.method != Method::Get || open.body.is_some()))
+            || (!player && !stream && (open.method != Method::Get || open.body.is_some()))
             || open.range.is_some()
             || open.if_range.is_some()
             || open.deliver != Deliver::Stream
@@ -272,7 +307,15 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             return Err("request outside the widget grant".into());
         }
         let (body, limit) = if source == YOUTUBE_ENTRY {
-            let limit = if player {navigator_control::youtube::PLAYER_RESPONSE_LIMIT} else if step == 0 { YOUTUBE_ENTRY_LIMIT } else { navigator_control::youtube::asset_limit(url) };
+            let limit = if stream {
+                media::REPLY
+            } else if player {
+                navigator_control::youtube::PLAYER_RESPONSE_LIMIT
+            } else if step == 0 {
+                YOUTUBE_ENTRY_LIMIT
+            } else {
+                navigator_control::youtube::asset_limit(url)
+            };
             if step > 0 && remaining == 0 { return Err("provider startup budget exhausted".into()); }
             if provider.is_none() { provider = Some(youtube_worker()?); }
             let (socket, _worker) = provider.as_mut().ok_or("provider worker missing")?;
@@ -290,8 +333,13 @@ fn fetch(socket: UnixStream, cfg: &Config, source: &str) -> Result<(), String> {
             return Err("widget document size".into());
         }
         let method = if player { "POST" } else { "GET" };
-        eprintln!("navigatord: widget {method} {url} bytes={length}");
+        if stream {
+            eprintln!("navigatord: media POST bytes={length}");
+        } else {
+            eprintln!("navigatord: widget {method} {url} bytes={length}");
+        }
         if player {
+            delivery = media::issued(&body);
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
                 let status = value["playabilityStatus"]["status"].as_str().unwrap_or("missing");
                 let status = match status {
@@ -343,7 +391,15 @@ fn youtube_resource(
     use std::io::{Read, Write};
 
     if let Some(body) = post {
-        reader.write_all(&[3]).and_then(|_|reader.write_all(&(body.len() as u16).to_be_bytes()))
+        if navigator_control::youtube_media::endpoint(url).is_some() {
+            reader.write_all(&[4])
+                .and_then(|_| reader.write_all(&(url.len() as u16).to_be_bytes()))
+                .and_then(|_| reader.write_all(url.as_bytes()))
+                .map_err(|e| e.to_string())?;
+        } else {
+            reader.write_all(&[3]).map_err(|e| e.to_string())?;
+        }
+        reader.write_all(&(body.len() as u16).to_be_bytes())
             .and_then(|_|reader.write_all(body)).map_err(|e|e.to_string())?;
     } else if url == YOUTUBE_ENTRY {
         reader.write_all(&[1]).map_err(|e| e.to_string())?;

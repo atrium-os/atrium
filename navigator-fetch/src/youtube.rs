@@ -53,6 +53,28 @@ pub fn player(input: &[u8], conv: &mut Conversation<'_>) -> Result<Vec<u8>, Stri
     exchange_player(&mut *stream, &body)
 }
 
+pub fn delivery(
+    url: &str,
+    body: &[u8],
+    conv: &mut Conversation<'_>,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    use navigator_control::youtube_media as media;
+    let (host, query) = media::endpoint(url).ok_or("invalid media endpoint")?;
+    if limit == 0 || body.is_empty() || body.len() > media::BODY {
+        return Err("empty or oversized delivery".into());
+    }
+    conv.site_check(host).map_err(|e| e.to_string())?;
+    let Conn::Tls(mut stream) = conv
+        .connect(host, 443, true, host)
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("media requires TLS".into());
+    };
+    write!(stream,"POST /videoplayback?{query} HTTP/1.1\r\nHost: {host}\r\nOrigin: {}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",navigator_control::youtube::ORIGIN,body.len()).and_then(|_|stream.write_all(body)).and_then(|_|stream.flush()).map_err(|e|e.to_string())?;
+    response(&mut *stream, media::MIME, limit)
+}
+
 fn exchange_player(stream: &mut (impl Read + Write), body: &[u8]) -> Result<Vec<u8>, String> {
     use navigator_control::youtube::{ORIGIN, PLAYER_RESPONSE_LIMIT};
     write!(stream, "POST /youtubei/v1/player?prettyPrint=false HTTP/1.1\r\nHost: {HOST}\r\nOrigin: {ORIGIN}\r\nReferer: {ORIGIN}/embed/M7lc1UVf-VE\r\nContent-Type: application/json\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).and_then(|_|stream.write_all(body)).and_then(|_|stream.flush()).map_err(|e|e.to_string())?;
@@ -72,15 +94,22 @@ fn response(stream: &mut impl Read, expected: &str, limit: usize) -> Result<Vec<
     if response.status != 200 {
         return Err(format!("YouTube entry returned HTTP {}", response.status));
     }
-    if expected == "image/svg+xml"
-        && !matches!(
-            response
-                .header("access-control-allow-origin")
-                .map(str::trim),
-            Some("*" | navigator_control::youtube::ORIGIN)
-        )
+    if matches!(
+        expected,
+        "image/svg+xml" | navigator_control::youtube_media::MIME
+    ) && !matches!(
+        response
+            .header("access-control-allow-origin")
+            .map(str::trim),
+        Some("*" | navigator_control::youtube::ORIGIN)
+    ) {
+        return Err("Provider did not grant access to the embed origin".into());
+    }
+    if expected == navigator_control::youtube_media::MIME
+        && (response.header("access-control-allow-origin").map(str::trim) != Some(navigator_control::youtube::ORIGIN)
+            || response.header("access-control-allow-credentials").map(str::trim) != Some("true"))
     {
-        return Err("Play icon did not grant access to the embed origin".into());
+        return Err("media response lacks the embed origin or credentials-mode permission".into());
     }
     let mime = response
         .header("content-type")

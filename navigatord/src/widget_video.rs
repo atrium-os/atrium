@@ -44,6 +44,7 @@ impl Video {
         path: &Path,
         window: [u8; 16],
         island: [f32; 4],
+        append_budget: usize,
     ) -> Result<(Self, UnixStream), String> {
         let mut parent = Parent::at(path).map_err(|e| format!("player connection: {e:?}"))?;
         let embed = parent
@@ -61,6 +62,7 @@ impl Video {
             slot: slot.clone(),
             media: Media::new(),
             bytes: 0,
+            append_budget,
             ended: false,
         };
         std::thread::spawn(move || {
@@ -90,6 +92,7 @@ struct Session {
     slot: Arc<Mutex<Option<Slot>>>,
     media: Media,
     bytes: usize,
+    append_budget: usize,
     ended: bool,
 }
 
@@ -199,7 +202,7 @@ impl Session {
         if self.ended
             || bytes.is_empty()
             || bytes.len() > video::MAX_APPEND
-            || self.bytes + bytes.len() > 65536
+            || self.bytes + bytes.len() > self.append_budget
         {
             return Err("append outside local video grant".into());
         }
