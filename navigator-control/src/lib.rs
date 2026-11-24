@@ -422,6 +422,9 @@ pub enum Event {
     /// The live page at `from` proposed going to `url` (I6.2): the UI opens
     /// it as a trail entry, live again if it is the same origin.
     LiveNavigate { from: String, url: String },
+    /// The live page at `from` changed its own address to `url`, same
+    /// origin (`history.pushState`, I6.2): a trail entry, same engine.
+    LiveUrlChanged { from: String, url: String },
 }
 
 /// What a VPN page's resource is, from its content type.

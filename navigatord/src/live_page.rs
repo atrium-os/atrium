@@ -186,6 +186,13 @@ pub fn navigation(page: Option<&str>, to: &str) -> Option<String> {
     (u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.as_str() == to).then(|| to.to_string())
 }
 
+/// The page changed its own address (I6.2): taken only as a plain HTTPS
+/// address at the page's own origin.
+pub fn address_change(page: Option<&str>, to: &str) -> Option<String> {
+    let to = navigation(page, to)?;
+    (page.and_then(crate::origin).is_some() && page.and_then(crate::origin) == crate::origin(&to)).then_some(to)
+}
+
 /// One running live page: its island, placed over the page area.
 pub struct Live {
     pub url: String,
@@ -219,6 +226,7 @@ impl Live {
         cfg: Arc<crate::Config>,
         started: impl FnOnce(String) + Send + 'static,
         navigate: impl Fn(String) + Send + 'static,
+        url_changed: impl Fn(String) + Send + 'static,
         finished: impl FnOnce(Option<String>) + Send + 'static,
     ) -> Result<Self, String> {
         scope(&url, &url).map_err(|why| format!("this page can't run live: {why}"))?;
@@ -292,14 +300,13 @@ impl Live {
                             Some(to) => navigate(to),
                             None => eprintln!("navigatord: a live page's navigation refused ({})", crate::refused_target(to)),
                         },
-                        Some(Report::UrlChanged(to)) => {
-                            // The address bar follows in a later step; the
-                            // engine must not claim another origin's address.
-                            if page.as_deref().and_then(crate::origin) != crate::origin(to) {
-                                break Some("the engine claimed another origin's address".into());
-                            }
-                            eprintln!("navigatord: a live page changed its address in place");
-                        }
+                        // The page changed its own address (pushState): a trail
+                        // entry in the UI. An engine that claims another
+                        // origin's address is ended.
+                        Some(Report::UrlChanged(to)) => match address_change(page.as_deref(), to) {
+                            Some(to) => url_changed(to),
+                            None => break Some("the engine claimed another origin's address".into()),
+                        },
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
                         // A live page has no unload question in I6.1: Stop is the person's.
@@ -368,6 +375,17 @@ mod tests {
         for bad in ["http://app.example/", "https://u:p@app.example/", "https://APP.example/", "file:///etc/passwd", "https://a.example/\u{7f}"] {
             assert_eq!(navigation(page, bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_page_changes_its_address_only_within_its_origin() {
+        let page = Some("https://app.example/app.html");
+        assert_eq!(address_change(page, "https://app.example/route/1").as_deref(), Some("https://app.example/route/1"));
+        for bad in ["https://api.app.example/route", "https://app.example:8443/route", "http://app.example/route",
+                    "https://user@app.example/route", "https://APP.example/route"] {
+            assert_eq!(address_change(page, bad), None, "{bad}");
+        }
+        assert_eq!(address_change(None, "https://app.example/route/1"), None, "not before the page was delivered");
     }
 
     #[test]

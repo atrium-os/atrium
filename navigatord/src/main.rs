@@ -2888,10 +2888,11 @@ mod island_metadata_tests {
 /// Start the whole-page engine for `page` in the UI's window (I6.1, I6.2),
 /// telling the UI when it started, where it asked to go, and when it ended.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4]) -> Result<live_page::Live, String> {
-    let (on_start, on_nav, on_end) = (w.clone(), w.clone(), w.clone());
-    let (start_url, nav_url, end_url) = (page.clone(), page.clone(), page.clone());
+    let (on_start, on_nav, on_route, on_end) = (w.clone(), w.clone(), w.clone(), w.clone());
+    let (start_url, nav_url, route_url, end_url) = (page.clone(), page.clone(), page.clone(), page.clone());
     live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(),
         move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
         move |url| send(&on_nav, &Event::LiveNavigate { from: nav_url.clone(), url }),
+        move |url| send(&on_route, &Event::LiveUrlChanged { from: route_url.clone(), url }),
         move |why| send(&on_end, &Event::LiveEnded { url: end_url, why }))
 }

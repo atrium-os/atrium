@@ -253,8 +253,9 @@ pub struct LiveRun {
     pub url: String,
     /// `None` until navigatord reports the engine started.
     pub origin: Option<String>,
-    /// The trail entry the live page went to (I6.2), until it runs there.
-    pub next: Option<(u64, PageId)>,
+    /// The trail entries this run made or went to (I6.2), `key` among
+    /// them: moving to one runs it live again with no new press.
+    pub entries: Vec<(u64, PageId)>,
 }
 
 /// The live page's state, as navigatord and the page child reported it.
@@ -766,29 +767,69 @@ impl Shell {
     /// navigatord shows it, if it is the same origin ([`Self::live_follow`]).
     pub fn live_navigated(&mut self, from: &str, url: &str) -> bool {
         let shown = self.shown_key();
-        let Some(run) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some() && r.next.is_none()) else { return false };
+        let Some(run) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some()) else { return false };
         if self.history.is_some() || shown != Some(run.key) { return false; }
         self.follow_link(url, false);
         let next = self.shown_key();
-        if let Some(run) = self.live_run.as_mut() { run.next = next; }
+        if let (Some(run), Some(next)) = (self.live_run.as_mut(), next) { run.entries.push(next); }
         true
     }
 
-    /// The page on screen changed while a page runs live: the page the
-    /// live page went to runs live too once navigatord shows it at the same
-    /// origin; anything else (Back, another tab, another origin, a failed
-    /// open) stops it. Returns whether anything changed.
+    /// The live page changed its own address (`history.pushState`, I6.2;
+    /// navigatord checked the origin): the same engine, a new trail entry
+    /// with nothing to open, or the entry just before or after it when the
+    /// page went back to that address itself.
+    pub fn live_url_changed(&mut self, from: &str, url: &str) -> bool {
+        let shown = self.shown_key();
+        let Some(run) = self.live_run.clone().filter(|r| r.url == from && r.origin.is_some()) else { return false };
+        if self.history.is_some() || shown != Some(run.key) { return false; }
+        if origin_of(url).is_none() || origin_of(url) != run.origin.as_deref().and_then(origin_of) { return false; }
+        let (tid, here) = run.key;
+        let t = self.store.trail();
+        if t.pages[here].url == url { return false; }
+        let mine = |id: PageId| run.entries.contains(&(tid, id)) && t.pages[id].url == url;
+        let to = match t.pages[here].parent.filter(|&p| mine(p)) {
+            Some(p) => Some(p),
+            None => t.pages[here].children.iter().rev().copied().find(|&c| mine(c)),
+        };
+        self.set_live_whole(run.key, false);
+        let key = match to {
+            Some(id) => { self.store.trail_mut().go(id); (tid, id) }
+            None => {
+                let spec = self.spec(url);
+                (tid, self.store.follow(spec))
+            }
+        };
+        self.set_live_whole(key, true);
+        if let Some(run) = self.live_run.as_mut() {
+            run.key = key;
+            if !run.entries.contains(&key) { run.entries.push(key); }
+        }
+        true
+    }
+
+    /// The page the live engine shows (I6.2: an entry it made by changing
+    /// its address has no page of its own to open).
+    pub fn live_route(&self, key: (u64, PageId)) -> bool {
+        self.history.is_none() && self.live_run.as_ref().is_some_and(|r| r.key == key && r.origin.is_some())
+    }
+
+    /// The page on screen changed while a page runs live: an entry of this
+    /// run (the page the live page went to, or Back and Forward among its
+    /// entries) runs live again once navigatord shows it at the same
+    /// origin; anything else (another tab, another origin, a failed open)
+    /// stops it. Returns whether anything changed.
     pub fn live_follow(&mut self) -> bool {
         let Some(run) = self.live_run.clone() else { return false };
         let shown = self.shown_key();
         if self.history.is_none() && shown == Some(run.key) { return false; }
-        if self.history.is_none() && run.next.is_some() && shown == run.next {
+        if let Some(to) = shown.filter(|k| self.history.is_none() && run.entries.contains(k)) {
             match &self.live {
                 Some(LivePage::Loading(_)) => return false,
                 Some(LivePage::Shown(u)) if origin_of(u).is_some() && origin_of(u) == run.origin.as_deref().and_then(origin_of) => {
                     let url = u.clone();
                     self.set_live_whole(run.key, false);
-                    self.live_run = Some(LiveRun { key: run.next.unwrap_or(run.key), url: url.clone(), origin: run.origin, next: None });
+                    self.live_run = Some(LiveRun { key: to, url: url.clone(), ..run });
                     self.outbox.push(Out::ContinueLive { url });
                     return true;
                 }
@@ -988,7 +1029,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, next: None });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key] });
                     self.outbox.push(Out::RunPageLive { url, press });
                 }
             }
@@ -2707,7 +2748,7 @@ mod tests {
         assert!(s.live_follow());
         assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/second.html?r=1".into() }));
         let run = s.live_run.clone().unwrap();
-        assert_eq!((run.key, run.next), (second, None));
+        assert_eq!((run.key, run.entries), (second, vec![first, second]));
         s.live_reported("https://app.example/second.html?r=1", Some("https://app.example".into()), None);
         assert_eq!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
         // A page of another origin opens in the document lane: live stops.
@@ -2728,6 +2769,53 @@ mod tests {
         s.live = Some(LivePage::Shown("https://app.example/typed.html".into()));
         assert!(s.live_follow());
         assert_eq!(s.outbox.pop(), Some(Out::StopLive { url: url.into() }));
+    }
+
+    #[test]
+    fn a_live_page_route_is_a_trail_entry_in_the_same_engine() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        let home = s.shown_key().unwrap();
+        // Not before the engine started, not from another page, not another origin.
+        assert!(!s.live_url_changed(url, "https://app.example/route/1"));
+        s.live_reported(url, Some("https://app.example".into()), None);
+        s.outbox.clear();
+        assert!(!s.live_url_changed("https://app.example/other.html", "https://app.example/route/1"));
+        assert!(!s.live_url_changed(url, "https://api.app.example/route/1"));
+        assert!(!s.live_url_changed(url, url), "the same address is no entry");
+        // pushState: a new entry, the engine is on it, nothing is sent.
+        assert!(s.live_url_changed(url, "https://app.example/route/1"));
+        let route = s.shown_key().unwrap();
+        assert_ne!(route, home);
+        assert_eq!(s.shown_url().as_deref(), Some("https://app.example/route/1"));
+        assert!(s.live_route(route) && !s.live_route(home));
+        assert_eq!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
+        assert!(!s.live_follow());
+        assert!(s.outbox.is_empty());
+        // The page goes back to its first address itself: the entry before.
+        assert!(s.live_url_changed(url, url));
+        assert_eq!(s.shown_key(), Some(home));
+        assert!(s.live_url_changed(url, "https://app.example/route/1"));
+        assert_eq!(s.shown_key(), Some(route), "forward to the entry it made, not a new one");
+        // The person's Back: the first entry runs live again at its own address.
+        s.store.trail_mut().back();
+        s.live = Some(LivePage::Shown(url.into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: url.into() }));
+        assert_eq!(s.live_run.as_ref().unwrap().key, home);
+        // Forward to the route: it is opened like a page, then runs live.
+        s.live_reported(url, Some("https://app.example".into()), None);
+        s.store.trail_mut().forward();
+        s.live = Some(LivePage::Loading("https://app.example/route/1".into()));
+        assert!(!s.live_follow());
+        s.live = Some(LivePage::Shown("https://app.example/route/1".into()));
+        assert!(s.live_follow());
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/route/1".into() }));
     }
 
     #[test]

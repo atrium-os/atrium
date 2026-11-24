@@ -2524,7 +2524,7 @@ strip in the captures, so the chip's "Live code" was read from the island's
 tag and navigatord's `LiveStarted`, not from the chip. Evidence is in
 `~/atrium-vm/evidence/navigator-i6-1-20261125/`.
 
-#### I6.2 as built (2026-11-25, first part)
+#### I6.2 as built (2026-11-25)
 
 Host-tested in the cloud; the engine side is written but not yet built.
 Same flag as I6.1.
@@ -2555,11 +2555,29 @@ Same flag as I6.1.
   the size; limend passes it only while the page runs. The engine lays the
   page out at that size (`navigator_take_page_size`), replacing I6.1's
   fixed 1024 x 768 after the first frame.
-- **`history.pushState`.** `Report::UrlChanged(url)` exists and navigatord
-  ends an engine that claims another origin's address with it, but the
-  engine does not send it yet and the address bar does not follow: the
-  next part of I6.2, with `window.open` (still refused) and the
-  cross-origin engine fixture.
+- **`history.pushState`** (second part, host-tested, engine unbuilt). The
+  engine's `drive_page` reports each change of the document's address as
+  `Report::UrlChanged(url)`. navigatord (`live_page::address_change`)
+  takes only a plain HTTPS address at the page's own origin, sends
+  `LiveUrlChanged { from, url }`, and ends an engine that claims another
+  origin's. The UI (`Shell::live_url_changed`) adds a trail entry for it
+  with nothing to open: the engine stays over the page area and the Where
+  field shows the new address. When the page goes back to the address of
+  the entry just before or after (its own `history.back()`, or a route
+  pushed again), the trail moves to that entry instead of adding one.
+  `replaceState` adds an entry too, since the engine reports only the
+  address.
+- **Back and Forward among a run's entries.** Every entry the run made or
+  went to (`LiveRun::entries`) runs live again when the person moves to
+  it, with no new press: the entry is opened as a page (a route the app
+  doesn't serve shows the server's answer), then `ContinueLive` starts a
+  fresh engine at that address. The engine's own history is not driven:
+  LibWeb sends traversals to the UI process, which this single-page host
+  doesn't have, so the app reloads at the route and keeps no page state.
+- **`window.open`** still returns `null` (`page_did_request_new_web_view`
+  gives no page), which the fixture reads as refused. Proposing it as an
+  entry opened beside needs the address, which that call does not carry;
+  it waits for the engine work on new web views.
 
 **Gate (Mac, arm64 Tessera),** after the I6.1 gate's setup:
 
@@ -2574,6 +2592,14 @@ Same flag as I6.1.
    and no engine is left.
 4. Resize the window while live: the page lays out at the new size (the
    navigatord log shows no "size not sent" line).
+5. Run `app.html` live, press **Route (pushState)**: the Where field reads
+   `https://app.example/route/1` as a new trail entry, the same engine
+   process keeps running (same pid), and no fetch of `/route/1` reaches
+   the fixture server.
+6. Back: `app.html` runs live again with no prompt (a new engine pid).
+   Forward: `/route/1` opens (the fixture server answers 404) and runs live.
+7. Press **Open another site**: the page reports `window-open` refused and the
+   trail is unchanged.
 
 #### I6.2 first part: gate results on arm64 Tessera, 2026-11-25
 
@@ -3552,4 +3578,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25-first-part) (links as trail entries that run live again at the same origin, and the engine's page size) is host-tested; its engine side waits for a Mac build and the I6.2 gate.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) is host-tested and waits for gate steps 5 to 7.

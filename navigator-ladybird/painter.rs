@@ -1089,6 +1089,23 @@ pub mod host {
         true
     }
 
+    /// A whole live page changed its own address (`history.pushState`,
+    /// I6.2): reported so the trail follows. False when it is not an
+    /// address an engine may report.
+    ///
+    /// # Safety
+    /// LibWeb owns the UTF-8 buffer for the duration of this call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_url_changed(state: &SceneState, url: *const u8, url_len: usize) -> bool {
+        use limen::web_island::{Report, URL_MAX};
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if url.is_null() || url_len == 0 || url_len > URL_MAX { return false; }
+        // SAFETY: the caller passes LibWeb's live buffer of `url_len` bytes.
+        let Ok(url) = std::str::from_utf8(unsafe { std::slice::from_raw_parts(url, url_len) }) else { return false };
+        let Some(bytes) = Report::UrlChanged(url).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_take_page_size(state: &mut SceneState, width: &mut u16, height: &mut u16) -> bool {
         let Some((w, h)) = state.page_size.take() else { return false };

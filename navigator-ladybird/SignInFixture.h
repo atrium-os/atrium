@@ -109,6 +109,7 @@ extern "C" bool navigator_counter_resize(NavigatorScene*, u16, u16);
 #endif
 #ifdef ATRIUM_I6_PAGE
 extern "C" bool navigator_take_page_size(NavigatorScene*, u16*, u16*);
+extern "C" bool navigator_live_url_changed(NavigatorScene*, u8 const*, size_t);
 #endif
 
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
@@ -121,6 +122,9 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
 #endif
 #ifdef ATRIUM_I1_COUNTER
     Gfx::IntSize last_extent { 640, 360 };
+#endif
+#ifdef ATRIUM_I6_PAGE
+    auto last_url = doc->url();
 #endif
 #ifdef ATRIUM_I4_YOUTUBE
     auto deadline = AK::MonotonicTime::now() + AK::Duration::from_seconds(3600);
@@ -161,6 +165,16 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         }
 #endif
         if (action < 0) break;
+#ifdef ATRIUM_I6_PAGE
+        // The page changed its own address (pushState, I6.2): the trail
+        // follows. One it may not report (not plain HTTPS) is only logged.
+        if (doc->url() != last_url) {
+            last_url = doc->url();
+            auto address = last_url.serialize();
+            if (!navigator_live_url_changed(scene, address.bytes().data(), address.bytes().size()))
+                warnln("live page: address {} not reported", address);
+        }
+#endif
 #ifdef ATRIUM_I6_PAGE
         // navigatord placed the page in a page area of this size (I6.2).
         u16 width = 0, height = 0;
