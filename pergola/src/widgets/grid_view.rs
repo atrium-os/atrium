@@ -568,6 +568,11 @@ pub enum GridAction {
     /// Ctrl+E: fill the cursor's column by the examples typed in it (Flash
     /// Fill; the app learns how).
     FlashFill { row: u32, col: u32 },
+    /// Alt+=: sum the numbers next to the selection (AutoSum; the app finds
+    /// which).
+    AutoSum(CellRange),
+    /// Ctrl+G or F5: ask where to go (the app asks).
+    GoTo,
 }
 
 impl GridState {
@@ -2596,8 +2601,17 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             reveal(src, geom, st, g.cursor);
             return true;
         }
+        Key::Char if m.alt && !cmd && chars == "=" && src.fills() => {
+            send(GridAction::AutoSum(g.selection()));
+            return true;
+        }
+        Key::F(5) if !cmd && !m.alt => {
+            send(GridAction::GoTo);
+            return true;
+        }
         Key::Char if cmd => {
             match chars.to_ascii_lowercase().as_str() {
+                "g" => send(GridAction::GoTo),
                 "z" if m.shift => send(GridAction::Redo),
                 "z" => send(GridAction::Undo),
                 "y" => send(GridAction::Redo),
@@ -3011,6 +3025,14 @@ mod tests {
         state.set(g);
         key(&mut app, Key::Char, "e", Modifiers { ctrl: true, ..Modifiers::default() });
         assert!(matches!(log.borrow().last(), Some(&GridAction::FlashFill { .. })));
+        // Alt+= sums next to the selection; Ctrl+G and F5 ask where to go.
+        key(&mut app, Key::Char, "=", Modifiers { alt: true, ..Modifiers::default() });
+        assert_eq!(log.borrow().last(), Some(&GridAction::AutoSum(CellRange { r0: 4, c0: 3, r1: 4, c1: 3 })));
+        key(&mut app, Key::Char, "g", Modifiers { ctrl: true, ..Modifiers::default() });
+        assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
+        log.borrow_mut().clear();
+        key(&mut app, Key::F(5), "", Modifiers::default());
+        assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
         key(&mut app, Key::Char, "d", Modifiers { ctrl: true, ..Modifiers::default() });
         let one = CellRange { r0: 3, c0: 3, r1: 3, c1: 3 };
         assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from: one, to: CellRange { r1: 4, ..one }, copy: true, flip: false }));

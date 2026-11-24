@@ -148,7 +148,14 @@ pub fn sort_op(wb: &Workbook, rect: Rect, keys: &[SortKey]) -> Option<GridOp> {
         return None;
     }
     let ord = order(wb, &rect, keys);
-    if ord.iter().enumerate().all(|(i, &r)| r == rect.r0 + i as u32) {
+    reorder_op(wb, rect, &ord)
+}
+
+/// The edit that puts the rows of `rect` in the order `ord` (`ord[i]` goes to
+/// row `rect.r0 + i`): their values, formulas, styles, comments and links. `ord`
+/// holds each of the rows once. `None` when that is the order they are in.
+pub fn reorder_op(wb: &Workbook, rect: Rect, ord: &[u32]) -> Option<GridOp> {
+    if ord.len() as u64 != (rect.r1 - rect.r0) as u64 + 1 || ord.iter().enumerate().all(|(i, &r)| r == rect.r0 + i as u32) {
         return None;
     }
     let s = rect.sheet;

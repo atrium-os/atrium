@@ -62,6 +62,10 @@ pub enum TabCmd {
     Linking,
     LinkDone,
     LinkCancel,
+    /// The Go To bar; its field submitted; closed.
+    GoTo,
+    GoToDone,
+    GoToCancel,
     /// The exact-size bar's field submitted; closed.
     SizeDone,
     SizeCancel,

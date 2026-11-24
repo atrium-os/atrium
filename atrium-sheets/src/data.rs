@@ -84,6 +84,21 @@ pub enum DataCmd {
     ChooseValues,
     /// Drop every condition: all rows show.
     ShowAll,
+    /// Rows of the data the same in every column as one above, taken out
+    /// (the rows below move up), as Excel's Remove Duplicates.
+    RemoveDuplicates,
+    /// The selection's column split at the delimiter its cells use, into the
+    /// empty columns to its right.
+    TextToColumns,
+    /// A SUM of the numbers next to the selection (Alt+=).
+    AutoSum,
+    /// The selection back to the default format; with its contents, comments
+    /// and links too.
+    ClearFormats,
+    ClearAll,
+    /// Ask for a cell, range, sheet or name to go to; the window runs it (a bar
+    /// under the grid).
+    GoTo,
     FormatAsTable,
     /// The table at the cursor becomes plain cells.
     RemoveTable,
@@ -390,6 +405,12 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Choose Values in Column {}…", officina_grid::addr::col_name(col))).enabled(filter.is_some_and(|f| f.rect().contains(CellAddr::new(s, row, col)))), Some(DataCmd::ChooseValues)),
         (MenuItem::new(format!("Clear Filter in Column {}", officina_grid::addr::col_name(col))).enabled(col_filtered), Some(DataCmd::ClearColumn)),
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
+        (MenuItem::new("Remove Duplicates").enabled(some).separated(), Some(DataCmd::RemoveDuplicates)),
+        (MenuItem::new("Text to Columns").enabled(sel.c0 == sel.c1), Some(DataCmd::TextToColumns)),
+        (MenuItem::new("AutoSum").shortcut("Alt+="), Some(DataCmd::AutoSum)),
+        (MenuItem::new("Clear Formats").separated(), Some(DataCmd::ClearFormats)),
+        (MenuItem::new("Clear All"), Some(DataCmd::ClearAll)),
+        (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
         v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
@@ -513,6 +534,181 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
     if d.status != crate::sheet_protection::REFUSED {
         d.status = msg;
     }
+}
+
+/// The most rows Remove Duplicates looks through.
+pub const MAX_DEDUP_ROWS: u32 = 1_000_000;
+/// The most rows Text to Columns and AutoSum read.
+pub const MAX_SPLIT_ROWS: u32 = 100_000;
+/// The most columns Text to Columns makes.
+pub const MAX_SPLIT_COLS: usize = 256;
+
+/// The rows of `rect` in order, split into the first of each kind and the
+/// ones the same in every column as a row above (text matched without regard
+/// to case, as Excel does).
+fn duplicate_rows(wb: &Workbook, rect: &Rect) -> (Vec<u32>, Vec<u32>) {
+    let key = |v: Value| match v {
+        Value::Str(t) => format!("s{}", t.to_lowercase()),
+        Value::Num(x) => format!("n{}", if x == 0.0 { 0.0 } else { x }),
+        other => format!("{other:?}"),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let (mut kept, mut dups) = (Vec::new(), Vec::new());
+    for r in rect.r0..=rect.r1 {
+        let row: Vec<String> = (rect.c0..=rect.c1).map(|c| key(wb.get(CellAddr::new(rect.sheet, r, c)))).collect();
+        if seen.insert(row) { kept.push(r) } else { dups.push(r) }
+    }
+    (kept, dups)
+}
+
+/// Splits the selected column (or the cursor's column of the data around it)
+/// at the delimiter most of its cells use: tab, semicolon, comma, bar, then
+/// space. The pieces go into that column and the ones to its right, which
+/// must be empty; each is typed as it would be (numbers become numbers).
+fn text_to_columns(d: &mut Doc, sel: CellRange, cursor: (u32, u32)) -> Result<String, String> {
+    use officina_grid::Input;
+    let s = d.sheet;
+    if sel.c0 != sel.c1 {
+        return Err("Select cells in one column to split.".into());
+    }
+    let (r0, r1, col) = if sel.r0 != sel.r1 {
+        (sel.r0, sel.r1, sel.c0)
+    } else {
+        let t = target(d, sel, cursor).ok_or("Put the cursor in the column to split.")?;
+        (t.rect.r0, t.rect.r1, cursor.1)
+    };
+    if r1 - r0 >= MAX_SPLIT_ROWS {
+        return Err(format!("Text to Columns splits at most {MAX_SPLIT_ROWS} rows."));
+    }
+    let texts: Vec<Option<String>> = (r0..=r1).map(|r| match d.wb.input(CellAddr::new(s, r, col)) {
+        Input::Value(Value::Str(t)) => Some(t.to_string()),
+        _ => None,
+    }).collect();
+    const DELIMS: [(char, &str); 5] = [('\t', "tabs"), (';', "semicolons"), (',', "commas"), ('|', "bars"), (' ', "spaces")];
+    let (delim, name) = DELIMS.iter()
+        .map(|&(c, n)| (texts.iter().flatten().filter(|t| t.trim().contains(c)).count(), c, n))
+        .filter(|&(k, ..)| k > 0)
+        .fold(None, |best: Option<(usize, char, &str)>, x| match best { Some(b) if b.0 >= x.0 => Some(b), _ => Some(x) })
+        .map(|(_, c, n)| (c, n))
+        .ok_or("These cells have no tabs, semicolons, commas, bars or spaces to split at.")?;
+    let pieces: Vec<Option<Vec<String>>> = texts.iter().map(|t| t.as_ref().filter(|t| t.trim().contains(delim)).map(|t| {
+        if delim == ' ' { t.split_whitespace().map(str::to_string).collect() } else { t.split(delim).map(|p| p.trim().to_string()).collect() }
+    })).collect();
+    let wide = pieces.iter().flatten().map(Vec::len).max().unwrap_or(1);
+    if wide > MAX_SPLIT_COLS || col as u64 + wide as u64 > officina_grid::addr::MAX_COLS as u64 {
+        return Err(format!("That would make {wide} columns; Text to Columns makes at most {MAX_SPLIT_COLS}."));
+    }
+    let right = Rect { sheet: s, r0, c0: col + 1, r1, c1: col + wide as u32 - 1 };
+    let mut busy = false;
+    d.wb.each(&right, &mut |_, _, v| busy |= v != Value::Empty);
+    if busy {
+        return Err(format!("Columns {}–{} have data where the pieces would go; insert columns first.", officina_grid::addr::col_name(right.c0), officina_grid::addr::col_name(right.c1)));
+    }
+    let rows: Vec<Vec<Input>> = pieces.into_iter().zip(r0..=r1).map(|(p, r)| match p {
+        Some(p) => p.into_iter().map(|t| if t.starts_with('=') { Input::Value(Value::str(&t)) } else { Input::typed(&t) }).collect(),
+        None => vec![d.wb.input(CellAddr::new(s, r, col))],
+    }).collect();
+    let n = rows.iter().filter(|r| r.len() > 1).count();
+    // Wide enough for every piece even when the last row isn't split.
+    let mut rows = rows;
+    if let Some(first) = rows.first_mut() {
+        first.resize(wide.max(first.len()), Input::Empty);
+    }
+    d.run("Text to Columns", vec![GridOp::block(s, r0, col, rows)]);
+    Ok(format!("Split {n} {} at {name} into {wide} columns.", if n == 1 { "cell" } else { "cells" }))
+}
+
+/// Alt+=: on one cell, a SUM of the run of numbers just above it (else just
+/// left of it). On a range, a SUM of each of its columns in the row under it.
+fn auto_sum(d: &mut Doc, sel: CellRange) -> Result<String, String> {
+    use officina_grid::addr::a1;
+    use officina_grid::Input;
+    let s = d.sheet;
+    let num = |d: &Doc, r: u32, c: u32| matches!(d.wb.get(CellAddr::new(s, r, c)), Value::Num(_));
+    if sel.r0 == sel.r1 && sel.c0 == sel.c1 {
+        let (r, c) = (sel.r0, sel.c0);
+        let mut top = r;
+        while top > 0 && r - top < MAX_SPLIT_ROWS && num(d, top - 1, c) {
+            top -= 1;
+        }
+        let formula = if top < r {
+            format!("=SUM({}:{})", a1(top, c), a1(r - 1, c))
+        } else {
+            let mut left = c;
+            while left > 0 && c - left < MAX_SPLIT_ROWS && num(d, r, left - 1) {
+                left -= 1;
+            }
+            if left == c {
+                return Err("There are no numbers just above or left of this cell to sum.".into());
+            }
+            format!("=SUM({}:{})", a1(r, left), a1(r, c - 1))
+        };
+        return if d.type_into(r, c, &formula) { Ok(format!("{} is {}.", a1(r, c), &formula[1..])) } else { Err(d.status.clone()) };
+    }
+    if sel.r1 - sel.r0 >= MAX_SPLIT_ROWS || sel.c1 - sel.c0 >= MAX_SPLIT_COLS as u32 {
+        return Err("Select fewer cells to sum.".into());
+    }
+    let below = sel.r1 + 1;
+    if below >= officina_grid::addr::MAX_ROWS {
+        return Err("There is no row under the selection for the totals.".into());
+    }
+    let mut busy = false;
+    d.wb.each(&Rect { sheet: s, r0: below, c0: sel.c0, r1: below, c1: sel.c1 }, &mut |_, _, v| busy |= v != Value::Empty);
+    if busy {
+        return Err(format!("Row {} under the selection isn't empty; the totals go there.", below + 1));
+    }
+    let row: Vec<Input> = (sel.c0..=sel.c1).map(|c| Input::Formula(format!("=SUM({}:{})", a1(sel.r0, c), a1(sel.r1, c)))).collect();
+    d.run("AutoSum", vec![GridOp::block(s, below, sel.c0, vec![row])]);
+    Ok(format!("Totals in row {}.", below + 1))
+}
+
+/// A Go To reference: `B4`, `B4:D9`, `C:C`, `3:5`, any of them after
+/// `Sheet2!` (quoted when the name needs it), or a defined name for one of
+/// them. The sheet and the range there.
+pub fn go_to_place(wb: &Workbook, own: u16, text: &str) -> Result<(u16, Rect), String> {
+    use officina_grid::addr::{parse_a1, parse_col, parse_row, MAX_COLS, MAX_ROWS};
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("Type a cell, a range or a name.".into());
+    }
+    let (sheet, part) = match t.rsplit_once('!') {
+        Some((name, part)) => {
+            let name = name.trim_start_matches('=').trim();
+            let name = name.strip_prefix('\'').and_then(|n| n.strip_suffix('\'')).map(|n| n.replace("''", "'")).unwrap_or_else(|| name.to_string());
+            (wb.sheet_id(&name).ok_or_else(|| format!("There's no sheet called {name}."))?, part)
+        }
+        None => (own, t.trim_start_matches('=')),
+    };
+    let part = part.replace('$', "");
+    let (a, b) = part.split_once(':').unwrap_or((&part, &part));
+    let rect = if let (Some((r0, c0)), Some((r1, c1))) = (parse_a1(a), parse_a1(b)) {
+        Some(Rect { sheet, r0: r0.min(r1), c0: c0.min(c1), r1: r0.max(r1), c1: c0.max(c1) })
+    } else if let (true, Some(c0), Some(c1)) = (part.contains(':'), parse_col(a), parse_col(b)) {
+        Some(Rect { sheet, r0: 0, c0: c0.min(c1), r1: MAX_ROWS - 1, c1: c0.max(c1) })
+    } else if let (true, Some(r0), Some(r1)) = (part.contains(':'), parse_row(a), parse_row(b)) {
+        Some(Rect { sheet, r0: r0.min(r1), c0: 0, r1: r0.max(r1), c1: MAX_COLS - 1 })
+    } else {
+        None
+    };
+    if let Some(r) = rect {
+        return Ok((sheet, r));
+    }
+    // A defined name: what it refers to, written out, read the same way once.
+    if !t.contains('!') {
+        if let Some(def) = wb.names().get(own, t) {
+            let src = officina_grid::formula::to_a1(&def.expr, 0, 0, &|id| wb.sheet_name(id));
+            let src = src.trim_start_matches('=');
+            if src != t && !src.contains(['(', ',', ' ']) {
+                return go_to_place(wb, def.scope.unwrap_or(own), &if src.contains('!') { src.to_string() } else { format!("{}!{src}", quoted(&wb.sheet_name(def.scope.unwrap_or(own)))) });
+            }
+            return Err(format!("{t} isn't a range to go to."));
+        }
+    }
+    Err(format!("There's no cell, range or name called {t}."))
+}
+
+fn quoted(name: &str) -> String {
+    if name.chars().all(|c| c.is_alphanumeric() || c == '_') { name.to_string() } else { format!("'{}'", name.replace('\'', "''")) }
 }
 
 /// The most values a column's value list offers.
@@ -939,6 +1135,59 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             })
         }
         DataCmd::ClearValidation => Ok(if crate::validation::clear(d, Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }) { "Validation cleared.".into() } else { "No validation there.".into() }),
+        DataCmd::RemoveDuplicates => {
+            let t = target(d, sel, cursor).ok_or_else(need)?;
+            let mut rect = t.rect;
+            if t.header {
+                rect.r0 += 1;
+            }
+            if rect.r0 > rect.r1 {
+                return Err("There is nothing under the header to look through.".into());
+            }
+            if rect.r1 - rect.r0 >= MAX_DEDUP_ROWS {
+                return Err(format!("Remove Duplicates looks through at most {MAX_DEDUP_ROWS} rows."));
+            }
+            if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= rect.r1 && f.rect.r1 >= rect.r0)
+                || d.wb.sheet(s).table_hidden().iter().any(|&(a, b)| a <= rect.r1 && b >= rect.r0) {
+                return Err("Show all rows first: the filter hides some of them.".into());
+            }
+            if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
+                return Err("Every row needs the same merged cells; unmerge them first.".into());
+            }
+            let (kept, dups) = duplicate_rows(&d.wb, &rect);
+            if dups.is_empty() {
+                return Ok(format!("No duplicate rows: all {} are different.", kept.len()));
+            }
+            let (n, left) = (dups.len(), kept.len());
+            let tail = Rect { r0: rect.r0 + left as u32, ..rect };
+            let ord: Vec<u32> = kept.into_iter().chain(dups).collect();
+            let mut ops: Vec<GridOp> = officina_grid::sort::reorder_op(&d.wb, rect, &ord).into_iter().collect();
+            ops.push(GridOp::clear(tail));
+            d.run("Remove Duplicates", ops);
+            Ok(format!("{} duplicate {} removed; {left} unique {} left.", n, if n == 1 { "row" } else { "rows" }, if left == 1 { "row" } else { "rows" }))
+        }
+        DataCmd::TextToColumns => text_to_columns(d, sel, cursor),
+        DataCmd::AutoSum => auto_sum(d, sel),
+        DataCmd::ClearFormats | DataCmd::ClearAll => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let all = cmd == DataCmd::ClearAll;
+            let mut ops = vec![GridOp::style(r, officina_grid::style::Style::default())];
+            if all {
+                ops.push(GridOp::clear(r));
+                let set: Vec<_> = comments_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+                if !set.is_empty() {
+                    ops.push(GridOp::Comments { sheet: s, set });
+                }
+                let set: Vec<_> = links_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+                if !set.is_empty() {
+                    ops.push(GridOp::Links { sheet: s, set });
+                }
+            }
+            d.run(if all { "Clear All" } else { "Clear Formats" }, ops);
+            Ok(if all { "Cleared: contents, formats, comments and links.".into() } else { "Formats cleared.".into() })
+        }
+        // The window opens its bar.
+        DataCmd::GoTo => Ok(String::new()),
         DataCmd::RemoveLinks => {
             let set: Vec<_> = links_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
             if set.is_empty() {

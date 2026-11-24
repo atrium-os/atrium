@@ -4737,6 +4737,18 @@ scrolled screenshots show the pinned top row and left column after reopen.
   - Two-digit years are 1930–2029. A dash needs a four-digit year, and a dot needs the year, so `1.5` stays a number and `26-11-19` stays text.
 - **Gates:** pergola `ctrl_enter_enters_the_text_in_every_selected_cell`, `arrows_finish_a_typed_entry_and_f2_edits_in_place`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Up and Down); atrium-sheets `typed_dates_and_times_become_them`, `ctrl_semicolon_gives_today_and_the_time_as_typed`, `rows_nobody_sized_grow_for_typed_lines` (shrinking), `the_size_bar_sets_exact_heights_and_widths` (0 hides).
 
+### 16.95 Everyday commands: Remove Duplicates, Text to Columns, AutoSum, Clear, Go To (2026-11-24)
+
+The Data menu gains five commands. Each makes one undo step.
+
+- **Remove Duplicates** works on the data around the cursor, or on the selection, with its header row kept. A row that matches an earlier row in every column is taken out, and the rows below move up. Text matches without regard to case, as in Excel. The rows' values, formulas, styles, comments and links move together through the same reorder that sorting uses (`officina_grid::sort::reorder_op`). It reads at most 1,000,000 rows. It refuses while a filter hides rows or the rows' merges differ, as sorting does.
+- **Text to Columns** splits one column, the selection or the cursor's column of the data. It splits at the delimiter most of the cells use: tab, semicolon, comma, bar, then space. Pieces are typed as typing would read them, so numbers become numbers, and a piece that starts with `=` stays text. The columns to the right must be empty, or it says which ones are in the way. It splits at most 100,000 rows into at most 256 columns.
+- **AutoSum** (Alt+=). On one cell it sums the run of numbers just above it, or else just left of it. On a range it puts each column's SUM in the empty row under it.
+- **Clear Formats** puts the selection back to the default format. **Clear All** also empties the cells and takes off their comments and links.
+- **Go To…** (Ctrl+G or F5) opens a bar under the grid. It takes `B4`, `B4:D9`, `C:D`, `4:6`, any of them after `Sheet2!` or `'My Totals'!`, or a defined name. It shows that sheet and selects the range. An unknown sheet or name is named in the status, and the bar stays open (`data::go_to_place`).
+
+pergola sends `GridAction::AutoSum` and `GridAction::GoTo`. Gates: atrium-sheets `remove_duplicates_keeps_the_first_of_each_row_and_undoes`, `text_to_columns_splits_at_the_delimiter_the_cells_use`, `autosum_totals_the_numbers_above_left_or_under_a_selection`, `clear_formats_and_clear_all` and `go_to_selects_a_cell_range_sheet_or_name`; pergola's grid key test. Not yet: Find and Replace (next), a choice of delimiter or fixed widths for Text to Columns, typed dates among its pieces, and a column choice for Remove Duplicates.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
