@@ -22,7 +22,7 @@ public:
     ErrorOr<void> load()
     {
         for (auto const& source : sources)
-            TRY(m_faces.try_append(TRY(Gfx::Typeface::try_load_from_temporary_memory(source.bytes))));
+            TRY(m_faces.try_append(TRY(Gfx::Typeface::try_load_from_static_memory(source.bytes))));
         return {};
     }
 

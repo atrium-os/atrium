@@ -1,0 +1,58 @@
+--- a/Libraries/LibGfx/Font/Typeface.h
++++ b/Libraries/LibGfx/Font/Typeface.h
+@@ -113,7 +113,7 @@
+ class Typeface : public AtomicRefCounted<Typeface> {
+ public:
+     struct FontDataBacking final : AtomicRefCounted<FontDataBacking> {
+-        using Storage = Variant<Core::AnonymousBuffer, NonnullOwnPtr<Core::MappedFile>>;
++        using Storage = Variant<Core::AnonymousBuffer, NonnullOwnPtr<Core::MappedFile>, ReadonlyBytes>;
+
+         explicit FontDataBacking(Storage storage)
+             : storage(move(storage))
+@@ -130,6 +130,8 @@
+     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_font_data(NonnullRefPtr<FontDataBacking>, u32 ttc_index = 0);
+     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_mapped_file(NonnullOwnPtr<Core::MappedFile>, u32 ttc_index = 0);
+     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_anonymous_buffer(Core::AnonymousBuffer, u32 ttc_index = 0);
++    // The bytes must be immutable and live for the lifetime of the process.
++    static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_static_memory(ReadonlyBytes bytes, u32 ttc_index = 0);
+     static ErrorOr<NonnullRefPtr<Typeface>> try_load_from_temporary_memory(ReadonlyBytes bytes, u32 ttc_index = 0);
+
+     virtual ~Typeface();
+--- a/Libraries/LibGfx/Font/Typeface.cpp
++++ b/Libraries/LibGfx/Font/Typeface.cpp
+@@ -66,7 +66,8 @@
+ {
+     return storage.visit(
+         [](Core::AnonymousBuffer const& anonymous_buffer) { return anonymous_buffer.bytes(); },
+-        [](NonnullOwnPtr<Core::MappedFile> const& mapped_file) { return mapped_file->bytes(); });
++        [](NonnullOwnPtr<Core::MappedFile> const& mapped_file) { return mapped_file->bytes(); },
++        [](ReadonlyBytes bytes) { return bytes; });
+ }
+
+ static constexpr FourCC truetype_tag { "true" };
+@@ -247,6 +248,11 @@
+ ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_anonymous_buffer(Core::AnonymousBuffer anonymous_buffer, u32 ttc_index)
+ {
+     return try_load_from_font_data(make_ref_counted<FontDataBacking>(move(anonymous_buffer)), ttc_index);
++}
++
++ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_static_memory(ReadonlyBytes bytes, u32 ttc_index)
++{
++    return try_load_from_font_data(make_ref_counted<FontDataBacking>(bytes), ttc_index);
+ }
+
+ ErrorOr<NonnullRefPtr<Typeface>> Typeface::try_load_from_temporary_memory(ReadonlyBytes bytes, u32 ttc_index)
+@@ -568,6 +574,13 @@
+             MUST(encoder.encode(anonymous_buffer));
+             MUST(encoder.encode(m_ttc_index));
+         },
++        [&](ReadonlyBytes bytes) {
++            auto buffer = MUST(Core::AnonymousBuffer::create_with_size(bytes.size()));
++            memcpy(buffer.data<void>(), bytes.data(), bytes.size());
++            MUST(encoder.encode(FontDataFormat::RawFontData));
++            MUST(encoder.encode(buffer));
++            MUST(encoder.encode(m_ttc_index));
++        },
+         [&](NonnullOwnPtr<Core::MappedFile> const&) {
+             // NB: SharedMappedFile backing should have an associated m_system_font_identifier or m_file_path and
+             //     therefore have already been handled above.

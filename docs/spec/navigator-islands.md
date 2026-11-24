@@ -1550,6 +1550,55 @@ caches, including input injection and PNG readback. The fork-before-taint
 comparison is pending. Evidence is in
 `~/atrium-vm/evidence/navigator-i5-worker-hardening-20261124/`.
 
+### I5 fork-before-taint gate
+
+The signed offline editor probe runs as an unprivileged user in Capsicum on
+Tessera, with networking disabled, a 1 GiB memory limit and a 100% CPU limit.
+It forks before admitting any site input. One arm initializes the pinned
+typefaces in each child. The other initializes them once in the template.
+The child creates its own event loop and JS agent, runs the scripted 128-line
+editor, builds a native Fresco scene, types a character and scrolls 24 pixels.
+The template checks that each child exited and its private write stayed local.
+No child receives an island, fetch or player channel in this gate.
+
+The initial font-warmed template held ten descriptors. The temporary-memory
+LibGfx loader copied each built-in face into a shared anonymous buffer. The
+[static-typeface patch](../../patches/ladybird/embedded-static-typeface.patch)
+lets the pinned provider use the immutable bytes in the engine image directly.
+Received and temporary fonts retain their existing ownership rules. Encoding a
+static face for LibGfx IPC materializes the existing raw-font wire format.
+The corrected template had zero descriptors above stdio and was single-threaded.
+Constructing the Unix event loop opened its two wake-pipe descriptors. Both
+were still open after JS agent initialization. The gate keeps that state local
+to each child.
+
+In three repeat launches with warm guest caches, all 18 children passed.
+The following medians cover nine children per arm. Each launch ran the
+child-initialized arm first. These timings end when the first scene conversion
+returns successfully. The separate 3,176 ms installed baseline includes jail
+creation, input injection, composition and headless frame observation.
+
+| Pinned faces initialized in | Fork to child entry | Fork to first native scene |
+| --- | ---: | ---: |
+| Child | 305 µs | 12.124 ms |
+| Template | 287 µs | 11.884 ms |
+
+A plain fork inherits the current jail. Portcullis currently asks jaild to
+create and attach a fresh island jail, drop privileges and exec the worker.
+The offline gate therefore establishes a usable initialization boundary, while
+the per-persona launch path still needs a design for assigning a child to its
+own jail and confirming its uid, limits and descriptor set before Limen
+delivers any page channels. Profile the installed Start stages before choosing
+that design. The offline medians alone do not establish an installed speedup.
+
+To repeat, apply the static-typeface patch to the pinned engine. Rebuild
+LibGfx and the pinned provider, including `Font-Typeface.o` in the staged link.
+Configure the editor host with `I5_FORK_CHECK=ON`, build `editor-host`, and
+use `scripts/navigator-i0-editor-link.py STAGE --fork-check`. Package the
+arm64 binary in a signed offline bundle and run
+`scripts/navigator-i5-fork-check.sh INSTALLED_BUNDLE` inside Tessera.
+Evidence is in `~/atrium-vm/evidence/navigator-i5-fork-20261124/`.
+
 ## 8. Costs and risks, stated
 
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
