@@ -242,6 +242,11 @@ impl Proposal {
         {
             return Err("Unsupported invitation details".into());
         }
+        self.validate_schedule()
+    }
+
+    /// Validate the schedule and return unique skipped slots in the series clock.
+    pub fn validate_schedule(&self) -> Result<Vec<OccurrenceId>, String> {
         if let Some(row) = &self.row {
             if !matches!(row.kind, Kind::Appointment | Kind::AllDay | Kind::Weekly)
                 || (self.original.is_some() && row.kind != Kind::Appointment)

@@ -42,6 +42,9 @@ const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
+    let skip_response = mode == "seed-skip-response";
+    let bounded_master = WEEKLY.replace("FREQ=WEEKLY", "FREQ=WEEKLY;COUNT=4");
+    let skip_update = EXDATES.replace("SEQUENCE:2", "SEQUENCE:4");
     let group_response = mode == "seed-group-response";
     let group_target = MOVED
         .replace(ORIGINAL, AFTER_CUTOFF)
@@ -152,6 +155,13 @@ fn seed(e: &Engine, mode: &str) {
                 ("Extend to December 29", UNTIL)
             },
         ]
+    } else if skip_response {
+        &[
+            ("Weekly studio", &bounded_master),
+            ("December 15 moved to December 9", &sibling),
+            ("December 22 moved to December 9", &group_target),
+            ("Skip December 8 and 22", &skip_update),
+        ]
     } else if group_response {
         &[
             ("Weekly studio", WEEKLY),
@@ -208,7 +218,9 @@ fn seed(e: &Engine, mode: &str) {
             .pop()
             .unwrap()
             .unwrap();
-        let sequence = if group_response {
+        let sequence = if skip_response {
+            [1, 2, 3, 4][n]
+        } else if group_response {
             [1, 2, 3, 2][n]
         } else if range_response {
             [1, 2, 2, 3][n]
@@ -856,6 +868,74 @@ fn during_group_cancellation(e: &Engine, dir: &Path) {
     println!("PASS live confirmation, per-date revisions in both orders, unlisted meeting delivered once");
 }
 
+fn during_weekly_skip(e: &Engine, dir: &Path) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    let account = e.store.add_account("dev@fixture.invalid").unwrap();
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let put = |id, body: &str, verified| put_revision(e, account, inbox, id, body, verified);
+    let target = put(
+        1,
+        &MOVED
+            .replace(ORIGINAL, AFTER_CUTOFF)
+            .replace("SEQUENCE:2", "SEQUENCE:3"),
+        true,
+    );
+    let sibling = put(2, &MOVED.replace(ORIGINAL, SIBLING), true);
+    let blob = |id| e.store.message(id).unwrap().full.unwrap();
+    let reply = Reply {
+        scope: Some(AFTER_CUTOFF.into()),
+        sequence: 3,
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        uid: "studio-planning@fixture.invalid".into(),
+        answer: Answer::Accept,
+    };
+    let exclusions = EXDATES.replace("SEQUENCE:2", "SEQUENCE:4").replace(
+        "EXDATE:20261208T140000Z,20261222T140000Z",
+        "EXDATE:20261208T140000Z\nEXDATE;TZID=America/New_York:20261222T090000",
+    );
+    let skip = check_open_window(e, dir, target, blob(target), &reply, || {
+        put(
+            3,
+            &EXDATES
+                .replace("20261222", "20261215")
+                .replace("SEQUENCE:2", "SEQUENCE:9"),
+            false,
+        );
+        put(4, &exclusions, true)
+    });
+    assert!(
+        matches!(e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update { msg, sequence:4, when, location }))
+        if msg == skip && when.contains("skips this occurrence") && location.is_empty())
+    );
+    assert!(e.store.outbox().unwrap().is_empty());
+    let other = Reply {
+        scope: Some(SIBLING.into()),
+        sequence: 2,
+        ..reply.clone()
+    };
+    e.send_invitation_reply(sibling, blob(sibling), &other)
+        .unwrap();
+    submit(e, 2, Some(SIBLING));
+    let reinstated = put(5, &WEEKLY.replace("SEQUENCE:1", "SEQUENCE:5"), true);
+    assert!(
+        matches!(e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update {msg, sequence:5, when, ..}))
+        if msg == reinstated && when.contains("revised after the skip"))
+    );
+    put(6, &exclusions.replace("SEQUENCE:4", "SEQUENCE:5"), true);
+    assert!(matches!(
+        e.send_invitation_reply(target, blob(target), &reply),
+        Err(Error::InvitationChanged(LatestInvitation::Conflict {
+            sequence: 5
+        }))
+    ));
+    assert!(e.store.outbox().unwrap().is_empty());
+    println!("PASS live confirmation, verified weekly exclusion, unlisted occurrence delivered once, newer revision and conflict");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -868,6 +948,7 @@ fn main() {
         mode @ ("seed"
         | "seed-range-response"
         | "seed-group-response"
+        | "seed-skip-response"
         | "seed-occurrences"
         | "seed-series"
         | "seed-bounded"
@@ -880,6 +961,7 @@ fn main() {
         | "seed-restart"
         | "seed-restore-one"
         | "seed-reissue") => seed(&e, mode),
+        "during-weekly-skip" => during_weekly_skip(&e, Path::new(&args[2])),
         "during-group-cancellation" => during_group_cancellation(&e, Path::new(&args[2])),
         "during-range-cancellation" => during_range_cancellation(&e, Path::new(&args[2])),
         "during-occurrence" => during_occurrence(&e, Path::new(&args[2])),

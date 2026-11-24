@@ -173,18 +173,20 @@ def occurrence_response(ui):
     print("PASS both occurrence replies delivered once, private move and other meetings preserved")
 
 
-def cancellation_response(ui, grouped=False):
-    case = "group" if grouped else "range"
-    change = (["one of 2 cancelled dates", "Organizer revision 4"] if grouped
-              else ["Cancelled from 2026-12-15 14:00", "UTC onward"])
-    original, proposed = ("2026-12-15", "2026-12-09") if grouped else ("2026-12-08", "2026-12-18")
+def cancellation_response(ui, case="range"):
+    change = {
+        "skip": ["Weekly invitation skips this occurrence", "Organizer revision 4"],
+        "group": ["one of 2 cancelled dates", "Organizer revision 4"],
+        "range": ["Cancelled from 2026-12-15 14:00", "UTC onward"],
+    }[case]
+    original, proposed = ("2026-12-15", "2026-12-09") if case != "range" else ("2026-12-08", "2026-12-18")
     print(guest(ui, case + "-response-setup"))
     open_mail(ui, first=True)
     print(guest(ui, case + "-window"))
     ui.see(f"rsvp-before-{case}-arrives", "One occurrence", "2026-12-22", "2026-12-09", "ACCEPTED")
     print(guest(ui, "response-deliver"))
     click(ui, 485, 355)
-    ui.see("rsvp-group-cancellation" if grouped else "rsvp-cutoff", "Invitation changed before sending", "2026-12-22", "2026-12-09",
+    ui.see({"group": "rsvp-group-cancellation", "range": "rsvp-cutoff", "skip": "rsvp-weekly-skip"}[case], "Invitation changed before sending", "2026-12-22", "2026-12-09",
            *change, "Your response has not been sent")
     click(ui, 485, 355)
     print(guest(ui, "response-result"))
@@ -194,6 +196,8 @@ def cancellation_response(ui, grouped=False):
     ui.see("range-series", "Whole weekly series", "14:00")
     click(ui, 568, 550)
     ui.see("range-series-saved", "Invitation saved")
+    if case == "skip":
+        move_meeting(ui, "2026-12-08", "2026-12-10", "16:30", "17:15")
     baseline = ui.store("work")
     ui.control("close", "work")
     review(ui, 248)
@@ -203,7 +207,14 @@ def cancellation_response(ui, grouped=False):
     click(ui, 485, 355)
     ui.see("range-later-paused", *change)
     click(ui, 485, 355)
-    if grouped:
+    if case == "skip":
+        ui.see("weekly-skip-review", "Whole weekly series", "Review 2 dates")
+        click(ui, 355, 412)
+        ui.see("weekly-skip-private-move", "Skipped date", "2026-12-08", "2026-12-10", "16:30", "Keep my move")
+        click(ui, 105, 300)
+        click(ui, 355, 412)
+        ui.see("weekly-skip-target", "Skipped date", "2026-12-22", "Saving the series skips this meeting")
+    elif case == "group":
         ui.see("group-cancellation-opened", "Review cancellation", "2 occurrences", "Review 2 dates")
         click(ui, 355, 412)
         ui.see("first-group-date", "Cancellation 1 of 2", "2026-12-08")
@@ -220,10 +231,10 @@ def cancellation_response(ui, grouped=False):
     ui.see("range-earlier-confirm", "One occurrence", original, proposed, "ACCEPTED")
     click(ui, 485, 355)
     ui.control("close", "work")
-    print(guest(ui, "sibling-submit" if grouped else "series-submit"))
+    print(guest(ui, "sibling-submit" if case != "range" else "series-submit"))
     assert ui.store("work") == baseline
     assert ui.control("fingerprint", "personal").strip() == b"empty"
-    print("PASS cancellation review opened from paused RSVP, unaffected occurrence accepted over SMTP, calendar preserved")
+    print(f"PASS {case} review opened from paused RSVP, unaffected occurrence accepted over SMTP, calendar preserved")
 
 
 def background(ui):
@@ -860,9 +871,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--group-cancel-response": lambda ui: cancellation_response(ui, grouped=True), "--range-cancel-response": cancellation_response, "--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--exdate-response": lambda ui: cancellation_response(ui, "skip"), "--group-cancel-response": lambda ui: cancellation_response(ui, "group"), "--range-cancel-response": cancellation_response, "--occurrence-response": occurrence_response, "--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--group-cancel-response|--range-cancel-response|--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--exdate-response|--group-cancel-response|--range-cancel-response|--occurrence-response|--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

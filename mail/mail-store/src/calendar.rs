@@ -13,7 +13,7 @@ fn candidate(m: &Message) -> bool {
         && matches!(m.summary.sender_check, SenderCheck::Verified { .. })
         && m.summary.invite.as_ref().is_some_and(|i| {
             (i.sequence > 0 || i.method == InviteMethod::Cancel)
-                && !i.repeats
+                && (!i.repeats || i.method == InviteMethod::Request)
                 && matches!(i.method, InviteMethod::Request | InviteMethod::Cancel)
         })
 }
@@ -30,6 +30,10 @@ pub enum OccurrenceSlot {
 impl OccurrenceSlot {
     pub fn parse(scope: &str) -> Option<Self> {
         Self::from_params(scope.strip_prefix("RECURRENCE-ID")?)
+    }
+
+    pub fn exdate(scope: &str) -> Option<Self> {
+        Self::from_params(scope.strip_prefix("EXDATE")?)
     }
 
     pub fn range_cutoff(scope: &str) -> Option<Self> {
@@ -161,7 +165,7 @@ impl Writer<'_> {
             self.tx
                 .open_table(REVISIONS)?
                 .insert((m.account, i.uid.as_str(), id), i.sequence)?;
-            return Ok(Some(i.sequence));
+            return Ok((!i.repeats).then_some(i.sequence));
         }
         Ok(None)
     }
@@ -185,7 +189,11 @@ impl Writer<'_> {
         let key = i.uid.as_str();
         for item in revisions.range((m.account, key, 0)..=(m.account, key, u64::MAX))? {
             let (k, v) = item?;
-            if v.value() > i.sequence {
+            if v.value() > i.sequence
+                && self
+                    .get_msg(k.value().2)?
+                    .is_some_and(|m| m.summary.invite.is_some_and(|i| !i.repeats))
+            {
                 self.mark_calendar_pending(k.value().2)?;
             }
         }
@@ -216,7 +224,7 @@ impl Store {
     }
 
     fn index_calendar_through(&self, through: MsgId) -> Result<bool> {
-        const CURSOR: &str = "calendar-group-backfill";
+        const CURSOR: &str = "calendar-weekly-backfill";
         let tx = self.db.begin_read()?;
         let meta = tx.open_table(META)?;
         let cursor = meta.get(CURSOR)?.map_or(0, |n| n.value());
@@ -240,10 +248,12 @@ impl Store {
             }
             // Previously scanned messages only need the wider index. Preserve
             // completed background deliveries and outstanding receipt generations.
-            let previous =
-                w.tx.open_table(META)?
-                    .get("calendar-backfill")?
-                    .map_or(0, |n| n.value());
+            let meta = w.tx.open_table(META)?;
+            let mut previous = 0;
+            for key in ["calendar-backfill", "calendar-group-backfill"] {
+                previous = previous.max(meta.get(key)?.map_or(0, |n| n.value()));
+            }
+            drop(meta);
             for (id, _) in &page {
                 if let Some(m) = w.get_msg(*id)? {
                     if *id <= previous {
@@ -278,28 +288,32 @@ mod tests {
     use super::OccurrenceSlot;
 
     #[test]
-    fn upgrade_indexes_old_zero_sequence_cancellations_without_replaying_deliveries() {
+    fn upgrade_indexes_old_cancellations_and_weekly_requests_without_replaying_deliveries() {
         use super::*;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let account = store.add_account("dev@fixture.invalid").unwrap();
         let inbox = store.folder_id(account, "INBOX", Role::Inbox).unwrap();
-        let add = |uid, sequence| {
+        let add = |uid, sequence, weekly| {
             let blob = store.put_blob(&[uid as u8]).unwrap();
             let summary = mail_schema::Summary {
                 invite: Some(mail_schema::Invite {
                     uid: "group".into(),
                     sequence,
-                    method: InviteMethod::Cancel,
+                    method: if weekly {
+                        InviteMethod::Request
+                    } else {
+                        InviteMethod::Cancel
+                    },
                     organizer: "mina@fixture.invalid".into(),
-                    cancelled: true,
+                    cancelled: !weekly,
                     title: String::new(),
                     start: None,
                     end: None,
                     location: String::new(),
                     attendees: 0,
                     my_status: None,
-                    repeats: false,
+                    repeats: weekly,
                 }),
                 sender_check: SenderCheck::Verified {
                     domain: "fixture.invalid".into(),
@@ -326,8 +340,9 @@ mod tests {
                 })
                 .unwrap()
         };
-        let zero = add(1, 0);
-        let other = add(2, 3);
+        let zero = add(1, 0, false);
+        let other = add(2, 3, false);
+        let weekly = add(3, 5, true);
         let pending = store.pending_calendar(0).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, other);
@@ -335,8 +350,10 @@ mod tests {
             .write(|w| {
                 w.tx.open_table(REVISIONS)?
                     .remove((account, "group", zero))?;
+                w.tx.open_table(REVISIONS)?
+                    .remove((account, "group", weekly))?;
                 w.tx.open_table(META)?
-                    .insert("calendar-backfill", u64::MAX)?;
+                    .insert("calendar-group-backfill", u64::MAX)?;
                 Ok(())
             })
             .unwrap();
@@ -351,6 +368,11 @@ mod tests {
             .messages
             .iter()
             .any(|&(sequence, id, _)| sequence == 0 && id == zero));
+        assert!(revisions()
+            .messages
+            .iter()
+            .any(|&(sequence, id, _)| sequence == 5 && id == weekly));
+        store.write(|w| w.replay_calendar_revisions(other)).unwrap();
         assert_eq!(store.pending_calendar(0).unwrap(), pending);
     }
 

@@ -401,6 +401,12 @@ When the organizer cancels several dates in one Mail message, **Send response** 
 
 Each date carries its own revision. A newer cancellation for December 22 can pause its RSVP even if the first date listed carries an older revision. A recipient can still answer an unlisted December 15 occurrence, including when both occurrences moved to December 9 at 15:00. Its reply names December 15. Dismissing the cancellation review preserves the saved series. Run the installed synthetic check with `--group-cancel-response`. [Synthetic invitations](../../mail/atrium-mail/examples/invitation_probe.rs) · [Installed check](../../scripts/calendar-invitation-check.py)
 
+### 7.29 A weekly invitation skips the occurrence being answered
+
+At **Send response**, Mail compares the occurrence’s original slot with the verified organizer’s EXDATE list. If it matches, the confirmation shows the original slot, the proposed time, **Weekly invitation skips this occurrence**, and the organizer’s revision. **Review latest invitation** opens the weekly update in Calendar. There the recipient can inspect each skipped date and decide whether to keep a private move. Dismissing the review preserves those moves and the saved series.
+
+A meeting originally on December 15 can still be answered when the organizer skips December 8 and 22, even if the December 15 and 22 meetings both moved to December 9 at 15:00. The reply identifies December 15. Mail recognizes equivalent time-zone representations and checks the exclusion against the weekly rule and its end date. If a newer weekly revision withdraws a skip while the old RSVP is open, Mail offers that revision for review. Contradictory instructions for the occurrence at the same highest revision pause Send until the organizer clarifies. Run the installed synthetic check with `--exdate-response`. [Synthetic weekly invitation](../../atrium-calendar/tests/fixtures/weekly-exdates.ics) · [Installed check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

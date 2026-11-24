@@ -560,10 +560,14 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
         return None;
     };
     let grouped = !p.cancelled_dates.is_empty();
+    let weekly = p
+        .row
+        .as_ref()
+        .is_some_and(|r| r.kind == atrium_calendar::Kind::Weekly);
     if (p.sequence == 0 && !grouped)
         || (p.this_and_future && p.row.is_some())
         || p.scope().as_deref() != scope
-        || (p.original.is_some() || grouped) != scope.is_some()
+        || (p.original.is_some() || grouped || weekly) != scope.is_some()
         || p.weekly_cancellation
         || (grouped && p.row.is_some())
     {
@@ -575,12 +579,50 @@ fn individual_update(bytes: &[u8], identities: &[String], scope: Option<&str>) -
     if !omit_attendees && p.attendees.len() != 1 {
         return None;
     }
+    if weekly {
+        let skips = p.validate_schedule().ok()?;
+        // Final Send only needs the checked identity and original skipped slots.
+        // A valid series with eight moves can exceed the small reply frame.
+        return Some(
+            serde_json::json!({
+                "uid": p.uid, "sequence": p.sequence, "organizer": p.organizer,
+                "attendees": p.attendees, "row": true,
+                "weekly_skips": skips.iter().map(|s| s.property()).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        )
+        .filter(|s| s.len() <= 4096);
+    }
     serde_json::to_string(&p).ok().filter(|s| s.len() <= 4096)
 }
 
 #[cfg(test)]
 mod background_tests {
     use super::individual_update;
+    #[test]
+    fn weekly_proof_checks_skips_against_the_rule_scope_and_recipient() {
+        let ics = include_str!("../../../atrium-calendar/tests/fixtures/weekly-exdates.ics");
+        let me = vec!["dev@fixture.invalid".into()];
+        let scope = "weekly;COUNT=4|EXDATE:20261208T140000Z|EXDATE:20261222T140000Z";
+        let proof = individual_update(ics.as_bytes(), &me, Some(scope)).unwrap();
+        assert!(proof.contains("RECURRENCE-ID:20261222T140000Z") && !proof.contains("Studio A"));
+        assert!(individual_update(ics.as_bytes(), &me, None).is_none());
+        assert!(individual_update(ics.as_bytes(), &me, Some("weekly;COUNT=4")).is_none());
+        assert!(individual_update(
+            ics.as_bytes(),
+            &["other@fixture.invalid".into()],
+            Some(scope)
+        )
+        .is_none());
+        let short = ics.replace("COUNT=4", "COUNT=2");
+        assert!(individual_update(
+            short.as_bytes(),
+            &me,
+            Some(&scope.replace("COUNT=4", "COUNT=2"))
+        )
+        .is_none());
+    }
+
     #[test]
     fn grouped_cancellation_requires_every_slot_revision_and_the_same_attendee() {
         let group = include_str!("../../../atrium-calendar/tests/fixtures/cancel-dates.ics");

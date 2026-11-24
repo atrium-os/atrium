@@ -11,6 +11,7 @@ struct IndividualIdentity {
     organizer: String,
     attendees: Vec<String>,
     row: Option<serde::de::IgnoredAny>,
+    weekly_skips: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,17 +71,22 @@ fn occurrence_label(property: &str) -> Result<(bool, String), Error> {
     ))
 }
 
-enum CancellationScope {
+enum ResponseScope {
     Individual,
     Range(OccurrenceSlot, String),
     Group(usize),
+    WeeklySkipped,
+    WeeklyRevised,
 }
 
-impl CancellationScope {
+impl ResponseScope {
     fn same_effect(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Range(a, _), Self::Range(b, _)) => a == b,
-            (Self::Group(_), Self::Group(_)) | (Self::Individual, Self::Individual) => true,
+            (Self::WeeklySkipped, Self::WeeklySkipped)
+            | (Self::WeeklyRevised, Self::WeeklyRevised)
+            | (Self::Group(_), Self::Group(_))
+            | (Self::Individual, Self::Individual) => true,
             _ => false,
         }
     }
@@ -88,7 +94,7 @@ impl CancellationScope {
 
 // The two parser workers have agreed on every component of this scope. A
 // sibling's SEQUENCE has no bearing on whether this reply is still current.
-fn grouped_revision(scope: &str, wanted: OccurrenceSlot) -> Option<(u32, CancellationScope)> {
+fn grouped_revision(scope: &str, wanted: OccurrenceSlot) -> Option<(u32, ResponseScope)> {
     let listed = scope.strip_prefix("cancel-dates|")?.split('|');
     let count = listed.clone().count();
     if !(2..=8).contains(&count) {
@@ -104,15 +110,35 @@ fn grouped_revision(scope: &str, wanted: OccurrenceSlot) -> Option<(u32, Cancell
             matched = Some(seq.parse().ok()?);
         }
     }
-    Some((matched?, CancellationScope::Group(count)))
+    Some((matched?, ResponseScope::Group(count)))
 }
 
 struct ResponseRevision {
     msg: MsgId,
     sequence: u32,
     invite: mail_schema::Invite,
-    scope: CancellationScope,
+    scope: ResponseScope,
     conflict: bool,
+}
+
+impl ResponseRevision {
+    fn consider(mut self, latest: &mut Option<Self>) {
+        if let Some(previous) = latest {
+            if self.sequence < previous.sequence {
+                return;
+            }
+            if self.sequence == previous.sequence {
+                self.conflict |= previous.conflict
+                    || !same_schedule(&previous.invite, &self.invite)
+                    || !previous.scope.same_effect(&self.scope);
+                if self.msg < previous.msg {
+                    previous.conflict = self.conflict;
+                    return;
+                }
+            }
+        }
+        *latest = Some(self);
+    }
 }
 
 fn same_schedule(a: &mail_schema::Invite, b: &mail_schema::Invite) -> bool {
@@ -312,7 +338,8 @@ impl Engine {
     ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
         use mail_schema::{FromJail, Raw, ToJail};
         let Some(i) = m.summary.invite.as_ref().filter(|i| {
-            !i.repeats && (i.sequence > 0 || slot.is_some() && i.method == InviteMethod::Cancel)
+            (!i.repeats || slot.is_some() && i.method == InviteMethod::Request)
+                && (i.sequence > 0 || slot.is_some() && i.method == InviteMethod::Cancel)
         }) else {
             return Ok(None);
         };
@@ -326,8 +353,11 @@ impl Engine {
         match (slot, scope.as_deref()) {
             (None, None) => (),
             (Some(wanted), Some(raw))
-                if mail_store::OccurrenceSlot::parse(raw)
-                    .is_some_and(|found| wanted.matches(found))
+                if (i.repeats
+                    && i.method == InviteMethod::Request
+                    && raw.split([';', '|']).next() == Some("weekly"))
+                    || mail_store::OccurrenceSlot::parse(raw)
+                        .is_some_and(|found| wanted.matches(found))
                     || (i.method == InviteMethod::Cancel
                         && (raw.starts_with("cancel-dates|")
                             || OccurrenceSlot::range_cutoff(raw)
@@ -478,6 +508,8 @@ impl Engine {
             .store
             .write(|w| w.calendar_revisions(account, &r.uid, floor, &r.organizer))?;
         let mut latest: Option<ResponseRevision> = None;
+        let mut latest_weekly = None;
+        let mut saw_skip = false;
         for &(seq, id, hash) in &revisions.messages {
             if id == msg {
                 continue;
@@ -496,10 +528,9 @@ impl Engine {
             };
             if seq < latest.as_ref().map_or(r.sequence, |v| v.sequence)
                 && !(slot.is_some()
-                    && m.summary
-                        .invite
-                        .as_ref()
-                        .is_some_and(|i| i.method == InviteMethod::Cancel))
+                    && m.summary.invite.as_ref().is_some_and(|i| {
+                        i.method == InviteMethod::Cancel || i.repeats && seq >= r.sequence
+                    }))
             {
                 continue;
             }
@@ -527,6 +558,39 @@ impl Engine {
             let Some(mut i) = m.summary.invite else {
                 return Err(mail_store::Error::CalendarChanged.into());
             };
+            if i.repeats {
+                let (Some(wanted), Some(raw), Some(skips)) =
+                    (slot, delivery.scope.as_deref(), proof.weekly_skips)
+                else {
+                    continue;
+                };
+                let matches =
+                    |slot: Option<OccurrenceSlot>| slot.is_some_and(|found| wanted.matches(found));
+                let wire_skip = raw
+                    .split('|')
+                    .any(|part| matches(OccurrenceSlot::exdate(part)));
+                let checked_skip = skips.iter().any(|s| matches(OccurrenceSlot::parse(s)));
+                if wire_skip != checked_skip || seq < r.sequence {
+                    continue;
+                }
+                saw_skip |= checked_skip;
+                i.start = None;
+                i.end = None;
+                i.location.clear();
+                ResponseRevision {
+                    msg: id,
+                    sequence: seq,
+                    invite: i,
+                    conflict: false,
+                    scope: if checked_skip {
+                        ResponseScope::WeeklySkipped
+                    } else {
+                        ResponseScope::WeeklyRevised
+                    },
+                }
+                .consider(&mut latest_weekly);
+                continue;
+            }
             let (sequence, scope) = match delivery.scope.as_deref() {
                 Some(raw) if raw.starts_with("cancel-dates|") => {
                     let Some(found) = slot.and_then(|wanted| grouped_revision(raw, wanted)) else {
@@ -541,39 +605,35 @@ impl Engine {
                 }
                 Some(raw) => (
                     seq,
-                    OccurrenceSlot::range_cutoff(raw)
-                        .map_or(CancellationScope::Individual, |start| {
-                            CancellationScope::Range(start, raw.to_owned())
-                        }),
+                    OccurrenceSlot::range_cutoff(raw).map_or(ResponseScope::Individual, |start| {
+                        ResponseScope::Range(start, raw.to_owned())
+                    }),
                 ),
-                None => (seq, CancellationScope::Individual),
+                None => (seq, ResponseScope::Individual),
             };
             if sequence == 0 || sequence < latest.as_ref().map_or(r.sequence, |v| v.sequence) {
                 continue;
             }
             let clashes_with_review =
-                sequence == r.sequence && matches!(scope, CancellationScope::Individual);
+                sequence == r.sequence && matches!(scope, ResponseScope::Individual);
             if clashes_with_review && same_schedule(&i, original) {
                 continue;
             }
-            if let Some(previous) = latest.as_mut().filter(|v| v.sequence == sequence) {
-                previous.conflict |= clashes_with_review
-                    || !same_schedule(&previous.invite, &i)
-                    || !previous.scope.same_effect(&scope);
-                if previous.msg > id {
-                    continue;
-                }
-                previous.msg = id;
-                previous.scope = scope;
-                previous.invite = i;
-            } else {
-                latest = Some(ResponseRevision {
-                    msg: id,
-                    sequence,
-                    invite: i,
-                    scope,
-                    conflict: clashes_with_review,
-                });
+            ResponseRevision {
+                msg: id,
+                sequence,
+                invite: i,
+                scope,
+                conflict: clashes_with_review,
+            }
+            .consider(&mut latest);
+        }
+        // An unrelated weekly refresh leaves this occurrence answerable. Once
+        // a verified edit skips it, review the newest weekly revision, even
+        // when that revision withdraws the skip.
+        if saw_skip {
+            if let Some(weekly) = latest_weekly {
+                weekly.consider(&mut latest);
             }
         }
         if let Some(ResponseRevision {
@@ -590,17 +650,19 @@ impl Engine {
                 }));
             }
             let when = match scope {
-                CancellationScope::Range(_, property) => {
+                ResponseScope::Range(_, property) => {
                     let (_, stamp) = occurrence_label(&property)?;
                     format!("Cancelled from {stamp} onward")
                 }
-                CancellationScope::Group(count) => {
+                ResponseScope::WeeklySkipped => "Weekly invitation skips this occurrence".into(),
+                ResponseScope::WeeklyRevised => "Weekly invitation revised after the skip".into(),
+                ResponseScope::Group(count) => {
                     format!("This meeting is one of {count} cancelled dates")
                 }
-                CancellationScope::Individual if invite.cancelled => {
+                ResponseScope::Individual if invite.cancelled => {
                     "Cancelled by the organizer".into()
                 }
-                CancellationScope::Individual => proposed_time(&invite).ok_or(Error::Refused(
+                ResponseScope::Individual => proposed_time(&invite).ok_or(Error::Refused(
                     "Open the latest invitation to review its time.",
                 ))?,
             };
