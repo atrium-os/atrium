@@ -75,7 +75,7 @@ Effort: **S** = under a day, **M** = a few days, **L** = a design change.
 | H3 | High | portcullisd, spec | portcullisd creates jails itself as unconfined host root, contrary to the spec | L | Open: Shankar chose (a), route through jaild (2026-11-24) |
 | H4 | High | portcullis-peer | A launch registry that fails to read is treated as empty (fails open) | M | **Fixed `2bd8429`** in portcullis-peer, portcullisd, ostiarius; other daemons' `.ok()`/default sites fail closed and keep their code |
 | H5 | High | forum-ctl, forum-wm | The WM control socket has no frame cap and no timeout | S | **Fixed `931bfc7`** |
-| M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | **Mostly fixed `M1HASH`**: one crate, `atrium-fdpass`; the broker-facing receivers use it, 15 lower-risk copies remain (listed below) |
+| M1 | Medium | 25 crates | SCM_RIGHTS receive code is hand-rolled 25 times, with inconsistent hardening | M | **Mostly fixed `3208109`**: one crate, `atrium-fdpass`; the broker-facing receivers use it, 15 lower-risk copies remain (listed below) |
 | M2 | Medium | netconf, navigatord | Socket permission changes that act as access control ignore their errors | S | **Fixed `61feb4a`** |
 | M3 | Medium | portcullisd | One root daemon carries 71 request kinds, with app features inside the broker | L | Open |
 | M4 | Medium | jaild, many crates | Security predicates and helpers are copy-pasted | M | **jaild part fixed `a716051`**; peer-uid, username and hex copies still open |
@@ -250,7 +250,7 @@ best of them: it checks truncation and closes extras.
 **Fix:** one audited fd-passing module (sockmux's, extended), with callers
 moved over one crate at a time by the thread that owns each crate.
 
-**Status (`M1HASH`):** `atrium-fdpass` (top level) is the one copy. Every
+**Status (`3208109`):** `atrium-fdpass` (top level) is the one copy. Every
 received descriptor is an `OwnedFd` and close-on-exec atomically; more
 descriptors than the caller accepts, or truncated control data, is an error
 with every descriptor closed. Its tests fail when either check is removed.
