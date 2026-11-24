@@ -35,22 +35,24 @@ fn form_border(
     c: libcompositing_rust::display_list::commands::FillRoundedRectRing,
 ) -> Result<Node, &'static str> {
     use pergola::shape::{Paint, PathData, Shape};
-    let width = c.top_width;
-    if width < 0 || [c.right_width, c.bottom_width, c.left_width] != [width; 3] {
-        return Err("nonuniform form border width");
+    // Each side its own width (a field with only a bottom rule is common);
+    // the hole's corners shrink by the widest side.
+    let [top, right, bottom, left] = [c.top_width, c.right_width, c.bottom_width, c.left_width];
+    if [top, right, bottom, left].iter().any(|w| *w < 0) {
+        return Err("negative form border width");
     }
-    let width = width as f32;
+    let [top, right, bottom, left] = [top as f32, right as f32, bottom as f32, left as f32];
     let radius = uniform_radius(c.corner_radii)?;
     let outer = rect(c.rect);
     let mut path = PathData::rounded_rect(outer, radius);
-    if outer.w() > 2. * width && outer.h() > 2. * width {
+    if outer.w() > left + right && outer.h() > top + bottom {
         let inner = Rect::new(
-            outer.x() + width,
-            outer.y() + width,
-            outer.w() - 2. * width,
-            outer.h() - 2. * width,
+            outer.x() + left,
+            outer.y() + top,
+            outer.w() - left - right,
+            outer.h() - top - bottom,
         );
-        let hole = PathData::rounded_rect(inner, (radius - width).max(0.));
+        let hole = PathData::rounded_rect(inner, (radius - top.max(right).max(bottom).max(left)).max(0.));
         path.verbs.extend(hole.verbs);
         path.points.extend(hole.points);
     }
@@ -361,7 +363,15 @@ pub fn editor_leaves(
                         return Ok(());
                     }
                     let node = match header.command_type {
-                        DisplayListCommandType::PaintOuterBoxShadow => box_shadow::paint(read_command(payload))?,
+                        DisplayListCommandType::PaintOuterBoxShadow => match box_shadow::paint(read_command(payload)) {
+                            // A shadow too large to raster here (a page-sized
+                            // card's) is drawn without it, said once per frame.
+                            Err("outer shadow raster budget") => {
+                                eprintln!("editor scene: an outer shadow over the raster budget is left out");
+                                return Ok(());
+                            }
+                            other => other?,
+                        },
                         DisplayListCommandType::FillPath => mask::vector_path(payload)?,
                         DisplayListCommandType::PaintRadialGradient => gradient::radial(payload)?,
                         DisplayListCommandType::PaintLinearGradient => gradient::direct(payload)?,
@@ -507,12 +517,44 @@ fn assemble_scene(
         // Clips inside a scrolling viewport's content (a form control's),
         // in document coordinates like the leaf's own.
         let mut content_clips = Vec::new();
+        // CSS transforms between the leaf and its scroller, inner first: each
+        // a uniform scale and a translation (`x' = s x + tx`), and the clips
+        // in their spaces with how many of them they are inside.
+        let mut chain: Vec<(f32, f32, f32)> = Vec::new();
+        let mut local_clips: Vec<(libgfx_rust::FloatRect, usize)> = Vec::new();
+        // The spaces walked without a scroll row (transforms, stationary
+        // scrollers), with how many transforms lie inside each.
+        let mut spaces = vec![(leaf.context.spatial, 0usize)];
         let table = &tree.compositor_scroll_table().nodes;
         while index != ROOT {
             let spatial = tree
                 .spatial_nodes
                 .get(index.0 as usize)
                 .ok_or("missing spatial node")?;
+            if let SpatialData::Transform(t) = &spatial.data {
+                let m = &t.matrix.elements;
+                let (scale, tx, ty) = (m[0][0], m[0][3], m[1][3]);
+                let aligned = m[0][1] == 0.0 && m[1][0] == 0.0 && m[0][2] == 0.0 && m[1][2] == 0.0
+                    && m[3] == [0.0, 0.0, 0.0, 1.0] && (m[0][0] - m[1][1]).abs() <= 1e-4 * m[0][0].abs();
+                if !aligned || !(scale.is_finite() && scale > 0.0 && tx.is_finite() && ty.is_finite())
+                    || !path.is_empty() || chain.len() >= 16 {
+                    return Err(format!("unsupported transform {index:?}: only a uniform scale and a translation inside its scroller"));
+                }
+                while !clip.is_none() {
+                    let c = tree.clip_nodes.get(clip.0 as usize).ok_or("invalid transformed clip")?;
+                    if c.spatial != index || local_clips.len() > tree.clip_nodes.len() { break; }
+                    let ClipNodeData::Rect(r) = &c.data else { return Err("nonrectangular transformed clip".into()); };
+                    if r.mode != ClipMode::Intersect {
+                        return Err("unsupported transformed clip geometry".into());
+                    }
+                    local_clips.push((r.rect, chain.len()));
+                    clip = c.parent;
+                }
+                chain.push((scale, tx, ty));
+                index = spatial.parent;
+                spaces.push((index, chain.len()));
+                continue;
+            }
             let row = match table.binary_search_by_key(&index, |r| r.scroll_node_index) {
                 Ok(row) => row,
                 Err(_)
@@ -524,6 +566,7 @@ fn assemble_scene(
                     // no scroll range and hence no compositor table row. It
                     // moves nothing: walk on to its parent.
                     index = spatial.parent;
+                    spaces.push((index, chain.len()));
                     continue;
                 }
                 Err(_) => {
@@ -558,7 +601,10 @@ fn assemble_scene(
                     let c = tree.clip_nodes.get(clip.0 as usize).ok_or("invalid content clip")?;
                     if c.spatial != index || content_clips.len() > tree.clip_nodes.len() { break; }
                     let ClipNodeData::Rect(r) = &c.data else { return Err("nonrectangular content clip".into()); };
-                    if r.mode != ClipMode::Intersect || r.corner_radii != Default::default() {
+                    // A rounded clip is taken as its rectangle: Fresco's clip
+                    // layers are rectangles, and the corners it would cut are
+                    // the box's own (its border radius), not another's content.
+                    if r.mode != ClipMode::Intersect {
                         return Err("unsupported content clip geometry".into());
                     }
                     content_clips.push(r.rect);
@@ -596,7 +642,16 @@ fn assemble_scene(
         }
         // A form control clips text in the stationary document coordinate space.
         // Intersect its ancestor clips in that same space.
-        let mut bounds = leaf.inline_clip;
+        // Through the transforms from the `from`th outward.
+        let through = |r: libgfx_rust::FloatRect, from: usize| {
+            chain[from..].iter().fold(r, |r, &(s, tx, ty)| libgfx_rust::FloatRect {
+                x: r.x * s + tx, y: r.y * s + ty, width: r.width * s, height: r.height * s,
+            })
+        };
+        let mut bounds = leaf.inline_clip.map(|r| through(r, 0));
+        for (r, from) in local_clips {
+            intersect_clip(&mut bounds, through(r, from))?;
+        }
         for r in content_clips {
             intersect_clip(&mut bounds, r)?;
         }
@@ -612,13 +667,14 @@ fn assemble_scene(
             depth += 1;
             if depth > tree.clip_nodes.len()
                 || !path.is_empty()
-                || (c.spatial != ROOT && c.spatial != leaf.context.spatial)
+                || (c.spatial != ROOT && !spaces.iter().any(|(s, _)| *s == c.spatial))
                 || r.mode != ClipMode::Intersect
-                || r.corner_radii != Default::default()
             {
+                // As above, a rounded clip is taken as its rectangle.
                 return Err("unsupported form clip geometry".into());
             }
-            intersect_clip(&mut bounds, r.rect)?;
+            let from = spaces.iter().find(|(s, _)| *s == c.spatial).map_or(chain.len(), |(_, k)| *k);
+            intersect_clip(&mut bounds, through(r.rect, from))?;
             clip = c.parent;
         }
         path.reverse();
@@ -715,7 +771,13 @@ fn assemble_scene(
             ));
             parent = Some(id);
         }
-        rows.push((parent, None, key, leaf.node));
+        let node = if chain.is_empty() {
+            leaf.node
+        } else {
+            let (s, tx, ty) = chain.iter().fold((1.0f32, 0.0f32, 0.0f32), |(s0, x0, y0), &(s, tx, ty)| (s * s0, s * x0 + tx, s * y0 + ty));
+            leaf.node.mapped(s, tx, ty).ok_or("unsupported transformed leaf")?
+        };
+        rows.push((parent, None, key, node));
     }
     let mut next = NodeTree::continuing(previous);
     let mut groups = HashMap::new();
@@ -920,8 +982,10 @@ pub mod host {
             server_decorations: Some(false),
             ..Default::default()
         };
+        // A VPN sign-in page fills the window's page area (SignInFixture.h).
+        let (w, h) = if vpn { (1024, 600) } else { (640, 360) };
         let window = conn
-            .window_create(640, 360, "Navigator editor", hints)
+            .window_create(w, h, "Navigator editor", hints)
             .map_err(|e| e.to_string())?;
         conn.set_default_window(u16::try_from(window).map_err(|_| "unroutable window id")?);
         if conn.window_scale(window) != 1.0 {

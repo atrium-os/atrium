@@ -26,7 +26,9 @@ pub const HEADERS_MAX: usize = 16;
 pub const HEADER_VALUE_MAX: usize = 1024;
 pub const SLOTS_MAX: usize = arcad::proto::courier_op::MAX_SLOTS;
 pub const SEGMENTS_MAX: usize = 256;
-pub const BODY_MAX: usize = 1024 * 1024;
+/// An IdP page's stylesheet can be over a megabyte (PatternFly 5 is
+/// 1.5 MB), and a sign-in page has no other way to get it.
+pub const BODY_MAX: usize = 4 * 1024 * 1024;
 /// The whole request frame.
 pub const FRAME_MAX: usize = BODY_MAX + 64 * 1024;
 

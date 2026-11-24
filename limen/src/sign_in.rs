@@ -30,7 +30,7 @@ pub enum ResourceKind {
 }
 
 /// The longest resource the broker hands a VPN page.
-pub const VPN_RESOURCE_MAX: usize = 1 << 20;
+pub const VPN_RESOURCE_MAX: usize = 4 << 20;
 /// The longest address a VPN page asks for.
 pub const VPN_RESOURCE_URL_MAX: usize = 2048;
 

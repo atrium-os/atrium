@@ -32,6 +32,9 @@ extern "C" bool navigator_scene_sample(NavigatorScene*, Web::Layout::RustFFI::Do
 #if defined(ATRIUM_MAIL_PAGE) && !defined(ATRIUM_INBOX_PAGE)
 extern "C" void navigator_get_realm(void const*);
 #endif
+#ifdef ATRIUM_MAIL_PAGE
+extern "C" bool navigator_is_vpn_page(NavigatorScene*);
+#endif
 
 namespace Navigator {
 
@@ -41,7 +44,14 @@ inline ErrorOr<void> paint_document(EditorPage& client, NavigatorScene* scene, S
 {
     auto nav = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(client.page(), nullptr);
     client.page().set_top_level_traversable(nav);
+#ifdef ATRIUM_MAIL_PAGE
+    // A VPN sign-in page has the window's whole page area (about 1030 x 620
+    // at 1280 x 840), not the Mail sheet's 640 x 360: an IdP's button below
+    // its first screen must be on it, since the page does not scroll.
+    nav->set_viewport_size(navigator_is_vpn_page(scene) ? Web::CSSPixelSize { 1024, 600 } : Web::CSSPixelSize { 640, 360 });
+#else
     nav->set_viewport_size({ 640, 360 });
+#endif
     auto doc = nav->active_document();
     auto parsed = URL::Parser::basic_parse(location);
     if (!parsed.has_value() || parsed->scheme() != "https"sv) return Error::from_string_literal("invalid document origin");

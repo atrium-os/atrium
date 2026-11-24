@@ -1317,7 +1317,8 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
     credentials or fragment (URL at most 2 KiB). It fetches once and
     follows no redirects, through the profile's couriers in the sign-in
     jar, and only while the attempt is current. The answer must be 200
-    with one content type, a script or a stylesheet, at most 1 MiB.
+    with one content type, a script or a stylesheet, at most 4 MiB (Arca's
+    courier body limit is 4 MiB too: PatternFly 5's stylesheet is 1.5 MB).
     navigatord answers `Event::VpnResource` with a sealed memfd, which
     the window hands the page as `ResourceReady` (or `ResourceFailed`).
     The page never names where a resource comes from beyond its own
@@ -1354,13 +1355,32 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
     to the panel as a scripted form, and the press sent it (607 bytes).
     Keycloak stored the passkey and answered its SAML page. The gateway
     accepted the assertion and redeemed its token once, and the tunnel came
-    up and fetched `crypta-ac-ok` over `tun6`. Not yet shown: a later
-    sign-in with that passkey (`navigator.credentials.get`). Keycloak's
-    security-key sign-in page has a CSS transform (a 1.14 scale) that the
-    native painter refuses, so its page child exits. The painter now takes
-    the content clips of a scrolling viewport and stationary nested
-    scrollers, which this page needed first. Evidence:
+    up and fetched `crypta-ac-ok` over `tun6`. Evidence:
     `~/atrium-vm/evidence/vpn-passkey-keycloak-20261124/`.
+  - *Passkey sign-in (2026-11-25).* After Keycloak's session ended, the
+    window showed Keycloak's styled "Passkey login" page (PatternFly loaded
+    through the couriers), and "Sign in with Passkey" opened Sigillum's
+    assert sheet for `idp.crypta.test`. The soft key answered after its PIN,
+    and the page's script handed the assertion to the panel. Keycloak
+    accepted it and answered its SAML page, and the tunnel fetched
+    `crypta-ac-ok` over `tun8`. This needed native painter work: uniform
+    scale and translate transforms, rounded clips taken as their
+    rectangles, per-side border widths, clips in stationary and
+    transformed spaces, and an oversized shadow left out with a log line.
+    A VPN page also now gets a 1024 x 600 viewport (the window's page
+    area), not the Mail sheet's 640 x 360, because the page does not
+    scroll and the button sat below 360. Evidence:
+    `~/atrium-vm/evidence/vpn-passkey-keycloak-get-20261125/`.
+  - *Gate base.* `sh scripts/navigator-signin-base.sh` builds the guest
+    base read-only in `~/atrium-vm/navigator-signin-base/`, from
+    `navigator-i0-tessera`: `/tmp/mail-button` (main's arcad, arca-probe,
+    arca-courierd and portcullis, a fresh publisher key the guest trusts,
+    the mail-page bundle template, navigatord's settings), the users
+    mailgate and gatevest, fonts, socket directories, the Navigator
+    fetcher, and the system worker rule that lets limend start the
+    sign-in page per instance. The previous base lived in `/private/tmp`
+    and macOS's daily clean-tmps deleted it. The fixture inputs used are in
+    `~/atrium-vm/navigator-signin-fixture/` (`artifacts.sha256`).
   - *Gate fixture notes.* frescod needs `FRESCOD_ACTIVATION_UIDS=65021,65030`
     so Sigillum's sheet can spend its press. With no Forum,
     `place_sigillum_fixture` places the sheet, and `place_sigillum_fixture

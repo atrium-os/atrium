@@ -1410,10 +1410,14 @@ fetches its own origin's scripts and stylesheets through its window, and a
 form its script submits goes to the window's panel. See vpn.md "Scripts in
 the sign-in window". The native painter now accepts clips inside a
 scrolling viewport's content (a text field's in a page taller than its
-window). It also accepts stationary scrollers below the viewport. It still
-refuses CSS transforms other than the identity, which Keycloak's
-security-key sign-in page needs (a 1.14 scale). Errors name the spatial
-kind and the clip that did not fit.
+window). It also accepts stationary scrollers below the viewport, and
+uniform scale and translate transforms (`pergola::Node::mapped` moves each
+leaf; clips in transformed spaces move with it). It takes rounded clips as
+their rectangles, draws per-side border widths, and leaves out an outer
+shadow over its raster budget with a log line. Other transforms are still
+refused, and errors name the spatial kind and the clip that did not fit.
+A VPN sign-in page gets a 1024 x 600 viewport and window. A Mail sheet page
+keeps 640 x 360.
 
 ### I3 physical YubiKey on Tessera
 
