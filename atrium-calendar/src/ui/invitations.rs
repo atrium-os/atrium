@@ -159,20 +159,23 @@ impl Sheet {
         )?;
         self.review.skips.get(index)
     }
+    fn choice_date(&self) -> Option<chrono::NaiveDate> {
+        if self.review.reinstating {
+            let day = self.review.range_dates.get(self.page.checked_sub(1)?)?;
+            return day.private_copy.as_ref().map(|_| day.original);
+        }
+        self.skip_page()
+            .filter(|s| s.effect == SkipEffect::ChooseLocalMove)
+            .map(|s| s.original.date)
+    }
     fn can_advance(&self) -> bool {
-        self.skip_page().is_none_or(|s| {
-            s.effect != SkipEffect::ChooseLocalMove
-                || self.choices.iter().any(|c| c.original == s.original.date)
-        })
+        self.choice_date()
+            .is_none_or(|date| self.choices.iter().any(|c| c.original == date))
     }
     pub(super) fn choose_skip(&mut self, keep: bool) {
-        let Some(skip) = self
-            .skip_page()
-            .filter(|s| s.effect == SkipEffect::ChooseLocalMove)
-        else {
+        let Some(original) = self.choice_date() else {
             return;
         };
-        let original = skip.original.date;
         self.choices.retain(|c| c.original != original);
         self.choices.push(SkipDecision { original, keep });
     }
@@ -234,7 +237,9 @@ impl Sheet {
             ctx,
             66.,
             22.,
-            if p.row.is_none() {
+            if self.review.reinstating {
+                "Review reinstatement"
+            } else if p.row.is_none() {
                 "Review cancellation"
             } else if self.review.previous.is_some() {
                 "Review invitation change"
@@ -476,11 +481,32 @@ impl Sheet {
                     e.zone.map_or("Floating", |z| z.name.name())
                 )
             };
+            if let Some(copy) = &date.private_copy {
+                line(
+                    ctx,
+                    203.,
+                    16.,
+                    format!("Your private copy · {}", display(copy)),
+                );
+            }
             if let Some(before) = &date.before {
                 line(ctx, 203., 16., format!("Saved here · {}", display(before)));
             }
             if let Some(after) = &date.after {
-                line(ctx, 242., 16., format!("Proposed · {}", display(after)));
+                line(
+                    ctx,
+                    242.,
+                    16.,
+                    format!(
+                        "{} · {}",
+                        if self.review.reinstating {
+                            "Returns"
+                        } else {
+                            "Proposed"
+                        },
+                        display(after)
+                    ),
+                );
             } else {
                 line(
                     ctx,
@@ -493,6 +519,38 @@ impl Sheet {
                     }
                     .into(),
                 );
+            }
+            if date.private_copy.is_some() {
+                line(ctx, 266., 14., "Only you see this choice.".into());
+                planner.button(
+                    ctx,
+                    18.,
+                    284.,
+                    175.,
+                    "Keep private copy",
+                    Action::ChooseSkip(true),
+                );
+                planner.button(
+                    ctx,
+                    211.,
+                    284.,
+                    175.,
+                    "Remove private copy",
+                    Action::ChooseSkip(false),
+                );
+                if let Some(c) = self.choices.iter().find(|c| c.original == date.original) {
+                    line(
+                        ctx,
+                        327.,
+                        14.,
+                        if c.keep {
+                            "Selected · keep private copy"
+                        } else {
+                            "Selected · remove private copy"
+                        }
+                        .into(),
+                    );
+                }
             }
             planner.button(
                 ctx,
@@ -811,6 +869,8 @@ impl Sheet {
                     } else {
                         "Remove meeting"
                     }
+                } else if self.review.reinstating {
+                    "Restore reviewed dates"
                 } else if p.this_and_future {
                     "Apply reviewed range"
                 } else if self.review.weekly && p.original.is_none() {

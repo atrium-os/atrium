@@ -322,7 +322,16 @@ impl Proposal {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CancelledTail {
+    pub master: Entry,
+    pub exceptions: Vec<Entry>,
+    pub copies: Vec<(NaiveDate, uuid::Uuid)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cancellation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<CancelledTail>,
     #[serde(default)]
     pub this_and_future: bool,
     pub key: MeetingKey,
@@ -356,6 +365,8 @@ pub struct SkipDecision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RangeDate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_copy: Option<EventEdit>,
     pub original: NaiveDate,
     pub before: Option<EventEdit>,
     pub after: Option<EventEdit>,
@@ -363,6 +374,8 @@ pub struct RangeDate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub reinstating: bool,
     #[serde(default)]
     pub range_summary: Option<String>,
     #[serde(default)]

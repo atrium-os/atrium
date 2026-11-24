@@ -73,7 +73,7 @@ impl Store {
                 }
                 let mut snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=10)
+                if !matches!(snapshot.version, 1..=11)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -476,7 +476,7 @@ impl Store {
         &mut self,
         revision: u64,
         entries: Vec<Entry>,
-        cancelled: Vec<crate::invitation::Cancellation>,
+        mut cancelled: Vec<crate::invitation::Cancellation>,
         opening_view: CalendarView,
         pinned_zone: Option<Tz>,
         device_zone: Option<Tz>,
@@ -485,9 +485,18 @@ impl Store {
             return Err("Calendar cancellation history limit reached".into());
         }
         validate_records(&entries)?;
+        // Deletion severs provenance even if a caller later reuses an appointment ID.
+        let appointments: HashSet<_> = entries
+            .iter()
+            .filter(|e| e.kind == Kind::Appointment && e.invitation.is_none())
+            .map(|e| e.id)
+            .collect();
+        for tail in cancelled.iter_mut().filter_map(|c| c.tail.as_mut()) {
+            tail.copies.retain(|(_, id)| appointments.contains(id));
+        }
         let next = Snapshot {
             opening_view,
-            version: 10,
+            version: 11,
             cancelled,
             pinned_zone,
             device_zone,

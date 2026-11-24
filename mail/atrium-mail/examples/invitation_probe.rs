@@ -28,7 +28,8 @@ fn seed(e: &Engine, mode: &str) {
     let grouped = mode == "seed-cancel-dates";
     let skipped = mode == "seed-exdates";
     let long = mode == "seed-long-range";
-    let cancel_future = mode == "seed-cancel-future";
+    let reinstate = mode == "seed-reinstate";
+    let cancel_future = mode == "seed-cancel-future" || reinstate;
     let future = mode == "seed-future" || long;
     let bounded = mode == "seed-bounded" || grouped || skipped || future || cancel_future;
     assert!(e.store.accounts().unwrap().is_empty());
@@ -47,7 +48,19 @@ fn seed(e: &Engine, mode: &str) {
         .replace("20261209T160000Z", "20270310T180000Z")
         .replace("20261209T170000Z", "20270310T190000Z");
     let spring_scope = FUTURE_SCOPE.replace("20261208", "20270309");
-    let messages: &[(&str, &str)] = if cancel_future {
+    let messages: &[(&str, &str)] = if reinstate {
+        &[
+            ("Weekly studio meetings", WEEKLY),
+            (
+                "Cancel December 15 onward",
+                include_str!("../../../atrium-calendar/tests/fixtures/cancel-future.ics"),
+            ),
+            (
+                "Return December 15 onward",
+                include_str!("../../../atrium-calendar/tests/fixtures/reinstate-future.ics"),
+            ),
+        ]
+    } else if cancel_future {
         &[
             ("Weekly studio meetings", WEEKLY),
             (
@@ -140,7 +153,9 @@ fn seed(e: &Engine, mode: &str) {
             use portcullis_ipc::calendar::{Answer, Reply};
             let scope = match (bounded, id) {
                 (true, 1) if cancel_future => Some("weekly".into()),
-                (true, 2) if cancel_future => Some(FUTURE_SCOPE.replace("20261208", "20261215")),
+                (true, 2 | 3) if cancel_future => {
+                    Some(FUTURE_SCOPE.replace("20261208", "20261215"))
+                }
                 (true, 1) if long => Some("weekly;COUNT=12".into()),
                 (true, 3) if long => Some("weekly".into()),
                 (true, 4) if long => Some(spring_scope.clone()),
@@ -200,7 +215,9 @@ fn seed(e: &Engine, mode: &str) {
                 let ics = std::str::from_utf8(&draft.attachments[0].bytes).unwrap();
                 assert_eq!(
                     ics.lines().find(|line| line.starts_with("RECURRENCE-ID")),
-                    if long && id == 4 {
+                    if reinstate && id == 3 {
+                        reply.scope.as_deref()
+                    } else if long && id == 4 {
                         Some(spring_scope.as_str())
                     } else if future && id == 2 {
                         Some(FUTURE_SCOPE)
@@ -355,7 +372,9 @@ fn main() {
     );
     match args[1].as_str() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
-        | "seed-future" | "seed-long-range" | "seed-cancel-future") => seed(&e, mode),
+        | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate") => {
+            seed(&e, mode)
+        }
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),

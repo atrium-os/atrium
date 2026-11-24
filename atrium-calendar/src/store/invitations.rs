@@ -1,5 +1,6 @@
 mod cancel_future;
 mod future;
+mod reinstate;
 use super::*;
 use crate::invitation::{Cancellation, MeetingKey, Origin, Proposal, Review};
 use portcullis_ipc::calendar::{Source, REVIEW_SECONDS};
@@ -238,6 +239,7 @@ impl Store {
         });
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
+            reinstating: false,
             range_summary: None,
             range_dates: vec![],
             previous_dates: vec![],
@@ -256,6 +258,23 @@ impl Store {
             );
         }
 
+        if p.this_and_future && !cancelled {
+            if let Some(mark) = history.iter().find(|c| {
+                c.this_and_future
+                    && c.key == key
+                    && (c.original == original_date
+                        || c.tail.as_ref().is_some_and(|t| {
+                            p.original
+                                .and_then(|o| o.in_series(&t.master).ok())
+                                .map(|o| o.date)
+                                == c.original
+                        }))
+            }) {
+                return Self::prepare_reinstatement(
+                    rows, history, view, revision, source, &p, mark, master, review, pending,
+                );
+            }
+        }
         if p.this_and_future && cancelled {
             return Self::prepare_range_cancellation(
                 rows, history, view, revision, source, &p, key, master, review, pending,
@@ -455,6 +474,7 @@ impl Store {
                                     row.date
                                 ));
                                 review.range_dates.push(crate::invitation::RangeDate {
+                                    private_copy: None,
                                     original: date,
                                     before: None,
                                     after: Some(row.fields_on(row.date)),
@@ -595,6 +615,7 @@ impl Store {
                 c.key != key || (original_date.is_some() && c.original != original_date)
             });
             marks.push(Cancellation {
+                tail: None,
                 this_and_future: false,
                 key,
                 original: original_date,

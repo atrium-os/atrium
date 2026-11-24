@@ -414,10 +414,10 @@ def long_range(ui):
     print("PASS long and open-ended range review, inherited extension, distant agenda and both private moves")
 
 
-def cancel_future(ui):
-    print(guest(ui, "cancel-future-setup"))
+def cancel_future(ui, reinstate=False):
+    print(guest(ui, "reinstate-setup" if reinstate else "cancel-future-setup"))
     open_mail(ui, first=True)
-    review(ui, 248)
+    review(ui, 318 if reinstate else 248)
     ui.see("cut-master", "Whole weekly series")
     click(ui, 568, 550)
     ui.see("cut-saved", "Invitation saved")
@@ -439,7 +439,7 @@ def cancel_future(ui):
 
     def inspect(keep):
         ui.control("close", "work")
-        review(ui, 178)
+        review(ui, 248 if reinstate else 178)
         ui.see("cut-overview", "This and future occurrences", "from 2026-12-15 onward", "no end date", "Review 4 dates")
         click(ui, 355, 412)
         ui.see("cut-earlier", "2026-12-08", "2026-12-18", "10:00", "stays put")
@@ -454,6 +454,40 @@ def cancel_future(ui):
         ui.see("cut-regular", "2026-12-29", "removes this meeting", "Apply range cancellation")
         assert ui.store("work") == baseline
 
+    if reinstate:
+        inspect(True)
+        click(ui, 568, 550)
+        ui.see("reinstatement-cancelled", "Cancellation applied")
+        cancelled = ui.store("work")
+        for keep in (True, False):
+            ui.control("close", "work")
+            review(ui, 178)
+            ui.see("reinstatement", "Review reinstatement", "2026-12-15", "no end date")
+            click(ui, 355, 412)
+            ui.see("reinstatement-start", "2026-12-15", "Returns", "2026-12-16", "16:00")
+            click(ui, 355, 412)
+            ui.see("reinstatement-copy", "2026-12-11", "16:30", "2026-12-23", "16:00", "Only you")
+            click(ui, 105 if keep else 290, 300)
+            ui.see("reinstatement-choice", "Restore reviewed dates")
+            assert ui.store("work") == cancelled
+            click(ui, 568, 550)
+            ui.see("reinstatement-saved", "Invitation saved")
+            saved = ui.store("work")
+            assert earlier in saved["entries"] and not saved.get("cancelled")
+            assert any(e["id"] == local["id"] for e in saved["entries"]) == keep
+            ui.open_date("2026-12-23")
+            ui.see("reinstatement-returned", "Studio planning", "16:00")
+            ui.open_date("2026-12-18")
+            ui.see("reinstatement-earlier", "Studio planning", "10:00")
+            click(ui, 590, 562)
+            ui.see("reinstatement-undo", "Change undone")
+            assert ui.store("work") == dict(cancelled, revision=saved["revision"] + 1)
+            cancelled = ui.store("work")
+        assert ui.control("fingerprint", "personal").strip() == b"empty"
+        ui.control("close", "work")
+        print(guest(ui, "series-check-empty"))
+        print("PASS restored weekly dates, both private copy choices, earlier move, Undo, empty outbox")
+        return
     inspect(True)
     click(ui, 70, 550)
     assert ui.store("work") == baseline
@@ -484,9 +518,9 @@ def cancel_future(ui):
 
 
 if __name__ == "__main__":
-    runner = {"--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

@@ -27,6 +27,10 @@ impl Store {
             Some(anchor.date),
             &mut group,
         )?;
+        if review.reinstating {
+            self.invite = group;
+            return Ok(review);
+        }
         let Some(ref mut plan) = group else {
             return Ok(review);
         };
@@ -112,6 +116,7 @@ impl Store {
             review.previous = None;
         }
         review.range_dates.push(RangeDate {
+            private_copy: None,
             original: anchor.date,
             before: review.previous.as_ref().map(|e| e.fields_on(e.date)),
             after: Some(proposed.fields_on(proposed.date)),
@@ -142,6 +147,7 @@ impl Store {
             });
             if before.is_none() || child.is_some() && !inherited {
                 review.range_dates.push(RangeDate {
+                    private_copy: None,
                     original: date,
                     before,
                     after: None,
@@ -156,6 +162,7 @@ impl Store {
             let after = row.fields_on(row.date);
             if summarized && !physical {
                 review.range_dates.push(RangeDate {
+                    private_copy: None,
                     original: date,
                     before,
                     after: Some(after),
@@ -191,6 +198,7 @@ impl Store {
                 plan.changes = Some(changes);
             }
             review.range_dates.push(RangeDate {
+                private_copy: None,
                 original: date,
                 before,
                 after: Some(after),

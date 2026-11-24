@@ -182,8 +182,42 @@ impl Store {
             true
         });
         let mut marks = history.to_vec();
-        marks.retain(|c| c.key != key || c.original.is_none_or(|d| d < cut));
+        // A separate cancellation keeps its own revision and recovery boundary.
+        let mut archived = base.clone();
+        let mut exceptions = Vec::new();
+        let mut copies = Vec::new();
+        for (&date, child) in children.range(cut..) {
+            if private_ids.contains(&child.id) {
+                copies.push((date, child.id));
+            }
+            // Store organizer fields only. The private appointment is independently editable.
+            if let Some(saved) = child.invitation.as_ref().filter(|o| {
+                date > cut && o.original.is_some() && o.range_from.is_none_or(|a| a > cut)
+            }) {
+                let mut row = (*child).clone();
+                let fields = &saved.accepted;
+                row.date = fields.date;
+                row.title.clone_from(&fields.title);
+                row.span = fields.span;
+                row.zone = fields.zone;
+                row.id = Uuid::new_v4();
+                exceptions.push(row);
+            } else {
+                archived.excluded.retain(|d| *d != date);
+            }
+        }
+        archived.excluded.retain(|d| *d >= cut);
+        let saved = archived.invitation.as_mut().unwrap();
+        saved.ranges.retain(|r| r.anchor > cut);
+        saved.included.retain(|o| o.date >= cut);
+        saved.skips.retain(|o| o.date >= cut);
+        saved.owned_skips.retain(|d| *d >= cut);
         marks.push(Cancellation {
+            tail: Some(crate::invitation::CancelledTail {
+                master: archived,
+                exceptions,
+                copies,
+            }),
             key,
             original: Some(cut),
             sequence: p.sequence,

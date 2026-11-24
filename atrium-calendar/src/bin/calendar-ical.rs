@@ -1532,6 +1532,205 @@ mod tests {
 
     const CANCEL_FUTURE: &str = include_str!("../../tests/fixtures/cancel-future.ics");
 
+    const REINSTATE: &str = include_str!("../../tests/fixtures/reinstate-future.ics");
+
+    #[test]
+    fn deleting_a_private_copy_severs_its_link_and_legacy_cuts_stay_closed() {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let t = review_range(&mut s, 0, weekly).token.unwrap();
+        s.apply_invitation(0, t).unwrap();
+        let original = date("2026-12-22");
+        let row = &s.day(original).entries[0];
+        let mut fields = row.fields_on(original);
+        fields.date = date("2026-12-11");
+        s.change(1, row.id, original, EditScope::ThisEvent, Some(fields))
+            .unwrap();
+        let t = review_range(&mut s, 2, CANCEL_FUTURE).token.unwrap();
+        s.apply_reviewed_invitation(
+            2,
+            t,
+            &[SkipDecision {
+                original,
+                keep: true,
+            }],
+        )
+        .unwrap();
+        let day = date("2026-12-11");
+        let mut unrelated = s.day(day).entries.pop().unwrap();
+        s.change(3, unrelated.id, day, EditScope::ThisEvent, None)
+            .unwrap();
+        unrelated.source = None;
+        s.add(4, unrelated.clone()).unwrap();
+        let r = review_range(&mut s, 5, REINSTATE);
+        assert!(r.reinstating && r.range_dates.iter().all(|d| d.private_copy.is_none()));
+        let (_, undo) = s.apply_invitation(5, r.token.unwrap()).unwrap();
+        assert_eq!(s.day(day).entries[0].id, unrelated.id);
+        s.undo(undo).unwrap();
+        drop(s);
+        let path = dir.path().join("calendar.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        snapshot["version"] = 10.into();
+        snapshot["cancelled"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("tail");
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let denied = review_range(&mut s, 7, REINSTATE);
+        assert!(denied.token.is_none() && denied.notice.contains("older cancellation"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(s.day(day).entries[0].id, unrelated.id);
+    }
+
+    #[test]
+    fn reinstatement_reviews_current_private_copy_and_keeps_the_live_prefix() {
+        use atrium_calendar::{invitation::SkipDecision, EditScope};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let weekly = include_str!("../../tests/fixtures/weekly.ics");
+        let save = |s: &mut Store, rev, ics| {
+            let t = review_range(s, rev, ics).token.unwrap();
+            s.apply_invitation(rev, t).unwrap();
+        };
+        save(&mut s, 0, weekly);
+        save(&mut s, 1, RANGE_REQUEST);
+        // A projected range occurrence has a deterministic ID. Move it onto the
+        // time at which the organizer will later bring that same meeting back.
+        let wed = date("2026-12-23");
+        let row = s.day(wed).entries.pop().unwrap();
+        let mut fields = row.fields_on(wed);
+        fields.date = date("2026-12-11");
+        s.change(2, row.id, wed, EditScope::ThisEvent, Some(fields))
+            .unwrap();
+        let cut = CANCEL_FUTURE.replace("SEQUENCE:2", "SEQUENCE:3");
+        let proposal = REINSTATE.replace("SEQUENCE:3", "SEQUENCE:4");
+        let token = review_range(&mut s, 3, &cut).token.unwrap();
+        let mut choice = SkipDecision {
+            original: date("2026-12-22"),
+            keep: true,
+        };
+        s.apply_reviewed_invitation(3, token, &[choice]).unwrap();
+        let mut private = row.fields_on(wed);
+        private.title = "Private appointment".into();
+        s.change(
+            4,
+            row.id,
+            date("2026-12-11"),
+            EditScope::ThisEvent,
+            Some(private.clone()),
+        )
+        .unwrap();
+        let earlier = date("2026-12-09");
+        let old = s.day(earlier).entries.pop().unwrap();
+        let mut edited = old.fields_on(earlier);
+        edited.date = date("2026-12-18");
+        s.change(
+            5,
+            old.id,
+            earlier,
+            EditScope::ThisEvent,
+            Some(edited.clone()),
+        )
+        .unwrap();
+        drop(s);
+        let mut s = Store::open(dir.path()).unwrap();
+        let p = range_proposal(&proposal);
+        let mut source = range_source(&p);
+        source.verified = false;
+        let denied = s.review_invitation(6, &source, p.clone()).unwrap();
+        assert!(denied.token.is_none() && denied.range_dates.is_empty());
+        assert!(review_range(&mut s, 6, REINSTATE).token.is_none());
+        let before = || std::fs::read(dir.path().join("calendar.json")).unwrap();
+        let baseline = before();
+        let far = wed + chrono::Days::new(7 * 2500);
+        for rev in [6, 8] {
+            choice.keep = rev == 6;
+            let r = review_range(&mut s, rev, &proposal);
+            assert!(r.reinstating && r.can_save);
+            let copy = r
+                .range_dates
+                .iter()
+                .find(|d| d.original == choice.original)
+                .unwrap();
+            assert_eq!(copy.private_copy.as_ref(), Some(&private));
+            assert_eq!(copy.after.as_ref().unwrap().date, wed);
+            assert!(r
+                .range_dates
+                .iter()
+                .all(|d| d.original >= date("2026-12-15")));
+            assert_eq!(s.day(wed).entries.len(), 1);
+            assert!(s.day(far).entries.is_empty());
+            let t = r.token.unwrap();
+            assert!(s.apply_invitation(rev, t).is_err());
+            if rev == 6 {
+                assert_eq!(before(), baseline);
+            }
+            let undo = s.apply_reviewed_invitation(rev, t, &[choice]).unwrap().1;
+            let day = s.day(wed).entries;
+            assert_eq!(day.len(), if choice.keep { 2 } else { 1 });
+            let returned = day.iter().find(|e| e.invitation.is_some()).unwrap();
+            assert_ne!(returned.id, row.id);
+            assert_eq!(returned.span.start, 960);
+            assert_eq!(day.iter().any(|r| r.id == row.id), choice.keep);
+            assert_eq!(s.day(far).entries.len(), 1);
+            assert_eq!(
+                s.day(date("2026-12-18")).entries[0].fields_on(edited.date),
+                edited
+            );
+            assert_eq!(s.day(date("2026-12-01")).entries[0].span.start, 840);
+            assert!(!review_range(&mut s, rev + 1, &proposal).can_save);
+            assert!(review_range(&mut s, rev + 1, &cut).token.is_none());
+            s.undo(undo).unwrap();
+            let mut restored: serde_json::Value = serde_json::from_slice(&before()).unwrap();
+            restored["revision"] = 6.into();
+            assert_eq!(
+                restored,
+                serde_json::from_slice::<serde_json::Value>(&baseline).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn reinstating_from_first_slot_preserves_separate_moves_skips_and_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path()).unwrap();
+        let weekly = RANGE_MASTER.replace("COUNT=4", "COUNT=4\nEXDATE:20261222T140000Z");
+        let t = review_range(&mut s, 0, &weekly).token.unwrap();
+        s.apply_invitation(0, t).unwrap();
+        let cut = CANCEL_FUTURE.replace("20261215", "20261201");
+        let t = review_range(&mut s, 1, &cut).token.unwrap();
+        s.apply_invitation(1, t).unwrap();
+        let req = REINSTATE
+            .replace("20261215", "20261201")
+            .replace("20261216", "20261202");
+        let r = review_range(&mut s, 2, &req);
+        let dates: Vec<_> = r
+            .range_dates
+            .iter()
+            .map(|d| d.after.as_ref().map(|e| e.date))
+            .collect();
+        assert_eq!(
+            dates,
+            [
+                Some(date("2026-12-02")),
+                Some(date("2026-12-09")),
+                Some(date("2026-12-17")),
+                None
+            ]
+        );
+        s.apply_invitation(2, r.token.unwrap()).unwrap();
+        drop(s);
+        let s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.day(date("2026-12-17")).entries[0].span.start, 660);
+        assert!(s.day(date("2026-12-23")).entries.is_empty());
+        assert!(s.day(date("2026-12-30")).entries.is_empty());
+    }
+
     #[test]
     fn range_cancellation_uses_original_dates_and_undo_restores_the_open_tail() {
         use atrium_calendar::{
