@@ -1590,6 +1590,8 @@ the per-persona launch path still needs a design for assigning a child to its
 own jail and confirming its uid, limits and descriptor set before Limen
 delivers any page channels. Profile the installed Start stages before choosing
 that design. The offline medians alone do not establish an installed speedup.
+(Settled: the Start was profiled and D7 chose a standby pool over a fork
+zygote; see "I5 warm start".)
 
 To repeat, apply the static-typeface patch to the pinned engine. Rebuild
 LibGfx and the pinned provider, including `Font-Typeface.o` in the staged link.
