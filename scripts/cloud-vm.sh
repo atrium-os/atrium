@@ -132,7 +132,9 @@ boot() {
     # disk; TESSERA_ROOT=1 puts it FIRST (vtbd0, bootindex 0) so its loader
     # and vfs.root.mountfrom=tessera:/dev/vtbd0p2 take over, with ZFS
     # attached behind it as the fallback.
-    ZFSD="-drive file=$VMDIR/vm.qcow2,format=qcow2,cache=writeback,if=none,id=zfsd"
+    # discard=unmap: a guest TRIM (zpool trim, or autotrim) punches holes in
+    # vm.qcow2, so freed guest space goes back to the host disk.
+    ZFSD="-drive file=$VMDIR/vm.qcow2,format=qcow2,cache=writeback,discard=unmap,detect-zeroes=unmap,if=none,id=zfsd"
     DEVD="-drive file=$VMDIR/devroot.img,format=raw,cache=writeback,if=none,id=devd"
     if [ -f "$VMDIR/devroot.img" ] && [ "${TESSERA_ROOT:-0}" = 1 ]; then
         DISKS="$DEVD -device virtio-blk-pci,drive=devd,bootindex=0 $ZFSD -device virtio-blk-pci,drive=zfsd"
