@@ -279,46 +279,86 @@ fn worker() -> io::Result<()> {
     wire::write(&mut control, &result, 64 << 10)
 }
 
-fn probe(path: &str, uid: u32, allow: bool) -> io::Result<()> {
-    for (mode, label) in ["RECEIPT_OK", "WRONG_ACCOUNT_REFUSED", "TLS_NAME_REFUSED"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(12)))?;
-        let mut body = uid.to_le_bytes().to_vec();
-        body.push(mode as u8);
-        proto::write_request(&mut stream, op::U_SMIME_SYNTHETIC_JMAP, &body)?;
-        // This lab opcode has a public result. The unprivileged Mail probe
-        // must be able to read a denial without allocating locked memory.
-        let mut header = [0; 5];
-        stream.read_exact(&mut header)?;
-        let length = u32::from_le_bytes(header[..4].try_into().map_err(io::Error::other)?);
-        if allow && header[4] == status::OK && length == 2 {
-            let mut witness = [0];
+// One lab request. `None` is Arca's public denial.
+fn request(path: &str, uid: u32, mode: u8) -> io::Result<Option<Vec<u8>>> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(12)))?;
+    let mut body = uid.to_le_bytes().to_vec();
+    body.push(mode);
+    proto::write_request(&mut stream, op::U_SMIME_SYNTHETIC_JMAP, &body)?;
+    // This lab opcode has a public result. The unprivileged Mail probe
+    // must be able to read a denial without allocating locked memory.
+    let mut header = [0; 5];
+    stream.read_exact(&mut header)?;
+    let length = u32::from_le_bytes(header[..4].try_into().map_err(io::Error::other)?);
+    match (header[4], length) {
+        (status::DENIED, 1) => Ok(None),
+        (status::OK, 2..=16) => {
+            let mut witness = vec![0; length as usize - 1];
             stream.read_exact(&mut witness)?;
-            if witness != [mode as u8] {
-                return Err(invalid());
-            }
-            println!("MAIL_JMAP_PROOF_{label}");
-        } else if !allow && header[4] == status::DENIED && length == 1 {
-            println!("MAIL_JMAP_PROOF_DIRECT_DENIED");
-            return Ok(());
-        } else {
-            return Err(io::Error::other(format!(
-                "JMAP proof witness {label} refused"
-            )));
+            Ok(Some(witness))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Mode 0 seals a new account (witness 0) or uses the sealed one (4), and
+// names it by a tag that matches only the same instance and receipt key.
+fn probe(path: &str, uid: u32, expect: &str) -> io::Result<()> {
+    let expected = match expect {
+        "new" => 0,
+        "kept" => 4,
+        _ => return Err(invalid()),
+    };
+    let refused = |label: &str| io::Error::other(format!("JMAP proof witness {label} refused"));
+    match request(path, uid, 0)? {
+        Some(witness) if witness.len() == 9 && witness[0] == expected => {
+            println!("MAIL_JMAP_PROOF_RECEIPT_OK");
+            println!("MAIL_JMAP_PROOF_ACCOUNT_{}", expect.to_uppercase());
+            println!("MAIL_JMAP_PROOF_AUTHORITY={}", hex(&witness[1..]));
+        }
+        _ => return Err(refused("RECEIPT_OK")),
+    }
+    for (mode, label) in [(1, "WRONG_ACCOUNT_REFUSED"), (2, "TLS_NAME_REFUSED")] {
+        if request(path, uid, mode)? != Some(vec![mode]) {
+            return Err(refused(label));
+        }
+        println!("MAIL_JMAP_PROOF_{label}");
+    }
+    Ok(())
+}
+
+fn revoke(path: &str, uid: u32, count: u8) -> io::Result<()> {
+    if request(path, uid, 3)? != Some(vec![3, count]) {
+        return Err(io::Error::other("JMAP proof revocation refused"));
+    }
+    println!("MAIL_JMAP_PROOF_REVOKED={count}");
+    Ok(())
+}
+
+fn deny(path: &str, uid: u32) -> io::Result<()> {
+    for mode in [0, 3] {
+        if request(path, uid, mode)?.is_some() {
+            return Err(io::Error::other("JMAP proof allowed a denied caller"));
         }
     }
+    println!("MAIL_JMAP_PROOF_DIRECT_DENIED");
     Ok(())
 }
 
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let uid = |uid: &String| uid.parse::<u32>().map_err(io::Error::other);
     match args.as_slice() {
-        [cmd, path, uid] if cmd == "probe" || cmd == "deny" => {
-            probe(path, uid.parse().map_err(io::Error::other)?, cmd == "probe")
+        [cmd, path, id, expect] if cmd == "probe" => probe(path, uid(id)?, expect),
+        [cmd, path, id, count] if cmd == "revoke" => {
+            revoke(path, uid(id)?, count.parse().map_err(io::Error::other)?)
         }
+        [cmd, path, id] if cmd == "deny" => deny(path, uid(id)?),
         #[cfg(target_os = "freebsd")]
         [] => worker(),
         _ => Err(invalid()),

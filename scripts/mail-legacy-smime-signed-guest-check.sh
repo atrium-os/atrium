@@ -366,14 +366,6 @@ test "$personaluid" != "$workuid"
 echo "MAIL_SIGNED_PERSONAL_UID=$personaluid"
 scenario closed approve personal "$personaluid" 6
 
-jexec -u "$(id -nu "$workuid")" "$work" /bin/arca-jmap-proof deny "$arca" "$workuid"
-su -m _arca-ui -c "exec $d/arca-jmap-proof deny $arca $personaluid"
-su -m _arca-ui -c "exec $d/arca-jmap-proof probe $arca $workuid"
-test "$(grep -Fc "_arca starts $jmap_worker as legacyjmapworker (system worker rule)" "$d/portcullisd.log")" = 3
-jls -q name >"$d/jmap-proof.jails"
-! grep -F 'app-org-atrium-jmap-proof-fixture' "$d/jmap-proof.jails"
-echo MAIL_JMAP_PROOF_SIGNED_TESSERA_OK
-
 worker_total=6
 for sample in 1 2 3; do
     for profile in missing-key unsupported; do
@@ -394,6 +386,66 @@ $2 == "ui" && $3 == "op=0x00e7" {
     else unexpected++
 } END { exit !(abandoned == 1 && opened == 3 && closed == 9 && managed == 3 && cancelled == 2 && !unexpected) }' /var/db/arca/audit.log
 echo MAIL_LEGACY_ARCA_DISPATCH_OK
+
+# Synthetic JMAP account: Arca seals the approved account and its receipt
+# key, keeps both across an arcad crash, and revocation survives a restart.
+# The gate runs last because it restarts arcad.
+fences=/var/db/arca/legacy-jmap-fences
+test ! -e "$fences"
+jexec -u "$(id -nu "$workuid")" "$work" /bin/arca-jmap-proof deny "$arca" "$workuid"
+su -m _arca-ui -c "exec $d/arca-jmap-proof deny $arca $personaluid"
+jmap_probe() {
+    su -m _arca-ui -c "exec $d/arca-jmap-proof probe $arca $workuid $1" >"$d/jmap-$2.log"
+    cat "$d/jmap-$2.log"
+    grep -qx "MAIL_JMAP_PROOF_ACCOUNT_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')" "$d/jmap-$2.log"
+}
+authority() {
+    sed -n 's/^MAIL_JMAP_PROOF_AUTHORITY=\([0-9a-f]\{16\}\)$/\1/p' "$d/jmap-$1.log"
+}
+restart_arca() {
+    old=$(pgrep -x atrium-arcad)
+    # A crash, not a clean stop: the supervisor restarts arcad on failure.
+    kill -KILL "$old"
+    new=
+    for _ in $(jot 60); do
+        new=$(pgrep -x atrium-arcad || true)
+        if [ -n "$new" ] && [ "$new" != "$old" ]; then break; fi
+        sleep .5
+    done
+    test -n "$new" && test "$new" != "$old"
+    for _ in $(jot 40); do
+        if su -m _ostiarius -c "$d/arca-probe $arca unlock $person local-synthetic-fixture" 2>/dev/null |
+            grep -qi '^unlocked'; then
+            printf 'MAIL_JMAP_PROOF_ARCA_RESTARTED pid=%s\n' "$new"
+            return
+        fi
+        sleep .5
+    done
+    echo "arcad did not come back unlocked" >&2
+    return 1
+}
+jmap_probe new first
+first=$(authority first)
+test -n "$first"
+test "$(stat -f %Sp "$fences")" = drwx------
+restart_arca
+jmap_probe kept restarted
+test "$(authority restarted)" = "$first"
+su -m _arca-ui -c "exec $d/arca-jmap-proof revoke $arca $workuid 1"
+su -m _arca-ui -c "exec $d/arca-jmap-proof revoke $arca $workuid 0"
+test "$(find "$fences" -name 'account-*' -perm 600 | wc -l | tr -d ' ')" = 1
+restart_arca
+su -m _arca-ui -c "exec $d/arca-jmap-proof revoke $arca $workuid 0"
+jmap_probe new re-enrolled
+again=$(authority re-enrolled)
+test -n "$again" && test "$again" != "$first"
+jmap_probe kept re-enrolled-kept
+test "$(authority re-enrolled-kept)" = "$again"
+test "$(grep -Fc "_arca starts $jmap_worker as legacyjmapworker (system worker rule)" "$d/portcullisd.log")" = 12
+jls -q name >"$d/jmap-proof.jails"
+! grep -F 'app-org-atrium-jmap-proof-fixture' "$d/jmap-proof.jails"
+echo MAIL_JMAP_PROOF_PERSISTED_REVOKED_RECOVERED_OK
+echo MAIL_JMAP_PROOF_SIGNED_TESSERA_OK
 if grep -Ei 'broken pipe|caller hung up; removing worker jail' "$d/portcullisd.log"; then
     echo "Portcullis detected a premature disconnect" >&2
     exit 1
