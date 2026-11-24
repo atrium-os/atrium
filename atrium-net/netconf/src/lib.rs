@@ -48,6 +48,10 @@ pub mod op {
     /// SSID: "Trust this server" (pin what was seen, for that network
     /// only), then join; answers like `WIFI_JOIN`.
     pub const WIFI_TRUST_SERVER: u16 = 0x27;
+    /// [`CertRequest`] → [`KeyRequest`]: a new EAP-TLS key for the
+    /// network, made and kept in Arca, and a certificate request for it
+    /// (DER) to give the network's IT team.
+    pub const WIFI_CERT_REQUEST: u16 = 0x28;
     pub const WIFI_NEARBY: u16 = 0x30;
     pub const SET_COUNTRY: u16 = 0x40;
     pub const SET_STATIC: u16 = 0x41;
@@ -128,7 +132,7 @@ impl Grant {
         match o {
             STATUS | SUBSCRIBE => true,
             INTERFACES | ROUTES => self == Grant::Details,
-            WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE | WIFI_JOIN_ENTERPRISE | WIFI_SERVER_SEEN | WIFI_TRUST_SERVER => self == Grant::Wifi,
+            WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE | WIFI_JOIN_ENTERPRISE | WIFI_SERVER_SEEN | WIFI_TRUST_SERVER | WIFI_CERT_REQUEST => self == Grant::Wifi,
             WIFI_NEARBY => self == Grant::Nearby,
             SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS => self == Grant::Configure,
             PRINT_DISCOVERY => self == Grant::PrintDiscovery,
@@ -372,12 +376,14 @@ pub struct Profile {
     pub enterprise: bool,
 }
 
-/// An 802.1X network to remember and join (wifi.md §7.4). The password is
-/// what the user typed into Arca's field: only its handle passes here.
+/// An 802.1X network to remember and join (wifi.md §7.4). A password is
+/// what the user typed into Arca's field: only its handle passes here. A
+/// certificate login (EAP-TLS) names the key Arca made for the network
+/// (`WIFI_CERT_REQUEST`) and the certificate issued for it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Enterprise {
     pub ssid: Vec<u8>,
-    /// `peap`, `ttls-pap` or `ttls-mschapv2`.
+    /// `peap`, `ttls-pap`, `ttls-mschapv2` or `tls`.
     pub method: String,
     pub identity: String,
     /// The name sent before the tunnel; None: `anonymous@<realm>`.
@@ -388,7 +394,10 @@ pub struct Enterprise {
     /// The network's CA certificate (DER), or the system's roots.
     pub ca: Option<Vec<u8>>,
     pub system_roots: bool,
-    pub handle: [u8; 16],
+    pub handle: Option<[u8; 16]>,
+    pub key: Option<[u8; 16]>,
+    /// Our certificate (DER), issued for `key`.
+    pub cert: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Enterprise {
@@ -397,35 +406,113 @@ impl std::fmt::Debug for Enterprise {
     }
 }
 
-pub const ENTERPRISE_METHODS: [&str; 3] = ["peap", "ttls-pap", "ttls-mschapv2"];
+pub const ENTERPRISE_METHODS: [&str; 4] = ["peap", "ttls-pap", "ttls-mschapv2", "tls"];
+
+/// The most a CA or client certificate may be (DER): an RSA-4096 one with
+/// a few extensions fits.
+pub const MAX_CERT: usize = 3000;
 
 fn dns_name_ok(n: &str) -> bool {
     n.len() <= 253 && n.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
 }
 
+fn der_ok(c: &[u8]) -> bool {
+    !c.is_empty() && c.len() <= MAX_CERT && c[0] == 0x30
+}
+
 impl Enterprise {
     pub fn check(&self) -> Res<()> {
+        let bad = |s: &str| Err(Fail::new(status::MALFORMED, s));
         let text = |s: &str| !s.is_empty() && s.len() <= 253 && s.chars().all(|c| !c.is_control());
         if !ENTERPRISE_METHODS.contains(&self.method.as_str()) {
-            return Err(Fail::new(status::MALFORMED, "method is peap, ttls-pap or ttls-mschapv2"));
+            return bad("method is peap, ttls-pap, ttls-mschapv2 or tls");
         }
         if !text(&self.identity) || self.anonymous.as_deref().is_some_and(|a| !text(a)) {
-            return Err(Fail::new(status::MALFORMED, "a username is 1 to 253 characters"));
+            return bad("a username is 1 to 253 characters");
         }
         if !self.domain.is_empty() && !dns_name_ok(&self.domain) {
-            return Err(Fail::new(status::MALFORMED, "the server's domain is a DNS name"));
+            return bad("the server's domain is a DNS name");
         }
         if (self.ca.is_some() || self.system_roots) && self.domain.is_empty() {
-            return Err(Fail::new(status::MALFORMED, "a CA needs the server's domain"));
+            return bad("a CA needs the server's domain");
         }
         if self.ca.is_some() && self.system_roots {
-            return Err(Fail::new(status::MALFORMED, "a CA or the system's roots, not both"));
+            return bad("a CA or the system's roots, not both");
         }
-        if self.ca.as_ref().is_some_and(|c| c.is_empty() || c.len() > 1500 || c[0] != 0x30) {
-            return Err(Fail::new(status::MALFORMED, "the CA certificate is DER, at most 1500 bytes"));
+        if self.ca.as_ref().is_some_and(|c| !der_ok(c)) || self.cert.as_ref().is_some_and(|c| !der_ok(c)) {
+            return bad("a certificate is DER, at most 3000 bytes");
         }
-        Ok(())
+        match (self.method == "tls", self.handle.is_some(), self.key.is_some() && self.cert.is_some()) {
+            (true, false, true) | (false, true, false) => Ok(()),
+            (true, _, _) => bad("a certificate login takes the key and its certificate, no password"),
+            (false, _, _) => bad("a password login takes Arca's handle"),
+        }
     }
+}
+
+/// `WIFI_CERT_REQUEST`: the network, and the name the request carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertRequest {
+    pub ssid: Vec<u8>,
+    pub name: String,
+}
+
+/// The new key's Arca id and the certificate request (DER).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRequest {
+    pub key: [u8; 16],
+    pub csr: Vec<u8>,
+}
+
+/// One PEM block (or DER as is) as DER: certificates picked from a file.
+pub fn pem_to_der(b: &[u8]) -> Option<Vec<u8>> {
+    if b.first() == Some(&0x30) {
+        return Some(b.to_vec());
+    }
+    let s = std::str::from_utf8(b).ok()?;
+    let start = s.find("-----BEGIN ")?;
+    let body_start = start + s[start..].find('\n')? + 1;
+    let end = body_start + s[body_start..].find("-----END ")?;
+    let mut bits = 0u32;
+    let mut n = 0;
+    let mut out = Vec::new();
+    for c in s[body_start..end].bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        bits = (bits << 6) | v as u32;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((bits >> n) as u8);
+        }
+    }
+    (out.first() == Some(&0x30)).then_some(out)
+}
+
+/// DER as a PEM block labelled `label` ("CERTIFICATE REQUEST").
+pub fn der_to_pem(der: &[u8], label: &str) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    for c in der.chunks(3) {
+        let v = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            b64.push(if i <= c.len() { A[(v >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    let mut pem = format!("-----BEGIN {label}-----\n");
+    for l in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(l).unwrap_or(""));
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {label}-----\n"));
+    pem
 }
 
 /// The certificate an 802.1X server showed on a first join, for "Trust
@@ -545,6 +632,9 @@ pub mod server {
         fn trust_server(&self, _ssid: Vec<u8>) -> Res<()> {
             Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
         }
+        fn cert_request(&self, _r: CertRequest) -> Res<KeyRequest> {
+            Err(Fail::new(status::UNSUPPORTED, "no 802.1X here"))
+        }
         fn leave(&self) -> Res<()>;
         fn forget(&self, ssid: Vec<u8>) -> Res<()>;
         fn set_profile(&self, p: Profile) -> Res<()>;
@@ -642,6 +732,13 @@ pub mod server {
                 op::WIFI_TRUST_SERVER => enc(&arg::<Vec<u8>>(p).and_then(|s| {
                     valid_ssid(&s)?;
                     b.trust_server(s)
+                })),
+                op::WIFI_CERT_REQUEST => enc(&arg::<CertRequest>(p).and_then(|r| {
+                    valid_ssid(&r.ssid)?;
+                    if r.name.is_empty() || r.name.len() > 64 || r.name.chars().any(|c| c.is_control()) {
+                        return Err(Fail::new(status::MALFORMED, "a name is 1 to 64 characters"));
+                    }
+                    b.cert_request(r)
                 })),
                 op::WIFI_LEAVE => enc(&b.leave()),
                 op::WIFI_FORGET => enc(&arg::<Vec<u8>>(p).and_then(|s| {
@@ -791,6 +888,9 @@ pub mod client {
         }
         pub fn trust_server(&mut self, ssid: &[u8]) -> Res<()> {
             self.call(op::WIFI_TRUST_SERVER, &ssid.to_vec())
+        }
+        pub fn cert_request(&mut self, r: &CertRequest) -> Res<KeyRequest> {
+            self.call(op::WIFI_CERT_REQUEST, r)
         }
         pub fn leave(&mut self) -> Res<()> {
             self.call(op::WIFI_LEAVE, &())

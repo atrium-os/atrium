@@ -2342,6 +2342,58 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
     cell_text(ctx, Rect::new(tx0, cy + line_top(cv.valign, ch, lh), w, lh), shown, style, cv.marks);
 }
 
+/// F4 in a formula: `text` with the cell reference touching byte `caret`
+/// moved to its next anchoring (A1 → $A$1 → A$1 → $A1 → A1; both ends of
+/// a range together), and the caret after it. `None` outside a formula or
+/// a reference.
+pub fn cycle_ref(text: &str, caret: usize) -> Option<(String, usize)> {
+    if !text.starts_with('=') || caret > text.len() || !text.is_char_boundary(caret) {
+        return None;
+    }
+    let tok = |c: char| c.is_ascii_alphanumeric() || c == '$' || c == ':';
+    let start = text[..caret].char_indices().rev().take_while(|&(_, c)| tok(c)).last().map_or(caret, |(i, _)| i);
+    let end = caret + text[caret..].chars().take_while(|&c| tok(c)).map(char::len_utf8).sum::<usize>();
+    if start == end || text[end..].starts_with('(') {
+        return None;
+    }
+    // A reference starts the token: not part of a name such as `Tax_A1`.
+    if text[..start].chars().next_back().is_some_and(|c| c == '_' || c == '.' || c.is_alphanumeric()) {
+        return None;
+    }
+    let parts: Vec<&str> = text[start..end].split(':').collect();
+    if parts.len() > 2 {
+        return None;
+    }
+    let mut cells = Vec::new();
+    for p in &parts {
+        let col_abs = p.starts_with('$');
+        let rest = p.trim_start_matches('$');
+        let letters = rest.chars().take_while(char::is_ascii_alphabetic).count();
+        if !(1..=3).contains(&letters) {
+            return None;
+        }
+        let (col, rest) = rest.split_at(letters);
+        let row_abs = rest.starts_with('$');
+        let row = rest.trim_start_matches('$');
+        if row.is_empty() || !row.chars().all(|c| c.is_ascii_digit()) || row.starts_with('0') || rest.matches('$').count() > 1 {
+            return None;
+        }
+        cells.push((col, row, col_abs, row_abs));
+    }
+    let (c0, r0) = (cells[0].2, cells[0].3);
+    let (col_abs, row_abs) = match (c0, r0) {
+        (false, false) => (true, true),
+        (true, true) => (false, true),
+        (false, true) => (true, false),
+        (true, false) => (false, false),
+    };
+    let dollar = |b: bool| if b { "$" } else { "" };
+    let new: Vec<String> = cells.iter().map(|(col, row, _, _)| format!("{}{col}{}{row}", dollar(col_abs), dollar(row_abs))).collect();
+    let new = new.join(":");
+    let out = format!("{}{new}{}", &text[..start], &text[end..]);
+    Some((out, start + new.len()))
+}
+
 /// The most times a `*` fill's character is repeated in one cell.
 const MAX_FILL_REPEAT: usize = 512;
 
@@ -2374,10 +2426,11 @@ fn format_key(chars: &str, shift: bool) -> Option<char> {
             '0' | ')' => Some(')'),
             '=' | '+' => Some('+'),
             '-' | '_' => Some('_'),
+            'l' => Some('L'),
             _ => None,
         };
     }
-    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`' | '9' | '0' | '-' | '+').then_some(c)
+    matches!(c, 'b' | 'i' | 'u' | '5' | '1' | '`' | '9' | '0' | '-' | '+' | 't' | 'l' | 'k').then_some(c)
 }
 
 /// How far down a cell `ch` px tall lines `th` px tall start, by `v`.
@@ -2560,6 +2613,15 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                     let (r, c) = (g.cursor.0 - 1, g.cursor.1);
                     let t = if m.shift || chars == "\"" { src.cell(r, c).map(|v| v.text).unwrap_or_default() } else { src.edit_text(r, c) };
                     ed.insert(&t);
+                }
+                return true;
+            }
+            // F4 in a formula: the reference at the caret cycles A1, $A$1,
+            // A$1, $A1.
+            Key::F(4) if !m.ctrl && !m.alt && !m.meta => {
+                if let Some((t, caret)) = cycle_ref(ed.text(), ed.caret()) {
+                    ed.set_text(&t);
+                    ed.set_caret(caret, false);
                 }
                 return true;
             }
@@ -3031,6 +3093,25 @@ mod tests {
     }
 
     #[test]
+    fn f4_cycles_the_reference_at_the_caret() {
+        let c = |t: &str, at: usize| cycle_ref(t, at).map(|(s, k)| (s, k));
+        assert_eq!(c("=A1+B2", 3), Some(("=$A$1+B2".into(), 5)));
+        assert_eq!(c("=$A$1+B2", 5), Some(("=A$1+B2".into(), 4)));
+        assert_eq!(c("=A$1+B2", 4), Some(("=$A1+B2".into(), 4)));
+        assert_eq!(c("=$A1+B2", 4), Some(("=A1+B2".into(), 3)));
+        // Inside a reference, and both ends of a range.
+        assert_eq!(c("=SUM(B2:C10)", 6), Some(("=SUM($B$2:$C$10)".into(), 15)));
+        assert_eq!(c("=Sheet2!A1*2", 10), Some(("=Sheet2!$A$1*2".into(), 12)));
+        // Not a reference: a function name, a defined name, plain text, no formula.
+        assert_eq!(c("=LOG10(5)", 6), None);
+        assert_eq!(c("=Tax_A1*2", 7), None);
+        assert_eq!(c("=Total+1", 6), None);
+        assert_eq!(c("A1", 2), None);
+        assert_eq!(c("=A0", 3), None);
+        assert_eq!(c("=1+2", 2), None);
+    }
+
+    #[test]
     fn column_letters() {
         assert_eq!(col_name(0), "A");
         assert_eq!(col_name(25), "Z");
@@ -3177,7 +3258,7 @@ mod tests {
         assert_eq!(log.borrow().last(), Some(&GridAction::AutoSum(CellRange { r0: 4, c0: 3, r1: 4, c1: 3 })));
         key(&mut app, Key::Char, "g", Modifiers { ctrl: true, ..Modifiers::default() });
         assert_eq!(log.borrow().last(), Some(&GridAction::GoTo));
-        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~'), ("`", false, '`'), ("1", false, '1'), ("7", true, '&'), ("_", true, '_'), ("9", false, '9'), ("0", false, '0'), ("(", true, '('), ("0", true, ')'), ("-", false, '-'), ("+", false, '+'), ("=", true, '+')] {
+        for (k, shift, want) in [("b", false, 'b'), ("I", false, 'i'), ("5", false, '5'), ("%", true, '%'), ("4", true, '$'), ("~", true, '~'), ("`", false, '`'), ("1", false, '1'), ("7", true, '&'), ("_", true, '_'), ("9", false, '9'), ("0", false, '0'), ("(", true, '('), ("0", true, ')'), ("-", false, '-'), ("+", false, '+'), ("=", true, '+'), ("t", false, 't'), ("l", false, 'l'), ("L", true, 'L'), ("k", false, 'k')] {
             key(&mut app, Key::Char, k, Modifiers { ctrl: true, shift, ..Modifiers::default() });
             assert_eq!(log.borrow().last(), Some(&GridAction::Format(want)), "{k}");
         }
@@ -3865,6 +3946,9 @@ mod tests {
         key(&mut app, Key::F(2), "", none);
         key(&mut app, Key::Left, "", none);
         assert_eq!(state.get_cloned().edit.as_ref().map(|e| (e.text().to_string(), e.caret())), Some(("=A1".into(), 2)));
+        // F4 there: the reference anchored, the caret after it.
+        key(&mut app, Key::F(4), "", none);
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| (e.text().to_string(), e.caret())), Some(("=$A$1".into(), 5)));
         key(&mut app, Key::Escape, "", none);
         // Ctrl+' below it: the formula above as written; Ctrl+Shift+': its text.
         key(&mut app, Key::Down, "", none);

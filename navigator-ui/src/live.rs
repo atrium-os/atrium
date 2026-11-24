@@ -355,6 +355,14 @@ impl Live {
 
     /// The document-lane child of the page on screen goes back in the
     /// page slot (a live page ended or was stopped).
+    /// The live run ended on an entry the engine made by changing its
+    /// address (I6.2): that entry has no page yet, so it opens now.
+    fn open_route_entry(&mut self) {
+        if self.shown.is_some_and(|k| !self.children.iter().any(|c| c.key == k)) {
+            self.started = false;
+        }
+    }
+
     fn reshow_document(&self) {
         let Some(key) = self.shown else { return };
         let Some(c) = self.children.iter().find(|c| c.key == key) else { return };
@@ -907,11 +915,17 @@ impl Live {
                         eprintln!("navigator-ui: a live page's navigation to {url} came after it left the screen");
                     }
                 }
+                Event::LiveUrlChanged { from, url } => {
+                    if !s.live_url_changed(&from, &url) {
+                        eprintln!("navigator-ui: a live page's address {url} not taken");
+                    }
+                }
                 Event::LiveEnded { url, why } => {
                     eprintln!("navigator-ui: {url} stopped running live{}", why.as_deref().map(|w| format!(": {w}")).unwrap_or_default());
                     if self.live_placed.as_ref().is_some_and(|(u, _)| *u == url) { self.live_placed = None; }
                     s.live_reported(&url, None, why);
                     self.reshow_document();
+                    self.open_route_entry();
                 }
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
@@ -999,6 +1013,17 @@ impl Live {
                 ParentEvent::Attached { .. } => {
                     eprintln!("navigator-ui: page child attached");
                     self.children[i].attached = true;
+                    // A page opened while the slot was hidden for a live page
+                    // (a live page's link to another site) must show: the
+                    // slot stays hidden only while its own page runs live.
+                    let live_here = s.live_run.as_ref().is_some_and(|r| r.origin.is_some() && Some(r.key) == self.shown);
+                    if on_screen && !live_here {
+                        if let Some(e) = &self.embeds {
+                            if let Err(err) = e.borrow_mut().show(PAGE_SLOT, self.children[i].embed) {
+                                eprintln!("navigator-ui: limend: {err:?}");
+                            }
+                        }
+                    }
                     if let Some(t) = self.children[i].pending.take() {
                         self.give(i, t);
                     }
@@ -1219,6 +1244,7 @@ impl Live {
                     send(&mut self.w, &Request::PlaceLive { url, rect: None });
                     self.live_placed = None;
                     self.reshow_document();
+                    self.open_route_entry();
                 }
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
@@ -1344,6 +1370,12 @@ impl Live {
             }
             self.shown = want;
             match want {
+                // The live engine changed its own address (I6.2): its entry
+                // has nothing to open, and the engine stays over the page.
+                Some(key) if s.live_route(key) => {
+                    if let Some(e) = &self.embeds { let _ = e.borrow_mut().hide(PAGE_SLOT); }
+                    s.live = s.shown_url().map(LivePage::Shown);
+                }
                 None => {
                     if let Some(e) = &self.embeds {
                         let _ = e.borrow_mut().hide(PAGE_SLOT);

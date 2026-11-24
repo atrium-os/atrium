@@ -18,7 +18,7 @@ use vinculum_control::Prompt;
 use crate::devices::{self, DevPage, Group, Row};
 use crate::display::{self as disp, DispPage, Place};
 use crate::sound::{self as snd, SoundPage};
-use crate::network::{headline, manual_fields, name, security_label, NetPage, EAP_METHODS, MAC_POLICIES};
+use crate::network::{headline, manual_fields, name, security_label, Check, NetPage, EAP_METHODS, MAC_POLICIES};
 use atrium_netconf::Target;
 use pergola::text_edit::TextEdit;
 
@@ -69,8 +69,9 @@ pub struct CuriaView {
     /// The IP settings row's address, router and DNS fields, then the DNS
     /// servers row's field.
     /// Address, router, DNS of a fixed setting; own DNS servers; their TLS
-    /// name; a work network's username and its server's domain.
-    pub net_fields: [Mutable<TextEdit>; 7],
+    /// name; a work network's username, its server's domain and the
+    /// anonymous identity.
+    pub net_fields: [Mutable<TextEdit>; 8],
     pub net_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
@@ -417,6 +418,13 @@ impl CuriaView {
                 .emit(ctx);
         }
 
+        // The system picker, over the window, while the sheet asks for a file.
+        if p.pick.is_some() {
+            let (w, h) = self.size.get();
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, crate::vpn::PICK_SLOT);
+        }
+
         // The last outcome, at the foot.
         if let Some(n) = &p.notice {
             let ny = h - em(44.0);
@@ -439,43 +447,91 @@ impl CuriaView {
         let fx = x0 + em(44.0);
         let fw = ((pw - em(120.0)) / 2.0).clamp(em(150.0), em(260.0));
         let fy = y + em(4.0);
-        let (pg, user, dom) = (self.page.clone(), self.net_fields[5].clone(), self.net_fields[6].clone());
+        let fields = (self.net_fields[5].clone(), self.net_fields[6].clone(), self.net_fields[7].clone());
+        let join = {
+            let (pg, fields) = (self.page.clone(), fields.clone());
+            move || {
+                let v = |m: &Mutable<TextEdit>| m.get_cloned().text().to_string();
+                let (u, d, a) = (v(&fields.0), v(&fields.1), v(&fields.2));
+                with(&pg, |p| p.ent_join_pressed(&u, &d, &a, std::time::Instant::now()));
+            }
+        };
+        let submit = join.clone();
         pergola::widgets::TextField::new(self.net_fields[5].clone())
             .placeholder("Username (e.g. alice@corp.example)")
             .autofocus(true)
             .at(fx, fy)
             .width(fw)
-            .on_submit(move |_| {
-                let (u, d) = (user.get_cloned().text().to_string(), dom.get_cloned().text().to_string());
-                with(&pg, |p| p.ent_join_pressed(&u, &d, std::time::Instant::now()));
-            })
+            .on_submit(move |_| submit())
             .render(ctx);
-        // Arca draws its key badge left of the field's rect.
-        self.cred.clone().at(fx + fw + em(32.0), fy).size(fw, em(32.0)).render(ctx);
+        let rx = fx + fw + em(32.0);
+        if f.tls() {
+            // No password: a key made in Arca, certified by the network.
+            let (pg, user) = (self.page.clone(), self.net_fields[5].clone());
+            let label = if f.request.is_some() { "Make a new request" } else { "Make a certificate request" };
+            button(ctx, rx, fy + em(1.0), label, Look::Secondary, p.joining.is_none(), move || {
+                let u = user.get_cloned().text().to_string();
+                with(&pg, |p| p.request_certificate(&u))
+            });
+        } else {
+            // Arca draws its key badge left of the field's rect.
+            self.cred.clone().at(rx, fy).size(fw, em(32.0)).render(ctx);
+        }
         y = fy + em(40.0);
         let pg = self.page.clone();
         let mut bx = fx;
         bx += button(ctx, bx, y, &format!("Sign-in: {}", EAP_METHODS[f.method].1), Look::Secondary, true, move || with(&pg, NetPage::next_method)) + em(8.0);
-        let (pg, on) = (self.page.clone(), f.system_roots);
-        bx += button(ctx, bx, y, if on { "Check server: system certificates" } else { "Check server: ask on first join" }, Look::Secondary, true, move || {
-            with(&pg, |p| p.set_system_roots(!on))
-        }) + em(8.0);
+        let check = match (f.check, &f.ca) {
+            (Check::FirstJoin, _) => "Check server: ask on first join".to_string(),
+            (Check::System, _) => "Check server: system certificates".to_string(),
+            (Check::CaFile, Some((n, _))) => format!("Check server: CA {n}"),
+            (Check::CaFile, None) => "Check server: CA file…".to_string(),
+        };
+        let pg = self.page.clone();
+        bx += button(ctx, bx, y, &check, Look::Secondary, p.pick.is_none(), move || with(&pg, NetPage::next_check)) + em(8.0);
         pergola::widgets::TextField::new(self.net_fields[6].clone())
-            .placeholder(if on { "Server's domain (needed)" } else { "Server's domain (optional)" })
+            .placeholder(if f.check == Check::FirstJoin { "Server's domain (optional)" } else { "Server's domain (needed)" })
             .at(bx, y)
-            .width((fx + 2.0 * fw + em(32.0) - bx).max(em(140.0)))
+            .width((rx + fw - bx).max(em(140.0)))
             .render(ctx);
         y += em(40.0);
-        let ready = p.joining.is_none() && p.armed.is_none() && p.field_up;
-        let (pg, user, dom) = (self.page.clone(), self.net_fields[5].clone(), self.net_fields[6].clone());
-        let jw = button(ctx, fx, y, "Join", Look::Primary, ready, move || {
-            let (u, d) = (user.get_cloned().text().to_string(), dom.get_cloned().text().to_string());
-            with(&pg, |p| p.ent_join_pressed(&u, &d, std::time::Instant::now()));
-        });
+        // Only the tunnelled methods have an outer identity of their own.
+        if !f.tls() {
+            pergola::widgets::TextField::new(self.net_fields[7].clone())
+                .placeholder("Anonymous identity (optional, e.g. anonymous@corp.example)")
+                .at(fx, y)
+                .width(rx + fw - fx)
+                .render(ctx);
+            y += em(40.0);
+        }
+        if let (true, Some((_, pem))) = (f.tls(), &f.request) {
+            let lines: Vec<&str> = pem.lines().collect();
+            let mh = em(40.0) + em(13.0) * lines.len() as f32 + em(44.0);
+            rect(ctx, fx, y, rx + fw - fx, mh, t.bg_surface(), 8.0);
+            text(ctx, fx + em(12.0), y + em(18.0), "Give your IT team this certificate request, then import what they sign. The key stays in Arca.", type_size::SM, Weight::Regular, t.text_secondary());
+            for (i, l) in lines.iter().enumerate() {
+                text(ctx, fx + em(12.0), y + em(40.0) + em(13.0) * i as f32, l, type_size::XS, Weight::Regular, t.text_primary());
+            }
+            let by = y + mh - em(40.0);
+            let pem2 = pem.clone();
+            let mut bx = fx + em(12.0);
+            bx += button(ctx, bx, by, "Copy the request", Look::Secondary, true, move || {
+                let _ = pergola::clipboard::copy_text(&pem2, false);
+            }) + em(8.0);
+            let pg = self.page.clone();
+            let label = match &f.cert {
+                Some((n, _)) => format!("Signed certificate: {n}"),
+                None => "Import the signed certificate…".to_string(),
+            };
+            button(ctx, bx, by, &label, if f.cert.is_some() { Look::Secondary } else { Look::Primary }, p.pick.is_none(), move || with(&pg, NetPage::import_certificate));
+            y += mh + em(8.0);
+        }
+        let ready = p.joining.is_none() && p.armed.is_none() && p.pick.is_none() && if f.tls() { f.cert.is_some() } else { p.field_up };
+        let jw = button(ctx, fx, y, "Join", Look::Primary, ready, join);
         let pg = self.page.clone();
         button(ctx, fx + jw + em(8.0), y, "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_ask));
         y += em(40.0);
-        if !p.field_up {
+        if !p.field_up && !f.tls() {
             text(ctx, fx, y - em(2.0), "The password field is not available right now; trying again…", type_size::XS, Weight::Regular, t.text_tertiary());
             y += em(20.0);
         }

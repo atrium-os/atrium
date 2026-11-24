@@ -352,3 +352,26 @@ fn a_hung_service_times_out() {
     held.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn enterprise_requests_are_checked_and_certificates_convert() {
+    use crate::{der_to_pem, pem_to_der, Enterprise};
+    let pw = Enterprise { ssid: b"corp".to_vec(), method: "peap".into(), identity: "alice".into(), anonymous: None, domain: String::new(), ca: None, system_roots: false, handle: Some([1; 16]), key: None, cert: None };
+    assert!(pw.check().is_ok());
+    assert!(Enterprise { handle: None, ..pw.clone() }.check().is_err(), "a password login needs the handle");
+    let tls = Enterprise { method: "tls".into(), handle: None, key: Some([2; 16]), cert: Some(vec![0x30, 3, 1, 2, 3]), ..pw.clone() };
+    assert!(tls.check().is_ok());
+    assert!(Enterprise { cert: None, ..tls.clone() }.check().is_err(), "a certificate login needs its certificate");
+    assert!(Enterprise { handle: Some([1; 16]), ..tls.clone() }.check().is_err(), "and no password");
+    assert!(Enterprise { cert: Some(vec![0x30; 3001]), ..tls.clone() }.check().is_err(), "bounded");
+    assert!(Enterprise { ca: Some(vec![0x30, 0]), ..pw.clone() }.check().is_err(), "a CA needs a domain");
+    assert!(Enterprise { method: "md5".into(), ..pw }.check().is_err());
+    let der: Vec<u8> = (0..=255u8).cycle().take(301).map(|b| if b == 0 { 0x30 } else { b }).collect();
+    let der = [vec![0x30], der].concat();
+    let pem = der_to_pem(&der, "CERTIFICATE REQUEST");
+    assert!(pem.starts_with("-----BEGIN CERTIFICATE REQUEST-----\n") && pem.lines().all(|l| l.len() <= 64));
+    assert_eq!(pem_to_der(pem.as_bytes()), Some(der.clone()));
+    assert_eq!(pem_to_der(&der), Some(der), "DER as is");
+    assert_eq!(pem_to_der(b"-----BEGIN X-----\n!!!!\n-----END X-----\n"), None);
+    assert_eq!(pem_to_der(b"not a certificate"), None);
+}

@@ -433,6 +433,10 @@ fi
 echo "=== fuzz and Move into a worker"
 if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/toolchains/rust/bin/cargo-atrium atrium 2>&1 | grep -q 'worker add'"; then
     rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    # New project leaves its Composition view up: the strip's Files (the
+    # first, 8 under the toolbar) brings back the tree.
+    press 64 100
+    waitstate 'view=Code' 20 || bad "files: $(state)"
     for r in photos photos/src photos/src/lib.rs; do
         ROW=$(rows | grep -n "^$r\$" | cut -d: -f1)
         [ -n "$ROW" ] || { bad "no row $r: $(state)"; break; }
@@ -441,25 +445,29 @@ if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/tool
     waitstate 'tabs=\[[^]]*photos/src/lib.rs' 20 && ok "photos/src/lib.rs opens" || bad "lib.rs: $(state)"
     waitstate 'fuzz=Some((false, "core:album", 0' 300 && ok "the fuzz panel lists core:album" || bad "fuzz list: $(state)"
     # The view strip's Fuzz (ui.rs: Files, Problems, Composition, Fuzz, 42
-    # apart from 8 under the toolbar), then Start fuzzing (220 from the right).
+    # apart from 8 under the toolbar), then Start fuzzing (views.rs: at the
+    # top right of the 300-wide list).
     press 64 226
-    waitstate 'panel=Some(Fuzz)' 20 && ok "the view strip opens Fuzz" || bad "strip: $(state)"
-    press 985 485
+    waitstate 'view=Fuzz' 20 && ok "the view strip opens the Fuzz view" || bad "strip: $(state)"
+    press 309 100
     # libFuzzer and the harness build in the workspace under TCG: slow.
     waitstate 'fuzz=Some((true, "core:album", [1-9][0-9]*, true' 3600 && ok "fuzzing finds the crash in the core" || bad "fuzz: $(state) $(V "tail -5 $B/artifex.log")"
     shot artifex-12-fuzz-crash
-    press 985 485              # Stop fuzzing
-    # The fix line's Move it button (row 2 of the panel, right-aligned).
-    press 1072 544
+    press 309 100              # Stop fuzzing
+    # The crash's Move into a worker (views.rs: first under its summary).
+    press 498 222
     waitstate 'moving=true' 300 && ok "Move it previews cargo atrium worker add" || bad "preview: $(state)"
     shot artifex-13-move-preview
     check "the preview writes nothing" "0" "$(V "grep -c 'workers' $W/proj/work/photos/atrium.toml")"
-    press 980 520              # the preview's Move
+    press 1076 636             # the preview pane's Move (bottom right)
     waitstate 'note=Some("Moved crate::read_album into the worker read-album")' 300 && ok "Move makes the worker" || bad "move: $(state)"
     check "atrium.toml has it" "1" "$(V "grep -c '^\[\[workers\]\]' $W/proj/work/photos/atrium.toml")"
     waitstate 'comp=Some(("org.example.photos", 1,' 60 && ok "the composition panel shows the worker" || bad "composition: $(state)"
     waitstate 'fuzz=Some((false, "[^"]*worker:read-album' 300 && ok "and the fuzz panel has worker:read-album" || bad "fuzz targets: $(state)"
     shot artifex-14-moved
+    press 64 184               # the strip's Composition
+    waitstate 'view=Composition' 20 && ok "the strip opens the Composition view" || bad "composition view: $(state)"
+    shot artifex-15-composition
 else
     echo "  (no vendored fuzz crates (FUZZ_VENDOR), or no cargo-atrium with worker add in the Rust layer: skipped)"
 fi

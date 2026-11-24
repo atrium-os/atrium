@@ -81,3 +81,5 @@ pub const WARNING: char = '\u{e4e0}';
 pub const WARNING_OCTAGON: char = '\u{e4e4}';
 pub const GEAR: char = '\u{e270}';
 pub const ARROW_CLOCKWISE: char = '\u{e036}';
+pub const GLOBE: char = '\u{e288}';
+pub const KEY: char = '\u{e2d6}';

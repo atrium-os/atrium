@@ -290,6 +290,7 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
             }
             Want::JoinEnterprise(x) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.join_enterprise(x).map_err(e)) },
             Want::Seen(s) => Got::Seen(s.clone(), connect(Grant::Wifi).and_then(|mut c| c.server_seen(s).map_err(e))),
+            Want::CertRequest(r) => Got::KeyRequest(r.ssid.clone(), connect(Grant::Wifi).and_then(|mut c| c.cert_request(r).map_err(e))),
             Want::Trust(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.trust_server(s).map_err(e)) },
             Want::Leave => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.leave().map_err(e)) },
             Want::Forget(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.forget(s).map_err(e)) },
@@ -569,6 +570,8 @@ fn main() {
     // The system picker, while a WireGuard file is chosen (vpn.md §7.3).
     let mut vpn_pick: Option<limen::proto::EmbedId> = None;
     let mut vpn_pick_ask = false;
+    // The picker for the work-network sheet (a CA, our certificate).
+    let mut net_pick: Option<limen::proto::EmbedId> = None;
     let workspaces = Mutable::with_dirty(curia::workspace_access::Page::default(), dirty.clone());
     let (workspaces_tx, workspaces_rx) = channel();
     let mut workspace_page_open = false;
@@ -933,10 +936,64 @@ fn main() {
                     }
                 }
             }
+            if let (Some(what), None) = (p.pick, net_pick) {
+                let asked = win.embed_token().ok_or(()).and_then(|token| {
+                    let title = match what {
+                        curia::network::NetPick::Ca => "The network's CA certificate",
+                        curia::network::NetPick::Cert => "Import the signed certificate",
+                    };
+                    let filter = limen::picker::Filter { title: title.into(), extensions: vec!["pem".into(), "crt".into(), "cer".into(), "der".into()], ..limen::picker::Filter::file() };
+                    let id = e.borrow_mut().request("picker", token, curia::vpn::PICK_SLOT).map_err(|_| ())?;
+                    e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map_err(|_| ())?;
+                    Ok(id)
+                });
+                match asked {
+                    Ok(id) => net_pick = Some(id),
+                    Err(()) => p.apply(Got::Picked(Err("the picker didn't open".into()))),
+                }
+                changed = true;
+            }
             let mut lost = false;
             loop {
                 let ev = e.borrow_mut().poll(Duration::from_millis(1));
                 match ev {
+                    // A certificate picked for the work-network sheet.
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if Some(embed) == net_pick => {
+                        let fd = e.borrow_mut().take_fd();
+                        if let (Some(limen::picker::ToParent::File { name, .. }), Some(fd)) = (limen::picker::ToParent::decode(&bytes), fd) {
+                            use std::io::Read;
+                            let mut buf = Vec::new();
+                            let max = 16 * 1024;
+                            let r = match std::fs::File::from(fd).take(max + 1).read_to_end(&mut buf) {
+                                Ok(n) if n as u64 > max => Err(format!("{name} is too large for a certificate")),
+                                Ok(_) => Ok((name, buf)),
+                                Err(err) => Err(format!("couldn't read {name}: {err}")),
+                            };
+                            p.apply(Got::Picked(r));
+                            changed = true;
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == net_pick => {
+                        let end = match limen::picker::ToParent::decode(&bytes) {
+                            Some(limen::picker::ToParent::Done { files }) => Some(if files == 0 { Some(String::new()) } else { None }),
+                            Some(limen::picker::ToParent::Cancelled) => Some(Some(String::new())),
+                            Some(limen::picker::ToParent::Failed { why }) => Some(Some(why)),
+                            _ => None,
+                        };
+                        if let Some(err) = end {
+                            if let Some(why) = err {
+                                p.apply(Got::Picked(Err(why)));
+                            }
+                            let _ = e.borrow_mut().detach_embed(embed);
+                            net_pick = None;
+                            changed = true;
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == net_pick => {
+                        net_pick = None;
+                        p.apply(Got::Picked(Err("the picker went away".into())));
+                        changed = true;
+                    }
                     // A WireGuard file picked: read in (64 KiB at most).
                     Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if Some(embed) == vpn_pick => {
                         let fd = e.borrow_mut().take_fd();
@@ -1015,6 +1072,9 @@ fn main() {
                 }
             }
             if lost {
+                if net_pick.take().is_some() {
+                    p.apply(Got::Picked(Err("the picker went away".into())));
+                }
                 if vpn_pick.take().is_some() {
                     let _ = vtx.send(curia::vpn::Got::Picked(Err("the picker went away".into())));
                 }
@@ -1026,6 +1086,10 @@ fn main() {
                 p.field(None, Instant::now());
                 changed = true;
             }
+        }
+        if embeds.is_none() && p.pick.is_some() {
+            p.apply(Got::Picked(Err("the system picker isn't running".into())));
+            changed = true;
         }
         if std::mem::take(&mut vpn_pick_ask) {
             // Asked with no limend: the picker can't come.

@@ -18,7 +18,7 @@ use crate::exec::{Exec, Proc};
 use crate::lsp;
 use crate::tasks::{self, Severity};
 use crate::tree::{self, Tree};
-use crate::ui::{Act, Debug, DocCells, Panel, State, Tab};
+use crate::ui::{Act, Debug, DocCells, Main, Panel, State, Tab};
 
 /// Output kept from a task (the tail).
 pub const OUTPUT_MAX: usize = 1 << 20;
@@ -171,7 +171,24 @@ impl Engine {
     /// its code grid).
     pub fn act(&mut self, a: Act, s: &mut State) -> bool {
         let before = self.active;
+        // What goes to a file, or opens a panel under the code, shows the code.
+        if matches!(a, Act::Open(_) | Act::Tab(_) | Act::Problem(_) | Act::Crash(_) | Act::Frame(_) | Act::Definition
+            | Act::ReplayCrash(_) | Act::Debug | Act::Panel(_) | Act::Task(_) | Act::Run | Act::CycleTab(_)) {
+            s.view = Main::Code;
+        }
         match a {
+            Act::View(v) => {
+                s.view = v;
+                // A full view has the window to itself.
+                if v != Main::Code {
+                    s.panel_open = false;
+                }
+            }
+            Act::SelectCrash(i) => {
+                if s.fuzz.as_ref().is_some_and(|f| i < f.crashes.len()) {
+                    s.crash = i;
+                }
+            }
             Act::Choose => {
                 self.list(s);
                 s.choosing = true;
@@ -415,6 +432,29 @@ impl Engine {
         }
     }
 
+    /// The start of the shown crash's input, for the fuzz view's dump.
+    fn crash_input(&self, s: &mut State) {
+        let Some(c) = s.fuzz.as_ref().and_then(|f| f.crashes.get(s.crash).or(f.crashes.first())) else {
+            s.crash_bytes = None;
+            return;
+        };
+        if s.crash_bytes.as_ref().is_some_and(|(i, _)| *i == c.input) {
+            return;
+        }
+        let rel = match (&self.remote_root, c.input.starts_with('/')) {
+            (Some(r), true) => c.input.strip_prefix(&format!("{r}/")).map(str::to_string),
+            (_, true) => None,
+            _ => join_rel(&s.project, &c.input),
+        };
+        let mut bytes = Vec::new();
+        if let Some(f) = rel.and_then(|rel| std::fs::File::open(self.root.join(rel)).ok()) {
+            use std::io::Read;
+            // The dump shows 8 lines of 16.
+            let _ = f.take(128).read_to_end(&mut bytes);
+        }
+        s.crash_bytes = Some((c.input.clone(), bytes));
+    }
+
     fn worker_add(&mut self, project: &str, worker: &str, from: &str, dry: bool, s: &mut State) {
         let mut argv: Vec<String> = crate::fuzz::WORKER_ADD.iter().map(|a| a.to_string()).collect();
         argv.extend([worker.to_string(), "--from".into(), from.to_string(), "--json".into()]);
@@ -462,9 +502,7 @@ impl Engine {
                 }
             }
         } else {
-            if matches!(s.panel, Panel::Composition | Panel::Fuzz) {
-                s.panel = Panel::Output;
-            }
+            s.view = Main::Code;
             self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. } | Job::FuzzList { .. }));
             s.fuzz = None;
         }
@@ -1042,6 +1080,7 @@ impl Engine {
     /// Between frames: follow edits, read processes, refresh git.
     pub fn tick(&mut self, s: &mut State) {
         let now = Instant::now();
+        self.crash_input(s);
         // The active file: edits into its tree, colours, the server.
         if let Some(i) = self.active {
             let mut d = std::mem::replace(&mut self.docs[i], placeholder());
@@ -1202,8 +1241,6 @@ impl Engine {
                     }
                 }
                 Job::WorkerAdd { project, worker, from, dry } => {
-                    s.panel = Panel::Output;
-                    s.panel_open = true;
                     match crate::fuzz::read_move(&buf, &worker, &from) {
                         Ok(m) => {
                             let mut out = format!("$ cargo atrium worker add {worker} --from {from}{}\n", if dry { " --dry-run" } else { "" });
@@ -1221,7 +1258,9 @@ impl Engine {
                             }
                             s.output = out;
                             if dry {
+                                // The preview is the fuzz view's right pane.
                                 s.moving = Some(m);
+                                s.view = Main::Fuzz;
                             } else {
                                 s.note = Some((format!("Moved {from} into the worker {worker}"), false));
                                 self.tree.refresh();
@@ -1234,6 +1273,8 @@ impl Engine {
                             }
                         }
                         Err(e) => {
+                            s.panel = Panel::Output;
+                            s.panel_open = true;
                             s.output = format!("cargo atrium worker add {worker}: {e}\n");
                             s.note = Some((format!("Can't move it: {e}"), true));
                         }
@@ -1275,7 +1316,8 @@ impl Engine {
                             self.open(&f, s);
                             self.sync_tabs(s);
                             self.follow_project(s);
-                            s.panel = Panel::Composition;
+                            s.view = Main::Composition;
+                            s.panel_open = false;
                         }
                         None => s.note = Some((format!("{dir} wasn't made: see the output"), true)),
                     }
@@ -1676,6 +1718,25 @@ mod tests {
         }
         let f = s.fuzz.clone().unwrap();
         assert!(f.listed && (f.error.is_some() || !f.targets.is_empty()), "{f:?}");
+        // The full views: one takes the window and hides the panel; a file
+        // brings the code back.
+        e.act(Act::Panel(Panel::Output), &mut s);
+        e.act(Act::View(Main::Fuzz), &mut s);
+        assert_eq!((s.view, s.panel_open), (Main::Fuzz, false));
+        // A crash's input is read for the dump, and a choice out of range is ignored.
+        std::fs::create_dir_all(d.join("proj/app/fuzz")).unwrap();
+        std::fs::write(d.join("proj/app/fuzz/crash-1"), [0x41u8; 200]).unwrap();
+        s.fuzz.as_mut().unwrap().crashes.push(crate::fuzz::Crash {
+            target: "core:x".into(), input: "fuzz/crash-1".into(), summary: "oops".into(), frame: None, in_core: true, fix: None, binary: None,
+        });
+        e.act(Act::SelectCrash(5), &mut s);
+        assert_eq!(s.crash, 0);
+        e.tick(&mut s);
+        assert_eq!(s.crash_bytes, Some(("fuzz/crash-1".to_string(), vec![0x41; 128])));
+        e.act(Act::View(Main::Composition), &mut s);
+        assert_eq!(s.view, Main::Composition);
+        e.act(Act::Open("app/src/main.rs".into()), &mut s);
+        assert_eq!(s.view, Main::Code);
         // Back to a file outside it.
         e.act(Act::Open("hello.c".into()), &mut s);
         assert_eq!(s.project, "");

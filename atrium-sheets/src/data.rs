@@ -423,7 +423,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("New Comment Thread…").enabled(wb.comment(s, row, col).is_none()), Some(DataCmd::NewThread)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
-        (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }), Some(DataCmd::Link)),
+        (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }).shortcut("Ctrl+K"), Some(DataCmd::Link)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Remove Links" } else { "Remove Link" }).enabled(links_in(wb, s, sel).next().is_some()), Some(DataCmd::RemoveLinks)),
         (MenuItem::new("Choose from List…").enabled(wb.validation_at(CellAddr::new(s, row, col)).is_some_and(|v| v.allow == officina_grid::validation::Allow::List)).separated(), Some(DataCmd::ChooseFromList)),
         if wb.sheet(s).freeze != (0, 0) {
@@ -446,7 +446,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Custom Sort…").enabled(some), Some(DataCmd::CustomSort)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
-        (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
+        (MenuItem::new("Filter").shortcut("Ctrl+Shift+L").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
         (MenuItem::new(format!("Show Only {shown}")).enabled(in_filter.is_some()), Some(DataCmd::KeepValue)),
         (MenuItem::new(format!("Hide {shown}")).enabled(in_filter.is_some()), Some(DataCmd::HideValue)),
         (MenuItem::new(format!("Choose Values in Column {}…", officina_grid::addr::col_name(col))).enabled(filter.is_some_and(|f| f.rect().contains(CellAddr::new(s, row, col)))), Some(DataCmd::ChooseValues)),
@@ -471,7 +471,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
             v.push((MenuItem::new(format!("Convert “{}” to Range", short(&t.name))).separated(), Some(DataCmd::RemoveTable)));
             v.push((MenuItem::new("Total Row").checked(t.totals), Some(DataCmd::TotalRow)));
         }
-        None => v.push((MenuItem::new("Format as Table").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
+        None => v.push((MenuItem::new("Format as Table").shortcut("Ctrl+T").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
     }
     v.push((MenuItem::new("Insert Column Chart").enabled(some).separated(), Some(DataCmd::Chart(ChartKind::Column))));
     v.push((MenuItem::new("Insert Line Chart").enabled(some), Some(DataCmd::Chart(ChartKind::Line))));
@@ -706,6 +706,9 @@ pub fn key_cmd(k: char, sel: CellRange, rows: u32, cols: u32) -> Option<DataCmd>
         '+' if whole_rows => DataCmd::InsertRows,
         '+' if whole_cols => DataCmd::InsertCols,
         '+' => DataCmd::InsertCellsDown,
+        't' | 'l' => DataCmd::FormatAsTable,
+        'L' => DataCmd::Filter,
+        'k' => DataCmd::Link,
         _ => return None,
     })
 }
@@ -2522,6 +2525,10 @@ mod tests {
         assert_eq!(key_cmd('+', cells, rows, cols), Some(DataCmd::InsertCellsDown));
         assert_eq!(key_cmd('+', rows_sel, rows, cols), Some(DataCmd::InsertRows));
         assert_eq!(key_cmd('+', cols_sel, rows, cols), Some(DataCmd::InsertCols));
+        assert_eq!(key_cmd('t', cells, rows, cols), Some(DataCmd::FormatAsTable));
+        assert_eq!(key_cmd('l', cells, rows, cols), Some(DataCmd::FormatAsTable));
+        assert_eq!(key_cmd('L', cells, rows, cols), Some(DataCmd::Filter));
+        assert_eq!(key_cmd('k', cells, rows, cols), Some(DataCmd::Link));
         assert_eq!(key_cmd('x', cells, rows, cols), None);
         // Ctrl+9 then Ctrl+Shift+( on a document: the rows go and come back.
         let mut d = doc();

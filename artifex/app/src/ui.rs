@@ -25,6 +25,7 @@ use portcullis_ipc::WorkspaceInfo;
 use crate::git;
 use crate::tasks::{Problem, Severity, Task};
 use crate::tree::Row;
+pub use crate::views::Main;
 
 pub fn em(pt: f32) -> f32 {
     pergola::theme::size::em(pt)
@@ -89,6 +90,10 @@ pub enum Act {
     Crash(usize),
     /// Run the crashing input under the debugger.
     ReplayCrash(usize),
+    /// Show a crash in the fuzz view.
+    SelectCrash(usize),
+    /// Fill the window right of the strip with a view.
+    View(Main),
 }
 
 /// The debugger as the window shows it.
@@ -108,9 +113,7 @@ pub enum Panel {
     #[default]
     Output,
     Problems,
-    Composition,
     Debug,
-    Fuzz,
 }
 
 /// A tab as the bar shows it.
@@ -182,6 +185,12 @@ pub struct State {
     /// Move into a worker: what `cargo atrium worker add --dry-run` would do,
     /// waiting for the person's yes.
     pub moving: Option<crate::fuzz::Move>,
+    /// The view right of the strip.
+    pub view: Main,
+    /// The crash the fuzz view shows, and the start of its input (input
+    /// path, bytes) once read.
+    pub crash: usize,
+    pub crash_bytes: Option<(String, Vec<u8>)>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -190,7 +199,7 @@ pub fn push(q: &Queue, a: Act) {
     q.lock().unwrap_or_else(|p| p.into_inner()).push(a);
 }
 
-fn plain(q: &Queue, a: Act) -> impl Fn() + Send + Sync + 'static {
+pub(crate) fn plain(q: &Queue, a: Act) -> impl Fn() + Send + Sync + 'static {
     let q = q.clone();
     move || push(&q, a.clone())
 }
@@ -237,22 +246,22 @@ pub struct ArtifexView {
     pub queue: Queue,
 }
 
-fn style(family: &str, size: f32, weight: Weight, color: Color) -> TextStyle {
+pub(crate) fn style(family: &str, size: f32, weight: Weight, color: Color) -> TextStyle {
     TextStyle { family: family.into(), size, weight, color }
 }
 
-fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, color: Color) {
+pub(crate) fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, color: Color) {
     let h = em(size) * 1.5;
     ctx.add(Node::Text { rect: Rect::new(x, cy - h / 2.0, 0.0, h), content: s.into(), style: style(font::SANS, size, weight, color) });
 }
 
-fn mono(ctx: &mut Ctx, x: f32, cy: f32, s: &str, color: Color) {
+pub(crate) fn mono(ctx: &mut Ctx, x: f32, cy: f32, s: &str, color: Color) {
     let h = em(type_size::SM) * 1.5;
     ctx.add(Node::Text { rect: Rect::new(x, cy - h / 2.0, 0.0, h), content: s.into(), style: style(font::MONO, type_size::SM, Weight::Regular, color) });
 }
 
 /// `s` cut to fit `width` points of text at `size`.
-fn fit(s: &str, width: f32, size: f32) -> String {
+pub(crate) fn fit(s: &str, width: f32, size: f32) -> String {
     let per = em(size) * 0.62;
     let n = (width / per).floor().max(1.0) as usize;
     if s.chars().count() <= n {
@@ -386,7 +395,63 @@ impl View for ArtifexView {
             Button::ghost("New project").lead(phosphor::PACKAGE).at(w - em(240.0), by).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
         }
 
-        // The tree.
+        // The view strip: Files, then the views the project has.
+        let st_top = bar_h();
+        ctx.add(Node::Rect { rect: Rect::new(0.0, st_top, strip_w(), h - st_top - status_h()), fill: t.bg_surface(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(strip_w() - 1.0, st_top, 1.0, h - st_top - status_h()), fill: t.border_default(), radius: 0.0 });
+        if s.ws.is_some() {
+            // Files, Composition and Fuzz fill the window; Problems and
+            // Debug open the panel under the code.
+            let code = s.view == Main::Code;
+            let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
+            let mut views: Vec<(&str, char, Act, bool, usize)> = vec![
+                ("Files", phosphor::FILES, Act::View(Main::Code), code, 0),
+                ("Problems", phosphor::WARNING, Act::Panel(Panel::Problems), code && s.panel_open && s.panel == Panel::Problems, errors),
+            ];
+            if s.composition.is_some() {
+                views.push(("Composition", phosphor::GRAPH, Act::View(Main::Composition), s.view == Main::Composition, 0));
+            }
+            if let Some(f) = &s.fuzz {
+                views.push(("Fuzz", phosphor::LIGHTNING, Act::View(Main::Fuzz), s.view == Main::Fuzz, f.crashes.len()));
+            }
+            if s.debug.is_some() {
+                views.push(("Debug", phosphor::BUG, Act::Panel(Panel::Debug), code && s.panel_open && s.panel == Panel::Debug, 0));
+            }
+            for (i, (label, icon, act, on, count)) in views.into_iter().enumerate() {
+                let y = st_top + em(8.0) + i as f32 * em(42.0);
+                if on {
+                    ctx.add(Node::Rect { rect: Rect::new(em(6.0), y, em(36.0), em(36.0)), fill: t.accent_bg(), radius: radius::MD });
+                }
+                ctx.key(8000 + i as u64);
+                let mut b = Button::ghost(label).icon(icon).at(em(6.0), y).width(em(36.0));
+                b.rect.size.h = em(36.0);
+                b = b.on_click(plain(q, act));
+                b.render(ctx);
+                if count > 0 {
+                    let label = if count > 9 { "9+".to_string() } else { count.to_string() };
+                    ctx.add(Node::Rect { rect: Rect::new(em(26.0), y + em(2.0), em(15.0), em(15.0)), fill: t.danger_fg(), radius: em(7.5) });
+                    let ts = style(font::SANS, type_size::XXS, Weight::Semibold, t.text_on_accent());
+                    let sz = Node::measure_text(&label, &ts);
+                    ctx.add(Node::Text { rect: Rect::new(em(33.5) - sz.w / 2.0, y + em(9.5) - sz.h / 2.0, sz.w, sz.h), content: label, style: ts });
+                }
+            }
+        }
+
+        // The tree, the tabs and the editor; or a full view.
+        let er = editor_rect(w, h, s.panel_open);
+        if s.view != Main::Code {
+            let bottom = h - status_h() - if s.panel_open { panel_h() } else { 0.0 };
+            let area = Rect::new(strip_w(), bar_h(), w - strip_w(), bottom - bar_h());
+            ctx.key(8050);
+            ctx.push(Node::Rect { rect: area, fill: t.bg_canvas(), radius: 0.0 });
+            match s.view {
+                Main::Fuzz => crate::views::fuzz(ctx, &s, q, area),
+                Main::Composition => crate::views::composition(ctx, &s, q, area),
+                Main::Code => {}
+            }
+            ctx.pop();
+        }
+        if s.view == Main::Code {
         let tree_top = bar_h();
         let tree_bottom = h - status_h();
         let sx = strip_w();
@@ -463,46 +528,6 @@ impl View for ArtifexView {
             text(ctx, sx + em(16.0), tree_top + em(20.0), "work is empty", type_size::SM, Weight::Regular, t.text_tertiary());
         }
 
-        // The view strip: Files, then the views the project has.
-        let st_top = bar_h();
-        ctx.add(Node::Rect { rect: Rect::new(0.0, st_top, strip_w(), h - st_top - status_h()), fill: t.bg_surface(), radius: 0.0 });
-        ctx.add(Node::Rect { rect: Rect::new(strip_w() - 1.0, st_top, 1.0, h - st_top - status_h()), fill: t.border_default(), radius: 0.0 });
-        if s.ws.is_some() {
-            let mut views: Vec<(&str, char, Option<Panel>, usize)> = vec![("Files", phosphor::FILES, None, 0)];
-            let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
-            views.push(("Problems", phosphor::WARNING, Some(Panel::Problems), errors));
-            if s.composition.is_some() {
-                views.push(("Composition", phosphor::GRAPH, Some(Panel::Composition), 0));
-            }
-            if let Some(f) = &s.fuzz {
-                views.push(("Fuzz", phosphor::LIGHTNING, Some(Panel::Fuzz), f.crashes.len()));
-            }
-            if s.debug.is_some() {
-                views.push(("Debug", phosphor::BUG, Some(Panel::Debug), 0));
-            }
-            for (i, (label, icon, panel, count)) in views.into_iter().enumerate() {
-                let y = st_top + em(8.0) + i as f32 * em(42.0);
-                let on = match panel { None => true, Some(p) => s.panel_open && s.panel == p };
-                if on {
-                    ctx.add(Node::Rect { rect: Rect::new(em(6.0), y, em(36.0), em(36.0)), fill: t.accent_bg(), radius: radius::MD });
-                }
-                ctx.key(8000 + i as u64);
-                let mut b = Button::ghost(label).icon(icon).at(em(6.0), y).width(em(36.0));
-                b.rect.size.h = em(36.0);
-                if let Some(p) = panel {
-                    b = b.on_click(plain(q, Act::Panel(p)));
-                }
-                b.render(ctx);
-                if count > 0 {
-                    let label = if count > 9 { "9+".to_string() } else { count.to_string() };
-                    ctx.add(Node::Rect { rect: Rect::new(em(26.0), y + em(2.0), em(15.0), em(15.0)), fill: t.danger_fg(), radius: em(7.5) });
-                    let ts = style(font::SANS, type_size::XXS, Weight::Semibold, t.text_on_accent());
-                    let sz = Node::measure_text(&label, &ts);
-                    ctx.add(Node::Text { rect: Rect::new(em(33.5) - sz.w / 2.0, y + em(9.5) - sz.h / 2.0, sz.w, sz.h), content: label, style: ts });
-                }
-            }
-        }
-
         // Tabs.
         let ty = bar_h();
         let mut tx = left();
@@ -550,7 +575,6 @@ impl View for ArtifexView {
         }
 
         // The editor.
-        let er = editor_rect(w, h, s.panel_open);
         if let Some(doc) = self.doc.get_cloned() {
             let q2 = q.clone();
             ctx.key(3000);
@@ -587,22 +611,19 @@ impl View for ArtifexView {
             }
             ctx.pop();
         }
+        }
 
-        // The panel: output or problems.
+        // The panel: output, problems or the debugger.
         if s.panel_open {
+            // Under the editor, or across a full view.
+            let pl = if s.view == Main::Code { left() } else { strip_w() };
             let py = er.y() + er.h();
-            ctx.add(Node::Rect { rect: Rect::new(left(), py, w - left(), panel_h()), fill: t.bg_surface(), radius: 0.0 });
-            ctx.add(Node::Rect { rect: Rect::new(left(), py, w - left(), 1.0), fill: t.border_default(), radius: 0.0 });
-            let mut px = left() + em(8.0);
+            ctx.add(Node::Rect { rect: Rect::new(pl, py, w - pl, panel_h()), fill: t.bg_surface(), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(pl, py, w - pl, 1.0), fill: t.border_default(), radius: 0.0 });
+            let mut px = pl + em(8.0);
             let mut tabs = vec![(Panel::Output, phosphor::CODE, "Output".to_string()), (Panel::Problems, phosphor::WARNING, format!("Problems ({})", s.problems.len()))];
-            if s.composition.is_some() {
-                tabs.push((Panel::Composition, phosphor::GRAPH, "Composition".to_string()));
-            }
             if s.debug.is_some() {
                 tabs.push((Panel::Debug, phosphor::BUG, "Debug".to_string()));
-            }
-            if let Some(f) = &s.fuzz {
-                tabs.push((Panel::Fuzz, phosphor::LIGHTNING, if f.crashes.is_empty() { "Fuzz".to_string() } else { format!("Fuzz ({})", f.crashes.len()) }));
             }
             for (i, (p, icon, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
@@ -618,15 +639,15 @@ impl View for ArtifexView {
             Button::ghost("Hide panel").icon(phosphor::X).at(w - em(44.0), py + em(4.0)).width(em(32.0)).on_click(plain(q, Act::HidePanel)).render(ctx);
             let body_y = py + em(42.0);
             let lines_fit = ((panel_h() - em(46.0)) / em(18.0)).floor().max(1.0) as usize;
-            let width = w - left() - em(24.0);
+            let width = w - pl - em(24.0);
             match s.panel {
                 Panel::Output => {
                     let mut body_y = body_y;
                     let mut lines_fit = lines_fit;
                     if let Some(m) = s.moving.as_ref().filter(|m| m.dry_run) {
                         let y = body_y + em(10.0);
-                        ctx.add(Node::Rect { rect: Rect::new(left() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
-                        text(ctx, left() + em(16.0), y, &fit(&format!("Move {} into a worker, {}", m.from, m.worker), width - em(220.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
+                        ctx.add(Node::Rect { rect: Rect::new(pl + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        text(ctx, pl + em(16.0), y, &fit(&format!("Move {} into a worker, {}", m.from, m.worker), width - em(220.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
                         ctx.key(4032);
                         Button::primary("Move").at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(plain(q, Act::ConfirmMove(true))).render(ctx);
                         ctx.key(4033);
@@ -636,9 +657,9 @@ impl View for ArtifexView {
                     } else if let (Some(folder), Some(ws)) = (&s.ask, &s.ws) {
                         // What atrium-run asks, as the Terminal asks it.
                         let y = body_y + em(10.0);
-                        ctx.add(Node::Rect { rect: Rect::new(left() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        ctx.add(Node::Rect { rect: Rect::new(pl + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
                         let (verb, yes) = if s.ask_debug { ("Debug", "Debug") } else { ("Run", "Run") };
-                        text(ctx, left() + em(16.0), y, &format!("{ws} asks to {verb} {folder}"), type_size::SM, Weight::Medium, t.text_primary());
+                        text(ctx, pl + em(16.0), y, &format!("{ws} asks to {verb} {folder}"), type_size::SM, Weight::Medium, t.text_primary());
                         ctx.key(4030);
                         Button::primary(yes).at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(pressed(q, |t| Act::AnswerRun(Some(t)))).render(ctx);
                         ctx.key(4031);
@@ -648,31 +669,17 @@ impl View for ArtifexView {
                     }
                     let all: Vec<&str> = s.output.lines().collect();
                     for (i, l) in all.iter().skip(all.len().saturating_sub(lines_fit)).enumerate() {
-                        mono(ctx, left() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());
-                    }
-                }
-                Panel::Composition => {
-                    let Some(c) = &s.composition else { return };
-                    ctx.key(4020);
-                    Button::ghost("Check again").at(w - em(200.0), py + em(4.0)).width(em(110.0)).on_click(plain(q, Act::Check)).render(ctx);
-                    for (i, (lvl, l)) in c.lines().iter().take(lines_fit).enumerate() {
-                        let color = match lvl {
-                            Some(crate::composition::Level::Error) => t.danger_fg(),
-                            Some(crate::composition::Level::Warning) => t.warning_fg(),
-                            Some(crate::composition::Level::Note) => t.info_fg(),
-                            None => t.text_primary(),
-                        };
-                        text(ctx, left() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                        mono(ctx, pl + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());
                     }
                 }
                 Panel::Debug => {
                     let Some(d) = &s.debug else { return };
-                    text(ctx, left() + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
-                    let half = (w - left()) / 2.0;
+                    text(ctx, pl + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
+                    let half = (w - pl) / 2.0;
                     for (i, (name, file, line)) in d.frames.iter().take(lines_fit.saturating_sub(1)).enumerate() {
                         let y = body_y + (i + 1) as f32 * em(18.0);
                         ctx.key(5500 + i as u64);
-                        let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        let id = ctx.push(Node::Rect { rect: Rect::new(pl + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
                         if ctx.is_hovered(id) {
                             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
                                 *fill = t.state_hover();
@@ -680,59 +687,23 @@ impl View for ArtifexView {
                         }
                         ctx.on_click(id, plain(q, Act::Frame(i)));
                         let place = match file { Some(f) => format!("{name}  {f}:{line}"), None => name.clone() };
-                        mono(ctx, left() + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
+                        mono(ctx, pl + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
                             if file.is_some() { t.text_primary() } else { t.text_tertiary() });
                         ctx.pop();
                     }
                     for (i, (name, value)) in d.locals.iter().take(lines_fit.saturating_sub(1)).enumerate() {
                         let y = body_y + (i + 1) as f32 * em(18.0);
-                        mono(ctx, left() + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
-                    }
-                }
-                Panel::Fuzz => {
-                    let Some(f) = &s.fuzz else { return };
-                    if f.listed && !f.targets.is_empty() {
-                        ctx.key(4030);
-                        Button::ghost(if f.on { "Stop fuzzing" } else { "Start fuzzing" }).at(w - em(220.0), py + em(4.0)).width(em(130.0))
-                            .on_click(plain(q, Act::Fuzz)).render(ctx);
-                    }
-                    for (i, (core, l, crash)) in f.lines().into_iter().take(lines_fit).enumerate() {
-                        let y = body_y + i as f32 * em(18.0);
-                        let color = match core { Some(true) => t.danger_fg(), Some(false) => t.warning_fg(), None => t.text_primary() };
-                        if let Some(c) = crash {
-                            ctx.key(5800 + i as u64);
-                            let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
-                            if ctx.is_hovered(id) {
-                                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
-                                    *fill = t.state_hover();
-                                }
-                            }
-                            ctx.on_click(id, plain(q, Act::Crash(c)));
-                            text(ctx, left() + em(12.0), y, &fit(&l, width - em(90.0), type_size::SM), type_size::SM, Weight::Regular, color);
-                            if core.is_some() {
-                                ctx.key(1);
-                                Button::ghost("Debug it").at(left() + width - em(86.0), y - em(14.0)).width(em(84.0))
-                                    .on_click(plain(q, Act::ReplayCrash(c))).render(ctx);
-                            } else if f.crashes.get(c).is_some_and(|x| x.in_core && x.frame.is_some()) {
-                                // The fix line under a core crash.
-                                ctx.key(2);
-                                Button::ghost("Move it").at(left() + width - em(86.0), y - em(14.0)).width(em(84.0))
-                                    .on_click(plain(q, Act::MoveToWorker(c))).render(ctx);
-                            }
-                            ctx.pop();
-                        } else {
-                            text(ctx, left() + em(12.0), y, &fit(&l, width, type_size::SM), type_size::SM, Weight::Regular, color);
-                        }
+                        mono(ctx, pl + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
                     }
                 }
                 Panel::Problems => {
                     if s.problems.is_empty() {
-                        text(ctx, left() + em(12.0), body_y, "No problems from the last task.", type_size::SM, Weight::Regular, t.text_tertiary());
+                        text(ctx, pl + em(12.0), body_y, "No problems from the last task.", type_size::SM, Weight::Regular, t.text_tertiary());
                     }
                     for (i, p) in s.problems.iter().take(lines_fit).enumerate() {
                         let y = body_y + i as f32 * em(18.0);
                         ctx.key(5000 + i as u64);
-                        let id = ctx.push(Node::Rect { rect: Rect::new(left() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        let id = ctx.push(Node::Rect { rect: Rect::new(pl + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
                         if ctx.is_hovered(id) {
                             if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
                                 *fill = t.state_hover();
@@ -741,9 +712,9 @@ impl View for ArtifexView {
                         ctx.on_click(id, plain(q, Act::Problem(i)));
                         let c = match p.severity { Severity::Error => t.danger_fg(), Severity::Warning => t.warning_fg(), Severity::Note => t.info_fg() };
                         let place = format!("{}:{}:{}", p.file, p.line, p.col);
-                        mono(ctx, left() + em(12.0), y, &place, c);
+                        mono(ctx, pl + em(12.0), y, &place, c);
                         let off = em(8.0) * place.chars().count() as f32 + em(24.0);
-                        text(ctx, left() + off, y, &fit(&p.message, width - off, type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
+                        text(ctx, pl + off, y, &fit(&p.message, width - off, type_size::SM), type_size::SM, Weight::Regular, t.text_primary());
                         ctx.pop();
                     }
                 }

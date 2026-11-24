@@ -16,6 +16,7 @@ pub mod lsp;
 pub mod tasks;
 pub mod tree;
 pub mod ui;
+pub mod views;
 
 /// How a workspace is named on screen.
 pub fn title(name: &str) -> String {

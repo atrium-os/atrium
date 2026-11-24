@@ -5,6 +5,10 @@
 #if defined(ATRIUM_I0_SIGN_IN) || defined(ATRIUM_I6_PAGE)
 #include <LibWebCommon/HTML/NavigationPopulationRequest.h>
 #endif
+#ifdef ATRIUM_I6_PAGE
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#endif
 
 struct NavigatorScene;
 #ifdef ATRIUM_I6_PAGE
