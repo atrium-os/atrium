@@ -693,6 +693,28 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 write_response(&mut writer, &refuse(format!("no system worker rule for {bundle}: it never runs as its caller")))?;
                 continue;
             };
+            // Its own installed manifest asks for nothing (a bundle that
+            // does is not the one this path runs); unreadable refuses.
+            let checked = launch::installed_manifest(bundle)
+                .ok_or_else(|| format!("{bundle} is not installed or its manifest is unreadable"))
+                .and_then(|m| portcullisd::system_worker::check_bundle(&m));
+            if let Err(why) = checked {
+                eprintln!("portcullisd: system worker {bundle} for {app} REFUSED: {why}");
+                write_response(&mut writer, &refuse(why))?;
+                continue;
+            }
+            // A few per caller, under the rule's system-wide cap: one app
+            // cannot take every decoder jail. Held until the jail is gone.
+            let _per_caller = match portcullisd::ratelimit::Slot::acquire_reserved(
+                &LIMITER, &portcullisd::system_worker::caller_key(bundle, &person, &app),
+                portcullisd::system_worker::PER_CALLER, now_millis()) {
+                Ok(s) => s,
+                Err(why) => {
+                    eprintln!("portcullisd: system worker {bundle} for {app} ({person}) REFUSED: {why}");
+                    write_response(&mut writer, &Response::LaunchFailed { stage: "ratelimit".into(), message: why.to_string() })?;
+                    continue;
+                }
+            };
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: system worker {bundle} {instance} for {app} ({person}) runs as {}", rule.run_as);
             handle_exec_instance(bundle.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
@@ -1372,7 +1394,10 @@ fn handle_exec_instance(
      * does for a renderer), the jail is removed. Without this the caller had
      * no way to end a worker that runs as another uid (a worker rule). */
     let watch = jail_name_for(&spec).and_then(|name| {
-        reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name))
+        // A system worker's jail also ends at its wall-clock bound.
+        let life = portcullis_ipc::SYSTEM_WORKERS.iter().any(|(_, b)| *b == app_id)
+            .then(|| std::time::Instant::now() + portcullisd::system_worker::LIFE);
+        reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name, life))
     });
     // A worker's caller has its answer once the jail is removed; its mounts
     // are unwound after (a dying jail can pin them for seconds).
@@ -1427,24 +1452,31 @@ fn jail_name_for(spec: &portcullis_oneshot::Spec) -> Option<String> {
     portcullis_jail::jaild_instance_name(&spec.target, spec.instance.as_deref())
 }
 
-/// Watch `caller` until `done` is set; if it hangs up first, remove the
-/// jail `name` (its processes are killed, and `run_with_stdio` returns).
-fn end_jail_on_hangup(caller: UnixStream, name: String) -> Arc<std::sync::atomic::AtomicBool> {
+/// Watch `caller` until `done` is set; if it hangs up first, or `until`
+/// passes, remove the jail `name` (its processes are killed, and
+/// `run_with_stdio` returns).
+fn end_jail_on_hangup(caller: UnixStream, name: String, until: Option<std::time::Instant>) -> Arc<std::sync::atomic::AtomicBool> {
     use std::sync::atomic::Ordering;
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d = done.clone();
     let _ = std::thread::Builder::new().name("portcullisd-exec-hup".into()).spawn(move || {
         while !d.load(Ordering::Acquire) {
+            let expired = until.is_some_and(|t| std::time::Instant::now() >= t);
             let mut p = libc::pollfd { fd: caller.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            let n = unsafe { libc::poll(&mut p, 1, 250) };
-            if n <= 0 || d.load(Ordering::Acquire) { continue }
-            let hung_up = p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
+            // SAFETY: `p` is one live pollfd on the stack for the call, and
+            // `caller` owns the descriptor for the thread's whole life.
+            let n = if expired { 0 } else { unsafe { libc::poll(&mut p, 1, 250) } };
+            if !expired && (n <= 0 || d.load(Ordering::Acquire)) { continue }
+            let hung_up = expired || p.revents & (libc::POLLHUP | libc::POLLERR) != 0 || {
                 let mut b = [0u8; 1];
+                // SAFETY: `b` is a 1-byte buffer that outlives the call, and
+                // the length passed is its length.
                 let r = unsafe { libc::recv(caller.as_raw_fd(), b.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
                 r == 0
             };
             if hung_up {
-                eprintln!("portcullisd: caller hung up; removing worker jail {name}");
+                if expired { eprintln!("portcullisd: worker jail {name} reached its time limit; removing it") }
+                else { eprintln!("portcullisd: caller hung up; removing worker jail {name}") }
                 // SIGKILL first: `jail -r` alone sends SIGTERM and waits ten
                 // seconds for a worker that may be ignoring it (or stopped).
                 let _ = std::process::Command::new("pkill").args(["-9", "-j", &name])

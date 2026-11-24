@@ -557,6 +557,16 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Does this declare no capability at all, not even one set to false
+    /// or a key this schema does not know? A system worker
+    /// (portcullis_ipc::SYSTEM_WORKERS) must, since it runs for any app
+    /// that names it. Judged on the serialized form, so a field added
+    /// later counts without this list knowing it; a form that cannot be
+    /// serialized declares something.
+    pub fn declares_nothing(&self) -> bool {
+        matches!(toml::Value::try_from(self), Ok(toml::Value::Table(t)) if t.is_empty())
+    }
+
     /// The system-only capabilities this asks for (homes.md §4, decision
     /// H5): an app holding any of them is part of the system, whose files
     /// are not the person's to edit by hand, so it has no console.
@@ -859,6 +869,17 @@ graphics = "fresco"
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn declares_nothing_counts_every_key() {
+        let caps = |t: &str| -> Capabilities { toml::from_str(t).expect("caps parse") };
+        assert!(Capabilities::default().declares_nothing());
+        assert!(caps("").declares_nothing());
+        assert!(!caps("clipboard = false").declares_nothing(), "a key set to false is still declared");
+        assert!(!caps("network = \"full\"").declares_nothing());
+        assert!(!caps("decoders = []").declares_nothing());
+        assert!(!caps("a-key-from-later = true").declares_nothing(), "an unknown key counts");
+    }
 
     #[test]
     fn override_adds_network_keeps_runtime_clipboard() {

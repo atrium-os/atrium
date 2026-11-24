@@ -37,6 +37,8 @@ pub mod ratelimit;
 /// A persona's route domain (vpn.md §5.4).
 pub mod route_domain;
 pub mod supervisor;
+/// What a system worker's bundle may be, and its per-caller bounds.
+pub mod system_worker;
 pub mod system_services;
 pub mod volumes_client;
 

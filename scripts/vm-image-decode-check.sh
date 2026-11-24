@@ -115,6 +115,7 @@ r=$(line script); case "$r" in "refused "*) ok "an SVG with a script is refused:
 r=$(line escape); case "$r" in "error "*"not a file name"*) ok "a name out of assets/ is refused here" ;; *) bad "escape: $r" ;; esac
 r=$(line timing); [ -n "$r" ] && ok "five decodes, a jail each: $r (TCG)" || bad "timing"
 r=$(line session); case "$r" in "ok 5 pictures"*) ok "one Decoder for five: ${r#ok } (TCG)" ;; *) bad "session: $r" ;; esac
+r=$(line per-caller); case "$r" in "held 4 refused "*) ok "four decoders per app at once, the fifth refused: ${r#held 4 refused }" ;; *) bad "per-caller: $r" ;; esac
 runs=$(V "grep -c 'system worker org.atrium.image-decode .* runs as _imagedec' $LOG")
 [ "${runs:-0}" -ge 9 ] 2>/dev/null && ok "the decoder ran as _imagedec, a jail per call ($runs)" || bad "decoder runs: $runs $(V "grep -i 'system worker' $LOG | tail -3")"
 core=$(line core-uid)

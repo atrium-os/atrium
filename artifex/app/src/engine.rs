@@ -76,6 +76,8 @@ pub struct Engine {
     jobs: Vec<(Job, Proc, Vec<u8>)>,
     /// The workspace's `work` as its own processes see it.
     remote_root: Option<String>,
+    /// A crash input that could not be read, and when (tried again later).
+    crash_miss: Option<(String, Instant)>,
     servers: HashMap<&'static str, Server>,
     /// Servers that failed to start: not tried again this session.
     no_server: Vec<&'static str>,
@@ -120,6 +122,7 @@ impl Engine {
             active: None,
             jobs: Vec::new(),
             remote_root: None,
+            crash_miss: None,
             servers: HashMap::new(),
             no_server: Vec::new(),
             next_git: Instant::now(),
@@ -433,26 +436,40 @@ impl Engine {
     }
 
     /// The start of the shown crash's input, for the fuzz view's dump.
-    fn crash_input(&self, s: &mut State) {
+    /// The selected crash's input, its first 128 bytes, for the dump. The
+    /// path stays inside the workspace (a remote one's prefix is stripped,
+    /// then it is joined like any relative path); an input that can't be
+    /// read yet (the run is still writing it) is tried again in a second.
+    fn crash_input(&mut self, s: &mut State) {
         let Some(c) = s.fuzz.as_ref().and_then(|f| f.crashes.get(s.crash).or(f.crashes.first())) else {
             s.crash_bytes = None;
             return;
         };
-        if s.crash_bytes.as_ref().is_some_and(|(i, _)| *i == c.input) {
+        if s.crash_bytes.as_ref().is_some_and(|(i, _)| *i == c.input)
+            || self.crash_miss.as_ref().is_some_and(|(i, at)| *i == c.input && at.elapsed() < Duration::from_secs(1)) {
             return;
         }
         let rel = match (&self.remote_root, c.input.starts_with('/')) {
-            (Some(r), true) => c.input.strip_prefix(&format!("{r}/")).map(str::to_string),
+            (Some(r), true) => c.input.strip_prefix(&format!("{r}/")).and_then(|p| join_rel("", p)),
             (_, true) => None,
             _ => join_rel(&s.project, &c.input),
         };
-        let mut bytes = Vec::new();
-        if let Some(f) = rel.and_then(|rel| std::fs::File::open(self.root.join(rel)).ok()) {
+        let read = rel.and_then(|rel| std::fs::File::open(self.root.join(rel)).ok()).and_then(|f| {
             use std::io::Read;
             // The dump shows 8 lines of 16.
-            let _ = f.take(128).read_to_end(&mut bytes);
+            let mut bytes = Vec::new();
+            f.take(128).read_to_end(&mut bytes).ok().map(|_| bytes)
+        });
+        match read {
+            Some(bytes) => {
+                self.crash_miss = None;
+                s.crash_bytes = Some((c.input.clone(), bytes));
+            }
+            None => {
+                self.crash_miss = Some((c.input.clone(), Instant::now()));
+                s.crash_bytes = None;
+            }
         }
-        s.crash_bytes = Some((c.input.clone(), bytes));
     }
 
     fn worker_add(&mut self, project: &str, worker: &str, from: &str, dry: bool, s: &mut State) {
@@ -1733,6 +1750,26 @@ mod tests {
         assert_eq!(s.crash, 0);
         e.tick(&mut s);
         assert_eq!(s.crash_bytes, Some(("fuzz/crash-1".to_string(), vec![0x41; 128])));
+        // An input that isn't there yet is read once it is (not cached as
+        // empty), and one that climbs out of the workspace is never read.
+        s.fuzz.as_mut().unwrap().crashes[0].input = "fuzz/crash-2".into();
+        e.tick(&mut s);
+        assert_eq!(s.crash_bytes, None);
+        std::fs::write(d.join("proj/app/fuzz/crash-2"), [0x42u8; 4]).unwrap();
+        e.crash_miss = None; // as if a second had passed
+        e.tick(&mut s);
+        assert_eq!(s.crash_bytes, Some(("fuzz/crash-2".to_string(), vec![0x42; 4])));
+        std::fs::write(d.join("secret"), b"no").unwrap();
+        s.fuzz.as_mut().unwrap().crashes[0].input = "../../../secret".into();
+        e.tick(&mut s);
+        assert_eq!(s.crash_bytes, None);
+        e.remote_root = Some("/r".into());
+        s.fuzz.as_mut().unwrap().crashes[0].input = "/r/../secret".into();
+        e.crash_miss = None;
+        e.tick(&mut s);
+        assert_eq!(s.crash_bytes, None);
+        e.remote_root = None;
+        s.fuzz.as_mut().unwrap().crashes[0].input = "fuzz/crash-1".into();
         e.act(Act::View(Main::Composition), &mut s);
         assert_eq!(s.view, Main::Composition);
         e.act(Act::Open("app/src/main.rs".into()), &mut s);

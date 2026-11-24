@@ -49,6 +49,18 @@ fn main() {
         Ok(v) => format!("ok {} pictures in {} ms", v.len(), t.elapsed().as_millis()),
         Err(e) => format!("error {e}"),
     });
+    // A few decoders per app at once (portcullisd's per-caller cap, 4):
+    // the fifth is refused while four are held, and each held one works.
+    let held: Vec<_> = (0..5).map(|_| atrium_assets::Decoder::new()).collect();
+    let mut kept = 0;
+    let mut refused = String::new();
+    for d in held {
+        match d {
+            Ok(mut d) => if d.image("icons/app.svg", 16, 16).is_ok() { kept += 1 },
+            Err(e) => refused = e.to_string(),
+        }
+    }
+    say("per-caller", format!("held {kept} refused {refused}"));
     say("done", String::new());
 }
 

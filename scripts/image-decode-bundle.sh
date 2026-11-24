@@ -38,8 +38,9 @@ id _imagedec >/dev/null 2>&1 || pw useradd _imagedec -u 65056 -g _imagedec -d /n
 test "$(id -u _imagedec):$(id -g _imagedec)" = 65056:65056
 P=/etc/atrium/policy.toml
 if ! grep -q 'workers."org.atrium.image-decode"' $P 2>/dev/null; then
-    # No callers: ExecInstance is refused for this app whatever the rule
-    # says; SystemWorker uses only run_as and the concurrency cap.
+    # No callers: no other user or app is delegated to start it as
+    # _imagedec. SystemWorker uses only run_as and the concurrency cap; a
+    # person's own CLI can still start the bundle, as that person.
     cat >> $P <<'T'
 
 [workers."org.atrium.image-decode"]
