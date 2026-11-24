@@ -149,6 +149,14 @@ struct Config {
 }
 
 impl Config {
+    /// Whole pages live on a press (navigator-islands.md I6.1), while it is
+    /// built: `NAVIGATORD_LIVE_PAGES=1`, in a Navigator with a UI, the
+    /// compositor's press guard and Limen; never in a portal or VPN window.
+    fn live_pages_enabled(&self) -> bool {
+        self.ui.is_some() && self.portal.is_none() && self.vpn.is_none() && self.activation.is_some()
+            && self.limen.is_some() && settings::get("NAVIGATORD_LIVE_PAGES").as_deref() == Some("1")
+    }
+
     fn inbox_enabled(&self) -> bool {
         self.ui.is_some() && self.portal.is_none() && self.vpn.is_none() && self.activation.is_some()
             && self.limen.is_some() && self.arca.is_some()
@@ -1157,6 +1165,10 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
     let presenter_s = presenter.clone();
     let press_strip = strip.clone();
     let mut widget: Option<widget::Widget> = None;
+    // The page running live (I6.1), and the page on screen: (the address
+    // the UI showed, the page's own address as delivered).
+    let mut live: Option<live_page::Live> = None;
+    let mut shown: Option<(String, String)> = None;
     let mut presses = cfg.activation.as_ref().map(press::Frescod::new);
     let mut spend = move |p: ctl::Press| -> Result<(), String> {
         let ui_uid = *presenter_s.lock().unwrap();
@@ -1293,6 +1305,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             }
             Request::Blank => {
                 widget = None;
+                live = None;
+                shown = None;
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;
                 st.widget_document = None;
@@ -1302,6 +1316,11 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 widget = None;
                 let doc = match req { Request::ShowDocument { document, .. } => Some(document), _ => None };
                 let p = state.lock().unwrap().page(&url);
+                // Leaving the page ends its live engine (I6.1).
+                shown = p.as_ref().map(|p| (url.clone(), p.url.clone()));
+                if live.as_ref().is_some_and(|l| shown.as_ref().is_none_or(|(_, page)| *page != l.url)) {
+                    live = None;
+                }
                 let mut st = strip.lock().unwrap();
                 st.latest = 0;
                 st.widget_document = doc.filter(|t| st.widget_records.iter().any(|(d,u,_)| t == d && u == url));
@@ -1900,6 +1919,46 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
+            Request::RunPageLive { url, rect, press } => {
+                let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone());
+                let window = strip.lock().unwrap().window_token;
+                let result = (|| {
+                    if !cfg.live_pages_enabled() { return Err("running a page live is off".to_string()); }
+                    let page = page.ok_or("that page is no longer on screen")?;
+                    let window = window.ok_or("no window to run it in")?;
+                    widget::bounds(rect)?;
+                    // A press frescod didn't count is asked again, not ended.
+                    if let Err(why) = spend(press) { return Err(format!("\0{why}")); }
+                    live = None;
+                    widget = None;
+                    let (on_start, on_end) = (w.clone(), w.clone());
+                    let (start_url, end_url) = (page.clone(), page.clone());
+                    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(),
+                        move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
+                        move |why| send(&on_end, &Event::LiveEnded { url: end_url, why }))
+                })();
+                match result {
+                    Ok(l) => live = Some(l),
+                    Err(why) => match why.strip_prefix('\0') {
+                        Some(why) => send(&w, &Event::PressRefused { why: why.into() }),
+                        None => {
+                            eprintln!("navigatord: run live: {why}");
+                            send(&w, &Event::LiveEnded { url, why: Some(why) });
+                        }
+                    },
+                }
+            }
+            Request::PlaceLive { url, rect } => {
+                if let Some(active) = live.as_ref().filter(|l| l.url == url) {
+                    match rect {
+                        None => live = None,
+                        Some(r) => if let Err(why) = active.place(r) {
+                            live = None;
+                            send(&w, &Event::LiveEnded { url, why: Some(why) });
+                        }
+                    }
+                }
+            }
             Request::RunLive { url, jar, press } => {
                 if !cfg.inbox_enabled() || url != ctl::INBOX_FIXTURE_URL || jar != ctl::Jar::Personal {
                     send(&w, &Event::LivePageFailed { why: "Live mode is unavailable for this page or jar".into() });
@@ -2377,7 +2436,10 @@ fn main() {
             std::process::exit(1)
         });
         let mut pairs = settings::ui_pairs();
-        pairs.retain(|(k, _)| k != "NAVIGATOR_UI_INBOX_FIXTURE");
+        pairs.retain(|(k, _)| k != "NAVIGATOR_UI_INBOX_FIXTURE" && k != "NAVIGATOR_UI_LIVE_PAGES");
+        if cfg.live_pages_enabled() {
+            pairs.push(("NAVIGATOR_UI_LIVE_PAGES".into(), "1".into()));
+        }
         if cfg.inbox_enabled() {
             pairs.push(("NAVIGATOR_UI_INBOX_FIXTURE".into(), ctl::INBOX_FIXTURE_URL.into()));
         }

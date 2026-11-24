@@ -168,6 +168,10 @@ pub enum Prompt {
     NotPrivate { origin: String },
     FetchAgain,
     RunLive,
+    /// Run the whole page live (navigator-islands.md I6.1), asked when the
+    /// person pressed "Run this page live" in the tier popover; `site` is
+    /// the page's registrable site, which its scripts may reach (D12).
+    RunPageLive { site: String },
     Widget { runnable: bool, key: u32, src: String, origin: String, rect: [f32; 4] },
     WidgetUnload { key: u32, start: navigator_control::Press, query: u32, origin: String },
     WidgetFailed { key: u32, failure: navigator_control::WidgetFailure },
@@ -212,6 +216,7 @@ impl Prompt {
             Prompt::Widget { runnable: true, .. } => &["Not now", "Start"],
             Prompt::Widget { .. } | Prompt::WidgetFailed { .. } => &["Close"],
             Prompt::RunLive => &["Not now", "Run live"],
+            Prompt::RunPageLive { .. } => &["Not now", "Run live"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],
             Prompt::Handoff { .. } => &["Not now", "Open"],
@@ -227,6 +232,7 @@ impl Prompt {
             Prompt::Download { file, origin, .. } => format!("download {origin} {file}"),
             Prompt::NotPrivate { origin } => format!("not-private {origin}"),
             Prompt::RunLive => "run-live".into(),
+            Prompt::RunPageLive { .. } => "run-page-live".into(),
             Prompt::WidgetUnload { key, .. } => format!("widget unload {key}"),
             Prompt::Widget { key, .. } | Prompt::WidgetFailed { key, .. } => format!("widget {key}"),
             Prompt::FetchAgain => "fetch-again".into(),
@@ -281,6 +287,9 @@ pub struct Page {
     pub facts: Facts,
     /// Process-local confirmation for the one supported embedded engine.
     pub attached_origin: Option<String>,
+    /// The whole page runs live now (I6.1): the chip reads "Live code".
+    /// Never stored: a page comes back in the document lane.
+    pub live_whole: bool,
     pub media: Media,
     pub asked: Option<Asked>,
     pub prompts: Prompts,
@@ -296,9 +305,10 @@ pub struct Page {
 
 impl Page {
     pub fn display_facts(&self) -> std::borrow::Cow<'_, Facts> {
-        let Some(origin) = &self.attached_origin else { return std::borrow::Cow::Borrowed(&self.facts) };
+        if self.attached_origin.is_none() && !self.live_whole { return std::borrow::Cow::Borrowed(&self.facts) }
         let mut facts = self.facts.clone();
-        facts.live_parts.push(origin.clone());
+        if let Some(origin) = &self.attached_origin { facts.live_parts.push(origin.clone()); }
+        if self.live_whole { facts.tier = Tier::Live; }
         std::borrow::Cow::Owned(facts.settle())
     }
 
@@ -391,6 +401,7 @@ impl Trail {
             seen,
             facts: spec.facts,
             attached_origin: None,
+            live_whole: false,
             media: spec.media,
             asked: None,
             prompts: Prompts::default(),

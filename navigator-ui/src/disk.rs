@@ -171,6 +171,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
         t.pages.push(Page {
             facts: facts(&p.url),
             attached_origin: None,
+            live_whole: false,
             url: p.url,
             title: cut(&p.title, MAX_TITLE),
             search: p.search,

@@ -107,6 +107,12 @@ impl ActiveWidget {
     }
 }
 
+/// The page area in the window, where a whole page's island goes (I6.1).
+fn live_rect(s: &Shell) -> [u32; 4] {
+    let r = s.geo().page;
+    [r.x().max(0.0).ceil() as u32, r.y().max(0.0).ceil() as u32, r.w().max(1.0).floor() as u32, r.h().max(1.0).floor() as u32]
+}
+
 fn retire_widget(active: &mut Option<ActiveWidget>, document: Ticket, press: ctl::Press) -> Option<ActiveWidget> {
     active.take_if(|w| w.document == document && w.press == press)
 }
@@ -117,6 +123,8 @@ pub struct Live {
     embeds: Option<Rc<RefCell<Embeds>>>,
     window: Option<WindowToken>,
     widget: Option<ActiveWidget>,
+    /// The page running live (I6.1) and where its island was last placed.
+    live_placed: Option<(String, [u32; 4])>,
     children: Vec<Child>,
     /// The page whose child is in the slot (`None`: Start).
     shown: Option<Key>,
@@ -289,6 +297,7 @@ impl Live {
                 embeds: None,
                 window: None,
                 widget: None,
+                live_placed: None,
                 children: vec![],
                 shown: None,
                 started: false,
@@ -872,6 +881,15 @@ impl Live {
                     }
                 }
                 Event::LivePageFailed { why } => s.last_note = Some(why),
+                Event::LiveStarted { url, origin } => {
+                    eprintln!("navigator-ui: {url} runs live ({origin})");
+                    s.live_reported(&url, Some(origin), None);
+                }
+                Event::LiveEnded { url, why } => {
+                    eprintln!("navigator-ui: {url} stopped running live{}", why.as_deref().map(|w| format!(": {w}")).unwrap_or_default());
+                    if self.live_placed.as_ref().is_some_and(|(u, _)| *u == url) { self.live_placed = None; }
+                    s.live_reported(&url, None, why);
+                }
                 Event::SignedOut { url, cookies, why } => {
                     let site = crate::trail::site(&url).to_string();
                     eprintln!("navigator-ui: signed out of {site} here: {}", match (cookies, &why) {
@@ -1164,6 +1182,15 @@ impl Live {
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
+                Out::RunPageLive { url, press } => {
+                    let rect = live_rect(s);
+                    send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press });
+                    self.live_placed = Some((url, rect));
+                }
+                Out::StopLive { url } => {
+                    send(&mut self.w, &Request::PlaceLive { url, rect: None });
+                    self.live_placed = None;
+                }
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::SubmitForm { page, jar, action, post, fields, press } => {
                     if self.arca_post.is_some() {
@@ -1331,6 +1358,20 @@ impl Live {
                 send(&mut self.w, &Request::PlaceWidget { document, rect });
                 if rect.is_none() { active.set_origin(s, None); changed = true; }
                 self.widget = rect.map(|rect| ActiveWidget { rect, ..active });
+            }
+        }
+        // The page running live (I6.1) follows the page area, and ends when
+        // the page leaves the screen.
+        if let Some(run) = s.live_run.clone() {
+            if s.shown_key() != Some(run.key) || s.history.is_some() {
+                s.stop_live();
+                changed = true;
+            } else if let Some((url, placed)) = self.live_placed.clone() {
+                let rect = live_rect(s);
+                if rect != placed {
+                    send(&mut self.w, &Request::PlaceLive { url: url.clone(), rect: Some(rect) });
+                    self.live_placed = Some((url, rect));
+                }
             }
         }
         // Reading choices changed (Aa, or the system appearance): the live
