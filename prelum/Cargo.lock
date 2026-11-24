@@ -995,10 +995,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-control"
+version = "0.1.0"
+dependencies = [
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "navigator-fetch"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "navigator-control",
  "nuntius",
  "rustls",
  "rustls-pki-types",
