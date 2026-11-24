@@ -96,6 +96,37 @@ def run(ui):
     print("PASS preview, local save, reschedule comparison, Cancel, Send, SMTP receipt and replay")
 
 
+def stale_response(ui):
+    print(guest(ui, "invitation-setup"))
+    open_mail(ui, first=True)
+    print(guest(ui, "response-window"))
+    ui.see("confirmation-before-delivery", "Review your invitation response", "15:00", "TENTATIVE")
+    print(guest(ui, "response-deliver"))
+    click(ui, 485, 323)
+    ui.see("late-change-before-send", "Invitation changed before sending", "15:00", "17:00", "Studio C", "revision 5")
+    click(ui, 485, 323)
+    print(guest(ui, "response-result"))
+
+    # Use the installed app's normal handoff to review and respond to the replacement.
+    open_mail(ui)
+    review(ui, 248)
+    ui.see("original-review", "Review invitation", "14:00")
+    click(ui, 80, 462)
+    ui.see("original-response", "Review your invitation response", "14:00")
+    click(ui, 485, 323)
+    ui.see("stale-response", "Invitation changed before sending", "14:00", "15:00", "Studio B")
+    click(ui, 485, 323)
+    ui.see("replacement-review", "Review invitation", "15:00", "Studio B")
+    click(ui, 80, 462)
+    ui.see("replacement-response", "Review your invitation response", "15:00", "ACCEPTED")
+    click(ui, 485, 323)
+    ui.control("close", "work")
+    print(guest(ui, "invitation-submit"))
+    for persona in ("work", "personal"):
+        assert ui.control("fingerprint", persona).strip() == b"empty"
+    print("PASS reviewed replacement from the paused confirmation and sent its revision exactly once")
+
+
 def background(ui):
     print(guest(ui, "invitation-setup"))
     open_mail(ui, first=True)
@@ -728,9 +759,9 @@ def check_reissue(ui, private):
 
 
 if __name__ == "__main__":
-    runner = {"--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--stale-response": stale_response, "--background": background, "--reissue": lambda ui: restore_one(ui, reissue=True), "--restore-one": restore_one, "--restart": restart_range, "--reinstate": lambda ui: cancel_future(ui, reinstate=True), "--cancel-future": cancel_future, "--long-range": long_range, "--future": future, "--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--stale-response|--background|--series|--bounded|--cancel-dates|--exdates|--future|--long-range|--cancel-future|--reinstate|--restart|--restore-one|--reissue] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

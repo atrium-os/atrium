@@ -18,7 +18,77 @@ fn candidate(m: &Message) -> bool {
         })
 }
 
+/// Eligible immutable parts at the moment Mail checks a one-off response.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CalendarRevisions {
+    account: AccountId,
+    uid: String,
+    sequence: u32,
+    organizer: String,
+    pub messages: Vec<(u32, MsgId, Hash)>,
+}
+
+impl CalendarRevisions {
+    pub fn recheck(&self, writer: &Writer<'_>) -> Result<()> {
+        if self
+            != &writer.calendar_revisions(
+                self.account,
+                &self.uid,
+                self.sequence,
+                &self.organizer,
+            )?
+        {
+            return Err(Error::CalendarChanged);
+        }
+        Ok(())
+    }
+}
+
 impl Writer<'_> {
+    pub fn calendar_revisions(
+        &self,
+        account: AccountId,
+        uid: &str,
+        sequence: u32,
+        organizer: &str,
+    ) -> Result<CalendarRevisions> {
+        let index = self.tx.open_table(REVISIONS)?;
+        let folders = self.tx.open_table(FOLDERS)?;
+        let mut messages = Vec::new();
+        for row in index.range((account, uid, 0)..=(account, uid, u64::MAX))? {
+            let (key, seq) = row?;
+            if seq.value() < sequence {
+                continue;
+            }
+            let id = key.value().2;
+            let Some(m) = self.get_msg(id)? else { continue };
+            if !candidate(&m) || !m.held.is_empty() {
+                continue;
+            }
+            let i = m.summary.invite.as_ref().unwrap();
+            if i.uid != uid || !i.organizer.eq_ignore_ascii_case(organizer) {
+                continue;
+            }
+            for (folder, _) in &m.locations {
+                let Some(row) = folders.get(*folder)? else {
+                    continue;
+                };
+                if dec::<Folder>(row.value())?.role == Role::Inbox {
+                    messages.push((i.sequence, id, m.full.unwrap()));
+                    break;
+                }
+            }
+        }
+        messages.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(CalendarRevisions {
+            account,
+            uid: uid.into(),
+            organizer: organizer.into(),
+            sequence,
+            messages,
+        })
+    }
+
     pub(super) fn queue_calendar(&mut self, id: MsgId, m: &Message) -> Result<()> {
         if candidate(m) {
             let i = m.summary.invite.as_ref().unwrap();
@@ -68,11 +138,23 @@ impl Writer<'_> {
 impl Store {
     /// A bounded upgrade pass also handles inboxes created before delivery existed.
     pub fn index_calendar_page(&self) -> Result<bool> {
+        self.index_calendar_through(u64::MAX)
+    }
+
+    /// A final Send includes the backlog present when the check started.
+    /// Messages arriving later already enter the revision index on write.
+    pub fn index_calendar_before_send(&self) -> Result<()> {
+        let through = self.last_message()?;
+        while self.index_calendar_through(through)? {}
+        Ok(())
+    }
+
+    fn index_calendar_through(&self, through: MsgId) -> Result<bool> {
         const CURSOR: &str = "calendar-backfill";
         let tx = self.db.begin_read()?;
         let meta = tx.open_table(META)?;
         let cursor = meta.get(CURSOR)?.map_or(0, |n| n.value());
-        if cursor == u64::MAX {
+        if cursor >= through {
             return Ok(false);
         }
         let page = self.messages_after(cursor, 64)?;
@@ -82,6 +164,14 @@ impl Store {
             u64::MAX
         };
         self.write(|w| {
+            // The background worker can finish this page while Send is reading it.
+            if w.tx
+                .open_table(META)?
+                .get(CURSOR)?
+                .is_some_and(|v| v.value() > cursor)
+            {
+                return Ok(());
+            }
             for (id, _) in &page {
                 if let Some(m) = w.get_msg(*id)? {
                     w.queue_calendar(*id, &m)?;
@@ -90,7 +180,7 @@ impl Store {
             w.tx.open_table(META)?.insert(CURSOR, last)?;
             Ok(())
         })?;
-        Ok(last != u64::MAX)
+        Ok(last < through)
     }
 
     pub fn pending_calendar(&self, after: MsgId) -> Result<Vec<(MsgId, u64)>> {

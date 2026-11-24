@@ -4,6 +4,28 @@ use mail_schema::{InviteMethod, PartKind, SenderCheck};
 use mail_store::MsgId;
 use portcullis_ipc::calendar::{address, Delivery, Reply, Source, FILE_MAX};
 
+#[derive(serde::Deserialize)]
+struct OneOffIdentity {
+    uid: String,
+    sequence: u32,
+    organizer: String,
+    attendees: Vec<String>,
+    row: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LatestInvitation {
+    Update {
+        msg: MsgId,
+        sequence: u32,
+        when: String,
+        location: String,
+    },
+    Conflict {
+        sequence: u32,
+    },
+}
+
 pub struct Selected {
     pub source: Source,
     pub bytes: Vec<u8>,
@@ -54,15 +76,14 @@ pub fn proposed_time(invite: &mail_schema::Invite) -> Option<String> {
 
 impl Engine {
     pub fn selected_invitation(&self, msg: MsgId) -> Result<Selected, Error> {
-        self.extract_invitation(msg, || self.parser.start())
+        self.extract_invitation(&self.store.message(msg)?, || self.parser.start())
     }
 
     fn extract_invitation(
         &self,
-        msg: MsgId,
+        m: &mail_store::Message,
         worker: impl FnOnce() -> Result<crate::Jail, Error>,
     ) -> Result<Selected, Error> {
-        let m = self.store.message(msg)?;
         let blob = m
             .full
             .ok_or(Error::Refused("Download the full invitation first"))?;
@@ -172,7 +193,6 @@ impl Engine {
         &self,
         msg: MsgId,
     ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
-        use mail_schema::{FromJail, Raw, ToJail};
         let m = match self.store.message(msg) {
             Ok(m) => m,
             Err(mail_store::Error::NotFound) => return Ok(None),
@@ -188,6 +208,15 @@ impl Engine {
         {
             return Ok(None);
         }
+        self.one_off_update(&m, None)
+    }
+
+    fn one_off_update(
+        &self,
+        m: &mail_store::Message,
+        attendee: Option<&str>,
+    ) -> Result<Option<portcullis_ipc::calendar::BackgroundUpdate>, Error> {
+        use mail_schema::{FromJail, Raw, ToJail};
         let Some(i) = m
             .summary
             .invite
@@ -196,7 +225,7 @@ impl Engine {
         else {
             return Ok(None);
         };
-        let selected = match self.extract_invitation(msg, crate::Parser::installed_worker) {
+        let selected = match self.extract_invitation(m, crate::Parser::installed_worker) {
             Ok(s) => s,
             Err(Error::Refused(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -216,6 +245,14 @@ impl Engine {
             cancelled: i.cancelled,
             scope: None,
         });
+        if let Some(attendee) = attendee {
+            source
+                .identities
+                .retain(|a| a.eq_ignore_ascii_case(attendee));
+            if source.identities.is_empty() {
+                return Ok(None);
+            }
+        }
         let mut jail = crate::Parser::installed_worker()?;
         let len = selected.bytes.len() as u64;
         mail_schema::write_frame(
@@ -353,6 +390,97 @@ impl Engine {
         }
     }
 
+    /// Check the newest eligible part first. A conflicting pair at the highest
+    /// verified sequence needs a later organizer revision to disambiguate it.
+    fn check_one_off_response(
+        &self,
+        msg: MsgId,
+        account: u32,
+        original: &mail_schema::Invite,
+        r: &Reply,
+    ) -> Result<mail_store::CalendarRevisions, Error> {
+        // Old stores may still be backfilling when the first RSVP is sent.
+        self.store.index_calendar_before_send()?;
+        let revisions = self
+            .store
+            .write(|w| w.calendar_revisions(account, &r.uid, r.sequence, &r.organizer))?;
+        let mut latest: Option<(MsgId, mail_schema::Invite)> = None;
+        for &(seq, id, hash) in &revisions.messages {
+            if latest.as_ref().is_some_and(|(_, i)| seq < i.sequence) {
+                break;
+            }
+            if id == msg {
+                continue;
+            }
+            let m = match self.store.message(id) {
+                Ok(m)
+                    if m.full == Some(hash)
+                        && matches!(m.summary.sender_check, SenderCheck::Verified { .. }) =>
+                {
+                    m
+                }
+                Ok(_) | Err(mail_store::Error::NotFound) => {
+                    return Err(mail_store::Error::CalendarChanged.into())
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let Some(update) = self.one_off_update(&m, Some(&r.attendee))? else {
+                continue;
+            };
+            let Some(delivery) = update.source.delivery else {
+                continue;
+            };
+            let proof: OneOffIdentity = serde_json::from_str(&update.proposal)
+                .map_err(|_| Error::Jail("Invalid one-off scheduling proof".into()))?;
+            if delivery.uid != r.uid
+                || delivery.sequence != seq
+                || !delivery.organizer.eq_ignore_ascii_case(&r.organizer)
+                || proof.uid != r.uid
+                || proof.sequence != seq
+                || !proof.organizer.eq_ignore_ascii_case(&r.organizer)
+                || delivery.cancelled != proof.row.is_none()
+                || !(proof.attendees.len() == 1
+                    && proof.attendees[0].eq_ignore_ascii_case(&r.attendee)
+                    || delivery.cancelled && proof.attendees.is_empty())
+            {
+                continue;
+            }
+            let Some(i) = m.summary.invite else {
+                return Err(mail_store::Error::CalendarChanged.into());
+            };
+            let previous = latest.as_ref().map(|(_, v)| v).unwrap_or(original);
+            if previous.sequence == seq {
+                if previous.cancelled != i.cancelled
+                    || previous.start != i.start
+                    || previous.end != i.end
+                    || previous.location != i.location
+                {
+                    return Err(Error::InvitationChanged(LatestInvitation::Conflict {
+                        sequence: seq,
+                    }));
+                }
+            } else {
+                latest = Some((id, i));
+            }
+        }
+        if let Some((msg, i)) = latest {
+            let when = if i.cancelled {
+                "Cancelled by the organizer".into()
+            } else {
+                proposed_time(&i).ok_or(Error::Refused(
+                    "Open the latest invitation to review its time.",
+                ))?
+            };
+            return Err(Error::InvitationChanged(LatestInvitation::Update {
+                msg,
+                sequence: i.sequence,
+                when,
+                location: i.location,
+            }));
+        }
+        Ok(revisions)
+    }
+
     pub fn send_invitation_reply(
         &self,
         msg: MsgId,
@@ -484,12 +612,32 @@ impl Engine {
             key.push('/');
             key.push_str(id);
         }
-        self.queue_message(
-            m.account,
-            &draft,
-            Default::default(),
-            Default::default(),
-            Some((&key, r.sequence)),
-        )
+        // Recheck inside the outbox transaction. If sync committed between
+        // parsing these parts and enqueueing, review the new set before sending.
+        for _ in 0..3 {
+            let checked = if r.scope.is_none() {
+                match self.check_one_off_response(msg, m.account, i, r) {
+                    Ok(checked) => Some(checked),
+                    Err(Error::Store(mail_store::Error::CalendarChanged)) => continue,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                None
+            };
+            let result = self.queue_message(
+                m.account,
+                &draft,
+                Default::default(),
+                Default::default(),
+                Some((&key, r.sequence, checked.as_ref())),
+            );
+            if !matches!(
+                result,
+                Err(Error::Store(mail_store::Error::CalendarChanged))
+            ) {
+                return result;
+            }
+        }
+        Err(mail_store::Error::CalendarChanged.into())
     }
 }

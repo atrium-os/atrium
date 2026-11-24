@@ -162,6 +162,25 @@ case "${2-}" in
                 test ! -f "$personal_store/meeting-changes.json" ;;
         esac
         exit 0 ;;
+    response-window|response-deliver|response-result)
+        root=$(jls -j "$mail_jail" path)
+        uid=$(stat -f %u "$mail_folder/index.redb")
+        fixture=/tmp/rsvp-fixture
+        case "$2" in
+            response-window)
+                install -d -o "$uid" -g "$uid" "$root$fixture"
+                install -m 0555 invitation_probe "$root/bin/invitation-probe"
+                daemon -f -o "$D/response-probe.log" jexec -u "$(id -nu "$uid")" "$mail_jail" /bin/invitation-probe during-confirmation "$fixture" /bin/mail-parse-jail ;;
+            response-deliver) touch "$root$fixture/deliver" ;;
+            response-result)
+                for i in $(jot 30); do
+                    if grep -q 'PASS live confirmation' response-probe.log; then cat response-probe.log; exit 0; fi
+                    if grep -q 'panicked' response-probe.log; then break; fi
+                    sleep 1
+                done
+                cat response-probe.log >&2; exit 1 ;;
+        esac
+        exit 0 ;;
     invitation-check-empty|series-check-empty)
         stop_mail
         ./invitation_probe empty "$mail_folder" "$D/mail-parse-jail"

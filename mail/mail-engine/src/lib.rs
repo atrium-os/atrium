@@ -63,6 +63,7 @@ pub const TEXT_WINDOW: i64 = 90 * 86_400;
 
 #[derive(Debug)]
 pub enum Error {
+    InvitationChanged(invitations::LatestInvitation),
     Store(mail_store::Error),
     /// The jail could not be started or sent an invalid frame.
     Jail(String),
@@ -78,6 +79,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::InvitationChanged(_) => f.write_str("The organizer changed this invitation. Review it before responding."),
             Error::Store(e) => write!(f, "{e}"),
             Error::Jail(e) => write!(f, "parse jail: {e}"),
             Error::NotFound => f.write_str("no such message"),

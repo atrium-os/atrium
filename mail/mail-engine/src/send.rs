@@ -103,7 +103,7 @@ impl Engine {
 
     pub(crate) fn queue_message(
         &self, account: AccountId, draft: &Draft, when: When,
-        protect: crate::smime::Protect, invitation: Option<(&str, u32)>,
+        protect: crate::smime::Protect, invitation: Option<(&str, u32, Option<&mail_store::CalendarRevisions>)>,
     ) -> Result<u64, Error> {
         let t = now();
         let undo = when.undo_secs.clamp(*UNDO_SEND_RANGE.start(), *UNDO_SEND_RANGE.end());
@@ -133,7 +133,10 @@ impl Engine {
                 wr.set_follow_up(&o.message_id, account, due)?;
             }
             match invitation {
-                Some((key, sequence)) => wr.queue_invitation(key, sequence, &o),
+                Some((key, sequence, checked)) => {
+                    if let Some(parts) = checked { parts.recheck(wr)?; }
+                    wr.queue_invitation(key, sequence, &o)
+                }
                 None => wr.queue_send(&o),
             }
         })?)

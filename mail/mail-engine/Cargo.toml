@@ -20,6 +20,7 @@ mail-schema = { path = "../mail-schema" }
 mail-store = { path = "../mail-store" }
 mail-sync = { path = "../mail-sync" }
 postcard = { version = "1", features = ["use-std"] }
+serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Private addresses (§13.3): their random part.
 getrandom = "0.2"
@@ -33,7 +34,6 @@ atrium-links = { path = "../../atrium-links" }
 
 [dev-dependencies]
 tempfile = "3"
-serde_json = "1"
 mail-proto = { path = "../mail-proto" }
 # S/MIME round trips with a software key.
 rsa = "0.9"

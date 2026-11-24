@@ -31,6 +31,7 @@ mod outbox;
 pub use outbox::{retry_after, JmapSendActivity, Outgoing, SendState};
 pub mod search;
 mod calendar;
+pub use calendar::CalendarRevisions;
 pub mod senders;
 pub mod certs;
 pub mod dns;
@@ -110,6 +111,7 @@ pub mod flag {
 
 #[derive(Debug)]
 pub enum Error {
+    CalendarChanged,
     Db(String),
     Io(std::io::Error),
     Corrupt(&'static str),
@@ -119,6 +121,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::CalendarChanged => f.write_str("The inbox changed during invitation review. Please try again."),
             Error::Db(e) => write!(f, "index: {e}"),
             Error::Io(e) => write!(f, "store: {e}"),
             Error::Corrupt(w) => write!(f, "index record: {w}"),

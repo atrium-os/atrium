@@ -1,5 +1,9 @@
 //! Disposable guest fixture. Seed two synthetic deliveries, or deliver the
 //! reviewed outbox operation to a local SMTP peer and inspect its MIME part.
+#[allow(dead_code)]
+#[path = "../src/bin/atrium-mail/invitation.rs"]
+mod invitation;
+
 use mail_engine::{Engine, Parser};
 use mail_store::{Incoming, Role, Store};
 use std::{
@@ -421,40 +425,56 @@ fn background_batch(e: &Engine) {
             .replace("SEQUENCE:1", &format!("SEQUENCE:{seq}"))
             .replace("T14", &format!("T{hour}"))
             .replace("Studio A", "Studio C");
-        let raw = format!("From: Mina <mina@fixture.invalid>\r\nTo: dev@fixture.invalid\r\nSubject: Studio update {uid}\r\nMessage-ID: <update-{uid}@fixture.invalid>\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REQUEST\r\n\r\n{}",body.replace('\n',"\r\n")).into_bytes();
-        let mut summary = e
-            .parser
-            .summarize(&[(1, &raw)], false, &[])
-            .unwrap()
-            .pop()
-            .unwrap()
-            .unwrap();
-        if verified {
-            summary.sender_check = mail_schema::SenderCheck::Verified {
-                domain: "fixture.invalid".into(),
-                by_provider: false,
-            };
-        }
-        let blob = e.store.put_blob(&raw).unwrap();
-        e.store
-            .write(|w| {
-                w.put(
-                    inbox,
-                    account,
-                    uid,
-                    Incoming {
-                        server_id: None,
-                        size: raw.len() as u64,
-                        internal_date: None,
-                        flags: 0,
-                        blob,
-                        full: true,
-                        summary,
-                    },
-                )
-            })
-            .unwrap();
+        put_revision(e, account, inbox, uid, &body, verified);
     }
+}
+
+fn put_revision(
+    e: &Engine,
+    account: u32,
+    inbox: u32,
+    uid: u32,
+    body: &str,
+    verified: bool,
+) -> mail_store::MsgId {
+    let method = if body.contains("METHOD:CANCEL") {
+        "CANCEL"
+    } else {
+        "REQUEST"
+    };
+    let raw = format!("From: Mina <mina@fixture.invalid>\r\nTo: dev@fixture.invalid\r\nSubject: Studio update {uid}\r\nMessage-ID: <update-{uid}@fixture.invalid>\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method={method}\r\n\r\n{}",body.replace('\n',"\r\n")).into_bytes();
+    let mut summary = e
+        .parser
+        .summarize(&[(1, &raw)], false, &[])
+        .unwrap()
+        .pop()
+        .unwrap()
+        .unwrap();
+    if verified {
+        summary.sender_check = mail_schema::SenderCheck::Verified {
+            domain: "fixture.invalid".into(),
+            by_provider: false,
+        };
+    }
+    let blob = e.store.put_blob(&raw).unwrap();
+    e.store
+        .write(|w| {
+            w.put(
+                inbox,
+                account,
+                uid,
+                Incoming {
+                    server_id: None,
+                    size: raw.len() as u64,
+                    internal_date: None,
+                    flags: 0,
+                    blob,
+                    full: true,
+                    summary,
+                },
+            )
+        })
+        .unwrap()
 }
 
 fn check_background(e: &Engine) {
@@ -472,6 +492,87 @@ fn check_background(e: &Engine) {
     assert!(e.store.outbox().unwrap().is_empty());
 }
 
+// A real Mail confirmation on the disposable guest. The driver waits for the
+// original time on screen before allowing a new delivery into this fixture.
+fn during_confirmation(e: &Engine, dir: &Path) {
+    use mail_engine::{invitations::LatestInvitation, Error};
+    use portcullis_ipc::calendar::{Answer, Reply};
+    seed(e, "seed");
+    let account = e.store.accounts().unwrap()[0].0;
+    let inbox = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let msg = e.store.at(inbox, 2).unwrap().unwrap().0;
+    let blob = e.selected_invitation(msg).unwrap().blob;
+    let reply = Reply {
+        scope: None,
+        answer: Answer::Maybe,
+        uid: "studio-planning@fixture.invalid".into(),
+        attendee: "dev@fixture.invalid".into(),
+        organizer: "mina@fixture.invalid".into(),
+        sequence: 2,
+    };
+    let mut window = invitation::ResponseWindow::new(e, msg, blob, reply.clone()).unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(120);
+    let mut delivered = false;
+    let mut latest = 0;
+    loop {
+        assert!(
+            std::time::Instant::now() < until,
+            "timed out waiting for fixture input"
+        );
+        if !delivered && dir.join("deliver").exists() {
+            background_batch(e);
+            latest = e.store.at(inbox, 5).unwrap().unwrap().0;
+            delivered = true;
+        }
+        if let Some(done) = window.tick(e) {
+            assert!(
+                matches!(done, invitation::Finished::Review(id, _) if delivered && id == latest)
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(e.store.outbox().unwrap().is_empty());
+    let latest_reply = Reply {
+        sequence: 5,
+        ..reply
+    };
+    let blob = e.selected_invitation(latest).unwrap().blob;
+    // Neither a different attendee nor another account sharing the UID
+    // supersedes this choice. A byte-for-byte replay also permits sending.
+    let higher = REQUEST.replace("SEQUENCE:1", "SEQUENCE:7");
+    put_revision(
+        e,
+        account,
+        inbox,
+        7,
+        &higher.replace("dev@fixture.invalid", "other@fixture.invalid"),
+        true,
+    );
+    let second = e.store.add_account("dev@fixture.invalid").unwrap();
+    let other = e.store.folder_id(second, "INBOX", Role::Inbox).unwrap();
+    put_revision(e, second, other, 1, &higher, true);
+    let op = e
+        .send_invitation_reply(latest, blob, &latest_reply)
+        .unwrap();
+    assert!(e.undo_send(op).unwrap().is_some());
+    let conflicting = REQUEST.replace("SEQUENCE:1", "SEQUENCE:5");
+    put_revision(e, account, inbox, 8, &conflicting, true);
+    assert!(matches!(
+        e.send_invitation_reply(latest, blob, &latest_reply),
+        Err(Error::InvitationChanged(LatestInvitation::Conflict {
+            sequence: 5
+        }))
+    ));
+    let cancel = higher.replace("METHOD:REQUEST", "METHOD:CANCEL");
+    let cancel_id = put_revision(e, account, inbox, 9, &cancel, true);
+    assert!(matches!(e.send_invitation_reply(latest,blob,&latest_reply),
+        Err(Error::InvitationChanged(LatestInvitation::Update{msg, sequence:7, when, ..}))
+        if msg == cancel_id && when.contains("Cancelled")));
+    assert!(e.store.outbox().unwrap().is_empty());
+    println!("PASS live confirmation, late verified move, duplicate, identity isolation, conflict and cancellation");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let e = Engine::new(
@@ -484,6 +585,7 @@ fn main() {
         mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates"
         | "seed-future" | "seed-long-range" | "seed-cancel-future" | "seed-reinstate"
         | "seed-restart" | "seed-restore-one" | "seed-reissue") => seed(&e, mode),
+        "during-confirmation" => during_confirmation(&e, Path::new(&args[2])),
         "background-batch" => background_batch(&e),
         "background-check" => check_background(&e),
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),

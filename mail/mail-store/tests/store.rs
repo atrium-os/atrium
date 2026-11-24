@@ -241,9 +241,12 @@ fn calendar_delivery_survives_restart_hydration_and_racing_receipts() {
     s.write(|w| w.set_sender_check(later, verified.clone()))
         .unwrap();
     assert!(s.pending_calendar(0).unwrap().is_empty());
+    let before_send = s.write(|w| w.calendar_revisions(account, "design", 1, "p@example.org")).unwrap();
+    s.write(|w| before_send.recheck(w)).unwrap();
     let mut full = invitation(3, true);
     full.summary.sender_check = verified;
     s.write(|w| w.put(inbox, account, 2, full)).unwrap();
+    assert!(matches!(s.write(|w| before_send.recheck(w)), Err(mail_store::Error::CalendarChanged)));
     let old = s.pending_calendar(0).unwrap()[0];
     assert_eq!(old.0, later);
     drop(s);

@@ -541,21 +541,9 @@ fn main() {
             if invite_pending || response_window.is_some() {
                 mail.file_note("Finish the open invitation review first.".into());
             } else {
-                match engine.selected_invitation(msg) {
-                    Ok(selected) => {
-                        let blob = selected.blob;
-                        let tx = reviewed.clone();
-                        invite_pending = true;
-                        let store = engine.store.clone();
-                        std::thread::spawn(move || {
-                            let result = invitation::offer(selected, press);
-                            if result.is_ok() && store.write(|w| w.replay_calendar_revisions(msg)).is_err() {
-                                eprintln!("atrium-mail: could not requeue later meeting updates");
-                            }
-                            let _ = tx.send((msg, blob, result));
-                        });
-                    }
-                    Err(e) => mail.file_note(e.to_string()),
+                match invitation::start_review(&engine, msg, press, reviewed.clone()) {
+                    Ok(()) => invite_pending = true,
+                    Err(e) => mail.file_note(e),
                 }
             }
         }
@@ -570,9 +558,17 @@ fn main() {
                 Err(e) => mail.file_note(e),
             }
         }
-        if let Some(note) = response_window.as_mut().and_then(|w| w.tick(&engine)) {
+        if let Some(result) = response_window.as_mut().and_then(|w| w.tick(&engine)) {
+            match result {
+                invitation::Finished::Note(note) => mail.file_note(note),
+                invitation::Finished::Review(msg, press) => {
+                    match invitation::start_review(&engine, msg, press, reviewed.clone()) {
+                        Ok(()) => invite_pending = true,
+                        Err(e) => mail.file_note(e),
+                    }
+                }
+            }
             response_window = None;
-            mail.file_note(note);
         }
         mail.poll_link();
         mail.tick();

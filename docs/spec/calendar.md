@@ -373,6 +373,14 @@ Mail checks the inbox, sending account, organizer, reply destination and invited
 
 The installed synthetic check saves the same 14:00 meeting in Work and Personal, closes both windows, then delivers a 17:00 proposal, a delayed 16:00 proposal, a duplicate and a higher unverified revision. It checks that only 17:00 appears for review, the saved meeting stays at 14:00, Personal receives no review, the messages stay unread and the outbox stays empty. Recurring changes still use the explicit Mail review flow. [Installed check](../../scripts/calendar-invitation-check.py) · [Mail delivery queue](../../mail/mail-store/src/calendar.rs)
 
+### 7.25 A meeting changes while the RSVP is open
+
+At **Send response**, Mail checks the one-off invitation against verified organizer revisions in this persona’s inbox. If the organizer moved the meeting, the confirmation shows the time the person reviewed, the latest proposed time and venue, and the organizer revision. A cancellation is identified explicitly. **Review latest invitation** opens that exact Mail delivery in the same persona’s Calendar. The person chooses a fresh response there and confirms it in Mail. Closing the paused confirmation leaves the outbox empty and the calendar as it was.
+
+Mail binds the check to the receiving account, organizer, invited identity and meeting UID. A replay of the same revision and schedule permits the reviewed response. Conflicting schedules at the highest verified revision pause Send until the organizer clarifies. The outbox transaction rechecks the set of eligible messages, including newly verified or downloaded parts, before recording the RSVP.
+
+The synthetic guest check opens a 15:00 confirmation, waits until the window is visible, and delivers a verified move to 17:00, a delayed older revision, a replay and an unverified higher revision. A second check follows the replacement from the installed Mail confirmation into Calendar and back to Mail, then inspects the one reply delivered to the synthetic SMTP organizer. [Installed scenarios](../../scripts/calendar-invitation-check.py) · [Synthetic deliveries](../../mail/atrium-mail/examples/invitation_probe.rs)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |
