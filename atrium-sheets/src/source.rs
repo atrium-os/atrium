@@ -151,6 +151,9 @@ fn styled_view(t: &StyleTable, id: StyleId, v: &Value, system: DateSystem) -> Op
     cv.bold = st.font.bold;
     cv.marks = font_marks(&st.font);
     cv.size = font_px(&st.font);
+    if st.indent > 0 && matches!(st.h_align, officina_grid::style::HAlign::Left | officina_grid::style::HAlign::General) {
+        cv.indent = st.indent;
+    }
     cv.fill = st.fill.map(rgb);
     cv.pattern = st.pattern.map(|p| (p.name(), rgb(p.foreground.unwrap_or(0)), rgb(p.background.unwrap_or(0xFFFFFF))));
     cv.gradient = st.gradient.as_ref().map(|g| (g.angle, g.stops.clone()));

@@ -4776,6 +4776,14 @@ Gates: atrium-sheets `the_format_menu_styles_the_selection_and_the_grid_shows_it
 
 Gates: atrium-sheets `insert_and_delete_cells_shift_their_neighbours_and_formulas_follow`, `the_custom_format_bar_takes_a_code_and_refuses_what_it_cannot_read` and `larger_text_grows_rows_nobody_sized_and_smaller_brings_them_back`; all 123 Sheets lib tests pass.
 
+### 16.99 Duplicate Sheet, Define Name, indent (2026-11-24)
+
+- **Duplicate Sheet** (Data menu) puts a copy of the shown sheet right after it, named `Name (2)` (or the next free number), as one undo step (`data::duplicate_sheet`). The copy brings the cells with their formulas, formats, comments and links, plus merged cells, row heights and column widths, frozen panes and tab colour. Formulas in the copy that read their own sheet read the copy. At most 20,000,000 used cells are copied. Not yet: the sheet's tables, charts, pictures, pivots, conditional formats, validations and sheet-scoped names stay with the original.
+- **Define Name…** (Data menu) opens a bar that names the selection for the whole workbook as one step (`data::define_name`), for example `Sheet1!$A$1:$B$2`. A name already in use now means the new place. Names that look like cells, or that break Excel's rules, are refused and the bar stays open. Formulas and Go To use the names at once. Not yet: a Name Manager to list, rename or delete names.
+- **Increase Indent / Decrease Indent** (Format menu) step text in from the left by up to 15 steps. Indenting General or centred text moves it to the left, as Excel does. The grid now draws a cell style's indent for left-aligned and General cells, which also covers indents that files bring in.
+
+Gates: atrium-sheets `duplicate_sheet_copies_cells_formats_sizes_and_merges_after_it`, `define_name_names_the_selection_and_formulas_and_go_to_use_it` and `indent_steps_text_in_and_the_grid_draws_it`; all 126 Sheets lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

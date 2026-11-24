@@ -199,6 +199,10 @@ pub enum DataCmd {
     MergeCopies,
     /// A new sheet at the end; the window runs it, as it shows the sheet.
     AddSheet,
+    /// A copy of the shown sheet right after it; the window runs it.
+    DuplicateSheet,
+    /// The bar naming the selection; the window runs it.
+    DefineName,
     /// Rename the sheet on screen; the window runs it (a bar under the grid).
     RenameSheet,
     /// Delete the sheet on screen, or move it a place; the window runs them.
@@ -463,10 +467,12 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Conditional Formatting…").separated(), Some(DataCmd::CondFormats)));
     let sel_rect = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
     let validated = wb.validations().iter().any(|v| v.ranges.iter().any(|r| r.sheet == s && r.r0 <= sel_rect.r1 && sel_rect.r0 <= r.r1 && r.c0 <= sel_rect.c1 && sel_rect.c0 <= r.c1));
+    v.push((MenuItem::new("Define Name…").separated(), Some(DataCmd::DefineName)));
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
     v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
+    v.push((MenuItem::new("Duplicate Sheet").enabled(wb.sheet_count() < officina_grid::book::MAX_SHEETS), Some(DataCmd::DuplicateSheet)));
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
     v.push((MenuItem::new("Tab Colour…"), Some(DataCmd::TabColor)));
     let n = wb.sheet_count() as u16;
@@ -554,6 +560,89 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
 }
 
 /// The most rows Remove Duplicates looks through.
+/// The most used cells Duplicate Sheet copies.
+pub const MAX_DUPLICATE_CELLS: u64 = 20_000_000;
+
+/// The name a copy of sheet `name` gets: `name (2)`, or the next free number.
+pub fn copy_name(wb: &Workbook, name: &str) -> String {
+    let base = match name.rsplit_once(" (") {
+        Some((b, n)) if n.strip_suffix(')').is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())) => b,
+        _ => name,
+    };
+    (2..).map(|k| format!("{base} ({k})")).find(|n| wb.sheet_id(n).is_none()).unwrap_or_default()
+}
+
+/// Duplicate Sheet: a copy of the shown sheet placed right after it, as one
+/// step: its cells with their formulas, formats, comments and links, merged
+/// cells, row heights and column widths, frozen panes and tab colour.
+/// Formulas in the copy that read its own sheet read the copy, as Excel's
+/// copy does. Returns the copy's place.
+pub fn duplicate_sheet(d: &mut Doc) -> Result<u16, String> {
+    let s = d.sheet;
+    let n = d.wb.sheet_count();
+    if n >= officina_grid::book::MAX_SHEETS {
+        return Err(format!("A workbook holds at most {} sheets.", officina_grid::book::MAX_SHEETS));
+    }
+    let (er, ec) = d.wb.extent(s);
+    if er as u64 * ec as u64 > MAX_DUPLICATE_CELLS {
+        return Err(format!("Duplicate Sheet copies at most {MAX_DUPLICATE_CELLS} cells."));
+    }
+    let name = copy_name(&d.wb, &d.wb.sheet_name(s));
+    let clip = (er > 0 && ec > 0).then(|| officina_grid::clip::Clip::take(&d.wb, Rect { sheet: s, r0: 0, c0: 0, r1: er - 1, c1: ec - 1 }, false));
+    d.run("Duplicate Sheet", vec![GridOp::add_sheet(name.clone())]);
+    if d.wb.sheet_count() <= n {
+        return Err(format!("Couldn't add a sheet called {name}."));
+    }
+    let t = n as u16;
+    let sh = d.wb.sheet(s);
+    let mut ops = vec![
+        GridOp::LayoutSizes { sheet: t, rows: true, default: sh.row_sizes.default, over: sh.row_sizes.overrides().to_vec() },
+        GridOp::LayoutSizes { sheet: t, rows: false, default: sh.col_sizes.default, over: sh.col_sizes.overrides().to_vec() },
+        GridOp::TabColor { sheet: t, color: sh.tab_color },
+        GridOp::Freeze { sheet: t, rows: sh.freeze.0, cols: sh.freeze.1, from: sh.freeze_from },
+    ];
+    if let Some(clip) = clip {
+        let (paste, _) = clip.paste(&d.wb, t, 0, 0)?;
+        ops.extend(paste);
+    }
+    let merges: Vec<Rect> = d.wb.merges(s).iter().map(|m| Rect { sheet: t, ..*m }).collect();
+    if !merges.is_empty() {
+        ops.push(GridOp::Merges { sheet: t, list: merges });
+    }
+    if s + 1 < t {
+        ops.push(GridOp::MoveSheet { from: t, to: s + 1 });
+    }
+    d.extend(ops);
+    Ok(s + 1)
+}
+
+/// Define Name: `name` given to the selection, for the whole workbook, as
+/// one step. A name already used for the workbook now means the selection.
+pub fn define_name(d: &mut Doc, sel: CellRange, name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if !officina_grid::names::valid_name(name) {
+        return Err(format!("{name:?} can't be a name: start with a letter or _, use letters, digits, _ and ., and don't spell a cell like A1."));
+    }
+    let s = d.sheet;
+    let place = {
+        let a = |r: u32, c: u32| format!("${}${}", officina_grid::addr::col_name(c), r + 1);
+        let sheet = d.wb.sheet_name(s);
+        let sheet = if sheet.chars().all(|c| c.is_alphanumeric() || c == '_') && !sheet.chars().next().is_some_and(|c| c.is_ascii_digit()) { sheet } else { format!("'{}'", sheet.replace('\'', "''")) };
+        if sel.r0 == sel.r1 && sel.c0 == sel.c1 { format!("={sheet}!{}", a(sel.r0, sel.c0)) } else { format!("={sheet}!{}:{}", a(sel.r0, sel.c0), a(sel.r1, sel.c1)) }
+    };
+    // Worked out on the workbook, then put back and made again as one
+    // undoable step.
+    let old: Vec<_> = d.wb.names().iter().cloned().collect();
+    let existed = d.wb.names().iter().any(|n| n.scope.is_none() && n.name.eq_ignore_ascii_case(name));
+    d.wb.define_name(name, None, &place).map_err(|e| format!("Couldn't name it: {e:?}"))?;
+    let new: Vec<_> = d.wb.names().iter().cloned().collect();
+    d.wb.replace_names(old);
+    let op = GridOp::names(&d.wb, &new);
+    d.run("Define Name", vec![op]);
+    let shown = place.trim_start_matches('=');
+    Ok(if existed { format!("{name} now means {shown}.") } else { format!("Named {shown} {name}.") })
+}
+
 /// The most cells Insert or Delete Cells moves.
 pub const MAX_SHIFT_CELLS: u64 = 2_000_000;
 
@@ -1558,7 +1647,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             change_filter(d, row, col, f)
         }
         // The window opens its value list for this one.
-        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
+        DataCmd::Author(_) | DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::BrowseVersions | DataCmd::PrintComments | DataCmd::TrackChanges | DataCmd::ReviewTracked | DataCmd::MergeCopies | DataCmd::AddSheet | DataCmd::DuplicateSheet | DataCmd::DefineName | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::NewThread | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth | DataCmd::PasteSpecial | DataCmd::CustomLists => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, row, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

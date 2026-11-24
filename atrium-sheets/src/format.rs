@@ -31,6 +31,8 @@ pub enum FormatCmd {
     Borders(BorderKind),
     /// Opens the bar for a format code of one's own; the window runs it.
     Custom,
+    /// The text moved one step in (true) or out from the left.
+    Indent(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,8 @@ pub fn menu(d: &Doc, sel: CellRange) -> Vec<(MenuItem, Option<FormatCmd>)> {
         (MenuItem::new("Align Centre").checked(st.h_align == HAlign::Center), Some(FormatCmd::Align(HAlign::Center))),
         (MenuItem::new("Align Right").checked(st.h_align == HAlign::Right), Some(FormatCmd::Align(HAlign::Right))),
         (MenuItem::new("Align by Value").checked(st.h_align == HAlign::General), Some(FormatCmd::Align(HAlign::General))),
+        (MenuItem::new("Increase Indent").enabled(st.indent < MAX_INDENT), Some(FormatCmd::Indent(true))),
+        (MenuItem::new("Decrease Indent").enabled(st.indent > 0), Some(FormatCmd::Indent(false))),
     ];
     let keys = ["Ctrl+Shift+~", "Ctrl+Shift+!", "Ctrl+Shift+$", "Ctrl+Shift+%", "Ctrl+Shift+#", "Ctrl+Shift+@", "Ctrl+Shift+^", ""];
     for (i, (name, code)) in NUMBER_FORMATS.iter().enumerate() {
@@ -152,6 +156,22 @@ fn apply(d: &mut Doc, sel: CellRange, cmd: FormatCmd) -> Result<String, String> 
     }
     match cmd {
         FormatCmd::Custom => Ok(String::new()),
+        FormatCmd::Indent(more) => {
+            if !more && first.indent == 0 {
+                return Err("The text isn't indented.".into());
+            }
+            if more && first.indent >= MAX_INDENT {
+                return Err(format!("Text is indented at most {MAX_INDENT} steps."));
+            }
+            let to = if more { first.indent + 1 } else { first.indent - 1 };
+            // Indented text sits at the left, as Excel puts it.
+            one(d, if more { "Increase Indent" } else { "Decrease Indent" }, &|st| Style {
+                indent: to,
+                h_align: if to > 0 && matches!(st.h_align, HAlign::General | HAlign::Center) { HAlign::Left } else { st.h_align },
+                ..st.clone()
+            });
+            Ok(if to == 0 { "Indent taken off.".into() } else { format!("Indented {to} {}.", if to == 1 { "step" } else { "steps" }) })
+        }
         FormatCmd::Bold => toggle!("Bold", bold),
         FormatCmd::Italic => toggle!("Italic", italic),
         FormatCmd::Underline => toggle!("Underline", underline),
@@ -323,6 +343,9 @@ mod tests {
         assert_eq!(decimals("@", true), None);
     }
 }
+
+/// The most indent steps a cell takes (Excel's indent buttons stop at 15).
+pub const MAX_INDENT: u8 = 15;
 
 /// The longest format code the Custom Format bar takes.
 pub const MAX_CODE: usize = 255;

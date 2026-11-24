@@ -69,6 +69,9 @@ pub enum TabCmd {
     /// The Custom Format bar's field submitted; closed.
     CodeDone,
     CodeCancel,
+    /// The Define Name bar's field submitted; closed.
+    NameDone,
+    NameCancel,
     /// The exact-size bar's field submitted; closed.
     SizeDone,
     SizeCancel,
