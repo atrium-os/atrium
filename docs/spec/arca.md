@@ -977,13 +977,23 @@ be idempotent. Re-adding the same address produces a new account
 instance. A changed account identity or publisher requires a new
 explicit enrollment.
 
-The next synthetic gate should use two accounts in the same persona
-with distinct keys. Check that only the selected enrolled account can
-open, that an approved alias works only for its own enrollment, and that
-removal, re-addition, or a changed account during an open invalidates the
-old authorization. Exercise these cases through signed Mail, the
-trusted enrollment sheet and the jailed reader, with one generic
-refusal and no outcome-dependent mailbox writes. The existing six
+The native synthetic account gate exercises four backend cases. It
+opens distinct fixed messages for two accounts in one persona, checks
+an approved alias against its own enrollment, and rejects a changed
+account binding before key use. It verifies that forget is idempotent
+and an old handle stays unusable after store reopen and account
+re-addition. When removal happens during a read, the approval is
+revoked and both worker sockets close before a result can publish.
+The opaque enrollment handle in this gate is Arca's sealed item ID.
+The existing persona, publisher, certificate digest and cross-purpose
+fingerprint checks still apply.
+
+The native gate supplies account selection and approval directly,
+generates its second synthetic key inside a temporary directory, and
+uses a socket peer for the reader. The separate signed regression lane
+still exercises the existing fixed one-account fixture. A subsequent
+gate must connect account provisioning and removal to signed Mail,
+the trusted enrollment sheet and the jailed reader. The existing six
 whole-path timing trials cover two operational failures only.
 
 ##### Failure observability review

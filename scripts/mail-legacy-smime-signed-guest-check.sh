@@ -29,7 +29,7 @@ run_suite() {
     awk '/^test .* \.\.\. ok$/ { sub(/^test /, ""); sub(/ \.\.\. ok$/, ""); print }' "$bin.out" | sort >"$bin.passed"
     diff -u "$bin.expected" "$bin.passed"
 }
-run_suite arcad-unit 16 server::smime
+run_suite arcad-unit 20 server::smime
 run_suite mail-smime-unit 3
 run_suite mail-smime-interop 5
 run_suite mail-received-unit 1 legacy_received_envelope

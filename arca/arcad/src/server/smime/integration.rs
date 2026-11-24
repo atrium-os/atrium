@@ -494,6 +494,17 @@ pub fn enroll(
     cert: &[u8],
     der: &[u8],
 ) -> io::Result<Fingerprint> {
+    enroll_key(store, persona, publisher, cert, der, &[]).map(|(fingerprint, _)| fingerprint)
+}
+
+fn enroll_key(
+    store: &mut Store,
+    persona: Option<&str>,
+    publisher: [u8; 32],
+    cert: &[u8],
+    der: &[u8],
+    account_binding: &[u8],
+) -> io::Result<(Fingerprint, arca_store::ItemId)> {
     let persona = storage_persona(persona).ok_or_else(closed)?;
     if publisher == [0; 32]
         || cert.len() > wire::MAX_CERT
@@ -514,10 +525,10 @@ pub fn enroll(
     {
         return Err(closed());
     }
-    let mut scope = [0u8; 64];
-    scope[..32].copy_from_slice(&fingerprint);
-    scope[32..].copy_from_slice(&Sha256::digest(cert));
-    store
+    let mut scope = fingerprint.to_vec();
+    scope.extend_from_slice(&Sha256::digest(cert));
+    scope.extend_from_slice(account_binding);
+    let saved = store
         .add(NewItem {
             persona,
             recipient: Recipient::SmimeLegacy { publisher },
@@ -529,8 +540,11 @@ pub fn enroll(
             value: der,
         })
         .map_err(|_| closed())?;
-    Ok(fingerprint)
+    Ok((fingerprint, saved.id))
 }
+
+#[cfg(test)]
+mod account_gate;
 
 #[cfg(test)]
 mod tests {
