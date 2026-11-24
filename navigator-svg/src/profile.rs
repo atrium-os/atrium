@@ -49,7 +49,7 @@ pub struct Checked { pub elements: usize, pub expanded: u64, pub layer_depth: us
 
 /// The text with a bare DOCTYPE removed, or a refusal for an internal subset
 /// or an entity.
-fn without_doctype(text: &str) -> Result<std::borrow::Cow<'_, str>, &'static str> {
+pub fn without_doctype(text: &str) -> Result<std::borrow::Cow<'_, str>, &'static str> {
     let low_has = |n: &str| text.as_bytes().windows(n.len()).any(|w| w.eq_ignore_ascii_case(n.as_bytes()));
     if low_has("<!ENTITY") { return Err("DTD entity") }
     let Some(at) = text.find("<!DOCTYPE").or_else(|| text.find("<!doctype")) else { return Ok(text.into()) };

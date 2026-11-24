@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
     "atrium-assets",
+    "atrium-icon",
     "atrium-message",
     "atrium-message-derive",
     "atrium-schema",

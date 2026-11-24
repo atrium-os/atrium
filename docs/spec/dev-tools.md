@@ -284,6 +284,24 @@ opens `assets/<name>` in the bundle (names of `A-Z a-z 0-9 . _ -` parts,
 no `..`), checks the answer's size and length, and with
 `ATRIUM_WORKERS=local` runs the decoder as a plain child for development
 off Atrium. `scripts/vm-image-decode-check.sh` is its VM check.
+A system worker's own installed manifest must declare nothing (no
+capability, not even one set to false, no `[[workers]]`, `[roles]` or
+`[ipc]`), each app holds at most 4 at once under the rule's system-wide
+cap, and a jail lives at most 5 minutes whatever its caller does
+(`portcullisd::system_worker`).
+
+As built (step 4, first half): `sdk/atrium-icon` is the dock's check
+(`check`: shapes, points and bytes against `portcullis_toml::icon`'s
+MAX_ICON_SHAPES 64, MAX_ICON_POINTS 8192 and MAX_ICON_BYTES 32 KB, which
+forum-dock also uses) and the importer (`import`): it drops other
+namespaces, editor metadata, hidden layers, scripts, handlers and outside
+links, names each element it can't keep (text, filters, masks, images,
+markers), and writes the rest as plain filled paths (transforms folded,
+gradients kept in `<defs>`, rectangular clips, opacity, even-odd).
+`cargo atrium icon check <svg> [--json]` and `cargo atrium icon import
+<svg> [--name n] [--dry-run] [--json]` (writes `assets/icons/<n>.svg`)
+are its CLI, and `cargo atrium bundle` now carries every file under
+`assets/` (plain names, no links, at most 4096).
 
 ## 4. C and C++ in a workspace
 

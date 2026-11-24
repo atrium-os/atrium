@@ -17,6 +17,7 @@ path = "src/lib.rs"
 portcullis-toml   = { path = "../../portcullis/portcullis-toml" }
 portcullis-policy = { path = "../../portcullis/portcullis-policy" }
 portcullis-sig    = { path = "../../portcullis/portcullis-sig" }
+atrium-icon       = { path = "../atrium-icon" }
 base64 = "0.22"
 flate2 = "1"
 sha2 = "0.10"
