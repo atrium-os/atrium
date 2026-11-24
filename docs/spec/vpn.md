@@ -1325,6 +1325,18 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
     the window hands the page as `ResourceReady` (or `ResourceFailed`).
     The page never names where a resource comes from beyond its own
     origin, and has no network of its own.
+    The engine asks only for a script or stylesheet element's load (669ba7e83;
+    a page's `fetch()` once went out with the jar's cookie, I6.0). The page
+    process is not trusted to say what a load is for, so navigatord also
+    fetches only a path ending in `.js`, `.mjs` or `.css`. A cookied request
+    for an API path never leaves it, even from a compromised engine.
+    Rechecked on 2026-11-25 on a fresh overlay of the committed base. The
+    Keycloak registration and passkey sign-in both completed, and
+    navigatord was asked for scripts and stylesheets only. The I6
+    fixture's server saw `/app.html` and `/app.js` and never `/api/me`. The
+    page's session check read "Only scripts and stylesheets come from the
+    VPN sign-in window". Evidence:
+    `~/atrium-vm/evidence/vpn-passkey-leak-recheck-20261125/`.
   - *Forms a script submits.* A top-level form POST
     (`application/x-www-form-urlencoded`) of the page's own origin, such as
     a script's `requestSubmit()`, is never followed in the page.
@@ -1383,6 +1395,16 @@ Navigator I3 (live sign-in pages with WebAuthn through Sigillum) was done.
     sign-in page per instance. The previous base lived in `/private/tmp`
     and macOS's daily clean-tmps deleted it. The fixture inputs used are in
     `~/atrium-vm/navigator-signin-fixture/` (`artifacts.sha256`).
+  - *Any page in the window.* `scripts/navigator-i6-window.py setup|open`
+    opens a page no gateway names. Its stand-in for cryptad's socket
+    (`navigator-i6-window/fake-crypta.c`, cross-built on the host) gives
+    every `sso-attempt` one live attempt. It reads a whole line, because
+    portcullisd writes in two parts. The script's docstring has the QEMU
+    forward for the I6 fixture names.
+  - *Restricted guest networking.* QEMU's resolver never answers under
+    `restrict=on`, so sshd's reverse lookup (UseDNS) hangs and SSH times
+    out in preauth. network.sh and the base add `10.0.2.2 qemu-host` to
+    `/etc/hosts`.
   - *Gate fixture notes.* frescod needs `FRESCOD_ACTIVATION_UIDS=65021,65030`
     so Sigillum's sheet can spend its press. With no Forum,
     `place_sigillum_fixture` places the sheet, and `place_sigillum_fixture

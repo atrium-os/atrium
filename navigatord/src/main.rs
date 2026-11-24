@@ -982,6 +982,13 @@ fn vpn_resource_target(document: &str, url: &str) -> Result<String, &'static str
     if target.as_str() != url {
         return Err("the address is not in its normal spelling");
     }
+    // The page process asks, and it is not trusted to say what a load is
+    // for: only a script or stylesheet file goes out with the jar's
+    // cookies, never an API path a page's fetch() names (I6.0 saw /api/me).
+    let path = target.path().to_ascii_lowercase();
+    if ![".js", ".mjs", ".css"].iter().any(|e| path.ends_with(e)) {
+        return Err("only a .js, .mjs or .css file");
+    }
     doc.host_str().map(str::to_ascii_lowercase).ok_or("the page has no host")
 }
 
@@ -2585,6 +2592,10 @@ mod tests {
         assert_eq!(refused_target("https://cdn.thirdparty.example/lib.js?k=secret"), "host cdn.thirdparty.example, site thirdparty.example");
         assert_eq!(refused_target("not an address"), "host unreadable");
         assert!(vpn_resource_target(doc, "https://IDP.crypta.test:448/a.js").is_err(), "only the normal spelling");
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/realms/corp/api/me").is_err(), "a page's fetch() is not a script");
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/a.json").is_err());
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/r/v5/patternfly.min.css?v=1").is_ok(), "a query is fine");
+        assert!(vpn_resource_target(doc, "https://idp.crypta.test:448/m.MJS").is_ok());
         assert!(vpn_resource_target("http://idp.crypta.test/", "http://idp.crypta.test/a.js").is_err());
         let long = format!("https://idp.crypta.test:448/{}", "a".repeat(limen::sign_in::VPN_RESOURCE_URL_MAX));
         assert!(vpn_resource_target(doc, &long).is_err());

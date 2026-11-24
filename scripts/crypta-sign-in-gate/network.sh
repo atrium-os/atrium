@@ -27,6 +27,9 @@ test -S "$D/net.sock"
 sleep 2
 grep -q '^nameserver' /etc/resolv.conf || echo 'nameserver 10.0.2.3' >> /etc/resolv.conf
 grep -q '^nameserver' /etc/resolv.conf
+# sshd looks up the host's address (UseDNS); under restrict=on QEMU's resolver
+# never answers, and SSH then times out in preauth. Answer it locally.
+grep -q '^10.0.2.2[[:space:]]' /etc/hosts || echo '10.0.2.2 qemu-host' >> /etc/hosts
 daemon -f -o "$D/crypta.log" /usr/local/bin/atrium-cryptad -v --state "$D/state" --net-sock "$D/net.sock" --sock "$D/crypta.sock" --arca /atrium/sockets/arca/arcad.sock
 for i in $(jot 20); do test -S "$D/crypta.sock" && break; sleep .25; done
 test -S "$D/crypta.sock"
