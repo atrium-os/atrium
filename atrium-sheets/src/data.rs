@@ -90,6 +90,8 @@ pub enum DataCmd {
     /// The selection's column split at the delimiter its cells use, into the
     /// empty columns to its right.
     TextToColumns,
+    /// The table's total row, on or off.
+    TotalRow,
     /// A SUM of the numbers next to the selection (Alt+=).
     AutoSum,
     /// The selection back to the default format; with its contents, comments
@@ -416,7 +418,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
     }
     match table {
-        Some(t) => v.push((MenuItem::new(format!("Convert “{}” to Range", short(&t.name))).separated(), Some(DataCmd::RemoveTable))),
+        Some(t) => {
+            v.push((MenuItem::new(format!("Convert “{}” to Range", short(&t.name))).separated(), Some(DataCmd::RemoveTable)));
+            v.push((MenuItem::new("Total Row").checked(t.totals), Some(DataCmd::TotalRow)));
+        }
         None => v.push((MenuItem::new("Format as Table").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
     }
     v.push((MenuItem::new("Insert Column Chart").enabled(some).separated(), Some(DataCmd::Chart(ChartKind::Column))));
@@ -878,6 +883,148 @@ pub fn keep_values(d: &mut Doc, row: u32, col: u32, keep: Vec<String>, every: bo
     d.status = match msg { Ok(m) | Err(m) => m };
 }
 
+/// The conditions a filter column offers besides picking values (index 0).
+pub const FILTER_CONDS: [&str; 16] = [
+    "Values", "Equals", "Does not equal", "Greater than", "Greater than or equal to", "Less than", "Less than or equal to", "Between",
+    "Top", "Bottom", "Top %", "Bottom %", "Begins with", "Ends with", "Contains", "Does not contain",
+];
+
+/// Condition `kind` of [`FILTER_CONDS`] with what was typed for it (`b` only for
+/// Between). Numbers compare as numbers; other text as text, ignoring case.
+pub fn filter_cond(kind: usize, a: &str, b: &str) -> Result<Cond, String> {
+    use officina_grid::filter::{Rank, Test, TextOp, TextTest};
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || (kind == 7 && b.is_empty()) {
+        return Err("Type a value for the condition.".into());
+    }
+    let num = |t: &str| match officina_grid::Input::typed(t) {
+        officina_grid::Input::Value(Value::Num(x)) => Some(x),
+        _ => None,
+    };
+    let text = |op, value: &str| Cond::Custom(vec![Test::Text(TextTest { op, value: value.to_string(), case_sensitive: false })], true);
+    Ok(match kind {
+        1..=6 => {
+            let op = ["=", "<>", ">", ">=", "<", "<="][kind - 1];
+            match num(a) {
+                Some(x) => Cond::Compare(vec![(op.to_string(), x)], true),
+                None => text(TextOp::comparison(op).ok_or("Unknown comparison.")?, a),
+            }
+        }
+        7 => match (num(a), num(b)) {
+            (Some(x), Some(y)) => Cond::Compare(vec![(">=".into(), x.min(y)), ("<=".into(), x.max(y))], true),
+            _ => return Err("Between takes two numbers.".into()),
+        },
+        8..=11 => {
+            let percent = kind >= 10;
+            Cond::Rank(Rank::parse(a, percent, kind == 9 || kind == 11).ok_or(if percent { "Type a whole percent from 1 to 100." } else { "Type a whole number of rows, 1 or more." })?)
+        }
+        12 => text(TextOp::Begins, a),
+        13 => text(TextOp::Ends, a),
+        14 => text(TextOp::Contains, a),
+        15 => text(TextOp::NotContains, a),
+        _ => return Err("Choose a condition.".into()),
+    })
+}
+
+/// The condition and its typed values a column's filter shows in the panel,
+/// when it is one the panel makes.
+pub fn cond_fields(c: &Cond) -> Option<(usize, String, String)> {
+    use officina_grid::filter::{Test, TextOp};
+    let n = |x: f64| Value::Num(x).display();
+    match c {
+        Cond::Compare(v, true) if v.len() == 2 && v[0].0 == ">=" && v[1].0 == "<=" => Some((7, n(v[0].1), n(v[1].1))),
+        Cond::Compare(v, _) if v.len() == 1 => {
+            let k = ["=", "<>", ">", ">=", "<", "<="].iter().position(|o| *o == v[0].0)?;
+            Some((k + 1, n(v[0].1), String::new()))
+        }
+        Cond::Rank(r) => Some((8 + 2 * usize::from(r.percent) + usize::from(r.bottom), r.limit().to_string(), String::new())),
+        Cond::Custom(t, _) if t.len() == 1 => match &t[0] {
+            Test::Text(t) if !t.case_sensitive => {
+                let k = match t.op {
+                    TextOp::Begins => 12,
+                    TextOp::Ends => 13,
+                    TextOp::Contains => 14,
+                    TextOp::NotContains => 15,
+                    op => ["=", "<>", ">", ">=", "<", "<="].iter().position(|o| Some(*o) == op.comparison_symbol())? + 1,
+                };
+                Some((k, t.value.clone(), String::new()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The panel's condition for column `col` of the filter at (`row`, `col`).
+pub fn column_cond(d: &Doc, row: u32, col: u32) -> Option<(usize, String, String)> {
+    let f = filter_scope(d, row, col)?.auto_filter();
+    f.conds.iter().find(|(c, _)| *c == col).and_then(|(_, c)| cond_fields(c))
+}
+
+/// Puts `cond` in place of column `col`'s condition in the filter at (`row`, `col`).
+pub fn set_condition(d: &mut Doc, row: u32, col: u32, cond: Cond) {
+    let msg = (|| {
+        let mut f = filter_scope(d, row, col).ok_or("There is no filter here.")?.auto_filter();
+        let mut conds = f.conds.clone();
+        conds.retain(|(c, cond)| *c != col || cond.is_expression());
+        conds.push((col, cond));
+        conds.sort_by_key(|(c, _)| *c);
+        if conds == f.conds {
+            return Ok::<String, String>("The filter is as it was.".into());
+        }
+        f.conds = conds;
+        change_filter(d, row, col, f)
+    })();
+    d.status = match msg { Ok(m) | Err(m) => m };
+}
+
+/// The table at (`row`, `col`) with a total row under its data, or without
+/// one. Turning it on needs the row under the table empty; its first column
+/// says Total and each column of numbers gets `SUBTOTAL(109, …)`, a sum of the
+/// rows the filter shows. Turning it off empties that row.
+fn total_row(d: &mut Doc, row: u32, col: u32) -> Result<String, String> {
+    use officina_grid::Input;
+    let s = d.sheet;
+    let t = d.wb.table_at(s, row, col).cloned().ok_or("The cursor isn't in a table.")?;
+    let mut all = d.wb.tables().to_vec();
+    let i = all.iter().position(|x| x.name == t.name).unwrap();
+    if t.totals {
+        let last = Rect { r0: t.rect.r1, ..t.rect };
+        all[i].totals = false;
+        all[i].rect.r1 -= 1;
+        d.run("Total Row", vec![GridOp::clear(last), GridOp::Tables(all)]);
+        return Ok(format!("{} has no total row now.", t.name));
+    }
+    let below = t.rect.r1 + 1;
+    if below >= officina_grid::addr::MAX_ROWS {
+        return Err("There is no row under the table for totals.".into());
+    }
+    let row_rect = Rect { r0: below, r1: below, ..t.rect };
+    let mut busy = false;
+    d.wb.each(&row_rect, &mut |_, _, v| busy |= v != Value::Empty);
+    if busy {
+        return Err(format!("Row {} under the table isn't empty; the totals go there.", below + 1));
+    }
+    let first = t.rect.r0 + u32::from(t.header);
+    let cells: Vec<Input> = (t.rect.c0..=t.rect.c1).enumerate().map(|(k, c)| {
+        let mut nums = false;
+        if first <= t.rect.r1 {
+            d.wb.each(&Rect { r0: first, c0: c, c1: c, ..t.rect }, &mut |_, _, v| nums |= matches!(v, Value::Num(_)));
+        }
+        if nums {
+            Input::Formula(format!("=SUBTOTAL(109,{}[{}])", t.name, t.columns[k].chars().flat_map(|ch| if "[]#'".contains(ch) { vec!['\'', ch] } else { vec![ch] }).collect::<String>()))
+        } else if k == 0 {
+            Input::Value(Value::str("Total"))
+        } else {
+            Input::Empty
+        }
+    }).collect();
+    all[i].totals = true;
+    all[i].rect.r1 = below;
+    d.run("Total Row", vec![GridOp::Tables(all), GridOp::block(s, below, t.rect.c0, vec![cells])]);
+    Ok(format!("{} has a total row: column sums of the rows shown.", t.name))
+}
+
 fn hidden_in(st: &officina_grid::filter::FilterState, r: &Rect) -> u32 {
     st.hidden.iter().filter(|(a, b)| *b > r.r0 && *a <= r.r1).map(|(a, b)| b.min(&r.r1) - a.max(&(r.r0 + 1)) + 1).sum()
 }
@@ -1167,6 +1314,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(format!("{} duplicate {} removed; {left} unique {} left.", n, if n == 1 { "row" } else { "rows" }, if left == 1 { "row" } else { "rows" }))
         }
         DataCmd::TextToColumns => text_to_columns(d, sel, cursor),
+        DataCmd::TotalRow => total_row(d, row, col),
         DataCmd::AutoSum => auto_sum(d, sel),
         DataCmd::ClearFormats | DataCmd::ClearAll => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };

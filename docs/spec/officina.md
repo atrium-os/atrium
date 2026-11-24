@@ -1481,8 +1481,7 @@ The O4d/O4e engine features, usable in `atrium-sheets` (`src/data.rs`):
   drawn for the visible part only; a mark on each filter header cell, lit on a
   filtered column.
 
-Not yet: picking several values from a list (the menu works on the cursor's value),
-number conditions in the UI, totals rows, chart editing (titles, kinds, ranges),
+Not yet: chart editing (titles, kinds, ranges),
 moving and sizing charts with the pointer. Charts leave out rows a filter (or the user) hides, as Excel's do.
 
 Gates: `atrium-sheets` tests (region and header, sort and undo, show only / hide /
@@ -4747,7 +4746,14 @@ The Data menu gains five commands. Each makes one undo step.
 - **Clear Formats** puts the selection back to the default format. **Clear All** also empties the cells and takes off their comments and links.
 - **Go To…** (Ctrl+G or F5) opens a bar under the grid. It takes `B4`, `B4:D9`, `C:D`, `4:6`, any of them after `Sheet2!` or `'My Totals'!`, or a defined name. It shows that sheet and selects the range. An unknown sheet or name is named in the status, and the bar stays open (`data::go_to_place`).
 
-pergola sends `GridAction::AutoSum` and `GridAction::GoTo`. Gates: atrium-sheets `remove_duplicates_keeps_the_first_of_each_row_and_undoes`, `text_to_columns_splits_at_the_delimiter_the_cells_use`, `autosum_totals_the_numbers_above_left_or_under_a_selection`, `clear_formats_and_clear_all` and `go_to_selects_a_cell_range_sheet_or_name`; pergola's grid key test. Not yet: Find and Replace (next), a choice of delimiter or fixed widths for Text to Columns, typed dates among its pieces, and a column choice for Remove Duplicates.
+pergola sends `GridAction::AutoSum` and `GridAction::GoTo`. Gates: atrium-sheets `remove_duplicates_keeps_the_first_of_each_row_and_undoes`, `text_to_columns_splits_at_the_delimiter_the_cells_use`, `autosum_totals_the_numbers_above_left_or_under_a_selection`, `clear_formats_and_clear_all` and `go_to_selects_a_cell_range_sheet_or_name`; pergola's grid key test. Find and Replace was already built (§8.4). Not yet: a choice of delimiter or fixed widths for Text to Columns, typed dates among its pieces, and a column choice for Remove Duplicates.
+
+### 16.96 Filter conditions and table total rows (2026-11-24)
+
+- **Filter conditions.** A filter column's panel opens on a menu: Pick values, as before, or a condition. The conditions are Equals, Does not equal, Greater than, Greater than or equal to, Less than, Less than or equal to, Between, Top, Bottom, Top %, Bottom %, Begins with, Ends with, Contains and Does not contain. A number compares as a number and other text compares as text, ignoring case. Between takes two numbers in either order. Top and Bottom take a row count, and the % forms take 1 to 100. Apply puts the condition in place of the column's choice. A refusal is said in the status, and the panel stays open. The panel reopens on the condition it made. The engine already held these conditions (`Cond::Compare`, `Rank`, `Custom` with `TextOp`), and `.xlsx` already reads and writes them. Code: `data::FILTER_CONDS`, `filter_cond`, `cond_fields`, `set_condition`.
+- **Table total row.** Data ▸ Total Row (checked when on) adds a row under a table, as one undo step. Its first column says Total, and each column holding numbers gets `=SUBTOTAL(109,Table1[Column])`, a sum of the rows the filter shows. The row under the table must be empty first. Turning it off empties the row and shrinks the table.
+
+Gates: atrium-sheets `a_filter_column_takes_a_condition` (each condition applied, read back and refused) and `a_table_total_row_sums_the_shown_rows_and_goes_again`. Not yet: Above or below average, date conditions in the panel (the engine has `DynamicDate`), two conditions joined by and or or, and a total row function other than SUM.
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -79,6 +79,8 @@ pub enum Cmd {
     ChartDone,
     /// The value list of filter column `col`, opened.
     FilterOpen(u32, u32),
+    /// The filter panel's condition chosen (an index of `data::FILTER_CONDS`).
+    FilterCond(usize),
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
@@ -209,6 +211,9 @@ pub struct FilterPanel {
     pub values: Vec<(String, u32)>,
     /// Chosen, by value.
     pub on: Vec<bool>,
+    /// The condition instead of picked values: an index of
+    /// [`crate::data::FILTER_CONDS`], 0 for picking values.
+    pub cond: usize,
 }
 
 impl FilterPanel {
@@ -286,6 +291,10 @@ pub struct Sheets {
     pub chart_group_menu: Mutable<MenuState>,
     pub filter: Mutable<FilterPanel>,
     pub filter_search: Mutable<TextEdit>,
+    /// The filter panel's condition menu and what is typed for it.
+    pub filter_cond_menu: Mutable<MenuState>,
+    pub filter_a: Mutable<TextEdit>,
+    pub filter_b: Mutable<TextEdit>,
     pub filter_scroll: Mutable<ScrollState>,
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
@@ -348,7 +357,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), goto_text: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), goto_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -392,7 +401,14 @@ impl Sheets {
                 drop(d);
                 let title = if head.trim().is_empty() { format!("Column {}", col_name(col)) } else { format!("{} · {}", col_name(col), head.trim()) };
                 let on = v.iter().map(|x| x.2).collect();
-                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on });
+                // A condition the panel makes is shown as it is.
+                let (cond, a, b) = {
+                    let d = self.doc.borrow();
+                    crate::data::column_cond(&d, row, col).unwrap_or((0, String::new(), String::new()))
+                };
+                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on, cond });
+                self.filter_a.set(TextEdit::new(&a));
+                self.filter_b.set(TextEdit::new(&b));
                 self.filter_search.set(TextEdit::new(""));
                 self.filter_scroll.set(ScrollState::default());
             }
@@ -405,6 +421,18 @@ impl Sheets {
     pub fn apply_values(&self) {
         let p = self.filter.get_cloned();
         if !p.open {
+            return;
+        }
+        if p.cond > 0 {
+            let made = crate::data::filter_cond(p.cond, self.filter_a.get_cloned().text(), self.filter_b.get_cloned().text());
+            match made {
+                Ok(c) => {
+                    crate::data::set_condition(&mut self.doc.borrow_mut(), p.row, p.col, c);
+                    self.filter.set(FilterPanel::default());
+                }
+                Err(why) => self.doc.borrow_mut().status = why,
+            }
+            self.changed();
             return;
         }
         if !p.on.iter().any(|&o| o) {
@@ -2332,18 +2360,41 @@ impl View for Sheets {
             ctx.on_click(back, || {});
             ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: fp.title.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
-            TextField::new(self.filter_search.clone()).placeholder("Search values").autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
-            let shown = fp.shown(self.filter_search.get_cloned().text());
             let push = |c: Cmd| {
                 let cmds = self.cmds.clone();
                 move || cmds.lock().unwrap().push(c)
             };
-            Button::secondary("Select All").at(x0 + 12.0, y0 + 78.0).width(100.0).on_click(push(Cmd::FilterAll(true))).render(ctx);
-            Button::secondary("Clear").at(x0 + 120.0, y0 + 78.0).width(72.0).on_click(push(Cmd::FilterAll(false))).render(ctx);
+            {
+                let items: Vec<pergola::widgets::MenuItem> = crate::data::FILTER_CONDS.iter().enumerate()
+                    .map(|(i, n)| pergola::widgets::MenuItem::new(if i == 0 { "Pick values" } else { *n }).radio(i == fp.cond)).collect();
+                let cmds = self.cmds.clone();
+                let now = if fp.cond == 0 { "Pick values" } else { crate::data::FILTER_CONDS[fp.cond] };
+                MenuButton::new(now.to_string(), self.filter_cond_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterCond(i))).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
+            }
+            if fp.cond > 0 {
+                let between = fp.cond == 7;
+                let fw = if between { (FILTER_W - 52.0) / 2.0 } else { FILTER_W - 24.0 };
+                let hint = match fp.cond { 8..=11 => "How many (or what percent)", 12..=15 => "Text", _ => "Number or text" };
+                let cmds = self.cmds.clone();
+                TextField::new(self.filter_a.clone()).key(0x4649_4c41).placeholder(hint).autofocus(true).at(x0 + 12.0, y0 + 78.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::FilterApply)).render(ctx);
+                if between {
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 16.0 + fw, y0 + 84.0, 24.0, 18.0), content: "and".into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+                    let cmds = self.cmds.clone();
+                    TextField::new(self.filter_b.clone()).key(0x4649_4c42).at(x0 + 40.0 + fw, y0 + 78.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::FilterApply)).render(ctx);
+                }
+                let note = match fp.cond { 8..=11 => "Rows with the largest (or smallest) numbers in the column.", 12..=15 => "Text compared ignoring case.", _ => "Numbers compare as numbers, other text as text." };
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 120.0, FILTER_W - 24.0, 18.0), content: note.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            }
+            let shown = if fp.cond == 0 { fp.shown(self.filter_search.get_cloned().text()) } else { Vec::new() };
+            if fp.cond == 0 {
+            TextField::new(self.filter_search.clone()).placeholder("Search values").autofocus(true).at(x0 + 12.0, y0 + 78.0).width(FILTER_W - 24.0).render(ctx);
+            Button::secondary("Select All").at(x0 + 12.0, y0 + 118.0).width(100.0).on_click(push(Cmd::FilterAll(true))).render(ctx);
+            Button::secondary("Clear").at(x0 + 120.0, y0 + 118.0).width(72.0).on_click(push(Cmd::FilterAll(false))).render(ctx);
             let chosen = fp.on.iter().filter(|&&o| o).count();
-            ctx.add(Node::Text { rect: Rect::new(x0 + 200.0, y0 + 86.0, FILTER_W - 212.0, 18.0), content: format!("{chosen} of {}", fp.values.len()), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
-            let ly = y0 + 120.0;
-            let lh = (ph - 120.0 - 56.0).max(FILTER_ROW_H);
+            ctx.add(Node::Text { rect: Rect::new(x0 + 200.0, y0 + 126.0, FILTER_W - 212.0, 18.0), content: format!("{chosen} of {}", fp.values.len()), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            }
+            let ly = y0 + 160.0;
+            let lh = (ph - 160.0 - 56.0).max(FILTER_ROW_H);
             let (vals, on, cmds) = (Rc::new(fp.values.clone()), Rc::new(fp.on.clone()), self.cmds.clone());
             let rows = Rc::new(shown);
             let n = rows.len();
@@ -2365,7 +2416,7 @@ impl View for Sheets {
             .backdrop(t.bg_surface())
             .key(0xF117)
             .emit(ctx);
-            if n == 0 {
+            if n == 0 && fp.cond == 0 {
                 ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, ly + 8.0, FILTER_W - 24.0, 18.0), content: "No value matches.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
             }
             let by = y0 + ph - 48.0;
@@ -3107,6 +3158,15 @@ impl Sheets {
                 }
                 Cmd::FilterOpen(row, col) => {
                     self.choose_values_at(row, col);
+                    self.changed();
+                    false
+                }
+                Cmd::FilterCond(i) => {
+                    let mut p = self.filter.get_cloned();
+                    if i < crate::data::FILTER_CONDS.len() {
+                        p.cond = i;
+                        self.filter.set(p);
+                    }
                     self.changed();
                     false
                 }
@@ -4794,6 +4854,87 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_column_takes_a_condition() {
+        use crate::data::{filter_cond, cond_fields};
+        let s = sheets_of(b"Fruit,Qty\npear,3\napple,10\nfig,7\napricot,1\n");
+        let hidden = |s: &Sheets| (1..=4).filter(|&r| s.doc.borrow().wb.sheet(0).row_hidden(r)).collect::<Vec<u32>>();
+        let cond = |s: &Sheets, col: u32, kind: usize, a: &str, b: &str| {
+            s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, col));
+            s.cmds.lock().unwrap().push(Cmd::FilterCond(kind));
+            s.take_cmds();
+            s.filter_a.set(TextEdit::new(a));
+            s.filter_b.set(TextEdit::new(b));
+            s.cmds.lock().unwrap().push(Cmd::FilterApply);
+            s.take_cmds();
+        };
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Filter));
+        s.take_cmds();
+        // Greater than 5 keeps 10 and 7.
+        cond(&s, 1, 3, "5", "");
+        assert_eq!(hidden(&s), [1, 4], "{}", s.doc.borrow().status);
+        // Opened again, the panel shows it.
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 1));
+        s.take_cmds();
+        assert_eq!((s.filter.get_cloned().cond, s.filter_a.get_cloned().text().to_string()), (3, "5".to_string()));
+        // Between 3 and 7 (either way round), top 2, bottom 1.
+        cond(&s, 1, 7, "7", "3");
+        assert_eq!(hidden(&s), [2, 4]);
+        cond(&s, 1, 8, "2", "");
+        assert_eq!(hidden(&s), [1, 4]);
+        cond(&s, 1, 9, "1", "");
+        assert_eq!(hidden(&s), [1, 2, 3]);
+        // Text: begins with "ap" (ignoring case), on the other column with Qty cleared.
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowAll));
+        s.take_cmds();
+        cond(&s, 0, 12, "AP", "");
+        assert_eq!(hidden(&s), [1, 3]);
+        cond(&s, 0, 15, "p", "");
+        assert_eq!(hidden(&s), [1, 2, 4]);
+        // Refusals say why and keep the panel open.
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 1));
+        s.cmds.lock().unwrap().push(Cmd::FilterCond(7));
+        s.take_cmds();
+        s.filter_a.set(TextEdit::new("x"));
+        s.filter_b.set(TextEdit::new("3"));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert!(s.filter.get_cloned().open && s.doc.borrow().status.contains("two numbers"));
+        let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+        let texts: Vec<String> = tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        assert!(["Between", "and", "Numbers compare as numbers, other text as text."].iter().all(|w| texts.iter().any(|t| t == w)), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Select All"));
+        assert!(filter_cond(10, "150", "").is_err() && filter_cond(3, "", "").is_err());
+        // Each condition the panel makes reads back as itself.
+        for (k, a, b) in [(1, "4", ""), (2, "pear", ""), (4, "2.5", ""), (6, "x", ""), (7, "1", "9"), (8, "3", ""), (11, "10", ""), (12, "a", ""), (13, "b", ""), (14, "c", ""), (15, "d", "")] {
+            assert_eq!(cond_fields(&filter_cond(k, a, b).unwrap()), Some((k, a.to_string(), b.to_string())), "{k}");
+        }
+    }
+
+    #[test]
+    fn a_table_total_row_sums_the_shown_rows_and_goes_again() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"Item,Qty,Price\na,2,10\nb,3,20\n");
+        select(&s, (0, 0), (2, 2));
+        data(&s, DataCmd::FormatAsTable);
+        select(&s, (1, 1), (1, 1));
+        let msg = data(&s, DataCmd::TotalRow);
+        assert!(msg.contains("has a total row"), "{msg}");
+        assert_eq!([shown(&s, 3, 0), shown(&s, 3, 1), shown(&s, 3, 2)], ["Total", "5", "30"]);
+        assert_eq!(s.doc.borrow().wb.input(officina_grid::addr::CellAddr::new(0, 3, 1)), officina_grid::Input::Formula("=SUBTOTAL(109,Table1[Qty])".into()));
+        {
+            let d = s.doc.borrow();
+            let t = d.wb.table_at(0, 1, 1).unwrap();
+            assert!(t.totals && t.rect.r1 == 3);
+        }
+        assert!(data(&s, DataCmd::TotalRow).contains("no total row"));
+        assert_eq!(shown(&s, 3, 1), "");
+        assert!(!s.doc.borrow().wb.table_at(0, 1, 1).unwrap().totals);
+        // A full row under the table is kept.
+        s.doc.borrow_mut().type_into(3, 2, "note");
+        assert!(data(&s, DataCmd::TotalRow).contains("isn't empty"));
+    }
+
+    #[test]
     fn a_filter_column_s_values_are_chosen_from_a_list() {
         let (mut d, _) = Doc::from_csv("t.csv", b"Fruit,Qty\npear,3\napple,10\nfig,7\napple,1\n").unwrap();
         d.wb.recalc();
@@ -4808,7 +4949,7 @@ mod tests {
         // A click on apple's row lets it go; Apply hides both apples, one undo step.
         let mut app = App::new(s.clone());
         app.tick();
-        let (x0, ly) = (1200.0 - FILTER_W + 1.0, TOOLBAR_H + FORMULA_H + 120.0);
+        let (x0, ly) = (1200.0 - FILTER_W + 1.0, TOOLBAR_H + FORMULA_H + 160.0);
         let at = pergola::geom::Point::new(x0 + 12.0 + 8.0, ly + 4.0 + 8.0);
         app.handle_event(Event::PointerDown { at });
         app.handle_event(Event::PointerUp { at });
