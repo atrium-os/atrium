@@ -197,7 +197,17 @@ impl Engine {
                         return Err(Error::Refused("Invalid weekly limit"));
                     }
                 }
-                let moves = parts.count();
+                let (mut skips, mut moves) = (0, 0);
+                for part in parts {
+                    if part.starts_with("EXDATE:") || part.starts_with("EXDATE;TZID=") {
+                        skips += 1;
+                    } else {
+                        moves += 1;
+                    }
+                }
+                if skips > 0 {
+                    label.push_str(&format!(" · {skips} skipped dates"));
+                }
                 if moves > 0 {
                     label.push_str(&format!(" · {moves} included moves"));
                 }

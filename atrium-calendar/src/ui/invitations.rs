@@ -2,7 +2,7 @@
 use super::*;
 use atrium_calendar::{
     import::{Outcome, Parse, Parsed, FILE_LIMIT, FRAME_LIMIT},
-    invitation::{Proposal, Review},
+    invitation::{Proposal, Review, SkipDecision, SkipEffect, SkipReview},
     wire,
 };
 use portcullis_ipc::calendar::{self, Answer, Source};
@@ -25,6 +25,7 @@ pub(super) struct Sheet {
     revision: u64,
     stream: Arc<UnixStream>,
     page: usize,
+    choices: Vec<SkipDecision>,
     proposed_last: Option<NaiveDate>,
 }
 fn receive(file: File) -> Result<Incoming, String> {
@@ -106,6 +107,7 @@ impl Incoming {
             proposal: self.proposal,
             stream: Arc::new(self.stream),
             page: 0,
+            choices: vec![],
             review,
             revision,
         })
@@ -146,16 +148,44 @@ fn viewing_schedule(row: &Entry, view: chrono_tz::Tz) -> String {
 }
 impl Sheet {
     fn detail_count(&self) -> usize {
-        self.proposal.exceptions.len() + self.proposal.cancelled_dates.len()
+        self.proposal.exceptions.len()
+            + self.proposal.cancelled_dates.len()
+            + self.review.skips.len()
+    }
+    fn skip_page(&self) -> Option<&SkipReview> {
+        let index = self.page.checked_sub(
+            1 + self.proposal.exceptions.len() + self.proposal.cancelled_dates.len(),
+        )?;
+        self.review.skips.get(index)
+    }
+    fn can_advance(&self) -> bool {
+        self.skip_page().is_none_or(|s| {
+            s.effect != SkipEffect::ChooseLocalMove
+                || self.choices.iter().any(|c| c.original == s.original.date)
+        })
+    }
+    pub(super) fn choose_skip(&mut self, keep: bool) {
+        let Some(skip) = self
+            .skip_page()
+            .filter(|s| s.effect == SkipEffect::ChooseLocalMove)
+        else {
+            return;
+        };
+        let original = skip.original.date;
+        self.choices.retain(|c| c.original != original);
+        self.choices.push(SkipDecision { original, keep });
     }
     pub(super) fn set_page(&mut self, page: usize) {
-        if page <= self.detail_count() && page <= self.page + 1 {
+        if page <= self.detail_count()
+            && page <= self.page + 1
+            && (page <= self.page || self.can_advance())
+        {
             self.page = page;
         }
     }
 
     fn reviewed_token(&self) -> Result<uuid::Uuid, String> {
-        if self.page != self.detail_count() {
+        if self.page != self.detail_count() || !self.can_advance() {
             return Err("Review each affected date first.".into());
         }
         self.review
@@ -164,6 +194,7 @@ impl Sheet {
     }
     pub fn save(&self) -> Result<Request, String> {
         Ok(Request::ApplyInvitation {
+            choices: self.choices.clone(),
             revision: self.revision,
             token: self.reviewed_token()?,
         })
@@ -363,8 +394,27 @@ impl Sheet {
                     .into(),
                 );
             }
+            if !self.review.skips.is_empty() {
+                let restored = self
+                    .review
+                    .skips
+                    .iter()
+                    .filter(|s| s.effect == SkipEffect::Restore)
+                    .count();
+                let skipped = self.review.skips.len() - restored;
+                line(
+                    ctx,
+                    356.,
+                    14.,
+                    format!("Skipped dates · {skipped}     Reinstated dates · {restored}"),
+                );
+            }
             if let Some(base) = self.review.previous.as_ref().filter(|e| {
-                !grouped && e.kind == Kind::Weekly && p.original.is_none() && !e.excluded.is_empty()
+                !grouped
+                    && self.review.skips.is_empty()
+                    && e.kind == Kind::Weekly
+                    && p.original.is_none()
+                    && !e.excluded.is_empty()
             }) {
                 let verb = if p.row.is_none() {
                     "removed"
@@ -385,6 +435,104 @@ impl Sheet {
                     ),
                 );
             }
+        } else if let Some(skip) = self.skip_page() {
+            let is_restore = skip.effect == SkipEffect::Restore;
+            let heading = if is_restore {
+                "Reinstated date"
+            } else {
+                "Skipped date"
+            };
+            line(
+                ctx,
+                160.,
+                19.,
+                format!("{heading} · {} of {}", self.page, self.detail_count()),
+            );
+            let original = skip.original;
+            line(
+                ctx,
+                198.,
+                16.,
+                format!(
+                    "Original slot · {} {} · {}",
+                    original.date,
+                    clock(original.minute),
+                    original.zone.map_or("Floating", |z| z.name())
+                ),
+            );
+            if let Some(row) = &skip.current {
+                line(
+                    ctx,
+                    232.,
+                    16.,
+                    format!(
+                        "Saved here · {}",
+                        viewing_schedule(row, planner.viewing_zone())
+                    ),
+                );
+            } else if is_restore {
+                if let Some(mut row) = p.row.clone() {
+                    row.date = original.date;
+                    line(
+                        ctx,
+                        232.,
+                        16.,
+                        format!(
+                            "Proposed · {}",
+                            viewing_schedule(&row, planner.viewing_zone())
+                        ),
+                    );
+                }
+            }
+            let note = match skip.effect {
+                SkipEffect::Skip => "Saving the series skips this meeting.",
+                SkipEffect::AlreadyAbsent => "This date is already absent from your calendar.",
+                SkipEffect::Restore => "Saving the series restores this regular meeting.",
+                SkipEffect::KeepLocalMove => "Your saved local move stays in this calendar.",
+                SkipEffect::ChooseLocalMove => {
+                    "You edited this occurrence locally. Choose what to keep here."
+                }
+            };
+            line(ctx, 265., 15., note.into());
+            if skip.effect == SkipEffect::ChooseLocalMove {
+                planner.button(
+                    ctx,
+                    18.,
+                    284.,
+                    175.,
+                    "Keep my move",
+                    Action::ChooseSkip(true),
+                );
+                planner.button(
+                    ctx,
+                    211.,
+                    284.,
+                    175.,
+                    "Skip it here",
+                    Action::ChooseSkip(false),
+                );
+                if let Some(c) = self.choices.iter().find(|c| c.original == original.date) {
+                    line(
+                        ctx,
+                        328.,
+                        14.,
+                        if c.keep {
+                            "Selected · keep my move"
+                        } else {
+                            "Selected · skip it here"
+                        }
+                        .into(),
+                    );
+                }
+            }
+            planner.button(
+                ctx,
+                18.,
+                347.,
+                145.,
+                "Previous",
+                Action::InvitationPage(self.page - 1),
+            );
         } else {
             let index = self.page - 1;
             let saved = self
@@ -482,15 +630,20 @@ impl Sheet {
                 Action::InvitationPage(self.page - 1),
             );
         }
-        if self.page < self.detail_count() {
+        if self.page < self.detail_count() && self.can_advance() {
             let label = if self.page == 0 {
-                if grouped {
+                if grouped || !self.review.skips.is_empty() {
                     format!("Review {} dates", self.detail_count())
                 } else {
                     format!("Review {} included moves", p.exceptions.len())
                 }
             } else {
-                if grouped { "Next date" } else { "Next move" }.into()
+                if grouped || !self.review.skips.is_empty() {
+                    "Next date"
+                } else {
+                    "Next move"
+                }
+                .into()
             };
             planner.button(
                 ctx,
@@ -502,12 +655,16 @@ impl Sheet {
             );
         }
         line(ctx, 377., 14., self.review.notice.clone());
-        if self.page == self.detail_count() && self.review.token.is_some() && p.row.is_some() {
+        if self.page == self.detail_count()
+            && self.can_advance()
+            && self.review.token.is_some()
+            && p.row.is_some()
+        {
             line(
                 ctx,
                 421.,
                 14.,
-                if p.exceptions.is_empty() {
+                if p.exceptions.is_empty() && self.review.skips.is_empty() {
                     "Choose a response to review in Mail before sending."
                 } else {
                     "Your response applies to the whole series. Review it in Mail before sending."
@@ -532,7 +689,11 @@ impl Sheet {
                 );
             }
         }
-        if self.page == self.detail_count() && self.review.token.is_some() && self.review.can_save {
+        if self.page == self.detail_count()
+            && self.can_advance()
+            && self.review.token.is_some()
+            && self.review.can_save
+        {
             planner.button(
                 ctx,
                 456.,

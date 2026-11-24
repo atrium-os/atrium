@@ -8,6 +8,7 @@ pub(super) struct Pending {
     revision: u64,
     created: Instant,
     date: NaiveDate,
+    local_moves: Vec<super::invitation_skips::LocalMove>,
     changes: Option<(Vec<Entry>, Vec<Cancellation>)>,
 }
 
@@ -16,13 +17,13 @@ impl Store {
         &mut self,
         revision: u64,
         source: &Source,
-        p: Proposal,
+        mut p: Proposal,
     ) -> Result<Review, String> {
         self.invite = None;
         if revision != self.state.revision {
             return Err("Calendar changed. Review this invitation again.".into());
         }
-        p.validate(source)?;
+        p.skips = p.validate_delivery(source)?;
         if !p.cancelled_dates.is_empty() {
             return self.review_cancelled_dates(revision, source, p);
         }
@@ -41,6 +42,7 @@ impl Store {
                 weekly_cancellation: false,
                 limit: None,
                 exceptions: vec![],
+                skips: vec![],
                 cancelled_dates: vec![],
             })
             .collect::<Vec<_>>();
@@ -222,6 +224,7 @@ impl Store {
         let original_date = p.original.map(|o| o.date);
         let mut review = Review {
             previous_dates: vec![],
+            skips: vec![],
             previous: master.cloned(),
             weekly: master.is_some_and(|e| e.kind == Kind::Weekly)
                 || p.row.as_ref().is_some_and(|e| e.kind == Kind::Weekly),
@@ -324,9 +327,14 @@ impl Store {
             }
             if let Some(date) = original_date {
                 if base.excluded.contains(&date) && explicit.is_none() {
-                    if !history
-                        .iter()
-                        .any(|c| c.key == key && c.original == Some(date))
+                    let organizer_skip = origin.owned_skips.contains(&date);
+                    if organizer_skip && (cancelled || p.sequence <= origin.sequence) {
+                        return Ok(review.blocked("This date is already skipped by the organizer."));
+                    }
+                    if !organizer_skip
+                        && !history
+                            .iter()
+                            .any(|c| c.key == key && c.original == Some(date))
                     {
                         return Ok(review.blocked("This occurrence was removed locally."));
                     }
@@ -344,9 +352,10 @@ impl Store {
                                 original: *date,
                             }
                     });
-                    let recorded = history
-                        .iter()
-                        .any(|c| c.key == key && c.original == Some(*date));
+                    let recorded = origin.owned_skips.contains(date)
+                        || history
+                            .iter()
+                            .any(|c| c.key == key && c.original == Some(*date));
                     if child.is_some_and(|e| {
                         !e.invitation.as_ref().is_some_and(|o| {
                             o.original.is_some()
@@ -396,6 +405,7 @@ impl Store {
                         && o.location == p.location
                         && o.limit == p.limit
                         && o.included == included
+                        && o.skips == p.skips
                 });
                 if !replay {
                     return Ok(review.blocked("Conflicting changes use the same revision."));
@@ -416,8 +426,13 @@ impl Store {
         let date = date.fields_on(date.date).agenda_date(view)?;
         let mut next = rows.to_vec();
         let mut marks = history.to_vec();
+        let mut local_moves = Vec::new();
         if let (Some(original), Some(base)) = (original_date, master) {
-            let exclusions = &mut next.iter_mut().find(|e| e.id == base.id).unwrap().excluded;
+            let parent = next.iter_mut().find(|e| e.id == base.id).unwrap();
+            if let Some(o) = &mut parent.invitation {
+                o.owned_skips.retain(|d| *d != original);
+            }
+            let exclusions = &mut parent.excluded;
             if let Err(at) = exclusions.binary_search(&original) {
                 exclusions.insert(at, original);
             }
@@ -437,11 +452,26 @@ impl Store {
                 limit: p.limit,
                 last,
                 included,
+                skips: p.skips,
+                owned_skips: vec![],
                 sequence: p.sequence,
                 accepted: row.fields_on(row.date),
                 location: p.location,
                 original: p.original,
             });
+            if row.kind == Kind::Weekly {
+                match super::invitation_skips::prepare(
+                    &mut row,
+                    master,
+                    &mut next,
+                    &p.exceptions,
+                    replay,
+                    &mut review.skips,
+                ) {
+                    Ok(conflicts) => local_moves = conflicts,
+                    Err(reason) => return Ok(review.blocked(reason)),
+                }
+            }
             if let Some(index) = next.iter().position(|e| e.id == row.id) {
                 next[index] = row;
             } else {
@@ -475,6 +505,7 @@ impl Store {
             revision,
             created: Instant::now(),
             date,
+            local_moves,
             changes: (!replay).then_some((next, marks)),
         });
         review.token = Some(token);
@@ -499,13 +530,23 @@ impl Store {
         revision: u64,
         token: Uuid,
     ) -> Result<(NaiveDate, UndoReceipt), String> {
+        self.apply_reviewed_invitation(revision, token, &[])
+    }
+
+    pub fn apply_reviewed_invitation(
+        &mut self,
+        revision: u64,
+        token: Uuid,
+        choices: &[crate::invitation::SkipDecision],
+    ) -> Result<(NaiveDate, UndoReceipt), String> {
         self.check_invitation(revision, token)?;
         let pending = self.invite.as_ref().unwrap();
         let date = pending.date;
-        let (rows, marks) = pending
+        let (mut rows, marks) = pending
             .changes
             .clone()
             .ok_or("This revision is already saved")?;
+        super::invitation_skips::resolve(&mut rows, &pending.local_moves, choices)?;
         self.commit_invitation(revision, rows, marks, date)
             .map(|receipt| (date, receipt))
     }

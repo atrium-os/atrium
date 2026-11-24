@@ -1,6 +1,6 @@
 //! Organizer identity and the original occurrence stay independent of its proposed time.
 use crate::{Entry, EventEdit, Kind};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use portcullis_ipc::calendar::{address, Source};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,47 @@ pub struct OccurrenceId {
     pub zone: Option<Tz>,
 }
 impl OccurrenceId {
+    pub fn in_series(self, base: &Entry) -> Result<Self, &'static str> {
+        let mismatch = "The skipped time does not match the weekly occurrence.";
+        if base.kind != Kind::Weekly || self.minute >= 1440 {
+            return Err(mismatch);
+        }
+        let source = base.zone.map(|z| z.name);
+        let mut result = self;
+        let mut supplied_instant = None;
+        if self.zone != source {
+            let (Some(from), Some(to)) = (self.zone, source) else {
+                return Err(mismatch);
+            };
+            let wall = self
+                .date
+                .and_hms_opt(u32::from(self.minute / 60), u32::from(self.minute % 60), 0)
+                .ok_or(mismatch)?;
+            let instant = from
+                .from_local_datetime(&wall)
+                .single()
+                .ok_or(mismatch)?
+                .to_utc();
+            let local = instant.with_timezone(&to);
+            result = Self {
+                date: local.date_naive(),
+                minute: (local.hour() * 60 + local.minute()) as u16,
+                zone: source,
+            };
+            supplied_instant = Some(instant);
+        }
+        if result.minute != base.span.start || !base.scheduled_on(result.date) {
+            return Err(mismatch);
+        }
+        if let Some(zone) = base.zone {
+            let (start, _) = zone.interval(result.date, base.span, true)?;
+            if supplied_instant.is_some_and(|i| i != start) {
+                return Err(mismatch);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn property(self) -> String {
         let stamp = format!(
             "{}T{:02}{:02}00",
@@ -37,6 +78,12 @@ impl OccurrenceId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Origin {
+    /// Organizer's most recently accepted EXDATE set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skips: Vec<OccurrenceId>,
+    /// Exclusions that can be lifted when the organizer reinstates a date.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_skips: Vec<NaiveDate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<crate::WeeklyLimit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,6 +101,8 @@ pub struct Origin {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skips: Vec<OccurrenceId>,
     #[serde(default)]
     pub limit: Option<crate::WeeklyLimit>,
     #[serde(default)]
@@ -87,9 +136,11 @@ pub const MAX_MOVES: usize = 8;
 pub const MAX_CANCELLED_DATES: usize = 8;
 
 impl Proposal {
-    pub fn validate(&self, source: &Source) -> Result<(), String> {
-        if self.exceptions.len() > MAX_MOVES {
-            return Err("Too many included moves".into());
+    // Return source-clock occurrences only after comparing Mail's independently
+    // read wire scope. Different representations can designate the same instant.
+    pub(crate) fn validate_delivery(&self, source: &Source) -> Result<Vec<OccurrenceId>, String> {
+        if self.exceptions.len().saturating_add(self.skips.len()) > MAX_MOVES {
+            return Err("Too many included moves or skipped dates".into());
         }
         if !self.cancelled_dates.is_empty() {
             let mut dates = std::collections::HashSet::new();
@@ -154,7 +205,8 @@ impl Proposal {
                 return Err("Unsupported invitation schedule".into());
             }
         }
-        if self.limit.is_some() || !self.exceptions.is_empty() {
+        let mut normalized = Vec::new();
+        if self.limit.is_some() || !self.exceptions.is_empty() || !self.skips.is_empty() {
             let base = self
                 .row
                 .as_ref()
@@ -162,6 +214,16 @@ impl Proposal {
                 .ok_or("Missing weekly master")?;
             let last = self.limit.map(|rule| rule.last(base)).transpose()?;
             let mut dates = std::collections::HashSet::new();
+            for skip in &self.skips {
+                let original = skip.in_series(base)?;
+                if last.is_some_and(|end| original.date > end) {
+                    return Err("The skipped date is outside the series.".into());
+                }
+                if dates.insert(original.date) {
+                    normalized.push(original);
+                }
+            }
+            normalized.sort_by_key(|o| o.date);
             for m in &self.exceptions {
                 if !dates.insert(m.original.date)
                     || !base.scheduled_on(m.original.date)
@@ -181,7 +243,10 @@ impl Proposal {
                 }
             }
         }
-        Ok(())
+        Ok(normalized)
+    }
+    pub fn validate(&self, source: &Source) -> Result<(), String> {
+        self.validate_delivery(source).map(drop)
     }
     pub fn scope(&self) -> Option<String> {
         if !self.cancelled_dates.is_empty() {
@@ -204,6 +269,10 @@ impl Proposal {
                         scope.push(';');
                         scope.push_str(&rule.property());
                     }
+                    for skip in &self.skips {
+                        scope.push('|');
+                        scope.push_str(&skip.property().replacen("RECURRENCE-ID", "EXDATE", 1));
+                    }
                     for m in &self.exceptions {
                         scope.push('|');
                         scope.push_str(&m.original.property());
@@ -221,8 +290,32 @@ pub struct Cancellation {
     pub sequence: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkipEffect {
+    Skip,
+    AlreadyAbsent,
+    ChooseLocalMove,
+    KeepLocalMove,
+    Restore,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkipReview {
+    pub original: OccurrenceId,
+    pub current: Option<Entry>,
+    pub effect: SkipEffect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipDecision {
+    pub original: NaiveDate,
+    pub keep: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub skips: Vec<SkipReview>,
     #[serde(default)]
     #[serde(rename = "before_moves")]
     pub previous_dates: Vec<Option<Entry>>,

@@ -35,6 +35,8 @@ pub enum Request {
         proposal: crate::invitation::Proposal,
     },
     ApplyInvitation {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<crate::invitation::SkipDecision>,
         revision: u64,
         token: uuid::Uuid,
     },
@@ -347,8 +349,12 @@ pub fn serve(s: &mut UnixStream, store: &mut Store) -> io::Result<()> {
                     &store.check_invitation(revision, token),
                 );
             }
-            Ok(Request::ApplyInvitation { revision, token }) => store
-                .apply_invitation(revision, token)
+            Ok(Request::ApplyInvitation {
+                revision,
+                token,
+                choices,
+            }) => store
+                .apply_reviewed_invitation(revision, token, &choices)
                 .map(|(date, receipt)| mutation_page(store, date, Some(receipt))),
             Ok(Request::PrepareImport {
                 revision,

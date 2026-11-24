@@ -303,7 +303,8 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     let mut stack = Vec::new();
     let mut events = Vec::new();
     let mut method = None;
-    let mut scope = None;
+    let mut scope: Option<String> = None;
+    let mut skips = std::collections::BTreeSet::<String>::new();
     let mut identity = Identity::default();
     for line in unfold(text) {
         let (key, params, value) = split_line(&line)?;
@@ -320,6 +321,13 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
                 if events.len() >= 9 {
                     return None;
                 }
+                if !skips.is_empty() {
+                    let root = scope.as_mut().filter(|s| s.starts_with("weekly"))?;
+                    for skip in std::mem::take(&mut skips) {
+                        root.push('|');
+                        root.push_str(&skip);
+                    }
+                }
                 events.push((scope.take(), std::mem::take(&mut identity)));
             }
         } else if key == "METHOD" && stack.as_slice() == ["VCALENDAR"] {
@@ -334,7 +342,20 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
                 "RECURRENCE-ID" if scope.is_none() => {
                     scope = Some(occurrence_scope(&params, &value)?)
                 }
-                "RECURRENCE-ID" | "RRULE" | "RDATE" | "EXDATE" | "EXRULE" => return None,
+                "EXDATE" => {
+                    for stamp in value.split(',') {
+                        let key = occurrence_scope(&params, stamp)?.replacen(
+                            "RECURRENCE-ID",
+                            "EXDATE",
+                            1,
+                        );
+                        skips.insert(key);
+                        if skips.len() > 8 {
+                            return None;
+                        }
+                    }
+                }
+                "RECURRENCE-ID" | "RRULE" | "RDATE" | "EXRULE" => return None,
                 "UID" => identity.uid = Some(value),
                 "ORGANIZER" => identity.organizer = Some(value.to_ascii_lowercase()),
                 "SEQUENCE" => identity.sequence = value.parse().ok()?,
@@ -354,6 +375,12 @@ pub(crate) fn reply_scope(text: &str) -> Option<Option<String>> {
     }
     let mut parts = events.into_iter();
     let (mut master, identity) = parts.next()?;
+    if let Some(root) = master.as_ref().filter(|s| s.contains("|EXDATE")) {
+        if method.as_deref() != Some("REQUEST") || root.split('|').skip(1).count() + parts.len() > 8
+        {
+            return None;
+        }
+    }
     if grouped_cancel {
         let first = master
             .as_deref()

@@ -227,10 +227,72 @@ def cancel_dates(ui):
     print("PASS reviewed moved and regular dates, cancelled together, preserved sibling schedules, one Undo restored both, empty outbox")
 
 
+def exdates(ui):
+    print(guest(ui, "exdates-setup"))
+    open_mail(ui, first=True)
+    inspect_moves(ui)
+    click(ui, 568, 550)
+    ui.see("exdates-series-saved", "Invitation saved")
+    ui.open_date("2026-12-09")
+    click(ui, 450, 268)
+    ui.field(80, 256, "2026-12-10")
+    ui.field(225, 256, "16:30")
+    ui.field(330, 256, "17:15")
+    click(ui, 92, 506)
+    ui.see("exdates-local-move", "2026-12-10", "16:30")
+    baseline = ui.store("work")
+    moved = next(e for e in baseline["entries"] if e["date"] == "2026-12-10")
+    assert moved["span"] == {"start": 990, "end": 1035}
+    sibling = next(e for e in baseline["entries"] if e["date"] == "2026-12-17")
+
+    def inspect(keep):
+        ui.control("close", "work")
+        review(ui, 178)
+        ui.see("exdates-overview", "Whole weekly series", "Review 2 dates")
+        click(ui, 355, 412)
+        ui.see("exdates-conflict", "Skipped date", "2026-12-08", "2026-12-10", "16:30", "Keep my move", "Skip it here")
+        click(ui, 355, 412)
+        ui.see("exdates-choice-required", "You edited this occurrence locally")
+        click(ui, 105 if keep else 290, 300)
+        ui.see("exdates-choice", "Selected", "keep my move" if keep else "skip it here")
+        click(ui, 355, 412)
+        ui.see("exdates-regular", "Skipped date", "2026-12-22", "Saving the series skips this meeting")
+        assert ui.store("work") == baseline
+
+    inspect(True)
+    click(ui, 75, 550)
+    assert ui.store("work") == baseline
+    inspect(True)
+    click(ui, 80, 462)
+    response = ui.see("exdates-response", "Whole weekly series", "2 skipped dates", "ACCEPTED")
+    assert "16:30" not in response and "2026-12-10" not in response
+    click(ui, 70, 355)
+    assert ui.store("work") == baseline
+    for keep in (True, False):
+        inspect(keep)
+        click(ui, 568, 550)
+        ui.see("exdates-saved", "Invitation saved")
+        saved = ui.store("work")
+        assert saved["revision"] == baseline["revision"] + 1
+        assert sibling in saved["entries"] and (moved in saved["entries"]) == keep
+        master = next(r for r in saved["entries"] if r["kind"] == "Weekly")
+        assert master["date"] == "2026-12-01" and master["span"]["start"] == 840
+        assert master["excluded"] == ["2026-12-08", "2026-12-15", "2026-12-22"]
+        click(ui, 590, 562)
+        ui.see("exdates-undone", "Change undone")
+        restored = ui.store("work")
+        assert restored == dict(baseline, revision=saved["revision"] + 1)
+        baseline = restored
+    assert ui.control("fingerprint", "personal").strip() == b"empty"
+    ui.control("close", "work")
+    print(guest(ui, "series-check-empty"))
+    print("PASS private local move choices, each skipped date reviewed, regular and moved siblings preserved, Undo and empty outbox")
+
+
 if __name__ == "__main__":
-    runner = {"--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
+    runner = {"--exdates": exdates, "--cancel-dates": cancel_dates, "--bounded": bounded, "--series": series}.get(next(iter(sys.argv[1:]), ""), run)
     if runner != run:
         del sys.argv[1]
     if len(sys.argv) < 6:
-        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
+        sys.exit("Usage: calendar-invitation-check.py [--series|--bounded|--cancel-dates|--exdates] GUEST_DIR MARKER EVIDENCE_DIR ssh [options] HOST")
     runner(keyboard.Desktop(*sys.argv[1:4], sys.argv[4:]))

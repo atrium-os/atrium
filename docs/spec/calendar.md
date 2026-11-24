@@ -275,6 +275,16 @@ Confirmation removes only the listed occurrences in one calendar revision. **Und
 
 The synthetic studio fixture cancels the December 8 meeting that moved to Wednesday, December 9 at 15:00 in Studio B, plus the regular December 22 meeting. December 1 remains at 14:00 and the December 15 meeting stays on Thursday, December 17 at 11:00 in Studio C. Run the §7.11 installed check with `--cancel-dates`. [Synthetic cancellation](../../atrium-calendar/tests/fixtures/cancel-dates.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
 
+### 7.15 Reviewing dates skipped by a weekly invitation
+
+A weekly invitation from Mail can use `EXDATE` to skip individual meetings. **Review dates** lists each skipped occurrence in order, including the first meeting if the organizer excluded it. Each page shows its original slot and, when present, the date and time saved in the active calendar. If you moved an occurrence locally, Calendar asks you to choose **Keep my move** or **Skip it here** before continuing. Neither choice is preselected. A regular skip, an organizer move and a date already absent each show what saving will do.
+
+**Save to calendar** applies the reviewed changes together. Dismissing the review preserves the schedule. One Undo restores the prior schedule and its exception history. If a later invitation drops an exclusion, Calendar shows the returning date before saving. It reinstates dates removed by that invitation mechanism and preserves independent local deletions and moves. Mail’s separate RSVP review shows the number of skipped dates. Your choice about a local move and its private time stay in the active calendar.
+
+Mail and Calendar independently identify the source properties. The supported weekly request can include up to eight skipped slots and moves combined. Repeated properties and comma-separated dates are supported. Equivalent source times identify one occurrence, including UTC and named-zone representations that land on different civil dates. Floating series use floating times. An out-of-series date or a move and a skip for the same slot blocks the request. A skipped date still counts toward a weekly rule’s original meeting count.
+
+The synthetic December invitation skips the 8th and 22nd. The installed check privately moves the 8th to Thursday the 10th at 16:30, exercises both choices, and verifies that the 1st stays at 14:00 and the independently moved 17th stays at 11:00. Run the §7.11 installed check with `--exdates`. [Synthetic invitation](../../atrium-calendar/tests/fixtures/weekly-exdates.ics) · [Installed desktop check](../../scripts/calendar-invitation-check.py)
+
 ## 8. Accepted decisions
 
 | Decision | Accepted choice | Cost or consequence |

@@ -1,5 +1,6 @@
 //! One Fasti process owns one private, supervisor-provisioned persona directory.
 mod import;
+mod invitation_skips;
 mod invitations;
 pub mod search;
 use super::{CalendarPage, CalendarView, Day, EditScope, Entry, EventEdit, Kind, UndoReceipt};
@@ -71,7 +72,7 @@ impl Store {
                 }
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
 
-                if !matches!(snapshot.version, 1..=6)
+                if !matches!(snapshot.version, 1..=7)
                     || snapshot.cancelled.len() > MAX_ENTRIES
                     || validate_records(&snapshot.entries).is_err()
                 {
@@ -460,7 +461,7 @@ impl Store {
         validate_records(&entries)?;
         let next = Snapshot {
             opening_view,
-            version: 6,
+            version: 7,
             cancelled,
             pinned_zone,
             device_zone,

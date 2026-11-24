@@ -159,7 +159,7 @@ impl Event {
             _ => Err(Issue::Component),
         }
     }
-    fn row(&self) -> Result<Entry> {
+    fn row(&self, exclusions: &[Stamp]) -> Result<Entry> {
         let start = self.start.ok_or(Issue::Format)?;
         let (span, kind) = if let Some(minute) = start.minute {
             let end = self.end.ok_or(Issue::Time)?;
@@ -216,7 +216,7 @@ impl Event {
             import_hash: None,
             invitation: None,
         };
-        for d in &self.skipped {
+        for d in exclusions {
             if !self.weekly
                 || !entry.scheduled_on(d.date)
                 || d.minute != start.minute
@@ -390,7 +390,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                             atrium_calendar::WeeklyLimit::parse(v).ok_or(Issue::Recurrence)?;
                         event.weekly = true;
                     }
-                    "EXDATE" | "RDATE" | "EXRULE" => return Err(Issue::Recurrence),
+                    "RDATE" | "EXRULE" => return Err(Issue::Recurrence),
                     "URL" | "ATTACH" | "LOCATION" | "SEQUENCE" | "STATUS" => {
                         return Err(Issue::Component)
                     }
@@ -415,7 +415,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
                     || e.original.is_none()))
             || (!children.is_empty() && !cancelled && !e.weekly)
             || e.cancelled_status.is_some_and(|s| s != cancelled)
-            || (cancelled && e.limit.is_some())
+            || (cancelled && (e.limit.is_some() || !e.skipped.is_empty()))
         {
             return Err(Issue::Scheduling);
         }
@@ -448,6 +448,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         let invited = identities(e);
         for child in children {
             if child.weekly
+                || !child.skipped.is_empty()
                 || child.cancelled_status.is_some_and(|s| s != cancelled)
                 || child.uid != e.uid
                 || child.organizer != e.organizer
@@ -472,13 +473,34 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
             }
             exceptions.push(atrium_calendar::invitation::IncludedMove {
                 original,
-                row: child.row()?,
+                row: child.row(&[])?,
                 location: child.location.clone().unwrap_or_default(),
             });
         }
+        let mut skips = e
+            .skipped
+            .iter()
+            .copied()
+            .map(occurrence)
+            .collect::<Result<Vec<_>>>()?;
+        skips.sort_by_cached_key(|o| o.property());
+        skips.dedup();
+        if skips.len() + exceptions.len() > atrium_calendar::invitation::MAX_MOVES {
+            return Err(Issue::Limit);
+        }
+        let row = if cancelled {
+            None
+        } else {
+            let row = e.row(&[])?;
+            for skip in &skips {
+                skip.in_series(&row).map_err(|_| Issue::Recurrence)?;
+            }
+            Some(row)
+        };
         return Ok(Outcome::Invitation(atrium_calendar::invitation::Proposal {
             uid: e.uid.clone().ok_or(Issue::Format)?,
             exceptions,
+            skips,
             limit: e.limit,
             sequence: e.sequence.unwrap_or(0),
             organizer: e.organizer.clone().ok_or(Issue::Scheduling)?,
@@ -487,7 +509,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
             original: if group { None } else { original },
             cancelled_dates,
             weekly_cancellation: cancelled && e.weekly,
-            row: if cancelled { None } else { Some(e.row()?) },
+            row,
         }));
     }
     let mut masters = HashMap::new();
@@ -497,7 +519,7 @@ fn parse_mode(bytes: &[u8], invitation: bool) -> Result<Outcome> {
         if e.original.is_none() && masters.insert(uid, i).is_some() {
             return Err(Issue::Recurrence);
         }
-        rows.push(e.row()?);
+        rows.push(e.row(&e.skipped)?);
     }
     let mut exceptions = HashSet::new();
     for (i, e) in events.iter().enumerate() {
@@ -1026,6 +1048,271 @@ mod tests {
             .unwrap()
             .token
             .is_none());
+    }
+
+    #[test]
+    fn exdate_review_preserves_local_moves_until_explicit_save() {
+        use atrium_calendar::{
+            invitation::{Proposal, SkipDecision, SkipEffect},
+            EditScope,
+        };
+        use portcullis_ipc::calendar::{Delivery, Source};
+        const SKIPS: &str = include_str!("../../tests/fixtures/weekly-exdates.ics");
+        const MASTER: &str = include_str!("../../tests/fixtures/bounded-moves.ics");
+        let proposal = |text: &str| match parse_mode(text.as_bytes(), true).unwrap() {
+            Outcome::Invitation(p) => p,
+            _ => panic!("expected scheduling proposal"),
+        };
+        let source = |p: &Proposal| Source {
+            account: 7,
+            from: p.organizer.clone(),
+            verified: true,
+            identities: vec!["dev@fixture.invalid".into()],
+            reply_destination_matches: true,
+            delivery: Some(Delivery {
+                uid: p.uid.clone(),
+                sequence: p.sequence,
+                organizer: p.organizer.clone(),
+                scope: p.scope(),
+                cancelled: false,
+            }),
+        };
+        let review = |s: &mut Store, rev, text: &str| {
+            let p = proposal(text);
+            s.review_invitation(rev, &source(&p), p)
+        };
+        let sample = |s: &Store| {
+            [
+                "2026-12-01",
+                "2026-12-08",
+                "2026-12-09",
+                "2026-12-10",
+                "2026-12-15",
+                "2026-12-17",
+                "2026-12-22",
+                "2026-12-29",
+            ]
+            .map(|day| {
+                s.day(date(day))
+                    .entries
+                    .into_iter()
+                    .map(|e| (e.id, e.span.start, e.span.end))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let r = review(&mut store, 0, MASTER).unwrap();
+        store.apply_invitation(0, r.token.unwrap()).unwrap();
+        let day = date("2026-12-09");
+        let moved = store.day(day).entries.pop().unwrap();
+        let mut edit = moved.fields_on(day);
+        edit.date = date("2026-12-10");
+        edit.span = Span {
+            start: 990,
+            end: 1035,
+        };
+        store
+            .change(1, moved.id, day, EditScope::ThisEvent, Some(edit))
+            .unwrap();
+        let baseline = sample(&store);
+        let mut substituted = proposal(SKIPS);
+        let mail = source(&substituted);
+        substituted.skips.pop();
+        assert!(store.review_invitation(2, &mail, substituted).is_err());
+        let r = review(&mut store, 2, SKIPS).unwrap();
+        assert_eq!(
+            r.skips.iter().map(|s| s.effect).collect::<Vec<_>>(),
+            [SkipEffect::ChooseLocalMove, SkipEffect::Skip]
+        );
+        assert_eq!(
+            r.skips[0].current.as_ref().unwrap().date,
+            date("2026-12-10")
+        );
+        let t = r.token.unwrap();
+        assert!(store.apply_invitation(2, t).is_err());
+        assert!(store
+            .apply_reviewed_invitation(
+                2,
+                t,
+                &[SkipDecision {
+                    original: date("2026-12-17"),
+                    keep: false
+                }]
+            )
+            .is_err());
+        assert_eq!(sample(&store), baseline);
+        let original = date("2026-12-08");
+        let (_, undo) = store
+            .apply_reviewed_invitation(
+                2,
+                t,
+                &[SkipDecision {
+                    original,
+                    keep: false,
+                }],
+            )
+            .unwrap();
+        let mut expected = baseline.clone();
+        expected[3].clear();
+        expected[6].clear();
+        assert_eq!(sample(&store), expected);
+        store.undo(undo).unwrap();
+        assert_eq!(sample(&store), baseline);
+        let t = review(&mut store, 4, SKIPS).unwrap().token.unwrap();
+        store
+            .apply_reviewed_invitation(
+                4,
+                t,
+                &[SkipDecision {
+                    original,
+                    keep: true,
+                }],
+            )
+            .unwrap();
+        let mut kept = baseline.clone();
+        kept[6].clear();
+        assert_eq!(sample(&store), kept);
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        let repeat = review(&mut store, 5, SKIPS).unwrap();
+        assert!(!repeat.can_save);
+        assert_eq!(repeat.skips[0].effect, SkipEffect::KeepLocalMove);
+        let restored = SKIPS
+            .replace("SEQUENCE:2", "SEQUENCE:3")
+            .replace("EXDATE:20261208T140000Z,20261222T140000Z\n", "");
+        let r = review(&mut store, 5, &restored).unwrap();
+        assert_eq!(r.skips.len(), 1);
+        assert_eq!(r.skips[0].effect, SkipEffect::Restore);
+        store.apply_invitation(5, r.token.unwrap()).unwrap();
+        assert_eq!(sample(&store), baseline);
+        // A local deletion belongs to the user even when a later EXDATE also names it.
+        let day = date("2026-12-22");
+        let master = store.day(day).entries[0].id;
+        store
+            .change(6, master, day, EditScope::ThisEvent, None)
+            .unwrap();
+        let r = review(&mut store, 7, &SKIPS.replace("SEQUENCE:2", "SEQUENCE:4")).unwrap();
+        assert_eq!(r.skips[1].effect, SkipEffect::AlreadyAbsent);
+        store
+            .apply_reviewed_invitation(
+                7,
+                r.token.unwrap(),
+                &[SkipDecision {
+                    original,
+                    keep: true,
+                }],
+            )
+            .unwrap();
+        let r = review(&mut store, 8, &restored.replace("SEQUENCE:3", "SEQUENCE:5")).unwrap();
+        assert!(r.skips.is_empty());
+        store.apply_invitation(8, r.token.unwrap()).unwrap();
+        assert_eq!(sample(&store), kept);
+        let clean_dir = tempfile::tempdir().unwrap();
+        let mut clean = Store::open(clean_dir.path()).unwrap();
+        let fresh = SKIPS.replace(
+            "20261208T140000Z,20261222T140000Z",
+            "20261201T140000Z\nEXDATE:20261201T140000Z,20261222T140000Z",
+        );
+        let r = review(&mut clean, 0, &fresh).unwrap();
+        assert_eq!(r.skips.len(), 2);
+        clean.apply_invitation(0, r.token.unwrap()).unwrap();
+        assert!(clean.day(date("2026-12-01")).entries.is_empty());
+        assert_eq!(clean.day(date("2026-12-08")).entries.len(), 1);
+        assert!(clean.day(date("2026-12-22")).entries.is_empty());
+        // A locally created move on a regular slot is protected even without a prior Mail override.
+        let day = date("2026-12-08");
+        let ordinary = clean.day(day).entries.pop().unwrap();
+        let mut edit = ordinary.fields_on(day);
+        edit.date = date("2026-12-10");
+        clean
+            .change(1, ordinary.id, day, EditScope::ThisEvent, Some(edit))
+            .unwrap();
+        let r = review(&mut clean, 2, &SKIPS.replace("SEQUENCE:2", "SEQUENCE:3")).unwrap();
+        let conflict = r.skips.iter().find(|s| s.original.date == day).unwrap();
+        assert_eq!(conflict.effect, SkipEffect::ChooseLocalMove);
+        assert_eq!(conflict.current.as_ref().unwrap().date, date("2026-12-10"));
+        clean
+            .apply_reviewed_invitation(
+                2,
+                r.token.unwrap(),
+                &[SkipDecision {
+                    original: day,
+                    keep: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(clean.day(date("2026-12-10")).entries.len(), 1);
+        assert_eq!(clean.day(date("2026-12-15")).entries.len(), 1);
+        let overlap = MASTER.replace(
+            "RRULE:FREQ=WEEKLY;COUNT=4",
+            "RRULE:FREQ=WEEKLY;COUNT=4\nEXDATE:20261208T140000Z",
+        );
+        assert!(review(&mut clean, 3, &overlap).is_err());
+        let beyond = SKIPS.replace("20261222T140000Z", "20261229T140000Z");
+        assert!(review(&mut clean, 3, &beyond).is_err());
+        for bad in [
+            SKIPS.replace("20261222T140000Z", "20261222T153000Z"),
+            SKIPS.replace("METHOD:REQUEST", "METHOD:CANCEL"),
+            SKIPS.replace("EXDATE:", "EXDATE;VALUE=DATE:"),
+        ] {
+            assert!(parse_mode(bad.as_bytes(), true).is_err());
+        }
+    }
+
+    #[test]
+    fn exdates_match_the_original_slot_across_midnight_and_daylight_saving() {
+        use portcullis_ipc::calendar::{Delivery, Source};
+        let invite = include_str!("../../tests/fixtures/weekly-exdates.ics")
+            .replace("DTSTART:20261201T140000Z", "DTSTART;TZID=America/Los_Angeles:20261027T233000")
+            .replace("DTEND:20261201T144500Z", "DTEND;TZID=America/Los_Angeles:20261027T235500")
+            .replace("EXDATE:20261208T140000Z,20261222T140000Z",
+                     "EXDATE:20261028T063000Z,20261104T073000Z\nEXDATE;TZID=America/Los_Angeles:20261103T233000");
+        let Outcome::Invitation(p) = parse_mode(invite.as_bytes(), true).unwrap() else {
+            panic!("expected a weekly invitation");
+        };
+        let scope = "weekly;COUNT=4|EXDATE:20261028T063000Z|EXDATE:20261104T073000Z|EXDATE;TZID=America/Los_Angeles:20261103T233000";
+        let source = Source {
+            account: 7,
+            verified: true,
+            identities: vec!["dev@fixture.invalid".into()],
+            from: p.organizer.clone(),
+            reply_destination_matches: true,
+            delivery: Some(Delivery {
+                uid: p.uid.clone(),
+                organizer: p.organizer.clone(),
+                sequence: p.sequence,
+                cancelled: false,
+                scope: Some(scope.into()),
+            }),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let review = store.review_invitation(0, &source, p).unwrap();
+        assert_eq!(
+            review
+                .skips
+                .iter()
+                .map(|s| s.original.date)
+                .collect::<Vec<_>>(),
+            [date("2026-10-27"), date("2026-11-03")]
+        );
+        store.apply_invitation(0, review.token.unwrap()).unwrap();
+        store
+            .set_viewing_zone(1, Some(chrono_tz::America::Los_Angeles))
+            .unwrap();
+        for (day, expected) in [
+            ("2026-10-27", false),
+            ("2026-11-03", false),
+            ("2026-11-10", true),
+            ("2026-11-17", true),
+        ] {
+            assert_eq!(!store.day(date(day)).entries.is_empty(), expected);
+        }
+        for wrong in ["20261104T063000Z", "20261104T073000"] {
+            let bad = invite.replace("20261104T073000Z", wrong);
+            assert!(parse_mode(bad.as_bytes(), true).is_err());
+        }
     }
 
     #[test]

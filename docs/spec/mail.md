@@ -1380,6 +1380,8 @@ Recurring requests show the organizer’s scope again at final Send. Mail derive
 
 For a cancellation listing several dates, Mail binds each original occurrence and its individual revision to the Calendar review. Calendar offers one local removal and one Undo for the group. [Grouped cancellations](calendar.md#714-reviewing-several-cancelled-occurrences)
 
+For a weekly request with `EXDATE`, Mail binds the skipped slots to the selected delivery and includes their count in response review. Calendar shows each date and resolves any local move privately. A whole-series reply addresses the organizer and contains only the attendee’s series response. [Reviewing skipped dates](calendar.md#715-reviewing-dates-skipped-by-a-weekly-invitation)
+
 ### 14.2 People
 
 Mail keeps a per-persona **address book**: addresses the person wrote to or replied to,

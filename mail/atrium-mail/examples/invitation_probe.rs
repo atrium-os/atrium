@@ -17,13 +17,15 @@ const CANCEL_ALL: &str = include_str!("../../../atrium-calendar/tests/fixtures/c
 const ORIGINAL: &str = "RECURRENCE-ID:20261208T140000Z";
 
 const BOUNDED: &str = include_str!("../../../atrium-calendar/tests/fixtures/bounded-moves.ics");
+const EXDATES: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly-exdates.ics");
 const CANCEL_DATES: &str = include_str!("../../../atrium-calendar/tests/fixtures/cancel-dates.ics");
 const UNTIL: &str = include_str!("../../../atrium-calendar/tests/fixtures/weekly-until.ics");
 
 fn seed(e: &Engine, mode: &str) {
     let series = mode == "seed-series";
     let grouped = mode == "seed-cancel-dates";
-    let bounded = mode == "seed-bounded" || grouped;
+    let skipped = mode == "seed-exdates";
+    let bounded = mode == "seed-bounded" || grouped || skipped;
     assert!(e.store.accounts().unwrap().is_empty());
     let account = e.store.add_account("dev@fixture.invalid").unwrap();
     let folder = e.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
@@ -37,6 +39,8 @@ fn seed(e: &Engine, mode: &str) {
             ("Four studio meetings", BOUNDED),
             if grouped {
                 ("Cancel two studio dates", CANCEL_DATES)
+            } else if skipped {
+                ("Two skipped Tuesdays", EXDATES)
             } else {
                 ("Extend to December 29", UNTIL)
             },
@@ -108,6 +112,9 @@ fn seed(e: &Engine, mode: &str) {
                 (true, 1) => Some(format!(
                     "weekly;COUNT=4|{ORIGINAL}|RECURRENCE-ID:20261215T140000Z"
                 )),
+                (true, 2) if skipped => {
+                    Some("weekly;COUNT=4|EXDATE:20261208T140000Z|EXDATE:20261222T140000Z".into())
+                }
                 (true, 2) if grouped => Some(format!(
                     "cancel-dates|2/{ORIGINAL}|4/RECURRENCE-ID:20261222T140000Z"
                 )),
@@ -116,7 +123,7 @@ fn seed(e: &Engine, mode: &str) {
                 (false, 2 | 4) => Some(ORIGINAL.into()),
                 _ => None,
             };
-            if grouped {
+            if grouped || skipped {
                 assert_eq!(
                     e.selected_invitation(msg)
                         .unwrap()
@@ -160,6 +167,10 @@ fn seed(e: &Engine, mode: &str) {
                     (!bounded && id == 2).then_some(ORIGINAL)
                 );
                 assert!(ics.contains("PARTSTAT=TENTATIVE"));
+                if skipped && id == 2 {
+                    assert!(draft.text.contains("2 skipped dates"));
+                    assert!(!ics.contains("EXDATE"));
+                }
             }
         }
         assert_eq!(
@@ -301,7 +312,9 @@ fn main() {
         },
     );
     match args[1].as_str() {
-        mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates") => seed(&e, mode),
+        mode @ ("seed" | "seed-series" | "seed-bounded" | "seed-cancel-dates" | "seed-exdates") => {
+            seed(&e, mode)
+        }
         "empty" => assert!(e.store.outbox().unwrap().is_empty()),
         "submit" => submit(&e, false),
         "submit-series" => submit(&e, true),
