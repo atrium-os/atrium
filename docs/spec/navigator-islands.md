@@ -2440,7 +2440,7 @@ Host-tested in the cloud; the engine side is written but not yet built
 `session` and `local-storage` checks stay failed. Responses carry only
 their content type, so a cross-origin `fetch()` to a sibling host fails
 Ladybird's CORS check until navigatord passes the CORS headers (I6.5).
-Links and `history.pushState` don't become trail entries yet (I6.2).
+Links became trail entries in I6.2 (below); `history.pushState` not yet.
 
 **Gate (Mac, arm64 Tessera).** Build the `I6_PAGE` engine, main's
 navigatord, navigator-ui and navigator-fetchd, and serve the I6 fixture
@@ -2523,6 +2523,57 @@ text appears doubled; the tier chip sat under the headless display's top
 strip in the captures, so the chip's "Live code" was read from the island's
 tag and navigatord's `LiveStarted`, not from the chip. Evidence is in
 `~/atrium-vm/evidence/navigator-i6-1-20261125/`.
+
+#### I6.2 as built (2026-11-25, first part)
+
+Host-tested in the cloud; the engine side is written but not yet built.
+Same flag as I6.1.
+
+- **A navigation is a proposal.** A top-level GET a live page starts (a
+  link, a GET form, `location`) reaches `EditorPage::
+  request_navigation_start`, which reports it as `Report::Navigate(url)`
+  (`navigator_live_propose`) and never follows it. Limen checks the report
+  on both sides (`web_island::reportable`: plain HTTPS, printable, at most
+  2,048 bytes; reports now frame up to 2,304 bytes) and takes it only
+  while the page runs. A POST, a frame's document, or a jump within the
+  same document is refused, loudly, as in I6.1.
+- **navigatord** (`live_page::navigation`) takes one plain HTTPS address in
+  its normal spelling, no credentials, and sends `LiveNavigate { from, url }`
+  to the UI. Any origin: where it opens is the UI's decision below.
+- **The UI** (`Shell::live_navigated`) follows it as a new trail entry,
+  exactly like a followed link, so Back and Forward work as for any page.
+  When navigatord shows the new page (`Shell::live_follow`): at the live
+  page's origin (after any redirect), the UI sends `ContinueLive { url,
+  rect }` and the page runs live again without another press (navigatord
+  checks it is the page it shows and the origin it ran live, D8's "this
+  origin, this trail"); at another origin it stays in the document lane
+  and the live run stops. Back, another tab, a typed address, or a failed
+  open stop it too.
+- **Page size.** navigatord tells the engine its page area with the new
+  `web_island::PageSize` control message (`P`, two `u16`, 1 to 16,384),
+  just after the engine reports its start and whenever a placement changes
+  the size; limend passes it only while the page runs. The engine lays the
+  page out at that size (`navigator_take_page_size`), replacing I6.1's
+  fixed 1024 x 768 after the first frame.
+- **`history.pushState`.** `Report::UrlChanged(url)` exists and navigatord
+  ends an engine that claims another origin's address with it, but the
+  engine does not send it yet and the address bar does not follow: the
+  next part of I6.2, with `window.open` (still refused) and the
+  cross-origin engine fixture.
+
+**Gate (Mac, arm64 Tessera),** after the I6.1 gate's setup:
+
+1. Run `app.html` live, press **Same origin page**: a new trail entry
+   `https://app.example/second.html`, the chip reads Live code again with
+   no prompt, and the fixture server's log shows `/second.html` fetched by
+   the engine through navigatord (the `same-origin-nav` POST stays
+   refused).
+2. Back: `app.html` shows in the document lane and no engine runs.
+3. Run live again, press **Another site**: the trail shows
+   `https://elsewhere.example/` in the document lane, the live run stops,
+   and no engine is left.
+4. Resize the window while live: the page lays out at the new size (the
+   navigatord log shows no "size not sent" line).
 
 #### Costs
 
@@ -3469,3 +3520,7 @@ Installed JIT-off Ladybird ran the external script. Its Continue button proposed
 ### 10.3 Long playback, frame accounting, I5 hardening and the Start
 
 Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58.633 s without input. The 60 s chapter fetched a new range and decoded at 64.900 s. Opening returned to 5 s and refilled without skipping across the gap. Lyra captured audio in all three cases. The restricted courier renewed after 12 requests and delivered 18 media replies. Pacing native submissions and separating headless video from PNG capture yielded 515, 521 and 527 landed frames. Median landing errors against Lyra were +1.6, +2.3 and +1.4 ms. The guest mix and both chapter seeks passed after renewal. The full 22 min 24 s demo played uninterrupted to 1,343.567 s with 453 media replies, 39,445,202 bytes and 37 renewals. The guest HDA/Lyra mix remained audible in the final minute. The provider ended on the continuous run. After wiring native drain into LibWeb, a fresh final-chapter replay also delivered one DOM ended event. The installed DOM frame-accounting gate passed in JIT-off Ladybird on arm64 Tessera. After the 1,325 s seek the final 983 DOM frames and four drops matched 979 Fresco presentations and four drops. Of 1,011 decoded frames, 28 were discarded across the seek before submission. A fresh engine reset both counters to zero. All 24 host checks passed. The private guest shut down cleanly and port 24223 was released. The multi-leaf mask now composites in Fresco. On Tessera all 14,400 sampled pixels matched, and jailed Ladybird displayed the provider error message and masked gradient after Play. [Error-screen gate and evidence](#error-screen-mask). I5 installed-worker hardening passed on Tessera. The symbol audit matched the installed binary, both live workers passed mapping and rctl checks, and after worker loss the fresh Start decoded red and sought to blue. The ordinary Start median was 3,176 ms across three headless observations. The jailed offline fork gate passed all 18 repeat editor children. Immutable pinned faces eliminated ten inherited descriptors. Median fork to first native scene was 12.124 ms with child font setup and 11.884 ms with template font setup. The event loop opens two wake-pipe descriptors and stays child-local. The installed Start now prints a `start-trace` line per hop in navigatord, limend, portcullisd, the one-shot lane and jaild, on one monotonic clock, and `scripts/navigator-i5-start-trace.sh` merges them ([Start trace](#i5-start-trace)). The trace ran on arm64 Tessera with main's four daemons: the press-to-fork daemon path is 16 to 29 ms, but the engine's first request came 2.0 s after fork because limend waits 2 s for the absent audio-attribution socket. With choragusd answering, the gap fell to 40 to 56 ms, so the 3,176 ms baseline includes that wait. Every press then failed the island, because main's navigatord now expects the Opus fetch the I5 fixture and worker never make ([results](#results-on-arm64-tessera-2026-11-24)). limend now asks for the audio ticket off its state lock, so a missing or slow choragusd no longer delays the island (host test; the player reopens sound when a late ticket arrives), and a navigatord test pins the four video fetches to the engine's fixture sequence and page ([follow-up](#follow-up-the-audio-wait-and-the-opus-fetch)). Main's sources already make the Opus fetch; only the audited worker binary was older. Shankar chose D7, a standby pool: limend keeps one warmed engine per Navigator uid and hands it the next island, off unless `LIMEN_ISLAND_STANDBY=1` ([warm start](#i5-warm-start-how-a-warmed-engine-gets-its-own-jail-d7-accepted)). The rerun from main `58f533c1b` on arm64 Tessera passed the cold path: the rebuilt, audited engine (`6b2b35bb…`) made all four fetches, the 2 s audio wait is gone (first request 60 to 170 ms after the press with or without choragusd), and press to red fell from 3,176 ms to a median of 1,697 ms without choragusd and 1,764 ms with it. navigator-fetchd must come from main too, since the old one refused the Opus fetch. The standby worked: later presses took the waiting standby, the worker check passed on an assigned standby, and a waiting standby held about 69 MiB. It did not speed the Start: first request stayed 41 to 172 ms and press to red 1,734 ms (median of four), because navigatord asks Limen for the embedded player before serving fetches and about 1.4 s lies after the engine's start report ([rerun results](#results-on-arm64-tessera-2026-11-24-rerun-from-main)). The trace now runs to the player's first decoded frame (player launch, each fetch upstream and delivered, MSE appends, Play, first frame), the player is launched beside the engine instead of before its first fetch, and the next standby waits 3 s after the island ([follow-up](#follow-up-tracing-past-the-engines-start-and-two-overlaps)); host tests pass. The traced rerun on arm64 Tessera (main `fe34b869c`) shows where the 1.7 s goes ([results](#results-on-arm64-tessera-2026-11-24-trace-to-the-first-frame)): about 700 ms is the JIT-off engine's own work between fetches (page script, which scans each clip with `findIndex`, and MediaSource setup), about 300 ms the four fetches (the first one 160 ms), about 240 ms appends and the first frame, and about 280 ms composition and capture. The player is now ready at 160 to 260 ms, off the press's path, and the 3 s standby refill no longer overlaps; warm and cold still reach red at about 1.74 s. A standby fed a byte without a descriptor exits within 101 ms, and so does one whose channel closes (a descriptor proceeds as the control). The clip scan is too short to matter (split at bytes 468 and 497); the gaps are about 200 ms each, which fits `drive_page` pumping the event loop once per 20 ms input poll, so it now drains ready work first ([follow-up](#follow-up-the-20-ms-input-poll-not-the-clip-scan); engine side, unbuilt in the cloud). Measured on arm64 Tessera with the rebuilt, audited engine (`1000beb6…`, main `d4a26635e`): the three ~200 ms gaps fell to 1 to 26 ms, and press to red dropped from about 1.74 s to 1,027 ms without choragusd, 1,062 ms with it and 962 ms warm, with the player's first frame at 630 to 690 ms ([results](#results-on-arm64-tessera-2026-11-24-drained-event-loop)). What is left is mostly the four upstream fetches (60 to 180 ms each) and about 330 ms from `player-ready` to the observed pixel, which includes composition and the headless capture. Next: decide whether that observation lag needs its own trace stage in frescod before tuning further. Draining the engine's ready work before its 20 ms input poll cut press to red from about 1.74 s to 1,027 ms cold and 962 ms warm ([drain results](#results-on-arm64-tessera-2026-11-24-drained-event-loop)); the standby now saves about 65 ms. Headless frescod now traces each composited frame and saved capture under `FRESCOD_START_TRACE=1`, to split the last 330 ms between composition and the 200 ms capture floor plus PNG encode ([follow-up](#follow-up-splitting-the-last-330-ms)). Measured on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-24-frescod-traced)): the 330 ms was the measurement (the 200 ms headless capture floor, 52 to 55 ms composition, the PNG and the SSH poll), so the gate now ends at frescod's `composited`: median press to composited 869 ms cold without choragusd, 872 ms with it, 855 ms warm, and about 730 to 770 ms without the headless floor. Main's portcullisd (launch registry check, `2bd8429`), frescod and navigatord ran the same Starts cleanly (red at 1,050, 881, 893 ms). The [I6 plan](#i6-plan-whole-pages-live-on-a-press-accepted) (whole pages live on a press) was accepted with D8 to D13 on 2026-11-24. I6.0 qualification is next: the fixture app and its server are in `test-assets/navigator-i6/`, and the [run steps](#i60-qualification-run) use the VPN sign-in window as the whole-page vehicle until I6.1. Next (Mac): the I6.0 run. Per-persona launch is settled by D7: each Navigator persona instance gets its own standby, launched as that persona's island uid. [Fork gate and evidence](#i5-fork-before-taint-gate). [I5 gate and evidence](#i5-installed-worker-hardening-on-tessera). Physical display cadence is pending hardware. [Frame accounting and evidence](#native-playback-quality). Fingerprint verification deferred.
+
+### 10.4 Whole pages live (I6)
+
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25-first-part) (links as trail entries that run live again at the same origin, and the engine's page size) is host-tested; its engine side waits for a Mac build and the I6.2 gate.

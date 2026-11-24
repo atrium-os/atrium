@@ -1,7 +1,10 @@
 //! Reports from a broker-fetched web island (navigator-islands.md §5).
 use serde::{Deserialize, Serialize};
 
-pub const MAX_FRAME: usize = 512;
+/// The longest report: a navigation's address and its framing.
+pub const MAX_FRAME: usize = 2304;
+/// The longest address a whole page's engine reports (I6.2).
+pub const URL_MAX: usize = 2048;
 
 /// A whole-page island's first request (navigator-islands.md I6.1): the
 /// engine asks for "its page" by this address, which never resolves
@@ -21,6 +24,17 @@ pub enum Report<'a> {
     Ended(EndReason),
     BeforeUnload { query: u32 },
     MediaReady,
+    /// A whole page asked to go to `url` (I6.2): a link, a GET form,
+    /// `location`. The engine never follows it; navigatord decides.
+    Navigate(&'a str),
+    /// The page's own address changed without a new document
+    /// (`history.pushState`, I6.2): a trail entry, same engine.
+    UrlChanged(&'a str),
+}
+
+/// An address an engine may report: plain HTTPS, bounded, printable.
+fn reportable(url: &str) -> bool {
+    url.len() <= URL_MAX && url.starts_with("https://") && url.bytes().all(|b| b.is_ascii_graphic())
 }
 
 impl Report<'_> {
@@ -32,6 +46,7 @@ impl Report<'_> {
             Self::Resize { width, height } => (1..=16384).contains(width) && (1..=16384).contains(height),
             Self::Ended(_) | Self::MediaReady => true,
             Self::BeforeUnload { query } => *query != 0,
+            Self::Navigate(url) | Self::UrlChanged(url) => reportable(url),
         }
     }
 
@@ -93,10 +108,36 @@ impl ChapterSeek {
     }
 }
 
+/// The page area a whole page is placed in (I6.2), from its parent: the
+/// engine lays the page out at this size, in CSS pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageSize { width: u16, height: u16 }
+
+impl PageSize {
+    pub fn new(width: u32, height: u32) -> Option<Self> {
+        let (width, height) = (u16::try_from(width).ok()?, u16::try_from(height).ok()?);
+        ((1..=16384).contains(&width) && (1..=16384).contains(&height)).then_some(Self { width, height })
+    }
+    pub fn width(self) -> u16 { self.width }
+    pub fn height(self) -> u16 { self.height }
+    pub fn encode(self) -> Vec<u8> {
+        let mut bytes = vec![b'P'];
+        bytes.extend(self.width.to_le_bytes());
+        bytes.extend(self.height.to_le_bytes());
+        bytes
+    }
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let &[b'P', a, b, c, d] = bytes else { return None };
+        Self::new(u16::from_le_bytes([a, b]).into(), u16::from_le_bytes([c, d]).into())
+    }
+}
+
 impl Lifecycle {
     pub fn accepts_control(&mut self, bytes: &[u8], media_ready: bool) -> bool {
         if let Some(answer) = UnloadAnswer::decode(bytes) { return self.answer(answer); }
-        media_ready && matches!(self, Self::Running { .. }) && ChapterSeek::decode(bytes).is_some()
+        let running = matches!(self, Self::Running { .. });
+        if PageSize::decode(bytes).is_some() { return running; }
+        media_ready && running && ChapterSeek::decode(bytes).is_some()
     }
 
     pub fn answer(&mut self, answer: UnloadAnswer) -> bool {
@@ -112,7 +153,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_)) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
@@ -159,6 +200,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_navigation_report_is_a_plain_https_address_after_the_start() {
+        let mut state = Lifecycle::default();
+        let nav = Report::Navigate("https://app.example/second.html").encode().unwrap();
+        assert!(state.receive(&nav).is_none(), "not before the page started");
+        assert!(state.receive(&Report::Started { origin: "https://app.example" }.encode().unwrap()).is_some());
+        assert_eq!(state.receive(&nav), Some(Report::Navigate("https://app.example/second.html")));
+        assert!(state.receive(&Report::UrlChanged("https://app.example/route/1").encode().unwrap()).is_some());
+        for bad in ["http://app.example/", "javascript:alert(1)", "https://a.example/x y", "https://a.example/\n"] {
+            assert!(Report::Navigate(bad).encode().is_none(), "{bad}");
+            assert!(state.receive(&postcard::to_stdvec(&Report::Navigate(bad)).unwrap()).is_none(), "{bad}");
+        }
+        let long = format!("https://a.example/{}", "x".repeat(URL_MAX));
+        assert!(Report::UrlChanged(&long).encode().is_none());
+    }
+
+    #[test]
+    fn a_page_size_is_bounded_and_taken_only_while_running() {
+        let size = PageSize::new(1024, 620).unwrap();
+        assert_eq!(PageSize::decode(&size.encode()), Some(size));
+        for (w, h) in [(0, 1), (1, 0), (16385, 1), (1, 70000)] { assert!(PageSize::new(w, h).is_none(), "{w}x{h}"); }
+        assert!(PageSize::decode(&[b'P', 0, 0, 1, 0]).is_none());
+        assert!(PageSize::decode(&size.encode()[..4]).is_none());
+        let mut state = Lifecycle::default();
+        assert!(!state.accepts_control(&size.encode(), false), "not before the page started");
+        let mut state = Lifecycle::Running { last_query: 0 };
+        assert!(state.accepts_control(&size.encode(), false));
+        assert!(!Lifecycle::Ended.accepts_control(&size.encode(), true));
     }
 
     #[test]

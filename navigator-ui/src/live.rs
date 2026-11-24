@@ -902,6 +902,11 @@ impl Live {
                         if let Some(e) = &self.embeds { let _ = e.borrow_mut().hide(PAGE_SLOT); }
                     }
                 }
+                Event::LiveNavigate { from, url } => {
+                    if !s.live_navigated(&from, &url) {
+                        eprintln!("navigator-ui: a live page's navigation to {url} came after it left the screen");
+                    }
+                }
                 Event::LiveEnded { url, why } => {
                     eprintln!("navigator-ui: {url} stopped running live{}", why.as_deref().map(|w| format!(": {w}")).unwrap_or_default());
                     if self.live_placed.as_ref().is_some_and(|(u, _)| *u == url) { self.live_placed = None; }
@@ -1205,6 +1210,11 @@ impl Live {
                     send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press });
                     self.live_placed = Some((url, rect));
                 }
+                Out::ContinueLive { url } => {
+                    let rect = live_rect(s);
+                    send(&mut self.w, &Request::ContinueLive { url: url.clone(), rect });
+                    self.live_placed = Some((url, rect));
+                }
                 Out::StopLive { url } => {
                     send(&mut self.w, &Request::PlaceLive { url, rect: None });
                     self.live_placed = None;
@@ -1380,11 +1390,10 @@ impl Live {
             }
         }
         // The page running live (I6.1) follows the page area, and ends when
-        // the page leaves the screen.
+        // the page leaves the screen, unless the live page went there (I6.2).
         if let Some(run) = s.live_run.clone() {
             if s.shown_key() != Some(run.key) || s.history.is_some() {
-                s.stop_live();
-                changed = true;
+                changed |= s.live_follow();
             } else if let Some((url, placed)) = self.live_placed.clone() {
                 let rect = live_rect(s);
                 if rect != placed {
