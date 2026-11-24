@@ -484,14 +484,10 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
     load_within(data, u64::MAX)
 }
 
-/// Column chunks loaded between checks of the workbook's size.
-const CHECK_EVERY: usize = 256;
-
 /// [`load`], stopping with [`LoadError::TooBig`] once the workbook would hold
-/// more than `budget` bytes ([`Workbook::memory_bytes`]). A small file can
-/// describe a big workbook (a chunk of a few bytes fills 4,096 rows), so the
-/// size is checked as cells arrive, every [`CHECK_EVERY`] column chunks, not
-/// guessed from the file.
+/// more than `budget` bytes ([`Workbook::memory_bytes`]). The loader counts
+/// each new column chunk as it is installed and checks large sparse index
+/// expansions before allocating the slots they require.
 pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     let c = ContainerReader::open(data, Limits::default())?;
     if c.kind != DocKind::Sheets {
@@ -738,15 +734,12 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
 
     // Cells.
     let max_chunk = (MAX_ROWS - 1) / CHUNK_ROWS;
-    let over = |wb: &Workbook| -> Result<(), LoadError> {
-        let b = wb.memory_bytes();
-        if b > budget { Err(LoadError::TooBig(b)) } else { Ok(()) }
-    };
-    over(&wb)?;
-    for (k, i) in of(COLUMN).enumerate() {
-        if k % CHECK_EVERY == CHECK_EVERY - 1 {
-            over(&wb)?;
-        }
+    let check = |bytes| if bytes > budget { Err(LoadError::TooBig(bytes)) } else { Ok(()) };
+    let over = |wb: &Workbook| check(wb.memory_bytes());
+    let mut cells_bytes = wb.memory_bytes();
+    check(cells_bytes)?;
+    let slot_cost = std::mem::size_of::<Option<Box<Chunk>>>() as u64;
+    for i in of(COLUMN) {
         let mut r = Reader::new(c.chunk(i)?);
         let s = r.u16()?;
         if s as usize >= wb.sheets.len() {
@@ -758,6 +751,11 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             return Err(LoadError::Bad("a column chunk twice"));
         }
         let base = n * CHUNK_ROWS;
+        let sheet = &wb.sheets[s as usize];
+        let old_slots = sheet.column(col).map_or(0, crate::column::Column::slot_capacity);
+        let new_indexes = (col as usize + 1).saturating_sub(sheet.fidx.len()) as u64 * 24;
+        let required_slots = (n as usize + 1).saturating_sub(old_slots) as u64 * slot_cost;
+        check(cells_bytes.saturating_add(new_indexes).saturating_add(required_slots))?;
         match r.u8()? {
             ENC_NUM => {
                 let mut present = vec![0u64; CHUNK_ROWS as usize / 64].into_boxed_slice();
@@ -830,9 +828,15 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             _ => return Err(LoadError::Bad("column encoding")),
         }
         done(&r)?;
+        let column = wb.sheets[s as usize].column(col).ok_or(LoadError::Bad("column chunk missing"))?;
+        let chunk = column.chunk(base).ok_or(LoadError::Bad("column chunk missing"))?;
+        let slots = (column.slot_capacity() - old_slots) as u64 * slot_cost;
+        cells_bytes = cells_bytes.saturating_add(new_indexes + slots + chunk.bytes() as u64);
+        check(cells_bytes)?;
     }
 
-    over(&wb)?;
+    let mut formula_bytes = wb.memory_bytes();
+    check(formula_bytes)?;
 
     // Formulas.
     for i in of(FORMULAS) {
@@ -849,6 +853,8 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             if r0 > r1 {
                 return Err(LoadError::Bad("formula rows"));
             }
+            formula_bytes = formula_bytes.saturating_add(256 + u64::from(r1 - r0) * 8);
+            check(formula_bytes)?;
             let src = r.str("formula", crate::formula::MAX_STORED_FORMULA_LEN as u64)?;
             let overlaps = wb.sheets[s as usize].fidx.get(col as usize).is_some_and(|f| {
                 f.range(r0..=r1).next().is_some() || f.range(..r0).next_back().is_some_and(|(_, &g)| wb.group(g).r1 >= r0)
@@ -863,6 +869,8 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
         done(&r)?;
     }
+
+    over(&wb)?;
 
     // Styles: the file's ids map to this workbook's (equal styles intern to one).
     let mut style_ids: Vec<u32> = vec![0];

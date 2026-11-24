@@ -4260,7 +4260,43 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 
 ### 16.76 Native files loaded within the memory budget (2026-11-18)
 
-`native::load_within(data, budget)` checks the workbook's size (`Workbook::memory_bytes`) after the strings, every 256 column chunks, after the formulas and at the end, and stops with `LoadError::TooBig` once it is past `budget`; `load` is the same without a limit. Sheets opens and recovers native files (and what the converter hands back) within its memory budget (§16.70), so a workbook too big for it is refused while loading, off the window's thread, with the reason in words, instead of after it has taken the memory. Gate: officina-grid `tests/budget.rs` `a_workbook_past_the_budget_is_refused_while_loading`.
+`native::load_within(data, budget)` begins with the workbook memory estimate
+after reading strings. For each column chunk it checks the required row-index
+slots and formula index space before allocating, then accounts for the actual
+column and chunk storage. It also checks the projected memory for formula
+fills before materializing their results and rechecks the workbook after the
+formula phase and at the end. When the estimate crosses the limit, it returns
+`LoadError::TooBig`. The same loader without a limit is `load`. Sheets uses
+the bounded loader off the window thread for native open and recovery and for
+native output from the converter. The refusal names the workbook and explains
+the memory limit. The budget measures the workbook estimate, while process RSS
+also includes the encoded file and other allocations.
+
+**Boundary gate (2026-11-24).** On an arm64 Tessera-root guest with four vCPUs
+and a 2,132,725,760-byte app budget, `atrium-sheets/examples/native_memory.rs`
+ran each case in a fresh process three times. The dense case used the 1 GiB
+opening floor from §16.78.
+
+| Native fixture | Stored bytes | Estimated workbook bytes | Loader time, three runs | Outcome |
+| --- | ---: | ---: | --- | --- |
+| Dense, 131,072,000 numeric cells | 1,065,968,177 | 1,066,755,256 | 2,416 / 2,495 / 2,465 ms | Opened and sampled all 125 columns |
+| Sparse, 507 columns through row 2,147,483,647 | 23,412 | 2,126,585,512 | 576 / 572 / 578 ms | Opened and checked every populated far-row cell |
+| Oversized sparse, 515 columns | 23,780 | 2,160,141,096 | 501 / 506 / 500 ms | Refused before allocating additional slots at a projected 2,134,974,288 bytes |
+
+Dense reads took 1,051 / 973 / 1,056 ms separately from the loader. These
+are timings for the guest. The installed Sheets app refused the oversized
+workbook through Scrinium. From that same window, the picker opened the
+near-limit sparse workbook in a fresh jail. Ordinary Save and picker reopen
+preserved the A1 edit and all 507 far-row cells. The oversized file's hash
+stayed the same. The dense workbook passed the engine boundary check. Its
+installed picker attempt expired before Sheets started. Scrinium computes
+the writable grant's content verification before Portcullis claims the Open
+press. The large-file picker path needs a separate fix and desktop retest.
+
+`officina-grid/tests/budget.rs` covers exact-budget sparse acceptance,
+early refusal and retry, and a compact million-row formula fill. Guest logs,
+screenshots, and small workbook snapshots are under
+`/private/tmp/atrium-sheets-memory/guest/`.
 
 ### 16.77 -IF criteria such as ">"&A1 from a sorted index (2026-11-18)
 

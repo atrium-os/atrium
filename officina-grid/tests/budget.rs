@@ -82,6 +82,51 @@ fn a_workbook_past_the_budget_is_refused_while_loading() {
 }
 
 #[test]
+fn native_reader_checks_sparse_slot_growth_before_installing_the_next_column() {
+    use officina_grid::addr::MAX_ROWS;
+    use officina_grid::{native, CellAddr, Value, Workbook};
+
+    let mut wb = Workbook::new();
+    wb.add_sheet("Far apart").unwrap();
+    let row = MAX_ROWS - 1;
+    wb.set_value(CellAddr::new(0, row, 0), Value::Num(1.0));
+    let budget = wb.memory_bytes();
+    let single_column = native::save_to_vec(&wb);
+    assert!(single_column.len() < 1024);
+    let accepted = native::load_within(&single_column, budget).unwrap();
+    assert_eq!(accepted.memory_bytes(), budget);
+    assert_eq!(accepted.value(0, row, 0), Value::Num(1.0));
+    assert!(matches!(native::load_within(&single_column, budget - 1), Err(native::LoadError::TooBig(_))));
+
+    for col in 1..4 {
+        wb.set_value(CellAddr::new(0, row, col), Value::Num(f64::from(col)));
+    }
+    let oversized = native::save_to_vec(&wb);
+    assert!(oversized.len() < 1024);
+    let Err(native::LoadError::TooBig(needed)) = native::load_within(&oversized, budget) else {
+        panic!("expected early budget refusal");
+    };
+    assert!(needed > budget && needed < wb.memory_bytes());
+    assert_eq!(native::load_within(&single_column, budget).unwrap().value(0, row, 0), Value::Num(1.0));
+}
+
+#[test]
+fn empty_formula_fills_count_against_the_native_open_budget() {
+    use officina_grid::{native, Workbook};
+
+    let mut wb = Workbook::new();
+    wb.add_sheet("Uncomputed").unwrap();
+    wb.fill_formula(0, 0, 0, 1_000_000, "=1").unwrap();
+    let data = native::save_to_vec(&wb);
+    let budget = wb.memory_bytes();
+    assert!(data.len() < 1024);
+    assert!(matches!(native::load_within(&data, 1 << 20), Err(native::LoadError::TooBig(_))));
+    let loaded = native::load_within(&data, budget).unwrap();
+    assert_eq!(loaded.memory_bytes(), budget);
+    assert!(loaded.group_at(0, 1_000_000, 0).is_some());
+}
+
+#[test]
 fn sliced_groups_preserve_disjoint_dirty_runs_and_count_completed_cells() {
     const ROWS: u32 = 131_072;
     const STARTS: [u32; 3] = [1, 40_000, 105_000];

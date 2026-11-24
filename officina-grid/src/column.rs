@@ -364,8 +364,13 @@ impl Column {
         self.chunks.iter().flatten().map(|c| c.count()).sum()
     }
 
+    pub(crate) fn slot_capacity(&self) -> usize {
+        self.chunks.capacity()
+    }
+
     pub fn bytes(&self) -> usize {
-        self.chunks.capacity() * 8 + self.chunks.iter().flatten().map(|c| c.bytes()).sum::<usize>()
+        self.slot_capacity() * std::mem::size_of::<Option<Box<Chunk>>>()
+            + self.chunks.iter().flatten().map(|c| c.bytes()).sum::<usize>()
     }
 
     /// Puts a whole chunk in place (the native format's load). The slot must be empty.
