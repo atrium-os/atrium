@@ -4901,7 +4901,7 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 
 - **Ctrl+.** moves the active cell to the selection's next corner, clockwise, and keeps the selection. **Shift+Backspace** leaves only the active cell selected. Neither clears anything.
 - **Ctrl+Backspace** scrolls back to the active cell. Plain Backspace and Delete still clear the selection.
-- **Alt+PageDown** and **Alt+PageUp** move one screen right or left. The step is as many columns as fit at the active column's width, so the two keys undo each other. Hidden columns are stepped over, and Shift is not needed to keep Ctrl+PageUp/PageDown for sheets.
+- **Alt+PageDown** and **Alt+PageUp** move one screen right or left. The step is as many columns as fit at the active column's width, so the two keys undo each other. Hidden columns are stepped over, and Ctrl+PageUp/PageDown still change sheet.
 - **Ctrl+Alt+V** opens the Paste Special bar (pergola's grid sends `GridAction::PasteSpecial`). The menu item shows the key.
 - Tests: `excel_keys_for_the_active_cell_corners_and_screens` (pergola) and the Paste Special test (Sheets). Sheets 143 and pergola 239 lib tests pass.
 
