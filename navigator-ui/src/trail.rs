@@ -355,13 +355,18 @@ pub struct Trail {
     pub anonymous: bool,
     /// Logical clock of the last navigation, for the rail's order.
     pub active: u64,
+    /// Pinned (§15.1): a tile at the top of the rail, out of Today.
+    pub pinned: bool,
 }
 
 /// The current trail's path as the rail draws it (§5.2).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct PathRows {
-    /// Root to current page.
+    /// Root to current page, a page opened again right after itself
+    /// folded into the later one.
     pub path: Vec<PageId>,
+    /// For each row of `path`, how many pages it stands for (1 or more).
+    pub repeats: Vec<usize>,
     /// The current page's children, newest last.
     pub branches: Vec<PageId>,
     /// Side branches off the path, folded into "N more".
@@ -382,7 +387,7 @@ impl Trail {
     }
 
     pub fn new(id: u64, unrecorded: bool) -> Self {
-        Trail { id, pages: vec![], current: None, unrecorded, jar: if unrecorded { random_jar() } else { 0 }, muted: false, anonymous: false, active: 0 }
+        Trail { id, pages: vec![], current: None, unrecorded, jar: if unrecorded { random_jar() } else { 0 }, muted: false, anonymous: false, active: 0, pinned: false }
     }
 
     pub fn page(&self) -> Option<&Page> {
@@ -614,7 +619,31 @@ impl Trail {
         }
         path.reverse();
         let folded = path.windows(2).map(|w| self.pages[w[0]].children.len() - 1).sum();
-        PathRows { path, branches: self.pages[cur].children.clone(), folded }
+        // A page opened again right after itself (a reload, a link to the
+        // same address) is one row, the later one, counted.
+        let mut rows: Vec<PageId> = vec![];
+        let mut repeats: Vec<usize> = vec![];
+        for p in path {
+            match rows.last() {
+                Some(&q) if self.pages[q].url == self.pages[p].url => {
+                    *rows.last_mut().unwrap() = p;
+                    *repeats.last_mut().unwrap() += 1;
+                }
+                _ => {
+                    rows.push(p);
+                    repeats.push(1);
+                }
+            }
+        }
+        PathRows { path: rows, repeats, branches: self.pages[cur].children.clone(), folded }
+    }
+
+    /// Whether `query` (lowercased) is in the trail's title or any of its
+    /// pages' titles or addresses (Find in trails, §15.1).
+    pub fn matches(&self, query: &str) -> bool {
+        query.is_empty()
+            || self.title().to_lowercase().contains(query)
+            || self.pages.iter().filter(|p| !p.cleared()).any(|p| p.title.to_lowercase().contains(query) || p.url.to_lowercase().contains(query))
     }
 
     /// The row glyph (§8a.2): sound wins over a silent video.
@@ -628,6 +657,9 @@ impl Trail {
         }
     }
 }
+
+/// The most trails pinned at once: two rows of tiles.
+pub const PINNED_MAX: usize = 10;
 
 /// A persona (§2.4). Named personas come when someone asks (D5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -736,6 +768,23 @@ impl TrailStore {
     }
 
     /// Open trails as the rail lists them: newest activity first.
+    /// Pin or unpin trail `index` (§15.1). At most [`PINNED_MAX`] pinned.
+    pub fn toggle_pin(&mut self, index: usize) -> bool {
+        let n = self.trails.iter().filter(|t| t.pinned).count();
+        let Some(t) = self.trails.get_mut(index) else { return false };
+        if !t.pinned && n >= PINNED_MAX {
+            return false;
+        }
+        t.pinned = !t.pinned;
+        true
+    }
+
+    /// The pinned trails, in the order they were opened (tiles keep their
+    /// places), and the others in the rail's order.
+    pub fn pinned_order(&self) -> Vec<usize> {
+        (0..self.trails.len()).filter(|i| self.trails[*i].pinned).collect()
+    }
+
     pub fn rail_order(&self) -> Vec<usize> {
         let mut v: Vec<usize> = (0..self.trails.len()).collect();
         v.sort_by(|a, b| self.trails[*b].active.cmp(&self.trails[*a].active).then(a.cmp(b)));
@@ -765,7 +814,7 @@ impl TrailStore {
         let id = self.next_id;
         self.next_id += 1;
         let n = pages.len();
-        let t = Trail { id, pages, current: Some(current.unwrap_or(0)), unrecorded, jar, muted, anonymous, active: self.tick() };
+        let t = Trail { id, pages, current: Some(current.unwrap_or(0)), unrecorded, jar, muted, anonymous, active: self.tick(), pinned: false };
         self.trails.push(t);
         if current.is_some() && self.current == index {
             self.current = self.trails.len() - 1;
@@ -1336,5 +1385,23 @@ mod asked_tests {
         s.put_away(0);
         assert!(s.open_sessions().is_empty());
         assert!(s.knows_in(Jar::Personal, "sd.example"), "it still knows you: only the session ends");
+    }
+
+    #[test]
+    fn a_page_opened_again_right_after_itself_is_one_row() {
+        let mut t = Trail::new(0, false);
+        let sp = |u: &str| PageSpec { url: u.into(), title: u.into(), search: None, facts: Facts::green(""), media: Media::None };
+        t.follow(sp("https://a.example/"));
+        t.follow(sp("https://b.example/"));
+        t.follow(sp("https://b.example/"));
+        t.follow(sp("https://b.example/"));
+        t.follow(sp("https://c.example/"));
+        let r = t.path_rows();
+        assert_eq!(r.path.len(), 3);
+        assert_eq!(r.repeats, vec![1, 3, 1]);
+        assert_eq!(t.pages[r.path[1]].url, "https://b.example/");
+        assert_eq!(r.path[1], 3, "the later page stands for them");
+        assert_eq!(t.current, Some(*r.path.last().unwrap()));
+        assert!(t.matches("b.exa") && t.matches("") && !t.matches("zzz"));
     }
 }

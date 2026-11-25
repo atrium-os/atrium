@@ -58,6 +58,7 @@ pub mod ph {
     pub const CHECK: char = '\u{e182}';
     pub const APP_WINDOW: char = '\u{e5da}';
     pub const SHARE_NETWORK: char = '\u{e408}';
+    pub const PUSH_PIN: char = '\u{e3e2}';
     pub const COOKIE: char = '\u{e6ca}';
     pub const PRINTER: char = '\u{e3dc}';
     pub const CLOCK_COUNTER_CLOCKWISE: char = '\u{e1a0}';
@@ -281,11 +282,22 @@ fn inline(ctx: &mut Ctx, x: f32, cy: f32, gap: f32, runs: &[(String, TextStyle)]
 fn monogram(ctx: &mut Ctx, x: f32, y: f32, url: &str, strong: bool) {
     let t = ctx.theme;
     let site = trail::site(url);
-    let letter: String = site.chars().next().map_or("·".into(), |c| c.to_uppercase().collect());
+    let letter = monogram_letters(site);
     rect(ctx, x, y, em(20.0), em(20.0), if strong { t.text_primary() } else { t.border_strong() }, em(4.0));
     let st = sans(type_size::XS, Weight::Semibold, if strong { t.bg_canvas() } else { t.text_primary() });
     let lw = width(&letter, &st);
     text(ctx, x + (em(20.0) - lw) / 2.0, y + em(10.0), &letter, type_size::XS, Weight::Semibold, if strong { t.bg_canvas() } else { t.text_primary() });
+}
+
+/// A site's monogram (D6, §15.1): the first two letters or digits of its
+/// first label, the first a capital ("atlas.example" is "At").
+pub fn monogram_letters(site: &str) -> String {
+    let mut it = site.split('.').next().unwrap_or("").chars().filter(|c| c.is_alphanumeric());
+    match (it.next(), it.next()) {
+        (Some(a), Some(b)) => a.to_uppercase().chain(b.to_lowercase()).collect(),
+        (Some(a), None) => a.to_uppercase().collect(),
+        _ => "·".into(),
+    }
 }
 
 fn light_glyph(l: Light) -> char {
@@ -470,11 +482,30 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let st2 = st.clone();
     icon_button(ctx, em(216.0), em(6.0), ph::SIDEBAR_SIMPLE, true, t.text_secondary(), "Collapse the rail (Ctrl-B)", move || with(&st2, |s| s.rail_collapsed = true));
 
-    let bottom = g.h - em(8.0);
-    let mut y = em(44.0);
+    // Find in trails (§15.1).
+    if let Some(f) = g.rail_find {
+        rail_find_field(ctx, s, f, st);
+    }
+    let bottom = g.all_history.map_or(g.h, |r| r.y()) - em(4.0);
+    let mut y = em(78.0);
+    let (pinned, today) = s.rail_trails();
+    let earlier = s.rail_earlier();
+    let filtering = !s.rail_query().is_empty();
+
+    // Pinned (§15.1): tiles, in the order they were pinned.
+    if !pinned.is_empty() {
+        label(ctx, y, "PINNED");
+        y += em(18.0);
+        let pitch = em(shell::TILE + shell::TILE_GAP);
+        let per = ((w - em(24.0) + em(shell::TILE_GAP)) / pitch).floor().max(1.0) as usize;
+        for (k, &i) in pinned.iter().enumerate() {
+            pinned_tile(ctx, s, em(12.0) + (k % per) as f32 * pitch, y + (k / per) as f32 * pitch, i, st);
+        }
+        y += pinned.len().div_ceil(per) as f32 * pitch + em(4.0);
+    }
 
     // "Playing" (§8a.2): another trail making sound.
-    if let Some(pi) = s.store.rail_order().into_iter().find(|i| *i != s.store.current && s.store.trails[*i].row_media() == Some(RowMedia::Sound)) {
+    if let Some(pi) = s.store.rail_order().into_iter().find(|i| !filtering && *i != s.store.current && s.store.trails[*i].row_media() == Some(RowMedia::Sound)) {
         let pt = &s.store.trails[pi];
         label(ctx, y, "PLAYING");
         y += em(18.0);
@@ -488,9 +519,14 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         y += em(40.0);
     }
 
-    label(ctx, y, "TODAY");
-    y += em(18.0);
-    for i in s.store.rail_order() {
+    if filtering && pinned.is_empty() && today.is_empty() && earlier.is_empty() {
+        text(ctx, em(16.0), y + em(12.0), "No trails match", type_size::SM, Weight::Regular, t.text_tertiary());
+    }
+    if !today.is_empty() {
+        label(ctx, y, "TODAY");
+        y += em(18.0);
+    }
+    for i in today {
         if y + em(32.0) > bottom {
             break;
         }
@@ -515,16 +551,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         }
         // State glyphs on the right, right to left.
         let mut gx = em(212.0);
-        let mut glyphs: Vec<(char, Color)> = vec![];
-        if tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
-            glyphs.push((ph::LIGHTNING, t.warning_fg()));
-        }
-        if tr.page().is_some_and(|p| s.store.trail_knows(i, trail::site(&p.url))) {
-            glyphs.push((ph::USER, t.accent_fg()));
-        }
-        if tr.unrecorded {
-            glyphs.push((ph::EYE_SLASH, t.text_secondary()));
-        }
+        let glyphs = trail_glyphs(ctx, s, i);
         let media = tr.row_media();
         if media.is_some() {
             gx -= em(26.0);
@@ -539,7 +566,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         }
         let w_title = gx + em(20.0) - em(46.0);
         let (wt, ct) = if current { (Weight::Semibold, t.text_primary()) } else { (Weight::Regular, t.text_primary()) };
-        let title = fit(tr.title(), &sans(type_size::SM, wt, ct), w_title);
+        let title = fit(&shell::plain(tr.title()), &sans(type_size::SM, wt, ct), w_title);
         text(ctx, em(46.0), y + em(16.0), &title, type_size::SM, wt, if tr.page().is_none() { t.text_secondary() } else { ct });
         ctx.pop();
         if media.is_some() {
@@ -553,11 +580,12 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
 
     // Earlier: trails put away, by day (§4.5).
     let now_s = crate::clock::now_s();
-    if !s.store.earlier.is_empty() && y + em(60.0) < bottom {
+    if !earlier.is_empty() && y + em(60.0) < bottom {
         y += em(8.0);
         label(ctx, y, "EARLIER");
         y += em(18.0);
-        for (i, e) in s.store.earlier.iter().enumerate() {
+        for i in earlier {
+            let e = &s.store.earlier[i];
             if y + em(32.0) > bottom {
                 break;
             }
@@ -572,13 +600,84 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
             let day = crate::clock::day_label(e.at_s, now_s);
             // The title ends a gap before the day.
             let title_max = em(228.0) - width(&day, &ds) - em(8.0) - em(46.0);
-            text(ctx, em(46.0), y + em(16.0), &fit(e.trail.title(), &ts, title_max), type_size::SM, Weight::Regular, t.text_secondary());
+            text(ctx, em(46.0), y + em(16.0), &fit(&shell::plain(e.trail.title()), &ts, title_max), type_size::SM, Weight::Regular, t.text_secondary());
             text(ctx, em(228.0) - width(&day, &ds), y + em(16.0), &day, type_size::XXS, Weight::Regular, t.text_tertiary());
             ctx.pop();
             ctx.tooltip(id, format!("Put away {} · click to bring it back", crate::clock::when_label(e.at_s, now_s)));
             y += em(32.0);
         }
     }
+
+    // The foot: All history (Ctrl-H, §5.5).
+    if let Some(r) = g.all_history {
+        rect(ctx, 0.0, r.y() - em(4.0), w, 1.0, t.border_default(), 0.0);
+        let st2 = st.clone();
+        area(ctx, r, em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.apply(crate::keys::Action::History, now_ms())));
+        let cy = r.y() + r.h() / 2.0;
+        icon(ctx, r.x() + em(10.0), cy - em(8.0), ph::CLOCK_COUNTER_CLOCKWISE, 16.0, t.text_secondary());
+        text(ctx, r.x() + em(36.0), cy, "All history", type_size::SM, Weight::Medium, t.text_secondary());
+        let ks = sans(type_size::XS, Weight::Regular, t.text_tertiary());
+        text(ctx, r.x() + r.w() - em(10.0) - width("Ctrl H", &ks), cy, "Ctrl H", type_size::XS, Weight::Regular, t.text_tertiary());
+        ctx.pop();
+    }
+}
+
+/// A trail's state glyphs (§5.2): live code, a site that knows you,
+/// Unrecorded.
+fn trail_glyphs(ctx: &Ctx, s: &Shell, i: usize) -> Vec<(char, Color)> {
+    let t = ctx.theme;
+    let tr = &s.store.trails[i];
+    let mut glyphs: Vec<(char, Color)> = vec![];
+    if tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
+        glyphs.push((ph::LIGHTNING, t.warning_fg()));
+    }
+    if tr.page().is_some_and(|p| s.store.trail_knows(i, trail::site(&p.url))) {
+        glyphs.push((ph::USER, t.accent_fg()));
+    }
+    if tr.unrecorded {
+        glyphs.push((ph::EYE_SLASH, t.text_secondary()));
+    }
+    glyphs
+}
+
+/// The Find in trails field (§15.1): a press gives it the keys.
+fn rail_find_field(ctx: &mut Ctx, s: &Shell, f: Rect, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    match (&s.rail_find, s.rail_find_focus) {
+        (Some(e), true) => text_field(ctx, f, e, "Find in trails"),
+        (e, _) => {
+            rect(ctx, f.x(), f.y(), f.w(), f.h(), t.border_default(), em(6.0));
+            let st2 = st.clone();
+            area(ctx, Rect::new(f.x() + 1.0, f.y() + 1.0, f.w() - 2.0, f.h() - 2.0), em(5.0), t.bg_canvas(), t.state_hover(), move || with(&st2, |s| s.begin_rail_find()));
+            icon(ctx, f.x() + em(10.0), f.y() + (f.h() - em(14.0)) / 2.0, ph::MAGNIFYING_GLASS, 14.0, t.text_tertiary());
+            let q = e.as_ref().map_or("", |e| e.text());
+            let (words, c) = if q.is_empty() { ("Find in trails".to_string(), t.text_tertiary()) } else { (q.to_string(), t.text_primary()) };
+            let ts = sans(type_size::SM, Weight::Regular, c);
+            text(ctx, f.x() + em(30.0), f.y() + f.h() / 2.0, &fit(&words, &ts, f.w() - em(40.0)), type_size::SM, Weight::Regular, c);
+            ctx.pop();
+        }
+    }
+}
+
+/// A pinned trail's tile (§15.1): its monogram, a mark for the current
+/// one, a dot while it plays or runs live code.
+fn pinned_tile(ctx: &mut Ctx, s: &Shell, x: f32, y: f32, i: usize, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    let tr = &s.store.trails[i];
+    let current = i == s.store.current;
+    let side = em(shell::TILE);
+    let st2 = st.clone();
+    if current {
+        rect(ctx, x - 2.0, y - 2.0, side + 4.0, side + 4.0, t.accent_mark(), em(8.0) + 2.0);
+    }
+    let id = area(ctx, Rect::new(x, y, side, side), em(8.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| s.show_trail(i)));
+    monogram(ctx, x + (side - em(20.0)) / 2.0, y + (side - em(20.0)) / 2.0, tr.page().map_or("", |p| &p.url), current);
+    if tr.row_media().is_some() || tr.page().is_some_and(|p| p.facts.tier == Tier::Live) {
+        let c = if tr.row_media().is_some() { t.accent_mark() } else { t.warning_fg() };
+        rect(ctx, x + side - em(9.0), y + em(3.0), em(6.0), em(6.0), c, em(3.0));
+    }
+    ctx.pop();
+    ctx.tooltip(id, shell::plain(tr.title()));
 }
 
 fn label(ctx: &mut Ctx, y: f32, s: &str) {
@@ -604,10 +703,10 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
     let tr = s.store.trail();
     let r = tr.path_rows();
     let top = y;
-    let rows: Vec<(usize, f32)> = r.path.iter().map(|p| (*p, 0.0)).chain(r.branches.iter().map(|b| (*b, em(14.0)))).collect();
+    let rows: Vec<(usize, f32, usize)> = r.path.iter().zip(&r.repeats).map(|(p, n)| (*p, 0.0, *n)).chain(r.branches.iter().map(|b| (*b, em(14.0), 1))).collect();
     let mut first_branch_y = None;
     let mut last_y = y;
-    for (k, (pi, indent)) in rows.iter().enumerate() {
+    for (k, (pi, indent, n)) in rows.iter().enumerate() {
         if y + em(26.0) > bottom {
             break;
         }
@@ -632,7 +731,16 @@ fn path_rows(ctx: &mut Ctx, s: &Shell, mut y: f32, bottom: f32, st: &Mutable<She
             text(ctx, x + em(18.0), y + em(13.0), &fit(&label, &ts, max - em(18.0)), type_size::XS, Weight::Regular, t.text_secondary());
         } else {
             let (wt, c) = if current { (Weight::Semibold, t.text_primary()) } else { (Weight::Regular, t.text_secondary()) };
-            text(ctx, x, y + em(13.0), &fit(&p.title, &sans(type_size::XS, wt, c), max), type_size::XS, wt, c);
+            // A page opened again right after itself shows once, counted.
+            let times = if *n > 1 { format!("\u{00d7}{n}") } else { String::new() };
+            let ns = sans(type_size::XXS, Weight::Medium, t.text_tertiary());
+            let tw = if times.is_empty() { 0.0 } else { width(&times, &ns) + em(6.0) };
+            let title = fit(&shell::plain(&p.title), &sans(type_size::XS, wt, c), max - tw);
+            let title_w = width(&title, &sans(type_size::XS, wt, c));
+            text(ctx, x, y + em(13.0), &title, type_size::XS, wt, c);
+            if !times.is_empty() {
+                text(ctx, x + title_w + em(6.0), y + em(13.0), &times, type_size::XXS, Weight::Medium, t.text_tertiary());
+            }
         }
         if current {
             rect(ctx, em(220.0), y + em(10.0), em(6.0), em(6.0), t.accent_mark(), em(3.0));
@@ -678,9 +786,17 @@ fn rail_narrow(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let st2 = st.clone();
     icon_button(ctx, em(14.0), em(44.0), ph::PLUS, true, t.text_primary(), "New trail (Ctrl-T)", move || with(&st2, |s| s.new_trail(false)));
     let mut y = em(84.0);
-    for i in s.store.rail_order() {
+    // Pinned trails first, a rule, then the others (§15.1).
+    let pinned = s.store.pinned_order();
+    let order: Vec<(usize, bool)> = pinned.iter().map(|&i| (i, true))
+        .chain(s.store.rail_order().into_iter().filter(|&i| !s.store.trails[i].pinned).map(|i| (i, false))).collect();
+    for (k, &(i, _)) in order.iter().enumerate() {
         if y + em(36.0) > g.h {
             break;
+        }
+        if k > 0 && order[k - 1].1 && !order[k].1 {
+            rect(ctx, em(14.0), y - em(2.0), em(28.0), 1.0, t.border_default(), 0.0);
+            y += em(6.0);
         }
         let tr = &s.store.trails[i];
         let current = i == s.store.current;
@@ -815,6 +931,7 @@ fn more_menu(ctx: &mut Ctx, r: Rect, rows: Vec<shell::MoreRow>, status_on: bool,
             shell::MoreRow::Reading => ph::TEXT_AA,
             shell::MoreRow::Share => ph::SHARE_NETWORK,
             shell::MoreRow::OpenWith => ph::ARROW_SQUARE_OUT,
+            shell::MoreRow::Pin | shell::MoreRow::Unpin => ph::PUSH_PIN,
             shell::MoreRow::Find => ph::MAGNIFYING_GLASS,
             shell::MoreRow::Print => ph::PRINTER,
             shell::MoreRow::History => ph::CLOCK_COUNTER_CLOCKWISE,

@@ -1663,3 +1663,29 @@ its own checks (trace lines plus a screenshot at each width the step touches).
   `share_needs_a_page_shown_and_a_press_and_goes_once`,
   `the_presence_pill_says_who_the_site_knows`; `tests/text_size.rs` checks the pill folds
   to its icon at 1.5× in a 1400 pt window.
+
+*Step 2, 2026-11-25* (`ui.rs` `rail`, `rail_find_field`, `pinned_tile`, `path_rows`,
+`rail_narrow`; `shell.rs` Find in trails; `trail.rs` `pinned`, `toggle_pin`, `matches`,
+`PathRows::repeats`):
+- **Find in trails**: a field under the persona row. Typing filters Pinned, Today and
+  Earlier to the trails whose title, or any page's title or address, contains the text. It
+  runs locally and sends nothing. Enter shows the first match and keeps the filter; Escape
+  clears it. A press outside an empty field lets it go. The query is cut at 256 bytes, and
+  "No trails match" shows when nothing does.
+- **Pinned**: "Pin this trail" / "Unpin this trail" in More. Pinned trails leave Today for
+  a grid of 36 pt tiles (five to a row on the 248 pt rail) with the monogram, a ring on the
+  current one, and a dot while it plays or runs live code. At most 10 are pinned. The pin
+  is kept in the trail store (`pinned`, written only when true); a file that pins more
+  keeps the first 10. The collapsed rail shows pinned tiles first, then a rule, then the
+  rest.
+- **Repeats fold**: a page opened again right after itself (a reload, a link to the same
+  address) is one path row, the later page, with "×N".
+- **All history** is the rail's foot (Ctrl-H).
+- **Monograms** are two letters of the site's first label ("At" for atlas.example). That
+  is still D6: no site pixels.
+- Site-chosen titles in the rail pass through `shell::plain` (no bidi or invisible marks).
+- The rail stays 248 pt, not the canvas's 272, so the toolbar's press points hold. The
+  live gate's branch-row press moves down 34 pt for the find field.
+- Host tests: `pinned_trails_are_tiles_and_find_narrows_the_rail`,
+  `monograms_are_two_letters_of_the_site`, `a_page_opened_again_right_after_itself_is_one_row`,
+  `pinned_trails_stay_pinned_and_only_so_many`. The Main scene pins Mail and the Handbook.

@@ -428,7 +428,7 @@ press $((PX + 50)) $((TOP + PY + 64 + 20))
 inj "KEY 0xe0 0 0"; sleep "$GAP"
 g "grep -q 'ax  *tree-item \"[^\"]*, not looked at yet\"' $S/ui10.log" && ok "Ctrl and a link opened it beside, a branch not looked at yet" || bad "beside: $(g "grep -E 'ax .*tree-item' $S/ui10.log | tail -4")"
 shot live-15-branch
-press 206 $((TOP + 122 + 13))   # the branch row's "Make its own trail"
+press 206 $((TOP + 156 + 13))   # the branch row's "Make its own trail" (under Find in trails, §15.1)
 sleep "$GAP"
 g "grep -q 'a branch of 1 pages is its own trail now' $S/ui10.log" && last | grep -q 'trails=2 ' \
     && ok "Make its own trail: the branch is a trail of its own" || bad "own trail: $(last); $(g "grep -v trace $S/ui10.log | tail -3")"
