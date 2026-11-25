@@ -3534,6 +3534,28 @@ only:
    holds them by reference, the commit gives an out-of-shape change (the
    commit fails, logged) rather than keeping a dangling reference.
 
+**The patch as written (2026-11-25).** `patches/ladybird/live-idb.patch`,
+behind the bindings crate's cargo feature `atrium-live-idb` (the painter's
+`live-idb` feature turns it on; `Painter.toml.in`). It builds against the
+pinned Ladybird, and the engine built with it passes the JIT audit.
+
+- `internal/live.rs`: the encodings (names as UTF-16LE code units; keys as
+  type and value, arrays nested at most 64 deep; a store's description as
+  auto-increment and key path; an index's as unique, multi-entry and key
+  path), the commit, the delete and the load.
+- Commit: `MutationLog::send_live_changes` turns each store's log into
+  changes in log order. A change names a store or index as it was at that
+  change, which is the old name of its next rename or its name now. A key
+  generator's value is the old value of its next change or its value now.
+  `RecordStored` sends the value now in the store, and nothing if the
+  record is gone.
+- Load: on the first non-opaque storage key that makes a factory. If
+  navigatord has no store for the engine (a frame, a widget), IndexedDB
+  is the run's and nothing is sent. A load out of shape is dropped,
+  loudly, and that run sends nothing either.
+- Blob and File values are their bytes inline (their serialization steps
+  write the byte sequence), so step 4 holds without a check.
+
 **Gate (Mac),** with `NAVIGATORD_STORE` set, on the fixture's
 `indexeddb` line ("N stored", the `i6` database's `items`) and its Add
 button:

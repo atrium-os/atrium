@@ -1,0 +1,710 @@
+--- a/Libraries/LibWeb/Bindings/Rust/Cargo.toml
++++ b/Libraries/LibWeb/Bindings/Rust/Cargo.toml
+@@ -12,6 +12,9 @@
+ default = ["jit"]
+ allocator = ["dep:ladybird_allocator", "libjs_rust/allocator", "libwasm_engine/allocator", "libweb_rust/allocator"]
+ jit = ["libjs_rust/jit"]
++# Atrium (navigator-islands.md I6.7): a live page's own IndexedDB is kept by navigatord through the engine's
++# navigator_live_idb_* functions, which the binary that links this crate provides.
++atrium-live-idb = []
+ address-sanitizer = ["libjs_rust/address-sanitizer"]
+ thread-sanitizer = ["libjs_rust/thread-sanitizer", "libweb_rust/thread-sanitizer"]
+ 
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/exports.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/exports.rs
+@@ -60,6 +60,14 @@
+ pub unsafe extern "C" fn web_rust_indexed_db_create_factory(vm: *mut c_void, realm: *mut c_void) -> *mut c_void {
+     // SAFETY: The caller passes the live VM and a live realm.
+     let (vm, realm) = unsafe { realm_arguments(vm, realm) };
++    // Atrium's live pages (I6.7): the page's own IndexedDB, kept by navigatord, the first time.
++    #[cfg(feature = "atrium-live-idb")]
++    crate::indexed_db::internal::live::load(
++        vm,
++        crate::storage_api::storage_key::obtain_a_storage_key(
++            &crate::bindings::environment_settings_object::relevant_settings_object(realm.global_object()),
++        ),
++    );
+     cell_into_abi(IDBFactory::create(vm, realm))
+ }
+ 
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/idb_transaction.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/idb_transaction.rs
+@@ -328,6 +328,15 @@
+         self.connection.set_version(self.original_version.get());
+     }
+ 
++    /// Atrium's live pages (I6.7): gives every store's changes to navigatord. False when one can't be given.
++    #[cfg(feature = "atrium-live-idb")]
++    pub(crate) fn send_live_changes(&self, vm: &Vm) -> bool {
++        self.store_mutation_logs
++            .borrow()
++            .iter()
++            .all(|entry| entry.log.send_live_changes(vm, entry.store))
++    }
++
+     pub(crate) fn discard_mutation_logs(&self, vm: &Vm) {
+         for entry in self.store_mutation_logs.borrow().iter() {
+             entry.store.set_mutation_log(None);
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/algorithms.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/algorithms.rs
+@@ -1155,6 +1155,16 @@
+ 
+             // FIXME: 3. Attempt to write any outstanding changes made by transaction to the database, considering transaction’s durability hint.
+             // FIXME: 4. If an error occurs while writing the changes to the database, then run abort a transaction with transaction and an appropriate type for the error, for example a QuotaExceededError or an "UnknownError" DOMException, and terminate these steps.
++            // Atrium's live pages (I6.7): steps 3 and 4 for the page's own databases, which navigatord keeps.
++            #[cfg(feature = "atrium-live-idb")]
++            if !crate::indexed_db::internal::live::commit(vm, transaction) {
++                abort_a_transaction(
++                    vm,
++                    transaction,
++                    Some(DomException::create("QuotaExceededError", "The page's stored data could not be kept")),
++                );
++                return;
++            }
+ 
+             // 5. Queue a database task to run these steps:
+             queue_a_database_task(
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/database.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/database.rs
+@@ -173,6 +173,8 @@
+ 
+     pub(crate) fn delete_for_key_and_name(vm: &Vm, key: &StorageKey, name: &Utf16String) {
+         storage(vm).remove_database(vm, key, name);
++        #[cfg(feature = "atrium-live-idb")]
++        crate::indexed_db::internal::live::deleted(key, name);
+     }
+ 
+     pub(crate) fn for_each_database(vm: &Vm, mut visitor: impl FnMut(DatabaseRef)) {
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/live.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/live.rs
+@@ -0,0 +1,567 @@
++/*
++ * Copyright (c) 2026-present, the Atrium developers.
++ *
++ * SPDX-License-Identifier: BSD-2-Clause
++ */
++
++//! Atrium's live pages (navigator-islands.md I6.7): the page's own IndexedDB is kept by navigatord across runs. A
++//! transaction that writes sends its changes when it commits, and the engine loads the page's store the first time the
++//! page's own storage key makes a factory. Anything else in the engine (another origin, or a page navigatord keeps no
++//! store for) keeps IndexedDB for the run only, as before.
++//!
++//! The changes are those of `limen::web_island::idb::Op`, given to the engine's `navigator_live_idb_*` functions as
++//! `(tag, a, b, n)`. Names, keys and descriptions are bytes of this module's encoding; values are the records'
++//! `StorageSerializationRecord` bytes, which hold a Blob's or a File's bytes inline (their serialization steps write
++//! the byte sequence), so nothing in a value refers to anything outside it.
++
++use core::cell::{Cell, RefCell};
++use core::ffi::c_void;
++use std::rc::Rc;
++
++use ak::Utf16String;
++use libjs_rust::api::Vm;
++
++use crate::bindings::interface::Ref;
++use crate::indexed_db::idb_record::{IndexRecord, ObjectStoreRecord};
++use crate::indexed_db::idb_transaction::IDBTransaction;
++use crate::indexed_db::internal::algorithms::KeyPath;
++use crate::indexed_db::internal::database::{Database, DatabaseRef};
++use crate::indexed_db::internal::index::{Index, IndexRef};
++use crate::indexed_db::internal::key::{Key, KeyType, KeyValue};
++use crate::indexed_db::internal::object_store::{ObjectStore, ObjectStoreRef};
++use crate::storage_api::storage_key::StorageKey;
++
++unsafe extern "C" {
++    fn navigator_live_idb_load(
++        ctx: *mut c_void,
++        on_op: unsafe extern "C" fn(*mut c_void, u8, *const u8, usize, *const u8, usize, u64),
++    ) -> bool;
++    fn navigator_live_idb_begin();
++    fn navigator_live_idb_op(t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64);
++    fn navigator_live_idb_commit() -> bool;
++}
++
++/// `limen::web_island::idb::tag`.
++mod tag {
++    pub(super) const DATABASE: u8 = 1;
++    pub(super) const VERSION: u8 = 2;
++    pub(super) const DELETE_DATABASE: u8 = 3;
++    pub(super) const STORE: u8 = 4;
++    pub(super) const CREATE_STORE: u8 = 5;
++    pub(super) const DELETE_STORE: u8 = 6;
++    pub(super) const RENAME_STORE: u8 = 7;
++    pub(super) const KEY_GENERATOR: u8 = 8;
++    pub(super) const PUT: u8 = 9;
++    pub(super) const APPEND: u8 = 10;
++    pub(super) const DELETE: u8 = 11;
++    pub(super) const CLEAR: u8 = 12;
++    pub(super) const INDEX: u8 = 13;
++    pub(super) const CREATE_INDEX: u8 = 14;
++    pub(super) const DELETE_INDEX: u8 = 15;
++    pub(super) const RENAME_INDEX: u8 = 16;
++    pub(super) const INDEX_PUT: u8 = 17;
++    pub(super) const INDEX_DELETE: u8 = 18;
++}
++
++thread_local! {
++    /// The page's storage key, once navigatord gave its store: only its databases are sent.
++    static PAGE: RefCell<Option<StorageKey>> = const { RefCell::new(None) };
++    /// Whether the load was tried; it is tried once, for the first storage key that makes a factory.
++    static TRIED: Cell<bool> = const { Cell::new(false) };
++}
++
++fn is_page_key(key: &StorageKey) -> bool {
++    PAGE.with_borrow(|page| page.as_ref().is_some_and(|page| page == key))
++}
++
++// Encodings. Names are UTF-16 code units, little-endian (a name may hold a lone surrogate). A key is its type and
++// value; an array holds its keys. A description is its flags and its key path.
++
++const KEY_NUMBER: u8 = 1;
++const KEY_DATE: u8 = 2;
++const KEY_STRING: u8 = 3;
++const KEY_BINARY: u8 = 4;
++const KEY_ARRAY: u8 = 5;
++/// The deepest array key read back: deeper bytes are out of shape.
++const KEY_DEPTH_MAX: usize = 64;
++
++fn put_units(out: &mut Vec<u8>, units: &[u16]) {
++    out.extend((units.len() as u32).to_le_bytes());
++    for unit in units {
++        out.extend(unit.to_le_bytes());
++    }
++}
++
++fn name_bytes(name: &Utf16String) -> Vec<u8> {
++    let units = name.to_utf16();
++    let mut out = Vec::with_capacity(units.len() * 2);
++    for unit in units.iter() {
++        out.extend(unit.to_le_bytes());
++    }
++    out
++}
++
++fn name_from(bytes: &[u8]) -> Option<Utf16String> {
++    if bytes.len() % 2 != 0 {
++        return None;
++    }
++    let units: Vec<u16> = bytes.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
++    Some(Utf16String::from_utf16(&units))
++}
++
++fn put_key(out: &mut Vec<u8>, key: &Key) -> bool {
++    match (key.r#type(), key.value()) {
++        (KeyType::Number, KeyValue::Double(d)) => {
++            out.push(KEY_NUMBER);
++            out.extend(d.to_le_bytes());
++        }
++        (KeyType::Date, KeyValue::Double(d)) => {
++            out.push(KEY_DATE);
++            out.extend(d.to_le_bytes());
++        }
++        (KeyType::String, KeyValue::String(s)) => {
++            out.push(KEY_STRING);
++            put_units(out, &s.to_utf16());
++        }
++        (KeyType::Binary, KeyValue::Bytes(b)) => {
++            out.push(KEY_BINARY);
++            out.extend((b.len() as u32).to_le_bytes());
++            out.extend(b);
++        }
++        (KeyType::Array, KeyValue::Keys(keys)) => {
++            out.push(KEY_ARRAY);
++            out.extend((keys.len() as u32).to_le_bytes());
++            for key in keys {
++                if !put_key(out, key) {
++                    return false;
++                }
++            }
++        }
++        // An invalid key is never stored.
++        _ => return false,
++    }
++    true
++}
++
++fn key_bytes(key: &Key) -> Option<Vec<u8>> {
++    let mut out = Vec::new();
++    put_key(&mut out, key).then_some(out)
++}
++
++/// A reader of bytes navigatord kept: every length is checked against what is left.
++struct Reader<'a>(&'a [u8]);
++
++impl Reader<'_> {
++    fn byte(&mut self) -> Option<u8> {
++        let (&b, rest) = self.0.split_first()?;
++        self.0 = rest;
++        Some(b)
++    }
++    fn u32(&mut self) -> Option<usize> {
++        let (n, rest) = self.0.split_first_chunk::<4>()?;
++        self.0 = rest;
++        usize::try_from(u32::from_le_bytes(*n)).ok()
++    }
++    fn f64(&mut self) -> Option<f64> {
++        let (n, rest) = self.0.split_first_chunk::<8>()?;
++        self.0 = rest;
++        Some(f64::from_le_bytes(*n))
++    }
++    fn take(&mut self, len: usize) -> Option<&[u8]> {
++        if len > self.0.len() {
++            return None;
++        }
++        let (b, rest) = self.0.split_at(len);
++        self.0 = rest;
++        Some(b)
++    }
++    fn units(&mut self) -> Option<Utf16String> {
++        let len = self.u32()?;
++        name_from(self.take(len.checked_mul(2)?)?)
++    }
++    fn key(&mut self, depth: usize) -> Option<Rc<Key>> {
++        if depth > KEY_DEPTH_MAX {
++            return None;
++        }
++        Some(match self.byte()? {
++            KEY_NUMBER => Key::create(KeyType::Number, KeyValue::Double(self.f64()?)),
++            KEY_DATE => Key::create(KeyType::Date, KeyValue::Double(self.f64()?)),
++            KEY_STRING => Key::create(KeyType::String, KeyValue::String(self.units()?)),
++            KEY_BINARY => {
++                let len = self.u32()?;
++                Key::create(KeyType::Binary, KeyValue::Bytes(self.take(len)?.to_vec()))
++            }
++            KEY_ARRAY => {
++                let count = self.u32()?;
++                // Each key takes at least a byte: a count past what is left is out of shape.
++                if count > self.0.len() {
++                    return None;
++                }
++                let mut keys = Vec::with_capacity(count);
++                for _ in 0..count {
++                    keys.push(self.key(depth + 1)?);
++                }
++                Key::create(KeyType::Array, KeyValue::Keys(keys))
++            }
++            _ => return None,
++        })
++    }
++    fn key_path(&mut self) -> Option<Option<KeyPath>> {
++        Some(match self.byte()? {
++            0 => None,
++            1 => Some(KeyPath::String(self.units()?)),
++            2 => {
++                let count = self.u32()?;
++                if count > self.0.len() {
++                    return None;
++                }
++                let mut names = Vec::with_capacity(count);
++                for _ in 0..count {
++                    names.push(self.units()?);
++                }
++                Some(KeyPath::Sequence(names))
++            }
++            _ => return None,
++        })
++    }
++}
++
++fn key_from(bytes: &[u8]) -> Option<Rc<Key>> {
++    let mut r = Reader(bytes);
++    let key = r.key(0)?;
++    r.0.is_empty().then_some(key)
++}
++
++fn put_key_path(out: &mut Vec<u8>, key_path: Option<&KeyPath>) {
++    match key_path {
++        None => out.push(0),
++        Some(KeyPath::String(s)) => {
++            out.push(1);
++            put_units(out, &s.to_utf16());
++        }
++        Some(KeyPath::Sequence(names)) => {
++            out.push(2);
++            out.extend((names.len() as u32).to_le_bytes());
++            for name in names {
++                put_units(out, &name.to_utf16());
++            }
++        }
++    }
++}
++
++fn store_description(store: &ObjectStore) -> Vec<u8> {
++    let mut out = vec![u8::from(store.uses_a_key_generator())];
++    put_key_path(&mut out, store.key_path());
++    out
++}
++
++fn index_description(index: &Index) -> Vec<u8> {
++    let mut out = vec![u8::from(index.unique()), u8::from(index.multi_entry())];
++    put_key_path(&mut out, Some(index.key_path()));
++    out
++}
++
++/// One change of a transaction that commits.
++fn send(t: u8, a: &[u8], b: &[u8], n: u64) {
++    // SAFETY: the buffers are readable for their lengths, for this call.
++    unsafe { navigator_live_idb_op(t, a.as_ptr(), a.len(), b.as_ptr(), b.len(), n) };
++}
++
++/// Sends what a store's mutation log holds, given as these events by the log (mutation_log.rs), in log order.
++pub(crate) enum Change<'a> {
++    StoreCreated,
++    StoreDeleted,
++    StoreRenamed(&'a Utf16String),
++    IndexCreated(IndexRef),
++    IndexDeleted(IndexRef),
++    IndexRenamed(IndexRef, &'a Utf16String),
++    KeyGeneratorChanged,
++    RecordsDeleted(&'a [ObjectStoreRecord]),
++    RecordStored(&'a Rc<Key>),
++    IndexRecordsDeleted(IndexRef, &'a [IndexRecord]),
++    IndexRecordStored(IndexRef, &'a IndexRecord),
++}
++
++/// What a log's changes refer to by name, as it was at a change: a change records the old name of a rename and the
++/// old value of a key generator, so the name or value after change `i` is the old one of the next change of that
++/// thing, or what it is now.
++fn store_name_after(store: &ObjectStore, changes: &[Change], i: Option<usize>) -> Utf16String {
++    let from = i.map_or(0, |i| i + 1);
++    changes[from..]
++        .iter()
++        .find_map(|c| match c {
++            Change::StoreRenamed(old) => Some((*old).clone()),
++            _ => None,
++        })
++        .unwrap_or_else(|| store.name())
++}
++
++fn index_name_after(index: IndexRef, changes: &[Change], i: usize) -> Utf16String {
++    changes[i + 1..]
++        .iter()
++        .find_map(|c| match c {
++            Change::IndexRenamed(other, old) if other.as_ptr() == index.as_ptr() => Some((*old).clone()),
++            _ => None,
++        })
++        .unwrap_or_else(|| index.name())
++}
++
++/// Gives one store's changes; false when one can't be given (a key out of shape).
++pub(crate) fn send_store_changes(vm: &Vm, store: ObjectStoreRef, changes: &[Change], key_generator_after: &[u64]) -> bool {
++    let _ = vm;
++    let mut index_selected: Option<*const c_void> = None;
++    let mut select_index = |index: IndexRef, i: usize, selected: &mut Option<*const c_void>| {
++        let ptr = index.as_ptr().cast_const().cast::<c_void>();
++        if *selected != Some(ptr) {
++            send(tag::INDEX, &name_bytes(&index_name_after(index, changes, i)), &[], 0);
++            *selected = Some(ptr);
++        }
++    };
++    if !matches!(changes.first(), Some(Change::StoreCreated)) {
++        send(tag::STORE, &name_bytes(&store_name_after(&store, changes, None)), &[], 0);
++    }
++    let mut generator = key_generator_after.iter();
++    for (i, change) in changes.iter().enumerate() {
++        match change {
++            Change::StoreCreated => {
++                send(tag::CREATE_STORE, &name_bytes(&store_name_after(&store, changes, Some(i))), &store_description(&store), 0);
++                index_selected = None;
++            }
++            Change::StoreDeleted => {
++                send(tag::DELETE_STORE, &name_bytes(&store_name_after(&store, changes, Some(i))), &[], 0);
++                index_selected = None;
++            }
++            Change::StoreRenamed(old) => {
++                let new = store_name_after(&store, changes, Some(i));
++                send(tag::RENAME_STORE, &name_bytes(old), &name_bytes(&new), 0);
++                send(tag::STORE, &name_bytes(&new), &[], 0);
++                index_selected = None;
++            }
++            Change::IndexCreated(index) => {
++                send(tag::CREATE_INDEX, &name_bytes(&index_name_after(*index, changes, i)), &index_description(index), 0);
++                index_selected = Some(index.as_ptr().cast_const().cast::<c_void>());
++            }
++            Change::IndexDeleted(index) => {
++                send(tag::DELETE_INDEX, &name_bytes(&index_name_after(*index, changes, i)), &[], 0);
++                index_selected = None;
++            }
++            Change::IndexRenamed(index, old) => {
++                send(tag::RENAME_INDEX, &name_bytes(old), &name_bytes(&index_name_after(*index, changes, i)), 0);
++                index_selected = None;
++            }
++            Change::KeyGeneratorChanged => {
++                let Some(&value) = generator.next() else { return false };
++                send(tag::KEY_GENERATOR, &[], &[], value);
++            }
++            Change::RecordsDeleted(records) => {
++                for record in records.iter() {
++                    let Some(key) = key_bytes(&record.key) else { return false };
++                    send(tag::DELETE, &key, &[], 0);
++                }
++            }
++            Change::RecordStored(key) => {
++                // The value as it is in the store now: a later change of the same key in this transaction sends it
++                // again, and a later delete deletes it.
++                let records = store.records();
++                let Ok(position) = records.binary_search_by(|record| Key::ordering(&record.key, key)) else {
++                    continue;
++                };
++                let Some(key) = key_bytes(key) else { return false };
++                send(tag::PUT, &key, &records[position].value, 0);
++            }
++            Change::IndexRecordsDeleted(index, records) => {
++                select_index(*index, i, &mut index_selected);
++                for record in records.iter() {
++                    let (Some(key), Some(primary)) = (key_bytes(&record.key), key_bytes(&record.value)) else {
++                        return false;
++                    };
++                    send(tag::INDEX_DELETE, &key, &primary, 0);
++                }
++            }
++            Change::IndexRecordStored(index, record) => {
++                select_index(*index, i, &mut index_selected);
++                let (Some(key), Some(primary)) = (key_bytes(&record.key), key_bytes(&record.value)) else {
++                    return false;
++                };
++                send(tag::INDEX_PUT, &key, &primary, 0);
++            }
++        }
++    }
++    true
++}
++
++/// At commit (abort a transaction's step 3 and 4): sends a writing transaction of the page's own databases. False
++/// when navigatord didn't keep it, which aborts the transaction.
++pub(crate) fn commit(vm: &Vm, transaction: Ref<IDBTransaction>) -> bool {
++    if transaction.is_readonly() {
++        return true;
++    }
++    let database = transaction.connection_object().associated_database();
++    let Some(key) = PAGE.with_borrow(|page| page.clone()) else { return true };
++    match Database::for_key_and_name(vm, &key, &database.name()) {
++        Some(ours) if ours.as_ptr() == database.as_ptr() => {}
++        _ => return true,
++    }
++    // SAFETY: an engine function with no arguments.
++    unsafe { navigator_live_idb_begin() };
++    send(tag::VERSION, &name_bytes(&database.name()), &[], database.version());
++    let given = transaction.send_live_changes(vm);
++    // SAFETY: as above; it sends what was given since the begin.
++    let kept = unsafe { navigator_live_idb_commit() };
++    if !given {
++        eprintln!("live page: an IndexedDB change could not be given; the transaction aborts");
++    }
++    given && kept
++}
++
++/// A database of the page's own was deleted.
++pub(crate) fn deleted(key: &StorageKey, name: &Utf16String) {
++    if !is_page_key(key) {
++        return;
++    }
++    // SAFETY: engine functions; the buffer is readable for its length.
++    unsafe {
++        navigator_live_idb_begin();
++        send(tag::DELETE_DATABASE, &name_bytes(name), &[], 0);
++        if !navigator_live_idb_commit() {
++            eprintln!("live page: navigatord didn't keep an IndexedDB deletion");
++        }
++    }
++}
++
++/// What a load is building.
++struct Load<'vm> {
++    vm: &'vm Vm,
++    key: StorageKey,
++    database: Option<DatabaseRef>,
++    store: Option<ObjectStoreRef>,
++    index: Option<IndexRef>,
++    /// A record whose value may go on with an `Append`, stored when the next change comes.
++    pending: Option<(Rc<Key>, Vec<u8>)>,
++    bad: bool,
++}
++
++impl Load<'_> {
++    fn flush(&mut self) {
++        if let Some((key, value)) = self.pending.take() {
++            match self.store {
++                Some(store) => store.store_a_record(self.vm, ObjectStoreRecord { key, value: Rc::from(value) }),
++                None => self.bad = true,
++            }
++        }
++    }
++
++    fn apply(&mut self, t: u8, a: &[u8], b: &[u8], n: u64) -> Option<()> {
++        if t != tag::APPEND {
++            self.flush();
++        }
++        match t {
++            tag::DATABASE | tag::VERSION => {
++                let name = name_from(a)?;
++                let database = Database::for_key_and_name(self.vm, &self.key, &name)
++                    .unwrap_or_else(|| Database::create_for_key_and_name(self.vm, &self.key, &name));
++                if t == tag::VERSION {
++                    database.set_version(n);
++                }
++                self.database = Some(database);
++                self.store = None;
++                self.index = None;
++            }
++            tag::STORE => {
++                self.store = Some(self.database?.object_store_with_name(&name_from(a)?)?);
++                self.index = None;
++            }
++            tag::CREATE_STORE => {
++                let mut r = Reader(b);
++                let auto_increment = r.byte()? != 0;
++                let key_path = r.key_path()?;
++                if !r.0.is_empty() {
++                    return None;
++                }
++                let store = ObjectStore::create(self.vm, self.database?, name_from(a)?, auto_increment, key_path);
++                self.store = Some(store);
++                self.index = None;
++            }
++            tag::KEY_GENERATOR => {
++                let store = self.store?;
++                if !store.uses_a_key_generator() {
++                    return None;
++                }
++                store.key_generator().set(n);
++            }
++            tag::PUT => self.pending = Some((key_from(a)?, b.to_vec())),
++            tag::APPEND => {
++                let key = key_from(a)?;
++                let (pending_key, value) = self.pending.as_mut()?;
++                if !Key::equals(pending_key, &key) {
++                    return None;
++                }
++                value.extend_from_slice(b);
++            }
++            tag::INDEX => self.index = Some(self.store?.index_set_get(&name_from(a)?)?),
++            tag::CREATE_INDEX => {
++                let mut r = Reader(b);
++                let unique = r.byte()? != 0;
++                let multi_entry = r.byte()? != 0;
++                let key_path = r.key_path()??;
++                if !r.0.is_empty() {
++                    return None;
++                }
++                self.index = Some(Index::create(self.vm, self.store?, &name_from(a)?, &key_path, unique, multi_entry));
++            }
++            tag::INDEX_PUT => {
++                let record = IndexRecord { key: key_from(a)?, value: key_from(b)? };
++                Index::store_a_record(self.index?, self.vm, &record);
++            }
++            // A load is the store's changes from empty: nothing is deleted, renamed or cleared in one.
++            _ => return None,
++        }
++        Some(())
++    }
++}
++
++unsafe extern "C" fn on_op(ctx: *mut c_void, t: u8, a: *const u8, a_len: usize, b: *const u8, b_len: usize, n: u64) {
++    // SAFETY: ctx is the Load that load() lends for the call.
++    let load = unsafe { &mut *ctx.cast::<Load>() };
++    if load.bad {
++        return;
++    }
++    let bytes = |p: *const u8, len: usize| -> &[u8] {
++        if len == 0 || p.is_null() {
++            return &[];
++        }
++        // SAFETY: the engine lends the bytes for this call.
++        unsafe { core::slice::from_raw_parts(p, len) }
++    };
++    if load.apply(t, bytes(a, a_len), bytes(b, b_len), n).is_none() {
++        load.bad = true;
++    }
++}
++
++/// A factory is made for `key`: the first time, ask navigatord for the page's store and rebuild it. No mutation log
++/// is open, so nothing is sent back. A failed or out-of-shape load leaves the engine's IndexedDB for this run only.
++pub(crate) fn load(vm: &Vm, key: Option<StorageKey>) {
++    // An opaque origin (the initial about:blank) is not the page's: the load waits for a real one.
++    let Some(key) = key.filter(|key| !key.origin.is_opaque()) else { return };
++    if TRIED.replace(true) {
++        return;
++    }
++    let mut state = Load { vm, key: key.clone(), database: None, store: None, index: None, pending: None, bad: false };
++    // SAFETY: on_op is called only during this call, with ctx the state above.
++    let loaded = unsafe { navigator_live_idb_load((&raw mut state).cast(), on_op) };
++    if !loaded {
++        // navigatord keeps no store for this engine (a frame, a widget): IndexedDB is the run's.
++        return;
++    }
++    state.flush();
++    if state.bad {
++        // Loud, and nothing is sent: commits on top of a partial copy would diverge from navigatord's.
++        eprintln!("live page: the IndexedDB navigatord gave is out of shape; this run keeps IndexedDB for itself");
++        let names: Vec<Utf16String> = Database::for_key(vm, &key).values().iter().map(|database| database.name()).collect();
++        for name in names {
++            Database::delete_for_key_and_name(vm, &key, &name);
++        }
++        return;
++    }
++    PAGE.with_borrow_mut(|page| *page = Some(key));
++}
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/mod.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/mod.rs
+@@ -12,6 +12,8 @@
+ pub(crate) mod index;
+ pub(crate) mod key;
+ pub(crate) mod key_generator;
++#[cfg(feature = "atrium-live-idb")]
++pub(crate) mod live;
+ pub(crate) mod mutation_log;
+ pub(crate) mod object_store;
+ pub(crate) mod record_range;
+--- a/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/mutation_log.rs
++++ b/Libraries/LibWeb/Bindings/Rust/src/indexed_db/internal/mutation_log.rs
+@@ -245,6 +245,49 @@
+         }
+     }
+ 
++    /// Atrium's live pages (I6.7): gives this store's changes to navigatord, in log order. False when one can't be
++    /// given.
++    #[cfg(feature = "atrium-live-idb")]
++    pub(crate) fn send_live_changes(&self, vm: &Vm, store: ObjectStoreRef) -> bool {
++        use crate::indexed_db::internal::live::{Change, send_store_changes};
++        let entries = self.entries.borrow();
++        if entries.is_empty() {
++            return true;
++        }
++        let changes: Vec<Change> = entries
++            .iter()
++            .map(|entry| match entry {
++                Entry::ObjectStoreCreated => Change::StoreCreated,
++                Entry::ObjectStoreDeleted => Change::StoreDeleted,
++                Entry::ObjectStoreRenamed { old_name } => Change::StoreRenamed(old_name),
++                Entry::IndexCreated { index } => Change::IndexCreated(*index),
++                Entry::IndexDeleted { index } => Change::IndexDeleted(*index),
++                Entry::IndexRenamed { index, old_name } => Change::IndexRenamed(*index, old_name),
++                Entry::KeyGeneratorChanged { .. } => Change::KeyGeneratorChanged,
++                Entry::RecordsDeleted { records } => Change::RecordsDeleted(records),
++                Entry::RecordStored { key } => Change::RecordStored(key),
++                Entry::IndexRecordsDeleted { index, records } => Change::IndexRecordsDeleted(*index, records),
++                Entry::IndexRecordStored { index, record } => Change::IndexRecordStored(*index, record),
++            })
++            .collect();
++        // The generator's value after each change of it: the old value of its next change, or its value now.
++        let olds: Vec<u64> = entries
++            .iter()
++            .filter_map(|entry| match entry {
++                Entry::KeyGeneratorChanged { old_value } => Some(*old_value),
++                _ => None,
++            })
++            .collect();
++        let mut after: Vec<u64> = olds.iter().skip(1).copied().collect();
++        if !olds.is_empty() {
++            if !store.uses_a_key_generator() {
++                return false;
++            }
++            after.push(store.key_generator().current_number());
++        }
++        send_store_changes(vm, store, &changes, &after)
++    }
++
+     // Undo all logged mutations in reverse order. Database and connection are required for schema entries.
+     pub(crate) fn revert(&self, vm: &Vm, store: ObjectStoreRef, database: DatabaseRef, connection: Ref<IDBDatabase>) {
+         self.revert_entries(vm, store, 0, Some((database, connection)));

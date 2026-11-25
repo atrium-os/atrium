@@ -5,6 +5,8 @@ edition = "2024"
 publish = false
 
 [features]
+# I6.7: a live page's IndexedDB kept by navigatord (patches/ladybird/live-idb.patch).
+live-idb = ["editor", "libweb_bindings_rust/atrium-live-idb"]
 editor = ["dep:navigator-control", "dep:navigator-forms", "dep:nuntius", "dep:libxml_rust", "dep:libweb_bindings_rust", "dep:libweb_rust", "dep:limen", "dep:fresco-client"]
 
 [lib]
