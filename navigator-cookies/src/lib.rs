@@ -82,19 +82,39 @@ pub struct Fetch {
     /// `body` at this byte offset (form-encoded by the courier), never
     /// through this process: Arca's handle for it (arca-autofill.md §3).
     pub secret: Option<(usize, [u8; 16])>,
+    /// A live page's script POST: its body's type (printable, at most
+    /// [`CONTENT_TYPE_MAX`] bytes); `None` is a form's.
+    pub content_type: Option<String>,
 }
+
+/// The longest body a request through a courier carries.
+pub const BODY_MAX: usize = arca_courier::schema::BODY_MAX;
+
+/// The longest content type a live page's script may give its POST.
+pub const CONTENT_TYPE_MAX: usize = 128;
 
 impl Fetch {
     pub fn navigation(url: &str, initiator: Option<&str>, gesture: bool) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![], secret: None }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![], secret: None, content_type: None }
     }
     pub fn subresource(url: &str, page_host: &str) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![], secret: None }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![], secret: None, content_type: None }
     }
     /// A form the reader pressed to send, as a POST of `body` from a page
     /// on `page_host`. Only a sign-in window's view sends one.
     pub fn form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
-        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body, secret: None }
+        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body, secret: None, content_type: None }
+    }
+    /// A live page's script POST (`fetch`, XHR) of `body` as
+    /// `content_type`, from a page on `page_host`. Only a live view sends one.
+    pub fn script_post(url: &str, page_host: &str, content_type: &str, body: Vec<u8>) -> Fetch {
+        Fetch { url: url.into(), method: Method::Post, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false,
+                body, secret: None, content_type: Some(content_type.into()) }
+    }
+    /// A form a live page submitted (I6.3): a POST navigation of `body`,
+    /// `application/x-www-form-urlencoded`. Only a live view sends one.
+    pub fn live_form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
+        Fetch { gesture: false, ..Fetch::form(url, page_host, body) }
     }
 }
 
@@ -210,7 +230,7 @@ pub trait Couriers {
 }
 
 #[derive(Debug, Clone)]
-struct View { partition: String, cookied: Option<Why>, sign_in: Option<String>, microsoft: bool }
+struct View { partition: String, cookied: Option<Why>, sign_in: Option<String>, microsoft: bool, live: bool }
 
 /// ★ THE BROKER'S COOKIE STATE: which views are cookied, and the only
 /// path by which a request of theirs carries a cookie.
@@ -271,7 +291,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         let p = partition_in(jar, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
         match self.views.get_mut(&view) {
             Some(v) if v.partition == p => {}
-            _ => { self.views.insert(view, View { partition: p, cookied: None, sign_in: None, microsoft: false }); }
+            _ => { self.views.insert(view, View { partition: p, cookied: None, sign_in: None, microsoft: false, live: false }); }
         }
         Ok(())
     }
@@ -288,7 +308,19 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             return Ok(());
         }
         let p = vpn_partition(profile, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
-        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: Some(profile.into()), microsoft: false });
+        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: Some(profile.into()), microsoft: false, live: false });
+        Ok(())
+    }
+
+    /// ★ A whole page running live (navigator-islands.md I6.3, D9): its
+    /// site's partition in the persona's jar ([`partition_in`]), the same
+    /// jar the document lane uses for that site, cookied from the start
+    /// (the person ran it live, and an app signed out at every Stop is no
+    /// app). Its scripts may POST, and its forms are sent; the engine never
+    /// holds a cookie. navigatord keeps its requests to the page's site.
+    pub fn show_live(&mut self, view: ViewId, top_url: &str, jar: Option<u64>) -> Result<(), Refused> {
+        let p = partition_in(jar, top_url).ok_or_else(|| Refused::Malformed(format!("no host in {top_url:?}")))?;
+        self.views.insert(view, View { partition: p, cookied: Some(Why::Reader), sign_in: None, microsoft: false, live: true });
         Ok(())
     }
 
@@ -301,7 +333,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         let partition = partition_in(Some(u64::from_le_bytes(handle[..8].try_into().unwrap())), url)
             .ok_or_else(|| Refused::Malformed("invalid authorization URL".into()))?;
         self.views.insert(view, View { partition,
-            cookied: Some(Why::Reader), sign_in: None, microsoft: true });
+            cookied: Some(Why::Reader), sign_in: None, microsoft: true, live: false });
         self.fetch(view, &Fetch::navigation(url, None, true))
     }
 
@@ -377,12 +409,16 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     }
 
     fn fetch_with_redirects(&mut self, view: ViewId, f: &Fetch, limit: Option<usize>) -> Result<Fetched, Refused> {
-        let Some(View { partition, cookied: Some(_), sign_in, microsoft }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
-        // A form only from a sign-in window, and only as a form.
+        let Some(View { partition, cookied: Some(_), sign_in, microsoft, live }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
+        // A form only from a sign-in window or a live page, and only as a form.
         let assertion = microsoft && limit.is_none() && f.secret.is_none() && f.url == "https://login.microsoftonline.com/atrium-fixture/continue";
-        let form = (sign_in.is_some() || assertion) && f.method == Method::Post && f.reason == Reason::Form;
-        if !matches!(f.method, Method::Get | Method::Head) && !form { return Err(Refused::Method) }
+        let form = (sign_in.is_some() || assertion || live && f.secret.is_none()) && f.method == Method::Post && f.reason == Reason::Form;
+        // A live page's script POST, with its own content type.
+        let script = live && f.method == Method::Post && f.reason == Reason::Subresource && f.secret.is_none()
+            && f.content_type.as_deref().is_some_and(|t| !t.is_empty() && t.len() <= CONTENT_TYPE_MAX && t.bytes().all(|b| (0x20..0x7f).contains(&b)));
+        if !matches!(f.method, Method::Get | Method::Head) && !form && !script { return Err(Refused::Method) }
         if f.reason == Reason::Form && !form { return Err(Refused::Method) }
+        if f.content_type.is_some() && !script { return Err(Refused::Malformed("a content type only on a live page's script POST".into())) }
         if f.body.len() > arca_courier::schema::BODY_MAX { return Err(Refused::Malformed("the form is too big".into())) }
         let (mut method, mut reason, mut form_body) = (f.method, f.reason, f.body.clone());
         if f.secret.is_some_and(|(at, _)| at > f.body.len() || !form) { return Err(Refused::Malformed("a password goes only in a sign-in window's form".into())) }
@@ -419,7 +455,8 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
                                   query: query.clone(), reason, initiator, gesture: f.gesture };
             let mut headers = vec![(Header::Accept, b"*/*".to_vec())];
             if method == Method::Post {
-                headers.push((Header::ContentType, b"application/x-www-form-urlencoded".to_vec()));
+                let kind = f.content_type.as_deref().filter(|_| script).unwrap_or("application/x-www-form-urlencoded");
+                headers.push((Header::ContentType, kind.as_bytes().to_vec()));
             }
             let segs = |at: Option<usize>| match at {
                 // The password's place: Arca's courier puts it there.

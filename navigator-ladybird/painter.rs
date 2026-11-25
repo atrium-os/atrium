@@ -1106,6 +1106,25 @@ pub mod host {
         child.borrow_mut().emit(*embed, bytes).is_ok()
     }
 
+    /// A whole live page submitted a form (I6.3): reported to navigatord,
+    /// which sends it through the page's jar and opens the answer; never
+    /// sent here. False when it is not one an engine may report (plain
+    /// HTTPS, a printable body of at most `FORM_MAX` bytes).
+    ///
+    /// # Safety
+    /// LibWeb owns both buffers for the duration of this call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_live_submit(state: &SceneState, url: *const u8, url_len: usize, body: *const u8, body_len: usize) -> bool {
+        use limen::web_island::{Report, FORM_MAX, URL_MAX};
+        let Some((child, embed, _)) = &state.embed else { return false };
+        if url.is_null() || url_len == 0 || url_len > URL_MAX || body_len > FORM_MAX || (body.is_null() && body_len > 0) { return false; }
+        // SAFETY: the caller passes LibWeb's live buffers of these lengths.
+        let (url, body) = unsafe { (std::slice::from_raw_parts(url, url_len), if body_len == 0 { &[][..] } else { std::slice::from_raw_parts(body, body_len) }) };
+        let Ok(url) = std::str::from_utf8(url) else { return false };
+        let Some(bytes) = (Report::Submit { url, body }).encode() else { return false };
+        child.borrow_mut().emit(*embed, bytes).is_ok()
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn navigator_take_page_size(state: &mut SceneState, width: &mut u16, height: &mut u16) -> bool {
         let Some((w, h)) = state.page_size.take() else { return false };

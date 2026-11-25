@@ -292,11 +292,11 @@ pub enum Out {
     StartWidget { page: (u64, PageId), key: u32, src: String, press: navigator_control::Press },
     RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
     /// Run the page on screen live (I6.1), with the press on "Run live".
-    RunPageLive { url: String, press: navigator_control::Press },
+    RunPageLive { url: String, press: navigator_control::Press, jar: navigator_control::Jar },
     /// Stop the page running live: back to the document lane.
     StopLive { url: String },
     /// Run `url` live too (I6.2): the live page went there, same origin.
-    ContinueLive { url: String },
+    ContinueLive { url: String, jar: navigator_control::Jar },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
@@ -830,7 +830,8 @@ impl Shell {
                     let url = u.clone();
                     self.set_live_whole(run.key, false);
                     self.live_run = Some(LiveRun { key: to, url: url.clone(), ..run });
-                    self.outbox.push(Out::ContinueLive { url });
+                    let jar = self.store.trail().jar();
+                    self.outbox.push(Out::ContinueLive { url, jar });
                     return true;
                 }
                 _ => {}
@@ -1030,7 +1031,8 @@ impl Shell {
             (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
                     self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key] });
-                    self.outbox.push(Out::RunPageLive { url, press });
+                    let jar = self.store.trail().jar();
+                    self.outbox.push(Out::RunPageLive { url, press, jar });
                 }
             }
             (Prompt::RunLive, "Run live") if live => {
@@ -2699,7 +2701,7 @@ mod tests {
         assert!(!s.answer_pressed(1, 900.0, Some([2; 16])));
         assert!(s.outbox.is_empty());
         assert!(s.answer_pressed(1, 1300.0, Some([2; 16])));
-        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16] }));
+        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16], jar: navigator_control::Jar::Personal }));
         assert_eq!(popover_action(&s), Some(PopoverAction::Stop));
         // The chip reads Live code only once the engine started the page.
         assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
@@ -2746,7 +2748,7 @@ mod tests {
         // Shown (after a redirect within the origin): it runs live there.
         s.live = Some(LivePage::Shown("https://app.example/second.html?r=1".into()));
         assert!(s.live_follow());
-        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/second.html?r=1".into() }));
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/second.html?r=1".into(), jar: navigator_control::Jar::Personal }));
         let run = s.live_run.clone().unwrap();
         assert_eq!((run.key, run.entries), (second, vec![first, second]));
         s.live_reported("https://app.example/second.html?r=1", Some("https://app.example".into()), None);
@@ -2806,7 +2808,7 @@ mod tests {
         s.store.trail_mut().back();
         s.live = Some(LivePage::Shown(url.into()));
         assert!(s.live_follow());
-        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: url.into() }));
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: url.into(), jar: navigator_control::Jar::Personal }));
         assert_eq!(s.live_run.as_ref().unwrap().key, home);
         // Forward to the route: it is opened like a page, then runs live.
         s.live_reported(url, Some("https://app.example".into()), None);
@@ -2815,7 +2817,7 @@ mod tests {
         assert!(!s.live_follow());
         s.live = Some(LivePage::Shown("https://app.example/route/1".into()));
         assert!(s.live_follow());
-        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/route/1".into() }));
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/route/1".into(), jar: navigator_control::Jar::Personal }));
     }
 
     #[test]

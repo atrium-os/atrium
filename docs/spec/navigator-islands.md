@@ -2658,6 +2658,60 @@ c6de813e7 (the document lane hidden while live) is confirmed: `second.html`,
 which has a clear background, no longer shows doubled text. Evidence is in
 `~/atrium-vm/evidence/navigator-i6-2a-20261125/`.
 
+#### I6.3 as built (2026-11-25, first part: the jar)
+
+Host-tested in the cloud; the engine side is written but not yet built.
+Storage (D10) is the second part.
+
+- **One jar per (persona, site).** When navigatord has Arca, a live run
+  opens a broker view with `Broker::show_live` (`LiveJar::open`): the
+  page's site partition in the trail's jar (`partition_in`, the persona's
+  own for a recorded trail, the trail's throwaway jar for an Unrecorded
+  one), cookied from the start. It is the same partition the document lane
+  uses for that site once the person lets it know them, so a sign-in in
+  either lane holds in the other. D9 said "(persona, origin)"; the site is
+  the unit because D12 already lets a page reach its sibling hosts. The UI
+  passes the trail's jar with `RunPageLive` and `ContinueLive`, and the
+  prompt row now ends "Its sign-in is kept for next time."
+- **Every request through Arca's couriers.** The page itself and each GET
+  go out with a ticket (`fetch_once`: no redirect, as for `L`), and the
+  cookies stay in Arca; the engine never holds one (`document.cookie`
+  reads empty, so a script that copies a CSRF cookie into a header fails
+  until script cookies are given to live pages).
+- **A script's POST** (`fetch`, XHR) inside the page's site is served
+  (I6.1 refused it): the engine's loader hands it to `navigator_live_post`
+  with its content type, the island channel carries it (at most 32 KiB,
+  Nuntius's `BODY_MAX`), and the broker sends it with
+  `Fetch::script_post`, its type printable and at most 128 bytes. Only a
+  live view may; a document-lane view still may not. Ranges and
+  conditional requests stay refused.
+- **A form the page submits** (a sign-in) is `Report::Submit { url, body }`
+  (`application/x-www-form-urlencoded`, printable, at most 4 KiB; reports
+  now frame up to 6,208 bytes). navigatord checks the address against the
+  page's scope (D12), sends it through the jar with `Fetch::live_form`,
+  follows the answer's redirects as a browser does after a form (a 307 or
+  308 is refused), and sends the answering page's address as
+  `LiveNavigate`, so it opens as the next trail entry and runs live again
+  (I6.2). A multipart form is refused. A form whose answer is a page
+  rather than a redirect opens that address with a GET, which loses the
+  answer: rare for sign-ins, recorded here.
+- Closing the run closes its broker view; the cookies stay in Arca until
+  the person forgets the site or removes the persona.
+
+**Gate (Mac, arm64 Tessera),** as for I6.2, with navigatord connected to
+Arca (`NAVIGATORD_ARCA` and `NAVIGATORD_COURIERD`, as for cookied pages; without them a live page has no jar and its POSTs are refused) and main's arcad, limend
+and navigator-cookies:
+
+1. Run `app.html` live in a recorded trail: the page reads "Not signed
+   in", and its check lines now reach the fixture server (`/report` is a
+   script POST): `session` reads not signed in.
+2. Press **Sign in**: the server logs `sign-in` pass, the trail gains
+   `app.html` as a new entry, it runs live with no prompt, and the page
+   reads "Signed in as ana".
+3. Stop, then Run live again: still signed in.
+4. Run the same page live in an Unrecorded trail: not signed in.
+5. Add an item: `/api/items` (a script POST with JSON) answers its count.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -3606,4 +3660,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) is host-tested and waits for gate steps 5 to 7.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) is host-tested and waits for its gate.

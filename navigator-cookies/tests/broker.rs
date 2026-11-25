@@ -98,6 +98,7 @@ fn http(status: &str, headers: &[String], body: &str) -> Vec<u8> {
 /// `/to?<url>` redirects to `<url>`.
 fn site(tag: &'static str) -> Handler {
     Arc::new(move |target, cookie| {
+        let target = target.split('#').next().unwrap_or(target);
         let (path, q) = target.split_once('?').unwrap_or((target, ""));
         match path {
             "/set" => http("200 OK", &[format!("Set-Cookie: {tag}lax=1"), format!("Set-Cookie: {tag}strict=1; SameSite=Strict"),
@@ -556,7 +557,7 @@ fn microsoft_sheet_claims_mail_session_and_fetches_with_its_own_cookies() {
     roots.add(p.ca_der.into()).unwrap();
     world.b.couriers.tls = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth());
-    let mail = Label::App { user: "alice".into(), app_id: "org.atrium.mail".into(), publisher: [9; 32] };
+    let mail = Label::App { user: "alice".into(), app_id: "org.atrium.mail".into(), publisher: [9; 32], persona: None };
     let mut arca = world.s.borrow_mut();
     assert_eq!(arca.handle(&mail, op::MAIL_SIGN_IN, &[]).status, status::UNSUPPORTED);
     arca.mail_sign_ins.registration = Some("11111111-1111-4111-8111-111111111111".into());
@@ -588,4 +589,49 @@ fn microsoft_sheet_claims_mail_session_and_fetches_with_its_own_cookies() {
     assert_eq!(world.b.tickets, tickets);
     world.b.close_mail_sheet(1);
     assert_eq!(world.b.partition(1), None);
+}
+
+#[test]
+fn a_live_page_signs_in_with_a_form_and_its_scripts_post_in_its_own_jar() {
+    let mut w = world();
+    // A cookied document-lane view may not POST, from a script or a form.
+    w.b.show(NEWS_VIEW, &format!("{}/", w.news)).unwrap();
+    w.b.set_cookied(NEWS_VIEW, Why::Reader).unwrap();
+    let script = Fetch::script_post(&format!("{}/echo", w.news), "www.news.example", "application/json", b"{}".to_vec());
+    assert_eq!(w.b.fetch(NEWS_VIEW, &script), Err(Refused::Method));
+    let form = Fetch::live_form(&format!("{}/login", w.news), "www.news.example", b"user=ana".to_vec());
+    assert_eq!(w.b.fetch(NEWS_VIEW, &form), Err(Refused::Method));
+    // A live page in an Unrecorded jar: cookied from the start, its form
+    // signs in (the cookie check's redirect lands on /echo with it).
+    const LIVE: ViewId = 7;
+    w.b.show_live(LIVE, &format!("{}/app", w.news), Some(42)).unwrap();
+    let r = w.b.fetch(LIVE, &form).unwrap();
+    assert_eq!((r.status, names(&r.body).as_str()), (200, "sess"));
+    assert_eq!(r.url, format!("{}/echo", w.news));
+    assert!(w.news_log.lock().unwrap().iter().any(|(t, _)| t == "/login#user=ana"), "the form's body was sent");
+    // Its scripts POST with their own type, and carry the session.
+    let r = w.b.fetch_once(LIVE, &script).unwrap();
+    assert_eq!(names(&r.body), "sess");
+    assert!(w.news_log.lock().unwrap().iter().any(|(t, _)| t == "/echo#{}"));
+    // A type out of shape, a password slot, or a type on a GET is refused.
+    for bad in ["", "text/plain\r\nX-Evil: 1", &"x".repeat(CONTENT_TYPE_MAX + 1)] {
+        let f = Fetch::script_post(&format!("{}/echo", w.news), "www.news.example", bad, vec![]);
+        assert_eq!(w.b.fetch(LIVE, &f), Err(Refused::Method), "{bad:?}");
+    }
+    let mut secret = form.clone();
+    secret.secret = Some((0, [1; 16]));
+    assert!(w.b.fetch(LIVE, &secret).is_err());
+    let mut typed = Fetch::subresource(&format!("{}/echo", w.news), "www.news.example");
+    typed.content_type = Some("text/plain".into());
+    assert!(matches!(w.b.fetch(LIVE, &typed), Err(Refused::Malformed(_))));
+    // The same site in another jar (the Personal one) has no session.
+    const OTHER: ViewId = 8;
+    w.b.show_live(OTHER, &format!("{}/app", w.news), None).unwrap();
+    let r = w.b.fetch(OTHER, &Fetch::subresource(&format!("{}/echo", w.news), "www.news.example")).unwrap();
+    assert_eq!(names(&r.body), "");
+    // A new run of the page in the first jar is still signed in.
+    w.b.close(LIVE);
+    w.b.show_live(LIVE, &format!("{}/app", w.news), Some(42)).unwrap();
+    let r = w.b.fetch(LIVE, &Fetch::navigation(&format!("{}/echo", w.news), None, false)).unwrap();
+    assert_eq!(names(&r.body), "sess");
 }

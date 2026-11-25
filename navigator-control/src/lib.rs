@@ -222,7 +222,9 @@ pub enum Request {
     /// the page shown, which navigatord checks is the one it showed;
     /// `rect`: the page area in the window. Answered by `LiveStarted`
     /// and later `LiveEnded`, or `LiveEnded` with why it could not start.
-    RunPageLive { url: String, rect: [u32; 4], press: Press },
+    /// `jar`: the trail's, whose partition for the page's site keeps its
+    /// cookies (I6.3, D9).
+    RunPageLive { url: String, rect: [u32; 4], press: Press, jar: Jar },
     /// The page area moved (`Some`), or Stop / leaving the page (`None`:
     /// the engine ends and no `LiveEnded` follows).
     PlaceLive { url: String, rect: Option<[u32; 4]> },
@@ -230,7 +232,7 @@ pub enum Request {
     /// the live page proposed, Back, Forward; I6.2): run it live too,
     /// without a press. navigatord refuses unless the person ran this
     /// origin live in this window and has not stopped it.
-    ContinueLive { url: String, rect: [u32; 4] },
+    ContinueLive { url: String, rect: [u32; 4], jar: Jar },
 }
 
 /// The longest WebAuthn options a `Credential` carries (the page's own
