@@ -473,6 +473,43 @@ Per-session retention policy (default: keep all unique blobs up to
 Tessera's GC handles the actual reclamation when the last reference
 to a blob is dropped — Stoa does not need to know about it.
 
+### 5.4a Where session state lives: PROPOSED 2026-11-25
+
+**What's wrong today** (review, `reviews/stores-at-rest-assessment.md` S1 in project files):
+- stoad is one `_stoad` service for every person. It writes the session table and each
+  window's scrollback to one state directory: `$STOA_STATE`, or `/tmp/stoad-<uid>.state`
+  when that's unset. No production config sets it.
+- That directory is on the plain internal disk, outside every person's key group. It holds
+  everyone's sessions together and survives a persona's removal.
+- Scrollback is where secrets end up: pasted tokens, a `cat` of a config file, mail read in a
+  terminal.
+- Consoles (§10a) were meant never to be persisted, but their scrollback was written all the
+  same. That is fixed now: `persisted()` in stoad, used for the table, the scrollback and
+  restore.
+
+**Proposal:**
+1. **State lives with its owner.** A persisted session belongs to one (person, persona), the
+   one whose shell it runs. Its state goes in that persona's key group, the way Fasti's store
+   does (portcullisd `calendar.rs`):
+   - portcullisd makes `<persona apps dir>/.stoa/` (root-owned, 0700; the session directory
+     inside belongs to `_stoad`, 0700), checking that the parent is root's and not
+     group- or world-writable.
+   - It hands stoad the open directory descriptor with the session (`MINT`'s answer path).
+     stoad then never names a person's path itself, and never opens one it wasn't given.
+2. **No directory, no persistence.** If the owner's group is not open and encrypted (mail.md
+   §6.4a A1/A2's answer), the session runs in memory only and says so on attach ("this
+   session's history is not kept"). The `/tmp` fallback goes. An unset `STOA_STATE` means
+   no persistence, and a dev run that wants persistence sets it explicitly.
+3. **Erase with the persona.** Because the state is in the persona's group, E5's
+   crypto-erase removes it with nothing extra. stoad drops a removed persona's sessions when
+   portcullisd tells it (`SessionEnded`, the logout path).
+4. **stoad's own state** (its MAC keys, its port table) stays in memory, as §11 already says.
+5. **Check:** extend `vm-console-check.sh` and add a Stoa run that types a marker into a Work
+   session, restarts stoad, finds the scrollback restored, and greps the raw device and
+   `/tmp` for the marker (none). It then removes Work and finds the session gone. A control
+   run with the state directory pointed at a plain path must find the marker, to prove the
+   grep works.
+
 ### 5.5 Live-process survival across `stoad` restart (S3b — aspirational TODO)
 
 §5.1–5.3 is **history-only**: a `stoad` restart (crash/upgrade) or host

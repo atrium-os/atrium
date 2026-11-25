@@ -319,6 +319,37 @@ A person's profile can use machine scope only if that person is an administrator
 role); otherwise app scope over their own apps. A machine profile set to "always" starts at
 boot, before login.
 
+### 7.1a Persona profiles at rest: PROPOSED 2026-11-25
+
+**What's wrong today** (review, `reviews/stores-at-rest-assessment.md` S2 in project files):
+- A persona-scoped profile sits in `/var/db/crypta`, on the plain root, beside machine
+  profiles. It holds the gateway, addresses, DNS domains and the client certificate chain,
+  which names the person. It holds no secret.
+- When the persona is removed, E5 crypto-erases its folders and its Arca items. The profile
+  stays behind, a plain record that the persona existed and where it connected.
+- `/var/run/atrium/vpn-state` (0644) names every running tunnel to any process on the
+  machine. portcullisd's `/var/run/atrium/persona-vpn` names the person and persona with
+  each tunnel.
+
+**Proposal:**
+1. **A person's profiles live in that person's key group:** Personal's in Personal's group,
+   a named persona's in that persona's.
+   - cryptad gets the directory from portcullisd as Fasti does: `<persona apps
+     dir>/.crypta/`, root's, 0700, with the parent checked.
+   - cryptad reads it while the group is open. A persona tunnel can only start for a
+     logged-in person anyway (§9.7).
+   - Machine profiles stay in `/var/db/crypta`.
+2. **Removal erases it.** E5's crypto-erase covers the directory, and cryptad forgets the
+   profile when portcullisd removes the persona. A tunnel still up is stopped first, as
+   removal already waits for sticks.
+3. **The state files are not world-readable.** `vpn-state` and `persona-vpn` become 0640,
+   to the group frescod reads them as (`_frescod`). Nobody else needs them.
+4. **Check:** extend `vm-personas-check.sh`:
+   - make a Work profile with a marker in its name and gateway;
+   - assert the profile is not in `/var/db/crypta`;
+   - remove Work and grep the raw device for the marker (none);
+   - assert the state files are 0640.
+
 ### 7.2 CLASS_VPN (new Aqueduct class 19)
 
 Served by `crypta-ctl` for cryptad, one socket per capability, as atrium-netconf does
