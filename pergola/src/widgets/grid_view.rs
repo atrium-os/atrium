@@ -553,11 +553,18 @@ pub enum GridAction {
     Redo,
     /// F4 outside the editor: the last command again, on the selection.
     Repeat,
+    /// Ctrl+PageUp (-1) / Ctrl+PageDown (1): the sheet before or after;
+    /// Shift+F11 (0): a new sheet.
+    Sheet(i8),
+    /// Shift+F2: the cursor cell's comment, to write or edit.
+    Comment,
     Copy(CellRange),
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
     /// filled with copies).
     Paste { row: u32, col: u32, sel: CellRange, plain: bool },
+    /// Ctrl+Alt+V: ask how to paste (the app's Paste Special).
+    PasteSpecial,
     /// Float `key` dragged to `at` (content px: x, y, width, height).
     PlaceFloat { key: u64, at: [f64; 4] },
     /// Delete with float `key` picked.
@@ -2743,6 +2750,20 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             };
             Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
+        // Alt+PageDown / Alt+PageUp: one screen right or left.
+        Key::PageUp | Key::PageDown if m.alt && !cmd => {
+            // As many columns as fit, at the active column's width, so the
+            // two keys undo each other.
+            let c = g.cursor.1;
+            let cw = src.col_left(c + 1) - src.col_left(c);
+            let n = if cw > 0.0 { (geom.body.w() as f64 / cw).floor().max(1.0) as i64 } else { 1 };
+            let dc = if key == Key::PageUp { -1 } else { 1 };
+            Some(past_hidden(src, g.cursor, step(g.cursor, 0, n * dc), 0, dc as i32))
+        }
+        Key::PageUp | Key::PageDown if cmd && !m.shift => {
+            send(GridAction::Sheet(if key == Key::PageUp { -1 } else { 1 }));
+            return true;
+        }
         // Hidden rows and columns are stepped over.
         Key::PageUp => Some(past_hidden(src, g.cursor, step(g.cursor, -page(st), 0), -1, 0)),
         Key::PageDown => Some(past_hidden(src, g.cursor, step(g.cursor, page(st), 0), 1, 0)),
@@ -2758,7 +2779,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             reveal(src, geom, st, to);
             return true;
         }
-        Key::Enter | Key::F(2) => {
+        Key::Enter | Key::F(2) if !(key == Key::F(2) && m.shift && src.fills()) => {
             let mut ed = TextEdit::new(&src.edit_text(g.cursor.0, g.cursor.1));
             ed.set_caret(ed.text().len(), false);
             g.anchor = g.cursor;
@@ -2766,8 +2787,29 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             g.entering = false;
             return true;
         }
+        // Ctrl+Backspace: back to the active cell; Shift+Backspace: only it selected.
+        Key::Backspace if cmd && !m.shift => {
+            reveal(src, geom, st, g.cursor);
+            return true;
+        }
+        Key::Backspace if m.shift && !cmd => {
+            g.select(g.cursor.0, g.cursor.1);
+            return true;
+        }
         Key::Delete | Key::Backspace => {
             send(GridAction::Clear(g.selection()));
+            return true;
+        }
+        // Ctrl+.: the active cell to the selection's next corner, clockwise;
+        // the selection stays.
+        Key::Char if cmd && !m.shift && chars == "." => {
+            let s = g.selection();
+            let corners = [(s.r0, s.c0), (s.r0, s.c1), (s.r1, s.c1), (s.r1, s.c0)];
+            let at = corners.iter().position(|&k| k == g.cursor).unwrap_or(3);
+            let to = corners[(at + 1) % 4];
+            g.cursor = to;
+            g.anchor = (if to.0 == s.r0 { s.r1 } else { s.r0 }, if to.1 == s.c0 { s.c1 } else { s.c0 });
+            reveal(src, geom, st, to);
             return true;
         }
         // Ctrl+' (Ctrl+Shift+'): start editing with the formula (value) above.
@@ -2801,6 +2843,14 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
         Key::F(4) if !cmd && !m.alt && src.fills() => {
             send(GridAction::Repeat);
+            return true;
+        }
+        Key::F(11) if m.shift && !cmd && !m.alt && src.fills() => {
+            send(GridAction::Sheet(0));
+            return true;
+        }
+        Key::F(2) if m.shift && !cmd && !m.alt && src.fills() => {
+            send(GridAction::Comment);
             return true;
         }
         // Ctrl+Shift+*: the data around the cursor (its current region).
@@ -2850,6 +2900,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 }
                 "e" if src.fills() => send(GridAction::FlashFill { row: g.cursor.0, col: g.cursor.1 }),
                 "x" => send(GridAction::Cut(g.selection())),
+                "v" if m.alt => send(GridAction::PasteSpecial),
                 "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection(), plain: m.shift }),
                 // Ctrl+A: the data around the cursor, then (pressed again,
                 // or on a lone cell) everything.
@@ -3228,6 +3279,19 @@ mod tests {
         // F4 outside the editor asks to repeat.
         key(&mut app, Key::F(4), "", Modifiers::default());
         assert_eq!(log.borrow().last(), Some(&GridAction::Repeat));
+        // Sheets: Ctrl+PageDown / Ctrl+PageUp step, Shift+F11 adds; Shift+F2 comments.
+        let cursor = state.get_cloned().cursor;
+        key(&mut app, Key::PageDown, "", ctrl);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(1)));
+        key(&mut app, Key::PageUp, "", ctrl);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(-1)));
+        assert_eq!(state.get_cloned().cursor, cursor, "the cursor stays");
+        let shift = Modifiers { shift: true, ..Modifiers::default() };
+        key(&mut app, Key::F(11), "", shift);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Sheet(0)));
+        key(&mut app, Key::F(2), "", shift);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Comment));
+        assert!(state.get_cloned().edit.is_none(), "Shift+F2 doesn't open the cell editor");
     }
 
     #[test]
@@ -3746,6 +3810,57 @@ mod tests {
         assert_eq!(st.physics.y, 10_000.0 * 20.0 - body_h);
         key(&mut app, Key::Home, "", Modifiers { ctrl: true, ..Default::default() });
         assert_eq!((scroll.get().physics.y, scroll.get().physics_x.y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn excel_keys_for_the_active_cell_corners_and_screens() {
+        let (mut app, _, scroll, state, log) = host(10_000, 200);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 5.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        let shift = Modifiers { shift: true, ..Default::default() };
+        let alt = Modifiers { alt: true, ..Default::default() };
+        // Ctrl+. walks the corners clockwise; the selection stays.
+        let mut g = state.get_cloned();
+        g.cursor = (2, 1);
+        g.anchor = (5, 4);
+        state.set(g);
+        let sel = CellRange { r0: 2, c0: 1, r1: 5, c1: 4 };
+        for want in [(2, 4), (5, 4), (5, 1), (2, 1)] {
+            key(&mut app, Key::Char, ".", ctrl);
+            assert_eq!((state.get_cloned().cursor, state.get_cloned().selection()), (want, sel));
+        }
+        assert!(log.borrow().is_empty(), "Ctrl+. is not a format key");
+        // Shift+Backspace: only the active cell; nothing is cleared.
+        key(&mut app, Key::Backspace, "", shift);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 2, c0: 1, r1: 2, c1: 1 });
+        assert!(log.borrow().is_empty());
+        // Ctrl+Backspace: scrolled away, back to the active cell, which stays.
+        let mut st = scroll.get();
+        st.physics.set_max(1e9);
+        st.physics.set_position(50_000.0);
+        scroll.set(st);
+        key(&mut app, Key::Backspace, "", ctrl);
+        assert_eq!(scroll.get().physics.y, 2.0 * 20.0, "row 3 at the top");
+        assert_eq!(state.get_cloned().cursor, (2, 1));
+        assert!(log.borrow().is_empty(), "Ctrl+Backspace clears nothing");
+        // Alt+PageDown / Alt+PageUp: a screen right and back.
+        key(&mut app, Key::PageDown, "", alt);
+        let c = state.get_cloned().cursor;
+        assert_eq!(c.0, 2);
+        assert!(c.1 > 3, "{c:?}");
+        assert!(scroll.get().physics_x.y > 0.0);
+        key(&mut app, Key::PageUp, "", alt);
+        assert_eq!(state.get_cloned().cursor, (2, 1));
+        assert_eq!(log.borrow().len(), 0, "Alt+PageDown doesn't change sheet");
+        // Ctrl+Alt+V asks for Paste Special; Ctrl+V still pastes.
+        key(&mut app, Key::Char, "v", Modifiers { ctrl: true, alt: true, ..Default::default() });
+        assert_eq!(log.borrow().last(), Some(&GridAction::PasteSpecial));
+        key(&mut app, Key::Char, "v", ctrl);
+        assert!(matches!(log.borrow().last(), Some(GridAction::Paste { plain: false, .. })));
     }
 
     #[test]

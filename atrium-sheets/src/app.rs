@@ -2181,6 +2181,18 @@ impl Sheets {
                 GridAction::AutoSum(_) => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::AutoSum)),
                 GridAction::GoTo => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::GoTo)),
                 GridAction::Repeat => cmds.lock().unwrap().push(Cmd::Repeat),
+                // Ctrl+PageUp / Ctrl+PageDown: the sheet before or after; Shift+F11: a new one.
+                GridAction::Sheet(0) => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Add)),
+                GridAction::Sheet(dir) => {
+                    let next = { let d = doc.borrow(); crate::tabs::step_sheet(&d.wb, d.sheet, dir) };
+                    if let Some(s) = next {
+                        cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Go(s)));
+                    }
+                }
+                // Ctrl+Alt+V: the Paste Special bar.
+                GridAction::PasteSpecial => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::PasteSpecial)),
+                // Shift+F2: the cursor cell's comment.
+                GridAction::Comment => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Commenting)),
                 // Ctrl+`: formulas shown in their cells, or values again.
                 GridAction::Format('`') => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowFormulas)),
                 // Ctrl+9 / Ctrl+0 hide, Ctrl+Shift+( / ) unhide, Ctrl+- / Ctrl++ delete and insert;
@@ -2237,7 +2249,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::PasteSpecial | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -5764,6 +5776,11 @@ mod tests {
         let mut g = grid.get_cloned();
         g.select(0, 1);
         grid.set(g);
+        // The menu names Excel's key (Ctrl+Alt+V, sent by the grid as PasteSpecial).
+        let items = crate::data::menu(&s.doc.borrow(), grid.get_cloned().selection(), (0, 1));
+        let it = items.iter().find(|(_, c)| *c == Some(crate::data::DataCmd::PasteSpecial)).map(|(m, _)| m.clone());
+        assert_eq!(it.as_ref().and_then(|m| m.shortcut.as_deref()), Some("Ctrl+Alt+V"));
+        assert!(it.is_some_and(|m| m.enabled));
         run(Cmd::Data(crate::data::DataCmd::PasteSpecial));
         assert_eq!(s.paste_bar.get().map(|p| p.what), Some(officina_grid::clip::What::All));
         for c in [TabCmd::PasteWhat(1), TabCmd::PasteOp(1), TabCmd::PasteTurn] {
@@ -7420,6 +7437,24 @@ mod tests {
         s.take_cmds();
         assert_eq!(f(3).as_deref(), Some("=SUM(Block)"));
         assert_eq!(shown(&s, 4, 0), "20");
+    }
+
+    #[test]
+    fn ctrl_page_keys_step_through_shown_sheets_only() {
+        let s = sheets_of(b"a\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        for _ in 0..3 {
+            run(Cmd::Tab(crate::tabs::TabCmd::Add));
+        }
+        let wb = |f: &dyn Fn(&officina_grid::Workbook) -> Option<u16>| f(&s.doc.borrow().wb);
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 4);
+        // Sheet 2 hidden: stepped over both ways; no wrapping at the ends.
+        s.doc.borrow_mut().run("Hide", vec![officina_grid::ops::GridOp::HideSheet { sheet: 2, hidden: true }]);
+        assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 1, 1)), Some(3));
+        assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 3, -1)), Some(1));
+        assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 3, 1)), None);
+        assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 0, -1)), None);
+        assert_eq!(wb(&|w| crate::tabs::step_sheet(w, 0, 0)), None);
     }
 
     #[test]

@@ -229,7 +229,7 @@ impl Stores {
 
 /// Write `bytes` to `file` whole or not at all: a fresh 0600 file beside
 /// it (never one already there), synced, then renamed over it.
-fn write(file: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write(file: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let dir = file.parent().ok_or("no directory")?;

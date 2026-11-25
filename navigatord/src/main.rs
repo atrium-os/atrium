@@ -57,6 +57,7 @@ mod inbox_fixture;
 mod live_page;
 mod live_frames;
 mod live_storage;
+mod live_remembered;
 mod press;
 mod settings;
 mod worker;
@@ -494,6 +495,20 @@ static LIVE_STORES: std::sync::OnceLock<Arc<Mutex<live_storage::Stores>>> = std:
 
 fn live_stores() -> Arc<Mutex<live_storage::Stores>> {
     LIVE_STORES.get_or_init(|| Arc::new(Mutex::new(live_storage::Stores::new(None)))).clone()
+}
+
+static LIVE_REMEMBERED: std::sync::OnceLock<Arc<Mutex<live_remembered::Remembered>>> = std::sync::OnceLock::new();
+
+/// The origins the persona runs live every time (D8).
+fn live_remembered() -> Arc<Mutex<live_remembered::Remembered>> {
+    LIVE_REMEMBERED.get_or_init(|| Arc::new(Mutex::new(live_remembered::Remembered::new(None)))).clone()
+}
+
+/// Whether a page at `url`, opened in `jar`, runs live without a press
+/// (D8): live pages are on, this is not a sign-in window, the trail is
+/// recorded and the person chose its origin.
+fn runs_live_unasked(cfg: &Config, url: &str, jar: ctl::Jar) -> bool {
+    cfg.live_pages_enabled() && cfg.vpn.is_none() && !jar.unrecorded() && live_remembered().lock().unwrap().holds(url)
 }
 
 static VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1758,6 +1773,9 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                                 }
                             }
                             send(&w, &Event::Opened { id, url: p.url.clone(), title: p.title.clone(), insecure: p.insecure, ticket, ms, saved: p.saved.clone(), from, knows: ctx.knows, asked, note });
+                            if !p.insecure && runs_live_unasked(&cfg, &p.url, jar) {
+                                send(&w, &Event::LiveRemembered { url: p.url.clone() });
+                            }
                             // The gateway's final page: the sign-in is over
                             // (its token, if it set one, is Arca's now).
                             if cfg.vpn.as_ref().is_some_and(|v| v.ends_at(&p.url)) {
@@ -1968,7 +1986,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
-            Request::RunPageLive { url, rect, press, jar } => {
+            Request::RunPageLive { url, rect, press, jar, remember } => {
                 let page = shown.as_ref().filter(|(asked, page)| *asked == url || *page == url).map(|(_, page)| page.clone())
                     .or_else(|| opened.as_ref().filter(|o| **o == url).and_then(|_| state.lock().unwrap().page(&url)).map(|p| p.url.clone()));
                 let window = strip.lock().unwrap().window_token;
@@ -1986,6 +2004,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 match result {
                     Ok(l) => {
                         live_origin = origin(&l.url);
+                        if remember && !jar.unrecorded() && cfg.vpn.is_none() {
+                            match live_remembered().lock().unwrap().remember(&l.url) {
+                                Ok(()) => send(&w, &Event::LiveRemembered { url: l.url.clone() }),
+                                Err(why) => eprintln!("navigatord: remembering a live origin: {why}"),
+                            }
+                        }
                         live = Some(l);
                     }
                     Err(why) => match why.strip_prefix('\0') {
@@ -2004,7 +2028,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 let result = (|| {
                     if !cfg.live_pages_enabled() { return Err("running a page live is off".to_string()); }
                     let page = page.ok_or("that page is no longer on screen")?;
-                    if live_origin.is_none() || origin(&page) != live_origin {
+                    let continues = live_origin.is_some() && origin(&page) == live_origin;
+                    if !continues && !runs_live_unasked(&cfg, &page, jar) {
                         return Err("this origin was not run live here".into());
                     }
                     let window = window.ok_or("no window to run it in")?;
@@ -2013,11 +2038,19 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar, &waiting)
                 })();
                 match result {
-                    Ok(l) => live = Some(l),
+                    Ok(l) => {
+                        live_origin = origin(&l.url);
+                        live = Some(l);
+                    }
                     Err(why) => {
                         eprintln!("navigatord: continue live: {why}");
                         send(&w, &Event::LiveEnded { url, why: Some(why) });
                     }
+                }
+            }
+            Request::ForgetLive { url } => {
+                if let Err(why) = live_remembered().lock().unwrap().forget(&url) {
+                    eprintln!("navigatord: forgetting a live origin: {why}");
                 }
             }
             Request::LivePasted { url, text } => {
@@ -2441,6 +2474,8 @@ fn main() {
     // Live pages' storage (I6.3): beside the page store, on the persona's
     // volume; in memory only without one.
     let _ = LIVE_STORES.set(Arc::new(Mutex::new(live_storage::Stores::new(cfg.store.as_ref().map(|d| d.join("live-storage"))))));
+    // The origins run live every time (D8): the same volume.
+    let _ = LIVE_REMEMBERED.set(Arc::new(Mutex::new(live_remembered::Remembered::new(cfg.store.as_ref().map(|d| d.join("live-origins"))))));
     // Arca, for sites that know you. An Unrecorded jar a crash left behind
     // is forgotten now: none outlives the navigatord that made it.
     let cookies: Option<Cookies> = cfg.arca.as_ref().filter(|_| cfg.portal.is_none()).map(|(a, c)| {

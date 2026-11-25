@@ -83,22 +83,13 @@ dd if=/dev/random of=$MNT/c bs=4k count=1 conv=fsync 2>/dev/null
 if [ $? -ne 0 ]; then ok "still refusing after the fault cleared (sticky, as intended)"
 else                  bad "volume silently resumed — a degraded mount must stay degraded"; fi
 
-# ── the operator clear must restore service IN PLACE ─────────────────
-# The root filesystem cannot be unmounted, so "sticky until unmount" would
-# mean "sticky until reboot" on the volume that needs this most. This is the
-# `zpool clear` equivalent.
-sysctl kern.tessera.commit_failed_clear=1 >/dev/null
-dd if=/dev/random of=$MNT/d bs=4k count=1 conv=fsync 2>/dev/null
-if [ $? -eq 0 ]; then ok "operator clear restores durability in place"
-else                  bad "operator clear did NOT restore service"; fi
-
-# ── clearing while STILL broken must re-latch, not paper over it ─────
-sysctl kern.tessera.fault_commit_fail=1 >/dev/null
-dd if=/dev/random of=$MNT/e bs=4k count=1 conv=fsync 2>/dev/null
-sysctl kern.tessera.commit_failed_clear=1 >/dev/null
-dd if=/dev/random of=$MNT/f bs=4k count=1 conv=fsync 2>/dev/null
-if [ $? -ne 0 ]; then ok "clearing a still-broken volume re-latches"
-else                  bad "clear papered over a volume that still cannot commit"; fi
+# ── there is no in-place clear: only a remount lifts the latch ───────
+# After a refused commit the in-memory roots are ahead of the durable
+# superblock, so a flush there would count as free what that superblock still
+# names. The kernel has no knob that lifts the latch on a mounted volume.
+sysctl -n kern.tessera.commit_failed_clear >/dev/null 2>&1 \
+  && bad "kern.tessera.commit_failed_clear still exists" \
+  || ok "no in-place clear: kern.tessera.commit_failed_clear is gone"
 sysctl kern.tessera.fault_commit_fail=0 >/dev/null
 
 # ── and a REMOUNT also restores service ──────────────────────────────

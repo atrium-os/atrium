@@ -162,7 +162,15 @@ pub struct Shell {
     /// The page running live, or asked to: its address, and its origin
     /// once the engine started (navigator-islands.md I6.1).
     pub live_run: Option<LiveRun>,
+    /// The origins navigatord said the persona runs live every time (D8,
+    /// `Event::LiveRemembered`), at most [`LIVE_REMEMBERED_MAX`]: the chip
+    /// offers to ask again for them. navigatord's list is the one that
+    /// counts; this only says which row to show.
+    pub live_remembered: Vec<String>,
 }
+
+/// The most remembered origins the UI keeps track of.
+pub const LIVE_REMEMBERED_MAX: usize = 256;
 
 /// The form panel (navigator-ui.md "Forms in the sign-in window"): the
 /// shown page's first plain form as its page child read it, with what the
@@ -298,7 +306,9 @@ pub enum Out {
     StartWidget { page: (u64, PageId), key: u32, src: String, press: navigator_control::Press },
     RunLive { url: String, jar: navigator_control::Jar, press: navigator_control::Press },
     /// Run the page on screen live (I6.1), with the press on "Run live".
-    RunPageLive { url: String, press: navigator_control::Press, jar: navigator_control::Jar },
+    RunPageLive { url: String, press: navigator_control::Press, jar: navigator_control::Jar, remember: bool },
+    /// The chip's "Ask before running live" (D8).
+    ForgetLive { url: String },
     /// Stop the page running live: back to the document lane.
     StopLive { url: String },
     /// Run `url` live too (I6.2): the live page went there, same origin.
@@ -448,7 +458,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None, live_pages: std::env::var("NAVIGATOR_UI_LIVE_PAGES").as_deref() == Ok("1"), live_run: None, live_remembered: Vec::new() }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -756,7 +766,44 @@ impl Shell {
             page.prompts.dismissed.retain(|k| k != "run-page-live");
             page.prompts.last_ms = None;
         }
-        self.ask(Prompt::RunPageLive { site }, now)
+        let recorded = !self.store.trail().jar().unrecorded();
+        self.ask(Prompt::RunPageLive { site, recorded }, now)
+    }
+
+    /// navigatord said the page at `url` is of an origin the persona runs
+    /// live every time (D8): it runs live now if it is the page on screen
+    /// and nothing runs live yet. navigatord checks the origin and the jar
+    /// again before it starts anything.
+    pub fn live_remembered(&mut self, url: &str) -> bool {
+        let Some(o) = origin_of(url).map(str::to_string) else { return false };
+        self.live_remembered.retain(|x| *x != o);
+        self.live_remembered.push(o);
+        if self.live_remembered.len() > LIVE_REMEMBERED_MAX { self.live_remembered.remove(0); }
+        let (Some(key), Some(shown)) = (self.shown_key(), self.shown_url()) else { return false };
+        if shown != url || !self.offers_live() || self.store.trail().jar().unrecorded()
+            || !matches!(&self.live, Some(LivePage::Shown(u)) if u == url) {
+            return false;
+        }
+        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new() });
+        let jar = self.store.trail().jar();
+        self.outbox.push(Out::ContinueLive { url: url.to_string(), jar });
+        true
+    }
+
+    /// Whether the page on screen is of an origin run live every time.
+    pub fn shown_remembered(&self) -> bool {
+        self.live_pages && self.history.is_none() && !self.store.trail().jar().unrecorded()
+            && self.shown_url().is_some_and(|u| origin_of(&u).is_some_and(|o| self.live_remembered.iter().any(|x| x == o)))
+    }
+
+    /// The popover's "Ask before running live" (D8): the page's origin is
+    /// no longer run live unasked. What runs live now goes on.
+    pub fn forget_live(&mut self) {
+        let Some(url) = self.shown_url() else { return };
+        let Some(o) = origin_of(&url).map(str::to_string) else { return };
+        self.popover = false;
+        self.live_remembered.retain(|x| *x != o);
+        self.outbox.push(Out::ForgetLive { url });
     }
 
     /// The popover's "Stop running live", or leaving the page: the
@@ -1076,11 +1123,12 @@ impl Shell {
             (Prompt::WidgetUnload { start, query, .. }, "Leave" | "Stay") if live => {
                 self.outbox.push(Out::AnswerUnload { start: *start, query: *query, leave: what == "Leave", press });
             }
-            (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
+            (Prompt::RunPageLive { recorded, .. }, "Run live" | "Always for this site") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
                     self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new() });
                     let jar = self.store.trail().jar();
-                    self.outbox.push(Out::RunPageLive { url, press, jar });
+                    let remember = *recorded && what == "Always for this site" && !jar.unrecorded();
+                    self.outbox.push(Out::RunPageLive { url, press, jar, remember });
                 }
             }
             (Prompt::RunLive, "Run live") if live => {
@@ -2000,13 +2048,14 @@ pub fn popover_height(s: &Shell, w: f32) -> f32 {
     }
     // Top 14, heading 28, two section labels 16 each, two 6 gaps, lines 16, bottom 14;
     // the action row 6 + 32.
-    let action = if popover_action(s).is_some() { 6.0 + 32.0 } else { 0.0 };
+    let action = (6.0 + 32.0) * popover_actions(s).len() as f32;
     em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + 16.0 * n + 14.0 + action)
 }
 
-/// The popover's one action (I6.1), if it has one.
+/// The popover's actions (I6.1): run live or stop, and for an origin run
+/// live every time, asking again (D8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PopoverAction { RunLive, Stop }
+pub enum PopoverAction { RunLive, Stop, Forget }
 
 pub fn popover_action(s: &Shell) -> Option<PopoverAction> {
     if s.live_run.as_ref().is_some_and(|r| Some(r.key) == s.shown_key()) {
@@ -2016,6 +2065,12 @@ pub fn popover_action(s: &Shell) -> Option<PopoverAction> {
     } else {
         None
     }
+}
+
+pub fn popover_actions(s: &Shell) -> Vec<PopoverAction> {
+    let mut all: Vec<PopoverAction> = popover_action(s).into_iter().collect();
+    if s.shown_remembered() { all.push(PopoverAction::Forget); }
+    all
 }
 
 /// The popover's connection line.
@@ -2741,16 +2796,16 @@ mod tests {
         assert!(!s.popover);
         assert!(s.outbox.is_empty());
         let asked = s.store.trail().page().unwrap().asked.clone().unwrap();
-        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "app.example".into() });
+        assert_eq!(asked.prompt, Prompt::RunPageLive { site: "app.example".into(), recorded: true });
         // "Not now", then asked again from the popover: the person's choice.
         assert!(s.answer_pressed(0, 600.0, Some([1; 16])));
         assert!(s.outbox.is_empty() && s.live_run.is_none());
         assert!(s.offer_live(700.0));
         // A press before the row was still for 500 ms does nothing.
-        assert!(!s.answer_pressed(1, 900.0, Some([2; 16])));
+        assert!(!s.answer_pressed(2, 900.0, Some([2; 16])));
         assert!(s.outbox.is_empty());
-        assert!(s.answer_pressed(1, 1300.0, Some([2; 16])));
-        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16], jar: navigator_control::Jar::Personal }));
+        assert!(s.answer_pressed(2, 1300.0, Some([2; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16], jar: navigator_control::Jar::Personal, remember: false }));
         assert_eq!(popover_action(&s), Some(PopoverAction::Stop));
         // The chip reads Live code only once the engine started the page.
         assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
@@ -2762,7 +2817,7 @@ mod tests {
         assert_eq!(popover_action(&s), Some(PopoverAction::RunLive));
         // An engine that ends by itself does the same, with why.
         assert!(s.offer_live(2000.0));
-        assert!(s.answer_pressed(1, 2600.0, Some([5; 16])));
+        assert!(s.answer_pressed(2, 2600.0, Some([5; 16])));
         s.live_reported(url, Some("https://app.example".into()), None);
         s.live_reported(url, None, Some("the page's engine failed".into()));
         assert!(s.live_run.is_none());
@@ -2778,7 +2833,7 @@ mod tests {
         s.live = Some(LivePage::Shown(url.into()));
         s.live_pages = true;
         assert!(s.offer_live(0.0));
-        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        assert!(s.answer_pressed(2, 600.0, Some([2; 16])));
         s.outbox.clear();
         let key = s.shown_key().unwrap();
         let dl = |id: u32| Prompt::Download { id, file: "report.csv".into(), size: "12 B".into(), origin: "https://app.example".into(), kind: "CSV file".into() };
@@ -2828,7 +2883,7 @@ mod tests {
         s.live = Some(LivePage::Shown(url.into()));
         s.live_pages = true;
         assert!(s.offer_live(0.0));
-        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        assert!(s.answer_pressed(2, 600.0, Some([2; 16])));
         s.outbox.clear();
         let first = s.shown_key().unwrap();
         // Before the engine started, a proposal is not followed.
@@ -2862,7 +2917,7 @@ mod tests {
         s.enter(url);
         s.live = Some(LivePage::Shown(url.into()));
         assert!(s.offer_live(5000.0));
-        assert!(s.answer_pressed(1, 5600.0, Some([3; 16])));
+        assert!(s.answer_pressed(2, 5600.0, Some([3; 16])));
         s.live_reported(url, Some("https://app.example".into()), None);
         s.outbox.clear();
         assert!(s.live_navigated(url, "https://app.example/third.html"));
@@ -2880,7 +2935,7 @@ mod tests {
         s.live = Some(LivePage::Shown(url.into()));
         s.live_pages = true;
         assert!(s.offer_live(0.0));
-        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        assert!(s.answer_pressed(2, 600.0, Some([2; 16])));
         let home = s.shown_key().unwrap();
         // Not before the engine started, not from another page, not another origin.
         assert!(!s.live_url_changed(url, "https://app.example/route/1"));
@@ -2917,6 +2972,53 @@ mod tests {
         s.live = Some(LivePage::Shown("https://app.example/route/1".into()));
         assert!(s.live_follow());
         assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: "https://app.example/route/1".into(), jar: navigator_control::Jar::Personal }));
+    }
+
+    #[test]
+    fn a_site_chosen_always_runs_live_unasked_until_the_chip_asks_again() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Always for this site", "Run live"]);
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::RunPageLive { url: url.into(), press: [2; 16], jar: navigator_control::Jar::Personal, remember: true }));
+        // navigatord remembered it; the page runs already, so nothing more.
+        assert!(!s.live_remembered(url));
+        assert!(s.outbox.is_empty());
+        s.live_reported(url, Some("https://app.example".into()), None);
+        assert_eq!(popover_actions(&s), vec![PopoverAction::Stop, PopoverAction::Forget]);
+        s.stop_live();
+        s.outbox.clear();
+        // Another page of the site, opened later: it runs live on navigatord's word.
+        let next = "https://app.example/next.html";
+        s.enter(next);
+        s.live = Some(LivePage::Loading(next.into()));
+        assert!(!s.live_remembered(next), "not before it is shown");
+        s.live = Some(LivePage::Shown(next.into()));
+        assert!(!s.live_remembered("https://app.example/other.html"), "not for a page not on screen");
+        assert!(s.live_remembered(next));
+        assert_eq!(s.outbox.pop(), Some(Out::ContinueLive { url: next.into(), jar: navigator_control::Jar::Personal }));
+        assert!(s.live_run.as_ref().is_some_and(|r| r.url == next));
+        // The chip's row: ask again. What runs goes on.
+        s.forget_live();
+        assert_eq!(s.outbox.pop(), Some(Out::ForgetLive { url: next.into() }));
+        assert!(s.live_run.is_some());
+        assert_eq!(popover_actions(&s), vec![PopoverAction::Stop]);
+        // An Unrecorded trail only asks, and never runs unasked.
+        s.stop_live();
+        s.outbox.clear();
+        s.new_trail(true);
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        assert!(s.offer_live(0.0));
+        assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Run live"]);
+        s.store.trail_mut().page_mut().unwrap().asked = None;
+        assert!(!s.live_remembered(url));
+        assert!(s.outbox.is_empty() && s.live_run.is_none());
+        assert!(!popover_actions(&s).contains(&PopoverAction::Forget));
     }
 
     #[test]

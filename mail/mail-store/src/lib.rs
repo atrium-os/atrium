@@ -256,6 +256,53 @@ pub struct Store {
     jmap_imports: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
+/// redb writes its magic number last, after the new file's header and
+/// allocator state are flushed, so a process stopped while creating the index
+/// can leave a file that `Database::create` refuses forever. Only a file that
+/// is zero from start to end is taken for that: a database that held commits
+/// and then had its first page zeroed (a torn write, a dropped buffer) keeps
+/// data further in, and is refused and left alone. Even the all-zero file is
+/// renamed aside, not removed, so a wrong guess costs disk space, not mail.
+fn set_aside_unborn_index(path: &Path) -> Result<()> {
+    use std::io::Read as _;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if buf[..n].iter().any(|b| *b != 0) {
+            return Ok(());
+        }
+        len += n as u64;
+    }
+    // An empty file is one redb initialises itself.
+    if len == 0 {
+        return Ok(());
+    }
+    drop(f);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = path.with_file_name(format!("index.redb.unborn-{secs}"));
+    std::fs::rename(path, &aside)?;
+    eprintln!(
+        "mail-store: index.redb was {len} zero bytes (its creation was cut short); \
+         moved to {} and created again",
+        aside.display()
+    );
+    Ok(())
+}
+
 /// Newest first: the key sorts ascending, so it is the date reversed.
 fn date_key(date: i64) -> u64 {
     (i64::MAX - date.max(0)) as u64
@@ -265,7 +312,9 @@ impl Store {
     /// Open (or create) the store in `dir`: `index.redb` and `blobs/`.
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir.join("blobs"))?;
-        let db = Database::create(dir.join("index.redb"))?;
+        let index = dir.join("index.redb");
+        set_aside_unborn_index(&index)?;
+        let db = Database::create(&index)?;
         let tx = db.begin_write()?;
         {
             tx.open_table(META)?;

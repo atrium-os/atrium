@@ -273,3 +273,42 @@ fn calendar_delivery_survives_restart_hydration_and_racing_receipts() {
         .unwrap();
     assert_eq!(s.pending_calendar(0).unwrap()[0].0, later);
 }
+
+#[test]
+fn an_index_whose_creation_was_cut_short_is_moved_aside_and_created_again() {
+    let d = tempfile::tempdir().unwrap();
+    // What a process stopped inside redb's create can leave: the file sized,
+    // nothing written yet, the magic number (written last) still zero.
+    std::fs::write(d.path().join("index.redb"), vec![0u8; 1 << 20]).unwrap();
+    let s = Store::open(d.path()).expect("an unborn index is recreated");
+    let a = s.add_account("priya@example.org").unwrap();
+    drop(s);
+    let aside: Vec<_> = std::fs::read_dir(d.path()).unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("index.redb.unborn-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "the old file is kept aside");
+    assert_eq!(std::fs::read(d.path().join(&aside[0])).unwrap(), vec![0u8; 1 << 20]);
+    let s = Store::open(d.path()).unwrap();
+    assert!(s.accounts().unwrap().iter().any(|(id, _)| *id == a));
+}
+
+#[test]
+fn an_index_with_a_zeroed_head_but_data_after_it_is_refused_and_kept() {
+    let d = tempfile::tempdir().unwrap();
+    // A database whose first page was zeroed after it held commits.
+    let mut damaged = vec![0u8; 1 << 20];
+    damaged[8192..8200].copy_from_slice(b"mailrows");
+    std::fs::write(d.path().join("index.redb"), &damaged).unwrap();
+    assert!(Store::open(d.path()).is_err());
+    assert_eq!(std::fs::read(d.path().join("index.redb")).unwrap(), damaged);
+}
+
+#[test]
+fn an_index_with_other_bytes_and_no_magic_is_refused_and_kept() {
+    let d = tempfile::tempdir().unwrap();
+    let junk = b"not a redb file, but maybe one damaged at the start".repeat(100);
+    std::fs::write(d.path().join("index.redb"), &junk).unwrap();
+    assert!(Store::open(d.path()).is_err());
+    assert_eq!(std::fs::read(d.path().join("index.redb")).unwrap(), junk);
+}

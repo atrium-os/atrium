@@ -925,6 +925,9 @@ impl Live {
                         if let Some(e) = &self.embeds { let _ = e.borrow_mut().hide(PAGE_SLOT); }
                     }
                 }
+                Event::LiveRemembered { url } => {
+                    if s.live_remembered(&url) { eprintln!("navigator-ui: {url} runs live, as chosen for its site"); }
+                }
                 Event::LiveNavigate { from, url } => {
                     if !s.live_navigated(&from, &url) {
                         eprintln!("navigator-ui: a live page's navigation to {url} came after it left the screen");
@@ -1290,9 +1293,9 @@ impl Live {
                     }
                 }
                 Out::RunLive { url, jar, press } => send(&mut self.w, &Request::RunLive { url, jar, press }),
-                Out::RunPageLive { url, press, jar } => {
+                Out::RunPageLive { url, press, jar, remember } => {
                     let rect = live_rect(s);
-                    send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press, jar });
+                    send(&mut self.w, &Request::RunPageLive { url: url.clone(), rect, press, jar, remember });
                     self.live_placed = Some((url, rect));
                 }
                 Out::ContinueLive { url, jar } => {
@@ -1300,6 +1303,7 @@ impl Live {
                     send(&mut self.w, &Request::ContinueLive { url: url.clone(), rect, jar });
                     self.live_placed = Some((url, rect));
                 }
+                Out::ForgetLive { url } => send(&mut self.w, &Request::ForgetLive { url }),
                 Out::StopLive { url } => {
                     send(&mut self.w, &Request::PlaceLive { url, rect: None });
                     self.live_placed = None;
