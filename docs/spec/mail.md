@@ -1836,10 +1836,10 @@ Stalwart in the cloud VM, and later a real account):
    *Built 2026-11-17 (host-tested):* `mail/mail-store`: the index in redb (accounts,
    folders with their sync checkpoints, messages, (folder, UID) locations with flags, a
    newest-first list key, server-id dedupe), message bytes as SHA-256-named blobs written
-   to a temporary file and renamed, checked on every read. An `index.redb` whose magic
-   bytes are still zero (Mail stopped while redb created it; redb writes the magic last, so
-   it never held a commit) is removed and created again; any other file without the magic
-   is refused and kept. `mail/mail-sync`: the session
+   to a temporary file and renamed, checked on every read. An `index.redb` that is zero
+   from start to end (Mail stopped while redb created it; redb writes the magic last) is
+   renamed to `index.redb.unborn-<unix time>`, logged, and created again; any other file
+   without the magic, including one whose first page alone is zero, is refused and kept. `mail/mail-sync`: the session
    over the courier's PREAUTH socket, `ENABLE QRESYNC`, folders with SPECIAL-USE roles
    (Gmail: only Inbox, Sent and All Mail walked), every folder opened with `EXAMINE`; the
    staged first sync of §6.4 (the inbox's newest 200 headers, then all headers in pages of
