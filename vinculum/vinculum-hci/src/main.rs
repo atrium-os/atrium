@@ -4,9 +4,10 @@
 //! vinculum-hci --controller tcp:HOST:PORT --host-listen PATH
 //! ```
 //!
-//! B1 transports: `tcp:` (H4 over TCP, Rootcanal) and `uart:PATH` (H4 on a
-//! serial line, raw mode). USB through libusb on `ugen`, and the vendor
-//! firmware loaders, come with the first real dongle (B1b). The host side is
+//! Transports: `tcp:` (H4 over TCP, Rootcanal), `uart:PATH` (H4 on a serial
+//! line, raw mode) and `usb:` / `usb:VVVV:PPPP` (the first Bluetooth
+//! controller on USB, or the one with those ids, through the libusb-1.0 API;
+//! see `usb_dev.rs`). A Realtek controller gets its patch from `--firmware-dir` first. The host side is
 //! a Unix socket the host connects to (in production portcullisd passes a
 //! socketpair instead). When the host disconnects, the controller is reset,
 //! so no link outlives the host that knows its keys (§4).
@@ -18,13 +19,19 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use vinculum_hci::relay::{Out, Relay};
 
+#[cfg(feature = "usb")]
+mod usb_dev;
+
 enum Controller {
     Tcp(TcpStream),
     Uart(std::fs::File),
+    /// The H4 end of the USB threads' socketpair.
+    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
+    Usb(UnixStream),
 }
 
 impl Controller {
-    fn open(spec: &str) -> std::io::Result<Controller> {
+    fn open(spec: &str, firmware_dir: &std::path::Path) -> std::io::Result<Controller> {
         if let Some(addr) = spec.strip_prefix("tcp:") {
             let s = TcpStream::connect(addr)?;
             s.set_nodelay(true)?;
@@ -33,26 +40,43 @@ impl Controller {
             // The line must already be in raw mode at the controller's rate
             // (stty -f PATH raw 115200); setting termios here comes with H5.
             Ok(Controller::Uart(std::fs::OpenOptions::new().read(true).write(true).open(path)?))
+        } else if let Some(rest) = spec.strip_prefix("usb") {
+            Controller::open_usb(rest.strip_prefix(':').unwrap_or(rest), firmware_dir)
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "controller must be tcp:HOST:PORT or uart:PATH"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "controller must be tcp:HOST:PORT, uart:PATH or usb[:VVVV:PPPP]"))
         }
+    }
+    #[cfg(feature = "usb")]
+    fn open_usb(rest: &str, firmware_dir: &std::path::Path) -> std::io::Result<Controller> {
+        let sel = vinculum_hci::usb::parse_select(rest)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "usb controller must be usb or usb:VVVV:PPPP (hex ids)"))?;
+        let (s, name) = usb_dev::start(sel, firmware_dir)?;
+        eprintln!("vinculum-hci: USB controller {name}");
+        Ok(Controller::Usb(s))
+    }
+    #[cfg(not(feature = "usb"))]
+    fn open_usb(_rest: &str, _firmware_dir: &std::path::Path) -> std::io::Result<Controller> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "built without the usb feature"))
     }
     fn fd(&self) -> RawFd {
         match self {
             Controller::Tcp(s) => s.as_raw_fd(),
             Controller::Uart(f) => f.as_raw_fd(),
+            Controller::Usb(s) => s.as_raw_fd(),
         }
     }
     fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Controller::Tcp(s) => s.read(b),
             Controller::Uart(f) => f.read(b),
+            Controller::Usb(s) => s.read(b),
         }
     }
     fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
         match self {
             Controller::Tcp(s) => s.write_all(b),
             Controller::Uart(f) => f.write_all(b),
+            Controller::Usb(s) => s.write_all(b),
         }
     }
 }
@@ -75,29 +99,108 @@ fn wait(fds: &[RawFd], timeout_ms: i32) -> Vec<bool> {
     p.iter().map(|x| x.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0).collect()
 }
 
+/// Where vendor firmware files live (spec §5.2), read-only in the jail.
+const DEFAULT_FIRMWARE_DIR: &str = "/usr/local/share/atrium/firmware/bluetooth";
+
 /// How long to wait for the controller to finish a reset before taking a
 /// new host anyway (the new host's own Reset then sorts it out).
 const RESET_WAIT_MS: u64 = 3000;
 
+/// Development bridge: serves the raw controller as H4 over TCP on a
+/// loopback address, so a stack elsewhere (vinculum-hci in a VM through
+/// QEMU's user network, which reaches the host's loopback as 10.0.2.2, or
+/// vinculum-probe on the host) can use a dongle plugged into this machine
+/// without USB passthrough. No allowlist here: the far side's vinculum-hci
+/// applies it. One client at a time; the controller is reset when it leaves.
+fn bridge(spec: &str, addr: &str, firmware_dir: &std::path::Path) -> ! {
+    let die = |m: String| -> ! {
+        eprintln!("vinculum-hci: {m}");
+        std::process::exit(1)
+    };
+    let sa: std::net::SocketAddr = addr.parse().unwrap_or_else(|_| die(format!("--serve-tcp {addr}: not IP:PORT")));
+    if !sa.ip().is_loopback() {
+        die(format!("--serve-tcp {addr}: only a loopback address may serve a controller"));
+    }
+    let mut ctl = Controller::open(spec, firmware_dir).unwrap_or_else(|e| die(format!("controller {spec}: {e}")));
+    let listener = std::net::TcpListener::bind(sa).unwrap_or_else(|e| die(format!("listen {addr}: {e}")));
+    eprintln!("vinculum-hci: serving controller {spec} as H4 on {addr}");
+    let mut buf = vec![0u8; 8192];
+    let mut client: Option<TcpStream> = None;
+    // Only whole frames reach the controller, so a client leaving mid-frame
+    // cannot leave half a command in front of the Reset.
+    let mut from_client = vinculum_hci_proto::h4::Decoder::new();
+    loop {
+        let other = client.as_ref().map(|c| c.as_raw_fd()).unwrap_or(listener.as_raw_fd());
+        let ready = wait(&[ctl.fd(), other], -1);
+        if ready[0] {
+            let n = ctl.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                die("controller closed".into());
+            }
+            if let Some(c) = client.as_mut() {
+                if c.write_all(&buf[..n]).is_err() {
+                    client = None;
+                }
+            }
+        }
+        if ready[1] {
+            match client.as_mut() {
+                None => {
+                    if let Ok((s, peer)) = listener.accept() {
+                        let _ = s.set_nodelay(true);
+                        eprintln!("vinculum-hci: bridge client {peer}");
+                        from_client.reset();
+                        client = Some(s);
+                    }
+                }
+                Some(c) => {
+                    let n = c.read(&mut buf).unwrap_or(0);
+                    let mut frames = Vec::new();
+                    let bad = n > 0 && from_client.push(&buf[..n], |f| frames.push(f)).is_err();
+                    for f in frames {
+                        if let Err(e) = ctl.write_all(&f.to_bytes()) {
+                            die(format!("controller write: {e}"));
+                        }
+                    }
+                    if n == 0 || bad {
+                        eprintln!("vinculum-hci: bridge client {}; resetting the controller", if bad { "sent a malformed stream" } else { "left" });
+                        client = None;
+                        if let Err(e) = ctl.write_all(&vinculum_hci::relay::HCI_RESET) {
+                            die(format!("controller write: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let mut controller_spec = None;
     let mut listen = None;
+    let mut serve_tcp: Option<String> = None;
+    let mut firmware_dir = std::path::PathBuf::from(DEFAULT_FIRMWARE_DIR);
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
             "--controller" => controller_spec = a.next(),
             "--host-listen" => listen = a.next(),
+            "--serve-tcp" => serve_tcp = a.next(),
+            "--firmware-dir" => firmware_dir = a.next().map(Into::into).unwrap_or(firmware_dir),
             _ => {
-                eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH --host-listen PATH");
+                eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] (--host-listen PATH | --serve-tcp 127.0.0.1:PORT) [--firmware-dir DIR]");
                 std::process::exit(2);
             }
         }
     }
+    if let (Some(spec), Some(addr)) = (controller_spec.as_deref(), serve_tcp.as_deref()) {
+        bridge(spec, addr, &firmware_dir);
+    }
     let (Some(spec), Some(path)) = (controller_spec, listen) else {
-        eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH --host-listen PATH");
+        eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] (--host-listen PATH | --serve-tcp 127.0.0.1:PORT) [--firmware-dir DIR]");
         std::process::exit(2);
     };
-    let mut ctl = Controller::open(&spec).unwrap_or_else(|e| {
+    let mut ctl = Controller::open(&spec, &firmware_dir).unwrap_or_else(|e| {
         eprintln!("vinculum-hci: controller {spec}: {e}");
         std::process::exit(1)
     });

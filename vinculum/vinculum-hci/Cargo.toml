@@ -9,6 +9,12 @@ license.workspace = true
 vinculum-hci-proto = { path = "../vinculum-hci-proto" }
 libc = "0.2"
 
+[features]
+# The USB transport links the libusb-1.0 API: libusb in FreeBSD base, or
+# libusb-1.0 on a macOS/Linux development host. Off, only tcp: and uart: exist.
+default = ["usb"]
+usb = []
+
 [[bin]]
 name = "vinculum-hci"
 path = "src/main.rs"

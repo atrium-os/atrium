@@ -5616,6 +5616,21 @@ then `vinculum-ctl -s ctl.sock pair NAME` (asks on the terminal; `--yes` for scr
 Classic devices pair with `vinculum-ctl pair ADDR --classic`. `peer_hid_keyboard.py` is the Bumble keyboard,
 `peer_hogp_mouse.py` the LE mouse. With `--hid`, vinculumd also scans in the background while a bonded LE device is away.
 
+Real controllers (B1b, `vinculum/firmware/README.md` for the dongles' firmware):
+
+```sh
+cd vinculum && cargo build -p vinculum-hci -p vinculum-probe   # needs libusb-1.0 on a dev host (brew install libusb)
+vinculum-hci --controller usb --host-listen hci.sock            # first USB controller (class E0/01/01); usb:2357:0604 picks the UB500
+vinculum-hci --controller usb:2357:0604 --firmware-dir DIR ...  # Realtek patch from DIR (rtl8761bu_fw.bin + _config.bin)
+vinculum-hci --controller usb --serve-tcp 127.0.0.1:6402        # dev bridge: the raw controller as H4 on loopback
+vinculum-probe --tcp 127.0.0.1:6402 --scan 10                   # through the bridge: Reset, version, scan nearby devices
+```
+
+A guest on QEMU's user network reaches the bridge as `10.0.2.2:6402`, so the VM's
+`vinculum-hci --controller tcp:10.0.2.2:6402` uses a dongle on the Mac without USB
+passthrough (full-speed passthrough has panicked the Mac before: ask first).
+`--serve-tcp` refuses any address that is not loopback.
+
 ### 13.6c Navigator UI shell on frescod (`scripts/navigator-ui-vm.sh`)
 
 `navigator-ui` (docs/spec/navigator-ui.md §14 step 1) is the Navigator's window over a stand-in trail
