@@ -48,6 +48,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-inspect"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "atrium-links"
 version = "0.1.0"
 dependencies = [
@@ -662,6 +671,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "atrium-colr",
+ "atrium-inspect",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",

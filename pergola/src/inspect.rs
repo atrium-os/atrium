@@ -12,111 +12,17 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
-
 use crate::geom::{Point, Rect};
 use crate::node::{Node, NodeId, NodeTree};
 
-/// The largest frame either side takes.
-pub const MAX_FRAME: usize = 8 << 20;
-/// The most nodes a tree answer lists.
-pub const MAX_ITEMS: usize = 20_000;
-/// The most boxes "every box" outlines.
-pub const MAX_BOUNDS: usize = 1_500;
+pub use atrium_inspect::{encode, Ask, Decoder, Item, Site, Tell, MAX_BOUNDS, MAX_FRAME, MAX_ITEMS};
+#[cfg(debug_assertions)]
+pub use atrium_inspect::Link;
+
 /// Longest text quoted in a node's detail, in characters.
 const MAX_QUOTE: usize = 120;
 /// Longest source path sent, in bytes.
 const MAX_PATH: usize = 1024;
-
-/// What the IDE asks.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Ask {
-    /// The node tree as last drawn: answered with [`Tell::Tree`].
-    Tree,
-    /// Take the next press for the inspector (not the app), and answer
-    /// [`Tell::Picked`]; `false` stops waiting for one.
-    Pick(bool),
-    /// Outline this node (`None`: none).
-    Highlight(Option<u32>),
-    /// Outline every box.
-    Bounds(bool),
-}
-
-/// What the app tells.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Tell {
-    /// First on the socket: which process this is.
-    Hello { pid: u32 },
-    Tree(Vec<Item>),
-    /// The node under the press a [`Ask::Pick`] waited for.
-    Picked(u32),
-    /// What is drawn changed since the last [`Tell::Tree`].
-    Changed,
-}
-
-/// One node of the tree, parents before children.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Item {
-    pub id: u32,
-    pub parent: Option<u32>,
-    pub depth: u16,
-    /// `Rect`, `Text`, `Stack`, ...
-    pub kind: String,
-    /// Its box in the window, in points (x, y, w, h); `None` when it is
-    /// scrolled out of view or has no size.
-    pub rect: Option<[f32; 4]>,
-    /// Its colours, fonts and text, in a line.
-    pub detail: String,
-    /// The app's source line that made it.
-    pub site: Option<Site>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Site {
-    pub file: String,
-    pub line: u32,
-    pub col: u32,
-}
-
-/// A frame: length, then the message.
-pub fn encode<T: Serialize>(msg: &T) -> Option<Vec<u8>> {
-    let body = postcard::to_allocvec(msg).ok()?;
-    if body.len() > MAX_FRAME {
-        return None;
-    }
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&body);
-    Some(out)
-}
-
-/// Frames out of a byte stream. A frame over [`MAX_FRAME`] or one that
-/// does not decode is an error: drop the peer.
-#[derive(Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-}
-
-impl Decoder {
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buf.extend_from_slice(bytes);
-    }
-
-    /// Bytes waiting for the rest of their frame.
-    pub fn pending(&self) -> usize { self.buf.len() }
-
-    pub fn next<T: for<'de> Deserialize<'de>>(&mut self) -> Result<Option<T>, String> {
-        let Some(head) = self.buf.get(..4) else { return Ok(None) };
-        let n = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        if n > MAX_FRAME {
-            return Err(format!("a frame of {n} bytes (at most {MAX_FRAME})"));
-        }
-        let Some(body) = self.buf.get(4..4 + n) else { return Ok(None) };
-        let msg = postcard::from_bytes(body).map_err(|e| format!("a frame that does not decode: {e}"))?;
-        self.buf.drain(..4 + n);
-        Ok(Some(msg))
-    }
-}
 
 /// Whether `at` is in Pergola's own source: what a widget draws inside
 /// itself belongs to the app's line that drew the widget.
@@ -265,96 +171,6 @@ pub fn draw_marks(tree: &mut NodeTree, marks: &Marks) -> HashSet<NodeId> {
         }
     }
     added
-}
-
-/// The app's end of the IDE's socket (dev builds).
-#[cfg(debug_assertions)]
-pub struct Link {
-    stream: std::os::unix::net::UnixStream,
-    rx: Decoder,
-    tx: Vec<u8>,
-    /// A press goes to the inspector, not the app.
-    pub picking: bool,
-    /// The IDE has a tree and wants to hear when it changes.
-    pub following: bool,
-    pub marks: Marks,
-}
-
-#[cfg(debug_assertions)]
-impl Link {
-    /// The socket `ATRIUM_INSPECT_FD` names, once per process.
-    pub fn from_env() -> Option<Self> {
-        use std::os::fd::FromRawFd;
-        static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let fd: i32 = std::env::var("ATRIUM_INSPECT_FD").ok()?.parse().ok()?;
-        if fd < 3 || TAKEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return None;
-        }
-        // SAFETY: fstat on a descriptor number only reads its status.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
-            return None;
-        }
-        // SAFETY: a socket this process was started with and nothing else
-        // owns: `TAKEN` lets it be taken once.
-        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        let mut l = Self::new(stream).ok()?;
-        l.send(&Tell::Hello { pid: std::process::id() });
-        Some(l)
-    }
-
-    pub fn new(stream: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
-        stream.set_nonblocking(true)?;
-        Ok(Self { stream, rx: Decoder::default(), tx: Vec::new(), picking: false, following: false, marks: Marks::default() })
-    }
-
-    /// Queue `msg` and send what the socket takes now.
-    pub fn send(&mut self, msg: &Tell) {
-        if let Some(f) = encode(msg) {
-            if self.tx.len() + f.len() <= 2 * MAX_FRAME {
-                self.tx.extend_from_slice(&f);
-            }
-        }
-        self.flush();
-    }
-
-    fn flush(&mut self) {
-        use std::io::Write;
-        while !self.tx.is_empty() {
-            match self.stream.write(&self.tx) {
-                Ok(0) => break,
-                Ok(n) => { self.tx.drain(..n); }
-                Err(_) => break,
-            }
-        }
-    }
-
-    /// What the IDE asked since the last call; `Err` when it went or
-    /// broke the protocol (drop the link).
-    pub fn poll(&mut self) -> Result<Vec<Ask>, String> {
-        use std::io::Read;
-        self.flush();
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.stream.read(&mut buf) {
-                Ok(0) => return Err("the inspector went".into()),
-                Ok(n) => {
-                    self.rx.push(&buf[..n]);
-                    if self.rx.buf.len() > MAX_FRAME + 4 {
-                        return Err("the inspector sent too much".into());
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        let mut asks = Vec::new();
-        while let Some(a) = self.rx.next::<Ask>()? {
-            asks.push(a);
-        }
-        Ok(asks)
-    }
 }
 
 #[cfg(test)]

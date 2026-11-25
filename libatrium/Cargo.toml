@@ -22,6 +22,8 @@ fresco-protocol = { path = "../fresco-protocol" }
 # the same one Pergola uses — not a parallel hand-rolled CLASS_DISPLAY impl.
 fresco-client   = { path = "../fresco-client" }
 postcard        = { version = "1", features = ["use-std"] }
+atrium-inspect  = { path = "../atrium-inspect" }
+libc            = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

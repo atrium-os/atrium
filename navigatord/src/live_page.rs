@@ -1819,3 +1819,119 @@ mod cors_tests {
         assert_eq!(cors(&h(&[("access-control-allow-origin", "https://a.example, https://b.example")])), None);
     }
 }
+
+/// The engine's side of the reporter channel, fuzzed (I6.6): every address
+/// and body it sends navigatord is hostile. A fixed seed, so a failure
+/// repeats; each case is a mutation of an honest request.
+#[cfg(test)]
+mod channel_fuzz {
+    use super::*;
+    use crate::live_frames::{FrameAsk, Mailbox, MESSAGE_MAX, QUEUE_MAX, FRAME_MIN};
+
+    pub(crate) struct Rng(u64);
+    impl Rng {
+        pub(crate) fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
+        pub(crate) fn below(&mut self, n: usize) -> usize { (self.next() % n.max(1) as u64) as usize }
+        pub(crate) fn bytes(&mut self, max: usize) -> Vec<u8> { let n = self.below(max + 1); (0..n).map(|_| self.next() as u8).collect() }
+    }
+
+    const PIECES: &[&str] = &["id", "url", "x", "y", "w", "h", "gone", "to", "target", "api", "name", "type", "=", "&", "?", "%", "%00",
+        "%ff", "-", "+", "0", "1", "4294967296", "-2147483649", "2147483647", "*", "/", "https://pay.example", "https://evil.example/x",
+        "javascript:1", "\u{202e}", " ", "#", "frame=1", "1;base64"];
+    const SEEDS: &[&str] = &[
+        "https://live-page.atrium.invalid/frame?id=1&url=https%3A%2F%2Fpay.example%2Ff.html&x=10&y=20&w=320&h=80",
+        "https://live-page.atrium.invalid/frame?id=3&gone=1",
+        "https://live-page.atrium.invalid/message?to=1&target=https%3A%2F%2Fpay.example",
+        "https://live-page.atrium.invalid/message?target=*",
+        "https://live-page.atrium.invalid/messages",
+        "https://live-page.atrium.invalid/refused?api=geolocation",
+        "https://live-page.atrium.invalid/download?name=report.csv&type=text%2Fcsv",
+        "https://live-page.atrium.invalid/reporter.js?frame=1",
+    ];
+
+    fn mutate(r: &mut Rng, s: &str) -> String {
+        let mut b = s.as_bytes().to_vec();
+        for _ in 0..1 + r.below(4) {
+            let at = r.below(b.len());
+            match r.below(4) {
+                0 => { b.truncate(at); }
+                1 => { let p = PIECES[r.below(PIECES.len())].as_bytes(); b.splice(at..at, p.iter().copied()); }
+                2 => { if at < b.len() { b[at] = r.next() as u8; } }
+                _ => { let n = r.below(3000); b.extend(std::iter::repeat_n(b'9', n)); }
+            }
+        }
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    #[test]
+    fn hostile_reporter_addresses_are_refused_or_taken_within_bounds() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut taken = 0;
+        for i in 0..20_000 {
+            let url = mutate(&mut r, SEEDS[i % SEEDS.len()]);
+            match reporter_request(&url) {
+                Some(Reporter::Frame(FrameAsk::At { id, url, rect })) => {
+                    taken += 1;
+                    assert!(id > 0 && navigator_control::clean(&url, navigator_control::URL_MAX), "{url}");
+                    let _ = (crate::live_frames::frame_rect([0, 0, 800, 600], rect), crate::live_frames::frame_address("https://app.example/", &url), FRAME_MIN);
+                }
+                Some(Reporter::Frame(FrameAsk::Gone { id })) => { taken += 1; assert!(id > 0); }
+                Some(Reporter::Message { to }) => { taken += 1; assert!(to != Some(0)); assert!(reporter_target(&url).is_some()); }
+                Some(Reporter::Download { name, kind }) => {
+                    taken += 1;
+                    assert!(name.chars().count() <= 255 && kind.len() <= 128 && kind.bytes().all(|b| b.is_ascii_graphic()));
+                }
+                Some(_) => taken += 1,
+                None => {}
+            }
+            if let Some(t) = reporter_target(&url) { assert!(t == "*" || t == "/" || t.len() <= 300); }
+        }
+        // The mutations are not all refused: the seeds' shapes still get through.
+        assert!(taken > 300, "{taken}");
+    }
+
+    #[test]
+    fn hostile_messages_between_a_page_and_its_frames_stay_bounded() {
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let origins = ["https://app.example", "https://pay.example", "https://evil.example"];
+        let targets = ["*", "/", "https://app.example", "https://pay.example/p", "https://evil.example", "", "app.example", "https://app.example:1"];
+        for _ in 0..200 {
+            let mut m = Mailbox::default();
+            for _ in 0..400 {
+                let id = r.below(5) as u32;
+                let data = if r.below(10) == 0 { "x".repeat(MESSAGE_MAX + r.below(2)) } else { String::from_utf8_lossy(&r.bytes(64)).into_owned() };
+                let target = targets[r.below(targets.len())];
+                match r.below(9) {
+                    0 => m.page_started(origins[r.below(3)].into()),
+                    1 => m.frame_added(id),
+                    2 => m.frame_started(id, origins[r.below(3)].into()),
+                    3 => m.frame_gone(id),
+                    4 | 5 => { if m.from_page(id, target, data.clone()).is_ok() { assert!(!data.is_empty() && data.len() <= MESSAGE_MAX); } }
+                    6 | 7 => { if m.from_frame(id, target, data.clone()).is_ok() { assert!(!data.is_empty() && data.len() <= MESSAGE_MAX); } }
+                    _ => {
+                        for got in [m.take_for_page(), m.take_for_frame(id)] {
+                            let v: Vec<serde_json::Value> = serde_json::from_slice(&got).expect("always JSON");
+                            assert!(v.len() <= QUEUE_MAX);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_hostile_document_gets_the_reporter_once_and_first() {
+        let mut r = Rng(0x1234_5678_9abc_def1);
+        let seeds: [&[u8]; 4] = [b"<!doctype html><html><head></head><body>x</body></html>", b"<!-- a --><!DOCTYPE html>", b"<html>", b""];
+        for i in 0..5_000 {
+            let mut html = seeds[i % seeds.len()].to_vec();
+            let extra = r.bytes(200);
+            let at = r.below(html.len());
+            html.splice(at..at, extra);
+            for frame in [false, true] {
+                let out = with_reporter_for(&html, frame);
+                assert!(out.len() > html.len(), "the script was added");
+            }
+        }
+    }
+}

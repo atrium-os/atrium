@@ -30,6 +30,7 @@
 
 #![warn(missing_docs)]
 
+pub mod inspect;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
@@ -1219,10 +1220,13 @@ pub extern "C" fn atrium_window_fill_rect(
     with_fresco_conn(|conn| {
         conn.set_default_window(window_id as u16);
         if conn.scene_frame_begin().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        inspect::begin();
         if conn.scene_node_rect(1, fresco_protocol::RectParams {
             x, y, w, h, r, g, b, a, radius: 0.0,
         }).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
-        if conn.scene_frame_end().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        inspect::record(1, "Rect", [x, y, w, h], || format!("fill {}", inspect::hex(r, g, b, a)));
+        if draw_marks(conn).is_err() || conn.scene_frame_end().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        inspect::end();
         0
     })
 }
@@ -1286,6 +1290,7 @@ pub extern "C" fn atrium_window_frame_begin(window_id: u32) -> c_int {
     });
     if rc == 0 {
         *guard = Some(window_id);
+        inspect::begin();
     }
     rc
 }
@@ -1314,6 +1319,7 @@ pub extern "C" fn atrium_window_frame_rect(
         }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
+        inspect::record(node_id, "Rect", [x, y, w, h], || format!("fill {}", inspect::hex(r, g, b, a)));
         0
     })
 }
@@ -1397,6 +1403,7 @@ pub extern "C" fn atrium_window_frame_texture(
         }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
+        inspect::record(node_id, "Texture", [x, y, w, h], || format!("slot {slot_id}"));
         0
     })
 }
@@ -1426,6 +1433,8 @@ pub extern "C" fn atrium_window_frame_path(
         }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
+        inspect::record(node_id, "Path", inspect::quad_box(cx, cy, length, width, angle),
+            || format!("length {length:.1} width {width:.1} turned {:.0}° {}", angle.to_degrees(), inspect::hex(r, g, b, a)));
         0
     })
 }
@@ -1501,6 +1510,15 @@ pub unsafe extern "C" fn atrium_window_frame_glyph_run(
             bearing_x: g.bearing_x, bearing_y: g.bearing_y,
         }
     }).collect();
+    let n = glyph_vec.len();
+    let bbox = glyph_vec.iter().fold(None::<[f32; 4]>, |acc, g| {
+        let (gx, gy) = (x + g.dx + g.bearing_x, y + g.dy - g.bearing_y);
+        let (gx1, gy1) = (gx + g.atlas_w as f32, gy + g.atlas_h as f32);
+        Some(match acc {
+            None => [gx, gy, gx1, gy1],
+            Some([a0, b0, a1, b1]) => [a0.min(gx), b0.min(gy), a1.max(gx1), b1.max(gy1)],
+        })
+    }).map(|[a0, b0, a1, b1]| [a0, b0, a1 - a0, b1 - b0]).unwrap_or([x, y, 0.0, 0.0]);
     with_fresco_conn(|conn| {
         conn.set_default_window(window_id as u16);
         if conn.scene_node_glyph_run(node_id, fresco_protocol::GlyphRunParams {
@@ -1511,6 +1529,7 @@ pub unsafe extern "C" fn atrium_window_frame_glyph_run(
         }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
+        inspect::record(node_id, "Glyphs", bbox, || format!("{n} glyphs, atlas slot {atlas_slot_id} {}", inspect::hex(r, g, b, a)));
         0
     })
 }
@@ -1527,13 +1546,28 @@ pub extern "C" fn atrium_window_frame_end() -> c_int {
         Some(w) => w,
         None => return ATRIUM_ERR_FRESCO_RPC,
     };
-    with_fresco_conn(|conn| {
+    let rc = with_fresco_conn(|conn| {
         conn.set_default_window(window_id as u16);
-        if conn.scene_frame_end().is_err() {
+        if draw_marks(conn).is_err() || conn.scene_frame_end().is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
-    })
+    });
+    inspect::end();
+    rc
+}
+
+/// The inspector's outlines (none unless an IDE asked), over the frame
+/// just before it ends: each box as four thin rects.
+fn draw_marks(conn: &mut fresco_client::Connection) -> std::io::Result<()> {
+    let mut id = inspect::MARK_BASE;
+    for ([x, y, w, h], [r, g, b, a], t) in inspect::marks() {
+        for (rx, ry, rw, rh) in [(x, y, w, t), (x, y + h - t, w, t), (x, y, t, h), (x + w - t, y, t, h)] {
+            conn.scene_node_rect(id, fresco_protocol::RectParams { x: rx, y: ry, w: rw, h: rh, r, g, b, a, radius: 0.0 })?;
+            id = id.wrapping_add(1);
+        }
+    }
+    Ok(())
 }
 
 /// Window event kinds returned by [`atrium_window_poll_event`].
@@ -1589,6 +1623,7 @@ pub unsafe extern "C" fn atrium_window_poll_event(
     if out.is_null() {
         return ATRIUM_ERR_INVALID_PATH;
     }
+    inspect::serve();
     let mut g = FRESCO_CONN.lock().unwrap();
     let Some(conn) = g.as_mut() else {
         return ATRIUM_ERR_NO_FRESCO;
@@ -1613,6 +1648,12 @@ pub unsafe extern "C" fn atrium_window_poll_event(
                     kind: ATRIUM_EV_WINDOW_CLOSE_REQUESTED, _pad: 0,
                     window_id, arg1: 0, arg2: 0,
                 },
+                // A press may be the inspector's pick; pointer events are not
+                // part of this v0 surface either way.
+                fresco_client::Event::PointerButton { x, y, pressed: true, .. } => {
+                    inspect::press(x, y);
+                    return 0;
+                }
                 // DPI / key / pointer / unknown aren't part of this v0 window-event
                 // surface — drop; the caller polls again.
                 _ => return 0,

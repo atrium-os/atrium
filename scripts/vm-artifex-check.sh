@@ -559,6 +559,46 @@ else
     echo "  (no dev app for the inspector: skipped)"
 fi
 
+echo "=== Inspect a C dev app (libatrium)"
+# libatrium answers too: each frame call is a node, and atrium.h's macros
+# give it the app's line. The C SDK in the base must be this tree's
+# (install-c-sdk.sh); the app was built by the Debug section.
+if want inspect && V "grep -q atrium__site /usr/include/atrium/atrium.h" && V "test -x $W/proj/work/app/app"; then
+    press 614 89               # the app.c tab
+    waitstate 'active=Some(2)' 20 || bad "app.c tab: $(state)"
+    press 296 52               # Run: make run, which asks to Run app
+    waitstate 'ask=Some("app")' 300 && ok "make run asks to Run app" || bad "c ask: $(state)"
+    GAP=8 press 980 520
+    CDEV=dev.alice.proj.org.example.app
+    n=0
+    while [ $n -lt 3 ] && ! waitstate "note=Some(\"Running $CDEV\")" 120 \
+        && [ "$(V "grep -c 'proj/app for alice REFUSED: the press was too long ago' $LOG")" -gt $n ]; do
+        n=$((n + 1)); echo "  (the press expired on the way: again, $n)"
+        waitstate 'running=None' 120
+        press 296 52
+        waitstate 'ask=Some("app")' 300 && GAP=8 press 980 520
+    done
+    waitstate "inspect=Some((\"$CDEV\", true, true, [1-9]" 300 && ok "a C dev build answers with its frame ($(state | sed 's/.*inspect=Some(([^,]*, true, true, \([0-9]*\).*/\1/') nodes)" \
+        || bad "no C frame: $(state | sed 's/.*inspect=//')"
+    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\)))$/\1/')
+    case "$I" in ''|*[!0-9]*) I=5;; esac
+    press 64 $((100 + 42 * I))
+    waitstate 'view=Inspect' 20 || bad "c view: $(state)"
+    press 864 102
+    waitstate "inspect=Some((\"$CDEV\", true, true, [0-9]*, true," 30 || bad "c pick: $(state | sed 's/.*inspect=//')"
+    # The window's background rect, left of Artifex's window.
+    press 20 300
+    LC=$(V "grep -n 'atrium_window_frame_rect(1' $W/proj/work/app/app.c | head -1 | cut -d: -f1")
+    waitstate "inspect=Some((\"$CDEV\", true, true, [0-9]*, false, false, Some(\"Rect\"), Some(\"app/app.c:$LC\")" 60 \
+        && ok "a press picks its background rect, drawn at app/app.c:$LC" || bad "c picked: $(state | sed 's/.*inspect=//')"
+    shot artifex-25-inspect-c-app
+    V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+    waitstate "inspect=Some((\"$CDEV\", false, true," 60 || bad "c ended: $(state | sed 's/.*inspect=//')"
+    GAP=8 press 700 640
+else
+    echo "  (no C SDK with the inspector in the base, or no C app: skipped)"
+fi
+
 echo "=== New project"
 if want newproject && V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
     press 962 52               # the bar's New project (ui.rs)

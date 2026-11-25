@@ -34,6 +34,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-inspect"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -315,8 +324,10 @@ name = "libatrium"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-inspect",
  "fresco-client",
  "fresco-protocol",
+ "libc",
  "postcard",
 ]
 

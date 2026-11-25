@@ -1,0 +1,12 @@
+[package]
+name = "atrium-inspect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The inspector's wire (dev-tools.md §3.6): what an IDE asks a dev build of an app about its UI and what the app answers, framed and bounded, and the app's end of the socket portcullisd hands it. Pergola and libatrium answer on it; Artifex asks."
+
+[dependencies]
+serde    = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+libc     = "0.2"

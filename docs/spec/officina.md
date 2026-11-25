@@ -4905,6 +4905,13 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - **Ctrl+Alt+V** opens the Paste Special bar (pergola's grid sends `GridAction::PasteSpecial`). The menu item shows the key.
 - Tests: `excel_keys_for_the_active_cell_corners_and_screens` (pergola) and the Paste Special test (Sheets). Sheets 143 and pergola 239 lib tests pass.
 
+### 16.117 Window keys: save, open, new, Save As, Name Manager (2026-11-25)
+
+- **Ctrl+S** saves, **F12** opens Save As, **Ctrl+O** opens the file picker, and **Ctrl+N** opens a new workbook. **Ctrl+F3** opens the Name Manager. Ctrl+P, Ctrl+F and Ctrl+H work as before, now through the same path.
+- `Sheets::window_key(usage, modifiers)` maps the window's raw key (USB HID usage and Fresco's modifier bits) to a `Cmd`. It enters a cell being edited first, as Excel does. It answers nothing while the password bar, the close question or a picker is up, or with Alt or the logo key held. On the launcher only Ctrl+O and Ctrl+N work.
+- The menus show Ctrl+F for Find and Replace and Ctrl+F3 for the Name Manager.
+- Test: `window_keys_save_open_find_and_enter_the_cell_being_edited`. All 144 Sheets lib tests and the bin tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

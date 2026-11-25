@@ -711,17 +711,14 @@ fn main() {
                 run.sheets.cmds.lock().unwrap().push(cmd);
                 true
             }
-            fresco_client::Event::Key { hid_usage: 0x09 | 0x0b, pressed: true, modifiers, repeat: false, .. }
-                if modifiers & 0b0001_0001 != 0 => {
-                run.sheets.cmds.lock().unwrap().push(Cmd::Author(atrium_sheets::app::AuthorCmd::FindOpen));
-                true
-            }
-            fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
-                want_print = Some(false);
-                true
-            }
             fresco_client::Event::Key { hid_usage: 0x1a, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
                 close_requested = true;
+                true
+            }
+            // Ctrl+S, Ctrl+O, Ctrl+N, F12, Ctrl+P, Ctrl+F/H, Ctrl+F3.
+            fresco_client::Event::Key { hid_usage, pressed: true, modifiers, repeat: false, .. } => {
+                let Some(cmd) = run.sheets.window_key(*hid_usage, *modifiers) else { return false };
+                run.sheets.cmds.lock().unwrap().push(cmd);
                 true
             }
             _ => false,
