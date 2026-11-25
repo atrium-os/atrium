@@ -652,7 +652,11 @@ fn validate_class_root(path: &str, class: &crate::protocol::JailClass, policy: &
         !owner.is_empty() && !owner.contains('/') && matches_glob(&pat.replace("{owner}", owner), path)
     });
     if !ok {
-        return deny("path.class_root", format!("{path:?} is not a {} jail's root for {owner}", class_name(class)));
+        // An empty list is an older policy file, not a bad request: say so.
+        let hint = if policy.apps.class_roots.is_empty() {
+            " (this jaild policy has no [apps] class_roots: it predates jails made by jaild; merge etc/jaild.policy.toml, as scripts/deploy-portcullis.sh does)"
+        } else { "" };
+        return deny("path.class_root", format!("{path:?} is not a {} jail's root for {owner}{hint}", class_name(class)));
     }
     Ok(())
 }

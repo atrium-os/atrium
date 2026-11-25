@@ -769,11 +769,21 @@ fn handle_remove(
     if let Some(p) = jail_path.as_deref() {
         if p != "/" && !p.is_empty() {
             let devdir = format!("{}/dev", p.trim_end_matches('/'));
-            {
-                if let Err(e) = ffi::unmount_at(&devdir, 0) {
-                    if e.raw_os_error() != Some(libc::EINVAL) {
-                        warn!("jaild: RemoveJail devfs unmount {devdir}: {e}");
+            // A jail that was just removed can hold its devfs for a moment
+            // while its last processes exit: a few short tries (jaild serves
+            // one request at a time, so never long), then say so.
+            let mut tries = 0;
+            loop {
+                match ffi::unmount_at(&devdir, 0) {
+                    Err(e) if e.raw_os_error() == Some(libc::EBUSY) && tries < 10 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
+                    Err(e) if e.raw_os_error() != Some(libc::EINVAL) => {
+                        warn!("jaild: RemoveJail devfs unmount {devdir} (after {tries} tries): {e}");
+                        break;
+                    }
+                    _ => break,
                 }
             }
         }

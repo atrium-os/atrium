@@ -1705,11 +1705,18 @@ pub fn remove_jail_rctl(name: &str) -> io::Result<()> {
             format!("jail name {name:?} contains unsafe characters")));
     }
     let out = std::process::Command::new("rctl").arg("-r").arg(format!("jail:{name}")).output()?;
-    // rctl -r on a filter that matches nothing exits 0 on FreeBSD; a missing
-    // RACCT (no rule could exist) is not a failure to remove either.
+    // A filter that matches nothing is success: rctl exits 0, or (16-CURRENT)
+    // fails with ESRCH, "No such process". A missing RACCT (no rule could
+    // exist) is not a failure to remove either.
     if out.status.success() || !racct_enabled() { return Ok(()) }
     let stderr = String::from_utf8_lossy(&out.stderr);
+    if no_matching_rule(&stderr) { return Ok(()) }
     Err(io::Error::new(io::ErrorKind::Other, format!("rctl -r jail:{name}: {}", stderr.trim())))
+}
+
+/// rctl's answer when no rule matched the filter (ESRCH).
+fn no_matching_rule(stderr: &str) -> bool {
+    stderr.trim_end().ends_with("No such process")
 }
 
 /// Set jail `name`'s RCTL `memoryuse` cap (and, if given, its `pcpu` cap).
@@ -1850,6 +1857,13 @@ mod privilege_drop_tests {
         assert_eq!(super::superseded_rules(listing, "app-x--1", 256, Some(50)),
                    vec!["jail:app-x--1:memoryuse:sigkill=4294967296".to_string(),
                         "jail:app-x--1:pcpu:deny=100".to_string()]);
+    }
+
+    #[test]
+    fn rctl_no_matching_rule_is_esrch_only() {
+        assert!(no_matching_rule("rctl: failed to remove rule 'jail:app-x--7': No such process\n"));
+        assert!(!no_matching_rule("rctl: failed to remove rule 'jail:x': Operation not permitted"));
+        assert!(!no_matching_rule(""));
     }
 
     #[test]
