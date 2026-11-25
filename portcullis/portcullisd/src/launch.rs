@@ -1591,6 +1591,14 @@ fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, p
         Some(uid) => uid,
         None => {
             let uid = portcullis_peer::allocate(reg).map_err(|e| fail(format!("allocate: {e}")))?;
+            /* A fresh binding may reuse the account of a uid whose registry
+             * entry is gone (the registry is in /var/run, which a boot
+             * clears; the account and its group memberships are not). It
+             * must start with no supplementary groups, or it carries the
+             * last owner's files groups into this app. */
+            if let Some(name) = portcullis_peer::username(uid) {
+                drop_supplementary_groups(&name).map_err(fail)?;
+            }
             portcullis_peer::register_document(reg, uid, owner, app_id, publisher, persona, document)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
@@ -1598,6 +1606,31 @@ fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, p
     };
     let run_as = ensure_passwd(uid).map_err(fail)?;
     Ok((uid, run_as))
+}
+
+/// Take an app account out of every group it is a member of, and check
+/// that it is out (an account left in one would get it at initgroups).
+fn drop_supplementary_groups(name: &str) -> Result<(), String> {
+    run("pw", &["usermod", name, "-G", ""]).map_err(|e| format!("clear the groups of {name}: {e}"))?;
+    let o = std::process::Command::new("pw").args(["groupshow", "-a"]).output()
+        .map_err(|e| format!("pw groupshow -a: {e}"))?;
+    if !o.status.success() {
+        return Err(format!("pw groupshow -a: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&o.stdout);
+    if let Some(g) = still_member(&text, name) {
+        return Err(format!("{name} is still in group {g}"));
+    }
+    eprintln!("portcullisd: reusing the account {name} with no supplementary groups");
+    Ok(())
+}
+
+/// The first group in `group(5)` text that lists `name` as a member.
+fn still_member<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() >= 4 && f[3].split(',').any(|m| m == name)).then_some(f[0])
+    })
 }
 
 /// Ensure a host passwd entry exists for a dedicated 50000+ uid (its
@@ -2247,5 +2280,19 @@ pub fn remove_jails_at(path: &Path) {
     // unmounts, or the root survives the teardown and Delete refuses.
     for name in removed {
         portcullis_mounts::wait_jail_gone(&name, portcullis_mounts::JAIL_GONE_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod reused_account_tests {
+    use super::still_member;
+
+    #[test]
+    fn a_reused_app_account_left_in_a_group_is_found() {
+        let groups = "wheel:*:0:root\nfiles-alice:*:2000:atrium-app-50006,atrium-app-50007\nfiles-bob:*:2002:\n";
+        assert_eq!(still_member(groups, "atrium-app-50006"), Some("files-alice"));
+        assert_eq!(still_member(groups, "atrium-app-50007"), Some("files-alice"));
+        assert_eq!(still_member(groups, "atrium-app-5000"), None, "a prefix is not a member");
+        assert_eq!(still_member("files-bob:*:2002:\n", "atrium-app-50006"), None);
     }
 }
