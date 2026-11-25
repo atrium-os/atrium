@@ -131,9 +131,10 @@ impl Launcher for Portcullis {
 
     /// A plugin: as any provider for the parent, held to the plugin
     /// limits whatever its manifest asks (dev-tools.md §3.8).
-    fn launch_plugin(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
+    /// `workspace` is the parent's to name and portcullisd's to check.
+    fn launch_plugin(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, workspace: Option<&str>) -> Result<u32, String> {
         self.start_limited(Exec::Instance, app, embed, channel, Some(parent_uid), None, None,
-            Some(crate::catalogue::PLUGIN_MEMORY_MB), Some(crate::catalogue::PLUGIN_CPU_PCT))
+            Some(crate::catalogue::PLUGIN_MEMORY_MB), Some(crate::catalogue::PLUGIN_CPU_PCT), workspace)
     }
 
     fn end(&mut self, embed: EmbedId) {
@@ -156,11 +157,11 @@ enum Exec {
 impl Portcullis {
     #[allow(clippy::too_many_arguments)]
     fn start_as(&mut self, exec: Exec, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>) -> Result<u32, String> {
-        self.start_limited(exec, app, embed, channel, serves, persona, fetch, memory_mb, None)
+        self.start_limited(exec, app, embed, channel, serves, persona, fetch, memory_mb, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_limited(&mut self, exec: Exec, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>, cpu_pct: Option<u32>) -> Result<u32, String> {
+    fn start_limited(&mut self, exec: Exec, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>, fetch: Option<UnixStream>, memory_mb: Option<u64>, cpu_pct: Option<u32>, workspace: Option<&str>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         // A provider from its manifest's [roles] implements has no system
         // rule: portcullisd runs it as a uid of the parent's instance (as a
@@ -200,6 +201,7 @@ impl Portcullis {
                     require_memory_limit: true,
                     serves,
                     persona: persona.map(str::to_string),
+                    workspace: workspace.map(str::to_string),
                 },
             };
             write_request(&mut s, &req)?;

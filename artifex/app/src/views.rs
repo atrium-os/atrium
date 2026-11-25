@@ -695,9 +695,15 @@ pub fn plugins(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
         ctx.key(8600 + i as u64 * 4);
         let app = r.app.clone();
         if r.on {
-            Button::secondary("Switch off").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app, false))).render(ctx);
+            Button::secondary("Switch off").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app.clone(), false))).render(ctx);
         } else {
-            Button::primary("Switch on").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app, true))).render(ctx);
+            Button::primary("Switch on").at(x0 + w - em(150.0), y + em(6.0)).width(em(118.0)).on_click(plain(q, Act::PluginSwitch(app.clone(), true))).render(ctx);
+        }
+        // Reading the workspace is the person's to allow, here.
+        if let Some(read) = r.read {
+            ctx.key(8602 + i as u64 * 4);
+            let b = if read { Button::secondary("Take back") } else { Button::secondary("Allow reading") };
+            b.at(x0 + w - em(150.0), y + em(44.0)).width(em(118.0)).on_click(plain(q, Act::PluginRead(app.clone(), !read))).render(ctx);
         }
         let mut ly = y + em(44.0);
         for a in &r.asks {

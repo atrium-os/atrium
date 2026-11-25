@@ -455,6 +455,11 @@ fn person_uid(person: &str) -> Option<u32> {
 }
 
 /// The person's home and files group (made if missing).
+/// The person's files group, which every workspace's `work` is shared under.
+pub fn files_gid(owner: &str) -> Result<u32, String> {
+    person(owner).map(|p| p.1)
+}
+
 fn person(owner: &str) -> Result<(PathBuf, u32), String> {
     let r = crate_home::ensure_person(owner)?;
     // Workspaces and their object cache are app data (E6).

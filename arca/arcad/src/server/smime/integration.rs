@@ -71,6 +71,7 @@ fn launch_worker(app_id: &str) -> io::Result<(UnixStream, UnixStream)> {
             require_memory_limit: true,
             serves: None,
             persona: None,
+            workspace: None,
         },
     )?;
     if !matches!(

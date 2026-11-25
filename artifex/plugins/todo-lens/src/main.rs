@@ -84,9 +84,15 @@ fn main() {
             let msg = match ev {
                 Event::Lsp(m) => m,
                 Event::Command { id, .. } if id == "todo-lens.count" => {
-                    let n: usize = found.values().map(Vec::len).sum();
-                    let files = found.values().filter(|v| !v.is_empty()).count();
-                    p.status(&format!("{n} TODO{} in {files} file{}", if n == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" }))?;
+                    // Allowed to read the workspace: all of it; else the open files.
+                    let (files, n, of) = match p.workspace() {
+                        Some(root) => {
+                            let (f, n) = todo_lens::in_tree(root);
+                            (f, n, " of the workspace")
+                        }
+                        None => (found.values().filter(|v| !v.is_empty()).count(), found.values().map(Vec::len).sum(), ""),
+                    };
+                    p.status(&format!("{n} TODO{} in {files} file{}{of}", if n == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" }))?;
                     continue;
                 }
                 Event::Detaching => return Ok(()),

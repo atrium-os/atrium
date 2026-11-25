@@ -552,10 +552,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             };
             handle_exec_instance(app_id.clone(), instance.clone(), 16, (Some(PANE_MEMORY_MB), None, true), Some(rule), Vec::new(),
                                  &owner, &shared, &LIMITER, &mut writer, &reader, None, Some(pane_uid), None, None, false,
-                                 Some(data))?;
+                                 Some(data), None)?;
             continue;
         }
-        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into } = req {
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into, workspace } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
              * fetcher's own network would make it anyone's raw fetch. */
@@ -623,6 +623,17 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                     message: "only limend starts a provider in another persona".into() })?;
                 continue;
             }
+            /* ★ A plugin's read of a workspace (dev-tools.md §3.8, D28):
+             * only limend asks, for a provider it starts for an instance,
+             * and below only for a workspace that instance's app picked and
+             * a plugin whose manifest asks for it. */
+            if workspace.is_some() && !(owner == LIMEN_USER && serves.is_some() && rule.as_ref().is_some_and(|r| r.per_instance)) {
+                eprintln!("portcullisd: ExecInstance of {app_id} with workspace {workspace:?} DENIED to uid {uid}: only limend, for a plugin");
+                write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                    message: "only limend starts a plugin that reads a workspace".into() })?;
+                continue;
+            }
+            let mut work = None;
             let mut as_uid = None;
             // The caller's own persona; a per-instance worker's, below.
             let mut domain = caller_domain(uid);
@@ -664,6 +675,19 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                     Ok((wuid, name)) => {
                         eprintln!("portcullisd: {app_id} for {person}'s {served_app}{} runs as {name}",
                                   persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default());
+                        if let Some(ws) = workspace.as_deref() {
+                            match ide::plugin_work(&person, &served_app, &app_id, ws) {
+                                Ok(w) => {
+                                    eprintln!("portcullisd: {app_id} for {person}'s {served_app} reads workspace {ws}");
+                                    work = Some(w);
+                                }
+                                Err(e) => {
+                                    eprintln!("portcullisd: {app_id} reading workspace {ws:?} for {person}'s {served_app} REFUSED: {e}");
+                                    write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(), message: e })?;
+                                    continue;
+                                }
+                            }
+                        }
                         r.run_as = name;
                         as_uid = Some(wuid);
                     }
@@ -679,7 +703,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
             } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain, false, None)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain, false, None, work)?;
             continue;
         }
         /* ★ WorkerCall (app-composition.md §4, dev-tools-plan.md M5): one
@@ -733,7 +757,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             };
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
                                  &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
-                                 Some((person.clone(), persona.clone())), false, None)?;
+                                 Some((person.clone(), persona.clone())), false, None, None)?;
             continue;
         }
         /* ★ SystemWorker (app-composition.md C6, dev-tools.md §3.5): one of
@@ -799,7 +823,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: system worker {bundle} {instance} for {app} ({person}) runs as {}", rule.run_as);
             handle_exec_instance(bundle.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None, None)?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -843,7 +867,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid), true, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid), true, None, None)?;
             continue;
         }
         /* ★ OpenPortalFetcher (atrium-net.md §8.1): a captive portal's
@@ -900,7 +924,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             portcullisd::portal::watch(true);
             // The sign-in page is the network's own: never in a tunnel.
             let r = handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None);
+                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None, false, None, None);
             portcullisd::portal::watch(false);
             r?;
             continue;
@@ -950,7 +974,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid), false, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid), false, None, None)?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -1309,6 +1333,9 @@ fn handle_exec_instance(
     /* Some: the app's settings pane (`[roles.app-settings]`, curia.md §15),
      * with this folder of the app's data; like a worker, no capability. */
     pane:     Option<PathBuf>,
+    /* Some: an editor plugin's granted workspace `work`, read-only at
+     * /work (checked by the caller, ide::plugin_work). */
+    work:     Option<(PathBuf, u32)>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -1485,6 +1512,8 @@ fn handle_exec_instance(
         extra_env,
         worker,
         pane,
+        group: work.as_ref().map(|w| w.1),
+        work: work.map(|w| w.0),
         fib,
     };
     /* ★ A worker does not outlive its caller. The caller holds this

@@ -378,6 +378,11 @@ pub struct MountSources {
     /// (`/usr/local/libexec/atrium/drivers/<id>`, opifex.md §8.2).
     #[serde(default)]
     pub ro_subtrees: Vec<String>,
+    /// Read-only sources by the same single-segment globs as
+    /// `rw_patterns`: a workspace's `work`, mounted read-only in an editor
+    /// plugin's jail (`/home/*/.atrium/workspaces/*/work`, dev-tools.md §3.8).
+    #[serde(default)]
+    pub ro_patterns: Vec<String>,
     /// ★ The largest tmpfs any jail may mount, in MiB, and the size given to
     /// one that does not ask. tmpfs is RAM-backed and was mounted with no
     /// options at all, so every tmpfs jaild created could grow until the

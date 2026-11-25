@@ -149,6 +149,7 @@ fn jail(app: &str, instance: &str, stdin: OwnedFd) -> io::Result<Proc> {
         require_memory_limit: true,
         serves: None,
         persona: None,
+        workspace: None,
     })?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}

@@ -22,3 +22,6 @@ implements = ["editor-extension"]
 languages = ["*"]
 commands  = ["todo-lens.count"]
 panel     = "TODOs"
+# The count command counts the whole workspace when the person allows it
+# (Plugins view, per workspace); otherwise only the open files.
+workspace-read = true

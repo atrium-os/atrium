@@ -110,6 +110,14 @@ impl Launcher for Launch {
         }
         self.launch(app, embed, ch)
     }
+    /// A plugin: this stand-in for portcullisd mounts the parent's picked
+    /// workspace `hello` and no other.
+    fn launch_plugin(&mut self, app: &str, embed: EmbedId, ch: UnixStream, _parent: u32, workspace: Option<&str>) -> Result<u32, String> {
+        if workspace.is_some_and(|w| w != "hello") {
+            return Err("not a workspace the parent picked".into());
+        }
+        self.launch(app, embed, ch)
+    }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
 }
 
@@ -919,7 +927,19 @@ fn a_plugin_is_any_app_the_parent_names_that_is_one_for_its_person() {
     app.detach(a).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: a });
     let c = app.request_plugin(W_APP, "org.example.notes").unwrap();
-    assert_eq!(w.spawned().0, c);
+    let (spawned, _c) = w.spawned();
+    assert_eq!(spawned, c);
+
+    // Reading a workspace: a name that can't be one goes no further, and
+    // the rest is portcullisd's to check (here: only the picked `hello`).
+    app.detach(c).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: c });
+    for bad in ["", "Hello", "../hello", "-x", &"a".repeat(33)] {
+        assert_eq!(refused(app.request_plugin_reading(W_APP, "org.example.notes", Some(bad))), refusal::MALFORMED, "{bad:?}");
+    }
+    assert_eq!(refused(app.request_plugin_reading(W_APP, "org.example.notes", Some("other"))), refusal::LAUNCH_FAILED);
+    let d = app.request_plugin_reading(W_APP, "org.example.notes", Some("hello")).unwrap();
+    assert_eq!(w.spawned().0, d);
 }
 
 #[test]
