@@ -1141,7 +1141,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
                 rect(ctx, r.x() + 1.0, y + em(3.0), r.w() - 2.0, 1.0, t.border_default(), 0.0);
                 y += em(9.0);
             } else {
-                text(ctx, r.x() + em(14.0), y + em(10.0), if group == 0 { "OPEN TRAILS" } else { "KEPT AND HISTORY" }, type_size::XXS, Weight::Semibold, t.text_tertiary());
+                text(ctx, r.x() + em(14.0), y + em(10.0), if group == 0 { "OPEN" } else { "KEPT AND VISITED" }, type_size::XXS, Weight::Semibold, t.text_tertiary());
                 y += em(DROP_LABEL);
             }
         }
@@ -1159,7 +1159,8 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
                 let b = fit(&format!("in trail “{trail_title}”"), &body(t.text_tertiary(), Weight::Regular), room * 0.4);
                 inline(ctx, r.x() + em(44.0), cy, em(10.0), &[(a, body(t.text_primary(), Weight::Medium)), (b, body(t.text_tertiary(), Weight::Regular))]);
                 let ss = sans(type_size::XS, Weight::Medium, t.accent_fg());
-                text(ctx, r.x() + r.w() - em(18.0) - width("Switch to", &ss), cy, "Switch to", type_size::XS, Weight::Medium, t.accent_fg());
+                text(ctx, r.x() + r.w() - em(36.0) - width("Go to it", &ss), cy, "Go to it", type_size::XS, Weight::Medium, t.accent_fg());
+                icon(ctx, r.x() + r.w() - em(30.0), cy - em(7.0), ph::ARROW_RIGHT, 14.0, t.accent_fg());
             }
             Source::Kept | Source::History => {
                 let g = if sg.source == Source::Kept { ph::BOOKMARK } else { ph::CLOCK };
@@ -1172,7 +1173,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
             Source::Search => {
                 icon(ctx, r.x() + em(16.0), y + em(7.0), ph::MAGNIFYING_GLASS, 16.0, t.text_tertiary());
                 let a = fit(&format!("Search for “{}”", sg.title), &body(t.text_primary(), Weight::Regular), room * 0.55);
-                inline(ctx, r.x() + em(44.0), cy, em(6.0), &[(a, body(t.text_primary(), Weight::Regular)), ("· sent only when you press Enter".into(), body(t.text_tertiary(), Weight::Regular))]);
+                inline(ctx, r.x() + em(44.0), cy, em(6.0), &[(a, body(t.text_primary(), Weight::Regular)), ("· sent when you press Enter".into(), body(t.text_tertiary(), Weight::Regular))]);
             }
         }
         ctx.pop();
@@ -1850,72 +1851,128 @@ fn start(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     let t = ctx.theme;
     let r = g.page;
     rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_canvas(), 0.0);
-    let x = g.where_.x();
-    let mut y = r.y() + em(32.0);
+    // The column under the field (§15.1): "Where to?" above it, the
+    // promise under it, then pinned trails, kept pages, and what was put
+    // away. The field itself is drawn with the toolbar.
+    let f = g.where_;
+    let (x, col) = (f.x(), f.w());
+    text(ctx, x, f.y() - em(26.0), "Where to?", type_size::XL, Weight::Semibold, t.text_primary());
+    let mut y = f.y() + f.h() + em(10.0);
     // Leave room for the suggestions when they are open.
-    if let Some(d) = g.drop {
-        y = d.y() + d.h() + em(28.0);
+    match g.drop {
+        Some(d) => y = d.y() + d.h() + em(24.0),
+        None => {
+            icon(ctx, x + em(2.0), y, ph::SHIELD_CHECK, 14.0, t.text_tertiary());
+            text(ctx, x + em(22.0), y + em(7.0), "Suggestions come from this computer. Nothing leaves it until you press Enter.", type_size::XS, Weight::Regular, t.text_tertiary());
+            y += em(36.0);
+        }
     }
     if s.store.trail().unrecorded {
         icon(ctx, x, y, ph::EYE_SLASH, 16.0, t.text_secondary());
         text(ctx, x + em(24.0), y + em(8.0), "Unrecorded: nothing in this trail is written down, and its cookies go when it closes.", type_size::SM, Weight::Regular, t.text_secondary());
         y += em(36.0);
     }
-    if !s.store.kept.is_empty() {
-        text(ctx, x, y + em(8.0), "Kept", type_size::SM, Weight::Semibold, t.text_secondary());
-        y += em(26.0);
-        let mut cx = x;
-        for k in &s.store.kept {
-            if cx + em(176.0) > r.x() + r.w() - em(16.0) {
-                break;
-            }
+    let bottom = r.y() + r.h() - em(8.0);
+    let card_w = em(196.0);
+    let per = ((col + em(12.0)) / (card_w + em(12.0))).floor().max(1.0) as usize;
+    let card_w = (col - em(12.0) * (per as f32 - 1.0)) / per as f32;
+    // Pinned trails as cards: a press goes to the trail, and this empty
+    // one closes.
+    let pinned = s.store.pinned_order();
+    if !pinned.is_empty() && y + em(80.0) < bottom {
+        start_label(ctx, x, y, "PINNED");
+        y += em(22.0);
+        for (k, &i) in pinned.iter().take(per * 2).enumerate() {
+            let (cx, cy) = (x + (k % per) as f32 * (card_w + em(12.0)), y + (k / per) as f32 * em(64.0));
+            let tr = &s.store.trails[i];
+            let url = tr.page().map_or(String::new(), |p| p.url.clone());
             let st2 = st.clone();
-            let url = k.url.clone();
-            rect(ctx, cx, y, em(176.0), em(64.0), t.border_default(), em(8.0));
-            area(ctx, Rect::new(cx + 1.0, y + 1.0, em(174.0), em(62.0)), em(7.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
+            rect(ctx, cx, cy, card_w, em(54.0), t.border_default(), em(8.0));
+            area(ctx, Rect::new(cx + 1.0, cy + 1.0, card_w - 2.0, em(52.0)), em(7.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| s.leave_start_for(i)));
+            monogram(ctx, cx + em(12.0), cy + em(17.0), &url, false);
+            let room = card_w - em(60.0);
+            let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
+            text(ctx, cx + em(42.0), cy + em(19.0), &fit(&shell::plain(tr.title()), &ts, room), type_size::SM, Weight::Medium, t.text_primary());
+            let live = tr.page().is_some_and(|p| p.facts.tier == Tier::Live);
+            let sub = if live { format!("{} · live", trail::host(&url)) } else { trail::host(&url).to_string() };
+            let ds = sans(type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, cx + em(42.0), cy + em(37.0), &fit(&sub, &ds, room), type_size::XS, Weight::Regular, if live { t.warning_fg() } else { t.text_tertiary() });
+            ctx.pop();
+        }
+        y += pinned.len().min(per * 2).div_ceil(per) as f32 * em(64.0) + em(12.0);
+    }
+    // Kept pages: a press opens it in this trail.
+    if !s.store.kept.is_empty() && y + em(80.0) < bottom {
+        start_label(ctx, x, y, "KEPT");
+        y += em(22.0);
+        for (k, kp) in s.store.kept.iter().take(per).enumerate() {
+            let cx = x + k as f32 * (card_w + em(12.0));
+            let st2 = st.clone();
+            let url = kp.url.clone();
+            rect(ctx, cx, y, card_w, em(54.0), t.border_default(), em(8.0));
+            area(ctx, Rect::new(cx + 1.0, y + 1.0, card_w - 2.0, em(52.0)), em(7.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
                 s.store.follow(fake::spec(&url));
             }));
-            monogram(ctx, cx + em(14.0), y + em(14.0), &k.url, false);
+            icon(ctx, cx + em(14.0), y + em(19.0), ph::BOOKMARK, 16.0, t.accent_fg());
+            let room = card_w - em(60.0);
             let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
-            text(ctx, cx + em(44.0), y + em(24.0), &fit(&k.title, &ts, em(100.0)), type_size::SM, Weight::Medium, t.text_primary());
+            text(ctx, cx + em(42.0), y + em(19.0), &fit(&shell::plain(&kp.title), &ts, room), type_size::SM, Weight::Medium, t.text_primary());
             let ds = sans(type_size::XS, Weight::Regular, t.text_tertiary());
-            text(ctx, cx + em(44.0), y + em(44.0), &fit(trail::host(&k.url), &ds, em(120.0)), type_size::XS, Weight::Regular, t.text_tertiary());
-            icon(ctx, cx + em(152.0), y + em(8.0), ph::STAR, 12.0, t.text_tertiary());
+            text(ctx, cx + em(42.0), y + em(37.0), &fit(trail::host(&kp.url), &ds, room), type_size::XS, Weight::Regular, t.text_tertiary());
             ctx.pop();
-            cx += em(188.0);
         }
-        y += em(96.0);
+        y += em(66.0);
     }
-    if !s.store.earlier.is_empty() {
-        text(ctx, x, y + em(8.0), "Put away", type_size::SM, Weight::Semibold, t.text_secondary());
-        y += em(26.0);
+    // Put away: each with Bring back, and Forget (its records go now, §4.5).
+    if !s.store.earlier.is_empty() && y + em(60.0) < bottom {
+        start_label(ctx, x, y, "PUT AWAY");
+        y += em(22.0);
+        let now_s = crate::clock::now_s();
         for (i, e) in s.store.earlier.iter().enumerate() {
-            if y + em(30.0) > r.y() + r.h() {
+            if y + em(36.0) > bottom {
                 break;
             }
+            rect(ctx, x, y + em(36.0), col, 1.0, t.border_default(), 0.0);
+            monogram(ctx, x + em(4.0), y + em(8.0), e.trail.page().map_or("", |p| &p.url), false);
+            let pages = e.trail.pages.iter().filter(|p| !p.cleared()).count();
+            let when = crate::clock::when_label(e.at_s, now_s);
+            let ts = sans(type_size::SM, Weight::Medium, t.text_primary());
+            let right = em(150.0);
+            let title = fit(&shell::plain(e.trail.title()), &ts, (col - right - em(34.0)) * 0.6);
+            let tw = width(&title, &ts);
+            text(ctx, x + em(34.0), y + em(18.0), &title, type_size::SM, Weight::Medium, t.text_primary());
+            let meta = format!("{} page{} · {when}", pages, if pages == 1 { "" } else { "s" });
+            let ms = sans(type_size::XS, Weight::Regular, t.text_tertiary());
+            text(ctx, x + em(34.0) + tw + em(10.0), y + em(18.0), &fit(&meta, &ms, col - right - em(44.0) - tw), type_size::XS, Weight::Regular, t.text_tertiary());
+            // Bring back, in place of this empty trail on Start.
             let st2 = st.clone();
-            area(ctx, Rect::new(x - em(8.0), y, em(420.0), em(30.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| {
+            let bw = em(96.0);
+            let bx = x + col - em(32.0) - bw;
+            rect(ctx, bx, y + em(5.0), bw, em(26.0), t.border_control(), em(6.0));
+            area(ctx, Rect::new(bx + 1.0, y + em(5.0) + 1.0, bw - 2.0, em(24.0)), em(5.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
                 s.end_edit();
-                // Bring it back in place of this empty trail on Start.
                 s.store.put_away(crate::clock::now_s());
                 s.store.bring_back(i);
             }));
-            monogram(ctx, x, y + em(5.0), e.trail.page().map_or("", |p| &p.url), false);
-            text(ctx, x + em(30.0), y + em(15.0), e.trail.title(), type_size::SM, Weight::Regular, t.text_primary());
-            text(ctx, x + em(320.0), y + em(15.0), &crate::clock::when_label(e.at_s, crate::clock::now_s()), type_size::XS, Weight::Regular, t.text_tertiary());
+            let bs = sans(type_size::XS, Weight::Medium, t.text_primary());
+            text(ctx, bx + (bw - width("Bring back", &bs)) / 2.0, y + em(18.0), "Bring back", type_size::XS, Weight::Medium, t.text_primary());
             ctx.pop();
-            // Forget: its records go now (§4.5).
             let st3 = st.clone();
-            let fid = area(ctx, Rect::new(x + em(432.0), y + em(3.0), em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
+            let fid = area(ctx, Rect::new(x + col - em(26.0), y + em(6.0), em(24.0), em(24.0)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st3, |s| {
                 s.store.forget(i);
             }));
-            icon(ctx, x + em(436.0), y + em(7.0), ph::X, 16.0, t.text_tertiary());
+            icon(ctx, x + col - em(22.0), y + em(10.0), ph::X, 16.0, t.text_tertiary());
             ctx.pop();
             ctx.tooltip(fid, "Forget this trail");
-            y += em(30.0);
+            y += em(38.0);
         }
     }
+}
+
+fn start_label(ctx: &mut Ctx, x: f32, y: f32, s: &str) {
+    let t = ctx.theme;
+    text(ctx, x, y + em(8.0), s, type_size::XXS, Weight::Semibold, t.text_tertiary());
 }
 
 /// A red page is not shown: the UI draws this in its place, with Go back
