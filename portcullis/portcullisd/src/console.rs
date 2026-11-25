@@ -383,6 +383,32 @@ fn stoad(cmd: &str, fds: &[std::os::fd::RawFd]) -> io::Result<String> {
     Ok(out)
 }
 
+/// stoad lets `person`'s sessions go (stoa.md §5.4a): in one persona or
+/// all, written out first unless `erase` (the persona is being removed).
+/// Logged, never fatal: stoad not running holds nothing.
+pub fn stoad_drop(person: &str, persona: Option<&str>, erase: bool) {
+    let Some(uid) = uid_of(person) else { return };
+    if !stoad_up() {
+        return;
+    }
+    let cmd = format!("DROP {uid} {} {}", persona.unwrap_or("*"), if erase { "erase" } else { "keep" });
+    match stoad(&cmd, &[]) {
+        Ok(r) => eprintln!("portcullisd: stoad {cmd}: {}", r.trim()),
+        Err(e) => eprintln!("portcullisd: stoad {cmd}: {e}"),
+    }
+}
+
+fn uid_of(person: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(person).ok()?;
+    // SAFETY: zeroed passwd and a buffer that outlive the call; getpwnam_r
+    // is the thread-safe lookup and fills only what it was given.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut res) };
+    (r == 0 && !res.is_null()).then_some(pwd.pw_uid)
+}
+
 /// `owner`'s live console sessions for `app_id`: (name, attached).
 pub fn sessions(owner: &str, app_id: &str) -> Vec<(String, bool)> {
     let p = session_prefix(owner, app_id);

@@ -1959,7 +1959,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     if let Err(why) = spend(press) { return Err(format!("\0{why}")); }
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, press, rect, cookies.clone(), jar)
+                    start_live(&cfg, &w, window, page, press, rect, cookies.clone(), jar, &waiting)
                 })();
                 match result {
                     Ok(l) => {
@@ -1988,7 +1988,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     let window = window.ok_or("no window to run it in")?;
                     live = None;
                     widget = None;
-                    start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar)
+                    start_live(&cfg, &w, window, page, [0; 16], rect, cookies.clone(), jar, &waiting)
                 })();
                 match result {
                     Ok(l) => live = Some(l),
@@ -2907,14 +2907,51 @@ mod island_metadata_tests {
 /// Its requests go through the trail's `jar` in Arca when navigatord has
 /// one (I6.3, D9), else the plain fetcher.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
-              cookies: Option<Cookies>, jar: Jar) -> Result<live_page::Live, String> {
+              cookies: Option<Cookies>, jar: Jar, waiting: &Arc<Mutex<files::Waiting>>) -> Result<live_page::Live, String> {
     let storage = live_page::JarStores { stores: live_stores(), jar: jar_id(jar) };
     let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
-    let (on_start, on_nav, on_route, on_end) = (w.clone(), w.clone(), w.clone(), w.clone());
-    let (start_url, nav_url, route_url, end_url) = (page.clone(), page.clone(), page.clone(), page.clone());
-    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage),
-        move |origin| send(&on_start, &Event::LiveStarted { url: start_url, origin }),
-        move |url| send(&on_nav, &Event::LiveNavigate { from: nav_url.clone(), url }),
-        move |url| send(&on_route, &Event::LiveUrlChanged { from: route_url.clone(), url }),
-        move |why| send(&on_end, &Event::LiveEnded { url: end_url, why }))
+    let tell = Arc::new(LiveTell { w: w.clone(), from: page.clone(), waiting: waiting.clone() });
+    live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage), tell)
+}
+
+/// The ids navigatord gives the files a live page offers (I6.4): the top
+/// half of the range, which the UI's own `Open` ids never reach.
+static LIVE_FILE_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1 << 31);
+
+/// What a live run at `from` tells the UI connection `w`.
+struct LiveTell {
+    w: Arc<Mutex<UnixStream>>,
+    from: String,
+    waiting: Arc<Mutex<files::Waiting>>,
+}
+
+impl live_page::Tell for LiveTell {
+    fn started(&self, origin: String) { send(&self.w, &Event::LiveStarted { url: self.from.clone(), origin }); }
+    fn navigate(&self, url: String) { send(&self.w, &Event::LiveNavigate { from: self.from.clone(), url }); }
+    fn url_changed(&self, url: String) { send(&self.w, &Event::LiveUrlChanged { from: self.from.clone(), url }); }
+    fn file(&self, f: live_page::Offered) {
+        let id = LIVE_FILE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | 1 << 31;
+        let (size, origin) = (f.bytes.len() as u64, origin(&f.url).unwrap_or_default());
+        let held = files::Held { url: f.url.clone(), name: f.name.clone(), bytes: f.bytes, since: Instant::now() };
+        match self.waiting.lock().unwrap().hold(id, held) {
+            Ok(()) => {
+                eprintln!("navigatord: a live page offered {} ({}, {size} bytes): asking", f.name, f.kind);
+                send(&self.w, &Event::LiveFile { from: self.from.clone(), id, url: f.url, name: f.name, size, origin, kind: f.kind });
+            }
+            Err(why) => {
+                eprintln!("navigatord: a live page's file not held: {why}");
+                self.refused(format!("a file too big to keep ({why})"));
+            }
+        }
+    }
+    fn refused(&self, what: String) {
+        let mut cut = String::new();
+        for c in what.chars().filter(|c| !c.is_control()) {
+            if cut.len() + c.len_utf8() > ctl::REFUSED_MAX { break; }
+            cut.push(c);
+        }
+        let what = cut;
+        send(&self.w, &Event::LiveRefused { from: self.from.clone(), what });
+    }
+    fn finished(&self, why: Option<String>) { send(&self.w, &Event::LiveEnded { url: self.from.clone(), why }); }
 }

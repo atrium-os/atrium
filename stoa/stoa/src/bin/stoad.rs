@@ -35,11 +35,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use std::path::{Path, PathBuf};
 
 use stoa::persist::{
-    default_state_dir, load_scrollback, remove_scrollback, save_scrollback, PersistDivider,
-    PersistPane, PersistSession, PersistState, PersistWindow,
+    dev_state_dir, PersistDivider, PersistPane, PersistSession, PersistState, PersistWindow, Store,
 };
 use stoa::link::Link;
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
@@ -86,9 +84,56 @@ fn send_output(udp: &Link, buf: &[u8], addr: SocketAddr) {
     let _ = udp.send_to(buf, addr);
 }
 
-/// Directory where session state is persisted (S3a): `meta.json` + per-window
-/// `scrollback/`. Set once in `main`; `None` before that or if disabled.
-static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// A dev run's one store for every session (`$STOA_STATE`, set explicitly).
+/// Unset in production: there a session is kept only in the store
+/// portcullisd hands over for its (person, persona), in that persona's key
+/// group (stoa.md §5.4a), and otherwise in memory alone.
+static DEV_STORE: OnceLock<Arc<Store>> = OnceLock::new();
+
+/// The stores portcullisd handed over, by (person's uid, persona).
+static STORES: OnceLock<Mutex<HashMap<(u32, String), Arc<Store>>>> = OnceLock::new();
+
+fn stores() -> &'static Mutex<HashMap<(u32, String), Arc<Store>>> {
+    STORES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What attaching to a session kept in memory only says (stoa.md §5.4a).
+const NOT_KEPT: &str = "nokeep";
+
+/// A persona name as portcullisd takes it (lowercase, digits, dashes).
+fn valid_persona(p: &str) -> bool {
+    let b = p.as_bytes();
+    !b.is_empty() && b.len() <= 32 && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// The store for `uid`'s sessions in `persona`: the dev store, one handed
+/// over before, or a new one asked of portcullisd (whose sessions are then
+/// restored). `None`: kept in memory only; why is logged.
+fn store_for(reg: &Reg, uid: u32, persona: &str) -> Option<Arc<Store>> {
+    if let Some(d) = DEV_STORE.get() {
+        return Some(d.clone());
+    }
+    if uid == 0 {
+        return None;
+    }
+    let key = (uid, persona.to_string());
+    if let Some(s) = stores().lock().unwrap().get(&key) {
+        return Some(s.clone());
+    }
+    match stoa_spawn::session_state_dir(uid, persona) {
+        Ok(fd) => {
+            let store = Arc::new(Store::from_fd(fd, format!("uid {uid}'s {persona} key group")));
+            let store = stores().lock().unwrap().entry(key).or_insert(store).clone();
+            restore_sessions(reg, &store, Some((uid, persona)));
+            Some(store)
+        }
+        Err(e) => {
+            eprintln!("stoad: uid {uid}'s {persona} sessions are kept in memory only: {e}");
+            None
+        }
+    }
+}
 
 /// A pane's shell cwd for respawn-after-restart, captured in-band from the
 /// shell's OSC 7 reports (uniform across macOS/FreeBSD, no syscall). `None`
@@ -97,13 +142,14 @@ fn pane_cwd(p: &Pane) -> Option<String> {
     p.term.grid().cwd().map(str::to_string)
 }
 
-/// Snapshot the live session table to the persisted [`PersistState`] form.
-/// Walks `reg` then each `inner` (the reg→inner lock order).
-fn snapshot_state(reg: &Reg) -> PersistState {
+/// Snapshot the live sessions kept in `store` to the persisted
+/// [`PersistState`] form. Walks `reg` then each `inner` (the reg→inner lock
+/// order).
+fn snapshot_state(reg: &Reg, store: &Arc<Store>) -> PersistState {
     let map = reg.lock().unwrap();
     let mut sessions = Vec::new();
     for (name, s) in map.iter() {
-        if s.dead.load(Ordering::SeqCst) || !persisted(name) {
+        if s.dead.load(Ordering::SeqCst) || !persisted(name) || !s.store.as_ref().is_some_and(|t| Arc::ptr_eq(t, store)) {
             continue;
         }
         let inner = s.inner.lock().unwrap();
@@ -139,7 +185,9 @@ fn snapshot_state(reg: &Reg) -> PersistState {
             continue; // brand-new, never contacted — nothing meaningful yet
         };
         sessions.push(PersistSession {
-            name: name.clone(),
+            name: shown(name).to_string(),
+            owner: s.owner,
+            persona: s.persona.clone(),
             target: s.target.clone(),
             cols: inner.cols,
             rows: inner.rows,
@@ -156,18 +204,32 @@ fn snapshot_state(reg: &Reg) -> PersistState {
 /// failure is logged but never propagates. Call after a structural or cwd
 /// change, with no session lock held.
 fn persist(reg: &Reg) {
-    let Some(dir) = STATE_DIR.get() else { return };
-    let st = snapshot_state(reg);
-    if let Err(e) = st.save_atomic(dir) {
-        eprintln!("stoad: persist meta to {dir:?} failed: {e}");
+    // Every store a live session is kept in.
+    let mut kept: Vec<Arc<Store>> = Vec::new();
+    for s in reg.lock().unwrap().values() {
+        if let Some(t) = &s.store {
+            if !s.dead.load(Ordering::SeqCst) && !kept.iter().any(|k| Arc::ptr_eq(k, t)) {
+                kept.push(t.clone());
+            }
+        }
+    }
+    for store in kept {
+        persist_store(reg, &store);
+    }
+}
+
+/// Write `store`'s session table and its sessions' scrollback.
+fn persist_store(reg: &Reg, store: &Arc<Store>) {
+    let st = snapshot_state(reg, store);
+    if let Err(e) = store.save_state(&st) {
+        eprintln!("stoad: persist meta to {} failed: {e}", store.label);
     }
     // Scrollback: dump each live window's history+screen as text. A console
     // (`console.<person>:<app>:<n>`, an app's or workspace's shell) is never
-    // persisted (§10a): its output belongs to the person's key group, not to
-    // stoad's own state.
+    // persisted (§10a), and has no store.
     let map = reg.lock().unwrap();
     for (name, s) in map.iter() {
-        if s.dead.load(Ordering::SeqCst) || !persisted(name) {
+        if s.dead.load(Ordering::SeqCst) || !persisted(name) || !s.store.as_ref().is_some_and(|t| Arc::ptr_eq(t, store)) {
             continue;
         }
         let inner = s.inner.lock().unwrap();
@@ -176,7 +238,9 @@ fn persist(reg: &Reg) {
         }
         for (widx, w) in inner.windows.iter().enumerate() {
             if let Some(p) = w.active() {
-                let _ = save_scrollback(dir, name, widx, &p.term.scrollback_text());
+                if let Err(e) = store.save_scrollback(name, widx, &p.term.scrollback_text()) {
+                    eprintln!("stoad: scrollback of {name:?} to {} failed: {e}", store.label);
+                }
             }
         }
     }
@@ -187,11 +251,13 @@ fn persist(reg: &Reg) {
 /// spawned — the saved layout is rebuilt + shells respawn on the first client
 /// datagram (like the lazy window-0 spawn). The live processes are gone with
 /// the old `stoad`; this is the history-only guarantee (S3a).
-fn restore_sessions(reg: &Reg, path: &Path) {
-    let st = match PersistState::load(path) {
+/// `only`: the (owner, persona) a store handed over belongs to; anything
+/// else in it is not restored.
+fn restore_sessions(reg: &Reg, store: &Arc<Store>, only: Option<(u32, &str)>) {
+    let st = match store.load_state() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("stoad: load state {path:?}: {e}");
+            eprintln!("stoad: load state from {}: {e}", store.label);
             return;
         }
     };
@@ -200,13 +266,18 @@ fn restore_sessions(reg: &Reg, path: &Path) {
     }
     let mut count = 0;
     for ps in st.sessions {
-        let mut map = reg.lock().unwrap();
-        if map.contains_key(&ps.name) {
-            continue;
-        }
         // An app's console isn't kept: its shells came from portcullisd,
         // and only a press there makes new ones.
-        if !persisted(&ps.name) {
+        if !persisted(&ps.name) || !valid_name(&ps.name) {
+            continue;
+        }
+        let key = reg_key(ps.owner, &ps.name);
+        let mut map = reg.lock().unwrap();
+        if map.contains_key(&key) {
+            continue;
+        }
+        if only.is_some_and(|(o, p)| ps.owner != o || ps.persona != p) {
+            eprintln!("stoad: {:?} in {} is not its owner's; not restored", ps.name, store.label);
             continue;
         }
         let udp = match UdpSocket::bind("0.0.0.0:0") {
@@ -215,9 +286,12 @@ fn restore_sessions(reg: &Reg, path: &Path) {
         };
         let port = udp.port();
         let (cols, rows) = (ps.cols, ps.rows);
-        let name = ps.name.clone();
+        let name = key;
         let state = Arc::new(SessionState {
             port,
+            owner: ps.owner,
+            persona: ps.persona.clone(),
+            store: Some(store.clone()),
             target: ps.target.clone(),
             dead: AtomicBool::new(false),
             adopted: Mutex::new(Vec::new()),
@@ -248,7 +322,7 @@ fn restore_sessions(reg: &Reg, path: &Path) {
         thread::spawn(move || recv_loop(name, state, udp, reg2));
         count += 1;
     }
-    eprintln!("stoad: restored {count} session(s) from {path:?}");
+    eprintln!("stoad: restored {count} session(s) from {}", store.label);
 }
 
 /// Rebuild a restored session's window/pane layout, respawning a fresh shell
@@ -278,8 +352,8 @@ fn rebuild_from_restore(
         inner.active = widx;
         // Restore the persisted scrollback into the primary pane (best-effort:
         // an empty/missing file just leaves a fresh history).
-        if let Some(dir) = STATE_DIR.get() {
-            let lines = load_scrollback(dir, name, pidx);
+        if let Some(store) = &state.store {
+            let lines = store.load_scrollback(name, pidx);
             if !lines.is_empty() {
                 if let Some(p) = inner.windows[widx].panes.first_mut() {
                     p.term.restore_scrollback(&lines);
@@ -643,6 +717,11 @@ impl Inner {
 
 struct SessionState {
     port: u16,
+    /// Whose shell it runs: the minting uid (0 for an app's console).
+    owner: u32,
+    persona: String,
+    /// Where its layout and scrollback are kept; `None`: in memory only.
+    store: Option<Arc<Store>>,
     /// Where this session's shell runs: `"session"` (the user's session
     /// jail, via DirectSpawner on dev) or `"jail:<id>"` (jexec into a
     /// running jail, via the portcullisd broker — stoa.md §4.5).
@@ -666,6 +745,25 @@ fn persisted(name: &str) -> bool {
     !name.starts_with(CONSOLE_PREFIX)
 }
 
+/// The table's key for `uid`'s session `name`: each person names their own
+/// sessions, so two people can both have "default". An app's console is
+/// root's (portcullisd's) and is keyed by its own name.
+fn reg_key(uid: u32, name: &str) -> String {
+    format!("{uid}/{name}")
+}
+
+/// The name its person gave a session, from its table key.
+fn shown(key: &str) -> &str {
+    key.split_once('/').map_or(key, |(_, n)| n)
+}
+
+/// A session name a person may give: one printable token, no `/` (the
+/// table key's separator), not a console's.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.starts_with(CONSOLE_PREFIX)
+        && name.bytes().all(|c| c.is_ascii_graphic() && c != b'/')
+}
+
 type Reg = Arc<Mutex<HashMap<String, Arc<SessionState>>>>;
 
 fn main() {
@@ -682,15 +780,24 @@ fn main() {
 
     let reg: Reg = Arc::new(Mutex::new(HashMap::new()));
 
-    // Session-state persistence (S3a): restore dormant sessions from the last
-    // snapshot, then remember the directory for future saves. $STOA_STATE=off
-    // (or empty) disables persistence entirely.
-    let state_dir = default_state_dir();
-    if state_dir.as_os_str().is_empty() || state_dir == Path::new("off") {
-        eprintln!("stoad: session persistence disabled");
-    } else {
-        restore_sessions(&reg, &state_dir);
-        let _ = STATE_DIR.set(state_dir);
+    // Session state (S3a, stoa.md §5.4a): a dev run that sets $STOA_STATE
+    // keeps every session there. Otherwise each person's sessions are kept
+    // in their persona's key group, in a directory portcullisd hands over at
+    // their first mint (and restored from it then), or in memory only.
+    match dev_state_dir() {
+        Some(dir) => match Store::open_path(&dir) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                eprintln!("stoad: DEV: every session is kept in {dir:?} ($STOA_STATE)");
+                restore_sessions(&reg, &store, None);
+                let _ = DEV_STORE.set(store);
+            }
+            Err(e) => {
+                eprintln!("stoad: $STOA_STATE {dir:?}: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => eprintln!("stoad: sessions are kept in their persona's key group, or in memory only"),
     }
 
     for conn in listener.incoming() {
@@ -734,7 +841,7 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
     // ★ Apps' consoles are root's (portcullisd's) alone: nobody else makes,
     // finds, attaches or ends one.
     let console = line.split_whitespace().nth(1).is_some_and(|n| n.starts_with(CONSOLE_PREFIX));
-    if uid != 0 && (console || matches!(cmd, Some("ADOPT" | "ATTACH" | "CONSOLES"))) {
+    if uid != 0 && (console || matches!(cmd, Some("ADOPT" | "ATTACH" | "CONSOLES" | "DROP"))) {
         eprintln!("stoad: {cmd:?} refused to uid {uid}: apps' consoles are portcullisd's");
         let _ = (&stream).write_all(b"ERR not yours\n");
         return;
@@ -797,33 +904,71 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
             let _ = (&stream).write_all(b"ERR an app's console is attached by portcullisd\n");
         }
         Some("MINT") => {
-            // `MINT <name> [target]` — target "session" (default) or "jail:<id>".
+            // `MINT <name> [target] [persona]` — target "session" (default) or
+            // "jail:<id>"; persona "personal" (default) or a named one. The
+            // answer is `<port> <key>`, with ` nokeep` when the session is
+            // kept in memory only (stoa.md §5.4a).
             let name = parts.next().unwrap_or("default").to_string();
             let target = parts.next().unwrap_or("session").to_string();
-            let (port, key) = mint(&reg, &name, &target);
-            eprintln!("stoad: mint {name:?} target={target} → port {port} for uid {uid}");
-            let _ = (&stream).write_all(format!("{port} {}\n", to_hex(&key)).as_bytes());
+            let persona = parts.next().unwrap_or("personal").to_string();
+            if !valid_name(&name) {
+                let _ = (&stream).write_all(b"ERR not a session name\n");
+                return;
+            }
+            if !valid_persona(&persona) {
+                let _ = (&stream).write_all(b"ERR not a persona\n");
+                return;
+            }
+            let reply = match mint(&reg, &reg_key(uid, &name), &target, uid, &persona) {
+                Ok((port, key, kept)) => {
+                    eprintln!("stoad: mint {name:?} target={target} persona={persona} → port {port} for uid {uid}{}",
+                              if kept { "" } else { " (in memory only)" });
+                    format!("{port} {}{}\n", to_hex(&key), if kept { String::new() } else { format!(" {NOT_KEPT}") })
+                }
+                Err(e) => format!("ERR {e}\n"),
+            };
+            let _ = (&stream).write_all(reply.as_bytes());
+        }
+        Some("DROP") => {
+            // `DROP <uid> <persona|*> <keep|erase>` (root, portcullisd): the
+            // person logged out, or the persona is being removed. Their
+            // sessions end; `keep` writes them out first, and the store is
+            // let go either way (stoa.md §5.4a).
+            let (Some(who), Some(persona), Some(how)) = (parts.next().and_then(|u| u.parse::<u32>().ok()), parts.next(), parts.next()) else {
+                let _ = (&stream).write_all(b"ERR usage: DROP <uid> <persona|*> <keep|erase>\n");
+                return;
+            };
+            let n = drop_sessions(&reg, who, (persona != "*").then_some(persona), how == "keep");
+            let _ = (&stream).write_all(format!("OK {n}\n").as_bytes());
         }
         Some("LIST") => {
             // One session per line: `<name>\t<nwindows>\t<active title>`.
+            let mine: Vec<String> = reg.lock().unwrap().iter().filter(|(_, s)| uid == 0 || s.owner == uid).map(|(n, _)| n.clone()).collect();
             let body: String = list_sessions(&reg)
                 .into_iter()
+                .filter(|(n, _, _)| mine.contains(n))
                 .filter(|(n, _, _)| uid == 0 || !n.starts_with(CONSOLE_PREFIX))
-                .map(|(n, nw, title)| format!("{n}\t{nw}\t{title}\n"))
+                .map(|(n, nw, title)| format!("{}\t{nw}\t{title}\n", if uid == 0 { n.as_str() } else { shown(&n) }))
                 .collect();
             let _ = (&stream).write_all(body.as_bytes());
         }
         Some("KILL") => {
-            let ok = match parts.next() {
-                Some(name) => kill_session(&reg, name),
-                None => false,
+            // A person names their own session; root names a table key
+            // (`<uid>/<name>`, as its LIST shows).
+            let given = parts.next().unwrap_or("");
+            let key = if uid == 0 && given.contains('/') { given.to_string() } else { reg_key(uid, given) };
+            let name = key.as_str();
+            let (owner, store) = match reg.lock().unwrap().get(name) {
+                Some(s) => (s.owner, s.store.clone()),
+                None => (uid, None),
             };
+            let ok = (uid == 0 || owner == uid) && kill_session(&reg, name);
             if ok {
                 // Drop the killed session from the snapshot + its scrollback.
-                if let (Some(dir), Some(name)) = (STATE_DIR.get(), line.split_whitespace().nth(1)) {
-                    remove_scrollback(dir, name);
+                if let Some(store) = store {
+                    store.remove_scrollback(name);
+                    persist_store(&reg, &store);
                 }
-                persist(&reg);
             }
             let _ = (&stream).write_all(if ok { b"OK\n" } else { b"ERR not found\n" });
         }
@@ -895,6 +1040,9 @@ fn adopt(reg: &Reg, name: &str, app: &str, pid: i32, procdesc: std::os::fd::Owne
                 let link = Link::local();
                 let state = Arc::new(SessionState {
                     port: 0,
+                    owner: 0,
+                    persona: String::new(),
+                    store: None,
                     target,
                     dead: AtomicBool::new(false),
                     adopted: Mutex::new(Vec::new()),
@@ -1031,9 +1179,23 @@ fn kill_session(reg: &Reg, name: &str) -> bool {
 }
 
 /// Find-and-rekey or create the session; return its `{port, key}`.
-fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
+/// The session's owner is the minting uid: another person's name is
+/// refused. `kept`: whether its layout and scrollback are kept.
+fn mint(reg: &Reg, name: &str, target: &str, uid: u32, persona: &str) -> Result<(u16, [u8; KEY_LEN], bool), String> {
+    // The store first (it may restore this very session), without the
+    // table's lock: asking portcullisd takes a while.
+    if reg.lock().unwrap().get(name).is_some_and(|s| s.owner != uid && !s.dead.load(Ordering::SeqCst)) {
+        return Err("not yours".into());
+    }
+    let store = store_for(reg, uid, persona);
     let mut map = reg.lock().unwrap();
     if let Some(s) = map.get(name) {
+        if s.owner != uid && !s.dead.load(Ordering::SeqCst) {
+            return Err("not yours".into());
+        }
+        if !s.dead.load(Ordering::SeqCst) && s.persona != persona {
+            return Err(format!("{} is a session of {}", shown(name), s.persona));
+        }
         if !s.dead.load(Ordering::SeqCst) {
             // Resume: keep the shell + port; rekey + reset the transport
             // window (a fresh path is a fresh transport session, same shell).
@@ -1045,7 +1207,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             inner.last_addr = None;
             // The reattaching client should see the current screen.
             inner.need_snapshot = inner.started;
-            return (s.port, key);
+            return Ok((s.port, key, s.store.is_some()));
         }
         // A dead session (shell exited, or spawn failed) — drop it and make
         // a fresh one below so the name is reusable.
@@ -1053,11 +1215,15 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
     }
     // New session: its own UDP port + key; the shell spawns lazily on the
     // first datagram (so its prompt has somewhere to go).
-    let udp = Link::udp(UdpSocket::bind("0.0.0.0:0").expect("bind session udp"));
+    let udp = Link::udp(UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind session udp: {e}"))?);
     let port = udp.port();
     let key = gen_key();
+    let kept = store.is_some();
     let state = Arc::new(SessionState {
         port,
+        owner: uid,
+        persona: persona.to_string(),
+        store,
         target: target.to_string(),
         dead: AtomicBool::new(false),
         adopted: Mutex::new(Vec::new()),
@@ -1086,7 +1252,41 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
     let name = name.to_string();
     let reg = reg.clone();
     thread::spawn(move || recv_loop(name, state, udp, reg));
-    (port, key)
+    Ok((port, key, kept))
+}
+
+/// End `uid`'s sessions (in `persona`, or all), writing them out first if
+/// `keep`, and let their stores go. Returns how many ended.
+fn drop_sessions(reg: &Reg, uid: u32, persona: Option<&str>, keep: bool) -> usize {
+    if keep {
+        persist(reg);
+    }
+    // Out of the table first, all at once: a write the ending shells set
+    // off then never sees them, so the store keeps them as they were.
+    let gone: Vec<(String, Arc<SessionState>)> = {
+        let mut map = reg.lock().unwrap();
+        let names: Vec<String> = map.iter()
+            .filter(|(n, s)| s.owner == uid && persisted(n) && persona.is_none_or(|p| s.persona == p))
+            .map(|(n, _)| n.clone()).collect();
+        names.into_iter().filter_map(|n| map.remove(&n).map(|s| (n, s))).collect()
+    };
+    let n = gone.len();
+    for (name, s) in gone {
+        let inner = s.inner.lock().unwrap();
+        for w in inner.windows.iter().filter(|w| w.alive) {
+            for p in w.panes.iter().filter(|p| p.alive) {
+                if let Some(sh) = &p.shell {
+                    let _ = sh.kill(libc::SIGHUP);
+                }
+            }
+        }
+        s.dead.store(true, Ordering::SeqCst);
+        eprintln!("stoad: session {name:?} of uid {uid} dropped");
+    }
+    stores().lock().unwrap().retain(|(u, p), _| !(*u == uid && persona.is_none_or(|x| x == p)));
+    eprintln!("stoad: dropped {n} session(s) of uid {uid} ({}), {}", persona.unwrap_or("every persona"),
+              if keep { "written out first" } else { "unsaved: their persona is being removed" });
+    n
 }
 
 /// Per-session receive loop: authenticate, anti-replay, learn the client
@@ -1790,7 +1990,7 @@ fn write_all_fd(fd: i32, mut data: &[u8]) {
 
 #[cfg(test)]
 mod persist_tests {
-    use super::persisted;
+    use super::*;
 
     #[test]
     fn consoles_are_never_written() {
@@ -1798,5 +1998,57 @@ mod persist_tests {
         assert!(!persisted("console.alice:ws_scratch:2"));
         assert!(persisted("main"));
         assert!(persisted("alice-work"));
+    }
+
+    fn saved(name: &str, owner: u32) -> stoa::persist::PersistSession {
+        stoa::persist::PersistSession {
+            name: name.into(),
+            owner,
+            persona: "personal".into(),
+            target: "session".into(),
+            cols: 80,
+            rows: 24,
+            active: 0,
+            last_active: 0,
+            windows: Vec::new(),
+        }
+    }
+
+    fn store(tag: &str, sessions: Vec<stoa::persist::PersistSession>) -> Arc<Store> {
+        let d = std::env::temp_dir().join(format!("stoad-two-owners-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let st = Arc::new(Store::open_path(&d).unwrap());
+        st.save_state(&PersistState { version: stoa::persist::VERSION, sessions }).unwrap();
+        st
+    }
+
+    /// Two people each have a session called "default": both come back,
+    /// each from their own store, and each store is written with its own
+    /// alone (stoa.md §5.4a).
+    #[test]
+    fn two_owners_keep_the_same_name_apart() {
+        let reg: Reg = Arc::new(Mutex::new(HashMap::new()));
+        let a = store("a", vec![saved("default", 1001)]);
+        let b = store("b", vec![saved("default", 1002), saved("other", 1001)]);
+        restore_sessions(&reg, &a, Some((1001, "personal")));
+        restore_sessions(&reg, &b, Some((1002, "personal")));
+        let mut keys: Vec<String> = reg.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["1001/default", "1002/default"], "both restored, and 1001's session in 1002's store is not");
+        for (st, owner) in [(&a, 1001), (&b, 1002)] {
+            let snap = snapshot_state(&reg, st);
+            let got: Vec<(String, u32)> = snap.sessions.iter().map(|s| (s.name.clone(), s.owner)).collect();
+            assert_eq!(got, [("default".to_string(), owner)]);
+        }
+        assert_eq!(shown("1002/default"), "default");
+    }
+
+    #[test]
+    fn a_session_name_is_one_plain_token() {
+        assert!(valid_name("default") && valid_name("alice-work.2"));
+        for bad in ["", "a/b", "a b", "console.alice:x:1", "\u{1b}[2J"] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
     }
 }

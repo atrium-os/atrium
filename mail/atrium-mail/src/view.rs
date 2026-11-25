@@ -397,6 +397,9 @@ pub struct Ui {
     /// The views shown under the folders, with a count where it matters.
     pub views: Vec<(Lane, usize)>,
     send_status_visible: bool,
+    /// The plain-store line at the foot of the sidebar (§6.4a A2): the
+    /// line, and whether this persona's mail is refused here.
+    at_rest: Option<(&'static str, bool)>,
     send_rows: Vec<mail_engine::send::JmapSendRow>,
     /// The Files view's files and their total size (§8.1).
     pub files_total: (usize, u64),
@@ -1526,6 +1529,16 @@ impl Mail {
         let mut ui = self.ui.get_cloned();
         if ui.saving != on {
             ui.saving = on;
+            self.ui.set(ui);
+        }
+    }
+
+    /// Show the plain-store line under the account list (§6.4a A2);
+    /// `refused` when this persona's accounts don't sync here.
+    pub fn set_at_rest(&self, line: Option<(&'static str, bool)>) {
+        if self.ui.get_cloned().at_rest != line {
+            let mut ui = self.ui.get_cloned();
+            ui.at_rest = line;
             self.ui.set(ui);
         }
     }
@@ -3654,18 +3667,23 @@ impl MailView {
         // Settings (,), kept at the foot of the sidebar.
         {
             let fy = h - place_h() - 8.0;
-            let foot_top = if ui.send_status_visible { fy - place_h() } else { fy };
+            let send_top = if ui.send_status_visible { fy - place_h() } else { fy };
+            let foot_top = if ui.at_rest.is_some() { send_top - place_h() } else { send_top };
             rect(ctx, Rect::new(0.0, foot_top - 8.0, w - 1.0, h - foot_top + 8.0), t.bg_surface());
+            if let Some((line, refused)) = ui.at_rest {
+                let c = if refused { t.danger_fg() } else { t.text_secondary() };
+                text(ctx, 20.0, foot_top + place_h() / 2.0, &fit(line, type_size::XS, Weight::Regular, w - 40.0), type_size::XS, Weight::Regular, c);
+            }
             if ui.send_status_visible {
                 let lane = Lane::SendStatus;
                 let selected = ui.search.as_ref().is_some_and(|s| s.view == Some(lane));
                 let fill = if selected { t.selection_bg() } else { Color::TRANSPARENT };
                 let m = self.mail.clone();
-                area(ctx, Rect::new(8.0, foot_top, w - 16.0, place_h()), fill, move || {
+                area(ctx, Rect::new(8.0, send_top, w - 16.0, place_h()), fill, move || {
                     m.close_side();
                     m.show_view(lane);
                 });
-                text(ctx, 20.0, foot_top + place_h() / 2.0, lane.label(), type_size::SM, Weight::Medium, t.text_primary());
+                text(ctx, 20.0, send_top + place_h() / 2.0, lane.label(), type_size::SM, Weight::Medium, t.text_primary());
                 ctx.pop();
             }
             let m = self.mail.clone();

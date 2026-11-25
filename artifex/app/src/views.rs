@@ -724,6 +724,10 @@ pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
     let cx = x0 + lw + pad;
     let cw = x1 - cx - pad;
     let mut y = y0 + em(36.0);
+    if let Some(e) = &a.editing {
+        icon_editor(ctx, e, q, Rect::new(cx, y0, x1 - cx - pad, area.h()), t);
+        return;
+    }
     if let Some(imp) = &a.importing {
         match imp {
             Importing::Choosing(list) => {
@@ -792,9 +796,18 @@ pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
         }
         return;
     }
+    // New icon, and Edit on an icon drawn here.
+    ctx.key(8800);
+    Button::secondary("New icon").lead(phosphor::PLUS).at(x1 - pad - em(116.0), y0 + em(20.0)).width(em(116.0))
+        .on_click(plain(q, Act::IconNew)).render(ctx);
     let Some(f) = a.selected() else { return };
+    if f.kind == Kind::Icon {
+        ctx.key(8801);
+        Button::secondary("Edit").lead(phosphor::PENCIL_SIMPLE).at(x1 - pad - em(208.0), y0 + em(20.0)).width(em(84.0))
+            .on_click(plain(q, Act::IconEdit)).render(ctx);
+    }
     let shown = f.rel.strip_prefix("assets/").unwrap_or(&f.rel);
-    text(ctx, cx, y, &fit(shown, cw, type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+    text(ctx, cx, y, &fit(shown, cw - em(220.0), type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
     y += em(22.0);
     let kind = match f.kind { Kind::Icon => "Icon", Kind::Picture => "Picture", Kind::Other => "File" };
     text(ctx, cx, y, &format!("{kind} · {} · atrium_assets::image(\"{}\", …)", size_label(f.bytes), f.name()), type_size::XS, Weight::Regular, t.text_tertiary());
@@ -868,4 +881,256 @@ pub fn assets(ctx: &mut Ctx, s: &State, q: &Queue, area: Rect) {
             }
         }
     }
+}
+
+/// A small toggle: a framed label, filled when `on`.
+fn chip(ctx: &mut Ctx, r: Rect, label: &str, on: bool, t: Theme, q: &Queue, a: Act) {
+    framed(ctx, r, if on { t.accent_bg() } else { t.bg_surface() }, if on { t.accent_strong() } else { t.border_default() }, radius::SM);
+    let w = Node::measure_text(label, &style(font::SANS, type_size::XS, Weight::Medium, t.text_primary())).w;
+    text(ctx, r.x() + (r.w() - w) / 2.0, r.y() + r.h() / 2.0, label, type_size::XS, Weight::Medium, if on { t.accent_fg() } else { t.text_primary() });
+    row(ctx, r, false, t, q, a);
+    ctx.pop();
+}
+
+fn srgb(c: [u8; 4]) -> Color {
+    Color::rgba(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, c[3] as f32 / 255.0)
+}
+
+/// A colour well: the colour on a checked ground, so transparency shows.
+fn swatch(ctx: &mut Ctx, r: Rect, c: Option<[u8; 4]>, on: bool, t: Theme) {
+    framed(ctx, r, Color::rgba(1.0, 1.0, 1.0, 1.0), if on { t.focus_ring() } else { t.border_default() }, radius::SM);
+    if on {
+        ctx.add(Node::Rect { rect: Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), fill: t.focus_ring(), radius: radius::SM });
+    }
+    let inner = Rect::new(r.x() + 3.0, r.y() + 3.0, r.w() - 6.0, r.h() - 6.0);
+    match c {
+        Some(c) => {
+            ctx.add(Node::Rect { rect: inner, fill: Color::rgba(0.8, 0.8, 0.8, 1.0), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(inner.x(), inner.y(), inner.w() / 2.0, inner.h() / 2.0), fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(inner.x() + inner.w() / 2.0, inner.y() + inner.h() / 2.0, inner.w() / 2.0, inner.h() / 2.0), fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 0.0 });
+            ctx.add(Node::Rect { rect: inner, fill: srgb(c), radius: 0.0 });
+        }
+        // None: a red stroke through white.
+        None => {
+            ctx.add(Node::Rect { rect: inner, fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 0.0 });
+            ctx.add(Node::Path { p0: (inner.x(), inner.y() + inner.h()), p1: (inner.x() + inner.w(), inner.y()), width: 1.5, color: t.danger_fg() });
+        }
+    }
+}
+
+/// An outline: four 1-point sides.
+fn outline(ctx: &mut Ctx, r: Rect, c: Color) {
+    for side in [Rect::new(r.x(), r.y(), r.w(), 1.0), Rect::new(r.x(), r.y() + r.h() - 1.0, r.w(), 1.0),
+                 Rect::new(r.x(), r.y(), 1.0, r.h()), Rect::new(r.x() + r.w() - 1.0, r.y(), 1.0, r.h())] {
+        ctx.add(Node::Rect { rect: side, fill: c, radius: 0.0 });
+    }
+}
+
+/// The icon editor (dev-tools.md §3.5): tools, the 24-unit canvas, the
+/// fill and stroke, the flat list of shapes, the dock's counter and the
+/// icon at the sizes the system draws it.
+fn icon_editor(ctx: &mut Ctx, e: &crate::iconedit::Editor, q: &Queue, area: Rect, t: Theme) {
+    use crate::iconedit::{fills, Fill, Kind, Tool, GRID, MAX_SHAPES, WIDTHS};
+    let (cx, y0, x1, y1) = (area.x(), area.y(), area.x() + area.w(), area.y() + area.h());
+    let name = e.rel.strip_prefix("assets/icons/").unwrap_or(&e.rel);
+    let title = format!("{}{name}", if e.changed { "• " } else { "" });
+    text(ctx, cx, y0 + em(36.0), &fit(&title, area.w() - em(200.0), type_size::LG), type_size::LG, Weight::Semibold, t.text_primary());
+    // The dock's counter.
+    let (n, _) = e.counts();
+    // A stroke is a shape of its own to the dock.
+    let count = format!("The dock draws {n} of {MAX_SHAPES} shapes");
+    let full = n >= MAX_SHAPES;
+    let w = Node::measure_text(&count, &style(font::SANS, type_size::SM, Weight::Medium, t.text_secondary())).w;
+    text(ctx, x1 - w, y0 + em(36.0), &count, type_size::SM, Weight::Medium, if full { t.warning_fg() } else { t.text_secondary() });
+
+    // Tools.
+    let tools = [(Tool::Select, "Select"), (Tool::Rect, "Rectangle"), (Tool::Ellipse, "Ellipse"), (Tool::Line, "Line"), (Tool::Pen, "Pen")];
+    let ty = y0 + em(58.0);
+    for (i, (tool, label)) in tools.iter().enumerate() {
+        ctx.key(8900 + i as u64);
+        chip(ctx, Rect::new(cx + i as f32 * em(84.0), ty, em(78.0), em(26.0)), label, e.tool == *tool, t, q, Act::IconTool(i as u8));
+    }
+    if e.tool == Tool::Pen {
+        let hint = if e.pen.is_empty() { "Click to place points; click the first to close." } else { "Click the first point to close, or" };
+        text(ctx, cx + 5.0 * em(84.0) + em(6.0), ty + em(13.0), hint, type_size::XS, Weight::Regular, t.text_tertiary());
+        if !e.pen.is_empty() {
+            let hw = Node::measure_text(hint, &style(font::SANS, type_size::XS, Weight::Regular, t.text_tertiary())).w;
+            ctx.key(8906);
+            chip(ctx, Rect::new(cx + 5.0 * em(84.0) + em(12.0) + hw, ty, em(56.0), em(26.0)), "Done", false, t, q, Act::IconFinishPen);
+        }
+    }
+
+    // The canvas: the grid, the shapes, the selection, what's being drawn.
+    // Room for the fill and stroke (232) and the shape list (at least 150)
+    // beside it; whole points per unit.
+    let side = em(384.0).min(y1 - (ty + em(40.0)) - em(100.0)).min(area.w() - em(410.0)).max(em(192.0));
+    let side = (side / GRID).floor() * GRID;
+    let (gx, gy) = (cx, ty + em(40.0));
+    let unit = side / GRID;
+    framed(ctx, Rect::new(gx - 1.0, gy - 1.0, side + 2.0, side + 2.0), Color::rgba(1.0, 1.0, 1.0, 1.0), t.border_strong(), 0.0);
+    for i in 1..GRID as usize {
+        let c = if i % 4 == 0 { Color::rgba(0.0, 0.0, 0.0, 0.14) } else { Color::rgba(0.0, 0.0, 0.0, 0.05) };
+        let o = i as f32 * unit;
+        ctx.add(Node::Rect { rect: Rect::new(gx + o, gy, 1.0, side), fill: c, radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(gx, gy + o, side, 1.0), fill: c, radius: 0.0 });
+    }
+    let mut shapes = e.shapes.clone();
+    shapes.extend(e.drawing.clone());
+    if e.pen.len() >= 2 {
+        let st = Some((e.stroke.map_or([0x1c, 0x1c, 0x1e, 0xff], |s| s.0), e.stroke.map_or(1.0, |s| s.1)));
+        shapes.push(crate::iconedit::Shape { kind: Kind::Poly { pts: e.pen.clone(), closed: false }, fill: Fill::None, stroke: st });
+    }
+    for f in fills(&shapes, gx, gy, side) {
+        ctx.add(Node::Fill(std::sync::Arc::new(f)));
+    }
+    for (i, &(px, py)) in e.pen.iter().enumerate() {
+        let r = if i == 0 { em(5.0) } else { em(3.5) };
+        let c = if i == 0 { t.accent_strong() } else { t.focus_ring() };
+        ctx.add(Node::Rect { rect: Rect::new(gx + px * unit - r, gy + py * unit - r, 2.0 * r, 2.0 * r), fill: c, radius: r });
+    }
+    if let Some(b) = e.selected.and_then(|i| e.shapes.get(i)).map(|s| s.bbox()) {
+        let pad = em(3.0);
+        outline(ctx, Rect::new(gx + b[0] * unit - pad, gy + b[1] * unit - pad, (b[2] - b[0]) * unit + 2.0 * pad, (b[3] - b[1]) * unit + 2.0 * pad), t.focus_ring());
+    }
+    // The pointer, in half units (the grid's snap), over everything.
+    ctx.key(8910);
+    let id = ctx.add(Node::Rect { rect: Rect::new(gx, gy, side, side), fill: Color::TRANSPARENT, radius: 0.0 });
+    let qd = q.clone();
+    ctx.on_drag_local(id, move |phase, p: pergola::geom::Point| {
+        let ph = match phase {
+            pergola::interaction::DragPhase::Start => 0,
+            pergola::interaction::DragPhase::Move => 1,
+            pergola::interaction::DragPhase::End => 2,
+        };
+        let half = |v: f32| (v / side * GRID * 2.0).round().clamp(-1.0, GRID * 2.0 + 1.0) as i32;
+        crate::ui::push(&qd, Act::IconCanvas(ph, half(p.x), half(p.y)));
+    });
+
+    // The icon at the sizes the system draws it, on light then on dark.
+    let py = gy + side + em(14.0);
+    let mut x = gx;
+    for ground in [Color::rgba(1.0, 1.0, 1.0, 1.0), Color::rgba(0.11, 0.11, 0.12, 1.0)] {
+        for n in crate::assets::ICON_SIZES {
+            let (s, tile) = (em(n as f32), em(n as f32 + 8.0));
+            let r = Rect::new(x, py + em(56.0) - tile, tile, tile);
+            framed(ctx, r, ground, t.border_default(), radius::SM);
+            for f in fills(&e.shapes, r.x() + em(4.0), r.y() + em(4.0), s) {
+                ctx.add(Node::Fill(std::sync::Arc::new(f)));
+            }
+            x += tile + em(6.0);
+        }
+        x += em(10.0);
+    }
+    text(ctx, gx, py + em(68.0), "16, 24, 32 and 48 pt, as the dock draws it", type_size::XXS, Weight::Regular, t.text_tertiary());
+
+    // Fill and stroke.
+    let sx = gx + side + em(24.0);
+    let sw = em(212.0);
+    let mut y = gy + em(6.0);
+    heading(ctx, sx, y, "FILL", t);
+    y += em(12.0);
+    let kind = match e.fill { Fill::None => 0, Fill::Solid(_) => 1, Fill::Linear(..) => 2, Fill::Radial(..) => 3 };
+    for (i, label) in ["None", "Colour", "Linear", "Radial"].iter().enumerate() {
+        ctx.key(8920 + i as u64);
+        chip(ctx, Rect::new(sx + i as f32 * em(53.0), y, em(50.0), em(24.0)), label, kind == i, t, q, Act::IconFillKind(i as u8));
+    }
+    y += em(34.0);
+    // What a colour goes to.
+    let (first, second) = match e.fill { Fill::Solid(c) => (Some(c), None), Fill::Linear(a, b) | Fill::Radial(a, b) => (Some(a), Some(b)), Fill::None => (None, None) };
+    let mut wells: Vec<(u8, &str, Option<[u8; 4]>)> = vec![(0, if second.is_some() { "From" } else { "Fill" }, first)];
+    if second.is_some() {
+        wells.push((1, "To", second));
+    }
+    wells.push((2, "Stroke", e.stroke.map(|s| s.0)));
+    for (i, (target, label, c)) in wells.iter().enumerate() {
+        let r = Rect::new(sx + i as f32 * em(72.0), y, em(68.0), em(30.0));
+        let on = e.target == *target;
+        framed(ctx, r, if on { t.accent_bg() } else { t.bg_surface() }, if on { t.accent_strong() } else { t.border_default() }, radius::SM);
+        swatch(ctx, Rect::new(r.x() + em(4.0), r.y() + em(5.0), em(20.0), em(20.0)), *c, false, t);
+        text(ctx, r.x() + em(28.0), r.y() + em(15.0), label, type_size::XS, Weight::Medium, t.text_primary());
+        ctx.key(8930 + i as u64);
+        row(ctx, r, false, t, q, Act::IconTarget(*target));
+        ctx.pop();
+    }
+    y += em(42.0);
+    let aimed = match e.target { 1 => second, 2 => e.stroke.map(|s| s.0), _ => first };
+    let colours = e.colours();
+    let per = 6;
+    for (i, c) in colours.iter().enumerate() {
+        let r = Rect::new(sx + (i % per) as f32 * em(35.0), y + (i / per) as f32 * em(35.0), em(30.0), em(30.0));
+        swatch(ctx, r, Some(*c), aimed == Some(*c), t);
+        ctx.key(8940 + i as u64);
+        row(ctx, r, false, t, q, Act::IconColour(i));
+        ctx.pop();
+    }
+    y += colours.len().div_ceil(per) as f32 * em(35.0) + em(4.0);
+    ctx.key(8970);
+    chip(ctx, Rect::new(sx, y, em(78.0), em(24.0)), "Lighter", false, t, q, Act::IconShade(true));
+    ctx.key(8971);
+    chip(ctx, Rect::new(sx + em(84.0), y, em(78.0), em(24.0)), "Darker", false, t, q, Act::IconShade(false));
+    y += em(30.0);
+    text(ctx, sx, y + em(6.0), &format!("{} of 8 colours of the icon's own", e.own.len()), type_size::XXS, Weight::Regular, t.text_tertiary());
+    y += em(26.0);
+    heading(ctx, sx, y, "STROKE", t);
+    y += em(12.0);
+    let width = e.stroke.map(|s| s.1);
+    let labels = ["None", "1", "1.5", "2", "3"];
+    for (i, label) in labels.iter().enumerate() {
+        let on = if i == 0 { width.is_none() } else { width == Some(WIDTHS[i - 1]) };
+        ctx.key(8980 + i as u64);
+        chip(ctx, Rect::new(sx + i as f32 * em(42.0), y, em(38.0), em(24.0)), label, on, t, q, Act::IconStroke(i as u8));
+    }
+    y += em(40.0);
+    if let Some(note) = &e.note {
+        icon(ctx, sx, y + em(8.0), phosphor::WARNING, type_size::SM, t.warning_fg());
+        para(ctx, sx + em(22.0), y + em(8.0), note, sw - em(22.0), type_size::XS, Weight::Regular, t.text_primary(), 4);
+    }
+
+    // The flat list of shapes, front at the top.
+    let lx = sx + sw + em(20.0);
+    let lw = (x1 - lx).max(em(140.0));
+    let mut y = gy + em(6.0);
+    heading(ctx, lx, y, "SHAPES · FRONT FIRST", t);
+    y += em(12.0);
+    let bottom = gy + side - em(30.0);
+    for (i, shape) in e.shapes.iter().enumerate().rev() {
+        if y > bottom - em(26.0) {
+            text(ctx, lx, y + em(10.0), &format!("{} more…", i + 1), type_size::XS, Weight::Regular, t.text_tertiary());
+            break;
+        }
+        let r = Rect::new(lx - em(4.0), y, lw, em(24.0));
+        ctx.key(9000 + i as u64);
+        row(ctx, r, e.selected == Some(i), t, q, Act::IconSelect(i));
+        let c = match shape.fill { Fill::Solid(c) | Fill::Linear(c, _) | Fill::Radial(c, _) => Some(c), Fill::None => shape.stroke.map(|s| s.0) };
+        swatch(ctx, Rect::new(r.x() + em(4.0), r.y() + em(4.0), em(16.0), em(16.0)), c, false, t);
+        let what = match &shape.kind {
+            Kind::Rect { .. } => "Rectangle",
+            Kind::Ellipse { .. } => "Ellipse",
+            Kind::Line { .. } => "Line",
+            Kind::Poly { closed: true, .. } => "Pen shape",
+            Kind::Poly { closed: false, .. } => "Pen line",
+        };
+        text(ctx, r.x() + em(26.0), r.y() + em(12.0), what, type_size::SM, Weight::Regular, t.text_primary());
+        ctx.pop();
+        y += em(26.0);
+    }
+    if e.shapes.is_empty() {
+        para(ctx, lx, y + em(8.0), "Nothing yet. Pick a tool and draw on the grid.", lw, type_size::XS, Weight::Regular, t.text_tertiary(), 3);
+    }
+    let by = gy + side - em(24.0);
+    if e.selected.is_some() {
+        ctx.key(9100);
+        chip(ctx, Rect::new(lx, by, em(54.0), em(24.0)), "Front", false, t, q, Act::IconReorder(true));
+        ctx.key(9101);
+        chip(ctx, Rect::new(lx + em(58.0), by, em(54.0), em(24.0)), "Back", false, t, q, Act::IconReorder(false));
+        ctx.key(9102);
+        chip(ctx, Rect::new(lx + em(116.0), by, em(58.0), em(24.0)), "Delete", false, t, q, Act::IconDelete);
+    }
+
+    // Save, or say why the dock would refuse it.
+    ctx.key(9110);
+    Button::primary("Save").at(sx, y1 - em(52.0)).width(em(96.0)).on_click(plain(q, Act::IconSave)).render(ctx);
+    ctx.key(9111);
+    Button::ghost(if e.changed { "Discard" } else { "Close" }).at(sx + em(106.0), y1 - em(52.0)).width(em(96.0))
+        .on_click(plain(q, Act::IconClose)).render(ctx);
 }

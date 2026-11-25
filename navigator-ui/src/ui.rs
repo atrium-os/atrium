@@ -329,8 +329,8 @@ impl View for ShellView {
         // frescod (the page's window is above this one), else drawn here.
         if let (Some(r), Some(p)) = (g.popover, page.clone()) {
             let (st, st2) = (self.state.clone(), self.state.clone());
-            let action = shell::popover_action(&s);
-            floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p, action, &st2));
+            let (action, refused) = (shell::popover_action(&s), s.live_refusals());
+            floating(ctx, r, shell::chip_rect(&g), move || with(&st, |s| s.popover = false), move |ctx| popover(ctx, r, &p, action, refused.as_deref(), &st2));
         }
         if let (Some(r), Some(p)) = (g.presence_menu, &page) {
             let (st, st2) = (self.state.clone(), self.state.clone());
@@ -910,7 +910,7 @@ fn suggestions(ctx: &mut Ctx, s: &Shell, r: Rect, st: &Mutable<Shell>) {
 
 /// The tier chip's popover (§6.5): Connection, What runs, the reasons,
 /// and the line that says what green does not mean.
-fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, action: Option<shell::PopoverAction>, st: &Mutable<Shell>) {
+fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, action: Option<shell::PopoverAction>, refused: Option<&str>, st: &Mutable<Shell>) {
     let t = ctx.theme;
     boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
     let f = &*p.display_facts();
@@ -939,6 +939,10 @@ fn popover(ctx: &mut Ctx, r: Rect, p: &trail::Page, action: Option<shell::Popove
     }
     for reason in &f.reasons {
         y = wrapped(ctx, x, y, w, reason, if f.light == Light::Red { t.danger_fg() } else { t.warning_fg() });
+    }
+    // What the live page was refused (I6.4): nothing is refused silently.
+    if let Some(r) = refused {
+        y = wrapped(ctx, x, y, w, r, t.text_secondary());
     }
     y += em(6.0);
     y = wrapped(ctx, x, y, w, shell::popover_last(f), t.text_tertiary());

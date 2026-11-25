@@ -32,15 +32,17 @@ fn main() {
             let mut name = "default".to_string();
             let mut host: Option<String> = None;
             let mut jail: Option<String> = None;
+            let mut persona = "personal".to_string();
             let mut it = argv.iter().skip(1);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--host" => host = it.next().cloned(),
                     "--jail" => jail = it.next().cloned(),
+                    "--persona" => persona = it.next().cloned().unwrap_or(persona),
                     other => name = other.to_string(),
                 }
             }
-            attach(&name, host.as_deref(), jail.as_deref());
+            attach(&name, host.as_deref(), jail.as_deref(), &persona);
         }
         Some("list") => list_sessions(),
         Some("kill") => match argv.get(1) {
@@ -120,7 +122,7 @@ fn kill_session(name: &str) {
 fn usage() {
     eprintln!(
         "usage:\n\
-         \x20 stoactl attach <name> [--host user@host] [--jail <id>]\n\
+         \x20 stoactl attach <name> [--host user@host] [--jail <id>] [--persona <persona>]\n\
          \x20 stoactl list                 list sessions on the local stoad\n\
          \x20 stoactl kill <name>          kill a session\n\
          \n\
@@ -139,7 +141,9 @@ fn usage() {
 
 /// (udp_host, udp_port, key). `jail` selects the session target: `None` →
 /// the user's session jail; `Some(id)` → jexec into that running jail.
-fn mint(name: &str, host: Option<&str>, jail: Option<&str>) -> Result<(String, u16, Vec<u8>), String> {
+/// The session is kept in memory only when stoad says so (`kept` false):
+/// no key group of its persona was open to keep it in (stoa.md §5.4a).
+fn mint(name: &str, host: Option<&str>, jail: Option<&str>, persona: &str) -> Result<(String, u16, Vec<u8>, bool), String> {
     let target = match jail {
         Some(id) => format!("jail:{id}"),
         None => "session".to_string(),
@@ -152,14 +156,14 @@ fn mint(name: &str, host: Option<&str>, jail: Option<&str>) -> Result<(String, u
                 .map_err(|e| format!("connect {ctl}: {e} (is stoad running?)"))?;
             use std::io::{BufRead, BufReader, Write};
             (&stream)
-                .write_all(format!("MINT {name} {target}\n").as_bytes())
+                .write_all(format!("MINT {name} {target} {persona}\n").as_bytes())
                 .map_err(|e| format!("mint request: {e}"))?;
             let mut reply = String::new();
             BufReader::new(&stream)
                 .read_line(&mut reply)
                 .map_err(|e| format!("mint reply: {e}"))?;
-            let (port, key) = parse_mint(reply.trim())?;
-            Ok(("127.0.0.1".to_string(), port, key))
+            let (port, key, kept) = parse_mint(reply.trim())?;
+            Ok(("127.0.0.1".to_string(), port, key, kept))
         }
         Some(hostspec) => {
             // Remote: a transport (ssh by default) runs stoa-shell; its
@@ -177,6 +181,7 @@ fn mint(name: &str, host: Option<&str>, jail: Option<&str>) -> Result<(String, u
             if let Some(id) = jail {
                 cmd.arg("--jail").arg(id);
             }
+            cmd.arg("--persona").arg(persona);
             let out = cmd
                 .output()
                 .map_err(|e| format!("spawn transport {prog:?}: {e}"))?;
@@ -191,15 +196,18 @@ fn mint(name: &str, host: Option<&str>, jail: Option<&str>) -> Result<(String, u
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("STOA_SESSION "))
                 .ok_or_else(|| format!("no STOA_SESSION line in ssh output:\n{stdout}"))?;
-            let (port, key) = parse_mint(line)?;
+            let (port, key, kept) = parse_mint(line)?;
             // UDP host = the host part of user@host.
             let udp_host = hostspec.rsplit('@').next().unwrap_or(hostspec).to_string();
-            Ok((udp_host, port, key))
+            Ok((udp_host, port, key, kept))
         }
     }
 }
 
-fn parse_mint(s: &str) -> Result<(u16, Vec<u8>), String> {
+fn parse_mint(s: &str) -> Result<(u16, Vec<u8>, bool), String> {
+    if let Some(e) = s.strip_prefix("ERR ") {
+        return Err(format!("stoad refused: {e}"));
+    }
     let mut p = s.split_whitespace();
     let port = p
         .next()
@@ -209,7 +217,8 @@ fn parse_mint(s: &str) -> Result<(u16, Vec<u8>), String> {
         .next()
         .and_then(from_hex)
         .ok_or_else(|| format!("bad key in mint reply: {s:?}"))?;
-    Ok((port, key))
+    let kept = p.next() != Some("nokeep");
+    Ok((port, key, kept))
 }
 
 /// The command prefix byte. `$STOA_PREFIX` overrides the default Ctrl-B:
@@ -234,14 +243,17 @@ fn prefix_byte() -> u8 {
     }
 }
 
-fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
-    let (udp_host, port, key) = match mint(name, host, jail) {
+fn attach(name: &str, host: Option<&str>, jail: Option<&str>, persona: &str) {
+    let (udp_host, port, key, kept) = match mint(name, host, jail, persona) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("stoactl: {e}");
             std::process::exit(1);
         }
     };
+    if !kept {
+        eprintln!("stoactl: this session's history is not kept (no open key group for {persona}): it lives in memory only");
+    }
     let prefix = prefix_byte();
 
     let sock = match UdpSocket::bind("0.0.0.0:0").and_then(|s| {

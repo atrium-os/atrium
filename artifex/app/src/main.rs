@@ -106,7 +106,7 @@ fn main() {
             state.set(s.clone());
         }
         if trace {
-            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?}",
+            let line = format!("choose={} [{}] ws={:?} rows=[{}] tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?} ask={:?} comp={:?} templates={} dbg={:?} bps={:?} fuzz={:?} moving={} panel={:?} view={:?} assets={:?} icon={:?}",
                 s.choosing || (s.ws.is_none() && s.listed), s.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(","),
                 s.ws, s.rows.iter().map(|r| r.rel.as_str()).collect::<Vec<_>>().join(","), s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
                 s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
@@ -128,7 +128,18 @@ fn main() {
                         Some(artifex::assets::Importing::Planned(p)) => format!("planned {} ok={} dropped={} preview={}", p.path, p.report.ok, p.dropped.len(),
                             a.import_preview.as_ref().map(|v| v.iter().filter(|i| i.is_ok()).count()).unwrap_or(0)),
                         Some(artifex::assets::Importing::Failed(e)) => format!("failed {e}"),
-                    })));
+                    })),
+                // The icon editor: (file, tool, shapes, kinds, fills, pen points, changed, note)
+                s.assets.as_ref().and_then(|a| a.editing.as_ref()).map(|e| (&e.rel, e.tool, e.shapes.len(),
+                    e.shapes.iter().map(|s| match s.kind {
+                        artifex::iconedit::Kind::Rect { .. } => 'r', artifex::iconedit::Kind::Ellipse { .. } => 'e',
+                        artifex::iconedit::Kind::Line { .. } => 'l', artifex::iconedit::Kind::Poly { .. } => 'p',
+                    }).collect::<String>(),
+                    e.shapes.iter().map(|s| match s.fill {
+                        artifex::iconedit::Fill::None => 'n', artifex::iconedit::Fill::Solid(_) => 's',
+                        artifex::iconedit::Fill::Linear(..) => 'l', artifex::iconedit::Fill::Radial(..) => 'r',
+                    }).collect::<String>(),
+                    e.pen.len(), e.changed, e.note.as_deref())));
             if line != traced {
                 eprintln!("artifex: {line}");
                 traced = line;

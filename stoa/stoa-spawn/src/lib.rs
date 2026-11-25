@@ -32,6 +32,15 @@ pub use direct::DirectSpawner;
 mod broker;
 #[cfg(target_os = "freebsd")]
 pub use broker::BrokerSpawner;
+#[cfg(target_os = "freebsd")]
+pub use broker::session_state_dir;
+
+/// Off FreeBSD there is no portcullisd to hand a key group's directory
+/// over: sessions are kept in memory only (or in `$STOA_STATE`).
+#[cfg(not(target_os = "freebsd"))]
+pub fn session_state_dir(_uid: u32, _persona: &str) -> io::Result<OwnedFd> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no portcullisd here"))
+}
 
 /// Which jail a session's shells attach to (stoa.md §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]

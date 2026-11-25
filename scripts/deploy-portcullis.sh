@@ -22,7 +22,11 @@
 #
 #   sh scripts/deploy-portcullis.sh              # deploy + enable + start
 #   START=0 sh scripts/deploy-portcullis.sh      # install only
+#   EGRESS_IF=vtnet0 sh scripts/deploy-portcullis.sh   # NAT interface, when
+#                     the guest has no default route and several interfaces
 set -u
+EGRESS_IF="${EGRESS_IF:-}"
+case "$EGRESS_IF" in *[!a-z0-9]*) echo "EGRESS_IF must be an interface name" >&2; exit 2;; esac
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-aarch64-unknown-freebsd}"
 T="$BSD/portcullis/target/$TARGET/release"
@@ -132,8 +136,12 @@ echo "=== pf isolation -> /usr/local/etc/atrium/pf.conf ==="
 # rules are loaded (network.md §0) — without them an app reached the host.
 scp $SSHOPT -P 2222 "$BSD/etc/atrium.pf" root@localhost:/root/atrium.pf >/dev/null 2>&1 \
   && g 'mkdir -p /usr/local/etc/atrium
-E=$(route -n get default 2>/dev/null | awk '"'"'/interface:/{print $2}'"'"')
-[ -n "$E" ] || { echo "no default route: cannot pick the NAT interface"; exit 1; }
+E='"$EGRESS_IF"'
+[ -n "$E" ] || E=$(route -n get default 2>/dev/null | awk '"'"'/interface:/{print $2}'"'"')
+# No default route (a restricted QEMU net): the one interface with an IPv4
+# address that is neither loopback nor a jail bridge is the egress.
+[ -n "$E" ] || E=$(ifconfig -l inet | tr " " "\n" | grep -Ev "^(lo|atrium|bridge|epair)" | awk '"'"'{n++; i=$0} END{if (n == 1) print i}'"'"')
+[ -n "$E" ] || { echo "no default route and not exactly one candidate interface: set EGRESS_IF"; exit 1; }
 cur=$(sysrc -n pf_rules 2>/dev/null)
 case "$cur" in ""|/etc/pf.conf|/usr/local/etc/atrium/pf.conf) ;;
   *) echo "pf_rules is $cur — an operator ruleset; add the atrium rules to it by hand"; exit 1;;
@@ -164,9 +172,25 @@ g 'id _volumes-vk >/dev/null 2>&1 || pw useradd _volumes-vk -u 65053 -d /nonexis
 # (portcullis.md §6.5.2e′ snags). ALLOW_RCTL=true|false sets it explicitly.
 tmpd=$(mktemp -d "${TMPDIR:-/tmp}/deploy-portcullis.XXXXXX")
 if g 'cat /etc/atrium/jaild.policy.toml' > "$tmpd/live.toml" 2>/dev/null; then live="$tmpd/live.toml"; else live=-; fi
+# ★ plain_app_data (mail.md §6.4a A1): portcullisd refuses every app launch
+# whose data the kernel doesn't report in an open key group, unless this is
+# true. This script deploys to dev VMs, so it defaults to true; the target's
+# own value survives a deploy, and PLAIN_APP_DATA=true|false sets it. It is
+# ignored wherever the kernel reports key groups, so it never unseals a
+# machine that has them.
+case "${PLAIN_APP_DATA:-}" in
+    true|false) plain=$PLAIN_APP_DATA ;;
+    '') plain=$(g 'sed -nE "s/^[[:space:]]*plain_app_data[[:space:]]*=[[:space:]]*(true|false).*/\\1/p" /etc/atrium/volumes.policy.toml' 2>/dev/null | head -1)
+        [ -n "$plain" ] || plain=true ;;
+    *) echo "PLAIN_APP_DATA must be true or false, not '$PLAIN_APP_DATA'" >&2; exit 2 ;;
+esac
+# A top-level key goes before the first table.
+awk -v plain="$plain" '!done && /^\[/ { print "plain_app_data = " plain "\n"; done = 1 } { print }' \
+    "$BSD/etc/volumes.policy.toml" > "$tmpd/volumes.policy.toml"
+echo "  plain_app_data = $plain"
 if sh "$BSD/scripts/jaild-policy-merge.sh" "$BSD/etc/jaild.policy.toml" "$live" \
         > "$tmpd/jaild.policy.toml" 2> "$tmpd/merge.log" \
-   && scp $SSHOPT -P 2222 "$tmpd/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \
+   && scp $SSHOPT -P 2222 "$tmpd/jaild.policy.toml" "$tmpd/volumes.policy.toml" \
         root@localhost:/etc/atrium/ >/dev/null 2>&1; then
     echo "  policies ok ($(sed 's/^jaild-policy-merge: //' "$tmpd/merge.log"))"
 else

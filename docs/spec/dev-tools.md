@@ -318,6 +318,33 @@ the limits, what was converted and what wasn't kept; Import writes it.
 `artifex::assets` is the model, `views::assets` the view;
 `vm-artifex-check.sh`'s "Assets" section is its VM check.
 
+As built (step 5, the icon editor; `artifex/app/src/iconedit.rs` the model,
+`views::icon_editor` the view): New icon (`assets/icons/app.svg`, or the
+first free `icon[-N].svg`) and Edit on an icon drawn here open the editor
+in the Assets view's right pane. Tools: Select (press a shape, drag to move
+it), Rectangle, Ellipse, Line (drag) and Pen (click points, click the first
+to close; Done leaves it open as a stroked line); points snap to half units
+of the 24-unit grid and stay on it. Fill is none, a colour, or a linear
+(top to bottom of the shape) or radial (from its centre) gradient between
+two colours; stroke is none or 1, 1.5, 2 or 3 units. Colours are the 12 of
+Atrium's palette plus at most 8 of the icon's own (Lighter and Darker make
+them). The shape list is flat, front first, with Front, Back and Delete.
+The counter shows the dock's shapes against 64 (a stroke is a shape of
+its own to the dock), and the icon is drawn
+beside the canvas at 16, 24, 32 and 48 pt on light and dark through the
+same Fresco fills the dock uses. Save writes plain filled paths (a stroke
+is written as the fill it paints; gradients in `<defs>` in user space) and
+refuses, saying why, an empty icon or one past the dock's shapes, points
+or 32 KB; `atrium_icon::check` passes what it writes, counting the same
+shapes and points (a unit test). The editor's own description of its
+shapes is a JSON comment in the file (`artifex-icon v1`), read back with
+bounds on every number; an icon without one was drawn elsewhere and is not
+opened for editing (it is edited there and imported again). Save goes
+through a temporary and a rename, and refuses a linked `assets/` or
+`assets/icons/`. An unsaved icon keeps the pane until saved or discarded.
+`vm-artifex-check.sh` draws one of each shape, reorders, saves, and checks
+the saved icon is decoded and passes the dock's check.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today

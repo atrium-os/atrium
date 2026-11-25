@@ -23,8 +23,9 @@ id mailgate >/dev/null 2>&1 || pw useradd mailgate -u 2002 -m -s /bin/sh -c 'sig
 id gatevest >/dev/null 2>&1 || pw useradd gatevest -u 2003 -d /nonexistent -s /usr/sbin/nologin -c 'sign-in gate vestibulum'
 pw groupmod audio -m _choragus
 # sshd's reverse lookup of the QEMU host must not wait on a resolver a
-# restricted network never answers.
+# restricted network never answers, whatever net= the gate gives QEMU.
 grep -q '^10.0.2.2[[:space:]]' /etc/hosts || echo '10.0.2.2 qemu-host' >> /etc/hosts
+grep -q '^UseDNS no$' /etc/ssh/sshd_config || echo 'UseDNS no' >> /etc/ssh/sshd_config
 
 # frescod's system-sans, and the icon face.
 install -d /usr/local/share/fonts/ibm-plex /usr/local/share/fonts/phosphor

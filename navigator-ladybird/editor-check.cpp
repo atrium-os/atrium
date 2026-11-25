@@ -6,6 +6,7 @@
 #include <LibCore/EventLoop.h>
 #if defined(ATRIUM_I0_SIGN_IN) || defined(ATRIUM_I1_COUNTER)
 #include "SignInFixture.h"
+#include "LiveStorage.h"
 #endif
 #include <LibURL/Parser.h>
 #include <LibWeb/Loader/LoadRequest.h>
@@ -147,6 +148,10 @@ int main(int argc, char** argv)
     size_t page_url_length = 0;
     auto body_length = navigator_live_page(page_url, sizeof(page_url), &page_url_length, document_body.data(), document_body.size());
     if (!body_length || body_length > document_body.size() || document_body.try_resize(body_length).is_error()) return 4;
+    // The page's localStorage is its site's store in navigatord, asked for
+    // only now that the page (and so the site) is delivered.
+    static Navigator::LiveStorage live_storage;
+    Web::StorageAPI::set_storage_area_mirror_client(&live_storage);
     StringView location { page_url, page_url_length };
     client->page().set_system_visibility_state(Web::HTML::VisibilityState::Visible);
     auto result = Navigator::paint_document(*client, scene, location, StringView(document_body.bytes()), false);

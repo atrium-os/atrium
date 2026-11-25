@@ -610,6 +610,9 @@ pub struct Syncer {
     /// What the last server search found in all, or why it failed; taken
     /// by the window.
     pub searched: Arc<Mutex<Option<Result<usize, String>>>>,
+    /// Set when nothing syncs because the store is plain and this is not
+    /// known to be Personal (§6.4a A2); the window shows it.
+    pub refused: Arc<Mutex<Option<&'static str>>>,
 }
 
 /// One account's IDLE watch (§6.1), on a thread and a connection of its
@@ -699,13 +702,32 @@ impl Drop for Watcher {
 /// Start syncing every configured account, on a thread with its own
 /// engine over the same store; IMAP accounts whose servers take IDLE are
 /// watched for new mail in their inbox.
-pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Connect + Send + Sync>) -> Syncer {
+pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Connect + Send + Sync>, data: crate::at_rest::AppData) -> Syncer {
     let (wake, rx) = mpsc::channel();
     let changed = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(Vec::new()));
     let searched = Arc::new(Mutex::new(None));
-    let (ch, st, waker, found) = (changed.clone(), status.clone(), wake.clone(), searched.clone());
+    let refused = Arc::new(Mutex::new(None));
+    let (ch, st, waker, found, rf) = (changed.clone(), status.clone(), wake.clone(), searched.clone(), refused.clone());
     std::thread::spawn(move || {
+        // A plain store syncs only once the persona is known to be
+        // Personal; until then no pass runs.
+        let persona = if data.sealed() { Ok(None) } else { persona_bounded() };
+        if let Err(why) = crate::at_rest::may_keep(data, &persona) {
+            eprintln!("atrium-mail: not syncing: {why} ({data:?}, persona {persona:?})");
+            *rf.lock().unwrap() = Some(why);
+            ch.store(true, Ordering::Release);
+            loop {
+                match rx.recv() {
+                    Ok(Wake::Stop) | Err(_) => return,
+                    Ok(Wake::Search(_)) => {
+                        *found.lock().unwrap() = Some(Err(why.into()));
+                        ch.store(true, Ordering::Release);
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
         let mut engine = Engine::new(store, Parser { program: jail });
         engine.set_roots(roots);
         engine.set_dns(Box::new(NuntiusDns::default()));
@@ -792,7 +814,23 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Conn
             }
         }
     });
-    Syncer { wake, changed, status, searched }
+    Syncer { wake, changed, status, searched, refused }
+}
+
+/// Which persona this is, from portcullisd, asked up to five times over
+/// about fifteen seconds; the last error when it never answers.
+fn persona_bounded() -> Result<Option<String>, String> {
+    let mut last = Err(String::new());
+    for i in 0..5u32 {
+        if i > 0 {
+            std::thread::sleep(Duration::from_secs(1 << (i - 1)));
+        }
+        last = crate::files::persona();
+        if last.is_ok() {
+            break;
+        }
+    }
+    last
 }
 
 /// Whether two settings reach the same servers with the same sign-in.

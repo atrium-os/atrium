@@ -220,6 +220,11 @@ pub struct Settings {
     /// The named persona Mail runs in (Work), shared with the main
     /// window; `None` for Personal.
     pub persona: Rc<RefCell<Option<String>>>,
+    /// Whether portcullisd found Mail's store encrypted (§6.4a A2). A
+    /// named persona adds no account into a plain store.
+    pub at_rest: crate::at_rest::AppData,
+    /// Set once `persona` holds portcullisd's answer.
+    pub persona_known: Rc<std::cell::Cell<bool>>,
 }
 
 impl Settings {
@@ -269,6 +274,8 @@ impl Settings {
             forgot: Rc::default(),
             arca: Rc::new(arca),
             persona: Rc::default(),
+            at_rest: crate::at_rest::app_data(),
+            persona_known: Rc::default(),
             ui,
         };
         s.reload();
@@ -467,8 +474,15 @@ impl Settings {
     }
 
     /// Whether Add can be pressed.
+    /// Whether accounts may be added here (§6.4a A2): a plain store takes
+    /// them only once this is known to be Personal.
+    pub fn keeps_here(&self) -> Result<(), &'static str> {
+        let persona = if self.persona_known.get() { Ok(self.persona.borrow().clone()) } else { Err(String::new()) };
+        crate::at_rest::may_keep(self.at_rest, &persona)
+    }
+
     pub fn can_add(&self) -> bool {
-        match &self.ui.get_cloned().adding {
+        self.keeps_here().is_ok() && match &self.ui.get_cloned().adding {
             Adding::Found(s) => (s.handled_by.is_none() || s.use_anyway) && match s.cfg.oauth.as_deref() { Some("microsoft") => self.microsoft.borrow().is_none() && !self.microsoft_sheet_open.get(), Some(_) => false, None => self.cred_state.get_cloned().handle.is_some() },
             _ => false,
         }
@@ -1226,6 +1240,15 @@ impl SettingsView {
 
         // Accounts.
         section(ctx, x, &mut y, "ACCOUNTS");
+        // A plain store says so; a named persona adds nothing to it.
+        if !self.s.at_rest.sealed() {
+            let named = self.s.persona_known.get() && self.s.persona.borrow().is_some();
+            text(ctx, x, y + em(12.0), crate::at_rest::PLAIN_LINE, type_size::SM, Weight::Medium, if named { t.danger_fg() } else { t.text_secondary() });
+            y += em(24.0);
+            if named {
+                y += para(ctx, x, y, inner, crate::at_rest::NAMED_REFUSED, type_size::XS, t.text_secondary()) + em(8.0);
+            }
+        }
         if ui.rows.is_empty() && ui.adding == Adding::Closed {
             text(ctx, x, y + em(12.0), "No accounts yet.", type_size::MD, Weight::Regular, t.text_secondary());
             y += em(28.0);

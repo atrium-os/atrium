@@ -393,6 +393,15 @@ pub enum Request {
         user: String,
     },
 
+    /// stoad (a `session_state` service) asks where `uid`'s sessions in
+    /// `persona` are kept (stoa.md §5.4a): that persona's key group.
+    /// Answer: `SessionStateDirReady`, then the open directory over
+    /// SCM_RIGHTS; or `Error` saying why they are kept in memory only.
+    SessionStateDir {
+        uid: u32,
+        persona: String,
+    },
+
     /// A jailed, non-root broker client (e.g. `_stoad`) asks portcullisd to
     /// exec a shell INSIDE an existing jaild-created jail on a pty — Stoa's
     /// jail-target sessions / `jexec` reimagined (stoa.md §4.5). portcullisd
@@ -1113,6 +1122,8 @@ pub enum Response {
     /// the uid the shell actually runs as inside the jail (the jail's
     /// app-uid, or 0 if `want_root` was granted) — for the caller's logs.
     JailExecStarted { pid: i32, uid: u32 },
+    /// The session-state directory follows (one descriptor).
+    SessionStateDirReady,
 
     /// Persona → the caller's: `None` for Personal, else the named
     /// persona and its colour (one of portcullis-policy's

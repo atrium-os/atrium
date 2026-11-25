@@ -350,6 +350,53 @@ boot, before login.
    - remove Work and grep the raw device for the marker (none);
    - assert the state files are 0640.
 
+**As built (2026-11-25).**
+- *cryptad* keeps a machine profile in `/var/db/crypta` and a person's in
+  that persona's folder. portcullisd names each folder with
+  `persona-store person= persona= dir=` (the directory must be root's,
+  0700, not a link). `owner=<person>/<persona>` on `import`, `create`,
+  `create-ac` or `create-gp` puts a new profile there and makes it
+  persona-scoped. `set scoped=0` is refused for it. Without the folder the
+  answer is `no-persona-store` and nothing is written. Loads and saves go
+  back to the folder a profile came from, and `list` shows `owner=`.
+  A new name must not be taken in any folder cryptad knows.
+- *portcullisd* (`home::vpn_profiles_dir`, `crypta.rs`) makes
+  `<persona apps dir>/.crypta` (Personal: `~/.atrium/apps/.crypta`),
+  root's, 0700, after `ensure_app_data`. As with Mail's accounts (mail.md
+  §6.4a), a named persona gets the folder only when the kernel reports its
+  app data sealed. Personal also gets it where its app data may be plain
+  (the machine's `plain_app_data` opt-out, or its one migrating login). A
+  thread names every loaded person's folders every 10 s, so a restarted
+  cryptad or a newly opened group is picked up. A folder that can't be had
+  is asked for again after 60 s.
+- *Removal.* After Sigillum's check, portcullisd sends `persona-forget`
+  before it touches the policy or the folders. cryptad takes the tunnels
+  down and deletes the profiles and their Arca items. An error from cryptad
+  refuses the removal ("nothing was removed"); no cryptad running means no
+  tunnel to stop. The folder then goes with the persona's crypto-erase.
+- *State files.* `vpn-state` (cryptad) and `persona-vpn` (portcullisd) are
+  written root's, group `_frescod`, 0640, and an old 0644 file is put
+  right. Without a `_frescod` group, `vpn-state` is root's alone and
+  `persona-vpn` isn't written, and both say so in the log.
+  `persona-colours` stays 0644.
+- *Checks.* `vm-personas-check.sh` (amd64 cloud VM, plain app data):
+  - portcullisd names Personal's folder;
+  - Work gets no folder and `owner=alice/work` is refused, with nothing
+    written;
+  - a marker profile for Personal lands only in its folder, scoped and
+    listed with its owner, and can't be made machine-wide;
+  - a machine profile still goes to `/var/db`;
+  - both state files are `root _frescod 640`;
+  - `persona-forget` takes the profile away and keeps the machine one.
+  
+  On sealed storage the same check uses Work. `tessera-personas-vm.sh` §5
+  (arm64 Tessera, the Mac VM) puts a marker profile where cryptad keeps
+  Work's. It checks that the profile is in Work's key group and never on
+  the raw disk in the clear, and that after the removal's crypto-erase it
+  is neither on the disk nor readable. That harness plays portcullisd, so
+  its part is the folder's erase. The cryptad and portcullisd wiring is
+  the personas check's part.
+
 ### 7.2 CLASS_VPN (new Aqueduct class 19)
 
 Served by `crypta-ctl` for cryptad, one socket per capability, as atrium-netconf does

@@ -116,6 +116,10 @@ pub struct JailRecord {
     /// Created without an exec: it stays until RemoveJail.
     #[serde(default)]
     pub persistent: bool,
+    /// Created with a system call filter. A record from before this field
+    /// reads as unfiltered, so its debug-class processes may dump.
+    #[serde(default)]
+    pub filtered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -224,16 +228,18 @@ impl PersistentState {
             fuse_mount: None,
             class: None,
             persistent: false,
+            filtered: false,
         });
         self.written_at_unix = now_unix();
     }
 
-    /// Record the class, and whether it persists, of the most recent record
-    /// named `name`.
-    pub fn set_class(&mut self, name: &str, class: Option<crate::protocol::JailClass>, persistent: bool) {
+    /// Record the class, whether it persists and whether it is filtered, of
+    /// the most recent record named `name`.
+    pub fn set_class(&mut self, name: &str, class: Option<crate::protocol::JailClass>, persistent: bool, filtered: bool) {
         if let Some(r) = self.jails.iter_mut().rev().find(|r| r.name == name) {
             r.class = class;
             r.persistent = persistent;
+            r.filtered = filtered;
         }
     }
 

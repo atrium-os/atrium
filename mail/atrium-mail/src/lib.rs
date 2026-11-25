@@ -8,6 +8,7 @@
 //! process.
 
 pub mod accounts;
+pub mod at_rest;
 pub mod compose;
 pub mod files;
 pub mod links;

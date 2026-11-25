@@ -510,6 +510,41 @@ to a blob is dropped — Stoa does not need to know about it.
    run with the state directory pointed at a plain path must find the marker, to prove the
    grep works.
 
+**As built (2026-11-25, not VM-run yet):**
+- portcullisd `stoa_state.rs`, request `SessionStateDir { uid, persona }` (capability
+  `session_state`, or root): `<persona apps dir>/.stoa/` (root, 0700) and `sessions/` in it
+  (stoad's uid, 0700), never a link, opened `O_DIRECTORY|O_NOFOLLOW`, owner and mode checked
+  on the descriptor, and `TESSERA_IOC_GROUP_INFO` on it must name an open, unlocked group.
+  `home::ensure_app_data` must say `Sealed`: plain app data under the dev opt-out keeps no
+  sessions. The reply `SessionStateDirReady` is followed by the one descriptor.
+- stoad asks at a person's first `MINT <name> [target] [persona]` in a persona (stoa-spawn
+  `session_state_dir`) and restores that store's sessions then. Each session has an owner
+  uid and a persona; `MINT` of another's session is refused, `LIST` and `KILL` see only the
+  caller's own. A session with no store says ` nokeep` in the `MINT` answer and `stoactl
+  attach` prints that its history is not kept. All writes are `*at` on the handed-over
+  descriptor (`O_NOFOLLOW`, temp `O_EXCL` 0600, fsync, rename).
+- `DROP <uid> <persona|*> <keep|erase>` (root): portcullisd sends `keep` at logout
+  (`SessionEnded`) and `erase` when a persona is removed. The sessions end and the store is
+  let go.
+- The table is keyed by (owner, name) (`<uid>/<name>`), so two people can each have a
+  `default`; a person's `LIST` shows their own names. Session names are one printable token
+  without `/`.
+- `SessionStateDir` only checks: the persona must be one of the person's own (their tenant
+  policy), and its apps folder must already exist, root's, as an app launch made it.
+  portcullisd makes nothing there but `.stoa/sessions`, and never a persona's folder or key
+  group.
+- The persona is a label the person gives the session, saying where its history is kept. It
+  is not where the shell runs: the shell is the person's own, unjailed, in any persona, so
+  this keeps a Work session's history in Work's group and does not confine its shell to
+  Work.
+- `STOA_STATE` is now only a dev directory; unset there is no fallback. The services.d
+  manifest has no data volume.
+- Gates: `scripts/stoa-at-rest-vm.sh` (check 5, 24 checks; needs `tessera_fs` and
+  `/root/sealed`; the key group comes from `tessera-keyload`, and Work's removal is played by
+  sending `DROP … erase` and erasing the group, since the real removal needs a press and
+  Sigillum), and `vm-console-check.sh` now runs stoad with a state folder and checks that no
+  console was written to it.
+
 ### 5.5 Live-process survival across `stoad` restart (S3b — aspirational TODO)
 
 §5.1–5.3 is **history-only**: a `stoad` restart (crash/upgrade) or host

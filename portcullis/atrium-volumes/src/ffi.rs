@@ -182,6 +182,9 @@ impl GroupInfo {
     pub const LOCKED: u32 = 0x4;
     pub const BAD: u32 = 0x8;
     pub const NO_RECORD: u32 = 0x10;
+    /// The volume has key groups (`TESSERA_INCOMPAT_KEY_GROUPS`): any
+    /// group, anyone's. A kernel from before this flag never sets it.
+    pub const VOLUME_GROUPS: u32 = 0x20;
     pub fn has(&self, f: u32) -> bool { self.flags & f != 0 }
 }
 
@@ -249,6 +252,17 @@ pub fn tessera_group_info(path: &Path) -> io::Result<GroupInfo> {
         }
         _ => dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?,
     }
+    Ok(gi)
+}
+
+/// What the directory `path` itself is, asked on its own descriptor
+/// (opened `O_DIRECTORY | O_NOFOLLOW`), never through its parent: the
+/// answer is about the very folder that is opened, so a link planted in
+/// its place cannot redirect it. A locked group's folder can't be opened,
+/// so this errors for one (use [`tessera_group_info`] to ask about it).
+pub fn tessera_group_info_here(path: &Path) -> io::Result<GroupInfo> {
+    let mut gi = GroupInfo::default();
+    dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?;
     Ok(gi)
 }
 

@@ -51,7 +51,7 @@ fn settings_window() {
 
     // A setup with no mail accounts can still open the trusted S/MIME sheet.
     assert!(texts(&app).iter().any(|t| t == "Add S/MIME identity"));
-    assert!(!s.take_smime_ask());
+    assert!(s.take_smime_ask().is_none());
 
     // Found from the address: a known provider needs no lookups.
     s.start_adding();
@@ -71,6 +71,15 @@ fn settings_window() {
     assert!(!s.can_add());
     s.cred.apply(limen::credential::ToParent::Filled { username: None });
     s.cred.apply(limen::credential::ToParent::Handle { handle: [7; 16] });
+    // A plain store (no ATRIUM_APP_DATA here) takes accounts only once
+    // this is known to be Personal (§6.4a A2).
+    drawn(&mut app, &["Mail on this device is not encrypted"]);
+    assert!(!s.can_add(), "the persona isn't known yet");
+    *s.persona.borrow_mut() = Some("work".into());
+    s.persona_known.set(true);
+    assert!(!s.can_add(), "a named persona adds nothing to a plain store");
+    assert_eq!(s.keeps_here(), Err(atrium_mail::at_rest::NAMED_REFUSED));
+    *s.persona.borrow_mut() = None;
     assert!(s.can_add());
     // Arca isn't running here: said, and the password is to be typed again.
     s.add();
@@ -380,6 +389,8 @@ fn lost_microsoft_sheet_releases_ticket_and_retries_existing_account() {
         }
     });
     let settings = Settings::new(engine.clone(), Arc::new(AtomicBool::new(true)), path);
+    // Personal: a plain store (§6.4a A2) still takes its accounts.
+    settings.persona_known.set(true);
     let retry = || {
         settings.renew_microsoft(id);
         let until = Instant::now() + Duration::from_secs(5);

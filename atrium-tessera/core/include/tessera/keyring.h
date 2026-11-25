@@ -103,6 +103,7 @@ struct tessera_ioc_group_info {
 #define TESSERA_GROUP_INFO_LOCKED    0x4u
 #define TESSERA_GROUP_INFO_BAD       0x8u  /* EINTEGRITY: record or MAC */
 #define TESSERA_GROUP_INFO_NO_RECORD 0x10u /* names a group with no record */
+#define TESSERA_GROUP_INFO_VOLUME_GROUPS 0x20u /* the volume has key groups */
 #define TESSERA_IOC_GROUP_INFO   _IOWR('T', 10, struct tessera_ioc_group_info)
 
 /* Scrub (E4.7, tessera-encryption.md §13.1): make deleted file contents

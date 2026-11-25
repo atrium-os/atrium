@@ -34730,6 +34730,11 @@ tessera_fs_group_info(struct vnode *vp, struct tessera_ioc_group_info *o)
 	memset(o, 0, sizeof(*o));
 	o->inode = ino;
 	memcpy(o->volume_uuid, tmp_->sb.volume_uuid, sizeof(o->volume_uuid));
+	/* Whether this machine encrypts at all, for portcullisd's
+	 * plain_app_data override (mail.md §6.4a A1): set once any group
+	 * was made on the volume, whatever this directory is. */
+	if ((tmp_->sb.incompat_flags & TESSERA_INCOMPAT_KEY_GROUPS) != 0)
+		o->flags |= TESSERA_GROUP_INFO_VOLUME_GROUPS;
 	if (tmp_->inode_tree == NULL)
 		return (0);
 	if (tessera_fs_inode_get(tmp_, ino, &dino) != TESSERA_OK)

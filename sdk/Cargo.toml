@@ -9,6 +9,7 @@ members = [
     "atrium-message",
     "atrium-message-derive",
     "atrium-schema",
+    "atrium-storage",
     "atrium-worker",
     "cargo-atrium",
 ]

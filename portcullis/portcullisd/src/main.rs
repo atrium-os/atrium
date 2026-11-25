@@ -52,6 +52,7 @@ use portcullis_ipc::{
 use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod calendar;
+mod crypta;
 mod console;
 mod dev;
 mod egress;
@@ -60,6 +61,7 @@ mod ide;
 mod host_dns;
 mod launch;
 mod ssh_agent;
+mod stoa_state;
 mod workspace;
 use portcullisd::manifest_trust;
 #[cfg(feature = "pam")]
@@ -157,6 +159,20 @@ fn main() -> ExitCode {
         is the DEV STUB (accepts ANY password). NOT FOR PRODUCTION.");
 
     let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
+
+    // Each person's VPN profile folders, named to cryptad (vpn.md §7.1a).
+    {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || loop {
+            let people: Vec<(String, Vec<String>)> = shared.lock().unwrap_or_else(|e| e.into_inner()).cache.iter()
+                .map(|(u, tp)| (u.clone(), tp.policy.personas.keys().cloned().collect()))
+                .collect();
+            for (u, personas) in people {
+                crypta::publish(&u, &personas);
+            }
+            thread::sleep(crypta::EVERY);
+        });
+    }
 
     /* ★ The worker-call socket (portcullis_ipc::WORKERS_SOCKET_PATH): what
      * an app with [[workers]] gets in its jail. Same daemon, same peer-uid
@@ -1110,6 +1126,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * write_response path. Peer-uid + jail_exec cap gated. */
         if matches!(req, Request::ExecInJail { .. }) {
             handle_exec_in_jail(uid, req, &mut writer)?;
+            continue;
+        }
+        if let Request::SessionStateDir { uid: of, persona } = req {
+            handle_session_state_dir(uid, of, &persona, &shared, &mut writer)?;
             continue;
         }
         let resp = handle(req, &user, &shared);
@@ -3016,6 +3036,11 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         if !sticks.is_empty() {
             return refuse(format!("{} of {name} was plugged in meanwhile: eject it first; nothing was removed", sticks.join(", ")));
         }
+        // Its VPN tunnels down and its profiles forgotten (vpn.md §7.1a);
+        // the profiles' folder goes with the persona's crypto-erase.
+        if let Err(why) = crypta::forget(&owner, &name) {
+            return refuse(why);
+        }
     }
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
     let tp = match s.get_or_load(&owner) {
@@ -3033,6 +3058,8 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
     publish_colours(&owner, &tp.policy);
     if removing {
         calendar::stop(&owner, Some(&name));
+        // Its Stoa sessions end, unsaved: their folder goes with the group.
+        console::stoad_drop(&owner, Some(&name), true);
         let gone = portcullis_overlay::remove_persona_places(&owner, &name);
         // Its files too (personas.md §4.1): encrypted, the key goes and the
         // kernel crypto-erases them (tessera-encryption.md E4.6).
@@ -3792,6 +3819,46 @@ fn handle_govern(uid: u32, req: Request) -> Response {
 /// NOTE (v1): gated on the `jail_exec` capability alone. A per-human
 /// ownership check (does *this* user own jail X — via the launch registry)
 /// is a documented follow-up; today `_stoad` holds `jail_exec` for the seat.
+/// Stoa's session state (stoa.md §5.4a): only root or a services.d service
+/// granted `session_state` asks; the answer is the open directory.
+fn handle_session_state_dir(peer: u32, of: u32, persona: &str, shared: &Mutex<Tenants>, writer: &mut UnixStream) -> std::io::Result<()> {
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: Stoa session state of uid {of} ({persona}): {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    if peer != 0 {
+        let manifests = match portcullisd::system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
+            Ok(o) => o.manifests,
+            Err(e) => return refuse(writer, format!("services.d load: {e}")),
+        };
+        if !manifests.iter().any(|m| m.exec.as_ref().is_some_and(|e| e.uid == peer) && m.capabilities.session_state) {
+            return refuse(writer, format!("cap.session_state.denied: uid {peer} is not a session_state service"));
+        }
+    }
+    let person = match username_for_uid(of) {
+        Ok(p) => p,
+        Err(e) => return refuse(writer, format!("uid {of}: {e}")),
+    };
+    // A named persona must be one of the person's own: stoad passes on
+    // the label the person typed.
+    if persona != "personal" {
+        let known = portcullis_peer::valid_person_persona(persona) && {
+            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.get_or_load(&person).map(|tp| tp.policy.has_persona(Some(persona))).unwrap_or(false)
+        };
+        if !known {
+            return refuse(writer, format!("{persona:?} is not one of {person}'s personas"));
+        }
+    }
+    match stoa_state::dir_for(peer, of, &person, persona) {
+        Ok(fd) => {
+            write_response(writer, &Response::SessionStateDirReady)?;
+            portcullis_ipc::send_fds(writer, &[fd.as_raw_fd()])
+        }
+        Err(why) => refuse(writer, why),
+    }
+}
+
 fn handle_exec_in_jail(uid: u32, req: Request, writer: &mut UnixStream) -> std::io::Result<()> {
     use portcullisd::jaild_client::Client;
     use portcullisd::system_services;
@@ -4043,6 +4110,10 @@ fn session_ended(user: &str) -> Response {
         return Response::Ok;
     }
     launch::stop_files_for_logout(user);
+    portcullisd::home::app_data_session_ended(user);
+    // Stoa writes the person's sessions out and lets them go before the
+    // keys do (stoa.md §5.4a).
+    console::stoad_drop(user, None, false);
     let uids = launch::user_uids(user);
     launch::end_processes(&uids);
     calendar::stop(user, None);
@@ -4350,6 +4421,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::NewWorkbook { .. } | Request::RecoverWorkbook { .. } | Request::RecoverSelectedWorkbook { .. } | Request::NameWorkbookRecovery { .. } | Request::OpenApps { .. } | Request::OpenFile { .. } | Request::WorkbookVersion { .. } | Request::WorkbookBookmark { .. } | Request::CalendarInvitation { .. } | Request::CalendarUpdate | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
+        },
+        Request::SessionStateDir { .. } => Response::Error {
+            message: "internal: SessionStateDir must go through handle_session_state_dir".into(),
         },
         Request::ExecInJail { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to

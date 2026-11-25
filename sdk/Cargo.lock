@@ -82,6 +82,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-storage"
+version = "0.1.0"
+
+[[package]]
 name = "atrium-types"
 version = "0.1.0"
 

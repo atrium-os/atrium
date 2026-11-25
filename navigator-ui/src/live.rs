@@ -920,6 +920,22 @@ impl Live {
                         eprintln!("navigator-ui: a live page's address {url} not taken");
                     }
                 }
+                Event::LiveFile { from, id, url, name, size, origin, kind } => {
+                    // A live page's file (I6.4): asked on its entry; the
+                    // engine keeps running.
+                    let prompt = crate::trail::Prompt::Download { id, file: name, size: human(size), origin, kind: kind.clone() };
+                    if s.live_file(&from, prompt, crate::ui::now_ms()) {
+                        eprintln!("navigator-ui: the live page offered {url} ({kind}, {size} bytes); asking");
+                    } else {
+                        eprintln!("navigator-ui: the live page's file {url} not asked; discarded");
+                        send(&mut self.w, &Request::Discard { id });
+                    }
+                }
+                Event::LiveRefused { from, what } => {
+                    if s.live_refused(&from, &what) {
+                        eprintln!("navigator-ui: the live page was refused {what}");
+                    }
+                }
                 Event::LiveEnded { url, why } => {
                     eprintln!("navigator-ui: {url} stopped running live{}", why.as_deref().map(|w| format!(": {w}")).unwrap_or_default());
                     if self.live_placed.as_ref().is_some_and(|(u, _)| *u == url) { self.live_placed = None; }

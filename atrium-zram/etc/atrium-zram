@@ -19,7 +19,15 @@
 #   atrium_zram_backing="gpt/swapfs"    # disk partition for cold/incompressible
 #                                       # pages (atrium-zram-v2.md §4.5). It is
 #                                       # taken off swap and given to zram, so
-#                                       # only zram0 is swapped on.
+#                                       # only zram0 is swapped on. zram gets it
+#                                       # under GELI one-time (a fresh random key
+#                                       # each boot, mail.md §6.4a A3) as
+#                                       # <backing>.eli, never plain: if GELI
+#                                       # fails, zram runs with no backing store.
+#
+# Any other swap device still on after start that isn't a .eli or zram0 is
+# plain swap: it is reported on every start. List swap in fstab as
+# /dev/<part>.eli (swapon(8) makes it one-time).
 
 # PROVIDE: atrium_zram
 # REQUIRE: sshd
@@ -65,13 +73,31 @@ atrium_zram_start()
 	    [ -z "$(sysctl -n kern.zram.backing_dev)" ]; then
 		# FreeBSD stripes swap across every device with no priorities, so
 		# the partition must not stay a swap device next to zram0.
-		bdev="/dev/${atrium_zram_backing#/dev/}"
-		if swapinfo | grep -q "^${bdev} "; then
-			echo "atrium_zram: swapoff ${bdev} (becomes zram backing)"
-			swapoff "${bdev}" || echo "atrium_zram: swapoff ${bdev} failed"
+		backing="${atrium_zram_backing#/dev/}"
+		bdev="/dev/${backing}"
+		for d in "${bdev}" "${bdev}.eli"; do
+			if swapinfo | grep -q "^${d} "; then
+				echo "atrium_zram: swapoff ${d} (becomes zram backing)"
+				swapoff "${d}" || echo "atrium_zram: swapoff ${d} failed"
+			fi
+		done
+		# swapon(8)'s one-time .eli detaches on its last close; wait
+		# (bounded) so the partition is free for a fresh key.
+		n=0
+		while [ -e "${bdev}.eli" ] && [ $n -lt 10 ]; do
+			geli detach "${bdev}.eli" 2>/dev/null || sleep 1
+			n=$((n + 1))
+		done
+		# Pages written back are plaintext: the store is only ever the
+		# one-time GELI provider, never the partition itself.
+		if kldload -n geom_eli && [ ! -e "${bdev}.eli" ] && \
+		    geli onetime -d -e AES-XTS -l 256 -s 4096 "${bdev}" && \
+		    [ -c "${bdev}.eli" ]; then
+			sysctl kern.zram.backing_dev="${backing}.eli" >/dev/null ||
+			    echo "atrium_zram: backing store ${backing}.eli not attached"
+		else
+			echo "atrium_zram: GELI one-time on ${bdev} failed: no backing store (RAM only)"
 		fi
-		sysctl kern.zram.backing_dev="${atrium_zram_backing}" >/dev/null ||
-		    echo "atrium_zram: backing store ${atrium_zram_backing} not attached"
 	fi
 	if checkyesno atrium_zram_swap; then
 		# Idempotent — only swapon if it is not already a swap device.
@@ -82,6 +108,10 @@ atrium_zram_start()
 			echo "atrium_zram: swapon -E ${atrium_zram_dev}"
 			swapon -E "${atrium_zram_dev}" || echo "atrium_zram: swapon failed"
 		fi
+	fi
+	plain=$(swapinfo | awk -v z="${atrium_zram_dev}" 'NR > 1 && $1 != "Total" && $1 != z && $1 !~ /\.eli$/ { print $1 }')
+	if [ -n "${plain}" ]; then
+		echo "atrium_zram: WARNING plain swap (not GELI one-time): ${plain}"
 	fi
 	echo "atrium_zram: ${atrium_zram_dev} ready"
 }

@@ -1,0 +1,9 @@
+[package]
+name = "atrium-storage"
+description = "Whether an Atrium app's data is sealed on this device (mail.md §6.4a A2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

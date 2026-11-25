@@ -197,10 +197,16 @@ impl Engine {
                     s.panel_open = false;
                 }
             }
+            // An icon being edited isn't left unsaved.
+            Act::SelectAsset(_) | Act::ImportSvg | Act::IconNew | Act::IconEdit
+                if s.assets.as_ref().and_then(|a| a.editing.as_ref()).is_some_and(|e| e.changed) => {
+                s.note = Some(("Save or close the icon first".into(), true));
+            }
             Act::SelectAsset(i) => {
                 if let Some(a) = s.assets.as_mut().filter(|a| i < a.files.len()) {
                     a.selected = i;
                     a.importing = None;
+                    a.editing = None;
                     self.show_asset(s);
                 }
             }
@@ -209,6 +215,7 @@ impl Engine {
                 if let Some(a) = s.assets.as_mut() {
                     a.importing = Some(crate::assets::Importing::Choosing(crate::assets::svgs(&dir)));
                     a.import_preview = None;
+                    a.editing = None;
                 }
             }
             Act::ImportFrom(i) => {
@@ -231,6 +238,34 @@ impl Engine {
                         a.importing = None;
                         a.import_preview = None;
                     },
+                }
+            }
+            Act::IconNew => self.icon_new(s),
+            Act::IconEdit => self.icon_edit(s),
+            Act::IconSave => self.icon_save(s),
+            Act::IconClose => if let Some(a) = s.assets.as_mut() {
+                a.editing = None;
+            },
+            Act::IconTool(_) | Act::IconCanvas(..) | Act::IconTarget(_) | Act::IconColour(_) | Act::IconShade(_)
+            | Act::IconFillKind(_) | Act::IconStroke(_) | Act::IconSelect(_) | Act::IconReorder(_) | Act::IconDelete
+            | Act::IconFinishPen => {
+                use crate::iconedit::Tool;
+                let Some(e) = s.assets.as_mut().and_then(|a| a.editing.as_mut()) else { return false };
+                match a {
+                    Act::IconTool(t) => e.set_tool(match t {
+                        1 => Tool::Rect, 2 => Tool::Ellipse, 3 => Tool::Line, 4 => Tool::Pen, _ => Tool::Select,
+                    }),
+                    // Half units: the grid's snap.
+                    Act::IconCanvas(phase, hx, hy) => e.pointer(phase, hx as f32 / 2.0, hy as f32 / 2.0),
+                    Act::IconTarget(t) => e.target = t.min(2),
+                    Act::IconColour(i) => e.colour(i),
+                    Act::IconShade(l) => e.shade(l),
+                    Act::IconFillKind(k) => e.fill_kind(k),
+                    Act::IconStroke(w) => e.stroke_width(w),
+                    Act::IconSelect(i) => e.select(i),
+                    Act::IconReorder(f) => e.reorder(f),
+                    Act::IconDelete => e.delete(),
+                    _ => e.finish_pen(),
                 }
             }
             Act::SelectCrash(i) => {
@@ -533,6 +568,7 @@ impl Engine {
         if let Some(o) = s.assets.take().filter(|o| o.project == s.project) {
             a.importing = o.importing;
             a.import_preview = o.import_preview;
+            a.editing = o.editing;
             if o.preview.as_ref().map(|p| &p.rel) == a.selected().map(|f| &f.rel) {
                 a.preview = o.preview;
                 a.check = o.check;
@@ -568,6 +604,69 @@ impl Engine {
             let job = Job::IconCheck { project: s.project.clone(), rel: f.rel.clone() };
             let project = s.project.clone();
             self.start_job(job, &crate::assets::check_argv(&f.rel), &project, s);
+        }
+    }
+
+    /// The icon editor on a new icon: `assets/icons/app.svg` when the
+    /// project has none, else the first free `icon[-N].svg`.
+    fn icon_new(&mut self, s: &mut State) {
+        let icons = self.project_dir(s).join("assets/icons");
+        let free = |n: &str| std::fs::symlink_metadata(icons.join(n)).is_err();
+        let name = std::iter::once("app.svg".to_string()).chain(std::iter::once("icon.svg".to_string()))
+            .chain((2..100).map(|i| format!("icon-{i}.svg"))).find(|n| free(n));
+        let Some(name) = name else {
+            s.note = Some(("assets/icons has no free icon name".into(), true));
+            return;
+        };
+        if let Some(a) = s.assets.as_mut() {
+            a.importing = None;
+            a.editing = Some(crate::iconedit::Editor::new(&format!("assets/icons/{name}")));
+        }
+    }
+
+    /// The icon editor on the selected icon, when it was drawn here.
+    fn icon_edit(&mut self, s: &mut State) {
+        let dir = self.project_dir(s);
+        let Some(a) = s.assets.as_mut() else { return };
+        let Some(f) = a.selected().filter(|f| f.kind == crate::assets::Kind::Icon).cloned() else { return };
+        match read_icon(&dir.join(&f.rel)) {
+            Ok(svg) => match crate::iconedit::Editor::open(&f.rel, &svg) {
+                Some(e) => {
+                    a.importing = None;
+                    a.editing = Some(e);
+                }
+                None => s.note = Some((format!("{} was drawn in another app: edit it there and import it again", f.name()), true)),
+            },
+            Err(e) => s.note = Some((format!("Can't read {}: {e}", f.rel), true)),
+        }
+    }
+
+    /// Write the edited icon, refusing one the dock wouldn't draw, then
+    /// show it (decoded and checked like any other).
+    fn icon_save(&mut self, s: &mut State) {
+        let dir = self.project_dir(s);
+        let Some(e) = s.assets.as_mut().and_then(|a| a.editing.as_mut()) else { return };
+        e.finish_pen();
+        let svg = match crate::iconedit::to_svg(&e.shapes) {
+            Ok(svg) => svg,
+            Err(why) => {
+                e.note = Some(format!("Not saved: {why}"));
+                return;
+            }
+        };
+        let rel = e.rel.clone();
+        match write_icon(&dir, &rel, &svg) {
+            Ok(()) => {
+                e.changed = false;
+                e.note = None;
+                s.note = Some((format!("Saved {rel}"), false));
+                if let Some(a) = s.assets.as_mut() {
+                    a.preview = None;
+                }
+                self.tree.refresh();
+                self.refresh_assets(Some(&rel), s);
+            }
+            Err(why) => e.note = Some(format!("Not saved: {why}")),
         }
     }
 
@@ -1696,6 +1795,45 @@ fn quiet(argv: &[&str]) -> Vec<String> {
     v
 }
 
+/// An icon's text, at most the dock's size and never through a link.
+fn read_icon(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let m = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !m.is_file() {
+        return Err("not a plain file".into());
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(crate::iconedit::MAX_BYTES as u64 + 1).read_to_end(&mut buf)).map_err(|e| e.to_string())?;
+    if buf.len() > crate::iconedit::MAX_BYTES {
+        return Err("larger than an icon may be".into());
+    }
+    String::from_utf8(buf).map_err(|_| "not text".into())
+}
+
+/// Write `svg` to `rel` (`assets/icons/<name>.svg`) in the project at
+/// `dir`, making the folders; a folder or icon that is a link is refused,
+/// so the write stays in the project.
+fn write_icon(dir: &Path, rel: &str, svg: &str) -> Result<(), String> {
+    let name = rel.strip_prefix("assets/icons/").filter(|n| {
+        n.ends_with(".svg") && !n.starts_with('.') && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    }).ok_or("not an icon's name")?;
+    let mut d = dir.to_path_buf();
+    for part in ["assets", "icons"] {
+        d.push(part);
+        match std::fs::symlink_metadata(&d) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(format!("{} isn't a folder", d.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&d).map_err(|e| e.to_string())?,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let path = d.join(name);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file()) {
+        return Err(format!("{rel} isn't a plain file"));
+    }
+    save_file(&path, svg, name).map_err(|e| e.to_string())
+}
+
 /// Save `text` to `path`. Through a temporary in the same folder, then
 /// renamed, so a crash never leaves half a file; but a file someone else
 /// owns (a workspace's, under Artifex's own uid) is rewritten in place, as
@@ -2211,6 +2349,59 @@ mod tests {
         e.act(Act::Open("pics/src/main.rs".into()), &mut s);
         assert_eq!(s.view, Main::Code);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_icon_editor() {
+        let (d, mut e, mut s) = asset_project("icon-editor");
+        let p = d.join("proj/pics");
+        e.act(Act::View(Main::Assets), &mut s);
+        wait_preview(&mut e, &mut s);
+        // app.svg was drawn elsewhere: not opened for editing.
+        e.act(Act::IconEdit, &mut s);
+        assert!(s.assets.as_ref().unwrap().editing.is_none());
+        assert!(s.note.as_ref().is_some_and(|n| n.0.contains("another app")), "{:?}", s.note);
+        // A new icon takes the first free name; a rectangle drawn in half units.
+        e.act(Act::IconNew, &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().editing.as_ref().map(|e| e.rel.as_str()), Some("assets/icons/icon.svg"));
+        e.act(Act::IconTool(1), &mut s);
+        for a in [Act::IconCanvas(0, 4, 4), Act::IconCanvas(1, 20, 20), Act::IconCanvas(2, 40, 44)] {
+            e.act(a, &mut s);
+        }
+        e.act(Act::IconFillKind(3), &mut s);
+        e.act(Act::IconStroke(3), &mut s);
+        let ed = s.assets.as_ref().unwrap().editing.clone().unwrap();
+        assert_eq!(ed.shapes.len(), 1);
+        assert_eq!(ed.shapes[0].bbox(), [2.0, 2.0, 20.0, 22.0]);
+        assert!(ed.changed);
+        // Unsaved: the view doesn't move away from it.
+        e.act(Act::SelectAsset(1), &mut s);
+        assert!(s.assets.as_ref().unwrap().editing.is_some());
+        assert_eq!(s.note.as_ref().map(|n| n.0.as_str()), Some("Save or close the icon first"));
+        e.act(Act::IconSave, &mut s);
+        let svg = std::fs::read_to_string(p.join("assets/icons/icon.svg")).unwrap();
+        assert!(svg.contains("<radialGradient") && svg.contains("artifex-icon v1"), "{svg}");
+        let a = s.assets.as_ref().unwrap();
+        assert_eq!(a.selected().map(|f| f.rel.as_str()), Some("assets/icons/icon.svg"));
+        assert!(!a.editing.as_ref().unwrap().changed);
+        // Closed and opened again: the same shapes.
+        e.act(Act::IconClose, &mut s);
+        e.act(Act::IconEdit, &mut s);
+        assert_eq!(s.assets.as_ref().unwrap().editing.as_ref().map(|e| e.shapes.clone()), Some(ed.shapes.clone()));
+        // Emptied, it isn't saved: the dock has nothing to draw.
+        e.act(Act::IconSelect(0), &mut s);
+        e.act(Act::IconDelete, &mut s);
+        e.act(Act::IconSave, &mut s);
+        let note = s.assets.as_ref().unwrap().editing.as_ref().unwrap().note.clone();
+        assert!(note.is_some_and(|n| n.starts_with("Not saved")));
+        assert_eq!(std::fs::read_to_string(p.join("assets/icons/icon.svg")).unwrap(), svg);
+        // A linked icons folder is refused.
+        assert!(write_icon(&d.join("nowhere"), "assets/icons/../x.svg", &svg).is_err());
+        let q = d.join("linked");
+        std::fs::create_dir_all(q.join("assets")).unwrap();
+        std::os::unix::fs::symlink(d.join("proj"), q.join("assets/icons")).unwrap();
+        assert!(write_icon(&q, "assets/icons/a.svg", &svg).unwrap_err().contains("isn't a folder"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

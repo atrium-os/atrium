@@ -102,6 +102,32 @@ pub enum Act {
     ImportFrom(usize),
     /// The import preview's answer.
     ConfirmImport(bool),
+    /// The icon editor on a new icon.
+    IconNew,
+    /// The icon editor on the selected icon.
+    IconEdit,
+    /// Select, Rectangle, Ellipse, Line, Pen.
+    IconTool(u8),
+    /// A press (0), move (1) or release (2) on the canvas, in half units.
+    IconCanvas(u8, i32, i32),
+    /// What a colour goes to: 0 fill, 1 a gradient's second, 2 stroke.
+    IconTarget(u8),
+    /// The `i`th colour: the palette, then the icon's own.
+    IconColour(usize),
+    /// The chosen colour a step lighter (true) or darker.
+    IconShade(bool),
+    /// No fill, a colour, a linear or a radial gradient.
+    IconFillKind(u8),
+    /// No stroke (0), or the `n`th width.
+    IconStroke(u8),
+    IconSelect(usize),
+    /// Move the selected shape towards the front (true) or back.
+    IconReorder(bool),
+    IconDelete,
+    /// End the pen's shape where it is.
+    IconFinishPen,
+    IconSave,
+    IconClose,
 }
 
 /// The debugger as the window shows it.
