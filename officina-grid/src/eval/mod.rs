@@ -13,6 +13,7 @@ pub mod dates;
 pub mod funcs;
 pub mod ifcache;
 mod fin;
+mod bonds;
 mod conv;
 mod dist;
 mod linest;

@@ -80,24 +80,36 @@ struct Fit {
     b: f64,
     /// (X'X)⁻¹ over the (centred, with a constant) predictors.
     inv: Vec<Vec<f64>>,
+    /// Variables left after dropping redundant ones.
+    kept: usize,
     means: Vec<f64>,
     n: f64,
     ss_reg: f64,
     ss_resid: f64,
 }
 
-fn invert(mut a: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
+/// The inverse of the symmetric positive semi-definite `a` (X'X) over the
+/// variables that aren't redundant, by Gauss–Jordan elimination in column
+/// order: a column whose pivot has fallen to almost nothing of its own
+/// diagonal is a combination of earlier ones, and is dropped (its rows and
+/// columns of the inverse are zero), as Excel drops collinear predictors.
+fn invert(mut a: Vec<Vec<f64>>) -> (Vec<Vec<f64>>, Vec<bool>) {
     let k = a.len();
     let mut inv: Vec<Vec<f64>> = (0..k).map(|i| (0..k).map(|j| f64::from(u8::from(i == j))).collect()).collect();
-    let scale = a.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
+    let diag: Vec<f64> = (0..k).map(|i| a[i][i]).collect();
+    let mut dropped = vec![false; k];
     for col in 0..k {
-        let pivot = (col..k).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
-        if a[pivot][col].abs() <= scale * 1e-13 {
-            return None;
-        }
-        a.swap(col, pivot);
-        inv.swap(col, pivot);
         let p = a[col][col];
+        if !(p > diag[col] * 1e-10) {
+            dropped[col] = true;
+            for i in 0..k {
+                a[col][i] = 0.0;
+                a[i][col] = 0.0;
+                inv[col][i] = 0.0;
+                inv[i][col] = 0.0;
+            }
+            continue;
+        }
         for j in 0..k {
             a[col][j] /= p;
             inv[col][j] /= p;
@@ -114,7 +126,7 @@ fn invert(mut a: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
             }
         }
     }
-    Some(inv)
+    (inv, dropped)
 }
 
 fn fit(d: &Data, constant: bool) -> Result<Fit, ErrorKind> {
@@ -139,7 +151,8 @@ fn fit(d: &Data, constant: bool) -> Result<Fit, ErrorKind> {
             }
         }
     }
-    let inv = invert(xtx).ok_or(ErrorKind::Num)?;
+    let (inv, dropped) = invert(xtx);
+    let kept = dropped.iter().filter(|d| !**d).count();
     let m: Vec<f64> = (0..k).map(|i| (0..k).map(|j| inv[i][j] * xty[j]).sum()).collect();
     let b = if constant { ymean - m.iter().zip(&means).map(|(m, x)| m * x).sum::<f64>() } else { 0.0 };
     let (mut ss_reg, mut ss_resid) = (0.0, 0.0);
@@ -148,7 +161,7 @@ fn fit(d: &Data, constant: bool) -> Result<Fit, ErrorKind> {
         ss_resid += (y - fitted) * (y - fitted);
         ss_reg += (fitted - ymean) * (fitted - ymean);
     }
-    Ok(Fit { m, b, inv, means, n, ss_reg, ss_resid })
+    Ok(Fit { m, b, inv, kept, means, n, ss_reg, ss_resid })
 }
 
 fn flag(c: &Ctx, a: &[Expr], i: usize, default: bool) -> Result<bool, ErrorKind> {
@@ -185,7 +198,7 @@ fn estimate(c: &Ctx, a: &[Expr], log: bool) -> Ev {
         if !stats {
             return Ok(array(1, cols, vals));
         }
-        let p = k as f64 + f64::from(u8::from(constant));
+        let p = f.kept as f64 + f64::from(u8::from(constant));
         let df = f.n - p;
         let na = Value::Err(ErrorKind::NA);
         // Without a constant this is the sum of the fitted values' squares.
@@ -204,7 +217,7 @@ fn estimate(c: &Ctx, a: &[Expr], log: bool) -> Ev {
         vals.push(num(r2));
         vals.push(num(sey2.sqrt()));
         vals.extend(std::iter::repeat_n(na.clone(), cols - 2));
-        let fstat = if df > 0.0 && f.ss_resid > 0.0 { (ss_reg / k as f64) / (f.ss_resid / df) } else { f64::NAN };
+        let fstat = if df > 0.0 && f.ss_resid > 0.0 { (ss_reg / f.kept as f64) / (f.ss_resid / df) } else { f64::NAN };
         vals.push(num(fstat));
         vals.push(num(df.max(0.0)));
         vals.extend(std::iter::repeat_n(na.clone(), cols - 2));

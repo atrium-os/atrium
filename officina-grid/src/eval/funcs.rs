@@ -13,6 +13,7 @@ use super::conv::*;
 use super::stats::*;
 use super::dist::*;
 use super::linest::*;
+use super::bonds::*;
 use super::{to_bool, to_text, Array, Ctx, Ev};
 use crate::addr::Rect;
 use crate::formula::Expr;
@@ -396,6 +397,45 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("LOGEST", 1, 4, logest),
     f!("TREND", 1, 4, trend),
     f!("GROWTH", 1, 4, growth),
+    // the seventh batch (bonds.rs, fin.rs, conv.rs)
+    f!("COUPPCD", 3, 4, couppcd),
+    f!("COUPNCD", 3, 4, coupncd),
+    f!("COUPNUM", 3, 4, coupnum),
+    f!("COUPDAYS", 3, 4, coupdays),
+    f!("COUPDAYBS", 3, 4, coupdaybs),
+    f!("COUPDAYSNC", 3, 4, coupdaysnc),
+    f!("PRICE", 6, 7, price),
+    f!("YIELD", 6, 7, yield_fn),
+    f!("DURATION", 5, 6, duration),
+    f!("MDURATION", 5, 6, mduration),
+    f!("ACCRINT", 6, 8, accrint),
+    f!("ACCRINTM", 4, 5, accrintm),
+    f!("DISC", 4, 5, disc),
+    f!("PRICEDISC", 4, 5, pricedisc),
+    f!("YIELDDISC", 4, 5, yielddisc),
+    f!("RECEIVED", 4, 5, received),
+    f!("INTRATE", 4, 5, intrate),
+    f!("PRICEMAT", 5, 6, pricemat),
+    f!("YIELDMAT", 5, 6, yieldmat),
+    f!("TBILLPRICE", 3, 3, tbillprice),
+    f!("TBILLYIELD", 3, 3, tbillyield),
+    f!("TBILLEQ", 3, 3, tbilleq),
+    f!("XNPV", 3, 3, xnpv),
+    f!("XIRR", 2, 3, xirr),
+    f!("MIRR", 3, 3, mirr),
+    f!("CUMIPMT", 6, 6, cumipmt),
+    f!("CUMPRINC", 6, 6, cumprinc),
+    f!("EFFECT", 2, 2, effect),
+    f!("NOMINAL", 2, 2, nominal),
+    f!("FVSCHEDULE", 2, 2, fvschedule),
+    f!("PDURATION", 3, 3, pduration),
+    f!("RRI", 3, 3, rri),
+    f!("ISPMT", 4, 4, ispmt),
+    f!("DOLLARDE", 2, 2, dollarde),
+    f!("DOLLARFR", 2, 2, dollarfr),
+    f!("VDB", 5, 7, vdb),
+    f!("CELL", 1, 2, cell),
+    f!("INFO", 1, 1, info, volatile),
 ];
 
 /// The id of a function by its upper-case name.
