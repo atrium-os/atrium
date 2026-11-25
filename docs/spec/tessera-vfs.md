@@ -500,12 +500,33 @@ The failed buffers stay dirty and land at the next commit that succeeds.
 - Unmount retries the device fsync three more times, 100 ms apart, then
   drops what still can't be written; those buffers hold only a generation
   no superblock names.
+- Once latched, the volume commits and writes nothing more until a remount
+  or an operator clear. `tessera_commit_sb` returns EIO while
+  `commit_failed` is set: the buffer cache drops a delayed write that failed
+  with ENXIO (or one already B_INVAL/B_NOCACHE) instead of re-dirtying it,
+  so a later device fsync can succeed with a node the next superblock would
+  name never written. `tessera_fs_flush` returns EIO before it publishes,
+  runs the preflight pinscan or COWs anything, and a data-zone GC pass
+  returns at once. After a refused commit the in-memory roots are ahead of
+  the durable superblock, so the pinscan and the epoch drain count as free
+  nodes and extents that superblock still names; a flush that ran there
+  wrote over them with no superblock to follow (the check below found a
+  pack the durable registry names overwritten by the unmount's publish, and
+  meta nodes it names reused). What was staged stays in RAM and is dropped
+  at unmount ("unmount DROPPED ... never published").
 
 `scripts/tessera-commit-refusal-vm-check.sh` makes every write fail with
-gnop(8) during a GC pass and during a sync, and checks the latch, the
-refused commit, a refused write after the latch, a clean unmount and a clean
-`tessera-fsck` after each, with a control run: 13/13 on an arm64 Tessera
-guest. Seen there and not resolved: "bulk write over DIRTY buffered sector"
+gnop(8) during a GC pass, during a sync, and during a sync with ENXIO (then
+a sync with the provider back), and checks the latch, the refused commit, a
+refused write after the latch, a clean unmount and a clean `tessera-fsck`
+after each, with a control run: 16/16 in four runs on an arm64 Tessera
+guest (9f2eed03a ATRIUM kernel, tessera_fs.ko with C decoders), and
+`scripts/mail-at-rest-vm-check.sh` 46/46 on the same kmod; evidence in
+`~/atrium-vm/evidence/tessera/commit-refusal-2026-11-25/` on the Mac.
+Not covered: after `kern.tessera.commit_failed_clear=1` the first flush's
+preflight pinscan still runs over in-memory roots that are ahead of the
+durable superblock; the clear is meant for after `tessera-fsck` on the
+unmounted volume, and a remount is the safe path. Seen there and not resolved: "bulk write over DIRTY buffered sector"
 fires when a data publish retries over sectors whose earlier write failed;
 the stale buffer is invalidated, which is right for that case, but the
 warning's comment still calls it a double allocation.

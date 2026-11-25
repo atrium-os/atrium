@@ -18364,6 +18364,18 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * blocks.
 	 */
 	tessera_fs_commit_clear_consume(tmp_);
+	/*
+	 * #135: a latched volume writes nothing more. Its in-memory roots are
+	 * ahead of the durable superblock, so the preflight pinscan and the
+	 * epoch drain count as free the nodes and extents that superblock
+	 * still names, and any publish or COW here would land on them while
+	 * no superblock can follow. What is staged stays in RAM and is
+	 * dropped at unmount, as the latch message says.
+	 */
+	if (tmp_->commit_failed) {
+		mtx_unlock(&tmp_->flush_mtx);
+		return (EIO);
+	}
 	for (;;) {
 		/*
 		 * ★ task #80: sb_dirty alone is NOT "nothing to do".
@@ -22399,6 +22411,11 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	tessera_btree_t *open_inode = NULL, *open_reg = NULL, *open_snap = NULL;
 
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
+		return (0);
+	/* #135: a latched volume frees nothing: the extents a pass would
+	 * free are still named by the durable superblock, and its
+	 * commit_extent would COW into sectors that superblock names. */
+	if (tmp_->commit_failed)
 		return (0);
 
 	if (concurrent) {
