@@ -223,7 +223,7 @@ page in it uses that persona's partition.
 
 | persona | cookies and logins | trails and history | shared store |
 |---|---|---|---|
-| **Personal** (the default) | kept in Arca, while unlocked | kept | anonymous conversions shared per user (threat model §2.6) |
+| **Personal** (the default) | kept in Arca: cookies after first unlock, so open pages refresh while locked; passwords and passkeys while unlocked (arca.md §6.2) | kept | anonymous conversions shared per user (threat model §2.6) |
 | **Unrecorded** | **one throwaway jar per trail** (Shankar, 2026-11-13), in memory, gone when that trail closes; two Unrecorded trails share nothing | never written; parked pages stay in memory | none: conversions are private and never stored |
 | **named** ("Work", "Shopping", added later) | their own Arca partition | kept, filtered by persona | as Personal |
 
