@@ -367,6 +367,11 @@ pub struct MountSources {
     /// allocator daemon producing the paths.
     #[serde(default)]
     pub rw_subtrees: Vec<String>,
+    /// `rw_patterns` globs whose folder must belong to the jail's own exec
+    /// uid (a directory, not a link): one app's data, mounted only into a
+    /// jail that runs as that app (curia.md §15, its settings pane).
+    #[serde(default)]
+    pub rw_owned_patterns: Vec<String>,
     /// Read-only package parents: a folder directly in one of these (never
     /// the folder itself, so one package never sees its neighbours) is
     /// permitted as an ro mount source. Catalog drivers' package folders

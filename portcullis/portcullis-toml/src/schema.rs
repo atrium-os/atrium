@@ -105,14 +105,30 @@ pub struct RolesSection {
     pub app_settings: Option<AppSettingsSection>,
 }
 
+/// A settings pane's `data`: a relative folder of 1 to 8 plain names
+/// (`a-z A-Z 0-9 . _ -`, never `.` or `..`), not under `dev/` or `atrium/`,
+/// where the jail's own mounts go.
+pub fn pane_data_ok(d: &str) -> bool {
+    let parts: Vec<&str> = d.split('/').collect();
+    !d.is_empty() && d.len() <= 255 && parts.len() <= 8 && !matches!(parts[0], "dev" | "atrium")
+        && parts.iter().all(|p| !p.is_empty() && *p != "." && *p != ".."
+            && p.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+}
+
 /// `[roles.app-settings]`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSettingsSection {
     /// Its program, a path in the bundle: run as the app's own uid in a
-    /// persona, with that persona's data of the app's at `/app-data` and no
-    /// capability of the app's.
+    /// persona, with no capability of the app's.
     pub entry: String,
+    /// The folder of the app's the pane works on, a relative path in the
+    /// app's jail (`var/db/navigatord`). portcullisd keeps it outside the
+    /// app's overlay, in the persona's key group, and mounts it there in the
+    /// app's jail and at `/app-data` in the pane's, so the pane never
+    /// reaches anything else of the app's (its overlay could shadow the
+    /// signed bundle). It may not be a path the bundle has.
+    pub data: String,
 }
 
 /// `[roles.share-target]`.

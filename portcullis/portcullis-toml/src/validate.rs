@@ -141,6 +141,9 @@ pub fn validate(m: &Manifest) -> Report {
                 if e == &m.app.entry {
                     r.errors.push(format!("[roles.app-settings].entry {e:?}: is the app's own entry; the pane is a separate program"));
                 }
+                if !crate::schema::pane_data_ok(&s.data) {
+                    r.errors.push(format!("[roles.app-settings].data {:?}: a relative folder of 1 to 8 plain names, not under dev/ or atrium/", s.data));
+                }
             }
         }
     }
@@ -598,17 +601,22 @@ uses     = ["org.atrium.notify/1"]
     #[test]
     fn a_settings_pane_is_its_own_program_in_the_bundle() {
         let with = |section: &str| PHOTOS.replace("implements = [\"share-target\"]", &format!("implements = [\"share-target\", \"app-settings\"]\n\n{section}"));
-        let m = Manifest::from_str(&with("[roles.app-settings]\nentry = \"bin/photos-settings\"")).unwrap();
+        let m = Manifest::from_str(&with("[roles.app-settings]\nentry = \"bin/photos-settings\"\ndata = \"var/db/photos\"")).unwrap();
         assert!(crate::validate(&m).is_ok(), "{:?}", crate::validate(&m).errors);
         assert_eq!(m.roles.as_ref().unwrap().app_settings.as_ref().unwrap().entry, "bin/photos-settings");
         assert!(!crate::validate(&Manifest::from_str(&with("")).unwrap()).is_ok(), "the role without its section");
         for bad in ["/bin/x", "../x", "bin/../../x", "", "bin/photos"] {
-            let m = Manifest::from_str(&with(&format!("[roles.app-settings]\nentry = {bad:?}"))).unwrap();
+            let m = Manifest::from_str(&with(&format!("[roles.app-settings]\nentry = {bad:?}\ndata = \"var/db/photos\""))).unwrap();
             assert!(!crate::validate(&m).is_ok(), "{bad}");
         }
-        let without = PHOTOS.replace("implements = [\"share-target\"]", "implements = [\"share-target\"]\n\n[roles.app-settings]\nentry = \"bin/x\"");
+        for bad in ["", "/var/db", "var/../etc", "./var", "dev/x", "atrium/sockets", "a/b/c/d/e/f/g/h/i", "var//db"] {
+            let m = Manifest::from_str(&with(&format!("[roles.app-settings]\nentry = \"bin/x\"\ndata = {bad:?}"))).unwrap();
+            assert!(!crate::validate(&m).is_ok(), "data {bad}");
+        }
+        assert!(Manifest::from_str(&with("[roles.app-settings]\nentry = \"bin/x\"")).is_err(), "data is required");
+        let without = PHOTOS.replace("implements = [\"share-target\"]", "implements = [\"share-target\"]\n\n[roles.app-settings]\nentry = \"bin/x\"\ndata = \"var/db/x\"");
         assert!(!crate::validate(&Manifest::from_str(&without).unwrap()).is_ok(), "the section without the role");
-        assert!(Manifest::from_str(&with("[roles.app-settings]\nentry = \"bin/x\"\ncapabilities = 1")).is_err(), "an unknown key");
+        assert!(Manifest::from_str(&with("[roles.app-settings]\nentry = \"bin/x\"\ndata = \"var/db/x\"\ncapabilities = 1")).is_err(), "an unknown key");
     }
 
     #[test]

@@ -27,13 +27,16 @@ ROLES=
 if [ -n "$PANE" ]; then
     cp "$PANE" $B/bin/navigator-settings
     ROLES='
-# Its own pane in Settings: run as the Navigator in a persona, with its data
-# there and no capability of its own (curia.md §15).
+# Its own pane in Settings: run as the Navigator in a persona, with its pane
+# data there and no capability of its own (curia.md §15.1).
 [roles]
 implements = ["app-settings"]
 
 [roles.app-settings]
-entry = "bin/navigator-settings"'
+entry = "bin/navigator-settings"
+# Kept out of its overlay, in the persona's key group; NAVIGATORD_STORE
+# must be under it for the pane to find the list.
+data = "var/db/navigatord"'
 fi
 cat > $B/atrium.toml <<T
 [app]

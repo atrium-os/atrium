@@ -826,6 +826,23 @@ fn launch_inner(
         // Presentation only. Fasti authorizes commands from kernel credentials.
         app_run.args = vec!["--persona".into(), persona.unwrap_or("personal").into()];
     }
+    /* An app with a settings pane (curia.md §15.1): the folder its pane
+     * works on is not in its overlay but in the persona's key group, at the
+     * path its manifest names, so the pane never reaches the overlay. */
+    let pane_data = manifest.roles.as_ref().filter(|r| r.implements.iter().any(|n| n == "app-settings"))
+        .and_then(|r| r.app_settings.as_ref()).map(|s| s.data.clone());
+    if let Some(data) = pane_data.filter(|_| document.is_none() && portcullis_overlay::home_of(user).is_some()) {
+        let placed = portcullisd::pane::bundle_has_none(&tree, &data)
+            .and_then(|_| portcullisd::pane::folder(user, persona, app_id, app_uid))
+            .and_then(|dir| portcullisd::pane::mountpoint(&jail_path, &data).map(|mp| (dir, mp)));
+        match placed {
+            Ok((dir, mp)) => jc.add_mount(&dir, &mp, "nullfs", &["rw", "nosuid", "noexec"]),
+            Err(e) => {
+                full_teardown(&jail_path, None);
+                return Err(LaunchError::Failed("pane data", e.to_string()));
+            }
+        }
+    }
     let mut recovery_mount = None;
     if let Some(doc) = &mut document {
         let mount = RecoveryMount::attach(doc, app_uid, &jail_path, &mut jc)?;
@@ -1748,9 +1765,9 @@ fn mount_overlay(user: &str, app_id: &str, persona: Option<&str>, manifest: &Man
 
 /// What a settings pane (curia.md §15) of `app_id` for `person` in
 /// `persona` runs as and sees: the app's own uid and account in that
-/// persona (the same publisher's binding as its launches), and its data
-/// folder, the overlay, mounted and the app uid's at 0700. Refused unless
-/// the installed, signed manifest has `[roles.app-settings]`.
+/// persona (the same publisher's binding as its launches), and the app's
+/// pane data folder there ([`portcullisd::pane`]), never its overlay.
+/// Refused unless the installed, signed manifest has `[roles.app-settings]`.
 pub fn settings_pane(person: &str, app_id: &str, persona: Option<&str>) -> Result<(u32, String, PathBuf), LaunchError> {
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) || !portcullis_overlay::plain_segment(app_id) {
         return Err(LaunchError::Failed("persona", "invalid persona or app name".into()));
@@ -1766,9 +1783,10 @@ pub fn settings_pane(person: &str, app_id: &str, persona: Option<&str>) -> Resul
     if !report.is_ok() {
         return Err(LaunchError::Failed("manifest", report.errors.join("; ")));
     }
-    if manifest.roles.as_ref().and_then(|r| r.app_settings.as_ref()).is_none() {
+    let Some(data) = manifest.roles.as_ref().and_then(|r| r.app_settings.as_ref()).map(|s| s.data.clone()) else {
         return Err(LaunchError::Failed("manifest", format!("{app_id} has no settings pane ([roles.app-settings])")));
-    }
+    };
+    portcullisd::pane::bundle_has_none(&tree, &data).map_err(|e| LaunchError::Failed("pane data", e.to_string()))?;
     if persona.is_some() {
         if let Some(why) = not_instanced_manifest(&manifest) {
             return Err(LaunchError::Failed("persona", format!("{app_id} runs once for every persona: {why}")));
@@ -1778,10 +1796,7 @@ pub fn settings_pane(person: &str, app_id: &str, persona: Option<&str>) -> Resul
     if portcullis_overlay::home_of(person).is_some() {
         portcullisd::home::ensure_app_data(person, persona).map_err(|m| LaunchError::Failed("app data", m))?;
     }
-    let dir = mount_overlay(person, app_id, persona, &manifest)?;
-    std::os::unix::fs::chown(&dir, Some(uid), Some(uid))
-        .and_then(|_| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
-        .map_err(|e| LaunchError::Failed("mount", format!("own {}: {e}", dir.display())))?;
+    let dir = portcullisd::pane::folder(person, persona, app_id, uid).map_err(|e| LaunchError::Failed("pane data", e.to_string()))?;
     Ok((uid, name, dir))
 }
 
