@@ -31,6 +31,9 @@ pub struct SheetSource {
     /// The cell whose comment is shown beside it (the cursor's, while not
     /// editing); the window sets it each frame.
     pub note_at: std::cell::Cell<Option<(u32, u32)>>,
+    /// The view's zoom (1: 100 %): rows, columns and cell text scale by it;
+    /// the sheet keeps its sizes at 100 %.
+    pub zoom: std::cell::Cell<f64>,
 }
 
 type ViewKey = (u16, u64, usize, usize, usize, usize, usize, usize, usize, u64);
@@ -39,7 +42,7 @@ type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
+        Self { doc, view: RefCell::new(None), col_view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None), zoom: std::cell::Cell::new(1.0) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
@@ -467,7 +470,8 @@ impl SheetSource {
         let sheet = self.doc.borrow().sheet;
         let corner = |x: f64, y: f64| {
             let (r, c) = (self.row_at(y.max(0.0)), self.col_at(x.max(0.0)));
-            (r, c, ((x - self.col_left(c)) * 72.0 / 96.0).max(0.0) as f32, ((y - self.row_top(r)) * 72.0 / 96.0).max(0.0) as f32)
+            let z = self.zoom.get();
+            (r, c, ((x - self.col_left(c)) / z * 72.0 / 96.0).max(0.0) as f32, ((y - self.row_top(r)) / z * 72.0 / 96.0).max(0.0) as f32)
         };
         officina_grid::charts::Anchor { sheet, from: corner(at[0], at[1]), to: corner(at[0] + at[2], at[1] + at[3]) }
     }
@@ -718,7 +722,7 @@ impl SheetSource {
             rows.retain(|&r| !sh.row_hidden(r) && d.wb.merge_at(CellAddr::new(d.sheet, r, col)).is_none_or(|m| m.c0 == m.c1));
             rows
         };
-        let w = rows.into_iter().filter_map(|r| self.cell(r, col)).map(|cv| pergola::widgets::grid_view::needed_width(&cv)).fold(0.0, f64::max);
+        let w = rows.into_iter().filter_map(|r| self.cell_at_100(r, col)).map(|cv| pergola::widgets::grid_view::needed_width(&cv)).fold(0.0, f64::max);
         (w > 0.0).then_some(w.max(pergola::widgets::grid_view::MIN_COL_W))
     }
 }
@@ -744,8 +748,59 @@ impl SheetSource {
             cols
         };
         let default = { let d = self.doc.borrow(); d.wb.sheet(d.sheet).row_sizes.default };
-        let h = cols.into_iter().filter_map(|(c, w)| self.cell(row, c).map(|cv| pergola::widgets::grid_view::needed_height(&cv, w))).fold(0.0, f64::max);
+        let h = cols.into_iter().filter_map(|(c, w)| self.cell_at_100(row, c).map(|cv| pergola::widgets::grid_view::needed_height(&cv, w))).fold(0.0, f64::max);
         h.max(default)
+    }
+}
+
+impl SheetSource {
+    /// How cell (`r`, `c`) shows at 100 % (fitting a column or row measures this).
+    pub fn cell_at_100(&self, r: u32, c: u32) -> Option<CellView> {
+        let d = self.doc.borrow();
+        if d.wb.hides_value(CellAddr::new(d.sheet, r, c)) {
+            return None;
+        }
+        if d.show_formulas {
+            let a = CellAddr::new(d.sheet, r, c);
+            if let Some(f) = d.wb.formula_text(a).filter(|_| !d.wb.hides_formula(a)) {
+                return Some(CellView::text(f));
+            }
+        }
+        let v = d.wb.value(d.sheet, r, c);
+        let sh = d.wb.sheet(d.sheet);
+        let id = sh.style_id(r, c);
+        let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v, d.wb.date_system()) };
+        if !d.wb.pivots().is_empty() {
+            let a = CellAddr::new(d.sheet, r, c);
+            if let Some((i, role)) = d.wb.pivot_at(a) {
+                cv = pivot_view(cv, role);
+                // Compact form: inner items indented, outer items bold.
+                let (indent, group) = d.wb.pivot_shape(i).map_or((0, false), |s| s.indent(a));
+                if let Some(v) = cv.as_mut() {
+                    v.indent = indent;
+                    v.bold |= group;
+                }
+            }
+        }
+        let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v, d.wb.date_system()) };
+        // A link reads as one: blue, unless the cell has a colour of its own.
+        if let Some(v) = cv.as_mut().filter(|v| v.color.is_none() && !v.text.is_empty()) {
+            if d.wb.link_at(CellAddr::new(d.sheet, r, c)).is_some() {
+                v.color = Some(palette::info_600());
+            }
+        }
+        if d.wb.comment(d.sheet, r, c).is_some() {
+            let mut v = cv.unwrap_or_else(|| CellView::text(""));
+            v.note = true;
+            cv = Some(v);
+        }
+        // Still to be recalculated: the old value, greyed (§8.4).
+        if d.wb.is_stale(d.sheet, r, c) {
+            if let Some(v) = cv.as_mut() {
+                v.color = Some(palette::neutral_400());
+            }
+        }
+        cv
     }
 }
 
@@ -815,10 +870,11 @@ impl GridSource for SheetSource {
                 continue;
             }
             // Offsets are points; the grid is in px.
-            let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0;
-            let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0;
-            let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0;
-            let y1 = self.row_top(a.to.0) + a.to.3 as f64 * 96.0 / 72.0;
+            let z = self.zoom.get();
+            let x0 = self.col_left(a.from.1) + a.from.2 as f64 * 96.0 / 72.0 * z;
+            let y0 = self.row_top(a.from.0) + a.from.3 as f64 * 96.0 / 72.0 * z;
+            let x1 = self.col_left(a.to.1) + a.to.2 as f64 * 96.0 / 72.0 * z;
+            let y1 = self.row_top(a.to.0) + a.to.3 as f64 * 96.0 / 72.0 * z;
             let (w, h) = ((x1 - x0).clamp(0.0, 8000.0), (y1 - y0).clamp(0.0, 8000.0));
             if w < 4.0 || h < 4.0 || x0 > view[0] + view[2] || y0 > view[1] + view[3] || x0 + w < view[0] || y0 + h < view[1] {
                 continue;
@@ -870,17 +926,22 @@ impl GridSource for SheetSource {
         MIN_COLS.max(c.max(end).saturating_add(26)).min(MAX_COLS)
     }
     fn row_top(&self, r: u32) -> f64 {
-        self.rows_view(|s| s.offset(r))
+        self.rows_view(|s| s.offset(r)) * self.zoom.get()
     }
     fn row_at(&self, y: f64) -> u32 {
         let rows = self.rows();
-        self.rows_view(|s| s.index_at(y.max(0.0))).min(rows - 1)
+        let z = self.zoom.get();
+        self.rows_view(|s| s.index_at((y / z).max(0.0))).min(rows - 1)
     }
     fn col_left(&self, c: u32) -> f64 {
-        self.cols_view(|s| s.offset(c))
+        self.cols_view(|s| s.offset(c)) * self.zoom.get()
     }
     fn col_at(&self, x: f64) -> u32 {
-        self.cols_view(|s| s.index_at(x.max(0.0))).min(self.cols() - 1)
+        let z = self.zoom.get();
+        self.cols_view(|s| s.index_at((x / z).max(0.0))).min(self.cols() - 1)
+    }
+    fn zoom(&self) -> f32 {
+        self.zoom.get() as f32
     }
     fn outline_control(&self, rows: bool, at: u32) -> Option<(u32, u32, bool)> {
         let d = self.doc.borrow();
@@ -906,51 +967,12 @@ impl GridSource for SheetSource {
         if rows { self.rows_view(control) } else { self.cols_view(control) }
     }
     fn cell(&self, r: u32, c: u32) -> Option<CellView> {
-        let d = self.doc.borrow();
-        if d.wb.hides_value(CellAddr::new(d.sheet, r, c)) {
-            return None;
+        let z = self.zoom.get() as f32;
+        let mut cv = self.cell_at_100(r, c)?;
+        if z != 1.0 {
+            cv.size = Some(cv.size.unwrap_or(pergola::theme::type_size::SM) * z);
         }
-        if d.show_formulas {
-            let a = CellAddr::new(d.sheet, r, c);
-            if let Some(f) = d.wb.formula_text(a).filter(|_| !d.wb.hides_formula(a)) {
-                return Some(CellView::text(f));
-            }
-        }
-        let v = d.wb.value(d.sheet, r, c);
-        let sh = d.wb.sheet(d.sheet);
-        let id = sh.style_id(r, c);
-        let mut cv = if id == 0 { view_of(&v) } else { styled_view(&d.wb.styles, id, &v, d.wb.date_system()) };
-        if !d.wb.pivots().is_empty() {
-            let a = CellAddr::new(d.sheet, r, c);
-            if let Some((i, role)) = d.wb.pivot_at(a) {
-                cv = pivot_view(cv, role);
-                // Compact form: inner items indented, outer items bold.
-                let (indent, group) = d.wb.pivot_shape(i).map_or((0, false), |s| s.indent(a));
-                if let Some(v) = cv.as_mut() {
-                    v.indent = indent;
-                    v.bold |= group;
-                }
-            }
-        }
-        let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v, d.wb.date_system()) };
-        // A link reads as one: blue, unless the cell has a colour of its own.
-        if let Some(v) = cv.as_mut().filter(|v| v.color.is_none() && !v.text.is_empty()) {
-            if d.wb.link_at(CellAddr::new(d.sheet, r, c)).is_some() {
-                v.color = Some(palette::info_600());
-            }
-        }
-        if d.wb.comment(d.sheet, r, c).is_some() {
-            let mut v = cv.unwrap_or_else(|| CellView::text(""));
-            v.note = true;
-            cv = Some(v);
-        }
-        // Still to be recalculated: the old value, greyed (§8.4).
-        if d.wb.is_stale(d.sheet, r, c) {
-            if let Some(v) = cv.as_mut() {
-                v.color = Some(palette::neutral_400());
-            }
-        }
-        cv
+        Some(cv)
     }
     fn edit_text(&self, r: u32, c: u32) -> String {
         let d = self.doc.borrow();

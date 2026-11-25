@@ -36,7 +36,7 @@ use std::rc::Rc;
 
 use crate::event::{Event, Key, Modifiers};
 use crate::geom::Rect;
-use crate::interaction::{DragPhase, ScrollInput};
+use crate::interaction::{DragPhase, ScrollInput, ScrollKind};
 use crate::layout::FlexStyle;
 use crate::node::{Node, NodeId, TextStyle};
 use crate::reactive::Mutable;
@@ -342,6 +342,11 @@ pub trait GridSource {
     fn merges_in(&self, _range: CellRange) -> Vec<CellRange> {
         Vec::new()
     }
+    /// The view's zoom (1: 100 %). The source scales its rows, columns and
+    /// cell text itself; the grid scales the in-cell editor's text to match.
+    fn zoom(&self) -> f32 {
+        1.0
+    }
     /// Today's date (or, `time`, the time now) as typed into a cell, for
     /// Ctrl+; and Ctrl+Shift+;. None: the keys do nothing.
     fn now_text(&self, _time: bool) -> Option<String> {
@@ -506,6 +511,13 @@ pub struct GridState {
     tab_from: Option<u32>,
     /// F8's Extend Selection: moves extend the selection as with Shift held.
     extend: bool,
+    /// End was pressed: the next arrow goes to the edge of the data, as
+    /// Ctrl+arrow does (Excel's End mode).
+    end: bool,
+    /// A selection kept while Enter or Tab steps the active cell through
+    /// it, and the cell it is at: shown only while the cursor is there and
+    /// nothing else is selected (any other move drops it).
+    held: Option<(CellRange, (u32, u32))>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -521,24 +533,56 @@ pub enum EditMode {
 }
 
 impl GridState {
-    /// While the editor is open: whether it is entering (started by typing:
-    /// arrows finish the entry, Excel's "Enter") or editing (arrows move the
-    /// caret, Excel's "Edit"). None when it is closed.
     /// Whether F8's Extend Selection is on (the app shows it in its status bar).
     pub fn extending(&self) -> bool {
         self.extend
     }
+    /// Whether End mode is on: the next arrow goes to the data's edge.
+    pub fn end_mode(&self) -> bool {
+        self.end
+    }
+    /// While the editor is open: whether it is entering (started by typing:
+    /// arrows finish the entry, Excel's "Enter") or editing (arrows move the
+    /// caret, Excel's "Edit"). None when it is closed.
     pub fn edit_mode(&self) -> Option<EditMode> {
         self.edit.as_ref().map(|_| if self.entering { EditMode::Enter } else { EditMode::Edit })
     }
     pub fn selection(&self) -> CellRange {
-        CellRange::of(self.anchor, self.cursor)
+        match self.held {
+            Some((r, at)) if at == self.cursor && self.anchor == self.cursor && r.contains(at.0, at.1) => r,
+            _ => CellRange::of(self.anchor, self.cursor),
+        }
     }
     /// Select one cell.
     pub fn select(&mut self, r: u32, c: u32) {
         self.anchor = (r, c);
         self.cursor = (r, c);
         self.tab_from = None;
+        self.held = None;
+        self.end = false;
+    }
+    /// Enter (`down`) or Tab (`!down`) in a selection of more than one
+    /// cell: the active cell steps to the next one in it, down the column
+    /// (across the row) and on to the next, round to the first after the
+    /// last; `back` (with Shift) the other way. The selection stays. False
+    /// for a single cell.
+    pub fn step_in_selection(&mut self, down: bool, back: bool) -> bool {
+        let s = self.selection();
+        if s.r0 == s.r1 && s.c0 == s.c1 {
+            return false;
+        }
+        let (h, w) = (u64::from(s.r1 - s.r0) + 1, u64::from(s.c1 - s.c0) + 1);
+        let n = h * w;
+        let (r, c) = (u64::from(self.cursor.0.clamp(s.r0, s.r1) - s.r0), u64::from(self.cursor.1.clamp(s.c0, s.c1) - s.c0));
+        let i = if down { c * h + r } else { r * w + c };
+        let j = if back { (i + n - 1) % n } else { (i + 1) % n };
+        let (dr, dc) = if down { (j % h, j / h) } else { (j / w, j % w) };
+        // dr ≤ r1 - r0 and dc ≤ c1 - c0, so both fit in u32.
+        let to = (s.r0 + dr as u32, s.c0 + dc as u32);
+        self.anchor = to;
+        self.cursor = to;
+        self.held = Some((s, to));
+        true
     }
 }
 
@@ -577,6 +621,8 @@ pub enum GridAction {
     Comment,
     /// A press (and drag) in the cells ended: the selection it made.
     Selected(CellRange),
+    /// Ctrl (or Cmd) with the wheel, or a pinch: zoom by this factor.
+    Zoom(f32),
     Copy(CellRange),
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
@@ -668,7 +714,7 @@ fn editor_rect(src: &dyn GridSource, g: &GridState) -> Option<[f64; 4]> {
     let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
     let (x, y) = (src.col_left(one.c0), src.row_top(one.r0));
     let (w, h) = (src.col_left(one.c1 + 1) - x, src.row_top(one.r1 + 1) - y);
-    let (tw, th) = editor_size(ed.text(), editor_wrap(src, g), &editor_style());
+    let (tw, th) = editor_size(ed.text(), editor_wrap(src, g), &editor_style(src.zoom()));
     Some([x, y, w.max(tw as f64 + 2.0 * PAD as f64 + 2.0), h.max(th as f64)])
 }
 
@@ -729,14 +775,14 @@ fn editor_lines(text: &str, wrap: Option<f32>, style: &TextStyle) -> Vec<std::op
 fn editor_size(text: &str, wrap: Option<f32>, style: &TextStyle) -> (f32, f32) {
     let lines = editor_lines(text, wrap, style);
     let w = lines.iter().map(|r| crate::text::measure(&text[r.clone()], style).w).fold(0.0, f32::max);
-    let h = if lines.len() > 1 { lines.len() as f32 * TEXT_SIZE * 1.3 + 2.0 * LINE_PAD } else { 0.0 };
+    let h = if lines.len() > 1 { lines.len() as f32 * style.size * 1.3 + 2.0 * LINE_PAD } else { 0.0 };
     (w, h)
 }
 
 /// Where the editor's first line starts down from its top, px: one line
 /// centred in the cell, several from the top.
-fn editor_top(lines: usize, h: f32) -> f32 {
-    if lines > 1 { LINE_PAD } else { ((h - TEXT_SIZE * 1.3) / 2.0).max(0.0) }
+fn editor_top(lines: usize, h: f32, lh: f32) -> f32 {
+    if lines > 1 { LINE_PAD } else { ((h - lh) / 2.0).max(0.0) }
 }
 
 fn in_editor(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> bool {
@@ -748,12 +794,13 @@ fn in_editor(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> bool {
 fn editor_index(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> Option<usize> {
     let r = editor_rect(src, g)?;
     let text = g.edit.as_ref()?.text();
-    let lines = editor_lines(text, editor_wrap(src, g), &editor_style());
+    let lines = editor_lines(text, editor_wrap(src, g), &editor_style(src.zoom()));
     let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
     let h = (src.row_top(one.r1 + 1) - src.row_top(one.r0)) as f32;
-    let k = (((cy - r[1]) as f32 - editor_top(lines.len(), h)) / (TEXT_SIZE * 1.3)).floor().clamp(0.0, (lines.len() - 1) as f32) as usize;
+    let lh = TEXT_SIZE * src.zoom() * 1.3;
+    let k = (((cy - r[1]) as f32 - editor_top(lines.len(), h, lh)) / lh).floor().clamp(0.0, (lines.len() - 1) as f32) as usize;
     let line = lines[k].clone();
-    Some(line.start + index_at(&text[line.clone()], (cx - r[0]) as f32 - PAD, &editor_style()))
+    Some(line.start + index_at(&text[line.clone()], (cx - r[0]) as f32 - PAD, &editor_style(src.zoom())))
 }
 
 /// The character boundary of `text` nearest `x` px from its start.
@@ -773,8 +820,8 @@ fn index_at(text: &str, x: f32, style: &TextStyle) -> usize {
     bounds[lo]
 }
 
-fn editor_style() -> TextStyle {
-    TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: Color::rgba(0.0, 0.0, 0.0, 1.0) }
+fn editor_style(zoom: f32) -> TextStyle {
+    TextStyle { family: font::SANS.into(), size: TEXT_SIZE * zoom, weight: Weight::Regular, color: Color::rgba(0.0, 0.0, 0.0, 1.0) }
 }
 
 /// How far `p` is past the body's edges, px: (right +, left -), (below +,
@@ -1057,7 +1104,27 @@ impl GridView {
         // Ctrl+Tab still moves focus out.
         ctx.takes_tab(body_id);
         let s = self.scroll.clone();
+        let (zact, pinch) = (self.on_action.clone(), Rc::new(std::cell::Cell::new(1.0f32)));
         ctx.on_scroll(body_id, move |inp: &ScrollInput| {
+            // Zoom gestures go to the app, which scales what it shows.
+            let factor = match inp.kind {
+                ScrollKind::Wheel { dy, modifiers, .. } if (modifiers.ctrl || modifiers.meta) && zact.is_some() => Some((1.0f32 - dy * 0.0025).clamp(0.8, 1.25)),
+                ScrollKind::Magnify { scale, phase, .. } if zact.is_some() => {
+                    if matches!(phase, crate::event::ScrollPhase::Begin) || pinch.get() <= 0.0 {
+                        pinch.set(1.0);
+                    }
+                    let f = if pinch.get() > 0.0 { scale / pinch.get() } else { 1.0 };
+                    pinch.set(scale);
+                    Some(f.clamp(0.5, 2.0))
+                }
+                _ => None,
+            };
+            if let Some(f) = factor {
+                if let Some(a) = &zact {
+                    a(GridAction::Zoom(f));
+                }
+                return;
+            }
             let mut st = s.get();
             st.input(inp.kind, inp.t, inp.node);
             s.set(st);
@@ -1837,15 +1904,15 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
         return;
     };
     // The editor: as wide and tall as its lines need, from the cell.
-    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: t.text_primary() };
+    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE * src.zoom(), weight: Weight::Regular, color: t.text_primary() };
     let text = ed.text();
     let wrap = editor_wrap(src, gs);
     let (tw, th) = editor_size(text, wrap, &style);
     let (ew, eh) = (w.max(tw + 2.0 * PAD + 2.0), h.max(th));
     ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, eh), fill: t.bg_canvas(), radius: 0.0 });
-    let lh = TEXT_SIZE * 1.3;
+    let lh = style.size * 1.3;
     let lines = editor_lines(text, wrap, &style);
-    let top = sy + editor_top(lines.len(), h);
+    let top = sy + editor_top(lines.len(), h, lh);
     let sel = ed.has_selection().then(|| ed.selection());
     for (k, line) in lines.iter().enumerate() {
         let ty = top + k as f32 * lh;
@@ -2657,6 +2724,17 @@ fn reveal(src: &dyn GridSource, geom: &Geom, st: &mut ScrollState, cell: (u32, u
 /// One key on the grid. Returns whether anything changed.
 #[allow(clippy::too_many_arguments)]
 fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollState, key: Key, m: Modifiers, chars: &str, act: &Option<ActionFn>) -> bool {
+    let before = (g.held, g.anchor, g.cursor);
+    let done = on_key_inner(src, geom, g, st, key, m, chars, act);
+    // A held selection goes with any move but the step that set it.
+    if g.held == before.0 && (g.anchor, g.cursor) != (before.1, before.2) {
+        g.held = None;
+    }
+    done
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_key_inner(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollState, key: Key, m: Modifiers, chars: &str, act: &Option<ActionFn>) -> bool {
     if geom.rows == 0 || geom.cols == 0 {
         return false;
     }
@@ -2700,6 +2778,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
     let wrap = editor_wrap(src, g);
     let guessed = std::mem::take(&mut g.guess);
     let tab_run = g.tab_from.take();
+    let ranged = g.selection() != CellRange::of(g.cursor, g.cursor);
     if let Some(ed) = &mut g.edit {
         if guessed && ed.text().starts_with('=') && ed.has_selection() {
             match key {
@@ -2783,19 +2862,27 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             }
             // Up and Down move between the editor's lines, at about the
             // same place across; past the first or last they end it.
-            Key::Up | Key::Down if !m.shift && editor_lines(ed.text(), wrap, &editor_style()).len() > 1 => {
+            Key::Up | Key::Down if !m.shift && editor_lines(ed.text(), wrap, &editor_style(src.zoom())).len() > 1 => {
                 let text = ed.text().to_string();
-                let lines = editor_lines(&text, wrap, &editor_style());
+                let lines = editor_lines(&text, wrap, &editor_style(src.zoom()));
                 let k = lines.iter().position(|l| (l.start..=l.end).contains(&ed.caret())).unwrap_or(0);
                 let to = if key == Key::Up { k.checked_sub(1) } else { Some(k + 1).filter(|&n| n < lines.len()) };
                 if let Some(n) = to {
-                    let style = editor_style();
+                    let style = editor_style(src.zoom());
                     let x = crate::text::measure(&text[lines[k].start..ed.caret()], &style).w;
                     let i = lines[n].start + index_at(&text[lines[n].clone()], x, &style);
                     ed.set_caret(i, false);
                     return true;
                 }
                 finish(g, st, if key == Key::Up { -1 } else { 1 }, 0);
+                return true;
+            }
+            // In a selection of several cells, Enter and Tab enter the cell
+            // and go on to the next one in it.
+            Key::Enter | Key::Tab if ranged => {
+                commit(g, act);
+                g.step_in_selection(key == Key::Enter, m.shift);
+                reveal(src, geom, st, g.cursor);
                 return true;
             }
             // Enter after a run of Tabs: the next row, where the run began.
@@ -2840,6 +2927,20 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
     }
 
+    // End mode: End, then an arrow goes to the data's edge (Home: the last
+    // used cell). Any other key ends it.
+    let end = std::mem::take(&mut g.end);
+    if key == Key::End && !cmd && !m.alt {
+        g.end = !end;
+        return true;
+    }
+    if end && key == Key::Home && !cmd && !m.alt {
+        let to = src.last_used();
+        if m.shift || g.extend { g.cursor = to } else { g.select(to.0, to.1) }
+        reveal(src, geom, st, to);
+        return true;
+    }
+    let cmd_or_end = cmd || (end && matches!(key, Key::Up | Key::Down | Key::Left | Key::Right));
     if key == Key::Down && m.alt && !cmd {
         send(GridAction::Choose { row: g.cursor.0, col: g.cursor.1 });
         return true;
@@ -2858,7 +2959,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 Key::Left => (0, -1),
                 _ => (0, 1),
             };
-            Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
+            Some(if cmd_or_end { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
         // Alt+PageDown / Alt+PageUp: one screen right or left.
         Key::PageUp | Key::PageDown if m.alt && !cmd => {
@@ -2883,6 +2984,11 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
         Key::Home => Some(past_hidden(src, g.cursor, (g.cursor.0, 0), 0, 1)),
         Key::End if cmd => Some(src.last_used()),
+        // Enter and Tab in a selection of several cells: the next cell in it.
+        Key::Enter | Key::Tab if !cmd && !m.alt && g.step_in_selection(key == Key::Enter, m.shift) => {
+            reveal(src, geom, st, g.cursor);
+            return true;
+        }
         Key::Tab => {
             let from = g.cursor.1;
             let to = step(g.cursor, 0, if m.shift { -1 } else { 1 });
@@ -2985,6 +3091,12 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             return true;
         }
         // Ctrl+Space: the selection's whole columns; Shift+Space: its whole rows.
+        // Ctrl+Shift+Space: everything, as Ctrl+A on a lone cell.
+        Key::Char if chars == " " && cmd && m.shift && !m.alt => {
+            g.anchor = (0, 0);
+            g.cursor = (last_r, last_c);
+            return true;
+        }
         Key::Char if chars == " " && cmd && !m.shift && !m.alt => {
             let s = g.selection();
             g.anchor = (0, s.c0);
@@ -3880,6 +3992,87 @@ mod tests {
     }
 
     #[test]
+    fn enter_and_tab_step_through_a_selection_end_mode_and_ctrl_wheel_zoom() {
+        let (mut app, grid, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 64.0 + 10.0, HEADER_H + 20.0 + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        app.tick();
+        let none = Modifiers::default();
+        let shift = Modifiers { shift: true, ..Default::default() };
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        // B2:C3 selected, the active cell at B2.
+        let mut g = state.get_cloned();
+        g.anchor = (2, 2);
+        g.cursor = (1, 1);
+        state.set(g);
+        app.tick();
+        let sel = CellRange { r0: 1, c0: 1, r1: 2, c1: 2 };
+        // Enter goes down the column, then to the next column's top, round to the first.
+        for want in [(2, 1), (1, 2), (2, 2), (1, 1)] {
+            key(&mut app, Key::Enter, "", none);
+            let g = state.get_cloned();
+            assert_eq!((g.cursor, g.selection(), g.edit.is_none()), (want, sel, true));
+        }
+        // Tab goes across the row; Shift+Tab and Shift+Enter go back.
+        key(&mut app, Key::Tab, "", none);
+        assert_eq!((state.get_cloned().cursor, state.get_cloned().selection()), ((1, 2), sel));
+        key(&mut app, Key::Tab, "", none);
+        assert_eq!(state.get_cloned().cursor, (2, 1));
+        key(&mut app, Key::Tab, "", shift);
+        assert_eq!(state.get_cloned().cursor, (1, 2));
+        key(&mut app, Key::Enter, "", shift);
+        assert_eq!((state.get_cloned().cursor, state.get_cloned().selection()), ((2, 1), sel));
+        // Typing enters the active cell; Tab enters it and goes on in the selection.
+        key(&mut app, Key::Char, "7", none);
+        key(&mut app, Key::Tab, "", none);
+        assert_eq!(grid.cells.borrow().get(&(2, 1)).map(String::as_str), Some("7"));
+        assert!(matches!(log.borrow().last(), Some(GridAction::Commit { row: 2, col: 1, .. })));
+        assert_eq!((state.get_cloned().cursor, state.get_cloned().selection()), ((2, 2), sel));
+        // Shift+arrow extends from where the active cell is, dropping the stepping.
+        key(&mut app, Key::Up, "", shift);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 1, c0: 2, r1: 2, c1: 2 });
+        // A lone cell: Enter edits, as before.
+        key(&mut app, Key::Right, "", none);
+        key(&mut app, Key::Enter, "", none);
+        assert!(state.get_cloned().edit.is_some());
+        key(&mut app, Key::Escape, "", none);
+        // End, then an arrow: the data's edge (the grid's end here), as Ctrl+arrow.
+        key(&mut app, Key::End, "", none);
+        assert!(state.get_cloned().end_mode());
+        key(&mut app, Key::Down, "", none);
+        let g = state.get_cloned();
+        assert_eq!((g.cursor, g.end_mode()), ((99, 3), false));
+        // Without End, Down is one row.
+        key(&mut app, Key::Up, "", none);
+        assert_eq!(state.get_cloned().cursor, (98, 3));
+        // End, Shift+Left extends to the edge; End twice is off again.
+        key(&mut app, Key::End, "", none);
+        key(&mut app, Key::Left, "", shift);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 98, c0: 0, r1: 98, c1: 3 });
+        key(&mut app, Key::End, "", none);
+        key(&mut app, Key::End, "", none);
+        assert!(!state.get_cloned().end_mode());
+        // End, Home: the last used cell.
+        key(&mut app, Key::End, "", none);
+        key(&mut app, Key::Home, "", none);
+        assert_eq!(state.get_cloned().cursor, (99, 19));
+        // Ctrl+Shift+Space: everything.
+        key(&mut app, Key::Char, " ", Modifiers { ctrl: true, shift: true, ..Default::default() });
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 0, r1: 99, c1: 19 });
+        // Ctrl+wheel asks for zoom, wheel up in, down out, and doesn't scroll.
+        log.borrow_mut().clear();
+        app.handle_event(Event::Scroll { at: Some(Point::new(400.0, 300.0)), dx: 0.0, dy: -40.0, modifiers: ctrl, phase: ScrollPhase::Update });
+        app.handle_event(Event::Scroll { at: Some(Point::new(400.0, 300.0)), dx: 0.0, dy: 40.0, modifiers: ctrl, phase: ScrollPhase::Update });
+        app.tick();
+        let zooms: Vec<f32> = log.borrow().iter().filter_map(|a| if let GridAction::Zoom(f) = a { Some(*f) } else { None }).collect();
+        assert_eq!(zooms.len(), 2, "{:?}", log.borrow());
+        assert!(zooms[0] > 1.0 && zooms[1] < 1.0, "{zooms:?}");
+    }
+
+    #[test]
     fn keys_move_extend_and_edit() {
         let (mut app, grid, _, state, log) = host(100, 20);
         app.tick();
@@ -3897,16 +4090,21 @@ mod tests {
         key(&mut app, Key::Down, "", shift);
         let g = state.get_cloned();
         assert_eq!(g.selection(), CellRange { r0: 1, c0: 2, r1: 3, c1: 2 });
-        // Typing starts an edit; Enter commits and moves down.
+        // Typing starts an edit; Enter commits and goes on to the next cell
+        // of the selection (round to its top), which stays.
         key(&mut app, Key::Char, "4", none);
         key(&mut app, Key::Char, "2", none);
         assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.text().to_string()), Some("42".into()));
         key(&mut app, Key::Enter, "", none);
         assert_eq!(grid.cells.borrow().get(&(3, 2)).map(String::as_str), Some("42"));
-        assert_eq!(state.get_cloned().cursor, (4, 2));
+        assert_eq!(state.get_cloned().cursor, (1, 2));
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 1, c0: 2, r1: 3, c1: 2 });
         assert!(matches!(log.borrow().last(), Some(GridAction::Commit { row: 3, col: 2, .. })));
+        // A plain arrow drops the selection.
+        key(&mut app, Key::Down, "", none);
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 2, c0: 2, r1: 2, c1: 2 });
         // Enter edits what is there; Escape leaves it.
-        key(&mut app, Key::Up, "", none);
+        key(&mut app, Key::Down, "", none);
         key(&mut app, Key::Enter, "", none);
         assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.text().to_string()), Some("42".into()));
         key(&mut app, Key::Backspace, "", none);
@@ -4225,7 +4423,7 @@ mod tests {
         let wrapped = needed_height(&CellView { wrap: true, ..CellView::text(long) }, 64.0);
         assert!(wrapped >= 3.0 * one - 2.0 * 2.0 * LINE_PAD as f64, "{one} {wrapped}");
         assert!(needed_height(&CellView::text("a\nb"), 64.0) > one);
-        let style = editor_style();
+        let style = editor_style(1.0);
         let lines = text_lines(&CellView { wrap: true, ..CellView::text(long) }, 60.0, &style);
         assert!(lines.len() > 2 && lines.iter().all(|l| crate::text::measure(l.trim_end(), &style).w <= 60.0), "{lines:?}");
         assert_eq!(lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" "), long);
@@ -4310,7 +4508,7 @@ mod tests {
         app.handle_event(Event::PointerUp { at: b2 });
         app.tick();
         key(&mut app, Key::Char, "hello world", Modifiers::default());
-        let style = editor_style();
+        let style = editor_style(1.0);
         let x_of = |s: &str| hw + 64.0 + PAD + crate::text::measure(s, &style).w;
         // A press just past "hello": the caret goes there, still editing.
         let at = Point::new(x_of("hello") + 1.0, HEADER_H + 30.0);
@@ -4409,7 +4607,7 @@ mod tests {
 
     #[test]
     fn the_editor_wraps_as_its_cell_does() {
-        let style = editor_style();
+        let style = editor_style(1.0);
         // Broken after spaces within the width; a word too long, inside it.
         let text = "aaa bbb ccc\ndddddddddddddddddddd";
         let w = crate::text::measure("aaa bbb ", &style).w + 1.0;

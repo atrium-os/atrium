@@ -47,11 +47,14 @@ if [ ! -x "$DT/atrium-dispensatord" ]; then
         echo "ABORT: dispensatord cross-build failed"; exit 1; }
 fi
 # ★ Cross-build on the HOST, never in the VM (feedback_always_cross_build).
-if [ ! -x "$T/atrium-jaild" ] || [ ! -x "$T/atrium-volumes" ]; then
-    echo "=== building missing daemons (cross) ==="
+# portcullis and opifex too: a guest base's older opifex refuses manifests
+# with roles it doesn't know (e.g. [roles.app-settings]), so skipping them
+# leaves the guest unable to install this tree's bundles.
+if [ ! -x "$T/atrium-jaild" ] || [ ! -x "$T/atrium-volumes" ] || [ ! -x "$T/portcullis" ] || [ ! -x "$T/opifex" ]; then
+    echo "=== building missing daemons and tools (cross) ==="
     ( cd "$BSD/portcullis" && TESSERA_CORE_LIB="$BSD/atrium-tessera/core" \
         cargo build --release --target "$TARGET" \
-        -p jaild -p atrium-volumes -p portcullisd ) || {
+        -p jaild -p atrium-volumes -p portcullisd -p portcullis-cli -p opifex ) || {
         echo "ABORT: cross-build failed"; exit 1; }
 fi
 

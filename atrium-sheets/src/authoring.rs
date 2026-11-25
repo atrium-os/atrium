@@ -122,6 +122,11 @@ impl Authoring {
         if i < rows * cols { i } else { 0 }
     }
 
+    /// Every pane's scroll, split or not.
+    pub(super) fn all_scrolls(&self, s: &Sheets) -> [Mutable<ScrollState>; 4] {
+        [s.scroll.clone(), self.extra_scrolls[0].clone(), self.extra_scrolls[1].clone(), self.extra_scrolls[2].clone()]
+    }
+
     pub(super) fn activation(&self) -> Mutable<usize> { self.active.clone() }
 
     pub(super) fn active_scroll(&self, s: &Sheets) -> Mutable<ScrollState> {
