@@ -449,7 +449,7 @@ Portcullisd sends the owner, persona, item ID and workspace to the SSH agent's
 root control protocol. Curia receives credential labels and grant state.
 See [arca.md](arca.md) §9.1.
 
-## 15. App settings panes (proposed 2026-11-25, for Navigator D8)
+## 15. App settings panes (accepted 2026-11-25, for Navigator D8)
 
 navigator-islands.md D8 says that "run this site live" stays revocable in
 Curia as well as from the chip. The list of sites is the Navigator's own
@@ -485,5 +485,12 @@ window, as a Limen embed.
   - It shares `live_remembered` with navigatord, moved into a small crate
     so both use the same parser, lock and atomic write.
 
-Status: proposed. Shankar was asked whether to build this, a list in
-Navigator only, or the chip alone.
+Status: accepted. Shankar chose app panes in Settings on 2026-11-25, over a
+list in Navigator only or the chip alone. Build order:
+
+1. The shared crate.
+2. The Limen role, with daemon tests.
+3. portcullisd's persona-scoped launch for an `app-grants` caller.
+4. Navigator's pane.
+5. Curia's row and embed.
+6. A VM check.
