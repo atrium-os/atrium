@@ -556,11 +556,17 @@ impl Workbook {
     /// Recalculates every formula from scratch (the reference for tests, and what a
     /// "recalculate all" command runs).
     pub fn recalc_all(&mut self) -> RecalcStats {
-        let ids: Vec<(GroupId, u32, u32)> = self.groups().map(|(g, grp)| (g, grp.r0, grp.r1)).collect();
+        self.mark_all(None);
+        self.recalc()
+    }
+
+    /// Marks every formula (or only `sheet`'s) as needing calculation, for
+    /// a later [`Workbook::recalc`] or slices of it (Excel's F9, Shift+F9).
+    pub fn mark_all(&mut self, sheet: Option<u16>) {
+        let ids: Vec<(GroupId, u32, u32)> = self.groups().filter(|(_, grp)| sheet.is_none_or(|s| grp.sheet == s)).map(|(g, grp)| (g, grp.r0, grp.r1)).collect();
         for (g, a, b) in ids {
             self.pending.entry(g).or_default().add(a, b);
         }
-        self.recalc()
     }
 }
 
