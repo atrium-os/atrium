@@ -3261,6 +3261,36 @@ in two ways:
   - navigatord `live_storage::storage_fuzz`: 50,000 storage batches and
     stores. A batch that is taken encodes back to its own bytes.
 
+#### I6.6 as built (2026-11-25, fourth part: the worker check on a whole page)
+
+`scripts/navigator-i6-worker-check.sh` widens the I5 worker check to a
+whole live page and its frames. Copy it and `scripts/lib/gate.sh` (as
+`lib/gate.sh` beside it) to the guest. Then, while the I6 fixture runs
+live with its `pay.example` frame, run as root:
+
+    sh navigator-i6-worker-check.sh PAGE_PID 1024 100 FRAME_PID
+
+`PAGE_MIB` is the installed engine manifest's `memory`. A frame's limit is
+always 256 MiB. For each engine (8 checks each, then 1 across them), the
+script checks:
+
+- its own `app-org-atrium-navigator-engine--` jail, with `ip4` and `ip6`
+  disabled;
+- Capsicum capability mode, and not root;
+- the RCTL `memoryuse` SIGKILL at its role's limit, and `pcpu`;
+- every executable mapping read-only, and either the bundle's `entry`,
+  another file of the bundle, or the kernel's shared page;
+- still the same process in the same jail after the checks;
+- across them: no two engines share a jail.
+
+Tested in the cloud against stub `ps`, `jls`, `procstat` and `rctl`. The
+honest stubs pass all 17 checks. A writable executable mapping fails the
+mapping check, and swapping the page and frame limits fails both memory
+checks. The binary audit is unchanged, since a whole page runs the same
+engine binary: `scripts/navigator-i5-worker-audit.sh UNSTRIPPED SHA256` on
+the Mac (interpreter entry points, no LibJS or LibWasm JIT symbols). The
+Mac run is next, together with the memory limits from the second part.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
