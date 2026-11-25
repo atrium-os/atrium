@@ -46,6 +46,7 @@ while True:
     if meth == "initialized":
         send({"jsonrpc": "2.0", "method": "artifex/registerCommand", "params": {"id": "todo.count", "label": "Count the TODOs"}})
         send({"jsonrpc": "2.0", "method": "artifex/registerCommand", "params": {"id": "todo.unlisted", "label": "Not in the manifest"}})
+        send({"jsonrpc": "2.0", "method": "artifex/panel", "params": {"open": True, "title": "TODOs"}})
     if meth == "artifex/command" and p.get("id") == "todo.count":
         n = sum(len(todos(t)) for t in docs.values())
         send({"jsonrpc": "2.0", "method": "artifex/status", "params": {"text": "%d TODOs (line %d of %s)" % (n, p["line"], p["file"].rsplit("/", 1)[-1])}})

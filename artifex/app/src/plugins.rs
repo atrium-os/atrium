@@ -57,7 +57,14 @@ pub trait Link {
     fn stop(&mut self, id: Id);
     /// What arrived since the last call, without waiting.
     fn poll(&mut self) -> Vec<(Id, LinkEvent)>;
+    /// Show `id`'s panel (its window) in the panel's slot, or none.
+    fn show(&mut self, id: Option<Id>) {
+        let _ = id;
+    }
 }
+
+/// The slot plugin panels are shown in (one at a time).
+pub const PANEL_SLOT: u64 = 0x6172_7466_706c_7567;
 
 /// A running plugin.
 pub struct Run {
@@ -90,11 +97,13 @@ pub struct Host {
     /// Plugins stopped this session, and why: not started again until
     /// the person restarts them.
     pub stopped: Vec<(String, String)>,
+    /// Whose panel is shown.
+    shown: Option<Id>,
 }
 
 impl Default for Host {
     fn default() -> Self {
-        Host { link: None, root: PathBuf::new(), workspace: String::new(), on: Vec::new(), read: Vec::new(), runs: Vec::new(), stopped: Vec::new() }
+        Host { link: None, root: PathBuf::new(), workspace: String::new(), on: Vec::new(), read: Vec::new(), runs: Vec::new(), stopped: Vec::new(), shown: None }
     }
 }
 
@@ -294,6 +303,32 @@ impl Host {
         self.runs.iter_mut().find(|r| r.id == id)
     }
 
+    /// The panels plugins ask to show: app, title, in the order the
+    /// plugins were switched on.
+    pub fn panels(&self) -> Vec<(String, String)> {
+        let mut v: Vec<&Run> = self.runs.iter().filter(|r| r.panel.is_some()).collect();
+        v.sort_by_key(|r| self.on.iter().position(|o| o.app == r.info.app).unwrap_or(usize::MAX));
+        v.into_iter().map(|r| (r.info.app.clone(), r.panel.clone().unwrap_or_default())).collect()
+    }
+
+    /// Show `app`'s panel, or none; the plugin is told whether its panel
+    /// shows (a hidden one need not draw).
+    pub fn show_panel(&mut self, app: Option<&str>) {
+        let want = app.and_then(|a| self.runs.iter().find(|r| r.info.app == a && r.panel.is_some())).map(|r| r.id);
+        if want == self.shown {
+            return;
+        }
+        let Some(link) = self.link.as_mut() else { return };
+        if let Some(old) = self.shown.filter(|o| self.runs.iter().any(|r| r.id == *o)) {
+            let _ = link.send(old, ToChild::PanelShown(false).encode());
+        }
+        link.show(want);
+        if let Some(new) = want {
+            let _ = link.send(new, ToChild::PanelShown(true).encode());
+        }
+        self.shown = want;
+    }
+
     /// Run `app`'s command `id` (from the palette), for `path`'s caret
     /// `line` when a file is active.
     pub fn command(&mut self, app: &str, id: &str, path: Option<&Path>, line: usize) -> Result<(), String> {
@@ -334,20 +369,23 @@ fn flush(r: &mut Run, link: &mut dyn Link) -> Result<(), String> {
 /// Plugins through limend: one connection, each plugin an
 /// `editor-extension` embed in Artifex's window.
 pub struct LimenLink {
-    parent: limen::client::Parent,
+    embeds: std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>,
     window: limen::proto::WindowToken,
 }
 
 impl LimenLink {
-    pub fn connect(window: limen::proto::WindowToken) -> Result<Self, String> {
-        let parent = limen::client::Parent::connect().map_err(|e| format!("{e:?}"))?;
-        Ok(LimenLink { parent, window })
+    /// limend for the window named by `window`; give the window the
+    /// returned binder so the panel slot's rect reaches limend.
+    pub fn connect(window: limen::proto::WindowToken) -> Result<(Self, Box<dyn pergola::slot::SlotBinder>), String> {
+        let embeds = pergola::embed::Embeds::connect().map_err(|e| format!("{e:?}"))?;
+        let binder = pergola::embed::Embeds::binder(&embeds);
+        Ok((LimenLink { embeds, window }, binder))
     }
 }
 
 impl Link for LimenLink {
     fn start(&mut self, app: &str) -> Result<Id, String> {
-        self.parent.request_plugin(self.window, app).map_err(|e| match e {
+        self.embeds.borrow_mut().request_plugin(self.window, app).map_err(|e| match e {
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NO_PLUGIN => "it isn't a plugin for you".into(),
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NOT_EMBEDDABLE => "Artifex may not start plugins".into(),
             e => format!("{e:?}"),
@@ -355,11 +393,22 @@ impl Link for LimenLink {
     }
 
     fn send(&mut self, id: Id, bytes: Vec<u8>) -> Result<(), String> {
-        self.parent.send(id, bytes).map_err(|e| format!("{e:?}"))
+        self.embeds.borrow_mut().send(id, bytes).map_err(|e| format!("{e:?}"))
     }
 
     fn stop(&mut self, id: Id) {
-        let _ = self.parent.detach(id);
+        let _ = self.embeds.borrow_mut().detach_embed(id);
+    }
+
+    fn show(&mut self, id: Option<Id>) {
+        let mut e = self.embeds.borrow_mut();
+        let r = match id {
+            Some(id) => e.show(PANEL_SLOT, id),
+            None => e.hide(PANEL_SLOT),
+        };
+        if let Err(err) = r {
+            eprintln!("artifex: plugin panel: {err:?}");
+        }
     }
 
     fn poll(&mut self) -> Vec<(Id, LinkEvent)> {
@@ -367,7 +416,8 @@ impl Link for LimenLink {
         let mut out = Vec::new();
         // Bounded: what's there now, not what keeps coming.
         for _ in 0..1024 {
-            match self.parent.poll(std::time::Duration::ZERO) {
+            let got = self.embeds.borrow_mut().poll(std::time::Duration::ZERO);
+            match got {
                 Ok(Some(P::Message { embed, bytes })) => out.push((embed, LinkEvent::Message(bytes))),
                 Ok(Some(P::ChildLost { embed })) => out.push((embed, LinkEvent::Gone("it stopped".into()))),
                 Ok(Some(P::Dropped { embed })) => out.push((embed, LinkEvent::Gone("it sent more than 256 messages a second".into()))),
@@ -400,12 +450,13 @@ pub mod testing {
         tx: mpsc::Sender<(Id, Option<Vec<u8>>)>,
         pub started: Vec<String>,
         pub inits: Vec<ext::Init>,
+        pub shown: std::rc::Rc<std::cell::RefCell<Vec<Option<Id>>>>,
     }
 
     impl Stdio {
         pub fn new(script: &Path) -> Self {
             let (tx, rx) = mpsc::channel();
-            Stdio { script: script.to_path_buf(), next: 100, procs: HashMap::new(), rx, tx, started: Vec::new(), inits: Vec::new() }
+            Stdio { script: script.to_path_buf(), next: 100, procs: HashMap::new(), rx, tx, started: Vec::new(), inits: Vec::new(), shown: Default::default() }
         }
     }
 
@@ -461,6 +512,10 @@ pub mod testing {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+        }
+
+        fn show(&mut self, id: Option<Id>) {
+            self.shown.borrow_mut().push(id);
         }
 
         fn poll(&mut self) -> Vec<(Id, LinkEvent)> {

@@ -640,6 +640,13 @@ lists Artifex's own acts with their keys and each running plugin's
 registered commands (only those its manifest lists) with its name; typed
 letters match in order, a word's start first, 12 rows at most. A plugin
 command goes as `Command { id, file, line }` for the active file.
+P4 (2026-11-25): a plugin whose manifest names a `panel` may ask for
+it (`Panel::Open { title }`); each such panel is a tab in the bottom
+panel (up to 8), and the shown one's window is placed in one Limen
+`plain` slot (`plugins::PANEL_SLOT`) through Pergola's `Embeds`, the
+others hidden but kept. The plugin is told `PanelShown(bool)`. A panel
+closed or a plugin stopped takes its tab, and the panel goes back to
+Output.
 
 **Decisions.**
 

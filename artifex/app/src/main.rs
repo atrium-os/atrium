@@ -128,7 +128,10 @@ fn main() {
             if let Some(token) = win.embed_token() {
                 limen_tried = true;
                 match artifex::plugins::LimenLink::connect(token) {
-                    Ok(link) => engine.set_plugin_link(Box::new(link)),
+                    Ok((link, binder)) => {
+                        win.set_slot_binder(binder);
+                        engine.set_plugin_link(Box::new(link));
+                    }
                     Err(e) => eprintln!("artifex: plugins: limend: {e}"),
                 }
             }

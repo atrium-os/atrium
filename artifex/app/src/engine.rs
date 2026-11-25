@@ -2336,6 +2336,7 @@ impl Engine {
         }
         self.read_jobs(s);
         self.read_servers(s);
+        self.plugin_panels(s);
         self.read_debugger(s);
         self.read_inspector(s);
         // Background fuzzing: the next target, never while a task runs
@@ -2756,6 +2757,28 @@ impl Engine {
         if d.cells.note.get_cloned() != note {
             d.cells.note.set(note);
         }
+    }
+
+    /// The plugins' panel tabs, and the one shown in the slot.
+    fn plugin_panels(&mut self, s: &mut State) {
+        let panels = self.plugins.panels();
+        if let Panel::Plugin(i) = s.panel {
+            // Its plugin closed it, or stopped: back to the output, and
+            // keep the same plugin's tab when the list moved.
+            let was = s.plugin_panels.get(i as usize).map(|p| p.0.clone());
+            match was.and_then(|a| panels.iter().position(|p| p.0 == a)) {
+                Some(k) => s.panel = Panel::Plugin(k as u8),
+                None => s.panel = Panel::Output,
+            }
+        }
+        if s.plugin_panels != panels {
+            s.plugin_panels = panels;
+        }
+        let shown = match s.panel {
+            Panel::Plugin(i) if s.panel_open => s.plugin_panels.get(i as usize).map(|p| p.0.clone()),
+            _ => None,
+        };
+        self.plugins.show_panel(shown.as_deref());
     }
 
     fn palette_query(&mut self, q: &str, s: &mut State) {
@@ -3836,9 +3859,11 @@ mod tests {
         std::fs::set_permissions(bin.join("pylsp"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::env::set_var("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
         std::fs::write(d.join("plugin.py"), include_str!("../tests/fixtures/fake_plugin.py")).unwrap();
-        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec!["todo.count".into()], panel: None, workspace_read: false };
+        let todo = plugins::Info { app: "org.example.todo".into(), name: "TODO lens".into(), languages: vec!["python".into(), "markdown".into()], commands: vec!["todo.count".into()], panel: Some("TODOs".into()), workspace_read: false };
         e.plugins.on = vec![todo];
-        e.set_plugin_link(Box::new(plugins::testing::Stdio::new(&d.join("plugin.py"))));
+        let link = plugins::testing::Stdio::new(&d.join("plugin.py"));
+        let shown = link.shown.clone();
+        e.set_plugin_link(Box::new(link));
         std::fs::write(d.join("proj/app.py"), "import os\n\ndef main():\n\tprint('hi')  # TODO say more\n\t\n").unwrap();
         e.act(Act::Use("proj".into()), &mut s);
         e.wait_jobs(&mut s);
@@ -3894,6 +3919,28 @@ mod tests {
         assert_eq!(rows(&s)[0], "Find references | Shift+F12");
         e.act(Act::PaletteRun(0), &mut s);
         assert!(tick_until(&mut e, &mut s, |s| !s.refs.is_empty()), "the server answered the palette's ask");
+
+        // Its panel is a tab; shown, its window goes in the slot, and
+        // out of it when the panel hides.
+        assert_eq!(s.plugin_panels, vec![("org.example.todo".to_string(), "TODOs".to_string())]);
+        let id = e.plugins.runs[0].id;
+        e.act(Act::Panel(Panel::Plugin(0)), &mut s);
+        e.tick(&mut s);
+        assert_eq!(shown.borrow().last(), Some(&Some(id)));
+        e.act(Act::Panel(Panel::Output), &mut s);
+        e.tick(&mut s);
+        assert_eq!(shown.borrow().last(), Some(&None));
+        e.act(Act::Panel(Panel::Plugin(0)), &mut s);
+        e.tick(&mut s);
+        e.act(Act::HidePanel, &mut s);
+        e.tick(&mut s);
+        assert_eq!(*shown.borrow(), vec![Some(id), None, Some(id), None]);
+        // A plugin that stops takes its tab with it.
+        e.act(Act::Panel(Panel::Plugin(0)), &mut s);
+        e.plugins.stop("org.example.todo", "switched off");
+        e.tick(&mut s);
+        assert!(s.plugin_panels.is_empty());
+        assert_eq!(s.panel, Panel::Output);
     }
 
     #[test]
