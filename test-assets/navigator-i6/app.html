@@ -27,6 +27,10 @@
    <a id="route" href="#">Route (pushState)</a>
    <a id="cross" href="https://elsewhere.example/">Another site</a>
    <button id="popup">Open another site</button></p>
+<!-- Memory (I6.6): Grow holds 64 MiB more, touched; Release lets it all go,
+     for the engine's trim (kill -INFO) to give back. -->
+<p><button id="grow">Grow</button> <button id="release">Release</button>
+   <span id="held">0 MiB held</span></p>
 <!-- D11: a cross-origin frame, its own jail. -->
 <iframe id="pay" src="https://pay.example/frame.html" title="Payment"></iframe>
 <ol id="checks"></ol>

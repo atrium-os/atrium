@@ -3259,6 +3259,9 @@ whole page, 256 MiB for parts):
     RSS did not drop: about 101 MB before and 102.5 MB after. The fixture
     page holds almost no garbage, so a lower RSS still needs a page that
     lets go of a large allocation first.
+    The fixture now has Grow and Release buttons: press Grow a few
+    times, then Release, then `kill -INFO`; RSS should fall by most of
+    what Grow added.
   - A Mac check: a fixture page that grows past 256 MiB keeps running up
     to 1 GiB and then falls back to the document lane, and a widget is
     still killed at 256 MiB.
@@ -3531,13 +3534,14 @@ only:
    holds them by reference, the commit gives an out-of-shape change (the
    commit fails, logged) rather than keeping a dangling reference.
 
-**Gate (Mac),** with `NAVIGATORD_STORE` set and a fixture line
-`indexeddb` (a database `fixture`, store `visits`, one put per run):
+**Gate (Mac),** with `NAVIGATORD_STORE` set, on the fixture's
+`indexeddb` line ("N stored", the `i6` database's `items`) and its Add
+button:
 
-1. Run `app.html` live: `indexeddb` reads 1 visit. Stop, run live: 2.
-   Restart navigatord, run live: 3.
-2. Grow the page past its 1 GiB limit (Grow buttons) so the engine is
-   killed, run live again: the count kept every committed visit.
+1. Run `app.html` live: `indexeddb` reads 0 stored. Add: 1 stored. Stop,
+   run live: 1 stored. Add, restart navigatord, run live: 2 stored.
+2. Add, then press Grow until the engine is killed at its 1 GiB limit,
+   run live again: 3 stored.
 3. An Unrecorded trail: 1 visit, and no `live-idb` file for it.
 4. Put a 60 MiB value: the transaction aborts with `QuotaExceededError`,
    and the next run reads the store as it was.
