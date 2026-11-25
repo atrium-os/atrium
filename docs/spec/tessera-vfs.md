@@ -526,7 +526,11 @@ The operator clear `kern.tessera.commit_failed_clear` is gone: lifting the
 latch on a mounted volume let the next flush pinscan roots ahead of the
 durable superblock, the overwrite above, and as one global it lifted
 whichever latched volume flushed first. `scripts/vm-commit-fail-test.sh`
-checks that the sysctl no longer exists.
+checks that the sysctl no longer exists: all 7 checks pass on the same
+guest setup with main's kmod after the removal (the latch holds after the
+fault clears, the sysctl is gone, a remount restores fsync), and the
+commit-refusal check (16/16) and A5 (46/46) pass on it too; evidence in
+`~/atrium-vm/evidence/tessera/latch-no-clear-2026-11-25/` on the Mac.
 
 Seen in the commit-refusal runs and not resolved: "bulk write over DIRTY
 buffered sector" fires when a data publish retries over sectors whose earlier write failed;
