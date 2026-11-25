@@ -3570,6 +3570,35 @@ button:
 5. `live-idb/app.example.idb-log` (and `.idb` after a fold) is 0600,
    owned by the persona's Navigator user.
 
+
+**Gate results on arm64 Tessera, 2026-11-25.** The engine was
+`a9204225…`, built with `live-idb.patch` (6d1f75ede) and passing the JIT
+audit, and navigatord was at 951f1b4df. Evidence is in
+`~/atrium-vm/evidence/navigator-i6-7-20261125/` on the Mac. jaild logged no
+WARNs.
+
+1. Passed. 0 stored; after Add, Stop and a new live run, 1; after Add, a
+   navigatord restart and a live run, 2.
+2. Passed. After Add, 14 presses of Grow took the page to 1009 MiB and it
+   was killed. The next live run read 3 stored.
+3. Passed. An Unrecorded trail read 0 stored, Add worked on the page, and
+   no file was written (the recorded log stayed at 301 bytes).
+4. Passed. A 60 MiB put, from a button on a copy of the fixture (kept
+   with the evidence), aborted with `QuotaExceededError`, and the next run
+   read 3 stored. The engine refused it before sending:
+   `Op::from_fields` takes no value past its bound, so the change was out
+   of shape and nothing reached navigatord. navigatord's 50 MiB a site was
+   not exercised; that needs values under the per-change bound that add up
+   past it.
+5. Passed. `live-idb/app.example.idb-log` was 0600, owned by the
+   Navigator's uid for the person. The log never passed 1 MiB, so there
+   was no fold.
+
+The trim, rechecked with the fixture's Grow and Release buttons: Grow
+three times took the page's engine from 109 to 306 MB, and Release left it
+there. `kill -INFO` logged the trim, and RSS fell to 110 MB. The page ran
+on.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
