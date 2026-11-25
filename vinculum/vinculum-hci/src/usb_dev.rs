@@ -140,6 +140,8 @@ extern "C" {
     fn libusb_bulk_transfer(handle: *mut Handle, ep: u8, data: *mut u8, length: c_int, transferred: *mut c_int, timeout: c_uint) -> c_int;
     fn libusb_interrupt_transfer(handle: *mut Handle, ep: u8, data: *mut u8, length: c_int, transferred: *mut c_int, timeout: c_uint) -> c_int;
     fn libusb_error_name(code: c_int) -> *const c_char;
+    fn libusb_get_string_descriptor_ascii(handle: *mut Handle, index: u8, data: *mut u8, length: c_int) -> c_int;
+    fn libusb_close(handle: *mut Handle);
 }
 
 fn err_name(code: c_int) -> String {
@@ -359,6 +361,13 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
     let Some((usb, name)) = found else {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no Bluetooth controller on USB"));
     };
+    claim(&usb, &name)?;
+    Ok((usb, name))
+}
+
+/// Makes the kernel let go of `usb`, configures it if it is not, and claims
+/// its HCI interface. Returns the configuration it was in when found.
+fn claim(usb: &Usb, name: &str) -> std::io::Result<u8> {
     // The kernel's own driver (ng_ubt on stock FreeBSD) must let go; on
     // macOS nothing holds a third-party controller, and libusb says so.
     // SAFETY: the handle was just opened.
@@ -389,7 +398,7 @@ fn open(sel: Select) -> std::io::Result<(Usb, String)> {
     if r < 0 {
         return Err(io_err(&format!("claim interface {} of {name}", usb.iface), r));
     }
-    Ok((usb, name))
+    Ok(cur.clamp(0, 255) as u8)
 }
 
 /// The HCI interface of `dev`'s active configuration (or, for a device not
@@ -467,6 +476,98 @@ pub fn start(sel: Select, firmware_dir: &Path) -> std::io::Result<(UnixStream, S
         });
     }
     Ok((mine, name))
+}
+
+/// A string descriptor as printable ASCII, at most 126 characters; None if
+/// the device has none or will not say.
+fn string(handle: *mut Handle, index: u8) -> Option<String> {
+    if index == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 128];
+    // SAFETY: the handle is open; `buf` is live for `buf.len()` bytes and
+    // libusb writes at most that many.
+    let n = unsafe { libusb_get_string_descriptor_ascii(handle, index, buf.as_mut_ptr(), buf.len() as c_int) };
+    let n = usize::try_from(n).ok()?.min(buf.len());
+    Some(buf[..n].iter().map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '?' }).collect())
+}
+
+/// `--report`: every Bluetooth controller `sel` matches, one by one, as
+/// [`vinculum_hci::report`] describes it. A controller that cannot be opened
+/// is listed with why.
+pub fn report(sel: Select) -> std::io::Result<String> {
+    let mut out = String::new();
+    let mut ctx: *mut Context = std::ptr::null_mut();
+    // SAFETY: `ctx` is a live out-pointer; the context is kept for the life
+    // of the process.
+    let r = unsafe { libusb_init(&mut ctx) };
+    if r < 0 {
+        return Err(io_err("libusb_init", r));
+    }
+    let mut list: *mut *mut Device = std::ptr::null_mut();
+    // SAFETY: `ctx` was initialised above; `list` is a live out-pointer.
+    let n = unsafe { libusb_get_device_list(ctx, &mut list) };
+    if n < 0 {
+        return Err(io_err("device list", n as c_int));
+    }
+    // SAFETY: libusb returned a list of `n` valid device pointers; it stays
+    // valid until libusb_free_device_list below.
+    let devices = unsafe { std::slice::from_raw_parts(list, n as usize) };
+    let mut count = 0;
+    for &dev in devices {
+        let mut dd = DeviceDescriptor::default();
+        // SAFETY: `dev` is from the live list; `dd` is a live out-struct.
+        if unsafe { libusb_get_device_descriptor(dev, &mut dd) } < 0 {
+            continue;
+        }
+        if let Select::Ids { vendor, product } = sel {
+            if dd.id_vendor != vendor || dd.id_product != product {
+                continue;
+            }
+        }
+        let Some((iface, eps, config)) = hci_interface(dev) else { continue };
+        count += 1;
+        // SAFETY: `dev` is from the live list.
+        let (bus, addr) = unsafe { (libusb_get_bus_number(dev), libusb_get_device_address(dev)) };
+        let name = format!("{:04x}:{:04x} on bus {bus} address {addr}", dd.id_vendor, dd.id_product);
+        let mut h: *mut Handle = std::ptr::null_mut();
+        // SAFETY: `dev` is from the live list; `h` is a live out-pointer.
+        let r = unsafe { libusb_open(dev, &mut h) };
+        if r < 0 {
+            out.push_str(&format!("controller {name}: cannot open: {} (run as root?)\n", err_name(r)));
+            continue;
+        }
+        let usb = Usb { handle: h, iface, config, eps, vendor: dd.id_vendor, product: dd.id_product };
+        match claim(&usb, &name) {
+            Ok(was) => {
+                let info = vinculum_hci::report::UsbInfo {
+                    vendor: dd.id_vendor,
+                    product: dd.id_product,
+                    bcd_device: dd.bcd_device,
+                    bcd_usb: dd.bcd_usb,
+                    manufacturer: string(h, dd.i_manufacturer),
+                    product_name: string(h, dd.i_product),
+                    bus,
+                    address: addr,
+                    configured: was,
+                    config,
+                    interface: iface,
+                    endpoints: eps,
+                };
+                out.push_str(&vinculum_hci::report::controller(&mut &usb, &info));
+            }
+            Err(e) => out.push_str(&format!("controller {name}: cannot claim: {e}\n")),
+        }
+        // SAFETY: the handle was opened above and nothing uses it after;
+        // closing releases the interface and gives the kernel its driver back.
+        unsafe { libusb_close(h) };
+    }
+    // SAFETY: frees the list got above; no pointer from it is used after.
+    unsafe { libusb_free_device_list(list, 1) };
+    if count == 0 {
+        out.push_str("no USB Bluetooth controller (interface class E0/01/01) found\n");
+    }
+    Ok(out)
 }
 
 /// Endpoint `ep` to the main loop: reassembles `kind` packets (they may span

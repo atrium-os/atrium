@@ -235,6 +235,24 @@ that cannot write controller memory. A refused command is answered to `vinculumd
 `Command Status: Unknown HCI Command` and logged. The point: the host stack is the large
 attack surface; even a full compromise of it must not be able to reflash the radio.
 
+### 5.4 Controllers we do not have: the report
+
+We cannot buy every chip, so support for a new one starts from its owner.
+`vinculum-hci --report [--controller usb:VVVV:PPPP]` (built 2026-11-25,
+`vinculum-hci/src/report.rs`) runs on Atrium, stock FreeBSD, Linux and macOS (root where the
+OS needs it for USB) and prints, per USB controller of class E0/01/01: its USB identity,
+strings, configuration and HCI endpoints; HCI Reset, then Read Local Version (manufacturer,
+LMP subversion: the chip and its ROM), Supported Commands, LMP and LE features, ACL/SCO/LE/ISO
+buffer sizes; the vendor's own version read where we know it carries nothing personal
+(Realtek ROM version today); and what Vinculum does about that maker's firmware. It loads no
+firmware, never reads the device address (no Read BD_ADDR, no vendor read known to carry
+one, such as Intel's version TLV), reads no USB serial number and does not scan, so the text
+is safe to post. The loop: the owner sends the report; we add the firmware loader or quirk
+(firmware licence checked first, §5.2); they run a test build's report again and pair one of
+their own devices. Order of loaders by how many machines they reach: Intel (most Intel-platform
+laptops), MediaTek (many AMD laptops), Qualcomm, Broadcom/Cypress (older Macs, Raspberry Pi,
+often on UART, which also needs H5).
+
 ## 6. The host: `vinculumd`
 
 ### 6.1 How it is built
