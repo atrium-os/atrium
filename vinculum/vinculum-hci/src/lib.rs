@@ -7,5 +7,6 @@
 
 pub mod allow;
 pub mod relay;
+pub mod report;
 pub mod rtl;
 pub mod usb;

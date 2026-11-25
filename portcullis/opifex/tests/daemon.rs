@@ -47,6 +47,7 @@ fn world(tag: &str) -> W {
         catalog_url: "https://example.org/cat/".into(),
         praeco: None, fonts: d.join("fonts"), system: d.join("sys"),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
+        app_registry: d.join("app-registry"),
     };
     W { d, plat, cat, daemon }
 }
@@ -629,6 +630,29 @@ fn a_file_opened_through_the_sheet() {
     assert!(matches!(r, Response::Done { .. }), "{r:?}");
     let rec = w.daemon.store().get(ID).unwrap().unwrap();
     assert_eq!((rec.source.as_str(), rec.installed_by), ("side-load", 1001));
+    // An app's uid (Files, Artifex) stands for its person; a person's own
+    // uid is theirs; an owner with no account, or no readable registry,
+    // refuses rather than recording the app.
+    fs::write(&w.daemon.app_registry, "50007 root org.atrium.artifex\n50008 no-such-person-here org.atrium.files\n").unwrap();
+    assert_eq!(w.daemon.person_for(50007), Ok(0));
+    assert_eq!(w.daemon.person_for(1001), Ok(1001));
+    assert!(w.daemon.person_for(50008).unwrap_err().contains("no account"));
+    fs::create_dir_all(w.daemon.app_registry.with_extension("d")).unwrap();
+    let saved = w.daemon.app_registry.with_extension("saved");
+    fs::rename(&w.daemon.app_registry, &saved).unwrap();
+    std::os::unix::fs::symlink(w.daemon.app_registry.with_extension("d"), &w.daemon.app_registry).unwrap();
+    assert!(w.daemon.person_for(50007).unwrap_err().contains("app registry"));
+    fs::remove_file(&w.daemon.app_registry).unwrap();
+    fs::rename(&saved, &w.daemon.app_registry).unwrap();
+    // Approved for an app: recorded for its person.
+    let c = w.daemon.store();
+    c.remove(ID).unwrap();
+    let _ = fs::remove_dir_all(w.daemon.root.join("apps").join(ID));
+    let token = match w.daemon.handle_with(65042, Request::PreviewLocal { for_uid: 50007 }, open()) {
+        Response::LocalPreview { token, .. } => token, other => panic!("{other:?}") };
+    let r = approve(&token, &app.manifest_sha256, 50007);
+    assert!(matches!(r, Response::Done { .. }), "{r:?}");
+    assert_eq!(w.daemon.store().get(ID).unwrap().unwrap().installed_by, 0, "the app's person");
     assert_eq!(fs::read(w.daemon.root.join("apps").join(ID).join("bin/hello")).unwrap(), elf(1));
     // Nothing is left held.
     assert_eq!(fs::read_dir(w.daemon.state.join("held")).unwrap().count(), 0);

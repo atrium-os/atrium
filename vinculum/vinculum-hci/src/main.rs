@@ -184,10 +184,39 @@ enum HostSide {
     Connect(String),
 }
 
+/// `--report [--controller usb[:VVVV:PPPP]]`: describes each USB controller
+/// on stdout and exits (vinculum_hci::report).
+fn run_report(spec: &str) -> ! {
+    #[cfg(feature = "usb")]
+    {
+        let Some(sel) = spec.strip_prefix("usb").and_then(|r| vinculum_hci::usb::parse_select(r.strip_prefix(':').unwrap_or(r))) else {
+            eprintln!("vinculum-hci: --report reads USB controllers: --controller usb or usb:VVVV:PPPP");
+            std::process::exit(2)
+        };
+        let os = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+        match usb_dev::report(sel) {
+            Ok(r) => {
+                print!("{}{r}", vinculum_hci::report::header(&os));
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("vinculum-hci: report: {e}");
+                std::process::exit(1)
+            }
+        }
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        let _ = spec;
+        eprintln!("vinculum-hci: --report needs the usb feature");
+        std::process::exit(2)
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] \
-         (--host-listen PATH | --host-connect PATH | --serve-tcp 127.0.0.1:PORT) [--host-uid UID]... [--firmware-dir DIR]"
+         (--host-listen PATH | --host-connect PATH | --serve-tcp 127.0.0.1:PORT) [--host-uid UID]... [--firmware-dir DIR]\n       vinculum-hci --report [--controller usb[:VVVV:PPPP]]"
     );
     std::process::exit(2)
 }
@@ -230,6 +259,7 @@ fn main() {
     let mut connect: Option<String> = None;
     let mut host_uids: Vec<u32> = Vec::new();
     let mut serve_tcp: Option<String> = None;
+    let mut report = false;
     let mut firmware_dir = std::path::PathBuf::from(DEFAULT_FIRMWARE_DIR);
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -242,9 +272,13 @@ fn main() {
                 None => usage(),
             },
             "--serve-tcp" => serve_tcp = a.next(),
+            "--report" => report = true,
             "--firmware-dir" => firmware_dir = a.next().map(Into::into).unwrap_or(firmware_dir),
             _ => usage(),
         }
+    }
+    if report {
+        run_report(controller_spec.as_deref().unwrap_or("usb"));
     }
     if let (Some(_spec), Some(_addr)) = (controller_spec.as_deref(), serve_tcp.as_deref()) {
         #[cfg(feature = "dev-bridge")]

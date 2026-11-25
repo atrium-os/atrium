@@ -46,7 +46,7 @@ fn text(c: &Ctx, a: &Expr) -> Result<std::sync::Arc<str>, ErrorKind> {
 
 /// `q` with the error of a division taken off: a quotient within 1e-12 of
 /// a whole number is that number, so CEILING(0.3, 0.1) is 0.3, not 0.4.
-fn snap(q: f64) -> f64 {
+pub(super) fn snap(q: f64) -> f64 {
     let r = q.round();
     if (q - r).abs() <= 1e-12 * r.abs().max(1.0) { r } else { q }
 }
@@ -332,9 +332,9 @@ pub(super) fn datedif(c: &Ctx, a: &[Expr]) -> Ev {
 /// The most holidays NETWORKDAYS and WORKDAY take.
 const MAX_HOLIDAYS: usize = 100_000;
 
-fn holidays(c: &Ctx, a: &[Expr]) -> Result<HashSet<i64>, ErrorKind> {
+fn holidays(c: &Ctx, a: &[Expr], at: usize) -> Result<HashSet<i64>, ErrorKind> {
     let mut set = HashSet::new();
-    let Some(arg) = a.get(2).filter(|x| !missing(x)) else { return Ok(set) };
+    let Some(arg) = a.get(at).filter(|x| !missing(x)) else { return Ok(set) };
     let mut over = false;
     each_num(c, std::slice::from_ref(arg), &mut |x| {
         if set.len() < MAX_HOLIDAYS {
@@ -346,52 +346,184 @@ fn holidays(c: &Ctx, a: &[Expr]) -> Result<HashSet<i64>, ErrorKind> {
     if over { Err(ErrorKind::Num) } else { Ok(set) }
 }
 
-fn weekend(c: &Ctx, day: i64) -> bool {
-    matches!(c.wb.date_system().weekday(day), 0 | 6)
+/// Weekend days as bits of the weekday (bit 0 Sunday … bit 6 Saturday).
+type Weekend = u8;
+const SAT_SUN: Weekend = 0b100_0001;
+
+/// The .INTL weekend argument: 1–7 for two days (1 Saturday and Sunday, 2
+/// Sunday and Monday, …), 11–17 for one (11 Sunday … 17 Saturday), or seven
+/// 0/1 characters from Monday; a week with no working day is #VALUE!.
+fn weekend_arg(c: &Ctx, a: &[Expr], at: usize) -> Result<Weekend, ErrorKind> {
+    let Some(arg) = a.get(at).filter(|x| !missing(x)) else { return Ok(SAT_SUN) };
+    match c.scalar(arg) {
+        Value::Str(s) => {
+            if s.len() != 7 || !s.bytes().all(|b| b == b'0' || b == b'1') {
+                return Err(ErrorKind::Value);
+            }
+            let mask = s.bytes().enumerate().filter(|(_, b)| *b == b'1').fold(0, |m, (i, _)| m | 1 << ((i + 1) % 7));
+            if mask == 0x7f { Err(ErrorKind::Value) } else { Ok(mask) }
+        }
+        Value::Err(k) => Err(k),
+        v => {
+            let k = c.number(&v)?;
+            if k.fract() != 0.0 {
+                return Err(ErrorKind::Num);
+            }
+            match k as i64 {
+                k @ 1..=7 => Ok(1 << ((k + 5) % 7) | 1 << ((k + 6) % 7)),
+                k @ 11..=17 => Ok(1 << (k - 11)),
+                _ => Err(ErrorKind::Num),
+            }
+        }
+    }
 }
 
-/// Monday-to-Friday days from `s` to `t` inclusive (s <= t).
-fn weekdays(c: &Ctx, s: i64, t: i64) -> i64 {
+fn weekend(c: &Ctx, mask: Weekend, day: i64) -> bool {
+    mask & 1 << c.wb.date_system().weekday(day) != 0
+}
+
+/// Working days from `s` to `t` inclusive (s <= t).
+fn weekdays(c: &Ctx, mask: Weekend, s: i64, t: i64) -> i64 {
     let total = t - s + 1;
     let (weeks, rest) = (total / 7, total % 7);
-    weeks * 5 + (0..rest).filter(|i| !weekend(c, s + weeks * 7 + i)).count() as i64
+    weeks * (7 - i64::from(mask.count_ones() as u8)) + (0..rest).filter(|i| !weekend(c, mask, s + weeks * 7 + i)).count() as i64
 }
 
-pub(super) fn networkdays(c: &Ctx, a: &[Expr]) -> Ev {
+fn network_days(c: &Ctx, a: &[Expr], intl: bool) -> Ev {
     let (s, _) = tri!(day_of(c, tri!(num(c, &a[0]))));
     let (t, _) = tri!(day_of(c, tri!(num(c, &a[1]))));
-    let hol = tri!(holidays(c, a));
+    let mask = if intl { tri!(weekend_arg(c, a, 2)) } else { SAT_SUN };
+    let hol = tri!(holidays(c, a, if intl { 3 } else { 2 }));
     let (lo, hi, sign) = if s <= t { (s as i64, t as i64, 1.0) } else { (t as i64, s as i64, -1.0) };
-    let off = hol.iter().filter(|&&h| (lo..=hi).contains(&h) && !weekend(c, h)).count() as i64;
-    n(sign * (weekdays(c, lo, hi) - off) as f64)
+    let off = hol.iter().filter(|&&h| (lo..=hi).contains(&h) && !weekend(c, mask, h)).count() as i64;
+    n(sign * (weekdays(c, mask, lo, hi) - off) as f64)
+}
+pub(super) fn networkdays(c: &Ctx, a: &[Expr]) -> Ev {
+    network_days(c, a, false)
+}
+pub(super) fn networkdays_intl(c: &Ctx, a: &[Expr]) -> Ev {
+    network_days(c, a, true)
 }
 
-pub(super) fn workday(c: &Ctx, a: &[Expr]) -> Ev {
+fn work_day(c: &Ctx, a: &[Expr], intl: bool) -> Ev {
     let (s, _) = tri!(day_of(c, tri!(num(c, &a[0]))));
     let k = tri!(num(c, &a[1])).trunc();
-    let hol = tri!(holidays(c, a));
+    let mask = if intl { tri!(weekend_arg(c, a, 2)) } else { SAT_SUN };
+    let hol = tri!(holidays(c, a, if intl { 3 } else { 2 }));
     if k.abs() > 3_000_000.0 {
         return e(ErrorKind::Num);
     }
+    let per_week = 7 - i64::from(mask.count_ones() as u8);
     let step = if k < 0.0 { -1 } else { 1 };
     let (mut day, mut left) = (s as i64, k.abs() as i64);
     // Whole weeks first when no holiday can fall in them.
-    if hol.is_empty() && left > 10 {
-        let weeks = left / 5 - 1;
+    if hol.is_empty() && left > 2 * per_week {
+        let weeks = left / per_week - 1;
         day += step * weeks * 7;
-        left -= weeks * 5;
-    }
-    while left > 0 {
-        day += step;
-        if !weekend(c, day) && !hol.contains(&day) {
-            left -= 1;
-        }
+        left -= weeks * per_week;
     }
     let system = c.wb.date_system();
+    while left > 0 {
+        day += step;
+        if !weekend(c, mask, day) && !hol.contains(&day) {
+            left -= 1;
+        }
+        // Holidays can't stall this for long, but keep the walk inside the calendar.
+        if system.ymd(day as f64).is_none() {
+            return e(ErrorKind::Num);
+        }
+    }
     if system.ymd(day as f64).is_none() {
         return e(ErrorKind::Num);
     }
     n(day as f64)
+}
+pub(super) fn workday(c: &Ctx, a: &[Expr]) -> Ev {
+    work_day(c, a, false)
+}
+pub(super) fn workday_intl(c: &Ctx, a: &[Expr]) -> Ev {
+    work_day(c, a, true)
+}
+
+/// DAYS360(start, end, [european]): Excel's 30/360 count, where a start on
+/// a month's last day is the 30th and an end on the 31st is the 30th when
+/// the start is (US), or every 31st is the 30th (European).
+pub(super) fn days360(c: &Ctx, a: &[Expr]) -> Ev {
+    let (s, (y1, m1, mut d1)) = tri!(day_of(c, tri!(num(c, &a[0]))));
+    let (_, (y2, m2, mut d2)) = tri!(day_of(c, tri!(num(c, &a[1]))));
+    let european = match a.get(2).filter(|x| !missing(x)) {
+        Some(x) => tri!(super::to_bool(&c.scalar(x))),
+        None => false,
+    };
+    if european {
+        (d1, d2) = (d1.min(30), d2.min(30));
+    } else {
+        if c.wb.date_system().month_end(s, 0.0).is_some_and(|last| last == s) {
+            d1 = 30;
+        }
+        if d2 == 31 && d1 == 30 {
+            d2 = 30;
+        }
+    }
+    n(((y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)) as f64)
+}
+
+/// TIMEVALUE(text): the time of day in time text ("6:35 AM", "18:35:20",
+/// "22-Aug-2011 6:35 AM") as a fraction of a day; a date part must be a
+/// date and is dropped.
+pub(super) fn timevalue(c: &Ctx, a: &[Expr]) -> Ev {
+    let t = match c.scalar(&a[0]) {
+        Value::Str(t) => t,
+        Value::Err(k) => return e(k),
+        _ => return e(ErrorKind::Value),
+    };
+    match time_of_text(c, &t) {
+        Some(x) => n(x),
+        None => e(ErrorKind::Value),
+    }
+}
+
+fn time_of_text(c: &Ctx, text: &str) -> Option<f64> {
+    let text = text.trim();
+    if text.len() > 255 {
+        return None;
+    }
+    let upper = text.to_ascii_uppercase();
+    let (body, pm) = if let Some(b) = upper.strip_suffix("AM") {
+        (b.trim_end(), Some(false))
+    } else if let Some(b) = upper.strip_suffix("PM") {
+        (b.trim_end(), Some(true))
+    } else {
+        (upper.as_str(), None)
+    };
+    let (date, clock) = match body.rfind(' ') {
+        Some(i) if body[i + 1..].contains(':') => (body[..i].trim(), &body[i + 1..]),
+        _ => ("", body),
+    };
+    if !date.is_empty() {
+        c.wb.date_system().datevalue(&text[..date.len()])?;
+    }
+    let mut parts = clock.split(':');
+    let h: f64 = parts.next()?.parse::<u32>().ok()?.into();
+    let m: f64 = parts.next()?.parse::<u32>().ok()?.into();
+    let sec: f64 = match parts.next() {
+        Some(s) => s.parse().ok().filter(|s: &f64| s.is_finite() && *s >= 0.0)?,
+        None => 0.0,
+    };
+    if parts.next().is_some() || m >= 60.0 || sec >= 60.0 {
+        return None;
+    }
+    let h = match pm {
+        Some(pm) => {
+            if !(0.0..=12.0).contains(&h) {
+                return None;
+            }
+            h % 12.0 + if pm { 12.0 } else { 0.0 }
+        }
+        None if h > 9999.0 => return None,
+        None => h,
+    };
+    Some(((h * 3600.0 + m * 60.0 + sec) / 86400.0).fract())
 }
 
 pub(super) fn weeknum(c: &Ctx, a: &[Expr]) -> Ev {
@@ -592,29 +724,37 @@ pub(super) fn rank_avg(c: &Ctx, a: &[Expr]) -> Ev {
 /// exclusive (strictly between, and only where the data reaches).
 fn percentile_of(c: &Ctx, a: &Expr, k: f64, exclusive: bool) -> Ev {
     let mut v = tri!(numbers(c, a));
+    match percentile_vec(&mut v, k, exclusive) {
+        Ok(x) => n(x),
+        Err(k) => e(k),
+    }
+}
+
+/// The `k` percentile of `v` (sorted here), as [`percentile_of`].
+pub(super) fn percentile_vec(v: &mut [f64], k: f64, exclusive: bool) -> Result<f64, ErrorKind> {
     if v.is_empty() {
-        return e(ErrorKind::Num);
+        return Err(ErrorKind::Num);
     }
     v.sort_by(f64::total_cmp);
     let len = v.len() as f64;
     let h = if exclusive {
         if k <= 0.0 || k >= 1.0 {
-            return e(ErrorKind::Num);
+            return Err(ErrorKind::Num);
         }
         let h = (len + 1.0) * k - 1.0;
         if h < 0.0 || h > len - 1.0 {
-            return e(ErrorKind::Num);
+            return Err(ErrorKind::Num);
         }
         h
     } else {
         if !(0.0..=1.0).contains(&k) {
-            return e(ErrorKind::Num);
+            return Err(ErrorKind::Num);
         }
         (len - 1.0) * k
     };
     let lo = h.floor() as usize;
     let hi = (lo + 1).min(v.len() - 1);
-    n(v[lo] + (h - lo as f64) * (v[hi] - v[lo]))
+    Ok(v[lo] + (h - lo as f64) * (v[hi] - v[lo]))
 }
 pub(super) fn percentile_inc(c: &Ctx, a: &[Expr]) -> Ev {
     let k = tri!(num(c, &a[1]));

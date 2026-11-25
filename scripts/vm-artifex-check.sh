@@ -55,7 +55,8 @@ export CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd --sysroot=
 export CXXFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd --sysroot=$S"
 xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2) || { echo "build of $1 failed"; echo "artifex: 1 failed"; exit 1; }; }
 xb frescod "--bin frescod"
-xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-volumes --bin portcullisd --bin portcullis --bin opifex --bin atrium-jaild --bin atrium-volumes"
+xb portcullis "-p portcullisd -p portcullis-cli -p opifex -p jaild -p atrium-volumes --bin portcullisd --bin portcullis --bin opifex --bin opifexd --bin opifex-check --bin atrium-jaild --bin atrium-volumes"
+xb opifex-sheet "--bin opifex-sheetd"
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex -p md-links -p todo-lens --bin artifex --bin md-links --bin todo-lens"
@@ -97,6 +98,7 @@ done
 V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/atrium-jaild portcullis/target/$TARGET/release/atrium-volumes \
+         portcullis/target/$TARGET/release/opifexd portcullis/target/$TARGET/release/opifex-check opifex-sheet/target/$TARGET/release/opifex-sheetd \
          atrium-term-socket/target/$TARGET/release/atrium-term-socket \
          stoa/target/$TARGET/release/stoad artifex/target/$TARGET/release/artifex \
          artifex/target/$TARGET/release/md-links artifex/target/$TARGET/release/todo-lens libatrium/target/$TARGET/release/words limen/target/$TARGET/release/limend; do
@@ -134,6 +136,12 @@ set -e
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
 install -m 0755 $B/portcullis /usr/local/bin/portcullis
 install -m 0755 $B/opifex /usr/local/bin/opifex
+# opifexd and the install sheet, for the Package view's Install.
+install -m 0755 $B/opifexd /usr/local/sbin/opifexd
+install -m 0755 $B/opifex-sheetd /usr/local/bin/opifex-sheetd
+mkdir -p /usr/local/libexec; install -m 0755 $B/opifex-check /usr/local/libexec/opifex-check
+id _opifex >/dev/null 2>&1 || pw useradd _opifex -u 65041 -d /nonexistent -s /usr/sbin/nologin -c "Opifex worker"
+id _opifexsheet >/dev/null 2>&1 || pw useradd _opifexsheet -u 65042 -d /nonexistent -s /usr/sbin/nologin -c "Opifex install sheet"
 # portcullisd speaks to jaild and atrium-volumes: main's go with main's portcullisd.
 for d in atrium-jaild atrium-volumes; do
   cmp -s $B/\$d /usr/local/bin/\$d || { install -m 0755 $B/\$d /usr/local/bin/\$d; service \$d restart >/dev/null 2>&1 || true; }
@@ -182,9 +190,9 @@ for x in md-links:$MDL todo-lens:$TODO words:$WRD; do
   O=$B/b-\$id; mkdir -p \$O/bin; cp $B/\$n \$O/bin/; cp $B/\$n.toml \$O/atrium.toml
   sign \$O; opifex install \$O >/dev/null
 done
-# The install sheet's socket directory: jaild mounts it into Artifex's jail,
-# and on a real system opifex-sheet's service makes it.
-mkdir -p /atrium/sockets/opifex-sheet
+# The install sheet's socket directory: jaild mounts it into Artifex's jail
+# (as opifex-sheet-service.sh makes it on a real system).
+install -d -o _opifexsheet -g _opifexsheet -m 0755 /atrium/sockets/opifex-sheet
 # limend, the embed broker, as _limen (vm-embeds-check.sh does the same):
 # it lists the plugins to Artifex and starts them through portcullisd.
 install -m 0755 $B/limend /usr/local/bin/limend
@@ -209,7 +217,7 @@ echo "=== frescod"
 V "grep -q AVX2 /var/run/dmesg.boot" || { bad "the VM's CPU has no AVX2: cloud-vm.sh down, then up with QEMU_BIN=\$HOME/qemu-atrium/build/qemu-system-x86_64 TCG_CPU=Haswell-noTSX"; echo "artifex: $fails failed"; exit 1; }
 V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=$B/wm.sock \
    FRESCOD_INPUT_SOCK=$B/inject.sock FRESCOD_ACTIVATION_SOCK=$B/activation.sock FRESCOD_SLOT_UIDS=0,65022 FRESCOD_DEV_CAPS=all \
-   FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=${TOKEN_LIFE_MS:-15000} FRESCOD_ACTIVATION_UIDS=0 \
+   FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=${TOKEN_LIFE_MS:-15000} FRESCOD_ACTIVATION_UIDS=0,65042=prompt \
    daemon -f -o $B/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 $B/*.sock /atrium/sockets/fresco/fresco.sock"
@@ -789,9 +797,9 @@ if want package && V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_pr
         || bad "key: $(pkg)"
     # A key file standing in for the Arca one (opifex --sign takes either),
     # owned as the key step's .atrium is: the workspace's uid and group.
-    K=$W/proj/work/app/.atrium
-    V "mkdir -p $K && openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $K/publisher.key && openssl ec -in $K/publisher.key -pubout -out $K/publisher.pem 2>/dev/null && chown \$(stat -f %u:%g $K) $K/publisher.key $K/publisher.pem && chmod 0640 $K/publisher.key"
-    check "the stand-in key file is there" "1" "$(V "test -s $K/publisher.key && echo 1")"
+    PK=$W/proj/work/app/.atrium
+    V "mkdir -p $PK && openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out $PK/publisher.key && openssl ec -in $PK/publisher.key -pubout -out $PK/publisher.pem 2>/dev/null && chown \$(stat -f %u:%g $PK) $PK/publisher.key $PK/publisher.pem && chmod 0640 $PK/publisher.key"
+    check "the stand-in key file is there" "1" "$(V "test -s $PK/publisher.key && echo 1")"
     # The palette's keys go to the editor: back to Files first.
     press 64 100; waitstate 'view=Code' 20 || bad "files: $(state)"
     pal "package" "Package the app" && waitstate 'pkg=Some(("found a key file", "idle"' 20 && ok "it finds the key file" || bad "key file: $(pkg)"
@@ -807,8 +815,37 @@ if want package && V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_pr
     check "and is signed" "1" "$(V "test -s $TREE/atrium.toml.sig && echo 1")"
     pbtn 3
     # The trace's Debug form escapes the answer's quotes: Failed(\"...\").
-    waitstate 'pkg=Some((.*"Failed(\\"[^\\]*install sheet' 60 && ok "Install hands it to the install sheet's socket (none runs here: $(pkg | grep -o 'Failed(\\"[^\\]*' | cut -c10-80))" \
+    waitstate 'pkg=Some((.*"Failed(\\"[^\\]*install sheet' 60 && ok "with no sheet running, Install says so: $(pkg | grep -o 'Failed(\\"[^\\]*' | cut -c10-80)" \
         || bad "install: $(pkg)"
+    # Now the real sheet: opifexd and opifex-sheetd as _opifexsheet on the
+    # sheet's socket in Artifex's jail, the stand-in key on the side-load
+    # list. Install shows the sheet; its Install press installs the bundle.
+    SB=$B/sheet; AID=org.example.app
+    V "pkill -x opifex-sheetd; pkill -x opifexd; rm -rf $SB; mkdir -p $SB; cp $PK/publisher.pem /etc/atrium/publishers/artifex-check.pem 2>/dev/null \
+       || { mkdir -p /etc/atrium/publishers && cp $PK/publisher.pem /etc/atrium/publishers/artifex-check.pem; }; \
+       daemon -f -o $SB/opifexd.log env OPIFEX_SOCKET=$SB/opifex.sock OPIFEX_DAILY=0 PRAECO_SOCKET=none /usr/local/sbin/opifexd; sleep 2; \
+       OPIFEX_SOCKET=$SB/opifex.sock opifex remove $AID >/dev/null 2>&1; \
+       daemon -f -u _opifexsheet -o $SB/sheet.log env OPIFEX_SHEET_SOCKET=/atrium/sockets/opifex-sheet/opifex-sheet.sock OPIFEX_SOCKET=$SB/opifex.sock \
+         OPIFEX_SHEET_ACTIVATION=$B/activation.sock FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock /usr/local/bin/opifex-sheetd"
+    i=0; while [ $i -lt 20 ] && ! V "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock"; do sleep 1; i=$((i+1)); done
+    check "opifex-sheetd runs as _opifexsheet" "_opifexsheet" "$(V "ps -o user= -p \$(pgrep -x opifex-sheetd) | tr -d ' '")"
+    pbtn 3
+    i=0; while [ $i -lt 120 ] && ! V "grep -q 'asking about' $SB/sheet.log"; do sleep 2; i=$((i+2)); done
+    L=$(V "grep 'asking about' $SB/sheet.log | tail -1")
+    IX=$(echo "$L" | sed -n 's/.*install=\([0-9]*\),.*/\1/p'); IY=$(echo "$L" | sed -n 's/.*install=[0-9]*,\([0-9]*\).*/\1/p')
+    [ -n "$IY" ] && ok "Install shows the install sheet: $(echo "$L" | sed 's/.*asking about \([^(]*\).*/\1/')" \
+        || bad "no sheet: $(pkg) $(V "tail -3 $SB/sheet.log; tail -3 $SB/opifexd.log")"
+    shot artifex-package-3-sheet
+    sleep 4   # the sheet's guard must see the pointer still before a press counts
+    [ -n "$IY" ] && press "$IX" "$IY"
+    waitstate 'pkg=Some((.*"Installed"))' 120 && ok "its Install press installs the bundle, and Artifex says so" \
+        || bad "installed: $(pkg) $(V "tail -3 $SB/sheet.log; tail -3 $SB/opifexd.log")"
+    check "the bundle's own binary is in apps/" "yes" "$(V "cmp -s $TREE/app /var/lib/atrium/apps/$AID/app && echo yes")"
+    check "recorded as a side-load" "1" "$(V "grep -A9 'id = \"$AID\"' /var/db/atrium/opifex/installed.toml | grep -c 'source = \"side-load\"'")"
+    check "for alice, whose Artifex asked (opifex.md §7.4)" "1" "$(V "grep -A9 'id = \"$AID\"' /var/db/atrium/opifex/installed.toml | grep -c 'installed_by = 1011'")"
+    check "opifexd took the file and the press from the sheet's uid" "2" "$(V "grep -c 'uid 65042: \\(PreviewLocal\\|InstallLocalApproved\\) -> ok' $SB/opifexd.log")"
+    shot artifex-package-4-installed
+    V "pkill -x opifex-sheetd; OPIFEX_SOCKET=$SB/opifex.sock opifex remove $AID >/dev/null 2>&1; pkill -x opifexd; rm -f /etc/atrium/publishers/artifex-check.pem; true"
     check "the sheet's socket is in Artifex's jail" "1" "$(V "p=\$(pgrep -x artifex | head -1); r=\$(jls -j \$(ps -o jid= -p \$p) path); test -d \$r/atrium/sockets/opifex-sheet && echo 1")"
     press 64 100
     waitstate 'view=Code' 20 || bad "files: $(state)"

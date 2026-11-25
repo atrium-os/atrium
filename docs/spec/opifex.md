@@ -434,6 +434,10 @@ copies go after 15 minutes. VM gate `scripts/vm-opifex-c3-check.sh` 0 failed on 
 (2026-11-18, with real presses): a file signed by a key off the side-load list refused with no
 sheet, the sheet for a listed key's file ("Not from a catalog: it won't update by itself"),
 Install putting that copy in as a side-load for the asker, nothing left held.
+The asker is usually an app (Files, or Artifex's Package view, dev-tools.md §3.9): opifexd
+records the person the launch registry binds that app's uid to (`person_for`), so the
+person, not the app, may later change how it updates; a uid not in the registry is the
+person's own, and an unreadable registry or an owner with no account refuses.
 
 ### 7.5 On disk
 

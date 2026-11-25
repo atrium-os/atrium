@@ -475,3 +475,79 @@ pub(super) fn vdb(c: &Ctx, a: &[Expr]) -> Ev {
     }
     n(sum)
 }
+
+/// AMORLINC and AMORDEGRC's arguments: cost, purchase date, end of the
+/// first period, salvage, period, rate, and the first period's share of a
+/// year on `basis` (0, 1, 3 or 4).
+struct Amort {
+    cost: f64,
+    salvage: f64,
+    period: f64,
+    rate: f64,
+    first: f64,
+}
+
+fn amort(c: &Ctx, a: &[Expr]) -> Result<Amort, ErrorKind> {
+    let num = |i: usize| c.number(&c.scalar(&a[i]));
+    let (cost, bought, first_end, salvage, period, rate) = (num(0)?, num(1)?.floor(), num(2)?.floor(), num(3)?, num(4)?.trunc(), num(5)?);
+    let basis = arg(c, a, 6, 0.0)?.trunc();
+    if cost < 0.0 || salvage < 0.0 || salvage > cost || period < 0.0 || rate <= 0.0 || bought > first_end || !matches!(basis as i32, 0 | 1 | 3 | 4) || basis.fract() != 0.0 {
+        return Err(ErrorKind::Num);
+    }
+    let share = super::more::year_frac(c.wb.date_system(), bought, first_end, basis as i32).ok_or(ErrorKind::Num)?;
+    Ok(Amort { cost, salvage, period, rate, first: share * rate * cost })
+}
+
+/// AMORLINC: straight-line depreciation at `rate` a year, the first period
+/// prorated, never below the salvage value.
+pub(super) fn amorlinc(c: &Ctx, a: &[Expr]) -> Ev {
+    let m = tri!(amort(c, a));
+    let left = m.cost - m.salvage;
+    if m.period == 0.0 {
+        return n(m.first.min(left));
+    }
+    let full = m.cost * m.rate;
+    n((left - m.first - (m.period - 1.0) * full).clamp(0.0, full))
+}
+
+/// The most periods AMORDEGRC walks.
+const AMOR_PERIODS: f64 = 100_000.0;
+
+/// AMORDEGRC: declining balance at `rate` times a coefficient for the
+/// asset's life (1/rate: under 3 years 1, under 5 1.5, to 6 2, over 6
+/// 2.5), rounded to whole units; once a period would take the value below
+/// salvage, that period and the next each take half of what is left.
+pub(super) fn amordegrc(c: &Ctx, a: &[Expr]) -> Ev {
+    let m = tri!(amort(c, a));
+    if m.period > AMOR_PERIODS {
+        return Ev::err(ErrorKind::Num);
+    }
+    let life = 1.0 / m.rate;
+    let coef = if life < 3.0 {
+        1.0
+    } else if life < 5.0 {
+        1.5
+    } else if life <= 6.0 {
+        2.0
+    } else {
+        2.5
+    };
+    let rate = m.rate * coef;
+    let first = (m.first * coef).round();
+    if m.period == 0.0 {
+        return n(first);
+    }
+    let mut value = m.cost - first;
+    let mut p = 1.0;
+    loop {
+        let dep = (value * rate).round();
+        if value - dep < m.salvage {
+            return n(if m.period - p <= 1.0 { (value * 0.5).round() } else { 0.0 });
+        }
+        if p == m.period {
+            return n(dep);
+        }
+        value -= dep;
+        p += 1.0;
+    }
+}

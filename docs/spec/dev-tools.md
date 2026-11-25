@@ -778,10 +778,14 @@ Host tests cover the cards and a whole flow against a stand-in `make
 bundle` and a stand-in sheet. `vm-artifex-check.sh` has a "Package"
 section (needs the Rust layer for cargo-atrium): the key step's refusal
 with no Arca key granted, a key file, a signed bundle from the c-app
-template, and Install reaching the sheet's socket. Run 2026-11-26 on the
-amd64 cloud VM (inspect, newproject, fuzz, assets and lsp skipped): 82 ok,
-1 failed; the failure was the check's own pattern for the sheet's answer
-(the trace escapes its quotes), fixed and matched against that run's line.
+template, Install with no sheet running, and then a real side-load:
+opifexd and opifex-sheetd (as `_opifexsheet`, on the socket Artifex's jail
+mounts) with the stand-in key on the side-load list; Install shows the
+sheet, its Install press installs the bundle (recorded as a side-load,
+taken from the sheet's uid) and Artifex shows Installed. The key step
+sends the same `WorkspaceExec` as `portcullis workspace exec`, so naming a
+real Arca key there is the path `vm-ssh-agent-check.sh` runs. opifexd
+records the person Artifex runs for as the installer (opifex.md §7.4).
 Artifex's jail now mounts `/atrium/sockets/opifex-sheet`, so that directory
 must exist on the host (the sheet's service makes it; the check makes it).
 

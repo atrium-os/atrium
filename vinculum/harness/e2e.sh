@@ -189,9 +189,10 @@ kaddr=$(sed -n 's/^classic address //p' "$work/kbd.log")
 hid_ok=1
 ctl pair "$kaddr" --classic --yes >"$work/ctl5.log" 2>&1 || hid_ok=0
 grep -q "paired .*(authenticated; keyboard allowed)" "$work/ctl5.log" || hid_ok=0
-# Usages 0x070004..6 are a, b, c.
+# Usages 0x070004..6 are a, b, c; wait for the last release, which comes
+# about 50 ms after its press.
 i=0
-until grep -q "usage: 458758, down: true" "$work/watch.log" 2>/dev/null; do
+until grep -q "usage: 458758, down: false" "$work/watch.log" 2>/dev/null; do
     i=$((i + 1)); [ $i -gt 200 ] && break
     sleep 0.1
 done

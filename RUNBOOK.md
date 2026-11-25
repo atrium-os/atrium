@@ -5624,6 +5624,7 @@ vinculum-hci --controller usb --host-listen hci.sock            # first USB cont
 vinculum-hci --controller usb:2357:0604 --firmware-dir DIR ...  # Realtek patch from DIR (rtl8761bu_fw.bin + _config.bin)
 vinculum-hci --controller usb --serve-tcp 127.0.0.1:6402        # dev bridge: the raw controller as H4 on loopback
 vinculum-probe --tcp 127.0.0.1:6402 --scan 10                   # through the bridge: Reset, version, scan nearby devices
+vinculum-hci --report                                           # describe every USB controller (read-only; send it to add a chip, bluetooth.md §5.4)
 ```
 
 A guest on QEMU's user network reaches the bridge as `10.0.2.2:6402`, so the VM's

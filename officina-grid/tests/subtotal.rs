@@ -129,3 +129,25 @@ fn table_filters_invalidate_cross_sheet_subtotals() {
     wb.set_table_filter("Amounts", previous).unwrap();
     assert_totals(&mut wb, [60.0, 60.0, 120.0]);
 }
+
+#[test]
+fn aggregate_follows_its_options_and_recalculates_when_rows_hide() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Source").unwrap();
+    wb.add_sheet("Totals").unwrap();
+    for (row, value) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+        wb.set_value(CellAddr::new(0, row, 0), Value::Num(value));
+    }
+    // A nested AGGREGATE counts as a subtotal for the options that skip those.
+    wb.set_formula(CellAddr::new(0, 4, 0), "=AGGREGATE(9,4,A2:A4)").unwrap();
+    // 5: skip hidden rows only; 4: skip nothing; 1: skip hidden rows and nested totals.
+    wb.set_formula(CellAddr::new(1, 0, 0), "=AGGREGATE(9,5,Source!A2:A5)").unwrap();
+    wb.set_formula(CellAddr::new(1, 1, 0), "=AGGREGATE(9,4,Source!A2:A5)").unwrap();
+    wb.set_formula(CellAddr::new(1, 2, 0), "=AGGREGATE(9,1,Source!A2:A5)").unwrap();
+    assert_totals(&mut wb, [120.0, 120.0, 60.0]);
+
+    let undo = GridOp::Sizes { sheet: 0, rows: true, over: vec![(3, 0.0)] }.apply(&mut wb);
+    assert_totals(&mut wb, [90.0, 120.0, 30.0]);
+    undo.apply(&mut wb);
+    assert_totals(&mut wb, [120.0, 120.0, 60.0]);
+}
