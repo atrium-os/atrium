@@ -37,6 +37,9 @@ pub mod op {
     /// [`Plugin`]: one of the parent's plugins (`editor-extension`,
     /// dev-tools.md §3.8), the app it names.
     pub const REQUEST_PLUGIN: u16 = 0x0c;
+    /// [`SpendPress`]: did the person press in this web island lately?
+    /// Spends that press (navigator-islands.md I6.8).
+    pub const SPEND_PRESS: u16 = 0x0d;
     // child or system provider
     pub const PROVIDE: u16 = 0x10;
     pub const READY: u16 = 0x11;
@@ -85,6 +88,9 @@ pub mod refusal {
     /// `REQUEST_PLUGIN`: the app doesn't implement `editor-extension` for
     /// the parent's person.
     pub const NO_PLUGIN: u8 = 18;
+    /// `SPEND_PRESS`: no unspent press routed to the island's window within
+    /// `catalogue::ISLAND_PRESS_MS`, or the embed isn't a bound web island.
+    pub const NO_PRESS: u8 = 19;
 }
 
 pub type EmbedId = u64;
@@ -159,6 +165,13 @@ pub struct FocusOut { pub embed: EmbedId, pub forward: bool }
 /// One embed is in PiP at a time: a new one ends the last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
+
+/// The parent of a web island asks whether a real press, routed by
+/// frescod, reached the island's window within
+/// `catalogue::ISLAND_PRESS_MS` and was not spent yet; `Ok` spends it. The
+/// engine's own word that the person pressed is not proof: this is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpendPress { pub embed: EmbedId }
 
 /// From the share sheet, for one of its `share` embeds: the person chose
 /// `app` (a registry app id). The parent's next `share-target` request,

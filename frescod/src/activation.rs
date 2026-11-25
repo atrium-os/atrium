@@ -83,6 +83,9 @@ pub struct Table {
     /// When a real key or button press last reached each window (ns), for
     /// `slot::op::PRESSED`; dropped with the window's tokens' bound.
     pressed: HashMap<u32, u64>,
+    /// The press last spent by `slot::op::SPEND_PRESS`, per window: a
+    /// press counts once.
+    spent: HashMap<u32, u64>,
 }
 
 fn refused(reason: u8) -> ConsumeResult {
@@ -300,6 +303,29 @@ impl Table {
             }
         }
         self.pressed.insert(window_id, now);
+    }
+
+    /// As [`Self::pressed_within`], and a press that answers yes is spent:
+    /// the next ask is no until another press reaches `window_id`.
+    pub fn spend_press(&mut self, window_id: u32, now: u64, within_ms: u32) -> bool {
+        if !self.pressed_within(window_id, now, within_ms) {
+            return false;
+        }
+        let at = self.pressed[&window_id];
+        if self.spent.get(&window_id) == Some(&at) {
+            return false;
+        }
+        // Only a press still within reach needs remembering as spent.
+        let horizon = now.saturating_sub(u64::from(fresco_protocol::slot::PRESSED_MAX_MS) * 1_000_000);
+        if self.spent.len() >= MAX_LIVE {
+            self.spent.retain(|_, &mut t| t >= horizon);
+            if self.spent.len() >= MAX_LIVE {
+                // Full of fresh spends: refuse rather than forget one.
+                return false;
+            }
+        }
+        self.spent.insert(window_id, at);
+        true
     }
 
     /// Whether a press reached `window_id` within `within_ms` of `now`
@@ -843,6 +869,17 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                     (Err(_), _) => PressedResult::Refused { reason: no::INVALID },
                 })
             }
+            fresco_protocol::slot::op::SPEND_PRESS => {
+                use fresco_protocol::slot::{refusal as no, PressedQuery, PressedResult};
+                fresco_protocol::encode(&match (fresco_protocol::decode::<PressedQuery>(&msg.payload), binder) {
+                    (Ok(q), Some(comp)) => match comp.lock().unwrap().window_by_token(&q.window) {
+                        Some(w) => PressedResult::Ok { pressed: table().lock().unwrap().spend_press(u32::from(w), now_ns(), q.within_ms) },
+                        None => PressedResult::Refused { reason: no::UNKNOWN_WINDOW },
+                    },
+                    (Ok(_), None) => PressedResult::Refused { reason: no::NOT_ALLOWED },
+                    (Err(_), _) => PressedResult::Refused { reason: no::INVALID },
+                })
+            }
             fresco_protocol::slot::op::BIND => {
                 use fresco_protocol::slot::{refusal as no, SlotBind, SlotBindResult};
                 fresco_protocol::encode(&match (fresco_protocol::decode::<SlotBind>(&msg.payload), binder) {
@@ -1135,6 +1172,28 @@ mod tests {
         assert!(!t.pressed_within(7, 11 * s + 1, 1000), "a second and a bit later");
         assert!(!t.pressed_within(8, 10 * s, 1000), "another window");
         assert!(!t.pressed_within(7, 16 * s, 60_000), "never past PRESSED_MAX_MS");
+    }
+
+    #[test]
+    fn a_spent_press_answers_once_and_a_new_press_answers_again() {
+        let mut t = Table::default();
+        let s = 1_000_000_000u64;
+        assert!(!t.spend_press(7, s, 2000), "no press yet");
+        t.pressed_at(7, 10 * s);
+        assert!(!t.spend_press(7, 13 * s, 2000), "too long ago");
+        assert!(!t.spend_press(8, 10 * s, 2000), "another window's press");
+        assert!(t.spend_press(7, 10 * s + 100, 2000));
+        assert!(!t.spend_press(7, 10 * s + 200, 2000), "spent");
+        assert!(t.pressed_within(7, 10 * s + 200, 2000), "the PiP check still sees it");
+        t.pressed_at(7, 11 * s);
+        assert!(t.spend_press(7, 11 * s + 100, 2000), "a new press");
+        assert!(!t.spend_press(7, 11 * s + 200, 2000));
+        // Spends stay bounded: stale ones go to make room.
+        for w in 100..100 + MAX_LIVE as u32 {
+            t.pressed_at(w, 20 * s);
+            assert!(t.spend_press(w, 20 * s, 2000));
+        }
+        assert!(t.spent.len() <= MAX_LIVE);
     }
 
     #[test]

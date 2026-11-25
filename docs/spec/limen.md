@@ -472,6 +472,12 @@ parent                    limend                 portcullisd       frescod      
   requesting connection receives the other with `IslandFetch { embed }` and
   claims it with `take_island_fetch(embed)` before its next poll. The
   broker serving that endpoint enforces origin, method and cookie policy.
+- `SPEND_PRESS` (0x0d, `SpendPress { embed }`): the parent of a bound web
+  island asks whether frescod routed a real press to the island's window
+  within `catalogue::ISLAND_PRESS_MS` (2 s) that wasn't spent yet; `Ok`
+  spends it (frescod `slot::op::SPEND_PRESS`), else `NO_PRESS`. Another
+  connection's embed is `NOT_YOURS`. navigatord spends one per new window
+  a live page opens (navigator-islands.md I6.8).
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch

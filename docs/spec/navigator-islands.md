@@ -2236,6 +2236,10 @@ origin that saved it.
    restart and an engine killed at its memory limit; an Unrecorded trail
    keeps nothing; a commit past the quota fails with `QuotaExceededError`
    and leaves the store as it was.
+9. **I6.8 The press proved** ([as built](#i68-as-built-2026-11-25-a-new-window-on-a-real-press)).
+   A live page's new window needs a press frescod routed to the page's
+   island, spent once through Limen, not the engine's word. Gate: the
+   I6.2 follow-up gate, and a click injected without a token refused.
 
 #### I6.0 qualification run
 
@@ -2608,12 +2612,10 @@ Host-tested; the engine side is written, not yet built.
   address checks as `Navigate`; a frame's is refused by navigatord, as
   its navigations are.
 - **navigatord** checks the address as for a navigation and sends
-  `LiveOpenBeside { from, url }`, at most one a second and 16 in a run
-  (`Beside`): the engine's word that the person pressed is all it has, so
-  a page past either is refused, named in the popover. Proving the press
-  needs frescod to tell an island's parent that the island had one, as
-  Tabula learns it for a copy; until then these two bounds are what holds
-  a hostile page to a few entries.
+  `LiveOpenBeside { from, url }`. Since I6.8 each one spends a press
+  frescod routed to the page's island (at most 64 in a run); before it,
+  the bounds were one a second and 16 a run, since the engine's word was
+  all navigatord had. A refusal is named in the popover.
 - **The UI** (`Shell::live_opened_beside`) adds the address beside the
   live page's entry, as Ctrl-click does for a link; the page stays on
   screen and runs on. Going there opens it in the document lane (live
@@ -3764,6 +3766,56 @@ against the pinned Ladybird, and the engine passes the JIT audit.
    user's, and `app.example.idb-log` holds none of it.
 4. One quota: after the IndexedDB gate's Fill 30 MiB, a 30 MiB
    `cache.put` fails with `QuotaExceededError`.
+
+#### I6.8 as built (2026-11-25): a new window on a real press
+
+Host-tested (limen, navigatord); frescod's part cross-checked for arm64
+FreeBSD, its unit tests to run in the guest.
+
+The engine runs untrusted script, so its report that the person pressed
+(`OpenBeside` comes only with LibWeb's transient activation) proves
+nothing: a hostile engine can send it at will. frescod knows: it routes
+every real press and records when one last reached each window
+(`pressed_at`, the PiP gesture check).
+
+- **frescod**: `slot::op::SPEND_PRESS`, on the slot allowlist (limend)
+  only. It answers as `PRESSED` does, a real key or button press on the
+  window within the asked time (at most `PRESSED_MAX_MS`), and a yes
+  spends that press: the next ask is no until another press reaches the
+  window. Spends are bounded as presses are (4096; stale ones go first,
+  and when all are fresh it refuses rather than forgets one). A click
+  injected without a token (no `FRESCOD_INJECT_ACTIVATION`) records no
+  press, so it proves nothing either.
+- **Limen**: `op::SPEND_PRESS` (`SpendPress { embed }`): the embed's own
+  parent only (`NOT_YOURS` otherwise), a bound web island only, and a
+  press on the island's window, not the parent's chrome, within
+  `catalogue::ISLAND_PRESS_MS` (2 s). Refused with `NO_PRESS`.
+  `Parent::spend_press`. The delegated Navigator UI stream can't send it.
+- **navigatord**: `Beside::allow` asks Limen to spend the press last, after
+  the address check and the run's bound (64), so a window refused anyway
+  spends none. With no press: "a new window with no press in the page".
+  Two presses close together open two windows, as in any browser; one
+  press opens at most one.
+- **Still open**: navigations and form submissions to other sites rest on
+  the UI's trail rules as before (they leave the live lane and need no
+  press to be safe); the same spend can gate them if a case shows a need.
+
+**Gate (Mac),** after the I6.2 follow-up gate's setup:
+
+1. frescod's unit tests, cross-built on the host and run in the guest
+   from its own disk: `a_spent_press_answers_once_and_a_new_press_answers_again`
+   and the rest pass.
+2. The I6.2 follow-up gate's steps 1 and 2 again: same results, and the
+   popover names step 2's as before (LibWeb gives the timer no
+   activation, so no report reaches navigatord).
+3. Two presses on **Open another site** 0.3 s apart: two entries beside
+   the page.
+4. The forged press: with frescod not minting for injected input
+   (`FRESCOD_INJECT_ACTIVATION` unset), a click injected on **Open another
+   site**: LibWeb sees a click and the engine reports `OpenBeside`, but
+   nothing is added beside, navigatord logs `no press to spend`, and the
+   popover names "a new window with no press in the page". (Positive
+   control: with it set, the same injected click opens one.)
 
 #### Costs
 

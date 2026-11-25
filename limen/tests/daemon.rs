@@ -56,6 +56,13 @@ impl Compositor for Fresco {
         assert_eq!(ms, catalogue::PIP_GESTURE_MS);
         self.1.lock().unwrap().pressed.contains(&w)
     }
+    fn spend_press(&mut self, w: WindowToken, ms: u32) -> bool {
+        assert_eq!(ms, catalogue::ISLAND_PRESS_MS);
+        let mut g = self.1.lock().unwrap();
+        let before = g.pressed.len();
+        g.pressed.retain(|&p| p != w);
+        g.pressed.len() != before
+    }
     fn release(&mut self, _p: WindowToken, c: WindowToken) -> Result<(), u8> {
         self.1.lock().unwrap().released.push(c);
         Ok(())
@@ -1071,6 +1078,33 @@ fn delegated_navigator_ui_keeps_document_embeds_and_cannot_launch_an_engine() {
     ui.detach(doc).unwrap();
     let broker = w.parent(4101).request_island(W_APP, 1).unwrap();
     assert_ne!(doc, broker);
+}
+
+#[test]
+fn an_islands_parent_spends_a_press_in_the_island_once() {
+    let w = World::new();
+    w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
+    w.fresco.0.lock().unwrap().0.insert(W_APP, 4101);
+    let mut app = w.parent(4101);
+    let id = app.request_island(W_APP, 1).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::IslandFetch { embed: id });
+    let _fetch = app.take_island_fetch(id).unwrap();
+    let (_, mut child) = w.spawned();
+    let _ = next_c(&mut child);
+    w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS, "not bound yet");
+    app.place(id, Some([0., 0., 640., 360.])).unwrap();
+    child.ready(id, W_VIEWER).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: id });
+    assert_eq!(refused(w.parent(OTHER).spend_press(id)), refusal::NOT_YOURS);
+    assert_eq!(refused(app.spend_press(id + 1)), refusal::NOT_YOURS);
+    app.spend_press(id).unwrap();
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS, "spent");
+    // A press on the parent's own window is not the island's.
+    w.fresco.1.lock().unwrap().pressed.push(W_APP);
+    assert_eq!(refused(app.spend_press(id)), refusal::NO_PRESS);
+    w.fresco.1.lock().unwrap().pressed.push(W_VIEWER);
+    app.spend_press(id).unwrap();
 }
 
 #[test]

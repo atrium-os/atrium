@@ -47,6 +47,12 @@ pub trait Compositor: Send {
         false
     }
 
+    /// As [`Self::pressed_within`], spending the press: the next ask is
+    /// no until another press. No frescod support: never.
+    fn spend_press(&mut self, _window: WindowToken, _ms: u32) -> bool {
+        false
+    }
+
     /// Take `child` out of `parent`'s slot but keep it shown, for Forum to
     /// place in the `pip` layer. A later `bind` puts it back.
     fn release(&mut self, _parent: WindowToken, _child: WindowToken) -> Result<(), u8> {
@@ -531,6 +537,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 emit(shared, conn, m, Some(fd))
             }
             op::PIP => pip(shared, conn, de(payload)?),
+            op::SPEND_PRESS => spend_press(shared, conn, de(payload)?),
             op::CHOOSE => choose(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
@@ -1214,6 +1221,26 @@ fn regular_file_size(fd: &OwnedFd) -> Option<u64> {
         return None;
     }
     u64::try_from(stat.st_size).ok()
+}
+
+/// A web island's parent spends the person's press in the island
+/// (navigator-islands.md I6.8).
+fn spend_press(shared: &Arc<Shared>, conn: ConnId, p: proto::SpendPress) -> Result<Reply, Reply> {
+    let st = shared.state.lock().unwrap();
+    let Some(e) = st.embeds.get(&p.embed).filter(|e| e.parent == conn) else {
+        return Err(Reply::Refused { reason: refusal::NOT_YOURS });
+    };
+    let child_w = match e.child_window {
+        Some(w) if e.island.is_some() && e.bound => w,
+        _ => return Err(Reply::Refused { reason: refusal::NO_PRESS }),
+    };
+    // Only a press in the island itself: one on the parent's own chrome
+    // is not the page's.
+    if shared.compositor.lock().unwrap().spend_press(child_w, catalogue::ISLAND_PRESS_MS) {
+        Ok(Reply::Ok)
+    } else {
+        Err(Reply::Refused { reason: refusal::NO_PRESS })
+    }
 }
 
 /// The child's PiP request (atrium-player-pip-keys.md §3).

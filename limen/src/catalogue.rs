@@ -121,6 +121,10 @@ pub const PIP_ROLES: &[&str] = &["media-player"];
 /// A PiP request needs a press routed to the child's or the parent's
 /// window within this long (§3.1 step 3).
 pub const PIP_GESTURE_MS: u32 = 1000;
+/// `SPEND_PRESS`: an island's parent acts for the island (a live page's
+/// new window, navigator-islands.md I6.8) only on a press routed to the
+/// island's window within this long, each press once.
+pub const ISLAND_PRESS_MS: u32 = 2000;
 
 pub fn role(name: &str) -> Option<&'static Role> {
     ROLES.iter().find(|r| r.name == name)

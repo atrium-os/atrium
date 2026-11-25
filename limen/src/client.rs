@@ -193,6 +193,14 @@ impl Parent {
         self.0.ok(op::SET_VISIBLE, &proto::SetVisible { embed, visible })
     }
 
+    /// Spend the person's press in a web island of ours: `Ok` when frescod
+    /// routed one to the island's window within
+    /// [`ISLAND_PRESS_MS`](crate::catalogue::ISLAND_PRESS_MS) that wasn't
+    /// spent yet; refused with `NO_PRESS` otherwise.
+    pub fn spend_press(&mut self, embed: EmbedId) -> Result<(), Error> {
+        self.0.ok(op::SPEND_PRESS, &proto::SpendPress { embed })
+    }
+
     /// A role message, already encoded with the role's types.
     pub fn send(&mut self, embed: EmbedId, bytes: Vec<u8>) -> Result<(), Error> {
         self.0.ok(op::SEND, &proto::Send { embed, bytes })
