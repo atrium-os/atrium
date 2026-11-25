@@ -295,8 +295,9 @@ impl LocalStorage for JarStores {
     fn used(&mut self, page: &str) -> Option<(u64, u64)> {
         let ls = crate::live_storage::Key::of(self.jar, page)?;
         let idb = crate::live_idb::Key::of(self.jar, page)?;
-        let n = self.stores.lock().unwrap().used(&ls) + self.idb.lock().unwrap().used(&idb);
-        Some((n as u64, STORED_MAX))
+        let kept = self.stores.lock().unwrap().used(&ls);
+        let indexed = self.idb.lock().unwrap().used(&idb);
+        Some(((kept + indexed) as u64, STORED_MAX))
     }
 }
 
@@ -435,7 +436,13 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
                 (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
                 (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
             };
-            if answer.is_ok() {
+            // Counted on a load, a localStorage batch, and a commit's last
+            // part: a part only buffered changes nothing.
+            let committed = match post {
+                Some(b) if idb => b.bytes.get(crate::live_idb::HEADER - 1) == Some(&1),
+                _ => true,
+            };
+            if answer.is_ok() && committed {
                 hooks.stored(&delivered_url);
             }
             match answer {
@@ -900,6 +907,8 @@ struct RunHooks {
     /// Its frames' reports, for the watcher (I6.5).
     asks: Arc<Mutex<VecDeque<FrameAsk>>>,
     mail: Arc<Mutex<Mailbox>>,
+    /// The stores' count last told to the UI.
+    told_usage: Option<(u64, u64)>,
 }
 
 /// How long after a print a page may ask for another.
@@ -926,8 +935,12 @@ impl Hooks for RunHooks {
     fn messages(&mut self) -> Vec<u8> { self.mail.lock().unwrap().take_for_page() }
     fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s as &mut dyn LocalStorage) }
     fn stored(&mut self, page: &str) {
-        if let Some((n, max)) = self.storage.as_mut().and_then(|s| s.used(page)) {
-            self.tell.usage(n, max);
+        if let Some(u) = self.storage.as_mut().and_then(|s| s.used(page)) {
+            // Told only when it changed.
+            if self.told_usage != Some(u) {
+                self.told_usage = Some(u);
+                self.tell.usage(u.0, u.1);
+            }
         }
     }
     fn made(&mut self, page: &str, name: &str, kind: &str, bytes: Vec<u8>) -> Result<(), String> {
@@ -1121,7 +1134,7 @@ impl Live {
         let asks = Arc::new(Mutex::new(VecDeque::new()));
         let mail = Arc::new(Mutex::new(Mailbox::default()));
         let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone(), printed: None,
-                                   asks: asks.clone(), mail: mail.clone() };
+                                   asks: asks.clone(), mail: mail.clone(), told_usage: None };
         std::thread::spawn(move || {
             let result = match jar {
                 Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
@@ -1782,7 +1795,7 @@ mod tests {
         let (page_end, page_engine) = UnixStream::pair().unwrap();
         let (delivered, _) = std::sync::mpsc::channel();
         let mut page_hooks = RunHooks { delivered, storage: None, tell: told.clone(), apis: Default::default(), picked: Default::default(),
-                                        printed: None, asks: asks.clone(), mail: mail.clone() };
+                                        printed: None, asks: asks.clone(), mail: mail.clone(), told_usage: None };
         let page_server = std::thread::spawn(move || serve(page_end, "https://app.example/app.html", &mut Fake(vec![]), &mut page_hooks));
         let mut page = nuntius::client::Client::from_stream(page_engine).unwrap();
         page.open(Open::get(1, LIVE_PAGE)).unwrap();
