@@ -526,6 +526,114 @@ checked with rust-analyzer and clangd. As built:
 Not built: plugins (no design yet), workspace symbol search, inlay hints,
 semantic tokens, server commands.
 
+### 3.8 Plugins for Artifex (proposal, 2026-11-25)
+
+Status: proposal, waiting for Shankar (D26–D30). It makes artifex.md §7
+(the `editor-extension` Limen role) concrete now that Limen, the LSP
+features (§3.7) and Pergola slots are built, and changes it in two places
+(D27, D28).
+
+**What a plugin is.** An app bundle whose manifest implements the
+`editor-extension` role. It runs in its own jail, started by limend when
+Artifex opens a file of a language it names, and stopped when Artifex
+closes or the plugin is switched off. It is written in any language; the
+SDK gives Rust a crate (`atrium-artifex-ext`) and C a header.
+
+```toml
+[app]
+id = "org.example.todo-lens"
+entry = "bin/todo-lens"
+
+[role]
+implements = ["editor-extension"]
+
+[editor-extension]
+languages = ["rust", "c"]          # what it is started for; "*" for all
+commands = ["todo-lens.list"]      # shown in the command palette
+panel = "TODOs"                    # it may draw a panel (a Limen slot)
+workspace-read = false             # D28: off unless asked for and granted
+network = []                       # hosts, shown when it is switched on
+```
+
+**What it speaks (D27).** Language Server Protocol, over the role's
+channel instead of a workspace process's stdio, plus three Artifex
+messages: `register_command`, `command_invoked` and `panel` (open, close,
+size). Artifex already turns LSP into completion, hover, diagnostics,
+references, rename, quick fixes and formatting, so a plugin gets all of
+that UI by answering the same requests a language server does, and an
+existing language server written for stdio becomes a plugin with a thin
+wrapper. Files are named `artifex:///<path in work>`; the text comes in
+`didOpen`/`didChange`, never by reading the disk. Edits a plugin makes
+(workspace edits, code actions, formatting) are applied by Artifex as
+for a server: one undo step per file, only files in `work`, the note
+says how many. A plugin never runs a server command in Artifex and never
+runs a command in the workspace in v1.
+
+**What it can reach (D28).** By default only what Artifex sends it: the
+open files of its languages. `workspace-read = true` asks for a read-only
+view of the workspace's `work` (a nullfs mount in its jail), granted per
+workspace when the person switches the plugin on there, and shown in the
+Plugins view. No write access, no home, no secrets. Network only to the
+hosts its manifest names, shown before it is switched on (D30). Limits:
+256 MiB, a CPU share, 64 KiB messages and 200 a second each way; a
+plugin over them is stopped and its panel says so, with Restart.
+
+**Its UI.** A panel is the plugin's own Pergola window in a Limen `plain`
+slot in Artifex's bottom panel (a tab with its name) or as a full view
+from the strip: Artifex never draws for it and it never sees Artifex's
+window. Commands go into a new command palette (Ctrl+Shift+P), which
+lists Artifex's own acts too. Diagnostics, completions and the rest show
+where the LSP ones do, marked with the plugin's name.
+
+**Many at once (D29).** Unlike other user roles (one default provider),
+every plugin the person switched on runs for its languages, side by side
+with the workspace's language server. Artifex merges their answers:
+completions in one menu (each row marked with its source), diagnostics
+in one list, quick fixes in one menu; for formatting and rename the
+workspace's server wins, then the plugin switched on first.
+
+**Getting and managing them.** Plugins are Opifex packages like any app
+(signed, from a registry the person trusts). A Plugins view in Artifex
+lists the installed ones with what each asks for, switches them on or
+off per workspace, and shows a stopped one's reason.
+
+**Why not in Artifex's process (D26).** WebAssembly plugins in Artifex
+(Zed's way, with wasmtime, Apache-2.0) would start faster and need no
+Limen hop, but they would run inside Artifex's jail, which holds every
+picked workspace, and a runtime bug would be a way out. A jail per plugin
+is how every other third-party code runs on Atrium; the cost is about
+one process and one channel per plugin.
+
+**Build steps if accepted.**
+
+- P1: the role's message types in `limen::editor_ext` (LSP frames as
+  bytes, the three Artifex messages, bounds), limend's catalogue with
+  a provider rule for "every plugin switched on" (D29), the manifest
+  section.
+- P2: Artifex's plugin host: start plugins for a file's language through
+  Limen, the LSP client over the channel, answers merged with the
+  server's.
+- P3: the command palette and plugin commands.
+- P4: plugin panels in Limen slots.
+- P5: the Plugins view, `workspace-read` grants, limits and restart.
+- P6: the SDK crate, two sample plugins (TODO lens with a panel; a
+  Markdown link checker as diagnostics), a VM check.
+
+**Decisions.**
+
+- D26: plugins run in their own jails through Limen, not in Artifex's
+  process. Recommended.
+- D27: the v1 protocol is LSP plus commands and a panel, replacing
+  artifex.md §7.2's own message table. Recommended: it reuses the UI just
+  built and existing servers.
+- D28: no workspace files by default; `workspace-read` asked for in the
+  manifest and granted per workspace; no writes or commands in v1.
+  Recommended (artifex.md §7.4 had workspace read implicit).
+- D29: all plugins switched on run together, answers merged.
+  Recommended.
+- D30: network only to the hosts the manifest names, shown when it's
+  switched on. Recommended.
+
 ## 4. C and C++ in a workspace
 
 ### 4.1 What works today
@@ -942,3 +1050,4 @@ decided. T2 and T3 together already give a usable terminal development setup.
 | D18 | Importing SVG from other tools | ACCEPTED: the dock's checker; convert what it can, name what it can't keep |
 | D19–D22 | Artifex's debugger UI (2026-11-25) | BUILT: a panel with a strip entry, one toolbar group, the stopped line and hover values, stack, expanding variables, breakpoints with conditions, an evaluate line (§3.6) |
 | D23–D25 | Inspecting a dev app's UI (2026-11-25) | BUILT: pick, tree and bounds; read-only; dev builds and their own Artifex only (§3.6) |
+| D26–D30 | Plugins for Artifex (2026-11-25) | PROPOSED: jailed apps through Limen speaking LSP plus commands and a panel; no workspace files unless granted; many at once (§3.8) |

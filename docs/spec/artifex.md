@@ -268,6 +268,10 @@ Stoa terminal for advanced operations.
 
 ## 7. Extension model — Limen `editor-extension` role
 
+> 2026-11-25: [dev-tools.md §3.8](dev-tools.md) proposes the v1 of this
+> role (LSP plus commands and a panel; no workspace files unless granted).
+> Where the two differ, §3.8 is the proposal under review.
+
 The Limen role catalogue in `insula.md` §10.3.2 lists
 `editor-extension` as one of the initial roles. This
 section makes it concrete.
