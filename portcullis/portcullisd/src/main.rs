@@ -112,6 +112,26 @@ fn main() -> ExitCode {
      * symlink below, so every existing client keeps working untouched. */
     let socket_path = socket_path.unwrap_or_else(|| PathBuf::from(SERVICE_SOCKET_PATH));
 
+    /* The launch registry is kept across boots (portcullis_peer::
+     * PERSISTENT_REGISTRY): put it back before anything allocates, so a uid
+     * stays with its person, app and persona. Unreadable is fatal: starting
+     * from an empty registry would hand bound uids to other identities. */
+    {
+        let reg = portcullis_peer::DEFAULT_REGISTRY;
+        if let Some(dir) = std::path::Path::new(reg).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let restored = portcullis_peer::lock_registry(reg).and_then(|_guard| portcullis_peer::restore_registry());
+        match restored {
+            Ok(portcullis_peer::RestoreOutcome::Restored) => eprintln!("portcullisd: launch registry restored from {}", portcullis_peer::PERSISTENT_REGISTRY),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("portcullisd: FATAL: kept launch registry {}: {e}", portcullis_peer::PERSISTENT_REGISTRY);
+                return ExitCode::from(70);
+            }
+        }
+    }
+
     /* Stale-socket cleanup: a previous crashed daemon may have left
      * the file behind; bind() refuses to overwrite. */
     let _ = std::fs::remove_file(&socket_path);

@@ -17,7 +17,15 @@ use std::io;
 use std::os::fd::RawFd;
 
 /// The platform launch registry's default path (Portcullis writes it).
+/// Services read this copy (and mount it into their jails).
 pub const DEFAULT_REGISTRY: &str = "/var/run/atrium/app-registry";
+
+/// The registry kept across boots, root's only (0700 directory, 0600
+/// file). Every binding written to [`DEFAULT_REGISTRY`] is written here
+/// first, and [`restore_registry`] puts it back after a boot clears
+/// /var/run. So a uid stays bound to one person, app and persona for good,
+/// and a reused account never carries files or grants between identities.
+pub const PERSISTENT_REGISTRY: &str = "/var/db/atrium/app-registry";
 
 /// The base of the reserved per-app uid range. Each app launch gets a dedicated
 /// uid at or above this — never the human's (those are low), never shared. The
@@ -423,7 +431,6 @@ pub fn register_document(
     persona: Option<&str>,
     document: Option<u8>,
 ) -> io::Result<()> {
-    use std::io::Write;
     if persona.is_some_and(|p| !valid_persona(p)) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid persona name"));
     }
@@ -439,17 +446,86 @@ pub fn register_document(
     if let Some(slot) = document {
         line.push_str(&format!(" document={slot}"));
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")
+    append_binding(path, &line)
 }
 
 /// Append a declared session component's binding (portcullisd only, for
 /// the root-owned session.d set): marked `session`, so shell roles can be
 /// granted to it and never to an app installed under the same id.
 pub fn register_session(path: &str, uid: u32, user: &str, component_id: &str) -> io::Result<()> {
+    append_binding(path, &format!("{uid} {user} {component_id} session"))
+}
+
+/// Append one binding line to `path`; for the platform registry, to the
+/// kept copy first. A binding that can't be kept is not made: the next
+/// boot could otherwise hand its uid to another identity.
+fn append_binding(path: &str, line: &str) -> io::Result<()> {
+    if path == DEFAULT_REGISTRY {
+        append_line_kept(std::path::Path::new(PERSISTENT_REGISTRY), line)?;
+    }
+    append_line(std::path::Path::new(path), line)
+}
+
+fn append_line(path: &std::path::Path, line: &str) -> io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{uid} {user} {component_id} session")
+    writeln!(f, "{line}")
+}
+
+/// Append to a root-only file in a root-only directory, synced.
+fn append_line_kept(path: &std::path::Path, line: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if let Some(dir) = path.parent() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+    writeln!(f, "{line}")?;
+    f.sync_data()
+}
+
+/// After a boot: put the kept registry back at [`DEFAULT_REGISTRY`] when
+/// that is gone, before anything allocates. Call it holding
+/// [`lock_registry`] on [`DEFAULT_REGISTRY`]. A kept copy that can't be
+/// read is an error, not an empty registry: starting empty would reuse
+/// every bound uid.
+pub fn restore_registry() -> io::Result<RestoreOutcome> {
+    restore_registry_at(std::path::Path::new(PERSISTENT_REGISTRY), std::path::Path::new(DEFAULT_REGISTRY))
+}
+
+/// What [`restore_registry`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The registry was already there (portcullisd restarted in this boot).
+    Present,
+    /// Put back from the kept copy.
+    Restored,
+    /// No kept copy yet (a first boot, or before the copy existed).
+    Fresh,
+}
+
+fn restore_registry_at(kept: &std::path::Path, live: &std::path::Path) -> io::Result<RestoreOutcome> {
+    if std::fs::symlink_metadata(live).is_ok() {
+        return Ok(RestoreOutcome::Present);
+    }
+    let bytes = match std::fs::read(kept) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RestoreOutcome::Fresh),
+        Err(e) => return Err(e),
+    };
+    if let Some(dir) = live.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = live.with_extension("restore");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, live)?;
+    Ok(RestoreOutcome::Restored)
 }
 
 /// As [`AppRegistry::uid_for_session`], reading the registry file.
@@ -773,3 +849,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+#[cfg(test)]
+mod kept_registry_tests {
+    use super::{append_line, append_line_kept, restore_registry_at, AppRegistry, RestoreOutcome};
+
+    #[test]
+    fn a_boot_keeps_every_binding() {
+        let d = tempfile_dir();
+        let kept = d.join("db/atrium/app-registry");
+        let live = d.join("run/atrium/app-registry");
+        assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Fresh);
+        for line in ["50000 alice org.atrium.mail", "50001 bob org.atrium.mail persona=work"] {
+            append_line_kept(&kept, line).unwrap();
+            std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+            append_line(&live, line).unwrap();
+        }
+        // A boot clears /var/run.
+        std::fs::remove_dir_all(d.join("run")).unwrap();
+        assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Restored);
+        let reg = AppRegistry::load(live.to_str().unwrap()).unwrap();
+        assert_eq!(reg.resolve(50000), Some(("alice", "org.atrium.mail")));
+        assert_eq!(reg.resolve(50001).map(|(u, _)| u), Some("bob"));
+        // A restart in the same boot leaves it alone.
+        assert_eq!(restore_registry_at(&kept, &live).unwrap(), RestoreOutcome::Present);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(kept.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn an_unreadable_kept_copy_is_an_error() {
+        let d = tempfile_dir();
+        let kept = d.join("kept");
+        std::fs::create_dir(&kept).unwrap(); // a directory: read fails, not NotFound
+        assert!(restore_registry_at(&kept, &d.join("live")).is_err());
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("peer-kept-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+}
+
