@@ -15,7 +15,10 @@
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/scratch/navigator-ui}"
-SCENES="${SCENES:-main main-dark prompt-dark start live stop}"
+SCENES="${SCENES:-main main-dark prompt-dark start start-dark live stop}"
+# Narrower windows (navigator-ui.md §15.1): the main scene, light and dark,
+# at each of these sizes; the toolbar folds as the trace's tools= says.
+NARROW="${NARROW:-1024x696 720x696 600x696}"
 SPLIT="${SPLIT:-1}"
 WAIT="${WAIT:-60}"
 set -- env
@@ -86,6 +89,30 @@ for sc in $SCENES; do
     shot "navigator-ui-$sc"
     stop
 done
+
+echo "=== narrow windows"
+WIDE=$SIZE
+for sz in $NARROW; do
+    for th in light dark; do
+        SIZE=$sz
+        run "narrow-$sz-$th" --scene main --$th
+        sleep "$WAIT"
+        shot "navigator-ui-main-$sz-$th"
+        stop
+    done
+    T=$(g "grep 'trace' $S/narrow-$sz-light.log | tail -1")
+    W=${sz%x*}
+    case "$T" in
+        *" tools="*) ;;
+        *) bad "no trace at $sz: $T"; continue ;;
+    esac
+    if [ "$W" -lt 640 ]; then
+        echo "$T" | grep -q 'tools=[^ ]*share:' && bad "$sz: Share still on the bar" || ok "$sz: Reading and Share folded into More"
+    else
+        echo "$T" | grep -q 'tools=[^ ]*share:' && ok "$sz: Share on the bar" || bad "$sz: Share folded too early: $T"
+    fi
+done
+SIZE=$WIDE
 
 if [ "${DRIVE:-1}" = 1 ]; then
     echo "=== drive: clicks and keys through the injector"

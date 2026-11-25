@@ -171,7 +171,12 @@ fn main() -> std::io::Result<()> {
     let trails_path = disk::path();
     let dirty = Arc::new(AtomicBool::new(true));
     let mut shell = match (scene, &live) {
-        (Some(sc), _) => Shell::scene(sc, window.width, window.height),
+        (Some(sc), _) => {
+            // One trace line for the scene, so a check can read its layout.
+            let mut s = Shell::scene(sc, window.width, window.height);
+            navigator_ui::ui::trace(&mut s);
+            s
+        }
         (None, Some(_)) => {
             let store = match &kept_trails {
                 Some(t) => restore_kept(t.as_deref()),

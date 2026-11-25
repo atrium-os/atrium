@@ -1704,3 +1704,35 @@ its own checks (trace lines plus a screenshot at each width the step touches).
 - The canvas's "Pin the page you're on" is not on Start, where there is no page; pinning
   is More's.
 - Host test: `start_puts_the_field_in_the_page_and_a_pinned_card_closes_the_empty_trail`.
+
+*Step 4, 2026-11-25* (`ui.rs` `prompt_row`, `popover`, `path_rows`; `shell.rs`
+`live_facts`, `LiveRun::beside`):
+- **Prompt row**: "Run this page live?" and the widget prompt lead with their question in
+  bold, then one line of why. The answer that starts code ("Run live", "Start") carries a
+  play glyph. Answers stay labelled, primary on the right. The row stays 44 pt.
+- **Live code popover**: once the engine has started, the heading is "*site* runs live"
+  and a "While it runs" section says:
+  - memory is capped by its jail, and the page stops past the cap;
+  - where its storage is kept (the window's persona, or "until this trail closes" when
+    Unrecorded);
+  - how many windows it opened beside, each on a press.
+  Then come the refusals (I6.4) and the actions (Run live or Stop, and "Ask before running
+  this site live").
+- The canvas's numbers (memory used of the limit, storage used of the quota) need
+  navigatord to report usage per run. That is a new event, `LiveUsage`, not built. The
+  popover says the cap in words until it is.
+- **Opened beside**: a page a live page opened beside on a press (I6.8) is marked with an
+  app-window glyph in the rail's path while the run lasts. At most 64 are tracked, which
+  is navigatord's own cap.
+- **Downloads** got its popover in step 1. "Show in Files" waits on a Files hand-off from
+  the Navigator.
+- Host test:
+  `the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows`.
+
+*Step 5, 2026-11-25*:
+- **Dark** needs no new code: every colour in the chrome is a Pergola token. The only fixed
+  colour is the white under a page that is shown. The scenes now include `start-dark`.
+- **Narrow**: `navigator-ui-vm.sh` adds the main scene, light and dark, at 1024, 720 and
+  600 pt wide (`NARROW=`). It checks from the trace's `tools=` that Share is on the bar at
+  720 and folded into More at 600. A scene now prints one trace line at start for this.
+- Screenshots of steps 1–5 wait for a VM run.

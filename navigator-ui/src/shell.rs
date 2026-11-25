@@ -395,7 +395,13 @@ pub struct LiveRun {
     /// What the page was refused (I6.4), in the popover's words, each
     /// once, at most [`LIVE_REFUSED_MAX`].
     pub refused: Vec<String>,
+    /// The entries it opened beside on a press (I6.8), at most
+    /// [`LIVE_BESIDE_MAX`]: the rail marks them, the popover counts them.
+    pub beside: Vec<(u64, PageId)>,
 }
+
+/// navigatord's own cap on windows one run opens (I6.8).
+pub const LIVE_BESIDE_MAX: usize = 64;
 
 /// The most refusals the popover names for one run.
 pub const LIVE_REFUSED_MAX: usize = 12;
@@ -963,7 +969,7 @@ impl Shell {
             || !matches!(&self.live, Some(LivePage::Shown(u)) if u == url) {
             return false;
         }
-        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new() });
+        self.live_run = Some(LiveRun { key, url: url.to_string(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new() });
         let jar = self.store.trail().jar();
         self.outbox.push(Out::ContinueLive { url: url.to_string(), jar });
         true
@@ -1015,7 +1021,34 @@ impl Shell {
         let Some(run) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some()) else { return false };
         if self.history.is_some() || shown != Some(run.key) { return false; }
         self.follow_link(url, true);
+        let t = self.store.trail();
+        let key = (t.id, t.pages.len().saturating_sub(1));
+        if let Some(run) = self.live_run.as_mut().filter(|r| r.beside.len() < LIVE_BESIDE_MAX) {
+            run.beside.push(key);
+        }
         true
+    }
+
+    /// Whether the page `key` was opened beside by the page running live.
+    pub fn opened_beside(&self, key: (u64, PageId)) -> bool {
+        self.live_run.as_ref().is_some_and(|r| r.beside.contains(&key))
+    }
+
+    /// What the running page holds and has done (§15.1 the Live code
+    /// popover), once its engine started and while it is on screen.
+    pub fn live_facts(&self) -> Vec<String> {
+        let Some(run) = self.live_run.as_ref().filter(|r| r.origin.is_some() && self.shown_key() == Some(r.key)) else { return vec![] };
+        let persona = self.window_persona.clone().unwrap_or_else(|| "Personal".into());
+        let n = run.beside.len();
+        vec![
+            "Memory: capped by its jail. Past the cap, the page stops.".into(),
+            if self.store.trail().unrecorded { "Storage: kept only until this trail closes.".into() } else { format!("Storage: kept on this computer, in your {persona} persona.") },
+            match n {
+                0 => "New windows: none. One opens only on your press in the page.".into(),
+                1 => "New windows: 1 opened beside, on your press.".into(),
+                n => format!("New windows: {n} opened beside, each on your press."),
+            },
+        ]
     }
 
     /// The live page changed its own address (`history.pushState`, I6.2;
@@ -1321,7 +1354,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { recorded, .. }, "Run live" | "Always for this site") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new() });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new(), beside: Vec::new() });
                     let jar = self.store.trail().jar();
                     let remember = *recorded && what == "Always for this site" && !jar.unrecorded();
                     self.outbox.push(Out::RunPageLive { url, press, jar, remember });
@@ -2471,6 +2504,9 @@ pub fn popover_height(s: &Shell, w: f32) -> f32 {
     let site = crate::trail::site(&p.url);
     let mut n = lines(&popover_connection(f, site)) + lines(&crate::ui::tier_sentence(f, site)) + lines(popover_last(f));
     if let Some(r) = s.live_refusals() { n += lines(&r); }
+    let facts = s.live_facts();
+    let while_runs = if facts.is_empty() { 0.0 } else { 16.0 + 6.0 };
+    for l in &facts { n += lines(l); }
     for o in &f.live_parts {
         n += lines(&popover_live_part(o));
     }
@@ -2480,7 +2516,7 @@ pub fn popover_height(s: &Shell, w: f32) -> f32 {
     // Top 14, heading 28, two section labels 16 each, two 6 gaps, lines 16, bottom 14;
     // the action row 6 + 32.
     let action = (6.0 + 32.0) * popover_actions(s).len() as f32;
-    em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + 16.0 * n + 14.0 + action)
+    em(14.0 + 28.0 + 16.0 * 2.0 + 6.0 * 2.0 + while_runs + 16.0 * n + 14.0 + action)
 }
 
 /// The popover's actions (I6.1): run live or stop, and for an origin run
@@ -3806,5 +3842,32 @@ mod tests {
         assert_eq!(s.store.trails.len(), n, "the empty trail closed");
         assert_eq!(s.store.trail().id, id);
         assert!(!s.on_start());
+    }
+
+    #[test]
+    fn the_live_popover_says_what_the_running_page_holds_and_the_rail_marks_its_windows() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])), "Run live");
+        assert!(s.live_facts().is_empty(), "nothing to say before the engine started");
+        s.live_reported(url, Some("https://app.example".into()), None);
+        let f = s.live_facts();
+        assert_eq!(f.len(), 3);
+        assert!(f[1].contains("Personal persona") && f[2].starts_with("New windows: none"));
+        assert!(s.live_opened_beside(url, "https://app.example/b.html"));
+        let t = s.store.trail();
+        let key = (t.id, t.pages.len() - 1);
+        assert_eq!(t.pages[key.1].url, "https://app.example/b.html");
+        assert!(s.opened_beside(key) && !s.opened_beside((key.0, 0)));
+        assert!(s.live_facts()[2].contains("1 opened beside"));
+        // The popover makes room for its lines.
+        s.popover = true;
+        let with = popover_height(&s, 360.0);
+        s.live_run.as_mut().unwrap().origin = None;
+        assert!(popover_height(&s, 360.0) < with);
     }
 }
