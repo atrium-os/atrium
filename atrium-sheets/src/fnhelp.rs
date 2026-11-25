@@ -199,6 +199,17 @@ const ARGS: &[(&str, &str)] = &[
     ("RATE", "nper, pmt, pv, [fv], [type], [guess]"),
     ("NPV", "rate, value1, [value2], ..."),
     ("IRR", "values, [guess]"),
+    ("TEXTBEFORE", "text, delimiter, [instance_num], [match_mode], [match_end], [if_not_found]"),
+    ("TEXTSPLIT", "text, col_delimiter, [row_delimiter], [ignore_empty], [match_mode], [pad_with]"),
+    ("FIXED", "number, [decimals], [no_commas]"),
+    ("LOOKUP", "lookup_value, lookup_vector, [result_vector]"),
+    ("ADDRESS", "row_num, column_num, [abs_num], [a1], [sheet_text]"),
+    ("ISREF", "value"),
+    ("YEARFRAC", "start_date, end_date, [basis]"),
+    ("SLN", "cost, salvage, life"),
+    ("SYD", "cost, salvage, life, per"),
+    ("DDB", "cost, salvage, life, period, [factor]"),
+    ("DB", "cost, salvage, life, period, [month]"),
 ];
 
 /// The most characters of a formula the tip reads.

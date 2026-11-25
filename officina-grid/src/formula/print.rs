@@ -208,19 +208,24 @@ fn num(v: f64) -> String {
 
 fn sheet(sh: Option<u16>, sn: &dyn Fn(u16) -> String, s: &mut String) {
     if let Some(id) = sh {
-        let name = sn(id);
-        let plain = !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-            && crate::addr::parse_a1(&name).is_none();
-        if plain {
-            s.push_str(&name);
-        } else {
-            s.push('\'');
-            s.push_str(&name.replace('\'', "''"));
-            s.push('\'');
-        }
+        push_sheet_name(&sn(id), s);
         s.push('!');
+    }
+}
+
+/// A sheet name as a formula writes it: bare when it reads back as a name,
+/// else in single quotes with quotes doubled.
+pub(crate) fn push_sheet_name(name: &str, s: &mut String) {
+    let plain = !name.is_empty()
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && crate::addr::parse_a1(name).is_none();
+    if plain {
+        s.push_str(name);
+    } else {
+        s.push('\'');
+        s.push_str(&name.replace('\'', "''"));
+        s.push('\'');
     }
 }
 

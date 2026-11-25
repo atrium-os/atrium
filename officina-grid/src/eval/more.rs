@@ -653,3 +653,91 @@ pub(super) fn mode_sngl(c: &Ctx, a: &[Expr]) -> Ev {
         None => e(ErrorKind::NA),
     }
 }
+
+// The fourth batch (§16.134).
+
+/// FIXED(number, [decimals], [no_commas]): the number rounded to `decimals`
+/// places (left of the point when negative) as text, with thousands commas
+/// unless `no_commas`.
+pub(super) fn fixed(c: &Ctx, a: &[Expr]) -> Ev {
+    let x = tri!(num(c, &a[0]));
+    let d = tri!(opt_num(c, a, 1, 2.0)).trunc();
+    let no_commas = match a.get(2).filter(|x| !missing(x)) {
+        Some(arg) => tri!(super::to_bool(&c.scalar(arg))),
+        None => false,
+    };
+    if d > 127.0 {
+        return e(ErrorKind::Value);
+    }
+    let d = d.max(-128.0) as i32;
+    let rounded = super::funcs::round_dec(x, d, 0);
+    let digits = format!("{:.*}", d.max(0) as usize, rounded.abs());
+    let (whole, frac) = digits.split_once('.').map_or((digits.as_str(), None), |(w, f)| (w, Some(f)));
+    let mut out = String::new();
+    if rounded < 0.0 {
+        out.push('-');
+    }
+    for (i, ch) in whole.chars().enumerate() {
+        if !no_commas && i > 0 && (whole.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if let Some(frac) = frac {
+        out.push('.');
+        out.push_str(frac);
+    }
+    Ev::V(Value::str(&out))
+}
+
+/// YEARFRAC(start, end, [basis]): the fraction of a year between two dates
+/// on a day-count basis: 0 US 30/360, 1 actual/actual, 2 actual/360,
+/// 3 actual/365, 4 European 30/360.
+pub(super) fn yearfrac(c: &Ctx, a: &[Expr]) -> Ev {
+    let (s, t) = (tri!(num(c, &a[0])), tri!(num(c, &a[1])));
+    let basis = tri!(opt_num(c, a, 2, 0.0)).trunc();
+    let (mut s, mut p) = tri!(day_of(c, s));
+    let (mut t, mut q) = tri!(day_of(c, t));
+    if s > t {
+        std::mem::swap(&mut s, &mut t);
+        std::mem::swap(&mut p, &mut q);
+    }
+    let ((y1, m1, mut d1), (y2, m2, mut d2)) = (p, q);
+    let system = c.wb.date_system();
+    let month_last = |day: f64| system.month_end(day, 0.0).is_some_and(|last| last == day);
+    let days360 = |d1: i64, d2: i64| ((y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)) as f64 / 360.0;
+    let r = match basis as i32 {
+        _ if basis.fract() != 0.0 => return e(ErrorKind::Num),
+        0 => {
+            if d1 == 31 && d2 == 31 {
+                (d1, d2) = (30, 30);
+            } else if d1 == 31 {
+                d1 = 30;
+            } else if d1 == 30 && d2 == 31 {
+                d2 = 30;
+            } else if m1 == 2 && m2 == 2 && month_last(s) && month_last(t) {
+                (d1, d2) = (30, 30);
+            } else if m1 == 2 && month_last(s) {
+                d1 = 30;
+            }
+            days360(d1, d2)
+        }
+        1 => {
+            let leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+            let within_year = y1 == y2 || (y1 + 1 == y2 && (m1, d1) >= (m2, d2));
+            if within_year {
+                let feb29 = (leap(y1) && m1 <= 2) || (leap(y2) && (m2 > 2 || (m2 == 2 && d2 == 29)));
+                let year = if (y1 == y2 && leap(y1)) || feb29 { 366.0 } else { 365.0 };
+                (t - s) / year
+            } else {
+                let (Some(first), Some(after)) = (system.date(y1 as f64, 1.0, 1.0), system.date((y2 + 1) as f64, 1.0, 1.0)) else { return e(ErrorKind::Num) };
+                (t - s) / ((after - first) / (y2 - y1 + 1) as f64)
+            }
+        }
+        2 => (t - s) / 360.0,
+        3 => (t - s) / 365.0,
+        4 => days360(d1.min(30), d2.min(30)),
+        _ => return e(ErrorKind::Num),
+    };
+    n(r)
+}

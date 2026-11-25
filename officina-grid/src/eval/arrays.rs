@@ -55,6 +55,7 @@ const LIFT: &[(&str, u32)] = &[
     ("SEARCH", ALL),
     ("SUBSTITUTE", ALL),
     ("TEXTAFTER", 0b11_1101), // the delimiter argument is a set, not lifted
+    ("TEXTBEFORE", 0b11_1101),
     ("VALUE", ALL),
     ("TEXT", ALL),
     ("EXACT", ALL),
@@ -132,11 +133,18 @@ const LIFT: &[(&str, u32)] = &[
     ("PV", ALL),
     ("NPER", ALL),
     ("RATE", ALL),
+    ("FIXED", ALL),
+    ("ADDRESS", ALL),
+    ("YEARFRAC", ALL),
+    ("SLN", ALL),
+    ("SYD", ALL),
+    ("DDB", ALL),
+    ("DB", ALL),
 ];
 
 /// Functions whose result may be an array whatever their arguments.
 const ARRAY_RESULT: &[&str] = &[
-    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY",
+    "INDEX", "XLOOKUP", "SEQUENCE", "RANDARRAY", "TRANSPOSE", "FILTER", "SORT", "SORTBY", "UNIQUE", "VSTACK", "HSTACK", "TAKE", "DROP", "CHOOSEROWS", "CHOOSECOLS", "TOCOL", "TOROW", "WRAPROWS", "WRAPCOLS", "EXPAND", "MAP", "SCAN", "BYROW", "BYCOL", "MAKEARRAY", "TEXTSPLIT",
 ];
 
 /// Functions whose result is an array when an argument is one.
@@ -172,7 +180,7 @@ fn on(mask: u32, i: usize) -> bool {
 
 fn legacy_arg(id: usize, position: usize, arg: &Expr) -> bool {
     on(shapes().lift[id], position)
-        || (position == 1 && FUNCS[id].name == "TEXTAFTER" && !matches!(arg, Expr::Array(_)))
+        || (position == 1 && matches!(FUNCS[id].name, "TEXTAFTER" | "TEXTBEFORE") && !matches!(arg, Expr::Array(_)))
 }
 
 fn missing(a: &Expr) -> bool {

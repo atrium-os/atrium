@@ -5052,6 +5052,21 @@ Twenty-three more functions, after §16.132's so function ids stay put:
 - Tests: 49 conformance cases with the results on Microsoft's function pages (money rounded to the cents the pages show), and `maxifs_and_minifs_agree_with_and_without_the_index`.
 - Not yet: TEXTBEFORE and TEXTSPLIT, OFFSET and INDIRECT, LOOKUP, ADDRESS, YEARFRAC, the depreciation functions, MODE.MULT and the rest of the long tail.
 
+### 16.134 TEXTBEFORE and TEXTSPLIT, FIXED, LOOKUP, ADDRESS, YEARFRAC and depreciation (2026-11-25)
+
+Eleven more functions, after §16.133's so function ids stay put:
+
+- **TEXTBEFORE**, the mirror of TEXTAFTER: both now go through one search (`textafter::around`) that keeps the chosen delimiter's start and end, so instance numbers from either end, case-insensitive matching (sliced back on the original text), match_end and if_not_found behave the same in both. It lifts over every argument but the delimiter set.
+- **TEXTSPLIT(text, col_delimiter, [row_delimiter], [ignore_empty], [match_mode], [pad_with])** returns an array: the text cut into rows, then each row into columns, where the longest delimiter that matches at a place wins. Short rows are padded with #N/A unless pad_with says otherwise; an empty delimiter, or neither delimiter, is #VALUE!; nothing left after ignoring empties is #CALC!. Delimiter sets hold at most 256 entries and the search shares TEXTAFTER's work budget (#LIMIT! past it); the result is bounded by the array limit before it is built.
+- **FIXED(number, [decimals], [no_commas])**: rounded the way ROUND rounds (negative decimals round left of the point), with thousands commas unless asked not to; decimals over 127 is #VALUE!.
+- **LOOKUP**, vector form and array form (searching the first row of a wider-than-tall array, else the first column, and answering from the last row or column). It takes the last place whose value of the same type is at most the one sought, which is where Excel's binary search lands on sorted data and makes `LOOKUP(2,1/(A:A<>""),A:A)` find the last filled cell. A one-cell or short result range reads on past its end as Excel's does.
+- **ADDRESS** in A1 and R1C1 style with the four absolute/relative kinds and an optional sheet name, quoted exactly as formulas quote sheet names (`print::push_sheet_name`, now shared); rows and columns beyond the sheet's limits are #VALUE!. **ISREF** is TRUE only for a reference.
+- **YEARFRAC** on all five bases: US 30/360 with its February month-end rules, actual/actual (a year of 366 days when a 29 February falls in a span of up to a year, else the average length of the years spanned), actual/360, actual/365 and European 30/360. Dates out of order are swapped; another basis is #NUM!.
+- **SLN, SYD, DDB and DB**. DDB never takes the book value below salvage; DB rounds its rate to three places and splits the first year by `month`, with the remainder in period life + 1. Both take closed forms, so a large life costs nothing.
+- Argument tips for all of them. `.xlsx` writes TEXTBEFORE and TEXTSPLIT with `_xlfn.`.
+- Tests: 85 conformance cases with the results on Microsoft's function pages.
+- Not yet: OFFSET and INDIRECT (references made at recalculation time need dependency tracking of their own), MODE.MULT and the rest of the long tail.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
