@@ -2954,10 +2954,12 @@ LibWeb's `handle_keydown` and `handle_keyup`, except Ctrl-C and Ctrl-V.
   on screen (`Shell::live_on_screen`).
 - **Paste.** On Ctrl-V the engine sends `Report::Paste { token }`. The UI reads Tabula with
   `paste_text_with`, then sends `Request::LivePasted { url, text }` if the text is at most
-  `COPY_MAX`. navigatord passes it to the engine as `Pasted` ('V' plus the text), and the
+  `COPY_MAX`, or else says in the prompt row that nothing was pasted
+  (`Prompt::PasteTooLong`). navigatord passes it to the engine as `Pasted` ('V' plus the text), and the
   engine types it into the page as key presses.
 - **The token.** It is minted for the press in the island. frescod lets the island's parent,
-  the Navigator UI, spend it on `COPY` or `PASTE` only (tabula.md §2.6). The page never reads
+  the Navigator UI, spend it on `COPY` or `PASTE` only, and only when the
+  press was the chord itself (tabula.md §2.6): never a click or Enter. The page never reads
   the clipboard on its own: the reporter still refuses `navigator.clipboard.read` and
   `readText`.
 

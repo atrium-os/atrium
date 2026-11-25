@@ -944,6 +944,9 @@ impl Live {
                             Ok(Some(text)) if !text.is_empty() && text.len() <= limen::web_island::COPY_MAX => {
                                 send(&mut self.w, &Request::LivePasted { url: from, text });
                             }
+                            Ok(Some(text)) if text.len() > limen::web_island::COPY_MAX => {
+                                s.live_file(&from, crate::trail::Prompt::PasteTooLong, crate::ui::now_ms());
+                            }
                             Ok(_) => eprintln!("navigator-ui: nothing to paste into the live page"),
                             Err(e) => eprintln!("navigator-ui: the live page's paste: {e:?}"),
                         }

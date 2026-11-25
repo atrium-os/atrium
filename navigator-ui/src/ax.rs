@@ -127,6 +127,7 @@ pub fn prompt_text(p: &Prompt) -> String {
         Prompt::RunLive => "Open inbox.example in a live window using its cookies?".into(),
         Prompt::RunPageLive { site } => format!("Run this page live? Its scripts run on this computer, in a jail, and can send what you type here to {site}'s sites. Its sign-in is kept for next time."),
         Prompt::FetchAgain => "This page could not be restored and will be fetched again".into(),
+        Prompt::PasteTooLong => "Nothing was pasted: a live page takes at most 16 KB at once".into(),
         Prompt::Play { origin } => format!("{origin} wants to play sound"),
         Prompt::Handoff { url, scheme } => format!("This link is for another program ({scheme}): {url}"),
         Prompt::OpenApp { name, about, .. } => match crate::trail::app_words(name, about.as_ref()) {

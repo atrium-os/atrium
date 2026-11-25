@@ -2799,6 +2799,11 @@ mod tests {
         assert!(s.live_print(url));
         assert_eq!(s.outbox.pop(), Some(Out::Print));
         assert!(!s.live_print(url), "one print at a time");
+        // A paste too long for the page is said in the row, with only Close.
+        assert!(s.live_file(url, Prompt::PasteTooLong, 30_000.0));
+        let asked = s.store.page_by_key_mut(key.0, key.1).and_then(|p| p.asked.as_ref()).map(|a| a.prompt.clone());
+        assert_eq!(asked, Some(Prompt::PasteTooLong));
+        assert_eq!(Prompt::PasteTooLong.answers(), &["Close"]);
         // Refusals: each once, bounded, and in the popover while it is shown.
         assert_eq!(s.live_refusals(), None);
         assert!(s.live_refused(url, "notifications"));

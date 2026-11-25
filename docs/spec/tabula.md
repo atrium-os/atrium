@@ -177,13 +177,23 @@ which owns the window the island is a slot of, writes and reads the clipboard fo
   and that window's owner's uid (`island_parent` in `socket_server.rs`, `Entry.parent_window`
   and `parent_uid` in `activation.rs`).
 - `CONSUME` with `presenter_uid` equal to that parent uid is taken for `COPY` and `PASTE`
-  only. Every other purpose still needs the island's own uid. The chord rule (§2.2) is
-  unchanged: Ctrl-C for a copy, Ctrl-V for a paste.
+  only. Every other purpose still needs the island's own uid.
+- The parent may spend only the chord itself: a key press of Ctrl-C or Ctrl-X for a copy,
+  Ctrl-V or Shift-Insert for a paste. A click, Enter or another Ctrl chord in the island is
+  refused (`WRONG_KIND`), though the island's own app could spend it under §2.2. The engine
+  that hands the parent the token runs untrusted content, so without this a compromised
+  engine could turn any click into a read of the clipboard, or Enter into a write of its own
+  text.
+- The rule covers every island's parent, not only Navigator: a sign-in page's slot
+  (`SIGN_IN_PAGE`) is an island too, so the sheet's owner may spend a Ctrl-V pressed in its
+  sign-in page. The parent is the more trusted side. Tabula's paste note names the parent
+  app, not the page.
 - The focus check passes when the island or its parent window is focused.
 - Tabula is unchanged: it still passes its caller's uid as `presenter_uid`.
 - The engine forwards each Ctrl-C (with the selected text, at most 16 KiB) and each Ctrl-V
   with its token to navigatord, which hands them to the UI. The UI spends the token through
   Pergola's `copy_text_with` and `paste_text_with`, and only for the live page on screen.
+  A paste over 16 KiB is not sent; the prompt row says so.
 
 Test: `an_islands_parent_spends_a_press_in_the_island_only_on_a_copy_or_a_paste` in
 `activation.rs`.
