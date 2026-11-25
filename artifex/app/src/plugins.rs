@@ -495,6 +495,8 @@ impl Link for LimenLink {
         self.embeds.borrow_mut().request_plugin(self.window, app).map_err(|e| match e {
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NO_PLUGIN => "it isn't a plugin for you".into(),
             limen::client::Error::Refused(r) if r == limen::proto::refusal::NOT_EMBEDDABLE => "Artifex may not start plugins".into(),
+            limen::client::Error::Refused(r) if r == limen::proto::refusal::LAUNCH_FAILED => "its jail couldn't start (limend's log says why)".into(),
+            limen::client::Error::Refused(r) if r == limen::proto::refusal::TOO_MANY => "it is already running here".into(),
             e => format!("{e:?}"),
         })
     }

@@ -3462,6 +3462,20 @@ Follow-up (cloud, 2026-11-25). What became of the rough edges:
   and `fork-check.cpp` recompile). Gate: in the sign-in field, Ctrl+A
   shows an amber wash over "ana" before "zz" replaces it, and a
   mouse-dragged selection in the page's text shows the same wash.
+  Mac run, 2026-11-25 (engine `38077286…`, JIT audit passed): Ctrl+A
+  showed the amber wash over "ana", and "zz" replaced it. A drag selected
+  nothing. The engine passes LibWeb only a press and a release
+  (`handle_mousedown`, `handle_mouseup` in `SignInFixture.h`, from
+  `PointerButton`), never pointer motion, so a drag can't make a
+  selection; this is unrelated to the palette. Evidence is in
+  `~/atrium-vm/evidence/navigator-selection-20261125/` on the Mac.
+  Then (cloud): the island records when the primary button goes down
+  and, while it is held, hands `PointerMotion` to the page as action 9
+  (`navigator_page_pointer`), which calls `handle_mousemove` with the
+  primary button in `buttons`. Motion with no button held is not passed,
+  so hovering doesn't lay the page out on every move. Gate (Mac): drag
+  across a line of the fixture's text: the amber wash follows the
+  pointer, and Ctrl-C copies the dragged words.
 - **`same-site-api` failed on `/route/1`** but passed on `/app.html`. It was
   the same stale connection, not CORS. The run came right after the
   fixture-server restart. No request for `api.app.example` reached the

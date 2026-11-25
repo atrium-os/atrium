@@ -16,5 +16,22 @@ fn main() {
         };
         println!("embeds-gate {role} {r}");
     }
+    // editor-extension as a plugin (dev-tools.md §3.8): limend lists the
+    // gate's Share (a dev build of the same person), starts it when named,
+    // and refuses an app that isn't a plugin (18, NO_PLUGIN).
+    let listed = match Parent::at(limen::client::DEFAULT_SOCKET).and_then(|mut p| p.list_plugins()) {
+        Ok(v) => v.iter().map(|i| format!("{}:{}", i.app, i.languages.join("+"))).collect::<Vec<_>>().join(","),
+        Err(Error::Refused(n)) => format!("refused {n}"),
+        Err(e) => format!("error {e:?}"),
+    };
+    println!("embeds-gate plugins {listed}");
+    for (what, app) in [("plugin", "dev.alice.scratch.org.example.share"), ("not-a-plugin", "dev.alice.scratch.org.example.bare")] {
+        let r = match Parent::at(limen::client::DEFAULT_SOCKET).and_then(|mut p| p.request_plugin([7u8; 16], app)) {
+            Ok(e) => format!("embed {e}"),
+            Err(Error::Refused(n)) => format!("refused {n}"),
+            Err(e) => format!("error {e:?}"),
+        };
+        println!("embeds-gate {what} {r}");
+    }
     println!("embeds-gate done 1");
 }

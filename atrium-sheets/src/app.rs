@@ -102,6 +102,10 @@ pub enum Cmd {
     FilterOpen(u32, u32),
     /// The filter panel's condition chosen (an index of `data::FILTER_CONDS`).
     FilterCond(usize),
+    /// The filter panel's second condition chosen (0: none).
+    FilterCond2(usize),
+    /// The filter panel's two conditions joined by or (`true`) or and.
+    FilterJoin(bool),
     /// A Format menu command on the selection.
     Format(crate::format::FormatCmd),
     /// The text or fill colour bar closed.
@@ -228,6 +232,8 @@ pub enum ListKind {
     Choose,
     /// `NAME(` into the cell's formula (Shift+F3).
     Function,
+    /// A table total row cell's function ([`crate::data::TOTAL_FUNCTIONS`]).
+    Total,
     /// The name into the cell's formula (F3).
     Name,
 }
@@ -256,6 +262,9 @@ pub struct FilterPanel {
     /// The condition instead of picked values: an index of
     /// [`crate::data::FILTER_CONDS`], 0 for picking values.
     pub cond: usize,
+    /// A second condition (0: none), joined by and, or by or with `or`.
+    pub cond2: usize,
+    pub or: bool,
 }
 
 impl FilterPanel {
@@ -339,6 +348,9 @@ pub struct Sheets {
     pub filter_cond_menu: Mutable<MenuState>,
     pub filter_a: Mutable<TextEdit>,
     pub filter_b: Mutable<TextEdit>,
+    /// The filter panel's second condition's value, and its menu.
+    pub filter_c: Mutable<TextEdit>,
+    pub filter_cond2_menu: Mutable<MenuState>,
     pub filter_scroll: Mutable<ScrollState>,
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
@@ -411,8 +423,9 @@ pub struct Sheets {
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
-    /// The Text to Columns at… bar, and what it splits at.
-    pub splitting: Mutable<bool>,
+    /// The bar that asks how to run Text to Columns at… or Remove
+    /// Duplicates by… (the command it is for), and what was typed.
+    pub splitting: Mutable<Option<crate::data::DataCmd>>,
     pub split_text: Mutable<TextEdit>,
     /// The bar renames this Name Manager row rather than naming the selection.
     pub name_rename: Mutable<Option<usize>>,
@@ -448,7 +461,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(false), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), painter: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), splitting: Mutable::new(None), split_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_refers: Mutable::new(false), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")), filter_c: Mutable::new(TextEdit::new("")), filter_cond2_menu: Mutable::new(MenuState::default()) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -543,13 +556,14 @@ impl Sheets {
                 let title = if head.trim().is_empty() { format!("Column {}", col_name(col)) } else { format!("{} · {}", col_name(col), head.trim()) };
                 let on = v.iter().map(|x| x.2).collect();
                 // A condition the panel makes is shown as it is.
-                let (cond, a, b) = {
+                let pc = {
                     let d = self.doc.borrow();
-                    crate::data::column_cond(&d, row, col).unwrap_or((0, String::new(), String::new()))
+                    crate::data::column_cond(&d, row, col).unwrap_or_default()
                 };
-                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on, cond });
-                self.filter_a.set(TextEdit::new(&a));
-                self.filter_b.set(TextEdit::new(&b));
+                self.filter.set(FilterPanel { open: true, row, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on, cond: pc.kind, cond2: pc.kind2, or: pc.or });
+                self.filter_a.set(TextEdit::new(&pc.a));
+                self.filter_b.set(TextEdit::new(&pc.b));
+                self.filter_c.set(TextEdit::new(&pc.c));
                 self.filter_search.set(TextEdit::new(""));
                 self.filter_scroll.set(ScrollState::default());
             }
@@ -565,7 +579,11 @@ impl Sheets {
             return;
         }
         if p.cond > 0 {
-            let made = crate::data::filter_cond(p.cond, self.filter_a.get_cloned().text(), self.filter_b.get_cloned().text());
+            let cond2 = if crate::data::filter_cond_joins(p.cond) { p.cond2 } else { 0 };
+            let made = crate::data::filter_cond2(&crate::data::PanelCond {
+                kind: p.cond, a: self.filter_a.get_cloned().text().into(), b: self.filter_b.get_cloned().text().into(),
+                kind2: cond2, c: self.filter_c.get_cloned().text().into(), or: p.or,
+            });
             match made {
                 Ok(c) => {
                     crate::data::set_condition(&mut self.doc.borrow_mut(), p.row, p.col, c);
@@ -1345,7 +1363,7 @@ impl Sheets {
         self.sorting.set(false);
         self.seeking.set(false);
         self.angling.set(false);
-        self.splitting.set(false);
+        self.splitting.set(None);
         self.color_bar.set(None);
     }
 
@@ -1767,13 +1785,14 @@ impl Sheets {
                 let res = match c {
                     TabCmd::SortDone => crate::data::custom_sort(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                     TabCmd::AngleDone => crate::format::set_angle(&mut self.doc.borrow_mut(), g.selection(), &typed),
+                    _ if self.splitting.get() == Some(crate::data::DataCmd::RemoveDuplicatesBy) => crate::data::remove_duplicates(&mut self.doc.borrow_mut(), g.selection(), g.cursor, Some(&typed)),
                     _ => crate::data::text_to_columns_at(&mut self.doc.borrow_mut(), g.selection(), g.cursor, &typed),
                 };
                 match res {
                     Ok(m) => {
                         self.sorting.set(false);
                         self.angling.set(false);
-                        self.splitting.set(false);
+                        self.splitting.set(None);
                         self.rev.set(self.rev.get().wrapping_add(1));
                         self.set_status(m);
                     }
@@ -1802,7 +1821,7 @@ impl Sheets {
             TabCmd::SortCancel | TabCmd::AngleCancel | TabCmd::SplitCancel => {
                 self.sorting.set(false);
                 self.angling.set(false);
-                self.splitting.set(false);
+                self.splitting.set(None);
                 self.changed();
             }
             TabCmd::NameCancel => {
@@ -1887,6 +1906,15 @@ impl Sheets {
         let (r, c) = self.grid.get_cloned().cursor;
         let mut d = self.doc.borrow_mut();
         let a = officina_grid::addr::CellAddr::new(d.sheet, r, c);
+        if crate::source::total_cell(&d.wb, a) {
+            let sheet = d.sheet;
+            drop(d);
+            let items = crate::data::TOTAL_FUNCTIONS.iter().map(|(n, _)| n.to_string()).collect();
+            self.list.set(ListPanel { open: true, kind: ListKind::Total, sheet, row: r, col: c, items });
+            self.list_search.set(TextEdit::new(""));
+            self.list_scroll.set(ScrollState::default());
+            return;
+        }
         let mut items: Vec<String> = d.wb.list_items(a).iter().map(|v| v.display()).filter(|t| !t.is_empty()).collect();
         if items.is_empty() {
             // Excel's Pick From Drop-down List: the column's own entries, sorted.
@@ -2021,6 +2049,14 @@ impl Sheets {
         let Some(text) = shown.get(k).and_then(|&i| p.items.get(i)) else { return };
         let mut d = self.doc.borrow_mut();
         if d.sheet != p.sheet {
+            return;
+        }
+        if p.kind == ListKind::Total {
+            let Some(k) = crate::data::TOTAL_FUNCTIONS.iter().position(|(n, _)| n == text) else { return };
+            let msg = crate::data::total_fn(&mut d, p.row, p.col, k);
+            d.status = match msg { Ok(m) | Err(m) => m };
+            drop(d);
+            self.rev.set(self.rev.get().wrapping_add(1));
             return;
         }
         if p.kind != ListKind::Choose {
@@ -2187,15 +2223,17 @@ impl Sheets {
             ctx.add(Node::Text { rect: Rect::new(294.0 + fw, y + 6.0, 260.0, 18.0), content: "the value, then the cell to change".into(), style: crate::tabs::style(t.text_secondary(), false) });
             return;
         }
-        if self.splitting.get() {
+        if let Some(kind) = self.splitting.get() {
+            let dedup = kind == crate::data::DataCmd::RemoveDuplicatesBy;
             let st = crate::tabs::style(t.text_primary(), true);
-            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Split at".into(), style: st });
-            let fw = 160.0;
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: if dedup { "Compare" } else { "Split at" }.into(), style: st });
+            let fw = 180.0;
             let cmds = self.cmds.clone();
-            TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder("comma, tab, - …").autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
-            Button::primary("Split").at(112.0 + fw, y + 2.0).width(64.0).on_click(push(TabCmd::SplitDone)).render(ctx);
-            Button::secondary("Cancel").at(184.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitCancel)).render(ctx);
-            ctx.add(Node::Text { rect: Rect::new(264.0 + fw, y + 6.0, 320.0, 18.0), content: "a name (comma, tab, space…) or the characters; empty finds one".into(), style: crate::tabs::style(t.text_secondary(), false) });
+            TextField::new(self.split_text.clone()).key(0x5348_5350).placeholder(if dedup { "Name, City" } else { "comma, -+, fixed 3, 8" }).autofocus(true).at(104.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SplitDone))).render(ctx);
+            Button::primary(if dedup { "Remove" } else { "Split" }).at(112.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitDone)).render(ctx);
+            Button::secondary("Cancel").at(192.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::SplitCancel)).render(ctx);
+            let hint = if dedup { "columns (letters or headers) that make a row a duplicate" } else { "a name or characters (+ after: runs count as one), fixed 3, 8 for widths, or empty to find one" };
+            ctx.add(Node::Text { rect: Rect::new(272.0 + fw, y + 6.0, (w - 284.0 - fw).max(0.0), 18.0), content: hint.into(), style: crate::tabs::style(t.text_secondary(), false) });
             return;
         }
         if self.sorting.get() || self.angling.get() {
@@ -3080,8 +3118,27 @@ impl View for Sheets {
                     let cmds = self.cmds.clone();
                     TextField::new(self.filter_b.clone()).key(0x4649_4c42).at(x0 + 40.0 + fw, y0 + 78.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::FilterApply)).render(ctx);
                 }
+                // A second condition, joined by And or Or, as Excel's Custom AutoFilter.
+                let mut note_y = y0 + 120.0;
+                if crate::data::filter_cond_joins(fp.cond) {
+                    for (k, (label, or)) in [("And", false), ("Or", true)].into_iter().enumerate() {
+                        let b = if fp.or == or { Button::primary(label) } else { Button::secondary(label) };
+                        b.at(x0 + 12.0 + k as f32 * 60.0, y0 + 116.0).width(56.0).on_click(push(Cmd::FilterJoin(or))).render(ctx);
+                    }
+                    let kinds: Vec<usize> = std::iter::once(0).chain((1..crate::data::FILTER_CONDS.len()).filter(|&k| crate::data::filter_cond_joins(k))).collect();
+                    let items: Vec<pergola::widgets::MenuItem> = kinds.iter().map(|&k| pergola::widgets::MenuItem::new(if k == 0 { "No second condition" } else { crate::data::FILTER_CONDS[k] }).radio(k == fp.cond2)).collect();
+                    let now = if fp.cond2 == 0 { "No second condition" } else { crate::data::FILTER_CONDS[fp.cond2] };
+                    let cmds = self.cmds.clone();
+                    MenuButton::new(now.to_string(), self.filter_cond2_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::FilterCond2(kinds.get(i).copied().unwrap_or(0)))).at(x0 + 136.0, y0 + 116.0).width(FILTER_W - 148.0).render(ctx);
+                    note_y = y0 + 156.0;
+                    if fp.cond2 > 0 {
+                        let cmds = self.cmds.clone();
+                        TextField::new(self.filter_c.clone()).key(0x4649_4c43).placeholder(if fp.cond2 >= 12 { "Text" } else { "Number or text" }).at(x0 + 12.0, y0 + 156.0).width(FILTER_W - 24.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::FilterApply)).render(ctx);
+                        note_y = y0 + 196.0;
+                    }
+                }
                 let note = match fp.cond { 8..=11 => "Rows with the largest (or smallest) numbers in the column.", 12..=15 => "Text compared ignoring case.", _ => "Numbers compare as numbers, other text as text." };
-                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 120.0, FILTER_W - 24.0, 18.0), content: note.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, note_y, FILTER_W - 24.0, 18.0), content: note.into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
             }
             let shown = if fp.cond == 0 { fp.shown(self.filter_search.get_cloned().text()) } else { Vec::new() };
             if fp.cond == 0 {
@@ -3210,8 +3267,9 @@ impl View for Sheets {
                 ListKind::Choose => format!("Choose for {}", officina_grid::addr::a1(lp.row, lp.col)),
                 ListKind::Function => "Insert Function".into(),
                 ListKind::Name => "Paste Name".into(),
+                ListKind::Total => format!("Total for {}", officina_grid::addr::a1(lp.row, lp.col)),
             };
-            let hint = match lp.kind { ListKind::Choose => "Search the list", ListKind::Function => "Search functions", ListKind::Name => "Search names" };
+            let hint = match lp.kind { ListKind::Choose | ListKind::Total => "Search the list", ListKind::Function => "Search functions", ListKind::Name => "Search names" };
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
             let cmds = self.cmds.clone();
             TextField::new(self.list_search.clone()).placeholder(hint).autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ListPick(0))).render(ctx);
@@ -3819,10 +3877,10 @@ impl Sheets {
                     self.autofit(c == crate::data::DataCmd::AutoFitRows);
                     false
                 }
-                Cmd::Data(crate::data::DataCmd::TextToColumnsAt) => {
+                Cmd::Data(c @ (crate::data::DataCmd::TextToColumnsAt | crate::data::DataCmd::RemoveDuplicatesBy)) => {
                     self.close_bars();
                     self.split_text.set(TextEdit::new(""));
-                    self.splitting.set(true);
+                    self.splitting.set(Some(c));
                     self.changed();
                     false
                 }
@@ -4104,6 +4162,22 @@ impl Sheets {
                 }
                 Cmd::FilterOpen(row, col) => {
                     self.choose_values_at(row, col);
+                    self.changed();
+                    false
+                }
+                Cmd::FilterCond2(k) => {
+                    let mut p = self.filter.get_cloned();
+                    if k == 0 || crate::data::filter_cond_joins(k) {
+                        p.cond2 = k;
+                        self.filter.set(p);
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::FilterJoin(or) => {
+                    let mut p = self.filter.get_cloned();
+                    p.or = or;
+                    self.filter.set(p);
                     self.changed();
                     false
                 }
@@ -5988,6 +6062,31 @@ mod tests {
         assert!(["Between", "and", "Numbers compare as numbers, other text as text."].iter().all(|w| texts.iter().any(|t| t == w)), "{texts:?}");
         assert!(!texts.iter().any(|t| t == "Select All"));
         assert!(filter_cond(10, "150", "").is_err() && filter_cond(3, "", "").is_err());
+        // Two conditions: Qty > 5 or < 2 keeps 10, 7 and 1; with And, nothing in between.
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowAll));
+        s.take_cmds();
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 1));
+        s.cmds.lock().unwrap().push(Cmd::FilterCond(3));
+        s.cmds.lock().unwrap().push(Cmd::FilterJoin(true));
+        s.cmds.lock().unwrap().push(Cmd::FilterCond2(5));
+        s.take_cmds();
+        s.filter_a.set(TextEdit::new("5"));
+        s.filter_c.set(TextEdit::new("2"));
+        let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Or")));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [1], "{}", s.doc.borrow().status);
+        // Opened again, both show, and And on text: begins with a, contains r.
+        s.cmds.lock().unwrap().push(Cmd::FilterOpen(0, 1));
+        s.take_cmds();
+        let p = s.filter.get_cloned();
+        assert_eq!((p.cond, p.cond2, p.or, s.filter_a.get_cloned().text().to_string(), s.filter_c.get_cloned().text().to_string()), (3, 5, true, "5".into(), "2".into()));
+        let pc = crate::data::PanelCond { kind: 12, a: "a".into(), kind2: 14, c: "r".into(), ..Default::default() };
+        assert_eq!(crate::data::panel_cond(&crate::data::filter_cond2(&pc).unwrap()), Some(pc));
+        assert!(crate::data::filter_cond2(&crate::data::PanelCond { kind: 8, a: "2".into(), kind2: 3, c: "1".into(), ..Default::default() }).is_err());
+        s.cmds.lock().unwrap().push(Cmd::FilterCancel);
+        s.take_cmds();
         // Above and below the average (5.25) take nothing typed.
         s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ShowAll));
         s.take_cmds();
@@ -6038,6 +6137,17 @@ mod tests {
         assert!(totals(&s).contains(&("Total: None".into(), true)));
         assert!(s.doc.borrow_mut().undo());
         assert_eq!(shown(&s, 3, 2), "2");
+        // The cell's own list (its drop button, or Alt+Down) offers the same.
+        select(&s, (3, 2), (3, 2));
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::ChooseFromList));
+        s.take_cmds();
+        let lp = s.list.get_cloned();
+        assert!(lp.open && lp.kind == ListKind::Total && lp.items.len() == crate::data::TOTAL_FUNCTIONS.len());
+        s.list_search.set(TextEdit::new("max"));
+        s.cmds.lock().unwrap().push(Cmd::ListPick(0));
+        s.take_cmds();
+        assert_eq!(shown(&s, 3, 2), "20");
+        assert!(crate::source::total_cell(&s.doc.borrow().wb, officina_grid::CellAddr::new(0, 3, 2)) && !crate::source::total_cell(&s.doc.borrow().wb, officina_grid::CellAddr::new(0, 2, 2)));
         // Only in the total row.
         select(&s, (1, 2), (1, 2));
         assert!(totals(&s).is_empty() && data(&s, DataCmd::TotalFn(1)).contains("total row first"));
@@ -7082,6 +7192,26 @@ mod tests {
         assert!(data(&s, DataCmd::RemoveDuplicates).contains("No duplicate rows"));
         s.doc.borrow_mut().undo();
         assert_eq!(col(0), ["Name", "a", "A", "b", "a", "c", "b", ""]);
+        // By… a header or letter: only that column makes a row a duplicate.
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::RemoveDuplicatesBy));
+        s.take_cmds();
+        assert_eq!(s.splitting.get(), Some(DataCmd::RemoveDuplicatesBy));
+        s.split_text.set(TextEdit::new("Price"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+        s.take_cmds();
+        assert!(s.splitting.get().is_some() && s.doc.borrow().status.contains("isn't a column"), "{}", s.doc.borrow().status);
+        s.split_text.set(TextEdit::new("name"));
+        s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
+        s.take_cmds();
+        assert!(s.splitting.get().is_none(), "{}", s.doc.borrow().status);
+        assert!(s.doc.borrow().status.contains("3 duplicate rows removed; 3 unique rows left"), "{}", s.doc.borrow().status);
+        assert_eq!(col(0), ["Name", "a", "b", "c", "", "", "", ""]);
+        assert_eq!(col(1), ["Qty", "1", "2", "3", "", "", "", ""]);
+        s.doc.borrow_mut().undo();
+        let sel = CellRange { r0: 1, c0: 0, r1: 1, c1: 0 };
+        assert!(crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some("B")).unwrap().contains("2 duplicate rows removed"));
+        assert_eq!(col(1), ["Qty", "1", "2", "3", "20", "", "", ""]);
+        assert!(crate::data::remove_duplicates(&mut s.doc.borrow_mut(), sel, (1, 0), Some(" , ")).is_err());
     }
 
     #[test]
@@ -7113,16 +7243,35 @@ mod tests {
         select(&s, (0, 0), (2, 0));
         s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::TextToColumnsAt));
         s.take_cmds();
-        assert!(s.splitting.get());
+        assert!(s.splitting.get().is_some());
         s.split_text.set(TextEdit::new("/"));
         s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
         s.take_cmds();
-        assert!(s.splitting.get() && s.doc.borrow().status.contains("no “/” to split at"), "{}", s.doc.borrow().status);
+        assert!(s.splitting.get().is_some() && s.doc.borrow().status.contains("no “/” to split at"), "{}", s.doc.borrow().status);
         s.split_text.set(TextEdit::new("-"));
         s.cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::SplitDone));
         s.take_cmds();
-        assert!(!s.splitting.get(), "{}", s.doc.borrow().status);
+        assert!(s.splitting.get().is_none(), "{}", s.doc.borrow().status);
         assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 1, 0), shown(&s, 1, 1), shown(&s, 2, 0)], ["ab", "cd", "ef", "a", "b; c", "plain"]);
+        // Runs of the delimiter as one with +, and fixed widths.
+        let s = sheets_of(b"x\n");
+        assert!(s.doc.borrow_mut().type_into(0, 0, "a--b-c"));
+        let one = CellRange { r0: 0, c0: 0, r1: 0, c1: 0 };
+        crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), one, (0, 0), "-+").unwrap();
+        assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 0, 3)], ["a", "b", "c", ""]);
+        s.doc.borrow_mut().undo();
+        crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), one, (0, 0), "-").unwrap();
+        assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 0, 3)], ["a", "", "b", "c"]);
+        let s = sheets_of(b"x\n");
+        for (r, t) in ["AB1234xyz", "CD56", "E"].iter().enumerate() {
+            assert!(s.doc.borrow_mut().type_into(r as u32, 0, t));
+        }
+        let msg = crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 0, r1: 2, c1: 0 }, (0, 0), "fixed 2, 6").unwrap();
+        assert!(msg.contains("Split 2 cells at character 2, 6 into 3 columns"), "{msg}");
+        assert_eq!([shown(&s, 0, 0), shown(&s, 0, 1), shown(&s, 0, 2), shown(&s, 1, 0), shown(&s, 1, 1), shown(&s, 2, 0)], ["AB", "1234", "xyz", "CD", "56", "E"]);
+        for bad in ["fixed", "fixed 5, 3", "fixed 0", "fixed x"] {
+            assert!(crate::data::text_to_columns_at(&mut s.doc.borrow_mut(), one, (0, 0), bad).is_err(), "{bad}");
+        }
         // Names, and limits.
         let s = sheets_of(b"x\n");
         assert!(s.doc.borrow_mut().type_into(0, 0, "p;q,r"));

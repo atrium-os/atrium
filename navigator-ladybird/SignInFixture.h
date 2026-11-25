@@ -343,6 +343,8 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         Web::DevicePixelPoint point { static_cast<int>(x), static_cast<int>(y) };
         if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);
         if (action == 2) client.page().handle_mouseup(point, point, Web::UIEvents::MouseButton::Primary, 0, 0);
+        // A drag with the primary button held: it extends a text selection.
+        if (action == 9) client.page().handle_mousemove(point, point, Web::UIEvents::MouseButton::Primary, 0);
         bool requested = client.take_frame_request();
 #ifdef ATRIUM_I4_YOUTUBE
         if (requested) {

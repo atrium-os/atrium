@@ -674,8 +674,19 @@ a panel listing them in its own Pergola window). `md-links`'s
 `tests/end_to_end.rs` runs limend's own daemon code on a real socket,
 Artifex's `LimenLink` and `Host`, and the real plugin program on its
 Limen channel: listed, started, warned, fixed, commanded, re-checked,
-and it exits when detached. **Not done yet:** a VM check with jails and
-frescod (the panel shown in Artifex), and the C header.
+and it exits when detached. The VM check is `vm-artifex-check.sh`'s
+"plugins" section (amd64 cloud VM, frescod headless, limend as `_limen`
+with `FRESCOD_SLOT_UIDS` naming it): limend lists both samples, the
+palette's "Show the plugins" opens the view, Switch on starts each in a
+jail of its own as a uid of Artifex's instance with rctl `pcpu:deny=50`
+and `memoryuse:sigkill=256M`, md-links marks `notes.md`'s dead anchor and
+its quick fix mends it, and TODO lens' command answers in the status line
+and its panel ("Show the panel TODOs" in the palette) shows its own
+window. A plugin's manifest asks for no `graphics`: its panel is on the
+embed-only frescod connection limend hands it, and limend refuses a
+provider that would also get frescod's app socket. `vm-embeds-check.sh`
+covers the refusals: a plain `editor-extension` request gets no provider,
+an app that isn't a plugin gets NO_PLUGIN. **Not done yet:** the C header.
 
 **Decisions.**
 

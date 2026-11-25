@@ -10,9 +10,10 @@ entry       = "bin/todo-lens"
 description = "Lists the TODOs in the files you open."
 icon        = "list-checks"
 
+# No `graphics`: its panel window is on the embed-only frescod connection
+# limend hands it, never frescod's app socket (limen.md §2.7).
 [capabilities]
-graphics = "fresco"
-network  = "none"
+network = "none"
 
 [roles]
 implements = ["editor-extension"]
