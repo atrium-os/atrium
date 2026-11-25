@@ -2631,6 +2631,22 @@ Host-tested; the engine side is written, not yet built.
 3. Press **Open another site** twice within a second: one entry beside,
    and the chip's popover names the refused second.
 
+**Gate results on arm64 Tessera, 2026-11-25.** The engine was
+`c2c60510…`, built with the patch at 5b76a7f15 (only `Element.cpp` and
+`Window.cpp` recompiled; the hook is last in `PageClient`, so the
+prebuilt LibWeb keeps its slots) and passing the JIT audit. jaild logged
+no WARNs, and evidence is in
+`~/atrium-vm/evidence/navigator-i6-2-beside-20261125/` on the Mac.
+
+1. Passed. `window-open` read `refused`, `elsewhere.example` showed beside
+   the page in the trail, both engines kept their pids, and the fixture
+   server saw no request for `elsewhere.example`.
+2. Passed. A copy of the fixture calls `window.open` from a timer 3 s after
+   load. It got `null` (`window-open-timer` refused), nothing was added
+   beside, and the popover named "a new window".
+3. Passed. Two presses 0.3 s apart added one entry, and the popover named
+   "a new window, too soon after the last".
+
 **Gate (Mac, arm64 Tessera),** after the I6.1 gate's setup:
 
 1. Run `app.html` live, press **Same origin page**: a new trail entry
