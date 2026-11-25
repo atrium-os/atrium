@@ -30,6 +30,15 @@ pub const PICKER_SLOT: u64 = 1;
 pub const TOOLBAR_H: f32 = 48.0;
 pub const FORMULA_H: f32 = 30.0;
 pub const STATUS_H: f32 = 26.0;
+/// The zoom's range, in percent, as Excel's.
+pub const MIN_ZOOM: u16 = 10;
+pub const MAX_ZOOM: u16 = 400;
+/// One Zoom In or Zoom Out step, in percent.
+pub const ZOOM_STEP: u16 = 10;
+/// The toolbar's Format Painter button.
+const FORMAT_PAINTER_W: f32 = 124.0;
+/// The status bar's zoom control: −, the percent, +.
+const ZOOM_BAR_W: f32 = 96.0;
 
 /// What the toolbar asks the event loop for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +51,8 @@ pub enum Cmd {
     Selected,
     /// Escape: Format Painter off.
     PainterOff,
+    /// The view's zoom, in percent (10–400).
+    Zoom(u16),
     /// Show or hide one of [`crate::data::STAT_NAMES`] in the status bar.
     StatsToggle(u8),
     /// Set, change or remove the document's password.
@@ -454,7 +465,12 @@ impl Sheets {
         const ALT_GUI: u8 = 0b1100_1100;
         // Ctrl+Alt+F9 (Excel's full calculation) is F9 here: F9 already does everything.
         let modifiers = if usage == 0x42 && modifiers & CTRL != 0 && modifiers & 0b0100_0100 != 0 && modifiers & 0b1010_1010 == 0 { 0 } else { modifiers };
-        if self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking || modifiers & ALT_GUI != 0 {
+        let blocked = self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking;
+        // Ctrl+Alt+= and Ctrl+Alt+-: Excel's zoom in and out (the cell being edited stays).
+        if !blocked && !self.launcher && matches!(usage, 0x2d | 0x2e) && modifiers & CTRL != 0 && modifiers & 0b0100_0100 != 0 && modifiers & 0b1000_1000 == 0 {
+            return Some(Cmd::Data(if usage == 0x2e { crate::data::DataCmd::ZoomIn } else { crate::data::DataCmd::ZoomOut }));
+        }
+        if blocked || modifiers & ALT_GUI != 0 {
             return None;
         }
         let (ctrl, shift) = (modifiers & CTRL != 0, modifiers & SHIFT != 0);
@@ -1134,6 +1150,65 @@ impl Sheets {
             Ok(()) => "Link opened.".to_string(),
             Err(why) => format!("The link didn't open: {why}."),
         });
+    }
+
+    /// The view's zoom in percent: rows, columns and cell text scale by it.
+    pub fn zoom_percent(&self) -> u16 {
+        (self.source.zoom.get() * 100.0).round() as u16
+    }
+
+    /// Zooms to `percent` (kept to 10–400 %), keeping each pane's top-left
+    /// cell where it is.
+    pub fn set_zoom(&self, percent: u16) {
+        use pergola::widgets::GridSource;
+        let z = f64::from(percent.clamp(MIN_ZOOM, MAX_ZOOM)) / 100.0;
+        let old = self.source.zoom.get();
+        if (z - old).abs() < 1e-9 {
+            return;
+        }
+        let scrolls = self.authoring.all_scrolls(self);
+        let tops: Vec<_> = scrolls.iter().map(|s| {
+            let st = s.get();
+            let (y, x) = (st.physics.y, st.physics_x.y);
+            let (r, c) = (self.source.row_at(y), self.source.col_at(x));
+            // The part of the top-left cell above (left of) the view, kept in proportion.
+            let fy = (y - self.source.row_top(r)) / old;
+            let fx = (x - self.source.col_left(c)) / old;
+            (r, c, fy, fx)
+        }).collect();
+        self.source.zoom.set(z);
+        for (scroll, (r, c, fy, fx)) in scrolls.iter().zip(tops) {
+            let mut st = scroll.get();
+            st.physics.stop();
+            st.physics_x.stop();
+            // The grid sets the true bounds on its next frame.
+            st.physics.set_max(f64::MAX);
+            st.physics_x.set_max(f64::MAX);
+            st.extent = None;
+            st.physics.set_position(self.source.row_top(r) + fy * z);
+            st.physics_x.set_position(self.source.col_left(c) + fx * z);
+            scroll.set(st);
+        }
+        self.set_status(&format!("Zoom {} %.", self.zoom_percent()));
+    }
+
+    /// The zoom that fits the selection into the active pane, as Excel's
+    /// Zoom to Selection, and the cell to bring to the top left.
+    fn zoom_to_selection(&self) {
+        use pergola::widgets::GridSource;
+        let sel = self.grid.get_cloned().selection();
+        let (w, h) = self.size.get();
+        let rect = Self::grid_rect(w, h);
+        let old = self.source.zoom.get();
+        let (sw, sh) = ((self.source.col_left(sel.c1 + 1) - self.source.col_left(sel.c0)) / old, (self.source.row_top(sel.r1 + 1) - self.source.row_top(sel.r0)) / old);
+        let (bw, bh) = (f64::from(rect.w() - 56.0).max(40.0), f64::from(rect.h() - pergola::widgets::grid_view::HEADER_H - 16.0).max(40.0));
+        let fit = (bw / sw.max(1.0)).min(bh / sh.max(1.0)) * 100.0;
+        self.set_zoom(fit.clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)).floor() as u16);
+        let scroll = self.authoring.active_scroll(self);
+        let mut st = scroll.get();
+        st.physics.set_position(self.source.row_top(sel.r0));
+        st.physics_x.set_position(self.source.col_left(sel.c0));
+        scroll.set(st);
     }
 
     /// Selects cell (`r`, `c`) of the sheet on screen and scrolls it into view.
@@ -2376,12 +2451,12 @@ impl Sheets {
                 // edge one of theirs, all of them take the size.
                 GridAction::ResizeCol { col, width } => {
                     let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
-                    doc.borrow_mut().size_preview(false, lo, hi, width);
+                    doc.borrow_mut().size_preview(false, lo, hi, width / src.zoom.get());
                     rev.set(rev.get().wrapping_add(1));
                 }
                 GridAction::ResizeRow { row, height } => {
                     let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
-                    doc.borrow_mut().size_preview(true, lo, hi, height);
+                    doc.borrow_mut().size_preview(true, lo, hi, height / src.zoom.get());
                     rev.set(rev.get().wrapping_add(1));
                 }
                 // A double-click on the fill handle: down along the data beside it.
@@ -2401,6 +2476,11 @@ impl Sheets {
                 }
                 // Ctrl+Alt+V: the Paste Special bar.
                 GridAction::PasteSpecial => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::PasteSpecial)),
+                // Ctrl+wheel or a pinch: the zoom times `f`.
+                GridAction::Zoom(f) => {
+                    let p = (src.zoom.get() * f64::from(f) * 100.0).round().clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)) as u16;
+                    cmds.lock().unwrap().push(Cmd::Zoom(p));
+                }
                 GridAction::Selected(_) => cmds.lock().unwrap().push(Cmd::Selected),
                 // Shift+F2: the cursor cell's comment.
                 GridAction::Comment => cmds.lock().unwrap().push(Cmd::Tab(crate::tabs::TabCmd::Commenting)),
@@ -2460,7 +2540,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Outline { .. } | GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::AutoSum(_) | GridAction::GoTo | GridAction::Repeat | GridAction::Sheet(_) | GridAction::Comment | GridAction::Selected(_) | GridAction::PasteSpecial | GridAction::Zoom(_) | GridAction::Format(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -2682,6 +2762,12 @@ impl View for Sheets {
             .width(84.0)
             .render(ctx);
             x += 92.0;
+            // Format Painter: pressed again while on, it stays on (Excel's double-click).
+            let cmds = self.cmds.clone();
+            let on = self.painter.borrow().is_some();
+            let button = if on { Button::primary("Format Painter") } else { Button::secondary("Format Painter") };
+            button.at(x, 8.0).width(FORMAT_PAINTER_W).on_click(move || cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::FormatPainter))).render(ctx);
+            x += FORMAT_PAINTER_W + 8.0;
         }
         {
             let cmds = self.cmds.clone();
@@ -2761,9 +2847,27 @@ impl View for Sheets {
         let mode = gs.edit_mode().map(|m| match m {
             pergola::widgets::EditMode::Enter => "Enter",
             pergola::widgets::EditMode::Edit => "Edit",
-        }).or(gs.extending().then_some("Extend Selection"));
+        }).or(gs.extending().then_some("Extend Selection")).or(gs.end_mode().then_some("End Mode"));
         let mode_w = if mode == Some("Extend Selection") { 120.0 } else { 60.0 };
         let mut room = if mode.is_some() { mode_w + 12.0 } else { 0.0 };
+        // The zoom, at the far right as in Excel: −, the percent (a press: 100 %), +.
+        {
+            let zoom = self.zoom_percent();
+            let x = (w - 12.0 - room - ZOOM_BAR_W).max(12.0);
+            for (i, (label, cmd)) in [("−", crate::data::DataCmd::ZoomOut), ("+", crate::data::DataCmd::ZoomIn)].into_iter().enumerate() {
+                let cmds = self.cmds.clone();
+                let mut button = Button::secondary(label).at(x + i as f32 * (ZOOM_BAR_W - 24.0), sy + 2.0).width(24.0).on_click(move || cmds.lock().unwrap().push(Cmd::Data(cmd)));
+                button.rect.size.h = STATUS_H - 4.0;
+                button.render(ctx);
+            }
+            let style = st(type_size::XS, Weight::Regular, t.text_primary());
+            let text = format!("{zoom}%");
+            let tw = Node::measure_text(&text, &style).w.ceil() + 2.0;
+            let hit = ctx.add(Node::Text { rect: Rect::new(x + (ZOOM_BAR_W - tw) / 2.0, sy + 4.0, tw, 18.0), content: text, style });
+            let cmds = self.cmds.clone();
+            ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Zoom100)));
+            room += ZOOM_BAR_W + 16.0;
+        }
         // The selection's Average, Count and Sum, at the right as in Excel.
         if let Some(summary) = self.selection_summary() {
             let style = st(type_size::XS, Weight::Regular, t.text_primary());
@@ -3979,6 +4083,31 @@ impl Sheets {
                         self.paint();
                         self.changed();
                     }
+                    false
+                }
+                Cmd::Zoom(p) => {
+                    self.set_zoom(p);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::ZoomIn) => {
+                    self.set_zoom(self.zoom_percent().saturating_add(ZOOM_STEP) / ZOOM_STEP * ZOOM_STEP);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::ZoomOut) => {
+                    self.set_zoom(self.zoom_percent().saturating_sub(1) / ZOOM_STEP * ZOOM_STEP);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::Zoom100) => {
+                    self.set_zoom(100);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::ZoomSelection) => {
+                    self.zoom_to_selection();
+                    self.changed();
                     false
                 }
                 Cmd::PainterOff => {
@@ -8089,6 +8218,66 @@ mod tests {
         select(&s, (2, 1), (2, 1));
         run(Cmd::Selected);
         assert!(!st(2, 1).font.bold);
+    }
+
+    #[test]
+    fn zoom_scales_rows_columns_and_text_and_keeps_the_top_left_cell() {
+        use crate::data::DataCmd;
+        use pergola::widgets::GridSource;
+        let s = sheets_of(b"a,b\n1,2\n3,4\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        assert_eq!(s.zoom_percent(), 100);
+        let (top10, left3) = (s.source.row_top(10), s.source.col_left(3));
+        let text = s.source.cell(0, 0).and_then(|v| v.size).unwrap_or(pergola::theme::type_size::SM);
+        let (fit_w, fit_h) = (s.source.fit_width(0), s.source.fit_height(0));
+        // Scrolled to row 11 and column D, then 200 %: the same cell at the top left.
+        let mut st = s.scroll.get();
+        st.physics.set_max(1e9);
+        st.physics_x.set_max(1e9);
+        st.physics.set_position(top10);
+        st.physics_x.set_position(left3);
+        s.scroll.set(st);
+        run(Cmd::Zoom(200));
+        assert_eq!(s.zoom_percent(), 200);
+        assert_eq!(s.source.row_top(10), 2.0 * top10);
+        assert_eq!(s.source.col_left(3), 2.0 * left3);
+        assert_eq!((s.scroll.get().physics.y, s.scroll.get().physics_x.y), (2.0 * top10, 2.0 * left3));
+        assert_eq!((s.source.row_at(2.0 * top10 + 1.0), s.source.col_at(2.0 * left3 + 1.0)), (10, 3));
+        assert_eq!(s.source.cell(0, 0).and_then(|v| v.size), Some(2.0 * text));
+        // A fitted width or height is in 100 % units whatever the zoom.
+        assert_eq!((s.source.fit_width(0), s.source.fit_height(0)), (fit_w, fit_h));
+        // Ctrl+Alt+= and Ctrl+Alt+-: 10 % steps, to the step below or above.
+        let (ctrl_alt, ctrl) = (0b0101, 0b0001);
+        let zin = s.window_key(0x2e, ctrl_alt);
+        assert!(matches!(zin, Some(Cmd::Data(DataCmd::ZoomIn))));
+        assert!(matches!(s.window_key(0x2d, ctrl_alt), Some(Cmd::Data(DataCmd::ZoomOut))));
+        assert!(s.window_key(0x2e, ctrl).is_none() && s.window_key(0x2e, ctrl_alt | 0b1000).is_none());
+        run(zin.unwrap());
+        assert_eq!(s.zoom_percent(), 210);
+        run(Cmd::Zoom(105));
+        run(Cmd::Data(DataCmd::ZoomOut));
+        assert_eq!(s.zoom_percent(), 100);
+        run(Cmd::Zoom(105));
+        run(Cmd::Data(DataCmd::ZoomIn));
+        assert_eq!(s.zoom_percent(), 110);
+        // Kept to 10–400 %.
+        run(Cmd::Zoom(1000));
+        assert_eq!(s.zoom_percent(), 400);
+        run(Cmd::Zoom(1));
+        assert_eq!(s.zoom_percent(), 10);
+        run(Cmd::Data(DataCmd::Zoom100));
+        assert_eq!(s.zoom_percent(), 100);
+        assert_eq!(s.source.row_top(10), top10);
+        // Zoom to Selection: two cells fill the grid, at its top left.
+        select(&s, (1, 0), (2, 1));
+        run(Cmd::Data(DataCmd::ZoomSelection));
+        let z = s.zoom_percent();
+        assert!(z > 100, "{z}");
+        assert_eq!((s.scroll.get().physics.y, s.scroll.get().physics_x.y), (s.source.row_top(1), 0.0));
+        // The status bar shows the percent; the toolbar has Format Painter.
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        let has = |t: &str| tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == t));
+        assert!(has(&format!("{z}%")) && has("Format Painter"));
     }
 
     #[test]

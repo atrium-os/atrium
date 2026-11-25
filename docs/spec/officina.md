@@ -4973,6 +4973,18 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - pergola's grid now sends `GridAction::Selected(range)` when a press in the cells or the headers ends. Sheets turns that into `Cmd::Selected`, which paints only while the painter is on. `data::paint_formats` uses the clipboard's Paste Formats path on a private copy (`Clip::take`), so the user's clipboard is untouched. At most `MAX_PAINT_TILES` (4,096) copies are made.
 - Tests: `format_painter_paints_the_next_selection_once_or_until_escape` (Sheets) and the drag and header tests (pergola), which now check that `Selected` comes once at the end of a press. All 155 Sheets and 242 pergola lib tests pass.
 
+### 16.127 Zoom, stepping through a selection, End mode, Format Painter button (2026-11-25)
+
+- **Zoom**, 10–400 %, per window (not saved with the workbook yet). Ctrl+wheel and a trackpad pinch zoom; **Ctrl+Alt+=** and **Ctrl+Alt+-** (Excel's) and the cell menu's Zoom In and Zoom Out go in 10 % steps to the next step up or down. Zoom to 100% and **Zoom to Selection** (fits the selection in the grid and puts it at the top left) are in the cell menu. The status bar shows the percent between − and + buttons at its right; pressing the percent goes back to 100 %.
+- Rows, columns, cell text and charts scale; headers keep their size. Each pane (split or not) keeps its top-left cell when the zoom changes. Dragged column and row edges and fitted sizes are kept in 100 % units, so a size made at 150 % is the same at 100 %.
+- How: `SheetSource::zoom` multiplies `row_top`/`col_left` and divides `row_at`/`col_at`; `cell` scales the text size, and `cell_at_100` keeps the unscaled view for fitting. pergola's `GridSource::zoom()` sizes the in-cell editor, and the grid sends `GridAction::Zoom(factor)` for Ctrl+wheel or a pinch instead of scrolling; Sheets turns it into `Cmd::Zoom(percent)`.
+- **Enter and Tab in a selection of several cells** step the active cell through it, as Excel does: Enter down the column and on to the next column, Tab across the row and on to the next row, round to the first after the last; Shift goes back. The selection stays, so a block can be typed in cell by cell: typing enters the active cell, and Enter or Tab enters it and goes on. Any other move drops the selection. On a single cell Enter still opens the editor. pergola keeps the selection in `GridState::held` while the active cell steps (`step_in_selection`).
+- **End mode**: End, then an arrow goes to the data's edge as Ctrl+arrow does (Shift extends); End then Home goes to the last used cell. The status bar shows "End Mode" while it is on; any other key or a press ends it.
+- **Ctrl+Shift+Space** selects everything.
+- **Format Painter** is now a toolbar button too, shown pressed while the painter is on. Pressing it again while on keeps it on, as Excel's double-click.
+- Tests: `enter_and_tab_step_through_a_selection_end_mode_and_ctrl_wheel_zoom` (pergola; `keys_move_extend_and_edit` now expects Enter to stay in the selection) and `zoom_scales_rows_columns_and_text_and_keeps_the_top_left_cell` (Sheets). All 156 Sheets and 245 pergola lib tests pass.
+- Not yet: zoom saved per sheet in the workbook, and headers scaling with it.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
