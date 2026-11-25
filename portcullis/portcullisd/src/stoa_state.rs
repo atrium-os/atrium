@@ -3,10 +3,11 @@
 //! never in stoad's own state.
 //!
 //! stoad asks (`SessionStateDir { uid, persona }`) the first time a person
-//! mints a session in a persona. portcullisd makes
-//! `<persona apps dir>/.stoa/` (root's, 0700) and in it `sessions/`
-//! (stoad's uid, 0700), asks the kernel that the folder is in an open key
-//! group, and hands stoad the open directory. stoad names no path of a
+//! mints a session in a persona; a named persona must be one of theirs.
+//! portcullisd makes nothing but `<persona apps dir>/.stoa/` (root's, 0700)
+//! and in it `sessions/` (stoad's uid, 0700), in an apps folder an app
+//! launch already prepared; it asks the kernel that the folder is in an
+//! open key group, and hands stoad the open directory. stoad names no path of a
 //! person's and opens nothing it wasn't given. Without an open, encrypted
 //! group there is no directory: the session is kept in memory only.
 //!
@@ -39,22 +40,18 @@ fn directory(path: &Path, uid: u32, mode: u32) -> Result<(), String> {
 }
 
 /// The persona's apps folder: Personal's `~/.atrium/apps`, a named
-/// persona's `~/.atrium/persona-apps/<persona>`. Root's, not writable by
-/// group or others.
+/// persona's `~/.atrium/persona-apps/<persona>`. Only looked at: the
+/// ordinary app launch prepares it (and its key group), as for Fasti. It
+/// must be root's and not writable by group or others.
 fn parent(person: &str, persona: &str) -> Result<PathBuf, String> {
     let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
     let home = fs::canonicalize(&home).map_err(|e| format!("{}: {e}", home.display()))?;
-    // Plain app data (a dev machine's opt-out, a migrating login) keeps
-    // no sessions: only an open key group does.
-    if portcullisd::home::ensure_app_data(person, (persona != "personal").then_some(persona))? != portcullisd::home::AppData::Sealed {
-        return Err(format!("{person}'s {persona} app data is not encrypted here"));
-    }
-    let p = if persona == "personal" {
-        portcullis_overlay::apps_root(&home)?
+    let p = home.join(".atrium").join(if persona == "personal" {
+        PathBuf::from("apps")
     } else {
-        portcullis_overlay::persona_apps_dir(&home, persona)
-    };
-    let m = fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        Path::new(portcullis_overlay::PERSONA_APPS).join(persona)
+    });
+    let m = fs::symlink_metadata(&p).map_err(|e| format!("{} ({e}): no app has run in {persona} yet", p.display()))?;
     if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
         return Err(format!("{} is not root's own folder", p.display()));
     }

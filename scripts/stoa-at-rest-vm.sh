@@ -19,7 +19,8 @@
 #      scrollback;
 #   3. the marker is not on the raw device, nor in /tmp;
 #   4. a persona with no key group: attach says the history is not kept,
-#      and nothing of it is written;
+#      and nothing of it is written; a persona that isn't theirs gets no
+#      folder made for it;
 #   5. Work is removed (stoad is told DROP … erase, as portcullisd does;
 #      the key goes and the kernel crypto-erases the group): the session
 #      is gone, after a restart too;
@@ -29,7 +30,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/scripts/lib/gate.sh"
-gate_begin stoa-at-rest 22
+gate_begin stoa-at-rest 24
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
@@ -75,6 +76,8 @@ mount -t tessera /dev/\$MD $M
 mkdir -p $M/home $M/plain; chmod 755 $M/home $M/plain
 pw userdel $P >/dev/null 2>&1 || true
 pw useradd $P -u 1077 -d $M/home/$P -s /bin/sh
+# Their personas: Work (a key group below) and Play (none).
+mkdir -p /var/db/atrium/$P; printf '[personas.work]\ncolour = "blue"\n\n[personas.play]\ncolour = "green"\n' > /var/db/atrium/$P/policy.toml
 mkdir -p $M/home/$P/.atrium/persona-apps/work $M/home/$P/.atrium/persona-apps/play
 chown $P:$P $M/home/$P; chmod 755 $M/home/$P
 chown root:wheel $M/home/$P/.atrium $M/home/$P/.atrium/persona-apps $M/home/$P/.atrium/persona-apps/*
@@ -138,6 +141,9 @@ check "attach says the history is not kept" yes "$(echo "$out" | grep -aq "histo
 check "…and the session runs" yes "$(echo "$out" | grep -aq "${MK}p42" && echo yes || echo no)"
 check "nothing written for it" 0 "$(V "ls -A $M/home/$P/.atrium/persona-apps/play | wc -l" | tr -d ' ')"
 check "stoad said why" yes "$(V "grep -q 'kept in memory only' $B/stoad.log" && echo yes || echo no)"
+out=$(attach x1 elsewhere "true\\r")
+check "a persona that isn't theirs: not kept either" yes "$(echo "$out" | grep -aq "history is not kept" && echo yes || echo no)"
+check "…and no folder is made for it" no "$(V "test -e $M/home/$P/.atrium/persona-apps/elsewhere && echo yes || echo no")"
 
 echo "=== 5. Work is removed: the session goes"
 check "stoad drops Work's sessions" yes "$(V "printf 'DROP 1077 work erase\\n' | nc -N -U $CTL" | grep -q '^OK' && echo yes || echo no)"
@@ -159,5 +165,5 @@ n=$(V "grep -ac '$MARK' /dev/$MD" | tr -d ' ')
 check "the grep finds the marker on /dev/$MD when kept in the clear" yes "$([ "${n:-0}" -gt 0 ] && echo yes || echo no)"
 
 stop_all
-V "umount -f $M >/dev/null 2>&1; mdconfig -d -u $MD >/dev/null 2>&1; pw userdel $P >/dev/null 2>&1; rm -rf $B /usr/local/bin/stoactl-rest; true"
+V "umount -f $M >/dev/null 2>&1; mdconfig -d -u $MD >/dev/null 2>&1; pw userdel $P >/dev/null 2>&1; rm -rf $B /var/db/atrium/$P /usr/local/bin/stoactl-rest; true"
 gate_end

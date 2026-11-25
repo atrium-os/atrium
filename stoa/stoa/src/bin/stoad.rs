@@ -185,7 +185,7 @@ fn snapshot_state(reg: &Reg, store: &Arc<Store>) -> PersistState {
             continue; // brand-new, never contacted — nothing meaningful yet
         };
         sessions.push(PersistSession {
-            name: name.clone(),
+            name: shown(name).to_string(),
             owner: s.owner,
             persona: s.persona.clone(),
             target: s.target.clone(),
@@ -266,13 +266,14 @@ fn restore_sessions(reg: &Reg, store: &Arc<Store>, only: Option<(u32, &str)>) {
     }
     let mut count = 0;
     for ps in st.sessions {
-        let mut map = reg.lock().unwrap();
-        if map.contains_key(&ps.name) {
-            continue;
-        }
         // An app's console isn't kept: its shells came from portcullisd,
         // and only a press there makes new ones.
-        if !persisted(&ps.name) {
+        if !persisted(&ps.name) || !valid_name(&ps.name) {
+            continue;
+        }
+        let key = reg_key(ps.owner, &ps.name);
+        let mut map = reg.lock().unwrap();
+        if map.contains_key(&key) {
             continue;
         }
         if only.is_some_and(|(o, p)| ps.owner != o || ps.persona != p) {
@@ -285,7 +286,7 @@ fn restore_sessions(reg: &Reg, store: &Arc<Store>, only: Option<(u32, &str)>) {
         };
         let port = udp.port();
         let (cols, rows) = (ps.cols, ps.rows);
-        let name = ps.name.clone();
+        let name = key;
         let state = Arc::new(SessionState {
             port,
             owner: ps.owner,
@@ -744,6 +745,25 @@ fn persisted(name: &str) -> bool {
     !name.starts_with(CONSOLE_PREFIX)
 }
 
+/// The table's key for `uid`'s session `name`: each person names their own
+/// sessions, so two people can both have "default". An app's console is
+/// root's (portcullisd's) and is keyed by its own name.
+fn reg_key(uid: u32, name: &str) -> String {
+    format!("{uid}/{name}")
+}
+
+/// The name its person gave a session, from its table key.
+fn shown(key: &str) -> &str {
+    key.split_once('/').map_or(key, |(_, n)| n)
+}
+
+/// A session name a person may give: one printable token, no `/` (the
+/// table key's separator), not a console's.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.starts_with(CONSOLE_PREFIX)
+        && name.bytes().all(|c| c.is_ascii_graphic() && c != b'/')
+}
+
 type Reg = Arc<Mutex<HashMap<String, Arc<SessionState>>>>;
 
 fn main() {
@@ -891,11 +911,15 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
             let name = parts.next().unwrap_or("default").to_string();
             let target = parts.next().unwrap_or("session").to_string();
             let persona = parts.next().unwrap_or("personal").to_string();
+            if !valid_name(&name) {
+                let _ = (&stream).write_all(b"ERR not a session name\n");
+                return;
+            }
             if !valid_persona(&persona) {
                 let _ = (&stream).write_all(b"ERR not a persona\n");
                 return;
             }
-            let reply = match mint(&reg, &name, &target, uid, &persona) {
+            let reply = match mint(&reg, &reg_key(uid, &name), &target, uid, &persona) {
                 Ok((port, key, kept)) => {
                     eprintln!("stoad: mint {name:?} target={target} persona={persona} → port {port} for uid {uid}{}",
                               if kept { "" } else { " (in memory only)" });
@@ -924,12 +948,16 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
                 .into_iter()
                 .filter(|(n, _, _)| mine.contains(n))
                 .filter(|(n, _, _)| uid == 0 || !n.starts_with(CONSOLE_PREFIX))
-                .map(|(n, nw, title)| format!("{n}\t{nw}\t{title}\n"))
+                .map(|(n, nw, title)| format!("{}\t{nw}\t{title}\n", if uid == 0 { n.as_str() } else { shown(&n) }))
                 .collect();
             let _ = (&stream).write_all(body.as_bytes());
         }
         Some("KILL") => {
-            let name = parts.next().unwrap_or("");
+            // A person names their own session; root names a table key
+            // (`<uid>/<name>`, as its LIST shows).
+            let given = parts.next().unwrap_or("");
+            let key = if uid == 0 && given.contains('/') { given.to_string() } else { reg_key(uid, given) };
+            let name = key.as_str();
             let (owner, store) = match reg.lock().unwrap().get(name) {
                 Some(s) => (s.owner, s.store.clone()),
                 None => (uid, None),
@@ -1166,7 +1194,7 @@ fn mint(reg: &Reg, name: &str, target: &str, uid: u32, persona: &str) -> Result<
             return Err("not yours".into());
         }
         if !s.dead.load(Ordering::SeqCst) && s.persona != persona {
-            return Err(format!("{name} is a session of {}", s.persona));
+            return Err(format!("{} is a session of {}", shown(name), s.persona));
         }
         if !s.dead.load(Ordering::SeqCst) {
             // Resume: keep the shell + port; rekey + reset the transport
@@ -1962,7 +1990,7 @@ fn write_all_fd(fd: i32, mut data: &[u8]) {
 
 #[cfg(test)]
 mod persist_tests {
-    use super::persisted;
+    use super::*;
 
     #[test]
     fn consoles_are_never_written() {
@@ -1970,5 +1998,57 @@ mod persist_tests {
         assert!(!persisted("console.alice:ws_scratch:2"));
         assert!(persisted("main"));
         assert!(persisted("alice-work"));
+    }
+
+    fn saved(name: &str, owner: u32) -> stoa::persist::PersistSession {
+        stoa::persist::PersistSession {
+            name: name.into(),
+            owner,
+            persona: "personal".into(),
+            target: "session".into(),
+            cols: 80,
+            rows: 24,
+            active: 0,
+            last_active: 0,
+            windows: Vec::new(),
+        }
+    }
+
+    fn store(tag: &str, sessions: Vec<stoa::persist::PersistSession>) -> Arc<Store> {
+        let d = std::env::temp_dir().join(format!("stoad-two-owners-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let st = Arc::new(Store::open_path(&d).unwrap());
+        st.save_state(&PersistState { version: stoa::persist::VERSION, sessions }).unwrap();
+        st
+    }
+
+    /// Two people each have a session called "default": both come back,
+    /// each from their own store, and each store is written with its own
+    /// alone (stoa.md §5.4a).
+    #[test]
+    fn two_owners_keep_the_same_name_apart() {
+        let reg: Reg = Arc::new(Mutex::new(HashMap::new()));
+        let a = store("a", vec![saved("default", 1001)]);
+        let b = store("b", vec![saved("default", 1002), saved("other", 1001)]);
+        restore_sessions(&reg, &a, Some((1001, "personal")));
+        restore_sessions(&reg, &b, Some((1002, "personal")));
+        let mut keys: Vec<String> = reg.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["1001/default", "1002/default"], "both restored, and 1001's session in 1002's store is not");
+        for (st, owner) in [(&a, 1001), (&b, 1002)] {
+            let snap = snapshot_state(&reg, st);
+            let got: Vec<(String, u32)> = snap.sessions.iter().map(|s| (s.name.clone(), s.owner)).collect();
+            assert_eq!(got, [("default".to_string(), owner)]);
+        }
+        assert_eq!(shown("1002/default"), "default");
+    }
+
+    #[test]
+    fn a_session_name_is_one_plain_token() {
+        assert!(valid_name("default") && valid_name("alice-work.2"));
+        for bad in ["", "a/b", "a b", "console.alice:x:1", "\u{1b}[2J"] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
     }
 }

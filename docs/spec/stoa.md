@@ -526,9 +526,20 @@ to a blob is dropped — Stoa does not need to know about it.
 - `DROP <uid> <persona|*> <keep|erase>` (root): portcullisd sends `keep` at logout
   (`SessionEnded`) and `erase` when a persona is removed. The sessions end and the store is
   let go.
+- The table is keyed by (owner, name) (`<uid>/<name>`), so two people can each have a
+  `default`; a person's `LIST` shows their own names. Session names are one printable token
+  without `/`.
+- `SessionStateDir` only checks: the persona must be one of the person's own (their tenant
+  policy), and its apps folder must already exist, root's, as an app launch made it.
+  portcullisd makes nothing there but `.stoa/sessions`, and never a persona's folder or key
+  group.
+- The persona is a label the person gives the session, saying where its history is kept. It
+  is not where the shell runs: the shell is the person's own, unjailed, in any persona, so
+  this keeps a Work session's history in Work's group and does not confine its shell to
+  Work.
 - `STOA_STATE` is now only a dev directory; unset there is no fallback. The services.d
   manifest has no data volume.
-- Gates: `scripts/stoa-at-rest-vm.sh` (check 5, 22 checks; needs `tessera_fs` and
+- Gates: `scripts/stoa-at-rest-vm.sh` (check 5, 24 checks; needs `tessera_fs` and
   `/root/sealed`; the key group comes from `tessera-keyload`, and Work's removal is played by
   sending `DROP … erase` and erasing the group, since the real removal needs a press and
   Sigillum), and `vm-console-check.sh` now runs stoad with a state folder and checks that no

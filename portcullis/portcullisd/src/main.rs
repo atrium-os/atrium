@@ -1129,7 +1129,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             continue;
         }
         if let Request::SessionStateDir { uid: of, persona } = req {
-            handle_session_state_dir(uid, of, &persona, &mut writer)?;
+            handle_session_state_dir(uid, of, &persona, &shared, &mut writer)?;
             continue;
         }
         let resp = handle(req, &user, &shared);
@@ -3821,7 +3821,7 @@ fn handle_govern(uid: u32, req: Request) -> Response {
 /// is a documented follow-up; today `_stoad` holds `jail_exec` for the seat.
 /// Stoa's session state (stoa.md §5.4a): only root or a services.d service
 /// granted `session_state` asks; the answer is the open directory.
-fn handle_session_state_dir(peer: u32, of: u32, persona: &str, writer: &mut UnixStream) -> std::io::Result<()> {
+fn handle_session_state_dir(peer: u32, of: u32, persona: &str, shared: &Mutex<Tenants>, writer: &mut UnixStream) -> std::io::Result<()> {
     let refuse = |w: &mut UnixStream, why: String| {
         eprintln!("portcullisd: Stoa session state of uid {of} ({persona}): {why}");
         write_response(w, &Response::Error { message: why })
@@ -3839,6 +3839,17 @@ fn handle_session_state_dir(peer: u32, of: u32, persona: &str, writer: &mut Unix
         Ok(p) => p,
         Err(e) => return refuse(writer, format!("uid {of}: {e}")),
     };
+    // A named persona must be one of the person's own: stoad passes on
+    // the label the person typed.
+    if persona != "personal" {
+        let known = portcullis_peer::valid_person_persona(persona) && {
+            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            s.get_or_load(&person).map(|tp| tp.policy.has_persona(Some(persona))).unwrap_or(false)
+        };
+        if !known {
+            return refuse(writer, format!("{persona:?} is not one of {person}'s personas"));
+        }
+    }
     match stoa_state::dir_for(peer, of, &person, persona) {
         Ok(fd) => {
             write_response(writer, &Response::SessionStateDirReady)?;
