@@ -312,7 +312,9 @@ impl<V: View> ScrollView<V> {
 }
 
 impl<V: View> View for ScrollView<V> {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -456,7 +458,9 @@ mod tests {
     }
 
     impl View for Doc {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let rows = crate::view::Draw(|ctx: &mut Ctx| {
                 for i in 0..50 {
                     ctx.add(Node::Rect {
@@ -485,7 +489,9 @@ mod tests {
     }
 
     impl View for Prose {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let w = self.width.get();
             let body = crate::view::Draw(move |ctx: &mut Ctx| {
                 let col = ctx.push(Node::vstack(Rect::new(0.0, 0.0, w, 0.0), 8.0));
@@ -667,7 +673,9 @@ mod tests {
     }
 
     impl View for Wide {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let rows = crate::view::Draw(|ctx: &mut Ctx| {
                 for i in 0..50 {
                     ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, 900.0, 40.0), fill: Color::rgba(i as f32 / 50.0, 0.0, 0.0, 1.0), radius: 0.0 });

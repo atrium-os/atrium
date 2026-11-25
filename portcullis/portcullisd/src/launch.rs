@@ -135,7 +135,25 @@ pub fn launch_debug(app_id: &str, user: &str, conn: OwnedFd) -> Result<LaunchOut
     if !app_id.starts_with("dev.") {
         return Err(LaunchError::Failed("debug", format!("{app_id} is not a dev build: installed apps are never debugged")));
     }
-    launch_inner(app_id, None, user, None, Some(conn), None, None)
+    launch_inner(app_id, None, user, None, Some(DevLink::Debugger(conn)), None, None)
+}
+
+/// Run dev app `app_id` with the inspector (dev-tools.md §3.6, D23–D25):
+/// `sock` is put at fd 3 in its jail and named by `ATRIUM_INSPECT_FD=3`; a
+/// Pergola dev build answers the IDE on it. Only `dev.` apps, as for the
+/// debugger.
+pub fn launch_inspected(app_id: &str, user: &str, sock: OwnedFd) -> Result<LaunchOutcome, LaunchError> {
+    if !app_id.starts_with("dev.") {
+        return Err(LaunchError::Failed("inspect", format!("{app_id} is not a dev build: installed apps are never inspected")));
+    }
+    launch_inner(app_id, None, user, None, Some(DevLink::Inspector(sock)), None, None)
+}
+
+/// What an IDE holds to a dev app it started: a debugger's connection
+/// (lldb-server's), or the inspector's socket.
+pub enum DevLink {
+    Debugger(OwnedFd),
+    Inspector(OwnedFd),
 }
 
 /// What a debug run mounts at [`DEBUG_IN_JAIL`]: lldb-server and sh from
@@ -492,11 +510,16 @@ fn launch_inner(
     persona: Option<&str>,
     user:    &str,
     stdio:   Option<[OwnedFd; 3]>,
-    debug:   Option<OwnedFd>,
+    dev:     Option<DevLink>,
     files_bundle: Option<&mut Option<BundleIdentity>>,
     mut document: Option<WorkbookLaunch>,
 ) -> Result<LaunchOutcome, LaunchError> {
     let mut stdio = stdio;
+    let (debug, inspector) = match dev {
+        Some(DevLink::Debugger(c)) => (Some(c), None),
+        Some(DevLink::Inspector(c)) => (None, Some(c)),
+        None => (None, None),
+    };
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
         return Err(LaunchError::Failed("persona", "invalid persona name".into()));
     }
@@ -597,7 +620,7 @@ fn launch_inner(
     let sysfil = app_sysfil(&manifest)?;
     let mut app_run = AppRun {
         owner: user.to_string(), app_id: app_id.to_string(), debug: debug.is_some(),
-        uid: app_uid, user: run_as_user.clone(), home: user_home.clone(), args: Vec::new(),
+        inspect: inspector.is_some(), uid: app_uid, user: run_as_user.clone(), home: user_home.clone(), args: Vec::new(),
         syscall_class: portcullis_jail::sysfil_class(&manifest.capabilities),
         app_data: None,
     };
@@ -763,10 +786,10 @@ fn launch_inner(
             ensure_mountpoints(&setup_jc)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             let setup_run = AppRun {
-                debug: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), ..app_run.clone()
+                debug: false, inspect: false, syscall_class: portcullis_jail::sysfil_class(&setup_manifest.capabilities), ..app_run.clone()
             };
             /* The setup's output goes to the daemon's. */
-            let setup_exit = run_one_jail(&setup_jc, &jail_path, None, &setup_run, None, None)
+            let setup_exit = run_one_jail(&setup_jc, &jail_path, None, Vec::new(), &setup_run, None, None)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             if setup_exit != Some(0) {
                 full_teardown(&jail_path, None);
@@ -919,6 +942,20 @@ fn launch_inner(
         stdio = Some([conn, out, out2]);
         eprintln!("portcullisd: {app_id} starts under lldb-server");
     }
+    /* ★ The inspector's socket at fd 3 (after the three stdio, which are
+     * the daemon's: an inspected run is otherwise a plain Run). */
+    let mut extra = Vec::new();
+    if let Some(sock) = inspector {
+        let err = |e: std::io::Error| { full_teardown(&jail_path, None); LaunchError::Failed("inspect", e.to_string()) };
+        if stdio.is_none() {
+            let null: OwnedFd = fs::File::open("/dev/null").map_err(err)?.into();
+            let out = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned().map_err(err)?;
+            let out2 = out.try_clone().map_err(err)?;
+            stdio = Some([null, out, out2]);
+        }
+        extra.push(sock);
+        eprintln!("portcullisd: {app_id} starts with the inspector at fd 3");
+    }
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
         return Err(e);
@@ -928,7 +965,7 @@ fn launch_inner(
         ready.send(result).map_err(|_| LaunchError::Failed("document", "recovery setup timed out".into()))?;
         Some(RecoveryStart { uid: app_uid, started, slot: doc.slot.0, pending: doc.pending.clone() })
     } else { None };
-    let outcome = run_one_jail(&jc, &jail_path, stdio, &app_run, refresh_groups.then_some(app_uid), recovery_start);
+    let outcome = run_one_jail(&jc, &jail_path, stdio, extra, &app_run, refresh_groups.then_some(app_uid), recovery_start);
 
     let clean = full_teardown(&jail_path, Some(&jc.name));
     if refresh_groups && !clean {
@@ -1232,6 +1269,8 @@ pub struct AppRun {
     pub app_id: String,
     /// Started under lldb-server (M10).
     pub debug:  bool,
+    /// The inspector's socket is at fd 3 (dev-tools.md §3.6).
+    pub inspect: bool,
     pub uid:    u32,
     /// The uid's account name, for its supplementary groups.
     pub user:   String,
@@ -1263,6 +1302,9 @@ fn clean_env(run: &AppRun) -> Vec<jaild::protocol::EnvPair> {
     }
     if let Some(d) = run.app_data {
         env.push(pair("ATRIUM_APP_DATA", d.env_value().into()));
+    }
+    if run.inspect {
+        env.push(pair("ATRIUM_INSPECT_FD", "3".into()));
     }
     env
 }
@@ -1307,6 +1349,7 @@ fn run_one_jail(
     jc:        &JailConfig,
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
+    extra:     Vec<OwnedFd>,
     run:       &AppRun,
     refresh_uid: Option<u32>,
     recovery_start: Option<RecoveryStart>,
@@ -1342,7 +1385,7 @@ fn run_one_jail(
     /* jaild mounts this jail's devfs; one left from a run that died would
      * be stacked under it. */
     let _ = umount_silent(&jail_path.join("dev"));
-    let running = portcullisd::jaild_jail::create(req, stdio).map_err(fail("jail"))?
+    let running = portcullisd::jaild_jail::create_with(req, stdio, extra).map_err(fail("jail"))?
         .ok_or_else(|| LaunchError::Failed("jail", "jaild started no entry".into()))?;
     let status = match (recovery_start, refresh_uid) {
         (Some(start), _) => wait_for_recovery(&running, &jc.name, start),

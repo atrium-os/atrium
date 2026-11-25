@@ -14,6 +14,8 @@
 #		[bundle] extra-libs it loads with dlopen; BUNDLE_FLAGS passes
 #		--sign <key.pem>, --out <dir> and the rest
 # make clean
+# make ATRIUM_DEBUG=1	builds at -O0, so a debugger sees every variable
+#		(Artifex's Debug builds this way)
 #
 # The SDK's libraries are in the base (/usr/lib, /usr/include/atrium); the
 # rest come from pkg (/usr/local) or a workspace this one uses
@@ -29,6 +31,9 @@ CFLAGS?=	-O2
 # applied): Debug and cores need it, and `make bundle` strips it into
 # <tree>.debug for a release (dev-tools-plan.md M10).
 CFLAGS+=	-g -Wall -I/usr/include/atrium
+.if defined(ATRIUM_DEBUG) && ${ATRIUM_DEBUG} != "0"
+CFLAGS+=	-O0
+.endif
 LDFLAGS+=	-Wl,-rpath,/usr/local/lib
 
 .for _l in ${ATRIUM_LIBS}
@@ -45,6 +50,12 @@ LDADD+=		${_pc_libs_${_l}}
 .endfor
 
 all: ${PROG}
+
+# The objects depend on the flags they were built with, so switching
+# between a Debug build and a plain one rebuilds them.
+_ATRIUM_FLAGS=	.atrium-cflags
+_flags!=	printf '%s\n' ${CFLAGS:Q} > ${_ATRIUM_FLAGS}.new; cmp -s ${_ATRIUM_FLAGS}.new ${_ATRIUM_FLAGS} && rm -f ${_ATRIUM_FLAGS}.new || mv -f ${_ATRIUM_FLAGS}.new ${_ATRIUM_FLAGS}; echo
+${OBJS}: ${_ATRIUM_FLAGS}
 
 ${PROG}: ${OBJS}
 	${CC} ${LDFLAGS} -o ${.TARGET} ${OBJS} ${LDADD}
@@ -70,7 +81,7 @@ bundle: ${PROG} atrium.toml
 	${CARGO_ATRIUM} bundle ${BUNDLE_FLAGS}
 
 clean:
-	rm -f ${PROG} ${OBJS}
+	rm -f ${PROG} ${OBJS} ${_ATRIUM_FLAGS}
 	rm -rf bundle
 
 .PHONY: all run bundle clean

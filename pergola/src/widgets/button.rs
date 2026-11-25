@@ -124,7 +124,9 @@ impl Button {
 }
 
 impl View for Button {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::button_height() };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.natural_width(), h);
 

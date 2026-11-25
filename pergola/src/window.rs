@@ -101,6 +101,12 @@ pub struct Window {
     min_floor: (u32, u32),
     /// Where the last [`Window::paint`] spent its time.
     pub last_paint: PaintTiming,
+    /// The IDE's inspector, when it started this dev build ([`crate::inspect`]).
+    #[cfg(debug_assertions)]
+    inspect: Option<crate::inspect::Link>,
+    /// The release of a press the inspector took.
+    #[cfg(debug_assertions)]
+    swallow_release: bool,
 }
 
 /// The parts of one [`Window::paint`], in milliseconds: rendering and diffing the
@@ -268,6 +274,10 @@ impl Window {
             min_due: desc.hosted.is_none(),
             min_sent: desc.hints.min_size.unwrap_or((0, 0)),
             min_floor: desc.hints.min_size.unwrap_or((0, 0)),
+            #[cfg(debug_assertions)]
+            inspect: if desc.hosted.is_none() { crate::inspect::Link::from_env() } else { None },
+            #[cfg(debug_assertions)]
+            swallow_release: false,
         })
     }
 
@@ -286,6 +296,8 @@ impl Window {
     /// Paint one frame now (initial paint, or after out-of-loop state
     /// changes).
     pub fn paint<V: View>(&mut self, app: &mut App<V>) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        self.serve_inspector(app);
         app.set_time(self.now_ms());
         if let Some(t) = self.appearance.take().filter(|_| self.follow_appearance) {
             app.set_theme(t);
@@ -300,6 +312,14 @@ impl Window {
         app.frame();
         let deltas = app.tick();
         let t1 = std::time::Instant::now();
+        #[cfg(debug_assertions)]
+        if !deltas.is_empty() {
+            if let Some(l) = self.inspect.as_mut().filter(|l| l.following) {
+                // Once until it asks again: it fetches when it wants to.
+                l.following = false;
+                l.send(&crate::inspect::Tell::Changed);
+            }
+        }
         if min_due {
             self.send_min_size(app);
         }
@@ -504,6 +524,12 @@ impl Window {
     fn wait_for<V: View>(&self, app: &App<V>, cap: Option<Duration>) -> Option<Duration> {
         // A socket timeout can't be zero: "now" is the shortest wait.
         const NOW: Duration = Duration::from_micros(100);
+        // The inspector's socket is read between events.
+        #[cfg(debug_assertions)]
+        let cap = match (&self.inspect, cap) {
+            (Some(_), c) => Some(c.map_or(INSPECT_POLL, |c| c.min(INSPECT_POLL))),
+            (None, c) => c,
+        };
         self.wait_raw(app, cap).map(|d| d.max(NOW))
     }
 
@@ -554,7 +580,7 @@ impl Window {
                 if self.closes(&ev) {
                     return Ok(StepResult::Closed);
                 }
-                if !first(&ev) {
+                if !self.inspector_takes(&ev, app) && !first(&ev) {
                     self.window_event(&ev, app);
                     if let Some(pev) = translate(&ev) {
                         app.handle_event_activated(pev, activation_of(&ev));
@@ -593,6 +619,10 @@ impl Window {
             app.set_time(self.now_ms());
             let ev = self.to_tree(ev);
 
+            if self.inspector_takes(&ev, app) {
+                self.paint(app)?;
+                continue;
+            }
             let mut flow = Flow { exit: false, consumed: false };
             hook(&ev, app, &mut flow);
             if flow.exit {
@@ -611,6 +641,73 @@ impl Window {
 
             self.paint(app)?;
         }
+    }
+}
+
+/// How often the inspector's socket is read while nothing else happens.
+#[cfg(debug_assertions)]
+const INSPECT_POLL: Duration = Duration::from_millis(200);
+
+impl Window {
+    /// Answer what the inspector asked (dev builds).
+    #[cfg(debug_assertions)]
+    fn serve_inspector<V: View>(&mut self, app: &mut App<V>) {
+        use crate::inspect::{Ask, Tell};
+        let Some(l) = self.inspect.as_mut() else { return };
+        let asks = match l.poll() {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("window: inspector: {e}; it is gone");
+                self.inspect = None;
+                app.set_marks(Default::default());
+                return;
+            }
+        };
+        for a in asks {
+            match a {
+                Ask::Tree => {
+                    l.following = true;
+                    l.send(&Tell::Tree(crate::inspect::snapshot(app.tree(), app.mark_ids())));
+                }
+                Ask::Pick(on) => l.picking = on,
+                Ask::Highlight(id) => {
+                    l.marks.highlight = id.map(crate::node::NodeId);
+                    app.set_marks(l.marks.clone());
+                }
+                Ask::Bounds(on) => {
+                    l.marks.bounds = on;
+                    app.set_marks(l.marks.clone());
+                }
+            }
+        }
+    }
+
+    /// Whether `ev` is the inspector's: the press it waits for to pick a
+    /// node, and that press's release. The app never sees them.
+    fn inspector_takes<V: View>(&mut self, ev: &fresco_client::Event, app: &mut App<V>) -> bool {
+        #[cfg(debug_assertions)]
+        if let fresco_client::Event::PointerButton { window_id, x, y, pressed, .. } = *ev {
+            if window_id != self.main {
+                return false;
+            }
+            if !pressed && std::mem::take(&mut self.swallow_release) {
+                return true;
+            }
+            if let Some(l) = self.inspect.as_mut().filter(|l| l.picking && pressed) {
+                l.picking = false;
+                self.swallow_release = true;
+                let at = crate::geom::Point::new(x, y);
+                if let Some(id) = crate::inspect::pick(app.tree(), at, app.mark_ids()) {
+                    l.marks.highlight = Some(id);
+                    app.set_marks(l.marks.clone());
+                    l.send(&crate::inspect::Tell::Picked(id.0));
+                }
+                return true;
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = (ev, app);
+        false
     }
 }
 
@@ -673,7 +770,9 @@ mod tests {
     /// A hairline whose points stay put while its window grows.
     struct Line;
     impl View for Line {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             ctx.add(Node::Rect { rect: Rect::new(0.0, 37.0, 100.0, 1.0), fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0 });
         }
     }

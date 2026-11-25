@@ -99,15 +99,29 @@ pub fn exit_code(status: i32) -> Option<i32> {
 /// is sent: a reader of the entry's stdout would otherwise wait on us for
 /// its EOF.
 pub fn create(req: CreateJailRequest, stdio: Option<[OwnedFd; 3]>) -> Result<Option<Running>, String> {
+    create_with(req, stdio, Vec::new())
+}
+
+/// [`create`], passing `extra` on to the entry at fd 3, 4, ... (jaild
+/// takes them only with the three stdio).
+pub fn create_with(req: CreateJailRequest, stdio: Option<[OwnedFd; 3]>, extra: Vec<OwnedFd>) -> Result<Option<Running>, String> {
     let has_exec = req.exec.is_some();
+    if !extra.is_empty() && (stdio.is_none() || !has_exec) {
+        return Err("descriptors for the entry need its stdio".into());
+    }
     let mut client = connect()?;
     let req = Request::CreateJail(req);
     let sent = match (&stdio, has_exec) {
-        (Some([i, o, e]), true) => client.send_with_fds(&req, &[i.as_fd(), o.as_fd(), e.as_fd()], 1),
+        (Some([i, o, e]), true) => {
+            let mut fds = vec![i.as_fd(), o.as_fd(), e.as_fd()];
+            fds.extend(extra.iter().map(|f| f.as_fd()));
+            client.send_with_fds(&req, &fds, 1)
+        }
         (None, true) => client.send_with_fds(&req, &[io::stdin().as_fd(), io::stdout().as_fd(), io::stderr().as_fd()], 1),
         (_, false) => client.send_recv_fds(&req, 1),
     };
     drop(stdio);
+    drop(extra);
     let (resp, got) = sent.map_err(|e| format!("jaild: {e}"))?;
     let mut got = owned(got);
     match resp {

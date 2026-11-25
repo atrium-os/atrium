@@ -944,14 +944,24 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Workspaces (homes.md §5): a launcher, or the person. */
         if let Request::WorkspaceRun { name, project, activation } = req {
-            let resp = handle_run(uid, &owner, &name, &project, activation, false, &shared);
+            let (resp, _) = handle_run(uid, &owner, &name, &project, activation, RunMode::Plain, &shared);
             write_response(&mut writer, &resp)?;
             continue;
         }
         /* ★ Under the debugger (dev-tools-plan.md M10): as Run. */
         if let Request::WorkspaceDebug { name, project, activation } = req {
-            let resp = handle_run(uid, &owner, &name, &project, activation, true, &shared);
+            let (resp, _) = handle_run(uid, &owner, &name, &project, activation, RunMode::Debug, &shared);
             write_response(&mut writer, &resp)?;
+            continue;
+        }
+        /* ★ With the inspector (dev-tools.md §3.6): as Run, and the asker
+         * gets its end of the app's inspector socket. */
+        if let Request::WorkspaceInspect { name, project, activation } = req {
+            let (resp, ours) = handle_run(uid, &owner, &name, &project, activation, RunMode::Inspect, &shared);
+            write_response(&mut writer, &resp)?;
+            if let Some(fd) = ours {
+                portcullis_ipc::send_fds(&mut writer, &[fd.as_raw_fd()])?;
+            }
             continue;
         }
         if let Request::WorkspaceCores { name } = req {
@@ -3252,12 +3262,34 @@ fn run_caller(uid: u32, owner: &str, ws: &str) -> Result<bool, String> {
 /// How long a debug run waits for its debugger.
 const DEBUG_WAIT_MS: i32 = 5 * 60 * 1000;
 
-fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], debug: bool, shared: &Mutex<Tenants>) -> Response {
-    let what = if debug { "Debug" } else { "Run" };
-    let refuse = |why: String| {
-        eprintln!("portcullisd: {what} of {ws}/{project} for {owner} REFUSED: {why}");
-        Response::Error { message: why }
-    };
+/// How a workspace's dev app is started.
+#[derive(Clone, Copy, PartialEq)]
+enum RunMode {
+    Plain,
+    /// Under lldb-server, once a debugger in the workspace connects.
+    Debug,
+    /// With a socket to the inspector, whose other end goes to the asker.
+    Inspect,
+}
+
+/// A Run, Debug or Inspect of a workspace's dev app. The descriptor, for
+/// an Inspect, is the asker's end of the app's inspector socket.
+fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], mode: RunMode, shared: &Mutex<Tenants>) -> (Response, Option<OwnedFd>) {
+    let r = run_dev(uid, owner, ws, project, activation, mode, shared);
+    match r {
+        Ok(done) => done,
+        Err(why) => {
+            let what = match mode { RunMode::Plain => "Run", RunMode::Debug => "Debug", RunMode::Inspect => "Inspect" };
+            eprintln!("portcullisd: {what} of {ws}/{project} for {owner} REFUSED: {why}");
+            (Response::Error { message: why }, None)
+        }
+    }
+}
+
+fn run_dev(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], mode: RunMode, shared: &Mutex<Tenants>) -> Result<(Response, Option<OwnedFd>), String> {
+    let debug = mode == RunMode::Debug;
+    let what = match mode { RunMode::Plain => "Run", RunMode::Debug => "Debug", RunMode::Inspect => "Inspect" };
+    let refuse = |why: String| Err(why);
     let app = match run_caller(uid, owner, ws) {
         Ok(a) => a,
         Err(why) => return refuse(why),
@@ -3320,9 +3352,22 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
         .and_then(|v| v.get("capabilities").and_then(|c| c.as_table()).map(|t| t.keys().cloned().collect()))
         .unwrap_or_default();
     eprintln!("portcullisd: {what}: {} for {owner} from {ws}/{project}, granted {caps:?}", p.id);
+    if mode == RunMode::Inspect {
+        /* Like the debugger's, the app's end is a descriptor it is handed,
+         * never a path either side could be pointed at. */
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+        let (id, o) = (p.id.clone(), owner.to_string());
+        thread::spawn(move || {
+            match launch::launch_inspected(&id, &o, theirs.into()) {
+                Ok(out) => eprintln!("portcullisd: {id} (inspected) exited {:?}", out.exit_code),
+                Err(e) => eprintln!("portcullisd: {id} (inspected) failed at {}: {}", e.stage(), e.message()),
+            }
+        });
+        return Ok((Response::WorkspaceRan { app_id: p.id, capabilities: caps }, Some(ours.into())));
+    }
     let Some(listener) = listener else {
         start_for(&p.id, owner, "a Run");
-        return Response::WorkspaceRan { app_id: p.id, capabilities: caps };
+        return Ok((Response::WorkspaceRan { app_id: p.id, capabilities: caps }, None));
     };
     let port = match local_port(&listener) {
         Ok(p) => p,
@@ -3356,7 +3401,7 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     });
     let address = format!("127.0.0.1:{port}");
     let program = format!("{}/{}/{}", dev::APPS_DIR, p.id, m.entry());
-    Response::WorkspaceDebugging { app_id: p.id, capabilities: caps, address, program }
+    Ok((Response::WorkspaceDebugging { app_id: p.id, capabilities: caps, address, program }, None))
 }
 
 /// The port a listening socket has.
@@ -4428,7 +4473,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::WorkspaceCredentials { .. } | Request::SetWorkspaceCredential { .. }
         | Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
-        | Request::WorkspaceDebug { .. } | Request::WorkspaceCores { .. }
+        | Request::WorkspaceDebug { .. } | Request::WorkspaceInspect { .. } | Request::WorkspaceCores { .. }
         | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } | Request::WorkspaceAdmin { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },

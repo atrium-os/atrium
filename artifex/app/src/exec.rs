@@ -118,8 +118,8 @@ pub trait Exec {
     /// Open the workspace's terminal with a press.
     fn terminal(&self, ws: &str, activation: [u8; 16]) -> Result<(), String>;
     /// Run folder `folder` of `ws`'s work as a dev app (W5), with a press:
-    /// the app's id.
-    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, String>;
+    /// the app's id, and the inspector's socket to it (dev-tools.md §3.6).
+    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, Option<OwnedFd>), String>;
     /// Debug folder `folder` as a dev app, with a press (dev-tools.md
     /// §7.3): the app's id, the debugger's address on the workspace's
     /// loopback (`gdb-remote`) and the program's path. The app waits for
@@ -191,11 +191,18 @@ impl Exec for Portcullis {
         }
     }
 
-    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, String> {
-        match ask(&Request::WorkspaceRun { name: ws.into(), project: folder.into(), activation })? {
-            Response::WorkspaceRan { app_id, .. } => Ok(app_id),
-            other => Err(format!("unexpected answer: {other:?}")),
-        }
+    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, Option<OwnedFd>), String> {
+        let mut s = connect()?;
+        write_request(&mut s, &Request::WorkspaceInspect { name: ws.into(), project: folder.into(), activation })
+            .map_err(|e| e.to_string())?;
+        let app_id = match portcullis_ipc::read_response_unbuffered(&mut s) {
+            Ok(Response::WorkspaceRan { app_id, .. }) => app_id,
+            Ok(Response::Error { message }) => return Err(message),
+            other => return Err(format!("unexpected answer: {other:?}")),
+        };
+        // The app runs either way; without its socket it isn't inspected.
+        let sock = portcullis_ipc::recv_fds(&s, 1).ok().and_then(|mut f| (f.len() == 1).then(|| f.remove(0)));
+        Ok((app_id, sock))
     }
 
     fn debug(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<(String, String, String), String> {
@@ -266,7 +273,7 @@ impl Exec for Local {
         Err("No terminal off Atrium".into())
     }
 
-    fn run(&self, _ws: &str, _folder: &str, _activation: [u8; 16]) -> Result<String, String> {
+    fn run(&self, _ws: &str, _folder: &str, _activation: [u8; 16]) -> Result<(String, Option<OwnedFd>), String> {
         Err("No Run off Atrium".into())
     }
 

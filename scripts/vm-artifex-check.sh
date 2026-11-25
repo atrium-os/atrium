@@ -35,6 +35,9 @@ K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHost
 V() { "$ROOT/scripts/vssh" "$@"; }
 get() { scp -q $K -P 2222 "root@localhost:$1" "$2"; }
 fails=0
+# SKIP="newproject fuzz assets": leave out those sections (to iterate on
+# another; a run that skips any is not a pass of the whole check).
+want() { case " ${SKIP:-} " in *" $1 "*) echo "  (skipped: SKIP has $1)"; return 1;; esac; }
 ok() { echo "  ok $1"; }
 bad() { echo "  FAIL $1"; fails=$((fails+1)); }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: expected [$2] got [$3]"; fi; }
@@ -52,6 +55,21 @@ xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex --bin artifex"
 xb atrium-image-decode ""
 [ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
+# The Inspect section's dev app: the SDK's app template as `cargo atrium new`
+# makes it, built as a dev build (debug assertions on, so Pergola records
+# source lines and answers the inspector), against this tree's Pergola. In
+# scratch/ (never committed): inside the tree, where the toolchain pin and
+# the cross config apply.
+UI=$ROOT/scratch/artifex-ui-app
+if want inspect; then
+    rm -rf "$UI"; mkdir -p "$UI/src"
+    sed 's/{{name}}/ui/g; s/{{title}}/UI/g' "$ROOT/sdk/templates/app/src/main.rs" > "$UI/src/main.rs"
+    sed 's/{{name}}/ui/g; s/{{title}}/UI/g; s/{{id}}/org.example.ui/g' "$ROOT/sdk/templates/app/atrium.toml.tmpl" > "$UI/atrium.toml"
+    printf '[package]\nname = "ui"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "ui"\npath = "src/main.rs"\n\n[dependencies]\npergola = { path = "%s/pergola" }\n\n[workspace]\n' "$ROOT" > "$UI/Cargo.toml"
+    cp "$ROOT/pergola/Cargo.lock" "$UI/" 2>/dev/null
+    (cd "$UI" && RUSTFLAGS="$CROSS_RUSTFLAGS" CARGO_PROFILE_DEV_DEBUG=0 cargo build -q --target "$TARGET") \
+        || { echo "build of the inspector's dev app failed"; echo "artifex: 1 failed"; exit 1; }
+fi
 
 echo "=== install"
 B=/var/tmp/artifexchk
@@ -100,6 +118,13 @@ install -m 0755 $B/opifex /usr/local/bin/opifex
 for d in atrium-jaild atrium-volumes; do
   cmp -s $B/\$d /usr/local/bin/\$d || { install -m 0755 $B/\$d /usr/local/bin/\$d; service \$d restart >/dev/null 2>&1 || true; }
 done
+# A dev VM's app data is in no key group: portcullisd launches apps only
+# with plain_app_data (mail.md §6.4a A1), a top-level key, so it goes first.
+VP=/etc/atrium/volumes.policy.toml
+if ! grep -qE '^[[:space:]]*plain_app_data[[:space:]]*=' \$VP 2>/dev/null; then
+  { echo 'plain_app_data = true'; echo; cat \$VP 2>/dev/null; } > \$VP.new && mv \$VP.new \$VP
+  service atrium-volumes restart >/dev/null 2>&1 || true
+fi
 test -f /root/of-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/of-key.pem
 mkdir -p /etc/atrium/publishers; openssl ec -in /root/of-key.pem -pubout -out /etc/atrium/publishers/of-gate.pem 2>/dev/null
 sign() { openssl dgst -sha256 -sign /root/of-key.pem -out \$1/atrium.toml.sig \$1/atrium.toml; }
@@ -146,7 +171,7 @@ echo "=== frescod"
 V "grep -q AVX2 /var/run/dmesg.boot" || { bad "the VM's CPU has no AVX2: cloud-vm.sh down, then up with QEMU_BIN=\$HOME/qemu-atrium/build/qemu-system-x86_64 TCG_CPU=Haswell-noTSX"; echo "artifex: $fails failed"; exit 1; }
 V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=$B/wm.sock \
    FRESCOD_INPUT_SOCK=$B/inject.sock FRESCOD_ACTIVATION_SOCK=$B/activation.sock FRESCOD_SLOT_UIDS=0 FRESCOD_DEV_CAPS=all \
-   FRESCOD_INJECT_ACTIVATION=1 FRESCOD_ACTIVATION_UIDS=0 \
+   FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=${TOKEN_LIFE_MS:-15000} FRESCOD_ACTIVATION_UIDS=0 \
    daemon -f -o $B/frescod.log $B/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! V "test -S /atrium/sockets/fresco/fresco.sock"; do sleep 2; i=$((i+1)); done
 V "chmod 666 $B/*.sock /atrium/sockets/fresco/fresco.sock"
@@ -237,6 +262,15 @@ if [ -d "$FUZZ_VENDOR/vendor" ]; then
     (cd "$FUZZ_VENDOR" && tar -czf /tmp/artifex-vendor.tgz vendor) && scp -q $K -P 2222 /tmp/artifex-vendor.tgz root@localhost:$B/vendor.tgz
 fi
 V "rm -rf $B/c-app; mkdir -p $B/c-app" && scp -q $K -P 2222 "$ROOT"/sdk/templates/c-app/*.tmpl root@localhost:$B/c-app/
+V "rm -rf $B/ui-app"
+if want inspect; then
+    V "mkdir -p $B/ui-app" && scp -q $K -P 2222 "$UI/target/$TARGET/debug/ui" "$UI/src/main.rs" "$UI/atrium.toml" root@localhost:$B/ui-app/ \
+        || echo "  (the inspector's dev app didn't copy)"
+fi
+# The make rules from this tree: a base older than 2a7b458a7 builds with no
+# -g (sys.mk's CFLAGS won over a ?=), and Debug then finds no lines.
+scp -q $K -P 2222 "$ROOT/etc/mk/atrium.app.mk" root@localhost:$B/atrium.app.mk \
+    && V "test ! -f /usr/share/mk/atrium.app.mk || install -m 0444 $B/atrium.app.mk /usr/share/mk/atrium.app.mk"
 V "service atrium-jaild status >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1; sleep 1; test -S /var/run/atrium/jaild.sock" && ok "jaild is up" || bad "no jaild"
 W=/home/alice/.atrium/workspaces
 for w in scratch proj; do V "su -m alice -c 'portcullis workspace stop $w'" >/dev/null 2>&1; done
@@ -264,11 +298,25 @@ printf 'mod missing;\n\nfn main() {\n    let n: i32 = "one";\n    println!("{n}"
 # A C app from the c-app template (cargo atrium new --template c-app), for
 # the composition panel and Run.
 if [ -f /usr/share/mk/atrium.app.mk ]; then
+    # A workspace keeps its own copy of /usr/share from when it was made.
+    for m in $W/*/.state/root/usr/share/mk; do [ -d \$m ] && install -m 0444 /usr/share/mk/atrium.app.mk \$m/; done
     mkdir -p $W/proj/work/app
     T=$B/c-app
     sed 's/{{name}}/app/g' \$T/Makefile.tmpl > $W/proj/work/app/Makefile
     sed 's/{{name}}/app/g; s/{{title}}/App/g; s/{{id}}/org.example.app/g' \$T/atrium.toml.tmpl > $W/proj/work/app/atrium.toml
-    sed 's/{{name}}/app/g; s/{{title}}/App/g' \$T/main.c.tmpl > $W/proj/work/app/app.c
+    # Line 9 (blank in the template) becomes a function line 32 calls, so
+    # the Debug section's Into and Out have somewhere to go.
+    sed 's/{{name}}/app/g; s/{{title}}/App/g; 9s/^$/static float span_of(float w) { return w > 160 ? w - 160 : 1; }/; s/float span = width > 160 ? width - 160 : 1;/float span = span_of(width);/' \$T/main.c.tmpl > $W/proj/work/app/app.c
+fi
+# A Pergola app from the app template, built on the host as a dev build,
+# with `make run` to Run it: the Inspect section.
+if [ -f $B/ui-app/ui ]; then
+    U=$W/proj/work/ui
+    mkdir -p \$U/src \$U/bin
+    install -m 0755 $B/ui-app/ui \$U/bin/ui
+    cp $B/ui-app/main.rs \$U/src/main.rs
+    cp $B/ui-app/atrium.toml \$U/atrium.toml
+    printf 'run:\n\tatrium-run ui\n' > \$U/Makefile
 fi
 # A Rust app whose core reads album bytes itself (a parser in the core):
 # the fuzz panel's core crash, and Move into a worker.
@@ -419,19 +467,99 @@ if V "test -f $W/proj/work/app/Makefile" && V "jexec ws_alice_proj test -x /atri
     waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3' 300 \
         && ok "the press starts it and lldb-dap stops it at the breakpoint ($(state | grep -o 'app/app.c:[0-9]*' | tail -1))" || bad "debug: $(state) $(V "grep -i 'debug\|REFUSED' $LOG | tail -4")"
     check "it runs in its own jail as the dev build" "1" "$(V "jls name | grep -c '^dev_alice_proj'")"
+    check "Debug built it at -O0 (make ATRIUM_DEBUG=1)" "1" "$(V "grep -c -- ' -O0' $W/proj/work/app/.atrium-cflags")"
     check "marked as debugging (the frame tag)" "$DEV" "$(V "ls /var/db/atrium/debugging 2>/dev/null")"
     shot artifex-9-debug-stopped
-    inj "KEY 0x3e 1" "KEY 0x3e 0"   # F5: continue, to the next frame
+    # Stepping: Into span_of (line 9), Out back to 32, Over to 33.
+    # The toolbar, not F-keys: with frescod alone (no Forum) the app's
+    # window keeps the keyboard once it exists, but a press still lands
+    # on the window under it. Continue 560, Over 650, Into 724, Out 794.
+    press 724 52
+    waitstate 'dbg=Some(("Stopped (step)", true, Some("app/app.c:9"' 120 && ok "Into steps into span_of" || bad "into: $(state)"
+    shot artifex-10-debug-into
+    # Out lands in main on line 32, or on 33 when -O2 left nothing of 32
+    # after the call; Over then moves to a later line of main.
+    press 794 52
+    waitstate 'dbg=Some(("Stopped (step)", true, Some("app/app.c:3[23]"' 120 && ok "Out returns to main" || bad "out: $(state)"
+    L=$(state | sed -n 's/.*dbg=Some(("Stopped (step)", true, Some("app\/app.c:\([0-9]*\)".*/\1/p')
+    case "$L" in ''|*[!0-9]*) L=32;; esac
+    press 650 52
+    waitstate 'dbg=Some(("Stopped (step)", true, Some("app/app.c:3[3-8]"' 120 \
+        && [ "$(state | sed -n 's/.*dbg=Some(("Stopped (step)", true, Some("app\/app.c:\([0-9]*\)".*/\1/p')" -gt "$L" ] \
+        && ok "Over goes on to a later line of main" || bad "over (from $L): $(state)"
+    press 560 52   # Continue, to the next frame
     waitstate 'dbg=Some(("Stopped (breakpoint)", true, Some("app/app.c:3' 120 && ok "continue stops at it again (the next frame)" || bad "continue: $(state)"
+    press 962 52   # Stop: ends the program and the session
+    i=0; while [ $i -lt 30 ] && [ "$(V "pgrep -x lldb-dap | wc -l; jls name | grep -c '^dev_alice_'" | tr -d ' \n')" != 00 ]; do sleep 2; i=$((i+1)); done
+    check "Stop ends lldb-dap" "0" "$(V "pgrep -x lldb-dap | wc -l" | tr -d ' ')"
+    check "and the app's jail with it" "0" "$(V "jls name | grep -c '^dev_alice_'")"
     V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
-    sleep 10
     GAP=8 press 700 640
 else
     echo "  (no app project, or no lldb-dap in proj (CDEV= a c-dev layer with it): skipped)"
 fi
 
+echo "=== Inspect a dev app (a Pergola dev build)"
+# Run from Artifex hands it the inspector's socket; the app (the app
+# template, a dev build) answers with its tree. Pick takes a press in the
+# app's window; the node's line is the template's own; Go to source opens it.
+if want inspect && V "test -x $W/proj/work/ui/bin/ui"; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    for r in ui ui/src ui/src/main.rs; do
+        ROW=$(rows | grep -n "^$r\$" | cut -d: -f1)
+        [ -n "$ROW" ] && press 100 $((89 + 22 * (ROW - 1)))
+    done
+    waitstate 'tabs=\[[^]]*ui/src/main.rs' 20 && ok "ui/src/main.rs of the app template opens" || bad "main.rs: $(state)"
+    # Run on the toolbar (make run, which asks to Run ui): a key would go
+    # to no one, as frescod alone gives the focus back to no window when
+    # the debugged app's closes.
+    press 296 52
+    waitstate 'ask=Some("ui")' 300 && ok "make run asks to Run ui" || bad "ask: $(state)"
+    GAP=8 press 980 520
+    UIDEV=dev.alice.proj.org.example.ui
+    n=0
+    while [ $n -lt 3 ] && ! waitstate "note=Some(\"Running $UIDEV\")" 120 \
+        && [ "$(V "grep -c 'proj/ui for alice REFUSED: the press was too long ago' $LOG")" -gt $n ]; do
+        n=$((n + 1)); echo "  (the press expired on the way: again, $n)"
+        waitstate 'running=None' 120
+        press 296 52
+        waitstate 'ask=Some("ui")' 300 && GAP=8 press 980 520
+    done
+    waitstate "note=Some(\"Running $UIDEV\")" 120 && ok "the press runs it with the inspector ($UIDEV)" || bad "run: $(state) $(V "grep -i 'Inspect\|REFUSED' $LOG | tail -3")"
+    V "grep -q '$UIDEV starts with the inspector at fd 3' $LOG" && ok "portcullisd puts the inspector's socket at its fd 3" || bad "no socket: $(V "grep '$UIDEV' $LOG | tail -3")"
+    waitstate "inspect=Some((\"$UIDEV\", true, true, [1-9]" 300 && ok "a Pergola dev build answers with its tree ($(state | sed 's/.*inspect=Some(([^,]*, true, true, \([0-9]*\).*/\1/') nodes)" \
+        || bad "no tree: $(state | sed 's/.*inspect=//')"
+    shot artifex-22-inspect-app
+    # The strip's Inspect entry: last, 42 apart from Files at 100.
+    I=$(state | sed 's/.*inspect=Some(.*, \([0-9]*\)))$/\1/')
+    case "$I" in ''|*[!0-9]*) I=5;; esac
+    press 64 $((100 + 42 * ${I:-5}))
+    waitstate 'view=Inspect' 20 && ok "the strip's Inspect shows the tree" || bad "view: $(state)"
+    # Pick (views.rs: right of the view's header), then a press on the
+    # app's button, in its window at the screen's top-left. (The window
+    # has no background: a press between glyphs of its text goes through
+    # to Artifex under it.)
+    press 864 102
+    waitstate "inspect=Some((\"$UIDEV\", true, true, [0-9]*, true," 30 && ok "Pick waits for a press in the app" || bad "pick: $(state | sed 's/.*inspect=//')"
+    press 84 88
+    LT=$(grep -n 'Button::primary("Press")' "$ROOT/sdk/templates/app/src/main.rs" | head -1 | cut -d: -f1)
+    waitstate "inspect=Some((\"$UIDEV\", true, true, [0-9]*, false, false, Some(\"[A-Za-z]*\"), Some(\"ui/src/main.rs:$LT\")" 60 \
+        && ok "the press picks its button, drawn at ui/src/main.rs:$LT ($(state | sed 's/.*inspect=Some(([^,]*, [^,]*, [^,]*, [^,]*, [^,]*, [^,]*, Some("\([^"]*\)").*/\1/'))" || bad "picked: $(state | sed 's/.*inspect=//')"
+    shot artifex-23-inspect-picked
+    press 974 103              # Bounds
+    waitstate "inspect=Some((\"$UIDEV\", true, true, [0-9]*, false, true," 30 && ok "Bounds outlines every box in the app" || bad "bounds: $(state | sed 's/.*inspect=//')"
+    shot artifex-24-inspect-bounds
+    press 1050 158             # Go to source
+    waitstate "tabs=\\[[^]]*ui/src/main.rs[^]]*\\] active=[^ ]* caret=($LT, 1)" 20 && ok "Go to source opens main.rs at line $LT" || bad "source: $(state)"
+    V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+    waitstate "inspect=Some((\"$UIDEV\", false, true," 60 && ok "when the app ends its last tree stays, marked ended" || bad "ended: $(state | sed 's/.*inspect=//')"
+    GAP=8 press 700 640
+else
+    echo "  (no dev app for the inspector: skipped)"
+fi
+
 echo "=== New project"
-if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
+if want newproject && V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
     press 962 52               # the bar's New project (ui.rs)
     waitstate 'templates=[2-9]' 300 && ok "New project lists the SDK's templates ($(state | sed 's/.*templates=\([0-9]*\).*/\1/'))" || bad "templates: $(state)"
     shot artifex-11-new-project
@@ -450,7 +578,7 @@ else
 fi
 
 echo "=== fuzz and Move into a worker"
-if V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/toolchains/rust/bin/cargo-atrium atrium 2>&1 | grep -q 'worker add'"; then
+if want fuzz && V "test -f $W/proj/work/photos/Cargo.toml && jexec ws_alice_proj /atrium/toolchains/rust/bin/cargo-atrium atrium 2>&1 | grep -q 'worker add'"; then
     rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
     # New project leaves its Composition view up: the strip's Files (the
     # first, 8 under the toolbar) brings back the tree.
@@ -499,7 +627,7 @@ echo "=== Assets"
 P=; F=
 if V "test -f $W/proj/work/photos/atrium.toml"; then P=photos; F=photos/Cargo.toml
 elif V "test -f $W/proj/work/app/atrium.toml"; then P=app; F=app/app.c; fi
-if [ -n "$P" ]; then
+if want assets && [ -n "$P" ]; then
     rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
     FX=$(mktemp -d)
     python3 -I - "$FX" <<'PY'

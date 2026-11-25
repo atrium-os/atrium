@@ -177,6 +177,7 @@ mod tests {
 
     struct Form { f: CredentialField }
     impl View for Form {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) { self.f.render(ctx) }
     }
 

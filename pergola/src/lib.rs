@@ -53,6 +53,7 @@ pub mod view;
 pub mod widgets;
 pub mod window;
 pub mod glyphs;
+pub mod inspect;
 pub mod shape;
 
 pub use app::App;

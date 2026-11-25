@@ -220,7 +220,9 @@ impl Menu {
 }
 
 impl View for Menu {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let st = self.state.get();
         if !st.open {
             return;
@@ -529,7 +531,9 @@ impl Dropdown {
 }
 
 impl View for Dropdown {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let r = self.rect;
         let cur = self.value.get().min(self.options.len().saturating_sub(1));
         let label = self.options.get(cur).cloned().unwrap_or_default();
@@ -805,7 +809,9 @@ impl MenuButton {
 }
 
 impl View for MenuButton {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let r = self.rect;
         trigger_with(ctx, r, &self.label, self.icon.clone(), &self.menu, None, self.attached);
         if self.menu.get().open {
@@ -915,7 +921,9 @@ impl PanelButton {
 }
 
 impl View for PanelButton {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         let r = self.rect;
         let edge = trigger_with(ctx, r, &self.label, self.icon.clone(), &self.open, None, self.attached);
         if let Some(f) = &self.hosted {
@@ -1015,7 +1023,9 @@ impl Dialog {
 }
 
 impl View for Dialog {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         if !self.open.get() {
             return;
         }
@@ -1108,7 +1118,9 @@ mod tests {
         menu: Mutable<MenuState>,
     }
     impl View for Form {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             Dropdown::new(self.value.clone(), self.menu.clone(), ["Daily", "Weekly", "Never"]).at(10.0, 10.0).render(ctx);
         }
     }
@@ -1192,7 +1204,9 @@ mod tests {
         menu: Mutable<MenuState>,
     }
     impl View for Long {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let options: Vec<String> = (0..10).map(|i| format!("Option {i}")).collect();
             Dropdown::new(self.value.clone(), self.menu.clone(), options).at(10.0, 10.0).render(ctx);
         }
@@ -1277,7 +1291,9 @@ mod tests {
         menu: Mutable<MenuState>,
     }
     impl View for Headed {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let mut items = vec![MenuItem::new("Heading").enabled(false)];
             items.extend((1..10).map(|i| MenuItem::new(format!("Item {i}"))));
             MenuButton::new("Menu", self.menu.clone(), items, |_| {}).at(10.0, 10.0).render(ctx);
@@ -1317,7 +1333,9 @@ mod tests {
         picked: Rc<std::cell::Cell<Option<usize>>>,
     }
     impl View for Bar {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let p = self.picked.clone();
             MenuButton::new("Controller", self.menu.clone(), vec![MenuItem::new("Pair"), MenuItem::new("Forget")], move |i| p.set(Some(i)))
                 .at(10.0, 0.0)
@@ -1353,7 +1371,9 @@ mod tests {
         menu: Mutable<MenuState>,
     }
     impl View for IconBar {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let row = ctx.push(Node::stack(crate::geom::Axis::Horizontal, Rect::new(0.0, 0.0, 400.0, 32.0), 8.0));
             ctx.set_flex(row, FlexStyle { justify: Justify::End, align: Align::Center, ..FlexStyle::default() });
             let b = MenuButton::new("Controllers", self.menu.clone(), vec![MenuItem::new("Fake Pad")], |_| {})
@@ -1387,7 +1407,9 @@ mod tests {
         out: Mutable<usize>,
     }
     impl View for Volume {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let (level, out) = (self.level.clone(), self.out.clone());
             PanelButton::new("Volume", self.open.clone(), crate::geom::Size::new(240.0, 120.0), move |ctx, r| {
                 crate::widgets::Slider::new(level.clone(), 0.0, 1.0).at(r.x(), r.y()).width(r.w()).render(ctx);
@@ -1433,7 +1455,9 @@ mod tests {
         log: Rc<std::cell::RefCell<Vec<String>>>,
     }
     impl View for Status {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let items = vec![
                 MenuItem::slider("Level", self.level.get()),
                 MenuItem::new("Mute").checked(true),
@@ -1498,7 +1522,9 @@ mod tests {
         done: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl View for Confirm {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let d = self.done.clone();
             Dialog::new(
                 self.open.clone(),

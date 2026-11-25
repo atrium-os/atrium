@@ -125,7 +125,9 @@ impl Canvas {
 }
 
 impl View for Canvas {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -146,7 +148,9 @@ mod tests {
     }
 
     impl View for Board {
+        #[cfg_attr(debug_assertions, track_caller)]
         fn render(&self, ctx: &mut Ctx) {
+            ctx.widget_site();
             let log = self.log.clone();
             Canvas::new(self.state.clone(), Rect::new(0.0, 0.0, 400.0, 300.0), Size::new(400.0, 2000.0), self.items.get_cloned())
                 .on_pointer(move |e| log.borrow_mut().push(e))

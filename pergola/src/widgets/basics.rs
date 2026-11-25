@@ -42,7 +42,9 @@ impl Divider {
 }
 
 impl View for Divider {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -76,7 +78,9 @@ impl Dot {
 }
 
 impl View for Dot {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -128,7 +132,9 @@ impl Avatar {
 }
 
 impl View for Avatar {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
@@ -171,7 +177,9 @@ impl ProgressBar {
 }
 
 impl View for ProgressBar {
+    #[cfg_attr(debug_assertions, track_caller)]
     fn render(&self, ctx: &mut Ctx) {
+        ctx.widget_site();
         self.emit(ctx);
     }
 }
