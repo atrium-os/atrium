@@ -36,6 +36,10 @@ pub const STATUS_H: f32 = 26.0;
 pub enum Cmd {
     /// The fill options button pressed: its menu of ways to fill.
     FillOptions,
+    /// A press on the status bar's summary: the menu of what it shows.
+    StatsMenu,
+    /// Show or hide one of [`crate::data::STAT_NAMES`] in the status bar.
+    StatsToggle(u8),
     /// Set, change or remove the document's password.
     PasswordOpen,
     /// The password bar's field submitted (to set, or to open a file).
@@ -380,7 +384,12 @@ pub struct Sheets {
     pub last_repeat: Cell<Option<Cmd>>,
     /// The status bar's selection summary, kept until the document, sheet or
     /// selection changes.
-    stats_cache: Rc<RefCell<Option<((u64, u16, CellRange), Option<String>)>>>,
+    stats_cache: Rc<RefCell<Option<((u64, u16, CellRange, u8), Option<String>)>>>,
+    /// Which summaries the status bar shows (bits of `data::STAT_NAMES`), and its menu.
+    pub stats_shown: Rc<Cell<u8>>,
+    pub stats_menu: Mutable<MenuState>,
+    /// Where the summary was drawn (x, y, width), to put its menu by it.
+    stats_at: Rc<Cell<(f32, f32, f32)>>,
     /// The Rotation Angle bar is open, with its field.
     pub angling: Mutable<bool>,
     pub angle_text: Mutable<TextEdit>,
@@ -415,7 +424,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
+        Self { authoring: authoring::Authoring::new(&rev), launcher: false, pending_books: Mutable::new(Vec::new()), doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), names_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), import_notes_open: Mutable::new(false), import_note: Mutable::new(0), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()), going: Mutable::new(false), format_menu: Mutable::new(MenuState::default()), color_bar: Mutable::new(None), goto_text: Mutable::new(TextEdit::new("")), coding: Mutable::new(false), code_text: Mutable::new(TextEdit::new("")), hex_text: Mutable::new(TextEdit::new("")), naming: Mutable::new(false), sorting: Mutable::new(false), sort_text: Mutable::new(TextEdit::new("")), seeking: Mutable::new(false), seek_text: Mutable::new(TextEdit::new("")), last_repeat: Cell::new(None), stats_cache: Rc::new(RefCell::new(None)), stats_shown: Rc::new(Cell::new(crate::data::STATS_DEFAULT)), stats_menu: Mutable::new(MenuState::default()), stats_at: Rc::new(Cell::new((0.0, 0.0, 0.0))), angling: Mutable::new(false), angle_text: Mutable::new(TextEdit::new("")), name_rename: Mutable::new(None), name_text: Mutable::new(TextEdit::new("")), filter_cond_menu: Mutable::new(MenuState::default()), filter_a: Mutable::new(TextEdit::new("")), filter_b: Mutable::new(TextEdit::new("")) }
     }
 
     /// Escape closes an open authoring panel before reaching the worksheet.
@@ -1834,15 +1843,14 @@ impl Sheets {
     pub fn selection_summary(&self) -> Option<String> {
         let sel = self.grid.get_cloned().selection();
         let sheet = self.doc.borrow().sheet;
-        let key = (self.rev.get(), sheet, sel);
+        let shown = self.stats_shown.get();
+        let key = (self.rev.get(), sheet, sel, shown);
         if let Some((k, v)) = &*self.stats_cache.borrow() {
             if *k == key {
                 return v.clone();
             }
         }
-        let cells = (sel.r1 - sel.r0) as u64 + 1;
-        let cells = cells.saturating_mul((sel.c1 - sel.c0) as u64 + 1);
-        let v = if cells < 2 { None } else { crate::data::selection_stats(&self.doc.borrow().wb, sheet, sel).text(cells) };
+        let v = crate::data::selection_summary(&self.doc.borrow().wb, sheet, sel, shown);
         *self.stats_cache.borrow_mut() = Some((key, v.clone()));
         v
     }
@@ -2712,7 +2720,10 @@ impl View for Sheets {
             let style = st(type_size::XS, Weight::Regular, t.text_primary());
             let width = Node::measure_text(&summary, &style).w.ceil() + 2.0;
             let x = (w - 12.0 - room - width).max(12.0);
-            ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: summary, style });
+            let hit = ctx.add(Node::Text { rect: Rect::new(x, sy + 4.0, width, 18.0), content: summary, style });
+            let cmds = self.cmds.clone();
+            ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::StatsMenu));
+            self.stats_at.set((x, sy, width));
             room += width + 16.0;
         }
         if self.doc.borrow().wb.recalc_pending() {
@@ -2751,6 +2762,18 @@ impl View for Sheets {
         }
 
         // The fill options button's menu, under the button.
+        if self.stats_menu.get().open {
+            use pergola::widgets::{Menu, MenuItem};
+            let shown = self.stats_shown.get();
+            let items: Vec<MenuItem> = crate::data::STAT_NAMES.iter().enumerate().map(|(i, n)| MenuItem::new(*n).checked(shown & (1 << i) != 0)).collect();
+            let cmds = self.cmds.clone();
+            let menu = Menu::new(self.stats_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StatsToggle(i.min(5) as u8))).width(180.0);
+            let (sx, sy, sw) = self.stats_at.get();
+            let mh = menu.height();
+            let x = sx.clamp(0.0, (w - 180.0).max(0.0));
+            let y = (sy - mh).max(0.0);
+            menu.at(x, y).anchored(Rect::new(sx, sy, sw, STATUS_H), pergola::popup::Side::Above, pergola::popup::Align::Start).render(ctx);
+        }
         if self.fill_menu.get().open {
             self.render_fill_menu(ctx, w, h);
         }
@@ -3896,6 +3919,16 @@ impl Sheets {
                     self.closing.set(false);
                     self.changed();
                     true
+                }
+                Cmd::StatsMenu => {
+                    self.stats_menu.set(MenuState::opened(None));
+                    self.changed();
+                    false
+                }
+                Cmd::StatsToggle(i) => {
+                    self.stats_shown.set(self.stats_shown.get() ^ (1 << i.min(5)));
+                    self.changed();
+                    false
                 }
                 Cmd::FillOptions => {
                     self.fill_menu.set(MenuState::opened(None));
@@ -7911,6 +7944,37 @@ mod tests {
         assert_eq!(s.selection_summary().as_deref(), Some("Average: 2.16666666666667   Count: 3   Sum: 6.5"));
         Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row: 3, col: 1, text: "10".into() });
         assert_eq!(s.selection_summary().as_deref(), Some("Average: 4.125   Count: 4   Sum: 16.5"));
+        // Results show in the first number's format.
+        select(&s, (0, 1), (0, 1));
+        crate::format::set_code(&mut s.doc.borrow_mut(), CellRange { r0: 0, c0: 1, r1: 0, c1: 1 }, "0.00").unwrap();
+        s.changed();
+        select(&s, (0, 1), (3, 1));
+        assert_eq!(s.selection_summary().as_deref(), Some("Average: 4.13   Count: 4   Sum: 16.50"));
+        // Rows a filter hides are left out.
+        {
+            let mut d = s.doc.borrow_mut();
+            let rect = officina_grid::Rect { sheet: 0, r0: 0, c0: 0, r1: 3, c1: 1 };
+            let st = d.wb.filtered(0, Some(officina_grid::filter::AutoFilter { rect, conds: vec![(0, officina_grid::filter::Cond::Values(vec!["a".into(), "b".into()]))] }));
+            d.run("Filter", vec![officina_grid::ops::GridOp::Filter(st)]);
+        }
+        s.changed();
+        assert!(s.doc.borrow().wb.sheet(0).row_filtered(2), "the blank row is filtered out");
+        assert_eq!(s.selection_summary().as_deref(), Some("Average: 1.50   Count: 2   Sum: 3.00"));
+        // The menu on the summary chooses what shows: Min and Max on, Average off.
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        run(Cmd::StatsMenu);
+        assert!(s.stats_menu.get().open);
+        let tree = pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0;
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if content == "Numerical Count")));
+        for i in [0, 2, 3, 4] {
+            run(Cmd::StatsToggle(i));
+        }
+        assert_eq!(s.selection_summary().as_deref(), Some("Count: 2   Numerical Count: 2   Min: 1.00   Max: 2.00   Sum: 3.00"));
+        // Nothing chosen that applies: no summary.
+        for i in [1, 2, 3, 4, 5] {
+            run(Cmd::StatsToggle(i));
+        }
+        assert_eq!(s.selection_summary(), None);
     }
 
     #[test]

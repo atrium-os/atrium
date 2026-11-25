@@ -828,6 +828,17 @@ impl Shell {
         true
     }
 
+    /// The live page asked for a new window (I6.2): an entry beside it in
+    /// the trail, opened in the document lane when the person goes there.
+    /// The page stays on screen and keeps running.
+    pub fn live_opened_beside(&mut self, from: &str, url: &str) -> bool {
+        let shown = self.shown_key();
+        let Some(run) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some()) else { return false };
+        if self.history.is_some() || shown != Some(run.key) { return false; }
+        self.follow_link(url, true);
+        true
+    }
+
     /// The live page changed its own address (`history.pushState`, I6.2;
     /// navigatord checked the origin): the same engine, a new trail entry
     /// with nothing to open, or the entry just before or after it when the
@@ -2925,6 +2936,29 @@ mod tests {
         s.live = Some(LivePage::Shown("https://app.example/typed.html".into()));
         assert!(s.live_follow());
         assert_eq!(s.outbox.pop(), Some(Out::StopLive { url: url.into() }));
+    }
+
+    #[test]
+    fn a_live_pages_new_window_is_an_entry_beside_it_and_the_page_runs_on() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(2, 600.0, Some([2; 16])));
+        s.outbox.clear();
+        let here = s.shown_key().unwrap();
+        assert!(!s.live_opened_beside(url, "https://elsewhere.example/"), "not before the engine started");
+        s.live_reported(url, Some("https://app.example".into()), None);
+        assert!(!s.live_opened_beside("https://app.example/other.html", "https://elsewhere.example/"), "only the page that runs live");
+        assert!(s.live_opened_beside(url, "https://elsewhere.example/"));
+        assert_eq!(s.shown_key(), Some(here), "the page stays on screen");
+        assert!(s.live_run.is_some(), "and keeps running");
+        assert!(s.outbox.is_empty());
+        let t = s.store.trail();
+        let beside: Vec<_> = t.pages[here.1].children.iter().map(|&c| t.pages[c].url.clone()).collect();
+        assert_eq!(beside, ["https://elsewhere.example/"]);
     }
 
     #[test]

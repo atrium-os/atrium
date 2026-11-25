@@ -973,7 +973,12 @@ impl Workbook {
     /// How a cell shows: its value through its number format.
     pub fn formatted(&self, a: CellAddr) -> Formatted {
         let v = self.get(a);
-        self.styles.format(self.style_id(a)).format_in(&v, self.date_system)
+        self.formatted_as(a, &v)
+    }
+
+    /// How `v` would show in cell `a`, through that cell's number format.
+    pub fn formatted_as(&self, a: CellAddr, v: &Value) -> Formatted {
+        self.styles.format(self.style_id(a)).format_in(v, self.date_system)
     }
 }
 

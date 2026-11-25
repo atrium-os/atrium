@@ -3007,6 +3007,7 @@ impl live_page::Tell for LiveTell {
     fn started(&self, origin: String) { send(&self.w, &Event::LiveStarted { url: self.from.clone(), origin }); }
     fn navigate(&self, url: String) { send(&self.w, &Event::LiveNavigate { from: self.from.clone(), url }); }
     fn url_changed(&self, url: String) { send(&self.w, &Event::LiveUrlChanged { from: self.from.clone(), url }); }
+    fn open_beside(&self, url: String) { send(&self.w, &Event::LiveOpenBeside { from: self.from.clone(), url }); }
     fn file(&self, f: live_page::Offered) {
         let id = LIVE_FILE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | 1 << 31;
         let (size, origin) = (f.bytes.len() as u64, origin(&f.url).unwrap_or_default());

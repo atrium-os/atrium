@@ -679,6 +679,19 @@ pub fn address_change(page: Option<&str>, to: &str) -> Option<String> {
     (page.and_then(crate::origin).is_some() && page.and_then(crate::origin) == crate::origin(&to)).then_some(to)
 }
 
+/// How often a page may open a window beside it: once a second.
+#[derive(Default)]
+pub struct Beside(Option<std::time::Instant>);
+
+impl Beside {
+    pub const GAP: std::time::Duration = std::time::Duration::from_secs(1);
+    pub fn allow(&mut self, now: std::time::Instant) -> bool {
+        if self.0.is_some_and(|last| now.saturating_duration_since(last) < Self::GAP) { return false; }
+        self.0 = Some(now);
+        true
+    }
+}
+
 /// One running live page: its island, placed over the page area.
 pub struct Live {
     pub url: String,
@@ -708,6 +721,8 @@ pub trait Tell: Send + Sync + 'static {
     fn navigate(&self, url: String);
     /// The page changed its own address within its origin (I6.2).
     fn url_changed(&self, url: String);
+    /// A new window the page asked for (I6.2): an entry beside it.
+    fn open_beside(&self, url: String);
     /// A file the page offered (I6.4): navigatord holds it and asks.
     fn file(&self, file: Offered);
     /// Something the page was refused (I6.4), in the popover's words.
@@ -1074,6 +1089,7 @@ impl Live {
             let mut pick = Pick::default();
             let mut page = None::<String>;
             let mut frames: HashMap<u32, FrameRun> = HashMap::new();
+            let mut beside = Beside::default();
             let mut frame_starts = 0usize;
             let mut page_rect = size.lock().unwrap().1;
             let cookies = forms.as_ref().map(|j| j.cookies.clone());
@@ -1117,6 +1133,20 @@ impl Live {
                         // (`ContinueLive`), in the document lane if not. Within
                         // the origin it is looked at through the jar first, off
                         // this thread: a file is offered, not run (I6.4).
+                        // A new window (I6.2): beside the page in the trail, at
+                        // most one a second, since the engine's word that the
+                        // person pressed is all there is.
+                        Some(Report::OpenBeside(to)) => match navigation(page.as_deref(), to) {
+                            Some(to) if beside.allow(std::time::Instant::now()) => tell.open_beside(to),
+                            Some(to) => {
+                                eprintln!("navigatord: a live page's new window refused, too soon ({})", crate::refused_target(&to));
+                                tell.refused("a new window, too soon after the last".into());
+                            }
+                            None => {
+                                eprintln!("navigatord: a live page's new window refused ({})", crate::refused_target(to));
+                                tell.refused("an address it could not open".into());
+                            }
+                        },
                         Some(Report::Navigate(to)) => match (navigation(page.as_deref(), to), &forms) {
                             (Some(to), Some(jar)) if page.as_deref().and_then(crate::origin) == crate::origin(&to) => {
                                 let (jar, tell) = (jar.clone(), tell.clone());
@@ -1229,7 +1259,7 @@ impl Live {
                             Some(Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::UrlChanged(_)) => false,
                             // A frame does not navigate the trail, send forms
                             // through a jar, or pick files in I6.5.
-                            Some(Report::Navigate(_) | Report::Submit { .. }) => {
+                            Some(Report::Navigate(_) | Report::Submit { .. } | Report::OpenBeside(_)) => {
                                 tell.refused("a frame's navigation or form".into());
                                 false
                             }
@@ -1623,6 +1653,16 @@ mod tests {
         assert_eq!(seen.started.len(), 1);
     }
 
+    #[test]
+    fn a_page_opens_at_most_one_window_beside_it_a_second() {
+        let mut b = Beside::default();
+        let t = std::time::Instant::now();
+        assert!(b.allow(t));
+        assert!(!b.allow(t + std::time::Duration::from_millis(500)));
+        assert!(b.allow(t + Beside::GAP));
+        assert!(!b.allow(t), "a clock that went back counts as no time at all");
+    }
+
     /// A run's `Tell` that keeps what it was told was refused.
     #[derive(Default)]
     struct Told(Mutex<Vec<String>>);
@@ -1630,6 +1670,7 @@ mod tests {
         fn started(&self, _: String) {}
         fn navigate(&self, _: String) {}
         fn url_changed(&self, _: String) {}
+        fn open_beside(&self, url: String) { self.0.lock().unwrap().push(format!("beside {url}")); }
         fn file(&self, _: Offered) {}
         fn refused(&self, what: String) { self.0.lock().unwrap().push(what); }
         fn print(&self) {}

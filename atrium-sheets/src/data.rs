@@ -1079,40 +1079,91 @@ pub struct SelStats {
     /// Cells holding a number, and their total.
     pub nums: u64,
     pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+    /// The top-left number's cell, (row, column): its format shows the results.
+    pub first: Option<(u32, u32)>,
 }
 
+/// The summaries the status bar can show, in its order, with their bits in
+/// the mask it keeps (Excel's defaults: Average, Count and Sum).
+pub const STAT_NAMES: [&str; 6] = ["Average", "Count", "Numerical Count", "Minimum", "Maximum", "Sum"];
+pub const STATS_DEFAULT: u8 = 0b10_0011;
+
 impl SelStats {
-    /// "Average: 2   Count: 3   Sum: 6", or "Count: 2" with no numbers;
-    /// None for one cell or nothing to count.
-    pub fn text(&self, cells: u64) -> Option<String> {
+    /// "Average: 2   Count: 3   Sum: 6" for the summaries `shown` (bits of
+    /// [`STAT_NAMES`]); the number ones only when there are numbers. None for
+    /// one cell, nothing to count, or nothing chosen that applies.
+    pub fn text(&self, cells: u64, shown: u8, num: &dyn Fn(f64) -> String) -> Option<String> {
         if cells < 2 || self.count == 0 {
             return None;
         }
-        let n = |x: f64| officina_grid::value::format_general(x);
-        Some(if self.nums > 0 {
-            format!("Average: {}   Count: {}   Sum: {}", n(self.sum / self.nums as f64), self.count, n(self.sum))
-        } else {
-            format!("Count: {}", self.count)
-        })
+        let mut parts = Vec::new();
+        for (i, name) in STAT_NAMES.iter().enumerate() {
+            if shown & (1 << i) == 0 {
+                continue;
+            }
+            let v = match i {
+                1 => self.count.to_string(),
+                2 => self.nums.to_string(),
+                _ if self.nums == 0 => continue,
+                0 => num(self.sum / self.nums as f64),
+                3 => num(self.min),
+                4 => num(self.max),
+                _ => num(self.sum),
+            };
+            parts.push(format!("{}: {v}", if i == 3 { "Min" } else if i == 4 { "Max" } else { name }));
+        }
+        (!parts.is_empty()).then(|| parts.join("   "))
     }
 }
 
-/// The selection's count, and the count and sum of its numbers. Empty
-/// stretches of the sheet are skipped unseen, so a whole column is cheap.
+/// The selection's count, and the count and sum of its numbers, leaving out
+/// rows a filter hides (as Excel's status bar does). Empty stretches of the
+/// sheet are skipped unseen, so a whole column is cheap.
 pub fn selection_stats(wb: &Workbook, sheet: u16, sel: CellRange) -> SelStats {
     let mut st = SelStats::default();
     let r = Rect { sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
-    wb.each(&r, &mut |_, _, v| match v {
-        Value::Empty => {}
-        Value::Num(x) => {
-            st.count += 1;
-            st.nums += 1;
-            st.sum += x;
+    let sh = wb.sheet(sheet);
+    wb.each(&r, &mut |row, col, v| {
+        if sh.row_filtered(row) {
+            return;
         }
-        Value::Str(t) if t.is_empty() => {}
-        _ => st.count += 1,
+        match v {
+            Value::Empty => {}
+            Value::Num(x) => {
+                st.count += 1;
+                st.nums += 1;
+                st.sum += x;
+                st.min = if st.nums == 1 { x } else { st.min.min(x) };
+                st.max = if st.nums == 1 { x } else { st.max.max(x) };
+                if st.first.is_none_or(|f| (row, col) < f) {
+                    st.first = Some((row, col));
+                }
+            }
+            Value::Str(t) if t.is_empty() => {}
+            _ => st.count += 1,
+        }
     });
     st
+}
+
+/// The status bar's summary text: results in the first number's format.
+pub fn selection_summary(wb: &Workbook, sheet: u16, sel: CellRange, shown: u8) -> Option<String> {
+    let cells = ((sel.r1 - sel.r0) as u64 + 1).saturating_mul((sel.c1 - sel.c0) as u64 + 1);
+    if cells < 2 {
+        return None;
+    }
+    let st = selection_stats(wb, sheet, sel);
+    let at = st.first.map(|(r, c)| CellAddr::new(sheet, r, c));
+    st.text(cells, shown, &|x| match at {
+        Some(a) => {
+            let f = wb.formatted_as(a, &Value::num(x));
+            let t = f.text.trim().to_string();
+            if t.is_empty() || t.chars().all(|ch| ch == '#') { officina_grid::value::format_general(x) } else { t }
+        }
+        None => officina_grid::value::format_general(x),
+    })
 }
 
 /// The most dependents Ctrl+] lists.

@@ -2583,7 +2583,48 @@ Same flag as I6.1.
 - **`window.open`** still returns `null` (`page_did_request_new_web_view`
   gives no page), which the fixture reads as refused. Proposing it as an
   entry opened beside needs the address, which that call does not carry;
-  it waits for the engine work on new web views.
+  it waits for the engine work on new web views. *Built 2026-11-25, see
+  [new windows](#i62-follow-up-2026-11-25-new-windows-opened-beside).*
+
+#### I6.2 follow-up (2026-11-25): new windows opened beside
+
+Host-tested; the engine side is written, not yet built.
+
+- **Engine.** `patches/ladybird/live-open-beside.patch` adds one
+  `PageClient` hook, `page_did_propose_new_window(url)`, called where the
+  address is known: in `window.open()`'s steps before a navigable is
+  chosen (target `_blank`, a URL given, the window has transient
+  activation; the activation is consumed) and in "follow the hyperlink"
+  (target `_blank`, followed by the person). A host that answers true
+  makes no window: `window.open()` returns `null`, as for a blocked popup.
+  `EditorPage` answers true for a live page and reports
+  `Report::OpenBeside(url)` (`navigator_live_open_beside`) when the
+  address is plain HTTPS. A form with `target=_blank` and a named new
+  target stay refused. The I6 build must apply the patch, since
+  `EditorPage` overrides the hook.
+- **Limen** takes `OpenBeside` only while the page runs, with the same
+  address checks as `Navigate`; a frame's is refused by navigatord, as
+  its navigations are.
+- **navigatord** checks the address as for a navigation and sends
+  `LiveOpenBeside { from, url }`, at most one a second (`Beside`): the
+  engine's word that the person pressed is all it has, so a page that
+  opens faster is refused, named in the popover.
+- **The UI** (`Shell::live_opened_beside`) adds the address beside the
+  live page's entry, as Ctrl-click does for a link; the page stays on
+  screen and runs on. Going there opens it in the document lane (live
+  again only by D8's rules).
+
+**Gate (Mac),** after the I6.2 gate's setup, with the patch applied:
+
+1. Run `app.html` live, press **Open another site**: the fixture's
+   `window-open` line reads `refused` (the page got `null`), the trail
+   shows `https://elsewhere.example/` beside the page, the page's engine
+   keeps its pid, and no fetch of `elsewhere.example` is made until the
+   person goes there.
+2. A script `window.open` with no press (the console, a timer): nothing
+   beside, `null`.
+3. Press **Open another site** twice within a second: one entry beside,
+   and the chip's popover names the refused second.
 
 **Gate (Mac, arm64 Tessera),** after the I6.1 gate's setup:
 

@@ -933,6 +933,11 @@ impl Live {
                         eprintln!("navigator-ui: a live page's navigation to {url} came after it left the screen");
                     }
                 }
+                Event::LiveOpenBeside { from, url } => {
+                    if !s.live_opened_beside(&from, &url) {
+                        eprintln!("navigator-ui: a live page's new window {url} came after it left the screen");
+                    }
+                }
                 Event::LiveUrlChanged { from, url } => {
                     if !s.live_url_changed(&from, &url) {
                         eprintln!("navigator-ui: a live page's address {url} not taken");

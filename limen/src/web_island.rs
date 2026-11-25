@@ -219,6 +219,11 @@ pub enum Report<'a> {
     /// read-only. navigatord opens Scrinium's picker over the window and
     /// answers with [`FilePicked`]; the engine never sees a folder.
     PickFile,
+    /// A whole page asked for `url` in a new window (`window.open`, a
+    /// `target=_blank` link or form, I6.2): the engine opens none and
+    /// reports it only on the person's activation; navigatord opens it
+    /// beside the page in the trail.
+    OpenBeside(&'a str),
 }
 
 /// An address an engine may report: plain HTTPS, bounded, printable.
@@ -237,7 +242,7 @@ impl Report<'_> {
             Self::Copy { text, token } => !text.is_empty() && text.len() <= COPY_MAX && *token != [0; 16],
             Self::Paste { token } => *token != [0; 16],
             Self::BeforeUnload { query } => *query != 0,
-            Self::Navigate(url) | Self::UrlChanged(url) => reportable(url),
+            Self::Navigate(url) | Self::UrlChanged(url) | Self::OpenBeside(url) => reportable(url),
             Self::Submit { url, body } => reportable(url) && body.len() <= FORM_MAX && body.iter().all(u8::is_ascii_graphic),
         }
     }
@@ -345,7 +350,7 @@ impl Lifecycle {
         if !rest.is_empty() || !report.valid() { return None; }
         *self = match (*self, report) {
             (Self::Waiting, Report::Started { .. }) => Self::Running { last_query: 0 },
-            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. } | Report::PickFile | Report::Copy { .. } | Report::Paste { .. }) => running,
+            (running @ Self::Running { .. }, Report::Title(_) | Report::Resize { .. } | Report::MediaReady | Report::Navigate(_) | Report::UrlChanged(_) | Report::Submit { .. } | Report::PickFile | Report::Copy { .. } | Report::Paste { .. } | Report::OpenBeside(_)) => running,
             (Self::Running { last_query }, Report::BeforeUnload { query }) if query > last_query => Self::AwaitingUnload(query),
             (Self::Running { .. }, Report::Ended(_)) => Self::Ended,
             _ => return None,
@@ -402,6 +407,8 @@ mod tests {
         assert!(state.receive(&Report::Started { origin: "https://app.example" }.encode().unwrap()).is_some());
         assert_eq!(state.receive(&nav), Some(Report::Navigate("https://app.example/second.html")));
         assert!(state.receive(&Report::UrlChanged("https://app.example/route/1").encode().unwrap()).is_some());
+        assert_eq!(state.receive(&Report::OpenBeside("https://elsewhere.example/").encode().unwrap()), Some(Report::OpenBeside("https://elsewhere.example/")));
+        assert!(Report::OpenBeside("http://elsewhere.example/").encode().is_none());
         for bad in ["http://app.example/", "javascript:alert(1)", "https://a.example/x y", "https://a.example/\n"] {
             assert!(Report::Navigate(bad).encode().is_none(), "{bad}");
             assert!(state.receive(&postcard::to_stdvec(&Report::Navigate(bad)).unwrap()).is_none(), "{bad}");
