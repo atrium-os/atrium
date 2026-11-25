@@ -2712,6 +2712,33 @@ and navigator-cookies:
 4. Run the same page live in an Unrecorded trail: not signed in.
 5. Add an item: `/api/items` (a script POST with JSON) answers its count.
 
+#### I6.3 first part: gate results on arm64 Tessera, 2026-11-25
+
+Main `a44a1e9d2`: the `I6_PAGE` engine (`live-page.patch` re-applied on a
+pristine `ResourceLoader.cpp` after `fixture-fetch.patch`; `3f738d5c…`,
+audit passed), navigatord, navigator-ui, limend, arcad, arca-courierd and
+the courier from main, and portcullisd and jaild deployed with
+`deploy-portcullis.sh` (J2). navigatord ran with `NAVIGATORD_ARCA` and
+`NAVIGATORD_COURIERD`; arcad had a fresh store with mailgate unlocked, and
+arca-courierd trusted the fixture CA under the private-network test grant.
+
+1. Run live in a recorded trail: "Not signed in", and every check line
+   reached the fixture server as a script POST to `/report` (204);
+   `session` read not signed in. Passed.
+2. **Sign in**: the server logged `POST /login` (303) and `sign-in` pass,
+   the trail gained `app.html` as a new entry, it ran live with no prompt,
+   and the page read "Signed in as ana"; its later requests carried the
+   session cookie. Passed.
+3. Stop, Run live again: "Signed in as ana" (`/api/me` with the session).
+   Passed.
+4. The same page live in an Unrecorded trail (Ctrl+Shift+N): not signed
+   in, no session cookie. Passed.
+5. **Add**: `POST /api/items` with JSON answered "1 on the server"
+   (`script-post` pass). Passed.
+
+jaild logged no warnings in the whole run. `api.app.example` (the sibling
+host) is fetched without the session cookie, as the cookie is the host's.
+
 #### I6.3 as built (2026-11-25, second part: storage)
 
 navigatord side host-tested; the engine's Rust side type-checks; the
@@ -2750,6 +2777,34 @@ LibWeb glue that makes `localStorage` use it is the Mac step.
    open another: 1 again.
 4. `live-storage/app.example.store` exists, mode 0600, owned by the
    persona's Navigator user, and no file appears for the Unrecorded runs.
+
+#### I6.3 second part: the LibWeb glue and gate results, 2026-11-25
+
+LibWeb's storage areas are mirrors kept behind one
+`StorageAPI::StorageAreaMirrorClient` per process; with none set, every
+area stays detached and `setItem` throws `QuotaExceededError` (the I6.1 and
+I6.2 gates' `local-storage` failure). `navigator-ladybird/LiveStorage.h` is
+that client for `ATRIUM_I6_PAGE`, set by `editor-check.cpp` once the page
+is delivered: the local area is loaded once with
+`navigator_live_storage_load` and written through with `_set`, `_remove`
+and `_clear`, a refused set answers `storage_area_did_refuse_write` with
+navigatord's contents, a refused removal or clear is acknowledged and then
+reset to them, loudly, and the session area lives in the engine only.
+No LibWeb source is patched.
+
+Gate on arm64 Tessera with the glue (engine `590a8f67…`, main `6033c3f49`)
+and `NAVIGATORD_STORE=/var/db/navigatord/store`:
+
+1. Run `app.html` live: `local-storage` pass, "visit 1". Passed.
+2. Stop, Run live: "visit 2"; restart navigatord, Run live: "visit 3".
+   Passed.
+3. An Unrecorded trail: "visit 1"; closing it (Ctrl+W forgot its jar) and
+   opening another: "visit 1" again. Passed.
+4. `live-storage/app.example.store` (in the Navigator's overlay) is mode
+   0600, owned by `atrium-app-50000`, holds `visits` = 3, and no other
+   store file appeared. Passed.
+
+Evidence for both parts is in `~/atrium-vm/evidence/navigator-i6-3-20261125/`.
 
 #### Costs
 
