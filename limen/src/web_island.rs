@@ -220,7 +220,7 @@ pub enum Report<'a> {
     /// answers with [`FilePicked`]; the engine never sees a folder.
     PickFile,
     /// A whole page asked for `url` in a new window (`window.open`, a
-    /// `target=_blank` link or form, I6.2): the engine opens none and
+    /// `target=_blank` link, I6.2): the engine opens none and
     /// reports it only on the person's activation; navigatord opens it
     /// beside the page in the trail.
     OpenBeside(&'a str),
