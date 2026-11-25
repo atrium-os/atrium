@@ -242,10 +242,12 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> std::io::Result<(usize
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr().cast();
     msg.msg_controllen = space as _;
-    #[cfg(target_os = "linux")]
+    // macOS (a development host) has no MSG_CMSG_CLOEXEC: the received fds
+    // are marked close-on-exec just below instead.
+    #[cfg(not(target_vendor = "apple"))]
     let flags = libc::MSG_CMSG_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let flags = 0;
     // SAFETY: msg points at valid buffers for the call.
     let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, flags) };
     if n < 0 {
@@ -261,7 +263,10 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> std::io::Result<(usize
                 let data = libc::CMSG_DATA(c).cast::<RawFd>();
                 let count = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
                 for i in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                    let fd = std::ptr::read_unaligned(data.add(i));
+                    #[cfg(target_vendor = "apple")]
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    fds.push(OwnedFd::from_raw_fd(fd));
                 }
             }
             c = libc::CMSG_NXTHDR(&msg, c);
@@ -273,13 +278,19 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> std::io::Result<(usize
 /// A SOCK_SEQPACKET socketpair (close-on-exec): one end per device.
 pub fn seqpacket_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
-    #[cfg(target_os = "linux")]
+    // macOS (a development host) has no SOCK_CLOEXEC: set it after.
+    #[cfg(not(target_vendor = "apple"))]
     let ty = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let ty = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let ty = libc::SOCK_SEQPACKET;
     // SAFETY: fds is a valid out-array of two ints.
     if unsafe { libc::socketpair(libc::AF_UNIX, ty, 0, fds.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(target_vendor = "apple")]
+    for fd in fds {
+        // SAFETY: fd is one of the two fresh descriptors socketpair returned.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     // SAFETY: socketpair returned two fresh fds we now own.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })

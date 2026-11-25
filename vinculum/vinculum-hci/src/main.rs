@@ -175,9 +175,58 @@ fn bridge(spec: &str, addr: &str, firmware_dir: &std::path::Path) -> ! {
     }
 }
 
+enum HostSide {
+    Listen(String),
+    /// Connect to vinculumd's transport socket (how dispensatord's driver
+    /// jail runs it: its mounts are read-only, so it cannot bind).
+    Connect(String),
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] \
+         (--host-listen PATH | --host-connect PATH | --serve-tcp 127.0.0.1:PORT) [--host-uid UID]... [--firmware-dir DIR]"
+    );
+    std::process::exit(2)
+}
+
+/// The host on `s` is one we serve: its uid is in `uids` (vinculumd's,
+/// `_vinculum`), or with none given, any. A refused peer is logged and closed.
+fn peer_allowed(s: &UnixStream, uids: &[u32]) -> bool {
+    if uids.is_empty() {
+        return true;
+    }
+    let uid = peer_uid(s);
+    if uid.is_some_and(|u| uids.contains(&u)) {
+        return true;
+    }
+    eprintln!("vinculum-hci: refused a host (uid {uid:?})");
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(s: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes of the sizes given; the
+    // fd is an open socket owned by `s`.
+    let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) };
+    (r == 0).then_some(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(s: &UnixStream) -> Option<u32> {
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: valid out-pointers; the fd is an open socket owned by `s`.
+    let r = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
+    (r == 0).then_some(uid)
+}
+
 fn main() {
     let mut controller_spec = None;
     let mut listen = None;
+    let mut connect: Option<String> = None;
+    let mut host_uids: Vec<u32> = Vec::new();
     let mut serve_tcp: Option<String> = None;
     let mut firmware_dir = std::path::PathBuf::from(DEFAULT_FIRMWARE_DIR);
     let mut a = std::env::args().skip(1);
@@ -185,37 +234,51 @@ fn main() {
         match k.as_str() {
             "--controller" => controller_spec = a.next(),
             "--host-listen" => listen = a.next(),
+            "--host-connect" => connect = a.next(),
+            "--host-uid" => match a.next().and_then(|v| v.parse().ok()) {
+                Some(u) => host_uids.push(u),
+                None => usage(),
+            },
             "--serve-tcp" => serve_tcp = a.next(),
             "--firmware-dir" => firmware_dir = a.next().map(Into::into).unwrap_or(firmware_dir),
-            _ => {
-                eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] (--host-listen PATH | --serve-tcp 127.0.0.1:PORT) [--firmware-dir DIR]");
-                std::process::exit(2);
-            }
+            _ => usage(),
         }
     }
     if let (Some(spec), Some(addr)) = (controller_spec.as_deref(), serve_tcp.as_deref()) {
         bridge(spec, addr, &firmware_dir);
     }
-    let (Some(spec), Some(path)) = (controller_spec, listen) else {
-        eprintln!("usage: vinculum-hci --controller tcp:HOST:PORT|uart:PATH|usb[:VVVV:PPPP] (--host-listen PATH | --serve-tcp 127.0.0.1:PORT) [--firmware-dir DIR]");
-        std::process::exit(2);
+    let Some(spec) = controller_spec else { usage() };
+    let side = match (listen, connect) {
+        (Some(p), None) => HostSide::Listen(p),
+        (None, Some(p)) => HostSide::Connect(p),
+        _ => usage(),
     };
     let mut ctl = Controller::open(&spec, &firmware_dir).unwrap_or_else(|e| {
         eprintln!("vinculum-hci: controller {spec}: {e}");
         std::process::exit(1)
     });
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap_or_else(|e| {
-        eprintln!("vinculum-hci: listen {path}: {e}");
-        std::process::exit(1)
-    });
-    eprintln!("vinculum-hci: controller {spec}, host socket {path}");
+    let listener = match &side {
+        HostSide::Listen(path) => {
+            let _ = std::fs::remove_file(path);
+            let l = UnixListener::bind(path).unwrap_or_else(|e| {
+                eprintln!("vinculum-hci: listen {path}: {e}");
+                std::process::exit(1)
+            });
+            eprintln!("vinculum-hci: controller {spec}, host socket {path}");
+            Some(l)
+        }
+        HostSide::Connect(path) => {
+            eprintln!("vinculum-hci: controller {spec}, host at {path}");
+            None
+        }
+    };
 
     let mut relay = Relay::new();
     let mut host: Option<UnixStream> = None;
     let mut buf = vec![0u8; 8192];
     let mut out = Vec::new();
     let mut reset_since: Option<std::time::Instant> = None;
+    let mut last_connect: Option<std::time::Instant> = None;
     loop {
         if relay.resetting && reset_since.is_some_and(|t| t.elapsed().as_millis() as u64 >= RESET_WAIT_MS) {
             eprintln!("vinculum-hci: controller did not complete the reset; taking the next host anyway");
@@ -224,14 +287,31 @@ fn main() {
         if !relay.resetting {
             reset_since = None;
         }
-        let host_fd = host.as_ref().map(|h| h.as_raw_fd()).unwrap_or(listener.as_raw_fd());
-        // While the controller resets, a waiting host is not accepted yet.
-        let ready = if relay.resetting && host.is_none() {
-            let mut r = wait(&[ctl.fd()], 100);
-            r.push(false);
-            r
-        } else {
-            wait(&[ctl.fd(), host_fd], -1)
+        // Connect mode: (re)connect to the host once the controller is clean,
+        // at most once a second, so a host that refuses us (or keeps
+        // leaving) is not hammered.
+        if let (HostSide::Connect(path), None, false) = (&side, host.as_ref(), relay.resetting) {
+            if last_connect.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+                last_connect = Some(std::time::Instant::now());
+                if let Ok(s) = UnixStream::connect(path) {
+                    if peer_allowed(&s, &host_uids) {
+                        eprintln!("vinculum-hci: connected to the host");
+                        relay.host_reset();
+                        host = Some(s);
+                    }
+                }
+            }
+        }
+        let host_fd = host.as_ref().map(|h| h.as_raw_fd()).or(listener.as_ref().map(|l| l.as_raw_fd()));
+        // While the controller resets, a waiting host is not accepted yet;
+        // in connect mode, with no host, retry the connect every second.
+        let ready = match host_fd {
+            Some(fd) if !(relay.resetting && host.is_none()) => wait(&[ctl.fd(), fd], -1),
+            _ => {
+                let mut r = wait(&[ctl.fd()], if relay.resetting { 100 } else { 1000 });
+                r.push(false);
+                r
+            }
         };
         if ready[0] {
             let n = ctl.read(&mut buf).unwrap_or(0);
@@ -247,10 +327,12 @@ fn main() {
         if ready[1] {
             match host.as_mut() {
                 None => {
-                    if let Ok((s, _)) = listener.accept() {
-                        eprintln!("vinculum-hci: host connected");
-                        relay.host_reset();
-                        host = Some(s);
+                    if let Some(Ok((s, _))) = listener.as_ref().map(|l| l.accept()) {
+                        if peer_allowed(&s, &host_uids) {
+                            eprintln!("vinculum-hci: host connected");
+                            relay.host_reset();
+                            host = Some(s);
+                        }
                     }
                 }
                 Some(h) => {

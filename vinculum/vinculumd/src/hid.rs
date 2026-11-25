@@ -152,8 +152,14 @@ fn monotonic_ns() -> u64 {
 
 /// Sends one packet without blocking. Ok(false): the buffer is full.
 fn send_packet(fd: RawFd, p: &[u8]) -> std::io::Result<bool> {
+    // macOS (a development host) has no MSG_NOSIGNAL; Rust programs ignore
+    // SIGPIPE from start-up anyway, so the error comes back as EPIPE.
+    #[cfg(not(target_vendor = "apple"))]
+    let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(target_vendor = "apple")]
+    let flags = libc::MSG_DONTWAIT;
     // SAFETY: `p` is valid for reads of its length; fd is an open socket.
-    let n = unsafe { libc::send(fd, p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    let n = unsafe { libc::send(fd, p.as_ptr().cast(), p.len(), flags) };
     if n >= 0 {
         return Ok(true);
     }

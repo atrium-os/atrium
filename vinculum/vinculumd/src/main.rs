@@ -7,7 +7,7 @@
 //! `vinculum/harness/e2e.sh`:
 //!
 //! ```text
-//! vinculumd --transport unix:PATH|tcp:HOST:PORT
+//! vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]...
 //!           [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS]
 //!           [--pair [--reconnect] [--passkey-file PATH]]
 //!           [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR]
@@ -62,7 +62,12 @@ enum Link {
 }
 
 impl Link {
-    fn open(spec: &str) -> std::io::Result<Link> {
+    /// `uids`: with `listen:`, the peer uids taken as a transport (spec §4:
+    /// `_vinculum-hci`); others are dropped and waited past.
+    fn open(spec: &str, uids: &[u32]) -> std::io::Result<Link> {
+        if let Some(p) = spec.strip_prefix("listen:") {
+            return Ok(Link::Unix(accept_transport(p, uids)?));
+        }
         if let Some(p) = spec.strip_prefix("unix:") {
             Ok(Link::Unix(UnixStream::connect(p)?))
         } else if let Some(a) = spec.strip_prefix("tcp:") {
@@ -70,7 +75,7 @@ impl Link {
             s.set_nodelay(true)?;
             Ok(Link::Tcp(s))
         } else {
-            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "transport must be unix:PATH or tcp:HOST:PORT"))
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "transport must be unix:PATH, listen:PATH or tcp:HOST:PORT"))
         }
     }
     fn fd(&self) -> RawFd {
@@ -93,6 +98,33 @@ impl Link {
     }
 }
 
+/// Binds `path` and waits for one transport (vinculum-hci connects to us
+/// when dispensatord starts it for a controller, spec §4). Only a peer whose
+/// uid is in `uids` (or, with none given, our own uid) is taken; any other
+/// is closed and logged. The socket is removed once a transport is taken,
+/// so a second controller's vinculum-hci waits until this vinculumd exits
+/// and the next one listens: one controller at a time.
+fn accept_transport(path: &str, uids: &[u32]) -> std::io::Result<UnixStream> {
+    let _ = std::fs::remove_file(path);
+    let l = std::os::unix::net::UnixListener::bind(path)?;
+    eprintln!("vinculumd: waiting for a controller on {path}");
+    loop {
+        let (s, _) = l.accept()?;
+        let uid = daemon::peer_uid(&s);
+        let ok = match uid {
+            Some(u) if uids.is_empty() => u == daemon::getuid(),
+            Some(u) => uids.contains(&u),
+            None => false,
+        };
+        if ok {
+            let _ = std::fs::remove_file(path);
+            eprintln!("vinculumd: controller transport connected (uid {})", uid.unwrap_or(u32::MAX));
+            return Ok(s);
+        }
+        eprintln!("vinculumd: refused a transport from uid {uid:?}");
+    }
+}
+
 /// poll(2) one fd for input, up to `timeout_ms`. True if readable.
 fn wait(fd: RawFd, timeout_ms: i32) -> bool {
     let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -103,6 +135,7 @@ fn wait(fd: RawFd, timeout_ms: i32) -> bool {
 
 struct Opts {
     transport: String,
+    transport_uids: Vec<u32>,
     scan_secs: Option<u64>,
     connect: Option<String>,
     att_mtu: bool,
@@ -124,10 +157,10 @@ struct Opts {
 
 fn opts() -> Opts {
     let usage = || -> ! {
-        eprintln!("usage: vinculumd --transport unix:PATH|tcp:HOST:PORT [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]]");
+        eprintln!("usage: vinculumd --transport unix:PATH|listen:PATH|tcp:HOST:PORT [--transport-uid UID]... [--scan SECS] [--connect NAME] [--att-mtu] [--timeout SECS] [--pair [--reconnect] [--passkey-file PATH]] [--keys DIR --machine-key PATH | --arca SOCKET] [--classic ADDR] [--control PATH [--control-uid UID]... [--control-apps REGISTRY APPS_DIR] [--power-file PATH] [--hid PATH [--hid-uid UID]...]]");
         std::process::exit(2)
     };
-    let mut o = Opts { transport: String::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
+    let mut o = Opts { transport: String::new(), transport_uids: Vec::new(), scan_secs: None, connect: None, att_mtu: false, timeout_secs: 20, pair: false,
         reconnect: false,
         passkey_file: None,
         keys: None,
@@ -145,6 +178,7 @@ fn opts() -> Opts {
     while let Some(k) = a.next() {
         match k.as_str() {
             "--transport" => o.transport = a.next().unwrap_or_else(|| usage()),
+            "--transport-uid" => o.transport_uids.push(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--scan" => o.scan_secs = Some(a.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage())),
             "--connect" => o.connect = Some(a.next().unwrap_or_else(|| usage())),
             "--att-mtu" => o.att_mtu = true,
@@ -228,7 +262,7 @@ fn main() {
     }
     println!("bonds: {}", bonds.len());
     let mut names: std::collections::HashMap<vinculum_host::Peer, String> = Default::default();
-    let mut link = Link::open(&o.transport).unwrap_or_else(|e| {
+    let mut link = Link::open(&o.transport, &o.transport_uids).unwrap_or_else(|e| {
         eprintln!("vinculumd: transport {}: {e}", o.transport);
         std::process::exit(1)
     });
