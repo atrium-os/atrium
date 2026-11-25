@@ -18,6 +18,82 @@ pub const LIVE_PAGE: &str = "https://live-page.atrium.invalid/";
 /// POST sends a batch of changes. navigatord keeps it; the engine holds
 /// no file.
 pub const LIVE_STORAGE: &str = "https://live-page.atrium.invalid/local-storage";
+/// A file a whole page's script made and asked to save (I6.4: `<a
+/// download>` on a `blob:` or `data:` address): its bytes are POSTed here,
+/// with `name` (the suggested name) and `type` (its content type) as
+/// query parameters. navigatord holds it and the person decides, as for
+/// any download.
+pub const LIVE_DOWNLOAD: &str = "https://live-page.atrium.invalid/download";
+/// A whole page asked for an API I6 refuses (I6.4): a GET here with
+/// `api` set to the [`Api`]'s token. navigatord tells the chip's popover.
+pub const LIVE_REFUSED: &str = "https://live-page.atrium.invalid/refused";
+/// The script navigatord puts first in a whole page (I6.4): it answers the
+/// refused APIs at once and reports each to [`LIVE_REFUSED`], and hands a
+/// script-made download to [`LIVE_DOWNLOAD`]. It reports; the engine,
+/// which has none of these APIs' backends, is what refuses.
+pub const LIVE_REPORTER: &str = "https://live-page.atrium.invalid/reporter.js";
+
+/// A web API a whole page asked for that I6 refuses (navigator-islands.md
+/// "What the page can reach"), so the popover can say what the page was
+/// refused; nothing is refused silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Api {
+    Notifications,
+    Geolocation,
+    Camera,
+    Microphone,
+    Midi,
+    Usb,
+    Bluetooth,
+    Serial,
+    Hid,
+    ServiceWorker,
+    Push,
+    BackgroundSync,
+    /// A paste the page asked for outside the person's Ctrl-V.
+    ClipboardRead,
+    /// A new window (`window.open` that is not a navigation).
+    Popup,
+    /// A file a script made that is over [`DOWNLOAD_MAX`].
+    LargeDownload,
+}
+
+/// The largest file a page's script may hand over to save (one POST on the
+/// fetch channel, Nuntius's body bound).
+pub const DOWNLOAD_MAX: usize = 32 * 1024;
+
+const APIS: &[(Api, &str, &str)] = &[
+    (Api::Notifications, "notifications", "notifications"),
+    (Api::Geolocation, "geolocation", "your location"),
+    (Api::Camera, "camera", "the camera"),
+    (Api::Microphone, "microphone", "the microphone"),
+    (Api::Midi, "midi", "MIDI devices"),
+    (Api::Usb, "usb", "USB devices"),
+    (Api::Bluetooth, "bluetooth", "Bluetooth devices"),
+    (Api::Serial, "serial", "serial ports"),
+    (Api::Hid, "hid", "input devices (HID)"),
+    (Api::ServiceWorker, "service-worker", "a service worker"),
+    (Api::Push, "push", "push messages"),
+    (Api::BackgroundSync, "background-sync", "background sync"),
+    (Api::ClipboardRead, "clipboard-read", "reading the clipboard without your paste"),
+    (Api::Popup, "popup", "a new window"),
+    (Api::LargeDownload, "large-download", "a file it made that is too big to save"),
+];
+
+impl Api {
+    /// The token the reporter sends.
+    pub fn token(self) -> &'static str {
+        APIS.iter().find(|a| a.0 == self).map_or("", |a| a.1)
+    }
+    /// The API a reporter's token names; `None` for any other text.
+    pub fn from_token(token: &str) -> Option<Self> {
+        APIS.iter().find(|a| a.1 == token).map(|a| a.0)
+    }
+    /// What the popover says the page was refused.
+    pub fn label(self) -> &'static str {
+        APIS.iter().find(|a| a.0 == self).map_or("", |a| a.2)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EndReason { Closed, Failed }
@@ -253,6 +329,19 @@ mod tests {
         let mut state = Lifecycle::Running { last_query: 0 };
         assert!(state.accepts_control(&size.encode(), false));
         assert!(!Lifecycle::Ended.accepts_control(&size.encode(), true));
+    }
+
+    #[test]
+    fn a_refused_api_has_one_token_and_the_popovers_words() {
+        let all = [Api::Notifications, Api::Geolocation, Api::Camera, Api::Microphone, Api::Midi, Api::Usb, Api::Bluetooth,
+                   Api::Serial, Api::Hid, Api::ServiceWorker, Api::Push, Api::BackgroundSync, Api::ClipboardRead, Api::Popup, Api::LargeDownload];
+        for api in all {
+            assert_eq!(Api::from_token(api.token()), Some(api), "{api:?}");
+            assert!(!api.label().is_empty());
+        }
+        for bad in ["", "Notifications", "notifications ", "camera\n", "x".repeat(4096).as_str()] {
+            assert_eq!(Api::from_token(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

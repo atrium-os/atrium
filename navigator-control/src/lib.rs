@@ -427,7 +427,20 @@ pub enum Event {
     /// The live page at `from` changed its own address to `url`, same
     /// origin (`history.pushState`, I6.2): a trail entry, same engine.
     LiveUrlChanged { from: String, url: String },
+    /// The live page at `from` offered a file (I6.4): a link or form whose
+    /// answer is not a page, or a file its script made. navigatord holds
+    /// it under `id` (its own, never one the UI sent) until `Save`,
+    /// `OpenFile` or `Discard`, as for [`Event::File`]; the engine keeps
+    /// running.
+    LiveFile { from: String, id: u32, url: String, name: String, size: u64, origin: String, kind: String },
+    /// The live page at `from` was refused something (I6.4): a web API,
+    /// a request beyond its scope, a form. `what` is the popover's words,
+    /// at most [`REFUSED_MAX`] bytes.
+    LiveRefused { from: String, what: String },
 }
+
+/// The longest refusal a [`Event::LiveRefused`] names.
+pub const REFUSED_MAX: usize = 160;
 
 /// What a VPN page's resource is, from its content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

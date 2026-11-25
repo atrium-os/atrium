@@ -100,6 +100,61 @@ pub struct LiveJar {
     pub view: u64,
     /// The page's host, the initiator of its requests.
     pub host: String,
+    /// The trail's jar (`None`: the persona's own).
+    pub jar: Option<u64>,
+    /// The page itself, already fetched when this run's navigation was
+    /// looked at ([`LiveJar::peek`]), so it is not asked for twice.
+    first: Option<(u16, String, Vec<u8>)>,
+}
+
+/// What a live page's navigation or form led to (I6.4).
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    /// A page at this address: the next trail entry, run live again.
+    Page(String),
+    /// A file to save: held, and the person asked.
+    File(Offered),
+}
+
+/// A file a live page offered, for navigatord to hold (I6.4).
+#[derive(Debug, PartialEq)]
+pub struct Offered {
+    pub url: String,
+    pub name: String,
+    pub kind: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A page a run looked at, kept briefly for the run that shows it.
+struct Stashed { jar: Option<u64>, url: String, at: Instant, answer: (u16, String, Vec<u8>) }
+static STASH: Mutex<Option<Stashed>> = Mutex::new(None);
+/// How long a looked-at page waits for its run.
+const STASH_LIFE: Duration = Duration::from_secs(30);
+
+fn stash(jar: Option<u64>, url: &str, answer: (u16, String, Vec<u8>)) {
+    if answer.2.len() <= navigator_prerender::fetch::LIVE_RESOURCE_MAX {
+        *STASH.lock().unwrap() = Some(Stashed { jar, url: url.to_string(), at: Instant::now(), answer });
+    }
+}
+
+fn unstash(jar: Option<u64>, url: &str) -> Option<(u16, String, Vec<u8>)> {
+    let mut slot = STASH.lock().unwrap();
+    let fresh = slot.as_ref().is_some_and(|s| s.jar == jar && s.url == url && s.at.elapsed() < STASH_LIFE);
+    if fresh { slot.take().map(|s| s.answer) } else { None }
+}
+
+/// A page or a file, from what the jar answered.
+fn answered(r: navigator_cookies::Fetched, jar: Option<u64>) -> Result<Answer, String> {
+    if r.body.len() as u64 > navigator_control::FILE_MAX {
+        return Err("the answer is over the largest file Navigator keeps".into());
+    }
+    match crate::files::live_file(&r.url, &r.headers, &r.body) {
+        Some((name, kind)) => Ok(Answer::File(Offered { url: r.url, name, kind, bytes: r.body })),
+        None => {
+            stash(jar, &r.url, (r.status, type_token(&r.headers), r.body));
+            Ok(Answer::Page(r.url))
+        }
+    }
 }
 
 impl LiveJar {
@@ -109,7 +164,7 @@ impl LiveJar {
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).ok_or("no host")?;
         let view = crate::VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cookies.lock().unwrap().show_live(view, url, jar).map_err(|e| format!("the page's jar: {e:?}"))?;
-        Ok(LiveJar { cookies, view, host })
+        Ok(LiveJar { cookies, view, host, jar, first: unstash(jar, url) })
     }
 
     fn answer(got: Result<navigator_cookies::Fetched, navigator_cookies::Refused>) -> Result<(u16, String, Vec<u8>), String> {
@@ -119,16 +174,27 @@ impl LiveJar {
     }
 
     /// A form the page submitted (I6.3): sent through the jar, its answer's
-    /// redirects followed; the address of the page that answered.
-    pub fn submit(&self, url: &str, body: &[u8]) -> Result<String, String> {
+    /// redirects followed. The page that answered is kept for the next
+    /// run, so an answer that is not a redirect is not lost (I6.4).
+    pub fn submit(&self, url: &str, body: &[u8]) -> Result<Answer, String> {
         let f = navigator_cookies::Fetch::live_form(url, &self.host, body.to_vec());
         let r = self.cookies.lock().unwrap().fetch(self.view, &f).map_err(|e| format!("through Arca: {e:?}"))?;
-        Ok(r.url)
+        answered(r, self.jar)
+    }
+
+    /// A navigation the page proposed within its origin (I6.4): fetched
+    /// through the jar to see whether it is a page or a file. A page is
+    /// kept for the run that shows it.
+    pub fn peek(&self, url: &str) -> Result<Answer, String> {
+        let f = navigator_cookies::Fetch::navigation(url, None, true);
+        let r = self.cookies.lock().unwrap().fetch(self.view, &f).map_err(|e| format!("through Arca: {e:?}"))?;
+        answered(r, self.jar)
     }
 }
 
 impl Resources for LiveJar {
     fn get(&mut self, url: &str, first: bool) -> Result<(u16, String, Vec<u8>), String> {
+        if first { if let Some(a) = self.first.take() { return Ok(a); } }
         let f = if first { navigator_cookies::Fetch::navigation(url, None, true) } else { navigator_cookies::Fetch::subresource(url, &self.host) };
         Self::answer(self.cookies.lock().unwrap().fetch_once(self.view, &f))
     }
@@ -173,10 +239,26 @@ pub struct Served {
     pub refused: Vec<String>,
 }
 
+/// What the serve loop tells its run, and what it keeps for it.
+pub trait Hooks {
+    /// The page itself was delivered, with its address.
+    fn started(&mut self, _page: &str) {}
+    /// The page's `localStorage` (I6.3), if it has one here.
+    fn storage(&mut self) -> Option<&mut dyn LocalStorage> { None }
+    /// The page's script made a file to save (I6.4), named `name`, of the
+    /// content type `kind`.
+    fn made(&mut self, _page: &str, _name: &str, _kind: &str, _bytes: Vec<u8>) -> Result<(), String> {
+        Err("no downloads here".into())
+    }
+    /// A request was refused: its host and site, once for each.
+    fn refused(&mut self, _target: &str) {}
+    /// The reporter says the page asked for an API I6 refuses.
+    fn refused_api(&mut self, _api: limen::web_island::Api) {}
+}
+
 /// Serve one live page's engine on its fetch channel until it closes it.
-/// `page` is the address the person pressed on; `started` is called once
-/// the page itself has been delivered, with its address.
-pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut local: Option<&mut dyn LocalStorage>, started: &mut dyn FnMut(&str)) -> Result<Served, String> {
+/// `page` is the address the person pressed on.
+pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks: &mut dyn Hooks) -> Result<Served, String> {
     let mut delivered_url = String::new();
     socket.set_write_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
     socket.set_read_timeout(Some(IDLE_POLL)).map_err(|e| e.to_string())?;
@@ -206,9 +288,10 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
             return Err("the page made too many requests".into());
         }
         let id = open.id;
-        let mut refuse = |why: &str, code: ErrorCode, served: &mut Served| -> Result<(), String> {
+        let mut refuse = |why: &str, code: ErrorCode, served: &mut Served, hooks: &mut dyn Hooks| -> Result<(), String> {
             let target = crate::refused_target(&open.url);
             eprintln!("navigatord: a live page's request refused: {why} ({target})");
+            if served.refused.len() < 64 && !served.refused.contains(&target) { hooks.refused(&target); }
             if served.refused.len() < 64 { served.refused.push(target); }
             output.send(Event::Error { id, code }).map_err(|e| e.to_string())
         };
@@ -220,18 +303,18 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
                 && !b.content_type.is_empty() && b.content_type.len() <= navigator_cookies::CONTENT_TYPE_MAX
                 && b.content_type.bytes().all(|c| (0x20..0x7f).contains(&c)) => Some(b),
             _ => {
-                refuse("only a whole GET, or a POST with its body", ErrorCode::Policy, &mut served)?;
+                refuse("only a whole GET, or a POST with its body", ErrorCode::Policy, &mut served, hooks)?;
                 continue;
             }
         };
         if open.range.is_some() || open.if_range.is_some() || open.deliver != Deliver::Stream {
-            refuse("only a whole resource", ErrorCode::Policy, &mut served)?;
+            refuse("only a whole resource", ErrorCode::Policy, &mut served, hooks)?;
             continue;
         }
         // The page's storage (I6.3): loaded once, changed in batches, kept
         // by navigatord for the page's site.
         if delivered && open.url == limen::web_island::LIVE_STORAGE {
-            let answer = match (local.as_deref_mut(), post) {
+            let answer = match (hooks.storage(), post) {
                 (None, _) => Err("no storage here".to_string()),
                 (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
                 (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
@@ -247,12 +330,43 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
                     }
                     output.send(Event::Done { id, bytes: length }).map_err(|e| e.to_string())?;
                 }
-                Ok(_) => refuse("the store is over the engine's bound", ErrorCode::TooBig, &mut served)?,
+                Ok(_) => refuse("the store is over the engine's bound", ErrorCode::TooBig, &mut served, hooks)?,
                 Err(why) => {
                     eprintln!("navigatord: a live page's storage: {why}");
                     output.send(Event::Error { id, code: ErrorCode::Policy }).map_err(|e| e.to_string())?;
                 }
             }
+            continue;
+        }
+        // The reporter's addresses (I6.4), on navigatord's own name: its
+        // script, a refused API, a file the page's script made. Only after
+        // the page; none goes to the network.
+        if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE {
+            let (status, kind, body): (u16, Option<&str>, &[u8]) = match (reporter_request(&open.url), post) {
+                (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER),
+                (Some(Reporter::Refused(api)), None) => {
+                    hooks.refused_api(api);
+                    (204, None, b"")
+                }
+                (Some(Reporter::Download { name, kind }), Some(b)) => match hooks.made(&delivered_url, &name, &kind, b.bytes.clone()) {
+                    Ok(()) => (204, None, b""),
+                    Err(why) => {
+                        eprintln!("navigatord: a live page's file not offered: {why}");
+                        refuse("a file the page made, not offered", ErrorCode::Policy, &mut served, hooks)?;
+                        continue;
+                    }
+                },
+                _ => {
+                    refuse("not one of the reporter's requests", ErrorCode::Policy, &mut served, hooks)?;
+                    continue;
+                }
+            };
+            output.send(Event::Head { id, status, final_url: open.url.clone(), redirects: 0, content_type: kind.map(str::to_string),
+                length: Some(body.len() as u64), accept_ranges: false, validator: None }).map_err(|e| e.to_string())?;
+            if !body.is_empty() {
+                output.send(Event::Data { id, offset: 0, bytes: body.to_vec() }).map_err(|e| e.to_string())?;
+            }
+            output.send(Event::Done { id, bytes: body.len() as u64 }).map_err(|e| e.to_string())?;
             continue;
         }
         // The engine's first request is for the page; it names no address.
@@ -263,7 +377,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
             page.to_string()
         } else {
             if let Err(why) = scope(page, &open.url) {
-                refuse(why, ErrorCode::Policy, &mut served)?;
+                refuse(why, ErrorCode::Policy, &mut served, hooks)?;
                 continue;
             }
             open.url.clone()
@@ -281,12 +395,13 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
             }
             Err(why) => return Err(format!("the page: {why}")),
         };
-        let length = body.len() as u64;
         if !delivered && (status != 200 || kind != "text/html") {
             return Err(format!("the page answered {status} {kind}, not an HTML page"));
         }
+        let body = if delivered { body } else { with_reporter(&body) };
+        let length = body.len() as u64;
         if length > open.limits.max_bytes || served.bytes.saturating_add(length) > MAX_BYTES {
-            refuse("over the page's byte bound", ErrorCode::TooBig, &mut served)?;
+            refuse("over the page's byte bound", ErrorCode::TooBig, &mut served, hooks)?;
             continue;
         }
         served.bytes += length;
@@ -307,9 +422,67 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, mut l
         if !delivered {
             delivered = true;
             delivered_url = url.clone();
-            started(&url);
+            hooks.started(&url);
         }
     }
+}
+
+/// The script put first in a live page (I6.4), [`LIVE_REPORTER`]'s body.
+///
+/// [`LIVE_REPORTER`]: limen::web_island::LIVE_REPORTER
+const REPORTER: &[u8] = include_bytes!("live_reporter.js");
+
+/// One of the reporter's requests.
+#[derive(Debug, PartialEq)]
+enum Reporter {
+    Script,
+    Refused(limen::web_island::Api),
+    Download { name: String, kind: String },
+}
+
+fn reporter_request(url: &str) -> Option<Reporter> {
+    use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
+    if url == LIVE_REPORTER { return Some(Reporter::Script); }
+    let (at, query) = url.split_once('?')?;
+    let u = url::Url::parse(url).ok()?;
+    let pairs: Vec<(String, String)> = u.query_pairs().take(4).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    let get = |k: &str| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if query.len() > 1024 { return None; }
+    match at {
+        _ if at == LIVE_REFUSED => Api::from_token(get("api")?).map(Reporter::Refused),
+        _ if at == LIVE_DOWNLOAD => {
+            let kind = get("type").unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            let kind = if kind.len() <= 128 && kind.bytes().all(|b| b.is_ascii_graphic()) { kind } else { String::new() };
+            Some(Reporter::Download { name: get("name").unwrap_or("").chars().take(255).collect(), kind })
+        }
+        _ => None,
+    }
+}
+
+/// `html` with the reporter's script first: after a doctype (and any
+/// comments before it), so the page keeps its mode.
+pub fn with_reporter(html: &[u8]) -> Vec<u8> {
+    let tag = format!("<script src=\"{}\"></script>", limen::web_island::LIVE_REPORTER);
+    let mut at = if html.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
+    let start = at;
+    loop {
+        while html.get(at).is_some_and(u8::is_ascii_whitespace) { at += 1; }
+        let rest = &html[at..];
+        if rest.starts_with(b"<!--") {
+            match rest.windows(3).position(|w| w == b"-->") { Some(end) => { at += end + 3; continue; } None => { at = start; break; } }
+        }
+        if rest.get(..9).is_some_and(|d| d.eq_ignore_ascii_case(b"<!doctype")) {
+            match rest.iter().position(|&b| b == b'>') { Some(end) => at += end + 1, None => at = start }
+        } else {
+            at = start;
+        }
+        break;
+    }
+    let mut out = Vec::with_capacity(html.len() + tag.len());
+    out.extend_from_slice(&html[..at]);
+    out.extend_from_slice(tag.as_bytes());
+    out.extend_from_slice(&html[at..]);
+    out
 }
 
 /// Where a live page's proposed navigation may go (I6.2): a plain HTTPS
@@ -350,11 +523,65 @@ fn tell_size(parent: &mut Parent, embed: u64, rect: [u32; 4]) {
     }
 }
 
+/// What a run tells the UI, from its threads.
+pub trait Tell: Send + Sync + 'static {
+    /// The page was delivered and the engine reported `origin`, the page's.
+    fn started(&self, origin: String);
+    /// A trail entry for `url` (I6.2): a link, a form's answer.
+    fn navigate(&self, url: String);
+    /// The page changed its own address within its origin (I6.2).
+    fn url_changed(&self, url: String);
+    /// A file the page offered (I6.4): navigatord holds it and asks.
+    fn file(&self, file: Offered);
+    /// Something the page was refused (I6.4), in the popover's words.
+    fn refused(&self, what: String);
+    /// The run ended by itself (`None`: the engine closed) or failed;
+    /// once, and never after [`Live::stop`].
+    fn finished(&self, why: Option<String>);
+}
+
+/// The host of a refused request's target, as `refused_target` spells it.
+fn refused_host(target: &str) -> &str {
+    target.strip_prefix("host ").and_then(|t| t.split(',').next()).unwrap_or("an unreadable address")
+}
+
+/// The serve loop's hooks for a running page.
+struct RunHooks {
+    delivered: std::sync::mpsc::Sender<String>,
+    storage: Option<JarStores>,
+    tell: Arc<dyn Tell>,
+    /// The APIs told already, each once.
+    apis: std::collections::HashSet<limen::web_island::Api>,
+}
+
+impl Hooks for RunHooks {
+    fn started(&mut self, page: &str) { let _ = self.delivered.send(page.to_string()); }
+    fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.storage.as_mut().map(|s| s as &mut dyn LocalStorage) }
+    fn made(&mut self, page: &str, name: &str, kind: &str, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.is_empty() { return Err("an empty file".into()); }
+        let (what, ext) = crate::files::kind(&bytes).unwrap_or(match kind {
+            "text/csv" => ("CSV file", "csv"),
+            "text/plain" => ("text file", "txt"),
+            "application/json" => ("JSON file", "json"),
+            "text/html" => ("web page", "html"),
+            _ => ("file", "bin"),
+        });
+        let name = crate::files::safe_name(name, ext);
+        self.tell.file(Offered { url: page.to_string(), name, kind: what.to_string(), bytes });
+        Ok(())
+    }
+    fn refused(&mut self, target: &str) { self.tell.refused(format!("a request to {}", refused_host(target))); }
+    fn refused_api(&mut self, api: limen::web_island::Api) {
+        if self.apis.insert(api) {
+            eprintln!("navigatord: a live page was refused {}", api.label());
+            self.tell.refused(api.label().to_string());
+        }
+    }
+}
+
 impl Live {
     /// Ask Limen for the island in the UI's `window`, place it at `rect`,
-    /// and serve it. `started(origin)` once the page is delivered and the
-    /// engine reported its start; `finished(why)` once, when it ends for
-    /// any reason other than [`Live::stop`] (`None`: it closed itself).
+    /// and serve it, telling `tell` what happens.
     pub fn start(
         socket: &Path,
         window: [u8; 16],
@@ -364,10 +591,7 @@ impl Live {
         cfg: Arc<crate::Config>,
         jar: Option<LiveJar>,
         storage: Option<JarStores>,
-        started: impl FnOnce(String) + Send + 'static,
-        navigate: impl Fn(String) + Send + Sync + 'static,
-        url_changed: impl Fn(String) + Send + 'static,
-        finished: impl FnOnce(Option<String>) + Send + 'static,
+        tell: Arc<dyn Tell>,
     ) -> Result<Self, String> {
         scope(&url, &url).map_err(|why| format!("this page can't run live: {why}"))?;
         let placed = Arc::new(Mutex::new((false, rect)));
@@ -395,13 +619,11 @@ impl Live {
         let (delivered_tx, delivered) = std::sync::mpsc::channel::<String>();
         let forms = jar.clone();
         let closing = jar.clone();
+        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default() };
         std::thread::spawn(move || {
-            let mut on_delivered = |u: &str| { let _ = delivered_tx.send(u.to_string()); };
-            let mut storage = storage;
-            let local = storage.as_mut().map(|s| s as &mut dyn LocalStorage);
             let result = match jar {
-                Some(mut jar) => serve(channel, &page, &mut jar, local, &mut on_delivered),
-                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, local, &mut on_delivered)),
+                Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
+                None => crate::upstream(&cfg, &crate::instance()).and_then(|mut up| serve(channel, &page, &mut up, &mut hooks)),
             };
             match &result {
                 Ok(s) => eprintln!("navigatord: live page served {} requests, {} bytes, {} refused", s.requests, s.bytes, s.refused.len()),
@@ -411,11 +633,10 @@ impl Live {
         });
         let watched = parent.clone();
         let size = placed.clone();
-        let navigate = Arc::new(navigate);
         std::thread::spawn(move || {
             use limen::web_island::{EndReason, Lifecycle, Report};
             let mut reports = Lifecycle::default();
-            let mut started = Some(started);
+            let mut started = false;
             let mut page = None::<String>;
             let why = loop {
                 let mut slot = watched.lock().unwrap();
@@ -434,7 +655,7 @@ impl Live {
                                 break Some(format!("the engine reported {origin}, not the page's origin"));
                             }
                             limen::start_trace("navigatord", "live-started", origin);
-                            if let Some(s) = started.take() { s(origin.to_string()); }
+                            if !std::mem::replace(&mut started, true) { tell.started(origin.to_string()); }
                             let rect = { let mut p = size.lock().unwrap(); p.0 = true; p.1 };
                             tell_size(connection, embed, rect);
                         }
@@ -442,16 +663,32 @@ impl Live {
                         // The page asked to go somewhere (I6.2): never followed in
                         // the engine. navigatord hands it to the UI, which opens
                         // it as a trail entry: live again if it is this origin's
-                        // (`ContinueLive`), in the document lane if not.
-                        Some(Report::Navigate(to)) => match navigation(page.as_deref(), to) {
-                            Some(to) => (*navigate)(to),
-                            None => eprintln!("navigatord: a live page's navigation refused ({})", crate::refused_target(to)),
+                        // (`ContinueLive`), in the document lane if not. Within
+                        // the origin it is looked at through the jar first, off
+                        // this thread: a file is offered, not run (I6.4).
+                        Some(Report::Navigate(to)) => match (navigation(page.as_deref(), to), &forms) {
+                            (Some(to), Some(jar)) if page.as_deref().and_then(crate::origin) == crate::origin(&to) => {
+                                let (jar, tell) = (jar.clone(), tell.clone());
+                                std::thread::spawn(move || match jar.peek(&to) {
+                                    Ok(Answer::Page(at)) => tell.navigate(at),
+                                    Ok(Answer::File(f)) => tell.file(f),
+                                    Err(why) => {
+                                        eprintln!("navigatord: a live page's navigation to {} failed: {why}", crate::refused_target(&to));
+                                        tell.navigate(to);
+                                    }
+                                });
+                            }
+                            (Some(to), _) => tell.navigate(to),
+                            (None, _) => {
+                                eprintln!("navigatord: a live page's navigation refused ({})", crate::refused_target(to));
+                                tell.refused("an address it could not go to".into());
+                            }
                         },
                         // The page changed its own address (pushState): a trail
                         // entry in the UI. An engine that claims another
                         // origin's address is ended.
                         Some(Report::UrlChanged(to)) => match address_change(page.as_deref(), to) {
-                            Some(to) => url_changed(to),
+                            Some(to) => tell.url_changed(to),
                             None => break Some("the engine claimed another origin's address".into()),
                         },
                         // A form (I6.3): only to the page's own site, sent
@@ -459,15 +696,20 @@ impl Live {
                         // answers opens as the next trail entry.
                         Some(Report::Submit { url: to, body }) => match (page.as_deref().map(|p| scope(p, to)), &forms) {
                             (Some(Ok(())), Some(jar)) => {
-                                let (jar, to, body, navigate) = (jar.clone(), to.to_string(), body.to_vec(), navigate.clone());
+                                let (jar, to, body, tell) = (jar.clone(), to.to_string(), body.to_vec(), tell.clone());
                                 std::thread::spawn(move || match jar.submit(&to, &body) {
-                                    Ok(answer) => (*navigate)(answer),
+                                    Ok(Answer::Page(at)) => tell.navigate(at),
+                                    Ok(Answer::File(f)) => tell.file(f),
                                     Err(why) => eprintln!("navigatord: a live page's form to {} failed: {why}", crate::refused_target(&to)),
                                 });
                             }
-                            (Some(Err(why)), _) => eprintln!("navigatord: a live page's form refused: {why} ({})", crate::refused_target(to)),
+                            (Some(Err(why)), _) => {
+                                eprintln!("navigatord: a live page's form refused: {why} ({})", crate::refused_target(to));
+                                tell.refused(format!("a form to {}", refused_host(&crate::refused_target(to))));
+                            }
                             _ => eprintln!("navigatord: a live page's form refused: no jar ({})", crate::refused_target(to)),
                         },
+
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
                         // A live page has no unload question in I6.1: Stop is the person's.
@@ -489,7 +731,7 @@ impl Live {
                 std::thread::sleep(Duration::from_millis(5));
             };
             if watched.lock().unwrap().take().is_some() {
-                finished(why);
+                tell.finished(why);
             }
         });
         Ok(Live { url, press, parent, embed, placed, jar: closing })
@@ -585,6 +827,23 @@ mod tests {
         }
     }
 
+    /// The stash is one slot for the process: its tests take turns.
+    static STASH_TESTS: Mutex<()> = Mutex::new(());
+
+    /// What the serve loop told its run.
+    #[derive(Default)]
+    struct Seen { started: Vec<String>, local: Option<JarStores>, made: Vec<(String, String, String, Vec<u8>)>, refused: Vec<String>, apis: Vec<limen::web_island::Api> }
+    impl Hooks for Seen {
+        fn started(&mut self, page: &str) { self.started.push(page.into()); }
+        fn storage(&mut self) -> Option<&mut dyn LocalStorage> { self.local.as_mut().map(|s| s as &mut dyn LocalStorage) }
+        fn made(&mut self, page: &str, name: &str, kind: &str, bytes: Vec<u8>) -> Result<(), String> {
+            self.made.push((page.into(), name.into(), kind.into(), bytes));
+            Ok(())
+        }
+        fn refused(&mut self, target: &str) { self.refused.push(target.into()); }
+        fn refused_api(&mut self, api: limen::web_island::Api) { self.apis.push(api); }
+    }
+
     fn body(client: &mut nuntius::client::Client) -> (Option<(u16, String, Option<String>)>, Vec<u8>, Option<ErrorCode>) {
         let (mut head, mut bytes) = (None, vec![]);
         loop {
@@ -604,16 +863,16 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let mut fake = Fake(vec![]);
-            let mut started = vec![];
-            let r = serve(ours, "https://app.example/app.html", &mut fake, None, &mut |u| started.push(u.to_string()));
-            tx.send((r, fake.0, started)).unwrap();
+            let mut seen = Seen::default();
+            let r = serve(ours, "https://app.example/app.html", &mut fake, &mut seen);
+            tx.send((r, fake.0, seen)).unwrap();
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, LIVE_PAGE)).unwrap();
         let (head, page, err) = body(&mut c);
         assert_eq!(err, None);
         assert_eq!(head, Some((200, "https://app.example/app.html".into(), Some("text/html".into()))), "the page's address is in the answer");
-        assert_eq!(page, b"<p>hi");
+        assert_eq!(page, with_reporter(b"<p>hi"), "the reporter first (I6.4)");
         c.open(Open::get(2, "https://app.example/app.js")).unwrap();
         assert_eq!(body(&mut c).1, b"x=1");
         c.open(Open::get(3, "https://api.app.example/status")).unwrap();
@@ -636,10 +895,12 @@ mod tests {
             assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
         }
         drop(c);
-        let (r, asked, started) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (r, asked, seen) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         server.join().unwrap();
         let served = r.unwrap();
-        assert_eq!(started, vec!["https://app.example/app.html".to_string()]);
+        assert_eq!(seen.started, vec!["https://app.example/app.html".to_string()]);
+        // Each refused host is told once, for the popover.
+        assert_eq!(seen.refused, ["host cdn.thirdparty.example, site thirdparty.example", "host app.example, site app.example"]);
         // Refused requests never reached the network.
         assert_eq!(asked, ["https://app.example/app.html", "https://app.example/app.js", "https://api.app.example/status",
                            "POST https://app.example/api/items application/json {}"]);
@@ -655,8 +916,8 @@ mod tests {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let s2 = stores.clone();
         let server = std::thread::spawn(move || {
-            let mut local = JarStores { stores: s2, jar: None };
-            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), Some(&mut local), &mut |_| {})
+            let mut seen = Seen { local: Some(JarStores { stores: s2, jar: None }), ..Seen::default() };
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let storage = limen::web_island::LIVE_STORAGE;
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
@@ -681,8 +942,8 @@ mod tests {
     fn storage_is_not_asked_for_before_the_page() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            let mut local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), jar: None };
-            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), Some(&mut local), &mut |_| {})
+            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), jar: None }), ..Seen::default() };
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, limen::web_island::LIVE_STORAGE)).unwrap();
@@ -693,7 +954,7 @@ mod tests {
     fn an_engine_that_names_its_own_page_is_ended() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), None, &mut |_| {})
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut Seen::default())
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, "https://app.example/app.html")).unwrap();
@@ -704,10 +965,111 @@ mod tests {
     fn a_page_that_is_not_html_does_not_start() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            serve(ours, "https://app.example/app.js", &mut Fake(vec![]), None, &mut |_| panic!("started"))
+            let mut seen = Seen::default();
+            let r = serve(ours, "https://app.example/app.js", &mut Fake(vec![]), &mut seen);
+            assert!(seen.started.is_empty());
+            r
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
         c.open(Open::get(1, LIVE_PAGE)).unwrap();
         assert!(server.join().unwrap().is_err_and(|e| e.contains("not an HTML page")));
+    }
+
+    #[test]
+    fn the_reporter_hands_over_files_and_refusals_after_the_page() {
+        use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Seen::default();
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen).map(|_| seen)
+        });
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_PAGE)).unwrap();
+        assert_eq!(body(&mut c).2, None);
+        c.open(Open::get(2, LIVE_REPORTER)).unwrap();
+        let (head, script, _) = body(&mut c);
+        assert_eq!((head.and_then(|h| h.2).as_deref(), script.as_slice()), (Some("text/javascript"), REPORTER));
+        c.open(Open::post(3, &format!("{LIVE_DOWNLOAD}?name=notes.txt&type=text%2Fplain"), "text/plain", b"I6 fixture notes\n".to_vec())).unwrap();
+        assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        c.open(Open::get(4, &format!("{LIVE_REFUSED}?api=notifications"))).unwrap();
+        assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        // A file only as a POST with its bytes; an API only by its token.
+        c.open(Open::get(5, &format!("{LIVE_DOWNLOAD}?name=x.txt"))).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
+        c.open(Open::get(6, &format!("{LIVE_REFUSED}?api=everything"))).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
+        c.open(Open::get(7, "https://live-page.atrium.invalid/other")).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy));
+        drop(c);
+        let seen = server.join().unwrap().unwrap();
+        assert_eq!(seen.made, [("https://app.example/app.html".to_string(), "notes.txt".to_string(), "text/plain".to_string(), b"I6 fixture notes\n".to_vec())]);
+        assert_eq!(seen.apis, [Api::Notifications]);
+        assert_eq!(seen.started.len(), 1);
+    }
+
+    #[test]
+    fn the_reporters_requests_are_parsed_strictly() {
+        use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
+        assert_eq!(reporter_request(LIVE_REPORTER), Some(Reporter::Script));
+        assert_eq!(reporter_request(&format!("{LIVE_REFUSED}?api=service-worker")), Some(Reporter::Refused(Api::ServiceWorker)));
+        assert_eq!(reporter_request(&format!("{LIVE_DOWNLOAD}?name=a%2Fb.csv&type=Text%2FCSV%3Bcharset%3Dutf-8")),
+                   Some(Reporter::Download { name: "a/b.csv".into(), kind: "text/csv".into() }), "the name is made safe when it is held");
+        assert_eq!(reporter_request(&format!("{LIVE_DOWNLOAD}?name={}", "a".repeat(5000))), None, "over the query bound");
+        assert_eq!(reporter_request(&format!("{LIVE_REPORTER}?x=1")), None);
+        assert_eq!(reporter_request(&format!("{LIVE_REFUSED}x?api=push")), None);
+        assert_eq!(reporter_request(&format!("{LIVE_REFUSED}?api=push%0a")), None);
+    }
+
+    #[test]
+    fn the_reporter_goes_first_without_changing_the_pages_mode() {
+        let tag = format!("<script src=\"{}\"></script>", limen::web_island::LIVE_REPORTER);
+        let put = |html: &str| String::from_utf8(with_reporter(html.as_bytes())).unwrap();
+        assert_eq!(put("<!doctype html><p>x"), format!("<!doctype html>{tag}<p>x"));
+        assert_eq!(put("\n <!-- a -->\n<!DOCTYPE html PUBLIC \"x\">\n<html>"), format!("\n <!-- a -->\n<!DOCTYPE html PUBLIC \"x\">{tag}\n<html>"));
+        assert_eq!(put("<p>no doctype"), format!("{tag}<p>no doctype"));
+        assert_eq!(put("\u{feff}<!doctype html>"), format!("\u{feff}<!doctype html>{tag}"), "after the byte order mark");
+        assert_eq!(put("<!-- never closed <!doctype html>"), format!("{tag}<!-- never closed <!doctype html>"));
+        assert_eq!(put("<!doctype html"), format!("{tag}<!doctype html"));
+    }
+
+    #[test]
+    fn a_made_file_is_not_taken_before_the_page() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut Seen::default()));
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::post(1, &format!("{}?name=a.txt", limen::web_island::LIVE_DOWNLOAD), "text/plain", b"x".to_vec())).unwrap();
+        assert!(server.join().unwrap().is_err(), "the first request is the page's");
+    }
+
+    #[test]
+    fn a_page_the_jar_looked_at_waits_briefly_for_its_own_jar_and_address() {
+        let _one = STASH_TESTS.lock().unwrap();
+        stash(Some(7), "https://app.example/answer", (200, "text/html".into(), b"<p>ok".to_vec()));
+        assert_eq!(unstash(None, "https://app.example/answer"), None, "another jar");
+        assert_eq!(unstash(Some(7), "https://app.example/other"), None, "another address");
+        assert_eq!(unstash(Some(7), "https://app.example/answer").map(|a| a.2), Some(b"<p>ok".to_vec()));
+        assert_eq!(unstash(Some(7), "https://app.example/answer"), None, "taken once");
+    }
+
+    #[test]
+    fn a_navigation_within_the_origin_is_a_page_to_run_or_a_file_to_save() {
+        let _one = STASH_TESTS.lock().unwrap();
+        let fetched = |url: &str, ctype: &str, extra: Option<(&str, &str)>, body: &[u8]| navigator_cookies::Fetched {
+            status: 200, url: url.into(), redirects: 0, body: body.to_vec(),
+            headers: [("Content-Type", ctype)].into_iter().chain(extra).map(|(a, b)| (a.to_string(), b.to_string())).collect(),
+        };
+        let page = answered(fetched("https://app.example/second.html", "text/html", None, b"<p>2"), Some(9)).unwrap();
+        assert_eq!(page, Answer::Page("https://app.example/second.html".into()));
+        assert_eq!(unstash(Some(9), "https://app.example/second.html").map(|a| a.2), Some(b"<p>2".to_vec()), "kept for the run that shows it");
+        let file = answered(fetched("https://app.example/report.csv", "text/csv", Some(("Content-Disposition", "attachment; filename=\"report.csv\"")), b"a,b\n"), Some(9)).unwrap();
+        assert_eq!(file, Answer::File(Offered { url: "https://app.example/report.csv".into(), name: "report.csv".into(), kind: "CSV file".into(), bytes: b"a,b\n".to_vec() }));
+        assert_eq!(unstash(Some(9), "https://app.example/report.csv"), None, "a file is not a page to run");
+    }
+
+    #[test]
+    fn refusals_are_told_in_the_popovers_words() {
+        assert_eq!(refused_host("host cdn.thirdparty.example, site thirdparty.example"), "cdn.thirdparty.example");
+        assert_eq!(refused_host("host unreadable"), "unreadable");
+        assert_eq!(refused_host("garbage"), "an unreadable address");
     }
 }

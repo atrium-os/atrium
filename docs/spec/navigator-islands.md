@@ -2806,6 +2806,76 @@ and `NAVIGATORD_STORE=/var/db/navigatord/store`:
 
 Evidence for both parts is in `~/atrium-vm/evidence/navigator-i6-3-20261125/`.
 
+#### I6.4 as built (2026-11-25, first part: downloads and refusals)
+
+Host-tested in navigatord, Limen and navigator-ui; no engine source
+changed. File input, printing and the clipboard are the second part.
+
+- **A link or form that answers with a file.** A navigation a live page
+  proposes within its own origin is first fetched through its jar
+  (`LiveJar::peek`, off the watcher thread), and a form's answer is looked
+  at the same way (`LiveJar::submit`). `files::live_file` decides: HTML
+  (or XHTML) not marked `Content-Disposition: attachment` and not sniffed
+  as a file is a page, everything else a file, since only a page can run
+  live. A page is kept for 30 s for the run that shows it (one slot, keyed
+  by jar and address), so it is not fetched twice and a form answered with
+  a page, not a redirect, keeps its answer. A file is held in the UI
+  connection's `files::Waiting` under an id from the top half of the u32
+  range (the UI's own `Open` ids never reach it), named from the
+  disposition's `filename` or the address and made safe, and the UI gets
+  `Event::LiveFile`. It asks `Prompt::Download` on the live page's own
+  entry while the engine keeps running; Save, Open and Cancel are the
+  document lane's (`Save`, `OpenFile`, `Discard` with that id). A file it
+  could not ask about is discarded at once.
+- **The reporter.** navigatord puts one tag first in the delivered page,
+  after any doctype and comments before it so the page keeps its mode:
+  `<script src="https://live-page.atrium.invalid/reporter.js">`
+  (`limen::web_island::LIVE_REPORTER`), whose body is
+  `navigatord/src/live_reporter.js`. The engine has no backend for the
+  refused APIs, so it is what refuses them; the reporter answers each at
+  once (a page waiting on a prompt nobody sees just stops) and GETs
+  `LIVE_REFUSED?api=<token>` once per API: notifications, geolocation,
+  camera, microphone, MIDI, USB, Bluetooth, serial, HID, service worker,
+  push, background sync, a clipboard read outside a paste, and a new
+  window (`window.open` still proposes its navigation, I6.2, and returns
+  `null`). A page that gets around the reporter is still refused, only
+  not reported. A page whose CSP forbids the script loses the reports.
+- **A file the page's script made.** The reporter takes a click on an `<a
+  download>` whose address is `blob:` or `data:` (on the way out, so a
+  page that prevented the default keeps it), and `a.click()` on such an
+  anchor outside the document: it reads the bytes and POSTs them to
+  `LIVE_DOWNLOAD?name=…&type=…` as `text/plain` (so `no-cors` allows it).
+  navigatord holds it as above, its kind from its bytes or its type. The
+  bound is one Nuntius body, 32 KiB (`DOWNLOAD_MAX`); a bigger one is
+  reported as refused. `serve` answers the reporter's three addresses only
+  after the page and only in their exact shapes; nothing on navigatord's
+  own name reaches the network.
+- **Refusals in the popover.** The UI collects `Event::LiveRefused` per
+  run, each once, at most 12, and the tier chip's popover says "Refused
+  here: …" while the live page is on screen. navigatord tells it each
+  refused API once, each host it refused a request to once ("a request to
+  cdn.thirdparty.example"), a form to another site, and a navigation it
+  could not make. `scripts/navigator-live-reporter-check.js` runs the
+  reporter against stand-in browser APIs under node.
+
+**Gate (Mac)**, on `app.html` run live:
+
+1. Download report: the prompt row asks "report.csv, … CSV file from
+   https://app.example" while the page keeps running; Save writes it to
+   Downloads with its origin recorded.
+2. Download notes (the blob link): the same prompt for `notes.txt`, text
+   file, and navigatord's log names `notes.txt` from the reporter; Cancel
+   discards it.
+3. The checks `notifications` (denied), `geolocation` (denied 1),
+   `service-worker` (refused) and `window-open` (refused) settle at once
+   rather than timing out, and the popover reads "Refused here:" with
+   notifications, your location, a service worker, a new window and a
+   request to cdn.thirdparty.example.
+4. Sign in: the fixture answers 303 to `/app.html`, and the run that
+   shows it is served the page navigatord already fetched: one GET of
+   `/app.html` through the jar after the POST, where I6.3 made two (the
+   document lane's own fetch of the trail entry is separate).
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -3754,4 +3824,4 @@ Installed JIT-off Ladybird on arm64 Tessera played the public YouTube demo to 58
 
 ### 10.4 Whole pages live (I6)
 
-I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) is host-tested and waits for its gate.
+I6.0 ran on arm64 Tessera ([results](#results-on-arm64-tessera-2026-11-25-i60)). [I6.1](#i61-as-built-2026-11-25) was built and its [gate passed](#i61-gate-results-on-arm64-tessera-2026-11-25) after five fixes. The [first part of I6.2](#i62-as-built-2026-11-25) (links as trail entries that run live again at the same origin, and the engine's page size) passed gate steps 1 to 4 on arm64 Tessera (0f3e97bba). The second part (`pushState` as trail entries, Back and Forward among a run's entries) passed gate steps 5 to 7 under J2. [I6.3's first part](#i63-as-built-2026-11-25-first-part-the-jar) (the jar: cookies through Arca, script POSTs, form sign-ins) and its second part (storage) passed their gates. [I6.4's first part](#i64-as-built-2026-11-25-first-part-downloads-and-refusals) (downloads from links, forms and scripts; refused APIs answered at once and named in the popover) is host-tested and waits for its gate.

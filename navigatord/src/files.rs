@@ -94,9 +94,15 @@ pub fn name(url: &str, ext: &str) -> String {
         .ok()
         .and_then(|u| u.path_segments().and_then(|mut s| s.next_back().map(str::to_string)))
         .unwrap_or_default();
-    let decoded: String = percent_decode(&last);
-    let mut n: String = decoded
+    safe_name(&percent_decode(&last), ext)
+}
+
+/// `raw` (a server's or a page's suggested name) as a safe file name, with
+/// `ext` when it has none.
+pub fn safe_name(raw: &str, ext: &str) -> String {
+    let mut n: String = raw
         .chars()
+        .take(NAME_MAX * 2)
         .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '(' | ')' | '+' | ',') { c } else { '_' })
         .collect();
     n = n.trim().trim_start_matches('.').trim_end_matches('.').to_string();
@@ -108,6 +114,48 @@ pub fn name(url: &str, ext: &str) -> String {
         n.push_str(ext);
     }
     cut(&n, NAME_MAX)
+}
+
+/// What a live page's answer is when it is a file to save rather than a
+/// page to run (I6.4): its safe name and what the prompt calls it. A page
+/// is HTML (or XHTML) that its server did not mark as an attachment and
+/// whose bytes don't look like a file; everything else is a file, since
+/// only a page can run live.
+pub fn live_file(url: &str, headers: &[(String, String)], body: &[u8]) -> Option<(String, String)> {
+    let header = |name: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+    let disposition = header("content-disposition").unwrap_or("");
+    let attachment = disposition.trim_start().get(..10).is_some_and(|d| d.eq_ignore_ascii_case("attachment"));
+    let mime = header("content-type").and_then(|v| v.split(';').next()).map(|m| m.trim().to_ascii_lowercase()).unwrap_or_default();
+    let sniffed = kind(body);
+    if !attachment && sniffed.is_none() && matches!(mime.as_str(), "text/html" | "application/xhtml+xml") {
+        return None;
+    }
+    let (what, ext) = sniffed.unwrap_or(match mime.as_str() {
+        "text/csv" => ("CSV file", "csv"),
+        "text/plain" => ("text file", "txt"),
+        "application/json" => ("JSON file", "json"),
+        "text/calendar" => ("calendar file", "ics"),
+        "text/html" | "application/xhtml+xml" => ("web page", "html"),
+        _ => ("file", "bin"),
+    });
+    let name = match disposition_name(disposition) {
+        Some(n) => safe_name(&n, ext),
+        None => self::name(url, ext),
+    };
+    Some((name, what.to_string()))
+}
+
+/// The `filename` a `Content-Disposition` suggests, quoted or not
+/// (`filename*` is not read: the plain form is enough for a safe name).
+fn disposition_name(d: &str) -> Option<String> {
+    for part in d.split(';').skip(1) {
+        let Some((k, v)) = part.split_once('=') else { continue };
+        if !k.trim().eq_ignore_ascii_case("filename") { continue; }
+        let v = v.trim();
+        let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v);
+        if !v.is_empty() { return Some(v.to_string()); }
+    }
+    None
 }
 
 /// At most `max` bytes, keeping the extension.
@@ -278,6 +326,24 @@ fn mark_origin(_: &std::fs::File, _: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_pages_answer_is_a_file_unless_it_is_a_page() {
+        let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        let url = "https://app.example/report.csv";
+        assert_eq!(live_file("https://app.example/second.html", &h(&[("Content-Type", "text/html; charset=utf-8")]), b"<p>hi"), None);
+        assert_eq!(live_file(url, &h(&[("content-type", "text/csv"), ("Content-Disposition", "attachment; filename=\"report.csv\"")]), b"a,b\n"),
+                   Some(("report.csv".into(), "CSV file".into())));
+        // Not marked, but not a page either: only a page runs live.
+        assert_eq!(live_file("https://app.example/export", &h(&[("content-type", "text/csv")]), b"a,b\n"), Some(("export.csv".into(), "CSV file".into())));
+        // HTML marked as an attachment, and HTML whose bytes are a PDF.
+        assert_eq!(live_file("https://app.example/page", &h(&[("content-type", "text/html"), ("content-disposition", "Attachment")]), b"<p>"),
+                   Some(("page.html".into(), "web page".into())));
+        assert_eq!(live_file("https://app.example/x", &h(&[("content-type", "text/html")]), b"%PDF-1.7"), Some(("x.pdf".into(), "PDF".into())));
+        // A suggested name is made safe.
+        assert_eq!(live_file(url, &h(&[("content-disposition", "attachment; filename=../../etc/passwd")]), b"x").unwrap().0, "_.._etc_passwd");
+        assert!(live_file(url, &h(&[("content-disposition", &format!("attachment; filename={}", "a".repeat(100_000)))]), b"x").unwrap().0.len() <= NAME_MAX);
+    }
 
     #[test]
     fn documents_and_files_are_told_apart_by_their_bytes() {

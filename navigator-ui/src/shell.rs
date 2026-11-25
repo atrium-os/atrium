@@ -256,7 +256,13 @@ pub struct LiveRun {
     /// The trail entries this run made or went to (I6.2), `key` among
     /// them: moving to one runs it live again with no new press.
     pub entries: Vec<(u64, PageId)>,
+    /// What the page was refused (I6.4), in the popover's words, each
+    /// once, at most [`LIVE_REFUSED_MAX`].
+    pub refused: Vec<String>,
 }
+
+/// The most refusals the popover names for one run.
+pub const LIVE_REFUSED_MAX: usize = 12;
 
 /// The live page's state, as navigatord and the page child reported it.
 #[derive(Clone, Debug, PartialEq)]
@@ -861,6 +867,32 @@ impl Shell {
         }
     }
 
+    /// The live page at `from` offered a file (I6.4): asked on its own
+    /// entry, while it keeps running. False when it was not asked (the
+    /// run is gone, or the prompt row won't take it), so the caller
+    /// discards it.
+    pub fn live_file(&mut self, from: &str, p: Prompt, now: f64) -> bool {
+        let Some(key) = self.live_run.as_ref().filter(|r| r.url == from && r.origin.is_some()).map(|r| r.key) else { return false };
+        self.ask_at(key, p, now)
+    }
+
+    /// The live page at `from` was refused something (I6.4): named in the
+    /// popover, each once.
+    pub fn live_refused(&mut self, from: &str, what: &str) -> bool {
+        let Some(run) = self.live_run.as_mut().filter(|r| r.url == from) else { return false };
+        if what.is_empty() || what.len() > navigator_control::REFUSED_MAX || what.chars().any(char::is_control) { return false; }
+        if !run.refused.iter().any(|r| r == what) && run.refused.len() < LIVE_REFUSED_MAX {
+            run.refused.push(what.to_string());
+        }
+        true
+    }
+
+    /// The popover's line for what the live page on screen was refused.
+    pub fn live_refusals(&self) -> Option<String> {
+        let run = self.live_run.as_ref().filter(|r| Some(r.key) == self.shown_key() && !r.refused.is_empty())?;
+        Some(format!("Refused here: {}.", run.refused.join("; ")))
+    }
+
     fn set_live_whole(&mut self, key: (u64, PageId), on: bool) {
         if let Some(page) = self.store.page_by_key_mut(key.0, key.1) {
             page.live_whole = on;
@@ -1030,7 +1062,7 @@ impl Shell {
             }
             (Prompt::RunPageLive { .. }, "Run live") if live && self.live_pages => {
                 if let (Some(url), Some(key)) = (self.shown_url(), key) {
-                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key] });
+                    self.live_run = Some(LiveRun { key, url: url.clone(), origin: None, entries: vec![key], refused: Vec::new() });
                     let jar = self.store.trail().jar();
                     self.outbox.push(Out::RunPageLive { url, press, jar });
                 }
@@ -1943,6 +1975,7 @@ pub fn popover_height(s: &Shell, w: f32) -> f32 {
     let lines = |t: &str| wrap(t, tw).len() as f32;
     let site = crate::trail::site(&p.url);
     let mut n = lines(&popover_connection(f, site)) + lines(&crate::ui::tier_sentence(f, site)) + lines(popover_last(f));
+    if let Some(r) = s.live_refusals() { n += lines(&r); }
     for o in &f.live_parts {
         n += lines(&popover_live_part(o));
     }
@@ -2719,6 +2752,44 @@ mod tests {
         assert!(s.live_run.is_none());
         assert_ne!(s.store.trail().page().unwrap().display_facts().tier, crate::trail::Tier::Live);
         assert!(s.last_note.as_deref().is_some_and(|n| n.contains("engine failed")));
+    }
+
+    #[test]
+    fn a_live_pages_file_is_asked_on_its_entry_and_its_refusals_are_named_in_the_popover() {
+        let mut s = shell();
+        let url = "https://app.example/app.html";
+        s.enter(url);
+        s.live = Some(LivePage::Shown(url.into()));
+        s.live_pages = true;
+        assert!(s.offer_live(0.0));
+        assert!(s.answer_pressed(1, 600.0, Some([2; 16])));
+        s.outbox.clear();
+        let key = s.shown_key().unwrap();
+        let dl = |id: u32| Prompt::Download { id, file: "report.csv".into(), size: "12 B".into(), origin: "https://app.example".into(), kind: "CSV file".into() };
+        assert!(!s.live_file(url, dl(1 << 31), 10_000.0), "not before the engine started");
+        s.live_reported(url, Some("https://app.example".into()), None);
+        assert!(!s.live_file("https://app.example/other.html", dl(1 << 31), 10_000.0), "only the page that runs live");
+        assert!(s.live_file(url, dl(1 << 31), 10_000.0));
+        let asked = s.store.page_by_key_mut(key.0, key.1).and_then(|p| p.asked.as_ref()).map(|a| a.prompt.clone());
+        assert_eq!(asked, Some(dl(1 << 31)), "on the live page's own entry");
+        assert!(s.live_run.is_some(), "the page keeps running");
+        // Save on it sends the held file's id.
+        assert!(s.answer_pressed(2, 20_000.0, Some([3; 16])));
+        assert_eq!(s.outbox.pop(), Some(Out::Save { id: 1 << 31, press: [3; 16] }));
+        // Refusals: each once, bounded, and in the popover while it is shown.
+        assert_eq!(s.live_refusals(), None);
+        assert!(s.live_refused(url, "notifications"));
+        assert!(s.live_refused(url, "notifications"));
+        assert!(s.live_refused(url, "a request to cdn.thirdparty.example"));
+        assert!(!s.live_refused(url, "a\nb"), "no control characters");
+        assert!(!s.live_refused("https://other.example/", "the camera"), "another page's");
+        for i in 0..40 { s.live_refused(url, &format!("api {i}")); }
+        assert_eq!(s.live_run.as_ref().unwrap().refused.len(), LIVE_REFUSED_MAX);
+        assert!(s.live_refusals().unwrap().starts_with("Refused here: notifications; a request to cdn.thirdparty.example; api 0"));
+        s.popover = true;
+        let with_refusals = popover_height(&s, 360.0);
+        s.live_run.as_mut().unwrap().refused.clear();
+        assert!(popover_height(&s, 360.0) < with_refusals, "the popover makes room for them");
     }
 
     #[test]
