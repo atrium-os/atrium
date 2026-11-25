@@ -9987,8 +9987,29 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		 * workloads because bdwrite cadence stayed low enough
 		 * that sched_sync always drained before unmount. */
 		if (tmp_->devvp != NULL) {
+			struct bufobj *_bo = &tmp_->devvp->v_bufobj;
+			int _ferr, _left;
+
 			vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
-			(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
+			_ferr = VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
+			BO_LOCK(_bo);
+			_left = _bo->bo_dirty.bv_cnt;
+			BO_UNLOCK(_bo);
+			/* A write that cannot land (the device refuses it: an
+			 * md over an image in a key group that was locked
+			 * under this mount answers EACCES) leaves its buffer
+			 * dirty. Once the consumer is closed, any later sync
+			 * of devvp (md detach, vgone) writes it through
+			 * g_vfs_strategy into freed state and panics. Those
+			 * writes are lost either way: say so and drop them. */
+			if (_left != 0) {
+				printf("tessera_fs: unmount of %s: %d metadata "
+				    "buffer(s) could not be written (error %d); "
+				    "discarding them\n",
+				    tmp_->dev != NULL ? devtoname(tmp_->dev) : "?",
+				    _left, _ferr);
+				(void)vinvalbuf(tmp_->devvp, 0, 0, 0);
+			}
 			VOP_UNLOCK(tmp_->devvp);
 		}
 		/* g_vfs_close invalidates devvp's buffers, syncing any still
