@@ -547,9 +547,9 @@ no device. So the answer comes from portcullisd, which asked the kernel.
   browser needs swap.
 
 **A4. No core dumps from apps (jaild).** Every app jail gets `RLIMIT_CORE=0` (hard),
-not only filtered jails. The exception is a launch with the Artifex debugger's
-`allow_proc_debug`, whose cores go to the workspace on purpose. Mail keeps decrypted
-mail in memory and should never dump it.
+not only filtered jails. The only exception is a debug launch (`allow_proc_debug`),
+which already accepts that its memory is exposed. Mail keeps decrypted mail in memory
+and should never dump it.
 
 **A5. A gate that proves it (scripts/mail-at-rest-vm-check.sh, on Tessera).** It syncs a
 synthetic account (the JMAP fixture) whose message carries a unique marker in four
