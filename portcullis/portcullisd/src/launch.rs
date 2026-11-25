@@ -1595,10 +1595,12 @@ fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, p
              * entry is gone (the registry is in /var/run, which a boot
              * clears; the account and its group memberships are not). It
              * must start with no supplementary groups, or it carries the
-             * last owner's files groups into this app. */
-            if let Some(name) = portcullis_peer::username(uid) {
-                drop_supplementary_groups(&name).map_err(fail)?;
-            }
+             * last owner's files groups into this app. A group(5) line can
+             * name the account even when its passwd entry is gone, and the
+             * entry is made again below, so the account is made first and
+             * cleared by its canonical name either way. */
+            let name = ensure_passwd(uid).map_err(fail)?;
+            drop_supplementary_groups(&name).map_err(fail)?;
             portcullis_peer::register_document(reg, uid, owner, app_id, publisher, persona, document)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
