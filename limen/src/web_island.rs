@@ -26,6 +26,11 @@ pub const LIVE_STORAGE: &str = "https://live-page.atrium.invalid/local-storage";
 /// part's answer says whether the commit was kept. navigatord keeps it.
 pub const LIVE_IDB: &str = "https://live-page.atrium.invalid/indexed-db";
 pub mod idb;
+/// A whole page's Cache API (`caches`, I6.7 second part): kept like its
+/// IndexedDB, in the same format and with the same bounds (a database per
+/// cache, its entries as records keyed by the engine's order), in a store
+/// of its own. Entries are the engine's bytes.
+pub const LIVE_CACHE: &str = "https://live-page.atrium.invalid/cache-storage";
 /// A file a whole page's script made and asked to save (I6.4: `<a
 /// download>` on a `blob:` or `data:` address): its bytes are POSTed here,
 /// with `name` (the suggested name) and `type` (its content type) as

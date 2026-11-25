@@ -91,6 +91,17 @@ document.getElementById("grow").addEventListener("click", () => {
 });
 document.getElementById("release").addEventListener("click", () => { held = []; showHeld(); });
 
+// I6.7 second part: the Cache API is kept too. One entry a run, under a
+// path of its own, so the count is how many runs this site has had.
+await step("cache-api", async () => {
+    const cache = await caches.open("i6");
+    const n = (await cache.keys()).length + 1;
+    await cache.put("/cached/" + n, new Response("run " + n, { headers: { "content-type": "text/plain" } }));
+    const back = await (await cache.match("/cached/" + n)).text();
+    if (back !== "run " + n) throw new Error("read back " + back);
+    return n + " cached";
+});
+
 // I6.7: navigatord's 50 MiB a site. Fill puts 30 MiB in one transaction;
 // the second Fill must abort with QuotaExceededError.
 async function write(change) {

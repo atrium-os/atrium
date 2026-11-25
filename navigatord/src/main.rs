@@ -505,6 +505,14 @@ fn live_idb() -> Arc<Mutex<live_idb::Stores>> {
     LIVE_IDB.get_or_init(|| Arc::new(Mutex::new(live_idb::Stores::new(None)))).clone()
 }
 
+/// Every live page's Cache API store (I6.7 second part): the same kind of
+/// store as IndexedDB's, apart from it.
+static LIVE_CACHE: std::sync::OnceLock<Arc<Mutex<live_idb::Stores>>> = std::sync::OnceLock::new();
+
+fn live_cache() -> Arc<Mutex<live_idb::Stores>> {
+    LIVE_CACHE.get_or_init(|| Arc::new(Mutex::new(live_idb::Stores::new(None)))).clone()
+}
+
 static LIVE_REMEMBERED: std::sync::OnceLock<Arc<Mutex<live_remembered::Remembered>>> = std::sync::OnceLock::new();
 
 /// The origins the persona runs live every time (D8).
@@ -1399,10 +1407,12 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     (Some(u), _) => if let Some(k) = live_storage::Key::of(jar_id(jar), u) {
                         live_stores().lock().unwrap().forget(&k);
                         live_idb().lock().unwrap().forget(&k);
+                        live_cache().lock().unwrap().forget(&k);
                     },
                     (None, Jar::Unrecorded(j)) => {
                         live_stores().lock().unwrap().forget_jar(j);
                         live_idb().lock().unwrap().forget_jar(j);
+                        live_cache().lock().unwrap().forget_jar(j);
                     }
                     (None, Jar::Personal) => {}
                 }
@@ -2489,6 +2499,7 @@ fn main() {
     // volume; in memory only without one.
     let _ = LIVE_STORES.set(Arc::new(Mutex::new(live_storage::Stores::new(cfg.store.as_ref().map(|d| d.join("live-storage"))))));
     let _ = LIVE_IDB.set(Arc::new(Mutex::new(live_idb::Stores::new(cfg.store.as_ref().map(|d| d.join("live-idb"))))));
+    let _ = LIVE_CACHE.set(Arc::new(Mutex::new(live_idb::Stores::new(cfg.store.as_ref().map(|d| d.join("live-cache"))))));
     // The origins run live every time (D8): the same volume.
     let _ = LIVE_REMEMBERED.set(Arc::new(Mutex::new(live_remembered::Remembered::new(cfg.store.as_ref().map(|d| d.join("live-origins"))))));
     // Arca, for sites that know you. An Unrecorded jar a crash left behind
@@ -2986,7 +2997,7 @@ mod island_metadata_tests {
 /// one (I6.3, D9), else the plain fetcher.
 fn start_live(cfg: &Arc<Config>, w: &Arc<Mutex<UnixStream>>, window: [u8; 16], page: String, press: ctl::Press, rect: [u32; 4],
               cookies: Option<Cookies>, jar: Jar, waiting: &Arc<Mutex<files::Waiting>>) -> Result<live_page::Live, String> {
-    let storage = live_page::JarStores { stores: live_stores(), idb: live_idb(), jar: jar_id(jar) };
+    let storage = live_page::JarStores { stores: live_stores(), idb: live_idb(), cache: live_cache(), jar: jar_id(jar) };
     let jar = cookies.map(|c| live_page::LiveJar::open(c, &page, jar_id(jar))).transpose()?;
     let tell = Arc::new(LiveTell { w: w.clone(), from: page.clone(), waiting: waiting.clone() });
     live_page::Live::start(cfg.limen.as_deref().ok_or("no Limen service")?, window, page, press, rect, cfg.clone(), jar, Some(storage), tell)

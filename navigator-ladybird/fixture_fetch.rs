@@ -534,9 +534,33 @@ pub unsafe extern "C" fn navigator_live_idb_load(
     ctx: *mut std::ffi::c_void,
     on_op: unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, usize, *const u8, usize, u64),
 ) -> bool {
+    // SAFETY: as this function's own contract.
+    unsafe { live_idb_load_from(limen::web_island::LIVE_IDB, ctx, on_op) }
+}
+
+/// As [`navigator_live_idb_load`], for the page's Cache API store
+/// (`limen::web_island::LIVE_CACHE`, I6.7 second part).
+/// # Safety
+/// As [`navigator_live_idb_load`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn navigator_live_cache_load(
+    ctx: *mut std::ffi::c_void,
+    on_op: unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, usize, *const u8, usize, u64),
+) -> bool {
+    // SAFETY: as this function's own contract.
+    unsafe { live_idb_load_from(limen::web_island::LIVE_CACHE, ctx, on_op) }
+}
+
+/// # Safety
+/// As [`navigator_live_idb_load`].
+unsafe fn live_idb_load_from(
+    at: &str,
+    ctx: *mut std::ffi::c_void,
+    on_op: unsafe extern "C" fn(*mut std::ffi::c_void, u8, *const u8, usize, *const u8, usize, u64),
+) -> bool {
     use limen::web_island::idb::{decode_ops, LOAD_MAX};
     let mut store = vec![];
-    let Some((200, _, _, _)) = live_exchange_into(limen::web_island::LIVE_IDB, None, LOAD_MAX, &mut store, Duration::from_secs(60)) else { return false };
+    let Some((200, _, _, _)) = live_exchange_into(at, None, LOAD_MAX, &mut store, Duration::from_secs(60)) else { return false };
     let Some(ops) = decode_ops(&store, LOAD_MAX) else { return false };
     drop(store);
     for op in &ops {
@@ -578,6 +602,18 @@ pub unsafe extern "C" fn navigator_live_idb_op(t: u8, a: *const u8, a_len: usize
 /// kept every one; false aborts the transaction (`QuotaExceededError`).
 #[unsafe(no_mangle)]
 pub extern "C" fn navigator_live_idb_commit() -> bool {
+    live_idb_commit_to(limen::web_island::LIVE_IDB)
+}
+
+/// As [`navigator_live_idb_commit`], to the page's Cache API store: the
+/// changes since `navigator_live_idb_begin` are one batch of cache
+/// operations (I6.7 second part).
+#[unsafe(no_mangle)]
+pub extern "C" fn navigator_live_cache_commit() -> bool {
+    live_idb_commit_to(limen::web_island::LIVE_CACHE)
+}
+
+fn live_idb_commit_to(at: &str) -> bool {
     let (ops, bad) = live_idb::RUN.with(|r| std::mem::take(&mut *r.borrow_mut()));
     if bad {
         eprintln!("island: an IndexedDB change was out of shape; the commit fails");
@@ -589,7 +625,7 @@ pub extern "C" fn navigator_live_idb_commit() -> bool {
     let mut answer = vec![];
     for part in parts {
         let post = Some(("application/octet-stream", part.as_slice()));
-        if !matches!(live_exchange_into(limen::web_island::LIVE_IDB, post, 0, &mut answer, Duration::from_secs(30)), Some((204, _, _, 0))) {
+        if !matches!(live_exchange_into(at, post, 0, &mut answer, Duration::from_secs(30)), Some((204, _, _, 0))) {
             eprintln!("island: navigatord didn't keep an IndexedDB commit");
             return false;
         }
