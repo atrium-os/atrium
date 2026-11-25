@@ -27,6 +27,12 @@ user _vinculum-hci 65025 "Vinculum Bluetooth controller transport"
 # See sigillum-service.sh: nullfs at boot, not on the first driver jail's mount.
 kldload -n nullfs
 sysrc -n kld_list 2>/dev/null | grep -qw nullfs || sysrc kld_list+=nullfs >/dev/null
+# The base netgraph driver (ng_ubt) must not take controllers: devmatch
+# reloads it on every attach (a plain kldunload does not last), and it starts
+# SCO isochronous transfers on interface 1, the path that panicked a Mac host
+# through qemu usb-host. dispensatord still detaches it if it is loaded.
+sysrc -n devmatch_blocklist 2>/dev/null | grep -qw ng_ubt || sysrc devmatch_blocklist+=ng_ubt >/dev/null
+kldunload -n ng_ubt 2>/dev/null || true
 
 install -d -m 0755 /atrium/sockets
 # The transport: only _vinculum-hci may reach it at all; vinculumd also checks the uid.
