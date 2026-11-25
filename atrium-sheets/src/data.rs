@@ -147,6 +147,14 @@ pub enum DataCmd {
     MergeAcross,
     /// Formulas shown as typed in their cells instead of their values (not saved).
     ShowFormulas,
+    /// Every formula calculated again (F9; random numbers and the time change).
+    CalculateNow,
+    /// This sheet's formulas calculated again (Shift+F9).
+    CalculateSheet,
+    /// A list of functions; the one picked goes into the formula (Shift+F3).
+    InsertFunction,
+    /// A list of the names here; the one picked goes into the formula (F3).
+    PasteName,
     /// The selected rows as tall as their tallest cell.
     AutoFitRows,
     /// The selected columns as wide as their widest entry.
@@ -460,6 +468,10 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Clear Comments").enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::ClearComments)),
         (MenuItem::new("Go To…").shortcut("Ctrl+G"), Some(DataCmd::GoTo)),
         (MenuItem::new("Show Formulas").checked(d.show_formulas).shortcut("Ctrl+`"), Some(DataCmd::ShowFormulas)),
+        (MenuItem::new("Insert Function…").shortcut("Shift+F3"), Some(DataCmd::InsertFunction)),
+        (MenuItem::new("Paste Name…").shortcut("F3").enabled(!paste_names(d).is_empty()), Some(DataCmd::PasteName)),
+        (MenuItem::new("Calculate Now").shortcut("F9"), Some(DataCmd::CalculateNow)),
+        (MenuItem::new("Calculate Sheet").shortcut("Shift+F9"), Some(DataCmd::CalculateSheet)),
         (MenuItem::new("Goal Seek…").enabled(wb.formula_text(CellAddr::new(s, row, col)).is_some()), Some(DataCmd::GoalSeek)),
     ];
     if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
@@ -1039,6 +1051,23 @@ pub fn name_rows(wb: &Workbook) -> Vec<NameRow> {
         refers: officina_grid::formula::to_a1(&n.expr, 0, 0, &|id| wb.sheet_name(id)),
     }).collect();
     v.sort_by(|a, b| a.scope.cmp(&b.scope).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    v
+}
+
+/// The names a formula on the sheet on screen can use, sorted: the
+/// workbook's and this sheet's own, without Excel's built-in `_xlnm.` ones.
+pub fn paste_names(d: &Doc) -> Vec<String> {
+    let mut v: Vec<String> = d.wb.names().iter().filter(|n| n.scope.is_none_or(|s| s == d.sheet) && !n.name.starts_with("_xlnm.")).map(|n| n.name.to_string()).collect();
+    v.sort_by_key(|n| n.to_lowercase());
+    v.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    v
+}
+
+/// Every function a formula can call, sorted, without internal ones.
+pub fn function_names() -> Vec<String> {
+    let mut v: Vec<String> = officina_grid::eval::funcs::FUNCS.iter().map(|f| f.name).filter(|n| !n.starts_with('_')).map(String::from).collect();
+    v.sort();
+    v.dedup();
     v
 }
 
@@ -2155,6 +2184,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
         }
         DataCmd::InsertCellsDown | DataCmd::InsertCellsRight | DataCmd::DeleteCellsUp | DataCmd::DeleteCellsLeft => shift_cells(d, sel, cmd),
         DataCmd::CustomSort | DataCmd::GoalSeek | DataCmd::AutoFitRows | DataCmd::AutoFitCols => Ok(String::new()),
+        DataCmd::CalculateNow | DataCmd::CalculateSheet => {
+            d.wb.mark_all((cmd == DataCmd::CalculateSheet).then_some(s));
+            d.recalc();
+            Ok(if cmd == DataCmd::CalculateNow { "Calculated every sheet.".into() } else { "Calculated this sheet.".into() })
+        }
+        DataCmd::InsertFunction | DataCmd::PasteName => Ok(String::new()),
         DataCmd::ShowFormulas => {
             d.show_formulas = !d.show_formulas;
             Ok(if d.show_formulas { "Formulas are shown in their cells.".into() } else { "Values are shown in their cells.".into() })

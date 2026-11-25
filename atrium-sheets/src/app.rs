@@ -194,10 +194,23 @@ pub const FILTER_ROW_H: f32 = 28.0;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListPanel {
     pub open: bool,
+    pub kind: ListKind,
     pub sheet: u16,
     pub row: u32,
     pub col: u32,
     pub items: Vec<String>,
+}
+
+/// What a pick from the list panel does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListKind {
+    /// Types the item into its cell (a validation list).
+    #[default]
+    Choose,
+    /// `NAME(` into the cell's formula (Shift+F3).
+    Function,
+    /// The name into the cell's formula (F3).
+    Name,
 }
 
 impl ListPanel {
@@ -417,11 +430,23 @@ impl Sheets {
         const CTRL: u8 = 0b0001_0001;
         const SHIFT: u8 = 0b0010_0010;
         const ALT_GUI: u8 = 0b1100_1100;
+        // Ctrl+Alt+F9 (Excel's full calculation) is F9 here: F9 already does everything.
+        let modifiers = if usage == 0x42 && modifiers & CTRL != 0 && modifiers & 0b0100_0100 != 0 && modifiers & 0b1010_1010 == 0 { 0 } else { modifiers };
         if self.password.get_cloned().open || self.closing.get() || self.ui.get_cloned().asking || modifiers & ALT_GUI != 0 {
             return None;
         }
         let (ctrl, shift) = (modifiers & CTRL != 0, modifiers & SHIFT != 0);
+        let editing = self.grid.get_cloned().edit.is_some();
+        // F3 and Shift+F3 add to a formula being typed: the editor stays.
+        if !ctrl && usage == 0x3c && !self.launcher {
+            return Some(Cmd::Data(if shift { crate::data::DataCmd::InsertFunction } else { crate::data::DataCmd::PasteName }));
+        }
         let cmd = match (usage, ctrl, shift) {
+            // F9 (also Ctrl+Alt+F9) and Shift+F9; not while editing, where
+            // Excel would work out part of the formula.
+            (0x42, false, _) if self.launcher || editing => return None,
+            (0x42, false, false) => Cmd::Data(crate::data::DataCmd::CalculateNow),
+            (0x42, false, true) => Cmd::Data(crate::data::DataCmd::CalculateSheet),
             (0x12, true, false) => Cmd::Open,
             (0x11, true, false) => Cmd::NewWorkbook(pergola::clipboard::current_activation()),
             _ if self.launcher => return None,
@@ -1754,7 +1779,24 @@ impl Sheets {
         }
         let sheet = d.sheet;
         drop(d);
-        self.list.set(ListPanel { open: true, sheet, row: r, col: c, items });
+        self.list.set(ListPanel { open: true, kind: ListKind::Choose, sheet, row: r, col: c, items });
+        self.list_search.set(TextEdit::new(""));
+        self.list_scroll.set(ScrollState::default());
+    }
+
+    /// Opens the list of functions (Shift+F3) or of names (F3) for the
+    /// cursor cell's formula. A cell being edited stays open.
+    pub fn formula_list(&self, kind: ListKind) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let mut d = self.doc.borrow_mut();
+        let items = if kind == ListKind::Name { crate::data::paste_names(&d) } else { crate::data::function_names() };
+        if items.is_empty() {
+            d.status = "This workbook has no names to paste. Define one with Define Name….".into();
+            return;
+        }
+        let sheet = d.sheet;
+        drop(d);
+        self.list.set(ListPanel { open: true, kind, sheet, row: r, col: c, items });
         self.list_search.set(TextEdit::new(""));
         self.list_scroll.set(ScrollState::default());
     }
@@ -1767,6 +1809,25 @@ impl Sheets {
         let Some(text) = shown.get(k).and_then(|&i| p.items.get(i)) else { return };
         let mut d = self.doc.borrow_mut();
         if d.sheet != p.sheet {
+            return;
+        }
+        if p.kind != ListKind::Choose {
+            // Into the open editor at its caret, or a new formula.
+            drop(d);
+            let mut g = self.grid.get_cloned();
+            if g.cursor != (p.row, p.col) {
+                return;
+            }
+            let ed = g.edit.get_or_insert_with(|| TextEdit::new(""));
+            if ed.text().is_empty() {
+                ed.insert("=");
+            }
+            ed.insert(text);
+            if p.kind == ListKind::Function {
+                ed.insert("(");
+            }
+            g.anchor = g.cursor;
+            self.grid.set(g);
             return;
         }
         // A text that would read as a formula or a number stays the item's text.
@@ -2841,10 +2902,15 @@ impl View for Sheets {
             let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
             ctx.on_click(back, || {});
             ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
-            let title = format!("Choose for {}", officina_grid::addr::a1(lp.row, lp.col));
+            let title = match lp.kind {
+                ListKind::Choose => format!("Choose for {}", officina_grid::addr::a1(lp.row, lp.col)),
+                ListKind::Function => "Insert Function".into(),
+                ListKind::Name => "Paste Name".into(),
+            };
+            let hint = match lp.kind { ListKind::Choose => "Search the list", ListKind::Function => "Search functions", ListKind::Name => "Search names" };
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
             let cmds = self.cmds.clone();
-            TextField::new(self.list_search.clone()).placeholder("Search the list").autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ListPick(0))).render(ctx);
+            TextField::new(self.list_search.clone()).placeholder(hint).autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ListPick(0))).render(ctx);
             let shown = lp.shown(self.list_search.get_cloned().text());
             let ly = y0 + 80.0;
             let lh = (ph - 80.0 - 56.0).max(FILTER_ROW_H);
@@ -3592,6 +3658,16 @@ impl Sheets {
                 }
                 Cmd::Pivot(c) => {
                     self.pivot_cmd(c);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::InsertFunction) => {
+                    self.formula_list(ListKind::Function);
+                    self.changed();
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::PasteName) => {
+                    self.formula_list(ListKind::Name);
+                    self.changed();
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::ChooseFromList) => {
@@ -7517,6 +7593,69 @@ mod tests {
         s.closing.set(true);
         assert!(s.window_key(0x16, ctrl).is_none());
         s.closing.set(false);
+    }
+
+    #[test]
+    fn f9_calculates_and_f3_lists_go_into_the_formula() {
+        use crate::data::DataCmd;
+        let s = sheets_of(b"a,b\n1,2\n");
+        let run = |c: Cmd| { s.cmds.lock().unwrap().push(c); s.take_cmds(); };
+        let commit = |row, col, text: &str| Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row, col, text: text.into() });
+        run(Cmd::Tab(crate::tabs::TabCmd::Add));
+        s.doc.borrow_mut().sheet = 1;
+        commit(0, 0, "=RAND()");
+        s.doc.borrow_mut().sheet = 0;
+        commit(2, 0, "=RAND()");
+        let v = |sh, r| s.doc.borrow().wb.value(sh, r, 0).display();
+        let (a, b) = (v(0, 2), v(1, 0));
+        // Shift+F9: this sheet only.
+        let Some(c) = s.window_key(0x42, 0b10) else { panic!("Shift+F9") };
+        run(c);
+        assert_eq!(s.doc.borrow().status, "Calculated this sheet.");
+        assert_ne!(v(0, 2), a);
+        // Volatile functions update everywhere on any calculation, as in Excel's automatic mode.
+        assert_ne!(v(1, 0), b);
+        // F9 and Ctrl+Alt+F9: every sheet.
+        for m in [0, 0b101] {
+            let (a, b) = (v(0, 2), v(1, 0));
+            let Some(c) = s.window_key(0x42, m) else { panic!("F9 {m:#b}") };
+            run(c);
+            assert_eq!(s.doc.borrow().status, "Calculated every sheet.");
+            assert!(v(0, 2) != a && v(1, 0) != b);
+        }
+        // F3 with no names says so; with names, a pick starts a formula.
+        let Some(c) = s.window_key(0x3c, 0) else { panic!("F3") };
+        run(c);
+        assert!(!s.list.get_cloned().open);
+        assert!(s.doc.borrow().status.contains("no names"), "{}", s.doc.borrow().status);
+        select(&s, (1, 0), (1, 1));
+        crate::data::define_name(&mut s.doc.borrow_mut(), CellRange { r0: 1, c0: 0, r1: 1, c1: 1 }, "Costs").unwrap();
+        select(&s, (4, 0), (4, 0));
+        run(s.window_key(0x3c, 0).unwrap());
+        let p = s.list.get_cloned();
+        assert!(p.open && p.kind == ListKind::Name && p.items == vec!["Costs".to_string()]);
+        run(Cmd::ListPick(0));
+        assert_eq!(s.grid.get_cloned().edit.as_ref().map(|e| e.text().to_string()).as_deref(), Some("=Costs"));
+        // Shift+F3 while editing: the function at the caret, the editor kept open.
+        let mut g = s.grid.get_cloned();
+        let ed = g.edit.as_mut().unwrap();
+        ed.set_text("=1+");
+        ed.set_caret(3, false);
+        s.grid.set(g);
+        run(s.window_key(0x3c, 0b10).unwrap());
+        assert_eq!(s.list.get_cloned().kind, ListKind::Function);
+        assert!(s.grid.get_cloned().edit.is_some(), "the editor stays open");
+        s.list_search.set(pergola::text_edit::TextEdit::new("sum"));
+        let p = s.list.get_cloned();
+        let k = p.shown("sum").iter().position(|&i| p.items[i] == "SUM").unwrap();
+        run(Cmd::ListPick(k));
+        assert_eq!(s.grid.get_cloned().edit.as_ref().unwrap().text(), "=1+SUM(");
+        // F9 while editing stays with the editor.
+        assert!(s.window_key(0x42, 0).is_none());
+        // The menu names the keys.
+        let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (4, 0));
+        let key = |c| items.iter().find(|(_, x)| *x == Some(c)).and_then(|(m, _)| m.shortcut.clone());
+        assert_eq!([key(DataCmd::CalculateNow), key(DataCmd::CalculateSheet), key(DataCmd::InsertFunction), key(DataCmd::PasteName)].map(|k| k.unwrap_or_default()), ["F9", "Shift+F9", "Shift+F3", "F3"]);
     }
 
     #[test]

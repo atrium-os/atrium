@@ -113,7 +113,7 @@ impl<'a> Courier<'a> {
     /// a body. The outer `Err` is the client gone; the inner one a refusal
     /// to send in place of the rest.
     fn events(&mut self, req: &Request, vault: &mut dyn Vault, out: &mut dyn Write) -> std::io::Result<Result<(), Refusal>> {
-        let (mut s, values, cookie, path) = match self.start(req, vault) {
+        let (mut s, values, cookie, path, _) = match self.start(req, vault) {
             Ok(x) => x,
             Err(e) => return Ok(Err(e)),
         };
@@ -159,12 +159,12 @@ impl<'a> Courier<'a> {
     }
 
     /// Connect (or reuse), fill the slots and write the request.
-    fn start(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<(Tls, Vec<LockedBuf>, Option<LockedBuf>, String), Refusal> {
+    fn start(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<(Tls, Vec<LockedBuf>, Option<LockedBuf>, String, Option<LockedBuf>), Refusal> {
         // A kept-alive connection is already past TLS to this host; a
         // fresh one gets there before the vault is asked.
-        let mut s = match self.conn.take() {
-            Some(s) => s,
-            None => self.connect()?,
+        let (mut s, reused) = match self.conn.take() {
+            Some(s) => (s, true),
+            None => (self.connect()?, false),
         };
         let values = if req.slots.is_empty() {
             Vec::new()
@@ -183,21 +183,38 @@ impl<'a> Courier<'a> {
         };
         let cookie = vault.cookies(req.method, path, query, req.ticket.as_ref(), origin)?;
         let wire = build(req, &self.endpoint, &values, cookie.as_ref())?;
+        let mut reused = reused;
         if s.write_all(wire.as_ref()).and_then(|_| s.flush()).is_err() {
             // The server closed a kept-alive connection: once more, fresh.
             // The values are already in hand; the new connection is past
             // TLS to the same host before they are written.
             s = self.connect()?;
+            reused = false;
             s.write_all(wire.as_ref()).and_then(|_| s.flush()).map_err(|_| Refusal::Http)?;
         }
-        drop(wire);
-        Ok((s, values, cookie, path.to_string()))
+        // Kept while a GET or HEAD on a kept-alive connection may still be
+        // sent again ([`Courier::send`]); dropped (and wiped) otherwise.
+        let again = (reused && idempotent(req.method)).then_some(wire);
+        Ok((s, values, cookie, path.to_string(), again))
     }
 
     fn send(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<Response, Refusal> {
-        let (mut s, values, cookie, path) = self.start(req, vault)?;
+        let (mut s, values, cookie, path, again) = self.start(req, vault)?;
         let path = path.as_str();
-        let (resp, keep) = read(&mut s, req.method)?;
+        // A kept-alive connection the server closed after the write went
+        // into it (a restarted server): the read fails. A GET or HEAD is
+        // sent once more on a fresh connection, the same bytes, as
+        // browsers do; nothing is asked of the vault twice.
+        let (resp, keep) = match (read(&mut s, req.method), again) {
+            (Ok(r), _) => r,
+            (Err(_), Some(wire)) => {
+                s = self.connect()?;
+                s.write_all(wire.as_ref()).and_then(|_| s.flush()).map_err(|_| Refusal::Http)?;
+                drop(wire);
+                read(&mut s, req.method)?
+            }
+            (Err(e), None) => return Err(e),
+        };
         if keep {
             self.conn = Some(s);
         }
@@ -228,6 +245,9 @@ fn event_end(b: &[u8]) -> Option<usize> {
     }
     None
 }
+
+/// A request that may be sent twice: the server keeps no change from it.
+fn idempotent(m: Method) -> bool { matches!(m, Method::Get | Method::Head) }
 
 fn read(s: &mut Tls, method: Method) -> Result<(navigator_fetch::http::Response, bool), Refusal> {
     // HEAD has no body whatever the length says.

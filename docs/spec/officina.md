@@ -4912,6 +4912,12 @@ Gates: the extended atrium-sheets `duplicate_sheet_brings_charts_and_tables_unde
 - The menus show Ctrl+F for Find and Replace and Ctrl+F3 for the Name Manager.
 - Test: `window_keys_save_open_find_and_enter_the_cell_being_edited`. All 144 Sheets lib tests and the bin tests pass.
 
+### 16.118 Calculation keys, Insert Function and Paste Name (2026-11-25)
+
+- **F9** (and **Ctrl+Alt+F9**) calculates every formula again, and **Shift+F9** the sheet on screen (`Workbook::mark_all`, then the usual sliced recalculation). Sheets always calculates automatically, so these matter for volatile functions such as RAND and NOW. As in Excel's automatic mode, those update on every sheet with any calculation. The Data menu has **Calculate Now** and **Calculate Sheet**. F9 does nothing while a cell is being edited, where Excel would work out part of the formula.
+- **Shift+F3** opens a searchable list of the functions Sheets has (**Insert Function…**). **F3** lists the names the sheet can use: the workbook's and this sheet's own, without Excel's built-in `_xlnm.` ones (**Paste Name…**). A pick goes into the open editor at its caret (a function as `NAME(`), or starts a formula with `=` when no cell is being edited. F3 with no names says so. The lists reuse the validation list panel (`ListKind`).
+- Test: `f9_calculates_and_f3_lists_go_into_the_formula`. All 145 Sheets and 122 officina-grid lib tests pass.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
