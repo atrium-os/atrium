@@ -21,6 +21,11 @@ pub const LIVE_PAGE: &str = "https://live-page.atrium.invalid/";
 /// POST sends a batch of changes. navigatord keeps it; the engine holds
 /// no file.
 pub const LIVE_STORAGE: &str = "https://live-page.atrium.invalid/local-storage";
+/// A whole page's IndexedDB (I6.7): a GET loads its site's databases, a
+/// POST sends one part of a committing transaction's changes, and the last
+/// part's answer says whether the commit was kept. navigatord keeps it.
+pub const LIVE_IDB: &str = "https://live-page.atrium.invalid/indexed-db";
+pub mod idb;
 /// A file a whole page's script made and asked to save (I6.4: `<a
 /// download>` on a `blob:` or `data:` address): its bytes are POSTed here,
 /// with `name` (the suggested name) and `type` (its content type) as

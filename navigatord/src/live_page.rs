@@ -253,11 +253,15 @@ impl Resources for LiveJar {
 pub trait LocalStorage {
     fn load(&mut self, page: &str) -> Result<Vec<u8>, String>;
     fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String>;
+    /// Its IndexedDB (I6.7): the site's databases, and one part of a commit.
+    fn load_idb(&mut self, _page: &str) -> Result<Vec<u8>, String> { Err("no IndexedDB here".into()) }
+    fn apply_idb(&mut self, _page: &str, _part: &[u8]) -> Result<(), String> { Err("no IndexedDB here".into()) }
 }
 
 /// The stores of one jar.
 pub struct JarStores {
     pub stores: Arc<Mutex<crate::live_storage::Stores>>,
+    pub idb: Arc<Mutex<crate::live_idb::Stores>>,
     pub jar: Option<u64>,
 }
 
@@ -269,6 +273,14 @@ impl LocalStorage for JarStores {
     fn apply(&mut self, page: &str, batch: &[u8]) -> Result<(), String> {
         let key = crate::live_storage::Key::of(self.jar, page).ok_or("the page's site has no store")?;
         self.stores.lock().unwrap().apply(&key, batch)
+    }
+    fn load_idb(&mut self, page: &str) -> Result<Vec<u8>, String> {
+        let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
+        Ok(self.idb.lock().unwrap().load(&key))
+    }
+    fn apply_idb(&mut self, page: &str, part: &[u8]) -> Result<(), String> {
+        let key = crate::live_idb::Key::of(self.jar, page).ok_or("the page's site has no store")?;
+        self.idb.lock().unwrap().apply(&key, part)
     }
 }
 
@@ -388,9 +400,12 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         }
         // The page's storage (I6.3): loaded once, changed in batches, kept
         // by navigatord for the page's site.
-        if delivered && open.url == limen::web_island::LIVE_STORAGE {
+        let idb = open.url == limen::web_island::LIVE_IDB;
+        if delivered && (open.url == limen::web_island::LIVE_STORAGE || idb) {
             let answer = match (hooks.storage(), post) {
                 (None, _) => Err("no storage here".to_string()),
+                (Some(l), None) if idb => l.load_idb(&delivered_url).map(|b| (200, b)),
+                (Some(l), Some(b)) if idb => l.apply_idb(&delivered_url, &b.bytes).map(|_| (204, vec![])),
                 (Some(l), None) => l.load(&delivered_url).map(|b| (200, b)),
                 (Some(l), Some(b)) => l.apply(&delivered_url, &b.bytes).map(|_| (204, vec![])),
             };
@@ -416,7 +431,7 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         // The reporter's addresses (I6.4), on navigatord's own name: its
         // script, a refused API, a file the page's script made. Only after
         // the page; none goes to the network.
-        if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE {
+        if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE && !idb {
             let (status, kind, body): (u16, Option<&str>, std::borrow::Cow<[u8]>) = match (reporter_request(&open.url), post) {
                 (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER.into()),
                 // Frames and their messages (I6.5).
@@ -1478,8 +1493,10 @@ mod tests {
         let stores = Arc::new(Mutex::new(Stores::new(None)));
         let (ours, theirs) = UnixStream::pair().unwrap();
         let s2 = stores.clone();
+        let idb = Arc::new(Mutex::new(crate::live_idb::Stores::new(None)));
+        let i2 = idb.clone();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: s2, jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: s2, idb: i2, jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let storage = limen::web_island::LIVE_STORAGE;
@@ -1499,13 +1516,49 @@ mod tests {
         // The store is the page's site's, in the persona's jar.
         let key = crate::live_storage::Key::of(None, "https://api.app.example/").unwrap();
         assert_ne!(stores.lock().unwrap().load(&key), b"");
+        let _ = idb;
+    }
+
+    #[test]
+    fn the_page_loads_and_commits_its_sites_indexeddb_after_it_is_delivered() {
+        use crate::live_idb::{parts, Op, Stores};
+        let idb = Arc::new(Mutex::new(Stores::new(None)));
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let i2 = idb.clone();
+        let server = std::thread::spawn(move || {
+            let local = JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: i2, jar: None };
+            let mut seen = Seen { local: Some(local), ..Seen::default() };
+            serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
+        });
+        let at = limen::web_island::LIVE_IDB;
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_PAGE)).unwrap();
+        assert_eq!(body(&mut c).2, None);
+        c.open(Open::get(2, at)).unwrap();
+        assert_eq!(body(&mut c), (Some((200, at.into(), Some("application/octet-stream".into()))), vec![], None), "empty at first");
+        let commit = [Op::Version(b"mail".to_vec(), 1), Op::CreateStore(b"m".to_vec(), vec![]), Op::Put(b"k".to_vec(), b"v".to_vec())];
+        let p = parts(7, &commit);
+        assert_eq!(p.len(), 1);
+        c.open(Open::post(3, at, "application/octet-stream", p[0].clone())).unwrap();
+        assert_eq!(body(&mut c).0.map(|h| h.0), Some(204));
+        let bad = parts(8, &[Op::Store(b"nope".to_vec())]);
+        c.open(Open::post(4, at, "application/octet-stream", bad[0].clone())).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "a commit refused");
+        c.open(Open::get(5, at)).unwrap();
+        let loaded = body(&mut c).1;
+        assert_eq!(crate::live_idb::decode_ops(&loaded, crate::live_idb::LOAD_MAX).unwrap(), commit, "read back as the commit made it");
+        // localStorage is a store of its own.
+        c.open(Open::get(6, limen::web_island::LIVE_STORAGE)).unwrap();
+        assert_eq!(body(&mut c).1, b"");
+        drop(c);
+        server.join().unwrap().unwrap();
     }
 
     #[test]
     fn storage_is_not_asked_for_before_the_page() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || {
-            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), jar: None }), ..Seen::default() };
+            let mut seen = Seen { local: Some(JarStores { stores: Arc::new(Mutex::new(crate::live_storage::Stores::new(None))), idb: Arc::new(Mutex::new(crate::live_idb::Stores::new(None))), jar: None }), ..Seen::default() };
             serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut seen)
         });
         let mut c = nuntius::client::Client::from_stream(theirs).unwrap();

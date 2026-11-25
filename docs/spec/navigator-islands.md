@@ -2230,7 +2230,7 @@ origin that saved it.
 7. **I6.6 Hardening.** The remembered choice (D8) in Curia with revoke,
    recycling under memory pressure, the worker audit and check on a
    whole-page engine, and the fuzzed channel's new navigation messages.
-8. **I6.7 IndexedDB kept** (D15, proposed). A live page's IndexedDB
+8. **I6.7 IndexedDB kept** (D15; [first part as built](#i67-as-built-2026-11-25-first-part-navigatord-and-the-channel)). A live page's IndexedDB
    outlives the run, kept by navigatord as `localStorage` is (D10). Gate:
    the fixture's `indexeddb` line counts visits across Stop, a navigatord
    restart and an engine killed at its memory limit; an Unrecorded trail
@@ -3451,6 +3451,88 @@ rather than kept for the run only), and that `StorageSerializationRecord`
 bytes read back by the same pinned engine; a new pin rereads them or
 starts the site empty.
 
+#### I6.7 as built (2026-11-25, first part: navigatord and the channel)
+
+navigatord side and the engine's Rust side host-tested; the LibWeb patch
+is the Mac step.
+
+- **Wire format.** `limen::web_island::idb`, shared by navigatord and the
+  engine: a change is `Op` (select or make a database with its version,
+  delete one; select, make, delete or rename an object store; set its key
+  generator; put, append to, delete a record, clear the store; select,
+  make, delete or rename an index; add or remove an index record). Names,
+  keys, values and descriptions (key path, auto-increment, unique,
+  multi-entry) are the engine's bytes. A commit is sent as `parts`: each
+  a 13-byte header (run, part number, last) and at most 32 KiB in all
+  (Nuntius's POST bound); a value longer than that goes as a put and
+  appends. A loaded store is the same changes from empty.
+- **navigatord** (`live_idb::Stores`). One store per (jar, site),
+  addressed at `limen::web_island::LIVE_IDB`
+  (`https://live-page.atrium.invalid/indexed-db`) after the page is
+  delivered: a GET loads it, a POST is one part. A run is applied when its
+  last part arrives, all of it or none (each change records how to undo
+  it, so a 50 MiB store is not copied per commit); a part out of order
+  drops the run. A recorded trail's store is `live-idb/<site>.idb` (the
+  image) and `<site>.idb-log` (each later commit appended and
+  `fsync`'d before the 204), both 0600 with a generation each; once the
+  log outgrows the image and 1 MiB, the next generation's image is written
+  whole and renamed in, with a fresh log. A log cut short at its end loses
+  only the commit that was never answered; anything else out of shape
+  starts the site empty, logged. Unrecorded stores are memory only, 200
+  MiB for all of them together, and go with their jar; file-backed stores
+  past 150 MiB loaded are dropped and reread on demand. Forgetting a site
+  removes its IndexedDB with its `localStorage`.
+- **Bounds.** 50 MiB a site (each database, store and index costs 64
+  bytes more than its bytes, each record and index record 16), names and
+  descriptions 4 KiB, keys 16 KiB, a run 54 MiB, a load 100 MiB (the
+  engine sizes its buffer from the answer's length, not up front).
+- **Engine, Rust** (`fixture_fetch.rs`): `navigator_live_idb_load(ctx,
+  on_op)` gives each change of the store from empty as `(tag, a, b, n)`
+  (`Op::fields`); `navigator_live_idb_begin`, `navigator_live_idb_op(tag,
+  a, a_len, b, b_len, n)` and `navigator_live_idb_commit() -> bool` send
+  one transaction's changes. A change out of shape fails the commit.
+
+**The LibWeb patch (`patches/ladybird/live-idb.patch`, Mac).** In
+`Libraries/LibWeb/Bindings/Rust/src/indexed_db/`, for `ATRIUM_I6_PAGE`
+only:
+
+1. *Commit.* `internal/algorithms.rs` `commit_a_transaction`, at the
+   FIXMEs for steps 3 and 4 inside the "all processed" function: when the
+   transaction is read-write or an upgrade, call `navigator_live_idb_begin`,
+   then from each `store_mutation_logs` entry (the log already records
+   store and index creation, deletion and renames, key generator changes,
+   records stored and deleted, index records stored and deleted) give the
+   changes in log order, after `Version` for the database (its new version
+   for an upgrade) and `Store` for each store. A `RecordStored` sends the
+   record's value as it is in the store now (`StorageSerializationRecord`
+   bytes). Then `navigator_live_idb_commit`; on false, run "abort a
+   transaction" with a `QuotaExceededError` and return, as step 4 says.
+2. *Delete.* `Database::delete_for_key_and_name` sends its own run:
+   `DeleteDatabase(name)`.
+3. *Load.* In `web_rust_indexed_db_create_factory`, the first time for the
+   page's own storage key (the delivered page's origin; other origins in
+   the engine keep IndexedDB per run and send nothing), call
+   `navigator_live_idb_load` and rebuild: `Database::create_for_key_and_name`
+   and its version, `ObjectStore::create` and `Index::create` from the
+   descriptions, `store_a_record` for each record, the index records, and
+   the key generators. No mutation log is open, so nothing is sent back.
+4. *Check.* `Blob` and `File` values: if `StorageSerializationRecord`
+   holds them by reference, the commit gives an out-of-shape change (the
+   commit fails, logged) rather than keeping a dangling reference.
+
+**Gate (Mac),** with `NAVIGATORD_STORE` set and a fixture line
+`indexeddb` (a database `fixture`, store `visits`, one put per run):
+
+1. Run `app.html` live: `indexeddb` reads 1 visit. Stop, run live: 2.
+   Restart navigatord, run live: 3.
+2. Grow the page past its 1 GiB limit (Grow buttons) so the engine is
+   killed, run live again: the count kept every committed visit.
+3. An Unrecorded trail: 1 visit, and no `live-idb` file for it.
+4. Put a 60 MiB value: the transaction aborts with `QuotaExceededError`,
+   and the next run reads the store as it was.
+5. `live-idb/app.example.idb-log` (and `.idb` after a fold) is 0600,
+   owned by the persona's Navigator user.
+
 #### Costs
 
 - A live whole page is a large attack surface in a JIT-off engine: the jail,
@@ -4310,7 +4392,7 @@ alongside I0.
 | **D11** ✓ | Cross-origin frames inside a live page (I6) | each its own engine jail, started with the page · a box the person presses, as in the document lane · not shown | **Its own engine jail, started with the page**, composed by Limen as a nested island. Payment and sign-in frames must work inside an app, and asking per frame would break it; the origin stays the isolation unit (legacy-web §7.6). Third-party frames refused by D12 are not started |
 | **D12** ✓ | What a live page's scripts may reach (I6) | its own origin only (legacy-web §5.4.1c) · its registrable domain · its registrable domain plus origins it names in a declared list | **Its registrable domain**, measured in I6.0 before it is fixed. Fat clients keep their APIs and static assets on sibling hosts; third-party requests are refused and listed in the popover. The chip's words change to "send it to atlas.example's sites" |
 | **D13** ✓ | GPU for live pages (I6) | none in I6 · a jailed GPU process later | **None in I6.** The threat model keeps GPU descriptors out of engines (§2). A jailed GPU broker for WebGL is its own spec, opened only if I6.0 shows that apps the person needs cannot run without it |
-| **D15** | Is a live page's IndexedDB kept (I6.7) | written through at each commit by a small LibWeb patch at the standard's own write step · a snapshot at Stop and every few seconds, no patch · per run only (today) | **Proposed: at each commit**, by navigatord as D10, 50 MiB a site ([I6.7 proposal](#i67-proposal-indexeddb-kept-d15-2026-11-25)) |
+| **D15** ✓ | Is a live page's IndexedDB kept (I6.7) | written through at each commit by a small LibWeb patch at the standard's own write step · a snapshot at Stop and every few seconds, no patch · per run only (today) | **At each commit** (Shankar 2026-11-25), by navigatord as D10, 50 MiB a site ([I6.7 proposal](#i67-proposal-indexeddb-kept-d15-2026-11-25)) |
 
 ### Local Mail callback and account storage
 
