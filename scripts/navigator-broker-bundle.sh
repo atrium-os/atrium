@@ -34,7 +34,7 @@ implements = ["app-settings"]
 
 [roles.app-settings]
 entry = "bin/navigator-settings"
-# Kept out of its overlay, in the persona's key group; NAVIGATORD_STORE
+# Kept out of its overlay, in the key group of the persona; NAVIGATORD_STORE
 # must be under it for the pane to find the list.
 data = "var/db/navigatord"'
 fi
