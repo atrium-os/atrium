@@ -648,6 +648,12 @@ impl Window {
 #[cfg(debug_assertions)]
 const INSPECT_POLL: Duration = Duration::from_millis(200);
 
+/// What the inspector asked to outline, as the app draws it.
+#[cfg(debug_assertions)]
+fn marks_of(l: &crate::inspect::Link) -> crate::inspect::Marks {
+    crate::inspect::Marks { highlight: l.highlight.map(crate::node::NodeId), bounds: l.bounds }
+}
+
 impl Window {
     /// Answer what the inspector asked (dev builds).
     #[cfg(debug_assertions)]
@@ -671,12 +677,12 @@ impl Window {
                 }
                 Ask::Pick(on) => l.picking = on,
                 Ask::Highlight(id) => {
-                    l.marks.highlight = id.map(crate::node::NodeId);
-                    app.set_marks(l.marks.clone());
+                    l.highlight = id;
+                    app.set_marks(marks_of(l));
                 }
                 Ask::Bounds(on) => {
-                    l.marks.bounds = on;
-                    app.set_marks(l.marks.clone());
+                    l.bounds = on;
+                    app.set_marks(marks_of(l));
                 }
             }
         }
@@ -698,8 +704,8 @@ impl Window {
                 self.swallow_release = true;
                 let at = crate::geom::Point::new(x, y);
                 if let Some(id) = crate::inspect::pick(app.tree(), at, app.mark_ids()) {
-                    l.marks.highlight = Some(id);
-                    app.set_marks(l.marks.clone());
+                    l.highlight = Some(id.0);
+                    app.set_marks(marks_of(l));
                     l.send(&crate::inspect::Tell::Picked(id.0));
                 }
                 return true;

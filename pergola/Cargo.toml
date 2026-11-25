@@ -36,6 +36,7 @@ limen           = { path = "../limen" }
 aqueduct        = { path = "../aqueduct" }
 serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
+atrium-inspect  = { path = "../atrium-inspect" }
 libc            = "0.2"
 
 [dev-dependencies]

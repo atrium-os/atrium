@@ -442,13 +442,29 @@ A, then B.
   the app by the socket portcullisd hands it rather than through the
   workspace, which keeps D25's point (nothing new is open to other apps)
   without putting Artifex in the workspace.
-- C apps (libatrium) draw through `fresco-client` directly and are not
-  inspected yet.
+- *C apps.* libatrium answers too (`libatrium/src/inspect.rs`): each
+  `atrium_window_frame_*` call (and `atrium_window_fill_rect`) is a node,
+  flat, in drawing order, with its box (a path's turned quad boxed, a
+  glyph run's glyphs), colour and the app's line. `atrium.h` wraps those
+  calls in macros that first pass `__FILE__` and `__LINE__` to
+  `atrium__site` (`ATRIUM_NO_SITES` turns them off); libatrium reads the
+  name only while an IDE listens, and records nothing otherwise. A press
+  while Pick waits picks the last-drawn node under it; Highlight and
+  Bounds are drawn as thin rects with ids from `0xFFFF0000` just before
+  the frame ends, and are never listed. Boxes are in the window's device
+  pixels, which C apps draw in.
+- The wire (`Ask`, `Tell`, the framing and the app's end of the socket)
+  is its own crate, `atrium-inspect`, which Pergola, libatrium and
+  Artifex share.
 - `vm-artifex-check.sh` covers both: stepping as above, then Run on the
   app template's Pergola app: portcullisd puts the socket at fd 3, the app
   answers with its tree, the strip's Inspect shows it, Pick and a press on
-  the app's button give its Text at `ui/src/main.rs:35`, Bounds, Go to
-  source opens line 35, and the ended app's tree stays marked ended.
+  the app's button give its Text at the button's line in `ui/src/main.rs`, Bounds, Go to
+  source opens that line, and the ended app's tree stays marked ended. Then
+  Run on the c-app template's app: its frame answers, and Pick and a
+  press on its background give the `Rect` drawn at its
+  `atrium_window_frame_rect(1, ...)` line (the C SDK in the base must be
+  this tree's: `install-c-sdk.sh`).
 
 ## 4. C and C++ in a workspace
 

@@ -280,6 +280,25 @@ int32_t atrium_window_poll_event(atrium_window_event_t* out);
  * shutdown). */
 void atrium_window_disconnect(void);
 
+/* The inspector (dev-tools.md §3.6): each frame call first names the
+ * app's file and line, so an IDE inspecting a dev build can show the
+ * line that drew a node. It costs a store per call; libatrium reads the
+ * name only while an IDE listens. Define ATRIUM_NO_SITES before this
+ * header to make the calls bare. */
+void atrium__site(const char* file, uint32_t line);
+#ifndef ATRIUM_NO_SITES
+#define atrium_window_fill_rect(...) \
+    (atrium__site(__FILE__, __LINE__), atrium_window_fill_rect(__VA_ARGS__))
+#define atrium_window_frame_rect(...) \
+    (atrium__site(__FILE__, __LINE__), atrium_window_frame_rect(__VA_ARGS__))
+#define atrium_window_frame_path(...) \
+    (atrium__site(__FILE__, __LINE__), atrium_window_frame_path(__VA_ARGS__))
+#define atrium_window_frame_texture(...) \
+    (atrium__site(__FILE__, __LINE__), atrium_window_frame_texture(__VA_ARGS__))
+#define atrium_window_frame_glyph_run(...) \
+    (atrium__site(__FILE__, __LINE__), atrium_window_frame_glyph_run(__VA_ARGS__))
+#endif
+
 #ifdef __cplusplus
 }
 #endif
