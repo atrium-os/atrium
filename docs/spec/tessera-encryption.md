@@ -935,7 +935,9 @@ anyway. So a process of another uid that has a person's overlay open (a
 root shell, or a system service such as an indexer or a backup) gets EBADF
 at their logout instead of holding it up: logout ending on time with the
 key gone outranks that process's open files (`scripts/vm-logout-check.sh` 7,
-20 rounds with a writer). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
+20 rounds with a writer; 0 failed on 2026-11-25 at b21ceebb5 on an arm64 Tessera
+guest with persona key groups: every round forced, no md left, the image fsck-clean
+and the writer's lines read back, no panic). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
 atrium-volumes only, key-group keys only, no second verification since
 portcullisd had Sigillum verify the removal) deletes the item and drops
 the key, then `GROUP_ERASE`; if a folder is still in use the erase waits
