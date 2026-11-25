@@ -254,6 +254,8 @@ pub trait Hooks {
     fn refused(&mut self, _target: &str) {}
     /// The reporter says the page asked for an API I6 refuses.
     fn refused_api(&mut self, _api: limen::web_island::Api) {}
+    /// The file the person picked for the page (I6.4), taken once.
+    fn picked(&mut self) -> Option<Vec<u8>> { None }
 }
 
 /// Serve one live page's engine on its fetch channel until it closes it.
@@ -342,14 +344,22 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
         // script, a refused API, a file the page's script made. Only after
         // the page; none goes to the network.
         if delivered && open.url.starts_with("https://live-page.atrium.invalid/") && open.url != limen::web_island::LIVE_STORAGE {
-            let (status, kind, body): (u16, Option<&str>, &[u8]) = match (reporter_request(&open.url), post) {
-                (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER),
+            let (status, kind, body): (u16, Option<&str>, std::borrow::Cow<[u8]>) = match (reporter_request(&open.url), post) {
+                (Some(Reporter::Script), None) => (200, Some("text/javascript"), REPORTER.into()),
                 (Some(Reporter::Refused(api)), None) => {
                     hooks.refused_api(api);
-                    (204, None, b"")
+                    (204, None, b"".into())
                 }
+                // The file the person picked (I6.4), once.
+                (Some(Reporter::PickedFile), None) => match hooks.picked() {
+                    Some(bytes) if bytes.len() as u64 <= open.limits.max_bytes => (200, Some("application/octet-stream"), bytes.into()),
+                    _ => {
+                        refuse("no picked file waiting", ErrorCode::Policy, &mut served, hooks)?;
+                        continue;
+                    }
+                },
                 (Some(Reporter::Download { name, kind }), Some(b)) => match hooks.made(&delivered_url, &name, &kind, b.bytes.clone()) {
-                    Ok(()) => (204, None, b""),
+                    Ok(()) => (204, None, b"".into()),
                     Err(why) => {
                         eprintln!("navigatord: a live page's file not offered: {why}");
                         refuse("a file the page made, not offered", ErrorCode::Policy, &mut served, hooks)?;
@@ -363,8 +373,8 @@ pub fn serve(socket: UnixStream, page: &str, upstream: &mut dyn Resources, hooks
             };
             output.send(Event::Head { id, status, final_url: open.url.clone(), redirects: 0, content_type: kind.map(str::to_string),
                 length: Some(body.len() as u64), accept_ranges: false, validator: None }).map_err(|e| e.to_string())?;
-            if !body.is_empty() {
-                output.send(Event::Data { id, offset: 0, bytes: body.to_vec() }).map_err(|e| e.to_string())?;
+            for (i, bytes) in body.chunks(nuntius::DATA_MAX).enumerate() {
+                output.send(Event::Data { id, offset: (i * nuntius::DATA_MAX) as u64, bytes: bytes.to_vec() }).map_err(|e| e.to_string())?;
             }
             output.send(Event::Done { id, bytes: body.len() as u64 }).map_err(|e| e.to_string())?;
             continue;
@@ -436,6 +446,7 @@ const REPORTER: &[u8] = include_bytes!("live_reporter.js");
 #[derive(Debug, PartialEq)]
 enum Reporter {
     Script,
+    PickedFile,
     Refused(limen::web_island::Api),
     Download { name: String, kind: String },
 }
@@ -443,6 +454,7 @@ enum Reporter {
 fn reporter_request(url: &str) -> Option<Reporter> {
     use limen::web_island::{Api, LIVE_DOWNLOAD, LIVE_REFUSED, LIVE_REPORTER};
     if url == LIVE_REPORTER { return Some(Reporter::Script); }
+    if url == limen::web_island::LIVE_FILE { return Some(Reporter::PickedFile); }
     let (at, query) = url.split_once('?')?;
     let u = url::Url::parse(url).ok()?;
     let pairs: Vec<(String, String)> = u.query_pairs().take(4).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
@@ -545,6 +557,101 @@ fn refused_host(target: &str) -> &str {
     target.strip_prefix("host ").and_then(|t| t.split(',').next()).unwrap_or("an unreadable address")
 }
 
+/// The largest file a live page is handed from the picker: one resource.
+const PICK_MAX: u64 = navigator_prerender::fetch::LIVE_RESOURCE_MAX as u64;
+/// After a pick ends, how long before the page may open another: a page
+/// can't hold the picker up over the window.
+const PICK_AGAIN: Duration = Duration::from_secs(2);
+
+/// A live page's file pick (I6.4): Scrinium's picker over the window,
+/// one at a time, one read-only file.
+#[derive(Default)]
+struct Pick {
+    embed: Option<limen::proto::EmbedId>,
+    /// The file handed over, until the picker says it is done.
+    file: Option<(String, Vec<u8>)>,
+    ended: Option<Instant>,
+}
+
+impl Pick {
+    /// The page asked: whether a picker may open now.
+    fn may_open(&self, now: Instant) -> Result<(), &'static str> {
+        if self.embed.is_some() { return Err("a file picker is already open"); }
+        if self.ended.is_some_and(|t| now.duration_since(t) < PICK_AGAIN) { return Err("a file picker asked for again at once"); }
+        Ok(())
+    }
+
+    /// A message from the picker, and its descriptor if it came with one.
+    /// `Some` when the pick is over: the file, or none.
+    fn message(&mut self, bytes: &[u8], fd: Option<std::os::fd::OwnedFd>) -> Option<Option<(String, Vec<u8>)>> {
+        use limen::picker::ToParent;
+        match (ToParent::decode(bytes), fd) {
+            (Some(ToParent::File { name, size, write: false }), Some(fd)) if self.file.is_none() && size <= PICK_MAX => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                match std::fs::File::from(fd).take(PICK_MAX + 1).read_to_end(&mut bytes) {
+                    Ok(n) if n as u64 <= PICK_MAX => self.file = Some((name, bytes)),
+                    _ => eprintln!("navigatord: the picked file could not be read whole"),
+                }
+                None
+            }
+            (Some(ToParent::File { .. }), _) => {
+                eprintln!("navigatord: the picker handed over a file the page can't take (too big, writable, or a second)");
+                None
+            }
+            (Some(ToParent::Done { .. } | ToParent::Cancelled | ToParent::Failed { .. }), None) => Some(self.end()),
+            _ => None,
+        }
+    }
+
+    /// The pick is over: the file, if one came.
+    fn end(&mut self) -> Option<(String, Vec<u8>)> {
+        self.embed = None;
+        self.ended = Some(Instant::now());
+        self.file.take()
+    }
+}
+
+/// Open Scrinium's picker over `window` for the page at `page`.
+fn open_picker(connection: &mut Parent, window: [u8; 16], rect: [u32; 4], page: &str) -> Result<limen::proto::EmbedId, String> {
+    let host = url::Url::parse(page).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let mut title = format!("Choose a file for {host}");
+    while title.len() > limen::picker::MAX_TITLE { title.pop(); }
+    let filter = limen::picker::Filter { title, ..limen::picker::Filter::file() };
+    let e = connection.request("picker", window).map_err(|e| format!("the picker: {e:?}"))?;
+    let bounds = crate::widget::bounds(rect).unwrap_or([0.0, 0.0, 640.0, 440.0]);
+    let opened = connection.place(e, Some(bounds)).and_then(|_| connection.send(e, limen::picker::ToChild::Open(filter).encode()));
+    if let Err(err) = opened {
+        let _ = connection.detach(e);
+        return Err(format!("the picker: {err:?}"));
+    }
+    Ok(e)
+}
+
+/// The pick is over: the file waits for the engine's GET, and the engine
+/// is told its name, or that there is none.
+fn finish_pick(connection: &mut Parent, embed: u64, file: Option<(String, Vec<u8>)>, picked: &Mutex<Option<Vec<u8>>>) {
+    use limen::web_island::FilePicked;
+    let answer = match file {
+        Some((name, bytes)) => {
+            let name: String = name.chars().filter(|c| !c.is_control() && *c != '/').take(limen::web_island::PICKED_NAME_MAX / 4).collect();
+            let name = if name.is_empty() { "file".to_string() } else { name };
+            eprintln!("navigatord: the person picked a file for a live page ({} bytes)", bytes.len());
+            *picked.lock().unwrap() = Some(bytes);
+            FilePicked::Chosen { name }
+        }
+        None => FilePicked::Cancelled,
+    };
+    tell_picked(connection, embed, &answer);
+}
+
+/// Tell the engine how its pick ended.
+fn tell_picked(connection: &mut Parent, embed: u64, answer: &limen::web_island::FilePicked) {
+    if let Some(bytes) = answer.encode() {
+        if let Err(e) = connection.send(embed, bytes) { eprintln!("navigatord: the picked file not told: {e:?}"); }
+    }
+}
+
 /// The serve loop's hooks for a running page.
 struct RunHooks {
     delivered: std::sync::mpsc::Sender<String>,
@@ -552,6 +659,8 @@ struct RunHooks {
     tell: Arc<dyn Tell>,
     /// The APIs told already, each once.
     apis: std::collections::HashSet<limen::web_island::Api>,
+    /// The file the person picked, waiting for the engine's GET.
+    picked: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl Hooks for RunHooks {
@@ -571,6 +680,7 @@ impl Hooks for RunHooks {
         Ok(())
     }
     fn refused(&mut self, target: &str) { self.tell.refused(format!("a request to {}", refused_host(target))); }
+    fn picked(&mut self) -> Option<Vec<u8>> { self.picked.lock().unwrap().take() }
     fn refused_api(&mut self, api: limen::web_island::Api) {
         if self.apis.insert(api) {
             eprintln!("navigatord: a live page was refused {}", api.label());
@@ -619,7 +729,8 @@ impl Live {
         let (delivered_tx, delivered) = std::sync::mpsc::channel::<String>();
         let forms = jar.clone();
         let closing = jar.clone();
-        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default() };
+        let picked = Arc::new(Mutex::new(None));
+        let mut hooks = RunHooks { delivered: delivered_tx, storage, tell: tell.clone(), apis: Default::default(), picked: picked.clone() };
         std::thread::spawn(move || {
             let result = match jar {
                 Some(mut jar) => serve(channel, &page, &mut jar, &mut hooks),
@@ -637,6 +748,7 @@ impl Live {
             use limen::web_island::{EndReason, Lifecycle, Report};
             let mut reports = Lifecycle::default();
             let mut started = false;
+            let mut pick = Pick::default();
             let mut page = None::<String>;
             let why = loop {
                 let mut slot = watched.lock().unwrap();
@@ -710,12 +822,38 @@ impl Live {
                             _ => eprintln!("navigatord: a live page's form refused: no jar ({})", crate::refused_target(to)),
                         },
 
+                        // A file input (I6.4): Scrinium's picker over the window;
+                        // only what the person picks reaches the page.
+                        Some(Report::PickFile) => {
+                            use limen::web_island::FilePicked;
+                            let rect = size.lock().unwrap().1;
+                            match pick.may_open(Instant::now()).map_err(String::from).and_then(|_| open_picker(connection, window, rect, page.as_deref().unwrap_or(""))) {
+                                Ok(e) => pick.embed = Some(e),
+                                Err(why) => {
+                                    eprintln!("navigatord: a live page's file picker: {why}");
+                                    if why.contains("again") { tell.refused(why.clone()); }
+                                    tell_picked(connection, embed, &FilePicked::Cancelled);
+                                }
+                            }
+                        }
                         Some(Report::Ended(EndReason::Closed)) => break None,
                         Some(Report::Ended(EndReason::Failed)) => break Some("the page's engine failed".into()),
                         // A live page has no unload question in I6.1: Stop is the person's.
                         Some(Report::BeforeUnload { .. }) | None => break Some("the engine sent a report out of order".into()),
                     },
                     Ok(Some(ParentEvent::IslandStopped { embed: id })) if id == embed => break None,
+                    // The picker (I6.4): its file, then its end; or it went.
+                    Ok(Some(ParentEvent::Message { embed: id, bytes } | ParentEvent::MessageFd { embed: id, bytes })) if Some(id) == pick.embed => {
+                        let fd = connection.take_fd();
+                        if let Some(file) = pick.message(&bytes, fd) {
+                            let _ = connection.detach(id);
+                            finish_pick(connection, embed, file, &picked);
+                        }
+                    }
+                    Ok(Some(ParentEvent::ChildLost { embed: id } | ParentEvent::Detached { embed: id })) if Some(id) == pick.embed => {
+                        let file = pick.end();
+                        finish_pick(connection, embed, file, &picked);
+                    }
                     Ok(Some(ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. })) | Err(_) => {
                         let why = match fetched.recv_timeout(Duration::from_millis(100)) {
                             Ok(Err(e)) => e,
@@ -1064,6 +1202,65 @@ mod tests {
         let file = answered(fetched("https://app.example/report.csv", "text/csv", Some(("Content-Disposition", "attachment; filename=\"report.csv\"")), b"a,b\n"), Some(9)).unwrap();
         assert_eq!(file, Answer::File(Offered { url: "https://app.example/report.csv".into(), name: "report.csv".into(), kind: "CSV file".into(), bytes: b"a,b\n".to_vec() }));
         assert_eq!(unstash(Some(9), "https://app.example/report.csv"), None, "a file is not a page to run");
+    }
+
+    #[test]
+    fn a_pick_is_one_read_only_file_and_the_page_cant_hold_the_picker_up() {
+        use limen::picker::ToParent;
+        use std::io::Write;
+        let file = |bytes: &[u8]| {
+            let path = std::env::temp_dir().join(format!("navigatord-pick-{}-{}", std::process::id(), bytes.len()));
+            std::fs::File::create(&path).unwrap().write_all(bytes).unwrap();
+            let f = std::fs::File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::fd::OwnedFd::from(f)
+        };
+        let now = Instant::now();
+        let mut pick = Pick::default();
+        assert_eq!(pick.may_open(now), Ok(()));
+        pick.embed = Some(5);
+        assert!(pick.may_open(now).is_err(), "one at a time");
+        let picked = ToParent::File { name: "notes.txt".into(), size: 5, write: false }.encode();
+        assert_eq!(pick.message(&picked, Some(file(b"hello"))), None, "not over until Done");
+        // A second file, a writable one, or one without its descriptor is not taken.
+        assert_eq!(pick.message(&ToParent::File { name: "b".into(), size: 1, write: false }.encode(), Some(file(b"b"))), None);
+        assert_eq!(pick.message(&ToParent::File { name: "c".into(), size: 1, write: true }.encode(), Some(file(b"c"))), None);
+        assert_eq!(pick.message(&ToParent::Done { files: 1 }.encode(), None), Some(Some(("notes.txt".into(), b"hello".to_vec()))));
+        assert!(pick.embed.is_none());
+        assert!(pick.may_open(Instant::now()).is_err(), "not again at once");
+        assert_eq!(pick.may_open(Instant::now() + PICK_AGAIN), Ok(()));
+        // Cancelled: no file.
+        pick.embed = Some(6);
+        assert_eq!(pick.message(&ToParent::Cancelled.encode(), None), Some(None));
+        // A file the picker said was bigger than a page may take.
+        pick.embed = Some(7);
+        pick.message(&ToParent::File { name: "big".into(), size: PICK_MAX + 1, write: false }.encode(), Some(file(b"x")));
+        assert_eq!(pick.message(&ToParent::Done { files: 1 }.encode(), None), Some(None));
+    }
+
+    #[test]
+    fn the_picked_file_is_served_once() {
+        use limen::web_island::LIVE_FILE;
+        struct Picked(Option<Vec<u8>>);
+        impl Hooks for Picked {
+            fn picked(&mut self) -> Option<Vec<u8>> { self.0.take() }
+        }
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut Picked(Some(b"hello".to_vec()))));
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_FILE)).unwrap();
+        assert!(server.join().unwrap().is_err(), "not before the page");
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || serve(ours, "https://app.example/app.html", &mut Fake(vec![]), &mut Picked(Some(b"hello".to_vec()))));
+        let mut c = nuntius::client::Client::from_stream(theirs).unwrap();
+        c.open(Open::get(1, LIVE_PAGE)).unwrap();
+        assert_eq!(body(&mut c).2, None);
+        c.open(Open::get(2, LIVE_FILE)).unwrap();
+        assert_eq!(body(&mut c).1, b"hello");
+        c.open(Open::get(3, LIVE_FILE)).unwrap();
+        assert_eq!(body(&mut c).2, Some(ErrorCode::Policy), "once");
+        drop(c);
+        server.join().unwrap().unwrap();
     }
 
     #[test]

@@ -110,6 +110,8 @@ extern "C" bool navigator_counter_resize(NavigatorScene*, u16, u16);
 #ifdef ATRIUM_I6_PAGE
 extern "C" bool navigator_take_page_size(NavigatorScene*, u16*, u16*);
 extern "C" bool navigator_live_url_changed(NavigatorScene*, u8 const*, size_t);
+extern "C" int navigator_take_file_picked(NavigatorScene*, u8*, size_t, size_t*);
+extern "C" ssize_t navigator_live_get(u8 const*, size_t, u8*, size_t, u16*, u8*, size_t, size_t*);
 #endif
 
 inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
@@ -176,6 +178,34 @@ inline int drive_page(EditorPage& client, NavigatorScene* scene, Core::EventLoop
         }
 #endif
 #ifdef ATRIUM_I6_PAGE
+        // The person's answer to the page's file input (I6.4): the picked
+        // file's bytes are one GET on the fetch channel; no file, or one
+        // that can't be fetched, closes the input empty.
+        if (action == 6) {
+            u8 name[256];
+            size_t name_length = 0;
+            int picked = navigator_take_file_picked(scene, name, sizeof(name), &name_length);
+            if (picked >= 0) {
+                Vector<Web::HTML::SelectedFile> files;
+                if (picked == 1) {
+                    auto buffer = ByteBuffer::create_uninitialized(8 * 1024 * 1024);
+                    constexpr auto address = "https://live-page.atrium.invalid/picked-file"sv;
+                    u16 status = 0;
+                    u8 kind[128];
+                    size_t kind_length = 0;
+                    ssize_t got = buffer.is_error() ? -1 : navigator_live_get(reinterpret_cast<u8 const*>(address.characters_without_null_termination()), address.length(),
+                        buffer.value().data(), buffer.value().size(), &status, kind, sizeof(kind), &kind_length);
+                    if (got >= 0 && status == 200) {
+                        auto contents = buffer.release_value();
+                        contents.resize(static_cast<size_t>(got));
+                        files.append(Web::HTML::SelectedFile { ByteString { StringView { name, name_length } }, move(contents) });
+                    } else {
+                        warnln("live page: the picked file could not be fetched");
+                    }
+                }
+                client.page().file_picker_closed(files.span());
+            }
+        }
         // navigatord placed the page in a page area of this size (I6.2).
         u16 width = 0, height = 0;
         if (action == 5 && navigator_take_page_size(scene, &width, &height))
